@@ -104,12 +104,15 @@ enum Tok {
     /// literal is expected, kept apart only to recognize a name position
     /// (`FROM "t"`, `"db"."t"`, `"f"(`). Its content is not kept: only
     /// whether it is an audit log administration function name
-    /// ([`is_audit_function`]) or `LOAD_FILE` ([`is_file_function`]), and
-    /// whether it holds a non-ASCII character, decided at lex time.
+    /// ([`is_audit_function`]) or `LOAD_FILE` ([`is_file_function`]),
+    /// whether it holds a non-ASCII character, and whether it is a
+    /// built-in function name when quoted ([`BuiltinFunctions`],
+    /// [`CallForm::Quoted`]), decided at lex time.
     DQuoted {
         audit_function: bool,
         file_function: bool,
         non_ascii: bool,
+        builtin: bool,
     },
     /// Operator or punctuation.
     Punct(String),
@@ -125,6 +128,54 @@ enum LexError {
 fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
+
+/// How an unqualified name stands before `(` in a MySQL / MariaDB text,
+/// which decides how the server resolves the call (ADR-0045 decision 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CallForm {
+    /// Unquoted, with `(` right after the name (`now(`).
+    Plain,
+    /// Unquoted, with whitespace or a comment before `(` (`now (`): the
+    /// servers read a keyword function of `lex.h`'s `sql_functions` set
+    /// as a plain identifier then, unless the session has `IGNORE_SPACE`
+    /// (unknown to the agent).
+    Spaced,
+    /// Backquoted, or double-quoted (an identifier under `ANSI_QUOTES`):
+    /// never a keyword, only a native function (or a stored one).
+    Quoted,
+}
+
+/// The built-in function names of the server a MySQL / MariaDB text was
+/// written for (ADR-0045 decisions 7 to 9), supplied by the caller: this
+/// crate knows no server version. An unqualified call of a name it does not
+/// accept is an unknown call ([`StatementInfo::unknown_call`]): possibly a
+/// stored or loadable function, code that runs out of sight.
+pub trait BuiltinFunctions: Send + Sync {
+    /// Whether `name(`, written in `form`, calls a built-in function, or
+    /// is a keyword that is not a call there (`IN (`, `VALUES (`).
+    /// `name` is the name as written (any bytes, any case; never kept):
+    /// compare it in place, ASCII-case-insensitively.
+    fn is_builtin(&self, name: &[u8], form: CallForm) -> bool;
+}
+
+/// A [`BuiltinFunctions`] in [`AnalyzeOptions`] (compared by address).
+#[derive(Clone, Copy)]
+pub struct Builtins(pub &'static dyn BuiltinFunctions);
+
+impl fmt::Debug for Builtins {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Builtins")
+    }
+}
+
+impl PartialEq for Builtins {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(self.0, other.0)
+    }
+}
+
+impl Eq for Builtins {}
 
 /// SQL dialect of a statement text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -196,11 +247,55 @@ fn my_dash_comment(b: &[u8], i: usize, end: usize) -> bool {
 
 /// Lexes a MySQL / MariaDB text under one `sql_mode` reading.
 fn lex_mysql(text: &str, mode: MyMode) -> Result<Vec<Tok>, LexError> {
+    lex_mysql_spaced(text, mode, None).map(|l| l.toks)
+}
+
+/// What the analysis of unknown calls needs to know of a MySQL token
+/// besides the token itself ([`has_unknown_call`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokFlags {
+    /// A byte stands between the previous token and this one (`count
+    /// (x)`, `count/**/(x)`: the server reads a keyword function name as a
+    /// plain identifier unless `(` follows right away).
+    spaced: bool,
+    /// A [`Tok::Literal`] that the servers read as a name starting with
+    /// digits (`1f`, [`my_digit_name`]).
+    digit_name: bool,
+}
+
+/// The tokens of a MySQL text, with their [`TokFlags`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MyLexed {
+    toks: Vec<Tok>,
+    flags: Vec<TokFlags>,
+    /// End of the last token pushed.
+    last_end: usize,
+}
+
+impl MyLexed {
+    fn push(&mut self, tok: Tok, start: usize, end: usize) {
+        self.toks.push(tok);
+        self.flags.push(TokFlags {
+            spaced: start != self.last_end,
+            digit_name: false,
+        });
+        self.last_end = end;
+    }
+}
+
+/// [`lex_mysql`], with the spacing between tokens; `builtins` decides
+/// whether a `"…"` token is a built-in function name (only compared in
+/// place, see [`Tok::DQuoted`]).
+fn lex_mysql_spaced(
+    text: &str,
+    mode: MyMode,
+    builtins: Option<&dyn BuiltinFunctions>,
+) -> Result<MyLexed, LexError> {
     if text.len() > MAX_QUERY_BYTES {
         return Err(LexError::TooLong);
     }
-    let mut out = Vec::new();
-    lex_mysql_range(text, 0, text.len(), mode, false, &mut out)?;
+    let mut out = MyLexed::default();
+    lex_mysql_range(text, 0, text.len(), mode, false, builtins, &mut out)?;
     Ok(out)
 }
 
@@ -212,14 +307,16 @@ fn lex_mysql_range(
     end: usize,
     mode: MyMode,
     in_comment: bool,
-    out: &mut Vec<Tok>,
+    builtins: Option<&dyn BuiltinFunctions>,
+    out: &mut MyLexed,
 ) -> Result<(), LexError> {
     let b = text.as_bytes();
     let mut i = start;
     while i < end {
-        if out.len() >= MAX_TOKENS {
+        if out.toks.len() >= MAX_TOKENS {
             return Err(LexError::TooLong);
         }
+        let tok_start = i;
         let c = b[i];
         let next = if i + 1 < end { Some(b[i + 1]) } else { None };
         if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
@@ -260,7 +357,7 @@ fn lex_mysql_range(
                 let mariadb_only = b.get(i + 2) == Some(&b'M');
                 let always = version_always_executed(mariadb_only, &b[digits_start..j]);
                 if always || !mode.version_as_comment {
-                    lex_mysql_range(text, j.min(close), close, mode, true, out)?;
+                    lex_mysql_range(text, j.min(close), close, mode, true, builtins, out)?;
                 }
             }
             i = close + 2;
@@ -269,13 +366,13 @@ fn lex_mysql_range(
         // Prefixed strings: N'…', X'…', B'…'.
         if matches!(c, b'n' | b'N' | b'b' | b'B' | b'x' | b'X') && next == Some(b'\'') {
             i = skip_quoted(b, i + 1, end, b'\'', mode.backslash)?;
-            out.push(Tok::Literal);
+            out.push(Tok::Literal, tok_start, i);
             continue;
         }
         match c {
             b'\'' => {
                 i = skip_quoted(b, i, end, b'\'', mode.backslash)?;
-                out.push(Tok::Literal);
+                out.push(Tok::Literal, tok_start, i);
             }
             b'"' => {
                 // A string, or an identifier under ANSI_QUOTES: never
@@ -285,11 +382,18 @@ fn lex_mysql_range(
                 i = skip_quoted(b, i, end, b'"', mode.backslash && !mode.ansi_quotes)?;
                 // The content is only compared in place, never copied.
                 let content = b.get(from..i.saturating_sub(1));
-                out.push(Tok::DQuoted {
-                    audit_function: content.is_some_and(is_audit_function),
-                    file_function: content.is_some_and(is_file_function),
-                    non_ascii: content.is_some_and(|c| !c.is_ascii()),
-                });
+                out.push(
+                    Tok::DQuoted {
+                        audit_function: content.is_some_and(is_audit_function),
+                        file_function: content.is_some_and(is_file_function),
+                        non_ascii: content.is_some_and(|c| !c.is_ascii()),
+                        builtin: content.is_some_and(|c| {
+                            builtins.is_some_and(|f| f.is_builtin(c, CallForm::Quoted))
+                        }),
+                    },
+                    tok_start,
+                    i,
+                );
             }
             b'`' => {
                 let mut j = i + 1;
@@ -310,31 +414,48 @@ fn lex_mysql_range(
                     j += 1;
                 }
                 i = j + 1;
-                out.push(Tok::Quoted(String::from_utf8_lossy(&name).into_owned()));
+                out.push(
+                    Tok::Quoted(String::from_utf8_lossy(&name).into_owned()),
+                    tok_start,
+                    i,
+                );
             }
             b'?' => {
-                out.push(Tok::Param);
                 i += 1;
+                out.push(Tok::Param, tok_start, i);
             }
             b'0'..=b'9' => {
                 let from = i;
                 i = skip_number(b, i).min(end);
                 let digits = &text[from..i];
                 match digits.parse::<u64>() {
-                    Ok(v) if digits.bytes().all(|d| d.is_ascii_digit()) => out.push(Tok::Int(v)),
-                    _ => out.push(Tok::Literal),
+                    Ok(v) if digits.bytes().all(|d| d.is_ascii_digit()) => {
+                        out.push(Tok::Int(v), tok_start, i);
+                    }
+                    // A name that starts with digits (`1f`, `1_000`): the
+                    // servers read it as an identifier, so `1f()` calls a
+                    // stored function (ADR-0045 decision 9). Kept a
+                    // literal (its content may be a value), marked.
+                    _ => {
+                        out.push(Tok::Literal, tok_start, i);
+                        if my_digit_name(digits)
+                            && let Some(f) = out.flags.last_mut()
+                        {
+                            f.digit_name = true;
+                        }
+                    }
                 }
             }
             b'.' if next.is_some_and(|d| d.is_ascii_digit()) => {
                 i = skip_number(b, i).min(end);
-                out.push(Tok::Literal);
+                out.push(Tok::Literal, tok_start, i);
             }
             _ if is_ident_start(c) || c == b'$' => {
                 let from = i;
                 while i < end && is_my_ident_cont(b[i]) {
                     i += 1;
                 }
-                out.push(Tok::Word(text[from..i].to_ascii_lowercase()));
+                out.push(Tok::Word(text[from..i].to_ascii_lowercase()), tok_start, i);
             }
             _ if is_my_op_char(c) => {
                 let from = i;
@@ -347,15 +468,51 @@ fn lex_mysql_range(
                     }
                     i += 1;
                 }
-                out.push(Tok::Punct(text[from..i].to_owned()));
+                out.push(Tok::Punct(text[from..i].to_owned()), tok_start, i);
             }
             _ => {
-                out.push(Tok::Punct(char::from(c).to_string()));
                 i += 1;
+                out.push(Tok::Punct(char::from(c).to_string()), tok_start, i);
             }
         }
     }
     Ok(())
+}
+
+/// A run that [`skip_number`] took for a number but that the MySQL and
+/// MariaDB lexers read as an identifier: digits followed by a letter, `_`
+/// or `$` (`1f`, `1_000`, `12abc`), unless it is a number (`1e5`, `1E+5`
+/// is cut before the sign, `0x1F`, `0b101`). A run with a dot stays a
+/// number.
+fn my_digit_name(run: &str) -> bool {
+    let b = run.as_bytes();
+    if b.contains(&b'.') || b.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let hex = b.len() > 2
+        && b[0] == b'0'
+        && matches!(b[1], b'x' | b'X')
+        && b[2..].iter().all(u8::is_ascii_hexdigit);
+    let bin = b.len() > 2
+        && b[0] == b'0'
+        && matches!(b[1], b'b' | b'B')
+        && b[2..].iter().all(|c| matches!(c, b'0' | b'1'));
+    // `1e5` (`skip_number` swallows `e+5` / `e-5` too).
+    let exponent = b
+        .iter()
+        .position(|c| matches!(c, b'e' | b'E'))
+        .is_some_and(|e| {
+            e > 0
+                && b[..e].iter().all(u8::is_ascii_digit)
+                && b.get(e + 1..).is_some_and(|rest| {
+                    let digits = rest
+                        .strip_prefix(b"+")
+                        .or_else(|| rest.strip_prefix(b"-"))
+                        .unwrap_or(rest);
+                    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+                })
+        });
+    !(hex || bin || exponent)
 }
 
 /// Skips a string quoted with `q` starting at `b[start] == q`, within
@@ -906,9 +1063,15 @@ pub struct StatementInfo {
     pub lead: Vec<String>,
     /// MySQL: the statement calls a schema-qualified function (`db.f(…)`),
     /// a stored function that may read or write any table. Unqualified
-    /// calls (`f(…)`) cannot be told from built-in functions and are not
-    /// flagged.
+    /// calls are [`Self::unknown_call`].
     pub routine_call: bool,
+    /// MySQL: the statement calls an unqualified name that is not a
+    /// built-in function of the server ([`AnalyzeOptions::builtins`],
+    /// ADR-0045 decision 9): a stored function of the default database or
+    /// a loadable function, code that runs out of sight. See
+    /// [`has_unknown_call`] for the positions that are not calls. The name
+    /// is compared in place and never kept.
+    pub unknown_call: bool,
     /// MySQL: the statement calls an audit log administration function
     /// (`audit_log_filter_set_user(…)`, `audit_log_rotate()`…), which
     /// changes or reads the audit configuration or log; its kind is DDL.
@@ -976,6 +1139,7 @@ pub struct QueryAnalysis {
     audit_function: bool,
     file_read: bool,
     non_ascii_call: bool,
+    unknown_call: bool,
 }
 
 impl QueryAnalysis {
@@ -992,7 +1156,17 @@ impl QueryAnalysis {
             audit_function: false,
             file_read: false,
             non_ascii_call: false,
+            unknown_call: false,
         }
+    }
+
+    /// MySQL: the text calls an unqualified name that is not a built-in
+    /// function ([`StatementInfo::unknown_call`]): in a statement of a
+    /// lexed text, or found by a raw scan of a text that did not lex (fail
+    /// closed: also inside a literal or a comment).
+    #[must_use]
+    pub fn unknown_call(&self) -> bool {
+        self.unknown_call || self.parts.iter().any(|p| p.unknown_call)
     }
 
     /// MySQL: the text calls an audit log administration function: in a
@@ -1099,6 +1273,15 @@ pub struct AnalyzeOptions {
     /// gbk / sjis trail-byte guard does not apply. Bytes that are not UTF-8
     /// still make the text opaque.
     pub transcoded: bool,
+    /// MySQL: the built-in function names of the server the text was
+    /// written for ([`StatementInfo::unknown_call`]). `None`: every
+    /// unqualified call is unknown (fail closed).
+    pub builtins: Option<Builtins>,
+    /// MySQL: the text is a `performance_schema` digest (`DIGEST_TEXT`),
+    /// which spaces every token and backquotes every identifier: an
+    /// unquoted name before `(` was a keyword token, read as written right
+    /// before `(` ([`CallForm::Plain`]).
+    pub digest: bool,
 }
 
 impl AnalyzeOptions {
@@ -1113,7 +1296,25 @@ impl AnalyzeOptions {
             dialect: Dialect::Postgres,
             opaque: false,
             transcoded: false,
+            builtins: None,
+            digest: false,
         }
+    }
+
+    /// The built-in function names of the server (see
+    /// [`AnalyzeOptions::builtins`]).
+    #[must_use]
+    pub fn builtins(mut self, builtins: &'static dyn BuiltinFunctions) -> Self {
+        self.builtins = Some(Builtins(builtins));
+        self
+    }
+
+    /// Marks the text as a `performance_schema` digest (see
+    /// [`AnalyzeOptions::digest`]).
+    #[must_use]
+    pub fn digest(mut self, digest: bool) -> Self {
+        self.digest = digest;
+        self
     }
 
     /// Marks the text as transcoded to UTF-8 by its source (see
@@ -1229,6 +1430,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         audit_function: false,
         file_read: false,
         non_ascii_call: false,
+        unknown_call: false,
     }
 }
 
@@ -1256,6 +1458,10 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
             if opts.dialect == Dialect::Mysql && !a.non_ascii_call && raw_non_ascii_call(raw) {
                 a.non_ascii_call = true;
             }
+            // MySQL: an unknown call anywhere in the bytes.
+            if opts.dialect == Dialect::Mysql && !a.unknown_call && raw_unknown_call(raw, opts) {
+                a.unknown_call = true;
+            }
             a
         }
     }
@@ -1265,8 +1471,9 @@ pub fn analyze_raw(raw: &[u8], opts: AnalyzeOptions) -> QueryAnalysis {
 /// an audit log administration function call ([`raw_audit_function`]),
 /// and marked as reading a file when one finds a `LOAD_FILE` call
 /// ([`raw_file_function`]) or as calling a non-ASCII name when one finds
-/// such a call ([`raw_non_ascii_call`]).
-fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
+/// such a call ([`raw_non_ascii_call`]), or a name that is not a built-in
+/// function ([`raw_unknown_call`]).
+fn my_unparsed(text: &str, kind: StatementKind, opts: AnalyzeOptions) -> QueryAnalysis {
     let mut a = QueryAnalysis::unparsed(kind);
     if raw_audit_function(text.as_bytes()) {
         a.kind = most_reportable(kind, StatementKind::Ddl);
@@ -1274,6 +1481,7 @@ fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
     }
     a.file_read = raw_file_function(text.as_bytes());
     a.non_ascii_call = raw_non_ascii_call(text.as_bytes());
+    a.unknown_call = raw_unknown_call(text.as_bytes(), opts);
     a
 }
 
@@ -1281,14 +1489,30 @@ fn my_unparsed(text: &str, kind: StatementKind) -> QueryAnalysis {
 /// give the same tokens.
 fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
     if opts.opaque || (!opts.transcoded && multibyte_hazard(text.as_bytes())) {
-        return my_unparsed(text, my_kind_prefix(text));
+        return my_unparsed(text, my_kind_prefix(text), opts);
     }
-    let readings: Vec<Result<Vec<Tok>, LexError>> = my_modes(text)
+    let builtins = opts.builtins.map(|b| b.0);
+    let readings: Vec<Result<MyLexed, LexError>> = my_modes(text)
         .into_iter()
-        .map(|m| lex_mysql(text, m))
+        .map(|m| lex_mysql_spaced(text, m, builtins))
         .collect();
-    let tokens = match readings.first() {
-        Some(Ok(t)) if readings.iter().all(|r| r.as_ref().is_ok_and(|o| o == t)) => t.clone(),
+    let (tokens, flags) = match readings.first() {
+        Some(Ok(t))
+            if readings
+                .iter()
+                .all(|r| r.as_ref().is_ok_and(|o| o.toks == t.toks)) =>
+        {
+            // A byte between two tokens in any reading (a version comment
+            // read as code or as a comment) counts.
+            let mut flags = t.flags.clone();
+            for r in readings.iter().flatten() {
+                for (f, o) in flags.iter_mut().zip(&r.flags) {
+                    f.spaced |= o.spaced;
+                    f.digit_name |= o.digit_name;
+                }
+            }
+            (t.toks.clone(), flags)
+        }
         _ => {
             // Readings that differ, or a reading that does not lex: the
             // most reportable kind of any reading (fail closed: a
@@ -1298,12 +1522,12 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 most_reportable(
                     k,
                     match r {
-                        Ok(t) => my_kind_all(t),
+                        Ok(t) => my_kind_all(&t.toks),
                         Err(_) => my_kind_prefix(text),
                     },
                 )
             });
-            return my_unparsed(text, kind);
+            return my_unparsed(text, kind, opts);
         }
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
@@ -1326,6 +1550,14 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .take(MAX_PARTS)
         .map(|(s, original)| {
             let mut info = statement_info(s, opts, false);
+            // Every statement is a sub-slice of `tokens`.
+            let at = offset_in(&tokens, s).unwrap_or(0);
+            let s_flags = flags.get(at..at + s.len()).unwrap_or(&[]);
+            let o_at = offset_in(&tokens, original).unwrap_or(0);
+            let o_flags = flags.get(o_at..o_at + original.len()).unwrap_or(&[]);
+            // `SET STATEMENT … FOR`: the assignments too.
+            info.unknown_call = has_unknown_call(s, s_flags, info.kind, opts)
+                || has_unknown_call(original, o_flags, info.kind, opts);
             let wrappers = my_wrappers(original);
             // `explain_analyze` on the statement after the wrappers too:
             // `SET STATEMENT … FOR EXPLAIN … ANALYZE …` whose `ANALYZE`
@@ -1360,6 +1592,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         audit_function: false,
         file_read: false,
         non_ascii_call: false,
+        unknown_call: false,
     }
 }
 
@@ -1670,6 +1903,248 @@ fn has_non_ascii_call(s: &[Tok], kind: StatementKind) -> bool {
         );
         !cte && !table_name_before(s, start, write, schema_change)
     })
+}
+
+/// Where `part`, a sub-slice of `all`, starts in it (`None` when it is
+/// not one). No unsafe code: addresses are compared as numbers.
+fn offset_in(all: &[Tok], part: &[Tok]) -> Option<usize> {
+    let size = std::mem::size_of::<Tok>();
+    let start = (part.as_ptr() as usize).checked_sub(all.as_ptr() as usize)?;
+    let at = start / size;
+    (start % size == 0 && at.checked_add(part.len())? <= all.len()).then_some(at)
+}
+
+/// What opened a parenthesis, for [`has_unknown_call`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    /// `CONVERT(`: a type follows its first comma (`CONVERT(x, CHAR(4))`).
+    Convert,
+    /// `COLUMNS (` (`JSON_TABLE`): column definitions, a type after each
+    /// column name (`c VARCHAR(10) PATH '$.c'`).
+    Columns,
+    /// Any other parenthesis.
+    Other,
+}
+
+/// One parenthesis level of [`has_unknown_call`].
+#[derive(Debug, Clone, Copy)]
+struct Level {
+    opener: Opener,
+    /// Commas seen at this level.
+    commas: usize,
+    /// A `SELECT` or `DELETE` was seen at this level and no `FROM` since:
+    /// the next `FROM` starts a table list.
+    query: bool,
+    /// In a table list (`FROM`, `JOIN`, `STRAIGHT_JOIN`, `UPDATE`).
+    tables: bool,
+}
+
+/// An unqualified call of a name that is not a built-in function
+/// ([`StatementInfo::unknown_call`], ADR-0045 decision 9), in any
+/// position: a select list, `WHERE`, `SET`, `DO`, `VALUES`, a `CALL`
+/// argument. A name (plain, backquoted, double-quoted, or a name that
+/// starts with digits) followed by `(`, compared in place with
+/// [`AnalyzeOptions::builtins`] in its [`CallForm`] (`flags[i]`: a byte
+/// before token `i`, a literal that is a name; a digest is read as plain;
+/// a name that starts with digits is never built in). Not a call:
+///
+/// - a qualified name (`db.f(`: [`StatementInfo::routine_call`]);
+/// - a table with a column list ([`table_name_before`]: `INSERT INTO t
+///   (a)`, `REFERENCES t (id)`) or a common table expression (`WITH x (a)
+///   AS (`: the `)` closing its list is followed by `AS`);
+/// - a name after `AS` (`CAST(x AS DECIMAL(10, 2))`, a derived table's
+///   column list `AS dt (a)`), after `)` (`MATCH (a) AGAINST (`, `OVER
+///   (`, `(SELECT …) dt (a)`), after a literal (`'$' COLUMNS (`, `IGNORE
+///   1 LINES (a)`), after `CHARACTER SET` / `CHARSET` (`LOAD DATA`), after
+///   `PROCEDURE` or `CALL` (a procedure: `CALL` is reported on its own);
+///   none of these is valid SQL before a call;
+/// - a type: after `RETURNING` in parentheses (`JSON_VALUE(… RETURNING
+///   DECIMAL(10, 2))`), after the first comma of `CONVERT(`, after a
+///   column name in `COLUMNS (…)`;
+/// - `JSON_TABLE` where a table list starts (`FROM JSON_TABLE(`, `JOIN`,
+///   `, JSON_TABLE(` in the list): a table function, not a stored one
+///   (MariaDB resolves `JSON_TABLE(` anywhere else to a stored function).
+///
+/// A name that is not a call in any of these positions on the servers
+/// keeps a false positive at worst (fail closed: reported).
+fn has_unknown_call(
+    s: &[Tok],
+    flags: &[TokFlags],
+    kind: StatementKind,
+    opts: AnalyzeOptions,
+) -> bool {
+    if opts.dialect != Dialect::Mysql {
+        return false;
+    }
+    let write = matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+    );
+    let schema_change = matches!(kind, StatementKind::Ddl | StatementKind::Dcl);
+    let builtin =
+        |name: &[u8], form: CallForm| opts.builtins.is_some_and(|b| b.0.is_builtin(name, form));
+    // The index of the `)` closing the `(` at each index, for the common
+    // table expression check (one pass).
+    let mut close: Vec<Option<usize>> = vec![None; s.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (i, t) in s.iter().enumerate() {
+        if is_punct(Some(t), "(") {
+            open.push(i);
+        } else if is_punct(Some(t), ")")
+            && let Some(o) = open.pop()
+        {
+            close[o] = Some(i);
+        }
+    }
+    let top = Level {
+        opener: Opener::Other,
+        commas: 0,
+        query: false,
+        tables: false,
+    };
+    let mut levels: Vec<Level> = vec![top];
+    for (i, t) in s.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| s.get(j));
+        let level = levels.last().copied().unwrap_or(top);
+        if is_punct(s.get(i + 1), "(") {
+            let call = match t {
+                Tok::Word(w) => {
+                    let form = if !opts.digest && flags.get(i + 1).is_none_or(|f| f.spaced) {
+                        CallForm::Spaced
+                    } else {
+                        CallForm::Plain
+                    };
+                    // `JSON_TABLE` where a table list starts.
+                    let table_start = (matches!(word(prev), Some("join" | "straight_join"))
+                        || (word(prev) == Some("from") && level.tables)
+                        || (level.tables && is_punct(prev, ",")))
+                        && w == "json_table";
+                    (!table_start).then(|| !builtin(w.as_bytes(), form))
+                }
+                Tok::Quoted(n) => Some(!builtin(n.as_bytes(), CallForm::Quoted)),
+                Tok::DQuoted { builtin, .. } => Some(!builtin),
+                Tok::Literal if flags.get(i).is_some_and(|f| f.digit_name) => Some(true),
+                _ => None,
+            };
+            if call == Some(true) {
+                let after = |w: &[&str]| word(prev).is_some_and(|p| w.contains(&p));
+                let not_a_call = is_punct(prev, ".")
+                    || is_punct(prev, ")")
+                    || matches!(
+                        prev,
+                        Some(Tok::Literal | Tok::Int(_) | Tok::Param | Tok::DQuoted { .. })
+                    )
+                    || after(&["as", "procedure", "call", "charset"])
+                    || (after(&["set"])
+                        && matches!(
+                            i.checked_sub(2).and_then(|j| word(s.get(j))),
+                            Some("character" | "char")
+                        ))
+                    || (after(&["returning"]) && levels.len() > 1)
+                    || (level.opener == Opener::Convert && level.commas > 0 && is_punct(prev, ","))
+                    || (level.opener == Opener::Columns
+                        && matches!(prev, Some(Tok::Word(_) | Tok::Quoted(_))))
+                    || table_name_before(s, i, write, schema_change)
+                    || close[i + 1].is_some_and(|c| word(s.get(c + 1)) == Some("as"));
+                if !not_a_call {
+                    return true;
+                }
+            }
+        }
+        match t {
+            Tok::Punct(p) if p == "(" => {
+                let opener = match word(prev) {
+                    Some("convert") => Opener::Convert,
+                    Some("columns") => Opener::Columns,
+                    _ => Opener::Other,
+                };
+                if levels.len() < MAX_DEPTH {
+                    levels.push(Level {
+                        opener,
+                        commas: 0,
+                        query: false,
+                        tables: level.tables,
+                    });
+                }
+            }
+            Tok::Punct(p) if p == ")" => {
+                if levels.len() > 1 {
+                    levels.pop();
+                }
+            }
+            Tok::Punct(p) if p == "," => {
+                if let Some(l) = levels.last_mut() {
+                    l.commas += 1;
+                }
+            }
+            Tok::Word(w) => {
+                if let Some(l) = levels.last_mut() {
+                    match w.as_str() {
+                        "select" | "delete" => {
+                            l.query = true;
+                            l.tables = false;
+                        }
+                        "from" => {
+                            l.tables = l.query;
+                            l.query = false;
+                        }
+                        "join" | "straight_join" | "update" => l.tables = true,
+                        "where" | "group" | "having" | "order" | "limit" | "union" | "set"
+                        | "values" | "value" | "on" | "using" | "for" | "window" | "lock"
+                        | "procedure" | "into" | "except" | "intersect" => l.tables = false,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Raw-text scan for an unknown call ([`StatementInfo::unknown_call`]),
+/// for a text that did not lex, with the rules of [`raw_audit_function`]
+/// (fail closed: inside a literal or a comment too, and no position is
+/// told apart but a qualified name): an identifier run (not only digits,
+/// not after `.`) followed by `(` as described there, that
+/// [`AnalyzeOptions::builtins`] does not accept in its form (quoted when a
+/// backtick or a double quote stands right before it, plain when `(`
+/// follows right after it, spaced otherwise). Compared in place.
+fn raw_unknown_call(b: &[u8], opts: AnalyzeOptions) -> bool {
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        if !is_my_ident_cont(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && is_my_ident_cont(b[i]) {
+            i += 1;
+        }
+        let name = &b[start..i];
+        if name.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let before = start.checked_sub(1).map(|j| b[j]);
+        if before == Some(b'.') || !raw_call_follows(b, i) {
+            continue;
+        }
+        let form = if matches!(before, Some(b'`' | b'"')) {
+            CallForm::Quoted
+        } else if b.get(i) == Some(&b'(') {
+            CallForm::Plain
+        } else {
+            CallForm::Spaced
+        };
+        if !opts.builtins.is_some_and(|f| f.0.is_builtin(name, form)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A server-side `LOAD DATA INFILE` / `LOAD XML INFILE` (no `LOCAL`), at
@@ -2174,6 +2649,8 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
         lead: lead_words(s),
         routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
+        // Set by `analyze_mysql`, which has the spacing of the tokens.
+        unknown_call: false,
         audit_function: opts.dialect == Dialect::Mysql && has_audit_function(s),
         dquoted_name: opts.dialect == Dialect::Mysql && has_dquoted_name(s),
         dquoted: s.iter().any(|t| matches!(t, Tok::DQuoted { .. })),
@@ -4387,5 +4864,202 @@ mod tests {
             Limit::Rows(50_000)
         );
         assert!(!shape("select * from t where a = ?").whole_relation(10));
+    }
+
+    /// A test list: native (`n`), keywords (`k`, plain or spaced) and
+    /// keyword functions read as keywords only right before `(` (`s`).
+    struct TestBuiltins;
+
+    impl BuiltinFunctions for TestBuiltins {
+        fn is_builtin(&self, name: &[u8], form: CallForm) -> bool {
+            const N: [&str; 5] = [
+                "concat",
+                "ifnull",
+                "load_file",
+                "row_number",
+                "last_insert_id",
+            ];
+            const K: [&str; 29] = [
+                "if",
+                "in",
+                "values",
+                "char",
+                "decimal",
+                "exists",
+                "as",
+                "select",
+                "not",
+                "and",
+                "or",
+                "over",
+                "row",
+                "match",
+                "database",
+                "interval",
+                "cast",
+                "convert",
+                "json_value",
+                "trim",
+                "extract",
+                "from",
+                "join",
+                "on",
+                "where",
+                "union",
+                "all",
+                "using",
+                "partition",
+            ];
+            const S: [&str; 4] = ["count", "now", "substr", "max"];
+            let is = |l: &[&str]| l.iter().any(|n| n.as_bytes().eq_ignore_ascii_case(name));
+            is(&N) || (form != CallForm::Quoted && is(&K)) || (form == CallForm::Plain && is(&S))
+        }
+    }
+
+    static TEST_BUILTINS: TestBuiltins = TestBuiltins;
+
+    fn uc_opts() -> AnalyzeOptions {
+        AnalyzeOptions::mysql().builtins(&TEST_BUILTINS)
+    }
+
+    fn unknown(s: &str) -> bool {
+        analyze(s, uc_opts()).unknown_call()
+    }
+
+    /// ADR-0045 decision 9: unqualified calls of names that are not built
+    /// in, in every position and quoting.
+    #[test]
+    fn unknown_calls_are_found() {
+        for q in [
+            "SELECT f()",
+            "select F ( 1 )",
+            "DO f()",
+            "SET @x = f()",
+            "SET @x := 1, @y = f(2)",
+            "SELECT a FROM hr.t WHERE b = f(1)",
+            "SELECT * FROM hr.t WHERE b IN (SELECT g(c) FROM u)",
+            "INSERT INTO t (a) VALUES (f())",
+            "UPDATE t SET a = f(a) WHERE b = 1",
+            "DELETE FROM t WHERE a = f()",
+            "CALL p(f())",
+            "SELECT 1 FROM DUAL WHERE NOT f()",
+            "SELECT CASE WHEN f() THEN 1 END",
+            "SELECT 1f()",
+            "SELECT 12_3()",
+            // Keyword functions with whitespace or a comment before `(`:
+            // identifiers then.
+            "SELECT now ()",
+            "SELECT count (*) FROM t",
+            "SELECT now/**/()",
+            "SELECT now/*!*/()",
+            "SELECT now\n()",
+            // Quoted: never a keyword.
+            "SELECT `now`()",
+            "SELECT `count`(*) FROM t",
+            "SELECT `if`(1, 2, 3)",
+            "SELECT `f`()",
+            "SELECT `get customer`(1)",
+            // `ANSI_QUOTES`.
+            "SELECT \"f\"()",
+            "SELECT \"now\"()",
+            // Executable comments are code.
+            "SELECT /*!50000 f() */",
+            "SELECT /*!f*/()",
+            // `JSON_TABLE` out of a table list (MariaDB: a stored
+            // function).
+            "SELECT json_table(1)",
+            "SELECT TRIM('a' FROM json_table(1))",
+            "SELECT EXTRACT(DAY FROM f(1))",
+            "SELECT a FROM t FOR SYSTEM_TIME FROM json_table() TO NOW()",
+            // After `SET STATEMENT … FOR`.
+            "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // A text that does not lex: a raw scan.
+            "SELECT f('a",
+            "SELECT 'a\\' , f(1)",
+        ] {
+            assert!(unknown(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn built_in_calls_and_non_call_positions_are_not_unknown() {
+        for q in [
+            "SELECT now(), count(*), max(a), substr(b, 1) FROM t",
+            "SELECT NOW(), COUNT(*) FROM t",
+            "SELECT concat ('a'), `concat`('b'), \"concat\"('c'), ifnull (1, 2)",
+            "SELECT IF (a, 1, 2), CHAR (65), DATABASE ()",
+            "SELECT LAST_INSERT_ID()",
+            "SELECT 1",
+            "SELECT a FROM t WHERE b IN (1, 2) AND EXISTS (SELECT 1) OR NOT (c)",
+            "INSERT INTO t (a, b) VALUES (1, 2), (3, 4)",
+            "INSERT t (a) VALUE (1)",
+            "REPLACE INTO hr.t (a) VALUES (1)",
+            "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = VALUES(a)",
+            "WITH x (a) AS (SELECT 1) SELECT * FROM x",
+            "WITH x AS (SELECT 1), y (b, c) AS (SELECT 2, 3) SELECT * FROM y",
+            "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r",
+            "SELECT CAST(a AS DECIMAL(10, 2)), CAST(b AS nchar(4)), CAST(c AS datetime(6)) FROM t",
+            "SELECT CONVERT(a, nchar(4)), CONVERT(b, datetime(6)) FROM t",
+            "SELECT JSON_VALUE(j, '$.a' RETURNING decimal(4, 2)) FROM t",
+            "SELECT MATCH (a) AGAINST ('x' IN BOOLEAN MODE) FROM t",
+            "SELECT row_number() OVER (ORDER BY a) FROM t",
+            "SELECT a FROM t WINDOW w AS (ORDER BY a)",
+            "SELECT * FROM (SELECT 1, 2) AS dt (a, b)",
+            "SELECT * FROM (SELECT 1, 2) dt (a, b)",
+            "SELECT * FROM JSON_TABLE('[]', '$[*]' COLUMNS (a varchar(10) PATH '$', \
+             NESTED PATH '$.b' COLUMNS (b datetime(6) PATH '$'))) jt",
+            "SELECT * FROM t JOIN JSON_TABLE('[]', '$' COLUMNS (a INT PATH '$')) jt ON TRUE",
+            "SELECT * FROM t, JSON_TABLE('[]', '$' COLUMNS (a INT PATH '$')) jt",
+            "LOAD DATA LOCAL INFILE 'f' INTO TABLE t CHARACTER SET latin1 \
+             FIELDS TERMINATED BY ',' IGNORE 1 LINES (a, b) SET c = 1",
+            "SELECT hr.f()",
+            "SELECT `hr`.`f`()",
+            "SELECT 1e5, 0x1F, 0b101, 1.5e3",
+            "SELECT a FROM t PARTITION (p0)",
+            "SELECT INTERVAL (1) DAY + NOW()",
+            "SELECT ROW (1, 2) = ROW (1, 2)",
+            "SELECT 'f(1)' /* g() */ -- h()\n",
+        ] {
+            assert!(!unknown(q), "{q}");
+        }
+        // Qualified calls are routine calls, not unknown ones.
+        let a = analyze("SELECT hr.f()", uc_opts());
+        assert!(a.parts()[0].routine_call && !a.unknown_call());
+    }
+
+    /// Without a list, every unqualified call is unknown (fail closed).
+    #[test]
+    fn no_list_means_every_call_is_unknown() {
+        assert!(my("SELECT now()").unknown_call());
+        assert!(!analyze("SELECT now()", AnalyzeOptions::new()).unknown_call());
+    }
+
+    /// A digest spaces every token and backquotes every identifier: an
+    /// unquoted name was a keyword written right before `(`.
+    #[test]
+    fn digests_read_unquoted_names_as_keywords() {
+        let d = |q: &str| analyze(q, uc_opts().digest(true)).unknown_call();
+        assert!(!d("SELECT COUNT ( * ) , NOW ( ) , `concat` ( ? ) FROM `t`"));
+        assert!(d("SELECT `count` ( * ) FROM `t`"));
+        assert!(d("SELECT `f` ( )"));
+        assert!(d("SELECT F ( )"));
+        assert!(unknown("SELECT COUNT ( * ) FROM `t`"));
+    }
+
+    /// The unknown-call analysis never changes the relations, the kind
+    /// nor the other flags.
+    #[test]
+    fn unknown_calls_keep_the_relations() {
+        for q in [
+            "SELECT f(a) FROM hr.t JOIN hr.u ON f(b)",
+            "INSERT INTO hr.t (a) SELECT g(b) FROM hr.u",
+            "UPDATE hr.t SET a = f(a)",
+        ] {
+            let with = analyze(q, uc_opts());
+            let without = my(q);
+            assert!(with.unknown_call(), "{q}");
+            assert_eq!(with.relations(), without.relations(), "{q}");
+            assert_eq!(with.kind(), without.kind(), "{q}");
+        }
     }
 }

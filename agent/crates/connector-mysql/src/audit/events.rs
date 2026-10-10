@@ -44,7 +44,9 @@
 //! text that only kept its kind (opaque, ambiguous readings, not
 //! lexable) is reported against `*` with the most reportable kind of its
 //! readings; code that runs out of sight (`CALL`, `EXECUTE`, `PREPARE`, a
-//! schema-qualified function call) adds `*`. A text with several
+//! schema-qualified function call, an unqualified call of a name that is
+//! not built in on the server's series: `crate::builtins`, ADR-0045 part
+//! (b)) adds `*`. A text with several
 //! statements takes the action of its most reportable one. A statement
 //! that writes or changes something, runs code out of sight or cannot be
 //! read is never left out as the agent's own (I4), unless table records
@@ -72,6 +74,7 @@ use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use databastion_core::audit::tail::RecordPos;
 
 use super::records::{FileRecord, Op, TableOp};
+use crate::builtins::BuiltinList;
 use crate::conn::Flavor;
 use crate::discover::normalize;
 
@@ -98,8 +101,12 @@ const PRE_EXECUTION_ERRORS: [u32; 13] = [
     1044, 1049, 1051, 1052, 1054, 1066, 1109, 1142, 1143, 1146, 1227, 1305, 1370,
 ];
 
+/// Analysis options of a text, with the names built in on every listed
+/// server (an event builder uses its server's list instead).
 fn analyze_opts(truncated: bool) -> AnalyzeOptions {
-    let mut o = AnalyzeOptions::mysql().truncated(truncated);
+    let mut o = AnalyzeOptions::mysql()
+        .truncated(truncated)
+        .builtins(crate::builtins::any_server());
     o.large_limit = LARGE_LIMIT + 1;
     o
 }
@@ -341,6 +348,7 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
         || p.analyze_wrapped
         || p.audit_function
         || p.file_read
+        || p.unknown_call
         || p.explain_unbounded
     {
         return false;
@@ -350,8 +358,8 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
     match lead.as_slice() {
         // Built-in calls are fine (`SET sql_mode = CONCAT(@@sql_mode, …)`,
         // sent by Connector/J on every pooled connection); a
-        // schema-qualified (stored) function is not, nor an audit
-        // function or `LOAD_FILE` (excluded above).
+        // schema-qualified (stored) function is not, nor an unknown call,
+        // an audit function or `LOAD_FILE` (excluded above).
         ["set", ..] => !p.routine_call && p.relations.is_empty(),
         ["begin"] | ["begin", "work"] => true,
         ["start", "transaction", ..]
@@ -853,6 +861,9 @@ pub(crate) struct Access<'a> {
     /// takes the objects and signals of both (security review of 09e93da,
     /// R1). The agent's exact-text matches use `text` only.
     pub(crate) alt_text: Option<&'a [u8]>,
+    /// `text` is a `performance_schema` digest (`alt_text` always is):
+    /// read with `AnalyzeOptions::digest`.
+    pub(crate) digest: bool,
     /// Table-access records of the statement.
     pub(crate) tables: Vec<(&'a str, &'a str, TableOp)>,
     pub(crate) rows: Option<u64>,
@@ -924,6 +935,9 @@ pub(crate) struct EventBuilder {
     /// The server's flavor, which decides a few statement-text tables
     /// ([`statement_text_table`]; `None`: every listed table).
     flavor: Option<Flavor>,
+    /// The server's built-in function names (ADR-0045 decision 8; until
+    /// set, the names built in on every listed server).
+    builtins: &'static BuiltinList,
     sessions: Sessions,
     /// Table-access records waiting for their statement record.
     pending: Pending,
@@ -941,6 +955,7 @@ impl EventBuilder {
             own_statements: Vec::new(),
             credits: None,
             flavor: None,
+            builtins: crate::builtins::any_server(),
             sessions: Sessions::default(),
             pending: Pending::default(),
             panicked: 0,
@@ -960,6 +975,13 @@ impl EventBuilder {
     #[must_use]
     pub(crate) fn with_flavor(mut self, flavor: Flavor) -> Self {
         self.flavor = Some(flavor);
+        self
+    }
+
+    /// The server's built-in function names (`crate::builtins::for_server`).
+    #[must_use]
+    pub(crate) fn with_builtins(mut self, builtins: &'static BuiltinList) -> Self {
+        self.builtins = builtins;
         self
     }
 
@@ -1124,16 +1146,24 @@ impl EventBuilder {
                 t,
                 analyze_opts(a.truncated)
                     .opaque(a.opaque)
-                    .transcoded(transcoded),
+                    .transcoded(transcoded)
+                    .builtins(self.builtins)
+                    .digest(a.digest),
             )
         });
         // A second whole text of the statement (the digest next to an
         // uncut `SQL_TEXT`): its statements are analyzed with the first
         // one's, so the event takes the objects and signals of both
         // (security review of 09e93da, R1).
-        let alt_analysis: Option<QueryAnalysis> = a
-            .alt_text
-            .map(|t| analyze_raw(t, analyze_opts(false).transcoded(transcoded)));
+        let alt_analysis: Option<QueryAnalysis> = a.alt_text.map(|t| {
+            analyze_raw(
+                t,
+                analyze_opts(false)
+                    .transcoded(transcoded)
+                    .builtins(self.builtins)
+                    .digest(true),
+            )
+        });
         let joined: Vec<StatementInfo>;
         let parts: &[StatementInfo] = match &alt_analysis {
             None => analysis.as_ref().map_or(&[], QueryAnalysis::parts),
@@ -1219,7 +1249,11 @@ impl EventBuilder {
         // text that did not lex, and an `EXPLAIN` whose statement is past
         // the prefix bound (#168 review L3): what they read (a server
         // file, a statement that may run) is named by no audit source, so
-        // the event adds `*` whatever its table records.
+        // the event adds `*` whatever its table records. So does an
+        // unqualified call of a name that is not a built-in function of the
+        // server's series (ADR-0045 decisions 8 to 10): a stored function
+        // of the default database or a loadable function, whose reads no
+        // statement text names; the routine's name is never an object.
         // A statement that shows other sessions' statement texts without
         // naming a table (`SHOW ENGINE INNODB STATUS`, `SHOW EXPLAIN FOR`,
         // `EXPLAIN FOR CONNECTION`; ADR-0045 open question 3) is handled
@@ -1234,6 +1268,7 @@ impl EventBuilder {
         let hidden = parts.iter().any(|p| {
             p.file_read
                 || p.non_ascii_call
+                || p.unknown_call
                 || p.explain_unbounded
                 || p.relations_full
                 || shows_session_text(p)
@@ -1244,11 +1279,11 @@ impl EventBuilder {
             || analysis
                 .iter()
                 .chain(&alt_analysis)
-                .any(|x| x.file_read() || x.non_ascii_call());
+                .any(|x| x.file_read() || x.non_ascii_call() || x.unknown_call());
         // Code that runs out of sight: a procedure, a prepared statement,
-        // a stored function (schema-qualified calls only: `f()` cannot be
-        // told from a built-in function), `LOAD_FILE` and an unbounded
-        // `EXPLAIN` (above).
+        // a stored function (schema-qualified, or an unqualified call of a
+        // name that is not built in on the server, above: ADR-0045 part
+        // (b)), `LOAD_FILE` and an unbounded `EXPLAIN` (above).
         // A `"…"` name (`ANSI_QUOTES`) hides the objects the same way.
         let call = hidden
             || parts.iter().any(|p| {
@@ -1780,6 +1815,7 @@ impl EventBuilder {
             text: text_record.and_then(|r| r.text.as_deref().map(Vec::as_slice)),
             opaque: text_record.is_some_and(|r| r.opaque),
             alt_text: None,
+            digest: false,
             truncated: text_record.is_some_and(|r| r.truncated),
             tables,
             rows: None,
@@ -1927,6 +1963,7 @@ mod tests {
             text: Some(text),
             opaque: false,
             alt_text: None,
+            digest: false,
             truncated,
             tables,
             rows: None,
@@ -2641,6 +2678,7 @@ mod tests {
                 text: Some(b"select a from `escalations_jean.richard@example.com` where x = 1"),
                 opaque: false,
                 alt_text: None,
+                digest: false,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(20_000),
@@ -2744,6 +2782,7 @@ mod tests {
                 text: Some(b"select email from employees where id > 0"),
                 opaque: false,
                 alt_text: None,
+                digest: false,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(99),
@@ -2770,9 +2809,10 @@ mod tests {
                 "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,hr,'select * from nope',1146",
             ]),
         );
+        // `leak()` is not a built-in function: `*` too (ADR-0045 part (b)).
         assert_eq!(
             out,
-            ["read [\"hr.employees\"] None [\"shape.full_table_read\"]"],
+            ["read [\"hr.*\", \"hr.employees\"] None [\"shape.full_table_read\"]"],
             "{out:#?}"
         );
         assert_eq!(b.failed, 1);
@@ -2792,6 +2832,7 @@ mod tests {
             text: Some(text.as_bytes()),
             opaque: false,
             alt_text: None,
+            digest: false,
             truncated: false,
             tables: Vec::new(),
             rows: Some(3),
@@ -3897,6 +3938,165 @@ mod tests {
         expect_everywhere("INSERT INTO hr.`client\u{e8}le` (nom) VALUES ('x')", |_| {
             "write [\"hr.client\u{e8}le\"]".to_owned()
         });
+    }
+
+    /// ADR-0045 part (b): an unqualified call of a name that is not built
+    /// in (a stored function reading `hr.customers`, a loadable function)
+    /// is a read of `*`, always reported and never the agent's own, on
+    /// every source, plainly, backquoted, double-quoted (`ANSI_QUOTES`),
+    /// or a keyword function with whitespace before `(`; the routine's
+    /// name is never an object.
+    #[test]
+    fn unknown_calls_are_reads_of_star() {
+        for text in [
+            "SELECT get_customer_email(1)",
+            "DO get_customer_email(1)",
+            "SET @x = get_customer_email(1)",
+            "SELECT `get_customer_email`(1)",
+            "SELECT \"get_customer_email\"(1)",
+            "SELECT `now`()",
+            "SELECT now ()",
+            "SELECT count (*)",
+            "SELECT \"count\"(*)",
+            "SELECT 1f()",
+            "SELECT /*!50000 get_customer_email(1) */",
+            "SELECT 1 WHERE f() > 0",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // A loadable function: not built in (open question 7).
+            "SELECT version_tokens_show()",
+            // `SHOW … WHERE` with an unknown call runs it.
+            "SHOW TABLES WHERE f()",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+            for user in ["app", "databastion"] {
+                for (_, e) in on_every_source(user, text) {
+                    let e = e.unwrap();
+                    assert!(
+                        e.objects()
+                            .iter()
+                            .all(|o| !o.object().as_str().contains("customer")),
+                        "{text}"
+                    );
+                }
+            }
+        }
+        // With tables: the tables and `*` (objects in name order).
+        let with_table = |action: &str, s: EventSource| {
+            let mut o = ["hr.t", star(s)];
+            o.sort_unstable();
+            format!("{action} {o:?} always")
+        };
+        expect_everywhere("SELECT a, f(b) FROM hr.t", |s| with_table("read", s));
+        expect_everywhere("UPDATE hr.t SET a = f(a)", |s| with_table("write", s));
+        // With table records: they decide the tables, `*` is added.
+        for user in ["databastion", "app"] {
+            let lines = sa_with_records(
+                user,
+                &[("READ", "hr", "t")],
+                "SELECT a, get_customer_email(a) FROM hr.t LIMIT 1",
+            );
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.t\", \"shop.*\"] always"],
+                "{user}"
+            );
+        }
+        // A digest: `` `f` ( `` is a call, `COUNT (` a keyword.
+        for (digest, want) in [
+            (
+                "SELECT `get_customer_email` ( ? )",
+                Some("read [\"*.*\"] always"),
+            ),
+            ("SELECT `count` ( * )", Some("read [\"*.*\"] always")),
+            ("SELECT COUNT ( * ) , NOW ( ) , `concat` ( ? )", None),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+            access.digest = true;
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            let got = b.statement(access, SystemTime::now());
+            assert_eq!(got.as_ref().map(shown).as_deref(), want, "{digest}");
+            // The digest next to a whole `SQL_TEXT`: analyzed too.
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(b"SELECT 1", false, Vec::new());
+            access.alt_text = Some(digest.as_bytes());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            let got = b.statement(access, SystemTime::now());
+            assert_eq!(got.as_ref().map(shown).as_deref(), want, "{digest}");
+        }
+    }
+
+    /// ADR-0045 part (b): every listed built-in, called table-less (plain;
+    /// backquoted when native; spaced unless `sql_functions`), gives no
+    /// event, on the list of its series; so do a driver's session probes.
+    #[test]
+    fn listed_built_ins_called_table_less_give_no_event() {
+        // `LOAD_FILE` keeps its own rule (a read of `*`). Keywords that
+        // are not calls (`SELECT in()`: a syntax error on the servers) give
+        // no event either.
+        let not_calls = |n: &str| n == "load_file";
+        let mut checked = 0;
+        for list in crate::builtins::lists() {
+            let mut texts: Vec<String> = Vec::new();
+            for (name, form) in list.names() {
+                if not_calls(name) {
+                    continue;
+                }
+                texts.push(format!("SELECT {name}()"));
+                texts.push(format!("SELECT {}()", name.to_ascii_uppercase()));
+                if form == crate::builtins::Form::Native {
+                    texts.push(format!("SELECT `{name}`()"));
+                }
+                if form != crate::builtins::Form::KeywordAdjacent {
+                    texts.push(format!("SELECT {name} ()"));
+                }
+            }
+            texts.extend(
+                [
+                    "SELECT NOW()",
+                    "SELECT LAST_INSERT_ID()",
+                    "SELECT DATABASE()",
+                    "SELECT @@session.auto_increment_increment AS auto_increment_increment, \
+                     @@character_set_client AS character_set_client, @@max_allowed_packet",
+                    "SELECT CONNECTION_ID()",
+                    "SELECT VERSION()",
+                    "SELECT USER(), CURRENT_USER()",
+                    "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+                    "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+                    "SET @@session.time_zone = '+00:00'",
+                    "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP()",
+                    "SELECT 1 FROM DUAL WHERE IFNULL(NULL, 1) = 1",
+                ]
+                .map(str::to_owned),
+            );
+            for text in texts {
+                for user in ["app", "databastion"] {
+                    let mut b = EventBuilder::new(own()).with_builtins(list);
+                    let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+                    access.user = user;
+                    access.principal = EventPrincipal::account(user);
+                    access.rows = Some(1);
+                    let got = b.statement(access, SystemTime::now());
+                    assert!(
+                        got.is_none(),
+                        "{:?} {:?} {user}: {text} -> {:?}",
+                        list.flavor,
+                        list.series,
+                        got.as_ref().map(shown)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 6 * 2 * 1000, "{checked}");
     }
 
     /// Security review of 914c9d2 (Low): the `SHOW GRANTS … USING`

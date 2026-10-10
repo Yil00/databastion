@@ -1595,19 +1595,52 @@ mod tests {
     /// Every statement the agent sends is a recognized read or on the
     /// Audit stream's allow-list of statements of no known kind: the
     /// fail-closed `Other` path never reports the agent's own traffic.
+    ///
+    /// ADR-0045 decision 9: no statement the agent sends calls a name that
+    /// is not built in, on any list (an unknown call is never the agent's
+    /// own), nor on the names built in on every listed server.
     #[test]
     fn own_statements_are_reads_or_allow_listed() {
         use databastion_classifiers::query::{AnalyzeOptions, StatementKind, analyze};
-        for s in all_statements() {
-            let a = analyze(&s, AnalyzeOptions::mysql());
-            assert!(a.lexed(), "{s}");
-            for p in a.parts() {
-                let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
-                let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
-                assert!(read || quiet, "{s}");
-                assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+        let lists = crate::builtins::lists()
+            .iter()
+            .chain(std::iter::once(crate::builtins::any_server()));
+        let mut statements = all_statements();
+        statements.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            statements.push(
+                sample_statement(
+                    flavor,
+                    1000,
+                    "s",
+                    "t",
+                    &[("a", Sampled::Text), ("b", Sampled::Plain)],
+                    10,
+                )
+                .unwrap(),
+            );
+        }
+        let mut checked = 0;
+        for list in lists {
+            for s in statements.clone() {
+                let a = analyze(&s, AnalyzeOptions::mysql().builtins(list));
+                assert!(a.lexed(), "{s}");
+                assert!(
+                    !a.unknown_call(),
+                    "{:?} {:?}: {s}",
+                    list.flavor,
+                    list.series
+                );
+                for p in a.parts() {
+                    let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
+                    let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
+                    assert!(read || quiet, "{s}");
+                    assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+                }
+                checked += 1;
             }
         }
+        assert!(checked > 7 * 50, "{checked}");
     }
 
     #[test]

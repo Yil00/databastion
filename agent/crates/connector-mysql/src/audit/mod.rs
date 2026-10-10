@@ -76,6 +76,9 @@ pub(crate) struct Prerequisites {
     pub(crate) own_addr: Option<ClientAddr>,
     /// The server's flavor, from the session's handshake.
     pub(crate) flavor: crate::conn::Flavor,
+    /// The server's version, from the handshake: picks the built-in
+    /// function list (ADR-0045 decision 8).
+    pub(crate) version: (u32, u32, u32),
     /// Seconds the server's system time zone is ahead of UTC.
     utc_offset: i64,
     query_limit: usize,
@@ -165,6 +168,7 @@ pub(crate) async fn probe_prerequisites(
         source,
         own_addr,
         flavor: session.flavor(),
+        version: session.version(),
         utc_offset,
         query_limit,
     })
@@ -197,6 +201,7 @@ fn builder(
 ) -> EventBuilder {
     EventBuilder::new(own_account(cfg, target, pre, state))
         .with_flavor(pre.flavor)
+        .with_builtins(crate::builtins::for_server(pre.flavor, pre.version))
         .with_own_statements(own_statements(target))
         .with_sample_credits(state.sample_credits(&target.id))
 }
@@ -756,6 +761,7 @@ mod tests {
             source: Source::File(MysqlLogFormat::ServerAudit),
             own_addr: None,
             flavor: crate::conn::Flavor::Mariadb,
+            version: (11, 4, 13),
             utc_offset: 0,
             query_limit: DEFAULT_QUERY_LIMIT,
         };

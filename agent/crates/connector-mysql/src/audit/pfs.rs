@@ -275,6 +275,8 @@ struct Row {
     truncated: bool,
     /// The whole digest next to a whole `SQL_TEXT` (see [`choose_text`]).
     alt: Option<Zeroizing<Vec<u8>>>,
+    /// `text` is the digest (`DIGEST_TEXT`), not `SQL_TEXT`.
+    digest: bool,
     rows: u64,
     errno: u32,
     thread_info: Option<ThreadInfo>,
@@ -556,6 +558,8 @@ impl PsPoller {
                 };
                 let (chosen, alt, truncated) =
                     choose_text(get(4), get(5), text_limit, digest_limit);
+                // The digest (column 4) was chosen: the same slice.
+                let digest = chosen.is_some_and(|c| get(4).is_some_and(|d| std::ptr::eq(c, d)));
                 let body = chosen.map(|t| Zeroizing::new(t.to_vec()));
                 let alt = alt.map(|t| Zeroizing::new(t.to_vec()));
                 let user = text_of(get(9));
@@ -571,6 +575,7 @@ impl PsPoller {
                     schema: text(get(3), 1024).unwrap_or_default(),
                     truncated,
                     alt,
+                    digest,
                     text: body,
                     rows: num(get(6)).unwrap_or(0).max(num(get(7)).unwrap_or(0)),
                     errno: num(get(8)).and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
@@ -688,6 +693,7 @@ impl PsPoller {
                     text: r.text.as_deref().map(Vec::as_slice),
                     opaque: false,
                     alt_text: r.alt.as_deref().map(Vec::as_slice),
+                    digest: r.digest,
                     truncated: r.truncated,
                     tables: Vec::new(),
                     rows: Some(r.rows),
@@ -991,6 +997,7 @@ mod tests {
             text: Some(text),
             opaque: false,
             alt_text: None,
+            digest: false,
             truncated: false,
             tables: Vec::new(),
             rows: Some(5),
