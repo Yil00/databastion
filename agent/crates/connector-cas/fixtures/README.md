@@ -12,7 +12,12 @@
   `eyJFAKE.REDACTED.FAKE`, the token request's `Authorization` header (CAS logs the client id and
   secret there in clear) by `Basic REDACTED-FAKE`, the `TGC` and `JSESSIONID` cookies (the
   encrypted ticket-granting cookie and the session id, logged in clear) by `REDACTED`, and `txn` by a fixed UUID. The user is a fake dev
-  user. Used by `audit::events` tests.
+  user. Used by `audit::events` tests (with a registry entry whose `clientId` is `scratch-m2m`, the
+  token responses of the `refresh_token`, `client_credentials` and `password` grants are named after
+  their token request, ADR-0044), by the `fuzz` entry point test, and its token request and response
+  records seed the `cas_audit_log` fuzz target (`agent/fuzz/smoke.sh`). Not extended: the
+  interleaving, expiry, duplicate `clientId` and `who` mismatch cases are synthetic records built by
+  the tests.
 - `registry/`: fake service definitions in pairs, each in JSON and in the YAML form CAS 8.0.2
   writes (`--- !<class>`, Jackson class hints as verbatim tags; the sample of the CAS 8.0.2 YAML
   service registry documentation, extended): an OIDC relying party with a clear `clientSecret`,
@@ -20,3 +25,11 @@
   collections (`Wiki-10000004.yaml`) and a SAML service provider with a block scalar
   (`SP-10000005`). Every value is fake. Used by the `parse::definition` and `discover` tests that
   check a YAML definition gives the same findings as its JSON equivalent.
+- `registry-hostile/`: synthetic YAML files (fake values only, each under 4 KiB) that the pre-scan
+  or libyaml refuse, or that exercise the parser's harder paths: billion laughs, merge keys,
+  `!!python` tags, deep block and flow nesting, keys more than 1024 bytes before their `:`, keys
+  without their `:`, bad indentation, escapes (valid and refused), multi-line, block and folded
+  scalars with chomping, credential values the pre-scan does not blank, flow single-pair
+  mappings and collection keys, number resolution, a second document and CRLF line ends. They
+  seed the `cas_registry_yaml` and `cas_registry_yaml_diff` fuzz targets (`agent/fuzz/smoke.sh`,
+  `.github/scripts/fuzz-nightly.sh`) and are read by the `fuzz` entry point test.

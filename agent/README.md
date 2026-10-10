@@ -3,7 +3,7 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: released (v0.1.0; latest v0.4.0).** `agent.yaml`
+> **Status: released (v0.1.0; latest v0.5.0).** `agent.yaml`
 > configuration, enrollment, `0600` identity storage, HTTPS uplink,
 > heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
 > detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
@@ -581,7 +581,9 @@ Behavior:
   (granted directly or through a role, MySQL mandatory roles, the MariaDB default role; enabled
   or not). MySQL: `SHOW GRANTS FOR CURRENT_USER() USING …` with the direct and mandatory roles
   (at most 16; names written into the statement only when they match an allow-listed charset),
-  which covers every role. MariaDB shows a role's grants to a least-privilege account only for
+  which covers every role; the role list is split over statements of at most 900 bytes, never
+  cut in the audit logs, and the privileges they show are added up (role privileges combine as
+  a union in MySQL, partial revokes included; `REVOKE` lines are ignored). MariaDB shows a role's grants to a least-privilege account only for
   the session's current role: `SHOW GRANTS FOR CURRENT_ROLE` evaluates the default role, and
   every other applicable role is reported as not evaluated. `WITH ADMIN OPTION` counts as a
   grant option. A role whose grants cannot be read or parsed is reported as

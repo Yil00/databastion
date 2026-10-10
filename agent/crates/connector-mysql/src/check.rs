@@ -59,7 +59,7 @@ use databastion_core::{
 
 use crate::audit::pfs::PsTable;
 use crate::catalog::{self, Coverage, EngineSkip};
-use crate::conn::{Flavor, Rows, Session, Timeouts};
+use crate::conn::{Flavor, Flow, Rows, Session, Timeouts};
 use crate::discover::normalize;
 use crate::error::{MyError, Stage};
 use crate::grants::{self as grant_lines, Line, Scope};
@@ -73,7 +73,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
 pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 /// Most names listed in a log line.
 const MAX_LOGGED_NAMES: usize = 20;
-/// Most roles named in the MySQL `SHOW GRANTS … USING` statement; with
+/// Most roles named in the MySQL `SHOW GRANTS … USING` statements; with
 /// more, the roles are reported as not evaluated.
 const MAX_EVALUATED_ROLES: usize = 16;
 
@@ -92,6 +92,10 @@ pub(crate) struct AuditProbe {
     pub(crate) current_readable: bool,
     pub(crate) history_readable: bool,
     pub(crate) history_long_readable: bool,
+    /// The `statements_digest` consumer is listed and disabled: no
+    /// statement gets a digest, so the `performance_schema` poll reads
+    /// every statement's `SQL_TEXT` (security review of #186, H1).
+    pub(crate) digest_disabled: bool,
     /// MariaDB `server_audit`: active, logging on, file output, and
     /// statements or tables among the logged events.
     pub(crate) server_audit: Option<ServerAudit>,
@@ -293,6 +297,17 @@ impl AuditProbe {
         if self.history_long_enabled && self.consumers_readable && !self.history_long_readable {
             out.push("performance_schema statement history not readable by the account".to_owned());
             codes.push(TargetNote::new(NoteCode::AuditHistoryNotReadable));
+        }
+        if self.ps_enabled && self.consumers_readable && self.digest_disabled {
+            // No closed note code fits (`shared/protocol` unchanged): the
+            // local detail only.
+            out.push(
+                "performance_schema statements_digest consumer disabled: no statement has a \
+                 digest, so the performance_schema Audit poll reads every statement's text \
+                 (SQL_TEXT, with its literals), and so does whoever replays the poll with \
+                 the agent's credential"
+                    .to_owned(),
+            );
         }
         if self.general_log {
             out.push("general log enabled (not used as an audit source)".to_owned());
@@ -554,6 +569,9 @@ pub(crate) struct CheckState {
     records: Mutex<HashMap<String, Instant>>,
     streams: Mutex<HashMap<String, usize>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
+    /// Per target: credits for the extra sampling statements of Discovery
+    /// (`audit::credits`).
+    sample_credits: Mutex<HashMap<String, crate::audit::credits::SharedCredits>>,
     /// Per target: audit log records dropped (not parsable, oversized or
     /// damaged), and when the count started (reported for 24 h).
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
@@ -603,7 +621,7 @@ impl CheckState {
         }
     }
 
-    fn stream_running(&self, target_id: &str) -> bool {
+    pub(crate) fn stream_running(&self, target_id: &str) -> bool {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -661,6 +679,16 @@ impl CheckState {
 
     /// The agent's own-read counters of `target_id`, created once and kept
     /// for the life of the connector.
+    pub(crate) fn sample_credits(&self, target_id: &str) -> crate::audit::credits::SharedCredits {
+        std::sync::Arc::clone(
+            self.sample_credits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
     pub(crate) fn own_usage(&self, target_id: &str) -> SharedOwnUsage {
         std::sync::Arc::clone(
             self.own_usage
@@ -1099,6 +1127,7 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
                     Some("events_statements_current") => p.current_enabled = enabled,
                     Some("global_instrumentation") => global = enabled,
                     Some("thread_instrumentation") => thread = enabled,
+                    Some("statements_digest") => p.digest_disabled = !enabled,
                     _ => {}
                 }
             }
@@ -1159,7 +1188,10 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// its roles through `SHOW GRANTS` only:
 /// - MySQL: `SHOW GRANTS FOR CURRENT_USER() USING <roles>` with the roles
 ///   granted to the account itself and the mandatory roles; the server
-///   expands the roles those grant.
+///   expands the roles those grant. The role list is split over several
+///   statements, each short enough never to be cut in the audit logs
+///   (`sql::MAX_OWN_STATEMENT`), and the privileges they show are added
+///   up (see [`merge_role_statements`]).
 /// - MariaDB: `SHOW GRANTS FOR CURRENT_ROLE`, the only role whose grants
 ///   MariaDB shows without `SELECT` on `mysql`: the default role enabled at
 ///   login. Every other applicable role is reported as not evaluated.
@@ -1171,8 +1203,8 @@ pub(crate) async fn audit_probe(session: &mut Session) -> Result<AuditProbe, MyE
 /// Role names are written into the statement only after an allow-list
 /// check (`sql::show_grants_using`). A role whose grants cannot be read (a
 /// refused name, a server error, a line the parser does not understand) is
-/// counted in `roles_unevaluated`; on MySQL, where one statement covers
-/// every role, all of them are.
+/// counted in `roles_unevaluated`; on MySQL, where the statements cover
+/// every role together, all of them are when any statement fails.
 ///
 /// Fail closed (end-of-phase-4 review L2): when `APPLICABLE_ROLES` cannot
 /// be read (no such table before MySQL 8.0.19, or any non-fatal error),
@@ -1335,15 +1367,60 @@ async fn mysql_role_privileges(
     let using: Vec<(String, String)> = using.into_iter().collect();
     let mut evaluated = false;
     if using.len() <= MAX_EVALUATED_ROLES
-        && let Some(statement) = sql::show_grants_using(&using)
-        && let Some(Some(rows)) = optional_complete(session, &statement).await?
+        && let Some(statements) = sql::show_grants_using(&using)
     {
-        evaluated = merge_grant_lines(&rows, grants);
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in &statements {
+            match optional_complete(session, statement).await? {
+                Some(Some(rows)) => results.push(rows),
+                // An error, or rows skipped: every role is unevaluated.
+                _ => {
+                    results.clear();
+                    break;
+                }
+            }
+        }
+        evaluated = results.len() == statements.len() && merge_role_statements(&results, grants);
     }
     if !evaluated {
         grants.roles_unevaluated = grants.roles;
     }
     Ok(true)
+}
+
+/// Adds the privileges shown by the `SHOW GRANTS … USING` statements of
+/// one role list (`sql::show_grants_using`, split over several statements)
+/// to `grants`: their union. `false` when a line of any of them is not
+/// understood (every role is then counted as not evaluated, and what was
+/// added only over-reports).
+///
+/// Why the union of the split lists is the privileges of the whole list
+/// (MySQL 8.0+): the privileges of an account with active roles are the
+/// union of the account's and every role's, and partial revokes
+/// (`partial_revokes = ON`) combine the same way: a restriction (`REVOKE
+/// SELECT ON db.* FROM r1` under a global `SELECT`) holds only where no
+/// other source (the account, another role) grants the privilege there,
+/// so a `REVOKE` line shown with one part of the list may be lifted by a
+/// role of another part, never the reverse. The parser ignores `REVOKE`
+/// lines (`grants`: ignoring a revoke over-reports, never under-reports),
+/// so no restriction of one statement can hide a grant of another: the
+/// grant lines of every statement are added, as a single statement's
+/// would be. A `SHOW GRANTS` line holds only grants of the account and of
+/// the roles named in its statement (and those they grant), all of which
+/// the account holds through the whole list too, so no statement shows a
+/// privilege the whole list would not. Measured on MySQL 8.4 with
+/// `partial_revokes = ON`: `USING r1` (`SELECT ON *.*`, `REVOKE SELECT ON
+/// mysql.*`) shows the revoke, `USING r1, r2` (`r2`: `SELECT ON mysql.*`)
+/// shows neither the revoke nor the `mysql` line, which the global grant
+/// covers. Split, that `mysql` line is shown too: a privilege the account
+/// holds, so a note it may add (`privilege.system_database_select`) is
+/// true.
+fn merge_role_statements(results: &[Rows], grants: &mut Grants) -> bool {
+    let mut understood = true;
+    for rows in results {
+        understood &= merge_grant_lines(rows, grants);
+    }
+    understood
 }
 
 /// `Ok(false)`: `APPLICABLE_ROLES` could not be read (see
@@ -1444,15 +1521,52 @@ pub(crate) async fn cas_guard_readable(
     // Several statements, each short enough never to be cut in the audit
     // logs (`sql::CAS_GUARD_MAX_STATEMENT`): tables matched by name first,
     // then by shape; at most `CAS_GUARD_MAX_ROWS` rows in all.
-    let statements = sql::cas_guard_statement_texts(stores)
+    let guard = sql::cas_guard_statements_of(stores)
         .ok_or(MyError::new(FailureCode::Internal, Stage::Check))?;
     let mut complete = true;
+    // The name keys present in the catalog: the table list is streamed and
+    // each name key computed here, as the column statements compute it in
+    // SQL; only the known keys are kept. A name that is not UTF-8 cannot
+    // be keyed: not complete (fail closed, as a skipped row below). More
+    // than `CAS_GUARD_MAX_TABLES` tables: the list is cut, not complete
+    // (security review of #181, L1).
+    let mut present: BTreeSet<&str> = BTreeSet::new();
+    let mut unkeyed = 0usize;
+    let mut listed = 0usize;
+    session
+        .query_stream(Stage::Check, guard.tables, |row| {
+            // The statement's `LIMIT` sends at most one row more (not
+            // stopped: a stopped stream poisons the session).
+            listed += 1;
+            if listed > sql::CAS_GUARD_MAX_TABLES {
+                return Flow::Continue;
+            }
+            match row.get(1).copied().flatten().map(std::str::from_utf8) {
+                Some(Ok(name)) => {
+                    let key = cas_guard::name_key(name);
+                    // `by_key` is in key order.
+                    if let Ok(i) = guard.by_key.binary_search_by(|(k, _)| k.as_str().cmp(&key)) {
+                        present.insert(guard.by_key[i].0.as_str());
+                    }
+                }
+                _ => unkeyed += 1,
+            }
+            Flow::Continue
+        })
+        .await?;
+    complete &= unkeyed == 0 && listed <= sql::CAS_GUARD_MAX_TABLES;
+    let statements = guard
+        .by_key
+        .iter()
+        .filter(|(k, _)| present.contains(k.as_str()))
+        .map(|(_, s)| s)
+        .chain([&guard.shape]);
     let mut taken = 0usize;
     // Per table: (column, readable).
     type Columns = Vec<(String, bool)>;
     let mut tables: Vec<((String, String), Columns)> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for statement in &statements {
+    for statement in statements {
         if taken > sql::CAS_GUARD_MAX_ROWS {
             break;
         }
@@ -2327,11 +2441,34 @@ mod tests {
             current_readable: true,
             history_readable: true,
             history_long_readable: true,
+            digest_disabled: false,
             server_audit: None,
             audit_log: None,
             audit_log_filter: None,
             general_log: false,
         }
+    }
+
+    /// Security review of #186, H1: a disabled `statements_digest`
+    /// consumer is shown (local detail; no closed note code fits) and
+    /// changes neither the level nor the notes.
+    #[test]
+    fn a_disabled_digest_consumer_is_shown() {
+        let on = ps_probe();
+        let off = AuditProbe {
+            digest_disabled: true,
+            ..ps_probe()
+        };
+        let (text_on, codes_on) = on.explain(None);
+        let (text_off, codes_off) = off.explain(None);
+        assert!(!text_on.iter().any(|t| t.contains("statements_digest")));
+        assert!(
+            text_off
+                .iter()
+                .any(|t| t.contains("statements_digest consumer disabled"))
+        );
+        assert_eq!(codes_on, codes_off);
+        assert_eq!(on.level(), off.level());
     }
 
     #[test]

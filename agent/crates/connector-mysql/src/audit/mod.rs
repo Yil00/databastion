@@ -24,6 +24,7 @@
 //!   the events are handed to the core, which aggregates them before
 //!   spooling.
 
+pub(crate) mod credits;
 pub(crate) mod events;
 pub(crate) mod pfs;
 pub(crate) mod records;
@@ -73,6 +74,11 @@ pub(crate) struct Prerequisites {
     /// Client address the server sees for the agent (`None`: unknown, or a
     /// host name).
     pub(crate) own_addr: Option<ClientAddr>,
+    /// The server's flavor, from the session's handshake.
+    pub(crate) flavor: crate::conn::Flavor,
+    /// The server's version, from the handshake: picks the built-in
+    /// function list (ADR-0045 decision 8).
+    pub(crate) version: (u32, u32, u32),
     /// Seconds the server's system time zone is ahead of UTC.
     utc_offset: i64,
     query_limit: usize,
@@ -161,6 +167,8 @@ pub(crate) async fn probe_prerequisites(
     Ok(Prerequisites {
         source,
         own_addr,
+        flavor: session.flavor(),
+        version: session.version(),
         utc_offset,
         query_limit,
     })
@@ -183,7 +191,7 @@ fn own_account(
 }
 
 /// The event builder of a target's stream, with the connector's own
-/// statements of that target (the CAS store guard's column query, built
+/// statements of that target (the CAS store guard's catalog queries, built
 /// from the same `cas_stores` as `check()`).
 fn builder(
     cfg: &AuditConfig,
@@ -192,7 +200,10 @@ fn builder(
     state: &CheckState,
 ) -> EventBuilder {
     EventBuilder::new(own_account(cfg, target, pre, state))
+        .with_flavor(pre.flavor)
+        .with_builtins(crate::builtins::for_server(pre.flavor, pre.version))
         .with_own_statements(own_statements(target))
+        .with_sample_credits(state.sample_credits(&target.id))
 }
 
 /// Exact texts of the statements `check()` sends that read
@@ -345,6 +356,13 @@ pub(crate) async fn audit_stream(
 ) -> Result<(), ConnectorError> {
     let target = cfg.target().ok_or_else(internal)?;
     let _running = state.stream_started(&target.id);
+    // Discovery grants sampling credits only while this stream runs, for
+    // about two polls (`audit::credits`).
+    state
+        .sample_credits(&target.id)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_poll_interval(cfg.poll_interval());
     let timeouts = Timeouts::new(cfg.statement_timeout().min(Duration::from_secs(30)));
     let mut file: Option<FileStream> = None;
     let mut ps: Option<PsStream> = None;
@@ -742,6 +760,8 @@ mod tests {
         let pre = Prerequisites {
             source: Source::File(MysqlLogFormat::ServerAudit),
             own_addr: None,
+            flavor: crate::conn::Flavor::Mariadb,
+            version: (11, 4, 13),
             utc_offset: 0,
             query_limit: DEFAULT_QUERY_LIMIT,
         };
@@ -822,7 +842,9 @@ mod tests {
         assert!(reads(&mut rx).is_empty());
         let mut file = Some(st);
         close_file(&target, &sink, &state, &mut file).await.unwrap();
-        assert_eq!(reads(&mut rx), ["z"]);
+        // Held table records without their statement: `*` too (security
+        // review of #188, M2).
+        assert_eq!(reads(&mut rx), ["*,z"]);
         append(&line(4, 13, "QUERY", "'select v from z where id = 1',0"));
         let mut st = stream();
         file_run(&cfg, &target, &sink, &state, &mut st, &pre)

@@ -1,0 +1,7 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+a: [b: c, d, ]
+e: {f, g: h, 'i': "j"}
+k: {[l], m: n}
+empty: [{}, []]

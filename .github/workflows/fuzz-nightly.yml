@@ -1,0 +1,91 @@
+name: Fuzz nightly
+
+# Nightly AddressSanitizer fuzz campaign on the agent's parser targets (agent/fuzz, cargo-fuzz on
+# nightly Rust; ROADMAP phase 8 follow-up, #169 review L4). The CI job "Agent fuzz smoke" (ci.yml)
+# runs the same targets for 10 s each on stable, without a sanitizer; this workflow runs them for
+# minutes with AddressSanitizer, debug assertions and overflow checks.
+#
+# Deliberately NOT part of the "CI result" aggregate in ci.yml and not a required check: a nightly
+# toolchain regression or a long-standing crash would otherwise block unrelated PRs. A failure is
+# triaged by the maintainers: the crashing input is uploaded as an artifact, reproduced locally with
+# `cargo +nightly fuzz run <target> <file>` in agent/ (agent/fuzz/README.md), and fixed with a
+# regression test in the connector.
+#
+# No secret is used: no `secrets.*`, no token beyond the default read-only GITHUB_TOKEN, and the
+# checkout does not persist it.
+
+on:
+  schedule:
+    - cron: "43 2 * * *" # daily, 02:43 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (ASan, ${{ matrix.seconds }} s)
+    runs-on: ubuntu-latest
+    # Build (about 5 to 8 minutes from a cold cache) + cargo-fuzz install + the run itself.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        # One entry per file in agent/fuzz/fuzz_targets/ (there is no MySQL / MariaDB fuzz target:
+        # its parsers are covered by property tests). The YAML service registry targets get the
+        # longest budget: the crate's own YAML parser (ADR-0046) is the newest code, and
+        # cas_registry_yaml_diff checks it against serde_yaml_ng (unsafe-libyaml, test only).
+        include:
+          - { target: cas_registry_yaml, seconds: 600 }
+          - { target: cas_registry_yaml_diff, seconds: 600 }
+          - { target: cas_registry, seconds: 300 }
+          - { target: cas_audit_log, seconds: 300 }
+          - { target: mongodb_bson, seconds: 180 }
+          - { target: mongodb_op_msg, seconds: 180 }
+          - { target: mongodb_audit_log, seconds: 180 }
+          - { target: mongodb_server_log, seconds: 180 }
+          - { target: mongodb_profiler, seconds: 180 }
+          - { target: openldap_ber, seconds: 180 }
+          - { target: openldap_message, seconds: 180 }
+          - { target: openldap_filter, seconds: 180 }
+          - { target: openldap_accesslog, seconds: 180 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Sanitizers need a nightly toolchain; an unpinned nightly can break the build on a given
+      # night, which is acceptable for a non-required scheduled job.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent/fuzz
+          shared-key: fuzz-nightly-asan
+          # One cache for the whole matrix (same dependencies, same build flags).
+          save-if: ${{ matrix.target == 'cas_registry_yaml' }}
+      # From crates.io with its own lockfile (no prebuilt binary from a third-party mirror).
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz@0.13.2
+      - name: Fuzz ${{ matrix.target }} for ${{ matrix.seconds }} s
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_BUDGET: ${{ matrix.seconds }}
+        run: .github/scripts/fuzz-nightly.sh "$TARGET" "$SECONDS_BUDGET"
+      # The crashing input is a mutation of the committed fixtures (fake values only: fake dev
+      # user, ticket and token ids, ID tokens, Authorization header and cookies replaced by
+      # placeholders; agent/crates/connector-cas/fixtures/README.md) or of random bytes. The job
+      # reads no secret and never sees real data, so the artifact cannot contain one.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: agent/fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 14
+          if-no-files-found: ignore

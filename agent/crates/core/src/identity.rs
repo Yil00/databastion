@@ -194,9 +194,8 @@ impl StateDir {
             rotation_job_ids: identity.rotation_jobs.clone(),
             heartbeat_interval_s: identity.heartbeat_interval_s,
         };
-        let bytes = Zeroizing::new(
-            serde_json::to_vec_pretty(&file).map_err(|_| IdentityError::Corrupt(path.clone()))?,
-        );
+        let bytes =
+            json_zeroizing(&file, true).map_err(|_| IdentityError::Corrupt(path.clone()))?;
         fsutil::write_private_atomic(&path, &bytes).map_err(|e| io_err(&path, &e))
     }
 
@@ -222,19 +221,43 @@ impl StateDir {
     }
 }
 
+/// The body of an agent secret: base64url without padding (RFC 4648
+/// section 5), 43 characters for 32 bytes. Pinned by a fixed vector test so
+/// that a `base64` upgrade cannot change it.
+fn encode_secret_body(raw: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
+/// Number of distinct bytes of an ASCII text (a set of bits, on the
+/// stack: no heap copy of the secret's characters).
+fn distinct_ascii(text: &str) -> u32 {
+    let seen = text
+        .bytes()
+        .fold(0u128, |seen, b| seen | (1u128 << (b & 0x7f)));
+    seen.count_ones()
+}
+
+/// Length of an agent secret: `dbs_` and 43 characters.
+const SECRET_LEN: usize = 4 + 43;
+
 /// Generates a new agent secret: `dbs_` + base64url of 32 bytes from the OS
 /// CSPRNG (ADR-0008). Retries in the (astronomically unlikely) case of a
 /// body with fewer than 16 distinct characters, which the console rejects.
+///
+/// Every copy is zeroized (review of #178, Low): the raw bytes and the
+/// body are zeroizing, and the value is built in a zeroizing buffer
+/// allocated once at its final length, so that a value dropped on the
+/// retry path (a refused body, a failed `AgentSecret::try_from`) is wiped
+/// too.
 pub(crate) fn generate_secret() -> Result<AgentSecret, IdentityError> {
     for _ in 0..8 {
         let mut raw = Zeroizing::new([0u8; 32]);
         getrandom::fill(raw.as_mut()).map_err(|_| IdentityError::Random)?;
-        let body = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*raw));
-        let distinct = body.bytes().collect::<std::collections::HashSet<_>>().len();
-        if distinct < 16 {
+        let body = encode_secret_body(&raw);
+        if distinct_ascii(&body) < 16 {
             continue;
         }
-        let mut value = String::with_capacity(47);
+        let mut value = Zeroizing::new(String::with_capacity(SECRET_LEN));
         value.push_str("dbs_");
         value.push_str(&body);
         if let Ok(secret) = AgentSecret::try_from(value) {
@@ -242,6 +265,44 @@ pub(crate) fn generate_secret() -> Result<AgentSecret, IdentityError> {
         }
     }
     Err(IdentityError::Random)
+}
+
+/// Serializes `value` as JSON into a zeroizing buffer allocated once at
+/// its final length. `serde_json::to_vec` grows its buffer by
+/// reallocation from 128 bytes, which frees, without wiping them, copies
+/// of what was written so far: an agent secret in `identity.json` or in a
+/// `/rotate` body, an enrollment token in an `/enroll` body. The value is
+/// serialized twice: once to count its bytes, once into the buffer.
+pub(crate) fn json_zeroizing<T: Serialize>(
+    value: &T,
+    pretty: bool,
+) -> serde_json::Result<Zeroizing<Vec<u8>>> {
+    /// Counts the bytes written (keeps none).
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn write<W: io::Write, T: Serialize>(w: W, value: &T, pretty: bool) -> serde_json::Result<()> {
+        if pretty {
+            serde_json::to_writer_pretty(w, value)
+        } else {
+            serde_json::to_writer(w, value)
+        }
+    }
+    let mut count = Count(0);
+    write(&mut count, value, pretty)?;
+    let mut out = Zeroizing::new(Vec::with_capacity(count.0));
+    write(&mut *out, value, pretty)?;
+    // Both passes serialize the same value: same length, so the buffer
+    // was never grown.
+    debug_assert_eq!(out.len(), count.0);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -365,11 +426,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn json_is_written_without_reallocation() {
+        let mut id = identity();
+        id.pending = Some(generate_secret().unwrap());
+        id.rotation_jobs = vec![id.agent_id; MAX_ROTATION_JOBS];
+        let file = IdentityFile {
+            agent_id: id.agent_id,
+            agent_secret: id.secret.clone(),
+            pending_secret: id.pending.clone(),
+            rotation_job_ids: id.rotation_jobs.clone(),
+            heartbeat_interval_s: id.heartbeat_interval_s,
+        };
+        for pretty in [false, true] {
+            let ours = json_zeroizing(&file, pretty).unwrap();
+            let theirs = if pretty {
+                serde_json::to_vec_pretty(&file).unwrap()
+            } else {
+                serde_json::to_vec(&file).unwrap()
+            };
+            assert_eq!(*ours, theirs);
+            // Allocated once at its final length: never grown.
+            assert_eq!(ours.capacity(), ours.len());
+            // Larger than `to_vec`'s first buffer: it would have grown.
+            assert!(ours.len() > 128);
+        }
+    }
+
+    #[test]
+    fn secret_values_are_built_at_their_final_capacity() {
+        assert_eq!(distinct_ascii("aab"), 2);
+        assert_eq!(
+            distinct_ascii("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"),
+            28
+        );
+        assert_eq!(distinct_ascii(&"-_".repeat(20)), 2);
+        let mut value = Zeroizing::new(String::with_capacity(SECRET_LEN));
+        value.push_str("dbs_");
+        value.push_str(&encode_secret_body(&[7; 32]));
+        assert_eq!((value.len(), value.capacity()), (SECRET_LEN, SECRET_LEN));
+        assert!(AgentSecret::try_from(value).is_ok());
+        assert!(AgentSecret::try_from(Zeroizing::new("dbs_short".to_owned())).is_err());
+    }
+
+    #[test]
     fn generated_secrets_match_contract_and_differ() {
         let a = generate_secret().unwrap();
         let b = generate_secret().unwrap();
         assert_eq!(a.expose().len(), 47);
         assert!(a.expose().starts_with("dbs_"));
         assert_ne!(a.expose(), b.expose());
+    }
+
+    /// Fixed vectors for the secret body: URL-safe alphabet (`-` and `_`,
+    /// never `+` or `/`), no `=` padding, 43 characters.
+    #[test]
+    fn secret_body_encoding_is_pinned() {
+        let mut raw = [0u8; 32];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap();
+        }
+        assert_eq!(
+            encode_secret_body(&raw).as_str(),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        );
+        assert_eq!(
+            encode_secret_body(&[0xfb; 32]).as_str(),
+            "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s"
+        );
+        assert_eq!(
+            encode_secret_body(&[0xff; 32]).as_str(),
+            "__________________________________________8"
+        );
     }
 }

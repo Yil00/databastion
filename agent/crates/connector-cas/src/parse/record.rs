@@ -2,11 +2,15 @@
 //!
 //! One record per line, written by the CAS `Slf4j` audit destination with
 //! `cas.audit.engine.audit-format: JSON`. The parser is a closed serde
-//! visitor on the keys `who`, `what`, `action`, `when`, `clientIpAddress`
-//! and `userAgent`; every other key (`application`, `headers`,
-//! `serverIpAddress`, `geoLocation`, `tenant`, unknown keys) is skipped
-//! with `IgnoredAny`, never kept (only the presence of `headers` is
-//! noted). **A record with a duplicate kept key is dropped.** A line that
+//! visitor on the keys `who`, `what`, `action`, `when`, `clientIpAddress`,
+//! `userAgent` and `serverIpAddress`; every other key (`application`,
+//! `headers`, `geoLocation`, `tenant`, unknown keys) is skipped with
+//! `IgnoredAny`, never kept (only the presence of `headers` is noted).
+//! `serverIpAddress` is borrowed raw and decoded only for the token
+//! request and response records, as an IP literal for their correlation
+//! key (ADR-0044), never sent. **A record with a duplicate kept key is
+//! dropped** (a duplicate `serverIpAddress` drops a token request or
+//! response record only). A line that
 //! is not one JSON object, or lacks a valid `action` or `when`, is dropped.
 //!
 //! `what` can hold a ticket id (a live SSO bearer credential). It is only
@@ -27,10 +31,18 @@
 //! OAuth 2.0 / OIDC (verified against CAS 8.0.2): the token endpoint's
 //! issuance is `OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED`, whose `what` holds
 //! the token values (`access_token`, `refresh_token`, `id_token`) and no
-//! `service`: they are skipped like `ticketId`. The other OAuth / OIDC
-//! actions (`OAUTH2_AUTHORIZATION_RESPONSE_CREATED`,
-//! `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED`, `OIDC_ID_TOKEN_CREATED`,
-//! `OAUTH2_USER_PROFILE_CREATED`) are counted per base and give no event.
+//! `service`: they are skipped like `ticketId`. The token request
+//! `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED` (ADR-0044) gives no event either:
+//! from its object-form `what` only the string values of `grant_type` and
+//! `service` (the client id for the token-only grants) are read; `code`
+//! (an authorization code or a refresh token id), `scope`,
+//! `response_type`, unknown keys and nested values are skipped with
+//! `IgnoredAny`, never copied; a duplicate `grant_type` or `service` drops
+//! the record, and a string-form or non-object `what` gives no
+//! [`TokenRequest`]. The other OAuth / OIDC actions
+//! (`OAUTH2_AUTHORIZATION_RESPONSE_CREATED`, `OIDC_ID_TOKEN_CREATED`, whose
+//! `what` holds the token request's headers, `OAUTH2_USER_PROFILE_CREATED`)
+//! are counted per base and their `what` is never decoded.
 //!
 //! **No unzeroized copy of a kept string** (ROADMAP phase 8 follow-up).
 //! The caller holds the line in a zeroizing buffer. Kept keys and values
@@ -53,6 +65,7 @@ use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::value::RawValue;
 use zeroize::Zeroizing;
 
+use super::MAX_CLIENT_ID_BYTES;
 use super::jtext::{self, Invalid, Scalar};
 use super::url::{ServiceHost, service_of};
 use super::when::{from_epoch, parse_when};
@@ -95,6 +108,9 @@ pub enum Action {
     /// 8.0.2: `who` is the user, or the client id for `client_credentials`,
     /// and `what` holds the token values and no service).
     TokenIssued,
+    /// `OAUTH2_ACCESS_TOKEN_REQUEST_CREATED`: a token request (no event;
+    /// ADR-0044: correlated with the next token response).
+    TokenRequested,
     /// `SAVE_SERVICE_SUCCESS`.
     SaveService,
     /// `DELETE_SERVICE_SUCCESS`.
@@ -119,6 +135,7 @@ impl Action {
             "AUTHENTICATION_FAILED" => Self::AuthFailed,
             "SERVICE_TICKET_CREATED" => Self::ServiceTicketCreated,
             "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED" => Self::TokenIssued,
+            "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED" => Self::TokenRequested,
             "SAVE_SERVICE_SUCCESS" => Self::SaveService,
             "DELETE_SERVICE_SUCCESS" => Self::DeleteService,
             other => {
@@ -138,6 +155,76 @@ impl Action {
     pub fn issues_for_service(&self) -> bool {
         matches!(self, Self::ServiceTicketCreated | Self::TokenIssued)
     }
+}
+
+/// Longest `grant_type` compared, in bytes.
+const MAX_GRANT_BYTES: usize = 32;
+
+/// The `grant_type` of a token request (closed list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// `authorization_code`.
+    AuthorizationCode,
+    /// `refresh_token`.
+    RefreshToken,
+    /// `client_credentials`.
+    ClientCredentials,
+    /// `password`.
+    Password,
+    /// Any other value (the device grant included), or none.
+    Other,
+}
+
+impl Grant {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "authorization_code" => Self::AuthorizationCode,
+            "refresh_token" => Self::RefreshToken,
+            "client_credentials" => Self::ClientCredentials,
+            "password" => Self::Password,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether the grant writes no service ticket: its token request's
+    /// `service` is the client id (ADR-0044 decision 3).
+    #[must_use]
+    pub fn is_token_only(self) -> bool {
+        matches!(
+            self,
+            Self::RefreshToken | Self::ClientCredentials | Self::Password
+        )
+    }
+}
+
+/// What is read from a token request's object-form `what` (ADR-0044
+/// decision 1).
+pub struct TokenRequest {
+    /// `grant_type`.
+    pub grant: Grant,
+    /// `service` (the client id for the token-only grants), exact, at most
+    /// [`MAX_CLIENT_ID_BYTES`] bytes (a longer one, or a value that is not
+    /// a string, is `None`), zeroized. Reduced to a keyed tag by the
+    /// event builder, then dropped with the record.
+    pub client_id: Option<Zeroizing<String>>,
+}
+
+impl fmt::Debug for TokenRequest {
+    // The client id is never printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenRequest")
+            .field("grant", &self.grant)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The correlation facts of a token request or response (ADR-0044): never
+/// sent, reduced to a keyed tag by the event builder.
+pub struct Correlation {
+    /// `serverIpAddress` when it is one IP literal.
+    pub server: Option<IpAddr>,
+    /// The whole `userAgent` (bounded, zeroized).
+    pub user_agent: Option<Zeroizing<String>>,
 }
 
 /// One parsed audit record (closed facts only).
@@ -160,15 +247,22 @@ pub struct AuditRecord {
     pub service: Option<ServiceHost>,
     /// The record carries a `headers` key (cookies in the log).
     pub headers_logged: bool,
+    /// For a token request with an object-form `what`: its grant and
+    /// client id.
+    pub token_request: Option<TokenRequest>,
+    /// For a token request or response: the correlation facts.
+    pub correlation: Option<Correlation>,
 }
 
 impl fmt::Debug for AuditRecord {
-    // Principals and hosts are never printed.
+    // Principals, hosts, client ids and correlation facts are never
+    // printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuditRecord")
             .field("action", &self.action)
             .field("when", &self.when)
             .field("headers_logged", &self.headers_logged)
+            .field("token_request", &self.token_request)
             .finish_non_exhaustive()
     }
 }
@@ -191,6 +285,7 @@ enum K {
     When,
     Client,
     Agent,
+    Server,
     Headers,
     Other,
 }
@@ -216,6 +311,7 @@ fn record_key<E: de::Error>(raw: &RawValue) -> Result<K, E> {
         "when" => K::When,
         "clientIpAddress" => K::Client,
         "userAgent" => K::Agent,
+        "serverIpAddress" => K::Server,
         "headers" => K::Headers,
         _ => K::Other,
     })
@@ -280,6 +376,75 @@ impl<'de> Visitor<'de> for WhatVisitor {
     }
 }
 
+/// The object form of a token request's `what` as read: `grant_type` and
+/// `service` (each a string, or nothing for any other type), and whether
+/// either came twice.
+#[derive(Default)]
+struct RequestWhat {
+    grant: Option<Option<Zeroizing<String>>>,
+    service: Option<Option<Zeroizing<String>>>,
+    duplicate: bool,
+}
+
+/// Reads a token request's `what` from its raw text (ADR-0044 decision 1):
+/// `Ok(None)` for a string-form or non-object `what`; `Err(Invalid)` for a
+/// duplicate `grant_type` or `service`, `Err(NotJson)` for a kept value
+/// that does not unescape.
+fn token_request_of(raw: &RawValue) -> Result<Option<TokenRequest>, RecordError> {
+    let text = raw.get();
+    if text.as_bytes().first() != Some(&b'{') {
+        return Ok(None);
+    }
+    let w = serde_json::Deserializer::from_str(text)
+        .deserialize_map(RequestVisitor)
+        .map_err(|_| RecordError::NotJson)?;
+    if w.duplicate {
+        return Err(RecordError::Invalid);
+    }
+    let grant = w
+        .grant
+        .flatten()
+        .map_or(Grant::Other, |g| Grant::from_name(&g));
+    let client_id = w
+        .service
+        .flatten()
+        .filter(|c| !c.is_empty() && c.len() <= MAX_CLIENT_ID_BYTES);
+    Ok(Some(TokenRequest { grant, client_id }))
+}
+
+/// The object form of a token request's `what`: only `grant_type` and
+/// `service` are read; every other key (`code`, `scope`, `response_type`,
+/// unknown keys) and value is skipped without being copied.
+struct RequestVisitor;
+
+impl<'de> Visitor<'de> for RequestVisitor {
+    type Value = RequestWhat;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an object")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<RequestWhat, A::Error> {
+        let mut w = RequestWhat::default();
+        while let Some(k) = map.next_key::<&'de RawValue>()? {
+            let (slot, max) = match key_text::<A::Error>(k)?.as_str() {
+                "grant_type" => (&mut w.grant, MAX_GRANT_BYTES + 1),
+                // One byte more than compared: a longer client id is
+                // recognized as such and selects nothing.
+                "service" => (&mut w.service, MAX_CLIENT_ID_BYTES + 1),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+            };
+            let raw = map.next_value::<&'de RawValue>()?;
+            let v = jtext::string(raw, max).map_err(refused)?;
+            if slot.replace(v).is_some() {
+                w.duplicate = true;
+            }
+        }
+        Ok(w)
+    }
+}
+
 /// `when`: a string or an epoch number.
 enum When {
     Text(Zeroizing<String>),
@@ -297,6 +462,12 @@ struct Raw<'de> {
     when: Option<When>,
     client: Option<Option<Zeroizing<String>>>,
     agent: Option<Option<Zeroizing<String>>>,
+    /// Kept raw (borrowed, not examined): decoded only for a token request
+    /// or response, once the action is known.
+    server: Option<&'de RawValue>,
+    /// `serverIpAddress` came twice: drops a token record only (the only
+    /// ones it is read for; review of #182 L4).
+    server_duplicate: bool,
     headers: bool,
     duplicate: bool,
 }
@@ -338,6 +509,13 @@ impl<'de> Visitor<'de> for RecordVisitor {
                     };
                     if r.when.replace(w).is_some() {
                         r.duplicate = true;
+                    }
+                    continue;
+                }
+                K::Server => {
+                    let v = map.next_value::<&'de RawValue>()?;
+                    if r.server.replace(v).is_some() {
+                        r.server_duplicate = true;
                     }
                     continue;
                 }
@@ -420,8 +598,13 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
         _ => None,
     }
     .ok_or(RecordError::Invalid)?;
-    // `what` is read only for service-ticket or token issuance (for any
-    // other action its raw text is never examined), then dropped (zeroized).
+    // `what` is read only for service-ticket or token issuance and for the
+    // token request (for any other action its raw text is never examined),
+    // then dropped (zeroized).
+    let token_request = match raw.what {
+        Some(w) if action == Action::TokenRequested => token_request_of(w)?,
+        _ => None,
+    };
     let service = match raw.what {
         Some(w) if action.issues_for_service() => {
             let w = what_of::<serde_json::Error>(w).map_err(|_| RecordError::NotJson)?;
@@ -437,7 +620,29 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
         .flatten()
         .and_then(|c| c.trim().parse::<IpAddr>().ok())
         .map(crate::audit::events::canonical);
-    let user_agent = raw.agent.flatten().and_then(|ua| first_token(&ua));
+    let agent = raw.agent.flatten();
+    let user_agent = agent.as_deref().and_then(|ua| first_token(ua));
+    // The correlation facts of the token request and response only
+    // (ADR-0044): `serverIpAddress` is decoded here and nowhere else.
+    let correlation = match action {
+        Action::TokenRequested | Action::TokenIssued => {
+            if raw.server_duplicate {
+                return Err(RecordError::Invalid);
+            }
+            let server = match raw.server {
+                Some(s) => jtext::string(s, 256)
+                    .map_err(|_| RecordError::NotJson)?
+                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                    .map(crate::audit::events::canonical),
+                None => None,
+            };
+            Some(Correlation {
+                server,
+                user_agent: agent,
+            })
+        }
+        _ => None,
+    };
     Ok(AuditRecord {
         action,
         who: raw.who.flatten(),
@@ -446,6 +651,8 @@ pub fn parse_record(line: &[u8], zone: UtcOffset) -> Result<AuditRecord, RecordE
         user_agent,
         service,
         headers_logged: raw.headers,
+        token_request,
+        correlation,
     })
 }
 
@@ -705,18 +912,21 @@ mod tests {
         assert_eq!(r.action, Action::TokenIssued);
         assert!(r.action.issues_for_service());
         assert!(r.service.is_none());
+        assert!(r.token_request.is_none());
+        let c = r.correlation.as_ref().unwrap();
+        assert_eq!(c.server, Some("172.18.0.3".parse().unwrap()));
+        assert_eq!(
+            c.user_agent.as_deref().map(String::as_str),
+            Some("python-requests/2.33.1")
+        );
         let dbg = format!("{r:?}");
-        for leak in ["FAKE", "eyJ", "jdoe", "Bearer"] {
+        for leak in ["FAKE", "eyJ", "jdoe", "Bearer", "172.18", "python"] {
             assert!(!dbg.contains(leak), "{leak}");
         }
         // The other OAuth / OIDC actions are not issuance: their `what`
         // (codes, refresh tokens, the token request's HTTP headers) is
         // never read.
         for (action, base) in [
-            (
-                "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
-                "OAUTH2_ACCESS_TOKEN_REQUEST",
-            ),
             ("OIDC_ID_TOKEN_CREATED", "OIDC_ID_TOKEN"),
             (
                 "OAUTH2_AUTHORIZATION_RESPONSE_CREATED",
@@ -734,6 +944,179 @@ mod tests {
             .unwrap();
             assert_eq!(r.action, Action::Other(base.to_owned()));
             assert!(r.service.is_none());
+            assert!(r.token_request.is_none() && r.correlation.is_none());
+        }
+    }
+
+    fn token_request(what: &str) -> Result<AuditRecord, RecordError> {
+        parse_record(
+            &line(&format!(
+                r#""who": "audit:unknown", "what": {what},
+                   "action": "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED", "when": 1791115200000,
+                   "clientIpAddress": "192.0.2.1", "serverIpAddress": "198.51.100.3",
+                   "userAgent": "python-requests/2.33.1 extra""#
+            )),
+            UTC,
+        )
+    }
+
+    /// The token request (ADR-0044 decision 1): only `grant_type` and
+    /// `service` are read from the object-form `what`.
+    #[test]
+    fn token_requests_read_grant_and_client_only() {
+        let r = token_request(
+            r#"{"code": "RT-1-FAKEclearREFRESH-cas01", "grant_type": "refresh_token",
+                "service": "scratch-m2m", "scope": ["email", "openid"], "response_type": "none",
+                "extra": {"service": "evil", "grant_type": "password"}}"#,
+        )
+        .unwrap();
+        assert_eq!(r.action, Action::TokenRequested);
+        assert!(!r.action.issues_for_service());
+        assert!(r.service.is_none());
+        let tr = r.token_request.as_ref().unwrap();
+        assert_eq!(tr.grant, Grant::RefreshToken);
+        assert_eq!(
+            tr.client_id.as_deref().map(String::as_str),
+            Some("scratch-m2m")
+        );
+        let c = r.correlation.as_ref().unwrap();
+        assert_eq!(c.server, Some("198.51.100.3".parse().unwrap()));
+        assert_eq!(
+            c.user_agent.as_deref().map(String::as_str),
+            Some("python-requests/2.33.1 extra")
+        );
+        let dbg = format!("{r:?}");
+        for leak in ["FAKE", "RT-1", "scratch", "evil", "198.51", "openid"] {
+            assert!(!dbg.contains(leak), "{leak}");
+        }
+        let grant = |g: &str| {
+            token_request(&format!(r#"{{"grant_type": {g}, "service": "c"}}"#))
+                .unwrap()
+                .token_request
+                .unwrap()
+                .grant
+        };
+        assert_eq!(grant(r#""client_credentials""#), Grant::ClientCredentials);
+        assert_eq!(grant(r#""password""#), Grant::Password);
+        assert_eq!(grant(r#""authorization_code""#), Grant::AuthorizationCode);
+        assert_eq!(
+            grant(r#""client\u005fcredentials""#),
+            Grant::ClientCredentials
+        );
+        for other in [
+            r#""urn:ietf:params:oauth:grant-type:device_code""#,
+            r#""Password""#,
+            r#""password ""#,
+            "null",
+            r#"["password"]"#,
+        ] {
+            assert_eq!(grant(other), Grant::Other, "{other}");
+        }
+        assert!(Grant::RefreshToken.is_token_only());
+        assert!(Grant::ClientCredentials.is_token_only());
+        assert!(Grant::Password.is_token_only());
+        assert!(!Grant::AuthorizationCode.is_token_only());
+        assert!(!Grant::Other.is_token_only());
+        // A client id that is not a string, empty or too long: none.
+        let client = |v: &str| {
+            token_request(&format!(r#"{{"grant_type": "password", "service": {v}}}"#))
+                .unwrap()
+                .token_request
+                .unwrap()
+                .client_id
+                .map(|c| c.len())
+        };
+        assert_eq!(client("3"), None);
+        assert_eq!(client(r#""""#), None);
+        assert_eq!(client(r#"{"id": "scratch-m2m"}"#), None);
+        let max = "a".repeat(MAX_CLIENT_ID_BYTES);
+        assert_eq!(client(&format!("\"{max}\"")), Some(MAX_CLIENT_ID_BYTES));
+        assert_eq!(client(&format!("\"{max}a\"")), None);
+        // A string-form or non-object `what` gives no token request.
+        for what in [r#""N/A grant_type=password""#, "null", "[1]"] {
+            assert!(
+                token_request(what).unwrap().token_request.is_none(),
+                "{what}"
+            );
+        }
+        // A duplicate `grant_type` or `service` drops the record.
+        for what in [
+            r#"{"grant_type": "password", "grant_type": "refresh_token", "service": "c"}"#,
+            r#"{"grant_type": "password", "service": "a", "s\u0065rvice": "b"}"#,
+            r#"{"grant_type": "password", "service": null, "service": "b"}"#,
+        ] {
+            assert_eq!(
+                token_request(what).err(),
+                Some(RecordError::Invalid),
+                "{what}"
+            );
+        }
+        // A kept value that does not unescape drops the line; a skipped
+        // one (`code`) is never decoded.
+        assert_eq!(
+            token_request(r#"{"grant_type": "password", "service": "\ud800"}"#).err(),
+            Some(RecordError::NotJson)
+        );
+        assert!(
+            token_request(r#"{"grant_type": "password", "code": "\ud800", "service": "c"}"#)
+                .is_ok()
+        );
+    }
+
+    /// `serverIpAddress` is decoded for the token request and response
+    /// only; a second one drops those records only.
+    #[test]
+    fn server_addresses_are_read_for_token_records_only() {
+        let rec = |action: &str, server: &str| {
+            parse_record(
+                &line(&format!(
+                    r#""action": "{action}", "when": 1791115200000, "serverIpAddress": {server}"#
+                )),
+                UTC,
+            )
+        };
+        let server =
+            |action: &str, v: &str| rec(action, v).unwrap().correlation.and_then(|c| c.server);
+        for action in [
+            "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+            "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+        ] {
+            assert_eq!(
+                server(action, r#""::ffff:198.51.100.3""#),
+                Some("198.51.100.3".parse().unwrap())
+            );
+            for bad in [
+                r#""cas01.example.org""#,
+                r#""198.51.100.3:8443""#,
+                "3",
+                "null",
+            ] {
+                assert_eq!(server(action, bad), None, "{bad}");
+            }
+            assert_eq!(rec(action, r#""\udc00""#).err(), Some(RecordError::NotJson));
+        }
+        // Any other action: never decoded nor kept.
+        let r = rec("SERVICE_TICKET_CREATED", r#""\udc00""#).unwrap();
+        assert!(r.correlation.is_none());
+        // A second `serverIpAddress` drops the token records only (review
+        // of #182 L4).
+        let twice = r#""198.51.100.3", "serverIpAddress": "198.51.100.4""#;
+        for action in [
+            "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+            "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED",
+        ] {
+            assert_eq!(
+                rec(action, twice).err(),
+                Some(RecordError::Invalid),
+                "{action}"
+            );
+        }
+        for action in [
+            "AUTHENTICATION_SUCCESS",
+            "SERVICE_TICKET_CREATED",
+            "TICKET_GRANTING_TICKET_CREATED",
+        ] {
+            assert!(rec(action, twice).is_ok(), "{action}");
         }
     }
 
@@ -837,6 +1220,14 @@ mod tests {
         assert_eq!(
             a("OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED"),
             Some(Action::TokenIssued)
+        );
+        assert_eq!(
+            a("OAUTH2_ACCESS_TOKEN_REQUEST_CREATED"),
+            Some(Action::TokenRequested)
+        );
+        assert_eq!(
+            a("OAUTH2_ACCESS_TOKEN_REQUEST_FAILED"),
+            Some(Action::Other("OAUTH2_ACCESS_TOKEN_REQUEST".to_owned()))
         );
         assert_eq!(
             a("TICKET_GRANTING_TICKET_NOT_CREATED"),

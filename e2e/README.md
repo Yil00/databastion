@@ -487,7 +487,11 @@ uses a fresh cookie jar (no SSO reuse).
    `volume.failed_logins_many_accounts`; every client address truncated to its /24, none stored as CAS
    logged it; no principal in clear but `svc-monitoring` and `*`; incidents of both policies (failed
    logins share one incident per client network, ADR-0031 decision 1: the stuffing incident links
-   the `*` aggregate).
+   the `*` aggregate). Then one OAuth 2.0 `client_credentials` token request of the HR-Portal client
+   (`cas_scenario.py client-credentials`, HTTP Basic, no scope; the tokens issued are searched by
+   the I2 scans): its token response must become a `read` of `service_registry` / `HR-Portal` with a
+   fingerprinted principal, named after its token request
+   ([ADR-0044](../docs/adr/0044-cas-token-only-grants-client-naming.md)).
 6. CAS store guard, real table: `cas_tickets` holds encoded tickets only; the agent logged
    `CAS ticket registry: metadata only` with `encrypted` > 0 and `unencrypted` 0 and did not sample
    it; the next heartbeat reports neither `security.ticket_registry_unencrypted`,

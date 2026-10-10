@@ -1,0 +1,9 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+ok: "a\x41\u00e9\U0001F600\N\L\P\_\0\t\/"
+folded: "multi
+  line\
+  joined"
+apiPassword: "FAKE\x41"
+bad: "\uD800 \q"

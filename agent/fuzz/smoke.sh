@@ -6,7 +6,7 @@
 # Builds the targets with libFuzzer's coverage instrumentation (the flags cargo-fuzz passes, without
 # a sanitizer: sanitizers need a nightly toolchain) plus debug assertions and overflow checks, then
 # runs each target for SECONDS from a temporary corpus (empty, or seeded with the committed CAS
-# registry fixtures for cas_registry and cas_registry_yaml). Exits non-zero on the
+# fixtures for cas_registry, cas_registry_yaml, cas_registry_yaml_diff and cas_audit_log). Exits non-zero on the
 # first crash, panic, timeout or out-of-memory; the crashing input is kept under
 # $CARGO_TARGET_DIR/fuzz-artifacts/ (never commit it if it was built from real data).
 # For longer campaigns, use cargo-fuzz on nightly (README.md).
@@ -30,10 +30,18 @@ trap 'rm -rf "$CORPUS"' EXIT
 # Synthetic seed inputs (committed fixtures, fake values only) for targets whose input must get
 # past a fixed header before the parser is reached.
 FIXTURES="$HERE/../crates/connector-cas/fixtures/registry"
+HOSTILE="$HERE/../crates/connector-cas/fixtures/registry-hostile"
+AUDIT_FIXTURE="$HERE/../crates/connector-cas/fixtures/cas-8.0.2-oauth-oidc-audit.jsonl"
 seed() {
   case "$1" in
     cas_registry) cp "$FIXTURES"/*.json "$2"/ ;;
-    cas_registry_yaml) cp "$FIXTURES"/*.yml "$FIXTURES"/*.yaml "$2"/ ;;
+    cas_registry_yaml | cas_registry_yaml_diff)
+      cp "$FIXTURES"/*.yml "$FIXTURES"/*.yaml "$HOSTILE"/*.yml "$2"/ ;;
+    # The token request / response records of the redacted CAS 8.0.2 excerpt (ADR-0044): all of
+    # them as one multi-line input (under -max_len), and each request with its response.
+    cas_audit_log)
+      grep -E '"action":"OAUTH2_ACCESS_TOKEN_(REQUEST|RESPONSE)_CREATED"' "$AUDIT_FIXTURE" >"$2/token-records.jsonl"
+      split -l 2 "$2/token-records.jsonl" "$2/token-pair-" ;;
   esac
 }
 for src in "$HERE"/fuzz_targets/*.rs; do

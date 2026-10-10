@@ -16,8 +16,9 @@ tests of each connector (`src/proptests.rs`).
 | `openldap_filter` | `…::fuzz::search_filter` | One logged search filter (`reqFilter`) |
 | `openldap_accesslog` | `…::fuzz::accesslog` | One `cn=accesslog` entry, NUL-separated attribute values |
 | `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
-| `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the same visitor |
-| `cas_audit_log` | `…::fuzz::audit_log` | One CAS JSON audit log line; `what` reducer, time parser, event builder |
+| `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the crate's own YAML parser and the same visitor |
+| `cas_registry_yaml_diff` | `…::fuzz::registry_yaml_diff` | Differential ([ADR-0046](../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md)): on every file the pre-scan accepts, the crate's YAML parser and `serde_yaml_ng` (the oracle, a dependency of this harness only) must read the same values and the same definition, or both fail; a disagreement panics |
+| `cas_audit_log` | `…::fuzz::audit_log` | A short CAS JSON audit log excerpt (at most 64 lines, in order): each line parsed, `what` reducer, time parser, event builder with the token request / response correlation state ([ADR-0044](../../docs/adr/0044-cas-token-only-grants-client-naming.md)) |
 
 The connectors expose these entry points only with their `fuzzing` feature, which the agent binary
 never enables. This directory is its own Cargo workspace: `cargo test` and `cargo clippy` in
@@ -33,9 +34,12 @@ agent/fuzz/smoke.sh 60     # seconds per target
 ```
 
 `smoke.sh` seeds `cas_registry` and `cas_registry_yaml` with the committed fake definitions of
-`crates/connector-cas/fixtures/registry/` (JSON and YAML respectively): from an empty corpus a
-YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. The other targets
-start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
+`crates/connector-cas/fixtures/registry/` (JSON and YAML respectively; the YAML targets, `cas_registry_yaml_diff` included, also with the synthetic hostile files of `crates/connector-cas/fixtures/registry-hostile/`): from an empty corpus a
+YAML input rarely gets past the `--- !<class>` header the pre-scanner requires. It seeds
+`cas_audit_log` with the token request and response records of the redacted CAS 8.0.2 excerpt
+`crates/connector-cas/fixtures/cas-8.0.2-oauth-oidc-audit.jsonl` (fake user, every token and ticket
+replaced): all of them as one input, and each request with its response, so the correlation state
+sees request and response pairs from the start. The other targets start empty. For a cargo-fuzz campaign, copy the same files into `corpus/<target>/`.
 
 Longer campaigns with AddressSanitizer need a nightly toolchain and cargo-fuzz:
 

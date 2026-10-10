@@ -21,7 +21,13 @@ use databastion_core::cas_guard::{self, CasStores, StoreKind, TicketCounts};
 use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 
+use crate::audit::credits::SharedCredits;
+
+/// Where Discovery grants its sampling credits, with the scan's statement
+/// timeout (`None`: no Audit stream runs for the target).
+type Credits<'a> = Option<(&'a SharedCredits, std::time::Duration)>;
 use crate::catalog::{self, Coverage, EngineSkip, Table};
+use crate::check::CheckState;
 use crate::conn::{Flow, ReadTx, Session, Streamed, Timeouts};
 use crate::error::{MyError, Stage};
 use crate::sql::{self, Sampled};
@@ -76,9 +82,21 @@ pub(crate) fn decode_value(raw: &[u8]) -> Option<String> {
 }
 
 /// Runs a Discovery scan of the job's target.
-pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
+pub(crate) async fn discover(
+    job: &ScanJob,
+    sink: &FindingSink,
+    state: &CheckState,
+) -> Result<(), ConnectorError> {
     let Some(target) = job.target() else {
         return Err(MyError::new(FailureCode::Internal, Stage::Connect).into_connector_error());
+    };
+    let shared_credits = state.sample_credits(&target.id);
+    // Credits only while the target's Audit stream runs (security review
+    // of 09e93da, L1), checked per table.
+    let credits_now = || {
+        state
+            .stream_running(&target.id)
+            .then_some((&shared_credits, job.statement_timeout()))
     };
     let timeouts = Timeouts::new(job.statement_timeout());
     if job.out_of_time() {
@@ -158,6 +176,7 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                 unit,
                 job.sample_rows(),
                 job.cas_stores(),
+                credits_now(),
             ))
             .await?
         {
@@ -175,7 +194,7 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
         } else {
             session = Some(current);
         }
-        let sample = match sampled {
+        let mut sample = match sampled {
             Ok(s) => s,
             Err(e) if !e.fatal && e.code == FailureCode::ResourceLimit => {
                 skipped += 1;
@@ -225,6 +244,69 @@ pub(crate) async fn discover(job: &ScanJob, sink: &FindingSink) -> Result<(), Co
                 "object not covered"
             );
             continue;
+        }
+        // Batches left after a budget stop (its session was dropped): on a
+        // new session, each within its share of the table's byte budget.
+        while sample.batches.next < sample.batches.statements.len() && !sample.batches.exhausted() {
+            if job.turn().await? == Paced::OutOfTime {
+                break;
+            }
+            let mut s = Session::connect(target, timeouts)
+                .await
+                .map_err(|e| fail(target, e))?;
+            let resumed = match job
+                .paced(resume_table(
+                    &mut s,
+                    &mut sample,
+                    job.sample_rows(),
+                    credits_now(),
+                ))
+                .await?
+            {
+                Paced::Done(r) => r,
+                Paced::OutOfTime => {
+                    s.close().await;
+                    break;
+                }
+            };
+            if s.is_poisoned() {
+                drop(s);
+            } else {
+                session = Some(s);
+            }
+            match resumed {
+                Ok(()) => {}
+                Err(e) if !e.fatal => {
+                    tracing::warn!(
+                        target_id = %target.id,
+                        database = db.as_str(),
+                        object = object.as_str(),
+                        stage = e.stage.as_str(),
+                        errno = e.errno,
+                        "sample batch skipped"
+                    );
+                    break;
+                }
+                Err(e) => return Err(fail(target, e)),
+            }
+        }
+        sample.finish();
+        if sample.batches.short() {
+            // Some columns got fewer rows than others, or none (security
+            // review of 914c9d2, N2): a gap of the connector's bounds.
+            sink.add_coverage(ScanCoverage {
+                limit: 1,
+                ..ScanCoverage::default()
+            });
+            tracing::warn!(
+                target_id = %target.id,
+                database = db.as_str(),
+                object = object.as_str(),
+                batches = sample.batches.statements.len(),
+                not_run = sample.batches.statements.len() - sample.batches.next,
+                reason = "sample byte budget reached in a column batch",
+                "object partly covered: some columns sampled short"
+            );
         }
         if sample.virtual_columns > 0 {
             tracing::info!(
@@ -373,6 +455,14 @@ pub(crate) fn log_coverage(target: &TargetConfig, c: &Coverage) {
 /// zeroized on drop). `Debug` shows counts only.
 pub(crate) struct TableSample {
     pub(crate) columns: Vec<(String, Vec<RawValue>)>,
+    /// The sampling statements of the table and how far they ran.
+    pub(crate) batches: Batches,
+    /// Sampled column names and their values, filled batch by batch
+    /// ([`TableSample::finish`] moves them to `columns`).
+    names: Vec<String>,
+    values: Vec<Vec<RawValue>>,
+    schema: String,
+    table: String,
     /// At least one column is readable (`SELECT` privilege).
     pub(crate) readable: bool,
     pub(crate) virtual_columns: usize,
@@ -386,6 +476,15 @@ pub(crate) struct TableSample {
     pub(crate) tickets: Option<TicketCounts>,
 }
 
+impl TableSample {
+    /// Moves the sampled values to `columns`, once every batch ran.
+    pub(crate) fn finish(&mut self) {
+        let names = std::mem::take(&mut self.names);
+        let values = std::mem::take(&mut self.values);
+        self.columns = names.into_iter().zip(values).collect();
+    }
+}
+
 impl std::fmt::Debug for TableSample {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableSample")
@@ -395,28 +494,91 @@ impl std::fmt::Debug for TableSample {
     }
 }
 
+/// The column batches of a table (`sql::sample_statements`) and their
+/// progress. Each batch gets a share of what is left of
+/// [`MAX_SAMPLE_BYTES`] in proportion to its columns, so that a batch of
+/// large values cannot take the whole budget (security review of
+/// 914c9d2, N2). A batch stopped on its share kills its statement: the
+/// next batches run on a new session.
+#[derive(Default)]
+pub(crate) struct Batches {
+    /// Per batch: its columns (range in `TableSample::columns`) and text.
+    pub(crate) statements: Vec<(std::ops::Range<usize>, String)>,
+    /// The next batch to run.
+    pub(crate) next: usize,
+    /// Rows read per batch run.
+    pub(crate) rows: Vec<u32>,
+    /// Bytes charged so far (all batches).
+    pub(crate) bytes: usize,
+}
+
+impl Batches {
+    /// Byte share of batch `i`: what is left of the budget, in proportion
+    /// to its columns among the batches not run yet.
+    fn share(&self, i: usize) -> usize {
+        let left = MAX_SAMPLE_BYTES.saturating_sub(self.bytes);
+        let cols = |r: &std::ops::Range<usize>| r.len().max(1);
+        let rest: usize = self.statements[i..].iter().map(|(r, _)| cols(r)).sum();
+        let mine = cols(&self.statements[i].0);
+        // `left * mine / rest` without overflow (`left` is at most 32 MiB).
+        left / rest.max(1) * mine + left % rest.max(1) * mine / rest.max(1)
+    }
+
+    /// What is left of the table's byte budget.
+    pub(crate) fn left(&self) -> usize {
+        MAX_SAMPLE_BYTES.saturating_sub(self.bytes)
+    }
+
+    /// Nothing left of the table's byte budget (the remaining batches are
+    /// not run).
+    pub(crate) fn exhausted(&self) -> bool {
+        self.left() == 0
+    }
+
+    /// Some columns got fewer rows than others, or were not sampled.
+    pub(crate) fn short(&self) -> bool {
+        self.next < self.statements.len()
+            || self.rows.iter().any(|r| Some(r) != self.rows.iter().max())
+    }
+}
+
 /// Accepts the rows of one sampling statement: at most `limit` rows (a
-/// server that ignores the `LIMIT` is stopped), and at most
-/// [`MAX_SAMPLE_BYTES`] per table, counting every value's length plus
-/// [`VALUE_OVERHEAD`] (so rows of NULL or empty values are bounded too).
+/// server that ignores the `LIMIT` is stopped), and at most `cap` bytes
+/// (the batch's share of [`MAX_SAMPLE_BYTES`]), counting every value's
+/// length plus [`VALUE_OVERHEAD`] (so rows of NULL or empty values are
+/// bounded too).
 pub(crate) struct RowSampler<'v> {
     limit: u32,
     pub(crate) rows: u32,
-    /// Bytes charged so far for the table (all batches).
+    /// Bytes charged by this statement.
     pub(crate) bytes: usize,
+    cap: usize,
+    /// Bound of the first row ([`RowSampler::first_row_within`]).
+    first_cap: usize,
     pub(crate) stop: Option<&'static str>,
     values: &'v mut [Vec<RawValue>],
 }
 
 impl<'v> RowSampler<'v> {
-    pub(crate) fn new(limit: u32, bytes: usize, values: &'v mut [Vec<RawValue>]) -> Self {
+    pub(crate) fn new(limit: u32, cap: usize, values: &'v mut [Vec<RawValue>]) -> Self {
         Self {
             limit,
             rows: 0,
-            bytes,
+            bytes: 0,
+            cap,
+            first_cap: cap,
             stop: None,
             values,
         }
+    }
+
+    /// Accepts a first row of up to `left` bytes (what is left of the
+    /// table's budget) even past the share: a batch whose single row is
+    /// larger than its share still samples one row.
+    #[must_use]
+    pub(crate) fn first_row_within(mut self, left: usize) -> Self {
+        self.first_cap = left.max(self.cap);
+        self
     }
 
     pub(crate) fn accept(&mut self, row: &[Option<&[u8]>]) -> Flow {
@@ -430,7 +592,12 @@ impl<'v> RowSampler<'v> {
             .fold(0, usize::saturating_add);
         // Budget checked per row, before decoding it. The row itself was
         // already received whole: one row is the residual peak.
-        if self.bytes.saturating_add(row_bytes) > MAX_SAMPLE_BYTES {
+        let cap = if self.rows == 0 {
+            self.first_cap
+        } else {
+            self.cap
+        };
+        if self.bytes.saturating_add(row_bytes) > cap {
             self.stop = Some("sample byte budget reached");
             return Flow::Stop;
         }
@@ -453,9 +620,10 @@ pub(crate) async fn sample_table(
     table: &Table,
     limit: u32,
     stores: Option<&CasStores>,
+    credits: Credits<'_>,
 ) -> Result<TableSample, MyError> {
     let mut tx = session.begin().await?;
-    match read_table(&mut tx, table, limit, stores).await {
+    match read_table(&mut tx, table, limit, stores, credits).await {
         Ok(sample) => {
             tx.commit().await?;
             Ok(sample)
@@ -467,14 +635,106 @@ pub(crate) async fn sample_table(
     }
 }
 
+/// Runs the batches of `sample` left after a budget stop, in one
+/// read-only transaction on `session` (a new one: the stopped statement's
+/// session was dropped), until done or the next stop.
+pub(crate) async fn resume_table(
+    session: &mut Session,
+    sample: &mut TableSample,
+    limit: u32,
+    credits: Credits<'_>,
+) -> Result<(), MyError> {
+    let mut tx = session.begin().await?;
+    match run_batches(&mut tx, sample, limit, credits).await {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(())
+        }
+        Err(e) => {
+            tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+/// Runs the batches of `sample` from `sample.batches.next`, each within
+/// its byte share, until done or a stop (the statement killed: the
+/// session is then poisoned). Before each batch but the table's first,
+/// a credit with its exact text is granted to the Audit stream
+/// (`audit::credits`): one scan of a table is charged once to the
+/// agent's own-account budget.
+async fn run_batches(
+    tx: &mut ReadTx<'_>,
+    sample: &mut TableSample,
+    limit: u32,
+    credits: Credits<'_>,
+) -> Result<(), MyError> {
+    while sample.batches.next < sample.batches.statements.len() {
+        let i = sample.batches.next;
+        if sample.batches.exhausted() {
+            // Nothing left of the table's budget: the remaining batches
+            // are not run (reported as short).
+            break;
+        }
+        let cap = sample.batches.share(i);
+        let left = sample.batches.left();
+        let (range, statement) = sample.batches.statements[i].clone();
+        if i > 0
+            && let Some((credits, timeout)) = credits
+        {
+            credits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .grant(
+                    &statement,
+                    &sample.schema,
+                    &sample.table,
+                    timeout,
+                    std::time::Instant::now(),
+                );
+        }
+        let mut sampler =
+            RowSampler::new(limit, cap, &mut sample.values[range]).first_row_within(left);
+        let streamed = tx
+            .query_stream(Stage::Sample, &statement, |row| sampler.accept(row))
+            .await?;
+        let (rows, used, stop) = (sampler.rows, sampler.bytes, sampler.stop);
+        sample.batches.bytes = sample.batches.bytes.saturating_add(used);
+        sample.batches.rows.push(rows);
+        sample.batches.next = i + 1;
+        sample.rows = sample.rows.max(rows);
+        if streamed == Streamed::Stopped {
+            if rows == 0 {
+                // A single row larger than what is left: no later batch
+                // runs (each would cost a new session for nothing).
+                sample.batches.bytes = MAX_SAMPLE_BYTES;
+            }
+            tracing::info!(
+                rows,
+                batch = i,
+                reason = stop.unwrap_or("stopped"),
+                "sample stopped: statement killed"
+            );
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn read_table(
     tx: &mut ReadTx<'_>,
     table: &Table,
     limit: u32,
     stores: Option<&CasStores>,
+    credits: Credits<'_>,
 ) -> Result<TableSample, MyError> {
     let mut sample = TableSample {
         columns: Vec::new(),
+        batches: Batches::default(),
+        names: Vec::new(),
+        values: Vec::new(),
+        schema: table.schema.clone(),
+        table: table.name.clone(),
         readable: false,
         virtual_columns: 0,
         rows: 0,
@@ -593,53 +853,76 @@ async fn read_table(
     if cols.is_empty() {
         return Ok(sample);
     }
-    let mut values: Vec<Vec<RawValue>> = cols.iter().map(|_| Vec::new()).collect();
-    let mut bytes = 0usize;
-    let mut rows = 0u32;
     // Columns in batches, so that one row of a batch stays well under the
     // largest packet the connector accepts (a table with thousands of text
-    // columns cannot make a single row oversized and abort the scan).
-    for (batch, (cols_batch, values_batch)) in cols
-        .chunks(MAX_BATCH_COLUMNS)
-        .zip(values.chunks_mut(MAX_BATCH_COLUMNS))
-        .enumerate()
-    {
-        let selected: Vec<(&str, Sampled)> =
-            cols_batch.iter().map(|(n, k)| (n.as_str(), *k)).collect();
-        let statement = sql::sample_statement(
-            tx.flavor(),
-            tx.timeouts().statement_ms(),
-            &table.schema,
-            &table.name,
-            &selected,
-            limit,
-        )
-        .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
-        let mut sampler = RowSampler::new(limit, bytes, values_batch);
-        let streamed = tx
-            .query_stream(Stage::Sample, &statement, |row| sampler.accept(row))
-            .await?;
-        let (batch_rows, used, stop) = (sampler.rows, sampler.bytes, sampler.stop);
-        bytes = used;
-        rows = rows.max(batch_rows);
-        if streamed == Streamed::Stopped {
-            tracing::info!(
-                rows = batch_rows,
-                batch,
-                reason = stop.unwrap_or("stopped"),
-                "sample stopped: statement killed"
-            );
-            break;
-        }
-    }
-    sample.rows = rows;
-    sample.columns = cols.into_iter().map(|(n, _)| n).zip(values).collect();
+    // columns cannot make a single row oversized and abort the scan), and
+    // each statement under the audit logs' default text limits
+    // (`sql::MAX_OWN_STATEMENT`: a cut text is reported as a read of `*`).
+    let selected: Vec<(&str, Sampled)> = cols.iter().map(|(n, k)| (n.as_str(), *k)).collect();
+    sample.batches.statements = sql::sample_statements(
+        tx.flavor(),
+        tx.timeouts().statement_ms(),
+        &table.schema,
+        &table.name,
+        &selected,
+        limit,
+        MAX_BATCH_COLUMNS,
+    )
+    .ok_or(MyError::new(FailureCode::Internal, Stage::Sample))?;
+    sample.values = cols.iter().map(|_| Vec::new()).collect();
+    sample.names = cols.into_iter().map(|(n, _)| n).collect();
+    run_batches(tx, &mut sample, limit, credits).await?;
     Ok(sample)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security review of 914c9d2, N2: each batch gets a share of what is
+    /// left of the byte budget in proportion to its columns; columns
+    /// sampled short or not at all are reported.
+    #[test]
+    fn batches_share_the_byte_budget_and_report_short_columns() {
+        let mut b = Batches {
+            statements: vec![
+                (0..30, String::new()),
+                (30..60, String::new()),
+                (60..65, String::new()),
+            ],
+            ..Batches::default()
+        };
+        assert_eq!(
+            b.share(0),
+            MAX_SAMPLE_BYTES / 65 * 30 + MAX_SAMPLE_BYTES % 65 * 30 / 65
+        );
+        // The first batch used less than its share: the rest is shared.
+        b.bytes = 1024;
+        b.rows.push(40);
+        b.next = 1;
+        let left = MAX_SAMPLE_BYTES - 1024;
+        assert!(b.share(1).abs_diff(left * 30 / 35) <= 1);
+        assert!(b.short(), "batches not run");
+        b.rows.extend([40, 40]);
+        b.next = 3;
+        assert!(!b.short());
+        b.rows[1] = 12;
+        assert!(b.short(), "a batch stopped on its share");
+        // Shares never exceed what is left.
+        b.bytes = MAX_SAMPLE_BYTES;
+        assert_eq!(b.share(2), 0);
+        // A first row past the share but within what is left is read.
+        let mut values = vec![Vec::new()];
+        let mut sampler = RowSampler::new(10, 20, &mut values).first_row_within(100);
+        assert_eq!(sampler.accept(&[Some(&[b'x'; 60][..])]), Flow::Continue);
+        assert_eq!(sampler.accept(&[Some(&b"x"[..])]), Flow::Stop);
+        assert_eq!(sampler.rows, 1);
+        let one = Batches {
+            statements: vec![(0..1, String::new())],
+            ..Batches::default()
+        };
+        assert_eq!(one.share(0), MAX_SAMPLE_BYTES);
+    }
 
     #[test]
     fn planned_coverage_counts_each_skip_reason() {

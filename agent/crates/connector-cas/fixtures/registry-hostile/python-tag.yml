@@ -1,0 +1,5 @@
+--- !<org.apereo.cas.services.CasRegisteredService>
+serviceId: "^https://app.example.org/.*"
+name: Hostile
+description: !!python/object/apply:os.system ["id"]
+other: !<tag:yaml.org,2002:str> x

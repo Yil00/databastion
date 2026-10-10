@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 85713fd995126a175a5f03b35c90c4144461aa43215085cf34ffc86cfef9e9f9 # shrinks to (text, m, d) = ("select 0b100000020 into outfile N'ZqAAAAAA' from t", "ZqAAAAAA", "100000020")

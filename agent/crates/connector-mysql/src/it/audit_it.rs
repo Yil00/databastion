@@ -38,7 +38,7 @@ const BIG_ROWS: u64 = 20_000;
 
 type Events = Vec<MaskedEvent>;
 
-fn describe(e: &MaskedEvent) -> String {
+pub(super) fn describe(e: &MaskedEvent) -> String {
     format!(
         "{:?} user={} app={:?} client={:?} objects={:?} rows={:?} signals={:?} source={}",
         e.action(),
@@ -77,7 +77,7 @@ fn has_write(events: &[MaskedEvent], table: &str) -> bool {
 }
 
 /// Collects events until `done` holds or `timeout`.
-async fn collect_until(
+pub(super) async fn collect_until(
     rx: &mut tokio::sync::mpsc::Receiver<MaskedEvent>,
     out: &mut Events,
     timeout: Duration,
@@ -93,7 +93,7 @@ async fn collect_until(
 }
 
 /// Runs `audit_stream` in a task (poll interval 1 s, cursors in `state`).
-fn start_audit(
+pub(super) fn start_audit(
     connector: Arc<MysqlConnector>,
     t: &TargetConfig,
     state: &Path,
@@ -112,7 +112,7 @@ fn start_audit(
 }
 
 /// A target for `user` with the dev TLS settings and an optional audit log.
-fn audit_target(
+pub(super) fn audit_target(
     server: &Server,
     user: &str,
     password: &str,
@@ -124,7 +124,7 @@ fn audit_target(
     target_tls(server, user, password, &format!("{}{audit}", server.tls()))
 }
 
-fn env_path(var: &str, key: &str) -> Option<PathBuf> {
+pub(super) fn env_path(var: &str, key: &str) -> Option<PathBuf> {
     // A dev log may belong to the test's own user (the tailer refuses it
     // in production).
     databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
@@ -141,7 +141,7 @@ fn env_path(var: &str, key: &str) -> Option<PathBuf> {
 }
 
 /// The Percona Server of `dev/`.
-fn percona() -> Option<Server> {
+pub(super) fn percona() -> Option<Server> {
     let var = |s: &str| std::env::var(format!("DATABASTION_TEST_PERCONA_{s}")).ok();
     let (Some(url), Some(ca)) = (var("URL").as_deref().and_then(parse_url), var("CA_FILE")) else {
         skip(
@@ -269,11 +269,63 @@ async fn audit_log_scenario(
         )
         .await;
     assert!(refused.is_err(), "{label}: INTO OUTFILE must fail here");
-    drop(a);
-    // The agent's own Discovery scan: its sampling reads are left out
-    // when the agent's address is known.
-    let (r, _) = scan(&agent_target(server).1).await;
-    r.unwrap();
+    // Reads of statement-text tables (ADR-0045): named, always reported.
+    for statement in [
+        "SELECT COUNT(*) FROM information_schema.PROCESSLIST",
+        "SELECT COUNT(*) FROM performance_schema.events_statements_history_long",
+    ] {
+        a.query(Stage::Check, statement).await.unwrap();
+    }
+    let text_read = |ev: &[MaskedEvent], db: &str, t: &str| {
+        ev.iter().any(|e| {
+            e.action() == EventAction::Read
+                && e.always_report()
+                && e.principal().account_name() == admin.user
+                && e.objects()
+                    .iter()
+                    .any(|o| o.database().as_str() == db && o.object().as_str() == t)
+        })
+    };
+    // A table of 40 columns, sampled in several column batches (security
+    // review of 914c9d2, N3): one scan is charged once to the agent's
+    // budget, its extra batches are left out by their credits.
+    exec(
+        &mut a,
+        &format!("DROP TABLE IF EXISTS `{database}`.it_wide40"),
+    )
+    .await;
+    exec(
+        &mut a,
+        &format!(
+            "CREATE TABLE `{database}`.it_wide40 ({})",
+            (0..40)
+                .map(|i| format!("customer_field_{i:02} VARCHAR(40)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    exec(
+        &mut a,
+        &format!(
+            "INSERT INTO `{database}`.it_wide40 VALUES ({})",
+            (0..40)
+                .map(|i| format!("'v{i}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    // The agent's own Discovery scan, by the connector that runs the
+    // Audit stream (one instance per agent): its sampling reads are left
+    // out when the agent's address is known.
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut rx) = FindingSink::channel(100_000);
+        connector.discover(&job, &sink).await.unwrap();
+        drop(sink);
+        while rx.recv().await.is_some() {}
+    }
     // check() at every heartbeat sends the CAS store guard statement, longer
     // than the default `server_audit_query_log_limit` (cut inside a string
     // literal there): never reported as the agent's read (mariadb-e2e I2).
@@ -292,6 +344,8 @@ async fn audit_log_scenario(
                     && e.objects().iter().any(|o| o.object().as_str() == table)
                     && e.principal().account_name() == admin.user
             })
+            && text_read(ev, "information_schema", "PROCESSLIST")
+            && text_read(ev, "performance_schema", "events_statements_history_long")
             && (!real
                 || ev.iter().any(|e| {
                     e.principal().client() != admin_addr
@@ -311,6 +365,18 @@ async fn audit_log_scenario(
     );
     assert!(has(&events, table, "shape.full_table_read"), "{label}");
     assert!(has(&events, table, "signature.into_outfile"), "{label}");
+    assert!(
+        text_read(&events, "information_schema", "PROCESSLIST"),
+        "{label}: {all:#?}"
+    );
+    assert!(
+        text_read(
+            &events,
+            "performance_schema",
+            "events_statements_history_long"
+        ),
+        "{label}: {all:#?}"
+    );
     assert!(
         events.iter().all(|e| e.source() == source),
         "{label}: {all:#?}"
@@ -364,6 +430,12 @@ async fn audit_log_scenario(
         );
     }
     assert_no_marker(&events, &logs);
+    exec(
+        &mut a,
+        &format!("DROP TABLE IF EXISTS `{database}`.it_wide40"),
+    )
+    .await;
+    drop(a);
     // A record was read: Partial.
     let health = connector.check(&t).await;
     assert_eq!(
@@ -550,9 +622,65 @@ async fn performance_schema_gives_events_with_rows() {
              WHERE NAME = 'events_stages_current'",
         )
         .await;
+        // Security review of #181, H1: token padding fills the digest
+        // (cut at its token storage, rendered past the limit): the read
+        // after the cut is reported as a read of `*`, always.
+        a.query(
+            Stage::Check,
+            &format!(
+                "SELECT i FROM {AUDIT_DB}.d WHERE 1 = 1{} UNION ALL SELECT i FROM {AUDIT_DB}.big",
+                " AND i = i".repeat(300)
+            ),
+        )
+        .await
+        .unwrap();
+        // Security review of 914c9d2, N1: one-letter identifier padding
+        // fills the digest's token storage while it renders well under the
+        // limit, without `...`. With a whole `SQL_TEXT` (400 names) the
+        // read is named from it; with `SQL_TEXT` cut too (600 names), it
+        // is a read of `*`, always reported.
+        for n in [400, 600] {
+            a.query(
+                Stage::Check,
+                &format!(
+                    "SELECT * FROM (SELECT 1 a) x WHERE a IN ({}) \
+                     UNION ALL SELECT i FROM {AUDIT_DB}.d WHERE i = 3",
+                    vec!["a"; n].join(",")
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let named_d = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.principal().account_name() == admin.user
+                    && !e.always_report()
+                    && e.signals().is_empty()
+                    && e.objects().iter().any(|o| o.object().as_str() == "d")
+            })
+        };
+        let only_star = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.always_report()
+                    && e.principal().account_name() == admin.user
+                    && !e.objects().is_empty()
+                    && e.objects().iter().all(|o| o.object().as_str() == "*")
+            })
+        };
+        let cut_star = |ev: &[MaskedEvent]| {
+            ev.iter().any(|e| {
+                e.always_report()
+                    && e.principal().account_name() == admin.user
+                    && e.objects().iter().any(|o| o.object().as_str() == "*")
+                    && e.objects().iter().any(|o| o.object().as_str() == "d")
+            })
+        };
         let mut events: Events = Vec::new();
         collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
-            has_write(ev, "setup_consumers")
+            cut_star(ev)
+                && named_d(ev)
+                && only_star(ev)
+                && has_write(ev, "setup_consumers")
                 && has(ev, "big", "volume.large_result")
                 && has(ev, "d", "signature.mysqldump")
                 && has(ev, "d", "signature.into_outfile")
@@ -598,6 +726,13 @@ async fn performance_schema_gives_events_with_rows() {
             "{}: write to performance_schema.setup_consumers: {all:#?}",
             server.name
         );
+        assert!(cut_star(&events), "{}: cut digest: {all:#?}", server.name);
+        assert!(
+            named_d(&events),
+            "{}: digest storage full: {all:#?}",
+            server.name
+        );
+        assert!(only_star(&events), "{}: both cut: {all:#?}", server.name);
         if real {
             assert!(
                 has(&events, "employees", "signature.mysqldump"),
@@ -683,5 +818,209 @@ async fn performance_schema_gives_events_with_rows() {
         task.abort();
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {AUDIT_DB}")).await;
         exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
+    }
+}
+
+/// Account of the many-roles test.
+const MANY_ROLES_USER: &str = "databastion_it_many";
+/// Roles of the many-roles test, as `'name'@'host'`: 16 granted directly
+/// (the most evaluated), with a long host part (role names have at most 32
+/// characters), each granting a nested role, 8 of them two (40 roles).
+/// A role as `(name, host)`.
+type Role = (String, String);
+
+fn many_roles() -> (Vec<Role>, Vec<(usize, String)>) {
+    let direct: Vec<Role> = (0..16)
+        .map(|i| {
+            (
+                format!("databastion_it_many_{i:02}"),
+                "many-roles.databastion-it.example.test".to_owned(),
+            )
+        })
+        .collect();
+    let nested: Vec<(usize, String)> = (0..24)
+        .map(|i| (i % 16, format!("'databastion_it_nested_{i:02}'@'%'")))
+        .collect();
+    (direct, nested)
+}
+
+/// `'name'@'host'`.
+fn account((name, host): &Role) -> String {
+    format!("'{name}'@'{host}'")
+}
+
+/// Drops the account, and on MySQL the roles (MariaDB roles have no
+/// host part; none are created there).
+async fn drop_many_roles(a: &mut Session, mysql: bool) {
+    exec(a, &format!("DROP USER IF EXISTS '{MANY_ROLES_USER}'@'%'")).await;
+    if !mysql {
+        return;
+    }
+    let (direct, nested) = many_roles();
+    for r in direct
+        .iter()
+        .map(account)
+        .chain(nested.into_iter().map(|(_, r)| r))
+    {
+        exec(a, &format!("DROP ROLE IF EXISTS {r}")).await;
+    }
+}
+
+/// Security review of 914c9d2 (Low) and #168 review L2, MySQL /
+/// MariaDB `performance_schema`.
+///
+/// MySQL: an account with 40 roles (16 granted directly, with names long
+/// enough that one `SHOW GRANTS … USING` statement would take about 1 100
+/// bytes and be cut at the default 1024): `check()` splits the role list,
+/// evaluates every role (a nested role of the second statement holds
+/// `SELECT` on `mysql`), and the Audit stream on the same account reports
+/// none of its own statements. (On `performance_schema` the whole digest
+/// of the old single statement was analyzed in place of its cut
+/// `SQL_TEXT`; the sources that only have the statement text, and a cut
+/// digest, are covered by the unit test
+/// `audit::events::tests::split_role_statements_are_never_cut`.)
+///
+/// Both: `LOAD_FILE` is reported against `*`, always, from another
+/// account and from the agent's.
+#[tokio::test]
+async fn many_roles_stay_whole_and_load_file_is_reported() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let name = server.name;
+        let mysql = server.flavor() == Flavor::Mysql;
+        let db = server.url.dbname.clone();
+        let mut a = admin_session(&server, &admin).await;
+        drop_many_roles(&mut a, mysql).await;
+        exec(
+            &mut a,
+            &format!(
+                "CREATE USER '{MANY_ROLES_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"
+            ),
+        )
+        .await;
+        for g in [
+            format!("GRANT SELECT ON `{db}`.* TO '{MANY_ROLES_USER}'@'%'"),
+            format!("GRANT SELECT ON performance_schema.* TO '{MANY_ROLES_USER}'@'%'"),
+        ] {
+            exec(&mut a, &g).await;
+        }
+        let (direct, nested) = many_roles();
+        if mysql {
+            let all: Vec<String> = direct
+                .iter()
+                .map(account)
+                .chain(nested.iter().map(|(_, r)| r.clone()))
+                .collect();
+            for r in &all {
+                exec(&mut a, &format!("CREATE ROLE {r}")).await;
+                exec(&mut a, &format!("GRANT SELECT ON `{db}`.* TO {r}")).await;
+            }
+            for (i, r) in &nested {
+                exec(&mut a, &format!("GRANT {r} TO {}", account(&direct[*i]))).await;
+            }
+            for r in &direct {
+                exec(
+                    &mut a,
+                    &format!("GRANT {} TO '{MANY_ROLES_USER}'@'%'", account(r)),
+                )
+                .await;
+            }
+            // The one statement of before would be cut; now several.
+            let statements = crate::sql::show_grants_using(&direct).unwrap();
+            assert!(statements.len() > 1, "{statements:?}");
+            assert!(
+                statements.iter().map(String::len).sum::<usize>() > 1024,
+                "{statements:?}"
+            );
+            for s in &statements {
+                assert!(crate::sql::server_audit_escaped_len(s) <= crate::sql::MAX_OWN_STATEMENT);
+            }
+        }
+        let (_d, t) = audit_target(&server, MANY_ROLES_USER, IT_PASSWORD, None);
+        if mysql {
+            // Every role evaluated, and none beyond the minimal grant (the
+            // `performance_schema` grant without Audit is the one note).
+            let (notes, output) = privilege_check(&t).await;
+            assert_eq!(
+                notes.iter().map(|n| n.code()).collect::<Vec<_>>(),
+                [NoteCode::PrivilegePerformanceSchemaWithoutAudit],
+                "{name}: {output}"
+            );
+            // A nested role of the last statement's direct role: evaluated.
+            let sys = &nested.iter().find(|(i, _)| *i == 15).unwrap().1;
+            exec(&mut a, &format!("GRANT SELECT ON `mysql`.* TO {sys}")).await;
+            let (notes, output) = privilege_check(&t).await;
+            server_note(name, &notes, NoteCode::PrivilegeSystemDatabaseSelect);
+            assert_no_note(name, &notes, NoteCode::PrivilegeRolesNotEvaluated, &output);
+            exec(&mut a, &format!("REVOKE SELECT ON `mysql`.* FROM {sys}")).await;
+        }
+        let connector = Arc::new(MysqlConnector::new());
+        let health = connector.check(&t).await;
+        assert!(health.reachable, "{name}: {health:?}");
+        if connector.audit_source(&t) != Some(EventSource::PerformanceSchema) {
+            skip(
+                &format!("{name}-pfs"),
+                &format!("{name}: performance_schema is not an Audit source here"),
+            );
+            drop_many_roles(&mut a, mysql).await;
+            continue;
+        }
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // Heartbeat checks of the account (fresh connectors: no cached
+        // report, so the role statements are sent each time).
+        for _ in 0..3 {
+            let h = MysqlConnector::new().check(&t).await;
+            assert!(h.reachable, "{name}: {h:?}");
+        }
+        // LOAD_FILE (NULL without `FILE` or outside `secure_file_priv`:
+        // the statement runs and is logged all the same), from the admin
+        // account and from the agent's.
+        let file = "SELECT LOAD_FILE('/etc/hostname')";
+        a.query(Stage::Check, file).await.unwrap();
+        let mut own = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        own.query(Stage::Check, "SET @x = LOAD_FILE('/etc/hostname')")
+            .await
+            .unwrap();
+        // Kept open until polled: the account of an ended session is not
+        // readable.
+        let star_of = |ev: &[MaskedEvent], user: &str| {
+            ev.iter().any(|e| {
+                e.principal().account_name() == user
+                    && e.always_report()
+                    && !e.objects().is_empty()
+                    && e.objects().iter().all(|o| o.object().as_str() == "*")
+            })
+        };
+        let mut events: Events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
+            star_of(ev, &admin.user) && star_of(ev, MANY_ROLES_USER)
+        })
+        .await;
+        // Let the checks' statements be polled too.
+        collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+        drop(own);
+        task.abort();
+        let _ = task.await;
+        let all: Vec<String> = events.iter().map(describe).collect();
+        eprintln!("{name} events:\n{}", all.join("\n"));
+        assert!(star_of(&events, &admin.user), "{name}: {all:#?}");
+        assert!(star_of(&events, MANY_ROLES_USER), "{name}: {all:#?}");
+        // The account's only event is its LOAD_FILE: none of the checks'
+        // statements (role lists included) surfaced.
+        let own_events: Vec<&String> = events
+            .iter()
+            .zip(&all)
+            .filter(|(e, _)| e.principal().account_name() == MANY_ROLES_USER)
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(own_events.len(), 1, "{name}: {own_events:#?}");
+        drop_many_roles(&mut a, mysql).await;
     }
 }

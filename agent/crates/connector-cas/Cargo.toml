@@ -27,11 +27,6 @@ regex.workspace = true
 # record strings are unescaped by the crate into zeroizing buffers, never by serde_json.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std", "raw_value"] }
-# YAML service definitions (`yaml_dir`), read by the same closed visitor
-# after a pre-scan of the raw bytes (src/parse/yaml.rs). The crate the core
-# already links for `agent.yaml` (ADR-0041 decisions 4 and 13): no new
-# dependency in the agent binary.
-serde_yaml_ng = "0.10"
 # openat / fstat / faccessat without `unsafe` (ADR-0041 decision 3), as the
 # core's state files.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
@@ -51,6 +46,11 @@ databastion-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
 # Property tests of every parser (src/proptests.rs).
 proptest = { version = "1", default-features = false, features = ["std"] }
+# YAML service definitions are read by the crate's own parser
+# (src/parse/yaml/, ADR-0046); `serde_yaml_ng` (on `unsafe-libyaml`) is only
+# the oracle of the differential tests, never linked into the agent binary
+# through this crate.
+serde_yaml_ng = "0.10"
 
 [lints]
 workspace = true

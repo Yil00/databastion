@@ -264,11 +264,7 @@ pub(crate) fn sample_statement(
     }
     let mut list = Vec::with_capacity(columns.len());
     for (name, kind) in columns {
-        let q = quote_ident(name)?;
-        list.push(match kind {
-            Sampled::Text => format!("LEFT({q}, {MAX_VALUE_CHARS})"),
-            Sampled::Plain => q,
-        });
+        list.push(sample_item(name, *kind)?);
     }
     let from = format!("{}.{}", quote_ident(schema)?, quote_ident(table)?);
     let ms = statement_ms.max(100);
@@ -283,6 +279,96 @@ pub(crate) fn sample_statement(
             ms % 1000,
             list.join(", ")
         ),
+    })
+}
+
+/// The sampling statements of one table ([`sample_statement`]): `columns`
+/// split, in order, into consecutive batches of at most `max_columns`, each
+/// as long as its statement stays within [`MAX_OWN_STATEMENT`] (so that it
+/// is never cut in the audit logs, where a cut text is reported as a read
+/// of `*`), counting [`SAMPLE_DIGEST_MARGIN`] more bytes per column for its
+/// `performance_schema` digest text. A batch has at least one column: one
+/// column always fits (three names of at most 64 characters). Each item:
+/// the batch's range in `columns` and its statement.
+#[must_use]
+pub(crate) fn sample_statements(
+    flavor: Flavor,
+    statement_ms: u32,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, Sampled)],
+    limit: u32,
+    max_columns: usize,
+) -> Option<Vec<(std::ops::Range<usize>, String)>> {
+    let first = sample_statement(
+        flavor,
+        statement_ms,
+        schema,
+        table,
+        columns.get(..1)?,
+        limit,
+    )?;
+    // Per column: its length as `server_audit` logs it (escaped) and as
+    // `performance_schema` may have stored it ([`stored_len`]: 4 bytes per
+    // non-ASCII character, security review of cea63c5, S1); a statement
+    // is bounded by the larger of the two.
+    let items: Vec<(usize, usize)> = columns
+        .iter()
+        .map(|(n, k)| {
+            sample_item(n, *k).map(|i| (server_audit_escaped_len(&i), stored_len(i.as_bytes())))
+        })
+        .collect::<Option<_>>()?;
+    // The statement without its column list (`, ` is ASCII, unescaped).
+    let base = (
+        server_audit_escaped_len(&first) - items[0].0,
+        stored_len(first.as_bytes()) - items[0].1,
+    );
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < columns.len() {
+        let mut len = (base.0 + items[start].0, base.1 + items[start].1);
+        let mut end = start + 1;
+        while end < columns.len()
+            && end - start < max_columns.max(1)
+            && (len.0 + 2 + items[end].0).max(len.1 + 2 + items[end].1)
+                + SAMPLE_DIGEST_MARGIN * (end - start + 1)
+                <= MAX_OWN_STATEMENT
+        {
+            len = (len.0 + 2 + items[end].0, len.1 + 2 + items[end].1);
+            end += 1;
+        }
+        let s = sample_statement(
+            flavor,
+            statement_ms,
+            schema,
+            table,
+            &columns[start..end],
+            limit,
+        )?;
+        debug_assert_eq!(
+            (server_audit_escaped_len(&s), stored_len(s.as_bytes())),
+            len
+        );
+        out.push((start..end, s));
+        start = end;
+    }
+    Some(out)
+}
+
+/// Bytes counted per sampled column on top of its text by
+/// [`sample_statements`]: a `performance_schema` digest text spaces its
+/// tokens (`LEFT ( `c` , ? ) , ` for `LEFT(`c`, 4096), `), at most 3 bytes
+/// more per column, and is reported cut from 4 bytes under
+/// `performance_schema_max_digest_length` (`audit::pfs`). Measured on MySQL
+/// 8.4 and MariaDB 11.4: see the `sample_statements_stay_short` test.
+pub(crate) const SAMPLE_DIGEST_MARGIN: usize = 4;
+
+/// One selected column of [`sample_statement`].
+fn sample_item(name: &str, kind: Sampled) -> Option<String> {
+    let q = quote_ident(name)?;
+    Some(match kind {
+        Sampled::Text => format!("LEFT({q}, {MAX_VALUE_CHARS})"),
+        Sampled::Plain => q,
     })
 }
 
@@ -338,12 +424,37 @@ macro_rules! name_key {
 /// to tell a cut list (then reported as not evaluated, PR #141 review L2).
 pub(crate) const CAS_GUARD_MAX_ROWS: usize = 20_000;
 
-/// Longest CAS store guard statement, in bytes as `server_audit` logs it
+/// Longest statement the agent sends, in bytes as `server_audit` logs it
 /// (escaped): well under the 1024-byte defaults of
 /// `server_audit_query_log_limit` and `performance_schema_max_sql_text_length`,
-/// so that a guard statement is never cut at the default limits and its
-/// exact text can be recognized by the Audit stream.
-pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = 900;
+/// so that the agent's statements are never cut at the default limits. The
+/// Audit stream reports a cut text with no table record as a read of `*`,
+/// always, whoever sent it (security review of #181, H1). Held by every
+/// fixed statement and the CAS store guard statements, and by the sampling
+/// statements, split into column batches ([`sample_statements`]), and by
+/// `SHOW GRANTS … USING`, whose role list is split over several statements
+/// ([`show_grants_using`]).
+pub(crate) const MAX_OWN_STATEMENT: usize = 900;
+
+/// Longest CAS store guard statement ([`MAX_OWN_STATEMENT`]): its exact
+/// text must be recognized by the Audit stream.
+pub(crate) const CAS_GUARD_MAX_STATEMENT: usize = MAX_OWN_STATEMENT;
+
+/// Upper estimate of the bytes `t` takes on the server in the client's
+/// character set (security review of 09e93da, R1): every allowed client
+/// character set is ASCII-compatible with at most 4 bytes per character,
+/// so an ASCII byte counts 1 and any other character 4 (any other byte 4
+/// when `t` is not UTF-8). `performance_schema` limits apply to these
+/// bytes (`audit::pfs::text_cut`). Never more than twice the length.
+#[must_use]
+pub(crate) fn stored_len(t: &[u8]) -> usize {
+    let ascii = t.iter().filter(|b| b.is_ascii()).count();
+    let other = match std::str::from_utf8(t) {
+        Ok(s) => s.chars().filter(|c| !c.is_ascii()).count(),
+        Err(_) => t.len() - ascii,
+    };
+    ascii + 4 * other
+}
 
 /// Length of `s` once escaped by MariaDB's `server_audit` (`'`, `\`,
 /// newline, carriage return, tab, backspace and form feed gain a `\`).
@@ -359,63 +470,99 @@ pub(crate) fn server_audit_escaped_len(s: &str) -> usize {
 const CAS_GUARD_SCHEMAS: &str =
     "LOWER(TABLE_SCHEMA) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')";
 
-/// The CAS store guard statements of `check()` (ADR-0041 decision 6): the
-/// columns of the tables that may be CAS stores, with the account's
-/// privileges on each. Columns: schema, table, column, privileges; each
-/// statement ordered by schema, table and column position, at most
-/// [`CAS_GUARD_MAX_ROWS`] + 1 rows.
+/// The CAS store guard's table list (ADR-0041 decision 6): the schema and
+/// name of every table and view outside the system schemas, nothing else.
+/// Selecting only these columns lets the server answer from the catalog
+/// without opening any table definition (measured: no
+/// `Opened_table_definitions` on MariaDB, a data dictionary index read on
+/// MySQL). `check()` streams it, computes each name key in Rust
+/// (`databastion_core::cas_guard::name_key`, the key of [`name_key!`]) and
+/// keeps only the keys it knows; no name is kept. At most
+/// [`CAS_GUARD_MAX_TABLES`] + 1 rows: one more tells a cut list (the guard
+/// is then not evaluated).
+pub(crate) const CAS_GUARD_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME \
+     FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) NOT IN \
+     ('mysql', 'sys', 'information_schema', 'performance_schema') LIMIT 1000001";
+
+/// Most rows of [`CAS_GUARD_TABLES`] read; it asks for one more.
+pub(crate) const CAS_GUARD_MAX_TABLES: usize = 1_000_000;
+
+/// The CAS store guard statements of `check()` (ADR-0041 decision 6),
+/// every text known from the configuration alone (the Audit stream
+/// recognizes them by their exact text; none depends on the catalog).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CasGuardStatements {
+    /// [`CAS_GUARD_TABLES`].
+    pub(crate) tables: &'static str,
+    /// Per name key, in key order: the columns, with the account's
+    /// privileges, of the tables whose name key is that key. Sent only for
+    /// the keys found in the table list.
+    pub(crate) by_key: Vec<(String, String)>,
+    /// The columns of the tables with a `body` / `json` / `AUD_RESOURCE` /
+    /// `AUD_USER` column (recognition by shape), sent last.
+    pub(crate) shape: String,
+}
+
+impl CasGuardStatements {
+    /// Every text, for the Audit stream: the name statements, the shape
+    /// statement, then the table list.
+    #[must_use]
+    pub(crate) fn texts(&self) -> Vec<String> {
+        self.by_key
+            .iter()
+            .map(|(_, s)| s.clone())
+            .chain([self.shape.clone(), self.tables.to_owned()])
+            .collect()
+    }
+}
+
+/// The CAS store guard statements for the name keys `keys` (the built-in
+/// names and `cas_stores`; see [`CasGuardStatements`]). Columns of the
+/// column statements: schema, table, column, privileges; each ordered by
+/// schema, table and column position, at most [`CAS_GUARD_MAX_ROWS`] + 1
+/// rows; each within [`CAS_GUARD_MAX_STATEMENT`].
 ///
-/// - First, tables whose name key is in `keys` (the built-in names and
-///   `cas_stores`), in as many statements as needed for each to stay within
-///   [`CAS_GUARD_MAX_STATEMENT`] (tables matched by name come first, PR
-///   #141 review L2);
-/// - last, the tables with a `body` / `json` / `AUD_RESOURCE` / `AUD_USER`
-///   column (recognition by shape).
+/// One column statement per key (PR #165 follow-up, measured cost): a
+/// filter on the name key cannot use the catalog's name lookup, so each
+/// statement walks the whole table list (without opening a table
+/// definition); `check()` sends only those of the keys the table list
+/// holds, usually none, instead of one per chunk of every key.
 ///
 /// `None` when a key cannot be quoted or does not fit one statement.
 #[must_use]
-pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<Vec<String>> {
+pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<CasGuardStatements> {
     let head = format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
          FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} AND {} IN (",
         name_key!("TABLE_NAME"),
     );
     let tail = ") ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001";
-    let mut out = Vec::new();
-    let mut list = String::new();
+    let mut by_key = Vec::with_capacity(keys.len());
     for k in keys {
-        let q = quote_str(k)?;
-        let candidate = if list.is_empty() {
-            q.clone()
-        } else {
-            format!("{list}, {q}")
-        };
-        let fits = |l: &str| {
-            server_audit_escaped_len(&head) + server_audit_escaped_len(l) + tail.len()
-                <= CAS_GUARD_MAX_STATEMENT
-        };
-        if fits(&candidate) {
-            list = candidate;
-        } else if list.is_empty() || !fits(&q) {
+        let s = format!("{head}{}{tail}", quote_str(k)?);
+        if server_audit_escaped_len(&s) > CAS_GUARD_MAX_STATEMENT {
             return None;
-        } else {
-            out.push(format!("{head}{list}{tail}"));
-            list = q;
         }
+        by_key.push((k.clone(), s));
     }
-    if !list.is_empty() {
-        out.push(format!("{head}{list}{tail}"));
-    }
-    out.push(format!(
+    by_key.sort();
+    by_key.dedup();
+    let shape = format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, PRIVILEGES \
          FROM information_schema.COLUMNS WHERE {CAS_GUARD_SCHEMAS} \
          AND (TABLE_SCHEMA, TABLE_NAME) IN (SELECT x.TABLE_SCHEMA, x.TABLE_NAME \
          FROM information_schema.COLUMNS x WHERE {} IN ('body', 'json', 'audresource', 'auduser')) \
          ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001",
         name_key!("x.COLUMN_NAME"),
-    ));
+    );
+    let out = CasGuardStatements {
+        tables: CAS_GUARD_TABLES,
+        by_key,
+        shape,
+    };
     debug_assert!(
-        out.iter()
+        out.texts()
+            .iter()
             .all(|s| server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT)
     );
     Some(out)
@@ -425,10 +572,18 @@ pub(crate) fn cas_guard_statements(keys: &[String]) -> Option<Vec<String>> {
 /// of the built-in and `cas_stores` name keys. One builder for `check()`
 /// and for the Audit stream, which recognizes them by their exact text.
 #[must_use]
+pub(crate) fn cas_guard_statements_of(
+    stores: Option<&databastion_core::cas_guard::CasStores>,
+) -> Option<CasGuardStatements> {
+    cas_guard_statements(&databastion_core::cas_guard::known_name_keys(stores))
+}
+
+/// Every CAS store guard text of a target ([`CasGuardStatements::texts`]).
+#[must_use]
 pub(crate) fn cas_guard_statement_texts(
     stores: Option<&databastion_core::cas_guard::CasStores>,
 ) -> Option<Vec<String>> {
-    cas_guard_statements(&databastion_core::cas_guard::known_name_keys(stores))
+    cas_guard_statements_of(stores).map(|g| g.texts())
 }
 
 // ------------------------------------------------------------------ check()
@@ -511,29 +666,65 @@ fn role_part_ok(part: &str, may_be_empty: bool) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_$.%-:/".contains(&b))
 }
 
+/// Head of the [`show_grants_using`] statements.
+const SHOW_GRANTS_USING: &str = "SHOW GRANTS FOR CURRENT_USER() USING ";
+
 /// MySQL: the privileges of the account and of `roles` (`(name, host)`,
 /// the roles granted to it directly or mandatory; the server expands the
 /// roles they grant). `SHOW GRANTS` about the current user needs no
 /// privilege. `None` for an empty list or a name outside the allow-list.
-pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<String> {
+///
+/// The role list is split over several statements, in order, each within
+/// [`MAX_OWN_STATEMENT`] bytes as `server_audit` logs it (its quotes
+/// escaped) and as `performance_schema` may store it ([`stored_len`]), so
+/// that no statement is cut at the default log limits (a cut text with no
+/// table record is a read of `*`, always, even from the agent's account).
+/// One role always fits: an allow-listed name and host take at most 519
+/// bytes escaped. The caller takes the union of the privileges the
+/// statements show (MySQL combines the privileges of the account and of
+/// its active roles as a union, partial revokes included: a restriction
+/// of one source is lifted by a grant of another), and the parser ignores
+/// `REVOKE` lines (`grants`), so the split changes no result.
+pub(crate) fn show_grants_using(roles: &[(String, String)]) -> Option<Vec<String>> {
     if roles.is_empty() {
         return None;
     }
-    let mut out = String::from("SHOW GRANTS FOR CURRENT_USER() USING ");
-    for (i, (name, host)) in roles.iter().enumerate() {
+    let fits = |t: &str| {
+        server_audit_escaped_len(t) <= MAX_OWN_STATEMENT
+            && stored_len(t.as_bytes()) <= MAX_OWN_STATEMENT
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::from(SHOW_GRANTS_USING);
+    for (name, host) in roles {
         if !role_part_ok(name, false) || !role_part_ok(host, true) {
             return None;
-        }
-        if i > 0 {
-            out.push_str(", ");
         }
         // `'name'@'host'`: the account-name form of the MySQL manual
         // ("Specifying Account Names"); an empty host is `''` (a quoted
         // identifier cannot be empty).
-        out.push_str(&quote_str(name)?);
-        out.push('@');
-        out.push_str(&quote_str(host)?);
+        let role = format!("{}@{}", quote_str(name)?, quote_str(host)?);
+        let first = cur.len() == SHOW_GRANTS_USING.len();
+        let next = if first {
+            format!("{cur}{role}")
+        } else {
+            format!("{cur}, {role}")
+        };
+        if fits(&next) {
+            cur = next;
+        } else if first {
+            // Unreachable with allow-listed parts; fail closed.
+            return None;
+        } else {
+            out.push(std::mem::replace(
+                &mut cur,
+                format!("{SHOW_GRANTS_USING}{role}"),
+            ));
+            if !fits(&cur) {
+                return None;
+            }
+        }
     }
+    out.push(cur);
     Some(out)
 }
 
@@ -608,15 +799,22 @@ pub(crate) const PS_CONSUMERS: &str = "SELECT c.NAME, c.ENABLED \
      FROM performance_schema.setup_consumers c \
      WHERE c.NAME IN ('events_statements_history_long', 'events_statements_history', \
                       'events_statements_current', 'global_instrumentation', \
-                      'thread_instrumentation')";
+                      'thread_instrumentation', 'statements_digest')";
 
-/// Readability of the statement history (a count: no statement text).
+/// Readability of the statement history: `EXPLAIN` needs the `SELECT`
+/// privilege on the table (error 1142 without it, 1146 for a table that
+/// does not exist; verified on MySQL 8.4 and MariaDB 11.4) and reads no
+/// row. Not a read of a statement-text table (ADR-0045): `check()` sends
+/// these on a short heartbeat session that has ended when a
+/// `performance_schema` poll sees them (no account, a digest only), so a
+/// `SELECT` there could not be recognized as the agent's own; an
+/// `EXPLAIN` is quiet for every account.
 pub(crate) const PS_HISTORY_LONG: &str =
-    "SELECT COUNT(*) FROM performance_schema.events_statements_history_long";
+    "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long";
 pub(crate) const PS_HISTORY: &str =
-    "SELECT COUNT(*) FROM performance_schema.events_statements_history";
+    "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history";
 pub(crate) const PS_CURRENT: &str =
-    "SELECT COUNT(*) FROM performance_schema.events_statements_current";
+    "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current";
 
 /// Thread id of this session in `performance_schema` (Audit).
 pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
@@ -631,49 +829,144 @@ pub(crate) const SERVER_UPTIME: &str = "SHOW GLOBAL STATUS LIKE 'Uptime'";
 /// Text limits of `performance_schema` (statement text, digest text).
 pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
 pub(crate) const PS_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_digest_length";
+/// The parser's digest storage (`max_digest_length`, set at startup): a
+/// digest is cut at the smaller of the two limits.
+pub(crate) const MAX_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.max_digest_length";
+
+/// The statement tables an Audit poll reads (`audit::pfs::PsTable`).
+pub(crate) const PS_POLL_TABLES: [&str; 3] = [
+    "events_statements_history_long",
+    "events_statements_history",
+    "events_statements_current",
+];
+
+/// Rows read per poll query at most (the constant `LIMIT` of
+/// [`ps_statements`]).
+pub(crate) const PS_BATCH: usize = 2000;
+
+/// This session's `performance_schema` thread id, computed by the server
+/// inside the stats texts (security review of #186, H1: a session variable
+/// set by the client could be set to another value by anyone replaying
+/// the constant text with the agent's credential). The poll texts leave
+/// their own thread out on the `threads` row they join instead
+/// ([`ps_statements`]).
+pub(crate) const PS_OWN_THREAD_EXPR: &str = "(SELECT o.THREAD_ID FROM performance_schema.threads o \
+     WHERE o.PROCESSLIST_ID = CONNECTION_ID())";
+
+/// The digest length from which the poll also reads `SQL_TEXT`
+/// (`audit::pfs::sql_text_from` of the smaller digest limit), computed by
+/// the server from its own settings inside the poll text (security review
+/// of #186, H1). Both settings are global only (`@@` reads the global
+/// value) and at most 1 MiB (`audit::pfs::MAX_TEXT_BYTES`); `GREATEST`
+/// before the subtraction keeps the unsigned value from going below zero.
+/// Pinned to the Rust function by a unit test and, on each server, by an
+/// integration test.
+#[must_use]
+pub(crate) fn ps_sql_text_from_expr() -> String {
+    let sub = crate::audit::pfs::MAX_DIGEST_TOKEN + 3;
+    format!(
+        "(GREATEST(LEAST(@@performance_schema_max_digest_length, @@max_digest_length), \
+         {sub}) - {sub}) DIV 3"
+    )
+}
+
+/// The session user variable of the poll texts (ADR-0045 decision 4),
+/// sent on the poll session right before each [`ps_statements`]: the end
+/// timer to read from (the agent's cursor). A session `SET` of a user
+/// variable produces no event (`audit::events::is_quiet`), and keeps the
+/// poll texts constant, so that the Audit stream recognizes them by their
+/// exact text. The thread id and the `SQL_TEXT` threshold are computed by
+/// the server ([`PS_OWN_THREAD_EXPR`], [`ps_sql_text_from_expr`]): whoever
+/// replays a poll text with the agent's credential chooses only where to
+/// read from, and reads what the poll reads.
+#[must_use]
+pub(crate) fn ps_poll_variables(from: u64) -> String {
+    format!("SET @databastion_from = {from}")
+}
 
 /// Timers of an Audit poll: this session's current statement start (the
 /// timer's "now") and the oldest and newest end in the polled table. No
-/// text. `table` is one of the three statement tables (`PsTable`).
+/// text. `table` is one of [`PS_POLL_TABLES`]. A constant text per table,
+/// with no variable.
 #[must_use]
-pub(crate) fn ps_stats(table: &str, own_thread: u64) -> String {
+pub(crate) fn ps_stats(table: &str) -> String {
     format!(
         "SELECT (SELECT c.TIMER_START FROM performance_schema.events_statements_current c \
-                 WHERE c.THREAD_ID = {own_thread} ORDER BY c.EVENT_ID DESC LIMIT 1), \
+                 WHERE c.THREAD_ID = {PS_OWN_THREAD_EXPR} ORDER BY c.EVENT_ID DESC LIMIT 1), \
                 MIN(h.TIMER_END), MAX(h.TIMER_END) FROM performance_schema.{table} h"
     )
 }
 
 /// The Audit poll of `performance_schema` statements (the only statement
 /// that reads statement text, ADR-0018): `DIGEST_TEXT`, and `SQL_TEXT` only
-/// for a statement without a digest; with the session's account, host,
-/// type and `program_name` while it is connected. Rows are ordered by end
-/// timer from `from`, this session's own thread excluded, at most `limit`.
-/// `table` is one of the three statement tables (`PsTable`).
+/// for a statement without a digest, with a digest of
+/// [`ps_sql_text_from_expr`] bytes or more (it may have been cut at its
+/// token storage: `pfs::digest_cut`), or of the agent's own sessions (the
+/// poll session's login user and client host, from `USER()`: its
+/// Discovery statements are recognized by their exact text); with the
+/// session's account, host, type and `program_name` while it is
+/// connected. Rows are ordered by end timer from `@databastion_from`, this
+/// session's own thread excluded (its `threads` row has this connection's
+/// id; `<=>` keeps the rows of ended threads, which have none), at most
+/// [`PS_BATCH`]. `table` is one of [`PS_POLL_TABLES`]. A constant text per
+/// table and `with_program` (the cursor is set by [`ps_poll_variables`]).
 #[must_use]
-pub(crate) fn ps_statements(
-    table: &str,
-    own_thread: u64,
-    from: u64,
-    limit: usize,
-    with_program: bool,
-) -> String {
+pub(crate) fn ps_statements(table: &str, with_program: bool) -> String {
     let program = if with_program {
         "(SELECT a.ATTR_VALUE FROM performance_schema.session_connect_attrs a \
           WHERE a.PROCESSLIST_ID = t.PROCESSLIST_ID AND a.ATTR_NAME = 'program_name' LIMIT 1)"
     } else {
         "NULL"
     };
+    let text_from = ps_sql_text_from_expr();
     format!(
         "SELECT h.THREAD_ID, h.EVENT_ID, h.TIMER_END, h.CURRENT_SCHEMA, h.DIGEST_TEXT, \
-         CASE WHEN h.DIGEST_TEXT IS NULL THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
+         CASE WHEN h.DIGEST_TEXT IS NULL OR LENGTH(h.DIGEST_TEXT) >= {text_from} \
+           OR CONCAT(t.PROCESSLIST_USER, '@', t.PROCESSLIST_HOST) = USER() \
+         THEN h.SQL_TEXT END, h.ROWS_SENT, h.ROWS_AFFECTED, \
          h.MYSQL_ERRNO, t.PROCESSLIST_USER, t.PROCESSLIST_HOST, t.TYPE, {program} \
          FROM performance_schema.{table} h \
          LEFT JOIN performance_schema.threads t ON t.THREAD_ID = h.THREAD_ID \
-         WHERE h.TIMER_END >= {from} AND h.END_EVENT_ID IS NOT NULL \
-           AND h.THREAD_ID <> {own_thread} \
-         ORDER BY h.TIMER_END, h.THREAD_ID, h.EVENT_ID LIMIT {limit}"
+         WHERE h.TIMER_END >= @databastion_from AND h.END_EVENT_ID IS NOT NULL \
+           AND NOT t.PROCESSLIST_ID <=> CONNECTION_ID() \
+         ORDER BY h.TIMER_END, h.THREAD_ID, h.EVENT_ID LIMIT {PS_BATCH}"
     )
+}
+
+/// The connector's own statements that read `performance_schema` tables
+/// (ADR-0045 decision 4): each exact text, with the tables it reads. The
+/// Audit stream leaves such a statement of the agent's identity out,
+/// without a charge, only when its whole uncut text is one of these and
+/// its table records (if any) read only these tables; any other read of a
+/// statement-text table by the agent's identity is reported. Every text
+/// is constant: the probes of `check()` and of the Audit re-probe (the
+/// readability probes are `EXPLAIN`s, quiet in any case, listed for
+/// completeness), the own-thread probe sent once per Audit session, and
+/// the poll and stats texts of each statement table.
+#[must_use]
+pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)> {
+    let mut v: Vec<(String, Vec<&'static str>)> = vec![
+        (PS_CONSUMERS.to_owned(), vec!["setup_consumers"]),
+        (
+            PS_HISTORY_LONG.to_owned(),
+            vec!["events_statements_history_long"],
+        ),
+        (PS_HISTORY.to_owned(), vec!["events_statements_history"]),
+        (PS_CURRENT.to_owned(), vec!["events_statements_current"]),
+        (PS_OWN_THREAD.to_owned(), vec!["threads"]),
+    ];
+    for table in PS_POLL_TABLES {
+        v.push((
+            ps_stats(table),
+            vec!["events_statements_current", "threads", table],
+        ));
+        v.push((ps_statements(table, false), vec![table, "threads"]));
+        v.push((
+            ps_statements(table, true),
+            vec![table, "threads", "session_connect_attrs"],
+        ));
+    }
+    v
 }
 
 #[cfg(test)]
@@ -770,6 +1063,24 @@ mod tests {
         );
     }
 
+    /// Role lists for `SHOW GRANTS … USING`: 40 roles of 20 characters,
+    /// 64 of the longest allow-listed name and host (255 each), and names
+    /// with every allow-listed punctuation character.
+    fn role_lists() -> Vec<Vec<(String, String)>> {
+        vec![
+            (0..40)
+                .map(|i| (format!("databastion_role_{i:03}"), "%".to_owned()))
+                .collect(),
+            (0..64)
+                .map(|i| (format!("{i:02}{}", "r".repeat(253)), "h".repeat(255)))
+                .collect(),
+            (0..64)
+                .map(|i| (format!("r_$.%-:/{i}"), "10.0.0.0/255.0.0.0".to_owned()))
+                .collect(),
+            vec![("r".to_owned(), String::new())],
+        ]
+    }
+
     fn all_statements() -> Vec<String> {
         let mut v = vec![
             session_setup(Flavor::Mysql, 1000),
@@ -792,7 +1103,10 @@ mod tests {
             COLUMN_PRIVILEGES.to_owned(),
             APPLICABLE_ROLES_MYSQL.to_owned(),
             APPLICABLE_ROLES_MARIADB.to_owned(),
-            show_grants_using(&[("app_read".to_owned(), "%".to_owned())]).unwrap(),
+            show_grants_using(&[("app_read".to_owned(), "%".to_owned())])
+                .unwrap()
+                .remove(0),
+            SHOW_GRANTS_OWN.to_owned(),
             CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_CURRENT_ROLE.to_owned(),
             SHOW_GRANTS_PUBLIC.to_owned(),
@@ -813,11 +1127,18 @@ mod tests {
             SESSION_USER.to_owned(),
             PS_TEXT_LIMIT.to_owned(),
             PS_DIGEST_LIMIT.to_owned(),
+            MAX_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
-            ps_stats("events_statements_history_long", 7),
+            ps_stats("events_statements_history_long"),
+            ps_poll_variables(8),
         ];
+        for roles in role_lists() {
+            v.extend(show_grants_using(&roles).unwrap());
+        }
         v.extend(
-            cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()]).unwrap(),
+            cas_guard_statements(&["castickets".to_owned(), "comaudittrail".to_owned()])
+                .unwrap()
+                .texts(),
         );
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
             v.push(set_statement_timeout(flavor, 1000));
@@ -828,8 +1149,8 @@ mod tests {
     }
 
     /// The guard statements never reach the default 1024-byte log limits
-    /// (security review of f9bab99): every name key is in exactly one of
-    /// them, the shape statement comes last.
+    /// (security review of f9bab99): one column statement per name key,
+    /// the shape statement, and the table list, which reads names only.
     #[test]
     fn cas_guard_statements_stay_short_and_cover_every_key() {
         let names = |p: char| -> Vec<String> {
@@ -844,27 +1165,233 @@ mod tests {
         };
         for stores in [None, Some(&full)] {
             let keys = databastion_core::cas_guard::known_name_keys(stores);
-            let all = cas_guard_statement_texts(stores).unwrap();
+            let guard = cas_guard_statements_of(stores).unwrap();
+            let all = guard.texts();
+            assert_eq!(cas_guard_statement_texts(stores).unwrap(), all);
             for s in &all {
                 assert!(
                     server_audit_escaped_len(s) <= CAS_GUARD_MAX_STATEMENT,
                     "{}",
                     s.len()
                 );
-                assert!(s.ends_with("LIMIT 20001"));
             }
-            let (shape, by_name) = all.split_last().unwrap();
-            assert!(shape.contains("'audresource'"));
-            for k in &keys {
-                let q = format!("'{k}'");
-                assert_eq!(by_name.iter().filter(|s| s.contains(&q)).count(), 1, "{k}");
+            assert_eq!(all.last().map(String::as_str), Some(CAS_GUARD_TABLES));
+            assert!(guard.shape.contains("'audresource'"));
+            assert!(guard.shape.ends_with("LIMIT 20001"));
+            // One column statement per key, with that key only.
+            assert_eq!(
+                guard.by_key.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                keys.iter().collect::<Vec<_>>()
+            );
+            for (k, s) in &guard.by_key {
+                assert!(
+                    s.ends_with(&format!(
+                        "IN ('{k}') ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION LIMIT 20001"
+                    )),
+                    "{s}"
+                );
+                assert_eq!(s.matches('\'').count(), 2 * 8, "{s}");
             }
-            // Built-in names: two name statements and the shape one; 64
-            // names of 128 characters per list: 67.
-            assert_eq!(all.len(), if stores.is_none() { 3 } else { 67 });
+            // Built-in names: 27 keys; 64 names of 128 characters per list
+            // more: 219.
+            assert_eq!(guard.by_key.len(), if stores.is_none() { 27 } else { 219 });
         }
         // A key that cannot fit one statement: no statement at all.
         assert!(cas_guard_statements(&["k".repeat(800)]).is_none());
+    }
+
+    /// The agent's statements stay within `MAX_OWN_STATEMENT`, so that
+    /// the audit logs never cut them at their default limits (a cut text
+    /// with no table record is reported as a read of `*`: security review
+    /// of #181, H1). Sampling statements are split into column batches;
+    /// their digest texts measured at most 850 bytes on MySQL 8.4 and
+    /// MariaDB 11.4 for these shapes (`SAMPLE_DIGEST_MARGIN`).
+    #[test]
+    fn sample_statements_stay_short() {
+        let name = |i: usize, n: usize| -> String {
+            let s = format!("{i:x}{}", "c".repeat(n));
+            s.chars().take(n.max(1)).collect::<String>() + &format!("{i}")
+        };
+        // Non-ASCII names (security review of cea63c5, S1): `中` (3 bytes
+        // in UTF-8), `é` (2), `😀` (4), each 4 bytes as stored.
+        let wide = |i: usize, n: usize, c: &str| -> String { format!("{}{i}", c.repeat(n)) };
+        let mut shapes: Vec<(Vec<String>, Sampled)> = [
+            (1, Sampled::Plain),
+            (1, Sampled::Text),
+            (20, Sampled::Text),
+            (60, Sampled::Plain),
+        ]
+        .into_iter()
+        .map(|(n, kind)| ((0..4096).map(|i| name(i, n)).collect(), kind))
+        .collect();
+        for c in ["中", "é", "\u{1F600}"] {
+            for (n, kind) in [
+                (30, Sampled::Text),
+                (60, Sampled::Plain),
+                (1, Sampled::Text),
+            ] {
+                shapes.push(((0..200).map(|i| wide(i, n, c)).collect(), kind));
+            }
+        }
+        for (cols, kind) in shapes {
+            let sel: Vec<(&str, Sampled)> = cols.iter().map(|c| (c.as_str(), kind)).collect();
+            for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+                for max in [1024, 3] {
+                    let all = sample_statements(
+                        flavor,
+                        4_294_967_295,
+                        "s'chema",
+                        "t\\able",
+                        &sel,
+                        u32::MAX,
+                        max,
+                    )
+                    .unwrap();
+                    let mut next = 0;
+                    for (range, s) in &all {
+                        assert_eq!(range.start, next);
+                        assert!(!range.is_empty() && range.len() <= max);
+                        next = range.end;
+                        let len = server_audit_escaped_len(s).max(stored_len(s.as_bytes()));
+                        assert!(
+                            len + SAMPLE_DIGEST_MARGIN * range.len() <= MAX_OWN_STATEMENT,
+                            "{len}"
+                        );
+                        assert!(stored_len(s.as_bytes()) + 4 < 1024);
+                        assert_eq!(
+                            *s,
+                            sample_statement(
+                                flavor,
+                                4_294_967_295,
+                                "s'chema",
+                                "t\\able",
+                                &sel[range.clone()],
+                                u32::MAX
+                            )
+                            .unwrap()
+                        );
+                    }
+                    assert_eq!(next, cols.len());
+                }
+            }
+        }
+        // The longest names (64 characters of 4 bytes, or of characters
+        // `server_audit` escapes): one column always fits.
+        for c in ["\u{1F600}", "中", "é", "'", "`"] {
+            let long = c.repeat(64);
+            for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+                let all = sample_statements(
+                    flavor,
+                    4_294_967_295,
+                    &long,
+                    &long,
+                    &[
+                        (long.as_str(), Sampled::Text),
+                        (long.as_str(), Sampled::Plain),
+                    ],
+                    u32::MAX,
+                    1024,
+                )
+                .unwrap();
+                assert_eq!(all.iter().map(|(r, _)| r.len()).sum::<usize>(), 2, "{c}");
+                for (_, s) in &all {
+                    assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{c}");
+                    // Never taken as cut by `performance_schema` (a single
+                    // column of 64 four-byte names still fits).
+                    assert!(stored_len(s.as_bytes()) + 4 < 1024, "{c}");
+                }
+            }
+        }
+        assert!(sample_statements(Flavor::Mysql, 1, "s", "t", &[], 1, 1).is_none());
+    }
+
+    /// Every fixed statement, and the per-table catalog statements with the
+    /// longest names, stay within `MAX_OWN_STATEMENT`.
+    #[test]
+    fn own_statements_stay_short() {
+        let long = [
+            "\u{1F600}".repeat(64),
+            "中".repeat(64),
+            "é".repeat(64),
+            "'".repeat(64),
+            "`".repeat(64),
+        ];
+        let mut all: Vec<String> = [
+            INTROSPECT,
+            SESSION_READ_ONLY,
+            BEGIN,
+            CURRENT_USER,
+            USER_PRIVILEGES,
+            SCHEMA_PRIVILEGES,
+            TABLE_PRIVILEGES,
+            COLUMN_PRIVILEGES,
+            APPLICABLE_ROLES_MYSQL,
+            APPLICABLE_ROLES_MARIADB,
+            CURRENT_ROLE,
+            SHOW_GRANTS_OWN,
+            MANDATORY_ROLES,
+            SHOW_GRANTS_CURRENT_ROLE,
+            SHOW_GRANTS_PUBLIC,
+            INIT_CONNECT,
+            AUDIT_PLUGINS,
+            SERVER_AUDIT_SETTINGS,
+            AUDIT_LOG_SETTINGS,
+            AUDIT_LOG_FILTER_FORMAT,
+            SERVER_AUDIT_QUERY_LIMIT,
+            SYSTEM_UTC_OFFSET,
+            SESSION_USER,
+            PS_ENABLED,
+            PS_CONSUMERS,
+            PS_HISTORY_LONG,
+            PS_HISTORY,
+            PS_CURRENT,
+            PS_OWN_THREAD,
+            SERVER_UPTIME,
+            PS_TEXT_LIMIT,
+            PS_DIGEST_LIMIT,
+            MAX_DIGEST_LIMIT,
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            all.push(session_setup(flavor, u32::MAX));
+            all.push(set_statement_timeout(flavor, u32::MAX));
+            all.push(session_check(flavor, "transaction_read_only"));
+            for n in &long {
+                all.push(ticket_type_counts(flavor, u32::MAX, n, n, n).unwrap());
+            }
+        }
+        for n in &long {
+            all.push(table_engine(n, n).unwrap());
+            all.push(table_rows(n, n).unwrap());
+            all.push(columns(n, n).unwrap());
+        }
+        all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
+        all.push(ps_poll_variables(u64::MAX));
+        all.push(kill_query(u32::MAX));
+        all.extend(cas_guard_statement_texts(None).unwrap());
+        for roles in role_lists() {
+            all.extend(show_grants_using(&roles).unwrap());
+        }
+        for s in &all {
+            assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
+            // Not taken as cut by `performance_schema` either (S1).
+            assert!(stored_len(s.as_bytes()) + 4 < 1024, "{s}");
+        }
+    }
+
+    /// The table list reads the schema and name only, outside the same
+    /// system schemas as the column statements.
+    #[test]
+    fn the_cas_guard_table_list_reads_names_only() {
+        assert!(CAS_GUARD_TABLES.contains(CAS_GUARD_SCHEMAS));
+        assert!(
+            CAS_GUARD_TABLES.starts_with(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE "
+            )
+        );
+        assert!(!CAS_GUARD_TABLES.contains("COLUMNS"));
     }
 
     #[test]
@@ -896,6 +1423,16 @@ mod tests {
                 if d == "general_log" && lower.contains("@@global.general_log") {
                     continue;
                 }
+                // The poll stats text finds its own thread by its
+                // connection id (`PS_OWN_THREAD_EXPR`), not the processlist.
+                if d == "processlist"
+                    && lower
+                        .replace(&PS_OWN_THREAD_EXPR.to_lowercase(), "")
+                        .find("processlist")
+                        .is_none()
+                {
+                    continue;
+                }
                 // A length setting, not the statement text.
                 if d == "sql_text"
                     && lower == "select @@global.performance_schema_max_sql_text_length"
@@ -910,14 +1447,21 @@ mod tests {
     #[test]
     fn the_audit_poll_reads_text_only_through_the_digest() {
         for with_program in [true, false] {
-            let s = ps_statements("events_statements_history_long", 7, 0, 10, with_program);
+            let s = ps_statements("events_statements_history_long", with_program);
             let lower = s.to_lowercase();
-            // SQL_TEXT only when there is no digest; never the text of a
-            // running statement of another session (PROCESSLIST_INFO), the
+            // SQL_TEXT only when there is no digest, a long digest or
+            // the agent's own account; never the text of a running
+            // statement of another session (PROCESSLIST_INFO), the
             // processlist, or another attribute than program_name.
             assert_eq!(lower.matches("sql_text").count(), 1, "{s}");
             assert!(
-                lower.contains("case when h.digest_text is null then h.sql_text end"),
+                lower.contains(
+                    "case when h.digest_text is null or length(h.digest_text) >= \
+                     (greatest(least(@@performance_schema_max_digest_length, \
+                     @@max_digest_length), 263) - 263) div 3 \
+                     or concat(t.processlist_user, '@', t.processlist_host) = user() \
+                     then h.sql_text end"
+                ),
                 "{s}"
             );
             for d in [
@@ -937,26 +1481,166 @@ mod tests {
             if with_program {
                 assert!(lower.contains("a.attr_name = 'program_name'"));
             }
-            assert!(lower.contains("h.thread_id <> 7"), "{s}");
+            assert!(
+                lower.contains("and not t.processlist_id <=> connection_id() order by"),
+                "{s}"
+            );
+            assert!(!lower.contains("@databastion_thread") && !lower.contains("@databastion_text"));
+            assert!(lower.contains("h.timer_end >= @databastion_from"), "{s}");
+            assert!(lower.ends_with(" limit 2000"), "{s}");
+        }
+    }
+
+    /// ADR-0045 decision 4: the poll and stats texts are constant (no
+    /// digit outside the fixed `LIMIT`s and the quoted names), distinct,
+    /// and each lists the `performance_schema` tables it names; the
+    /// session `SET` before them is quiet and names no table.
+    #[test]
+    fn the_poll_texts_are_constant_and_their_tables_listed() {
+        use databastion_classifiers::query::{AnalyzeOptions, analyze};
+        let own = own_performance_schema_reads();
+        assert_eq!(own.len(), 5 + 3 * 3);
+        let texts: std::collections::HashSet<&str> = own.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts.len(), own.len(), "texts are distinct");
+        for (text, tables) in &own {
+            let a = analyze(text, AnalyzeOptions::mysql());
+            assert!(a.lexed(), "{text}");
+            let mut named: Vec<String> = Vec::new();
+            for p in a.parts() {
+                for r in &p.relations {
+                    assert_eq!(r.schema.as_deref(), Some("performance_schema"), "{text}");
+                    named.push(r.name.to_ascii_lowercase());
+                }
+            }
+            named.sort();
+            named.dedup();
+            let mut listed: Vec<String> = tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+            listed.sort();
+            listed.dedup();
+            assert_eq!(named, listed, "{text}");
+            // Constant: no number but the fixed limits and the threshold
+            // formula's constants (security review of #186, H1).
+            let stripped = text
+                .replace(&ps_sql_text_from_expr(), "")
+                .replace("LIMIT 2000", "")
+                .replace("LIMIT 1", "")
+                .replace("'@', -1", "")
+                .replace("'@', 1", "")
+                .replace("SELECT 1 FROM", "");
+            assert!(!stripped.bytes().any(|b| b.is_ascii_digit()), "{text}");
+            assert!(
+                server_audit_escaped_len(text) <= MAX_OWN_STATEMENT,
+                "{text}"
+            );
+            assert!(stored_len(text.as_bytes()) <= MAX_OWN_STATEMENT, "{text}");
+        }
+        for from in [0, u64::MAX] {
+            let set = ps_poll_variables(from);
+            assert_eq!(set, format!("SET @databastion_from = {from}"));
+            let a = analyze(&set, AnalyzeOptions::mysql());
+            assert!(a.lexed(), "{set}");
+            for p in a.parts() {
+                assert!(p.relations.is_empty(), "{set}");
+                assert!(crate::audit::events::is_quiet(p), "{set}");
+            }
+            assert!(server_audit_escaped_len(&set) <= MAX_OWN_STATEMENT);
+        }
+        assert_eq!(
+            PS_POLL_TABLES.map(|t| t.to_owned()),
+            [
+                crate::audit::pfs::PsTable::HistoryLong,
+                crate::audit::pfs::PsTable::History,
+                crate::audit::pfs::PsTable::Current
+            ]
+            .map(|t| t.name().to_owned())
+        );
+    }
+
+    /// The server-side `SQL_TEXT` threshold of the poll text is the Rust
+    /// one (`pfs::sql_text_from` of the smaller digest limit, each capped
+    /// at `pfs::MAX_TEXT_BYTES`; security review of #186, H1).
+    #[test]
+    fn the_server_side_threshold_is_the_rust_one() {
+        use crate::audit::pfs::{MAX_DIGEST_TOKEN, MAX_TEXT_BYTES, sql_text_from};
+        let expr = ps_sql_text_from_expr();
+        assert_eq!(
+            expr,
+            "(GREATEST(LEAST(@@performance_schema_max_digest_length, @@max_digest_length), \
+             263) - 263) DIV 3"
+        );
+        // The SQL formula, evaluated as the server does (unsigned values
+        // that never go below zero, `DIV` truncating). The servers cap
+        // both settings at 1 MiB (`MAX_TEXT_BYTES`).
+        let sql = |ps: u64, parser: u64| -> u64 {
+            let sub = u64::try_from(MAX_DIGEST_TOKEN + 3).unwrap();
+            (ps.min(parser).max(sub) - sub) / 3
+        };
+        let values = [
+            0, 1, 100, 262, 263, 264, 265, 266, 500, 1023, 1024, 1025, 4096, 65_536, 1_048_575,
+            1_048_576,
+        ];
+        for ps in values {
+            for parser in values {
+                let limit = |v: u64| usize::try_from(v).unwrap().min(MAX_TEXT_BYTES);
+                let rust = sql_text_from(limit(ps).min(limit(parser)));
+                assert_eq!(
+                    usize::try_from(sql(ps, parser)).unwrap(),
+                    rust,
+                    "{ps} {parser}"
+                );
+            }
         }
     }
 
     /// Every statement the agent sends is a recognized read or on the
     /// Audit stream's allow-list of statements of no known kind: the
     /// fail-closed `Other` path never reports the agent's own traffic.
+    ///
+    /// ADR-0045 decision 9: no statement the agent sends calls a name that
+    /// is not built in, on any list (an unknown call is never the agent's
+    /// own), nor on the names built in on every listed server.
     #[test]
     fn own_statements_are_reads_or_allow_listed() {
         use databastion_classifiers::query::{AnalyzeOptions, StatementKind, analyze};
-        for s in all_statements() {
-            let a = analyze(&s, AnalyzeOptions::mysql());
-            assert!(a.lexed(), "{s}");
-            for p in a.parts() {
-                let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
-                let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
-                assert!(read || quiet, "{s}");
-                assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+        let lists = crate::builtins::lists()
+            .iter()
+            .chain(std::iter::once(crate::builtins::any_server()));
+        let mut statements = all_statements();
+        statements.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            statements.push(
+                sample_statement(
+                    flavor,
+                    1000,
+                    "s",
+                    "t",
+                    &[("a", Sampled::Text), ("b", Sampled::Plain)],
+                    10,
+                )
+                .unwrap(),
+            );
+        }
+        let mut checked = 0;
+        for list in lists {
+            for s in statements.clone() {
+                let a = analyze(&s, AnalyzeOptions::mysql().builtins(list));
+                assert!(a.lexed(), "{s}");
+                assert!(
+                    !a.unknown_call(),
+                    "{:?} {:?}: {s}",
+                    list.flavor,
+                    list.series
+                );
+                for p in a.parts() {
+                    let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
+                    let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
+                    assert!(read || quiet, "{s}");
+                    assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+                }
+                checked += 1;
             }
         }
+        assert!(checked > 7 * 50, "{checked}");
     }
 
     #[test]
@@ -1021,8 +1705,9 @@ mod tests {
             ])
             .as_deref(),
             Some(
-                "SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
+                &["SHOW GRANTS FOR CURRENT_USER() USING 'app_read'@'%', \
                  'ops'@'10.0.0.0/255.0.0.0', 'r'@''"
+                    .to_owned()][..]
             )
         );
         assert_eq!(show_grants_using(&[]), None);
@@ -1049,5 +1734,55 @@ mod tests {
                 );
             }
         }
+        // A bad name anywhere in a long list: no statement at all.
+        let mut roles = role_lists().remove(0);
+        roles.push(("a'b".to_owned(), "%".to_owned()));
+        assert_eq!(show_grants_using(&roles), None);
+    }
+
+    /// Security review of 914c9d2 (Low): the role list is split over
+    /// statements of at most `MAX_OWN_STATEMENT` bytes by both measures,
+    /// each role named once, in order, and a statement is closed only when
+    /// the next role does not fit.
+    #[test]
+    fn role_lists_are_split_within_the_own_statement_bound() {
+        for roles in role_lists() {
+            let statements = show_grants_using(&roles).unwrap();
+            let mut named = Vec::new();
+            for (i, s) in statements.iter().enumerate() {
+                assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
+                assert!(stored_len(s.as_bytes()) <= MAX_OWN_STATEMENT, "{s}");
+                let list = s.strip_prefix(SHOW_GRANTS_USING).unwrap();
+                let here: Vec<&str> = list.split(", ").collect();
+                assert!(
+                    !here.is_empty() && here.iter().all(|r| !r.is_empty()),
+                    "{s}"
+                );
+                if let Some(next) = statements.get(i + 1) {
+                    let first = next
+                        .strip_prefix(SHOW_GRANTS_USING)
+                        .unwrap()
+                        .split(", ")
+                        .next()
+                        .unwrap();
+                    let joined = format!("{s}, {first}");
+                    assert!(
+                        server_audit_escaped_len(&joined) > MAX_OWN_STATEMENT
+                            || stored_len(joined.as_bytes()) > MAX_OWN_STATEMENT,
+                        "{s}"
+                    );
+                }
+                named.extend(here.into_iter().map(str::to_owned));
+            }
+            let want: Vec<String> = roles.iter().map(|(n, h)| format!("'{n}'@'{h}'")).collect();
+            assert_eq!(named, want);
+        }
+        // 40 roles of 20 characters: more than one statement, where one
+        // statement was cut before (1 315 bytes escaped).
+        assert!(show_grants_using(&role_lists()[0]).unwrap().len() > 1);
+        // The longest role alone, with the most escaping.
+        let one = show_grants_using(&[("r".repeat(255), "h".repeat(255))]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(server_audit_escaped_len(&one[0]) <= MAX_OWN_STATEMENT);
     }
 }

@@ -439,6 +439,106 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(config(128))]
+
+    /// ADR-0044 (I2): a token request's `code` (an authorization code or a
+    /// refresh token id), its other skipped keys and the response's token
+    /// values never reach an event, a contract body, a record's or the
+    /// builder's debug line, whatever the grant; the client id itself
+    /// leaves only as its registry entry's name.
+    #[test]
+    fn token_request_and_response_values_never_leave(
+        code in marker(),
+        token in marker(),
+        scope in marker(),
+        client_suffix in marker(),
+        user in marker(),
+        extra in "[a-z_]{1,12}",
+        grant in prop::sample::select(vec![
+            "refresh_token", "client_credentials", "password", "authorization_code",
+            "urn:ietf:params:oauth:grant-type:device_code",
+        ]),
+        registered in any::<bool>(),
+        code_first in any::<bool>(),
+        gap_ms in 0u64..8000,
+    ) {
+        let client = format!("client-{client_suffix}");
+        let registered_id = if registered { client.clone() } else { "someone-else".to_owned() };
+        let def = crate::parse::definition::parse_definition(
+            format!(
+                r#"{{"@class": "org.apereo.cas.services.OidcRegisteredService", "name": "M2M",
+                    "serviceId": "^https://m2m\\.example\\.org/cb$", "clientId": {}}}"#,
+                lit(&registered_id)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let idx = Arc::new(crate::registry::ServiceIndex::new([&def]));
+        let code_kv = format!(r#""code": {}"#, lit(&format!("RT-1-{code}")));
+        let extra_kv = if extra == "service" || extra == "grant_type" {
+            format!(r#""x{extra}": {}"#, lit(&code))
+        } else {
+            format!(r#"{}: {{"service": {}, "grant_type": "password", "v": [{}]}}"#, lit(&extra), lit(&code), lit(&token))
+        };
+        let mut fields = vec![
+            format!(r#""grant_type": {}"#, lit(grant)),
+            format!(r#""service": {}"#, lit(&client)),
+            format!(r#""scope": [{}, "openid"]"#, lit(&scope)),
+            format!(r#""response_type": {}"#, lit(&code)),
+            extra_kv,
+        ];
+        if code_first { fields.insert(0, code_kv) } else { fields.push(code_kv) }
+        let request = format!(
+            r#"{{"who": "audit:unknown", "what": {{{}}}, "action": "OAUTH2_ACCESS_TOKEN_REQUEST_CREATED",
+                "when": 1791115200000, "clientIpAddress": "203.0.113.7", "serverIpAddress": "198.51.100.3",
+                "userAgent": "python-requests/2.33.1", "headers": {{"Authorization": {}}}}}"#,
+            fields.join(", "),
+            lit(&format!("Basic {token}")),
+        );
+        let who = if grant == "client_credentials" { client.clone() } else { user.clone() };
+        let response = format!(
+            r#"{{"who": {}, "what": {{"access_token": {at}, "refresh_token": {rt}, "id_token": {it},
+                "scope": {sc}, "token_type": "Bearer", "expires_in": "28800"}},
+                "action": "OAUTH2_ACCESS_TOKEN_RESPONSE_CREATED", "when": {},
+                "clientIpAddress": "203.0.113.7", "serverIpAddress": "198.51.100.3",
+                "userAgent": "python-requests/2.33.1"}}"#,
+            lit(&who),
+            1_791_115_200_000u64 + gap_ms,
+            at = lit(&format!("AT-1-{token}")),
+            rt = lit(&format!("RT-1-{token}")),
+            it = lit(&format!("eyJ{token}.{code}.sig")),
+            sc = lit(&scope),
+        );
+        let recs: Vec<_> = [request, response]
+            .iter()
+            .map(|l| parse_record(l.as_bytes(), UtcOffset(0)).unwrap())
+            .collect();
+        let mut b = Builder::new(key(), &[], ClientAddrMode::Truncated, Some(idx));
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut out = Vec::new();
+        for r in &recs {
+            b.push(r, now, &mut out);
+        }
+        b.flush(SystemTime::now(), true, &mut out);
+        prop_assert_eq!(out.len(), 1);
+        let object = out[0].object.as_ref().map(|o| o.object().as_str().to_owned());
+        let expect_named = registered
+            && gap_ms <= 5000
+            && matches!(grant, "refresh_token" | "client_credentials" | "password");
+        prop_assert_eq!(object.as_deref(), Some(if expect_named { "M2M" } else { "*" }));
+        let dbg = format!("{out:?} {recs:?} {b:?}");
+        let masked: Vec<_> = out.into_iter().map(crate::audit::events::CasEvent::into_masked).collect();
+        let hmac = databastion_classifiers::masking::HmacKey::new(&[9u8; 32]).unwrap();
+        let sent = databastion_core::test_support::contract_events_json(&masked, &hmac);
+        for m in [&code, &token, &scope, &client_suffix, &user] {
+            prop_assert!(!dbg.contains(m.as_str()), "{} leaked in debug", m);
+            prop_assert!(!sent.contains(m.as_str()), "{} leaked in the contract", m);
+        }
+        prop_assert!(!sent.contains("198.51.100.3"));
+    }
+}
+
+proptest! {
     #![proptest_config(config(24))]
 
     /// The masking path: registry values only leave as masked samples
@@ -816,5 +916,181 @@ proptest! {
             v
         };
         prop_assert_eq!(pairs(&d), pairs(&json));
+    }
+}
+
+/// The crate's YAML parser and `serde_yaml_ng` (the oracle, ADR-0046)
+/// disagree on `bytes`, if anywhere.
+fn yaml_diff(bytes: &[u8]) -> Option<&'static str> {
+    crate::fuzz::yaml_difference(bytes, &crate::fuzz::Ng)
+}
+
+/// Lines of YAML the subset accepts, in every style the parser decodes
+/// (folding, escapes, block scalars and chomping, indentation, flow
+/// collections, resolution of numbers and nulls), at varied indentations,
+/// so that some documents are not valid YAML.
+fn yaml_line() -> impl Strategy<Value = String> {
+    let key = prop::sample::select(vec![
+        "name",
+        "k",
+        "ké",
+        "\"q k\"",
+        "'s''k'",
+        "clientSecret",
+        "password",
+        "serviceId",
+        "1",
+        "x y",
+    ]);
+    let value = prop::sample::select(vec![
+        "",
+        "plain",
+        "two words",
+        "a:b",
+        "x # c",
+        "0x1F",
+        "-0x10",
+        "-0X10",
+        "+12",
+        "012",
+        "-0o7",
+        "0b101",
+        "-0b",
+        "1e3",
+        "1_000",
+        ".inf",
+        "-.Inf",
+        "+.inf",
+        ".nan",
+        "+.nan",
+        "nan",
+        "0.",
+        ".5",
+        "-0",
+        "~",
+        "Null",
+        "TRUE",
+        "yes",
+        "18446744073709551616",
+        "-9223372036854775809",
+        "-170141183460469231731687303715884105728",
+        "340282366920938463463374607431768211456",
+        "'it''s'",
+        "''",
+        "\"\"",
+        "\"a\\x41\\u00e9\\U0001F600\\N\\L\\P\\_\\0\\t\\/\\\\\\\"\"",
+        "\"a\\\n  b\"",
+        "\"multi\n  line\n\n   text \"",
+        "'single\n\n  multi '",
+        "plain\n  continued\n\n  again",
+        "|\n  lit\n   more\n\n",
+        "|-\n  a\n  b\n",
+        "|+\n  a\n\n",
+        ">\n  folded\n  text\n\n   indented\n  back\n",
+        ">-\n\n  x\n",
+        "[a, b c, 'd', \"e\", [f], {g: h}]",
+        "{a: 1, b, c: [d], 'e': \"f\"}",
+        "[a: b, c]",
+        "[a,]",
+        "{}",
+        "[]",
+    ]);
+    (
+        0usize..5,
+        prop::bool::ANY,
+        prop::option::of(key),
+        value,
+        prop::bool::ANY,
+    )
+        .prop_map(|(indent, dash, key, value, crlf)| {
+            let mut line = " ".repeat(indent);
+            if dash {
+                line.push_str("- ");
+            }
+            if let Some(k) = key {
+                line.push_str(k);
+                line.push(':');
+                if !value.is_empty() {
+                    line.push(' ');
+                }
+            }
+            line.push_str(&value.replace('\n', &format!("\n{}", " ".repeat(indent))));
+            if crlf {
+                line = line.replace('\n', "\r\n");
+            }
+            line
+        })
+}
+
+proptest! {
+    #![proptest_config(config(1024))]
+
+    /// Generated documents (anchors and aliases left out): the crate's
+    /// parser reads every value and definition as `serde_yaml_ng` does.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_rendered_documents(doc in yaml_doc()) {
+        let (clean, _) = Render::doc(&doc, usize::MAX, Inject::Nothing);
+        prop_assert_eq!(yaml_diff(clean.as_bytes()), None, "{}", clean);
+    }
+
+    /// Lines in every style at random indentations: valid documents read
+    /// the same, documents libyaml refuses are refused (or refused by the
+    /// pre-scan).
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_lines(
+        lines in proptest::collection::vec(yaml_line(), 0..10),
+        indent in 0usize..3,
+        trailing in prop::bool::ANY,
+        service_id in prop::bool::ANY,
+    ) {
+        let mut doc = String::from("--- !<org.apereo.cas.services.CasRegisteredService>\n");
+        let pad = " ".repeat(indent);
+        if service_id {
+            doc.push_str(&pad);
+            doc.push_str("serviceId: \"^https://app.example.org/.*\"\n");
+        }
+        for l in &lines {
+            doc.push_str(&pad);
+            doc.push_str(l);
+            doc.push('\n');
+        }
+        if !trailing {
+            doc.pop();
+        }
+        prop_assert_eq!(yaml_diff(doc.as_bytes()), None, "{:?}", doc);
+    }
+
+    /// YAML-ish fragments after the class hint.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_fragments(data in yaml_ish()) {
+        let mut bytes = b"--- !<org.apereo.cas.services.CasRegisteredService>\n".to_vec();
+        bytes.extend_from_slice(&data);
+        prop_assert_eq!(yaml_diff(&bytes), None, "{:?}", String::from_utf8_lossy(&bytes));
+    }
+
+    /// Mutations of the fixtures (truncations, flips, insertions).
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_mutations(
+        base in 0usize..3,
+        edits in proptest::collection::vec((any::<usize>(), any::<u8>(), any::<u8>()), 0..8),
+    ) {
+        let fixtures = [
+            include_str!("../fixtures/registry/HR-Portal-10000003.yml"),
+            include_str!("../fixtures/registry/Wiki-10000004.yaml"),
+            include_str!("../fixtures/registry/SP-10000005.yml"),
+        ];
+        let bytes = mutate(fixtures[base].as_bytes().to_vec(), &edits);
+        prop_assert_eq!(yaml_diff(&bytes), None, "{:?}", String::from_utf8_lossy(&bytes));
+    }
+
+    /// Credential documents in YAML form, with any value.
+    #[test]
+    fn yaml_parser_agrees_with_serde_yaml_ng_on_credentials(
+        secret in marker(),
+        user in marker(),
+        value in "[ -~]{0,40}",
+    ) {
+        let doc = yaml_definition(&secret, "apiKeyX", &value, &user);
+        prop_assert_eq!(yaml_diff(doc.as_bytes()), None, "{}", doc);
     }
 }

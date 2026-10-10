@@ -10,7 +10,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use databastion_classifiers::query::{
-    AnalyzeOptions, MAX_NORMALIZED_CHARS, QueryAnalysis, analyze, analyze_raw,
+    AnalyzeOptions, BuiltinFunctions, CallForm, MAX_NORMALIZED_CHARS, QueryAnalysis, analyze,
+    analyze_raw,
 };
 use proptest::prelude::*;
 
@@ -302,5 +303,139 @@ fn passwords_never_survive_in_logged_forms() {
         for p in a.parts() {
             assert!(p.lead.iter().all(|w| !w.contains("zqpasswd")), "{q}");
         }
+    }
+}
+
+/// Every name is built in, in every form.
+struct All;
+impl BuiltinFunctions for All {
+    fn is_builtin(&self, _: &[u8], _: CallForm) -> bool {
+        true
+    }
+}
+/// No name is built in.
+struct NoName;
+impl BuiltinFunctions for NoName {
+    fn is_builtin(&self, _: &[u8], _: CallForm) -> bool {
+        false
+    }
+}
+static ALL: All = All;
+static NO_NAME: NoName = NoName;
+
+/// A statement with calls in many positions and quotings.
+fn calls() -> impl Strategy<Value = String> {
+    let call = prop::sample::select(vec![
+        "f()",
+        "f (1)",
+        "`f`(a)",
+        "\"f\"(1)",
+        "now()",
+        "count (*)",
+        "hr.f()",
+        "1f()",
+        "f/**/()",
+        "/*!50700 f*/()",
+        "CAST(a AS DECIMAL(4, 2))",
+        "JSON_TABLE('[]', '$' COLUMNS (a INT PATH '$'))",
+    ]);
+    (
+        prop::collection::vec(call, 1..4),
+        prop::sample::select(vec![
+            "select {} from hr.t join hr.u on {} where a = {}",
+            "insert into hr.t (a, b) values ({}, {}); select {}",
+            "update hr.t set a = {} where b in (select {} from hr.u where c = {})",
+            "delete from hr.t where a = {} or b = {} or c = {}",
+            "set @x = {}, @y = {}; do {}",
+            "call hr.p({}, {}, {})",
+            "with x (a) as (select {} from hr.t) select {}, {} from x",
+            "select * from {} , hr.t where {} = {}",
+        ]),
+    )
+        .prop_map(|(picks, template)| {
+            let mut out = template.to_owned();
+            let mut k = 0;
+            while let Some(pos) = out.find("{}") {
+                out.replace_range(pos..pos + 2, picks[k % picks.len()]);
+                k += 1;
+            }
+            out
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// ADR-0045 part (b): the unknown-call analysis never removes an
+    /// object nor changes a kind (whatever the list says, the relations
+    /// and the statement kinds are the same), and a smaller list only
+    /// finds more unknown calls.
+    #[test]
+    fn unknown_calls_never_remove_an_object(text in calls(), truncated in any::<bool>()) {
+        let base = AnalyzeOptions::mysql().truncated(truncated);
+        let all = analyze(&text, base.builtins(&ALL));
+        let none = analyze(&text, base.builtins(&NO_NAME));
+        let plain = analyze(&text, base);
+        for a in [&all, &none] {
+            prop_assert_eq!(a.relations(), plain.relations(), "{}", text);
+            prop_assert_eq!(a.kind(), plain.kind(), "{}", text);
+            prop_assert_eq!(a.parts().len(), plain.parts().len(), "{}", text);
+            for (p, q) in a.parts().iter().zip(plain.parts()) {
+                prop_assert_eq!(&p.relations, &q.relations, "{}", text);
+                prop_assert_eq!(p.kind, q.kind, "{}", text);
+                prop_assert_eq!(p.routine_call, q.routine_call, "{}", text);
+                prop_assert_eq!(p.dquoted_name, q.dquoted_name, "{}", text);
+            }
+        }
+        prop_assert!(!all.unknown_call() || none.unknown_call(), "{}", text);
+        // Without a list, every call is unknown, like with an empty one.
+        prop_assert_eq!(plain.unknown_call(), none.unknown_call(), "{}", text);
+    }
+
+    /// Arbitrary text with an unknown-call list never panics.
+    #[test]
+    fn unknown_call_analysis_is_total(text in "[a-z '\"`#/*!M0-9\\\\;,()?@_.\n-]{0,200}") {
+        let _ = analyze(&text, AnalyzeOptions::mysql().builtins(&NO_NAME));
+        let _ = analyze(&text, AnalyzeOptions::mysql().builtins(&ALL).digest(true));
+        let _ = analyze_raw(text.as_bytes(), AnalyzeOptions::mysql().builtins(&ALL));
+    }
+}
+
+/// Every name is built in but `f`.
+struct AllButF;
+impl BuiltinFunctions for AllButF {
+    fn is_builtin(&self, name: &[u8], _: CallForm) -> bool {
+        !name.eq_ignore_ascii_case(b"f")
+    }
+}
+static ALL_BUT_F: AllButF = AllButF;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Security review of #188, H1: an alias after a call (`f() AS x`, in
+    /// any quoting, in any position) never clears the unknown call.
+    #[test]
+    fn an_alias_never_hides_an_unknown_call(
+        call in prop::sample::select(vec!["f()", "f (1)", "`f`(a)", "\"f\"(1)", "F(1, 2)", "1f()"]),
+        alias in prop::sample::select(vec![" AS x", " AS `x`", " AS \"x\"", " AS (x)", " as x", " AS x, 1"]),
+        template in prop::sample::select(vec![
+            "SELECT {}",
+            "SELECT a, {} FROM hr.t",
+            "SELECT CAST({} AS CHAR)",
+            "INSERT INTO hr.t SELECT {}",
+            "SET @x = (SELECT {})",
+            "DO (SELECT {})",
+            "CREATE TABLE x AS SELECT {} FROM hr.t",
+            "WITH c AS (SELECT {}) SELECT * FROM c",
+            "WITH c (a) AS (SELECT 1) SELECT {} FROM c",
+            "SELECT * FROM hr.t WHERE a IN (SELECT {})",
+        ]),
+    ) {
+        let opts = AnalyzeOptions::mysql().builtins(&ALL_BUT_F);
+        let bare = template.replacen("{}", call, 1);
+        let with = template.replacen("{}", &format!("{call}{alias}"), 1);
+        prop_assert!(analyze(&bare, opts).unknown_call(), "{}", bare);
+        prop_assert!(analyze(&with, opts).unknown_call(), "{}", with);
     }
 }
