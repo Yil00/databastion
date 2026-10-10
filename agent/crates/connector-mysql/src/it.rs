@@ -32,6 +32,7 @@
 #![allow(clippy::print_stderr)]
 
 mod audit_it;
+mod builtins_it;
 mod cas_guard_it;
 mod stmt_text_it;
 
