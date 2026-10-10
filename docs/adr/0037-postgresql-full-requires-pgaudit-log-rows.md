@@ -38,3 +38,6 @@ The stream does not match that rule. At Full and Partial, `source_for` picks the
 
   It can be revisited by a new ADR if servers without `pgaudit.log_rows` turn out to be common.
 - **Keep the rule and document it**: the console would keep showing Full for targets where `volume.*` policies cannot fire, against the docs/08 rule that a degraded audit never passes for a full one.
+
+## Refinement (2026-10-10, phase 8 follow-ups)
+- **Row counts and the own-account budget** (security reviews of #196 and #197). The engine-agnostic own-account rule of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md#refinement-2026-10-10-phase-8-follow-ups) (refinement of decision 6) applies here too: every read with the agent's identity is charged at least one row, aggregates `max(r, 1) + n - 1`, and budget keys ignore case.
