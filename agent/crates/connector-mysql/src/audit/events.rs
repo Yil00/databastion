@@ -399,6 +399,24 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
     }
 }
 
+/// Whether a raw statement text starts with `EXPLAIN`, `DESCRIBE` or
+/// `DESC` (after ASCII whitespace and opening parentheses), compared
+/// ASCII-case-insensitively: for texts that did not lex (ADR-0047). A
+/// comment before the word is not skipped.
+fn explain_lead(text: &[u8]) -> bool {
+    let start = text
+        .iter()
+        .position(|b| !b.is_ascii_whitespace() && *b != b'(')
+        .unwrap_or(text.len());
+    let word: Vec<u8> = text[start..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .take(9)
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    matches!(word.as_slice(), b"explain" | b"describe" | b"desc")
+}
+
 /// A statement kind that changes something: rows, schema or privileges.
 fn is_change_kind(k: StatementKind) -> bool {
     is_write_kind(k) || matches!(k, StatementKind::Ddl | StatementKind::Dcl)
@@ -1282,8 +1300,11 @@ impl EventBuilder {
         // const reads that matter examine none), never the agent's own (it
         // sends no explain but the probe shape). The probe shape that the
         // rule above did not leave out (in a longer text, or with table
-        // records of another table) is one too.
-        let explain = parts.iter().any(|p| p.explain_statement);
+        // records of another table) is one too. So is a text that cannot
+        // be read but starts with an explain word, when its table records
+        // decide (fail closed: they name what it read, not that it ran).
+        let explain = parts.iter().any(|p| p.explain_statement)
+            || (unparsed && !parsed && a.text.is_some_and(explain_lead));
         let table_action = if a.tables.iter().any(|t| t.2 == TableOp::Read) {
             Some(EventAction::Read)
         } else if a.tables.iter().any(|t| t.2 == TableOp::Write) {
@@ -5248,6 +5269,43 @@ mod tests {
         expect_everywhere("EXPLAIN FORMAT=JSON FOR CONNECTION 12", |s| {
             format!("read [{:?}] always", star(s))
         });
+    }
+
+    /// ADR-0047, fail closed: an explain whose text cannot be read (the
+    /// multibyte rule) and whose table records all read is decided by its
+    /// records, always reported, with no row count, never the agent's own.
+    #[test]
+    fn unreadable_explains_with_read_records_are_always_reported() {
+        let text = "EXPLAIN SELECT * FROM `hr`.`caf\u{e9}` WHERE id = 1";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        for user in ["app", "databastion"] {
+            let lines = [
+                format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,caf\u{e9},"),
+                sa_line(user, "172.18.0.1", 1, text),
+            ];
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 4096),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(out.len(), 1, "{user}");
+            assert!(out[0].always_report() && out[0].rows().is_none(), "{user}");
+            assert_eq!(out[0].action(), EventAction::Read, "{user}");
+        }
+        for (t, want) in [
+            (&b"EXPLAIN x"[..], true),
+            (b"  (describe x", true),
+            (b"DESC", true),
+            (b"\tdEsC t", true),
+            (b"DESCRIPTION", false),
+            (b"EXPLAINED", false),
+            (b"SELECT 1", false),
+            (b"/* x */ EXPLAIN", false),
+            (b"", false),
+        ] {
+            assert_eq!(explain_lead(t), want, "{t:?}");
+        }
     }
 
     /// ADR-0047 decisions 4 and 5: the metadata forms and the literal
