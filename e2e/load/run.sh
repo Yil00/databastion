@@ -718,7 +718,9 @@ run_workload() {
   [ "$sb_rc" = 0 ] || { tail -n 20 "$W/out/mariadb-$phase.summary" >&2; fail "sysbench ($phase) exited $sb_rc"; }
   [ "$side_rc" = 0 ] || { tail -n 20 "$W/out/side-$phase.out" >&2; fail "side clients ($phase) exited $side_rc"; }
   while read -r tag account issued failed; do
-    [ "$tag" = side ] && [[ "$issued" =~ ^[0-9]+$ ]] && [[ "$failed" =~ ^[01]$ ]] || continue
+    if [ "$tag" != side ] || ! [[ "$issued" =~ ^[0-9]+$ ]] || ! [[ "$failed" =~ ^[01]$ ]]; then
+      continue
+    fi
     fact --arg account "$account" --arg phase "$phase" --argjson n "$issued" --argjson f "$failed" \
       '{kind: "side", target: "mariadb-load", account: $account, phase: $phase, issued: $n, failed: $f}'
   done <"$W/out/side-$phase.out"
