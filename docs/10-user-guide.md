@@ -220,6 +220,16 @@ The agent has no allow-list of monitoring accounts: a monitoring credential is o
 
 **MySQL / MariaDB function calls** (since 0.6.0): an unqualified call of a name that is not a built-in function of the server's release series (`SELECT f()`, `DO f()`, `SET @x = f()`) may run a stored function, possibly with its definer's privileges, or a loadable function (UDF): it is a read of `*`, always reported. Applications that call stored functions or UDFs get one such event per principal and aggregation window; there is no allow-list. Upgrade the agent when you upgrade the server to a new release series ([08-engine-capabilities.md](08-engine-capabilities.md#unqualified-function-calls)).
 
+**Statistics catalogs** ([ADR-0048](adr/0048-statistics-catalogs-as-reads.md), PostgreSQL and MySQL / MariaDB): the optimizer's statistics hold sampled column values (most common values, histogram bounds, minimum and maximum). Reads of PostgreSQL `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` and `pg_statistic_ext_data`, MySQL `information_schema.COLUMN_STATISTICS` and MariaDB `mysql.column_stats` are read events naming them (PostgreSQL: in schema `pg_catalog`), always reported whatever the minimum rows, from every account, the agent's included (it never reads them). With pgaudit, **keep `pgaudit.log_catalog = on`** (the pgaudit default) on the monitored databases: with `off`, pgaudit does not log a statement that reads only catalogs, so a read of `pg_stats` alone gives no event, and `check()` says so in the agent's log. Bloat checks and monitoring tools that read `pg_stats` on a schedule, `mysqldump --column-statistics` and `mariadb-dump --system=stats` appear as readers ([08-engine-capabilities.md](08-engine-capabilities.md#statistics-catalogs)). A sample policy that opens an incident when any other account reads them:
+
+| Key | Value |
+|-----|-------|
+| `engines` | `postgres`, `mysql`, `mariadb` |
+| `event_actions` | `read` |
+| `objects` | `{schema: pg_catalog, object: pg_stats*}`, `{schema: pg_catalog, object: pg_statistic*}`, `{database: information_schema, object: COLUMN_STATISTICS}`, `{database: mysql, object: column_stats}` |
+| `exclude_principals` | your monitoring account running bloat checks, if any |
+| Action | an incident of severity `high` |
+
 The export signatures recognized per engine are listed in [08-engine-capabilities.md](08-engine-capabilities.md#known-export-signatures).
 
 ## 11. Policies, incidents and notifications
