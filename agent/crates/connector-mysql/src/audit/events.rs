@@ -3966,6 +3966,12 @@ mod tests {
             "SELECT version_tokens_show()",
             // `SHOW … WHERE` with an unknown call runs it.
             "SHOW TABLES WHERE f()",
+            // Followed by `AS` (security review of #188, H1).
+            "SELECT get_customer_email(1) AS x",
+            "SELECT CAST(get_customer_email(1) AS CHAR)",
+            "SET @x = (SELECT get_customer_email(1) AS y)",
+            "DO (SELECT get_customer_email(1) AS y)",
+            "SELECT get_customer_email(1) AS \"x\"",
         ] {
             expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
             for user in ["app", "databastion"] {
@@ -3988,6 +3994,7 @@ mod tests {
         };
         expect_everywhere("SELECT a, f(b) FROM hr.t", |s| with_table("read", s));
         expect_everywhere("UPDATE hr.t SET a = f(a)", |s| with_table("write", s));
+        expect_everywhere("SELECT f(1) AS a FROM hr.t", |s| with_table("read", s));
         // With table records: they decide the tables, `*` is added.
         for user in ["databastion", "app"] {
             let lines = sa_with_records(

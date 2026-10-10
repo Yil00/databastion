@@ -1948,6 +1948,65 @@ fn offset_in(all: &[Tok], part: &[Tok]) -> Option<usize> {
     (start % size == 0 && at.checked_add(part.len())? <= all.len()).then_some(at)
 }
 
+/// Whether the name at `i`, followed by the parenthesized list that
+/// closes at `c`, is a common table expression's name and column list:
+/// `WITH [RECURSIVE] name (a) AS (`, or `, name (a) AS (` after another
+/// common table expression of the same `WITH` (`name [(…)] AS (…)`,
+/// walked back to the `WITH`). Anything else followed by `AS` is a call
+/// (`SELECT f() AS x`; security review of #188, H1). `opened[k]`: the
+/// index of the `(` that the `)` at `k` closes.
+fn cte_column_list(s: &[Tok], i: usize, c: usize, opened: &[Option<usize>]) -> bool {
+    if word(s.get(c + 1)) != Some("as") || !is_punct(s.get(c + 2), "(") {
+        return false;
+    }
+    let name =
+        |t: Option<&Tok>| matches!(t, Some(Tok::Word(_) | Tok::Quoted(_) | Tok::DQuoted { .. }));
+    let mut at = i;
+    loop {
+        let Some(p) = at.checked_sub(1) else {
+            return false;
+        };
+        if matches!(word(s.get(p)), Some("with" | "recursive")) {
+            return true;
+        }
+        if !is_punct(s.get(p), ",") {
+            return false;
+        }
+        // The previous common table expression: `name [(…)] AS (…)`.
+        let Some(body) = p
+            .checked_sub(1)
+            .and_then(|k| opened.get(k).copied().flatten())
+        else {
+            return false;
+        };
+        let Some(as_at) = body
+            .checked_sub(1)
+            .filter(|&k| word(s.get(k)) == Some("as"))
+        else {
+            return false;
+        };
+        let mut n = match as_at.checked_sub(1) {
+            Some(k) => k,
+            None => return false,
+        };
+        if is_punct(s.get(n), ")") {
+            match opened
+                .get(n)
+                .copied()
+                .flatten()
+                .and_then(|o| o.checked_sub(1))
+            {
+                Some(k) => n = k,
+                None => return false,
+            }
+        }
+        if !name(s.get(n)) || matches!(word(s.get(n)), Some("with" | "recursive")) {
+            return false;
+        }
+        at = n;
+    }
+}
+
 /// What opened a parenthesis, for [`has_unknown_call`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Opener {
@@ -1984,8 +2043,9 @@ struct Level {
 ///
 /// - a qualified name (`db.f(`: [`StatementInfo::routine_call`]);
 /// - a table with a column list ([`table_name_before`]: `INSERT INTO t
-///   (a)`, `REFERENCES t (id)`) or a common table expression (`WITH x (a)
-///   AS (`: the `)` closing its list is followed by `AS`);
+///   (a)`, `REFERENCES t (id)`) or a common table expression's column
+///   list (`WITH x (a) AS (`, `, y (b) AS (` in the same `WITH`:
+///   [`cte_column_list`]); a call followed by `AS` is a call;
 /// - a name after `AS` (`CAST(x AS DECIMAL(10, 2))`, a derived table's
 ///   column list `AS dt (a)`), after `)` (`MATCH (a) AGAINST (`, `OVER
 ///   (`, `(SELECT …) dt (a)`), after a literal (`'$' COLUMNS (`, `IGNORE
@@ -2023,6 +2083,7 @@ fn has_unknown_call(
     // The index of the `)` closing the `(` at each index, for the common
     // table expression check (one pass).
     let mut close: Vec<Option<usize>> = vec![None; s.len()];
+    let mut opened: Vec<Option<usize>> = vec![None; s.len()];
     let mut open: Vec<usize> = Vec::new();
     for (i, t) in s.iter().enumerate() {
         if is_punct(Some(t), "(") {
@@ -2031,6 +2092,7 @@ fn has_unknown_call(
             && let Some(o) = open.pop()
         {
             close[o] = Some(i);
+            opened[i] = Some(o);
         }
     }
     let top = Level {
@@ -2082,7 +2144,7 @@ fn has_unknown_call(
                     || (level.opener == Opener::Columns
                         && matches!(prev, Some(Tok::Word(_) | Tok::Quoted(_))))
                     || table_name_before(s, i, write, schema_change)
-                    || close[i + 1].is_some_and(|c| word(s.get(c + 1)) == Some("as"));
+                    || close[i + 1].is_some_and(|c| cte_column_list(s, i, c, &opened));
                 if !not_a_call {
                     return true;
                 }
@@ -5012,6 +5074,20 @@ mod tests {
             "SELECT a FROM t FOR SYSTEM_TIME FROM json_table() TO NOW()",
             // After `SET STATEMENT … FOR`.
             "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // Followed by `AS` (security review of #188, H1).
+            "SELECT f() AS x",
+            "SELECT f(1) AS a FROM hr.t",
+            "SELECT CAST(f() AS CHAR)",
+            "INSERT INTO hr.t SELECT f() AS x",
+            "SET @x = (SELECT f() AS y)",
+            "DO (SELECT f() AS y)",
+            "CREATE TABLE x AS SELECT f(a) AS c FROM hr.t",
+            "SELECT f(1) AS \"x\"",
+            "SELECT f(1) AS (x)",
+            "SELECT a, f(1) AS (x)",
+            "WITH x AS (SELECT f(1) AS y) SELECT * FROM x",
+            "WITH x (a) AS (SELECT 1) SELECT g(a) AS b FROM x",
+            "WITH x AS (SELECT 1) SELECT 1, f(2) AS (y)",
             // A select modifier inside a write is not the write's head
             // (security review of #184, N1).
             "INSERT INTO hr.t SELECT HIGH_PRIORITY f(1)",
@@ -5045,6 +5121,8 @@ mod tests {
             "WITH x (a) AS (SELECT 1) SELECT * FROM x",
             "WITH x AS (SELECT 1), y (b, c) AS (SELECT 2, 3) SELECT * FROM y",
             "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r",
+            "WITH x (a) AS (SELECT 1), y AS (SELECT 2), `z` (b) AS (SELECT 3) SELECT * FROM z",
+            "WITH RECURSIVE \"q\" (a) AS (SELECT 1), r (b, c) AS (SELECT 2, 3) SELECT 1",
             "SELECT CAST(a AS DECIMAL(10, 2)), CAST(b AS nchar(4)), CAST(c AS datetime(6)) FROM t",
             "SELECT CONVERT(a, nchar(4)), CONVERT(b, datetime(6)) FROM t",
             "SELECT JSON_VALUE(j, '$.a' RETURNING decimal(4, 2)) FROM t",

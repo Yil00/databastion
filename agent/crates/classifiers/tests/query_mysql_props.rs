@@ -400,3 +400,42 @@ proptest! {
         let _ = analyze_raw(text.as_bytes(), AnalyzeOptions::mysql().builtins(&ALL));
     }
 }
+
+/// Every name is built in but `f`.
+struct AllButF;
+impl BuiltinFunctions for AllButF {
+    fn is_builtin(&self, name: &[u8], _: CallForm) -> bool {
+        !name.eq_ignore_ascii_case(b"f")
+    }
+}
+static ALL_BUT_F: AllButF = AllButF;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Security review of #188, H1: an alias after a call (`f() AS x`, in
+    /// any quoting, in any position) never clears the unknown call.
+    #[test]
+    fn an_alias_never_hides_an_unknown_call(
+        call in prop::sample::select(vec!["f()", "f (1)", "`f`(a)", "\"f\"(1)", "F(1, 2)", "1f()"]),
+        alias in prop::sample::select(vec![" AS x", " AS `x`", " AS \"x\"", " AS (x)", " as x", " AS x, 1"]),
+        template in prop::sample::select(vec![
+            "SELECT {}",
+            "SELECT a, {} FROM hr.t",
+            "SELECT CAST({} AS CHAR)",
+            "INSERT INTO hr.t SELECT {}",
+            "SET @x = (SELECT {})",
+            "DO (SELECT {})",
+            "CREATE TABLE x AS SELECT {} FROM hr.t",
+            "WITH c AS (SELECT {}) SELECT * FROM c",
+            "WITH c (a) AS (SELECT 1) SELECT {} FROM c",
+            "SELECT * FROM hr.t WHERE a IN (SELECT {})",
+        ]),
+    ) {
+        let opts = AnalyzeOptions::mysql().builtins(&ALL_BUT_F);
+        let bare = template.replacen("{}", call, 1);
+        let with = template.replacen("{}", &format!("{call}{alias}"), 1);
+        prop_assert!(analyze(&bare, opts).unknown_call(), "{}", bare);
+        prop_assert!(analyze(&with, opts).unknown_call(), "{}", with);
+    }
+}
