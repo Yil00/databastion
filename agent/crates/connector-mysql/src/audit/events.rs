@@ -400,15 +400,43 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
 }
 
 /// Whether a raw statement text starts with `EXPLAIN`, `DESCRIBE` or
-/// `DESC` (after ASCII whitespace and opening parentheses), compared
-/// ASCII-case-insensitively: for texts that did not lex (ADR-0047). A
-/// comment before the word is not skipped.
+/// `DESC`, compared ASCII-case-insensitively: for texts that did not lex
+/// (ADR-0047). ASCII whitespace, opening parentheses, `/* … */` and `#` /
+/// `-- ` comments before the word are skipped; executable comments
+/// (`/*!…`, `/*M!…`, with their version digits) are read inside, as code a
+/// server may run (security review of #195, L1).
 fn explain_lead(text: &[u8]) -> bool {
-    let start = text
-        .iter()
-        .position(|b| !b.is_ascii_whitespace() && *b != b'(')
-        .unwrap_or(text.len());
-    let word: Vec<u8> = text[start..]
+    let n = text.len();
+    let mut i = 0;
+    while i < n {
+        let rest = &text[i..];
+        if rest[0].is_ascii_whitespace() || rest[0] == b'(' {
+            i += 1;
+        } else if rest.starts_with(b"/*!") || rest.starts_with(b"/*M!") {
+            i += if rest[2] == b'!' { 3 } else { 4 };
+            while i < n && text[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if rest.starts_with(b"/*") {
+            match rest[2..].windows(2).position(|w| w == b"*/") {
+                Some(k) => i += 2 + k + 2,
+                None => return false,
+            }
+        } else if rest.starts_with(b"*/") {
+            // The end of an executable comment read inside.
+            i += 2;
+        } else if rest[0] == b'#'
+            || (rest.starts_with(b"--") && rest.get(2).is_none_or(u8::is_ascii_whitespace))
+        {
+            match rest.iter().position(|b| *b == b'\n') {
+                Some(k) => i += k + 1,
+                None => return false,
+            }
+        } else {
+            break;
+        }
+    }
+    let word: Vec<u8> = text[i.min(n)..]
         .iter()
         .take_while(|b| b.is_ascii_alphabetic())
         .take(9)
@@ -1355,6 +1383,7 @@ impl EventBuilder {
                 || p.unknown_call
                 || p.explain_unbounded
                 || p.relations_full
+                || p.explain_schema
                 || shows_session_text(p)
         }) || analysis
             .iter()
@@ -1591,8 +1620,14 @@ impl EventBuilder {
             return None;
         }
         let ts = a.ts.min(now);
-        // An explain's row count is the plan's, not the data's.
-        let rows = if explain { None } else { a.rows };
+        // An explain's row count is the plan's, not the data's; so is
+        // that of `EXPLAIN ANALYZE` / MariaDB `ANALYZE`, which shows the
+        // same const values (security review of #195, M2).
+        let rows = if explain || analyze_wrapped {
+            None
+        } else {
+            a.rows
+        };
         let mut e = MaskedEvent::new(a.source, action, a.principal.clone(), ts).with_rows(rows);
         // An event names 16 objects at most: `*` keeps its place.
         let star = unknown || (dquoted && rw);
@@ -1633,7 +1668,15 @@ impl EventBuilder {
         // Also reads of `*`: code that runs out of sight or a text that
         // cannot be read never matches `sensitive_objects` and has no
         // useful row count, so `min_rows` would drop it.
-        if touches_system || configuration || call || blind || cut_blind || text_tables || explain {
+        if touches_system
+            || configuration
+            || call
+            || blind
+            || cut_blind
+            || text_tables
+            || explain
+            || analyze_wrapped
+        {
             e = e.with_always_report();
         }
         // Read signals per read statement, whatever the event's action (a
@@ -4825,15 +4868,15 @@ mod tests {
             ),
             (
                 "ANALYZE DELETE FROM hr.customers",
-                "write [\"hr.customers\"]",
+                "write [\"hr.customers\"] always",
             ),
             (
                 "ANALYZE SELECT * FROM hr.customers",
-                "read [\"hr.customers\"]",
+                "read [\"hr.customers\"] always",
             ),
             (
                 "DESCRIBE ANALYZE SELECT * FROM hr.customers",
-                "read [\"hr.customers\"]",
+                "read [\"hr.customers\"] always",
             ),
             (
                 "EXPLAIN ANALYZE UPDATE performance_schema.setup_consumers c, performance_schema.setup_instruments i SET c.ENABLED='NO'",
@@ -4894,7 +4937,7 @@ mod tests {
             "SHOW TABLES",
             "SHOW GRANTS FOR CURRENT_USER()",
             "DESCRIBE hr.customers",
-            "EXPLAIN SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM performance_schema.threads",
             "LOCK TABLES hr.customers READ",
             "UNLOCK TABLES",
             "FLUSH PRIVILEGES",
@@ -4948,7 +4991,7 @@ mod tests {
         }
         expect_everywhere(
             "EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM hr.t",
-            |_| "write [\"hr.t\"]".to_owned(),
+            |_| "write [\"hr.t\"] always".to_owned(),
         );
         for (source, ev) in on_every_source(
             "databastion",
@@ -5260,11 +5303,33 @@ mod tests {
         access.status = 1142;
         access.rows = Some(0);
         assert!(b.statement(access, SystemTime::now()).is_none());
-        // Unchanged rules: `EXPLAIN ANALYZE` runs its statement, the plan
-        // of another connection is a read of `*`.
+        // `EXPLAIN ANALYZE` runs its statement and shows the same const
+        // values: always reported, with no row count (security review of
+        // #195, M2); the plan of another connection is a read of `*`.
         expect_everywhere(
             "EXPLAIN ANALYZE SELECT * FROM hr.customers WHERE id = 42",
-            |_| "read [\"hr.customers\"]".to_owned(),
+            |_| "read [\"hr.customers\"] always".to_owned(),
+        );
+        for user in [Some("app"), Some("databastion")] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(
+                &mut b,
+                user,
+                "EXPLAIN ANALYZE SELECT * FROM hr.customers WHERE id = 42",
+                false,
+                50_000,
+            )
+            .unwrap();
+            assert!(e.always_report() && e.rows().is_none(), "{user:?}");
+        }
+        // `EXPLAIN FOR SCHEMA name` (security review of #195, L2): the
+        // relations in `name`, and `*`.
+        expect_everywhere(
+            "EXPLAIN FOR SCHEMA hr SELECT * FROM customers WHERE id = 42",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
         );
         expect_everywhere("EXPLAIN FORMAT=JSON FOR CONNECTION 12", |s| {
             format!("read [{:?}] always", star(s))
@@ -5301,7 +5366,19 @@ mod tests {
             (b"DESCRIPTION", false),
             (b"EXPLAINED", false),
             (b"SELECT 1", false),
-            (b"/* x */ EXPLAIN", false),
+            // Security review of #195, L1: leading comments.
+            (b"/* x */ EXPLAIN", true),
+            (b"/* x */ /* y */\n EXPLAIN", true),
+            (b"/*!50000 EXPLAIN */ SELECT", true),
+            (b"/*M!100000 describe */", true),
+            (b"/*!*/ desc t", true),
+            (b"-- note\nEXPLAIN", true),
+            (b"--\tnote\r\nEXPLAIN", true),
+            (b"# note\n(EXPLAIN", true),
+            (b"/* x EXPLAIN", false),
+            (b"-- EXPLAIN", false),
+            (b"--x\nEXPLAIN", false),
+            (b"/* EXPLAIN */ SELECT", false),
             (b"", false),
         ] {
             assert_eq!(explain_lead(t), want, "{t:?}");
@@ -5328,9 +5405,8 @@ mod tests {
             crate::sql::PS_HISTORY_LONG,
             crate::sql::PS_HISTORY,
             crate::sql::PS_CURRENT,
-            "EXPLAIN SELECT 1 FROM hr.customers",
-            "DESCRIBE SELECT 1 FROM `hr`.`customers`;",
-            "desc select 7 from customers",
+            "DESCRIBE SELECT 1 FROM `performance_schema`.`threads`;",
+            "desc select 7 from PERFORMANCE_SCHEMA.setup_consumers",
         ] {
             for user in ["app", "databastion"] {
                 for (source, ev) in on_every_source(user, text) {
@@ -5421,8 +5497,73 @@ mod tests {
                 EventSource::MysqlAuditLog,
                 SystemTime::now(),
             );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.customers\"] always"],
+                "{user}"
+            );
+            // The probe on the JSON log: no `table_access` record for a
+            // `performance_schema` table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, "10.0.0.5", 7, &[], crate::sql::PS_HISTORY),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
             assert!(ev.is_empty(), "{user}");
+            // Security review of #195, H1: a view (merged, with its const
+            // reads), with the records of the view and its base table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "v"), ("READ", "hr", "customers")],
+                        "EXPLAIN SELECT 1 FROM hr.v",
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.customers\", \"hr.v\"] always"],
+                "{user}"
+            );
         }
+        // Security review of #195, H1: the literal shape on any table
+        // outside `performance_schema`, qualified or not, is a read.
+        for text in [
+            "EXPLAIN SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.v",
+            "DESCRIBE SELECT 1 FROM `hr`.`customers`;",
+        ] {
+            let want = if text.contains("hr.v") {
+                "hr.v"
+            } else {
+                "hr.customers"
+            };
+            expect_everywhere(text, |_| format!("read [{want:?}] always"));
+        }
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, "EXPLAIN SELECT 1 FROM t") {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert!(e.always_report(), "{user} {source:?}");
+                assert_eq!(e.action(), EventAction::Read);
+                assert!(
+                    e.objects().iter().any(|o| o.object().as_str() == "t"),
+                    "{user} {source:?}: {}",
+                    shown(&e)
+                );
+            }
+        }
+        for user in [Some("app"), None] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(&mut b, user, "EXPLAIN SELECT ? FROM hr . v", true, 1).unwrap();
+            assert_eq!(shown(&e), "read [\"hr.v\"] always", "{user:?}");
+        }
+
         // One step from the shape: an explain of a statement.
         for (text, want) in [
             (

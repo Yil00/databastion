@@ -1130,10 +1130,17 @@ pub struct StatementInfo {
     /// MySQL: the literal probe shape (ADR-0047 decision 5): the whole
     /// statement is exactly `EXPLAIN | DESCRIBE | DESC`, `SELECT`, one
     /// integer literal (or the digest placeholder `?`), `FROM` and one
-    /// table name (`t`, `` `t` ``, `s.t`), with no wrapper. It shows no
-    /// column value on any verified server. Implies
+    /// `performance_schema` table, schema-qualified (plain or backquoted;
+    /// no view can be created there: security review of #195, H1), with
+    /// no wrapper. It shows no column value on any verified server. Implies
     /// [`Self::explain_statement`].
     pub explain_probe: bool,
+    /// MySQL: an explain of a statement with a default schema before its
+    /// statement (`EXPLAIN FOR SCHEMA | DATABASE name <statement>`): its
+    /// unqualified relations are in `name` ([`Self::relations`]); what
+    /// the server resolves them to is not proven, so callers add `*`
+    /// (security review of #195, L2).
+    pub explain_schema: bool,
     /// [`Self::relations`] reached [`MAX_RELATIONS`]: the statement may
     /// name more relations than were kept (a caller that must see every
     /// name fails closed).
@@ -1648,9 +1655,49 @@ fn explain_analyze(s: &[Tok]) -> bool {
     let end = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
         .find(|&j| runs_statement_at(s, j, true))
         .unwrap_or(s.len().min(MAX_EXPLAIN_PREFIX_TOKENS));
-    s[1..end]
-        .iter()
-        .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
+    prefix_keyword(s, 1, end, "analyze")
+}
+
+/// Whether `s[from..to]` holds the keyword `w`: a word that is not a
+/// variable name (a word right after `@` or `@@`: `INTO @analyze`,
+/// `INTO @for`; security review of #195, M1).
+fn prefix_keyword(s: &[Tok], from: usize, to: usize, w: &str) -> bool {
+    (from..to.min(s.len())).any(|j| {
+        matches!(&s[j], Tok::Word(x) if x == w)
+            && !is_punct(j.checked_sub(1).and_then(|k| s.get(k)), "@")
+    })
+}
+
+/// The schema name of `FOR SCHEMA | DATABASE name` at `j` (MySQL: the
+/// default schema of the explained statement), `None` when the `FOR` at
+/// `j` is something else.
+fn for_schema_at(s: &[Tok], j: usize) -> Option<&str> {
+    if word(s.get(j)) != Some("for")
+        || is_punct(j.checked_sub(1).and_then(|k| s.get(k)), "@")
+        || !matches!(word(s.get(j + 1)), Some("schema" | "database"))
+    {
+        return None;
+    }
+    match s.get(j + 2) {
+        Some(Tok::Word(n) | Tok::Quoted(n)) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `s[from..to]` holds a `FOR` keyword other than `FOR SCHEMA |
+/// DATABASE name`: `… FOR CONNECTION id` (the plan of another session).
+fn prefix_for_connection(s: &[Tok], from: usize, to: usize) -> bool {
+    (from..to.min(s.len()))
+        .any(|j| prefix_keyword(s, j, j + 1, "for") && for_schema_at(s, j).is_none())
+}
+
+/// The default schema an explain of a statement names before its
+/// statement (`EXPLAIN FOR SCHEMA hr SELECT …`, security review of #195,
+/// L2).
+fn explain_schema_name(s: &[Tok]) -> Option<&str> {
+    let lead = s.iter().take_while(|t| is_punct(Some(t), "(")).count();
+    let start = explain_statement_at(s)?;
+    (lead + 1..start).find_map(|j| for_schema_at(s, j))
 }
 
 /// Whether an `EXPLAIN` / `DESCRIBE` / `DESC` has more than
@@ -1682,12 +1729,8 @@ fn explain_statement_at(s: &[Tok]) -> Option<usize> {
     }
     let start =
         (1..e.len().min(MAX_EXPLAIN_PREFIX_TOKENS)).find(|&j| runs_statement_at(e, j, true))?;
-    let prefix_word = |w: &str| {
-        e[1..start]
-            .iter()
-            .any(|t| matches!(t, Tok::Word(x) if x == w))
-    };
-    (!prefix_word("analyze") && !prefix_word("for")).then_some(lead + start)
+    (!prefix_keyword(e, 1, start, "analyze") && !prefix_for_connection(e, 1, start))
+        .then_some(lead + start)
 }
 
 /// See [`StatementInfo::explain_probe`]. Comments are not tokens (a
@@ -1695,16 +1738,20 @@ fn explain_statement_at(s: &[Tok]) -> Option<usize> {
 /// the text keeps only its kind and never gets here); a hint is a comment.
 fn explain_probe(s: &[Tok]) -> bool {
     let name = |t: Option<&Tok>| matches!(t, Some(Tok::Word(_) | Tok::Quoted(_)));
-    matches!(word(s.first()), Some("explain" | "describe" | "desc"))
+    // `performance_schema` only, qualified (security review of #195, H1):
+    // no account can create a view there, so the table is a base table
+    // with no condition; a view elsewhere is merged, and its `ON` /
+    // `WHERE` const reads happen while it is planned.
+    let ps = matches!(s.get(4), Some(Tok::Word(n) | Tok::Quoted(n))
+        if n.eq_ignore_ascii_case("performance_schema"));
+    s.len() == 7
+        && matches!(word(s.first()), Some("explain" | "describe" | "desc"))
         && word(s.get(1)) == Some("select")
         && matches!(s.get(2), Some(Tok::Int(_) | Tok::Param))
         && word(s.get(3)) == Some("from")
-        && name(s.get(4))
-        && match s.len() {
-            5 => true,
-            7 => is_punct(s.get(5), ".") && name(s.get(6)),
-            _ => false,
-        }
+        && ps
+        && is_punct(s.get(5), ".")
+        && name(s.get(6))
 }
 
 /// The relations of a MySQL statement ([`collect_relations_dialect`]);
@@ -1714,8 +1761,24 @@ fn explain_probe(s: &[Tok]) -> bool {
 /// words), ADR-0047 decision 2. The prefix (`FORMAT = x`, `INTO @var`)
 /// names no relation.
 fn my_statement_relations(s: &[Tok], out: &mut Vec<RelationName>) {
-    let s = explain_statement_at(s).map_or(s, |start| &s[start..]);
-    collect_relations_dialect(s, Dialect::Mysql, out);
+    let Some(start) = explain_statement_at(s) else {
+        collect_relations_dialect(s, Dialect::Mysql, out);
+        return;
+    };
+    // `EXPLAIN FOR SCHEMA hr SELECT … FROM t`: `t` is `hr.t`.
+    let schema = explain_schema_name(s);
+    let mut inner = Vec::new();
+    collect_relations_dialect(&s[start..], Dialect::Mysql, &mut inner);
+    for mut r in inner {
+        if r.schema.is_none()
+            && let Some(db) = schema
+        {
+            r.schema = Some(db.to_owned());
+        }
+        if out.len() < MAX_RELATIONS && !out.contains(&r) {
+            out.push(r);
+        }
+    }
 }
 
 /// See [`StatementInfo::explain_connection`]. An `EXPLAIN` whose
@@ -1729,9 +1792,7 @@ fn explain_connection(s: &[Tok]) -> bool {
             let end = (1..bound)
                 .find(|&j| runs_statement_at(s, j, true))
                 .unwrap_or(bound);
-            s[1..end]
-                .iter()
-                .any(|t| matches!(t, Tok::Word(w) if w == "for"))
+            prefix_for_connection(s, 1, end)
         }
         _ => false,
     }
@@ -1785,10 +1846,7 @@ fn wrapper_level(s: &[Tok]) -> Option<(&[Tok], Wrapper)> {
         (Some("explain" | "describe" | "desc"), _) => {
             let start = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
                 .find(|&j| runs_statement_at(s, j, true))?;
-            s[1..start]
-                .iter()
-                .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
-                .then(|| (&s[start..], Wrapper::Analyze))
+            prefix_keyword(s, 1, start, "analyze").then(|| (&s[start..], Wrapper::Analyze))
         }
         // `ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE …` stays a utility.
         (Some("analyze"), _) => {
@@ -2867,6 +2925,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
         explain_connection: opts.dialect == Dialect::Mysql && explain_connection(s),
         explain_statement,
+        explain_schema: opts.dialect == Dialect::Mysql && explain_schema_name(s).is_some(),
         // Set by `analyze_mysql`, on the statement before its wrappers
         // (the whole token sequence must be the shape).
         explain_probe: false,
@@ -5085,6 +5144,38 @@ mod tests {
         let far = format!("EXPLAIN {}SELECT * FROM t", "FORMAT = TREE ".repeat(11));
         let a = my(&far);
         assert!(a.parts()[0].explain_unbounded && !a.parts()[0].explain_statement);
+        // Security review of #195, L2: `FOR SCHEMA | DATABASE name` gives
+        // the default schema of unqualified names; not another connection.
+        for (q, want) in [
+            (
+                "EXPLAIN FOR SCHEMA hr SELECT * FROM customers WHERE id = 1",
+                &["hr.customers"][..],
+            ),
+            (
+                "EXPLAIN FORMAT=TREE FOR DATABASE `hr` SELECT * FROM customers c JOIN shop.orders o ON o.cid = c.id",
+                &["hr.customers", "shop.orders"][..],
+            ),
+            (
+                "explain for schema hr update customers set a = 1 where id = 2",
+                &["hr.customers"][..],
+            ),
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement && p.explain_schema, "{q}");
+            assert!(!p.explain_connection && !p.explain_probe, "{q}");
+            assert_eq!(rels_of(p), want, "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT * FROM hr.customers",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN FORMAT=JSON INTO @for SELECT 1 FROM t",
+        ] {
+            assert!(!my(q).parts()[0].explain_schema, "{q}");
+        }
+        assert!(my("EXPLAIN FOR CONNECTION 12").parts()[0].explain_connection);
+        assert!(my("EXPLAIN FOR SCHEMA hr FOR CONNECTION 12").parts()[0].explain_connection);
     }
 
     /// ADR-0047 decision 5: the literal probe shape, and one-step
@@ -5095,12 +5186,11 @@ mod tests {
             "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long",
             "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history",
             "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current",
-            "DESCRIBE SELECT 1 FROM hr.customers",
-            "desc select 0 from customers",
-            "EXPLAIN SELECT 1 FROM `hr`.`customers`;",
-            "EXPLAIN SELECT 1 FROM `customers`",
-            "EXPLAIN /* plain comment */ SELECT 1 FROM t",
-            "EXPLAIN SELECT /*+ NO_INDEX(t) */ 1 FROM t",
+            "DESCRIBE SELECT 1 FROM performance_schema.threads",
+            "desc select 0 from PERFORMANCE_SCHEMA.setup_consumers",
+            "EXPLAIN SELECT 1 FROM `performance_schema`.`threads`;",
+            "EXPLAIN /* plain comment */ SELECT 1 FROM performance_schema.threads",
+            "EXPLAIN SELECT /*+ NO_INDEX(t) */ 1 FROM performance_schema.threads",
             // Digests.
             "EXPLAIN SELECT ? FROM performance_schema . events_statements_history_long",
             "EXPLAIN SELECT ? FROM `performance_schema` . `events_statements_history_long`",
@@ -5113,6 +5203,19 @@ mod tests {
             assert_eq!(p.relations.len(), 1, "{q}");
         }
         for q in [
+            // Security review of #195, H1: any table outside
+            // `performance_schema` (a view there is merged, with its
+            // const reads), qualified or not.
+            "EXPLAIN SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.v",
+            "DESCRIBE SELECT 1 FROM `hr`.`customers`",
+            "desc select 0 from customers",
+            "EXPLAIN SELECT 1 FROM t",
+            "EXPLAIN SELECT 1 FROM threads",
+            "EXPLAIN SELECT 1 FROM `performance_schema`",
+            "EXPLAIN SELECT 1 FROM performance_schemax.threads",
+            "EXPLAIN SELECT 1 FROM hr.performance_schema",
+            "EXPLAIN SELECT 1 FROM performance_schema.threads WHERE THREAD_ID = 1",
             "EXPLAIN SELECT 1 FROM hr.customers WHERE id = 42",
             "EXPLAIN SELECT 1 FROM hr.customers, hr.orders",
             "EXPLAIN SELECT 1 FROM hr.customers JOIN hr.orders",
@@ -5138,6 +5241,35 @@ mod tests {
             "EXPLAIN ANALYZE SELECT 1 FROM t",
         ] {
             assert!(my(q).parts().iter().all(|p| !p.explain_probe), "{q}");
+        }
+        // Security review of #195, M1: a variable named like a keyword is
+        // not the keyword.
+        for q in [
+            "EXPLAIN FORMAT=JSON INTO @analyze SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @ANALYZE SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @`analyze` SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @@analyze SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @for SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @FOR SELECT * FROM hr.customers WHERE id = 1",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement, "{q}");
+            assert!(!p.analyze_wrapped && !p.explain_connection, "{q}");
+            assert_eq!(p.kind, StatementKind::Other, "{q}");
+            assert_eq!(rels_of(p), ["hr.customers"], "{q}");
+        }
+        // A real `ANALYZE` after the variable still runs the statement.
+        let a = my("EXPLAIN FORMAT=JSON INTO @analyze ANALYZE SELECT * FROM hr.customers");
+        assert!(a.parts()[0].analyze_wrapped && !a.parts()[0].explain_statement);
+        // L3: `EXPLAIN ANALYZE … INTO OUTFILE` runs: it keeps `outfile`.
+        for q in [
+            "EXPLAIN ANALYZE SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+            "ANALYZE SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+        ] {
+            let a = my(q);
+            assert!(a.parts()[0].analyze_wrapped && a.parts()[0].outfile, "{q}");
         }
         // A version comment every supported server runs is code; one that
         // a server may run gives readings that differ: only the kind.

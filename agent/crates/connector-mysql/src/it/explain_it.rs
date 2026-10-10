@@ -7,9 +7,11 @@
 //! n` (the optimizer reads the `const` row) and `SHOW WARNINGS` (Note 1003
 //! holds its values on MySQL), and gets one read event naming the table
 //! per explain, always reported (never dropped by `min_rows`) and with no
-//! row count; its `DESCRIBE t` and its literal probe shape (`EXPLAIN SELECT
-//! 1 FROM t`) give none. The agent's own readability probes (`check()`)
-//! give none on any source. No seeded value reaches an event or a log.
+//! row count. `EXPLAIN SELECT 1 FROM t` and the same on a merged view are
+//! reads too (security review of #195, H1); its `DESCRIBE t` and the
+//! literal probe shape on a `performance_schema` table give none. The
+//! agent's own readability probes (`check()`) give none on any source. No
+//! seeded value reaches an event or a log.
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -42,7 +44,11 @@ async fn ex_fixture(a: &mut Session) {
         ),
         format!("DROP USER IF EXISTS '{EX_USER}'@'%'"),
         format!("CREATE USER '{EX_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        format!(
+            "CREATE VIEW {EX_DB}.v AS SELECT c.id, c.name FROM {EX_DB}.customers c WHERE c.id = 2"
+        ),
         format!("GRANT SELECT ON {EX_DB}.* TO '{EX_USER}'@'%'"),
+        format!("GRANT SELECT ON performance_schema.threads TO '{EX_USER}'@'%'"),
     ] {
         exec(a, &statement).await;
     }
@@ -76,7 +82,11 @@ async fn ex_traffic(server: &Server) -> Held {
     }
     for statement in [
         format!("DESCRIBE {EX_DB}.customers"),
+        "EXPLAIN SELECT 1 FROM performance_schema.threads".to_owned(),
+        // The literal shape outside `performance_schema`: a read, and on
+        // a merged view a read with the view's const condition.
         format!("EXPLAIN SELECT 1 FROM {EX_DB}.customers"),
+        format!("EXPLAIN SELECT 1 FROM {EX_DB}.v"),
     ] {
         s.query(Stage::Check, &statement).await.unwrap();
     }
@@ -104,17 +114,41 @@ fn walk_reads(ev: &[MaskedEvent]) -> usize {
     ev.iter().filter(|e| walk_read(e)).count()
 }
 
+/// The explain of the view: a read naming it, always reported, with no
+/// row count.
+fn view_read(e: &MaskedEvent) -> bool {
+    e.principal().account_name() == EX_USER
+        && e.action() == EventAction::Read
+        && e.always_report()
+        && e.rows().is_none()
+        && e.objects()
+            .iter()
+            .any(|o| o.database().as_str() == EX_DB && o.object().as_str() == "v")
+}
+
+/// Every explain of the traffic is seen: the walk, the literal shape on
+/// the table, and the view.
+fn ex_done(ev: &[MaskedEvent]) -> bool {
+    walk_reads(ev) > WALK as usize && ev.iter().any(view_read)
+}
+
 /// Checks the events and logs of one source: one read per explain of the
 /// walk, no other event from the explaining account but connections, no
 /// event naming the agent's probe tables, and no seeded value anywhere.
 fn ex_check(label: &str, ev: &[MaskedEvent], logs: &Logs) {
     let all: Vec<String> = ev.iter().map(describe).collect();
     eprintln!("{label} events ({}):\n{}", all.len(), all.join("\n"));
-    assert_eq!(walk_reads(ev), WALK as usize, "{label}: {all:#?}");
+    // The walk and the literal shape on the table.
+    assert_eq!(walk_reads(ev), WALK as usize + 1, "{label}: {all:#?}");
+    assert_eq!(
+        ev.iter().filter(|e| view_read(e)).count(),
+        1,
+        "{label}: {all:#?}"
+    );
     assert!(
         ev.iter()
             .filter(|e| e.principal().account_name() == EX_USER)
-            .all(|e| walk_read(e) || e.action() == EventAction::Connect),
+            .all(|e| walk_read(e) || view_read(e) || e.action() == EventAction::Connect),
         "{label}: DESCRIBE, SHOW WARNINGS or the probe shape gave an event: {all:#?}"
     );
     // The agent's readability probes (`check()`): no event, from any
@@ -179,10 +213,7 @@ async fn explains_are_reads_on_performance_schema() {
         }
         let held = ex_traffic(&server).await;
         let mut ev: Vec<MaskedEvent> = Vec::new();
-        collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            walk_reads(e) >= WALK as usize
-        })
-        .await;
+        collect_until(&mut rx, &mut ev, Duration::from_secs(30), ex_done).await;
         for _ in 0..2 {
             assert!(connector.check(&t).await.reachable, "{}", server.name);
         }
@@ -239,10 +270,7 @@ async fn explains_are_reads_on_audit_logs() {
         }
         let held = ex_traffic(&server).await;
         let mut ev: Vec<MaskedEvent> = Vec::new();
-        collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            walk_reads(e) >= WALK as usize
-        })
-        .await;
+        collect_until(&mut rx, &mut ev, Duration::from_secs(30), ex_done).await;
         // The probe shape's records are grouped until the connection's
         // next record: its disconnection.
         drop(held);
