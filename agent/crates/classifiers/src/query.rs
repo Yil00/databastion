@@ -1198,6 +1198,7 @@ pub struct QueryAnalysis {
     file_read: bool,
     non_ascii_call: bool,
     unknown_call: bool,
+    create_unread: bool,
 }
 
 impl QueryAnalysis {
@@ -1215,7 +1216,18 @@ impl QueryAnalysis {
             file_read: false,
             non_ascii_call: false,
             unknown_call: false,
+            create_unread: false,
         }
+    }
+
+    /// MySQL: a text that did not lex unambiguously ([`Self::lexed`] is
+    /// `false`) one of whose readings is a `CREATE … AS <query>`
+    /// ([`StatementInfo::create_query`]), such as `CREATE /*!99999
+    /// TEMPORARY*/ TABLE t AS SELECT …`: the relations it reads cannot be
+    /// told (callers add `*`).
+    #[must_use]
+    pub fn create_unread(&self) -> bool {
+        self.create_unread
     }
 
     /// MySQL: the text calls an unqualified name that is not a built-in
@@ -1489,6 +1501,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         file_read: false,
         non_ascii_call: false,
         unknown_call: false,
+        create_unread: false,
     }
 }
 
@@ -1586,7 +1599,13 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                     },
                 )
             });
-            return my_unparsed(text, kind, opts);
+            let mut a = my_unparsed(text, kind, opts);
+            a.create_unread = readings.iter().flatten().any(|r| {
+                split_statements(&r.toks)
+                    .iter()
+                    .any(|s| create_query(my_set_statement_body(s).unwrap_or(s)).is_some())
+            });
+            return a;
         }
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
@@ -1658,6 +1677,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         file_read: false,
         non_ascii_call: false,
         unknown_call: false,
+        create_unread: false,
     }
 }
 
@@ -3193,7 +3213,12 @@ fn query_starts_at(s: &[Tok], i: usize) -> bool {
     }
     match word(s.get(k)) {
         Some("select" | "table" | "values") => true,
-        Some("with") => word(s.get(k + 1)) != Some("system"),
+        // A common table expression may be named `system`: only MariaDB's
+        // `WITH SYSTEM VERSIONING` table option is not a query (security
+        // review of #196, L2).
+        Some("with") => {
+            !(word(s.get(k + 1)) == Some("system") && word(s.get(k + 2)) == Some("versioning"))
+        }
         _ => false,
     }
 }
@@ -6139,6 +6164,26 @@ mod tests {
                 &["db.t"],
             ),
             (
+                "CREATE TABLE copy AS WITH system AS (SELECT a FROM db.t) SELECT * FROM system",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS ( WITH system AS (SELECT a FROM db.t) SELECT * FROM system )",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy WITH system (x) AS (SELECT a FROM db.t) SELECT * FROM system",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE VIEW v AS WITH system AS (TABLE db.t) SELECT * FROM system",
+                "v",
+                &["db.t"],
+            ),
+            (
                 "CREATE TABLE copy AS SELECT sql_text FROM performance_schema.events_statements_history_long",
                 "copy",
                 &["performance_schema.events_statements_history_long"],
@@ -6193,6 +6238,16 @@ mod tests {
             assert_eq!(target(&p).as_deref(), Some(t), "{q}");
             assert_eq!(rels_of(&p), sources, "{q}");
         }
+        // A version comment a server may skip: readings that differ, one
+        // of them a `CREATE … AS <query>` (security review of #196, L2).
+        for q in [
+            "CREATE /*!99999 TEMPORARY*/ TABLE copy AS SELECT a FROM db.t",
+            "CREATE /*M!100000 OR REPLACE */ TABLE copy SELECT a FROM db.t",
+        ] {
+            let a = my(q);
+            assert!(!a.lexed() && a.create_unread(), "{q}");
+        }
+        assert!(!my("CREATE /*!99999 TEMPORARY*/ TABLE copy (a INT)").create_unread());
         for q in [
             "CREATE TABLE copy LIKE db.t",
             "CREATE TABLE copy (LIKE db.t)",

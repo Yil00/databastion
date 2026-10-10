@@ -7,10 +7,11 @@
 //! A second account walks a table with `SELECT email INTO @v FROM t WHERE
 //! id = n` (classic and trailing `INTO`) and `SET @x = (SELECT …)`: each
 //! is a read event naming the table, always reported (never dropped by
-//! `min_rows`) and with no row count (`ROWS_SENT` is 0 on
-//! `performance_schema`). Its `CREATE TABLE copy AS SELECT * FROM t` and
-//! `CREATE VIEW v AS SELECT … FROM t` name `t`, always reported. No seeded
-//! value reaches an event or a log.
+//! `min_rows`), with the one row the servers count as sent for `INTO`
+//! (`ROWS_SENT` 1 on MySQL 8.4.11 and MariaDB 11.4.13) or, for the `SET`,
+//! no row count. Its `CREATE TABLE copy AS SELECT * FROM t` and `CREATE
+//! VIEW v AS SELECT … FROM t` name `t`, always reported. No seeded value
+//! reaches an event or a log.
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -104,12 +105,14 @@ fn names(e: &MaskedEvent, table: &str) -> bool {
 
 /// A stored read: a read of the table (and possibly `*`, for a `SET`
 /// that `server_audit` with `QUERY_DML` shows by its table records only),
-/// always reported, with no row count and no signal.
+/// always reported, with no signal, and no row count when it sent no row.
+/// MySQL 8.4 `performance_schema` counts the row of a `SELECT … INTO @v`
+/// as sent (`ROWS_SENT` 1); a `SET` sends none.
 fn stored_read(e: &MaskedEvent) -> bool {
     e.principal().account_name() == ST_USER
         && e.action() == EventAction::Read
         && e.always_report()
-        && e.rows().is_none()
+        && e.rows().is_none_or(|r| r == 1)
         && e.signals().is_empty()
         && names(e, "customers")
         && e.objects()

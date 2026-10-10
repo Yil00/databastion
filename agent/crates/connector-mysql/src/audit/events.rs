@@ -1487,10 +1487,11 @@ impl EventBuilder {
         // client (#195 review M2): `SELECT … INTO @v` (or `INTO` local
         // variables), an `@v := …` assignment in any expression, and a
         // `SET` or `DO` that reads tables through a subquery (`SET @v =
-        // (SELECT … FROM t WHERE …)`). Their row count says nothing of
-        // what was read (`ROWS_SENT` is 0 on `performance_schema`, the
-        // file sources have none), so a `min_rows` setting would drop a
-        // key walk: always reported, with no row count on a read, and
+        // (SELECT … FROM t WHERE …)`). The file sources have no row
+        // count and `performance_schema` counts at most the one row of an
+        // `INTO` (`ROWS_SENT` 1 on MySQL 8.4.11 and MariaDB 11.4.13, 0 for
+        // a `SET` or `DO`), so a `min_rows` setting would drop a key walk:
+        // always reported, with no row count on a read that sent none, and
         // never the agent's own (it sends none of them).
         let stored = parts.iter().any(|p| {
             p.into_var
@@ -1678,6 +1679,29 @@ impl EventBuilder {
                     .iter()
                     .any(|p| p.create_query && (p.relations_full || p.create_target.is_none()));
         }
+        // A text whose readings differ, one of them a `CREATE … AS
+        // <query>` (`CREATE /*!99999 TEMPORARY*/ TABLE t AS SELECT …`): what
+        // it reads cannot be told, so it adds `*` (security review of #196,
+        // L2).
+        let create_unread = action == EventAction::Ddl
+            && analysis
+                .iter()
+                .chain(&alt_analysis)
+                .any(QueryAnalysis::create_unread);
+        if create_unread {
+            unknown = true;
+        }
+        // A failed statement that is still reported (not refused before
+        // reading anything, above) and sent no row: its error or warning
+        // text can carry the values it read (`EXTRACTVALUE(1, CONCAT(0x7e,
+        // (SELECT email …)))`, error 1105; a JSON error, 3141), which a row
+        // count of 0 would let `min_rows` drop (security review of #196,
+        // L3). Reads, and writes holding a subquery (a duplicate key on a
+        // plain `INSERT` stays under the filter).
+        let failed_unsent = a.status != 0
+            && a.rows.unwrap_or(0) == 0
+            && (action == EventAction::Read
+                || (action == EventAction::Write && parts.iter().any(|p| p.subquery)));
         if processlist && rw {
             let o = ("information_schema".to_owned(), "PROCESSLIST".to_owned());
             if !objects.contains(&o) {
@@ -1710,8 +1734,13 @@ impl EventBuilder {
         // same const values (security review of #195, M2).
         // Writes run by `EXPLAIN ANALYZE` / `ANALYZE` keep their affected
         // rows (security review of #195, L3).
-        // A read stored into variables sends no row (above).
-        let rows = if explain || ((analyze_wrapped || stored) && action == EventAction::Read) {
+        // A read stored into variables that sent no row (above) has no
+        // count; one that sent rows (a `SELECT *, @x := 1` dump, a text
+        // with a `SET` after its read) keeps them, and `volume.*` with
+        // them (security review of #196, H1).
+        let stored_unsent = stored && a.rows.unwrap_or(0) == 0;
+        let rows = if explain || ((analyze_wrapped || stored_unsent) && action == EventAction::Read)
+        {
             None
         } else {
             a.rows
@@ -1766,6 +1795,8 @@ impl EventBuilder {
             || analyze_wrapped
             || stored
             || create
+            || create_unread
+            || failed_unsent
         {
             e = e.with_always_report();
         }
@@ -3059,6 +3090,59 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(ev.unwrap().rows(), Some(99));
+    }
+
+    /// Security review of #196, L3: a reported failed read that sent no
+    /// row may carry values in its error or warning text: always reported.
+    #[test]
+    fn failed_reads_that_sent_no_row_are_always_reported() {
+        let run = |text: &str, status: u32, rows: Option<u64>| {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            access.status = status;
+            access.rows = rows;
+            b.statement(access, SystemTime::now())
+        };
+        for (text, status) in [
+            (
+                "SELECT EXTRACTVALUE(1, CONCAT(0x7e, (SELECT email FROM hr.customers WHERE id = 1)))",
+                1105,
+            ),
+            (
+                "SELECT JSON_EXTRACT((SELECT email FROM hr.customers WHERE id = 1), '$')",
+                3141,
+            ),
+            ("SELECT email FROM hr.customers WHERE id > 0", 3024),
+            (
+                "INSERT INTO hr.t SELECT EXTRACTVALUE(1, CONCAT(0x7e, (SELECT email FROM hr.customers WHERE id = 1)))",
+                1105,
+            ),
+        ] {
+            for rows in [Some(0), None] {
+                let e = run(text, status, rows).expect(text);
+                assert!(e.always_report(), "{rows:?}: {text}");
+                assert!(
+                    e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "customers"),
+                    "{text}"
+                );
+            }
+        }
+        // Rows sent before the error, a success, or a plain write that
+        // failed (duplicate key): the filter applies as before.
+        for (text, status, rows) in [
+            ("SELECT email FROM hr.customers WHERE id > 0", 3024, Some(5)),
+            ("SELECT email FROM hr.customers WHERE id = 1", 0, Some(0)),
+            ("INSERT INTO hr.customers VALUES (1, 'x')", 1062, Some(0)),
+        ] {
+            let e = run(text, status, rows).expect(text);
+            assert!(!e.always_report(), "{text}");
+        }
+        // Refused before reading anything: no event, as before.
+        assert!(run("SELECT email FROM hr.customers", 1142, Some(0)).is_none());
     }
 
     #[test]
@@ -5435,8 +5519,9 @@ mod tests {
 
     /// #195 review M2: a read whose values go into session variables
     /// (`SELECT … INTO @v`, `@v := …`, `SET` / `DO` with a subquery) is
-    /// always reported, with no row count (`ROWS_SENT` is 0 on
-    /// `performance_schema`), never the agent's own, on every source.
+    /// always reported, never the agent's own, on every source; with no row
+    /// count when it sent none (`ROWS_SENT` 0 for a `SET`; 1 for an `INTO`
+    /// on MySQL 8.4.11 and MariaDB 11.4.13, kept).
     #[test]
     fn reads_stored_into_variables_are_always_reported() {
         let cust = "read [\"hr.customers\"] always";
@@ -5460,13 +5545,15 @@ mod tests {
             "DO (SELECT email FROM hr.customers WHERE id = 42)",
         ] {
             expect_everywhere(text, |_| cust.to_owned());
-            // `performance_schema`: `ROWS_SENT` 0, with or without an
-            // account; never a row count.
+            // `performance_schema`, with or without an account: no row
+            // count when none was sent, the count otherwise.
             for user in [Some("app"), Some("databastion"), None] {
-                let mut b = EventBuilder::new(own());
-                let e = pfs_record(&mut b, user, text, false, 0).expect(text);
-                assert_eq!(shown(&e), cust, "{user:?}: {text}");
-                assert_eq!(e.rows(), None, "{user:?}: {text}");
+                for (sent, rows) in [(0, None), (1, Some(1))] {
+                    let mut b = EventBuilder::new(own());
+                    let e = pfs_record(&mut b, user, text, false, sent).expect(text);
+                    assert_eq!(shown(&e), cust, "{user:?}: {text}");
+                    assert_eq!(e.rows(), rows, "{user:?}: {text}");
+                }
             }
         }
         // Digests, alone (the session ended) or next to the text.
@@ -5531,6 +5618,31 @@ mod tests {
                 &[],
             ) {
                 assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust), "{source:?}");
+            }
+        }
+        // A stored read that sent rows keeps them, and `volume.*` with
+        // them: an assignment or a trailing `SET` does not hide a dump
+        // (security review of #196, H1).
+        for text in [
+            "SELECT *, @x := 1 FROM hr.customers",
+            "SELECT * FROM hr.customers WHERE id > 0 AND (@x := 1)",
+            "SELECT * FROM hr.customers; SET @y = (SELECT 1)",
+            "SELECT * FROM hr.customers; SET @y = (SELECT email FROM hr.customers WHERE id = 1)",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, text, false, 500_000).expect(text);
+                assert_eq!(e.rows(), Some(500_000), "{user:?}: {text}");
+                assert!(
+                    e.signals().contains(&Signal::LargeResult) && e.always_report(),
+                    "{user:?}: {text}"
+                );
+                assert!(
+                    e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "customers"),
+                    "{user:?}: {text}"
+                );
             }
         }
         // Unchanged: a read sent to the client keeps its rows and the
@@ -5653,6 +5765,17 @@ mod tests {
                 "*.*" => "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always".to_owned(),
                 st => format!("ddl [\"hr.copy\", \"hr.customers\", {st:?}] always"),
             },
+        );
+        // A `WITH` named `system` is a query (security review of #196,
+        // L2).
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS ( WITH system AS (SELECT email FROM hr.customers) SELECT * FROM system )",
+            |_| copy.to_owned(),
+        );
+        // Readings that differ, one a `CREATE … AS SELECT`: `*`.
+        expect_everywhere(
+            "CREATE /*!99999 TEMPORARY*/ TABLE hr.copy AS SELECT * FROM hr.customers",
+            |s| format!("ddl [{:?}] always", star(s)),
         );
         // Other DDL still takes no name from the text (ADR-0023 decision
         // 7).

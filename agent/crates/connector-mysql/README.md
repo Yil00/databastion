@@ -199,7 +199,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   event names the created table or view and the sources of the query, as
   an `INSERT … SELECT` write names its target and sources. A read whose
   values go into variables (`SELECT … INTO @v`, `@v := …`, `SET` / `DO`
-  with a subquery) is always reported, with no row count, and never the
+  with a subquery) is always reported (with no row count when it sent no
+  row) and never the
   agent's own (docs/08). An unqualified name is in the statement's
   current database. A name holding
   a dot is sent as `*` (as in Discovery). A text that does not lex (cut at
