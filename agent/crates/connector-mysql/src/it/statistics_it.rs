@@ -88,6 +88,17 @@ async fn st_fixture(a: &mut Session, flavor: Flavor) {
                 &format!("GRANT SELECT ON mysql.column_stats TO '{ST_USER}'@'%'"),
             )
             .await;
+            // A view over the statistics (security review of #199, H2):
+            // `server_audit` logs its `column_stats` record without the
+            // `table_stats` record of a statistics load.
+            exec(
+                a,
+                &format!(
+                    "CREATE VIEW {ST_DB}.v_stats AS SELECT column_name, min_value \
+                     FROM mysql.column_stats WHERE db_name = '{ST_DB}'"
+                ),
+            )
+            .await;
             (
                 format!("ANALYZE TABLE {ST_DB}.customers PERSISTENT FOR ALL"),
                 format!("SELECT COUNT(*) FROM mysql.column_stats WHERE db_name = '{ST_DB}'"),
@@ -165,6 +176,9 @@ async fn st_traffic(server: &Server, admin: &mut Session) -> Held {
         )
         .await
         .unwrap();
+        s.query(Stage::Check, &format!("SELECT * FROM {ST_DB}.v_stats"))
+            .await
+            .unwrap();
     }
     Held {
         _dir: dir,
@@ -193,16 +207,32 @@ fn plain_read(e: &MaskedEvent) -> bool {
             .any(|o| o.database().as_str() == ST_DB && o.object().as_str() == "customers")
 }
 
+/// The reader's read of the view over the statistics (MariaDB).
+fn view_read(e: &MaskedEvent) -> bool {
+    e.principal().account_name() == ST_USER
+        && e.action() == EventAction::Read
+        && e.objects()
+            .iter()
+            .any(|o| o.database().as_str() == ST_DB && o.object().as_str() == "v_stats")
+}
+
 fn names_statistics(e: &MaskedEvent) -> bool {
     e.objects()
         .iter()
         .any(|o| statistics_table(o.database().as_str(), o.object().as_str()).is_some())
 }
 
-fn st_done(flavor: Flavor) -> impl Fn(&[MaskedEvent]) -> bool {
+/// Every read of the traffic is seen. With MariaDB `server_audit` table
+/// records (`records`), the read of the view over the statistics names the
+/// table the view reads (`mysql.column_stats`; the server writes no record
+/// of the view), always reported: one statistics read more (security
+/// review of #199, H2). Without records it names the view.
+fn st_done(flavor: Flavor, records: bool) -> impl Fn(&[MaskedEvent]) -> bool {
     move |ev: &[MaskedEvent]| {
-        ev.iter().filter(|e| stats_read(e, flavor)).count() >= st_reads(flavor).len()
-            && (flavor == Flavor::Mysql || ev.iter().any(plain_read))
+        let reads = st_reads(flavor).len() + usize::from(records);
+        ev.iter().filter(|e| stats_read(e, flavor)).count() >= reads
+            && (flavor == Flavor::Mysql
+                || (ev.iter().any(plain_read) && (records || ev.iter().any(view_read))))
     }
 }
 
@@ -215,7 +245,8 @@ fn st_done(flavor: Flavor) -> impl Fn(&[MaskedEvent]) -> bool {
 fn st_check(label: &str, flavor: Flavor, admin: &str, ev: &[MaskedEvent], logs: &Logs) {
     let all: Vec<String> = ev.iter().map(describe).collect();
     eprintln!("{label} events ({}):\n{}", all.len(), all.join("\n"));
-    assert!(st_done(flavor)(ev), "{label}: {all:#?}");
+    let records = label.contains("server_audit");
+    assert!(st_done(flavor, records)(ev), "{label}: {all:#?}");
     assert!(
         ev.iter()
             .filter(|e| names_statistics(e) && e.principal().account_name() != admin)
@@ -283,7 +314,13 @@ async fn statistics_reads_on_performance_schema() {
         }
         let held = st_traffic(&server, &mut a).await;
         let mut ev: Vec<MaskedEvent> = Vec::new();
-        collect_until(&mut rx, &mut ev, Duration::from_secs(30), st_done(flavor)).await;
+        collect_until(
+            &mut rx,
+            &mut ev,
+            Duration::from_secs(30),
+            st_done(flavor, false),
+        )
+        .await;
         for _ in 0..2 {
             assert!(connector.check(&t).await.reachable, "{}", server.name);
         }
@@ -348,7 +385,13 @@ async fn statistics_reads_on_audit_logs() {
         }
         let held = st_traffic(&server, &mut a).await;
         let mut ev: Vec<MaskedEvent> = Vec::new();
-        collect_until(&mut rx, &mut ev, Duration::from_secs(30), st_done(flavor)).await;
+        collect_until(
+            &mut rx,
+            &mut ev,
+            Duration::from_secs(30),
+            st_done(flavor, format == "server_audit"),
+        )
+        .await;
         // Records are grouped until the connection's next record: its
         // disconnection.
         drop(held);

@@ -106,11 +106,13 @@ load otherwise), so a server-wide load is the normal case.
   pgaudit relation record in `pg_catalog`, or by the text qualified with
   `pg_catalog` or unqualified, they are objects named
   `pg_catalog.<name>`, always reported and never the agent's own (it
-  sends no statement naming them: `sql.rs` unit test). With a relation
-  record and `pgaudit.log_catalog` not proven on, the text's statistics
-  relations are added to read events too. A text that decides and
-  reaches the analyzer's 16-relation bound adds `*`, always reported,
-  never the agent's own. `check()` says `pgaudit.log_catalog = off` in
+  sends no statement naming them: `sql.rs` unit test). With relation
+  records, the text's statistics relations are added to the events of
+  every action class too, unless a record names the unqualified name in
+  another schema (shadowing). `U&"…"` names are compared decoded. A text
+  that decides and reaches the analyzer's 16-relation bound adds `*`,
+  always reported, never the agent's own, even when every kept relation
+  is a catalog. Every read or write against `*` is always reported. `check()` says `pgaudit.log_catalog = off` in
   its local detail when pgaudit is the source. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-catalogs).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a

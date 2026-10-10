@@ -314,19 +314,6 @@ fn user_relations(parts: &[&StatementInfo], rule: CatalogRule<'_>) -> (Vec<Relat
     (out, any)
 }
 
-/// The statistics relations named by `parts` (ADR-0048 decision 2).
-fn statistics_relations(parts: &[&StatementInfo]) -> Vec<RelationName> {
-    let mut out = Vec::new();
-    for r in parts.iter().flat_map(|p| &p.relations) {
-        if let Some(s) = statistics_relation(r)
-            && !out.contains(&s)
-        {
-            out.push(s);
-        }
-    }
-    out
-}
-
 /// Signals of statements from their analysis (not the session pattern).
 fn statement_signals(
     parts: &[&StatementInfo],
@@ -769,12 +756,18 @@ impl PgauditEvents {
         // the first text of each substatement (`log_statement_once`: later
         // records carry `<previously logged>`).
         let mut confirmed: HashSet<String> = HashSet::new();
+        // Names pgaudit reports in another schema than `pg_catalog`: an
+        // unqualified statistics name of the text shadowed by one of them
+        // is that relation, not the catalog's.
+        let mut shadowing: HashSet<String> = HashSet::new();
         let mut first_texts: HashMap<u64, &str> = HashMap::new();
         for r in &group {
-            if let Some(rel) = split_object_name(&r.audit.object_name)
-                && rel.schema.as_deref() == Some("pg_catalog")
-            {
-                confirmed.insert(rel.name);
+            if let Some(rel) = split_object_name(&r.audit.object_name) {
+                if rel.schema.as_deref() == Some("pg_catalog") {
+                    confirmed.insert(rel.name);
+                } else if rel.schema.is_some() {
+                    shadowing.insert(rel.name);
+                }
             }
             let text: &str = &r.audit.statement;
             if text != PREVIOUSLY_LOGGED {
@@ -857,12 +850,22 @@ impl PgauditEvents {
                 part.unknown = true;
             }
             if named {
-                // The statistics relations the text reads, which relation
+                // The statistics relations the text names, which relation
                 // records leave out with `pgaudit.log_catalog = off`
-                // (ADR-0048 decision 5). Unqualified names are over-reported
-                // when a relation of the search path shadows them.
-                if action == EventAction::Read && log_catalog != Some(true) {
-                    for s in statistics_relations(&stmts) {
+                // (ADR-0048 decision 5), in every action class (`INSERT …
+                // SELECT … FROM pg_stats`, `CREATE TABLE … AS`: security
+                // review of #199, M1), whatever `log_catalog` says (L1).
+                // An unqualified name is skipped only when a record of the
+                // statement names that relation in another schema (a
+                // shadowing relation of the search path).
+                for p in &stmts {
+                    for r in &p.relations {
+                        let Some(s) = statistics_relation(r) else {
+                            continue;
+                        };
+                        if r.schema.is_none() && shadowing.contains(&r.name) {
+                            continue;
+                        }
                         if !part.objects.contains(&s) {
                             part.objects.push(s);
                         }
@@ -929,10 +932,13 @@ impl PgauditEvents {
             let mut objects: Vec<&RelationName> = part.objects.iter().collect();
             objects.sort_by_key(|o| !is_statistics(o));
             let statistics = objects.first().is_some_and(|o| is_statistics(o)) || part.bound;
-            if statistics {
+            let unknown = rw && (part.objects.is_empty() || part.unknown);
+            // Reads and writes of unknown objects (`*`) are always reported
+            // too: they never match `sensitive_objects` and their row count
+            // says nothing of what they read (security review of #199, M2).
+            if statistics || unknown {
                 e = e.with_always_report();
             }
-            let unknown = rw && (part.objects.is_empty() || part.unknown);
             for o in objects.into_iter().take(if unknown { 15 } else { 16 }) {
                 e = e.with_object(object(&first.database, o));
             }
@@ -1139,7 +1145,13 @@ fn pss_event(
     };
     let (objects, named_any) = user_relations(&all, rule);
     let rw = matches!(action, EventAction::Read | EventAction::Write);
-    if rw && objects.is_empty() && named_any {
+    // A text at the analyzer's relation bound may name a statistics
+    // relation that was not kept (after 16 catalogs, say): `*`, always
+    // reported, never the agent's own (as ADR-0045 decision 4 on MySQL /
+    // MariaDB). Decided before the catalog-only skip (security review of
+    // #199, H1).
+    let bound = rw && all.iter().any(|p| p.relations_full);
+    if rw && objects.is_empty() && named_any && !bound {
         return None;
     }
     // COPY counts rows in pg_stat_statements too.
@@ -1156,12 +1168,11 @@ fn pss_event(
     // (ADR-0048 decision 3).
     let mut named: Vec<&RelationName> = objects.iter().collect();
     named.sort_by_key(|o| !is_statistics(o));
-    // A text at the analyzer's relation bound may name a statistics
-    // relation that was not kept: `*`, always reported, never the agent's
-    // own (as ADR-0045 decision 4 on MySQL / MariaDB).
-    let bound = rw && all.iter().any(|p| p.relations_full);
     let statistics = named.first().is_some_and(|o| is_statistics(o)) || bound;
-    if statistics {
+    // A read or write of unknown objects (`*`) has no useful row count for
+    // `min_rows` and never matches `sensitive_objects`: always reported,
+    // as on MySQL / MariaDB (security review of #199, M2).
+    if statistics || (rw && objects.is_empty()) {
         e = e.with_always_report();
     }
     for o in named.into_iter().take(if bound { 15 } else { 16 }) {
@@ -3067,27 +3078,76 @@ mod tests {
                 assert_eq!(objects_of(&ev[0]), want_objects(name, true), "{app}");
             }
         }
-        // A write statement reading statistics: the read event names them,
-        // the write event does not.
-        let text = "insert into crm.copy select * from pg_stats";
-        let mut b = PgauditEvents::new(own());
-        b.set_catalogs(shop_catalogs(Some(false)));
-        let ev = b.convert(
-            vec![rec(
-                "w1",
-                1,
-                1,
+        // Statements copying statistics (security review of #199, M1): with
+        // relation records naming only the target (`log_catalog` off or
+        // unknown), every action class names the statistics relations of
+        // its text, always reported.
+        for (class, command, object, text, action) in [
+            (
                 "WRITE",
                 "INSERT",
                 "crm.copy",
-                text,
+                "insert into crm.copy select * from pg_stats",
+                EventAction::Write,
+            ),
+            (
+                "DDL",
+                "CREATE TABLE AS",
+                "crm.x",
+                "create table crm.x as select * from pg_catalog.pg_stats",
+                EventAction::Ddl,
+            ),
+        ] {
+            for log_catalog in [Some(false), None, Some(true)] {
+                let mut b = PgauditEvents::new(own());
+                b.set_catalogs(shop_catalogs(log_catalog));
+                let ev = b.convert(
+                    vec![rec(
+                        "w1",
+                        1,
+                        1,
+                        class,
+                        command,
+                        object,
+                        text,
+                        Some(1),
+                        "psql",
+                    )],
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{text}");
+                assert_eq!(ev[0].action(), action);
+                assert!(ev[0].always_report(), "{text}");
+                let mut want = vec![
+                    "shop.pg_catalog.pg_stats".to_owned(),
+                    format!("shop.{object}"),
+                ];
+                want.sort();
+                assert_eq!(objects_of(&ev[0]), want, "{log_catalog:?}: {text}");
+            }
+        }
+        // `log_catalog = on` with a record naming only the application
+        // table (a pgaudit that would not name catalog relations): the
+        // text's statistics relations are still named (security review of
+        // #199, L1).
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let ev = b.convert(
+            vec![rec(
+                "w2",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "crm.customer",
+                "select * from crm.customer, pg_stats",
                 Some(1),
                 "psql",
             )],
             SystemTime::now(),
         );
-        assert_eq!(ev.len(), 1);
-        assert_eq!(objects_of(&ev[0]), ["shop.crm.copy"]);
+        assert_eq!(objects_of(&ev[0]), want_objects("pg_stats", true));
+        assert!(ev[0].always_report());
     }
 
     /// ADR-0048 decision 1: look-alikes are not statistics relations, and
@@ -3111,20 +3171,13 @@ mod tests {
             assert!(!ev[0].always_report(), "{text}");
             assert_eq!(objects_of(&ev[0]), [object], "{text}");
         }
-        // `public.pg_stats` named by a relation record, with `log_catalog
-        // = on` (records name every `pg_catalog` relation): itself only.
-        // Otherwise the unqualified text name is over-reported as the
-        // statistics relation (ADR-0048 decision 2), never missed.
+        // `public.pg_stats` named by a relation record: the unqualified
+        // text name is that relation (it shadows the catalog's), whatever
+        // `log_catalog` says.
         for (log_catalog, want) in [
             (Some(true), vec!["shop.public.pg_stats"]),
-            (
-                Some(false),
-                vec!["shop.pg_catalog.pg_stats", "shop.public.pg_stats"],
-            ),
-            (
-                None,
-                vec!["shop.pg_catalog.pg_stats", "shop.public.pg_stats"],
-            ),
+            (Some(false), vec!["shop.public.pg_stats"]),
+            (None, vec!["shop.public.pg_stats"]),
         ] {
             let mut b = PgauditEvents::new(own());
             b.set_catalogs(shop_catalogs(log_catalog));
@@ -3143,7 +3196,7 @@ mod tests {
                 SystemTime::now(),
             );
             assert_eq!(objects_of(&ev[0]), want, "{log_catalog:?}");
-            assert_eq!(ev[0].always_report(), want.len() == 2, "{log_catalog:?}");
+            assert!(!ev[0].always_report(), "{log_catalog:?}");
         }
         // Dictionary reads and the counter views: quiet.
         for text in [
@@ -3293,6 +3346,65 @@ mod tests {
                 }
             }
         }
+        // Sixteen catalogs, then a statistics relation (security review of
+        // #199, H1): the catalog-only skip must not hide it.
+        let catalogs = [
+            "pg_class",
+            "pg_attribute",
+            "pg_namespace",
+            "pg_type",
+            "pg_proc",
+            "pg_index",
+            "pg_constraint",
+            "pg_database",
+            "pg_roles",
+            "pg_tables",
+            "pg_views",
+            "pg_am",
+            "pg_opclass",
+            "pg_operator",
+            "pg_language",
+            "pg_depend",
+        ];
+        for prefix in ["", "pg_catalog."] {
+            let names: Vec<String> = catalogs.iter().map(|c| format!("{prefix}{c}")).collect();
+            let text = format!("select * from {}, {prefix}pg_stats", names.join(", "));
+            for user in ["app", "databastion"] {
+                let usage = SharedOwnUsage::default();
+                let a = analyze_pss(&text, false);
+                let deltas = [StatementDelta {
+                    own_text: false,
+                    user,
+                    database: "shop",
+                    analysis: &a,
+                    calls: 1,
+                    rows: 1,
+                }];
+                let t0 = SystemTime::UNIX_EPOCH;
+                let ev = pss_events(
+                    &deltas,
+                    &mut own_with(None, 1000, usage.clone()),
+                    &shop_catalogs(None),
+                    t0,
+                    t0,
+                );
+                assert_eq!(ev.len(), 1, "{user}: {text}");
+                assert!(ev[0].always_report());
+                assert_eq!(objects_of(&ev[0]), ["shop..*"], "{text}");
+                assert!(charged_keys(&usage).is_empty());
+            }
+            for app in ["psql", crate::conn::APPLICATION_NAME] {
+                let mut b = PgauditEvents::new(own());
+                b.set_catalogs(shop_catalogs(Some(true)));
+                let ev = b.convert(
+                    vec![rec("b2", 1, 1, "READ", "SELECT", "", &text, Some(1), app)],
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{app}: {text}");
+                assert!(ev[0].always_report());
+                assert_eq!(objects_of(&ev[0]), ["shop..*"], "{text}");
+            }
+        }
         // Below the bound: no `*`.
         let a = analyze_pss("select * from crm.a, crm.b, pg_stats", false);
         let deltas = [StatementDelta {
@@ -3306,5 +3418,62 @@ mod tests {
         let t0 = SystemTime::UNIX_EPOCH;
         let ev = pss_events(&deltas, &mut own(), &shop_catalogs(None), t0, t0);
         assert!(!objects_of(&ev[0]).iter().any(|o| o.ends_with('*')));
+    }
+
+    /// Security review of #199, M2: a `U&"…"` name is compared decoded, and
+    /// a read of unknown objects (`*`, a function that runs SQL) is always
+    /// reported on both sources, never dropped by `min_rows`.
+    #[test]
+    fn unicode_names_and_unknown_objects() {
+        for text in [
+            r#"select * from U&"\0070g_stats""#,
+            r#"select * from pg_catalog.U&"pg_st!0061ts" UESCAPE '!'"#,
+        ] {
+            let a = analyze_pss(text, false);
+            let deltas = [StatementDelta {
+                own_text: false,
+                user: "app",
+                database: "shop",
+                analysis: &a,
+                calls: 1,
+                rows: 1,
+            }];
+            let t0 = SystemTime::UNIX_EPOCH;
+            let ev = pss_events(&deltas, &mut own(), &shop_catalogs(None), t0, t0);
+            assert_eq!(objects_of(&ev[0]), ["shop.pg_catalog.pg_stats"], "{text}");
+            assert!(ev[0].always_report());
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(shop_catalogs(Some(true)));
+            let ev = b.convert(
+                vec![rec("u1", 1, 1, "READ", "SELECT", "", text, Some(1), "psql")],
+                SystemTime::now(),
+            );
+            assert_eq!(objects_of(&ev[0]), ["shop.pg_catalog.pg_stats"], "{text}");
+            assert!(ev[0].always_report());
+        }
+        let text = "select query_to_xml('select * from pg_stats', true, false, '')";
+        for user in ["app", "databastion"] {
+            let a = analyze_pss(text, false);
+            let deltas = [StatementDelta {
+                own_text: false,
+                user,
+                database: "shop",
+                analysis: &a,
+                calls: 1,
+                rows: 1,
+            }];
+            let t0 = SystemTime::UNIX_EPOCH;
+            let ev = pss_events(&deltas, &mut own(), &shop_catalogs(None), t0, t0);
+            assert_eq!(ev.len(), 1, "{user}");
+            assert_eq!(objects_of(&ev[0]), ["shop..*"]);
+            assert!(ev[0].always_report(), "{user}");
+        }
+        let mut b = PgauditEvents::new(own());
+        let ev = b.convert(
+            vec![rec("u2", 1, 1, "READ", "SELECT", "", text, Some(1), "psql")],
+            SystemTime::now(),
+        );
+        assert_eq!(objects_of(&ev[0]), ["shop..*"]);
+        assert!(ev[0].always_report());
     }
 }

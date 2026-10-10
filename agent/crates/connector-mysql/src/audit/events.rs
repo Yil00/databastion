@@ -1627,7 +1627,38 @@ impl EventBuilder {
                 unknown = true;
             }
         } else {
+            // Whether a `READ` record of `mysql.column_stats` may be a read
+            // of the statistics rather than the server's own load of them
+            // (security review of #199, H2): the text cannot be read whole
+            // or runs code out of sight (a procedure, a prepared
+            // statement, a stored function, a version comment, a cut
+            // text), it is a `HANDLER` read (whose text names an alias),
+            // or the record does not come with the `table_stats` record
+            // every statistics load writes (a view over the table). Such a
+            // record names `mysql.column_stats`, always reported and never
+            // the agent's own.
+            let loads_table_stats = a.tables.iter().any(|(db, table, op)| {
+                *op == TableOp::Read
+                    && db.eq_ignore_ascii_case("mysql")
+                    && table.eq_ignore_ascii_case("table_stats")
+            });
+            let stats_record_kept = unparsed
+                || call
+                || dquoted
+                || cut_blind
+                || !loads_table_stats
+                || parts.iter().any(|p| p.kind == StatementKind::Handler);
             for (db, table, op) in &a.tables {
+                if *op == TableOp::Read
+                    && stats_record_kept
+                    && let Some((d, t)) = statistics_table(db, table)
+                {
+                    let o = (d.to_owned(), t.to_owned());
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                    continue;
+                }
                 // System tables are skipped from reads only: a write
                 // statement names every table it touched, and a table
                 // record that writes or changes a system schema table
@@ -1683,13 +1714,15 @@ impl EventBuilder {
             }
             // A statistics table the text names (ADR-0048 decision 2):
             // its table records are not enough (the server's own loads
-            // write them, above), and `audit_log_filter` writes none for
-            // `information_schema`.
+            // write them, above), and `audit_log_filter` writes no
+            // `table_access` record for `information_schema` nor
+            // `performance_schema`, so a statement-text table the text
+            // names is added too (security review of #199, M3).
             if rw {
                 for p in parts {
                     for r in &p.relations {
                         let db = r.schema.as_deref().unwrap_or(a.database);
-                        if let Some((d, t)) = statistics_table(db, &r.name) {
+                        if let Some((d, t)) = listed_table(self.flavor, db, &r.name) {
                             let o = (d.to_owned(), t.to_owned());
                             if !objects.contains(&o) {
                                 objects.push(o);
@@ -1699,8 +1732,11 @@ impl EventBuilder {
                 }
             }
             // The table records do not name the server file `LOAD_FILE`
-            // read, nor what a cut text hid past the cut.
-            unknown = (hidden || cut_blind) && rw;
+            // read, nor what a cut text hid past the cut, nor what code
+            // out of sight read on a source that writes no record for it
+            // (`audit_log_filter` and `information_schema`; security
+            // review of #199, H2).
+            unknown = (hidden || cut_blind || call) && rw;
         }
         // `CREATE TABLE … AS <query>`, `CREATE | ALTER VIEW … AS <query>`
         // (#186 review L4): one DDL event naming the created table or view
@@ -3671,7 +3707,12 @@ mod tests {
             ],
             t1,
         );
-        assert_eq!(out, ["read [\"shop.salaries\"] None []"], "{out:#?}");
+        // A `CALL` adds `*` (security review of #199, H2).
+        assert_eq!(
+            out,
+            ["read [\"shop.*\", \"shop.salaries\"] None []"],
+            "{out:#?}"
+        );
         // A continuation that times out too is reported, and remembered
         // with every table so far.
         assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
@@ -3987,9 +4028,10 @@ mod tests {
                 1024,
             ),
         );
+        // A `CALL` adds `*` (security review of #199, H2).
         assert_eq!(
             out,
-            ["read [\"performance_schema.setup_consumers\"] None []"]
+            ["read [\"performance_schema.setup_consumers\", \"shop.*\"] None []"]
         );
         // The agent's own MariaDB sample on performance_schema: a read of
         // the sampled table, within the row budget.
@@ -7267,5 +7309,98 @@ mod tests {
         assert!(statistics_table("information_schema", "column_statistics").is_some());
         assert!(statistics_table("mysql", "column_statistics").is_none());
         assert!(statistics_table("hr", "column_stats").is_none());
+    }
+
+    /// Security review of #199, H2: a `READ,mysql,column_stats` record
+    /// with a text that cannot be read whole, that runs code out of sight,
+    /// that is a `HANDLER` read, or without the `table_stats` record of a
+    /// statistics load (a view), names `mysql.column_stats`, always
+    /// reported and never the agent's own; a `CALL` adds `*` whatever its
+    /// records, on `server_audit` and `audit_log_filter` alike.
+    #[test]
+    fn statistics_records_behind_unreadable_or_hidden_code_are_kept() {
+        let rec = |user: &str, ip: &str, q: u64, t: &str| {
+            format!("20260929 09:40:35,h,{user},{ip},30,{q},READ,mysql,{t},")
+        };
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            let all = ["table_stats", "column_stats", "index_stats"];
+            for (text, tables, star) in [
+                ("CALL hr.dump_stats()", &all[..], true),
+                ("EXECUTE s", &all[..], true),
+                ("SELECT hr.f()", &all[..], true),
+                ("/*M!100000 SELECT * FROM hr.customers */", &all[..], false),
+                ("/*!80000 SELECT * FROM hr.customers */", &all[..], false),
+                ("HANDLER h READ FIRST", &["column_stats"][..], false),
+                ("HANDLER h READ NEXT", &all[..], false),
+                ("SELECT * FROM hr.v_stats", &["column_stats"][..], false),
+            ] {
+                let mut lines: Vec<String> = tables.iter().map(|t| rec(user, ip, 7, t)).collect();
+                lines.push(sa_line(user, ip, 7, text));
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    sa_at(&lines, 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.len(),
+                    1,
+                    "{user}: {text}: {:?}",
+                    ev.iter().map(shown).collect::<Vec<_>>()
+                );
+                let e = &ev[0];
+                let names: Vec<String> = e
+                    .objects()
+                    .iter()
+                    .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    .collect();
+                assert!(e.always_report(), "{user}: {text}");
+                assert!(
+                    names.iter().any(|n| n == "mysql.column_stats"),
+                    "{user}: {text}: {names:?}"
+                );
+                if star {
+                    assert!(names.iter().any(|n| n.ends_with(".*")), "{text}: {names:?}");
+                }
+            }
+        }
+        // Percona `audit_log_filter`: a `CALL` with a `table_access`
+        // record adds `*` (the procedure may read `COLUMN_STATISTICS`,
+        // which gets no record).
+        let recs = filter_json("app", "10.0.0.5", 8, &[("hr", "customers")], "CALL hr.p()");
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].always_report());
+        assert!(
+            ev[0].objects().iter().any(|o| o.object().as_str() == "*"),
+            "{}",
+            shown(&ev[0])
+        );
+    }
+
+    /// Security review of #199, M3: on the `table_access` path, a
+    /// statement-text table the text names is named too (Percona writes no
+    /// record for `performance_schema`), always reported.
+    #[test]
+    fn statement_text_tables_named_by_the_text_with_table_records() {
+        let recs = filter_json(
+            "app",
+            "10.0.0.5",
+            9,
+            &[("hr", "customers")],
+            "SELECT c.*, t.SQL_TEXT FROM hr.customers c JOIN performance_schema.events_statements_history t ON 1 = 1",
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"performance_schema.events_statements_history\"] always"]
+        );
     }
 }
