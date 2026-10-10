@@ -88,14 +88,32 @@ async fn st_fixture(a: &mut Session, flavor: Flavor) {
                 &format!("GRANT SELECT ON mysql.column_stats TO '{ST_USER}'@'%'"),
             )
             .await;
-            // A view over the statistics (security review of #199, H2):
-            // `server_audit` logs its `column_stats` record without the
-            // `table_stats` record of a statistics load.
+            // `table_stats` holds no value; the reader reads it next to a
+            // view over the statistics (security re-review of #199, N-H1).
+            exec(
+                a,
+                &format!("GRANT SELECT ON mysql.table_stats TO '{ST_USER}'@'%'"),
+            )
+            .await;
+            // Views over the statistics (security review of #199, H2, and
+            // re-review N-H1): `server_audit` writes no record of a view,
+            // only of the tables it reads; `v_stats2` reads `table_stats`
+            // too, as a statistics load does.
             exec(
                 a,
                 &format!(
-                    "CREATE VIEW {ST_DB}.v_stats AS SELECT column_name, min_value \
+                    "CREATE OR REPLACE VIEW {ST_DB}.v_stats AS SELECT column_name, min_value \
                      FROM mysql.column_stats WHERE db_name = '{ST_DB}'"
+                ),
+            )
+            .await;
+            exec(
+                a,
+                &format!(
+                    "CREATE OR REPLACE VIEW {ST_DB}.v_stats2 AS SELECT c.column_name, c.min_value \
+                     FROM mysql.column_stats c JOIN mysql.table_stats t \
+                     ON t.db_name = c.db_name AND t.table_name = c.table_name \
+                     WHERE c.db_name = '{ST_DB}'"
                 ),
             )
             .await;
@@ -176,9 +194,13 @@ async fn st_traffic(server: &Server, admin: &mut Session) -> Held {
         )
         .await
         .unwrap();
-        s.query(Stage::Check, &format!("SELECT * FROM {ST_DB}.v_stats"))
-            .await
-            .unwrap();
+        for statement in view_reads() {
+            if statement.contains("JOIN") {
+                // A cold cache: the joined table's statistics are loaded.
+                exec(admin, "FLUSH TABLES").await;
+            }
+            s.query(Stage::Check, &statement).await.unwrap();
+        }
     }
     Held {
         _dir: dir,
@@ -207,13 +229,26 @@ fn plain_read(e: &MaskedEvent) -> bool {
             .any(|o| o.database().as_str() == ST_DB && o.object().as_str() == "customers")
 }
 
-/// The reader's read of the view over the statistics (MariaDB).
+/// The reader's reads of the views over the statistics (MariaDB): a view
+/// reading `column_stats`, one reading `table_stats` too, one with a
+/// `table_stats` subquery, one joined with a table whose statistics are
+/// loaded (security re-review of #199, N-H1).
+fn view_reads() -> Vec<String> {
+    vec![
+        format!("SELECT * FROM {ST_DB}.v_stats"),
+        format!("SELECT * FROM {ST_DB}.v_stats2"),
+        format!("SELECT * FROM {ST_DB}.v_stats WHERE EXISTS (SELECT 1 FROM mysql.table_stats)"),
+        format!("SELECT * FROM {ST_DB}.v_stats v JOIN {ST_DB}.customers c ON c.id = 1"),
+    ]
+}
+
+/// A reader's read of a view over the statistics (MariaDB).
 fn view_read(e: &MaskedEvent) -> bool {
     e.principal().account_name() == ST_USER
         && e.action() == EventAction::Read
         && e.objects()
             .iter()
-            .any(|o| o.database().as_str() == ST_DB && o.object().as_str() == "v_stats")
+            .any(|o| o.database().as_str() == ST_DB && o.object().as_str().starts_with("v_stats"))
 }
 
 fn names_statistics(e: &MaskedEvent) -> bool {
@@ -223,16 +258,25 @@ fn names_statistics(e: &MaskedEvent) -> bool {
 }
 
 /// Every read of the traffic is seen. With MariaDB `server_audit` table
-/// records (`records`), the read of the view over the statistics names the
-/// table the view reads (`mysql.column_stats`; the server writes no record
-/// of the view), always reported: one statistics read more (security
-/// review of #199, H2). Without records it names the view.
+/// records (`records`), each read of a view over the statistics names the
+/// view and the table it reads (`mysql.column_stats`; the server writes no
+/// record of the view), always reported (security review of #199, H2, and
+/// re-review N-H1). Without records it names the view.
 fn st_done(flavor: Flavor, records: bool) -> impl Fn(&[MaskedEvent]) -> bool {
     move |ev: &[MaskedEvent]| {
-        let reads = st_reads(flavor).len() + usize::from(records);
+        let views = view_reads().len();
+        let reads = st_reads(flavor).len() + if records { views } else { 0 };
         ev.iter().filter(|e| stats_read(e, flavor)).count() >= reads
             && (flavor == Flavor::Mysql
-                || (ev.iter().any(plain_read) && (records || ev.iter().any(view_read))))
+                || (ev.iter().any(|e| plain_read(e) && !view_read(e))
+                    && if records {
+                        ev.iter()
+                            .filter(|e| view_read(e) && stats_read(e, flavor))
+                            .count()
+                            >= views
+                    } else {
+                        ev.iter().any(view_read)
+                    }))
     }
 }
 
@@ -256,7 +300,7 @@ fn st_check(label: &str, flavor: Flavor, admin: &str, ev: &[MaskedEvent], logs: 
     if flavor == Flavor::Mariadb {
         assert!(
             ev.iter()
-                .filter(|e| plain_read(e))
+                .filter(|e| plain_read(e) && !view_read(e))
                 .all(|e| !names_statistics(e) && e.objects().len() == 1),
             "{label}: the statistics load named a statistics table: {all:#?}"
         );

@@ -1642,11 +1642,42 @@ impl EventBuilder {
                     && db.eq_ignore_ascii_case("mysql")
                     && table.eq_ignore_ascii_case("table_stats")
             });
+            let reads_column_stats = a.tables.iter().any(|(db, table, op)| {
+                *op == TableOp::Read && statistics_table(db, table).is_some()
+            });
+            // The relations the text names outside the server's own
+            // schemas that have no table record of their own: a view
+            // (`server_audit` writes no record for it, only for the tables
+            // it reads) or anything the source did not record. Next to a
+            // `column_stats` read record, one of them may be a view over
+            // the statistics, whatever other records come with it (a view
+            // reading `table_stats` too, a `table_stats` subquery, a
+            // statistics load of a joined table): the record is kept, and
+            // the relation named too (security re-review of #199, N-H1).
+            let mut unrecorded: Vec<(String, String)> = Vec::new();
+            if reads_column_stats {
+                for p in parts {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        if is_dual(r) || is_system_relation(r, a.database) {
+                            continue;
+                        }
+                        let recorded = a.tables.iter().any(|(d, t, _)| {
+                            d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(&r.name)
+                        });
+                        let o = (db.to_owned(), r.name.clone());
+                        if !recorded && !unrecorded.contains(&o) {
+                            unrecorded.push(o);
+                        }
+                    }
+                }
+            }
             let stats_record_kept = unparsed
                 || call
                 || dquoted
                 || cut_blind
                 || !loads_table_stats
+                || !unrecorded.is_empty()
                 || parts.iter().any(|p| p.kind == StatementKind::Handler);
             for (db, table, op) in &a.tables {
                 if *op == TableOp::Read
@@ -1681,6 +1712,11 @@ impl EventBuilder {
                     |(d, t)| (d.to_owned(), t.to_owned()),
                 );
                 if !system && !objects.contains(&o) {
+                    objects.push(o);
+                }
+            }
+            for o in unrecorded {
+                if !objects.contains(&o) {
                     objects.push(o);
                 }
             }
@@ -7381,6 +7417,101 @@ mod tests {
             ev[0].objects().iter().any(|o| o.object().as_str() == "*"),
             "{}",
             shown(&ev[0])
+        );
+    }
+
+    /// Security re-review of #199, N-H1: a view over `mysql.column_stats`
+    /// gets no `server_audit` record of its own, so a `column_stats` read
+    /// record is kept, naming it and the view, whenever the text names a
+    /// relation outside the server's schemas with no table record, whatever
+    /// `table_stats` records come with it.
+    #[test]
+    fn statistics_records_next_to_unrecorded_relations_are_kept() {
+        let rec = |user: &str, ip: &str, q: u64, db: &str, t: &str| {
+            format!("20260929 09:40:35,h,{user},{ip},30,{q},READ,{db},{t},")
+        };
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            for (text, records, want) in [
+                // (1) The view reads `column_stats` and `table_stats`.
+                (
+                    "SELECT * FROM hr.v_stats",
+                    &[("mysql", "column_stats"), ("mysql", "table_stats")][..],
+                    &["hr.v_stats", "mysql.column_stats"][..],
+                ),
+                // (2) A `table_stats` subquery next to the view.
+                (
+                    "SELECT * FROM hr.v_stats WHERE EXISTS (SELECT 1 FROM mysql.table_stats)",
+                    &[("mysql", "column_stats"), ("mysql", "table_stats")][..],
+                    &["hr.v_stats", "mysql.column_stats"][..],
+                ),
+                // (3) The view joined with a table whose statistics are
+                // loaded (a cold cache).
+                (
+                    "SELECT * FROM hr.v_stats JOIN hr.customers",
+                    &[
+                        ("hr", "customers"),
+                        ("mysql", "table_stats"),
+                        ("mysql", "column_stats"),
+                        ("mysql", "index_stats"),
+                    ][..],
+                    &["hr.customers", "hr.v_stats", "mysql.column_stats"][..],
+                ),
+            ] {
+                let mut lines: Vec<String> = records
+                    .iter()
+                    .map(|(d, t)| rec(user, ip, 11, d, t))
+                    .collect();
+                lines.push(sa_line(user, ip, 11, text));
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    sa_at(&lines, 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.len(),
+                    1,
+                    "{user}: {text}: {:?}",
+                    ev.iter().map(shown).collect::<Vec<_>>()
+                );
+                let mut names: Vec<String> = ev[0]
+                    .objects()
+                    .iter()
+                    .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    .collect();
+                names.sort();
+                assert_eq!(names, want, "{user}: {text}");
+                assert!(ev[0].always_report(), "{user}: {text}");
+            }
+        }
+        // Every relation recorded (a join with loads): the loads stay
+        // dropped.
+        let mut lines = vec![
+            rec("app", "10.0.0.5", 12, "hr", "customers"),
+            rec("app", "10.0.0.5", 12, "hr", "orders"),
+            rec("app", "10.0.0.5", 12, "mysql", "table_stats"),
+            rec("app", "10.0.0.5", 12, "mysql", "column_stats"),
+        ];
+        lines.push(sa_line(
+            "app",
+            "10.0.0.5",
+            12,
+            "WITH x AS (SELECT * FROM hr.orders) SELECT * FROM hr.customers c JOIN x ON 1 = 1",
+        ));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"hr.orders\"]"]
         );
     }
 

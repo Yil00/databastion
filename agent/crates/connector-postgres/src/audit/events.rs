@@ -756,17 +756,29 @@ impl PgauditEvents {
         // the first text of each substatement (`log_statement_once`: later
         // records carry `<previously logged>`).
         let mut confirmed: HashSet<String> = HashSet::new();
-        // Names pgaudit reports in another schema than `pg_catalog`: an
-        // unqualified statistics name of the text shadowed by one of them
-        // is that relation, not the catalog's.
-        let mut shadowing: HashSet<String> = HashSet::new();
+        // Per substatement: the names pgaudit reports in `pg_catalog`, and
+        // those it reports in another schema. With `log_catalog = on`, an
+        // unqualified statistics name of a substatement's text that a
+        // record names in another schema, and none in `pg_catalog`, is
+        // that relation, not the catalog's (security re-review of #199,
+        // N-M1: never decided across substatements nor without
+        // `log_catalog = on`).
+        let mut confirmed_in: HashMap<u64, HashSet<String>> = HashMap::new();
+        let mut shadowing_in: HashMap<u64, HashSet<String>> = HashMap::new();
         let mut first_texts: HashMap<u64, &str> = HashMap::new();
         for r in &group {
             if let Some(rel) = split_object_name(&r.audit.object_name) {
                 if rel.schema.as_deref() == Some("pg_catalog") {
+                    confirmed_in
+                        .entry(r.audit.substatement_id)
+                        .or_default()
+                        .insert(rel.name.clone());
                     confirmed.insert(rel.name);
                 } else if rel.schema.is_some() {
-                    shadowing.insert(rel.name);
+                    shadowing_in
+                        .entry(r.audit.substatement_id)
+                        .or_default()
+                        .insert(rel.name);
                 }
             }
             let text: &str = &r.audit.statement;
@@ -842,9 +854,14 @@ impl PgauditEvents {
                     part.objects.push(rel);
                 }
             }
+            let sub_confirmed = confirmed_in.get(&r.audit.substatement_id);
+            let sub_shadowing = shadowing_in.get(&r.audit.substatement_id);
             // The text decides on statistics relations unless relation
-            // records name every `pg_catalog` relation (`log_catalog = on`).
-            let text_decides = !named || log_catalog != Some(true);
+            // records name `pg_catalog` relations of this substatement
+            // (`log_catalog = on`, and seen at work: security re-review of
+            // #199, N-L1).
+            let text_decides =
+                !named || log_catalog != Some(true) || sub_confirmed.is_none_or(HashSet::is_empty);
             if text_decides && stmts.iter().any(|p| p.relations_full) {
                 part.bound = true;
                 part.unknown = true;
@@ -855,15 +872,21 @@ impl PgauditEvents {
                 // (ADR-0048 decision 5), in every action class (`INSERT …
                 // SELECT … FROM pg_stats`, `CREATE TABLE … AS`: security
                 // review of #199, M1), whatever `log_catalog` says (L1).
-                // An unqualified name is skipped only when a record of the
-                // statement names that relation in another schema (a
-                // shadowing relation of the search path).
+                // An unqualified name is skipped only with `log_catalog =
+                // on`, when a record of the same substatement names that
+                // relation in another schema (a shadowing relation of the
+                // search path) and none names it in `pg_catalog`; otherwise
+                // it is over-reported.
                 for p in &stmts {
                     for r in &p.relations {
                         let Some(s) = statistics_relation(r) else {
                             continue;
                         };
-                        if r.schema.is_none() && shadowing.contains(&r.name) {
+                        if r.schema.is_none()
+                            && log_catalog == Some(true)
+                            && sub_shadowing.is_some_and(|n| n.contains(&r.name))
+                            && !sub_confirmed.is_some_and(|n| n.contains(&r.name))
+                        {
                             continue;
                         }
                         if !part.objects.contains(&s) {
@@ -932,7 +955,11 @@ impl PgauditEvents {
             let mut objects: Vec<&RelationName> = part.objects.iter().collect();
             objects.sort_by_key(|o| !is_statistics(o));
             let statistics = objects.first().is_some_and(|o| is_statistics(o)) || part.bound;
-            let unknown = rw && (part.objects.is_empty() || part.unknown);
+            // A `CREATE … AS <query>` at the relation bound may hide a
+            // statistics relation too: `*` (security re-review of #199,
+            // N-L2).
+            let unknown = (rw && (part.objects.is_empty() || part.unknown))
+                || (action == EventAction::Ddl && part.bound);
             // Reads and writes of unknown objects (`*`) are always reported
             // too: they never match `sensitive_objects` and their row count
             // says nothing of what they read (security review of #199, M2).
@@ -1150,7 +1177,9 @@ fn pss_event(
     // reported, never the agent's own (as ADR-0045 decision 4 on MySQL /
     // MariaDB). Decided before the catalog-only skip (security review of
     // #199, H1).
-    let bound = rw && all.iter().any(|p| p.relations_full);
+    // So is a DDL statement (`CREATE TABLE … AS <query>`, `CREATE VIEW
+    // … AS`: security re-review of #199, N-L2).
+    let bound = (rw || action == EventAction::Ddl) && all.iter().any(|p| p.relations_full);
     if rw && objects.is_empty() && named_any && !bound {
         return None;
     }
@@ -1178,7 +1207,7 @@ fn pss_event(
     for o in named.into_iter().take(if bound { 15 } else { 16 }) {
         e = e.with_object(object(d.database, o));
     }
-    if rw && (objects.is_empty() || bound) {
+    if (rw && objects.is_empty()) || bound {
         e = e.with_object(unknown_object(d.database));
     }
     if action == EventAction::Read {
@@ -3171,13 +3200,23 @@ mod tests {
             assert!(!ev[0].always_report(), "{text}");
             assert_eq!(objects_of(&ev[0]), [object], "{text}");
         }
-        // `public.pg_stats` named by a relation record: the unqualified
-        // text name is that relation (it shadows the catalog's), whatever
-        // `log_catalog` says.
-        for (log_catalog, want) in [
-            (Some(true), vec!["shop.public.pg_stats"]),
-            (Some(false), vec!["shop.public.pg_stats"]),
-            (None, vec!["shop.public.pg_stats"]),
+        // `public.pg_stats` named by a relation record: with `log_catalog
+        // = on` (and no `pg_catalog.pg_stats` record), the unqualified text
+        // name is that relation (it shadows the catalog's); otherwise the
+        // catalog's is named too, always reported (security re-review of
+        // #199, N-M1).
+        for (log_catalog, want, always) in [
+            (Some(true), vec!["shop.public.pg_stats"], false),
+            (
+                Some(false),
+                vec!["shop.pg_catalog.pg_stats", "shop.public.pg_stats"],
+                true,
+            ),
+            (
+                None,
+                vec!["shop.pg_catalog.pg_stats", "shop.public.pg_stats"],
+                true,
+            ),
         ] {
             let mut b = PgauditEvents::new(own());
             b.set_catalogs(shop_catalogs(log_catalog));
@@ -3196,7 +3235,79 @@ mod tests {
                 SystemTime::now(),
             );
             assert_eq!(objects_of(&ev[0]), want, "{log_catalog:?}");
-            assert!(!ev[0].always_report(), "{log_catalog:?}");
+            assert_eq!(ev[0].always_report(), always, "{log_catalog:?}");
+        }
+        // Security re-review of #199, N-M1: a qualified shadowing name next
+        // to the unqualified one, with `log_catalog` off or unknown: the
+        // catalog's is named too.
+        for log_catalog in [Some(false), None] {
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(shop_catalogs(log_catalog));
+            let ev = b.convert(
+                vec![rec(
+                    "l3",
+                    1,
+                    1,
+                    "READ",
+                    "SELECT",
+                    "public.pg_stats",
+                    "select * from pg_stats p, public.pg_stats x",
+                    Some(1),
+                    "psql",
+                )],
+                SystemTime::now(),
+            );
+            assert_eq!(
+                objects_of(&ev[0]),
+                ["shop.pg_catalog.pg_stats", "shop.public.pg_stats"],
+                "{log_catalog:?}"
+            );
+            assert!(ev[0].always_report(), "{log_catalog:?}");
+        }
+        // A DO block whose first substatement reads `public.pg_stats` and
+        // whose second reads `pg_stats` (the catalog's): the shadowing is
+        // decided per substatement, whatever `log_catalog` says.
+        for log_catalog in [Some(true), Some(false), None] {
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(shop_catalogs(log_catalog));
+            let ev = b.convert(
+                vec![
+                    rec(
+                        "l4",
+                        1,
+                        1,
+                        "READ",
+                        "SELECT",
+                        "public.pg_stats",
+                        "select * from public.pg_stats",
+                        Some(1),
+                        "psql",
+                    ),
+                    rec(
+                        "l4",
+                        1,
+                        2,
+                        "READ",
+                        "SELECT",
+                        "crm.customer",
+                        "select * from crm.customer, pg_stats",
+                        Some(1),
+                        "psql",
+                    ),
+                ],
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{log_catalog:?}");
+            assert_eq!(
+                objects_of(&ev[0]),
+                [
+                    "shop.crm.customer",
+                    "shop.pg_catalog.pg_stats",
+                    "shop.public.pg_stats"
+                ],
+                "{log_catalog:?}"
+            );
+            assert!(ev[0].always_report(), "{log_catalog:?}");
         }
         // Dictionary reads and the counter views: quiet.
         for text in [
@@ -3403,6 +3514,143 @@ mod tests {
                 assert_eq!(ev.len(), 1, "{app}: {text}");
                 assert!(ev[0].always_report());
                 assert_eq!(objects_of(&ev[0]), ["shop..*"], "{text}");
+            }
+        }
+        // Security re-review of #199, N-L1: a record names the application
+        // table, `log_catalog = on` but no `pg_catalog` record for the
+        // statement, and the text is at the bound: `*`, always reported.
+        let text = format!(
+            "select * from crm.customer, {}, pg_stats",
+            catalogs[..15].join(", ")
+        );
+        for app in ["psql", crate::conn::APPLICATION_NAME] {
+            let usage = SharedOwnUsage::default();
+            let mut b = PgauditEvents::new(own_with(
+                ClientAddr::parse("192.0.2.14"),
+                1000,
+                usage.clone(),
+            ));
+            b.set_catalogs(shop_catalogs(Some(true)));
+            let ev = b.convert(
+                vec![rec(
+                    "b3",
+                    1,
+                    1,
+                    "READ",
+                    "SELECT",
+                    "crm.customer",
+                    &text,
+                    Some(1),
+                    app,
+                )],
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{app}");
+            assert!(ev[0].always_report(), "{app}");
+            let objects = objects_of(&ev[0]);
+            assert!(objects.iter().any(|o| o == "shop..*"), "{objects:?}");
+            assert!(
+                objects.iter().any(|o| o == "shop.crm.customer"),
+                "{objects:?}"
+            );
+            assert!(charged_keys(&usage).is_empty(), "{app}");
+        }
+        // With `pg_catalog` records for the statement, the records decide.
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let ev = b.convert(
+            vec![
+                rec(
+                    "b4",
+                    1,
+                    1,
+                    "READ",
+                    "SELECT",
+                    "crm.customer",
+                    &text,
+                    Some(1),
+                    "psql",
+                ),
+                rec(
+                    "b4",
+                    1,
+                    1,
+                    "READ",
+                    "SELECT",
+                    "pg_catalog.pg_stats",
+                    &text,
+                    Some(1),
+                    "psql",
+                ),
+            ],
+            SystemTime::now(),
+        );
+        assert_eq!(
+            objects_of(&ev[0]),
+            ["shop.crm.customer", "shop.pg_catalog.pg_stats"]
+        );
+        // Security re-review of #199, N-L2: a `CREATE TABLE … AS` at the
+        // bound adds `*`, always reported, on `pg_stat_statements` and on
+        // pgaudit (with or without a record naming the new table).
+        let text = format!(
+            "create table crm.x as select * from {}, pg_stats",
+            catalogs.join(", ")
+        );
+        for user in ["app", "databastion"] {
+            let usage = SharedOwnUsage::default();
+            let a = analyze_pss(&text, false);
+            let deltas = [StatementDelta {
+                own_text: false,
+                user,
+                database: "shop",
+                analysis: &a,
+                calls: 1,
+                rows: 0,
+            }];
+            let t0 = SystemTime::UNIX_EPOCH;
+            let ev = pss_events(
+                &deltas,
+                &mut own_with(None, 1000, usage.clone()),
+                &shop_catalogs(None),
+                t0,
+                t0,
+            );
+            assert_eq!(ev.len(), 1, "{user}");
+            assert_eq!(ev[0].action(), EventAction::Ddl);
+            assert!(ev[0].always_report(), "{user}");
+            assert!(
+                objects_of(&ev[0]).iter().any(|o| o == "shop..*"),
+                "{:?}",
+                objects_of(&ev[0])
+            );
+            assert!(charged_keys(&usage).is_empty());
+        }
+        for log_catalog in [Some(true), Some(false), None] {
+            for object in ["crm.x", ""] {
+                let mut b = PgauditEvents::new(own());
+                b.set_catalogs(shop_catalogs(log_catalog));
+                let ev = b.convert(
+                    vec![rec(
+                        "b5",
+                        1,
+                        1,
+                        "DDL",
+                        "CREATE TABLE AS",
+                        object,
+                        &text,
+                        None,
+                        "psql",
+                    )],
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{log_catalog:?} {object}");
+                assert_eq!(ev[0].action(), EventAction::Ddl);
+                assert!(ev[0].always_report(), "{log_catalog:?} {object}");
+                assert!(
+                    objects_of(&ev[0]).iter().any(|o| o == "shop..*"),
+                    "{log_catalog:?} {object}: {:?}",
+                    objects_of(&ev[0])
+                );
             }
         }
         // Below the bound: no `*`.

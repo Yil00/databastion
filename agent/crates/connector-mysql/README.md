@@ -302,7 +302,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   statistics: such a `column_stats` record is dropped when it comes with
   the load's `table_stats` record and a text read whole, and names
   `mysql.column_stats` otherwise (code out of sight, an unreadable or cut
-  text, `HANDLER`, a view). Code out of sight adds `*` whatever its table
+  text, `HANDLER`, no `table_stats` record, or a relation of the text with
+  no table record of its own, such as a view, which is then named too). Code out of sight adds `*` whatever its table
   records. Drift
   test and server facts: `it::statistics_it`. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).

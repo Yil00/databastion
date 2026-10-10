@@ -108,9 +108,12 @@ load otherwise), so a server-wide load is the normal case.
   `pg_catalog.<name>`, always reported and never the agent's own (it
   sends no statement naming them: `sql.rs` unit test). With relation
   records, the text's statistics relations are added to the events of
-  every action class too, unless a record names the unqualified name in
-  another schema (shadowing). `U&"…"` names are compared decoded. A text
-  that decides and reaches the analyzer's 16-relation bound adds `*`,
+  every action class too; an unqualified one is left out only with
+  `pgaudit.log_catalog = on`, when a record of the same substatement
+  names it in another schema and none in `pg_catalog` (shadowing). `U&"…"` names are compared decoded. A text
+  that decides (relation records naming no `pg_catalog` relation of the
+  substatement included) and reaches the analyzer's 16-relation bound,
+  DDL included, adds `*`,
   always reported, never the agent's own, even when every kept relation
   is a catalog. Every read or write against `*` is always reported. `check()` says `pgaudit.log_catalog = off` in
   its local detail when pgaudit is the source. Details:
