@@ -206,7 +206,8 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   concurrent sessions interleave their records (`READ a`, `READ b`,
   `QUERY a`, `QUERY b`). A statement's table records wait for its statement
   record across polls and log rotations; they are reported without it at
-  the connection's next statement, its disconnect, after 5 minutes, when
+  the connection's next statement, its disconnect, after 11 minutes (longer than the
+  longest `statement_timeout_ms`), when
   the audit source changes, or when more than 1024 connections have a
   statement waiting (the oldest first; logged and counted in the
   heartbeat metric `audit_pending_evicted_total`). The waiting state is
@@ -220,7 +221,7 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   is ignored, one of another table is reported (with the statement record
   when it comes, or at the next flush), and a late statement record alone
   yields a second event only when its text shows a signal (a whole-table
-  read by a dump that ran longer than 5 minutes). That memory is kept 10
+  read by a dump that ran longer than 11 minutes). That memory is kept 22
   minutes.
   The saved cursor is moved back to the first record of the oldest
   statement still waiting in the current file, with the end read so far
@@ -233,7 +234,7 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   agent was stopped) it is dropped and the file is read from its start. A
   replayed statement has been waiting
   since its log time, not since the restart: an agent that restarts more
-  often than every 5 minutes still reports it after 5 minutes, and its
+  often than every 11 minutes still reports it after 11 minutes, and its
   cursor moves on instead of staying pinned to it. When the stream ends gracefully (the
   source changes, the log becomes unreadable), the waiting statements are
   reported and the cursor saved without them. Residuals: statements
