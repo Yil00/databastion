@@ -94,10 +94,25 @@ load otherwise), so a server-wide load is the normal case.
     and reads it later by its unqualified name is not reported for that
     later read (the copy itself reads the source relation and is
     reported). With pgaudit, `pgaudit.log_relation = on` names every
-    relation with its schema and closes this; so does `log_catalog = off`.
+    relation with its schema and closes this (`log_catalog = off` is no
+    longer advised: it hides reads of the statistics catalogs alone).
     An unqualified `pg_stat_statements` / `pg_stat_statements_info` counts
     as a catalog when the extension is installed in the database (the same
     residual for a shadowing relation earlier in the search path).
+- **Statistics catalogs** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)).
+  `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` and
+  `pg_statistic_ext_data` (`audit::events::STATISTICS_RELATIONS`) hold
+  sampled column values and are not catalogs for these rules: named by a
+  pgaudit relation record in `pg_catalog`, or by the text qualified with
+  `pg_catalog` or unqualified, they are objects named
+  `pg_catalog.<name>`, always reported and never the agent's own (it
+  sends no statement naming them: `sql.rs` unit test). With a relation
+  record and `pgaudit.log_catalog` not proven on, the text's statistics
+  relations are added to read events too. A text that decides and
+  reaches the analyzer's 16-relation bound adds `*`, always reported,
+  never the agent's own. `check()` says `pgaudit.log_catalog = off` in
+  its local detail when pgaudit is the source. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statistics-catalogs).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first
