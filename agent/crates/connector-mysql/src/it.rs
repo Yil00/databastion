@@ -36,6 +36,7 @@ mod builtins_it;
 mod cas_guard_it;
 mod explain_it;
 mod stmt_text_it;
+mod stored_it;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
