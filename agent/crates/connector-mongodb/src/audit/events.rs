@@ -859,6 +859,36 @@ mod tests {
         assert_eq!(reported, 1);
     }
 
+    /// Collection names that differ only in case share one budget
+    /// (security review of #197, M2).
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let mut b = builder();
+        let app = Some("databastion-agent");
+        let read = |coll: &str| {
+            let mut r = own_record(Cmd::Find, coll, Some(150), app);
+            r.shape.filter = Filter::Keys(1);
+            r
+        };
+        assert!(
+            b.convert(
+                vec![read("Customers")],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            b.convert(
+                vec![read("customers")],
+                EventSource::MongodbProfiler,
+                SystemTime::now()
+            )
+            .len(),
+            1
+        );
+    }
+
     /// Security review M1: only the agent's exact profiler polls, on the
     /// profiler source, are free; any other read of `system.profile` with
     /// the agent's identity is charged (and reported past the budget).

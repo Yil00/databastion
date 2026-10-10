@@ -764,6 +764,44 @@ mod tests {
         assert_eq!(reported, [false, false, false, true]);
     }
 
+    /// Containers written in another case share one budget (security
+    /// review of #197, M2), with or without findings.
+    #[test]
+    fn own_budget_ignores_the_case_of_containers() {
+        let now = Instant::now();
+        let mut b = EventBuilder::new(
+            OwnAccount::new(AGENT, None, None, 2, SharedOwnUsage::default()),
+            AGENT.to_owned(),
+            2,
+            Vec::new(),
+        );
+        b.set_contexts(vec![Context {
+            canon: "dc=example,dc=org".to_owned(),
+            name: normalize_ldap_dn("dc=example,dc=org"),
+        }]);
+        let reported: Vec<bool> = [
+            "ou=Empty,dc=example,dc=org",
+            "ou=empty,dc=example,dc=org",
+            "ou=EMPTY,dc=Example,dc=org",
+        ]
+        .iter()
+        .map(|base| {
+            let empty = S {
+                who: AGENT,
+                base,
+                scope: "one",
+                filter: "(objectClass=*)",
+                attrs: &["cn", "mail", "objectClass", "structuralObjectClass"],
+                entries: "0",
+                size: "2",
+                ..DEFAULT
+            };
+            !b.convert(vec![search(&empty)], now).is_empty()
+        })
+        .collect();
+        assert_eq!(reported, [false, false, true]);
+    }
+
     #[test]
     fn binds_writes_and_other_records() {
         let mut b = builder(Vec::new());

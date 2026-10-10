@@ -3246,6 +3246,35 @@ mod tests {
         }
     }
 
+    /// Names that differ only in case share one budget (security review
+    /// of #197, M2): with `lower_case_table_names` 1 or 2 they are the
+    /// same table.
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let usage = SharedOwnUsage::default();
+        let mut b = EventBuilder::new(OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("172.18.0.1"),
+            2,
+            usage.clone(),
+        ));
+        let reported: Vec<bool> = [
+            "SELECT 1 FROM hr.customers WHERE id = 1",
+            "SELECT 1 FROM `HR`.`Customers` WHERE id = 2",
+            "SELECT 1 FROM Hr.CUSTOMERS WHERE id = 3",
+        ]
+        .iter()
+        .map(|t| {
+            let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+            access.rows = Some(0);
+            b.statement(access, SystemTime::now()).is_some()
+        })
+        .collect();
+        assert_eq!(reported, [false, false, true]);
+        assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
+    }
+
     #[test]
     fn failed_statements_with_read_records_are_reported() {
         // A function SIGNALs 1146 after rows were sent: the TABLE records

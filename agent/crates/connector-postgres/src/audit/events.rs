@@ -1692,6 +1692,40 @@ mod tests {
         assert_eq!(pss_events(&[delta(4)], &mut own3(), &cats, t0, t0).len(), 1);
     }
 
+    /// Quoted identifiers that differ only in case share one budget
+    /// (security review of #197, M2): fails closed, `"T"` and `t` are
+    /// charged together.
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let read = |n: u64, object: &str, text: &str| {
+            rec(
+                "c1",
+                n,
+                1,
+                "READ",
+                "SELECT",
+                object,
+                text,
+                Some(0),
+                "databastion-agent",
+            )
+        };
+        let mut b = PgauditEvents::new(own_with(
+            ClientAddr::parse("192.0.2.14"),
+            2,
+            SharedOwnUsage::default(),
+        ));
+        let reported: Vec<usize> = [
+            read(1, "crm.t", "SELECT 1 FROM crm.t WHERE id = $1"),
+            read(2, "crm.T", "SELECT 1 FROM crm.\"T\" WHERE id = $1"),
+            read(3, "CRM.t", "SELECT 1 FROM \"CRM\".t WHERE id = $1"),
+        ]
+        .into_iter()
+        .map(|r| b.convert(vec![r], SystemTime::now()).len())
+        .collect();
+        assert_eq!(reported, [0, 0, 1]);
+    }
+
     /// The per-transaction statements of one Discovery scan (about 90
     /// transactions) and the check / stream probes, as the agent sends
     /// them.

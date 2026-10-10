@@ -140,6 +140,9 @@ impl OwnUsage {
     /// objects are taken.
     fn merge(&mut self, file: OwnFile, current: u64) {
         for (key, hours) in file.o {
+            // Files written before keys were lowercased: folded the same
+            // way, so a restart after the upgrade keeps the charges.
+            let key = key.to_lowercase();
             if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
                 break;
             }
@@ -297,9 +300,32 @@ fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration)
 /// object and scan (an empty table's sample, a short `TABLESAMPLE`
 /// before the plain read, an empty LDAP container's one-level search), so
 /// its routine traffic stays far within the budget.
+///
+/// An aggregated event of `n` statements and `r` rows in total is charged
+/// `max(r, 1) + n - 1`: the largest the sum of `max(rᵢ, 1)` over its
+/// statements can be (one statement may have sent every row, each other
+/// none), so one large call cannot hide many empty ones (security review
+/// of #197, L2a: one call of 500 rows and 500 empty calls cost 1000).
 fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
+    let calls = e.aggregated_count().max(1);
     e.rows()
-        .map_or(budget, |r| r.max(e.aggregated_count().max(1)))
+        .map_or(budget, |r| r.max(1).saturating_add(calls - 1))
+}
+
+/// The budget key of an object (`database NUL schema NUL object`), each
+/// part Unicode-lowercased on every engine (security review of #197, M2):
+/// names that differ only in case (`` `HR`.`Customers` `` with
+/// `lower_case_table_names` 1 or 2, an LDAP container written in another
+/// case, a quoted PostgreSQL identifier or a MongoDB collection) share
+/// one budget. Two objects that really differ by case then share it too,
+/// which only reports sooner (fails closed).
+fn budget_key(database: &str, schema: &str, object: &str) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        database.to_lowercase(),
+        schema.to_lowercase(),
+        object.to_lowercase()
+    )
 }
 
 /// The agent's own activity, which may be left out of the events.
@@ -435,11 +461,10 @@ impl OwnAccount {
         let identity = self.identity(application, client);
         let mut over = false;
         for o in e.objects() {
-            let key = format!(
-                "{}\u{0}{}\u{0}{}",
+            let key = budget_key(
                 o.database().as_str(),
                 o.schema().map_or("", |s| s.as_str()),
-                o.object().as_str()
+                o.object().as_str(),
             );
             over |= self.charge(key, rows, now);
         }
@@ -711,8 +736,12 @@ mod tests {
         assert_eq!(charged_rows(&ev(None), 1000), 1000);
         let agg = |rows| ev(rows).with_aggregate(40, SystemTime::UNIX_EPOCH);
         assert_eq!(charged_rows(&agg(Some(0)), 1000), 40);
-        assert_eq!(charged_rows(&agg(Some(3)), 1000), 40);
-        assert_eq!(charged_rows(&agg(Some(500)), 1000), 500);
+        assert_eq!(charged_rows(&agg(Some(3)), 1000), 42);
+        assert_eq!(charged_rows(&agg(Some(500)), 1000), 539);
+        // One call of 500 rows and 500 empty calls: 1000, not 501 (L2a).
+        let mixed = ev(Some(500)).with_aggregate(501, SystemTime::UNIX_EPOCH);
+        assert_eq!(charged_rows(&mixed, 5000), 1000);
+
         assert_eq!(charged_rows(&agg(None), 1000), 1000);
         // 25 executions of a 0-row statement in one delta use up a budget
         // of 25.
@@ -747,6 +776,62 @@ mod tests {
             assert!(o.routine("databastion", None, ClientSeen::NotVisible, &connect, now));
         }
         assert!(fresh.lock().unwrap().budgeted_objects().is_empty());
+    }
+
+    /// Names that differ only in case share one budget (security review
+    /// of #197, M2), and persisted keys are folded the same way.
+    #[test]
+    fn budget_keys_ignore_case() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("192.0.2.14"),
+            2,
+            std::sync::Arc::clone(&usage),
+        );
+        let read = |db: &str, schema: &str, t: &str| {
+            MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("databastion"),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_object(EventObject::new(
+                normalize_path(db),
+                Some(normalize_path(schema)),
+                normalize_path(t),
+            ))
+            .with_rows(Some(0))
+        };
+        let agent = Some("databastion-agent");
+        assert!(o.routine("databastion", agent, logged, &read("Shop", "CRM", "T"), now));
+        assert!(o.routine("databastion", agent, logged, &read("shop", "crm", "t"), now));
+        assert!(!o.routine("databastion", agent, logged, &read("SHOP", "Crm", "t"), now));
+        assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
+        assert_eq!(budget_key("Ä", "Ω", "Straße"), "ä\u{0}ω\u{0}straße");
+        // A file written before the fold: its keys merge into one.
+        let mut u = OwnUsage::default();
+        let current = u.hour(now);
+        u.merge(
+            OwnFile {
+                v: OWN_FILE_VERSION,
+                o: vec![
+                    ("HR\u{0}\u{0}Customers".to_owned(), vec![(current, 3)]),
+                    ("hr\u{0}\u{0}customers".to_owned(), vec![(current, 4)]),
+                ],
+            },
+            current,
+        );
+        assert_eq!(
+            u.usage["hr\u{0}\u{0}customers"]
+                .iter()
+                .map(|(_, n)| n)
+                .sum::<u64>(),
+            7
+        );
     }
 
     #[test]
