@@ -1158,6 +1158,26 @@ pub struct StatementInfo {
     /// name more relations than were kept (a caller that must see every
     /// name fails closed).
     pub relations_full: bool,
+    /// MySQL: a read that stores its result into variables rather than
+    /// sending it to the client: `SELECT … INTO @v` / `INTO @a, @b`, the
+    /// trailing form `SELECT … FROM t WHERE … INTO @v` (MySQL 8.0.20+),
+    /// and `INTO` local variables (`DECLARE`d, without `@`, inside stored
+    /// programs). Not `INTO OUTFILE` / `INTO DUMPFILE` ([`Self::outfile`]).
+    /// The variable names are never taken for relations.
+    pub into_var: bool,
+    /// MySQL: the statement assigns a user variable inside an expression
+    /// (`@v := …`), so it keeps a value in the session whatever it sends.
+    pub var_assign: bool,
+    /// MySQL: `CREATE [OR REPLACE] [TEMPORARY] TABLE x … [AS] <query>`
+    /// (`SELECT`, `TABLE t`, `VALUES`, `WITH`, `(`) and `CREATE [OR
+    /// REPLACE] … VIEW` / `ALTER … VIEW v … AS <query>`: [`Self::relations`]
+    /// holds the source relations of the query (its common table
+    /// expressions aside), and [`Self::create_target`] the created table or
+    /// view.
+    pub create_query: bool,
+    /// The table or view a [`Self::create_query`] statement creates or
+    /// replaces, when its name could be read.
+    pub create_target: Option<RelationName>,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1605,6 +1625,9 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 || explain_analyze(original)
                 || explain_analyze(s);
             info.compound = wrappers.contains(&Wrapper::Compound);
+            // `SET STATEMENT … FOR`, `EXPLAIN ANALYZE … INTO @x`: the
+            // wrappers too.
+            info.var_assign |= has_var_assign(original);
             info.explain_probe = info.explain_statement && explain_probe(original, o_flags);
             info.explain_probe_case =
                 info.explain_statement && probe_shape(original, o_flags) == Some(false);
@@ -1794,6 +1817,19 @@ fn probe_shape(s: &[Tok], flags: &[TokFlags]) -> Option<bool> {
 /// names no relation.
 fn my_statement_relations(s: &[Tok], out: &mut Vec<RelationName>) {
     let Some(start) = explain_statement_at(s) else {
+        // `CREATE TABLE … AS <query>`, `CREATE | ALTER VIEW … AS <query>`:
+        // the relations of the query, read on its own (its common table
+        // expressions are not tables, `AS TABLE t` names `t`).
+        if let Some((_, q)) = create_query(s) {
+            collect_relations_dialect(&s[q..], Dialect::Mysql, out);
+            return;
+        }
+        // `SELECT … INTO @a, v`: variables, not relations.
+        if let Some((from, to)) = into_var_at(s).filter(|_| my_kind(s).is_read()) {
+            let rest: Vec<Tok> = s[..from].iter().chain(&s[to..]).cloned().collect();
+            collect_relations_dialect(&rest, Dialect::Mysql, out);
+            return;
+        }
         collect_relations_dialect(s, Dialect::Mysql, out);
         return;
     };
@@ -2921,6 +2957,11 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         Dialect::Postgres => collect_relations_dialect(s, opts.dialect, &mut relations),
     }
     let explain_statement = opts.dialect == Dialect::Mysql && explain_statement_at(s).is_some();
+    let create = if opts.dialect == Dialect::Mysql {
+        create_query(s)
+    } else {
+        None
+    };
     let (shape, copy) = if opts.possibly_truncated {
         (None, None)
     } else {
@@ -2962,7 +3003,224 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         // Set by `analyze_mysql`, on the statement before its wrappers
         // (the whole token sequence must be the shape).
         explain_probe: false,
+        into_var: opts.dialect == Dialect::Mysql
+            && !explain_statement
+            && kind.is_read()
+            && into_var_at(s).is_some(),
+        var_assign: opts.dialect == Dialect::Mysql && has_var_assign(s),
+        create_query: create.is_some(),
+        create_target: create.and_then(|(target, _)| target),
     }
+}
+
+/// `INTO` a variable list in a MySQL statement (`SELECT … INTO @a, @b`,
+/// `INTO v`): the range of the list (from `INTO` to the token after it),
+/// `None` when there is none. `INTO OUTFILE` / `INTO DUMPFILE` are not
+/// one. The caller checks that the statement is a read: elsewhere `INTO`
+/// names a table (`INSERT INTO`, `LOAD DATA … INTO TABLE`) or, before an
+/// explained statement, the variable that takes the plan.
+fn into_var_at(s: &[Tok]) -> Option<(usize, usize)> {
+    let at = (0..s.len()).find(|&i| {
+        word(s.get(i)) == Some("into")
+            && !is_punct(i.checked_sub(1).and_then(|j| s.get(j)), "@")
+            && !matches!(word(s.get(i + 1)), Some("outfile" | "dumpfile"))
+    })?;
+    // `@a`, `@'a'`, `` @`a` ``, `@"a"`, `@a.b`, `v` (a local variable),
+    // `?` (a digest), separated by commas.
+    let mut j = at + 1;
+    loop {
+        if is_punct(s.get(j), "@") {
+            j += 1;
+        }
+        if !matches!(
+            s.get(j),
+            Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Literal | Tok::DQuoted { .. } | Tok::Param)
+        ) {
+            break;
+        }
+        j += 1;
+        while is_punct(s.get(j), ".") && matches!(s.get(j + 1), Some(Tok::Word(_) | Tok::Quoted(_)))
+        {
+            j += 2;
+        }
+        if !is_punct(s.get(j), ",") {
+            break;
+        }
+        j += 1;
+    }
+    Some((at, j))
+}
+
+/// `@v := …` (`:=` anywhere): an assignment inside an expression, the
+/// only use of `:=` in MySQL / MariaDB.
+fn has_var_assign(s: &[Tok]) -> bool {
+    s.windows(2)
+        .any(|w| is_punct(w.first(), ":") && is_punct(w.get(1), "="))
+}
+
+/// Most tokens between `CREATE` / `ALTER` and `VIEW` (`ALGORITHM = x`,
+/// `DEFINER = user`, `SQL SECURITY x`).
+const MAX_VIEW_PREFIX_TOKENS: usize = 24;
+
+/// A `CREATE TABLE … [AS] <query>` or `CREATE` / `ALTER … VIEW … AS
+/// <query>` ([`StatementInfo::create_query`]): the created table or view
+/// (when its name reads) and the position of the query. `None` for any
+/// other statement, `CREATE TABLE … LIKE`, and a `CREATE TABLE` with no
+/// query.
+fn create_query(s: &[Tok]) -> Option<(Option<RelationName>, usize)> {
+    let lead = word(s.first())?;
+    if !matches!(lead, "create" | "alter") {
+        return None;
+    }
+    let mut i = 1;
+    if lead == "create" && word(s.get(1)) == Some("or") && word(s.get(2)) == Some("replace") {
+        i = 3;
+    }
+    if lead == "create" {
+        let t = if word(s.get(i)) == Some("temporary") {
+            i + 1
+        } else {
+            i
+        };
+        if word(s.get(t)) == Some("table") {
+            return create_table_query(s, t + 1);
+        }
+    }
+    let view = view_keyword_at(s, i)?;
+    let (target, mut j) = created_name(s, view + 1);
+    // `[(columns)]`, then `AS`.
+    if is_punct(s.get(j), "(") {
+        j = skip_parens(s, j);
+    }
+    if word(s.get(j)) != Some("as") || !query_starts_at(s, j + 1) {
+        return None;
+    }
+    Some((target, j + 1))
+}
+
+/// The position of `VIEW` after `CREATE [OR REPLACE]` / `ALTER` at `i`,
+/// past the view options (`ALGORITHM = x`, `DEFINER = user`, `SQL
+/// SECURITY x`); `None` when anything else comes first (`CREATE DEFINER =
+/// u PROCEDURE …`).
+fn view_keyword_at(s: &[Tok], mut i: usize) -> Option<usize> {
+    let end = s.len().min(MAX_VIEW_PREFIX_TOKENS);
+    while i < end {
+        match word(s.get(i)) {
+            Some("view") => return Some(i),
+            Some("algorithm") if is_punct(s.get(i + 1), "=") => i += 3,
+            Some("sql") if word(s.get(i + 1)) == Some("security") => i += 3,
+            Some("definer") if is_punct(s.get(i + 1), "=") => {
+                // The user (`CURRENT_USER[()]`, `name`, `name@host`,
+                // `'name'@'host'`): up to the next option or `VIEW` that
+                // does not follow `=` or `@`.
+                i += 2;
+                let from = i;
+                while i < end {
+                    let after_name =
+                        i > from && !is_punct(s.get(i - 1), "@") && !is_punct(s.get(i - 1), "=");
+                    if after_name && matches!(word(s.get(i)), Some("view" | "sql" | "algorithm")) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The name of a created table or view at `i` (after `IF NOT EXISTS`),
+/// and the position after it.
+fn created_name(s: &[Tok], mut i: usize) -> (Option<RelationName>, usize) {
+    if word(s.get(i)) == Some("if")
+        && word(s.get(i + 1)) == Some("not")
+        && word(s.get(i + 2)) == Some("exists")
+    {
+        i += 3;
+    }
+    let mut parts = Vec::new();
+    let mut j = i;
+    while let Some(Tok::Word(w) | Tok::Quoted(w)) = s.get(j) {
+        parts.push(w.clone());
+        j += 1;
+        if is_punct(s.get(j), ".") && parts.len() < 2 {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(name) = parts.pop() else {
+        return (None, i);
+    };
+    (
+        Some(RelationName {
+            schema: parts.pop(),
+            name,
+        }),
+        j,
+    )
+}
+
+/// The position after the parenthesized group opening at `i`.
+fn skip_parens(s: &[Tok], i: usize) -> usize {
+    let mut depth = 0usize;
+    for (j, t) in s.iter().enumerate().skip(i) {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Whether a query starts at `i`: `SELECT`, `TABLE`, `VALUES`, `WITH`
+/// (not MariaDB's `WITH SYSTEM VERSIONING` table option), or parentheses
+/// opening one of them. A word right after `@` is a variable name.
+fn query_starts_at(s: &[Tok], i: usize) -> bool {
+    if is_punct(i.checked_sub(1).and_then(|j| s.get(j)), "@") {
+        return false;
+    }
+    let mut k = i;
+    while is_punct(s.get(k), "(") {
+        k += 1;
+    }
+    match word(s.get(k)) {
+        Some("select" | "table" | "values") => true,
+        Some("with") => word(s.get(k + 1)) != Some("system"),
+        _ => false,
+    }
+}
+
+/// `CREATE [OR REPLACE] [TEMPORARY] TABLE` at `i` (after `TABLE`): `[IF
+/// NOT EXISTS] name [(definitions)] [options] [IGNORE | REPLACE] [AS]
+/// <query>`. The query is the first one found at the top level after the
+/// name, parenthesized groups that do not open a query (definitions,
+/// partitions, `UNION = (…)`) skipped.
+fn create_table_query(s: &[Tok], i: usize) -> Option<(Option<RelationName>, usize)> {
+    let (target, mut j) = created_name(s, i);
+    while j < s.len() {
+        if query_starts_at(s, j) {
+            return Some((target, j));
+        }
+        match &s[j] {
+            Tok::Word(w) if w == "like" => return None,
+            Tok::Punct(p) if p == "(" => {
+                if word(s.get(j + 1)) == Some("like") {
+                    return None;
+                }
+                j = skip_parens(s, j);
+            }
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 /// The body of `DO [LANGUAGE x] $tag$ body $tag$` (dollar quoting only).
@@ -5744,6 +6002,211 @@ mod tests {
             assert!(with.unknown_call(), "{q}");
             assert_eq!(with.relations(), without.relations(), "{q}");
             assert_eq!(with.kind(), without.kind(), "{q}");
+        }
+    }
+
+    fn part0(q: &str) -> StatementInfo {
+        let a = my(q);
+        assert!(a.lexed(), "{q}");
+        a.parts()[0].clone()
+    }
+
+    /// `SELECT … INTO` variables (#195 review M2): flagged, never
+    /// `OUTFILE` / `DUMPFILE`, and the variables are not relations.
+    #[test]
+    fn mysql_into_variables() {
+        for q in [
+            "SELECT email INTO @v FROM hr.customers WHERE id = 1",
+            "SELECT email FROM hr.customers WHERE id = 1 INTO @v",
+            "SELECT email, name INTO @a, @b FROM hr.customers WHERE id = 1",
+            "SELECT email FROM hr.customers WHERE id = 1 FOR UPDATE INTO @a",
+            "SELECT email INTO @'v', @`w`, @\"x\", @v.y FROM hr.customers",
+            "SELECT email INTO v_email FROM hr.customers WHERE id = 1",
+            "SELECT email INTO v_email, `w` FROM hr.customers",
+            "(SELECT email FROM hr.customers WHERE id = 1) INTO @v",
+            "SELECT email FROM hr.customers UNION SELECT 'x' INTO @v",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT email INTO @v FROM hr.customers",
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+            "SELECT `email` INTO ? FROM `hr` . `customers` WHERE `id` = ?",
+            "TABLE hr.customers LIMIT 1 INTO @a, @b, @c, @d",
+        ] {
+            let p = part0(q);
+            assert!(p.into_var && !p.outfile, "{q}");
+            assert_eq!(rels_of(&p), ["hr.customers"], "{q}");
+        }
+        for q in [
+            "SELECT email INTO OUTFILE '/tmp/x' FROM hr.customers",
+            "SELECT email FROM hr.customers INTO DUMPFILE '/tmp/x'",
+            "INSERT INTO hr.t SELECT email FROM hr.customers",
+            "REPLACE INTO hr.t SELECT email FROM hr.customers",
+            "EXPLAIN FORMAT=JSON INTO @x SELECT email FROM hr.customers WHERE id = 1",
+            "SELECT @into FROM hr.customers",
+            "SET @v = 1",
+            "LOAD DATA LOCAL INFILE 'x' INTO TABLE hr.t",
+        ] {
+            assert!(!part0(q).into_var, "{q}");
+        }
+        // The variable that takes `EXPLAIN ANALYZE`'s plan is no relation.
+        let p = part0("EXPLAIN ANALYZE FORMAT=JSON INTO @x SELECT email FROM hr.customers");
+        assert_eq!(rels_of(&p), ["hr.customers"]);
+    }
+
+    /// `:=` assigns a user variable inside an expression.
+    #[test]
+    fn mysql_variable_assignments() {
+        for q in [
+            "SELECT @v := email FROM hr.customers WHERE id = 1",
+            "SELECT 1 FROM hr.customers WHERE id = 1 AND (@v:=email) IS NULL",
+            "DO @v := (SELECT email FROM hr.customers WHERE id = 1)",
+            "SET @v := (SELECT email FROM hr.customers WHERE id = 1)",
+        ] {
+            let p = part0(q);
+            assert!(p.var_assign, "{q}");
+            assert_eq!(rels_of(&p), ["hr.customers"], "{q}");
+        }
+        for q in [
+            "SELECT email FROM hr.customers WHERE id = 1",
+            "SET @v = 1",
+            "SELECT ':=' FROM hr.customers",
+        ] {
+            assert!(!part0(q).var_assign, "{q}");
+        }
+    }
+
+    /// `CREATE TABLE … AS <query>` and `CREATE | ALTER VIEW … AS <query>`
+    /// (#186 review L4): the created table or view, and the relations of
+    /// the query only.
+    #[test]
+    fn mysql_create_from_a_query() {
+        let target = |p: &StatementInfo| {
+            p.create_target.as_ref().map(|r| match &r.schema {
+                Some(s) => format!("{s}.{}", r.name),
+                None => r.name.clone(),
+            })
+        };
+        for (q, t, sources) in [
+            (
+                "CREATE TABLE db.copy AS SELECT * FROM db.t",
+                "db.copy",
+                &["db.t"][..],
+            ),
+            (
+                "CREATE TABLE db.copy SELECT * FROM db.t",
+                "db.copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TEMPORARY TABLE copy AS SELECT a FROM db.t JOIN db.u ON 1",
+                "copy",
+                &["db.t", "db.u"],
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS copy (a INT, b TEXT, KEY (a)) ENGINE=InnoDB IGNORE SELECT a, b FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy (a INT) REPLACE AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy PARTITION BY RANGE (a) (PARTITION p VALUES LESS THAN (10)) AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS (SELECT a FROM db.t)",
+                "copy",
+                &["db.t"],
+            ),
+            ("CREATE TABLE copy AS TABLE db.t", "copy", &["db.t"]),
+            ("CREATE TABLE copy TABLE db.t", "copy", &["db.t"]),
+            ("CREATE TABLE copy AS VALUES ROW(1), ROW(2)", "copy", &[]),
+            (
+                "CREATE TABLE copy AS WITH c AS (SELECT a FROM db.t) SELECT * FROM c",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE OR REPLACE TABLE copy SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy (a INT) WITH SYSTEM VERSIONING SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS SELECT sql_text FROM performance_schema.events_statements_history_long",
+                "copy",
+                &["performance_schema.events_statements_history_long"],
+            ),
+            (
+                "CREATE TABLE `db` . `copy` AS SELECT * FROM `db` . `t` WHERE `a` = ?",
+                "db.copy",
+                &["db.t"],
+            ),
+            ("CREATE VIEW db.v AS SELECT a FROM db.t", "db.v", &["db.t"]),
+            (
+                "CREATE VIEW v (x, y) AS SELECT a, b FROM db.t WITH CASCADED CHECK OPTION",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = 'root'@'%' SQL SECURITY INVOKER VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = CURRENT_USER() VIEW v AS (SELECT a FROM db.t)",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = root@localhost VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = view@sql VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            ("CREATE VIEW IF NOT EXISTS v AS TABLE db.t", "v", &["db.t"]),
+            ("ALTER VIEW db.v AS SELECT a FROM db.t", "db.v", &["db.t"]),
+            (
+                "ALTER ALGORITHM = TEMPTABLE DEFINER = x SQL SECURITY DEFINER VIEW v AS WITH c AS (TABLE db.t) SELECT * FROM c, db.u",
+                "v",
+                &["db.t", "db.u"],
+            ),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR CREATE TABLE copy AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+        ] {
+            let p = part0(q);
+            assert!(p.create_query, "{q}");
+            assert_eq!(p.kind, StatementKind::Ddl, "{q}");
+            assert_eq!(target(&p).as_deref(), Some(t), "{q}");
+            assert_eq!(rels_of(&p), sources, "{q}");
+        }
+        for q in [
+            "CREATE TABLE copy LIKE db.t",
+            "CREATE TABLE copy (LIKE db.t)",
+            "CREATE TABLE copy (a INT, b TEXT)",
+            "CREATE TABLE copy (a INT CHECK (a IN (1, 2)))",
+            "CREATE INDEX i ON db.t (a)",
+            "CREATE DEFINER = root PROCEDURE p() SELECT a FROM db.t",
+            "CREATE DEFINER = root FUNCTION f() RETURNS INT RETURN (SELECT 1)",
+            "CREATE TRIGGER tr BEFORE INSERT ON db.t FOR EACH ROW SET @x = 1",
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO SELECT a FROM db.t",
+            "ALTER TABLE db.t ADD COLUMN b INT",
+            "CREATE VIEW v",
+        ] {
+            assert!(!part0(q).create_query, "{q}");
         }
     }
 }

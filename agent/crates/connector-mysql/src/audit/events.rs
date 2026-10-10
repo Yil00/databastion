@@ -1483,7 +1483,24 @@ impl EventBuilder {
         // `SHOW [FULL] PROCESSLIST`: a read of
         // `information_schema.PROCESSLIST` (ADR-0045 decision 2).
         let processlist = parts.iter().any(is_show_processlist);
+        // A read whose values go into session variables rather than to the
+        // client (#195 review M2): `SELECT … INTO @v` (or `INTO` local
+        // variables), an `@v := …` assignment in any expression, and a
+        // `SET` or `DO` that reads tables through a subquery (`SET @v =
+        // (SELECT … FROM t WHERE …)`). Their row count says nothing of
+        // what was read (`ROWS_SENT` is 0 on `performance_schema`, the
+        // file sources have none), so a `min_rows` setting would drop a
+        // key walk: always reported, with no row count on a read, and
+        // never the agent's own (it sends none of them).
+        let stored = parts.iter().any(|p| {
+            p.into_var
+                || p.var_assign
+                || (p.kind == StatementKind::Other
+                    && matches!(p.lead.first().map(String::as_str), Some("set" | "do"))
+                    && (p.subquery || !p.relations.is_empty()))
+        });
         let changes = is_change_kind(kind)
+            || stored
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
             || dquoted
@@ -1617,6 +1634,50 @@ impl EventBuilder {
             // read, nor what a cut text hid past the cut.
             unknown = (hidden || cut_blind) && rw;
         }
+        // `CREATE TABLE … AS <query>`, `CREATE | ALTER VIEW … AS <query>`
+        // (#186 review L4): one DDL event naming the created table or view
+        // and the source relations of its query, as a write event of
+        // `INSERT … SELECT` names its target and its sources. These
+        // statements hold no program body, so their names are taken from
+        // the text (a refinement of ADR-0023 decision 7), with the table
+        // records' when the source has them. Sources are filtered as a
+        // read's: system tables are dropped but the statement-text tables
+        // (ADR-0045), named as listed. Code that runs out of sight, a cut
+        // text or a statement at the relation bound adds `*`.
+        let create = action == EventAction::Ddl && parts.iter().any(|p| p.create_query);
+        if create {
+            for p in parts.iter().filter(|p| p.create_query) {
+                if let Some(t) = &p.create_target {
+                    let o = (
+                        t.schema.as_deref().unwrap_or(a.database).to_owned(),
+                        t.name.clone(),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+                for r in &p.relations {
+                    let db = r.schema.as_deref().unwrap_or(a.database);
+                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
+                        continue;
+                    }
+                    let o = text_table.map_or_else(
+                        || (db.to_owned(), r.name.clone()),
+                        |(d, t)| (d.to_owned(), t.to_owned()),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
+            unknown = unknown
+                || call
+                || cut_blind
+                || parts
+                    .iter()
+                    .any(|p| p.create_query && (p.relations_full || p.create_target.is_none()));
+        }
         if processlist && rw {
             let o = ("information_schema".to_owned(), "PROCESSLIST".to_owned());
             if !objects.contains(&o) {
@@ -1649,7 +1710,8 @@ impl EventBuilder {
         // same const values (security review of #195, M2).
         // Writes run by `EXPLAIN ANALYZE` / `ANALYZE` keep their affected
         // rows (security review of #195, L3).
-        let rows = if explain || (analyze_wrapped && action == EventAction::Read) {
+        // A read stored into variables sends no row (above).
+        let rows = if explain || ((analyze_wrapped || stored) && action == EventAction::Read) {
             None
         } else {
             a.rows
@@ -1702,6 +1764,8 @@ impl EventBuilder {
             || text_tables
             || explain
             || analyze_wrapped
+            || stored
+            || create
         {
             e = e.with_always_report();
         }
@@ -2897,7 +2961,16 @@ mod tests {
                 r"20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'create table t2 as select * from tickets',0",
             ]),
         );
-        assert_eq!(out, ["ddl [] None []", "ddl [] None []"], "{out:#?}");
+        // `CREATE TABLE … AS SELECT` names its table and its sources
+        // (#186 review L4): no program body there.
+        assert_eq!(
+            out,
+            [
+                "ddl [] None []",
+                "ddl [\"support.t2\", \"support.tickets\"] None []"
+            ],
+            "{out:#?}"
+        );
     }
 
     #[test]
@@ -4781,7 +4854,9 @@ mod tests {
             "SET @x = CONCAT('a', (SELECT GROUP_CONCAT(email) FROM hr.customers))",
             "SET STATEMENT max_statement_time = 1 FOR SET @x = (SELECT email FROM hr.customers LIMIT 1)",
         ] {
-            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+            // Their values stay in the session: always reported (#195
+            // review M2).
+            expect_everywhere(text, |_| "read [\"hr.customers\"] always".to_owned());
         }
         // A subquery inside a function call of a read names its table.
         for (source, ev) in on_every_source(
@@ -4794,15 +4869,11 @@ mod tests {
                 "{source:?}"
             );
         }
-        // Already a read (and the agent's own within its budget).
-        for (source, ev) in on_every_source("app", "SELECT email INTO @x FROM hr.customers LIMIT 1")
-        {
-            assert_eq!(
-                ev.as_ref().map(shown).as_deref(),
-                Some("read [\"hr.customers\"]"),
-                "{source:?}"
-            );
-        }
+        // Already a read; stored into a variable, so always reported and
+        // never the agent's own (#195 review M2).
+        expect_everywhere("SELECT email INTO @x FROM hr.customers LIMIT 1", |_| {
+            "read [\"hr.customers\"] always".to_owned()
+        });
         // A subquery without a user table: a read of `*` (fail closed);
         // of a statement-text table: a read of it, always (ADR-0045).
         for text in [
@@ -4812,7 +4883,7 @@ mod tests {
             for (source, ev) in on_every_source("app", text) {
                 assert_eq!(
                     ev.as_ref().map(shown).as_deref(),
-                    Some(format!("read [{:?}]", star(source)).as_str()),
+                    Some(format!("read [{:?}] always", star(source)).as_str()),
                     "{source:?}: {text}"
                 );
             }
@@ -5360,6 +5431,308 @@ mod tests {
         expect_everywhere("EXPLAIN FORMAT=JSON FOR CONNECTION 12", |s| {
             format!("read [{:?}] always", star(s))
         });
+    }
+
+    /// #195 review M2: a read whose values go into session variables
+    /// (`SELECT … INTO @v`, `@v := …`, `SET` / `DO` with a subquery) is
+    /// always reported, with no row count (`ROWS_SENT` is 0 on
+    /// `performance_schema`), never the agent's own, on every source.
+    #[test]
+    fn reads_stored_into_variables_are_always_reported() {
+        let cust = "read [\"hr.customers\"] always";
+        for text in [
+            "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "SELECT email FROM hr.customers WHERE id = 42 INTO @v",
+            "SELECT email, name INTO @a, @b FROM hr.customers WHERE id = 42",
+            "select email from hr.customers where id = 42 for update into @a",
+            "SELECT email INTO @`v` FROM hr.customers WHERE id = 42",
+            "SELECT email INTO v_email FROM hr.customers WHERE id = 42",
+            "(SELECT email FROM hr.customers WHERE id = 42) INTO @v",
+            "SELECT email FROM hr.customers WHERE id = 42 UNION SELECT 'x' INTO @v",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "TABLE hr.customers LIMIT 1 INTO @a, @b, @c, @d",
+            "SELECT @v := email FROM hr.customers WHERE id = 42",
+            "SELECT 1 FROM hr.customers WHERE id = 42 AND (@v := email) IS NULL",
+            "SET @v = (SELECT email FROM hr.customers WHERE id = 42)",
+            "SET @v := (SELECT email FROM hr.customers WHERE id = 42)",
+            "SET @a = 1, @v = (SELECT email FROM hr.customers WHERE id = 42)",
+            "DO @v := (SELECT email FROM hr.customers WHERE id = 42)",
+            "DO (SELECT email FROM hr.customers WHERE id = 42)",
+        ] {
+            expect_everywhere(text, |_| cust.to_owned());
+            // `performance_schema`: `ROWS_SENT` 0, with or without an
+            // account; never a row count.
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, text, false, 0).expect(text);
+                assert_eq!(shown(&e), cust, "{user:?}: {text}");
+                assert_eq!(e.rows(), None, "{user:?}: {text}");
+            }
+        }
+        // Digests, alone (the session ended) or next to the text.
+        for digest in [
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+            "SELECT `email` FROM `hr` . `customers` WHERE `id` = ? INTO @v",
+            "SELECT `email` INTO ? FROM `hr` . `customers` WHERE `id` = ?",
+            "SET @v = ( SELECT `email` FROM `hr` . `customers` WHERE `id` = ? )",
+            "SELECT @v := `email` FROM `hr` . `customers` WHERE `id` = ?",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, digest, true, 0).expect(digest);
+                assert_eq!(shown(&e), cust, "{user:?}: {digest}");
+                assert_eq!(e.rows(), None);
+            }
+        }
+        for ev in on_pfs_digest(
+            "databastion",
+            "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+        ) {
+            assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust));
+        }
+        // Table records (`server_audit` `TABLE`, `audit_log_filter`
+        // `table_access`).
+        for user in ["app", "databastion"] {
+            let text = "SELECT email INTO @v FROM hr.customers WHERE id = 42";
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(user, &[("READ", "hr", "customers")], text),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [cust], "{user}");
+            assert_eq!(ev[0].rows(), None);
+            let ip = if user == "databastion" {
+                "172.18.0.1"
+            } else {
+                "10.0.0.5"
+            };
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, ip, 7, &[("hr", "customers")], text),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [cust], "{user}");
+        }
+        // The agent's identity, address and program: never its own, never
+        // charged, a hundred times over.
+        let usage = SharedOwnUsage::default();
+        for _ in 0..100 {
+            for (source, ev) in own_sources(
+                &usage,
+                "databastion",
+                "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+                false,
+                &[],
+            ) {
+                assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust), "{source:?}");
+            }
+        }
+        // Unchanged: a read sent to the client keeps its rows and the
+        // filter; `INTO OUTFILE` keeps its signal; a statement with no
+        // table, or a session `SET` without one, gives no event; a write
+        // keeps its affected rows.
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "SELECT email FROM hr.customers WHERE id = 42",
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(!e.always_report() && e.rows() == Some(1));
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            show(&e),
+            "read [\"hr.customers\"] Some(0) [\"shape.full_table_read\", \"signature.into_outfile\"]"
+        );
+        for text in [
+            "SELECT 1 INTO @v",
+            "SELECT @v := 1",
+            "SET @v := 1",
+            "SET @v = NOW()",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "UPDATE hr.customers SET name = name WHERE id = 42 AND (@v := email) IS NOT NULL",
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(show(&e), "write [\"hr.customers\"] Some(0) []");
+        assert!(e.always_report());
+    }
+
+    /// #186 review L4: `CREATE TABLE … AS <query>` and `CREATE | ALTER
+    /// VIEW … AS <query>` are one DDL event naming the created table or
+    /// view and the sources of the query (as `INSERT … SELECT` names its
+    /// target and sources), always reported, never the agent's own, on
+    /// every source.
+    #[test]
+    fn creates_from_a_query_name_their_sources() {
+        let copy = "ddl [\"hr.copy\", \"hr.customers\"] always";
+        for text in [
+            "CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy SELECT email FROM hr.customers WHERE id = 42",
+            "CREATE TEMPORARY TABLE hr.copy AS SELECT * FROM hr.customers",
+            "CREATE TABLE IF NOT EXISTS hr.copy (a INT, KEY (a)) ENGINE=InnoDB IGNORE SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy REPLACE AS SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy AS (SELECT * FROM hr.customers)",
+            "CREATE TABLE hr.copy AS TABLE hr.customers",
+            "CREATE TABLE hr.copy AS WITH c AS (SELECT * FROM hr.customers) SELECT * FROM c",
+            "CREATE OR REPLACE TABLE hr.copy SELECT * FROM hr.customers",
+            "create or replace table hr.copy as select * from hr.customers",
+            "SET STATEMENT max_statement_time = 1 FOR CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+        ] {
+            expect_everywhere(text, |_| copy.to_owned());
+        }
+        let view = "ddl [\"hr.customers\", \"hr.v\"] always";
+        for text in [
+            "CREATE VIEW hr.v AS SELECT email FROM hr.customers",
+            "CREATE VIEW hr.v (e) AS SELECT email FROM hr.customers WHERE id > 0 WITH CHECK OPTION",
+            "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = 'app'@'%' SQL SECURITY DEFINER VIEW hr.v AS SELECT email FROM hr.customers",
+            "CREATE DEFINER = CURRENT_USER VIEW hr.v AS TABLE hr.customers",
+            "ALTER VIEW hr.v AS SELECT email FROM hr.customers",
+            "ALTER ALGORITHM = UNDEFINED SQL SECURITY INVOKER VIEW hr.v AS SELECT email FROM hr.customers",
+        ] {
+            expect_everywhere(text, |_| view.to_owned());
+        }
+        // The values form names the table only.
+        expect_everywhere("CREATE TABLE hr.copy AS VALUES ROW(1), ROW(2)", |_| {
+            "ddl [\"hr.copy\"] always".to_owned()
+        });
+        // Unqualified names are in the session's database (`shop` in the
+        // `server_audit` lines, none in the other test records).
+        expect_everywhere(
+            "CREATE TABLE copy AS SELECT * FROM customers",
+            |s| match s {
+                EventSource::MariadbServerAudit => {
+                    "ddl [\"shop.copy\", \"shop.customers\"] always".to_owned()
+                }
+                _ => "ddl [\"*.copy\", \"*.customers\"] always".to_owned(),
+            },
+        );
+        // Statement-text tables keep their listed name; the other
+        // system tables and `DUAL` are dropped.
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS SELECT h.sql_text FROM performance_schema.events_statements_history_long h JOIN information_schema.TABLES t JOIN hr.customers",
+            |_| {
+                "ddl [\"hr.copy\", \"hr.customers\", \"performance_schema.events_statements_history_long\"] always"
+                    .to_owned()
+            },
+        );
+        expect_everywhere("CREATE VIEW hr.v AS SELECT 1 FROM DUAL", |_| {
+            "ddl [\"hr.v\"] always".to_owned()
+        });
+        // Code that runs out of sight adds `*`.
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS SELECT hr.f(email) FROM hr.customers",
+            |s| match star(s) {
+                "*.*" => "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always".to_owned(),
+                st => format!("ddl [\"hr.copy\", \"hr.customers\", {st:?}] always"),
+            },
+        );
+        // Other DDL still takes no name from the text (ADR-0023 decision
+        // 7).
+        for text in [
+            "CREATE TABLE hr.copy LIKE hr.customers",
+            "CREATE TABLE hr.copy (a INT)",
+            "CREATE DEFINER = app PROCEDURE hr.p() SELECT email FROM hr.customers",
+            "CREATE EVENT hr.e ON SCHEDULE EVERY 1 DAY DO CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let e = ev.expect(text);
+                    assert!(
+                        e.action() == EventAction::Ddl && e.objects().is_empty(),
+                        "{user} {source:?}: {text}"
+                    );
+                }
+            }
+        }
+        // Digests, with or without an account.
+        for (digest, want) in [
+            (
+                "CREATE TABLE `hr` . `copy` AS SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+                copy,
+            ),
+            (
+                "CREATE VIEW `hr` . `v` AS SELECT `email` FROM `hr` . `customers`",
+                view,
+            ),
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, digest, true, 3).expect(digest);
+                assert_eq!(shown(&e), want, "{user:?}: {digest}");
+            }
+        }
+        // A cut text adds `*`.
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(
+            b"CREATE TABLE hr.copy AS SELECT * FROM hr.customers WHERE id IN (1, 2",
+            true,
+            Vec::new(),
+        );
+        access.user = "app";
+        access.principal = EventPrincipal::account("app");
+        let e = b.statement(access, SystemTime::now()).unwrap();
+        assert_eq!(
+            shown(&e),
+            "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always"
+        );
+        // Table records: their tables and the text's.
+        for user in ["app", "databastion"] {
+            let text = "CREATE TABLE hr.copy AS SELECT * FROM hr.customers";
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("CREATE", "hr", "copy"), ("READ", "hr", "customers")],
+                        text,
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [copy], "{user}");
+            let ip = if user == "databastion" {
+                "172.18.0.1"
+            } else {
+                "10.0.0.5"
+            };
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, ip, 7, &[("hr", "customers")], text),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [copy], "{user}");
+        }
     }
 
     /// ADR-0047, fail closed: an explain whose text cannot be read (the
