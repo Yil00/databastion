@@ -1643,6 +1643,10 @@ mod tests {
                     // statement but the literal probe shape.
                     assert!(!p.explain_statement || p.explain_probe, "{s}");
                     assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+                    // No read into variables (#195 review M2) and no
+                    // `CREATE … AS SELECT` (#186 review L4): never the
+                    // agent's own.
+                    assert!(!p.into_var && !p.var_assign && !p.create_query, "{s}");
                 }
                 checked += 1;
             }
