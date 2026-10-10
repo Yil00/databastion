@@ -47,7 +47,8 @@ async fn ex_fixture(a: &mut Session) {
         format!(
             "CREATE VIEW {EX_DB}.v AS SELECT c.id, c.name FROM {EX_DB}.customers c WHERE c.id = 2"
         ),
-        format!("GRANT SELECT ON {EX_DB}.* TO '{EX_USER}'@'%'"),
+        // `EXPLAIN` of a view also needs `SHOW VIEW` (error 1345).
+        format!("GRANT SELECT, SHOW VIEW ON {EX_DB}.* TO '{EX_USER}'@'%'"),
         format!("GRANT SELECT ON performance_schema.threads TO '{EX_USER}'@'%'"),
     ] {
         exec(a, &statement).await;
