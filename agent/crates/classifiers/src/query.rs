@@ -1866,7 +1866,22 @@ fn table_name_before(s: &[Tok], i: usize, write: bool, schema_change: bool) -> b
             write && !after_select_modifiers(s, i - 1)
         }
         Some("table") => write || schema_change,
-        Some("exists" | "on" | "view" | "references") => schema_change,
+        Some("view" | "references") => schema_change,
+        // `CREATE INDEX i [USING …] ON t (a)`: not a join's `ON f(x)` in
+        // the `SELECT` of a DDL statement (security review of #188, L3).
+        Some("on") => {
+            let before = &s[..i - 1];
+            schema_change
+                && before.iter().any(|t| word(Some(t)) == Some("index"))
+                && !before.iter().any(|t| word(Some(t)) == Some("select"))
+        }
+        // `… IF NOT EXISTS t (a)`.
+        Some("exists") => {
+            schema_change
+                && i >= 3
+                && word(s.get(i - 2)) == Some("not")
+                && word(s.get(i - 3)) == Some("if")
+        }
         _ => false,
     }
 }
@@ -2393,12 +2408,22 @@ fn raw_call(b: &[u8], head: &[u8], is_name: fn(&[u8]) -> bool) -> bool {
 /// Whether, after a name ending at `j`, a raw text holds a call: an
 /// optional closing quote or backtick, then whitespace (the lexer's set,
 /// `0x0b` and `0x0c` included), comments, ends of comments (`*/`) and
-/// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`.
+/// executable comment openers (`/*!NNNNN`, `/*M!NNNNN`), then `(`. An
+/// executable comment is read both ways, as code (a server at or above
+/// its version) and skipped whole (below it, or the other flavor), and
+/// either reaching `(` is a call (`f/*!99999 abs*/()` runs `f()` on a
+/// server below 9.99.99; security review of #188, L2).
 fn raw_call_follows(b: &[u8], mut j: usize) -> bool {
-    let n = b.len();
     if matches!(b.get(j), Some(b'"' | b'`')) {
         j += 1;
     }
+    raw_call_follows_from(b, j, 8)
+}
+
+/// [`raw_call_follows`] after the optional closing quote; `depth` bounds
+/// the readings of nested executable comment openers.
+fn raw_call_follows_from(b: &[u8], mut j: usize, depth: u8) -> bool {
+    let n = b.len();
     loop {
         match b.get(j) {
             Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) => j += 1,
@@ -2410,6 +2435,13 @@ fn raw_call_follows(b: &[u8], mut j: usize) -> bool {
                     _ => None,
                 };
                 if let Some(mut k) = bang {
+                    // Skipped whole: what follows its end.
+                    if depth > 0
+                        && let Some(e) = find(&b[j + 2..], b"*/")
+                        && raw_call_follows_from(b, j + 2 + e + 2, depth - 1)
+                    {
+                        return true;
+                    }
                     while k < n && b[k].is_ascii_digit() {
                         k += 1;
                     }
@@ -5074,6 +5106,16 @@ mod tests {
             "SELECT a FROM t FOR SYSTEM_TIME FROM json_table() TO NOW()",
             // After `SET STATEMENT … FOR`.
             "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // An executable comment read both ways (security review of
+            // #188, L2): skipped below its version, `f()` runs.
+            "SELECT f/*!99999 abs*/()",
+            "SELECT f/*!999999 abs*/()",
+            "SELECT f/*M!999999 abs*/()",
+            "SELECT f /*!99999 abs */ (1), 'x\u{e9}\\'",
+            // `ON` / `EXISTS` inside DDL (security review of #188, L3).
+            "CREATE TABLE x AS SELECT * FROM hr.a JOIN hr.b ON f(a.k)",
+            "CREATE VIEW v AS SELECT 1 FROM hr.t JOIN hr.u ON f(1)",
+            "CREATE TABLE x AS SELECT 1 FROM hr.t WHERE EXISTS (SELECT f(1))",
             // Followed by `AS` (security review of #188, H1).
             "SELECT f() AS x",
             "SELECT f(1) AS a FROM hr.t",
@@ -5123,6 +5165,12 @@ mod tests {
             "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r",
             "WITH x (a) AS (SELECT 1), y AS (SELECT 2), `z` (b) AS (SELECT 3) SELECT * FROM z",
             "WITH RECURSIVE \"q\" (a) AS (SELECT 1), r (b, c) AS (SELECT 2, 3) SELECT 1",
+            "CREATE INDEX i ON t (a)",
+            "CREATE UNIQUE INDEX i USING BTREE ON hr.t (a, b)",
+            "CREATE INDEX IF NOT EXISTS i ON t (a)",
+            "CREATE TABLE IF NOT EXISTS t (a INT)",
+            "CREATE TABLE IF NOT EXISTS hr.t (a INT)",
+            "CREATE TABLE IF NOT EXISTS `t` (a INT)",
             "SELECT CAST(a AS DECIMAL(10, 2)), CAST(b AS nchar(4)), CAST(c AS datetime(6)) FROM t",
             "SELECT CONVERT(a, nchar(4)), CONVERT(b, datetime(6)) FROM t",
             "SELECT JSON_VALUE(j, '$.a' RETURNING decimal(4, 2)) FROM t",
