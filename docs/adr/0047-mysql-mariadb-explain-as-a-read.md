@@ -1,6 +1,6 @@
 # ADR-0047: MySQL / MariaDB Audit reports `EXPLAIN` / `DESCRIBE` of a statement as a read of the relations it names
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-10-10; the maintainer accepted the recommended answers to the six open questions)
 - **Date**: 2026-10-10
 - **Refines**: [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md) (which stays Accepted), decision 4 (what the statement analysis takes from a text), as already refined by [ADR-0045](0045-mysql-mariadb-statement-text-tables-and-unqualified-calls.md); and ADR-0045 (which stays Accepted), the refinement of 2026-10-09 to decision 4 ("`check()`'s readability probes … `EXPLAIN` … is quiet for every account"). Levels (ADR-0023 decision 2), sources (decision 1) and the agent's own-account rule (decision 6, as refined by [ADR-0027](0027-mongodb-audit.md) decision 7 and ADR-0045 decision 4) are unchanged except where decision 6 below says so.
 - **Context references**: security review of #186, finding M2; ROADMAP [phase 8 follow-ups](../ROADMAP.md#phase-8-follow-ups); [08-engine-capabilities.md, MySQL / MariaDB Audit, Known limits](../08-engine-capabilities.md#known-limits-1) ("`EXPLAIN` is quiet"); `agent/crates/connector-mysql/src/audit/events.rs` (`is_quiet`, `shows_session_text`, `own_ps_read`, the table-record action), `agent/crates/connector-mysql/src/sql.rs` (`PS_HISTORY_LONG`, `PS_HISTORY`, `PS_CURRENT`, `own_performance_schema_reads`), `agent/crates/classifiers/src/query.rs` (`wrapper_level`, `runs_statement_at`, `explain_analyze`, `explain_unbounded`, `explain_connection`, `MAX_EXPLAIN_PREFIX_TOKENS`), `agent/crates/core/src/audit.rs` (`reportable`: the `audit.configure` filter)
@@ -105,17 +105,18 @@ So the optimizer reads `const` tables (a primary or unique key equality, includi
 - **Running the explained statement's analysis as a write for `EXPLAIN UPDATE` / `DELETE`**: nothing is written; a write event would trip the agent's "never writes" rule (I4) for nothing and mislead write policies.
 - **Exempting only the agent's three probe texts and digests**: the digest-only record has no account, so the exemption would apply to anyone sending the same shape anyway; a narrowly defined shape that reads no value says the same thing honestly and also covers tools that check privileges with the same statement.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
+Each answer is the recommendation of this ADR, accepted by the maintainer on 2026-10-10.
 
 1. Option (a), every explain of a statement is a read of the relations it names, as proposed, or (b), (c) or (d)?
-   **Recommended answer**: (a). The verified servers read const and `system` tables through more paths than a lexical test can see, and give values without `SHOW WARNINGS`.
+   **Answer (decided by the maintainer on 2026-10-10)**: (a). The verified servers read const and `system` tables through more paths than a lexical test can see, and give values without `SHOW WARNINGS`.
 2. `min_rows`: always report explain events with no row count (decision 3), or count one row per explain and let the filter apply after aggregation, or let the filter drop them?
-   **Recommended answer**: always report, as ADR-0045 does for statement-text tables. No source gives a data row count for an `EXPLAIN`, so any filter on rows either drops them all or relies on a guess that a paced walk stays under.
+   **Answer (decided by the maintainer on 2026-10-10)**: always report, as ADR-0045 does for statement-text tables. No source gives a data row count for an `EXPLAIN`, so any filter on rows either drops them all or relies on a guess that a paced walk stays under.
 3. The literal probe shape (decision 5): quiet for every account, or exempt only the agent's three probe texts (exact text, as today) and their three digests?
-   **Recommended answer**: the shape, for every account. It reads no column value on any verified server, a digest-only record has no account to restrict it to anyway, and a tight token shape is easier to test than a list of digests.
+   **Answer (decided by the maintainer on 2026-10-10)**: the shape, for every account. It reads no column value on any verified server, a digest-only record has no account to restrict it to anyway, and a tight token shape is easier to test than a list of digests.
 4. Explained writes (`EXPLAIN UPDATE` / `DELETE` / `INSERT … SELECT` / `REPLACE`): a read of every relation named, target included (decision 2), or of the source relations only?
-   **Recommended answer**: every relation named. The plan uses the target's index for the `WHERE` of an `UPDATE` / `DELETE`, a multi-table `UPDATE` reads its const tables, and the account needs `SELECT` on the columns the `WHERE` reads (verified, error 1143), so naming the target matches what the account can learn. It is also the simpler rule to test.
+   **Answer (decided by the maintainer on 2026-10-10)**: every relation named. The plan uses the target's index for the `WHERE` of an `UPDATE` / `DELETE`, a multi-table `UPDATE` reads its const tables, and the account needs `SELECT` on the columns the `WHERE` reads (verified, error 1143), so naming the target matches what the account can learn. It is also the simpler rule to test.
 5. Monitoring and analyser noise: no agent-side allow-list, as decided for ADR-0045 (open question 2), or a per-target list of principals whose explains produce no event?
-   **Recommended answer**: no allow-list. Analysers that explain real statements read real rows, and their credentials are often shared; the console can scope or exclude principals.
+   **Answer (decided by the maintainer on 2026-10-10)**: no allow-list. Analysers that explain real statements read real rows, and their credentials are often shared; the console can scope or exclude principals.
 6. A dedicated signal (for example `shape.explain`) so that console policies can tell an explain read from a `SELECT`?
-   **Recommended answer**: not in this ADR. It is a protocol change (`signals.json`, [ADR-0022](0022-protocol-capability-negotiation.md)); the principal and objects are enough for the first policies. Revisit if users ask to scope explains separately.
+   **Answer (decided by the maintainer on 2026-10-10)**: not in this ADR. It is a protocol change (`signals.json`, [ADR-0022](0022-protocol-capability-negotiation.md)); the principal and objects are enough for the first policies. Revisit if users ask to scope explains separately.
