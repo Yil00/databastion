@@ -421,6 +421,11 @@ fn explain_lead_at(text: &[u8], mut i: usize, depth: u8) -> bool {
         if rest[0].is_ascii_whitespace() || rest[0] == b'(' {
             i += 1;
         } else if rest.starts_with(b"/*!") || rest.starts_with(b"/*M!") {
+            // Past the branch bound, fail closed: taken as an explain
+            // (security review of #195).
+            if depth >= MAX_LEAD_BRANCHES {
+                return true;
+            }
             // Skipped whole (a server that does not run it).
             if depth < MAX_LEAD_BRANCHES
                 && let Some(k) = rest[2..].windows(2).position(|w| w == b"*/")
@@ -5443,6 +5448,14 @@ mod tests {
             (b"/* EXPLAIN */ SELECT", false),
             // Re-review of #195, L1: an executable comment skipped whole.
             (b"/*!99999 x */ EXPLAIN SELECT 1", true),
+            (
+                b"/*!99999 a */ /*!99999 b */ /*!99999 c */ /*!99999 d */ /*!99999 e */ EXPLAIN SELECT 1",
+                true,
+            ),
+            (
+                b"/*!99999 a */ /*!99999 b */ /*!99999 c */ /*!99999 d */ /*!99999 e */ SELECT 1",
+                true,
+            ),
             (b"/*M!999999 x */ desc t", true),
             (b"/*!99999 x */ SELECT 1", false),
             (b"", false),
