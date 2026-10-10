@@ -9,7 +9,8 @@
 //!     commented [`NOT_BUILT_IN`] list, and those resolve to a stored
 //!     function (error 1305 or 1630) or do not parse (1064);
 //!   - every listed name, called with no argument in an empty schema, does
-//!     not resolve to a stored function, in each form its list accepts
+//!     not resolve to a stored function (nor with one or two `NULL`
+//!     arguments, plain), in each form its list accepts
 //!     (plain; backquoted when native; with a space before `(` unless it
 //!     is a keyword function of `sql_functions`), and does in the forms it
 //!     does not accept (the list is exact, so a server change fails here).
@@ -147,6 +148,16 @@ async fn builtin_lists_match_the_server() {
             }
             if stored(spaced) == spaced_ok {
                 wrong.push(format!("{name} ({form:?}): spaced {spaced:?}"));
+            }
+            // With one and two arguments too: a name whose resolution
+            // depends on the argument count (MariaDB's geometry
+            // constructors) must not be listed (security review of #188,
+            // L4).
+            for args in ["NULL", "NULL, NULL"] {
+                let code = errno(&mut a, &format!("SELECT {name}({args})")).await;
+                if stored(code) {
+                    wrong.push(format!("{name}: not built in with ({args}): {code:?}"));
+                }
             }
         }
         // Help topics of the function categories.
