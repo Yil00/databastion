@@ -807,8 +807,11 @@ pub(crate) const PS_CONSUMERS: &str = "SELECT c.NAME, c.ENABLED \
 /// row. Not a read of a statement-text table (ADR-0045): `check()` sends
 /// these on a short heartbeat session that has ended when a
 /// `performance_schema` poll sees them (no account, a digest only), so a
-/// `SELECT` there could not be recognized as the agent's own; an
-/// `EXPLAIN` is quiet for every account.
+/// `SELECT` there could not be recognized as the agent's own. Each is the
+/// literal probe shape of ADR-0047 decision 5 (`EXPLAIN SELECT 1 FROM t`:
+/// no condition, so no `const` table, and a literal select list), quiet
+/// for every account on every source, digests included; any other
+/// `EXPLAIN` is a read of what it names, never the agent's own.
 pub(crate) const PS_HISTORY_LONG: &str =
     "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long";
 pub(crate) const PS_HISTORY: &str =
@@ -940,8 +943,9 @@ pub(crate) fn ps_statements(table: &str, with_program: bool) -> String {
 /// its table records (if any) read only these tables; any other read of a
 /// statement-text table by the agent's identity is reported. Every text
 /// is constant: the probes of `check()` and of the Audit re-probe (the
-/// readability probes are `EXPLAIN`s, quiet in any case, listed for
-/// completeness), the own-thread probe sent once per Audit session, and
+/// readability probes have the literal probe shape of ADR-0047, quiet in
+/// any case, listed for completeness), the own-thread probe sent once per
+/// Audit session, and
 /// the poll and stats texts of each statement table.
 #[must_use]
 pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)> {
@@ -1635,6 +1639,9 @@ mod tests {
                     let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
                     let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
                     assert!(read || quiet, "{s}");
+                    // ADR-0047 decision 6: the agent sends no explain of a
+                    // statement but the literal probe shape.
+                    assert!(!p.explain_statement || p.explain_probe, "{s}");
                     assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
                 }
                 checked += 1;

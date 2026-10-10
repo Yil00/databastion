@@ -7,6 +7,9 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ⚠️ Upgrade notes
+- **MySQL / MariaDB Audit reports `EXPLAIN` / `DESCRIBE` / `DESC` of a statement as a read (behaviour change, [ADR-0047](docs/adr/0047-mysql-mariadb-explain-as-a-read.md)).** The optimizer reads the rows of `const` tables (a primary or unique key lookup) while it plans, and MySQL and MariaDB show their values (`SHOW WARNINGS`, JSON and TREE plans) or answer a value guess in the plan. Such an explain is now a read event naming every relation its statement names (an explained `UPDATE`, `DELETE`, `INSERT … SELECT` or `REPLACE` names its target too), from every account, the agent's included, **never dropped by `min_rows`**, with no row count. **Developers' and DBAs' tools (Workbench, phpMyAdmin, DBeaver), ORM explain helpers and query analysers (PMM Query Analytics, `pt-query-digest --explain`) now produce events**; there is no allow-list: scope the policies by object or exclude the analyser's principal there. `EXPLAIN ANALYZE` and MariaDB `ANALYZE` are now always reported too, with no row count. `DESCRIBE t`, `EXPLAIN t`, `SHOW COLUMNS` and the literal shape `EXPLAIN SELECT 1 FROM performance_schema.<table>` (the agent's readability probes) stay quiet ([docs/08](docs/08-engine-capabilities.md#explains-of-a-statement)).
+
 ## [0.6.0](https://github.com/Yil00/databastion/compare/0.5.0...0.6.0) (2026-10-10)
 
 ### ⚠️ Upgrade notes
