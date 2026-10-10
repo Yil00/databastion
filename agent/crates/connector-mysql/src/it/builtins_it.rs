@@ -17,8 +17,8 @@
 //!   `SELECT f()` (also backquoted, and double-quoted under `ANSI_QUOTES`),
 //!   `DO f()` and `SET @x = f()`, is a read of `*`, always reported, on
 //!   every source (`server_audit` with `QUERY_DML` logs no `SET`: there the
-//!   function's `TABLE` record is a read of the table); a table-less
-//!   built-in mix gives no event.
+//!   function's `TABLE` record alone is a read of the table and of `*`); a
+//!   table-less built-in mix gives no event.
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -520,13 +520,13 @@ async fn unknown_calls_are_reported_on_audit_logs() {
         let held = uc_traffic(&server).await;
         // `server_audit` with `QUERY_DML` (the dev set, one of the
         // recommended ones) logs no `SET` statement: the `SET @x = f()`
-        // call shows as the `TABLE` record of the function's read, a read
-        // of the table (docs/08). The JSON log has every statement.
+        // call shows as the `TABLE` record of the function's read alone,
+        // a read of the table and of `*` (security review of #188, M2).
+        // The JSON log has every statement.
         let server_audit = source == EventSource::MariadbServerAudit;
-        let star = if server_audit { 4 } else { 5 };
         let mut ev: Vec<MaskedEvent> = Vec::new();
         collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            caller_star(e) >= star
+            caller_star(e) >= if server_audit { 4 } else { 5 }
         })
         .await;
         // The `TABLE` records of a statement with no `QUERY` record are
@@ -534,7 +534,7 @@ async fn unknown_calls_are_reported_on_audit_logs() {
         // here).
         drop(held);
         collect_until(&mut rx, &mut ev, Duration::from_secs(30), |e| {
-            !server_audit || caller_table(e) >= 5
+            caller_star(e) >= 5 && (!server_audit || caller_table(e) >= 5)
         })
         .await;
         collect_until(&mut rx, &mut ev, Duration::from_secs(3), |_| false).await;
@@ -544,7 +544,7 @@ async fn unknown_calls_are_reported_on_audit_logs() {
             let all: Vec<String> = ev.iter().map(describe).collect();
             assert!(caller_table(&ev) >= 5, "{label}: {all:#?}");
         }
-        uc_check(&label, &ev, &logs, star);
+        uc_check(&label, &ev, &logs, 5);
         for user in [UC_CALLER, UC_PLAIN] {
             exec(&mut a, &format!("DROP USER IF EXISTS '{user}'@'%'")).await;
         }

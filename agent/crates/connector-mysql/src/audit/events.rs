@@ -1791,6 +1791,7 @@ impl EventBuilder {
         };
         let query = group.iter().find(|r| r.op == Op::Query);
         let text_record = query.or_else(|| group.iter().find(|r| r.text.is_some()));
+        let unlogged = source == EventSource::MariadbServerAudit && text_record.is_none();
         let key = format!("c{}", first.connection);
         let program = self.sessions.get(&key).and_then(|s| s.program.clone());
         let client = databastion_classifiers::masking::ClientAddr::parse(&first.host);
@@ -1816,7 +1817,14 @@ impl EventBuilder {
             opaque: text_record.is_some_and(|r| r.opaque),
             alt_text: None,
             digest: false,
-            truncated: text_record.is_some_and(|r| r.truncated),
+            // `server_audit` table-access records with no statement record
+            // (security review of #188, M2): a statement the event set does
+            // not log (`SET @x = f()`, DDL under `QUERY_DML`), a lost
+            // record, or one that outlived the pending timeout. What the
+            // text would have shown (a function call, a server file) is
+            // unknown: handled as a cut text, a read or write of the tables
+            // and of `*`, always reported, never the agent's own.
+            truncated: text_record.is_some_and(|r| r.truncated) || unlogged,
             tables,
             rows: None,
             status: query.map_or(0, |q| q.status),
@@ -2516,7 +2524,9 @@ mod tests {
                 "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'select count(*) from information_schema.tables',0",
                 // No table: skipped.
                 "20260929 09:41:34,h,app,10.0.0.5,37,3,QUERY,support,'select 1',0",
-                // Write, from TABLE events only (QUERY record filtered out).
+                // Write, from TABLE events only (QUERY record filtered out):
+                // the statement is unknown, `*` too (security review of
+                // #188, M2).
                 "20260929 09:41:34,h,app,10.0.0.5,37,4,WRITE,support,tickets,",
                 // DDL on the mysql schema (a GRANT): no mysql object.
                 "20260929 09:41:34,h,app,10.0.0.5,37,5,WRITE,mysql,global_priv,",
@@ -2534,7 +2544,7 @@ mod tests {
             out,
             [
                 "read [\"support.escalations\", \"support.tickets\"] None []",
-                "write [\"support.tickets\"] None []",
+                "write [\"support.*\", \"support.tickets\"] None []",
                 "dcl [] None []",
                 "read [\"mysql.user\"] None [\"shape.full_table_read\"]",
                 "read [\"support.*\"] None []",
@@ -2964,9 +2974,9 @@ mod tests {
         assert_eq!(
             out,
             [
-                "write [\"shop.a\"] None []",
+                "write [\"shop.*\", \"shop.a\"] None []",
                 "read [\"shop.a\"] None []",
-                "read [\"shop.b\"] None []",
+                "read [\"shop.*\", \"shop.b\"] None []",
             ],
             "{out:#?}"
         );
@@ -2976,8 +2986,34 @@ mod tests {
             .iter()
             .map(show)
             .collect();
-        assert_eq!(out, ["read [\"shop.c\"] None []"], "{out:#?}");
+        assert_eq!(out, ["read [\"shop.*\", \"shop.c\"] None []"], "{out:#?}");
         assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #188, M2: `server_audit` table-access records
+    /// with no statement record (`SET @x = f()` under `QUERY_DML`) are a
+    /// read of the tables and of `*`, always reported, also with the
+    /// agent's identity.
+    #[test]
+    fn unlogged_statements_are_reads_of_star() {
+        for user in ["app", "databastion"] {
+            let lines = [
+                format!("20260929 09:41:34,h,{user},172.18.0.1,7,50,READ,shop,customers,"),
+                format!("20260929 09:41:34,h,{user},172.18.0.1,7,0,DISCONNECT,shop,,0"),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(show).collect::<Vec<_>>(),
+                ["read [\"shop.*\", \"shop.customers\"] None []"],
+                "{user}"
+            );
+            assert!(ev.iter().all(MaskedEvent::always_report), "{user}");
+        }
     }
 
     /// Security review of #93, R4: a statement re-read after a restart is
@@ -3003,7 +3039,7 @@ mod tests {
         );
         assert_eq!(
             out.iter().map(show).collect::<Vec<_>>(),
-            ["read [\"shop.a\"] None []"]
+            ["read [\"shop.*\", \"shop.a\"] None []"]
         );
         assert!(b.held().is_empty());
         // Logged 100 s ago: flushed 200 s later, not after a full timeout.
@@ -3041,7 +3077,10 @@ mod tests {
         let out = at(&mut b, &[], t0 + PENDING_TIMEOUT);
         assert_eq!(
             out,
-            ["read [\"shop.a\"] None []", "read [\"shop.big\"] None []"],
+            [
+                "read [\"shop.*\", \"shop.a\"] None []",
+                "read [\"shop.*\", \"shop.big\"] None []"
+            ],
             "{out:#?}"
         );
         // The late QUERY records: no second event without a signal, one
@@ -3080,7 +3119,11 @@ mod tests {
         assert!(at(&mut b, &[rd(1, 40, "harmless")], t0).is_empty());
         let t1 = t0 + PENDING_TIMEOUT;
         let out = at(&mut b, &[], t1);
-        assert_eq!(out, ["read [\"shop.harmless\"] None []"], "{out:#?}");
+        assert_eq!(
+            out,
+            ["read [\"shop.*\", \"shop.harmless\"] None []"],
+            "{out:#?}"
+        );
         // The procedure goes on: the same table again (ignored), then
         // another one, then its statement record.
         let out = at(
@@ -3097,10 +3140,16 @@ mod tests {
         // with every table so far.
         assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
         let t2 = t1 + PENDING_TIMEOUT;
-        assert_eq!(at(&mut b, &[], t2), ["read [\"shop.a\"] None []"]);
+        assert_eq!(
+            at(&mut b, &[], t2),
+            ["read [\"shop.*\", \"shop.a\"] None []"]
+        );
         assert!(at(&mut b, &[rd(2, 41, "b")], t2).is_empty());
         let t3 = t2 + PENDING_TIMEOUT;
-        assert_eq!(at(&mut b, &[], t3), ["read [\"shop.b\"] None []"]);
+        assert_eq!(
+            at(&mut b, &[], t3),
+            ["read [\"shop.*\", \"shop.b\"] None []"]
+        );
         let out = at(
             &mut b,
             &[

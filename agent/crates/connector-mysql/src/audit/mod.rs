@@ -842,7 +842,9 @@ mod tests {
         assert!(reads(&mut rx).is_empty());
         let mut file = Some(st);
         close_file(&target, &sink, &state, &mut file).await.unwrap();
-        assert_eq!(reads(&mut rx), ["z"]);
+        // Held table records without their statement: `*` too (security
+        // review of #188, M2).
+        assert_eq!(reads(&mut rx), ["*,z"]);
         append(&line(4, 13, "QUERY", "'select v from z where id = 1',0"));
         let mut st = stream();
         file_run(&cfg, &target, &sink, &state, &mut st, &pre)
