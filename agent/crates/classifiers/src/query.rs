@@ -683,9 +683,14 @@ fn lex(text: &str, scs: bool) -> Result<Vec<Tok>, LexError> {
                     continue;
                 }
                 Some(b'"') => {
-                    let (end, name) = quoted_ident(text, i + 2)?;
+                    // Decoded as the server decodes it, so that names are
+                    // compared on what they are (`U&"\0070g_stats"` is
+                    // `pg_stats`: security review of #199, M2); an escape
+                    // the server would refuse does not lex (fail closed).
+                    let (end, raw) = quoted_ident(text, i + 2)?;
+                    let (end, escape) = uescape(b, end)?;
                     i = end;
-                    out.push(Tok::Quoted(name));
+                    out.push(Tok::Quoted(decode_unicode_ident(&raw, escape)?));
                     continue;
                 }
                 _ => {}
@@ -822,6 +827,98 @@ fn quoted_ident(text: &str, start: usize) -> Result<(usize, String), LexError> {
             }
         }
     }
+}
+
+/// The optional `UESCAPE '<c>'` clause after a PostgreSQL `U&"…"`
+/// identifier ending at `b[end]` (exclusive): the index after the clause
+/// and the escape character (`\` by default). Only whitespace may come
+/// between the identifier and the clause; a malformed clause or escape
+/// character (a hexadecimal digit, `+`, `'`, `"` or whitespace, which the
+/// server refuses) does not lex.
+fn uescape(b: &[u8], end: usize) -> Result<(usize, char), LexError> {
+    let mut j = end;
+    while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+        j += 1;
+    }
+    let word = b.get(j..j + 7);
+    if !word.is_some_and(|w| w.eq_ignore_ascii_case(b"uescape"))
+        || b.get(j + 7)
+            .copied()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Ok((end, '\\'));
+    }
+    j += 7;
+    while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+        j += 1;
+    }
+    match (b.get(j), b.get(j + 1), b.get(j + 2)) {
+        (Some(b'\''), Some(&c), Some(b'\''))
+            if c.is_ascii()
+                && !c.is_ascii_hexdigit()
+                && !c.is_ascii_whitespace()
+                && !matches!(c, b'+' | b'\'' | b'"') =>
+        {
+            Ok((j + 3, char::from(c)))
+        }
+        _ => Err(LexError::Unterminated),
+    }
+}
+
+/// Decodes the escapes of a PostgreSQL `U&"…"` identifier: `<e>XXXX` (4
+/// hexadecimal digits), `<e>+XXXXXX` (6), `<e><e>` (the escape character
+/// itself), with UTF-16 surrogate pairs combined, as the server does. Any
+/// other escape, an invalid code point or a lone surrogate does not lex.
+fn decode_unicode_ident(raw: &str, escape: char) -> Result<String, LexError> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != escape {
+            if high.is_some() {
+                return Err(LexError::Unterminated);
+            }
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&escape) {
+            chars.next();
+            if high.is_some() {
+                return Err(LexError::Unterminated);
+            }
+            out.push(escape);
+            continue;
+        }
+        let digits = if chars.peek() == Some(&'+') {
+            chars.next();
+            6
+        } else {
+            4
+        };
+        let mut v: u32 = 0;
+        for _ in 0..digits {
+            let d = chars
+                .next()
+                .and_then(|d| d.to_digit(16))
+                .ok_or(LexError::Unterminated)?;
+            v = v * 16 + d;
+        }
+        match (high.take(), v) {
+            (None, 0xD800..=0xDBFF) => high = Some(v),
+            (Some(h), 0xDC00..=0xDFFF) => {
+                let cp = 0x10000 + ((h - 0xD800) << 10) + (v - 0xDC00);
+                out.push(char::from_u32(cp).ok_or(LexError::Unterminated)?);
+            }
+            (None, 0) | (Some(_), _) | (None, 0xDC00..=0xDFFF) => {
+                return Err(LexError::Unterminated);
+            }
+            (None, v) => out.push(char::from_u32(v).ok_or(LexError::Unterminated)?),
+        }
+    }
+    if high.is_some() {
+        return Err(LexError::Unterminated);
+    }
+    Ok(out)
 }
 
 /// End index of a dollar-quote tag `$tag$` / `$$` starting at `b[i]`.
@@ -6331,6 +6428,44 @@ mod tests {
             "CREATE VIEW v",
         ] {
             assert!(!part0(q).create_query, "{q}");
+        }
+    }
+
+    /// PostgreSQL `U&"…"` identifiers are compared decoded (security
+    /// review of #199, M2); an escape the server refuses does not lex.
+    #[test]
+    fn unicode_escaped_identifiers_are_decoded() {
+        let s = |n: &str| (Some("pg_catalog".to_owned()), n.to_owned());
+        assert_eq!(
+            rels(r#"select * from U&"\0070g_stats""#),
+            [(None, "pg_stats".to_owned())]
+        );
+        assert_eq!(
+            rels(r#"select * from pg_catalog.u&"pg_st\+000061ts""#),
+            [s("pg_stats")]
+        );
+        assert_eq!(
+            rels(r#"select * from U&"!0070g_stat!!s" UESCAPE '!'"#),
+            [(None, "pg_stat!s".to_owned())]
+        );
+        assert_eq!(
+            rels(r#"select * from U&"pg_st\\ats""#),
+            [(None, "pg_st\\ats".to_owned())]
+        );
+        // A surrogate pair is one character.
+        assert_eq!(
+            rels(r#"select * from U&"a\D83D\DE00""#),
+            [(None, "a\u{1F600}".to_owned())]
+        );
+        for bad in [
+            r#"select * from U&"\00""#,
+            r#"select * from U&"\D83D""#,
+            r#"select * from U&"\zzzz""#,
+            r#"select * from U&"!0070" UESCAPE '+'"#,
+            r#"select * from U&"\0000x""#,
+        ] {
+            let a = analyze(bad, AnalyzeOptions::new());
+            assert!(!a.lexed(), "{bad}");
         }
     }
 }

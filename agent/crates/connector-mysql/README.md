@@ -291,6 +291,25 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   (`sql::own_performance_schema_reads`); its readability probes are
   `EXPLAIN`s (the same privilege, no row read, quiet). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
+- **Statistics tables** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)):
+  `information_schema.COLUMN_STATISTICS` and `mysql.column_stats`
+  (`audit::events::STATISTICS_TABLES`) hold column values. Named by the
+  statement text on every source, they are objects of reads (as listed),
+  always reported and never the agent's own (it names neither: `sql.rs`
+  unit test). Table records alone do not name them: MariaDB writes
+  `server_audit` `READ` records of `mysql.column_stats`, `table_stats` and
+  `index_stats` under the reader's account when it loads a table's
+  statistics: such a `column_stats` record is dropped when it comes with
+  the load's `table_stats` record and a text read whole, and names
+  `mysql.column_stats` otherwise (code out of sight, an unreadable or cut
+  text, `HANDLER`, no `table_stats` record, or a relation of the text with
+  no table record of its own, such as a view, which is then named too;
+  a record counts only for its exact name, so a text writing a name in
+  another case over-reports under `lower_case_table_names = 1`, and a
+  text creating or dropping a temporary table counts none). Code out of sight adds `*` whatever its table
+  records. Drift
+  test and server facts: `it::statistics_it`. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by
   `server_audit`, JSON-encoded by `audit_log`), so it cannot add records.

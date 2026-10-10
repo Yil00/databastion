@@ -1840,3 +1840,276 @@ async fn pg_stat_statements_mode_is_limited_and_attributes_roles_only() {
         assert!(!format!("{e:?}").contains(AUDIT_MARKER));
     }
 }
+
+/// A role reading the statistics catalogs (ADR-0048).
+const STATS_ROLE: &str = "databastion_it_stats";
+const STATS_PASSWORD: &str = "dev-only-it-stats-FAKE";
+/// Marker in the analyzed values: never in an event or a log line (I2).
+const STATS_MARK: &str = "St7Qz";
+
+/// The statistics reads of the test: (role, statement). The second role
+/// reads `pg_stats` (whole-row, `TABLE`, and through a column that holds
+/// no value); the administrator (a superuser, the table owner) reads
+/// `pg_statistic` and `pg_stats_ext`.
+fn statistics_reads(adm: &Url) -> Vec<(String, &'static str)> {
+    vec![
+        (
+            STATS_ROLE.to_owned(),
+            "SELECT most_common_vals IS NOT NULL FROM pg_stats WHERE tablename = 'it_stats'",
+        ),
+        (
+            STATS_ROLE.to_owned(),
+            "SELECT s FROM pg_catalog.pg_stats s WHERE s.schemaname = 'crm'",
+        ),
+        (
+            STATS_ROLE.to_owned(),
+            "SELECT avg_width, null_frac FROM pg_stats",
+        ),
+        (STATS_ROLE.to_owned(), "TABLE pg_stats"),
+        (
+            adm.user.clone(),
+            "SELECT count(*) FROM pg_catalog.pg_statistic",
+        ),
+        (adm.user.clone(), "SELECT count(*) FROM pg_stats_ext"),
+    ]
+}
+
+/// A read event of `user` naming `pg_catalog.<relation>`, always reported.
+fn statistics_read(
+    e: &databastion_classifiers::masking::MaskedEvent,
+    user: &str,
+    relation: &str,
+) -> bool {
+    e.principal().account_name() == user
+        && e.action() == databastion_classifiers::masking::EventAction::Read
+        && e.always_report()
+        && e.objects().iter().any(|o| {
+            o.schema().is_some_and(|s| s.as_str() == "pg_catalog")
+                && o.object().as_str() == relation
+        })
+}
+
+/// ADR-0048 against the dev server, on every available source (the
+/// pgaudit log files, then `pg_stat_statements`): a second role's reads of
+/// `pg_stats` and a superuser's reads of `pg_statistic` / `pg_stats_ext`
+/// are read events naming them (`pg_catalog.<name>`), always reported; the
+/// agent's own statements (`check()`) give none, `pgaudit.log_catalog = on`
+/// included (the dev and e2e setting since ADR-0048); no analyzed value
+/// reaches an event or a log.
+#[tokio::test]
+async fn statistics_reads_are_named_and_always_reported() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let a = admin(&adm, &u.dbname).await;
+    a.batch_execute(&format!(
+        "DROP TABLE IF EXISTS crm.it_stats; \
+         CREATE TABLE crm.it_stats AS SELECT g AS id, \
+           'user' || g || '-{STATS_MARK}@example.test' AS email, \
+           CASE WHEN g % 2 = 0 THEN 'Lille{STATS_MARK}' ELSE 'Nantes{STATS_MARK}' END AS city \
+           FROM generate_series(1, 200) g; \
+         CREATE STATISTICS IF NOT EXISTS crm.it_stats_mcv (mcv) ON email, city FROM crm.it_stats; \
+         ANALYZE crm.it_stats; \
+         DROP ROLE IF EXISTS {STATS_ROLE}; \
+         CREATE ROLE {STATS_ROLE} LOGIN PASSWORD '{STATS_PASSWORD}'; \
+         GRANT CONNECT ON DATABASE \"{db}\" TO {STATS_ROLE}; \
+         GRANT USAGE ON SCHEMA crm TO {STATS_ROLE}; \
+         GRANT SELECT ON crm.it_stats TO {STATS_ROLE};",
+        db = u.dbname
+    ))
+    .await
+    .unwrap();
+    // The server facts the decision rests on (counts only): the reader
+    // sees the analyzed values of its columns in `pg_stats`, and only the
+    // owner sees the extended statistics.
+    let reader = raw_client(&adm, STATS_ROLE, STATS_PASSWORD, &u.dbname).await;
+    let n: i64 = reader
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM pg_stats WHERE tablename = 'it_stats' AND \
+                 (most_common_vals::text LIKE '%{STATS_MARK}%' \
+                  OR histogram_bounds::text LIKE '%{STATS_MARK}%')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 2, "pg_stats values of the reader's columns");
+    let n: i64 = reader
+        .query_one(
+            "SELECT count(*) FROM pg_stats_ext WHERE tablename = 'it_stats'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0, "pg_stats_ext is the owner's only");
+    drop(reader);
+    let mut sources: Vec<(String, Option<(PathBuf, &'static str)>)> = audit_logs()
+        .into_iter()
+        .map(|(p, f)| (format!("pgaudit {f}"), Some((p, f))))
+        .collect();
+    sources.push(("pg_stat_statements".to_owned(), None));
+    if sources.len() > 1 {
+        // The dev and e2e configuration (ADR-0048 open question 6).
+        let on: Option<String> = a
+            .query_one("SELECT current_setting('pgaudit.log_catalog', true)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            on.as_deref(),
+            Some("on"),
+            "pgaudit.log_catalog in the dev image"
+        );
+    }
+    for (i, (label, log)) in sources.into_iter().enumerate() {
+        let (_dir, t) = audit_target(
+            &u,
+            &format!("pg-stats-{i}"),
+            log.as_ref().map(|(p, f)| (p.as_path(), *f)),
+        );
+        let connector = Arc::new(PostgresConnector::new());
+        let health = connector.check(&t).await;
+        if log.is_none() && health.audit_level != AuditLevel::Limited {
+            skip("pss", "pg_stat_statements is not usable by the agent role");
+            continue;
+        }
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit_with(Arc::clone(&connector), &t, &state.0);
+        // The tailers open the log; the first poll takes the baseline.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        for _ in 0..3 {
+            assert!(connector.check(&t).await.reachable, "{label}");
+        }
+        let reader = raw_client(&adm, STATS_ROLE, STATS_PASSWORD, &u.dbname).await;
+        for (user, statement) in statistics_reads(&adm) {
+            let c = if user == STATS_ROLE { &reader } else { &a };
+            c.simple_query(statement).await.unwrap();
+        }
+        let done = |ev: &[databastion_classifiers::masking::MaskedEvent]| {
+            ev.iter()
+                .any(|e| statistics_read(e, STATS_ROLE, "pg_stats"))
+                && ev
+                    .iter()
+                    .any(|e| statistics_read(e, &adm.user, "pg_statistic"))
+                && ev
+                    .iter()
+                    .any(|e| statistics_read(e, &adm.user, "pg_stats_ext"))
+        };
+        let mut events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(30), done).await;
+        for _ in 0..2 {
+            assert!(connector.check(&t).await.reachable, "{label}");
+        }
+        collect_until(&mut rx, &mut events, Duration::from_secs(4), |_| false).await;
+        task.abort();
+        drop(reader);
+        let all: Vec<String> = events.iter().map(describe).collect();
+        eprintln!("{label} events ({}):\n{}", all.len(), all.join("\n"));
+        assert!(done(&events), "{label}: {all:#?}");
+        // Every event of the reader names `pg_stats` (each of its
+        // statements reads it), always reported.
+        assert!(
+            events
+                .iter()
+                .filter(|e| e.principal().account_name() == STATS_ROLE)
+                .all(|e| statistics_read(e, STATS_ROLE, "pg_stats")),
+            "{label}: {all:#?}"
+        );
+        // The agent's own statements: none, catalog reads included.
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.principal().account_name() == u.user),
+            "{label}: {all:#?}"
+        );
+        assert!(!all.iter().any(|d| d.contains(STATS_MARK)), "{label}");
+    }
+    a.batch_execute(&format!(
+        "DROP TABLE IF EXISTS crm.it_stats; \
+         REVOKE ALL ON SCHEMA crm FROM {STATS_ROLE}; \
+         REVOKE ALL ON DATABASE \"{db}\" FROM {STATS_ROLE}; \
+         DROP ROLE IF EXISTS {STATS_ROLE};",
+        db = u.dbname
+    ))
+    .await
+    .unwrap();
+    let text = logs.text();
+    assert!(
+        !text.contains(STATS_MARK),
+        "an analyzed value reached the logs"
+    );
+    assert!(!text.contains("pg_stats"), "statement text in the logs");
+}
+
+/// `pg_catalog` relations found by the statistics drift test that hold no
+/// sampled value: (relation, reason).
+const NOT_VALUE_STATISTICS: [(&str, &str); 1] = [
+    // `attmissingval` (`anyarray`): the default of a column added with
+    // `ALTER TABLE … ADD COLUMN … DEFAULT`, a constant of the DDL, for the
+    // rows that existed before; not sampled from the data.
+    ("pg_attribute", "fast default of an added column"),
+];
+
+/// ADR-0048 drift test: every `pg_catalog` relation with a column of type
+/// `anyarray`, `pg_mcv_list` or `pg_statistic[]`, or a column named
+/// `most_common_vals`, `histogram_bounds` or `most_common_elems`, is in
+/// `STATISTICS_RELATIONS` or a commented exception. A new server version
+/// that adds such a relation fails the engine matrix instead of being
+/// missed.
+#[tokio::test]
+async fn statistics_relations_match_the_server() {
+    let Some(adm) = admin_url() else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let a = admin(&adm, &adm.dbname).await;
+    let version: String = a
+        .query_one("SELECT pg_catalog.version()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let rows = a
+        .query(
+            "SELECT DISTINCT c.relname::text FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'pg_catalog' AND a.attnum > 0 AND NOT a.attisdropped \
+             AND (a.atttypid IN ('pg_catalog.anyarray'::pg_catalog.regtype, \
+               'pg_catalog.pg_mcv_list'::pg_catalog.regtype, \
+               'pg_catalog.pg_statistic[]'::pg_catalog.regtype) \
+             OR a.attname IN ('most_common_vals', 'histogram_bounds', 'most_common_elems')) \
+             ORDER BY 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let found: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    eprintln!("{version}: statistics columns in {found:?}");
+    let listed = crate::audit::events::STATISTICS_RELATIONS;
+    let missing: Vec<&String> = found
+        .iter()
+        .filter(|r| {
+            !listed.contains(&r.as_str()) && !NOT_VALUE_STATISTICS.iter().any(|(n, _)| n == r)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{version}: pg_catalog relations with statistics columns not in STATISTICS_RELATIONS \
+         (add them, or to NOT_VALUE_STATISTICS with a reason): {missing:?}"
+    );
+    // Every listed relation exists on the server.
+    let absent: Vec<&&str> = listed
+        .iter()
+        .filter(|n| !found.iter().any(|f| f == **n))
+        .collect();
+    assert!(
+        absent.is_empty(),
+        "{version}: listed, not found: {absent:?}"
+    );
+}

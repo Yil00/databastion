@@ -656,6 +656,22 @@ mod tests {
         }
     }
 
+    /// ADR-0048 decision 4: the connector names no statistics relation
+    /// (a read of one is never its own), and none of its statements
+    /// reaches the analyzer's relation bound (a text there adds `*` and is
+    /// never its own either).
+    #[test]
+    fn no_statement_names_a_statistics_relation_or_reaches_the_bound() {
+        for s in all_statements() {
+            let lower = s.to_lowercase();
+            for n in crate::audit::events::STATISTICS_RELATIONS {
+                assert!(!lower.contains(n), "{n} in {s}");
+            }
+            let a = crate::audit::events::analyze_pss(&s, false);
+            assert!(!a.parts().iter().any(|p| p.relations_full), "{s}");
+        }
+    }
+
     #[test]
     fn statements_are_single_and_never_set_read_write() {
         for s in all_statements() {

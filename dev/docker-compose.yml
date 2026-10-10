@@ -59,8 +59,10 @@ services:
       - pgaudit.role=databastion_auditor
       - -c
       - pgaudit.log_relation=on
+      # Statements on catalogs only are logged too: reads of the statistics catalogs that hold
+      # column values (pg_stats, pg_statistic…) are reported (ADR-0048, the recommended setting).
       - -c
-      - pgaudit.log_catalog=off
+      - pgaudit.log_catalog=on
       - -c
       - pgaudit.log_parameter=off
       # Rows per statement in the pgaudit records (P4-A: volume of each access, Full level). pgaudit
