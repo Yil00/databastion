@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.6.0](https://github.com/Yil00/databastion/compare/0.5.0...0.6.0) (2026-10-10)
+
 ### ⚠️ Upgrade notes
 From 0.5.x: upgrade the console first, then the agents, as for every release (a console `X.Y` accepts agents `X.Y` and `X.(Y-1)`, [RELEASE.md](RELEASE.md#compatibility)). This release changes the agent only: no console code, console migration or protocol change. **The minimum MySQL / MariaDB grants are unchanged** ([05-security.md](docs/05-security.md#recommended-database-accounts-read-only)): the `performance_schema` source still needs `SELECT ON performance_schema.*`, the audit-log sources no grant. Check these points before upgrading the agents:
 - **MySQL / MariaDB Audit reports more (behaviour change, #184 to #188).** The following are now reported from every account, the agent's included, are never dropped by the `audit.configure` minimum rows (`min_rows`) and, except the agent's own constant `performance_schema` texts (below), are never left out as the agent's own ([docs/08](docs/08-engine-capabilities.md#statement-text-tables)):
