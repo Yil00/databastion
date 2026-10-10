@@ -604,6 +604,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         );
         notes.extend(text);
         codes.extend(probe_codes);
+        notes.extend(log_catalog_detail(
+            &probe,
+            settings.audit_log.is_some() && log_readable,
+            database,
+        ));
         let key = (target.id.clone(), database.clone());
         if state.due(&key) {
             match report(&session, timeouts, settings.extended_grants).await {
@@ -714,6 +719,24 @@ fn probe_notes(
         }
     }
     (text, codes)
+}
+
+/// ADR-0048 decision 5: the local detail (never a closed note, no level
+/// change) when pgaudit is the source (`log_read`) and `pgaudit.log_catalog`
+/// is proven off in `database`: a statement that reads only `pg_catalog`
+/// relations is not logged, so a read of the statistics relations alone
+/// gives no event.
+fn log_catalog_detail(probe: &AuditProbe, log_read: bool, database: &str) -> Option<String> {
+    (log_read && probe.pgaudit_loaded == Some(true) && probe.pgaudit_log_catalog == Some(false))
+        .then(|| {
+            format!(
+                "database {}: pgaudit.log_catalog is off, so a statement that reads only \
+                 catalogs is not logged: a read of the statistics catalogs alone (pg_stats, \
+                 pg_statistic and their extended forms) gives no event; set \
+                 pgaudit.log_catalog = on",
+                normalize(database).as_str()
+            )
+        })
 }
 
 /// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
@@ -1501,6 +1524,47 @@ mod tests {
         assert!(!pgaudit_rows_on(true, false, Some("on")));
         assert!(!pgaudit_rows_on(false, false, Some("on")));
         assert!(!pgaudit_rows_on(false, true, Some("on")));
+    }
+
+    /// ADR-0048 decision 5 and open question 5: `pgaudit.log_catalog = off`
+    /// is said in the local detail only, when pgaudit is the source; no
+    /// note, no level change.
+    #[test]
+    fn log_catalog_off_is_a_local_detail() {
+        let p = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            pgaudit_rows: true,
+            pgaudit_log_catalog: Some(false),
+            ..AuditProbe::default()
+        };
+        let d = log_catalog_detail(&p, true, "shop").unwrap();
+        assert!(
+            d.contains("pgaudit.log_catalog") && d.contains("shop"),
+            "{d}"
+        );
+        assert_eq!(p.level(true), AuditLevel::Full);
+        let (_, notes) = probe_notes(&p, true, true);
+        assert!(notes.is_empty(), "{notes:?}");
+        // Not the source, on, unknown, or pgaudit not loaded: nothing.
+        assert!(log_catalog_detail(&p, false, "shop").is_none());
+        for probe in [
+            AuditProbe {
+                pgaudit_log_catalog: Some(true),
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_log_catalog: None,
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_loaded: Some(false),
+                ..p.clone()
+            },
+        ] {
+            assert!(log_catalog_detail(&probe, true, "shop").is_none());
+        }
     }
 
     #[test]
