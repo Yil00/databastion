@@ -5282,7 +5282,8 @@ mod tests {
             "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
             "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
         ] {
-            let p = &my(q).parts()[0];
+            let a = my(q);
+            let p = &a.parts()[0];
             assert!(
                 p.explain_statement && !p.explain_probe && p.explain_probe_case,
                 "{q}"
