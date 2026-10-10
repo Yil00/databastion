@@ -716,9 +716,11 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
                    "per principal, action, source and object set: events - (floor(span / window) + 2), "
                    "the most windows of the agent's aggregator that span can meet")
         elif role == "builtins":
-            nc = s.get("non_connect")
-            ck.add(f"audit.{target}.builtins_no_event", None if nc is None else nc == 0, nc, "0",
-                   "table-less built-in calls (ADR-0045 part (b)): no event but connections")
+            nc, n = s.get("non_connect"), s.get("events")
+            ck.add(f"audit.{target}.builtins_no_event", None if nc is None or n is None else nc == 0 and n >= 1,
+                   {"non_connect": nc, "events": n}, "0 non-connect, >= 1 connect",
+                   "table-less built-in calls (ADR-0045 part (b)): no event but connections, and the "
+                   "account's connection was audited (the stream saw it)")
     if side:
         rep["side"] = side
 

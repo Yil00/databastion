@@ -437,7 +437,7 @@ class ReportTest(unittest.TestCase):
     def test_side_accounts(self) -> None:
         # ADR-0045: the monitoring-like reader and the built-in mix of the MariaDB Audit run.
         def side(excess: int = 0, non_connect: int = 0, objects: list | None = None,
-                 failed: int = 0) -> list[dict]:
+                 failed: int = 0, builtin_events: int = 1) -> list[dict]:
             exp = ["performance_schema.threads", "information_schema.PROCESSLIST"]
             return [
                 {"kind": "side", "target": "mariadb-load", "account": "load_monitor", "phase": "off",
@@ -451,8 +451,8 @@ class ReportTest(unittest.TestCase):
                  "non_connect": 22, "objects": exp if objects is None else objects, "expected": exp,
                  "window_s": 60},
                 {"kind": "side_events", "target": "mariadb-load", "account": "load_builtins", "role": "builtins",
-                 "events": 1, "received": 1, "groups": 1, "max_events_per_group": 1, "max_excess": -11,
-                 "non_connect": non_connect, "objects": [], "expected": [], "window_s": 60},
+                 "events": builtin_events + non_connect, "received": builtin_events + non_connect,
+                 "groups": 1, "max_events_per_group": 1, "max_excess": -11, "non_connect": non_connect, "objects": [], "expected": [], "window_s": 60},
             ]
         facts, samples, hbs = scenario()
         rep, ck = L.build_report(facts + side(), samples, hbs, L.Limits())
@@ -471,7 +471,9 @@ class ReportTest(unittest.TestCase):
         for kw, failing in ((dict(excess=1), "monitor_one_event_per_window"),
                             (dict(non_connect=3), "builtins_no_event"),
                             (dict(objects=["performance_schema.threads"]), "monitor_reported"),
-                            (dict(failed=2), "monitor_ran")):
+                            (dict(failed=2), "monitor_ran"),
+                            # Nothing seen at all: the stream may have missed the account.
+                            (dict(builtin_events=0), "builtins_no_event")):
             rep, ck = L.build_report(facts + side(**kw), samples, hbs, L.Limits())
             self.assertEqual(self.names(ck, False), {f"audit.mariadb-load.{failing}"}, kw)
         # Without the side facts (the CAS harness, an older run): no side check.
