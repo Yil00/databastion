@@ -29,6 +29,7 @@
 
 mod audit;
 mod auth;
+mod builtins;
 mod catalog;
 mod check;
 mod conn;

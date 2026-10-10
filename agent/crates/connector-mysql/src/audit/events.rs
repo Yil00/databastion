@@ -44,7 +44,9 @@
 //! text that only kept its kind (opaque, ambiguous readings, not
 //! lexable) is reported against `*` with the most reportable kind of its
 //! readings; code that runs out of sight (`CALL`, `EXECUTE`, `PREPARE`, a
-//! schema-qualified function call) adds `*`. A text with several
+//! schema-qualified function call, an unqualified call of a name that is
+//! not built in on the server's series: `crate::builtins`, ADR-0045 part
+//! (b)) adds `*`. A text with several
 //! statements takes the action of its most reportable one. A statement
 //! that writes or changes something, runs code out of sight or cannot be
 //! read is never left out as the agent's own (I4), unless table records
@@ -72,6 +74,7 @@ use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use databastion_core::audit::tail::RecordPos;
 
 use super::records::{FileRecord, Op, TableOp};
+use crate::builtins::BuiltinList;
 use crate::conn::Flavor;
 use crate::discover::normalize;
 
@@ -98,8 +101,12 @@ const PRE_EXECUTION_ERRORS: [u32; 13] = [
     1044, 1049, 1051, 1052, 1054, 1066, 1109, 1142, 1143, 1146, 1227, 1305, 1370,
 ];
 
+/// Analysis options of a text, with the names built in on every listed
+/// server (an event builder uses its server's list instead).
 fn analyze_opts(truncated: bool) -> AnalyzeOptions {
-    let mut o = AnalyzeOptions::mysql().truncated(truncated);
+    let mut o = AnalyzeOptions::mysql()
+        .truncated(truncated)
+        .builtins(crate::builtins::any_server());
     o.large_limit = LARGE_LIMIT + 1;
     o
 }
@@ -341,6 +348,7 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
         || p.analyze_wrapped
         || p.audit_function
         || p.file_read
+        || p.unknown_call
         || p.explain_unbounded
     {
         return false;
@@ -350,8 +358,8 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
     match lead.as_slice() {
         // Built-in calls are fine (`SET sql_mode = CONCAT(@@sql_mode, …)`,
         // sent by Connector/J on every pooled connection); a
-        // schema-qualified (stored) function is not, nor an audit
-        // function or `LOAD_FILE` (excluded above).
+        // schema-qualified (stored) function is not, nor an unknown call,
+        // an audit function or `LOAD_FILE` (excluded above).
         ["set", ..] => !p.routine_call && p.relations.is_empty(),
         ["begin"] | ["begin", "work"] => true,
         ["start", "transaction", ..]
@@ -502,14 +510,23 @@ const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 /// Fixed overhead counted per pending record.
 const RECORD_OVERHEAD: usize = 256;
 /// A pending statement whose statement record has not come after this
-/// long is reported from its table-access records alone.
-const PENDING_TIMEOUT: Duration = Duration::from_secs(300);
+/// long is reported from its table-access records alone. It outlasts the
+/// longest statement timeout an agent may configure, plus a margin: since
+/// a group without a statement record is a read of `*`, always reported
+/// and never the agent's own, an agent sample still running when its
+/// table records are flushed would otherwise be reported as a read with
+/// the agent's credential (security review of #188, N1).
+const PENDING_TIMEOUT: Duration = Duration::from_secs(660);
+const _: () = assert!(
+    PENDING_TIMEOUT.as_secs()
+        >= databastion_core::config::STATEMENT_TIMEOUT_MS_RANGE.1 as u64 / 1000 + 60
+);
 /// A statement flushed early is forgotten after this long: its late
 /// records are then handled as a new statement (security review of #93,
 /// L4: the memory of `reported` does not outlive the statements it is for,
 /// and a connection id reused after a server restart is not mistaken for
 /// the old one for long).
-const REPORTED_TTL: Duration = Duration::from_secs(2 * 300);
+const REPORTED_TTL: Duration = Duration::from_secs(2 * 660);
 
 /// Bytes a pending record holds (see [`MAX_PENDING_BYTES`]).
 fn record_bytes(r: &FileRecord) -> usize {
@@ -853,6 +870,9 @@ pub(crate) struct Access<'a> {
     /// takes the objects and signals of both (security review of 09e93da,
     /// R1). The agent's exact-text matches use `text` only.
     pub(crate) alt_text: Option<&'a [u8]>,
+    /// `text` is a `performance_schema` digest (`alt_text` always is):
+    /// read with `AnalyzeOptions::digest`.
+    pub(crate) digest: bool,
     /// Table-access records of the statement.
     pub(crate) tables: Vec<(&'a str, &'a str, TableOp)>,
     pub(crate) rows: Option<u64>,
@@ -924,6 +944,9 @@ pub(crate) struct EventBuilder {
     /// The server's flavor, which decides a few statement-text tables
     /// ([`statement_text_table`]; `None`: every listed table).
     flavor: Option<Flavor>,
+    /// The server's built-in function names (ADR-0045 decision 8; until
+    /// set, the names built in on every listed server).
+    builtins: &'static BuiltinList,
     sessions: Sessions,
     /// Table-access records waiting for their statement record.
     pending: Pending,
@@ -941,6 +964,7 @@ impl EventBuilder {
             own_statements: Vec::new(),
             credits: None,
             flavor: None,
+            builtins: crate::builtins::any_server(),
             sessions: Sessions::default(),
             pending: Pending::default(),
             panicked: 0,
@@ -960,6 +984,13 @@ impl EventBuilder {
     #[must_use]
     pub(crate) fn with_flavor(mut self, flavor: Flavor) -> Self {
         self.flavor = Some(flavor);
+        self
+    }
+
+    /// The server's built-in function names (`crate::builtins::for_server`).
+    #[must_use]
+    pub(crate) fn with_builtins(mut self, builtins: &'static BuiltinList) -> Self {
+        self.builtins = builtins;
         self
     }
 
@@ -1124,16 +1155,24 @@ impl EventBuilder {
                 t,
                 analyze_opts(a.truncated)
                     .opaque(a.opaque)
-                    .transcoded(transcoded),
+                    .transcoded(transcoded)
+                    .builtins(self.builtins)
+                    .digest(a.digest),
             )
         });
         // A second whole text of the statement (the digest next to an
         // uncut `SQL_TEXT`): its statements are analyzed with the first
         // one's, so the event takes the objects and signals of both
         // (security review of 09e93da, R1).
-        let alt_analysis: Option<QueryAnalysis> = a
-            .alt_text
-            .map(|t| analyze_raw(t, analyze_opts(false).transcoded(transcoded)));
+        let alt_analysis: Option<QueryAnalysis> = a.alt_text.map(|t| {
+            analyze_raw(
+                t,
+                analyze_opts(false)
+                    .transcoded(transcoded)
+                    .builtins(self.builtins)
+                    .digest(true),
+            )
+        });
         let joined: Vec<StatementInfo>;
         let parts: &[StatementInfo] = match &alt_analysis {
             None => analysis.as_ref().map_or(&[], QueryAnalysis::parts),
@@ -1219,7 +1258,11 @@ impl EventBuilder {
         // text that did not lex, and an `EXPLAIN` whose statement is past
         // the prefix bound (#168 review L3): what they read (a server
         // file, a statement that may run) is named by no audit source, so
-        // the event adds `*` whatever its table records.
+        // the event adds `*` whatever its table records. So does an
+        // unqualified call of a name that is not a built-in function of the
+        // server's series (ADR-0045 decisions 8 to 10): a stored function
+        // of the default database or a loadable function, whose reads no
+        // statement text names; the routine's name is never an object.
         // A statement that shows other sessions' statement texts without
         // naming a table (`SHOW ENGINE INNODB STATUS`, `SHOW EXPLAIN FOR`,
         // `EXPLAIN FOR CONNECTION`; ADR-0045 open question 3) is handled
@@ -1234,6 +1277,7 @@ impl EventBuilder {
         let hidden = parts.iter().any(|p| {
             p.file_read
                 || p.non_ascii_call
+                || p.unknown_call
                 || p.explain_unbounded
                 || p.relations_full
                 || shows_session_text(p)
@@ -1244,11 +1288,11 @@ impl EventBuilder {
             || analysis
                 .iter()
                 .chain(&alt_analysis)
-                .any(|x| x.file_read() || x.non_ascii_call());
+                .any(|x| x.file_read() || x.non_ascii_call() || x.unknown_call());
         // Code that runs out of sight: a procedure, a prepared statement,
-        // a stored function (schema-qualified calls only: `f()` cannot be
-        // told from a built-in function), `LOAD_FILE` and an unbounded
-        // `EXPLAIN` (above).
+        // a stored function (schema-qualified, or an unqualified call of a
+        // name that is not built in on the server, above: ADR-0045 part
+        // (b)), `LOAD_FILE` and an unbounded `EXPLAIN` (above).
         // A `"…"` name (`ANSI_QUOTES`) hides the objects the same way.
         let call = hidden
             || parts.iter().any(|p| {
@@ -1756,6 +1800,7 @@ impl EventBuilder {
         };
         let query = group.iter().find(|r| r.op == Op::Query);
         let text_record = query.or_else(|| group.iter().find(|r| r.text.is_some()));
+        let unlogged = source == EventSource::MariadbServerAudit && text_record.is_none();
         let key = format!("c{}", first.connection);
         let program = self.sessions.get(&key).and_then(|s| s.program.clone());
         let client = databastion_classifiers::masking::ClientAddr::parse(&first.host);
@@ -1780,7 +1825,15 @@ impl EventBuilder {
             text: text_record.and_then(|r| r.text.as_deref().map(Vec::as_slice)),
             opaque: text_record.is_some_and(|r| r.opaque),
             alt_text: None,
-            truncated: text_record.is_some_and(|r| r.truncated),
+            digest: false,
+            // `server_audit` table-access records with no statement record
+            // (security review of #188, M2): a statement the event set does
+            // not log (`SET @x = f()`, DDL under `QUERY_DML`), a lost
+            // record, or one that outlived the pending timeout. What the
+            // text would have shown (a function call, a server file) is
+            // unknown: handled as a cut text, a read or write of the tables
+            // and of `*`, always reported, never the agent's own.
+            truncated: text_record.is_some_and(|r| r.truncated) || unlogged,
             tables,
             rows: None,
             status: query.map_or(0, |q| q.status),
@@ -1927,6 +1980,7 @@ mod tests {
             text: Some(text),
             opaque: false,
             alt_text: None,
+            digest: false,
             truncated,
             tables,
             rows: None,
@@ -2479,7 +2533,9 @@ mod tests {
                 "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'select count(*) from information_schema.tables',0",
                 // No table: skipped.
                 "20260929 09:41:34,h,app,10.0.0.5,37,3,QUERY,support,'select 1',0",
-                // Write, from TABLE events only (QUERY record filtered out).
+                // Write, from TABLE events only (QUERY record filtered out):
+                // the statement is unknown, `*` too (security review of
+                // #188, M2).
                 "20260929 09:41:34,h,app,10.0.0.5,37,4,WRITE,support,tickets,",
                 // DDL on the mysql schema (a GRANT): no mysql object.
                 "20260929 09:41:34,h,app,10.0.0.5,37,5,WRITE,mysql,global_priv,",
@@ -2497,7 +2553,7 @@ mod tests {
             out,
             [
                 "read [\"support.escalations\", \"support.tickets\"] None []",
-                "write [\"support.tickets\"] None []",
+                "write [\"support.*\", \"support.tickets\"] None []",
                 "dcl [] None []",
                 "read [\"mysql.user\"] None [\"shape.full_table_read\"]",
                 "read [\"support.*\"] None []",
@@ -2641,6 +2697,7 @@ mod tests {
                 text: Some(b"select a from `escalations_jean.richard@example.com` where x = 1"),
                 opaque: false,
                 alt_text: None,
+                digest: false,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(20_000),
@@ -2744,6 +2801,7 @@ mod tests {
                 text: Some(b"select email from employees where id > 0"),
                 opaque: false,
                 alt_text: None,
+                digest: false,
                 truncated: false,
                 tables: Vec::new(),
                 rows: Some(99),
@@ -2770,9 +2828,10 @@ mod tests {
                 "20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,hr,'select * from nope',1146",
             ]),
         );
+        // `leak()` is not a built-in function: `*` too (ADR-0045 part (b)).
         assert_eq!(
             out,
-            ["read [\"hr.employees\"] None [\"shape.full_table_read\"]"],
+            ["read [\"hr.*\", \"hr.employees\"] None [\"shape.full_table_read\"]"],
             "{out:#?}"
         );
         assert_eq!(b.failed, 1);
@@ -2792,6 +2851,7 @@ mod tests {
             text: Some(text.as_bytes()),
             opaque: false,
             alt_text: None,
+            digest: false,
             truncated: false,
             tables: Vec::new(),
             rows: Some(3),
@@ -2923,9 +2983,9 @@ mod tests {
         assert_eq!(
             out,
             [
-                "write [\"shop.a\"] None []",
+                "write [\"shop.*\", \"shop.a\"] None []",
                 "read [\"shop.a\"] None []",
-                "read [\"shop.b\"] None []",
+                "read [\"shop.*\", \"shop.b\"] None []",
             ],
             "{out:#?}"
         );
@@ -2935,8 +2995,34 @@ mod tests {
             .iter()
             .map(show)
             .collect();
-        assert_eq!(out, ["read [\"shop.c\"] None []"], "{out:#?}");
+        assert_eq!(out, ["read [\"shop.*\", \"shop.c\"] None []"], "{out:#?}");
         assert_eq!(b.pending.sizes(), (0, 0, 0, 0));
+    }
+
+    /// Security review of #188, M2: `server_audit` table-access records
+    /// with no statement record (`SET @x = f()` under `QUERY_DML`) are a
+    /// read of the tables and of `*`, always reported, also with the
+    /// agent's identity.
+    #[test]
+    fn unlogged_statements_are_reads_of_star() {
+        for user in ["app", "databastion"] {
+            let lines = [
+                format!("20260929 09:41:34,h,{user},172.18.0.1,7,50,READ,shop,customers,"),
+                format!("20260929 09:41:34,h,{user},172.18.0.1,7,0,DISCONNECT,shop,,0"),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(show).collect::<Vec<_>>(),
+                ["read [\"shop.*\", \"shop.customers\"] None []"],
+                "{user}"
+            );
+            assert!(ev.iter().all(MaskedEvent::always_report), "{user}");
+        }
     }
 
     /// Security review of #93, R4: a statement re-read after a restart is
@@ -2962,7 +3048,7 @@ mod tests {
         );
         assert_eq!(
             out.iter().map(show).collect::<Vec<_>>(),
-            ["read [\"shop.a\"] None []"]
+            ["read [\"shop.*\", \"shop.a\"] None []"]
         );
         assert!(b.held().is_empty());
         // Logged 100 s ago: flushed 200 s later, not after a full timeout.
@@ -3000,7 +3086,10 @@ mod tests {
         let out = at(&mut b, &[], t0 + PENDING_TIMEOUT);
         assert_eq!(
             out,
-            ["read [\"shop.a\"] None []", "read [\"shop.big\"] None []"],
+            [
+                "read [\"shop.*\", \"shop.a\"] None []",
+                "read [\"shop.*\", \"shop.big\"] None []"
+            ],
             "{out:#?}"
         );
         // The late QUERY records: no second event without a signal, one
@@ -3039,7 +3128,11 @@ mod tests {
         assert!(at(&mut b, &[rd(1, 40, "harmless")], t0).is_empty());
         let t1 = t0 + PENDING_TIMEOUT;
         let out = at(&mut b, &[], t1);
-        assert_eq!(out, ["read [\"shop.harmless\"] None []"], "{out:#?}");
+        assert_eq!(
+            out,
+            ["read [\"shop.*\", \"shop.harmless\"] None []"],
+            "{out:#?}"
+        );
         // The procedure goes on: the same table again (ignored), then
         // another one, then its statement record.
         let out = at(
@@ -3056,10 +3149,16 @@ mod tests {
         // with every table so far.
         assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
         let t2 = t1 + PENDING_TIMEOUT;
-        assert_eq!(at(&mut b, &[], t2), ["read [\"shop.a\"] None []"]);
+        assert_eq!(
+            at(&mut b, &[], t2),
+            ["read [\"shop.*\", \"shop.a\"] None []"]
+        );
         assert!(at(&mut b, &[rd(2, 41, "b")], t2).is_empty());
         let t3 = t2 + PENDING_TIMEOUT;
-        assert_eq!(at(&mut b, &[], t3), ["read [\"shop.b\"] None []"]);
+        assert_eq!(
+            at(&mut b, &[], t3),
+            ["read [\"shop.*\", \"shop.b\"] None []"]
+        );
         let out = at(
             &mut b,
             &[
@@ -3897,6 +3996,250 @@ mod tests {
         expect_everywhere("INSERT INTO hr.`client\u{e8}le` (nom) VALUES ('x')", |_| {
             "write [\"hr.client\u{e8}le\"]".to_owned()
         });
+    }
+
+    /// ADR-0045 part (b): an unqualified call of a name that is not built
+    /// in (a stored function reading `hr.customers`, a loadable function)
+    /// is a read of `*`, always reported and never the agent's own, on
+    /// every source, plainly, backquoted, double-quoted (`ANSI_QUOTES`),
+    /// or a keyword function with whitespace before `(`; the routine's
+    /// name is never an object.
+    #[test]
+    fn unknown_calls_are_reads_of_star() {
+        for text in [
+            "SELECT get_customer_email(1)",
+            "DO get_customer_email(1)",
+            "SET @x = get_customer_email(1)",
+            "SELECT `get_customer_email`(1)",
+            "SELECT \"get_customer_email\"(1)",
+            "SELECT `now`()",
+            "SELECT now ()",
+            "SELECT count (*)",
+            "SELECT \"count\"(*)",
+            "SELECT 1f()",
+            "SELECT /*!50000 get_customer_email(1) */",
+            "SELECT 1 WHERE f() > 0",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT f()",
+            // A loadable function: not built in (open question 7).
+            "SELECT version_tokens_show()",
+            // `SHOW … WHERE` with an unknown call runs it.
+            "SHOW TABLES WHERE f()",
+            // Followed by `AS` (security review of #188, H1).
+            "SELECT get_customer_email(1) AS x",
+            "SELECT CAST(get_customer_email(1) AS CHAR)",
+            "SET @x = (SELECT get_customer_email(1) AS y)",
+            "DO (SELECT get_customer_email(1) AS y)",
+            "SELECT get_customer_email(1) AS \"x\"",
+        ] {
+            expect_everywhere(text, |s| format!("read [{:?}] always", star(s)));
+            for user in ["app", "databastion"] {
+                for (_, e) in on_every_source(user, text) {
+                    let e = e.unwrap();
+                    assert!(
+                        e.objects()
+                            .iter()
+                            .all(|o| !o.object().as_str().contains("customer")),
+                        "{text}"
+                    );
+                }
+            }
+        }
+        // With tables: the tables and `*` (objects in name order).
+        let with_table = |action: &str, s: EventSource| {
+            let mut o = ["hr.t", star(s)];
+            o.sort_unstable();
+            format!("{action} {o:?} always")
+        };
+        expect_everywhere("SELECT a, f(b) FROM hr.t", |s| with_table("read", s));
+        expect_everywhere("UPDATE hr.t SET a = f(a)", |s| with_table("write", s));
+        expect_everywhere("SELECT f(1) AS a FROM hr.t", |s| with_table("read", s));
+        // With table records: they decide the tables, `*` is added.
+        for user in ["databastion", "app"] {
+            let lines = sa_with_records(
+                user,
+                &[("READ", "hr", "t")],
+                "SELECT a, get_customer_email(a) FROM hr.t LIMIT 1",
+            );
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                out.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.t\", \"shop.*\"] always"],
+                "{user}"
+            );
+        }
+        // A digest: `` `f` ( `` is a call, `COUNT (` a keyword.
+        for (digest, want) in [
+            (
+                "SELECT `get_customer_email` ( ? )",
+                Some("read [\"*.*\"] always"),
+            ),
+            ("SELECT `count` ( * )", Some("read [\"*.*\"] always")),
+            ("SELECT COUNT ( * ) , NOW ( ) , `concat` ( ? )", None),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+            access.digest = true;
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            let got = b.statement(access, SystemTime::now());
+            assert_eq!(got.as_ref().map(shown).as_deref(), want, "{digest}");
+            // The digest next to a whole `SQL_TEXT`: analyzed too.
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(b"SELECT 1", false, Vec::new());
+            access.alt_text = Some(digest.as_bytes());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            let got = b.statement(access, SystemTime::now());
+            assert_eq!(got.as_ref().map(shown).as_deref(), want, "{digest}");
+        }
+    }
+
+    /// The side accounts of the load harness's MariaDB Audit run
+    /// (`e2e/load/side-clients.sh`, ADR-0045): the monitoring-like reader
+    /// names `threads` and `PROCESSLIST` only (the digest summary holds no
+    /// statement text on MariaDB), always reported; the table-less built-in
+    /// mix gives no event on any MariaDB list.
+    #[test]
+    fn load_harness_side_statements() {
+        let monitor = [
+            (
+                "SELECT SCHEMA_NAME, DIGEST, COUNT_STAR, SUM_TIMER_WAIT FROM \
+                 performance_schema.events_statements_summary_by_digest ORDER BY SUM_TIMER_WAIT \
+                 DESC LIMIT 50",
+                None,
+            ),
+            (
+                "SELECT THREAD_ID, PROCESSLIST_ID, PROCESSLIST_USER, PROCESSLIST_COMMAND, \
+                 PROCESSLIST_STATE FROM performance_schema.threads",
+                Some("performance_schema.threads"),
+            ),
+            (
+                "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE FROM information_schema.PROCESSLIST",
+                Some("information_schema.PROCESSLIST"),
+            ),
+        ];
+        let builtins = [
+            "SELECT NOW()",
+            "SELECT LAST_INSERT_ID()",
+            "SELECT DATABASE()",
+            "SELECT @@session.auto_increment_increment AS auto_increment_increment, \
+             @@character_set_client AS character_set_client, @@max_allowed_packet AS \
+             max_allowed_packet, @@sql_mode AS sql_mode",
+            "SELECT CONNECTION_ID(), VERSION(), USER(), CURRENT_USER()",
+            "SET NAMES utf8mb4",
+            "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP(), CONCAT('a', 'b'), IFNULL(NULL, 1), \
+             COALESCE(NULL, 2)",
+            "SELECT 1",
+        ];
+        let lists = crate::builtins::lists()
+            .iter()
+            .filter(|l| l.flavor == Flavor::Mariadb);
+        let mut checked = 0;
+        for list in lists {
+            for (text, want) in monitor {
+                let mut b = EventBuilder::new(own())
+                    .with_flavor(Flavor::Mariadb)
+                    .with_builtins(list);
+                let out = b.convert_file(
+                    sa_at(&[sa_line("load_monitor", "10.0.0.7", 1, text)], 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                let names: Vec<String> = out
+                    .iter()
+                    .flat_map(|e| {
+                        e.objects()
+                            .iter()
+                            .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    })
+                    .collect();
+                assert_eq!(names, want.into_iter().collect::<Vec<_>>(), "{text}");
+                assert!(out.iter().all(MaskedEvent::always_report), "{text}");
+                checked += 1;
+            }
+            for text in builtins {
+                let mut b = EventBuilder::new(own())
+                    .with_flavor(Flavor::Mariadb)
+                    .with_builtins(list);
+                let out = file(
+                    &mut b,
+                    sa_at(&[sa_line("load_builtins", "10.0.0.7", 1, text)], 1024),
+                );
+                assert!(out.is_empty(), "{:?}: {text}: {out:?}", list.series);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3 * 11);
+    }
+
+    /// ADR-0045 part (b): every listed built-in, called table-less (plain;
+    /// backquoted when native; spaced unless `sql_functions`), gives no
+    /// event, on the list of its series; so do a driver's session probes.
+    #[test]
+    fn listed_built_ins_called_table_less_give_no_event() {
+        // `LOAD_FILE` keeps its own rule (a read of `*`). Keywords that
+        // are not calls (`SELECT in()`: a syntax error on the servers) give
+        // no event either.
+        let not_calls = |n: &str| n == "load_file";
+        let mut checked = 0;
+        for list in crate::builtins::lists() {
+            let mut texts: Vec<String> = Vec::new();
+            for (name, form) in list.names() {
+                if not_calls(name) {
+                    continue;
+                }
+                texts.push(format!("SELECT {name}()"));
+                texts.push(format!("SELECT {}()", name.to_ascii_uppercase()));
+                if form == crate::builtins::Form::Native {
+                    texts.push(format!("SELECT `{name}`()"));
+                }
+                if form != crate::builtins::Form::KeywordAdjacent {
+                    texts.push(format!("SELECT {name} ()"));
+                }
+            }
+            texts.extend(
+                [
+                    "SELECT NOW()",
+                    "SELECT LAST_INSERT_ID()",
+                    "SELECT DATABASE()",
+                    "SELECT @@session.auto_increment_increment AS auto_increment_increment, \
+                     @@character_set_client AS character_set_client, @@max_allowed_packet",
+                    "SELECT CONNECTION_ID()",
+                    "SELECT VERSION()",
+                    "SELECT USER(), CURRENT_USER()",
+                    "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+                    "SET sql_mode = CONCAT(@@sql_mode, ',STRICT_TRANS_TABLES')",
+                    "SET @@session.time_zone = '+00:00'",
+                    "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP()",
+                    "SELECT 1 FROM DUAL WHERE IFNULL(NULL, 1) = 1",
+                ]
+                .map(str::to_owned),
+            );
+            for text in texts {
+                for user in ["app", "databastion"] {
+                    let mut b = EventBuilder::new(own()).with_builtins(list);
+                    let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+                    access.user = user;
+                    access.principal = EventPrincipal::account(user);
+                    access.rows = Some(1);
+                    let got = b.statement(access, SystemTime::now());
+                    assert!(
+                        got.is_none(),
+                        "{:?} {:?} {user}: {text} -> {:?}",
+                        list.flavor,
+                        list.series,
+                        got.as_ref().map(shown)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 6 * 2 * 1000, "{checked}");
     }
 
     /// Security review of 914c9d2 (Low): the `SHOW GRANTS … USING`

@@ -72,6 +72,13 @@ impl Flavor {
 
 /// Parses a handshake version (`8.4.11`, `11.4.13-MariaDB-ubu2404`,
 /// `5.5.5-10.6.20-MariaDB`).
+/// Whether `VERSION()`, read after TLS, names the flavor and release
+/// series (major, minor) the unauthenticated handshake announced.
+fn same_series(flavor: Flavor, version: (u32, u32, u32), version_text: &str) -> bool {
+    parse_version(version_text)
+        .is_some_and(|(f, v)| (f, v.0, v.1) == (flavor, version.0, version.1))
+}
+
 pub(crate) fn parse_version(v: &str) -> Option<(Flavor, (u32, u32, u32))> {
     let mariadb = v.contains("MariaDB");
     let v = if mariadb {
@@ -458,9 +465,11 @@ impl Session {
             ),
             (
                 // Read after TLS: the handshake that announced the flavor
-                // was not authenticated.
-                parse_version(&text(6)).map(|(f, _)| f) == Some(self.flavor),
-                "the server flavor differs from the handshake",
+                // and the version was not authenticated, and the version
+                // picks the built-in function list of the Audit analysis
+                // (ADR-0045 decision 8; security review of #188, L1).
+                same_series(self.flavor, self.version, &text(6)),
+                "the server flavor or release series differs from the handshake",
             ),
             (timeout_ok, "statement timeout not applied"),
             (
@@ -935,6 +944,20 @@ mod tests {
             Some((Flavor::Mysql, (8, 0, 36)))
         );
         assert_eq!(parse_version("garbage"), None);
+        // Security review of #188, L1: the series read after TLS must be
+        // the handshake's.
+        assert!(same_series(Flavor::Mysql, (8, 4, 11), "8.4.11"));
+        assert!(same_series(Flavor::Mysql, (8, 4, 11), "8.4.12-12"));
+        assert!(same_series(
+            Flavor::Mariadb,
+            (11, 4, 13),
+            "11.4.13-MariaDB-ubu2404"
+        ));
+        assert!(!same_series(Flavor::Mysql, (8, 4, 11), "9.7.2"));
+        assert!(!same_series(Flavor::Mysql, (8, 0, 46), "8.4.11"));
+        assert!(!same_series(Flavor::Mysql, (11, 4, 13), "11.4.13-MariaDB"));
+        assert!(!same_series(Flavor::Mariadb, (11, 4, 13), "11.8.9-MariaDB"));
+        assert!(!same_series(Flavor::Mysql, (8, 4, 11), ""));
         assert!(parse_version("5.7.44").unwrap().1 < MIN_MYSQL);
     }
 }

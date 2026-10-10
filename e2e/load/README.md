@@ -124,7 +124,16 @@ local `e2e/run.sh`).
 8. **Workload without Audit**: pgbench (`-M simple`, one point-select script per workload table,
    picked at random, `-R` fixed rate, per-transaction log) and sysbench (a Lua point-select script
    over the same tables, `--rate`, 95th percentile; the password in a `--config-file` on its tmpfs)
-   run together for `LOAD_BASELINE_S` seconds, as `load_app`.
+   run together for `LOAD_BASELINE_S` seconds, as `load_app`. Next to them on `target-mariadb`, the
+   **side accounts** of [ADR-0045](../../docs/adr/0045-mysql-mariadb-statement-text-tables-and-unqualified-calls.md)
+   ([`side-clients.sh`](side-clients.sh), service `my-side`, the target image's `mariadb` client),
+   one session each, once a second: `load_monitor`, a monitoring-like reader (`SELECT` on
+   `performance_schema` and `PROCESS`, as PMM or `mysqld_exporter`) of
+   `events_statements_summary_by_digest`, `performance_schema.threads` and
+   `information_schema.PROCESSLIST`; `load_builtins` (no privilege), a table-less built-in mix
+   (`NOW()`, `LAST_INSERT_ID()`, `DATABASE()`, a Connector/J-style `@@session` probe,
+   `CONNECTION_ID()`, `VERSION()`, `USER()`, `SET NAMES`, `SELECT 1`). They run in both phases, so
+   the latency comparison sees the same load; their statements are not in the workload counts.
 9. Audit on for `pg-load` and `mariadb-load` (`audit.configure` through the user API, contract
    defaults: aggregation 60 s, poll 10 s, no `min_rows`, so every event is reported); wait for the
    agent's "audit source" line. The stream starts at the end of the log: the baseline is not replayed.
@@ -178,6 +187,10 @@ resolution shows), and the agent account's own statement time from the engine's 
 | `audit.<target>.events_accounted` | 0.99 to 1.01 | sum of `aggregated_count` of `load_app`'s `read` events / statements issued during the Audit run: nothing lost, nothing counted twice |
 | `audit.<target>.drain_s` | ≤ 240 s | end of the workload → last of those events stored (`received_at`); includes the 60 s aggregation window by design |
 | `audit.<target>.p95_latency_ms` | ≤ 3 × p95 without Audit + 5 ms | p95 latency of the workload with Audit vs without (pgbench: per-transaction log, from the scheduled start; sysbench: its 95th percentile). Generous on purpose: shared CI runners are noisy |
+| `audit.mariadb-load.monitor_ran`, `.builtins_ran` | issued > 0, 0 failed | the side accounts ran in both phases (statements counted for the Audit run) |
+| `audit.mariadb-load.monitor_reported` | `threads` and `PROCESSLIST` named | the reader's reads of [statement-text tables](../../docs/08-engine-capabilities.md#statement-text-tables) are events naming them (ADR-0045 part (a); the digest summary has no statement text on MariaDB and stays quiet) |
+| `audit.mariadb-load.monitor_one_event_per_window` | ≤ 0 | per principal, action, source and object set: events − (⌊span / 60 s⌋ + 2), where span is first `ts` → last `ts_last`. The agent's aggregation windows last at least 60 s (the contract default) and follow each other, so that is the most windows such a span can meet: at most one event per window. It catches an unaggregated stream (one event per statement), not a single extra event |
+| `audit.mariadb-load.builtins_no_event` | 0, with ≥ 1 event | events of `load_builtins` other than its connection: table-less built-in calls are never unknown calls (ADR-0045 part (b)); its connection event must be there, so that the check cannot pass on a stream that never saw the account |
 | `agent.spool_bounded` | ≤ 1000 batches | peak `spool.batches` over the heartbeats of the run |
 | `agent.spool_drained` | 0 | a heartbeat after the drain reports an empty spool |
 | `agent.no_dropped_batches` | 0 | `spool.dropped_batches` and `dropped_items` (the documented drops happen only when the spool is full, `spool` in [`agent.example.yaml`](../../agent/agent.example.yaml)) |

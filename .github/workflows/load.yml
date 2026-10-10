@@ -38,7 +38,7 @@ jobs:
       - name: Unit tests (seed generator, sampler, analysis)
         run: timeout 120 python3 -m unittest discover -s e2e/load -p 'test_*.py' -v
       - name: shellcheck
-        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/initdb/*.sh
+        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/side-clients.sh e2e/load/initdb/*.sh
 
   load:
     name: Load / database impact

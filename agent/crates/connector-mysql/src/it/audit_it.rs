@@ -112,7 +112,7 @@ pub(super) fn start_audit(
 }
 
 /// A target for `user` with the dev TLS settings and an optional audit log.
-fn audit_target(
+pub(super) fn audit_target(
     server: &Server,
     user: &str,
     password: &str,
@@ -124,7 +124,7 @@ fn audit_target(
     target_tls(server, user, password, &format!("{}{audit}", server.tls()))
 }
 
-fn env_path(var: &str, key: &str) -> Option<PathBuf> {
+pub(super) fn env_path(var: &str, key: &str) -> Option<PathBuf> {
     // A dev log may belong to the test's own user (the tailer refuses it
     // in production).
     databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
