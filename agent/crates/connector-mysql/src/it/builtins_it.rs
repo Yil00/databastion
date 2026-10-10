@@ -41,7 +41,7 @@ const UC_EMAIL: &str = "uc-it-7Qw@example.test";
 
 /// Help topics that are not on a list, with the reason: each must resolve
 /// to a stored function or not parse (checked).
-const NOT_BUILT_IN: [(&str, &str); 16] = [
+const NOT_BUILT_IN: [(&str, &str); 17] = [
     // Not callable names (help pages).
     ("parentheses", "an operator page"),
     ("_rowid", "a column alias"),
@@ -65,10 +65,11 @@ const NOT_BUILT_IN: [(&str, &str); 16] = [
     ("spider_copy_tables", "loadable"),
     ("spider_flush_table_mon_cache", "loadable"),
     // MySQL 9.7: `MD5`, `SHA1` and `DISTANCE` are documented but not
-    // built in (error 1305); MariaDB 10.11: `TRUNC` is documented for
-    // 11.x.
+    // built in (error 1305); MariaDB 10.11: `TRUNC` and `MBRCoveredBy`
+    // are documented for 11.x.
     ("md5", "MySQL 9.7: removed"),
     ("trunc", "MariaDB 10.11: documented ahead"),
+    ("mbrcoveredby", "MariaDB 10.11: documented ahead"),
 ];
 /// Also not built in (same rule): `SHA1`, `DISTANCE` (MySQL 9.7).
 const NOT_BUILT_IN_MORE: [&str; 2] = ["sha1", "distance"];
@@ -155,7 +156,7 @@ async fn builtin_lists_match_the_server() {
                 "SELECT DISTINCT t.name FROM mysql.help_topic t JOIN mysql.help_category c \
                  ON c.help_category_id = t.help_category_id \
                  WHERE (c.name LIKE '%Function%' OR c.name LIKE '%Operator%' \
-                 OR c.name IN ('Geometry Constructors', 'MBR', 'WKT', 'XML')) \
+                 OR c.name IN ('Geometry Constructors', 'MBR', 'WKT', 'XML', 'Geographic Features')) \
                  AND c.name NOT IN ('Enterprise Encryption Functions', 'Loadable Functions')",
             )
             .await
