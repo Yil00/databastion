@@ -275,6 +275,37 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   holding the agent's credentials on the agent host, spoofing its
   `program_name` and reading at most that many rows per table and day with
   filtered queries stays unreported.
+- **The agent's own ended sessions on `performance_schema`**
+  (`audit::own_threads`; security reviews of #186, L1, and of #197, M3).
+  A row of a session that ended before the poll has no account. Each poll
+  session reads its own thread id with the server's identity
+  (`@@hostname`, `@@port`, `@@server_id`, and `@@server_uuid` on MySQL)
+  and its start time computed by the server (`UNIX_TIMESTAMP()` minus
+  `Uptime` from `global_status`) when it attaches (`sql::ps_own_thread`;
+  `sql::PS_OWN_THREAD_ID` alone when that fails, and then nothing is
+  recognized). Every stream of the connector on that server run (identity,
+  start time within 2 s) drops the rows of that thread whose text or digest
+  has the shape of one of the connector's own `performance_schema` reads,
+  unless the thread is connected under another account; any other
+  statement of that thread takes the usual path. While a target's stream
+  polls `performance_schema`, each Discovery session pins its thread at its
+  start (a random nonce in `@databastion_pin`, then `sql::ps_own_pin`:
+  exactly one row of `user_variables_by_thread` holding the nonce **and**
+  equal to the session's own thread, with the identity and start time). A
+  row of an ended pinned thread is attributed to the agent's identity (the
+  pinning target's account, the agent's address, its `program_name`),
+  charged to the own budget, and takes every always-report rule; the pin
+  expires two poll intervals after the scan ends (30 s to 15 min). A pinned
+  session's digests (the poll reads no `SQL_TEXT` of an ended session) are
+  matched by shape (`events::text_shape`) with the pin statement and the
+  target's sampling credits only, not with the poll texts (those are
+  matched by shape only to drop the ended poll sessions' rows, above;
+  ADR-0045 decision 4, refinement of 2026-10-11, accepted). Nothing is noted or
+  pinned on a server up for less than 10 s, or without a readable identity
+  or start time. In memory only: after an agent restart, the earlier
+  sessions' statements that the persisted cursor reads again are reported
+  as before. Two agents sharing one account on one server each report the
+  other's ended sessions as unidentified reads (noise).
 - **Statement-text tables** (ADR-0045 part (a)): reads of the system
   tables that hold other sessions' statement texts
   (`audit::events::STATEMENT_TEXT_TABLES`: `performance_schema`
@@ -288,7 +319,9 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   `SQL_TEXT` threshold; only the cursor is a session user variable,
   `sql::ps_poll_variables`), left out uncharged only by their whole uncut
   text with table records of their own tables
-  (`sql::own_performance_schema_reads`); its readability probes are
+  (`sql::own_performance_schema_reads`, which also lists the own-thread
+  probe and the Discovery pin; a pinned Discovery session's digest by its
+  shape, above); its readability probes are
   `EXPLAIN`s (the same privilege, no row read, quiet). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
 - **Statistics tables** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)):
@@ -306,7 +339,10 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   no table record of its own, such as a view, which is then named too;
   a record counts only for its exact name, so a text writing a name in
   another case over-reports under `lower_case_table_names = 1`, and a
-  text creating or dropping a temporary table counts none). Code out of sight adds `*` whatever its table
+  text creating or dropping a temporary table counts none). An
+  `ALGORITHM=TEMPTABLE` view gets no `server_audit` record under its own
+  name either (MariaDB 10.11.19, 11.4.13, 11.8.9): only the
+  `column_stats` record, so it never counts as recorded. Code out of sight adds `*` whatever its table
   records. Drift
   test and server facts: `it::statistics_it`. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).
@@ -355,3 +391,11 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   and a second account's reads of `events_statements_history_long` and
   `information_schema.PROCESSLIST` reported, while the agent's own probes
   and polls (two targets on one server) are not.
+- The agent's own ended sessions (`src/it/own_sessions_it.rs`): two
+  targets on one server (MySQL, MariaDB, Percona), a Discovery scan run
+  between two polls of the first stream, then that stream reconnecting and
+  the sibling stream restarting from its saved cursor: no unknown-principal
+  event (the dev healthchecks' `hr.employees` reads aside), no event of
+  the agent's account, the scanned tables charged to both targets' own
+  budgets (on `events_statements_history_long`), no value in an event or
+  a log line.

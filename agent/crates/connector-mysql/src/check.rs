@@ -572,6 +572,12 @@ pub(crate) struct CheckState {
     /// Per target: credits for the extra sampling statements of Discovery
     /// (`audit::credits`).
     sample_credits: Mutex<HashMap<String, crate::audit::credits::SharedCredits>>,
+    /// The agent's `performance_schema` poll sessions, per server run,
+    /// for every stream of the connector (`audit::own_threads`).
+    poll_threads: crate::audit::own_threads::SharedPollThreads,
+    /// The threads of the agent's Discovery sessions, per server run
+    /// (`audit::own_threads`).
+    discovery_pins: crate::audit::own_threads::SharedPins,
     /// Per target: audit log records dropped (not parsable, oversized or
     /// damaged), and when the count started (reported for 24 h).
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
@@ -687,6 +693,16 @@ impl CheckState {
                 .entry(target_id.to_owned())
                 .or_default(),
         )
+    }
+
+    /// The agent's poll sessions on every server (`audit::own_threads`).
+    pub(crate) fn poll_threads(&self) -> crate::audit::own_threads::SharedPollThreads {
+        std::sync::Arc::clone(&self.poll_threads)
+    }
+
+    /// The Discovery pins of every target (`audit::own_threads`).
+    pub(crate) fn discovery_pins(&self) -> crate::audit::own_threads::SharedPins {
+        std::sync::Arc::clone(&self.discovery_pins)
     }
 
     pub(crate) fn own_usage(&self, target_id: &str) -> SharedOwnUsage {

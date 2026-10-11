@@ -26,6 +26,7 @@
 
 pub(crate) mod credits;
 pub(crate) mod events;
+pub(crate) mod own_threads;
 pub(crate) mod pfs;
 pub(crate) mod records;
 
@@ -52,7 +53,7 @@ const REPROBE: Duration = Duration::from_secs(300);
 #[cfg(test)]
 const REPROBE: Duration = Duration::from_secs(3);
 /// `program_name` the connector sends (`proto`).
-const PROGRAM_NAME: &str = "databastion-agent";
+pub(crate) const PROGRAM_NAME: &str = "databastion-agent";
 /// `server_audit_query_log_limit` when it cannot be read.
 const DEFAULT_QUERY_LIMIT: usize = 1024;
 
@@ -309,12 +310,21 @@ fn apply_replay(
     out
 }
 
+/// Tests: the next `performance_schema` poll replaces its session first,
+/// as for a stale one (the integration tests' reconnection).
+#[cfg(test)]
+pub(crate) static FORCE_PS_RECONNECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 struct PsStream {
     table: pfs::PsTable,
     /// The held session (`None` only between closing a stale one and
     /// opening its replacement).
     session: Option<Session>,
     poller: PsPoller,
+    /// Discovery pins its sessions for this stream while it lives
+    /// (`own_threads`).
+    _pins: own_threads::PsStreamMark,
 }
 
 impl PsStream {
@@ -327,10 +337,15 @@ impl PsStream {
         target: &TargetConfig,
         timeouts: Timeouts,
     ) -> Result<&mut Session, ConnectorError> {
-        if self
-            .session
-            .as_ref()
-            .is_none_or(|s| s.is_stale() || s.is_poisoned())
+        #[cfg(test)]
+        let forced = FORCE_PS_RECONNECT.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let forced = false;
+        if forced
+            || self
+                .session
+                .as_ref()
+                .is_none_or(|s| s.is_stale() || s.is_poisoned())
         {
             if let Some(old) = self.session.take() {
                 old.close().await;
@@ -444,8 +459,13 @@ pub(crate) async fn audit_stream(
                             .map_err(MyError::into_connector_error)?,
                     };
                     let builder = builder(cfg, target, &pre, state);
+                    let own = pfs::OwnSessions {
+                        account: target.account.clone(),
+                        poll_threads: state.poll_threads(),
+                        pins: state.discovery_pins(),
+                    };
                     let poller =
-                        PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR))
+                        PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR), own)
                             .await
                             .map_err(MyError::into_connector_error)?;
                     tracing::info!(
@@ -457,6 +477,11 @@ pub(crate) async fn audit_stream(
                         table,
                         session: Some(session),
                         poller,
+                        _pins: own_threads::PsStreamMark::new(
+                            state.discovery_pins(),
+                            &target.id,
+                            cfg.poll_interval(),
+                        ),
                     });
                 }
                 if let Some(st) = ps.as_mut() {
