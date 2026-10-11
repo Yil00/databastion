@@ -4650,6 +4650,51 @@ mod tests {
         ] {
             assert_text_read(text, class, command, &["shop..*"], true);
         }
+        // The CTEs of a wrapped query are not relations (re-review of #211,
+        // R-M1): still a read of `*`, never a read of the CTE's name.
+        for (text, class, command) in [
+            (
+                "DECLARE c CURSOR FOR WITH x AS (SELECT public.f()) \
+                 SELECT 1 FROM pg_catalog.pg_class, x",
+                "READ",
+                "DECLARE CURSOR",
+            ),
+            (
+                "PREPARE p AS WITH x AS (SELECT public.f()) SELECT 1 FROM pg_catalog.pg_class, x",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "EXPLAIN (ANALYZE, BUFFERS) WITH x AS (SELECT public.f()) \
+                 SELECT 1 FROM pg_catalog.pg_class, x",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "CREATE TABLE t AS WITH x AS (SELECT public.f()) \
+                 SELECT 1 FROM pg_catalog.pg_class, x",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "CREATE TABLE t AS WITH x AS (SELECT public.f()) \
+                 SELECT 1 FROM pg_catalog.pg_class, x",
+                "DDL",
+                "CREATE TABLE AS",
+            ),
+        ] {
+            assert_text_read(text, class, command, &["shop..*"], true);
+            for ev in [
+                pgaudit_text_events(text, class, command, "psql", Some(true), own()),
+                pss_text_events(text, "app", false, &mut own(), false),
+            ] {
+                assert!(
+                    ev.iter()
+                        .all(|e| !objects_of(e).contains(&"shop..x".to_owned())),
+                    "{text}"
+                );
+            }
+        }
         // An unqualified collision behind each wrapper, and quiet without it.
         for text in [
             "PREPARE p AS SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
