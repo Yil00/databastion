@@ -152,7 +152,10 @@ pub(crate) async fn probe_prerequisites(
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_QUERY_LIMIT);
-        if limit < sql::CAS_GUARD_MAX_STATEMENT + 2 {
+        let low = limit < sql::CAS_GUARD_MAX_STATEMENT + 2;
+        // `check()` reports it as a closed note while this stream runs.
+        state.note_text_limit(&target.id, EventSource::MariadbServerAudit, limit, low);
+        if low {
             tracing::warn!(
                 target_id = %target.id,
                 limit,
@@ -335,6 +338,7 @@ impl PsStream {
     async fn fresh_session(
         &mut self,
         target: &TargetConfig,
+        state: &CheckState,
         timeouts: Timeouts,
     ) -> Result<&mut Session, ConnectorError> {
         #[cfg(test)]
@@ -357,6 +361,14 @@ impl PsStream {
                 .reattach(&mut session)
                 .await
                 .map_err(MyError::into_connector_error)?;
+            // The limit read again after a reconnection (a server restart
+            // may have changed it): `check()` reports the current one.
+            state.note_text_limit(
+                &target.id,
+                EventSource::PerformanceSchema,
+                self.poller.text_limit(),
+                self.poller.text_limit_low(),
+            );
             self.session = Some(session);
         }
         self.session.as_mut().ok_or_else(internal)
@@ -389,7 +401,7 @@ pub(crate) async fn audit_stream(
         let mut probe_session: Option<Session> = None;
         let pre = match ps.as_mut() {
             Some(st) => {
-                let session = st.fresh_session(target, timeouts).await?;
+                let session = st.fresh_session(target, state, timeouts).await?;
                 probe_prerequisites(state, target, session).await
             }
             None => {
@@ -468,6 +480,12 @@ pub(crate) async fn audit_stream(
                         PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR), own)
                             .await
                             .map_err(MyError::into_connector_error)?;
+                    state.note_text_limit(
+                        &target.id,
+                        EventSource::PerformanceSchema,
+                        poller.text_limit(),
+                        poller.text_limit_low(),
+                    );
                     tracing::info!(
                         target_id = %target.id,
                         table = table.name(),
@@ -699,7 +717,7 @@ async fn ps_run(
 ) -> Result<(), ConnectorError> {
     let started = Instant::now();
     loop {
-        st.fresh_session(target, timeouts).await?;
+        st.fresh_session(target, state, timeouts).await?;
         let panicked_before = st.poller.panicked;
         let Some(session) = st.session.as_mut() else {
             return Err(internal());
