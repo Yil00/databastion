@@ -18,19 +18,23 @@
 //!   and notes it here; every stream on that server run then drops the
 //!   rows of that thread, as the poll text drops its own. A row whose
 //!   thread is still connected under another account is never dropped.
-//! - **Discovery sessions** ([`DiscoveryPins`], per target): the scan's
-//!   session has usually ended when the next poll reads its samples. When
+//! - **Discovery sessions** ([`DiscoveryPins`], per connector): the scan's
+//!   session has usually ended when the next poll reads its samples. While
 //!   the target's Audit stream polls `performance_schema`, each Discovery
 //!   session reads its thread id at its start (by a random nonce in a
 //!   session user variable, `sql::PS_OWN_PIN`: exactly one thread must
-//!   hold it) and pins it for the
-//!   target's stream until the scan ends plus two poll intervals
-//!   ([`MIN_PIN_TTL`] to [`MAX_PIN_TTL`]). A row of a pinned thread with
-//!   no account is attributed to the agent's identity (its account, its
-//!   address as the server sees it, its `program_name`) and takes the
-//!   usual own-account path: reads are charged to the own-read budget;
-//!   writes, DDL and DCL, statement-text and statistics reads stay always
-//!   reported.
+//!   hold it) and pins it, with the target's account, until the scan ends
+//!   plus two poll intervals of the target's stream ([`MIN_PIN_TTL`] to
+//!   [`MAX_PIN_TTL`]). For every stream on that server run, a row of a
+//!   pinned thread with no account is attributed to the agent's identity
+//!   (the pin's account, the agent's address as the server sees it, its
+//!   `program_name`) and takes the usual own-account path: reads are
+//!   charged to the own-read budget; writes, DDL and DCL, statement-text
+//!   and statistics reads stay always reported. The poll reads no
+//!   `SQL_TEXT` of an ended session: the digests of a pinned session are
+//!   compared with the agent's own texts by their shape
+//!   (`events::text_shape`), for its pin statement and its sampling
+//!   credits only.
 //!
 //! **Fail closed.** A thread id is matched only together with the server
 //! run it was read on ([`ServerRun`]): the server's identity (`@@hostname`,

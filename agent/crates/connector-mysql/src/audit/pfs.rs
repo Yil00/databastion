@@ -44,7 +44,7 @@
 //! The agent's own sessions that ended ([`super::own_threads`]): the rows
 //! of its poll sessions on the same server run (another stream's, or this
 //! stream's before it reconnected) are dropped, as the poll text drops its
-//! own session's; the rows of the target's pinned Discovery sessions are
+//! own session's; the rows of its pinned Discovery sessions are
 //! attributed to the agent's identity.
 
 use std::collections::{HashMap, VecDeque};
@@ -333,7 +333,7 @@ pub(crate) struct OwnSessions {
     pub(crate) account: String,
     /// The poll sessions of every stream of the connector.
     pub(crate) poll_threads: SharedPollThreads,
-    /// The target's Discovery pins.
+    /// The Discovery pins of every target of the connector.
     pub(crate) pins: SharedPins,
 }
 
