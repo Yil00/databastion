@@ -105,9 +105,9 @@ The agent's Discovery account (ADR-0026 decision 5) has no privilege that shows 
 ## Refinement (2026-10-10, phase 8 follow-ups)
 - **Decision 7, the agent's own account** (security reviews of #196 and #197). The engine-agnostic own-account rule of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md#refinement-2026-10-10-phase-8-follow-ups) (refinement of decision 6) applies here too: every read with the agent's identity is charged at least one row, aggregates `max(r, 1) + n - 1`, and budget keys ignore case.
 
-## Refinement (2026-10-11, proposed, #207)
+## Refinement (2026-10-11, accepted, #207)
 
-**Status: proposed, pending the maintainer's acceptance.** It replaces the rule of decision 4 (Actions) that "a failed operation is reported only when it returned documents (a failure after a partial read); one refused before reading anything (unauthorized, unknown namespace, bad command) is skipped", on the **profiler and the server log** (security review of #197, L1, and of #207). Until it is accepted, the implementation in #207 is held to it and to nothing wider.
+**Status: accepted by the maintainer on 2026-10-11.** It replaces the rule of decision 4 (Actions) that "a failed operation is reported only when it returned documents (a failure after a partial read); one refused before reading anything (unauthorized, unknown namespace, bad command) is skipped", on the **profiler and the server log** (security review of #197, L1, and of #207). Until it is accepted, the implementation in #207 is held to it and to nothing wider.
 
 - **Context.** An error text can show the values an operation read: `{$toInt: "$email"}` fails with `ConversionFailure` (241) and the text "Failed to parse number '<the address>' in $convert"; so do other expression errors, a JavaScript `throw` in `$where` or `$function` (139), a duplicate key built from a stored value (11000) and many location-coded errors. Such a read returns no document, so it gave no event at all, for any account, and a walk through error messages went unseen, the agent's credentials included.
 - **Decision.** A failure is classified by its numeric `errCode` only; `errMsg` and `errName` are never read, nor projected from the profiler.
