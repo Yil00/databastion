@@ -105,6 +105,15 @@ DN, shapes and row budget only) and the object class of the entries a
 search returned (events name the objects of the console's
 `sensitive_objects` below the search base, else `*` with the container).
 
+The agent's own entry sampling is left out within `limits.max_sample_rows`
+entries per object and 24 h, each search counting at least one entry.
+Containers whose DNs normalize to one name (`ou=<person>,ou=teams,…`
+becomes `ou=*,ou=teams,…`) share that budget, so Discovery caps their
+pooled sample at `sample_rows` per scan: each search asks for what is left,
+and the containers past the cap are not searched (`skipped_limit`). One
+scan thus never pushes its own searches past the budget, however many
+containers share a name.
+
 ## Target settings
 
 ```yaml
@@ -131,6 +140,8 @@ search returned (events name the objects of the console's
   binaries, certificates, unknown syntaxes).
 - Samples are the first entries of each container in server order, cut by the
   server's size limit for the service DN when it is below `sample_rows`.
+- Containers whose DNs normalize to one name past the first `sample_rows`
+  entries (or empty searches) of that name in a scan (`skipped_limit`).
 - Referrals and subordinate servers (counted, never followed).
 - `olcAccessLogSuccess: TRUE` (failed binds are not logged) and an
   `olcAccessLogBase` covering part of a naming context cannot be seen by the
