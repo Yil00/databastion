@@ -368,27 +368,31 @@ impl EventBuilder {
         ts: SystemTime,
     ) -> Option<MaskedEvent> {
         let action = action(cmd, &r.shape)?;
-        // A failed operation that returned (or wrote) no document
-        // (security review of #197, L1; `Failure`).
-        let failure = r.failure.filter(|_| r.rows.unwrap_or(0) == 0);
-        let telling = match failure {
-            None => false,
-            // The `auditLog` logs authorization checks (a refused one read
-            // nothing) and completed DDL / DCL, never how a command ended:
-            // no event, as before.
-            Some(_) if source == EventSource::MongodbAuditLog => return None,
-            // Refused before reading anything.
-            Some(Failure::Refused) => return None,
-            // As an operation that returned no document.
-            Some(Failure::Quiet) => false,
-            // Its error text may show the values it read: reads, writes
-            // that select or compute from stored documents (`update`,
-            // `delete`, `findAndModify`, `bulkWrite`, `$out` / `$merge`)
-            // and DDL (an index build quotes a duplicate key). A failed
-            // `insert` only quotes its own documents, and DCL reads no
-            // document: both stay under the `audit.configure` filters.
-            Some(Failure::Telling) => !matches!(cmd, Cmd::Insert | Cmd::Dcl),
-        };
+        // A failed operation (security review of #197, L1; `Failure`).
+        let failure = r.failure;
+        let empty = r.rows.unwrap_or(0) == 0;
+        if failure.is_some() && empty {
+            match failure {
+                // The `auditLog` logs authorization checks (a refused one
+                // read nothing) and completed DDL / DCL, never how a
+                // command ended: no event, as before.
+                _ if source == EventSource::MongodbAuditLog => return None,
+                // Refused before reading anything.
+                Some(Failure::Refused) => return None,
+                // Quiet: as an operation that returned no document.
+                _ => {}
+            }
+        }
+        // Its error text may show the values it read, whether or not it
+        // returned documents first (security review of #207, M2): reads,
+        // writes that select or compute from stored documents (`update`,
+        // `delete`, `findAndModify`, `bulkWrite`, `$out` / `$merge`) and
+        // DDL (an index build quotes a duplicate key). A failed `insert`
+        // only quotes its own documents, and DCL reads no document: both
+        // stay under the `audit.configure` filters.
+        let telling = source != EventSource::MongodbAuditLog
+            && failure == Some(Failure::Telling)
+            && !matches!(cmd, Cmd::Insert | Cmd::Dcl);
         let mut principal = match &r.user {
             Some(u) => EventPrincipal::account(u.as_str()),
             None => EventPrincipal::unidentified(),
@@ -410,11 +414,11 @@ impl EventBuilder {
         if matches!(action, EventAction::Read | EventAction::Write) {
             // A failed command returns no document: 0 when the source
             // logged no count.
-            e = e.with_rows(r.rows.or(failure.map(|_| 0)));
+            e = e.with_rows(r.rows.or(failure.filter(|_| empty).map(|_| 0)));
         }
         if telling {
-            // Never dropped by `min_rows` (0 documents) nor by
-            // `sensitive_objects`.
+            // Never dropped by `min_rows` nor by `sensitive_objects`; a
+            // count it has is kept.
             e = e.with_always_report();
         }
         if action == EventAction::Read && collection.is_some() {
@@ -435,7 +439,7 @@ impl EventBuilder {
         let user = r.user.as_ref().map_or("", |u| u.as_str());
         // Writes, DDL and DCL by the agent's account are always reported:
         // the agent only reads (I4). So is a failure whose text may show
-        // values: with no document it would be charged one at most, and
+        // values: it would be charged its documents only, and
         // the agent's own reads fail only in quiet ways (its `maxTimeMS`,
         // a closed connection, a refused privilege).
         if user != self.own_user || action != EventAction::Read || telling {
@@ -791,6 +795,11 @@ mod tests {
             ),
             (FIND, "424242"),
             (FIND, "241.5"),
+            (FIND, "\"241\""),
+            (FIND, "null"),
+            // Network time limits can embed the remote command (#207, L1).
+            (FIND, "89"),
+            (FIND, "202"),
         ] {
             let ev = b.convert(
                 log(&[failed(1, command, code)]),
@@ -813,7 +822,7 @@ mod tests {
             assert_eq!(ev[0].rows(), Some(0));
         }
         // Refused before reading anything: no event.
-        for code in ["13", "40414", "40415"] {
+        for code in ["13", "26", "59", "40414", "40415"] {
             assert!(
                 b.convert(
                     log(&[failed(1, FIND, code)]),
@@ -832,16 +841,44 @@ mod tests {
         );
         assert_eq!(ev.len(), 1);
         assert!(!ev[0].always_report());
-        // A failed read that returned documents keeps its count.
+        // A telling failure that returned documents first keeps its count
+        // and is always reported (security review of #207, M2); a quiet
+        // one keeps its count under the filters.
         let mut r = own_record(Cmd::Find, "customers", Some(5), None);
         r.user = Some(Zeroizing::new("alice@admin".to_owned()));
         r.failure = Some(Failure::Telling);
-        let ev = b.convert(vec![r], EventSource::MongodbProfiler, SystemTime::now());
+        let ev = b.convert(
+            vec![r.clone()],
+            EventSource::MongodbProfiler,
+            SystemTime::now(),
+        );
+        assert_eq!(ev[0].rows(), Some(5));
+        assert!(ev[0].always_report());
+        r.failure = Some(Failure::Quiet);
+        let ev = b.convert(
+            vec![r.clone()],
+            EventSource::MongodbProfiler,
+            SystemTime::now(),
+        );
         assert_eq!(ev[0].rows(), Some(5));
         assert!(!ev[0].always_report());
+        // Refused after returning documents cannot happen; were it logged,
+        // the count stands.
+        r.failure = Some(Failure::Refused);
+        let ev = b.convert(vec![r], EventSource::MongodbProfiler, SystemTime::now());
+        assert_eq!(ev[0].rows(), Some(5));
+        // The agent's identity: a telling failure after documents is
+        // never left out, even within the budget.
+        let mut b = builder();
+        let mut own = own_record(Cmd::Find, "customers", Some(5), Some("databastion-agent"));
+        own.shape.filter = Filter::Keys(1);
+        own.failure = Some(Failure::Telling);
+        let ev = b.convert(vec![own], EventSource::MongodbLog, SystemTime::now());
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].always_report());
     }
 
-    const QUIET: [i64; 21] = super::super::records::QUIET_CODES;
+    const QUIET: [i64; 19] = super::super::records::QUIET_CODES;
 
     /// Writes that select or compute from stored documents, and DDL, are
     /// always reported when they fail that way; a failed `insert` (it

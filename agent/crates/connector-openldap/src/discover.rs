@@ -297,7 +297,18 @@ where
             .map(|c| (normalize_ldap_dn(&c), c))
             .filter(|(name, _)| job.includes_schema(name.as_str()))
             .collect();
-        ordered.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        // Names that differ only in case are adjacent: they share one
+        // pooled sample (`Pooled`).
+        ordered.sort_by(|a, b| {
+            let (x, y) = (a.0.as_str(), b.0.as_str());
+            x.to_lowercase()
+                .cmp(&y.to_lowercase())
+                .then_with(|| x.cmp(y))
+        });
+        // Another first container within each name at each scan, so the
+        // containers past a full pooled sample are sampled over time
+        // (security review of #207, L5).
+        rotate_within_names(job, &mut ordered);
         // Another starting container at each scan (security review of
         // #93, M3), at a boundary between normalized names so a pooled
         // group stays in one run.
@@ -537,6 +548,22 @@ impl Pooled {
     }
 }
 
+/// Rotates the containers of each run of names that are equal without
+/// case (`ordered` sorted that way) by the scan's rotation offset for
+/// the run's length, so that the containers a full pooled sample leaves
+/// out ([`Pooled`]) change from scan to scan. The order of the runs is
+/// unchanged.
+fn rotate_within_names<T>(job: &ScanJob, ordered: &mut [(NormalizedName, T)]) {
+    let same = |a: &(NormalizedName, T), b: &(NormalizedName, T)| {
+        a.0.as_str().to_lowercase() == b.0.as_str().to_lowercase()
+    };
+    for run in ordered.chunk_by_mut(same) {
+        if let Some(k) = job.rotation_offset(run.len()) {
+            run.rotate_left(k);
+        }
+    }
+}
+
 /// One one-level search of `container`, its entries added to `groups`
 /// (`n` values per attribute and group, at most `limit` entries). Returns
 /// the entries and continuation references read.
@@ -713,6 +740,48 @@ mod tests {
         // Offset 2 is inside the `b` group: moved on to `c`.
         assert_eq!(order(2), [4, 0, 1, 2, 3]);
         assert_eq!(order(1), [1, 2, 3, 4, 0]);
+    }
+
+    /// Security review of #207, L5: within one normalized name (without
+    /// case), the containers start at a position that changes with the
+    /// job's seed, so those past a full pooled sample are read later.
+    #[test]
+    fn containers_rotate_within_a_name() {
+        use databastion_classifiers::names::normalize_path;
+        let job = |seed: u64| {
+            ScanJob::new(
+                databastion_core::ScanParams::contract_defaults(),
+                &databastion_core::AgentConfig::parse(
+                    "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                     engine: openldap, host: 127.0.0.1, account: a, secret: {env: PW}, \
+                     openldap: {tls: disable}}]}",
+                )
+                .unwrap()
+                .targets[0],
+                &databastion_core::config::Limits::default(),
+                std::sync::Arc::new(
+                    databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap(),
+                ),
+            )
+            .with_rotation(seed)
+        };
+        let names = ["a", "b", "b", "B", "c", "c"];
+        let order = |seed: u64| {
+            let mut v: Vec<(NormalizedName, usize)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (normalize_path(n), i))
+                .collect();
+            rotate_within_names(&job(seed), &mut v);
+            v.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), [0, 1, 2, 3, 4, 5]);
+        // `a` alone; `b b B` (one name without case) by 1; `c c` by 1.
+        assert_eq!(order(1), [0, 2, 3, 1, 5, 4]);
+        assert_eq!(order(2), [0, 3, 1, 2, 4, 5]);
+        // Over successive scans, every container of a run comes first.
+        let firsts: std::collections::BTreeSet<usize> = (0..3).map(|s| order(s)[1]).collect();
+        assert_eq!(firsts.into_iter().collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     /// Security review of #93, R1: the naming contexts start at a position

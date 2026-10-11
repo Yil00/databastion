@@ -110,7 +110,9 @@ entries per object and 24 h, each search counting at least one entry.
 Containers whose DNs normalize to one name (`ou=<person>,ou=teams,…`
 becomes `ou=*,ou=teams,…`) share that budget, so Discovery caps their
 pooled sample at `sample_rows` per scan: each search asks for what is left,
-and the containers past the cap are not searched (`skipped_limit`). One
+and the containers past the cap are not searched (`skipped_limit`); the
+containers of a name are rotated from scan to scan, so later scans reach
+them. One
 scan thus never pushes its own searches past the budget, however many
 containers share a name.
 

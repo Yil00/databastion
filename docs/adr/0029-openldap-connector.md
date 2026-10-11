@@ -118,3 +118,13 @@ LDAP raises its own questions:
 
 ## Refinement (2026-10-10, phase 8 follow-ups)
 - **Decision 9, the agent's own account** (security reviews of #196 and #197). The engine-agnostic own-account rule of [ADR-0023](0023-mysql-mariadb-audit-sources-and-levels.md#refinement-2026-10-10-phase-8-follow-ups) (refinement of decision 6) applies here too: every read with the agent's identity is charged at least one row, aggregates `max(r, 1) + n - 1`, and budget keys ignore case.
+
+## Refinement (2026-10-11, proposed, #207)
+
+**Status: proposed, pending the maintainer's acceptance.** It refines decision 5 (Discovery sampling) for containers whose DNs normalize to one name (security review of #197, L3, and of #207). Until it is accepted, the implementation in #207 is held to it and to nothing wider.
+
+- **Context.** The Audit stream charges the agent's own one-level searches to one budget per normalized container (`limits.max_sample_rows` entries per 24 h, each search at least one entry, names compared without case), so containers that normalize to one name (`ou=<person>,ou=teams,…` become `ou=*,ou=teams,…`) share it; with more of them than the budget, empty or not, one scan got the agent's own searches reported.
+- **Decision.** Per scan, the containers of one normalized name (compared without case) share a **pooled allowance of `sample_rows`** entries (at most the budget): each search's `sizeLimit` is what is left (never 0), each search counts `max(entries, 1)`, a failed or interrupted one its whole limit; once the allowance is used up, the other containers of the name are not searched and are counted **`skipped_limit`** (one warning per name). Within each name the containers are **rotated** by the scan's seed, as the groups are (security review of #93, M3), so those left out by one scan are sampled by later ones (#207, L5).
+- **Rejected: a budget per raw container.** It would let the agent's credentials read the budget once per container unreported, and put raw container DNs in the persisted budget keys.
+- **Cost.** An attribute present only in containers past the allowance is missed by that scan; the rotation spreads the coverage over scans.
+

@@ -196,19 +196,20 @@ impl Pipeline {
 /// conversion quotes the value (`{$toInt: "$email"}`, `ConversionFailure`
 /// 241), so do expression errors, a JavaScript `throw` in `$where` or
 /// `$function` (139), a duplicate key built from a stored value (11000),
-/// and many location-coded errors. Such a failure returns no document, so
-/// it carries no row count (security review of #197, L1). Only codes
-/// whose text is known to hold no value read are not [`Failure::Telling`];
-/// any other code, an unknown one, or a code that is not an integer is.
+/// and many location-coded errors (security review of #197, L1). Only
+/// codes whose text is known to hold no value read are not
+/// [`Failure::Telling`]; any other code, an unknown one, a code that is
+/// not an integer, or `ok: 0` without a code is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// Refused before running: `Unauthorized` (13, the server checks the
-    /// privileges before the command reads anything) and the command
-    /// parser's unknown or missing field (40414, 40415).
+    /// privileges before the command reads anything), `NamespaceNotFound`
+    /// (26, its text names the namespace the client sent),
+    /// `CommandNotFound` (59) and the command parser's unknown or missing
+    /// field (40414, 40415).
     Refused,
     /// Stopped in a way whose text names no value read: time limits
-    /// (`MaxTimeMSExpired` 50, `ExceededTimeLimit` 262, `LockTimeout` 24,
-    /// `NetworkTimeout` 89, `NetworkInterfaceExceededTimeLimit` 202),
+    /// (`MaxTimeMSExpired` 50, `ExceededTimeLimit` 262, `LockTimeout` 24),
     /// interruptions (`Interrupted` 11601, `InterruptedAtShutdown` 11600,
     /// `InterruptedDueToReplStateChange` 11602, `ClientDisconnect` 279,
     /// `ShutdownInProgress` 91), cursors and plans killed
@@ -217,19 +218,41 @@ pub(crate) enum Failure {
     /// node's role (`PrimarySteppedDown` 189, `NotWritablePrimary` 10107,
     /// `NotPrimaryNoSecondaryOk` 13435, `NotPrimaryOrSecondary` 13436),
     /// and memory limits (`ExceededMemoryLimit` 146,
-    /// `QueryExceededMemoryLimitNoDiskUseAllowed` 292).
+    /// `QueryExceededMemoryLimitNoDiskUseAllowed` 292). The network time
+    /// limits (`NetworkTimeout` 89, `NetworkInterfaceExceededTimeLimit`
+    /// 202) are not: on sharded paths their text can embed the remote
+    /// command (security review of #207, L1).
     Quiet,
     /// Any other failure: its text may show the values read.
     Telling,
 }
 
 /// Codes of [`Failure::Refused`].
-pub(crate) const REFUSED_CODES: [i64; 3] = [13, 40414, 40415];
+pub(crate) const REFUSED_CODES: [i64; 5] = [13, 26, 59, 40414, 40415];
 /// Codes of [`Failure::Quiet`].
-pub(crate) const QUIET_CODES: [i64; 21] = [
-    50, 262, 24, 89, 202, 11601, 11600, 11602, 279, 91, 43, 237, 175, 112, 251, 189, 10107, 13435,
-    13436, 146, 292,
+pub(crate) const QUIET_CODES: [i64; 19] = [
+    50, 262, 24, 11601, 11600, 11602, 279, 91, 43, 237, 175, 112, 251, 189, 10107, 13435, 13436,
+    146, 292,
 ];
+
+/// A field that is present, `null` included (`Some(Value::Null)`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+/// The code of an operation from its `errCode` and `ok` fields: `None`
+/// when it succeeded; `Err(())` (telling) for a code that is not an
+/// integer, or for `ok: 0` (or `false`) without a code.
+pub(crate) fn code_of(
+    err_code: Option<Option<i64>>,
+    ok: Option<Option<f64>>,
+) -> Option<Result<i64, ()>> {
+    match (err_code, ok) {
+        (Some(code), _) => Some(code.ok_or(())),
+        (None, Some(ok)) if ok.is_none_or(|v| v == 0.0) => Some(Err(())),
+        _ => None,
+    }
+}
 
 impl Failure {
     /// The failure of an error code (`Some(0)` and no code: none). A
@@ -1300,8 +1323,12 @@ struct SlowAttr {
     ndeleted: Option<serde_json::Number>,
     #[serde(default, rename = "nUpserted")]
     upserted: Option<serde_json::Number>,
-    #[serde(default, rename = "errCode")]
-    err_code: Option<serde_json::Number>,
+    /// Any JSON value: a code that is not an integer is telling, never a
+    /// dropped line (security review of #207, L4).
+    #[serde(default, rename = "errCode", deserialize_with = "present")]
+    err_code: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    ok: Option<serde_json::Value>,
     #[serde(default)]
     remote: Option<String>,
 }
@@ -1524,7 +1551,13 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             } else {
                 count_of(a.nreturned.as_ref())
             };
-            r.failure = Failure::of(a.err_code.as_ref().map(|c| c.as_i64().ok_or(())));
+            r.failure = Failure::of(code_of(
+                a.err_code.as_ref().map(serde_json::Value::as_i64),
+                a.ok.as_ref().map(|v| match v {
+                    serde_json::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    v => v.as_f64(),
+                }),
+            ));
             Some(r)
         }
         ID_ACCEPTED => {
@@ -1737,7 +1770,7 @@ mod tests {
         // Server log: from `errCode` only, never `errMsg`.
         let slow = |code: &str| {
             format!(
-                r#"{{"t":{{"$date":"2026-09-29T10:00:00.000+00:00"}},"s":"I","c":"COMMAND","id":51803,"ctx":"conn1","msg":"Slow query","attr":{{"type":"command","ns":"app.customers","command":{{"find":"customers","$db":"app"}},"ok":0,"errMsg":"Unauthorized","errName":"Unauthorized"{code},"nreturned":0}}}}"#
+                r#"{{"t":{{"$date":"2026-09-29T10:00:00.000+00:00"}},"s":"I","c":"COMMAND","id":51803,"ctx":"conn1","msg":"Slow query","attr":{{"type":"command","ns":"app.customers","command":{{"find":"customers","$db":"app"}},"errMsg":"Unauthorized","errName":"Unauthorized"{code},"nreturned":0}}}}"#
             )
         };
         let failure = |code: &str| {
@@ -1752,6 +1785,17 @@ mod tests {
         assert_eq!(failure(r#","errCode":50"#), Some(Failure::Quiet));
         assert_eq!(failure(r#","errCode":241"#), Some(Failure::Telling));
         assert_eq!(failure(r#","errCode":2.5"#), Some(Failure::Telling));
+        // Not a number: telling, never a dropped line (#207, L4).
+        assert_eq!(failure(r#","errCode":"241""#), Some(Failure::Telling));
+        assert_eq!(failure(r#","errCode":null"#), Some(Failure::Telling));
+        // `ok: 0` without a code: telling; `ok: 1`: none.
+        assert_eq!(failure(r#","ok":0"#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":false"#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":"x""#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":1"#), None);
+        assert_eq!(failure(r#","ok":0,"errCode":50"#), Some(Failure::Quiet));
+        assert_eq!(failure(r#","ok":0,"errCode":26"#), Some(Failure::Refused));
+        assert_eq!(failure(r#","ok":0,"errCode":89"#), Some(Failure::Telling));
     }
 
     #[test]
