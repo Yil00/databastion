@@ -46,7 +46,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.digest_consumer_disabled": {
-    "description": "The performance_schema statements_digest consumer is disabled: no statement has a digest, so the performance_schema Audit poll reads every statement's full text (SQL_TEXT, with its literals), and so can whoever reuses the agent's credential. Enable the consumer.",
+    "description": "The performance_schema statements_digest consumer is disabled: no statement has a digest, so a performance_schema poll reads every statement's full text (SQL_TEXT, with its literals): the agent's own, when performance_schema is the Audit source, and a replay of it with the agent's credential, address and program name, which is left out like the agent's. Enable the consumer.",
     "engines": [
       "mysql",
       "mariadb"
@@ -212,7 +212,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.statement_text_limit_low": {
-    "description": "The audit source cuts statement texts at {count} bytes (server_audit_query_log_limit or performance_schema_max_sql_text_length), below the agent's longest statement: the agent's own statements, such as its CAS store guard queries, are cut and reported as reads of * by its account. Keep the limit at 1024 or more.",
+    "description": "The audit source cuts statement texts at {count} bytes (server_audit_query_log_limit or performance_schema_max_sql_text_length), below the agent's longest statement: the agent's own statements, such as its CAS store guard queries, are cut and reported as reads of * by its account (loud, never quiet). Keep the limit at 1024 or more.",
     "engines": [
       "mysql",
       "mariadb"

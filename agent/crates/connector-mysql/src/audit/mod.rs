@@ -338,6 +338,7 @@ impl PsStream {
     async fn fresh_session(
         &mut self,
         target: &TargetConfig,
+        state: &CheckState,
         timeouts: Timeouts,
     ) -> Result<&mut Session, ConnectorError> {
         #[cfg(test)]
@@ -360,6 +361,14 @@ impl PsStream {
                 .reattach(&mut session)
                 .await
                 .map_err(MyError::into_connector_error)?;
+            // The limit read again after a reconnection (a server restart
+            // may have changed it): `check()` reports the current one.
+            state.note_text_limit(
+                &target.id,
+                EventSource::PerformanceSchema,
+                self.poller.text_limit(),
+                self.poller.text_limit_low(),
+            );
             self.session = Some(session);
         }
         self.session.as_mut().ok_or_else(internal)
@@ -392,7 +401,7 @@ pub(crate) async fn audit_stream(
         let mut probe_session: Option<Session> = None;
         let pre = match ps.as_mut() {
             Some(st) => {
-                let session = st.fresh_session(target, timeouts).await?;
+                let session = st.fresh_session(target, state, timeouts).await?;
                 probe_prerequisites(state, target, session).await
             }
             None => {
@@ -708,7 +717,7 @@ async fn ps_run(
 ) -> Result<(), ConnectorError> {
     let started = Instant::now();
     loop {
-        st.fresh_session(target, timeouts).await?;
+        st.fresh_session(target, state, timeouts).await?;
         let panicked_before = st.poller.panicked;
         let Some(session) = st.session.as_mut() else {
             return Err(internal());

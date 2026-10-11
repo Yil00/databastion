@@ -304,9 +304,10 @@ impl AuditProbe {
             codes.push(TargetNote::new(NoteCode::AuditDigestConsumerDisabled));
             out.push(
                 "performance_schema statements_digest consumer disabled: no statement has a \
-                 digest, so the performance_schema Audit poll reads every statement's text \
-                 (SQL_TEXT, with its literals), and so does whoever replays the poll with \
-                 the agent's credential"
+                 digest, so a performance_schema poll reads every statement's full text \
+                 (SQL_TEXT, with its literals): the agent's own, when performance_schema is \
+                 the Audit source, and a replay of it with the agent's credential, address \
+                 and program name, which is left out like the agent's; enable the consumer"
                     .to_owned(),
             );
         }

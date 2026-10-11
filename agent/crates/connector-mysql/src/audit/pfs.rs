@@ -586,6 +586,15 @@ pub(crate) async fn pinned_session_with(
     Ok(own_row(row))
 }
 
+/// A server text or digest limit as read (`None`: unreadable or not a
+/// number, the default), at most [`MAX_TEXT_BYTES`].
+fn parse_limit(value: Option<String>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TEXT_LIMIT)
+        .min(MAX_TEXT_BYTES)
+}
+
 /// Whether a `performance_schema_max_sql_text_length` of `limit` cuts the
 /// agent's longest statement (with room for the server's `...` marker).
 fn text_limit_low(limit: usize) -> bool {
@@ -613,11 +622,7 @@ impl PsPoller {
         own: OwnSessions,
     ) -> Result<Self, MyError> {
         let attached = own_thread(session).await?;
-        let limit = |v: Option<String>| {
-            v.and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_TEXT_LIMIT)
-                .min(MAX_TEXT_BYTES)
-        };
+        let limit = parse_limit;
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         if text_limit_low(text_limit) {
             tracing::warn!(
@@ -715,8 +720,6 @@ impl PsPoller {
         self.builder.set_own_addr(addr);
     }
 
-    /// Re-attaches the poller to a new session (reconnection): the
-    /// cursor is kept, the own thread is read again and noted.
     /// The `performance_schema_max_sql_text_length` this poller applies.
     pub(crate) fn text_limit(&self) -> usize {
         self.text_limit
@@ -727,9 +730,30 @@ impl PsPoller {
         text_limit_low(self.text_limit)
     }
 
+    /// Sets the `performance_schema_max_sql_text_length` read on the
+    /// server (`None`: unreadable, the default).
+    fn set_text_limit(&mut self, value: Option<String>) {
+        let limit = parse_limit(value);
+        if limit != self.text_limit && text_limit_low(limit) {
+            tracing::warn!(
+                limit,
+                "performance_schema_max_sql_text_length below the agent's longest statement: \
+                 its CAS store guard statements are cut and reported as its own reads; keep \
+                 it at 1024 or more"
+            );
+        }
+        self.text_limit = limit;
+    }
+
+    /// Re-attaches the poller to a new session (reconnection): the
+    /// cursor is kept, the own thread is read again and noted, and the
+    /// text limit is read again (a server restart may have changed it;
+    /// security review of #210, L3).
     pub(crate) async fn reattach(&mut self, session: &mut Session) -> Result<(), MyError> {
         let own = own_thread(session).await?;
         self.note_own(own);
+        let limit = scalar(session, sql::PS_TEXT_LIMIT).await?;
+        self.set_text_limit(limit);
         Ok(())
     }
 
@@ -1425,6 +1449,32 @@ mod tests {
                 usage,
                 credits,
             }
+        }
+
+        /// Security review of #210, L3: the text limit read again at a
+        /// reattach (after a server restart) replaces the one of the start.
+        #[test]
+        fn the_text_limit_is_read_again_at_reattach() {
+            let mut f = fixture(None, None);
+            assert_eq!(f.poller.text_limit(), 1024);
+            assert!(!f.poller.text_limit_low());
+            f.poller.set_text_limit(Some("512".to_owned()));
+            assert_eq!(f.poller.text_limit(), 512);
+            assert!(f.poller.text_limit_low());
+            f.poller.set_text_limit(Some("4096".to_owned()));
+            assert_eq!(f.poller.text_limit(), 4096);
+            assert!(!f.poller.text_limit_low());
+            // Unreadable or not a number: the default; never above the cap.
+            f.poller.set_text_limit(None);
+            assert_eq!(f.poller.text_limit(), DEFAULT_TEXT_LIMIT);
+            f.poller.set_text_limit(Some("-1".to_owned()));
+            assert_eq!(f.poller.text_limit(), DEFAULT_TEXT_LIMIT);
+            f.poller.set_text_limit(Some("999999999".to_owned()));
+            assert_eq!(f.poller.text_limit(), MAX_TEXT_BYTES);
+            // The threshold: the agent's longest statement and the `...`
+            // marker.
+            assert!(text_limit_low(sql::CAS_GUARD_MAX_STATEMENT + 3));
+            assert!(!text_limit_low(sql::CAS_GUARD_MAX_STATEMENT + 4));
         }
 
         fn info(user: &str) -> ThreadInfo {
