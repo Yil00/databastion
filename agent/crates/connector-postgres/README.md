@@ -128,15 +128,17 @@ load otherwise), so a server-wide load is the normal case.
   reported, in every action class, unless a core-list read has the
   no-text shape (`text_reads`, with the token scan
   `classifiers::query::pg_scan`: no `query` identifier, no `*` but
-  `count(*)`, no whole-row reference, no column alias list but on
-  constant `VALUES`, no `NATURAL`, only catalogs and listed entries
-  named). pgaudit relation records of a listed entry the substatement's
+  `count(*)`, no whole-row reference, no column alias list (whatever
+  the alias's word) but on constant `VALUES`, no `NATURAL`, only
+  catalogs and listed entries named, and no schema-qualified call
+  outside `pg_catalog` and the lists until decision 8). pgaudit relation records of a listed entry the substatement's
   text does not name, or next to a view outside `pg_catalog`, make a text
   read. The `pg_catalog` functions of decision 7 (`DATA_FUNCTIONS`:
   SQL-running, file, logical decoding, large objects) add `*`, also next
   to catalogs only. The connector's `pss_texts` is left out only by exact
   text (`OwnKind::StatementText`; on pgaudit only within a
-  `pg_stat_statements` period of the target, `PssPeriods`), never
+  `pg_stat_statements` period of the target, `PssPeriods`, whose closed
+  periods end 5 s early for clock skew), never
   otherwise. `check()` says `pg_read_all_stats` is held while pgaudit is
   the source in its local detail. Drift and pinning tests in `it.rs`.
   Decision 8 (user functions, operators and casts next to catalogs only)

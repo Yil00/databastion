@@ -388,7 +388,14 @@ impl PssPoller {
     }
 
     /// Sets the per-database catalog facts (re-probed with the source).
+    /// The cached analyses hold what each text reads of the lists, decided
+    /// with the extension's schema at the time (ADR-0049): a change of any
+    /// database's `pg_stat_statements` schema clears them, so the texts are
+    /// read and analyzed again (security review L1).
     pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
+        if self.catalogs.pss_schema_changed(&catalogs) {
+            self.analyses.clear();
+        }
         self.catalogs = catalogs;
     }
 
@@ -919,6 +926,74 @@ mod tests {
             assert!(p.analyses[&k].is_none(), "poisoned");
             assert_eq!(p.unanalyzed, 1, "counted once (poll {poll})");
         }
+    }
+
+    /// Security review L1: a change of a database's `pg_stat_statements`
+    /// schema clears the cached analyses (what a text reads of the lists
+    /// depends on it); the same schemas keep them.
+    #[test]
+    fn a_changed_extension_schema_clears_the_analyses() {
+        let catalogs = |schema: Option<&str>| {
+            let mut c = Catalogs::default();
+            for (db, s) in [("shop", schema), ("crm", Some("public"))] {
+                c.insert(
+                    db,
+                    super::super::events::DbCatalog {
+                        pss_schema: s.map(str::to_owned),
+                        pgaudit_log_catalog: None,
+                    },
+                );
+            }
+            c
+        };
+        let mut p = poller();
+        p.set_catalogs(catalogs(Some("public")));
+        let k = (AGENT_ROLE, POLLER_DB, 700, true);
+        p.record_text(
+            k,
+            "shop",
+            "SELECT queryid FROM ext.pg_stat_statements",
+            false,
+        );
+        assert!(p.analyses.contains_key(&k));
+        // Same facts again: kept.
+        p.set_catalogs(catalogs(Some("public")));
+        assert!(p.analyses.contains_key(&k));
+        // The extension moved to another schema: cleared.
+        p.set_catalogs(catalogs(Some("ext")));
+        assert!(p.analyses.is_empty());
+        p.record_text(
+            k,
+            "shop",
+            "SELECT queryid FROM ext.pg_stat_statements",
+            false,
+        );
+        // Dropped from one database: cleared.
+        p.set_catalogs(catalogs(None));
+        assert!(p.analyses.is_empty());
+        p.record_text(k, "shop", "SELECT 1", false);
+        // A database added without the extension changes nothing; one
+        // added with it clears.
+        let mut c = catalogs(None);
+        c.insert(
+            "hr",
+            super::super::events::DbCatalog {
+                pss_schema: None,
+                pgaudit_log_catalog: None,
+            },
+        );
+        p.set_catalogs(c);
+        assert!(p.analyses.contains_key(&k));
+        let mut c = catalogs(None);
+        c.insert(
+            "hr",
+            super::super::events::DbCatalog {
+                pss_schema: Some("public".to_owned()),
+                pgaudit_log_catalog: None,
+            },
+        );
+        p.set_catalogs(c);
+        assert!(p.analyses.is_empty());
     }
 
     /// ADR-0049 decision 5 on `pg_stat_statements`: the text query is a

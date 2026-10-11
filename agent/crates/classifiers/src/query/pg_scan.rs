@@ -91,6 +91,10 @@ struct Segment {
     /// Aliases of parenthesized joins (`(a JOIN b ON …) AS j`): a whole-row
     /// reference to one reads every column of the joined items.
     join_aliases: Vec<usize>,
+    /// An alias the `FROM` parser recorded (of an item, a join or a
+    /// subquery) is followed by `(`: a column alias list, whatever the
+    /// alias's word (security review H1).
+    column_list: bool,
 }
 
 /// The scan of a PostgreSQL text ([`pg_scan`]). Holds identifier tokens
@@ -122,12 +126,13 @@ pub fn pg_scan(text: &str) -> Option<PgScan> {
     let mut segments = Vec::with_capacity(1 + bodies.len());
     for t in std::iter::once(tokens).chain(bodies) {
         let names = names_of(&t);
-        let (items, join_aliases) = from_items(&t, &names);
+        let (items, join_aliases, column_list) = from_items(&t, &names);
         segments.push(Segment {
             tokens: t,
             names,
             items,
             join_aliases,
+            column_list,
         });
     }
     Some(PgScan { segments })
@@ -182,8 +187,10 @@ impl PgScan {
     ///   and a column name (a listed set-returning function called outside
     ///   `FROM` is one, and so is `TABLE <view>`);
     /// - a column alias list anywhere (`AS a (c1, …)`, `) j (c1)`, `AS (…)`
-    ///   after a call, a CTE column list), except on a parenthesized
-    ///   `VALUES` list of constants (ADR-0049 refinement of 2026-10-11);
+    ///   after a call, a CTE column list), whatever the alias's word (an
+    ///   alias the `FROM` parser recorded, or any identifier after `AS`,
+    ///   followed by `(`), except on a parenthesized `VALUES` list of
+    ///   constants (ADR-0049 refinement of 2026-10-11);
     /// - `NATURAL`.
     #[must_use]
     pub fn no_text_shape(
@@ -358,10 +365,19 @@ struct Frame {
     open: Open,
     in_from: bool,
     after: After,
+    /// Token index of its `(`.
+    start: usize,
 }
 
-/// The `FROM` items of `s` and the aliases of its parenthesized joins.
-fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
+/// Whether the alias at `alias` is followed by `(` (a column alias list).
+fn listed_columns(s: &[Tok], alias: Option<usize>) -> bool {
+    alias.is_some_and(|a| is_punct(s.get(a + 1), "("))
+}
+
+/// The `FROM` items of `s`, the aliases of its parenthesized joins, and
+/// whether a recorded alias has a column alias list (one on a subquery of
+/// constant `VALUES` rows excepted, ADR-0049 refinement of 2026-10-11).
+fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) {
     let by_start: HashMap<usize, usize> = names
         .iter()
         .enumerate()
@@ -369,10 +385,12 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
         .collect();
     let mut items: Vec<FromItem> = Vec::new();
     let mut joins: Vec<usize> = Vec::new();
+    let mut column_list = false;
     let mut frames = vec![Frame {
         open: Open::Group,
         in_from: false,
         after: After::Nothing,
+        start: 0,
     }];
     let mut expect = false;
     let mut i = 0;
@@ -392,6 +410,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                         open: Open::Group,
                         in_from: !sub,
                         after: if sub { After::Subquery } else { After::Join },
+                        start: i,
                     });
                 }
                 i += 1;
@@ -407,6 +426,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                         open: Open::RowsFrom,
                         in_from: true,
                         after: After::Items(Vec::new()),
+                        start: i + 2,
                     });
                 }
                 i += 3;
@@ -436,11 +456,13 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                             } else {
                                 After::Items(vec![idx])
                             },
+                            start: n.end,
                         });
                     }
                     i = n.end + 1;
                 } else {
                     let (alias, next) = alias_at(s, n.end);
+                    column_list |= listed_columns(s, alias);
                     items[idx].alias = alias;
                     i = next;
                 }
@@ -466,6 +488,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                         open: if call { Open::Call } else { Open::Group },
                         in_from: false,
                         after: After::Nothing,
+                        start: i,
                     });
                 }
                 i += 1;
@@ -479,6 +502,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                         After::Nothing => {}
                         After::Items(v) => {
                             let (alias, next) = alias_at(s, i);
+                            column_list |= listed_columns(s, alias);
                             for k in v {
                                 items[k].alias = alias;
                             }
@@ -486,11 +510,14 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
                         }
                         After::Join => {
                             let (alias, next) = alias_at(s, i);
+                            column_list |= listed_columns(s, alias);
                             joins.extend(alias);
                             i = next;
                         }
                         After::Subquery => {
-                            let (_, next) = alias_at(s, i);
+                            let (alias, next) = alias_at(s, i);
+                            column_list |=
+                                listed_columns(s, alias) && !constant_values(s, f.start, i - 1);
                             i = next;
                         }
                     }
@@ -538,7 +565,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>) {
             _ => i += 1,
         }
     }
-    (items, joins)
+    (items, joins, column_list)
 }
 
 /// Keywords after which `<name> (` is a call, not an alias with a column
@@ -747,12 +774,28 @@ fn constant_values(s: &[Tok], open: usize, close: usize) -> bool {
         })
 }
 
+/// `AS MATERIALIZED (` of a CTE: the `(` opens its query (a column alias
+/// list cannot start with a reserved word, nor be `(update t …)`).
+fn cte_materialized(s: &[Tok], open: usize) -> bool {
+    match word(s.get(open + 1)) {
+        Some("select" | "with" | "values" | "table") => true,
+        Some("insert" | "update" | "delete" | "merge") => {
+            !matches!(s.get(open + 2), Some(Tok::Punct(p)) if p == "," || p == ")")
+        }
+        _ => false,
+    }
+}
+
 /// A column alias list anywhere in `s` (ADR-0049 decision 2), found
-/// lexically so that a form the `FROM` parser misses is still refused:
-/// `<alias> (` after `AS`, after `)` or after another name (outside
-/// `CAST(…)`), `) AS (`, and a CTE column list.
+/// lexically as a backstop of the `FROM` parser's aliases
+/// ([`Segment::column_list`]): `AS <any identifier> (` outside the direct
+/// frame of `CAST(…)` (whatever the identifier's word, security review
+/// H1), `<alias> (` after `)` or after another name, `) AS (`, and a CTE
+/// column list.
 fn alias_list(s: &[Tok]) -> bool {
-    // Calls of `cast` open frames where `AS <type>(n)` is a type modifier.
+    // The direct frame of a `cast` call, where `AS <type>(n)` is a type
+    // modifier. Not inherited by nested parentheses (a subquery inside
+    // `CAST` is checked like any other).
     let mut cast: Vec<bool> = Vec::new();
     for i in 0..s.len() {
         match &s[i] {
@@ -773,11 +816,19 @@ fn alias_list(s: &[Tok]) -> bool {
                 {
                     return true;
                 }
-                let y_name = match y {
-                    Some(Tok::Quoted(_)) => true,
-                    Some(Tok::Word(w)) => !paren_keyword(w),
-                    _ => false,
-                };
+                // After `AS`, any identifier is an alias (`AS zone (c)`,
+                // `AS set (c)`), except a CTE's `AS MATERIALIZED (query)`.
+                let cte = word(x) == Some("as")
+                    && word(y) == Some("materialized")
+                    && cte_materialized(s, i);
+                let after_as = word(x) == Some("as") && ident(y).is_some();
+                let y_name = !cte
+                    && (after_as
+                        || match y {
+                            Some(Tok::Quoted(_)) => true,
+                            Some(Tok::Word(w)) => !paren_keyword(w),
+                            _ => false,
+                        });
                 if y_name && !in_cast {
                     let flagged = match x {
                         Some(Tok::Word(w)) if w == "as" => true,
@@ -807,7 +858,7 @@ fn alias_list(s: &[Tok]) -> bool {
                         }
                     }
                 }
-                cast.push(is_cast || in_cast);
+                cast.push(is_cast);
             }
             Tok::Punct(p) if p == ")" => {
                 cast.pop();
@@ -918,7 +969,7 @@ fn segment_shape(
     if t.iter().any(|x| word(Some(x)) == Some("natural")) {
         return false;
     }
-    if alias_list(t) {
+    if s.column_list || alias_list(t) {
         return false;
     }
     // Range variables: the listed names, the aliases of listed items and
@@ -1103,5 +1154,75 @@ mod tests {
         }
         // Nothing listed: quiet.
         assert!(quiet("SELECT * FROM crm.customer"));
+    }
+
+    /// The probes of security review H1, each a text read.
+    const KEYWORD_ALIAS_PROBES: [&str; 10] = [
+        "SELECT zone.c7 FROM pg_stat_activity zone (c1, c2, c3, c4, c5, c6, c7)",
+        "SELECT filter.c FROM pg_stat_activity filter (c)",
+        "SELECT zone.c FROM pg_stat_activity AS zone (c)",
+        "SELECT second.c FROM pg_stat_get_activity(NULL) AS second (c)",
+        "SELECT columns.c FROM (pg_stat_activity a CROSS JOIN pg_database d) columns (c)",
+        "SELECT set.c FROM pg_stat_activity AS set (c)",
+        "SELECT call.c FROM pg_stat_activity call (c)",
+        "SELECT v.c FROM pg_stat_activity values (c)",
+        "SELECT x.c FROM pg_stat_get_activity(NULL) WITH ORDINALITY AS zone (c, n)",
+        "SELECT x.c FROM ROWS FROM (pg_stat_get_activity(NULL)) AS columns (c)",
+    ];
+
+    /// Security review H1: an alias that is a keyword of the lexical lists
+    /// (`zone`, `filter`, `second`, `columns`, `set`, `call`, `values`)
+    /// still has its column alias list refused, by the `FROM` parser's
+    /// aliases and by the `AS <identifier> (` backstop.
+    #[test]
+    fn keyword_aliases_with_column_lists() {
+        for q in KEYWORD_ALIAS_PROBES {
+            assert!(!quiet(q), "{q}");
+        }
+        // Each check alone.
+        for q in [
+            "SELECT zone.c7 FROM pg_stat_activity zone (c1, c2, c3, c4, c5, c6, c7)",
+            "SELECT filter.c FROM pg_stat_activity filter (c)",
+            "SELECT columns.c FROM (pg_stat_activity a CROSS JOIN pg_database d) columns (c)",
+            "SELECT call.c FROM pg_stat_activity call (c)",
+            "SELECT x.c FROM (SELECT a.pid FROM pg_stat_activity a) zone (c)",
+        ] {
+            assert!(pg_scan(q).unwrap().segments[0].column_list, "{q}");
+        }
+        for q in [
+            "SELECT zone.c FROM pg_stat_activity AS zone (c)",
+            "SELECT second.c FROM pg_stat_get_activity(NULL) AS second (c)",
+            "SELECT set.c FROM pg_stat_activity AS set (c)",
+            "SELECT x.c FROM ROWS FROM (pg_stat_get_activity(NULL)) AS columns (c)",
+        ] {
+            assert!(alias_list(&pg_scan(q).unwrap().segments[0].tokens), "{q}");
+        }
+        // A subquery inside `CAST` is not covered by the cast's exemption.
+        assert!(!quiet(
+            "SELECT CAST((SELECT x.c FROM pg_stat_activity AS x (c) LIMIT 1) AS int)"
+        ));
+        // Not a column list: a CTE's `AS [NOT] MATERIALIZED (query)` and
+        // type modifiers in `CAST` (a CTE reference is itself an item the
+        // text cannot decide on, so these are checked on the backstop).
+        for q in [
+            "WITH x AS MATERIALIZED (SELECT a.pid FROM pg_stat_activity a) SELECT x.pid FROM x",
+            "WITH x AS NOT MATERIALIZED (SELECT a.pid FROM pg_stat_activity a) \
+             SELECT x.pid FROM x",
+            "WITH x AS MATERIALIZED (UPDATE t SET c = 1 RETURNING c) SELECT 1",
+            "SELECT CAST(pid AS numeric(10, 0)), CAST(backend_start AS timestamp(3)) \
+             FROM pg_stat_activity",
+        ] {
+            let scan = pg_scan(q).unwrap();
+            assert!(!alias_list(&scan.segments[0].tokens), "{q}");
+            assert!(!scan.segments[0].column_list, "{q}");
+        }
+        assert!(quiet(
+            "SELECT CAST(pid AS numeric(10, 0)), CAST(backend_start AS timestamp(3)) \
+             FROM pg_stat_activity"
+        ));
+        // `AS MATERIALIZED (c)` on an item is an alias with a column list.
+        assert!(!quiet(
+            "SELECT materialized.c FROM pg_stat_activity AS materialized (c)"
+        ));
     }
 }

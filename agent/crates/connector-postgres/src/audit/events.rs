@@ -110,6 +110,17 @@ impl Catalogs {
         self.dbs.get(database)
     }
 
+    /// Whether some database's `pg_stat_statements` schema differs between
+    /// `self` and `other` (a database present in only one counts as
+    /// differing when it has a schema).
+    pub(crate) fn pss_schema_changed(&self, other: &Catalogs) -> bool {
+        let schema = |c: &Catalogs, db: &str| c.get(db).and_then(|d| d.pss_schema.clone());
+        self.dbs
+            .keys()
+            .chain(other.dbs.keys())
+            .any(|db| schema(self, db) != schema(other, db))
+    }
+
     /// The rule for a statement of `database`. `unqualified_pg`: whether an
     /// unqualified `pg_*` name counts as a catalog without confirmation.
     pub(crate) fn rule<'a>(
@@ -412,8 +423,22 @@ pub(crate) fn text_reads(
                     || (is_catalog(r, rule) && statistics_relation(r).is_none())
             })
     });
-    let quiet =
-        !cut && analysis.lexed() && only_catalogs && scan.no_text_shape(TEXT_COLUMN, &classify);
+    // A schema-qualified call of a function outside `pg_catalog` and
+    // outside the lists of decisions 1 and 7 (a user function can read the
+    // text column without the text naming it): a text read until decision
+    // 8 (part 2) reports user functions next to catalogs (security review
+    // M1). Unqualified calls are left to decision 8.
+    let user_call = scan.names().iter().any(|u| {
+        u.call
+            && u.name.schema.as_deref().is_some_and(|s| s != "pg_catalog")
+            && listed(&u.name, true, rule.pss_schema).is_none()
+            && !data_function(&u.name)
+    });
+    let quiet = !cut
+        && !user_call
+        && analysis.lexed()
+        && only_catalogs
+        && scan.no_text_shape(TEXT_COLUMN, &classify);
     if !quiet {
         for o in &core {
             push_unique(&mut out.objects, o.clone());
@@ -649,6 +674,16 @@ pub(crate) type SharedOwnStatements = std::sync::Arc<std::sync::Mutex<Vec<String
 /// Most closed `pg_stat_statements` periods remembered per target.
 const MAX_PSS_PERIODS: usize = 16;
 
+/// Taken off the end of a closed `pg_stat_statements` period (security
+/// review L2): pgaudit record times are the server's log clock, compared
+/// with the agent's clock, and a server clock behind the agent's would
+/// otherwise widen the window after the stream stopped by the skew. A
+/// skew up to this tolerance is absorbed; a server clock ahead of the
+/// agent's (or a skew beyond it in the other direction) makes the
+/// agent's last polls reported, never more of the log quiet. The start
+/// has no margin: a skew there reports loudly too.
+pub(crate) const PSS_PERIOD_SKEW: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// When the target's `pg_stat_statements` stream ran (ADR-0049 decision
 /// 5): the pgaudit records of the connector's text query are its own only
 /// within one of these periods. In memory only, bounded: after an agent
@@ -671,13 +706,17 @@ impl PssPeriods {
     }
 
     /// The stream stopped at `now`; its last statement may run up to
-    /// `timeout` longer.
+    /// `timeout` longer. The end is shortened by [`PSS_PERIOD_SKEW`]
+    /// (never before the start).
     pub(crate) fn stop(&mut self, now: SystemTime, timeout: std::time::Duration) {
         if let Some(start) = self.open.take() {
             if self.closed.len() >= MAX_PSS_PERIODS {
                 self.closed.pop_front();
             }
-            self.closed.push_back((start, now + timeout));
+            let end = (now + timeout)
+                .checked_sub(PSS_PERIOD_SKEW)
+                .map_or(start, |e| e.max(start));
+            self.closed.push_back((start, end));
         }
     }
 
@@ -4563,7 +4602,7 @@ mod tests {
 
     /// The common monitoring reads and the shape-respecting forms of
     /// decision 2: no event on either source, for any account.
-    const QUIET: [&str; 12] = [
+    const QUIET: [&str; 13] = [
         "SELECT state, count(*) FROM pg_stat_activity GROUP BY state",
         "SELECT pid FROM pg_stat_activity WHERE state = 'idle'",
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle' \
@@ -4587,11 +4626,13 @@ mod tests {
          AND pg_database.datname = tmp2.datname",
         "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend'",
         "SELECT CAST(pid AS numeric(10, 0)) FROM pg_stat_activity",
+        // A `pg_catalog`-qualified call is no user function (M1).
+        "SELECT pg_catalog.pg_terminate_backend(a.pid) FROM pg_stat_activity a",
     ];
 
     /// Every way decision 2 refuses (each condition broken alone): a text
     /// read of `pg_catalog.pg_stat_activity`.
-    const DODGES: [&str; 37] = [
+    const DODGES: [&str; 48] = [
         "SELECT query FROM pg_stat_activity",
         "SELECT \"query\" FROM pg_stat_activity",
         r#"SELECT U&"\0071uery" FROM pg_stat_activity"#,
@@ -4633,6 +4674,20 @@ mod tests {
         "SELECT a.pid FROM pg_stat_activity a, pg_catalog.pg_stats s",
         "SELECT a.pid FROM pg_stat_activity a WHERE a IS DISTINCT FROM NULL",
         "SELECT 1 FROM pg_stat_activity, (VALUES ((SELECT 1))) AS v (c)",
+        // Security review H1: keyword aliases with a column alias list.
+        "SELECT zone.c7 FROM pg_stat_activity zone (c1, c2, c3, c4, c5, c6, c7)",
+        "SELECT filter.c FROM pg_stat_activity filter (c)",
+        "SELECT zone.c FROM pg_stat_activity AS zone (c)",
+        "SELECT second.c FROM pg_stat_get_activity(NULL) AS second (c)",
+        "SELECT columns.c FROM (pg_stat_activity a CROSS JOIN pg_database d) columns (c)",
+        "SELECT set.c FROM pg_stat_activity AS set (c)",
+        "SELECT call.c FROM pg_stat_activity call (c)",
+        "SELECT v.c FROM pg_stat_activity values (c)",
+        // Security review M1: a schema-qualified user function in the
+        // select list, until decision 8.
+        "SELECT a.pid, public.f() FROM pg_stat_activity a",
+        "SELECT a.pid FROM pg_stat_activity a WHERE app.check(a.pid)",
+        "SELECT \"Ops\".f(a.pid) FROM pg_catalog.pg_stat_activity a",
     ];
 
     /// ADR-0049 decision 2: the quiet shapes give no event; each refused
@@ -4894,6 +4949,23 @@ mod tests {
             )
             .is_empty()
         );
+        // A closed period ends at its stop plus the statement timeout, less
+        // the skew tolerance (security review L2), never before its start.
+        let mut p = PssPeriods::default();
+        let t0 = record - std::time::Duration::from_secs(100);
+        p.start(t0);
+        p.stop(
+            t0 + std::time::Duration::from_secs(50),
+            std::time::Duration::from_secs(30),
+        );
+        let end = t0 + std::time::Duration::from_secs(80) - PSS_PERIOD_SKEW;
+        assert!(p.covers(t0) && p.covers(end));
+        assert!(!p.covers(end + std::time::Duration::from_millis(1)));
+        assert!(!p.covers(t0 - std::time::Duration::from_millis(1)));
+        let mut p = PssPeriods::default();
+        p.start(t0);
+        p.stop(t0, std::time::Duration::from_secs(1));
+        assert!(p.covers(t0) && !p.covers(t0 + std::time::Duration::from_millis(1)));
         // Ended before the record (plus the statement timeout): reported.
         let ended = SharedPssPeriods::default();
         ended
