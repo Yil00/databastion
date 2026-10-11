@@ -56,8 +56,8 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, QueryAnalysis, RelationName, StatementInfo, StatementKind,
-    analyze,
+    AnalyzeOptions, CopyEndpoint, PgItemClass, PgListed, QueryAnalysis, RelationName,
+    StatementInfo, StatementKind, analyze, pg_scan,
 };
 
 use super::records::AuditRecord;
@@ -112,7 +112,7 @@ impl Catalogs {
 
     /// The rule for a statement of `database`. `unqualified_pg`: whether an
     /// unqualified `pg_*` name counts as a catalog without confirmation.
-    fn rule<'a>(
+    pub(crate) fn rule<'a>(
         &'a self,
         database: &str,
         unqualified_pg: bool,
@@ -134,7 +134,7 @@ fn is_pss_relation(name: &str) -> bool {
 
 /// Which relations count as catalogs for one statement.
 #[derive(Clone, Copy)]
-struct CatalogRule<'a> {
+pub(crate) struct CatalogRule<'a> {
     /// Schema of the `pg_stat_statements` extension in the statement's
     /// database: only its two relations there count, not a
     /// `pg_stat_statements*` name elsewhere (any role with `CREATE` can
@@ -200,6 +200,237 @@ fn statistics_relation(r: &RelationName) -> Option<RelationName> {
 /// Whether `r` is a statistics relation as named in events.
 fn is_statistics(r: &RelationName) -> bool {
     r.schema.as_deref() == Some("pg_catalog") && STATISTICS_RELATIONS.contains(&r.name.as_str())
+}
+
+// ------------------------------------------- statement-text views (ADR-0049)
+
+/// The `pg_catalog` view of the core list (decision 1): other sessions'
+/// current or last statement texts, in its `query` column.
+pub(crate) const ACTIVITY_VIEW: &str = "pg_stat_activity";
+/// The set-returning function behind [`ACTIVITY_VIEW`] (`query` column).
+pub(crate) const ACTIVITY_FUNCTION: &str = "pg_stat_get_activity";
+/// The scalar function that returns one backend's statement text.
+pub(crate) const BACKEND_ACTIVITY_FUNCTION: &str = "pg_stat_get_backend_activity";
+/// The view and function of the `pg_stat_statements` extension (core
+/// list), in the extension's schema of the database.
+pub(crate) const PSS_VIEW: &str = "pg_stat_statements";
+/// The column of the core list that holds statement text.
+pub(crate) const TEXT_COLUMN: &str = "query";
+
+/// The extension list of decision 1 (security review M3): names of
+/// relations or functions that hold statement texts, plans or predicate
+/// constants, in any schema or unqualified, with no shape exemption.
+pub(crate) const EXTENSION_TEXT_NAMES: [&str; 3] =
+    ["pg_stat_monitor", "pg_store_plans", "pg_show_plans"];
+/// Prefix of the extension list (`pg_qualstats`, `pg_qualstats_all`,
+/// `pg_qualstats_pretty`, `pg_qualstats_example_query`…).
+pub(crate) const EXTENSION_TEXT_PREFIX: &str = "pg_qualstats";
+
+/// The `pg_catalog` functions of decision 7: they run SQL text or read a
+/// relation named by their argument, server files (logs hold statement
+/// texts), decoded rows of a replication slot, or large objects. A call
+/// adds `*` to the statement, also next to catalogs only.
+///
+/// `pg_read_file_old` (the pre-11 C entry point of `pg_read_file`, still in
+/// `pg_catalog` on PostgreSQL 14 to 16, removed in 17, superuser only) is found by the
+/// decision 9 drift test and added (refinement of 2026-10-11).
+pub(crate) const DATA_FUNCTIONS: [&str; 21] = [
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "ts_stat",
+    "ts_rewrite",
+    "pg_read_file",
+    "pg_read_file_old",
+    "pg_read_binary_file",
+    "pg_logical_slot_get_changes",
+    "pg_logical_slot_peek_changes",
+    "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_peek_binary_changes",
+    "lo_get",
+    "loread",
+    "lo_export",
+    "lo_import",
+];
+/// Prefixes of decision 7 (`schema_to_xml*`, `database_to_xml*`).
+pub(crate) const DATA_FUNCTION_PREFIXES: [&str; 2] = ["schema_to_xml", "database_to_xml"];
+
+/// A `pg_catalog` function of decision 7, called qualified with
+/// `pg_catalog` or unqualified. A function of that name in another schema
+/// is a user function (decision 8, not this list).
+fn data_function(r: &RelationName) -> bool {
+    matches!(r.schema.as_deref(), None | Some("pg_catalog"))
+        && (DATA_FUNCTIONS.contains(&r.name.as_str())
+            || DATA_FUNCTION_PREFIXES.iter().any(|p| r.name.starts_with(p)))
+}
+
+/// Whether `name` is on the extension list.
+fn extension_text_name(name: &str) -> bool {
+    EXTENSION_TEXT_NAMES.contains(&name) || name.starts_with(EXTENSION_TEXT_PREFIX)
+}
+
+/// What a name of the statement-text lists is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Listed {
+    /// Core list: the object named in events, and the shape rule.
+    Core(RelationName, PgListed),
+    /// Extension list relation: named as the text gives it, no shape
+    /// exemption.
+    Extension(RelationName),
+    /// A call that names no relation of the lists: `*` (an extension-list
+    /// function, or an unqualified `pg_stat_statements(` where the
+    /// extension is not installed: a user function).
+    Star,
+}
+
+/// The core-list object of `pg_stat_activity` and its functions.
+fn activity_object() -> RelationName {
+    RelationName {
+        schema: Some("pg_catalog".to_owned()),
+        name: ACTIVITY_VIEW.to_owned(),
+    }
+}
+
+/// Places `r` (`call`: followed by `(`) on the lists of decision 1, in a
+/// database whose `pg_stat_statements` schema is `pss_schema`. Names are
+/// compared after the analyzer's folding: a quoted `"PG_STAT_ACTIVITY"`,
+/// a `public.pg_stat_activity` or a `pg_stat_statements` outside the
+/// extension's schema is not listed (an ordinary relation, or a user
+/// function).
+fn listed(r: &RelationName, call: bool, pss_schema: Option<&str>) -> Option<Listed> {
+    let catalog = matches!(r.schema.as_deref(), None | Some("pg_catalog"));
+    match (r.name.as_str(), call) {
+        (ACTIVITY_VIEW, false) if catalog => Some(Listed::Core(activity_object(), PgListed::View)),
+        (ACTIVITY_FUNCTION, true) if catalog => {
+            Some(Listed::Core(activity_object(), PgListed::SetFunction))
+        }
+        (BACKEND_ACTIVITY_FUNCTION, true) if catalog => {
+            Some(Listed::Core(activity_object(), PgListed::Always))
+        }
+        (PSS_VIEW, _) => {
+            let in_extension = match (r.schema.as_deref(), pss_schema) {
+                (Some(s), Some(p)) => s == p,
+                (None, Some(_)) => true,
+                (_, None) => false,
+            };
+            if in_extension {
+                let object = RelationName {
+                    schema: pss_schema.map(str::to_owned),
+                    name: PSS_VIEW.to_owned(),
+                };
+                let kind = if call {
+                    PgListed::SetFunction
+                } else {
+                    PgListed::View
+                };
+                Some(Listed::Core(object, kind))
+            } else if call && r.schema.is_none() {
+                Some(Listed::Star)
+            } else {
+                None
+            }
+        }
+        (n, false) if extension_text_name(n) => Some(Listed::Extension(r.clone())),
+        (n, true) if extension_text_name(n) => Some(Listed::Star),
+        _ => None,
+    }
+}
+
+/// What a statement text reads of the statement-text lists (ADR-0049
+/// decisions 1, 2 and 7), decided on the whole text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TextReads {
+    /// Listed objects read with their text (core list outside the no-text
+    /// shape, extension list): named in the event, always reported.
+    pub(crate) objects: Vec<RelationName>,
+    /// `*`: a call of decision 7, of an extension-list function, or of an
+    /// unqualified `pg_stat_statements(` without the extension.
+    pub(crate) star: bool,
+    /// Core-list objects the text names (in the no-text shape or not).
+    pub(crate) named: Vec<RelationName>,
+}
+
+fn push_unique(v: &mut Vec<RelationName>, r: RelationName) {
+    if !v.contains(&r) {
+        v.push(r);
+    }
+}
+
+/// [`TextReads`] of `text`, analyzed as `analysis`, in a statement of the
+/// database `rule` describes. `cut`: the text may be cut at its source's
+/// bound. Only names are kept, never a literal (I2).
+pub(crate) fn text_reads(
+    text: &str,
+    analysis: &QueryAnalysis,
+    rule: CatalogRule<'_>,
+    cut: bool,
+) -> TextReads {
+    let mut out = TextReads::default();
+    let Some(scan) = pg_scan(text) else {
+        return out;
+    };
+    let mut core: Vec<RelationName> = Vec::new();
+    for u in scan.names() {
+        if u.call && data_function(&u.name) {
+            out.star = true;
+        }
+        match listed(&u.name, u.call, rule.pss_schema) {
+            Some(Listed::Core(o, _)) => push_unique(&mut core, o),
+            Some(Listed::Extension(o)) => push_unique(&mut out.objects, o),
+            Some(Listed::Star) => out.star = true,
+            None => {}
+        }
+    }
+    if core.is_empty() {
+        return out;
+    }
+    // The no-text shape (decision 2): a complete text below the relation
+    // bound, naming only catalogs and core-list entries, with no access to
+    // `query` that the scan cannot rule out.
+    let classify = |r: &RelationName, call: bool| match listed(r, call, rule.pss_schema) {
+        Some(Listed::Core(_, kind)) => PgItemClass::Listed(kind),
+        Some(Listed::Extension(_) | Listed::Star) => PgItemClass::Listed(PgListed::Always),
+        None if call => {
+            if r.schema.as_deref() == Some("pg_catalog") {
+                PgItemClass::Catalog
+            } else {
+                PgItemClass::Other
+            }
+        }
+        None if is_catalog(r, rule) && statistics_relation(r).is_none() => PgItemClass::Catalog,
+        None => PgItemClass::Other,
+    };
+    let only_catalogs = analysis.parts().iter().all(|p| {
+        !p.relations_full
+            && p.relations.iter().all(|r| {
+                matches!(listed(r, false, rule.pss_schema), Some(Listed::Core(..)))
+                    || (is_catalog(r, rule) && statistics_relation(r).is_none())
+            })
+    });
+    let quiet =
+        !cut && analysis.lexed() && only_catalogs && scan.no_text_shape(TEXT_COLUMN, &classify);
+    if !quiet {
+        for o in &core {
+            push_unique(&mut out.objects, o.clone());
+        }
+    }
+    out.named = core;
+    out
+}
+
+/// Whether `r` (a relation, from the analysis or a pgaudit record) is a
+/// relation of the lists, which [`text_reads`] and the relation-record
+/// rule name instead of the catalog rule.
+fn listed_relation(r: &RelationName, rule: CatalogRule<'_>) -> bool {
+    matches!(
+        listed(r, false, rule.pss_schema),
+        Some(Listed::Core(..) | Listed::Extension(_))
+    )
 }
 
 /// Splits a pgaudit object name (`schema.table`, parts possibly quoted).
@@ -301,6 +532,11 @@ fn user_relations(parts: &[&StatementInfo], rule: CatalogRule<'_>) -> (Vec<Relat
     for p in parts {
         for r in &p.relations {
             any = true;
+            if listed_relation(r, rule) {
+                // Named by `text_reads` when read with their text
+                // (ADR-0049), catalogs otherwise.
+                continue;
+            }
             let r = match statistics_relation(r) {
                 Some(s) => s,
                 None if is_catalog(r, rule) => continue,
@@ -335,7 +571,9 @@ fn statement_signals(
             }
         }
         if p.kind.is_read()
-            && p.relations.iter().any(|r| !is_catalog(r, rule))
+            && p.relations
+                .iter()
+                .any(|r| !is_catalog(r, rule) && !listed_relation(r, rule))
             && p.shape.is_some_and(|s| s.whole_relation(LARGE_LIMIT + 1))
         {
             out.push(Signal::FullTableRead);
@@ -354,7 +592,12 @@ fn copied_to_client(parts: &[&StatementInfo], rule: CatalogRule<'_>) -> Vec<Rela
         if p.copy
             .is_some_and(|c| c.to && c.whole_relation && c.endpoint == CopyEndpoint::Client)
         {
-            out.extend(p.relations.iter().filter(|r| !is_catalog(r, rule)).cloned());
+            out.extend(
+                p.relations
+                    .iter()
+                    .filter(|r| !is_catalog(r, rule) && !listed_relation(r, rule))
+                    .cloned(),
+            );
         }
     }
     out
@@ -392,26 +635,101 @@ impl DumpTracker {
     }
 }
 
-/// Most statements registered at run time ([`PgOwn::allow_statement`]).
+/// Most statements registered at run time ([`PgOwn::allow_text_query`]).
 const OWN_MAX_EXTRA_STATEMENTS: usize = 8;
 
-/// Table-less statements registered at run time for a target (the
-/// `pg_stat_statements` text query, whose schema is only known then). Kept
+/// The connector's `pg_stat_statements` text queries (`sql::pss_texts`,
+/// whose schema is only known at run time) registered for a target. Kept
 /// per target by the connector (`CheckState`), like the row budget, so
 /// that a pgaudit stream started after a `pg_stat_statements` period
-/// recognizes them in the records of that period. Not persisted.
+/// recognizes them in the records of that period ([`PssPeriods`]). Not
+/// persisted.
 pub(crate) type SharedOwnStatements = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Most closed `pg_stat_statements` periods remembered per target.
+const MAX_PSS_PERIODS: usize = 16;
+
+/// When the target's `pg_stat_statements` stream ran (ADR-0049 decision
+/// 5): the pgaudit records of the connector's text query are its own only
+/// within one of these periods. In memory only, bounded: after an agent
+/// restart no period is known, and the agent's earlier polls found in the
+/// log are reported.
+#[derive(Debug, Default)]
+pub(crate) struct PssPeriods {
+    /// Start of the running stream.
+    open: Option<SystemTime>,
+    /// Closed periods (start, end plus the statement timeout).
+    closed: VecDeque<(SystemTime, SystemTime)>,
+}
+
+impl PssPeriods {
+    /// A `pg_stat_statements` stream of the target started.
+    pub(crate) fn start(&mut self, now: SystemTime) {
+        if self.open.is_none() {
+            self.open = Some(now);
+        }
+    }
+
+    /// The stream stopped at `now`; its last statement may run up to
+    /// `timeout` longer.
+    pub(crate) fn stop(&mut self, now: SystemTime, timeout: std::time::Duration) {
+        if let Some(start) = self.open.take() {
+            if self.closed.len() >= MAX_PSS_PERIODS {
+                self.closed.pop_front();
+            }
+            self.closed.push_back((start, now + timeout));
+        }
+    }
+
+    /// Whether `ts` falls within a period.
+    pub(crate) fn covers(&self, ts: SystemTime) -> bool {
+        self.open.is_some_and(|s| ts >= s) || self.closed.iter().any(|(a, b)| ts >= *a && ts <= *b)
+    }
+}
+
+/// [`PssPeriods`] shared by the streams of one target.
+pub(crate) type SharedPssPeriods = std::sync::Arc<std::sync::Mutex<PssPeriods>>;
+
+/// Marks a `pg_stat_statements` period of a target from its creation to its
+/// drop (held by the poller).
+pub(crate) struct PssPeriodGuard {
+    periods: SharedPssPeriods,
+    timeout: std::time::Duration,
+}
+
+impl PssPeriodGuard {
+    pub(crate) fn start(periods: SharedPssPeriods, timeout: std::time::Duration) -> Self {
+        periods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .start(SystemTime::now());
+        Self { periods, timeout }
+    }
+}
+
+impl Drop for PssPeriodGuard {
+    fn drop(&mut self) {
+        self.periods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop(SystemTime::now(), self.timeout);
+    }
+}
 
 /// What an event of the agent's account is about, for [`PgOwn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnKind {
     /// One of the connector's own statements that read no relation.
     Tableless,
+    /// The connector's own `pg_stat_statements` text query, matched by
+    /// exact text (ADR-0049 decision 5): left out uncharged.
+    StatementText,
     /// A read or write whose objects the source does not tell (`*`).
     Unknown,
-    /// A statement naming a statistics relation (ADR-0048 decision 4): the
-    /// connector never reads them (ADR-0012 obligation 1).
-    Statistics,
+    /// Never the agent's own: a statistics relation (ADR-0048 decision 4,
+    /// ADR-0012 obligation 1), any other read of the statement-text lists,
+    /// or a function of ADR-0049 decision 7.
+    Never,
     /// Named relations.
     Named,
 }
@@ -548,24 +866,30 @@ fn pss_form(text: &str) -> Option<String> {
 /// signal, row budget per object) plus what is PostgreSQL-specific.
 ///
 /// - The connector's own statements that name no relation (closed list:
-///   [`sql::OWN_TABLELESS`], and the `pg_stat_statements` text query
-///   registered by its stream) are left out on the core's identity and
+///   [`sql::OWN_TABLELESS`]) are left out on the core's identity and
 ///   signal rules without being charged ([`OwnKind::Tableless`]): they read
 ///   no row, and charging them used up the `*` budget within one scan.
 ///   They are recognized by their exact text: as sent with pgaudit (it
 ///   logs the text verbatim), and as `pg_stat_statements` stores it
 ///   ([`pss_form`]: constants as `$n`, the connector's bound parameters
 ///   in place) with `pg_stat_statements`.
+/// - The `pg_stat_statements` text query registered by that stream reads
+///   every role's statement texts (ADR-0049): left out uncharged only on
+///   its exact text ([`OwnKind::StatementText`]), on pgaudit only within a
+///   period of the target's `pg_stat_statements` stream ([`PssPeriods`]).
 /// - Any other event of the agent's account on the unknown object `*`
-///   ([`OwnKind::Unknown`]: a function call, even in `pg_catalog`, e.g.
-///   `query_to_xml`; a text that does not parse) is reported and never
-///   budgeted: the connector names every relation it reads.
+///   ([`OwnKind::Unknown`]: a function call, even in `pg_catalog`; a text
+///   that does not parse) is reported and never budgeted: the connector
+///   names every relation it reads.
 pub(crate) struct PgOwn {
     core: OwnAccount,
     own_texts: Vec<String>,
+    /// The registered text queries, as sent.
+    text_queries: Vec<String>,
     /// (`pg_stat_statements` form, statement as sent).
     own_pss: Vec<(String, String)>,
     registry: SharedOwnStatements,
+    periods: SharedPssPeriods,
 }
 
 impl PgOwn {
@@ -577,33 +901,46 @@ impl PgOwn {
         let mut own = Self {
             core,
             own_texts: Vec::new(),
+            text_queries: Vec::new(),
             own_pss: Vec::new(),
             registry,
+            periods: SharedPssPeriods::default(),
         };
         for text in sql::OWN_TABLELESS {
-            own.add_statement(text);
+            own.own_texts.push(text.to_owned());
+            own.add_form(text);
         }
         for text in &extra {
-            own.add_statement(text);
+            own.add_text_query(text);
         }
         own
     }
 
-    fn add_statement(&mut self, text: &str) {
-        if self.own_texts.iter().any(|t| t == text) {
-            return;
-        }
-        self.own_texts.push(text.to_owned());
+    /// The target's `pg_stat_statements` periods (decision 5).
+    pub(crate) fn with_periods(mut self, periods: SharedPssPeriods) -> Self {
+        self.periods = periods;
+        self
+    }
+
+    fn add_form(&mut self, text: &str) {
         if let Some(f) = pss_form(text) {
             self.own_pss.push((f, text.to_owned()));
         }
     }
 
-    /// Adds a statement the connector sends that names no relation, and
-    /// keeps it for the target's later streams (at most
+    fn add_text_query(&mut self, text: &str) {
+        if self.text_queries.iter().any(|t| t == text) {
+            return;
+        }
+        self.text_queries.push(text.to_owned());
+        self.add_form(text);
+    }
+
+    /// Adds the connector's `pg_stat_statements` text query, and keeps it
+    /// for the target's later streams (at most
     /// [`OWN_MAX_EXTRA_STATEMENTS`]; beyond, this stream only).
-    pub(crate) fn allow_statement(&mut self, text: &str) {
-        self.add_statement(text);
+    pub(crate) fn allow_text_query(&mut self, text: &str) {
+        self.add_text_query(text);
         let mut guard = self
             .registry
             .lock()
@@ -618,12 +955,26 @@ impl PgOwn {
         self.own_texts.iter().any(|t| t == text)
     }
 
-    /// Which of the connector's own table-less statements (as sent) `text`,
-    /// read from `pg_stat_statements` (not cut), is exactly, as
-    /// `pg_stat_statements` stores it ([`pss_form`]). The text is
-    /// necessary, not sufficient: the poller also requires the agent's
-    /// role, a top-level entry, a database where the connector runs that
-    /// statement, and pins the entry's `queryid` (`audit::pss`).
+    /// `text` is exactly one of the registered text queries (as sent).
+    fn text_query(&self, text: &str) -> bool {
+        self.text_queries.iter().any(|t| t == text)
+    }
+
+    /// Whether `ts` falls within a `pg_stat_statements` period of the
+    /// target.
+    fn in_pss_period(&self, ts: SystemTime) -> bool {
+        self.periods
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .covers(ts)
+    }
+
+    /// Which of the connector's own statements (as sent) `text`, read from
+    /// `pg_stat_statements` (not cut), is exactly, as `pg_stat_statements`
+    /// stores it ([`pss_form`]). The text is necessary, not sufficient:
+    /// the poller also requires the agent's role, a top-level entry, a
+    /// database where the connector runs that statement, and pins the
+    /// entry's `queryid` (`audit::pss`).
     pub(crate) fn own_pss_form(&self, text: &str) -> Option<&str> {
         self.own_pss
             .iter()
@@ -648,8 +999,10 @@ impl PgOwn {
         now: Instant,
     ) -> bool {
         match kind {
-            OwnKind::Tableless => self.core.routine_unbudgeted(user, application, client, e),
-            OwnKind::Unknown | OwnKind::Statistics => false,
+            OwnKind::Tableless | OwnKind::StatementText => {
+                self.core.routine_unbudgeted(user, application, client, e)
+            }
+            OwnKind::Unknown | OwnKind::Never => false,
             OwnKind::Named => self.core.routine(user, application, client, e, now),
         }
     }
@@ -684,6 +1037,15 @@ struct ClassPart {
     /// ADR-0045 decision 4 on MySQL / MariaDB): `*`, always reported,
     /// never the agent's own.
     bound: bool,
+    /// Objects of the statement-text lists read with their text (ADR-0049
+    /// decisions 1 to 3): named first, always reported.
+    text_objects: Vec<RelationName>,
+    /// `*` of ADR-0049 (decision 7, an extension-list call): always
+    /// reported, never the agent's own.
+    star: bool,
+    /// A record of this class has a text other than one of the registered
+    /// `pg_stat_statements` text queries (ADR-0049 decision 5).
+    not_text_query: bool,
 }
 
 impl PgauditEvents {
@@ -796,7 +1158,15 @@ impl PgauditEvents {
         // Each record is analyzed on its own text (a substatement of a
         // function or DO block logs its own text); consecutive records
         // with the same text reuse the analysis.
-        let mut cached: Option<(&str, QueryAnalysis)> = None;
+        let mut cached: Option<(&str, QueryAnalysis, TextReads)> = None;
+        // ADR-0049 decision 3: per substatement, the core-list objects its
+        // text names, the core-list relation records (with their class),
+        // and whether a record names a view, materialized view or foreign
+        // relation outside `pg_catalog` (which can carry `query` under
+        // another name).
+        let mut text_named: HashMap<u64, Vec<RelationName>> = HashMap::new();
+        let mut core_records: Vec<(EventAction, u64, RelationName)> = Vec::new();
+        let mut derived_in: HashSet<u64> = HashSet::new();
         for r in &group {
             let action = match r.audit.class.as_str() {
                 "READ" => EventAction::Read,
@@ -823,24 +1193,57 @@ impl PgauditEvents {
                     .copied()
                     .unwrap_or(PREVIOUSLY_LOGGED);
             }
-            if cached.as_ref().is_none_or(|(t, _)| *t != text) {
-                cached = Some((text, analyze(text, analyze_opts(false))));
+            if cached.as_ref().is_none_or(|(t, ..)| *t != text) {
+                let analysis = analyze(text, analyze_opts(false));
+                // A `<previously logged>` without its first record is a
+                // cut text: it names nothing, and records decide.
+                let reads = text_reads(text, &analysis, rule, text == PREVIOUSLY_LOGGED);
+                cached = Some((text, analysis, reads));
             }
-            let Some((_, analysis)) = cached.as_ref() else {
+            let Some((_, analysis, reads)) = cached.as_ref() else {
                 continue;
             };
+            text_named
+                .entry(r.audit.substatement_id)
+                .or_default()
+                .extend(reads.named.iter().cloned());
             let stmts = matching(analysis, Some(r.audit.command.as_str()));
             let (text_relations, named_any) = user_relations(&stmts, rule);
             let own_text = self.own.own_text(text);
             let part = parts.entry(action).or_default();
             part.not_own_text |= !own_text;
+            part.not_text_query |= !self.own.text_query(text);
+            for o in &reads.objects {
+                push_unique(&mut part.text_objects, o.clone());
+            }
+            part.star |= reads.star;
             let mut named = false;
             if !r.audit.object_name.is_empty()
                 && is_relation_type(&r.audit.object_type)
                 && let Some(rel) = split_object_name(&r.audit.object_name)
             {
                 named = true;
-                if let Some(s) = statistics_relation(&rel) {
+                if rel.schema.as_deref() != Some("pg_catalog")
+                    && matches!(
+                        r.audit.object_type.as_str(),
+                        "VIEW" | "MATERIALIZED VIEW" | "FOREIGN TABLE"
+                    )
+                    && !listed_relation(&rel, rule)
+                {
+                    derived_in.insert(r.audit.substatement_id);
+                }
+                match listed(&rel, false, rule.pss_schema) {
+                    Some(Listed::Core(o, _)) => {
+                        // Decided after every record (decision 3).
+                        core_records.push((action, r.audit.substatement_id, o));
+                        part.catalog_only = true;
+                    }
+                    Some(Listed::Extension(o)) => push_unique(&mut part.text_objects, o),
+                    Some(Listed::Star) | None => {}
+                }
+                if listed_relation(&rel, rule) {
+                    // Handled above.
+                } else if let Some(s) = statistics_relation(&rel) {
                     // A statistics relation named by pgaudit (ADR-0048).
                     if !part.objects.contains(&s) {
                         part.objects.push(s);
@@ -896,7 +1299,9 @@ impl PgauditEvents {
                 }
             } else {
                 if text_relations.is_empty() {
-                    if named_any {
+                    // A table-less read of a function of the lists is
+                    // named by its view (ADR-0049 decision 1), not `*`.
+                    if named_any || !reads.objects.is_empty() || !reads.named.is_empty() {
                         part.catalog_only = true;
                     } else {
                         part.unknown = true;
@@ -930,6 +1335,17 @@ impl PgauditEvents {
                 }
             }
         }
+        // Decision 3: a core-list record the substatement's text does not
+        // name, or next to a view, materialized view or foreign relation
+        // outside `pg_catalog`, is a text read of that entry.
+        for (action, sub, o) in core_records {
+            let named_by_text = text_named.get(&sub).is_some_and(|v| v.contains(&o));
+            if (!named_by_text || derived_in.contains(&sub))
+                && let Some(part) = parts.get_mut(&action)
+            {
+                push_unique(&mut part.text_objects, o);
+            }
+        }
         if parts.is_empty() {
             return;
         }
@@ -944,7 +1360,15 @@ impl PgauditEvents {
                 continue;
             };
             let rw = matches!(action, EventAction::Read | EventAction::Write);
-            if rw && part.objects.is_empty() && part.catalog_only && !part.unknown {
+            let text_read = !part.text_objects.is_empty();
+            let mut part = part;
+            for o in std::mem::take(&mut part.text_objects) {
+                if !part.objects.contains(&o) {
+                    part.objects.push(o.clone());
+                }
+                part.text_objects.push(o);
+            }
+            if rw && part.objects.is_empty() && part.catalog_only && !part.unknown && !part.star {
                 // Only catalogs: not application data.
                 continue;
             }
@@ -952,18 +1376,23 @@ impl PgauditEvents {
                 .with_rows(part.rows);
             // Statistics relations first (an event names 16 objects at
             // most), always reported (ADR-0048 decision 3).
+            // Statement-text objects (ADR-0049) first, then statistics
+            // relations: an event names 16 objects at most.
             let mut objects: Vec<&RelationName> = part.objects.iter().collect();
-            objects.sort_by_key(|o| !is_statistics(o));
-            let statistics = objects.first().is_some_and(|o| is_statistics(o)) || part.bound;
+            objects.sort_by_key(|o| (!part.text_objects.contains(o), !is_statistics(o)));
+            let statistics = part.objects.iter().any(is_statistics) || part.bound;
             // A `CREATE … AS <query>` at the relation bound may hide a
             // statistics relation too: `*` (security re-review of #199,
-            // N-L2).
+            // N-L2). A function of ADR-0049 decision 7 adds `*` in every
+            // class.
             let unknown = (rw && (part.objects.is_empty() || part.unknown))
-                || (action == EventAction::Ddl && part.bound);
+                || (action == EventAction::Ddl && part.bound)
+                || part.star;
             // Reads and writes of unknown objects (`*`) are always reported
             // too: they never match `sensitive_objects` and their row count
-            // says nothing of what they read (security review of #199, M2).
-            if statistics || unknown {
+            // says nothing of what they read (security review of #199, M2);
+            // so are statement-text reads (ADR-0049 decision 4).
+            if statistics || unknown || text_read {
                 e = e.with_always_report();
             }
             for o in objects.into_iter().take(if unknown { 15 } else { 16 }) {
@@ -991,8 +1420,22 @@ impl PgauditEvents {
                 e = e.with_signal(Signal::PgDump);
             }
             let client = first.remote.as_deref().and_then(ClientAddr::parse);
-            let kind = if statistics {
-                OwnKind::Statistics
+            // ADR-0049 decision 5: the registered text query, exactly, with
+            // no other object, within a `pg_stat_statements` period.
+            let own_text_query = text_read
+                && !part.not_text_query
+                && !part.star
+                && !part.unknown
+                && !statistics
+                && part
+                    .objects
+                    .iter()
+                    .all(|o| o.name == PSS_VIEW && o.schema.as_deref() == rule.pss_schema)
+                && self.own.in_pss_period(ts);
+            let kind = if own_text_query {
+                OwnKind::StatementText
+            } else if statistics || text_read || part.star {
+                OwnKind::Never
             } else if !part.not_own_text && part.objects.is_empty() {
                 OwnKind::Tableless
             } else if unknown {
@@ -1020,6 +1463,9 @@ pub(crate) struct StatementDelta<'a> {
     pub(crate) user: &'a str,
     pub(crate) database: &'a str,
     pub(crate) analysis: &'a QueryAnalysis,
+    /// What the text reads of the statement-text lists (ADR-0049), decided
+    /// when the text was read.
+    pub(crate) reads: &'a TextReads,
     /// The text is exactly one of the connector's own table-less
     /// statements ([`PgOwn::own_pss_text`]).
     pub(crate) own_text: bool,
@@ -1170,7 +1616,15 @@ fn pss_event(
         StatementKind::Dcl => EventAction::Dcl,
         _ => return None,
     };
-    let (objects, named_any) = user_relations(&all, rule);
+    let (mut objects, named_any) = user_relations(&all, rule);
+    // ADR-0049: the statement-text objects the text reads, and `*` of
+    // decision 7, in every action class.
+    let reads = d.reads;
+    // A core-list entry read in the no-text shape is a catalog read.
+    let named_any = named_any || !reads.named.is_empty();
+    for o in &reads.objects {
+        push_unique(&mut objects, o.clone());
+    }
     let rw = matches!(action, EventAction::Read | EventAction::Write);
     // A text at the analyzer's relation bound may name a statistics
     // relation that was not kept (after 16 catalogs, say): `*`, always
@@ -1180,7 +1634,7 @@ fn pss_event(
     // So is a DDL statement (`CREATE TABLE … AS <query>`, `CREATE VIEW
     // … AS`: security re-review of #199, N-L2).
     let bound = (rw || action == EventAction::Ddl) && all.iter().any(|p| p.relations_full);
-    if rw && objects.is_empty() && named_any && !bound {
+    if rw && objects.is_empty() && named_any && !bound && !reads.star {
         return None;
     }
     // COPY counts rows in pg_stat_statements too.
@@ -1193,21 +1647,24 @@ fn pss_event(
     )
     .with_rows(rows)
     .with_aggregate(d.calls, to);
-    // Statistics relations first (16 objects at most), always reported
-    // (ADR-0048 decision 3).
+    // Statement-text objects (ADR-0049), then statistics relations (16
+    // objects at most), always reported (ADR-0048 decision 3, ADR-0049
+    // decision 4).
     let mut named: Vec<&RelationName> = objects.iter().collect();
-    named.sort_by_key(|o| !is_statistics(o));
-    let statistics = named.first().is_some_and(|o| is_statistics(o)) || bound;
+    named.sort_by_key(|o| (!reads.objects.contains(o), !is_statistics(o)));
+    let statistics = objects.iter().any(is_statistics) || bound;
+    let text_read = !reads.objects.is_empty();
+    let star = (rw && objects.is_empty()) || bound || reads.star;
     // A read or write of unknown objects (`*`) has no useful row count for
     // `min_rows` and never matches `sensitive_objects`: always reported,
     // as on MySQL / MariaDB (security review of #199, M2).
-    if statistics || (rw && objects.is_empty()) {
+    if statistics || star || text_read {
         e = e.with_always_report();
     }
-    for o in named.into_iter().take(if bound { 15 } else { 16 }) {
+    for o in named.into_iter().take(if star { 15 } else { 16 }) {
         e = e.with_object(object(d.database, o));
     }
-    if (rw && objects.is_empty()) || bound {
+    if star {
         e = e.with_object(unknown_object(d.database));
     }
     if action == EventAction::Read {
@@ -1224,8 +1681,20 @@ fn pss_event(
     } else if d.rows > LARGE_ROWS {
         e = e.with_signal(Signal::LargeResult);
     }
-    let kind = if statistics {
-        OwnKind::Statistics
+    // ADR-0049 decision 5: the connector's text query, exactly (`own_text`
+    // also pins the agent's role, top level, the poller's database and the
+    // `queryid`, `audit::pss`), reading nothing else.
+    let own_text_query = d.own_text
+        && text_read
+        && !reads.star
+        && !statistics
+        && objects
+            .iter()
+            .all(|o| o.name == PSS_VIEW && o.schema.as_deref() == rule.pss_schema);
+    let kind = if own_text_query {
+        OwnKind::StatementText
+    } else if statistics || text_read || reads.star {
+        OwnKind::Never
     } else if objects.is_empty() && !named_any && d.own_text {
         OwnKind::Tableless
     } else if rw && objects.is_empty() {
@@ -1256,6 +1725,13 @@ pub(crate) fn analyze_pss(text: &str, truncated: bool) -> QueryAnalysis {
 mod tests {
     use super::*;
     use crate::audit::records::{Format, parse_record};
+
+    /// No statement-text read (texts that name no listed entry).
+    static NO_READS: TextReads = TextReads {
+        objects: Vec::new(),
+        star: false,
+        named: Vec::new(),
+    };
 
     #[allow(clippy::too_many_arguments)]
     fn rec(
@@ -1657,6 +2133,7 @@ mod tests {
         let dump = analyze_pss("select * from crm.t", false);
         let deltas = [
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "databastion",
                 database: "shop",
@@ -1665,6 +2142,7 @@ mod tests {
                 rows: 1000,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "databastion",
                 database: "shop",
@@ -1729,6 +2207,7 @@ mod tests {
         // pg_stat_statements: rows per object within the poll.
         let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
         let deltas = [StatementDelta {
+            reads: &NO_READS,
             own_text: false,
             user: "databastion",
             database: "shop",
@@ -1772,6 +2251,7 @@ mod tests {
         // same object is still charged, and the next read is reported.
         let routine = analyze_pss("SELECT \"a\" FROM ONLY \"crm\".\"t\" LIMIT $1", false);
         let deltas = [StatementDelta {
+            reads: &NO_READS,
             own_text: false,
             user: "databastion",
             database: "shop",
@@ -1830,6 +2310,7 @@ mod tests {
         // one of 4 calls is over it.
         let routine = analyze_pss("SELECT 1 FROM crm.t WHERE id = $1 AND email = $2", false);
         let delta = |calls| StatementDelta {
+            reads: &NO_READS,
             own_text: false,
             user: "databastion",
             database: "shop",
@@ -2073,6 +2554,7 @@ mod tests {
         assert!(b.convert(vec![r], SystemTime::now()).is_empty());
         let a = analyze_pss(text, false);
         let deltas = [StatementDelta {
+            reads: &NO_READS,
             own_text: false,
             user: "databastion",
             database: "shop",
@@ -2104,6 +2586,7 @@ mod tests {
         // pg_stat_statements: rows summed over the poll.
         let a = analyze_pss(PSS_SET_LOCAL, false);
         let deltas = [StatementDelta {
+            reads: &NO_READS,
             own_text: true,
             user: "databastion",
             database: "shop",
@@ -2185,7 +2668,7 @@ mod tests {
             10,
             std::sync::Arc::clone(&usage),
         );
-        own.allow_statement(&texts_sql);
+        own.allow_text_query(&texts_sql);
         for t in [PSS_SET_LOCAL, &setup, sql::OWN_CLIENT_ADDR, &texts] {
             assert!(own.own_pss_text(t), "{t}");
         }
@@ -2208,7 +2691,14 @@ mod tests {
         ] {
             assert!(!own.own_pss_text(t), "{t}");
         }
-        let analyzed = |t: &str| (analyze_pss(t, false), own.own_pss_text(t));
+        let catalogs = shop_catalogs(None);
+        let none = HashSet::new();
+        let rule = catalogs.rule("shop", true, &none);
+        let analyzed = |t: &str| {
+            let a = analyze_pss(t, false);
+            let reads = text_reads(t, &a, rule, false);
+            (a, own.own_pss_text(t), reads)
+        };
         let set_local = analyzed(PSS_SET_LOCAL);
         let setup = analyzed(&setup);
         let addr = analyzed(sql::OWN_CLIENT_ADDR);
@@ -2216,9 +2706,14 @@ mod tests {
         let literals = analyzed(literals);
         let other = analyzed("select crm.f($1)");
         // A cut text is never an own statement (the poller checks `cut`).
-        let cut = (analyze_pss(sql::OWN_CLIENT_ADDR, true), false);
-        fn delta<'a>(user: &'a str, a: &'a (QueryAnalysis, bool)) -> StatementDelta<'a> {
+        let cut = (
+            analyze_pss(sql::OWN_CLIENT_ADDR, true),
+            false,
+            TextReads::default(),
+        );
+        fn delta<'a>(user: &'a str, a: &'a (QueryAnalysis, bool, TextReads)) -> StatementDelta<'a> {
             StatementDelta {
+                reads: &a.2,
                 user,
                 database: "shop",
                 analysis: &a.0,
@@ -2236,7 +2731,7 @@ mod tests {
                 delta("databastion", &addr),
                 delta("databastion", &texts),
             ];
-            let ev = pss_events(&deltas, &mut own, &Catalogs::default(), t0, t0);
+            let ev = pss_events(&deltas, &mut own, &catalogs, t0, t0);
             assert!(
                 ev.is_empty(),
                 "{:?}",
@@ -2245,18 +2740,22 @@ mod tests {
         }
         assert!(charged_keys(&usage).is_empty());
         // Another role, a cut text, another function, the own statement
-        // with constants instead of parameters: reported on `*`.
+        // with constants instead of parameters: reported on `*`; the text
+        // query from another role: a read of the statement texts
+        // (ADR-0049).
         let deltas = [
             delta("app", &set_local),
-            delta("app", &texts),
             delta("databastion", &cut),
             delta("databastion", &other),
             delta("databastion", &literals),
         ];
-        let ev = pss_events(&deltas, &mut own, &Catalogs::default(), t0, t0);
-        assert_eq!(ev.len(), 5);
+        let ev = pss_events(&deltas, &mut own, &catalogs, t0, t0);
+        assert_eq!(ev.len(), 4);
         assert!(ev.iter().all(|e| json(e).contains("shop..*")));
-        assert!(charged_keys(&usage).is_empty(), "`*` is never budgeted");
+        let ev = pss_events(&[delta("app", &texts)], &mut own, &catalogs, t0, t0);
+        assert_eq!(objects_of(&ev[0]), ["shop.public.pg_stat_statements"]);
+        assert!(ev[0].always_report());
+        assert!(charged_keys(&usage).is_empty(), "never budgeted");
         // Without the stream's registration, the text query is not one of
         // the agent's statements.
         let fresh = own_account();
@@ -2280,15 +2779,22 @@ mod tests {
             std::sync::Arc::clone(&usage),
             std::sync::Arc::clone(&statements),
         );
-        pss.allow_statement(&sql::pss_texts("public", true).unwrap());
-        pss.allow_statement(&sql::pss_texts("public", false).unwrap());
+        pss.allow_text_query(&sql::pss_texts("public", true).unwrap());
+        pss.allow_text_query(&sql::pss_texts("public", false).unwrap());
         drop(pss);
-        let mut b = PgauditEvents::new(own_shared(
-            ClientAddr::parse("192.0.2.14"),
-            1000,
-            std::sync::Arc::clone(&usage),
-            statements,
-        ));
+        // ADR-0049 decision 5: the records fall within that stream's
+        // period.
+        let periods = SharedPssPeriods::default();
+        periods.lock().unwrap().start(SystemTime::UNIX_EPOCH);
+        let mut b = PgauditEvents::new(
+            own_shared(
+                ClientAddr::parse("192.0.2.14"),
+                1000,
+                std::sync::Arc::clone(&usage),
+                statements,
+            )
+            .with_periods(periods),
+        );
         b.set_catalogs(shop_catalogs(Some(false)));
         let mut recs = own_tableless_records("databastion-agent", 90);
         for (i, text) in sql::all_statements().iter().enumerate() {
@@ -2430,11 +2936,12 @@ mod tests {
         let mut b = PgauditEvents::new(own());
         b.set_catalogs(shop_catalogs(Some(true)));
         let recs = vec![
-            // The extension's relations in its schema: statistics.
+            // The extension's relations in its schema: statistics, read
+            // without the text (ADR-0049 decision 2).
             read(
                 1,
                 "public.pg_stat_statements",
-                "select query from public.pg_stat_statements",
+                "select queryid, calls from public.pg_stat_statements",
             ),
             read(
                 2,
@@ -2487,6 +2994,7 @@ mod tests {
         let bare = analyze_pss("select query from pg_stat_statements", false);
         let deltas = [
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "app",
                 database: "shop",
@@ -2495,6 +3003,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "app",
                 database: "shop",
@@ -2503,6 +3012,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "app",
                 database: "shop",
@@ -2783,6 +3293,7 @@ mod tests {
         let ddl = analyze_pss("alter table crm.customers add column x int", false);
         let deltas = [
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "u",
                 database: "shop",
@@ -2791,6 +3302,7 @@ mod tests {
                 rows: 150,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "u",
                 database: "shop",
@@ -2799,6 +3311,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "u",
                 database: "shop",
@@ -2807,6 +3320,7 @@ mod tests {
                 rows: 1,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "v",
                 database: "shop",
@@ -2815,6 +3329,7 @@ mod tests {
                 rows: 30,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "v",
                 database: "shop",
@@ -2866,6 +3381,7 @@ mod tests {
         let read = analyze_pss("SELECT * FROM crm.customers", false);
         let deltas = vec![
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: TEST_POISON_USER,
                 database: "shop",
@@ -2874,6 +3390,7 @@ mod tests {
                 rows: 5,
             },
             StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "alice",
                 database: "shop",
@@ -2924,6 +3441,7 @@ mod tests {
         ] {
             let analysis = analyze_pss(q, false);
             let deltas = vec![StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "alice",
                 database: "shop",
@@ -3326,6 +3844,7 @@ mod tests {
             assert!(ev.is_empty(), "{text}");
             let a = analyze_pss(text, false);
             let deltas = [StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "app",
                 database: "shop",
@@ -3375,6 +3894,7 @@ mod tests {
                     let mut own = own_with(None, 1000, usage.clone());
                     let a = analyze_pss(&text, false);
                     let deltas = [StatementDelta {
+                        reads: &NO_READS,
                         own_text: false,
                         user,
                         database: "shop",
@@ -3416,6 +3936,7 @@ mod tests {
                 let usage = SharedOwnUsage::default();
                 let a = analyze_pss(text, false);
                 let deltas = [StatementDelta {
+                    reads: &NO_READS,
                     own_text: false,
                     user,
                     database: "shop",
@@ -3484,6 +4005,7 @@ mod tests {
                 let usage = SharedOwnUsage::default();
                 let a = analyze_pss(&text, false);
                 let deltas = [StatementDelta {
+                    reads: &NO_READS,
                     own_text: false,
                     user,
                     database: "shop",
@@ -3600,6 +4122,7 @@ mod tests {
             let usage = SharedOwnUsage::default();
             let a = analyze_pss(&text, false);
             let deltas = [StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user,
                 database: "shop",
@@ -3656,6 +4179,7 @@ mod tests {
         // Below the bound: no `*`.
         let a = analyze_pss("select * from crm.a, crm.b, pg_stats", false);
         let deltas = [StatementDelta {
+            reads: &NO_READS,
             own_text: false,
             user: "app",
             database: "shop",
@@ -3679,6 +4203,7 @@ mod tests {
         ] {
             let a = analyze_pss(text, false);
             let deltas = [StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user: "app",
                 database: "shop",
@@ -3703,6 +4228,7 @@ mod tests {
         for user in ["app", "databastion"] {
             let a = analyze_pss(text, false);
             let deltas = [StatementDelta {
+                reads: &NO_READS,
                 own_text: false,
                 user,
                 database: "shop",
@@ -3723,5 +4249,811 @@ mod tests {
         );
         assert_eq!(objects_of(&ev[0]), ["shop..*"]);
         assert!(ev[0].always_report());
+    }
+
+    // ------------------------------------------------- ADR-0049 unit tests
+
+    /// The `pg_stat_statements` events of `text` (as stored, `cut` when at
+    /// the read bound) run by `user` in `shop` (extension in `public`),
+    /// with the reads decided as the poller does.
+    fn pss_text_events(
+        text: &str,
+        user: &str,
+        cut: bool,
+        own: &mut PgOwn,
+        own_text: bool,
+    ) -> Vec<MaskedEvent> {
+        let catalogs = shop_catalogs(None);
+        let a = analyze_pss(text, cut);
+        let none = HashSet::new();
+        let reads = text_reads(text, &a, catalogs.rule("shop", true, &none), cut);
+        let deltas = [StatementDelta {
+            reads: &reads,
+            own_text,
+            user,
+            database: "shop",
+            analysis: &a,
+            calls: 3,
+            rows: 2,
+        }];
+        let t0 = SystemTime::UNIX_EPOCH;
+        pss_events(&deltas, own, &catalogs, t0, t0)
+    }
+
+    /// The pgaudit events of one record of `text` (no relation object:
+    /// `log_relation` off, the text decides).
+    fn pgaudit_text_events(
+        text: &str,
+        class: &str,
+        command: &str,
+        app: &str,
+        log_catalog: Option<bool>,
+        own: PgOwn,
+    ) -> Vec<MaskedEvent> {
+        let mut b = PgauditEvents::new(own);
+        b.set_catalogs(shop_catalogs(log_catalog));
+        b.convert(
+            vec![rec("t1", 1, 1, class, command, "", text, Some(2), app)],
+            SystemTime::now(),
+        )
+    }
+
+    const ACTIVITY: &str = "shop.pg_catalog.pg_stat_activity";
+    const PSS: &str = "shop.public.pg_stat_statements";
+
+    /// `text` is a text read naming `want` (and maybe other objects), always
+    /// reported, on every source, from any account; the agent's never left
+    /// out nor charged. `pss`: also check `pg_stat_statements` (not for a
+    /// `DO` block, which gives no event there).
+    fn assert_text_read(text: &str, class: &str, command: &str, want: &[&str], pss: bool) {
+        for log_catalog in [Some(true), Some(false), None] {
+            for app in ["psql", crate::conn::APPLICATION_NAME] {
+                let usage = SharedOwnUsage::default();
+                let ev = pgaudit_text_events(
+                    text,
+                    class,
+                    command,
+                    app,
+                    log_catalog,
+                    own_with(ClientAddr::parse("192.0.2.14"), 1000, usage.clone()),
+                );
+                assert_eq!(ev.len(), 1, "{app} {log_catalog:?}: {text}");
+                let objects = objects_of(&ev[0]);
+                for w in want {
+                    assert!(
+                        objects.contains(&(*w).to_owned()),
+                        "{app} {log_catalog:?}: {text}: {objects:?}"
+                    );
+                }
+                assert!(ev[0].always_report(), "{app}: {text}");
+                assert!(charged_keys(&usage).is_empty(), "{app}: {text}");
+            }
+        }
+        if pss {
+            for user in ["app", "databastion"] {
+                let usage = SharedOwnUsage::default();
+                let mut own = own_with(None, 1000, usage.clone());
+                let ev = pss_text_events(text, user, false, &mut own, false);
+                assert_eq!(ev.len(), 1, "{user}: {text}");
+                let objects = objects_of(&ev[0]);
+                for w in want {
+                    assert!(
+                        objects.contains(&(*w).to_owned()),
+                        "{user}: {text}: {objects:?}"
+                    );
+                }
+                assert!(ev[0].always_report(), "{user}: {text}");
+                assert!(charged_keys(&usage).is_empty(), "{user}: {text}");
+            }
+        }
+    }
+
+    /// `text` gives no event on either source (pgaudit with `log_catalog`
+    /// on or unknown, the text deciding), for any account.
+    fn assert_quiet(text: &str) {
+        for log_catalog in [Some(true), None] {
+            for app in ["psql", crate::conn::APPLICATION_NAME] {
+                let ev = pgaudit_text_events(text, "READ", "SELECT", app, log_catalog, own());
+                assert!(
+                    ev.is_empty(),
+                    "{app} {log_catalog:?}: {text}: {:?}",
+                    ev.iter().map(json).collect::<Vec<_>>()
+                );
+            }
+        }
+        for user in ["app", "databastion"] {
+            let ev = pss_text_events(text, user, false, &mut own(), false);
+            assert!(
+                ev.is_empty(),
+                "{user}: {text}: {:?}",
+                ev.iter().map(json).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// ADR-0049 decision 1: each core-list entry, qualified, unqualified,
+    /// `U&`-escaped, in a join with an application table, a subquery, a
+    /// CTE, a `DO` body, a `COPY (…) TO` and a `CREATE TABLE … AS`, is a
+    /// text read naming its view; look-alikes are ordinary relations.
+    #[test]
+    fn statement_text_entries_in_every_form() {
+        let views: [(&str, &str); 7] = [
+            ("pg_catalog.pg_stat_activity", ACTIVITY),
+            ("pg_stat_activity", ACTIVITY),
+            (r#"U&"\0070g_stat_activity""#, ACTIVITY),
+            (
+                "pg_catalog.U&\"pg_st!0061t_activity\" UESCAPE '!'",
+                ACTIVITY,
+            ),
+            ("public.pg_stat_statements", PSS),
+            ("\"public\".pg_stat_statements", PSS),
+            ("pg_stat_statements", PSS),
+        ];
+        let functions: [(&str, &str); 4] = [
+            ("pg_catalog.pg_stat_get_activity(NULL)", ACTIVITY),
+            ("pg_stat_get_activity(NULL)", ACTIVITY),
+            ("public.pg_stat_statements(true)", PSS),
+            ("pg_stat_statements(true)", PSS),
+        ];
+        let mut forms: Vec<(String, &str)> = Vec::new();
+        for (v, o) in views {
+            forms.push((
+                v.split(" UESCAPE")
+                    .next()
+                    .map_or(String::new(), |_| v.to_owned()),
+                o,
+            ));
+        }
+        for (f, o) in functions {
+            forms.push((f.to_owned(), o));
+        }
+        for (q, o) in &forms {
+            assert_text_read(
+                &format!("SELECT x.query FROM {q} x"),
+                "READ",
+                "SELECT",
+                &[o],
+                true,
+            );
+            assert_text_read(
+                &format!("SELECT c.email, x.pid FROM crm.customer c JOIN {q} x ON true"),
+                "READ",
+                "SELECT",
+                &[o, "shop.crm.customer"],
+                true,
+            );
+            assert_text_read(
+                &format!("SELECT * FROM crm.customer WHERE email IN (SELECT x.query FROM {q} x)"),
+                "READ",
+                "SELECT",
+                &[o, "shop.crm.customer"],
+                true,
+            );
+            assert_text_read(
+                &format!("WITH w AS (SELECT x.query FROM {q} x) SELECT w.query FROM w"),
+                "READ",
+                "SELECT",
+                &[o],
+                true,
+            );
+            assert_text_read(
+                &format!("DO $$ BEGIN PERFORM x.query FROM {q} x; END $$"),
+                "READ",
+                "SELECT",
+                &[o],
+                false,
+            );
+            assert_text_read(
+                &format!("COPY (SELECT x.query FROM {q} x) TO STDOUT"),
+                "READ",
+                "COPY",
+                &[o],
+                true,
+            );
+            assert_text_read(
+                &format!("CREATE TABLE crm.t AS SELECT x.query FROM {q} x"),
+                "DDL",
+                "CREATE TABLE AS",
+                &[o],
+                true,
+            );
+            assert_text_read(
+                &format!("INSERT INTO crm.t SELECT x.query FROM {q} x"),
+                "WRITE",
+                "INSERT",
+                &[o],
+                true,
+            );
+        }
+        // The scalar function: always a text read, named by the view, also
+        // table-less (no `*`).
+        for text in [
+            "SELECT pg_stat_get_backend_activity(1)",
+            "SELECT pg_catalog.pg_stat_get_backend_activity(b) FROM pg_stat_get_backend_idset() b",
+        ] {
+            assert_text_read(text, "READ", "SELECT", &[ACTIVITY], true);
+            let ev = pgaudit_text_events(text, "READ", "SELECT", "psql", Some(true), own());
+            assert_eq!(objects_of(&ev[0]), [ACTIVITY], "{text}");
+            let ev = pss_text_events(text, "app", false, &mut own(), false);
+            assert_eq!(objects_of(&ev[0]), [ACTIVITY], "{text}");
+        }
+        // Look-alikes: a quoted upper-case name, another schema, a
+        // `pg_stat_statements` outside the extension's schema: ordinary
+        // relations (not always reported).
+        for (text, object) in [
+            (
+                "SELECT query FROM \"PG_STAT_ACTIVITY\"",
+                "shop..PG_STAT_ACTIVITY",
+            ),
+            (
+                "SELECT query FROM public.pg_stat_activity",
+                "shop.public.pg_stat_activity",
+            ),
+            (
+                "SELECT query FROM crm.pg_stat_statements",
+                "shop.crm.pg_stat_statements",
+            ),
+        ] {
+            let ev = pgaudit_text_events(text, "READ", "SELECT", "psql", Some(true), own());
+            assert_eq!(objects_of(&ev[0]), [object], "{text}");
+            assert!(!ev[0].always_report(), "{text}");
+            let ev = pss_text_events(text, "app", false, &mut own(), false);
+            assert_eq!(objects_of(&ev[0]), [object], "{text}");
+            assert!(!ev[0].always_report(), "{text}");
+        }
+        // An unqualified `pg_stat_statements(` where the extension is not
+        // installed: a user function, `*`.
+        let mut b = PgauditEvents::new(own());
+        let ev = b.convert(
+            vec![rec(
+                "t2",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "pg_catalog.pg_class",
+                "SELECT s.calls FROM pg_stat_statements(true) s, pg_class c",
+                Some(1),
+                "psql",
+            )],
+            SystemTime::now(),
+        );
+        assert_eq!(objects_of(&ev[0]), ["shop..*"]);
+        assert!(ev[0].always_report());
+        // `pg_stat_statements_info` stays a catalog.
+        assert_quiet("SELECT dealloc FROM public.pg_stat_statements_info");
+    }
+
+    /// ADR-0049 decision 1, extension list: in any schema or unqualified,
+    /// with or without a shape-like text, a text read named as the text
+    /// gives it; a call `*`.
+    #[test]
+    fn extension_list_names_are_text_reads() {
+        for (text, want) in [
+            (
+                "SELECT count(*) FROM pg_stat_monitor",
+                "shop..pg_stat_monitor",
+            ),
+            (
+                "SELECT bucket FROM pmm.pg_stat_monitor",
+                "shop.pmm.pg_stat_monitor",
+            ),
+            (
+                "SELECT queryid FROM pg_qualstats_all",
+                "shop..pg_qualstats_all",
+            ),
+            (
+                "SELECT 1 FROM public.pg_qualstats",
+                "shop.public.pg_qualstats",
+            ),
+            ("SELECT queryid FROM pg_store_plans", "shop..pg_store_plans"),
+            (
+                "SELECT pid FROM ext.pg_show_plans",
+                "shop.ext.pg_show_plans",
+            ),
+            ("SELECT pg_qualstats_example_query(1)", "shop..*"),
+            (
+                "SELECT x.y FROM pg_qualstats_pretty() x, pg_class",
+                "shop..*",
+            ),
+        ] {
+            assert_text_read(text, "READ", "SELECT", &[want], true);
+        }
+    }
+
+    /// The common monitoring reads and the shape-respecting forms of
+    /// decision 2: no event on either source, for any account.
+    const QUIET: [&str; 12] = [
+        "SELECT state, count(*) FROM pg_stat_activity GROUP BY state",
+        "SELECT pid FROM pg_stat_activity WHERE state = 'idle'",
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle' \
+         AND state_change < now() - interval '10 minutes'",
+        "SELECT queryid, calls FROM pg_stat_statements",
+        "SELECT s.queryid, s.calls FROM public.pg_stat_statements(false) AS s",
+        "SELECT a.pid, d.datname FROM pg_catalog.pg_stat_activity a \
+         JOIN pg_catalog.pg_database d ON d.oid = a.datid",
+        "SELECT s.pid FROM pg_stat_get_activity(NULL) s",
+        "SELECT r.pid FROM ROWS FROM (pg_stat_get_activity(NULL)) WITH ORDINALITY AS r",
+        // The join-using alias exposes the `USING` columns only (verified on
+        // PostgreSQL 16).
+        "SELECT j.pid FROM pg_stat_activity a JOIN pg_stat_activity b USING (pid) AS j",
+        // postgres_exporter's activity query (refinement of 2026-10-11).
+        "SELECT pg_database.datname, tmp.state, COALESCE(count,0) as count, \
+         COALESCE(max_tx_duration,0) as max_tx_duration FROM ( VALUES ('active'), ('idle'), \
+         ('idle in transaction'), ('idle in transaction (aborted)'), ('fastpath function call'), \
+         ('disabled') ) AS tmp(state) CROSS JOIN pg_database LEFT JOIN ( SELECT datname, state, \
+         count(*) AS count, MAX(EXTRACT(EPOCH FROM now() - xact_start))::float AS max_tx_duration \
+         FROM pg_stat_activity GROUP BY datname,state) AS tmp2 ON tmp.state = tmp2.state \
+         AND pg_database.datname = tmp2.datname",
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend'",
+        "SELECT CAST(pid AS numeric(10, 0)) FROM pg_stat_activity",
+    ];
+
+    /// Every way decision 2 refuses (each condition broken alone): a text
+    /// read of `pg_catalog.pg_stat_activity`.
+    const DODGES: [&str; 37] = [
+        "SELECT query FROM pg_stat_activity",
+        "SELECT \"query\" FROM pg_stat_activity",
+        r#"SELECT U&"\0071uery" FROM pg_stat_activity"#,
+        "SELECT query(a) FROM pg_stat_activity a",
+        "SELECT count(*) FILTER (WHERE query LIKE '%x%') FROM pg_stat_activity",
+        "SELECT * FROM pg_stat_activity",
+        "SELECT a.* FROM pg_stat_activity a",
+        "SELECT row_to_json(a) FROM pg_stat_activity a",
+        "SELECT a::text FROM pg_stat_activity a",
+        "SELECT (a).* FROM pg_stat_activity a",
+        "SELECT a FROM pg_stat_activity a",
+        "SELECT pg_catalog.pg_stat_activity FROM pg_catalog.pg_stat_activity",
+        "SELECT row_to_json(pg_stat_get_activity) FROM pg_stat_get_activity(NULL)",
+        "SELECT pg_stat_get_activity::text FROM pg_catalog.pg_stat_get_activity(NULL)",
+        "SELECT row_to_json(pg_stat_get_activity) FROM ROWS FROM (pg_stat_get_activity(NULL))",
+        "SELECT pg_stat_get_activity::text FROM ROWS FROM (pg_catalog.pg_stat_get_activity(NULL))",
+        "SELECT row_to_json(pg_stat_get_activity) FROM pg_stat_get_activity(NULL) WITH ORDINALITY",
+        "SELECT pg_stat_get_activity::text FROM pg_stat_get_activity(NULL) WITH ORDINALITY",
+        // Over-reported, never missed.
+        "SELECT state FROM pg_stat_activity state",
+        "SELECT NULL::pg_stat_activity FROM pg_stat_activity",
+        // Column alias lists.
+        "SELECT a.c FROM pg_stat_activity AS a (c, d, e)",
+        "SELECT x.c FROM (SELECT a.pid FROM pg_stat_activity a) x (c)",
+        "SELECT j.c FROM (pg_stat_activity a CROSS JOIN pg_database d) AS j (c)",
+        "SELECT s.c FROM pg_stat_get_activity(NULL) AS s (c)",
+        "SELECT r.c FROM ROWS FROM (pg_stat_get_activity(NULL)) AS r (c)",
+        "SELECT r.c FROM pg_stat_get_activity(NULL) WITH ORDINALITY AS r (c, n)",
+        "WITH x (c) AS (SELECT a.pid FROM pg_stat_activity a) SELECT x.c FROM x",
+        // A parenthesized join's alias read whole.
+        "SELECT row_to_json(j) FROM (pg_stat_activity a CROSS JOIN pg_database d) j",
+        "SELECT b.pid FROM pg_stat_activity a NATURAL JOIN pg_stat_activity b",
+        "TABLE pg_stat_activity",
+        "SELECT pg_stat_get_activity(NULL)",
+        "SELECT pg_stat_get_backend_activity(1) FROM pg_stat_activity",
+        // The text decides only on catalogs and listed entries (N2).
+        "SELECT a.pid FROM pg_stat_activity a, public.v",
+        "SELECT a.pid FROM pg_stat_activity a, public.f() f",
+        "SELECT a.pid FROM pg_stat_activity a, pg_catalog.pg_stats s",
+        "SELECT a.pid FROM pg_stat_activity a WHERE a IS DISTINCT FROM NULL",
+        "SELECT 1 FROM pg_stat_activity, (VALUES ((SELECT 1))) AS v (c)",
+    ];
+
+    /// ADR-0049 decision 2: the quiet shapes give no event; each refused
+    /// form is a text read, always reported, never charged to the agent.
+    #[test]
+    fn the_no_text_shape_and_its_dodges() {
+        for text in QUIET {
+            assert_quiet(text);
+        }
+        for text in DODGES {
+            assert_text_read(text, "READ", "SELECT", &[ACTIVITY], true);
+        }
+        // A cut text (at the read bound of `pg_stat_statements`), and a
+        // text at the analyzer's relation bound, are text reads.
+        let ev = pss_text_events(QUIET[0], "app", true, &mut own(), false);
+        assert!(objects_of(&ev[0]).contains(&ACTIVITY.to_owned()));
+        let many: Vec<String> = (0..20).map(|i| format!("pg_catalog.t{i}")).collect();
+        let bound = format!("SELECT a.pid FROM {}, pg_stat_activity a", many.join(", "));
+        assert_text_read(&bound, "READ", "SELECT", &["shop..*"], true);
+        // A `<previously logged>` record whose first record is not read:
+        // no text, so the relation records decide (decision 3).
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let ev = b.convert(
+            vec![rec(
+                "t3",
+                1,
+                1,
+                "READ",
+                "SELECT",
+                "pg_catalog.pg_stat_activity",
+                PREVIOUSLY_LOGGED,
+                Some(1),
+                "psql",
+            )],
+            SystemTime::now(),
+        );
+        assert_eq!(objects_of(&ev[0]), [ACTIVITY]);
+        assert!(ev[0].always_report());
+    }
+
+    /// A `DO` block running dynamic SQL: reported only through pgaudit's
+    /// substatement record of the generated text; on `pg_stat_statements`
+    /// the `DO` gives no event (an existing residual).
+    #[test]
+    fn dynamic_sql_in_a_do_block() {
+        let block =
+            "DO $$ BEGIN EXECUTE format('SELECT %I FROM pg_stat_activity', 'que' || 'ry'); END $$";
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let ev = b.convert(
+            vec![
+                rec("t4", 1, 1, "FUNCTION", "DO", "", block, None, "psql"),
+                rec(
+                    "t4",
+                    1,
+                    2,
+                    "READ",
+                    "SELECT",
+                    "",
+                    "SELECT query FROM pg_stat_activity",
+                    Some(3),
+                    "psql",
+                ),
+            ],
+            SystemTime::now(),
+        );
+        assert_eq!(objects_of(&ev[0]), [ACTIVITY]);
+        assert!(ev[0].always_report());
+        assert!(pss_text_events(block, "app", false, &mut own(), false).is_empty());
+    }
+
+    /// One pgaudit record of class `READ` naming `object` of `object_type`.
+    fn obj_rec(sub: u64, object: &str, object_type: &str, text: &str) -> AuditRecord {
+        let mut r = rec(
+            "r9",
+            1,
+            sub,
+            "READ",
+            "SELECT",
+            object,
+            text,
+            Some(1),
+            "psql",
+        );
+        r.audit.object_type = object_type.to_owned();
+        r
+    }
+
+    /// ADR-0049 decision 3 with `pgaudit.log_relation` (records as seen on
+    /// PostgreSQL 16 with pgaudit 16.0: a read of `pg_stat_activity` gets
+    /// records of the view, `pg_database` and `pg_authid`; a user view
+    /// over it adds the view's record in the same substatement).
+    #[test]
+    fn relation_records_of_listed_entries() {
+        let activity_records = |sub: u64, text: &str| {
+            vec![
+                obj_rec(sub, "pg_catalog.pg_stat_activity", "VIEW", text),
+                obj_rec(sub, "pg_catalog.pg_database", "TABLE", text),
+                obj_rec(sub, "pg_catalog.pg_authid", "TABLE", text),
+            ]
+        };
+        let convert = |recs: Vec<AuditRecord>, log_catalog| {
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(shop_catalogs(log_catalog));
+            b.convert(recs, SystemTime::now())
+        };
+        // The text names the view in the no-text shape: quiet.
+        assert!(convert(activity_records(1, QUIET[0]), Some(true)).is_empty());
+        // The text names it with its text: a text read.
+        let ev = convert(activity_records(1, DODGES[0]), Some(true));
+        assert_eq!(objects_of(&ev[0]), [ACTIVITY]);
+        // A user view over it: the view's record and the core-list record
+        // in the same substatement; the text names only the view.
+        let text = "SELECT pid FROM public.v";
+        let mut recs = vec![obj_rec(1, "public.v", "VIEW", text)];
+        recs.extend(activity_records(1, text));
+        let ev = convert(recs, Some(true));
+        assert_eq!(objects_of(&ev[0]), [ACTIVITY, "shop.public.v"]);
+        assert!(ev[0].always_report());
+        // A view outside `pg_catalog` next to a core-list record the text
+        // names in the no-text shape (security re-review N2): a text read.
+        let text = "SELECT a.pid FROM pg_stat_activity a, public.v";
+        let mut recs = vec![obj_rec(1, "public.v", "VIEW", text)];
+        recs.extend(activity_records(1, text));
+        let ev = convert(recs, Some(true));
+        assert!(objects_of(&ev[0]).contains(&ACTIVITY.to_owned()));
+        // An SQL function's body logged as its own substatement.
+        let mut recs = vec![rec(
+            "r9",
+            1,
+            1,
+            "FUNCTION",
+            "EXECUTE",
+            "",
+            "SELECT * FROM public.f()",
+            None,
+            "psql",
+        )];
+        recs.extend(activity_records(
+            2,
+            "SELECT query FROM pg_catalog.pg_stat_activity",
+        ));
+        recs.push(rec(
+            "r9",
+            1,
+            3,
+            "READ",
+            "SELECT",
+            "",
+            "SELECT * FROM public.f()",
+            Some(1),
+            "psql",
+        ));
+        let ev = convert(recs, Some(true));
+        assert!(
+            objects_of(&ev[0]).contains(&ACTIVITY.to_owned()),
+            "{:?}",
+            objects_of(&ev[0])
+        );
+        // The extension's view: function record (ignored) then the view's.
+        let text = "SELECT queryid FROM public.pg_stat_statements";
+        let recs = vec![
+            rec("r9", 1, 1, "FUNCTION", "EXECUTE", "", text, None, "psql"),
+            obj_rec(2, "public.pg_stat_statements", "VIEW", text),
+        ];
+        assert!(convert(recs, Some(true)).is_empty());
+        // An extension-list record the text does not name.
+        let text = "SELECT * FROM public.v2";
+        let recs = vec![
+            obj_rec(1, "public.v2", "VIEW", text),
+            obj_rec(1, "pmm.pg_stat_monitor", "VIEW", text),
+        ];
+        let ev = convert(recs, Some(true));
+        assert_eq!(
+            objects_of(&ev[0]),
+            ["shop.pmm.pg_stat_monitor", "shop.public.v2"]
+        );
+        assert!(ev[0].always_report());
+        // `log_catalog = off` (verified): the user view's record only; it is
+        // named by what the statement shows (residual).
+        let text = "SELECT pid FROM public.v";
+        let ev = convert(vec![obj_rec(1, "public.v", "VIEW", text)], Some(false));
+        assert_eq!(objects_of(&ev[0]), ["shop.public.v"]);
+        assert!(!ev[0].always_report());
+    }
+
+    /// ADR-0049 decision 5: `pss_counters` is quiet in both `toplevel`
+    /// forms on both sources; `pss_texts` is the agent's own only by exact
+    /// text (and, on pgaudit, within a `pg_stat_statements` period).
+    #[test]
+    fn the_agents_own_statement_text_query() {
+        for toplevel in [true, false] {
+            let counters = sql::pss_counters("public", toplevel).unwrap();
+            assert_quiet(&counters);
+            // As `pg_stat_statements` stores it.
+            assert_quiet(&pss_form(&counters).unwrap());
+        }
+        let texts_sql = sql::pss_texts("public", true).unwrap();
+        let stored = pss_form(&texts_sql).unwrap();
+        // pg_stat_statements: the poller's admitted own entry (`own_text`)
+        // is left out uncharged; the same text otherwise is reported.
+        let usage = SharedOwnUsage::default();
+        let mut own = own_with(ClientAddr::parse("192.0.2.14"), 1000, usage.clone());
+        own.allow_text_query(&texts_sql);
+        assert!(pss_text_events(&stored, "databastion", false, &mut own, true).is_empty());
+        for (user, own_text) in [("databastion", false), ("app", false)] {
+            let ev = pss_text_events(&stored, user, false, &mut own, own_text);
+            assert_eq!(objects_of(&ev[0]), [PSS], "{user}");
+            assert!(ev[0].always_report());
+        }
+        // One byte changed: not the own text, reported.
+        let changed = stored.replace("LIMIT", "limit");
+        assert!(!own.own_pss_text(&changed));
+        let ev = pss_text_events(&changed, "databastion", false, &mut own, false);
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        assert!(charged_keys(&usage).is_empty());
+        // pgaudit: within a `pg_stat_statements` period, from the agent's
+        // application and address, exactly: left out.
+        let periods = SharedPssPeriods::default();
+        let registry = SharedOwnStatements::default();
+        let fresh = |periods: &SharedPssPeriods| {
+            let mut o = own_shared(
+                ClientAddr::parse("192.0.2.14"),
+                1000,
+                SharedOwnUsage::default(),
+                std::sync::Arc::clone(&registry),
+            )
+            .with_periods(std::sync::Arc::clone(periods));
+            o.allow_text_query(&texts_sql);
+            o
+        };
+        let agent = crate::conn::APPLICATION_NAME;
+        // No period yet (an agent restart): reported.
+        let ev = pgaudit_text_events(
+            &texts_sql,
+            "READ",
+            "SELECT",
+            agent,
+            Some(true),
+            fresh(&periods),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        assert!(ev[0].always_report());
+        // The record time (2026-09-28 21:45:31 UTC) within a period.
+        let record = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_631_931);
+        periods
+            .lock()
+            .unwrap()
+            .start(record - std::time::Duration::from_secs(60));
+        assert!(
+            pgaudit_text_events(
+                &texts_sql,
+                "READ",
+                "SELECT",
+                agent,
+                Some(true),
+                fresh(&periods)
+            )
+            .is_empty()
+        );
+        // Ended before the record (plus the statement timeout): reported.
+        let ended = SharedPssPeriods::default();
+        ended
+            .lock()
+            .unwrap()
+            .start(record - std::time::Duration::from_secs(600));
+        ended.lock().unwrap().stop(
+            record - std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        );
+        let ev = pgaudit_text_events(
+            &texts_sql,
+            "READ",
+            "SELECT",
+            agent,
+            Some(true),
+            fresh(&ended),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        // Within the statement timeout after the end: left out.
+        let late = SharedPssPeriods::default();
+        late.lock()
+            .unwrap()
+            .start(record - std::time::Duration::from_secs(600));
+        late.lock().unwrap().stop(
+            record - std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(
+            pgaudit_text_events(
+                &texts_sql,
+                "READ",
+                "SELECT",
+                agent,
+                Some(true),
+                fresh(&late)
+            )
+            .is_empty()
+        );
+        // Within a period: another application, another role, one byte
+        // changed, a relation record of another listed entry, nested in a
+        // DO block: reported.
+        let ev = pgaudit_text_events(
+            &texts_sql,
+            "READ",
+            "SELECT",
+            "stolen",
+            Some(true),
+            fresh(&periods),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        let ev = pgaudit_text_events(
+            &texts_sql,
+            "READ",
+            "SELECT",
+            "psql",
+            Some(true),
+            fresh(&periods),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        let ev = pgaudit_text_events(
+            &texts_sql.replace("LIMIT", "limit"),
+            "READ",
+            "SELECT",
+            agent,
+            Some(true),
+            fresh(&periods),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        let mut b = PgauditEvents::new(fresh(&periods));
+        b.set_catalogs(shop_catalogs(Some(true)));
+        let mut r = rec(
+            "o1",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "pg_catalog.pg_stat_activity",
+            &texts_sql,
+            Some(1),
+            agent,
+        );
+        r.audit.object_type = "VIEW".to_owned();
+        let ev = b.convert(vec![r], SystemTime::now());
+        assert_eq!(objects_of(&ev[0]), [ACTIVITY, PSS]);
+        let nested = format!("DO $$ BEGIN PERFORM 1 FROM ({texts_sql}) x; END $$");
+        let ev = pgaudit_text_events(
+            &nested,
+            "READ",
+            "SELECT",
+            agent,
+            Some(true),
+            fresh(&periods),
+        );
+        assert_eq!(objects_of(&ev[0]), [PSS]);
+        // Any other text read from the agent's account: reported.
+        for text in [DODGES[0], "SELECT query FROM public.pg_stat_statements"] {
+            let ev =
+                pgaudit_text_events(text, "READ", "SELECT", agent, Some(true), fresh(&periods));
+            assert_eq!(ev.len(), 1, "{text}");
+        }
+    }
+
+    /// ADR-0049 decision 7: each function next to a catalog, and
+    /// table-less, is a read of `*`, always reported, never the agent's
+    /// own; the same name in another schema is a user function (decision
+    /// 8, a separate change).
+    #[test]
+    fn functions_that_read_past_the_relations() {
+        let calls = [
+            "query_to_xml('select query from pg_stat_activity', true, false, '')",
+            "query_to_xmlschema('select 1', true, false, '')",
+            "query_to_xml_and_xmlschema('select 1', true, false, '')",
+            "cursor_to_xml('c', 1, true, false, '')",
+            "cursor_to_xmlschema('c', true, false, '')",
+            "table_to_xml('crm.customer', true, false, '')",
+            "table_to_xmlschema('crm.customer', true, false, '')",
+            "table_to_xml_and_xmlschema('crm.customer', true, false, '')",
+            "schema_to_xml('crm', true, false, '')",
+            "schema_to_xmlschema('crm', true, false, '')",
+            "schema_to_xml_and_xmlschema('crm', true, false, '')",
+            "database_to_xml(true, false, '')",
+            "database_to_xmlschema(true, false, '')",
+            "database_to_xml_and_xmlschema(true, false, '')",
+            "ts_stat('select v from crm.docs')",
+            "ts_rewrite('a'::tsquery, 'select t, s from crm.aliases')",
+            "pg_read_file('log/postgresql.log')",
+            "pg_read_file('log/postgresql.log', 0, 100)",
+            "pg_read_binary_file('log/postgresql.log')",
+            "pg_read_file_old('log/postgresql.log', 0, 100)",
+            "pg_logical_slot_get_changes('s', NULL, NULL)",
+            "pg_logical_slot_peek_changes('s', NULL, NULL)",
+            "pg_logical_slot_get_binary_changes('s', NULL, NULL)",
+            "pg_logical_slot_peek_binary_changes('s', NULL, NULL)",
+            "lo_get(16400)",
+            "loread(0, 10)",
+            "lo_export(16400, '/tmp/x')",
+            "lo_import('/etc/hostname')",
+            "lo_import('/etc/hostname', 16500)",
+        ];
+        for call in calls {
+            for text in [
+                format!("SELECT {call} FROM pg_class LIMIT 1"),
+                format!("SELECT pg_catalog.{call} FROM pg_catalog.pg_class LIMIT 1"),
+                format!("SELECT {call}"),
+            ] {
+                assert_text_read(&text, "READ", "SELECT", &["shop..*"], true);
+            }
+        }
+        let text =
+            "SELECT data FROM pg_logical_slot_peek_changes('s', NULL, NULL), pg_class LIMIT 1";
+        assert_text_read(text, "READ", "SELECT", &["shop..*"], true);
+        // Not this list: `crm.query_to_xml` is a user function next to
+        // catalogs (decision 8), `pg_ls_dir` and `pg_stat_file` metadata.
+        for text in [
+            "SELECT crm.query_to_xml('x') FROM pg_class LIMIT 1",
+            "SELECT pg_ls_dir('log') FROM pg_class LIMIT 1",
+            "SELECT pg_stat_file('PG_VERSION') FROM pg_class LIMIT 1",
+        ] {
+            assert_quiet(text);
+        }
     }
 }

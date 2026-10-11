@@ -313,6 +313,9 @@ pub(crate) struct CheckState {
     /// Per target: the table-less statements registered by its streams
     /// (see `audit::events::PgOwn`).
     own_statements: Mutex<HashMap<String, crate::audit::events::SharedOwnStatements>>,
+    /// Per target: when its `pg_stat_statements` streams ran (ADR-0049
+    /// decision 5).
+    pss_periods: Mutex<HashMap<String, crate::audit::events::SharedPssPeriods>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -374,6 +377,18 @@ impl CheckState {
     ) -> crate::audit::events::SharedOwnStatements {
         std::sync::Arc::clone(
             self.own_statements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The `pg_stat_statements` periods of `target_id`, kept for the life
+    /// of the connector (in memory only).
+    pub(crate) fn pss_periods(&self, target_id: &str) -> crate::audit::events::SharedPssPeriods {
+        std::sync::Arc::clone(
+            self.pss_periods
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(target_id.to_owned())
@@ -526,6 +541,8 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     // whose pgaudit settings could not be read, caps the target at Partial, whatever the other
     // databases reach.
     let mut rows_gap = false;
+    // ADR-0049 decision 11: the role reads every role's statement texts.
+    let mut stats_reader = false;
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
             Ok(s) => s,
@@ -581,6 +598,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             }
         }
         level = level.max(probe.level(log_readable));
+        stats_reader |= probe.stats_visible;
         if probe.reads_without_row_counts() {
             rows_gap = true;
             notes.push(format!(
@@ -632,6 +650,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         }
     }
     level = capped_without_row_counts(level, rows_gap);
+    notes.extend(stats_reader_detail(level, stats_reader));
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
         // ADR-0015 decision 4: Full once the log is actually read.
         level = AuditLevel::Partial;
@@ -725,18 +744,35 @@ fn probe_notes(
 /// change) when pgaudit is the source (`log_read`) and `pgaudit.log_catalog`
 /// is proven off in `database`: a statement that reads only `pg_catalog`
 /// relations is not logged, so a read of the statistics relations alone
-/// gives no event.
+/// gives no event, nor a read of `pg_stat_activity` alone (ADR-0049
+/// decision 6).
 fn log_catalog_detail(probe: &AuditProbe, log_read: bool, database: &str) -> Option<String> {
     (log_read && probe.pgaudit_loaded == Some(true) && probe.pgaudit_log_catalog == Some(false))
         .then(|| {
             format!(
                 "database {}: pgaudit.log_catalog is off, so a statement that reads only \
                  catalogs is not logged: a read of the statistics catalogs alone (pg_stats, \
-                 pg_statistic and their extended forms) gives no event; set \
-                 pgaudit.log_catalog = on",
+                 pg_statistic and their extended forms) or of pg_stat_activity alone (other \
+                 sessions' statement texts) gives no event; set pgaudit.log_catalog = on",
                 normalize(database).as_str()
             )
         })
+}
+
+/// ADR-0049 decision 11: the local detail (never a closed note, no level
+/// change) when pgaudit is the source (Full or Partial) and the agent's
+/// role is a member of `pg_read_all_stats` (or a superuser): the grant then
+/// serves only the fallback to `pg_stat_statements`, and still lets
+/// whoever holds the agent's credentials read every role's statement
+/// texts. `stats_visible`: membership, or superuser.
+fn stats_reader_detail(level: AuditLevel, stats_visible: bool) -> Option<String> {
+    (stats_visible && matches!(level, AuditLevel::Full | AuditLevel::Partial)).then(|| {
+        "the agent's role is a member of pg_read_all_stats (or a superuser) while pgaudit is \
+         the source: the grant only serves the pg_stat_statements fallback, and lets whoever \
+         holds the agent's credentials read every role's statement texts \
+         (pg_stat_activity, pg_stat_statements); revoke it if the fallback is not needed"
+            .to_owned()
+    })
 }
 
 /// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
@@ -1526,6 +1562,21 @@ mod tests {
         assert!(!pgaudit_rows_on(false, true, Some("on")));
     }
 
+    /// ADR-0049 decision 11 and open question 5: `pg_read_all_stats` with
+    /// pgaudit as the source is said in the local detail only.
+    #[test]
+    fn stats_reader_with_pgaudit_is_a_local_detail() {
+        for level in [AuditLevel::Full, AuditLevel::Partial] {
+            let d = stats_reader_detail(level, true).unwrap();
+            assert!(d.contains("pg_read_all_stats"), "{d}");
+            assert!(stats_reader_detail(level, false).is_none());
+        }
+        // `pg_stat_statements` is the source: the grant is the one it needs.
+        for level in [AuditLevel::Limited, AuditLevel::None] {
+            assert!(stats_reader_detail(level, true).is_none());
+        }
+    }
+
     /// ADR-0048 decision 5 and open question 5: `pgaudit.log_catalog = off`
     /// is said in the local detail only, when pgaudit is the source; no
     /// note, no level change.
@@ -1541,7 +1592,9 @@ mod tests {
         };
         let d = log_catalog_detail(&p, true, "shop").unwrap();
         assert!(
-            d.contains("pgaudit.log_catalog") && d.contains("shop"),
+            d.contains("pgaudit.log_catalog")
+                && d.contains("shop")
+                && d.contains("pg_stat_activity"),
             "{d}"
         );
         assert_eq!(p.level(true), AuditLevel::Full);

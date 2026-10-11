@@ -118,6 +118,30 @@ load otherwise), so a server-wide load is the normal case.
   is a catalog. Every read or write against `*` is always reported. `check()` says `pgaudit.log_catalog = off` in
   its local detail when pgaudit is the source. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-catalogs).
+- **Statement-text views** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md), part 1).
+  The core list (`pg_stat_activity`, `pg_stat_get_activity(`,
+  `pg_stat_get_backend_activity(`, the extension's `pg_stat_statements`
+  view and function: `audit::events::listed`) and the extension list
+  (`pg_stat_monitor`, `pg_store_plans`, `pg_show_plans`, `pg_qualstats*`,
+  in any schema) are named in events (`pg_catalog.pg_stat_activity`,
+  `<ext>.pg_stat_statements`, the extension names as written), always
+  reported, in every action class, unless a core-list read has the
+  no-text shape (`text_reads`, with the token scan
+  `classifiers::query::pg_scan`: no `query` identifier, no `*` but
+  `count(*)`, no whole-row reference, no column alias list but on
+  constant `VALUES`, no `NATURAL`, only catalogs and listed entries
+  named). pgaudit relation records of a listed entry the substatement's
+  text does not name, or next to a view outside `pg_catalog`, make a text
+  read. The `pg_catalog` functions of decision 7 (`DATA_FUNCTIONS`:
+  SQL-running, file, logical decoding, large objects) add `*`, also next
+  to catalogs only. The connector's `pss_texts` is left out only by exact
+  text (`OwnKind::StatementText`; on pgaudit only within a
+  `pg_stat_statements` period of the target, `PssPeriods`), never
+  otherwise. `check()` says `pg_read_all_stats` is held while pgaudit is
+  the source in its local detail. Drift and pinning tests in `it.rs`.
+  Decision 8 (user functions, operators and casts next to catalogs only)
+  is not implemented yet. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statement-text-views).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first

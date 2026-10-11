@@ -672,6 +672,65 @@ mod tests {
         }
     }
 
+    /// ADR-0049 decision 5: every connector statement names no entry of
+    /// the statement-text lists, or reads one in the no-text shape
+    /// (`pss_counters`), or is the text query (`pss_texts`); the names in
+    /// the string literals of `AUDIT_PREREQUISITES` and
+    /// `PSS_FUNCTION_SCHEMA` are not names; none calls a function of
+    /// decision 7. In every database setting of the extension's schema.
+    #[test]
+    fn statements_and_the_statement_text_lists() {
+        use crate::audit::events::{Catalogs, DbCatalog, analyze_pss, text_reads};
+        for pss_schema in [Some("public"), None] {
+            let mut catalogs = Catalogs::default();
+            catalogs.insert(
+                "shop",
+                DbCatalog {
+                    pss_schema: pss_schema.map(str::to_owned),
+                    pgaudit_log_catalog: Some(false),
+                },
+            );
+            let none = std::collections::HashSet::new();
+            for unqualified_pg in [true, false] {
+                let rule = catalogs.rule("shop", unqualified_pg, &none);
+                for s in all_statements() {
+                    let a = analyze_pss(&s, false);
+                    let reads = text_reads(&s, &a, rule, false);
+                    assert!(!reads.star, "{s}");
+                    let texts = s == pss_texts("public", true).unwrap()
+                        || s == pss_texts("public", false).unwrap();
+                    if texts && pss_schema.is_some() {
+                        assert_eq!(reads.objects.len(), 1, "{s}");
+                        assert_eq!(reads.objects[0].name, "pg_stat_statements");
+                    } else {
+                        assert!(reads.objects.is_empty(), "{s}: {:?}", reads.objects);
+                    }
+                    let counters = s == pss_counters("public", true).unwrap()
+                        || s == pss_counters("public", false).unwrap();
+                    if counters && pss_schema.is_some() {
+                        assert!(!reads.named.is_empty(), "the no-text shape: {s}");
+                    }
+                    if s == AUDIT_PREREQUISITES || s == PSS_FUNCTION_SCHEMA {
+                        assert!(reads.named.is_empty(), "string literals: {s}");
+                    }
+                }
+            }
+        }
+        // The decision 7 names appear only in the policy-function regular
+        // expression literal.
+        for s in all_statements() {
+            for f in crate::audit::events::DATA_FUNCTIONS {
+                let calls = s.matches(&format!("{f}(")).count();
+                assert_eq!(calls, 0, "{f} called in {s}");
+            }
+        }
+        // No connector statement reads `pg_stat_activity`.
+        for s in all_statements() {
+            assert!(!s.contains("pg_stat_activity"), "{s}");
+            assert!(!s.contains("pg_stat_get_"), "{s}");
+        }
+    }
+
     #[test]
     fn statements_are_single_and_never_set_read_write() {
         for s in all_statements() {
