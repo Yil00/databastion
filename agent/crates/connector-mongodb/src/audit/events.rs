@@ -41,7 +41,7 @@ use databastion_classifiers::names::NormalizedName;
 use databastion_core::audit::own::{ClientSeen, OwnAccount};
 use zeroize::Zeroizing;
 
-use super::records::{Cmd, ConnId, Kind, Record, Shape};
+use super::records::{Cmd, ConnId, Failure, Kind, Record, Shape};
 use crate::discover::{normalize_collection, normalize_database};
 
 /// A limit above this many documents reads a whole collection.
@@ -368,10 +368,27 @@ impl EventBuilder {
         ts: SystemTime,
     ) -> Option<MaskedEvent> {
         let action = action(cmd, &r.shape)?;
-        // A failed operation is reported only when it returned documents.
-        if r.failed && r.rows.unwrap_or(0) == 0 {
-            return None;
-        }
+        // A failed operation that returned (or wrote) no document
+        // (security review of #197, L1; `Failure`).
+        let failure = r.failure.filter(|_| r.rows.unwrap_or(0) == 0);
+        let telling = match failure {
+            None => false,
+            // The `auditLog` logs authorization checks (a refused one read
+            // nothing) and completed DDL / DCL, never how a command ended:
+            // no event, as before.
+            Some(_) if source == EventSource::MongodbAuditLog => return None,
+            // Refused before reading anything.
+            Some(Failure::Refused) => return None,
+            // As an operation that returned no document.
+            Some(Failure::Quiet) => false,
+            // Its error text may show the values it read: reads, writes
+            // that select or compute from stored documents (`update`,
+            // `delete`, `findAndModify`, `bulkWrite`, `$out` / `$merge`)
+            // and DDL (an index build quotes a duplicate key). A failed
+            // `insert` only quotes its own documents, and DCL reads no
+            // document: both stay under the `audit.configure` filters.
+            Some(Failure::Telling) => !matches!(cmd, Cmd::Insert | Cmd::Dcl),
+        };
         let mut principal = match &r.user {
             Some(u) => EventPrincipal::account(u.as_str()),
             None => EventPrincipal::unidentified(),
@@ -391,7 +408,14 @@ impl EventBuilder {
             e = e.with_object(EventObject::new(normalize_database(db), None, object));
         }
         if matches!(action, EventAction::Read | EventAction::Write) {
-            e = e.with_rows(r.rows);
+            // A failed command returns no document: 0 when the source
+            // logged no count.
+            e = e.with_rows(r.rows.or(failure.map(|_| 0)));
+        }
+        if telling {
+            // Never dropped by `min_rows` (0 documents) nor by
+            // `sensitive_objects`.
+            e = e.with_always_report();
         }
         if action == EventAction::Read && collection.is_some() {
             if cmd.returns_documents()
@@ -410,8 +434,11 @@ impl EventBuilder {
         }
         let user = r.user.as_ref().map_or("", |u| u.as_str());
         // Writes, DDL and DCL by the agent's account are always reported:
-        // the agent only reads (I4).
-        if user != self.own_user || action != EventAction::Read {
+        // the agent only reads (I4). So is a failure whose text may show
+        // values: with no document it would be charged one at most, and
+        // the agent's own reads fail only in quiet ways (its `maxTimeMS`,
+        // a closed connection, a refused privilege).
+        if user != self.own_user || action != EventAction::Read || telling {
             return Some(e);
         }
         let client = ClientSeen::Logged(r.client);
@@ -434,7 +461,7 @@ impl EventBuilder {
             true
         } else if (cmd == Cmd::Count && r.shape.filter.is_empty()) || own_key_probe {
             self.own.routine_unbudgeted(user, app, client, &e)
-        } else if r.rows.is_some() {
+        } else if e.rows().is_some() {
             self.own.routine(user, app, client, &e, Instant::now())
         } else {
             // No count (auditLog): only a `find` with a limit within the
@@ -711,18 +738,272 @@ mod tests {
         assert_eq!(ev[2].objects()[0].database().as_str(), "app");
     }
 
-    #[test]
-    fn failed_operations_without_documents_are_skipped() {
-        let mut b = builder();
-        let failed = line(
+    /// A slow-query line of `command` on `app.customers` that failed with
+    /// `code` (a JSON value) and an error text holding a value read.
+    fn failed(conn: u64, command: &str, code: &str) -> String {
+        line(
             51803,
-            "conn1",
-            r#"{"type":"command","ns":"app.customers","command":{"find":"customers","$db":"app"},"ok":0,"errMsg":"x@example.com","errName":"Unauthorized","errCode":13,"nreturned":0}"#,
+            &format!("conn{conn}"),
+            &format!(
+                r#"{{"type":"command","ns":"app.customers","command":{command},"ok":0,"errMsg":"Failed to parse number 'x@example.com' in $convert","errName":"ConversionFailure","errCode":{code},"nreturned":0}}"#
+            ),
+        )
+    }
+
+    const FIND: &str =
+        r#"{"find":"customers","filter":{"$expr":{"$eq":[{"$toInt":"$email"},1]}},"$db":"app"}"#;
+
+    /// Security review of #197, L1: a failed read that returned no
+    /// document is reported, always, unless it was refused before
+    /// reading (no event) or failed in a way whose text holds no value
+    /// (an event like a read of 0 documents). The error text is never
+    /// kept.
+    #[test]
+    fn failed_reads_without_documents_are_reported() {
+        let mut b = builder();
+        let prefix = || vec![accepted(1, "10.0.0.9"), auth(1, "alice", true)];
+        let mut lines = prefix();
+        lines.push(failed(1, FIND, "241"));
+        let ev = b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now());
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        let read = &ev[1];
+        assert_eq!(read.action(), EventAction::Read);
+        assert_eq!(read.principal().account_name(), "alice@admin");
+        assert_eq!(read.objects()[0].object().as_str(), "customers");
+        assert_eq!(read.rows(), Some(0));
+        assert!(read.always_report());
+        assert!(read.signals().is_empty());
+        assert!(!format!("{ev:?}").contains("example.com"));
+        // Every other read command, and an unknown or non-integer code.
+        for (command, code) in [
+            (
+                r#"{"aggregate":"customers","pipeline":[{"$match":{}}],"$db":"app"}"#,
+                "16020",
+            ),
+            (r#"{"count":"customers","query":{"a":1},"$db":"app"}"#, "2"),
+            (
+                r#"{"distinct":"customers","key":"email","$db":"app"}"#,
+                "139",
+            ),
+            (
+                r#"{"getMore":7,"collection":"customers","$db":"app"}"#,
+                "241",
+            ),
+            (FIND, "424242"),
+            (FIND, "241.5"),
+        ] {
+            let ev = b.convert(
+                log(&[failed(1, command, code)]),
+                EventSource::MongodbLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{command} {code}");
+            assert!(ev[0].always_report(), "{command} {code}");
+            assert_eq!(ev[0].rows(), Some(0));
+        }
+        // Quiet failures: an event, under the `audit.configure` filters.
+        for code in QUIET {
+            let ev = b.convert(
+                log(&[failed(1, FIND, &code.to_string())]),
+                EventSource::MongodbLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{code}");
+            assert!(!ev[0].always_report(), "{code}");
+            assert_eq!(ev[0].rows(), Some(0));
+        }
+        // Refused before reading anything: no event.
+        for code in ["13", "40414", "40415"] {
+            assert!(
+                b.convert(
+                    log(&[failed(1, FIND, code)]),
+                    EventSource::MongodbLog,
+                    SystemTime::now()
+                )
+                .is_empty(),
+                "{code}"
+            );
+        }
+        // A success (`errCode` 0) of no document stays as it was.
+        let ev = b.convert(
+            log(&[failed(1, FIND, "0")]),
+            EventSource::MongodbLog,
+            SystemTime::now(),
         );
+        assert_eq!(ev.len(), 1);
+        assert!(!ev[0].always_report());
+        // A failed read that returned documents keeps its count.
+        let mut r = own_record(Cmd::Find, "customers", Some(5), None);
+        r.user = Some(Zeroizing::new("alice@admin".to_owned()));
+        r.failure = Some(Failure::Telling);
+        let ev = b.convert(vec![r], EventSource::MongodbProfiler, SystemTime::now());
+        assert_eq!(ev[0].rows(), Some(5));
+        assert!(!ev[0].always_report());
+    }
+
+    const QUIET: [i64; 21] = super::super::records::QUIET_CODES;
+
+    /// Writes that select or compute from stored documents, and DDL, are
+    /// always reported when they fail that way; a failed `insert` (it
+    /// only quotes its own documents) and DCL stay under the filters.
+    #[test]
+    fn failed_writes_and_ddl_without_documents() {
+        let mut b = builder();
+        let cases = [
+            (
+                r#"{"update":"customers","updates":[{"q":{},"u":[{"$set":{"n":{"$toInt":"$email"}}}]}],"$db":"app"}"#,
+                EventAction::Write,
+                true,
+            ),
+            (
+                r#"{"delete":"customers","deletes":[{"q":{"$where":"throw this.email"},"limit":0}],"$db":"app"}"#,
+                EventAction::Write,
+                true,
+            ),
+            (
+                r#"{"findAndModify":"customers","query":{},"update":{"$set":{"a":1}},"$db":"app"}"#,
+                EventAction::Write,
+                true,
+            ),
+            (
+                r#"{"aggregate":"customers","pipeline":[{"$set":{"n":{"$toInt":"$email"}}},{"$out":"copy"}],"$db":"app"}"#,
+                EventAction::Write,
+                true,
+            ),
+            (
+                r#"{"createIndexes":"customers","indexes":[{"key":{"email":1},"name":"e","unique":true}],"$db":"app"}"#,
+                EventAction::Ddl,
+                true,
+            ),
+            (
+                r#"{"insert":"customers","documents":[{"_id":1}],"$db":"app"}"#,
+                EventAction::Write,
+                false,
+            ),
+            (
+                r#"{"createUser":"bob","pwd":"x","roles":[],"$db":"app"}"#,
+                EventAction::Dcl,
+                false,
+            ),
+        ];
+        for (command, action, always) in cases {
+            let ev = b.convert(
+                log(&[failed(1, command, "11000")]),
+                EventSource::MongodbLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{command}");
+            assert_eq!(ev[0].action(), action, "{command}");
+            assert_eq!(ev[0].always_report(), always, "{command}");
+            // Quiet: as an operation of no document.
+            let ev = b.convert(
+                log(&[failed(1, command, "112")]),
+                EventSource::MongodbLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{command}");
+            assert!(!ev[0].always_report(), "{command}");
+            // Refused: nothing.
+            assert!(
+                b.convert(
+                    log(&[failed(1, command, "13")]),
+                    EventSource::MongodbLog,
+                    SystemTime::now()
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    /// The agent's identity: a failure that may show values is always
+    /// reported, never left out (it would be charged one document at
+    /// most); a quiet one is a read of 0 documents, charged one, so a walk
+    /// of them is left out for at most the budget.
+    #[test]
+    fn own_failed_reads() {
+        let mut b = builder();
+        let app = Some("databastion-agent");
+        let own = |failure| {
+            let mut r = own_record(Cmd::Find, "customers", Some(0), app);
+            r.shape.filter = Filter::Keys(1);
+            r.failure = Some(failure);
+            r
+        };
+        for source in [EventSource::MongodbProfiler, EventSource::MongodbLog] {
+            for _ in 0..300 {
+                let ev = b.convert(vec![own(Failure::Telling)], source, SystemTime::now());
+                assert_eq!(ev.len(), 1);
+                assert!(ev[0].always_report());
+                assert_eq!(ev[0].principal().account_name(), "databastion@admin");
+            }
+        }
+        // None of them was charged: the budget is whole.
+        let mut quiet = 0;
+        while b
+            .convert(
+                vec![own(Failure::Quiet)],
+                EventSource::MongodbProfiler,
+                SystemTime::now(),
+            )
+            .is_empty()
+        {
+            quiet += 1;
+            assert!(quiet <= 200);
+        }
+        assert_eq!(quiet, 200);
+        // Without a count in the source: still 0 documents, charged one.
+        let mut b = builder();
+        let mut r = own(Failure::Quiet);
+        r.rows = None;
         assert!(
-            b.convert(log(&[failed]), EventSource::MongodbLog, SystemTime::now())
+            b.convert(vec![r], EventSource::MongodbLog, SystemTime::now())
                 .is_empty()
         );
+        // A refused read of the agent's: no event, nothing charged.
+        let mut b = builder();
+        for _ in 0..300 {
+            assert!(
+                b.convert(
+                    vec![own(Failure::Refused)],
+                    EventSource::MongodbProfiler,
+                    SystemTime::now()
+                )
+                .is_empty()
+            );
+        }
+        let mut whole = own_record(Cmd::Find, "customers", Some(200), app);
+        whole.shape.filter = Filter::Keys(1);
+        assert!(
+            b.convert(vec![whole], EventSource::MongodbProfiler, SystemTime::now())
+                .is_empty()
+        );
+        // A quiet failure of the agent's own poll stays free.
+        let mut b = builder();
+        b.grant_poll("app");
+        let mut poll = own_record(Cmd::Find, "system.profile", Some(0), app);
+        poll.shape.filter = Filter::Keys(1);
+        poll.shape.limit = Some(crate::audit::profiler::BATCH);
+        poll.failure = Some(Failure::Quiet);
+        assert!(
+            b.convert(vec![poll], EventSource::MongodbProfiler, SystemTime::now())
+                .is_empty()
+        );
+    }
+
+    /// The `auditLog` logs authorization checks, not how commands ended:
+    /// a failed record there gives no event, as before.
+    #[test]
+    fn audit_log_failures_give_no_event() {
+        let mut b = builder();
+        for failure in [Failure::Refused, Failure::Quiet, Failure::Telling] {
+            let mut r = own_record(Cmd::Find, "customers", None, None);
+            r.user = Some(Zeroizing::new("alice@admin".to_owned()));
+            r.failure = Some(failure);
+            assert!(
+                b.convert(vec![r], EventSource::MongodbAuditLog, SystemTime::now())
+                    .is_empty()
+            );
+        }
     }
 
     fn own_record(cmd: Cmd, coll: &str, rows: Option<u64>, app: Option<&str>) -> Record {

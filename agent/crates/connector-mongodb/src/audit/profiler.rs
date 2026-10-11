@@ -38,7 +38,7 @@ use databastion_classifiers::masking::ClientAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::records::{
-    Cmd, Filter, Kind, MAX_STAGES, Pipeline, Record, Shape, StageKind, address, bounded,
+    Cmd, Failure, Filter, Kind, MAX_STAGES, Pipeline, Record, Shape, StageKind, address, bounded,
     millis_time, namespace,
 };
 use crate::bson::{Doc, DocBuf, Malformed, Value};
@@ -487,6 +487,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
     ];
     let wrote = written.iter().flatten().any(|n| *n > 0);
     let returned = count(doc, "nreturned")?.is_some_and(|n| n > 0);
+    // From the numeric code only; a code that is not an integer fails
+    // closed (`Failure::Telling`). `errMsg` is never projected.
+    let failure = Failure::of(doc.get("errCode")?.map(|v| v.as_i64().ok_or(())));
     let cmd = match op.as_str() {
         "query" => Cmd::Find,
         "getmore" => Cmd::GetMore,
@@ -499,6 +502,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
             // (a write, else a read of unknown shape), never dropped.
             _ if odd && wrote => Cmd::Update,
             _ if odd && returned => Cmd::Find,
+            // Its failure may show the values read (security review of
+            // #197, L1): a read of unknown shape too.
+            _ if odd && failure == Some(Failure::Telling) => Cmd::Find,
             _ => Cmd::Other,
         },
         _ => Cmd::Other,
@@ -517,7 +523,7 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
         .as_deref()
         .and_then(address)
         .map(|(ip, _)| ClientAddr::Ip(ip));
-    r.failed = doc.int("errCode")?.is_some_and(|c| c != 0);
+    r.failure = failure;
     r.rows = match cmd {
         Cmd::Insert | Cmd::Update | Cmd::Delete | Cmd::FindAndModify | Cmd::BulkWrite => written
             .iter()
@@ -876,6 +882,57 @@ mod tests {
             .finish();
         let (_, r) = record_of(&Doc::new(&nothing).unwrap()).unwrap().unwrap();
         assert_eq!(r.kind, Kind::Op(Cmd::Other));
+    }
+
+    /// Security review of #197, L1: the failure of an entry is read from
+    /// its numeric `errCode` only (never `errMsg`), and a code that is not
+    /// an integer fails closed.
+    #[test]
+    fn failures_come_from_the_error_code() {
+        let with = |f: fn(DocBuf) -> DocBuf| {
+            let entry = DocBuf::new()
+                .date("ts", 5)
+                .str("op", "command")
+                .str("cmd", "find")
+                .str("ns", "app.customers")
+                .i32("nreturned", 0)
+                .str("user", "alice@admin")
+                .i32("fk", 1);
+            let (_, r) = record_of(&Doc::new(&f(entry).finish()).unwrap())
+                .unwrap()
+                .unwrap();
+            r.failure
+        };
+        assert_eq!(with(|d| d), None);
+        assert_eq!(with(|d| d.i32("errCode", 0)), None);
+        assert_eq!(with(|d| d.i32("errCode", 241)), Some(Failure::Telling));
+        assert_eq!(with(|d| d.i32("errCode", 50)), Some(Failure::Quiet));
+        assert_eq!(with(|d| d.i32("errCode", 13)), Some(Failure::Refused));
+        assert_eq!(with(|d| d.i64("errCode", 11000)), Some(Failure::Telling));
+        // Not an integer: fails closed.
+        assert_eq!(with(|d| d.str("errCode", "50")), Some(Failure::Telling));
+        // A truncated command whose name was cut off, that failed in a
+        // way that may show values: a read of unknown shape.
+        let cut = |code: i32| {
+            DocBuf::new()
+                .date("ts", 5)
+                .str("op", "command")
+                .str("cmd", "$truncated")
+                .str("ns", "app.customers")
+                .bool("tr", true)
+                .i32("errCode", code)
+                .finish()
+        };
+        let (_, r) = record_of(&Doc::new(&cut(241)).unwrap()).unwrap().unwrap();
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert_eq!(r.shape.filter, Filter::Unknown);
+        assert_eq!(r.failure, Some(Failure::Telling));
+        for quiet_or_refused in [50, 13] {
+            let (_, r) = record_of(&Doc::new(&cut(quiet_or_refused)).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.kind, Kind::Op(Cmd::Other));
+        }
     }
 
     #[test]

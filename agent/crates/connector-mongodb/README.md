@@ -137,6 +137,17 @@ out only from its account, its address and its application name
 DDL and DCL with its identity are always reported. On the `auditLog` (no
 counts), only a `find` with a limit within the budget is left out.
 
+Failed operations that returned no document (server log and profiler) are
+classified by their numeric `errCode` only (`errMsg` is never read): refused
+before reading (`Unauthorized` 13, parser errors 40414 / 40415) give no
+event; quiet failures whose text holds no value (time limits, interruptions,
+killed cursors, write conflicts, topology changes, memory limits) are
+operations of 0 documents, charged one to the agent's budget; any other
+code may show the values read in its text (`$toInt` of an e-mail address,
+`ConversionFailure` 241) and is always reported for reads, document-reading
+writes and DDL, and never left out as the agent's own. On the `auditLog`,
+which logs authorization checks, failed records give no event, as before.
+
 ## Target settings
 
 ```yaml
