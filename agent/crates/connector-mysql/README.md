@@ -298,8 +298,9 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   expires two poll intervals after the scan ends (30 s to 15 min). A pinned
   session's digests (the poll reads no `SQL_TEXT` of an ended session) are
   matched by shape (`events::text_shape`) with the pin statement and the
-  target's sampling credits only, never with the poll texts (ADR-0045
-  decision 4, refinement of 2026-10-11, proposed). Nothing is noted or
+  target's sampling credits only, not with the poll texts (those are
+  matched by shape only to drop the ended poll sessions' rows, above;
+  ADR-0045 decision 4, refinement of 2026-10-11, proposed). Nothing is noted or
   pinned on a server up for less than 10 s, or without a readable identity
   or start time. In memory only: after an agent restart, the earlier
   sessions' statements that the persisted cursor reads again are reported
