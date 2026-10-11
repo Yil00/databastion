@@ -29,7 +29,8 @@ use databastion_core::{EventSink, FailureCode};
 use tokio_postgres::types::Type;
 
 use super::events::{
-    Catalogs, PgOwn, StatementDelta, analyze_pss, pss_events_counted, pss_unanalyzed_event,
+    Catalogs, PgOwn, PssPeriodGuard, StatementDelta, TextReads, analyze_pss, pss_events_counted,
+    pss_unanalyzed_event, text_reads,
 };
 use crate::check::audit_probe;
 use crate::conn::{Session, Timeouts};
@@ -67,6 +68,9 @@ pub(crate) struct PssPoller {
     /// The `queryid` pinned for each of the connector's own statements.
     own_keys: OwnKeys,
     last_poll: SystemTime,
+    /// The `pg_stat_statements` period of the target while this poller
+    /// lives (ADR-0049 decision 5).
+    _period: Option<PssPeriodGuard>,
     /// Statements whose analysis or conversion panicked (poisoned),
     /// counted once each; they are not dropped: their deltas are reported
     /// as reads of `*` (#90).
@@ -137,6 +141,9 @@ impl OwnKeys {
 struct Analyzed {
     analysis: QueryAnalysis,
     own_text: bool,
+    /// What the text reads of the statement-text lists (ADR-0049), decided
+    /// for the entry's database.
+    reads: TextReads,
 }
 
 /// Tests: a text holding this marker makes its analysis panic (a bug on
@@ -146,14 +153,28 @@ const TEST_POISON: &str = "TEST-ANALYZER-PANIC";
 
 /// One text's analysis in isolation (`databastion_core::isolate`, as the
 /// file sources do; security review of #85): `None` when it panicked.
+#[cfg(test)]
 fn analyze_isolated(text: &str, cut: bool) -> Option<QueryAnalysis> {
+    analyze_with_reads(text, cut, &Catalogs::default(), "").map(|(a, _)| a)
+}
+
+/// One text's analysis and [`TextReads`] in `database`, in isolation.
+fn analyze_with_reads(
+    text: &str,
+    cut: bool,
+    catalogs: &Catalogs,
+    database: &str,
+) -> Option<(QueryAnalysis, TextReads)> {
     databastion_core::isolate(|| {
         #[cfg(test)]
         #[allow(clippy::panic)]
         if text.contains(TEST_POISON) {
             panic!("analysis bug on a statement");
         }
-        analyze_pss(text, cut)
+        let analysis = analyze_pss(text, cut);
+        let none = std::collections::HashSet::new();
+        let reads = text_reads(text, &analysis, catalogs.rule(database, true, &none), cut);
+        (analysis, reads)
     })
 }
 
@@ -163,7 +184,9 @@ pub(crate) async fn connect(
     target: &TargetConfig,
     timeouts: Timeouts,
     own: PgOwn,
+    period: PssPeriodGuard,
 ) -> Result<(Session, PssPoller), PgError> {
+    let mut period = Some(period);
     let mut own = Some(own);
     let settings = target.postgres_settings();
     let mut last = PgError::new(FailureCode::Unsupported, Stage::Audit);
@@ -208,7 +231,7 @@ pub(crate) async fn connect(
         // skipped as statistics for every role.
         let texts_sql = sql::pss_texts(&schema, toplevel)
             .ok_or(PgError::new(FailureCode::Internal, Stage::Audit))?;
-        own.allow_statement(&texts_sql);
+        own.allow_text_query(&texts_sql);
         let (role, databases, poller_database) =
             own_oids(&session, timeouts, &settings.databases).await?;
         return Ok((
@@ -229,6 +252,7 @@ pub(crate) async fn connect(
                     pinned: HashMap::new(),
                 },
                 last_poll: SystemTime::now(),
+                _period: period.take(),
                 unanalyzed: 0,
             },
         ));
@@ -298,13 +322,20 @@ impl PssPoller {
     /// caches the result for its entry: whether it is one of the
     /// connector's own statements (exact text and pinned `queryid`), and
     /// `None` when the analysis panicked (counted once).
-    fn record_text(&mut self, key: Key, text: &str, cut: bool) {
+    fn record_text(&mut self, key: Key, database: &str, text: &str, cut: bool) {
         let own_text = !cut
             && self
                 .own
                 .own_pss_form(text)
                 .is_some_and(|sent| self.own_keys.admit(key, sent));
-        let analysis = analyze_isolated(text, cut).map(|analysis| Analyzed { analysis, own_text });
+        let analysis =
+            analyze_with_reads(text, cut, &self.catalogs, database).map(|(analysis, reads)| {
+                Analyzed {
+                    analysis,
+                    own_text,
+                    reads,
+                }
+            });
         if analysis.is_none() {
             self.unanalyzed = self.unanalyzed.saturating_add(1);
         }
@@ -357,7 +388,14 @@ impl PssPoller {
     }
 
     /// Sets the per-database catalog facts (re-probed with the source).
+    /// The cached analyses hold what each text reads of the lists, decided
+    /// with the extension's schema at the time (ADR-0049): a change of any
+    /// database's `pg_stat_statements` schema clears them, so the texts are
+    /// read and analyzed again (security review L1).
     pub(crate) fn set_catalogs(&mut self, catalogs: Catalogs) {
+        if self.catalogs.pss_schema_changed(&catalogs) {
+            self.analyses.clear();
+        }
         self.catalogs = catalogs;
     }
 
@@ -431,6 +469,10 @@ impl PssPoller {
                     return Err(e.into());
                 }
             };
+            let databases: HashMap<Key, &str> = changed
+                .iter()
+                .map(|(k, _, d, ..)| (*k, d.as_str()))
+                .collect();
             for r in &texts {
                 let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Audit);
                 let key: Key = (
@@ -446,7 +488,8 @@ impl PssPoller {
                     .try_get::<_, Option<bool>>(5)
                     .map_err(get)?
                     .unwrap_or(true);
-                self.record_text(key, &text, cut);
+                let database = databases.get(&key).copied().unwrap_or("");
+                self.record_text(key, database, &text, cut);
             }
         }
         tx.commit().await?;
@@ -488,6 +531,7 @@ fn split_deltas<'a>(
                     user,
                     database,
                     analysis: &a.analysis,
+                    reads: &a.reads,
                     own_text: a.own_text,
                     calls: *calls,
                     rows: *n,
@@ -618,6 +662,7 @@ mod tests {
                     Analyzed {
                         analysis,
                         own_text: false,
+                        reads: TextReads::default(),
                     }
                 }),
             ),
@@ -627,6 +672,7 @@ mod tests {
                     |analysis| Analyzed {
                         analysis,
                         own_text: false,
+                        reads: TextReads::default(),
                     },
                 ),
             ),
@@ -695,7 +741,7 @@ mod tests {
             ),
             super::super::events::SharedOwnStatements::default(),
         );
-        own.allow_statement(&texts_sql);
+        own.allow_text_query(&texts_sql);
         PssPoller {
             database: "shop".to_owned(),
             schema: "public".to_owned(),
@@ -712,6 +758,7 @@ mod tests {
                 pinned: HashMap::new(),
             },
             last_poll: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000),
+            _period: None,
             unanalyzed: 0,
         }
     }
@@ -735,10 +782,10 @@ mod tests {
         let agent = (AGENT_ROLE, POLLER_DB, 100, true);
         let agent_other_db = (AGENT_ROLE, OTHER_TARGET_DB, 100, true);
         let agent_texts = (AGENT_ROLE, POLLER_DB, 200, true);
-        p.record_text(agent, &set_local, false);
-        p.record_text(agent_other_db, &set_local, false);
-        p.record_text(agent_texts, &texts, false);
-        p.record_text((AGENT_ROLE, POLLER_DB, 101, true), &setup, false);
+        p.record_text(agent, "shop", &set_local, false);
+        p.record_text(agent_other_db, "shop", &set_local, false);
+        p.record_text(agent_texts, "shop", &texts, false);
+        p.record_text((AGENT_ROLE, POLLER_DB, 101, true), "shop", &setup, false);
         for k in [
             agent,
             agent_other_db,
@@ -773,29 +820,39 @@ mod tests {
             ),
         ];
         for (what, k, text) in cases {
-            p.record_text(k, text, false);
+            p.record_text(k, "shop", text, false);
             assert!(!own(&p, &k), "{what}");
         }
         assert_eq!(p.own_keys.pinned.len(), 4, "only the connector's slots");
         // The pin survives the cache being cleared (texts read again).
         p.analyses.clear();
-        p.record_text((AGENT_ROLE, POLLER_DB, 999, true), &set_local, false);
-        p.record_text(agent, &set_local, false);
+        p.record_text(
+            (AGENT_ROLE, POLLER_DB, 999, true),
+            "shop",
+            &set_local,
+            false,
+        );
+        p.record_text(agent, "shop", &set_local, false);
         assert!(!own(&p, &(AGENT_ROLE, POLLER_DB, 999, true)));
         assert!(own(&p, &agent));
         // A cut text is never own, and does not pin.
         let cut = (AGENT_ROLE, OTHER_TARGET_DB, 7, true);
-        p.record_text(cut, &setup, true);
+        p.record_text(cut, "shop", &setup, true);
         assert!(!own(&p, &cut));
-        p.record_text((AGENT_ROLE, OTHER_TARGET_DB, 8, true), &setup, false);
+        p.record_text(
+            (AGENT_ROLE, OTHER_TARGET_DB, 8, true),
+            "shop",
+            &setup,
+            false,
+        );
         assert!(own(&p, &(AGENT_ROLE, OTHER_TARGET_DB, 8, true)));
         // Unknown agent role: nothing is own.
         let mut q = poller();
         q.own_keys.role = None;
-        q.record_text(agent, &set_local, false);
+        q.record_text(agent, "shop", &set_local, false);
         assert!(!own(&q, &agent));
         for (_, k, text) in &cases {
-            p.record_text(*k, text, false);
+            p.record_text(*k, "shop", text, false);
         }
         // Events: the agent's own entry is left out; the same text in a
         // non-target database, nested, or under another queryid, run by the
@@ -852,7 +909,7 @@ mod tests {
     fn a_conversion_panic_poisons_the_statement() {
         let mut p = poller();
         let k = (20, 1, 42, true);
-        p.record_text(k, "SELECT * FROM crm.customers", false);
+        p.record_text(k, "shop", "SELECT * FROM crm.customers", false);
         let changed = vec![(
             k,
             super::super::events::TEST_POISON_USER.to_owned(),
@@ -868,6 +925,126 @@ mod tests {
             assert_eq!(events[0].aggregated_count(), 2);
             assert!(p.analyses[&k].is_none(), "poisoned");
             assert_eq!(p.unanalyzed, 1, "counted once (poll {poll})");
+        }
+    }
+
+    /// Security review L1: a change of a database's `pg_stat_statements`
+    /// schema clears the cached analyses (what a text reads of the lists
+    /// depends on it); the same schemas keep them.
+    #[test]
+    fn a_changed_extension_schema_clears_the_analyses() {
+        let catalogs = |schema: Option<&str>| {
+            let mut c = Catalogs::default();
+            for (db, s) in [("shop", schema), ("crm", Some("public"))] {
+                c.insert(
+                    db,
+                    super::super::events::DbCatalog {
+                        pss_schema: s.map(str::to_owned),
+                        pgaudit_log_catalog: None,
+                    },
+                );
+            }
+            c
+        };
+        let mut p = poller();
+        p.set_catalogs(catalogs(Some("public")));
+        let k = (AGENT_ROLE, POLLER_DB, 700, true);
+        p.record_text(
+            k,
+            "shop",
+            "SELECT queryid FROM ext.pg_stat_statements",
+            false,
+        );
+        assert!(p.analyses.contains_key(&k));
+        // Same facts again: kept.
+        p.set_catalogs(catalogs(Some("public")));
+        assert!(p.analyses.contains_key(&k));
+        // The extension moved to another schema: cleared.
+        p.set_catalogs(catalogs(Some("ext")));
+        assert!(p.analyses.is_empty());
+        p.record_text(
+            k,
+            "shop",
+            "SELECT queryid FROM ext.pg_stat_statements",
+            false,
+        );
+        // Dropped from one database: cleared.
+        p.set_catalogs(catalogs(None));
+        assert!(p.analyses.is_empty());
+        p.record_text(k, "shop", "SELECT 1", false);
+        // A database added without the extension changes nothing; one
+        // added with it clears.
+        let mut c = catalogs(None);
+        c.insert(
+            "hr",
+            super::super::events::DbCatalog {
+                pss_schema: None,
+                pgaudit_log_catalog: None,
+            },
+        );
+        p.set_catalogs(c);
+        assert!(p.analyses.contains_key(&k));
+        let mut c = catalogs(None);
+        c.insert(
+            "hr",
+            super::super::events::DbCatalog {
+                pss_schema: Some("public".to_owned()),
+                pgaudit_log_catalog: None,
+            },
+        );
+        p.set_catalogs(c);
+        assert!(p.analyses.is_empty());
+    }
+
+    /// ADR-0049 decision 5 on `pg_stat_statements`: the text query is a
+    /// read of the statement texts, left out only in the connector's own
+    /// slot (the agent's role, top level, the poller's database, the
+    /// pinned `queryid`); nested, in another database or under a second
+    /// `queryid`, it is reported naming the extension's view, always
+    /// reported.
+    #[test]
+    fn the_text_query_is_own_only_in_its_slot() {
+        let mut p = poller();
+        let mut catalogs = Catalogs::default();
+        for db in ["shop", "crm"] {
+            catalogs.insert(
+                db,
+                super::super::events::DbCatalog {
+                    pss_schema: Some("public".to_owned()),
+                    pgaudit_log_catalog: None,
+                },
+            );
+        }
+        p.set_catalogs(catalogs);
+        let texts = own_pss_text(&sql::pss_texts("public", true).unwrap());
+        let own_slot = (AGENT_ROLE, POLLER_DB, 500, true);
+        let nested = (AGENT_ROLE, POLLER_DB, 501, false);
+        let other_db = (AGENT_ROLE, OTHER_TARGET_DB, 502, true);
+        let second = (AGENT_ROLE, POLLER_DB, 503, true);
+        p.record_text(own_slot, "shop", &texts, false);
+        p.record_text(nested, "shop", &texts, false);
+        p.record_text(other_db, "crm", &texts, false);
+        p.record_text(second, "shop", &texts, false);
+        let agent = |k: Key, db: &str| (k, "databastion".to_owned(), db.to_owned(), 2, 7);
+        let changed = vec![
+            agent(own_slot, "shop"),
+            agent(nested, "shop"),
+            agent(other_db, "crm"),
+            agent(second, "shop"),
+        ];
+        let events = p.events_of(
+            &changed,
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000),
+        );
+        assert_eq!(events.len(), 3, "{events:?}");
+        for e in &events {
+            assert!(e.always_report());
+            assert_eq!(e.objects().len(), 1);
+            assert_eq!(e.objects()[0].object().as_str(), "pg_stat_statements");
+            assert_eq!(
+                e.objects()[0].schema().map(|s| s.as_str().to_owned()),
+                Some("public".to_owned())
+            );
         }
     }
 }

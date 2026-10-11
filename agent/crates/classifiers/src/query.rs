@@ -73,6 +73,9 @@ use zeroize::Zeroizing;
 
 use crate::names;
 
+mod pg_scan;
+pub use pg_scan::{PgItemClass, PgListed, PgNameUse, PgScan, pg_scan};
+
 /// Largest statement text analyzed, in bytes. Longer text is not lexed.
 pub const MAX_QUERY_BYTES: usize = 1024 * 1024;
 /// Longest normalized text, in characters (cut at a token boundary).
@@ -3875,13 +3878,25 @@ fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
                             Some(Tok::Quoted(_)) => true,
                             _ => false,
                         });
+                // A parenthesized join in a `FROM` list (`FROM (a JOIN b ON
+                // …)`, `JOIN ((a JOIN b …) …)`): its first item is a
+                // relation too (ADR-0049 implementation).
+                let prev = i.checked_sub(1).and_then(|j| s.get(j));
+                let in_from = frames.last().is_some_and(|f| f.in_from);
+                let join_group = !subquery
+                    && !call
+                    && (matches!(word(prev), Some("from" | "join" | "lateral" | "only"))
+                        || (in_from && (is_punct(prev, ",") || is_punct(prev, "("))));
                 if frames.len() < MAX_DEPTH {
                     frames.push(Frame {
                         call,
-                        in_from: false,
+                        in_from: join_group,
                     });
                 }
                 i += 1;
+                if join_group {
+                    i = read_relation(s, i, &ctes, false, out);
+                }
             }
             Tok::Punct(p) if p == ")" => {
                 if frames.len() > 1 {
@@ -3969,6 +3984,14 @@ fn read_relation(
 ) -> usize {
     while matches!(word(s.get(i)), Some("only" | "lateral")) {
         i += 1;
+    }
+    // PostgreSQL `ROWS FROM (f(…), …)`: function calls, not a relation
+    // named `rows` (ADR-0049).
+    if word(s.get(i)) == Some("rows")
+        && word(s.get(i + 1)) == Some("from")
+        && is_punct(s.get(i + 2), "(")
+    {
+        return i + 1;
     }
     // MySQL `UPDATE [LOW_PRIORITY] [IGNORE] t …`: modifiers, not names.
     if word(i.checked_sub(1).and_then(|j| s.get(j))) == Some("update") {
@@ -6467,5 +6490,35 @@ mod tests {
             let a = analyze(bad, AnalyzeOptions::new());
             assert!(!a.lexed(), "{bad}");
         }
+    }
+
+    /// ADR-0049 implementation: the first item of a parenthesized join is
+    /// a relation, and `ROWS FROM (…)` names none.
+    #[test]
+    fn parenthesized_joins_and_rows_from() {
+        let rels = |t: &str| -> Vec<String> {
+            analyze(t, AnalyzeOptions::new())
+                .relations()
+                .iter()
+                .map(|r| format!("{}.{}", r.schema.as_deref().unwrap_or(""), r.name))
+                .collect()
+        };
+        assert_eq!(
+            rels("select * from (crm.a x join crm.b y on true)"),
+            ["crm.a", "crm.b"]
+        );
+        assert_eq!(
+            rels("select * from t, ((crm.a x join crm.b y on true) join crm.c on true)"),
+            [".t", "crm.a", "crm.b", "crm.c"]
+        );
+        assert_eq!(
+            rels("select * from (select 1) x, (values (1)) v"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            rels("select * from rows from (f(1), g(2)) with ordinality r, crm.a"),
+            ["crm.a"]
+        );
+        assert_eq!(rels("select * from t where x in (crm.y)"), [".t"]);
     }
 }

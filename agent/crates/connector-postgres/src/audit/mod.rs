@@ -101,7 +101,7 @@ fn own_account(
         state.own_usage(&target.id),
     )
     .persisted(cfg);
-    PgOwn::new(core, state.own_statements(&target.id))
+    PgOwn::new(core, state.own_statements(&target.id)).with_periods(state.pss_periods(&target.id))
 }
 
 /// State kept across source re-evaluations.
@@ -187,10 +187,21 @@ pub(crate) async fn audit_stream(
                     pss_session = Some((session, poller));
                 }
                 if pss_session.is_none() {
-                    let conn =
-                        pss::connect(target, timeouts, own_account(cfg, target, &pre, state))
-                            .await
-                            .map_err(PgError::into_connector_error)?;
+                    // The period of this `pg_stat_statements` stream (ADR-0049
+                    // decision 5) ends when the poller is dropped (source
+                    // switch, error, stop), plus the statement timeout.
+                    let period = events::PssPeriodGuard::start(
+                        state.pss_periods(&target.id),
+                        cfg.statement_timeout().min(Duration::from_secs(30)),
+                    );
+                    let conn = pss::connect(
+                        target,
+                        timeouts,
+                        own_account(cfg, target, &pre, state),
+                        period,
+                    )
+                    .await
+                    .map_err(PgError::into_connector_error)?;
                     tracing::info!(target_id = %target.id, "audit source: pg_stat_statements (Limited)");
                     pss_session = Some(conn);
                 }
