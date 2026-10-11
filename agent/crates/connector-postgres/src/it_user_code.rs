@@ -186,11 +186,14 @@ async fn run(c: &tokio_postgres::Client, q: &str) {
         .unwrap_or_else(|e| panic!("{q}: {e}"));
 }
 
-/// `check()` (the collision probe) once the stream has read the DDL just
-/// run: a probe that starts before the stream sees a DDL stays stale (the
-/// mark is the time the stream saw it, fail closed).
+/// Two `check()`s (collision probes) once the stream has read the DDL
+/// just run: a mark is cleared by the second probe that started after it
+/// (security review of #211, L1), and a probe that starts before the
+/// stream sees a DDL does not count (the mark is the time the stream saw
+/// it, fail closed).
 async fn probe_after_ddl(connector: &PostgresConnector, t: &TargetConfig) {
     tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(connector.check(t).await.reachable);
     assert!(connector.check(t).await.reachable);
 }
 
@@ -329,6 +332,23 @@ async fn user_code_next_to_catalogs_is_a_read_of_star() {
             CODE_ROLE,
             CODE_DB,
             &format!("{label}: cast to a user domain"),
+        )
+        .await;
+        // A bound parameter (extended protocol) in a database with that
+        // domain: its type is the client's (security review of #211, M1);
+        // the agent's own parameterized statements stay quiet (exact text).
+        code.query(
+            "SELECT relname FROM pg_catalog.pg_class WHERE relname = $1 LIMIT 1",
+            &[&"pg_class"],
+        )
+        .await
+        .unwrap();
+        expect_star(
+            &mut rx,
+            &mut events,
+            CODE_ROLE,
+            CODE_DB,
+            &format!("{label}: parameter next to a checked domain"),
         )
         .await;
         run(
@@ -823,6 +843,16 @@ async fn user_code_server_facts() {
             .unwrap()
             .expect("not cut")
     };
+    // The probe writes `pg_catalog` as its oid.
+    assert_eq!(
+        one_text(
+            &code,
+            "SELECT 'pg_catalog'::pg_catalog.regnamespace::pg_catalog.oid"
+        )
+        .await,
+        "11",
+        "{version}"
+    );
     // A fresh database: nothing.
     assert_eq!(
         probe().await,
@@ -1047,7 +1077,28 @@ async fn user_code_server_facts() {
         "DROP CAST (integer AS text); DROP FUNCTION public.f(integer)",
     )
     .await;
-    // (8) User types named like built-ins: a domain `public.int4` is
+    // (8) Domains: a CHECK of built-in code is not flagged; one that calls
+    // an SQL function is (a bound parameter of that domain runs it).
+    run(
+        &code,
+        "CREATE DOMAIN public.dplain AS integer CHECK (VALUE > 0)",
+    )
+    .await;
+    assert!(!probe().await.param_domain, "{version}");
+    run(
+        &code,
+        "CREATE FUNCTION public.chk(integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'; \
+         CREATE DOMAIN public.dchecked AS integer CHECK (public.chk(VALUE))",
+    )
+    .await;
+    assert!(probe().await.param_domain, "{version}");
+    run(
+        &code,
+        "DROP DOMAIN public.dchecked; DROP FUNCTION public.chk(integer); \
+         DROP DOMAIN public.dplain",
+    )
+    .await;
+    // (9) User types named like built-ins: a domain `public.int4` is
     // reported; a table named `text` (a relation row type) is not.
     run(
         &code,

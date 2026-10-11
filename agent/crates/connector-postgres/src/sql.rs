@@ -338,7 +338,7 @@ pub(crate) const CAS_GUARD_COLUMNS: &str = concat!(
     name_key!("x.attname"),
     " OPERATOR(pg_catalog.=) \
                ANY (ARRAY['body', 'json', 'audresource', 'auduser']::pg_catalog.text[]))) \
-       ORDER BY 2 DESC, c.oid LIMIT 257) \
+       ORDER BY named DESC, c.oid LIMIT 257) \
      SELECT c.oid, c.relname, a.attname, \
        pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') \
      FROM cand JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) cand.oid \
@@ -500,15 +500,16 @@ pub(crate) const PSS_FUNCTION_SCHEMA: &str = "SELECT n.nspname FROM pg_catalog.p
          AND p.pronamespace OPERATOR(pg_catalog.=) e.extnamespace AND p.pronargs OPERATOR(pg_catalog.=) 1 \
        LIMIT 1";
 
-/// The namespace column `$col` is a user schema
-/// for the collision probe: neither `pg_catalog` nor `information_schema`.
+/// The namespace column `$col` is a user schema for the collision probe:
+/// neither `pg_catalog` (its oid, 11) nor `information_schema` (the `ic`
+/// CTE).
 macro_rules! probe_user_ns {
     ($col:literal) => {
         concat!(
             $col,
-            " OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace AND ",
+            " OPERATOR(pg_catalog.<>) '11' AND ",
             $col,
-            " OPERATOR(pg_catalog.<>) 'information_schema'::pg_catalog.regnamespace"
+            " OPERATOR(pg_catalog.<>) (TABLE ic)"
         )
     };
 }
@@ -517,7 +518,7 @@ macro_rules! probe_user_ns {
 /// cast (the `reach` CTE of [`USER_CODE_PROBE`]).
 macro_rules! probe_reached {
     ($t:literal) => {
-        concat!($t, " OPERATOR(pg_catalog.=) ANY (SELECT r.t FROM reach r)")
+        concat!($t, " OPERATOR(pg_catalog.=) ANY (TABLE reach)")
     };
 }
 
@@ -539,24 +540,16 @@ macro_rules! probe_co_candidate {
 }
 
 /// Whether the function `$p` (a `pg_proc` alias) runs only C or internal
-/// code (an aggregate: every support function too).
+/// code (an aggregate: every support function too; the `lang` and
+/// `badagg` CTEs of [`USER_CODE_PROBE`]).
 macro_rules! probe_native {
     ($p:literal) => {
         concat!(
             "(",
             $p,
-            ".prolang OPERATOR(pg_catalog.=) ANY (SELECT l.oid FROM pg_catalog.pg_language l \
-               WHERE l.lanname OPERATOR(pg_catalog.=) ANY ('{c,internal}'::pg_catalog.name[])) \
-             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_aggregate a \
-               CROSS JOIN LATERAL pg_catalog.unnest(ARRAY[a.aggtransfn, a.aggfinalfn, \
-                 a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, \
-                 a.aggminvtransfn, a.aggmfinalfn]::pg_catalog.oid[]) AS s(f) \
-               JOIN pg_catalog.pg_proc q ON q.oid OPERATOR(pg_catalog.=) s.f \
-              WHERE a.aggfnoid OPERATOR(pg_catalog.=) ",
+            ".prolang OPERATOR(pg_catalog.=) ANY (TABLE lang) AND NOT ",
             $p,
-            ".oid AND NOT q.prolang OPERATOR(pg_catalog.=) ANY (SELECT l.oid \
-                 FROM pg_catalog.pg_language l \
-                WHERE l.lanname OPERATOR(pg_catalog.=) ANY ('{c,internal}'::pg_catalog.name[]))))"
+            ".oid OPERATOR(pg_catalog.=) ANY (TABLE badagg))"
         )
     };
 }
@@ -583,38 +576,55 @@ macro_rules! probe_native {
 ///   built-in types, explicit / implicit or assignment;
 /// - `F` / `O`: a function / operator name of `pg_catalog` with a user
 ///   overload, of any argument types, whose code is neither C nor internal
-///   (a bound parameter typed by the client reaches it).
+///   (a bound parameter typed by the client reaches it);
+/// - `d`: a user domain has a constraint that depends on a function or
+///   operator outside `pg_catalog` whose code is neither C nor internal (a
+///   bound parameter of that domain runs it; security review of #211, M1).
+///   A direct call of a `pg_catalog` function is not seen: PostgreSQL
+///   records no dependency on the objects initdb creates.
 ///
 /// Every operator is written `OPERATOR(pg_catalog.…)` and every function
 /// and type is qualified, so that the probe itself never triggers decision
-/// 8. Argument positions and counts come from constant series (a function
+/// 8. `pg_catalog` is written as its oid, `'11'` (`PG_CATALOG_NAMESPACE`,
+/// the same on every version; pinned by the facts test of
+/// `it_user_code.rs`): a constant keeps the planner's estimates, which a
+/// subquery does not, and the text short enough for the
+/// `pg_stat_statements` read bound (a unit test). Argument positions and
+/// counts come from constant series (a function
 /// has at most 100 arguments), which keeps the planner's estimate below
 /// PostgreSQL's default `jit_above_cost` on usual databases (JIT
 /// compilation took the probe from about 15 ms to about 160 ms). Names only, kept in the agent's memory (`audit::user_code`), never
 /// logged nor sent (I2).
 pub(crate) const USER_CODE_PROBE: &str = concat!(
-    "WITH RECURSIVE uf AS ( \
+    "WITH RECURSIVE ic AS (SELECT 'information_schema'::pg_catalog.regnamespace::pg_catalog.oid), \
+             lang AS (SELECT l.oid FROM pg_catalog.pg_language l \
+               WHERE l.lanname OPERATOR(pg_catalog.=) ANY ('{c,internal}'::pg_catalog.name[])), \
+             badagg AS (SELECT a.aggfnoid FROM pg_catalog.pg_aggregate a \
+               , pg_catalog.unnest(ARRAY[a.aggtransfn, a.aggfinalfn, \
+                 a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, \
+                 a.aggminvtransfn, a.aggmfinalfn]::pg_catalog.oid[]) AS s(f) \
+               JOIN pg_catalog.pg_proc q ON q.oid OPERATOR(pg_catalog.=) s.f \
+              WHERE NOT q.prolang OPERATOR(pg_catalog.=) ANY (TABLE lang)), \
+             uf AS ( \
                SELECT p.oid, p.proname AS name, p.proargtypes AS args, \
                       p.pronargs::pg_catalog.int4 AS n, p.pronargdefaults::pg_catalog.int4 AS d, \
-                      p.provariadic OPERATOR(pg_catalog.<>) 0::pg_catalog.oid AS variadic \
+                      p.provariadic OPERATOR(pg_catalog.<>) '0' AS variadic \
                  FROM pg_catalog.pg_proc p \
                 WHERE ",
     probe_user_ns!("p.pronamespace"),
     " AND p.proname OPERATOR(pg_catalog.=) ANY (SELECT b.proname FROM pg_catalog.pg_proc b \
-                    WHERE b.pronamespace OPERATOR(pg_catalog.=) \
-                          'pg_catalog'::pg_catalog.regnamespace)), \
+                    WHERE b.pronamespace OPERATOR(pg_catalog.=) '11')), \
              uo AS ( \
                SELECT o.oid, o.oprname AS name, o.oprleft AS l, o.oprright AS r, o.oprcode \
                  FROM pg_catalog.pg_operator o \
                 WHERE ",
     probe_user_ns!("o.oprnamespace"),
     " AND o.oprname OPERATOR(pg_catalog.=) ANY (SELECT b.oprname \
-                    FROM pg_catalog.pg_operator b WHERE b.oprnamespace OPERATOR(pg_catalog.=) \
-                          'pg_catalog'::pg_catalog.regnamespace)), \
+                    FROM pg_catalog.pg_operator b WHERE b.oprnamespace OPERATOR(pg_catalog.=) '11')), \
              argt AS ( \
-               SELECT a.t FROM uf CROSS JOIN LATERAL \
+               SELECT a.t FROM uf, \
                       pg_catalog.unnest(uf.args::pg_catalog.oid[]) AS a(t) \
-               UNION SELECT uo.l FROM uo WHERE uo.l OPERATOR(pg_catalog.<>) 0::pg_catalog.oid \
+               UNION SELECT uo.l FROM uo WHERE uo.l OPERATOR(pg_catalog.<>) '0' \
                UNION SELECT uo.r FROM uo), \
              chain(root, cur, depth) AS ( \
                SELECT argt.t, argt.t, 0 FROM argt \
@@ -625,21 +635,20 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
                       c.depth OPERATOR(pg_catalog.+) 1 \
                  FROM chain c JOIN pg_catalog.pg_type y ON y.oid OPERATOR(pg_catalog.=) c.cur \
                 WHERE c.depth OPERATOR(pg_catalog.<) 8 \
-                  AND y.typnamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace \
+                  AND y.typnamespace OPERATOR(pg_catalog.<>) '11' \
                   AND (y.typtype OPERATOR(pg_catalog.=) 'd' \
                        OR (y.typcategory OPERATOR(pg_catalog.=) 'A' \
-                           AND y.typelem OPERATOR(pg_catalog.<>) 0::pg_catalog.oid))), \
+                           AND y.typelem OPERATOR(pg_catalog.<>) '0'))), \
              reach AS ( \
                SELECT DISTINCT c.root AS t FROM chain c \
                  JOIN pg_catalog.pg_type y ON y.oid OPERATOR(pg_catalog.=) c.cur \
-                WHERE y.typnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
+                WHERE y.typnamespace OPERATOR(pg_catalog.=) '11' \
                    OR y.typtype OPERATOR(pg_catalog.=) 'c' \
                    OR EXISTS (SELECT 1 FROM pg_catalog.pg_cast k \
                         JOIN pg_catalog.pg_type s ON s.oid OPERATOR(pg_catalog.=) k.castsource \
                        WHERE k.casttarget OPERATOR(pg_catalog.=) y.oid \
                          AND k.castcontext OPERATOR(pg_catalog.=) 'i' \
-                         AND s.typnamespace OPERATOR(pg_catalog.=) \
-                             'pg_catalog'::pg_catalog.regnamespace)), \
+                         AND s.typnamespace OPERATOR(pg_catalog.=) '11')), \
              fk AS ( \
                SELECT uf.name, uf.args, uf.variadic, k.k \
                  FROM uf CROSS JOIN pg_catalog.generate_series(0, 100) AS k(k) \
@@ -652,9 +661,9 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
     probe_reached!("fk.args[i.i]"),
     ") \
                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc b \
-                  WHERE b.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
+                  WHERE b.pronamespace OPERATOR(pg_catalog.=) '11' \
                     AND b.proname OPERATOR(pg_catalog.=) fk.name \
-                    AND b.provariadic OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    AND b.provariadic OPERATOR(pg_catalog.=) '0' \
                     AND fk.k OPERATOR(pg_catalog.>=) \
                         (b.pronargs OPERATOR(pg_catalog.-) b.pronargdefaults) \
                     AND fk.k OPERATOR(pg_catalog.<=) b.pronargs \
@@ -669,16 +678,16 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
     "))) \
              UNION ALL \
              SELECT DISTINCT 'o', uo.name::pg_catalog.text FROM uo \
-              WHERE NOT ((uo.l OPERATOR(pg_catalog.<>) 0::pg_catalog.oid AND NOT ",
+              WHERE NOT ((uo.l OPERATOR(pg_catalog.<>) '0' AND NOT ",
     probe_reached!("uo.l"),
     ") OR NOT ",
     probe_reached!("uo.r"),
     ") \
                  OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_operator b \
-                  WHERE b.oprnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
+                  WHERE b.oprnamespace OPERATOR(pg_catalog.=) '11' \
                     AND b.oprname OPERATOR(pg_catalog.=) uo.name \
-                    AND (b.oprleft OPERATOR(pg_catalog.=) 0::pg_catalog.oid) \
-                        OPERATOR(pg_catalog.=) (uo.l OPERATOR(pg_catalog.=) 0::pg_catalog.oid) \
+                    AND (b.oprleft OPERATOR(pg_catalog.=) '0') \
+                        OPERATOR(pg_catalog.=) (uo.l OPERATOR(pg_catalog.=) '0') \
                     AND NOT EXISTS ( \
                       SELECT 1 FROM (VALUES (uo.l, b.oprleft), (uo.r, b.oprright)) AS v(u, b) \
                         JOIN pg_catalog.pg_type ut ON ut.oid OPERATOR(pg_catalog.=) v.u \
@@ -690,13 +699,12 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
              SELECT DISTINCT 't', t.typname::pg_catalog.text FROM pg_catalog.pg_type t \
               WHERE ",
     probe_user_ns!("t.typnamespace"),
-    " AND t.typrelid OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+    " AND t.typrelid OPERATOR(pg_catalog.=) '0' \
                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type e \
                      WHERE e.oid OPERATOR(pg_catalog.=) t.typelem \
-                       AND e.typrelid OPERATOR(pg_catalog.<>) 0::pg_catalog.oid) \
+                       AND e.typrelid OPERATOR(pg_catalog.<>) '0') \
                 AND t.typname OPERATOR(pg_catalog.=) ANY (SELECT b.typname \
-                     FROM pg_catalog.pg_type b WHERE b.typnamespace OPERATOR(pg_catalog.=) \
-                          'pg_catalog'::pg_catalog.regnamespace) \
+                     FROM pg_catalog.pg_type b WHERE b.typnamespace OPERATOR(pg_catalog.=) '11') \
              UNION ALL \
              SELECT DISTINCT CASE WHEN k.castcontext OPERATOR(pg_catalog.=) 'e' \
                                   THEN 'e' ELSE 'i' END, tt.typname::pg_catalog.text \
@@ -704,9 +712,9 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
                JOIN pg_catalog.pg_proc f ON f.oid OPERATOR(pg_catalog.=) k.castfunc \
                JOIN pg_catalog.pg_type st ON st.oid OPERATOR(pg_catalog.=) k.castsource \
                JOIN pg_catalog.pg_type tt ON tt.oid OPERATOR(pg_catalog.=) k.casttarget \
-              WHERE f.pronamespace OPERATOR(pg_catalog.<>) 'pg_catalog'::pg_catalog.regnamespace \
-                AND st.typnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
-                AND tt.typnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
+              WHERE f.pronamespace OPERATOR(pg_catalog.<>) '11' \
+                AND st.typnamespace OPERATOR(pg_catalog.=) '11' \
+                AND tt.typnamespace OPERATOR(pg_catalog.=) '11' \
              UNION ALL \
              SELECT DISTINCT 'F', uf.name::pg_catalog.text FROM uf \
                JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) uf.oid \
@@ -719,6 +727,30 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
               WHERE NOT ",
     probe_native!("p"),
     " \
+             UNION ALL \
+             SELECT 'd', '' WHERE EXISTS ( \
+               SELECT 1 FROM pg_catalog.pg_constraint c \
+                 JOIN pg_catalog.pg_type t ON t.oid OPERATOR(pg_catalog.=) c.contypid \
+                 JOIN pg_catalog.pg_depend dp \
+                   ON dp.classid OPERATOR(pg_catalog.=) \
+                      'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                  AND dp.objid OPERATOR(pg_catalog.=) c.oid \
+                WHERE ",
+    probe_user_ns!("t.typnamespace"),
+    " AND ((dp.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc dq \
+                    WHERE dq.oid OPERATOR(pg_catalog.=) dp.refobjid \
+                      AND (dq.pronamespace OPERATOR(pg_catalog.<>) '11' AND NOT ",
+    probe_native!("dq"),
+    "))) \
+           OR (dp.refclassid OPERATOR(pg_catalog.=) \
+               'pg_catalog.pg_operator'::pg_catalog.regclass \
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_operator o \
+                 JOIN pg_catalog.pg_proc dq ON dq.oid OPERATOR(pg_catalog.=) o.oprcode \
+                    WHERE o.oid OPERATOR(pg_catalog.=) dp.refobjid \
+                      AND o.oprnamespace OPERATOR(pg_catalog.<>) '11' AND NOT ",
+    probe_native!("dq"),
+    ")))) \
              LIMIT 20001"
 );
 
@@ -768,6 +800,36 @@ pub(crate) fn pss_texts(schema: &str, toplevel: bool) -> Option<String> {
         if toplevel { "s.toplevel" } else { "true" },
         quote_ident(schema)?
     ))
+}
+
+/// The connector's fixed statements (not those built per schema or per
+/// relation), as sent: what the Audit streams recognize as the
+/// connector's own by exact text when a bound parameter meets a checked
+/// user domain (ADR-0049 decision 8, security review of #211, M1).
+pub(crate) fn connector_statements() -> Vec<String> {
+    vec![
+        SESSION_SETUP.to_owned(),
+        SET_LOCAL_TIMEOUTS.to_owned(),
+        INTROSPECT.to_owned(),
+        POLICY_TREES.to_owned(),
+        POLICY_REFS_REJECTED.to_owned(),
+        COLUMNS.to_owned(),
+        ROLE_ATTRIBUTES.to_owned(),
+        MEMBERSHIPS.to_owned(),
+        write_privileges(true),
+        write_privileges(false),
+        OWNERSHIP.to_owned(),
+        LOGIN_EVENT_TRIGGERS.to_owned(),
+        SCHEMAS_WITHOUT_USAGE.to_owned(),
+        AUDIT_PREREQUISITES.to_owned(),
+        PGAUDIT_SETTINGS.to_owned(),
+        OWN_CLIENT_ADDR.to_owned(),
+        PSS_FUNCTION_SCHEMA.to_owned(),
+        OWN_OIDS.to_owned(),
+        USER_CODE_PROBE.to_owned(),
+        ALL_COLUMNS.to_owned(),
+        CAS_GUARD_COLUMNS.to_owned(),
+    ]
 }
 
 /// Every statement text of this module (tests).
@@ -1016,13 +1078,40 @@ mod tests {
                 for t in &code.types {
                     all.types.insert(t.name.name.clone());
                 }
+                // A checked user domain: a parameterized statement is
+                // spared only by the exact-text exemption, which must know
+                // it (security review of #211, M1).
+                let mut domain = all.clone();
+                domain.param_domain = true;
+                let exempt: Vec<String> = connector_statements()
+                    .into_iter()
+                    .chain(pss_probe("public"))
+                    .chain(
+                        [true, false]
+                            .into_iter()
+                            .filter_map(|t| pss_counters("public", t)),
+                    )
+                    .chain(
+                        [true, false]
+                            .into_iter()
+                            .filter_map(|t| pss_texts("public", t)),
+                    )
+                    .collect();
+                match user_code(Some(&code), false, &View::Known(&domain, lists), &excluded) {
+                    crate::audit::user_code::Verdict::BuiltIn => {}
+                    crate::audit::user_code::Verdict::ParamDomain => {
+                        assert!(exempt.contains(&s), "{major}: not exempt: {s}");
+                    }
+                    crate::audit::user_code::Verdict::UserCode => panic!("{major}: {s}"),
+                }
                 for view in [
                     View::Unknown(lists),
                     View::Unknown(None),
                     View::Known(&all, lists),
                 ] {
                     assert!(
-                        !user_code(Some(&code), false, &view, &excluded),
+                        user_code(Some(&code), false, &view, &excluded)
+                            == crate::audit::user_code::Verdict::BuiltIn,
                         "{major} {view:?}: {s}"
                     );
                 }
@@ -1030,6 +1119,72 @@ mod tests {
         }
         // Most of them are catalog-only.
         assert!(applicable >= 5 * 20, "{applicable}");
+    }
+
+    /// The statements of the exact-text exemption are statements of this
+    /// module.
+    #[test]
+    fn connector_statements_are_listed() {
+        let all = all_statements();
+        for c in connector_statements() {
+            assert!(all.contains(&c), "{c}");
+        }
+    }
+
+    #[test]
+    fn parentheses_balance() {
+        for s in all_statements() {
+            let mut depth = 0i32;
+            let mut quote: Option<char> = None;
+            for c in s.chars() {
+                match (quote, c) {
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '\'' | '"') => quote = Some(c),
+                    (None, '(') => depth += 1,
+                    (None, ')') => {
+                        depth -= 1;
+                        assert!(depth >= 0, "{s}");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(depth, 0, "{s}");
+            assert!(quote.is_none(), "{s}");
+        }
+    }
+
+    /// Every statement fits the `pg_stat_statements` text bound: a cut
+    /// text is a read of `*` (ADR-0049 decision 8), so a longer statement
+    /// of the connector would be reported on that source.
+    #[test]
+    fn statements_fit_the_text_bound() {
+        for s in all_statements() {
+            assert!(
+                s.chars().count() < PSS_MAX_TEXT_CHARS as usize,
+                "{} characters: {s}",
+                s.chars().count()
+            );
+        }
+    }
+
+    /// `pg_stat_statements` keeps an `ORDER BY` / `GROUP BY` position as
+    /// written while `audit::events::pss_form` replaces every integer: the
+    /// statements of the exact-text exemption use names there.
+    #[test]
+    fn connector_statements_order_by_name() {
+        for s in connector_statements() {
+            let upper = s.to_uppercase();
+            for clause in ["ORDER BY ", "GROUP BY "] {
+                for (i, _) in upper.match_indices(clause) {
+                    let rest = &upper[i + clause.len()..];
+                    assert!(
+                        !rest.starts_with(|c: char| c.is_ascii_digit()),
+                        "{clause}<position> in {s}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

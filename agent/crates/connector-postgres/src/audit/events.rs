@@ -61,7 +61,7 @@ use databastion_classifiers::query::{
 };
 
 use super::records::AuditRecord;
-use super::user_code::{CodeUse, UserCodeHandle, routine_ddl_command};
+use super::user_code::{CodeUse, UserCodeHandle, Verdict, routine_ddl_command};
 use crate::discover::normalize;
 use crate::sql;
 
@@ -117,6 +117,11 @@ impl Catalogs {
 
     fn get(&self, database: &str) -> Option<&DbCatalog> {
         self.dbs.get(database)
+    }
+
+    /// The `pg_stat_statements` schema of `database`, when installed.
+    pub(crate) fn pss_schema(&self, database: &str) -> Option<&str> {
+        self.get(database).and_then(|c| c.pss_schema.as_deref())
     }
 
     /// Whether some database's `pg_stat_statements` schema differs between
@@ -381,6 +386,10 @@ pub(crate) struct TextReads {
     /// domain, cast or extension (or drops with `CASCADE`): the collision
     /// probe of its database is stale.
     pub(crate) routine_ddl: bool,
+    /// Set by the `pg_stat_statements` poller: the stored text is exactly
+    /// one of the connector's statements, in a slot of the agent's role
+    /// (its role, top level, a declared database).
+    pub(crate) own_connector: bool,
 }
 
 fn push_unique(v: &mut Vec<RelationName>, r: RelationName) {
@@ -468,11 +477,13 @@ pub(crate) fn text_reads(
     out
 }
 
-/// ADR-0049 decision 8: a query (`SELECT`, `TABLE`, `VALUES`, a write,
-/// `COPY`) whose text lexed and names at least one relation, every one a
-/// catalog (the statistics relations of ADR-0048 are not) or a core-list
-/// entry of decision 1, below the analyzer's relation bound: its code is
-/// judged when the event is built. A text that names no relation is
+/// ADR-0049 decision 8: a text that lexed and names at least one relation,
+/// every one a catalog (the statistics relations of ADR-0048 are not) or a
+/// core-list entry of decision 1, below the analyzer's relation bound: its
+/// code is judged when the event is built, whatever its statements are (a
+/// query, or one that wraps a query: `EXPLAIN`, `PREPARE … AS`, `DECLARE …
+/// CURSOR FOR`, `CREATE … AS`; any other statement is scanned whole: fail
+/// closed, security review of #211, H1). A text that names no relation is
 /// already a read of `*`.
 fn code_use(
     analysis: &QueryAnalysis,
@@ -481,19 +492,6 @@ fn code_use(
     scan: Option<&PgScan>,
 ) -> CodeUse {
     let parts = analysis.parts();
-    let query = parts.iter().any(|p| {
-        matches!(
-            p.kind,
-            StatementKind::Select
-                | StatementKind::Table
-                | StatementKind::Values
-                | StatementKind::Insert
-                | StatementKind::Update
-                | StatementKind::Delete
-                | StatementKind::Merge
-                | StatementKind::Copy
-        )
-    });
     let named = parts.iter().any(|p| !p.relations.is_empty());
     let catalogs = parts.iter().all(|p| {
         !p.relations_full
@@ -502,7 +500,7 @@ fn code_use(
                     || (is_catalog(r, rule) && statistics_relation(r).is_none())
             })
     });
-    if !(analysis.lexed() && query && named && catalogs) {
+    if !(analysis.lexed() && named && catalogs) {
         return CodeUse::NotApplicable;
     }
     CodeUse::CatalogOnly {
@@ -511,23 +509,33 @@ fn code_use(
     }
 }
 
-/// ADR-0049 decision 8, when the event of a read or write is built:
+/// ADR-0049 decision 8, when the event is built (every action class):
 /// whether the catalog-only statement `reads` describes runs user code in
 /// `database` (`*`, always reported, never the agent's own). The functions
 /// of decisions 1 and 7 are left to those decisions (re-review N4).
+/// `own_exact`: the statement is exactly one of the connector's own, from
+/// the agent's identity, asked only for a parameter in a database with a
+/// user domain whose `CHECK` runs non-C code (security review of #211,
+/// M1).
 fn user_code_star(
     reads: &TextReads,
     catalogs: &Catalogs,
     database: &str,
     rule: CatalogRule<'_>,
+    own_exact: &dyn Fn() -> bool,
 ) -> bool {
     let CodeUse::CatalogOnly { code, cut } = &reads.code else {
         return false;
     };
     let excluded = |r: &RelationName| decided_elsewhere(r, rule.pss_schema);
-    catalogs
+    match catalogs
         .user_code
         .decide(database, code.as_deref(), *cut, &excluded)
+    {
+        Verdict::BuiltIn => false,
+        Verdict::UserCode => true,
+        Verdict::ParamDomain => !own_exact(),
+    }
 }
 
 /// A call left to ADR-0049 decisions 1 and 7, not to decision 8
@@ -1018,6 +1026,9 @@ pub(crate) struct PgOwn {
     own_pss: Vec<(String, String)>,
     registry: SharedOwnStatements,
     periods: SharedPssPeriods,
+    /// Every fixed statement of the connector, as sent (ADR-0049 decision
+    /// 8, security review of #211, M1).
+    connector: Vec<String>,
 }
 
 impl PgOwn {
@@ -1033,6 +1044,7 @@ impl PgOwn {
             own_pss: Vec::new(),
             registry,
             periods: SharedPssPeriods::default(),
+            connector: sql::connector_statements(),
         };
         for text in sql::OWN_TABLELESS {
             own.own_texts.push(text.to_owned());
@@ -1076,6 +1088,55 @@ impl PgOwn {
         if !guard.iter().any(|t| t == text) && guard.len() < OWN_MAX_EXTRA_STATEMENTS {
             guard.push(text.to_owned());
         }
+    }
+
+    /// The connector's statements in a database whose `pg_stat_statements`
+    /// schema is `pss_schema`, as sent.
+    fn connector_candidates(&self, pss_schema: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = self.connector.clone();
+        out.extend(self.text_queries.iter().cloned());
+        if let Some(schema) = pss_schema {
+            out.extend(sql::pss_probe(schema));
+            for toplevel in [true, false] {
+                out.extend(sql::pss_counters(schema, toplevel));
+                out.extend(sql::pss_texts(schema, toplevel));
+            }
+        }
+        out
+    }
+
+    /// `text` is exactly one of the connector's statements, as sent
+    /// (pgaudit).
+    pub(crate) fn connector_sent(&self, text: &str, pss_schema: Option<&str>) -> bool {
+        self.connector_candidates(pss_schema)
+            .iter()
+            .any(|c| c == text)
+    }
+
+    /// `text` is exactly one of the connector's statements as
+    /// `pg_stat_statements` stores it ([`pss_form`]).
+    pub(crate) fn connector_pss_form(&self, text: &str, pss_schema: Option<&str>) -> bool {
+        self.connector_candidates(pss_schema)
+            .iter()
+            .any(|c| pss_form(c).is_some_and(|f| f == text))
+    }
+
+    /// The agent's identity: its account, and, when the source logs them,
+    /// its application name and client address (no budget involved).
+    pub(crate) fn agent_identity(
+        &self,
+        user: &str,
+        application: Option<&str>,
+        client: ClientSeen,
+    ) -> bool {
+        let probe = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account(user),
+            SystemTime::now(),
+        );
+        self.core
+            .routine_unbudgeted(user, application, client, &probe)
     }
 
     /// `text` is exactly one of the connector's own table-less statements.
@@ -1358,9 +1419,17 @@ impl PgauditEvents {
             }
             // ADR-0049 decisions 7 and 8 (user code next to catalogs only,
             // for reads and writes).
+            let own = &self.own;
+            let own_exact = || {
+                own.connector_sent(text, rule.pss_schema)
+                    && own.agent_identity(
+                        &first.user,
+                        Some(&first.application),
+                        ClientSeen::Logged(first.remote.as_deref().and_then(ClientAddr::parse)),
+                    )
+            };
             part.star |= reads.star
-                || (matches!(action, EventAction::Read | EventAction::Write)
-                    && user_code_star(reads, &self.catalogs, &first.database, rule));
+                || user_code_star(reads, &self.catalogs, &first.database, rule, &own_exact);
             let mut named = false;
             if !r.audit.object_name.is_empty()
                 && is_relation_type(&r.audit.object_type)
@@ -1752,6 +1821,10 @@ fn pss_event(
     let rule = catalogs.rule(d.database, true, &none);
     let a = d.analysis;
     let all: Vec<&StatementInfo> = a.parts().iter().collect();
+    // ADR-0049 decision 8: user code next to catalogs only, `*` like the
+    // functions of decision 7, in every action class.
+    let own_exact = || d.reads.own_connector;
+    let code_star = user_code_star(d.reads, catalogs, d.database, rule, &own_exact);
     let action = match a.kind() {
         StatementKind::Select | StatementKind::Table | StatementKind::Values => EventAction::Read,
         StatementKind::Copy => {
@@ -1767,6 +1840,10 @@ fn pss_event(
         | StatementKind::Merge => EventAction::Write,
         StatementKind::Ddl => EventAction::Ddl,
         StatementKind::Dcl => EventAction::Dcl,
+        // A statement that wraps a query (`EXPLAIN`, `PREPARE`, `DECLARE …
+        // CURSOR`) and runs user code next to catalogs: a read of `*`
+        // (security review of #211, H1).
+        _ if code_star => EventAction::Read,
         _ => return None,
     };
     let (mut objects, named_any) = user_relations(&all, rule);
@@ -1774,9 +1851,7 @@ fn pss_event(
     // decision 7, in every action class.
     let reads = d.reads;
     let rw = matches!(action, EventAction::Read | EventAction::Write);
-    // ADR-0049 decision 8: user code next to catalogs only, `*` like the
-    // functions of decision 7.
-    let reads_star = reads.star || (rw && user_code_star(reads, catalogs, d.database, rule));
+    let reads_star = reads.star || code_star;
     // A core-list entry read in the no-text shape is a catalog read.
     let named_any = named_any || !reads.named.is_empty();
     for o in &reads.objects {
@@ -1889,6 +1964,7 @@ mod tests {
         named: Vec::new(),
         code: CodeUse::NotApplicable,
         routine_ddl: false,
+        own_connector: false,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -4454,6 +4530,227 @@ mod tests {
             vec![rec("t1", 1, 1, class, command, "", text, Some(2), app)],
             SystemTime::now(),
         )
+    }
+
+    /// Catalog facts of `shop` with a collision probe that found `rows`
+    /// (kind, name), on PostgreSQL 16.
+    fn probed_catalogs(rows: &[(&str, &str)]) -> Catalogs {
+        let names = super::super::user_code::ProbeNames::from_rows(
+            rows.iter().map(|(k, n)| ((*k).to_owned(), (*n).to_owned())),
+        )
+        .unwrap();
+        let shared = super::super::user_code::SharedUserCode::default();
+        super::super::user_code::lock(&shared).store("shop", Instant::now(), 160_013, Some(names));
+        shop_catalogs(Some(true)).with_user_code(UserCodeHandle::new(shared))
+    }
+
+    /// Events of one pgaudit record (`app`: its application; the agent's
+    /// own address) with probed catalogs.
+    fn probed_pgaudit(
+        text: &str,
+        class: &str,
+        command: &str,
+        app: &str,
+        rows: &[(&str, &str)],
+    ) -> Vec<MaskedEvent> {
+        let mut b = PgauditEvents::new(own());
+        b.set_catalogs(probed_catalogs(rows));
+        b.convert(
+            vec![rec("t1", 1, 1, class, command, "", text, Some(2), app)],
+            SystemTime::now(),
+        )
+    }
+
+    /// Events of one `pg_stat_statements` delta with probed catalogs.
+    fn probed_pss(
+        text: &str,
+        user: &str,
+        own_connector: bool,
+        rows: &[(&str, &str)],
+    ) -> Vec<MaskedEvent> {
+        let catalogs = probed_catalogs(rows);
+        let a = analyze_pss(text, false);
+        let none = HashSet::new();
+        let mut reads = text_reads(text, &a, catalogs.rule("shop", true, &none), false);
+        reads.own_connector = own_connector;
+        let deltas = [StatementDelta {
+            reads: &reads,
+            own_text: false,
+            user,
+            database: "shop",
+            analysis: &a,
+            calls: 1,
+            rows: 1,
+        }];
+        let t0 = SystemTime::UNIX_EPOCH;
+        pss_events(&deltas, &mut own(), &catalogs, t0, t0)
+    }
+
+    fn is_star(ev: &[MaskedEvent]) -> bool {
+        ev.len() == 1 && ev[0].always_report() && objects_of(&ev[0]).contains(&"shop..*".to_owned())
+    }
+
+    /// Security review of #211, H1: the statements that wrap a query run
+    /// (or plan, folding immutable and stable calls) the code of their
+    /// query: user code there is `*` too, on both sources, in the class
+    /// pgaudit logs it (a `CREATE … AS` also gets its DDL record).
+    #[test]
+    fn wrapped_queries_run_user_code() {
+        for (text, class, command) in [
+            (
+                "PREPARE p AS SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "PREPARE",
+            ),
+            (
+                "PREPARE p AS SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "EXPLAIN ANALYZE SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "EXPLAIN SELECT public.f(1) FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT public.f() FROM pg_catalog.pg_class",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "DECLARE c CURSOR FOR SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "DECLARE CURSOR",
+            ),
+            (
+                "CREATE TEMP TABLE tt AS SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "CREATE TEMP TABLE tt AS SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                "DDL",
+                "CREATE TABLE AS",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv AS SELECT public.f() FROM pg_catalog.pg_class",
+                "READ",
+                "SELECT",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv AS SELECT public.f() FROM pg_catalog.pg_class",
+                "DDL",
+                "CREATE MATERIALIZED VIEW",
+            ),
+        ] {
+            assert_text_read(text, class, command, &["shop..*"], true);
+        }
+        // An unqualified collision behind each wrapper, and quiet without it.
+        for text in [
+            "PREPARE p AS SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
+            "EXPLAIN ANALYZE SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
+            "EXPLAIN SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
+            "DECLARE c CURSOR FOR SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
+            "CREATE TEMP TABLE tt AS SELECT length(42) FROM pg_catalog.pg_class LIMIT 1",
+            "CREATE MATERIALIZED VIEW mv AS SELECT length(42) FROM pg_catalog.pg_class",
+        ] {
+            let colliding = [("f", "length")];
+            assert!(
+                is_star(&probed_pgaudit(text, "READ", "SELECT", "psql", &colliding)),
+                "{text}"
+            );
+            assert!(
+                is_star(&probed_pss(text, "app", false, &colliding)),
+                "{text}"
+            );
+            // Without the collision: no `*` (a `CREATE … AS` stays a DDL
+            // event on pg_stat_statements).
+            let no_star = |ev: Vec<MaskedEvent>| {
+                !ev.iter()
+                    .any(|e| objects_of(e).contains(&"shop..*".to_owned()))
+            };
+            assert!(
+                no_star(probed_pgaudit(text, "READ", "SELECT", "psql", &[])),
+                "{text}"
+            );
+            assert!(no_star(probed_pss(text, "app", false, &[])), "{text}");
+        }
+        // Any other statement of a catalog-only text is scanned whole.
+        assert!(is_star(&probed_pss(
+            "SELECT 1 FROM pg_catalog.pg_class; SET search_path TO my_f(1)",
+            "app",
+            false,
+            &[]
+        )));
+    }
+
+    /// Security review of #211, M1: a bound parameter in a database with a
+    /// user domain whose `CHECK` runs non-C code is `*`, except the
+    /// connector's own statement by exact text from the agent's identity.
+    #[test]
+    fn parameters_next_to_a_checked_domain() {
+        let domain = [("d", "")];
+        let own_stmt = sql::OWN_OIDS;
+        // pgaudit: the agent (its application and address), exact text.
+        assert!(
+            probed_pgaudit(
+                own_stmt,
+                "READ",
+                "SELECT",
+                crate::conn::APPLICATION_NAME,
+                &domain
+            )
+            .is_empty()
+        );
+        // The same text from another client, or a changed text.
+        assert!(is_star(&probed_pgaudit(
+            own_stmt, "READ", "SELECT", "psql", &domain
+        )));
+        let changed = own_stmt.replace(" FROM ", "  FROM ");
+        assert!(is_star(&probed_pgaudit(
+            &changed,
+            "READ",
+            "SELECT",
+            crate::conn::APPLICATION_NAME,
+            &domain
+        )));
+        let other =
+            "SELECT relname FROM pg_catalog.pg_class WHERE relname OPERATOR(pg_catalog.=) $1";
+        assert!(is_star(&probed_pgaudit(
+            other, "READ", "SELECT", "psql", &domain
+        )));
+        // Without the domain, or without a parameter: quiet.
+        assert!(probed_pgaudit(other, "READ", "SELECT", "psql", &[]).is_empty());
+        assert!(
+            probed_pgaudit(
+                "SELECT relname FROM pg_catalog.pg_class",
+                "READ",
+                "SELECT",
+                "psql",
+                &domain
+            )
+            .is_empty()
+        );
+        // pg_stat_statements: the poller's exact-text and slot decision.
+        assert!(probed_pss(other, "databastion", true, &domain).is_empty());
+        assert!(is_star(&probed_pss(other, "databastion", false, &domain)));
+        // The connector's exact texts are recognized as stored.
+        let p = own();
+        for c in sql::connector_statements() {
+            assert!(p.connector_sent(&c, Some("public")), "{c}");
+            if let Some(f) = pss_form(&c) {
+                assert!(p.connector_pss_form(&f, Some("public")), "{c}");
+            }
+        }
+        let counters = sql::pss_counters("public", true).unwrap();
+        assert!(p.connector_pss_form(&pss_form(&counters).unwrap(), Some("public")));
+        assert!(!p.connector_sent(&counters, None));
+        assert!(!p.connector_sent(other, Some("public")));
     }
 
     const ACTIVITY: &str = "shop.pg_catalog.pg_stat_activity";

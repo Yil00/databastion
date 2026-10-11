@@ -145,11 +145,14 @@ load otherwise), so a server-wide load is the normal case.
   Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-views).
 - **User code next to catalogs only** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)
-  decision 8, part 2 refinement proposed). In a read or write whose
-  relations are all catalogs (`audit::events::code_use`), a call, an
-  operator (written, or implied by `LIKE`, `IN`, `BETWEEN`…) or a cast
-  that is not built in for that database adds `*`, always reported,
-  never the agent's own (`audit::user_code::user_code`, decided when the
+  decision 8, part 2 refinement proposed). In a text whose relations are
+  all catalogs (`audit::events::code_use`), whatever its statements
+  (a statement that wraps a query, `EXPLAIN`, `PREPARE … AS`,
+  `DECLARE … CURSOR FOR`, `CREATE … AS`, is scanned from its query; any
+  other is scanned whole), a call, an operator (written, or implied by
+  `LIKE`, `IN`, `BETWEEN`…) or a cast that is not built in for that
+  database adds `*` in every action class, always reported, never the
+  agent's own (`audit::user_code::user_code`, decided when the
   event is built, from the code uses that `classifiers::query::PgScan::code`
   extracts). "Built in": the lists of the server's major version
   (`builtins/<major>/{functions,operators,types,keywords}.txt`, generated
@@ -161,10 +164,16 @@ load otherwise), so a server-wide load is the normal case.
   reaches, user types named like built-in ones, user-function casts
   between built-in types (an implicit one: every catalog-only statement
   is `*`), and, with a `$n` in the text, user overloads whose code is
-  not C. The probes are kept per target in `CheckState` and marked stale
-  by the streams on routine, type, cast and extension DDL (`UserCode`); a
-  failed, cut, stale, old (15 min) or missing probe makes every
-  unqualified call, operator and cast `*`. Every connector statement is
+  not C, and user domains whose `CHECK` runs non-C code (a parameterized
+  statement is then `*` unless it is exactly a connector statement from
+  the agent's identity: `PgOwn::connector_sent`, `agent_identity`, and on
+  `pg_stat_statements` `connector_pss_form` in the agent's slot). The
+  probes are kept per target in `CheckState` and marked stale by the
+  streams on routine, type, cast and extension DDL (`UserCode`), until
+  two probes that started after the mark; a failed, cut, stale, old
+  (15 min) or missing probe makes every unqualified call, operator and
+  cast `*`. Every connector statement stays under the 8 192-character
+  `pg_stat_statements` read bound (unit test). Every connector statement is
   written with qualified functions and types and
   `OPERATOR(pg_catalog.…)` (unit test `statements_never_trigger_decision_8`).
   Integration tests in `it_user_code.rs` (scenarios on every source, a

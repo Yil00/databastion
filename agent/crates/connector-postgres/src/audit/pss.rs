@@ -110,6 +110,16 @@ struct OwnKeys {
 }
 
 impl OwnKeys {
+    /// A slot where the connector runs its catalog statements: the agent's
+    /// role, top level, a declared database (ADR-0049 decision 8, security
+    /// review of #211, M1; no `queryid` pin: the exemption only spares a
+    /// parameterized connector statement in a database with a checked user
+    /// domain).
+    fn connector_slot(&self, key: Key) -> bool {
+        let (userid, dbid, _, toplevel) = key;
+        self.role == Some(userid) && toplevel && self.databases.contains(&dbid)
+    }
+
     /// Whether the entry `key`, whose text is the own statement `sent` (as
     /// sent), is the connector's (pinning it when it is the first seen in
     /// its slot).
@@ -328,8 +338,14 @@ impl PssPoller {
                 .own
                 .own_pss_form(text)
                 .is_some_and(|sent| self.own_keys.admit(key, sent));
+        let own_connector = !cut
+            && self.own_keys.connector_slot(key)
+            && self
+                .own
+                .connector_pss_form(text, self.catalogs.pss_schema(database));
         let analysis =
-            analyze_with_reads(text, cut, &self.catalogs, database).map(|(analysis, reads)| {
+            analyze_with_reads(text, cut, &self.catalogs, database).map(|(analysis, mut reads)| {
+                reads.own_connector = own_connector;
                 Analyzed {
                     analysis,
                     own_text,

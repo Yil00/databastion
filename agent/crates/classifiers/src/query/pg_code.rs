@@ -15,10 +15,13 @@
 //! call, an operator or a type are left out (an alias with its column
 //! list, `ORDER BY (`, `FILTER (`, `OVER (`, `GROUP BY CUBE (`…).
 //!
-//! Only the statements that run as queries are scanned: `SELECT`, `TABLE`,
-//! `VALUES`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `WITH …`, and the
-//! query of `COPY (…) TO`. The body of a `DO` block is not: its
-//! statements reach the sources as statements of their own.
+//! Queries (`SELECT`, `TABLE`, `VALUES`, `INSERT`, `UPDATE`, `DELETE`,
+//! `MERGE`, `WITH …`) are scanned whole; the statements that wrap a query
+//! (`EXPLAIN`, `PREPARE … AS`, `DECLARE … CURSOR FOR`, `CREATE TABLE /
+//! MATERIALIZED VIEW … AS`, `COPY (…) TO`) from their query on, with a
+//! `PREPARE`'s parameter types; `COPY` of a relation not at all; every
+//! other statement whole (fail closed). The body of a `DO` block is not
+//! scanned: its statements reach the sources as statements of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -480,27 +483,165 @@ struct Scan<'a> {
     pending: Option<Kind>,
 }
 
+/// Where the code of the statement `t[a..b]` is: the range to scan, and
+/// the type positions of a `PREPARE` parameter list. A query is scanned
+/// whole; a statement that wraps one (`EXPLAIN [ANALYZE] [(…)]`,
+/// `PREPARE p [(types)] AS`, `DECLARE c … CURSOR … FOR`, `CREATE … TABLE /
+/// MATERIALIZED VIEW … AS`) from its query on (security review of #211,
+/// H1: the query runs, or is planned with its immutable and stable calls
+/// folded); `COPY (query)` its query; `COPY` of a relation nothing (its
+/// options are keywords and literals); any other statement whole (fail
+/// closed).
+fn scope(
+    t: &[Tok],
+    a: usize,
+    b: usize,
+    depth: usize,
+    types: &mut Vec<usize>,
+) -> Option<(usize, usize)> {
+    let s = &t[a..b];
+    let m = main_start(s)?;
+    let i = a + m;
+    if depth > 8 {
+        return Some((a, b));
+    }
+    match word(t.get(i)) {
+        Some("select" | "table" | "values" | "insert" | "update" | "delete" | "merge" | "with") => {
+            Some((a, b))
+        }
+        Some("copy") => {
+            if is_punct(t.get(i + 1), "(") {
+                Some((i + 2, close_of(t, i + 1).saturating_sub(1).min(b)))
+            } else {
+                None
+            }
+        }
+        Some("explain") => {
+            let mut j = i + 1;
+            while matches!(word(t.get(j)), Some("analyze" | "analyse" | "verbose")) {
+                j += 1;
+            }
+            if is_punct(t.get(j), "(") {
+                j = close_of(t, j);
+            }
+            if j >= b {
+                return Some((a, b));
+            }
+            scope(t, j, b, depth + 1, types)
+        }
+        Some("prepare") => {
+            let mut j = i + 2;
+            if is_punct(t.get(j), "(") {
+                // `PREPARE p (type, …)`: each entry starts a type.
+                let close = close_of(t, j).min(b);
+                types.push(j + 1);
+                let mut d = 0usize;
+                for (k, x) in t
+                    .iter()
+                    .enumerate()
+                    .take(close.saturating_sub(1))
+                    .skip(j + 1)
+                {
+                    match x {
+                        Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+                        Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+                        Tok::Punct(p) if p == "," && d == 0 => types.push(k + 1),
+                        _ => {}
+                    }
+                }
+                j = close;
+            }
+            if word(t.get(j)) == Some("as") && j + 1 < b {
+                scope(t, j + 1, b, depth + 1, types)
+            } else {
+                Some((a, b))
+            }
+        }
+        Some("declare") => match top_level_word(t, i + 1, b, &["for"]) {
+            Some(f) if f + 1 < b => scope(t, f + 1, b, depth + 1, types),
+            _ => Some((a, b)),
+        },
+        Some("create") => {
+            let creates_relation = t[i..b]
+                .iter()
+                .take(8)
+                .any(|x| matches!(word(Some(x)), Some("table" | "materialized")));
+            match creates_relation
+                .then(|| top_level_query_as(t, i + 1, b))
+                .flatten()
+            {
+                Some(k) => scope(t, k + 1, b, depth + 1, types),
+                None => Some((a, b)),
+            }
+        }
+        _ => Some((a, b)),
+    }
+}
+
+/// The first of `words` at parenthesis depth 0 in `t[from..to]`.
+fn top_level_word(t: &[Tok], from: usize, to: usize, words: &[&str]) -> Option<usize> {
+    let mut d = 0usize;
+    for (k, x) in t.iter().enumerate().take(to).skip(from) {
+        match x {
+            Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+            Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+            Tok::Word(w) if d == 0 && words.contains(&w.as_str()) => return Some(k),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `AS` of `CREATE … AS <query>` at depth 0 in `t[from..to]`: one
+/// followed by a query (`SELECT`, `WITH`, `VALUES`, `TABLE`, `EXECUTE`,
+/// `(`).
+fn top_level_query_as(t: &[Tok], from: usize, to: usize) -> Option<usize> {
+    let mut d = 0usize;
+    for (k, x) in t.iter().enumerate().take(to).skip(from) {
+        match x {
+            Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+            Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+            Tok::Word(w) if d == 0 && w == "as" => {
+                let next = t.get(k + 1);
+                if is_punct(next, "(")
+                    || matches!(
+                        word(next),
+                        Some("select" | "with" | "values" | "table" | "execute")
+                    )
+                {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn code_of(seg: &Segment, out: &mut PgCode) {
     let t = &seg.tokens;
     let by_start: HashMap<usize, &NameAt> = seg.names.iter().map(|n| (n.start, n)).collect();
     let aliases: HashSet<usize> = seg.aliases.iter().copied().collect();
     for (a, b) in statement_ranges(t) {
-        let s = &t[a..b];
-        let Some(m) = main_start(s) else {
+        let mut types = Vec::new();
+        let Some((lo, hi)) = scope(t, a, b, 0, &mut types) else {
             continue;
         };
-        let (lo, hi) = match word(s.get(m)) {
-            Some(
-                "select" | "table" | "values" | "insert" | "update" | "delete" | "merge" | "with",
-            ) => (a, b),
-            // `COPY (query) TO …`: the query only (the options hold
-            // keywords and literals, not code).
-            Some("copy") if is_punct(s.get(m + 1), "(") => {
-                let open = a + m + 1;
-                (open + 1, close_of(t, open).saturating_sub(1).min(b))
+        if !types.is_empty() {
+            // The `PREPARE` parameter types (before its query).
+            let mut scan = Scan {
+                t,
+                lo: a,
+                hi: b,
+                by_start: &by_start,
+                aliases: &aliases,
+                frames: vec![Frame::new(Kind::Group)],
+                pending: None,
+            };
+            for j in types {
+                scan.type_at(j, out);
             }
-            _ => continue,
-        };
+        }
         let mut scan = Scan {
             t,
             lo,
@@ -1147,8 +1288,9 @@ mod tests {
         assert!(code("SELECT relname FROM pg_class UNION SELECT 'x'").coercion);
         assert!(!code("SELECT relname FROM pg_class").coercion);
         assert!(code("SELECT relname FROM pg_class").is_empty());
-        // Utility statements are not scanned; COPY only its query.
-        assert!(code("SET search_path TO my_f(1)").is_empty());
+        // COPY: only its query; any other statement is scanned whole (fail
+        // closed).
+        assert_eq!(calls("SET search_path TO my_f(1)"), ["my_f"]);
         assert!(code("COPY pg_class TO STDOUT (FORMAT csv, DELIMITER ',')").is_empty());
         assert_eq!(
             calls("COPY (SELECT my_f() FROM pg_class) TO STDOUT WITH (FORMAT csv)"),
@@ -1159,6 +1301,65 @@ mod tests {
         // A DO body is not scanned for code (its statements are logged on
         // their own), but is for DDL.
         assert!(code("DO $$ BEGIN PERFORM my_f() FROM pg_class; END $$").is_empty());
+    }
+
+    /// Security review of #211, H1: the statements that wrap a query are
+    /// scanned from their query on.
+    #[test]
+    fn wrapped_queries() {
+        for (q, want) in [
+            (
+                "PREPARE p AS SELECT public.f() FROM pg_catalog.pg_class LIMIT 1",
+                &["public.f"][..],
+            ),
+            (
+                "EXPLAIN SELECT public.f(1) FROM pg_catalog.pg_class LIMIT 1",
+                &["public.f"][..],
+            ),
+            (
+                "EXPLAIN ANALYZE VERBOSE SELECT length(42) FROM pg_class",
+                &["length"][..],
+            ),
+            (
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT public.f() FROM pg_class",
+                &["public.f"][..],
+            ),
+            (
+                "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT public.f() FROM pg_class",
+                &["public.f"][..],
+            ),
+            (
+                "CREATE TEMP TABLE tt (a) AS SELECT public.f() FROM pg_catalog.pg_class",
+                &["public.f"][..],
+            ),
+            (
+                "CREATE UNLOGGED TABLE IF NOT EXISTS tt AS SELECT length(42) FROM pg_class \
+                 WITH NO DATA",
+                &["length"][..],
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv AS SELECT public.f() FROM pg_class",
+                &["public.f"][..],
+            ),
+            (
+                "EXPLAIN ANALYZE CREATE TABLE t AS SELECT public.f() FROM pg_class",
+                &["public.f"][..],
+            ),
+        ] {
+            assert_eq!(calls(q), want, "{q}");
+        }
+        // A `PREPARE`'s parameter types, then its query.
+        let c = code("PREPARE p (integer, public.dom) AS SELECT $1 FROM pg_class");
+        assert_eq!(
+            types("PREPARE p (integer, public.dom) AS SELECT $1 FROM pg_class"),
+            ["integer", "public.dom"]
+        );
+        assert!(c.params && c.calls.is_empty());
+        // Implied operators in a wrapped query.
+        assert_eq!(
+            ops("DECLARE c CURSOR FOR SELECT 1 FROM pg_class WHERE relname IN ('a')"),
+            ["=", "<>"]
+        );
     }
 
     #[test]

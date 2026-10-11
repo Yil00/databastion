@@ -23,12 +23,15 @@
 //! - **bound parameters** (refinement, proposed): a client types a `$n`
 //!   itself, so with a parameter in the text the names of user overloads
 //!   whose code is not C or internal are not built in whatever their
-//!   argument types.
+//!   argument types; and in a database with a user domain whose `CHECK`
+//!   calls code that is not C or internal, a statement with a parameter is `*`, unless it is exactly one of the
+//!   connector's own statements from the agent's identity
+//!   ([`Verdict::ParamDomain`], decided by the caller).
 //!
 //! A probe that failed, was cut (more than [`PROBE_MAX_NAMES`] rows), is
 //! older than [`PROBE_MAX_AGE`], is stale (a routine, type, cast or
-//! extension DDL of that database seen by the stream after it started) or
-//! has not run yet: every unqualified call, operator and cast of a
+//! extension DDL of that database seen by the stream, until two probes
+//! that both started after it have been stored) or has not run yet: every unqualified call, operator and cast of a
 //! catalog-only statement is `*` (fail closed).
 //!
 //! The probe's names stay in this module's memory: never logged, never
@@ -69,6 +72,9 @@ pub(crate) struct ProbeNames {
     pub(crate) param_functions: HashSet<String>,
     /// Operator symbols with such a user overload.
     pub(crate) param_operators: HashSet<String>,
+    /// A user domain has a constraint that calls code that is neither C
+    /// nor internal (a bound parameter of that domain runs it).
+    pub(crate) param_domain: bool,
 }
 
 impl std::fmt::Debug for ProbeNames {
@@ -82,6 +88,7 @@ impl std::fmt::Debug for ProbeNames {
             .field("implicit_cast", &self.implicit_cast)
             .field("param_functions", &self.param_functions.len())
             .field("param_operators", &self.param_operators.len())
+            .field("param_domain", &self.param_domain)
             .finish()
     }
 }
@@ -118,6 +125,7 @@ impl ProbeNames {
                 "O" => {
                     out.param_operators.insert(name);
                 }
+                "d" => out.param_domain = true,
                 _ => return None,
             }
         }
@@ -141,6 +149,10 @@ struct DbEntry {
     /// When the stream last saw a routine, type, cast or extension DDL in
     /// this database.
     stale_since: Option<Instant>,
+    /// Probes stored since the mark that started after it: the mark is
+    /// cleared at the second (security review of #211, L1: one probe may
+    /// still race the DDL's commit).
+    fresh_after_mark: u8,
 }
 
 /// Most databases remembered per target (a pgaudit log names every
@@ -193,19 +205,24 @@ impl UserCode {
         let outcome = names.map_or(Outcome::Failed, |n| Outcome::Done(Box::new(n)));
         e.probe = Some((started, server_version_num, outcome));
         if e.stale_since.is_some_and(|s| started > s) {
-            e.stale_since = None;
+            e.fresh_after_mark = e.fresh_after_mark.saturating_add(1);
+            if e.fresh_after_mark >= 2 {
+                e.stale_since = None;
+                e.fresh_after_mark = 0;
+            }
         }
     }
 
     /// The stream saw, at `now`, a routine, type, cast or extension DDL in
-    /// `database` (already executed): its probe is stale until one starts
-    /// after `now`.
+    /// `database` (already executed): its probe is stale until two probes
+    /// that started after `now` have been stored.
     pub(crate) fn mark_stale(&mut self, database: &str, now: Instant) {
         if !self.dbs.contains_key(database) && self.dbs.len() >= MAX_DATABASES {
             return;
         }
         let e = self.dbs.entry(database.to_owned()).or_default();
         e.stale_since = Some(e.stale_since.map_or(now, |s| s.max(now)));
+        e.fresh_after_mark = 0;
     }
 
     /// The view of `database` at `now`.
@@ -217,7 +234,7 @@ impl UserCode {
             return View::Unknown(None);
         };
         let lists = builtins::for_server(*version);
-        let stale = e.stale_since.is_some_and(|s| s >= *started);
+        let stale = e.stale_since.is_some();
         let old = now.saturating_duration_since(*started) > PROBE_MAX_AGE;
         match outcome {
             Outcome::Done(names) if !stale && !old => {
@@ -251,28 +268,57 @@ pub(crate) enum CodeUse {
     },
 }
 
+/// The verdict on the code of a catalog-only statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Only built-in code.
+    BuiltIn,
+    /// User code: `*`.
+    UserCode,
+    /// Only built-in code, but a bound parameter in a database with a user
+    /// domain whose `CHECK` runs code that is not C: `*` unless the
+    /// statement is exactly one of the connector's own, from the agent's
+    /// identity (the caller knows).
+    ParamDomain,
+}
+
 /// Whether a catalog-only statement reads past its relations through user
-/// code: `*`. `excluded`: the functions of decisions 1 and 7, decided by
-/// those decisions (ADR-0049 re-review N4).
+/// code (see [`Verdict`]). `excluded`: the functions of decisions 1 and
+/// 7, decided by those decisions (ADR-0049 re-review N4).
 pub(crate) fn user_code(
     code: Option<&PgCode>,
     cut: bool,
     view: &View<'_>,
     excluded: &dyn Fn(&RelationName) -> bool,
-) -> bool {
+) -> Verdict {
+    let star = |b: bool| {
+        if b {
+            Verdict::UserCode
+        } else {
+            Verdict::BuiltIn
+        }
+    };
     if cut {
-        return true;
+        return Verdict::UserCode;
     }
     let Some(code) = code else {
-        return true;
+        return Verdict::UserCode;
     };
     if code.overflow {
-        return true;
+        return Verdict::UserCode;
     }
     match view {
-        View::Everything => true,
-        View::Unknown(lists) => unknown(code, *lists, excluded),
-        View::Known(names, lists) => known(code, names, *lists, excluded),
+        View::Everything => Verdict::UserCode,
+        View::Unknown(lists) => star(unknown(code, *lists, excluded)),
+        View::Known(names, lists) => {
+            if known(code, names, *lists, excluded) {
+                Verdict::UserCode
+            } else if code.params && names.param_domain {
+                Verdict::ParamDomain
+            } else {
+                Verdict::BuiltIn
+            }
+        }
     }
 }
 
@@ -496,7 +542,7 @@ impl UserCodeHandle {
         code: Option<&PgCode>,
         cut: bool,
         excluded: &dyn Fn(&RelationName) -> bool,
-    ) -> bool {
+    ) -> Verdict {
         match &self.0 {
             Some(shared) => {
                 let guard = lock(shared);
@@ -542,12 +588,22 @@ mod tests {
         false
     }
 
+    /// Reported (`*`), the connector's exact-text exemption not applying.
+    fn uc(
+        code: Option<&PgCode>,
+        cut: bool,
+        view: &View<'_>,
+        excluded: &dyn Fn(&RelationName) -> bool,
+    ) -> bool {
+        user_code(code, cut, view, excluded) != Verdict::BuiltIn
+    }
+
     /// The verdict on `text` with a probe of `rows` on PostgreSQL 16.
     fn star(text: &str, rows: &[(&str, &str)]) -> bool {
         let mut u = UserCode::default();
         u.store("shop", Instant::now(), 160_013, Some(names(rows)));
         let code = pg_scan(text).unwrap().code();
-        user_code(Some(&code), false, &u.view("shop", Instant::now()), &none)
+        uc(Some(&code), false, &u.view("shop", Instant::now()), &none)
     }
 
     #[test]
@@ -597,8 +653,8 @@ mod tests {
         u.store("a", now, 160_013, Some(names(&colliding)));
         u.store("b", now, 160_013, Some(names(&[])));
         let code = pg_scan("SELECT length(42) FROM pg_class").unwrap().code();
-        assert!(user_code(Some(&code), false, &u.view("a", now), &none));
-        assert!(!user_code(Some(&code), false, &u.view("b", now), &none));
+        assert!(uc(Some(&code), false, &u.view("a", now), &none));
+        assert!(!uc(Some(&code), false, &u.view("b", now), &none));
         // Operators, types, explicit casts.
         assert!(star("SELECT 1 + 1 FROM pg_class", &[("o", "+")]));
         assert!(star("SELECT 1 FROM pg_class WHERE 1 IN (1)", &[("o", "=")]));
@@ -641,6 +697,71 @@ mod tests {
         assert!(star("SELECT 1 FROM pg_class WHERE relname = $1", &rows));
     }
 
+    /// Security review of #211, M1: a parameter in a database with a user
+    /// domain whose CHECK runs non-C code.
+    #[test]
+    fn parameters_and_checked_domains() {
+        let mut u = UserCode::default();
+        let now = Instant::now();
+        u.store("shop", now, 160_013, Some(names(&[("d", "")])));
+        let v = u.view("shop", now);
+        let with = pg_scan("SELECT relname FROM pg_class WHERE relname = $1")
+            .unwrap()
+            .code();
+        let without = pg_scan("SELECT relname FROM pg_class WHERE relname = 'x'")
+            .unwrap()
+            .code();
+        assert_eq!(
+            user_code(Some(&with), false, &v, &none),
+            Verdict::ParamDomain
+        );
+        assert_eq!(
+            user_code(Some(&without), false, &v, &none),
+            Verdict::BuiltIn
+        );
+        // User code first: plain `*`.
+        let both = pg_scan("SELECT my_f($1) FROM pg_class").unwrap().code();
+        assert_eq!(user_code(Some(&both), false, &v, &none), Verdict::UserCode);
+        // Not without the flag.
+        assert!(!star("SELECT 1 FROM pg_class WHERE relname = $1", &[]));
+    }
+
+    /// Security review of #211, L3: colliding operators reached through
+    /// keywords and `USING`.
+    #[test]
+    fn colliding_operators_behind_keywords() {
+        for (q, op) in [
+            ("SELECT 1 FROM pg_class WHERE relname IN ('a', 'b')", "="),
+            ("SELECT 1 FROM pg_class WHERE relname NOT IN ('a')", "<>"),
+            (
+                "SELECT 1 FROM pg_class WHERE relname IS DISTINCT FROM 'a'",
+                "=",
+            ),
+            (
+                "SELECT 1 FROM pg_class WHERE relname IS NOT DISTINCT FROM 'a'",
+                "=",
+            ),
+            ("SELECT CASE relkind WHEN 'r' THEN 1 END FROM pg_class", "="),
+            ("SELECT relname FROM pg_class ORDER BY relname USING <", "<"),
+            (
+                "SELECT relname FROM pg_class ORDER BY relname USING ~<~",
+                "~<~",
+            ),
+            (
+                "SELECT pg_catalog.array_agg(relname ORDER BY relname USING >) FROM pg_class",
+                ">",
+            ),
+        ] {
+            assert!(star(q, &[("o", op)]), "{q}");
+            assert!(!star(q, &[]), "{q}");
+        }
+        // A searched CASE compares with no operator.
+        assert!(!star(
+            "SELECT CASE WHEN relhasindex THEN 1 END FROM pg_class",
+            &[("o", "=")]
+        ));
+    }
+
     #[test]
     fn decisions_1_and_7_are_left_to_them() {
         let mut u = UserCode::default();
@@ -649,9 +770,9 @@ mod tests {
         let code = pg_scan("SELECT s.calls FROM public.pg_stat_statements(false) s, pg_class")
             .unwrap()
             .code();
-        assert!(user_code(Some(&code), false, &view, &none));
+        assert!(uc(Some(&code), false, &view, &none));
         let pss = |r: &RelationName| r.name == "pg_stat_statements";
-        assert!(!user_code(Some(&code), false, &view, &pss));
+        assert!(!uc(Some(&code), false, &view, &pss));
     }
 
     #[test]
@@ -671,15 +792,15 @@ mod tests {
         // Not run yet.
         let v = u.view("shop", t0);
         assert!(matches!(v, View::Unknown(None)));
-        assert!(user_code(Some(&unqualified), false, &v, &none));
-        assert!(user_code(Some(&operator), false, &v, &none));
-        assert!(!user_code(Some(&plain), false, &v, &none));
+        assert!(uc(Some(&unqualified), false, &v, &none));
+        assert!(uc(Some(&operator), false, &v, &none));
+        assert!(!uc(Some(&plain), false, &v, &none));
         // Failed (or cut).
         u.store("shop", t0, 160_013, None);
         let v = u.view("shop", t0);
         assert!(matches!(v, View::Unknown(Some(_))));
-        assert!(user_code(Some(&unqualified), false, &v, &none));
-        assert!(!user_code(Some(&qualified), false, &v, &none));
+        assert!(uc(Some(&unqualified), false, &v, &none));
+        assert!(!uc(Some(&qualified), false, &v, &none));
         // Cut: more rows than the bound.
         assert!(
             ProbeNames::from_rows((0..=PROBE_MAX_NAMES).map(|k| ("f".to_owned(), k.to_string())))
@@ -692,20 +813,10 @@ mod tests {
         // Done, then stale after a DDL, fresh again after a later probe.
         let t1 = t0 + Duration::from_secs(1);
         u.store("shop", t1, 160_013, Some(ProbeNames::default()));
-        assert!(!user_code(
-            Some(&unqualified),
-            false,
-            &u.view("shop", t1),
-            &none
-        ));
+        assert!(!uc(Some(&unqualified), false, &u.view("shop", t1), &none));
         let t2 = t1 + Duration::from_secs(1);
         u.mark_stale("shop", t2);
-        assert!(user_code(
-            Some(&unqualified),
-            false,
-            &u.view("shop", t2),
-            &none
-        ));
+        assert!(uc(Some(&unqualified), false, &u.view("shop", t2), &none));
         // A probe that started before the mark does not clear it.
         u.store(
             "shop",
@@ -713,31 +824,26 @@ mod tests {
             160_013,
             Some(ProbeNames::default()),
         );
-        assert!(user_code(
-            Some(&unqualified),
-            false,
-            &u.view("shop", t2),
-            &none
-        ));
+        assert!(uc(Some(&unqualified), false, &u.view("shop", t2), &none));
+        // Security review of #211, L1: one probe after the mark is not
+        // enough (it may race the DDL's commit); the second clears it.
+        let t25 = t2 + Duration::from_millis(500);
+        u.store("shop", t25, 160_013, Some(ProbeNames::default()));
+        assert!(uc(Some(&unqualified), false, &u.view("shop", t25), &none));
+        // A new mark restarts the count.
+        u.mark_stale("shop", t25 + Duration::from_millis(1));
+        let t26 = t25 + Duration::from_millis(2);
+        u.store("shop", t26, 160_013, Some(ProbeNames::default()));
+        assert!(uc(Some(&unqualified), false, &u.view("shop", t26), &none));
         let t3 = t2 + Duration::from_secs(1);
         u.store("shop", t3, 160_013, Some(ProbeNames::default()));
-        assert!(!user_code(
-            Some(&unqualified),
-            false,
-            &u.view("shop", t3),
-            &none
-        ));
+        assert!(!uc(Some(&unqualified), false, &u.view("shop", t3), &none));
         // Too old.
         let late = t3 + PROBE_MAX_AGE + Duration::from_secs(1);
-        assert!(user_code(
-            Some(&unqualified),
-            false,
-            &u.view("shop", late),
-            &none
-        ));
+        assert!(uc(Some(&unqualified), false, &u.view("shop", late), &none));
         // A cut text or an unscanned one.
-        assert!(user_code(Some(&plain), true, &u.view("shop", t3), &none));
-        assert!(user_code(None, false, &u.view("shop", t3), &none));
+        assert!(uc(Some(&plain), true, &u.view("shop", t3), &none));
+        assert!(uc(None, false, &u.view("shop", t3), &none));
         // A stale implicit cast stays "everything".
         let t4 = t3 + Duration::from_secs(1);
         u.store("shop", t4, 160_013, Some(names(&[("i", "text")])));
@@ -757,9 +863,9 @@ mod tests {
         let code = pg_scan("SELECT pg_catalog.length(relname) FROM pg_class")
             .unwrap()
             .code();
-        assert!(user_code(Some(&code), false, &v, &none));
+        assert!(uc(Some(&code), false, &v, &none));
         let code = pg_scan("SELECT relname FROM pg_class").unwrap().code();
-        assert!(!user_code(Some(&code), false, &v, &none));
+        assert!(!uc(Some(&code), false, &v, &none));
     }
 
     #[test]
