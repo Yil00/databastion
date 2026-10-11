@@ -819,9 +819,34 @@ pub(crate) const PS_HISTORY: &str =
 pub(crate) const PS_CURRENT: &str =
     "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current";
 
-/// Thread id of this session in `performance_schema` (Audit).
-pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
+/// Thread id of this session in `performance_schema`, and the server's
+/// identity read in the same statement (`audit::own_threads::ServerRun`):
+/// sent once per Audit poll session (and again after a server restart).
+/// Columns: thread id, `@@hostname`, `@@port`, `@@server_id`.
+pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID, @@hostname, @@port, @@server_id FROM performance_schema.threads t \
      WHERE t.PROCESSLIST_ID = CONNECTION_ID()";
+
+/// A Discovery session's pin (`audit::own_threads`), sent right before
+/// [`PS_OWN_PIN`]: a session user variable holding a random nonce (32
+/// hexadecimal digits). A session `SET` of a user variable produces no
+/// event (`audit::events::is_quiet`).
+#[must_use]
+pub(crate) fn ps_pin_variable(nonce: &str) -> Option<String> {
+    (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("SET @databastion_pin = '{nonce}'"))
+}
+
+/// A Discovery session's `performance_schema` thread id, found by the
+/// nonce of [`ps_pin_variable`] in `user_variables_by_thread` (neither a
+/// statement-text nor a statistics table: MariaDB has no
+/// `PS_CURRENT_THREAD_ID()`, and a read of `threads` from a session that
+/// has ended when the poll sees it could not be told from anyone else's),
+/// with the server's identity, in one statement. The pin needs exactly one
+/// row (another session holding the same value makes it fail closed).
+/// Columns: thread id, `@@hostname`, `@@port`, `@@server_id`.
+pub(crate) const PS_OWN_PIN: &str = "SELECT u.THREAD_ID, @@hostname, @@port, @@server_id \
+     FROM performance_schema.user_variables_by_thread u \
+     WHERE u.VARIABLE_NAME = 'databastion_pin' AND u.VARIABLE_VALUE = @databastion_pin";
 
 /// Seconds since the server started (`SHOW GLOBAL STATUS` needs no
 /// privilege). With the agent's clock it gives the server's start time,
@@ -958,6 +983,7 @@ pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)>
         (PS_HISTORY.to_owned(), vec!["events_statements_history"]),
         (PS_CURRENT.to_owned(), vec!["events_statements_current"]),
         (PS_OWN_THREAD.to_owned(), vec!["threads"]),
+        (PS_OWN_PIN.to_owned(), vec!["user_variables_by_thread"]),
     ];
     for table in PS_POLL_TABLES {
         v.push((
@@ -1373,6 +1399,7 @@ mod tests {
         }
         all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
         all.push(ps_poll_variables(u64::MAX));
+        all.extend(ps_pin_variable(&"f".repeat(32)));
         all.push(kill_query(u32::MAX));
         all.extend(cas_guard_statement_texts(None).unwrap());
         for roles in role_lists() {
@@ -1529,7 +1556,7 @@ mod tests {
     fn the_poll_texts_are_constant_and_their_tables_listed() {
         use databastion_classifiers::query::{AnalyzeOptions, analyze};
         let own = own_performance_schema_reads();
-        assert_eq!(own.len(), 5 + 3 * 3);
+        assert_eq!(own.len(), 6 + 3 * 3);
         let texts: std::collections::HashSet<&str> = own.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(texts.len(), own.len(), "texts are distinct");
         for (text, tables) in &own {
@@ -1575,6 +1602,21 @@ mod tests {
             }
             assert!(server_audit_escaped_len(&set) <= MAX_OWN_STATEMENT);
         }
+        // The Discovery pin's variable: a nonce of 32 hexadecimal digits
+        // only, quiet, naming no table.
+        let nonce = "0123456789abcdef0123456789ABCDEF";
+        let set = ps_pin_variable(nonce).unwrap();
+        assert_eq!(set, format!("SET @databastion_pin = '{nonce}'"));
+        let a = analyze(&set, AnalyzeOptions::mysql());
+        assert!(a.lexed(), "{set}");
+        for p in a.parts() {
+            assert!(p.relations.is_empty(), "{set}");
+            assert!(crate::audit::events::is_quiet(p), "{set}");
+        }
+        for bad in ["", "abc", "0123456789abcdef0123456789abcdeg", "x' OR '1"] {
+            assert!(ps_pin_variable(bad).is_none(), "{bad}");
+        }
+        assert!(ps_pin_variable(&"0".repeat(33)).is_none());
         assert_eq!(
             PS_POLL_TABLES.map(|t| t.to_owned()),
             [

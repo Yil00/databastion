@@ -40,9 +40,15 @@
 //! The sessions' accounts are not persisted: a statement of a session that
 //! ended while the agent was stopped is reported as an unidentified
 //! account.
+//!
+//! The agent's own sessions that ended ([`super::own_threads`]): the rows
+//! of its poll sessions on the same server run (another stream's, or this
+//! stream's before it reconnected) are dropped, as the poll text drops its
+//! own session's; the rows of the target's pinned Discovery sessions are
+//! attributed to the agent's identity.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{ClientAddr, EventPrincipal, EventSource};
 use databastion_core::audit::CursorStore;
@@ -52,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::events::{Access, EventBuilder};
+use super::own_threads::{ServerRun, SharedPins, SharedPollThreads};
 use crate::conn::{Flow, Session, Streamed};
 use crate::error::{MyError, Stage};
 use crate::sql;
@@ -127,7 +134,7 @@ impl From<MyError> for PollError {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ThreadInfo {
     user: String,
     host: String,
@@ -307,6 +314,41 @@ pub(crate) struct PsPoller {
     floor: Option<u64>,
     /// The cursor last saved.
     saved: Option<Saved>,
+    /// The agent's own sessions (see [`super::own_threads`]).
+    own: OwnSessions,
+    /// The server run of the poll session (`None`: unknown; no own
+    /// session is then recognized).
+    run: Option<ServerRun>,
+    /// The agent's address as the server sees it.
+    own_addr: Option<ClientAddr>,
+    /// Rows of the agent's ended poll sessions dropped.
+    pub(crate) own_dropped: u64,
+    /// Rows attributed to the agent through a Discovery pin.
+    pub(crate) pinned: u64,
+}
+
+/// What the poller needs to know the agent's own sessions.
+pub(crate) struct OwnSessions {
+    /// The agent's account (`targets[].account`).
+    pub(crate) account: String,
+    /// The poll sessions of every stream of the connector.
+    pub(crate) poll_threads: SharedPollThreads,
+    /// The target's Discovery pins.
+    pub(crate) pins: SharedPins,
+}
+
+/// How a statement row's session is seen (see [`PsPoller::identify`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Seen {
+    /// One of the agent's poll sessions: no event.
+    Drop,
+    /// The session, when known, and its client address; `own`: a pinned
+    /// Discovery session of the agent (`Access::own_session`).
+    As {
+        info: Option<ThreadInfo>,
+        client: Option<ClientAddr>,
+        own: bool,
+    },
 }
 
 fn unix_now() -> u64 {
@@ -315,9 +357,9 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The server's start time: now minus `Uptime`.
-async fn server_boot(session: &mut Session) -> Result<Option<u64>, MyError> {
-    let rows = match session.query(Stage::Audit, sql::SERVER_UPTIME).await {
+/// Seconds since the server started (`Uptime`).
+async fn server_uptime(session: &mut Session, stage: Stage) -> Result<Option<u64>, MyError> {
+    let rows = match session.query(stage, sql::SERVER_UPTIME).await {
         Ok(rows) => rows,
         Err(e) if !e.fatal => return Ok(None),
         Err(e) => return Err(e),
@@ -325,8 +367,52 @@ async fn server_boot(session: &mut Session) -> Result<Option<u64>, MyError> {
     Ok(rows
         .first()
         .and_then(|r| r.get(1).cloned().flatten())
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.parse::<u64>().ok()))
+}
+
+/// The server's start time: now minus `Uptime`.
+async fn server_boot(session: &mut Session) -> Result<Option<u64>, MyError> {
+    Ok(server_uptime(session, Stage::Audit)
+        .await?
         .map(|uptime| unix_now().saturating_sub(uptime)))
+}
+
+/// A session of the agent as `performance_schema` shows it.
+pub(crate) struct OwnSession {
+    /// Its `performance_schema` thread id.
+    pub(crate) thread: u64,
+    /// The server run (`None`: identity or start time unknown).
+    pub(crate) run: Option<ServerRun>,
+    /// Seconds the server had been up (0 when unknown).
+    pub(crate) uptime: u64,
+}
+
+/// This session's thread id and server run (`sql::PS_OWN_THREAD`, then
+/// `Uptime`). `Ok(None)` when its thread is not readable.
+async fn own_session(session: &mut Session, stage: Stage) -> Result<Option<OwnSession>, MyError> {
+    let rows = match session.query(stage, sql::PS_OWN_THREAD).await {
+        Ok(rows) => rows,
+        Err(e) if !e.fatal => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(thread) = row
+        .first()
+        .cloned()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return Ok(None);
+    };
+    let uptime = server_uptime(session, stage).await?;
+    let run = uptime.and_then(|u| ServerRun::new(row.get(1..4)?, unix_now().saturating_sub(u)));
+    Ok(Some(OwnSession {
+        thread,
+        run,
+        uptime: uptime.unwrap_or(0),
+    }))
 }
 
 /// Where polling resumes after a restart: `(last, seen, floor)`.
@@ -409,14 +495,64 @@ async fn scalar(session: &mut Session, statement: &str) -> Result<Option<String>
     }
 }
 
+/// A random nonce for [`sql::ps_pin_variable`] (32 hexadecimal digits),
+/// from the TLS provider's random source.
+fn pin_nonce() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A Discovery session's thread id and server run, through the nonce
+/// variable of [`sql::ps_pin_variable`] (see [`sql::PS_OWN_PIN`]).
+/// `Ok(None)` unless exactly one thread holds the nonce.
+pub(crate) async fn pinned_session(
+    session: &mut Session,
+    stage: Stage,
+) -> Result<Option<OwnSession>, MyError> {
+    let Some(set) = pin_nonce().as_deref().and_then(sql::ps_pin_variable) else {
+        return Ok(None);
+    };
+    match session.exec(stage, &set).await {
+        Ok(_) => {}
+        Err(e) if !e.fatal => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let rows = match session.query(stage, sql::PS_OWN_PIN).await {
+        Ok(rows) => rows,
+        Err(e) if !e.fatal => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let [row] = rows.as_slice() else {
+        return Ok(None);
+    };
+    let Some(thread) = row
+        .first()
+        .cloned()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return Ok(None);
+    };
+    let ident = row.get(1..4).map(<[Option<String>]>::to_vec);
+    let uptime = server_uptime(session, stage).await?;
+    let run = uptime.and_then(|u| ServerRun::new(ident.as_deref()?, unix_now().saturating_sub(u)));
+    Ok(Some(OwnSession {
+        thread,
+        run,
+        uptime: uptime.unwrap_or(0),
+    }))
+}
+
 /// This session's thread is visible in `performance_schema.threads`: the
 /// poll texts find it there by `CONNECTION_ID()` (`sql::PS_OWN_THREAD_EXPR`)
 /// to leave it out; without it the source is unsupported.
-async fn own_thread(session: &mut Session) -> Result<(), MyError> {
-    scalar(session, sql::PS_OWN_THREAD)
+async fn own_thread(session: &mut Session) -> Result<OwnSession, MyError> {
+    own_session(session, Stage::Audit)
         .await?
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(drop)
         .ok_or(MyError::new(FailureCode::Unsupported, Stage::Audit))
 }
 
@@ -429,8 +565,9 @@ impl PsPoller {
         table: PsTable,
         builder: EventBuilder,
         store: Option<CursorStore>,
+        own: OwnSessions,
     ) -> Result<Self, MyError> {
-        own_thread(session).await?;
+        let attached = own_thread(session).await?;
         let limit = |v: Option<String>| {
             v.and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_TEXT_LIMIT)
@@ -466,7 +603,7 @@ impl PsPoller {
             }
             saved = None;
         }
-        Ok(Self {
+        let mut poller = Self {
             table,
             text_limit,
             digest_limit,
@@ -482,7 +619,27 @@ impl PsPoller {
             boot,
             floor,
             saved,
-        })
+            own,
+            run: None,
+            own_addr: None,
+            own_dropped: 0,
+            pinned: 0,
+        };
+        poller.note_own(attached);
+        Ok(poller)
+    }
+
+    /// The poll session's server run, and its thread noted as one of the
+    /// agent's poll sessions (`own_threads::PollThreads`).
+    fn note_own(&mut self, own: OwnSession) {
+        if let Some(run) = &own.run {
+            self.own
+                .poll_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note(run, own.uptime, own.thread);
+        }
+        self.run = own.run;
     }
 
     /// Saves the cursor when it moved (after the poll's events were handed
@@ -509,13 +666,84 @@ impl PsPoller {
     /// The agent's address as the server sees it (refreshed at each
     /// re-probe).
     pub(crate) fn set_own_addr(&mut self, addr: Option<ClientAddr>) {
+        self.own_addr = addr;
         self.builder.set_own_addr(addr);
     }
 
     /// Re-attaches the poller to a new session (reconnection): the
-    /// cursor is kept, the own thread is read again.
+    /// cursor is kept, the own thread is read again and noted.
     pub(crate) async fn reattach(&mut self, session: &mut Session) -> Result<(), MyError> {
-        own_thread(session).await
+        let own = own_thread(session).await?;
+        self.note_own(own);
+        Ok(())
+    }
+
+    /// How the session of a statement row of `thread` is seen (`live`: its
+    /// `threads` row, while it is connected):
+    /// - one of the agent's poll sessions on this server run, with no
+    ///   account or the agent's: dropped (a session connected under
+    ///   another account is never one of them);
+    /// - connected: as it is (and remembered);
+    /// - ended: as remembered, else, when the thread is a live Discovery
+    ///   pin of this server run, the agent's identity with the account
+    ///   of the pinning target (its address as the server sees it, its
+    ///   `program_name`), else unknown.
+    ///
+    /// `own` (`Access::own_session`): the thread is a live pin and the
+    /// session's account is the pin's.
+    fn identify(&mut self, thread: u64, live: Option<&ThreadInfo>, now: Instant) -> Seen {
+        let other_account = live.is_some_and(|i| i.user != self.own.account);
+        if let Some(run) = &self.run
+            && !other_account
+            && self
+                .own
+                .poll_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(run, thread)
+        {
+            return Seen::Drop;
+        }
+        let pin = self.run.as_ref().and_then(|run| {
+            self.own
+                .pins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .matches(run, thread, now)
+        });
+        let known = match live {
+            Some(i) => {
+                self.remember(thread, i);
+                Some(i.clone())
+            }
+            None => self.threads.get(&thread).cloned(),
+        };
+        if let Some(i) = known {
+            let own = pin.as_deref() == Some(i.user.as_str());
+            let client = ClientAddr::parse(&i.host);
+            return Seen::As {
+                info: Some(i),
+                client,
+                own,
+            };
+        }
+        if let Some(account) = pin {
+            self.pinned = self.pinned.saturating_add(1);
+            return Seen::As {
+                info: Some(ThreadInfo {
+                    user: account,
+                    host: String::new(),
+                    program: Some(super::PROGRAM_NAME.to_owned()),
+                }),
+                client: self.own_addr,
+                own: true,
+            };
+        }
+        Seen::As {
+            info: None,
+            client: None,
+            own: false,
+        }
     }
 
     fn remember(&mut self, thread: u64, info: &ThreadInfo) {
@@ -628,8 +856,14 @@ impl PsPoller {
             last = 0;
             self.seen.clear();
             self.floor = None;
-            // A new server run: its start time goes with the cursor.
+            // A new server run: its start time goes with the cursor, its
+            // thread ids are new (the sessions remembered and the server
+            // run are the old run's).
             self.boot = server_boot(session).await?;
+            self.threads.clear();
+            self.thread_order.clear();
+            let own = own_thread(session).await?;
+            self.note_own(own);
         }
         if self.table == PsTable::HistoryLong && last > 0 && min.is_some_and(|m| m > last) {
             self.wrapped += 1;
@@ -652,6 +886,7 @@ impl PsPoller {
             from = from.max(floor);
         }
         let mut events = Vec::new();
+        let mono = Instant::now();
         for _ in 0..MAX_BATCHES {
             let rows = self.read_rows(session, from).await?;
             let full = rows.len() >= BATCH;
@@ -665,47 +900,11 @@ impl PsPoller {
                 if r.background {
                     continue;
                 }
-                let info = match &r.thread_info {
-                    Some(i) => {
-                        self.remember(r.thread, i);
-                        Some(i.clone())
-                    }
-                    None => self.threads.get(&r.thread).cloned(),
-                };
-                let client = info.as_ref().and_then(|i| ClientAddr::parse(&i.host));
-                let principal = match &info {
-                    Some(i) => {
-                        let p = EventPrincipal::account(&i.user).with_client(client);
-                        match &i.program {
-                            Some(prog) => p.with_application(prog),
-                            None => p,
-                        }
-                    }
-                    None => EventPrincipal::unidentified(),
-                };
-                let access = Access {
-                    session: format!("t{}", r.thread),
-                    user: info.as_ref().map_or("", |i| i.user.as_str()),
-                    principal,
-                    client: ClientSeen::Logged(client),
-                    application: info.as_ref().and_then(|i| i.program.as_deref()),
-                    database: &r.schema,
-                    text: r.text.as_deref().map(Vec::as_slice),
-                    opaque: false,
-                    alt_text: r.alt.as_deref().map(Vec::as_slice),
-                    digest: r.digest,
-                    truncated: r.truncated,
-                    tables: Vec::new(),
-                    rows: Some(r.rows),
-                    status: r.errno,
-                    ts: ts_of(r.timer_end),
-                    source: EventSource::PerformanceSchema,
-                };
                 // Per-statement isolation: a statement that makes the
                 // conversion panic is dropped alone and counted (the
                 // cursor is persisted, so a panic that ended the stream
                 // would come back at every restart).
-                match convert(&mut self.builder, access, now) {
+                match self.row_event(&r, ts_of(r.timer_end), mono, now) {
                     Ok(Some(e)) => events.push(e),
                     Ok(None) => {}
                     Err(()) => self.panicked = self.panicked.saturating_add(1),
@@ -724,6 +923,57 @@ impl PsPoller {
         }
         self.save();
         Ok(())
+    }
+}
+
+impl PsPoller {
+    /// The event of one statement row, if any: its session seen by
+    /// [`Self::identify`], then converted in isolation ([`convert`]).
+    fn row_event(
+        &mut self,
+        r: &Row,
+        ts: SystemTime,
+        mono: Instant,
+        now: SystemTime,
+    ) -> Result<Option<databastion_classifiers::masking::MaskedEvent>, ()> {
+        let (info, client, own_session) =
+            match self.identify(r.thread, r.thread_info.as_ref(), mono) {
+                Seen::Drop => {
+                    self.own_dropped = self.own_dropped.saturating_add(1);
+                    return Ok(None);
+                }
+                Seen::As { info, client, own } => (info, client, own),
+            };
+        let principal = match &info {
+            Some(i) => {
+                let p = EventPrincipal::account(&i.user).with_client(client);
+                match &i.program {
+                    Some(prog) => p.with_application(prog),
+                    None => p,
+                }
+            }
+            None => EventPrincipal::unidentified(),
+        };
+        let access = Access {
+            session: format!("t{}", r.thread),
+            user: info.as_ref().map_or("", |i| i.user.as_str()),
+            principal,
+            client: ClientSeen::Logged(client),
+            application: info.as_ref().and_then(|i| i.program.as_deref()),
+            database: &r.schema,
+            text: r.text.as_deref().map(Vec::as_slice),
+            opaque: false,
+            alt_text: r.alt.as_deref().map(Vec::as_slice),
+            digest: r.digest,
+            truncated: r.truncated,
+            tables: Vec::new(),
+            rows: Some(r.rows),
+            status: r.errno,
+            ts,
+            source: EventSource::PerformanceSchema,
+            own_session,
+        };
+        convert(&mut self.builder, access, now)
     }
 }
 
@@ -1004,6 +1254,7 @@ mod tests {
             status: 0,
             ts: SystemTime::now(),
             source: EventSource::PerformanceSchema,
+            own_session: false,
         };
         let now = SystemTime::now();
         assert!(
@@ -1018,5 +1269,357 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(e.principal().account_name(), "app");
+    }
+
+    mod own_sessions {
+        use super::*;
+        use crate::audit::own_threads::{DiscoveryPins, PollThreads};
+        use databastion_classifiers::masking::{EventAction, MaskedEvent};
+        use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+        use std::sync::{Arc, Mutex};
+
+        const AGENT: &str = "databastion";
+        const BUDGET: u64 = 10;
+
+        fn run(boot: u64) -> ServerRun {
+            ServerRun::new(
+                &[
+                    Some("db1".to_owned()),
+                    Some("3306".to_owned()),
+                    Some("1".to_owned()),
+                ],
+                boot,
+            )
+            .unwrap()
+        }
+
+        fn addr() -> Option<ClientAddr> {
+            ClientAddr::parse("172.18.0.1")
+        }
+
+        struct Fixture {
+            poller: PsPoller,
+            polls: SharedPollThreads,
+            pins: SharedPins,
+            usage: SharedOwnUsage,
+            credits: crate::audit::credits::SharedCredits,
+        }
+
+        fn fixture(poller_run: Option<ServerRun>, own_addr: Option<ClientAddr>) -> Fixture {
+            let usage = SharedOwnUsage::default();
+            let credits = crate::audit::credits::SharedCredits::default();
+            let builder = EventBuilder::new(OwnAccount::new(
+                AGENT,
+                Some(crate::audit::PROGRAM_NAME),
+                own_addr,
+                BUDGET,
+                Arc::clone(&usage),
+            ))
+            .with_flavor(crate::conn::Flavor::Mariadb)
+            .with_sample_credits(Arc::clone(&credits));
+            let polls: SharedPollThreads = Arc::new(Mutex::new(PollThreads::default()));
+            let pins: SharedPins = Arc::new(Mutex::new(DiscoveryPins::default()));
+            let poller = PsPoller {
+                table: PsTable::HistoryLong,
+                text_limit: 1024,
+                digest_limit: 1024,
+                with_program: true,
+                last: Some(0),
+                seen: HashMap::new(),
+                threads: HashMap::new(),
+                thread_order: VecDeque::new(),
+                builder,
+                wrapped: 0,
+                panicked: 0,
+                store: None,
+                boot: None,
+                floor: None,
+                saved: None,
+                own: OwnSessions {
+                    account: AGENT.to_owned(),
+                    poll_threads: Arc::clone(&polls),
+                    pins: Arc::clone(&pins),
+                },
+                run: poller_run,
+                own_addr,
+                own_dropped: 0,
+                pinned: 0,
+            };
+            Fixture {
+                poller,
+                polls,
+                pins,
+                usage,
+                credits,
+            }
+        }
+
+        fn info(user: &str) -> ThreadInfo {
+            ThreadInfo {
+                user: user.to_owned(),
+                host: "172.18.0.1".to_owned(),
+                program: (user == AGENT).then(|| crate::audit::PROGRAM_NAME.to_owned()),
+            }
+        }
+
+        fn row(thread: u64, text: &str, rows: u64, live: Option<ThreadInfo>) -> Row {
+            Row {
+                thread,
+                event: 1,
+                timer_end: 1,
+                schema: "hr".to_owned(),
+                text: Some(Zeroizing::new(text.as_bytes().to_vec())),
+                truncated: false,
+                alt: None,
+                digest: false,
+                rows,
+                errno: 0,
+                thread_info: live,
+                background: false,
+            }
+        }
+
+        fn event(f: &mut Fixture, r: &Row, mono: Instant) -> Option<MaskedEvent> {
+            let now = SystemTime::now();
+            f.poller.row_event(r, now, mono, now).unwrap()
+        }
+
+        fn unidentified(e: &MaskedEvent) -> bool {
+            !e.principal().send_name() && e.principal().account_name().is_empty()
+        }
+
+        /// Security review of #186, L1: the rows of an ended poll session
+        /// of the agent (a reconnected or restarted stream, a sibling
+        /// stream) are dropped on the same server run only, never when the
+        /// thread is connected under another account.
+        #[test]
+        fn ended_poll_sessions_of_the_agent_are_dropped() {
+            let poll_text = crate::sql::ps_statements("events_statements_history_long", true);
+            let mono = Instant::now();
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            f.polls.lock().unwrap().note(&run(1_000_001), 3600, 7);
+            // Ended, and still connected under the agent's account.
+            assert!(event(&mut f, &row(7, &poll_text, 3, None), mono).is_none());
+            assert!(event(&mut f, &row(7, &poll_text, 3, Some(info(AGENT))), mono).is_none());
+            // Any text of that session (it only sends the connector's).
+            assert!(event(&mut f, &row(7, "SELECT 1 FROM hr.customers", 1, None), mono).is_none());
+            assert_eq!(f.poller.own_dropped, 3);
+            // Connected under another account: not the agent's session.
+            let e = event(&mut f, &row(7, &poll_text, 3, Some(info("app"))), mono).unwrap();
+            assert_eq!(e.principal().account_name(), "app");
+            assert!(e.always_report());
+            // Another thread, ended: unidentified, always reported.
+            let e = event(&mut f, &row(8, &poll_text, 3, None), mono).unwrap();
+            assert!(unidentified(&e) && e.always_report());
+            // Another server run (restarted, or another server).
+            let mut g = fixture(Some(run(1_000_100)), addr());
+            g.polls.lock().unwrap().note(&run(1_000_000), 3600, 7);
+            let e = event(&mut g, &row(7, &poll_text, 3, None), mono).unwrap();
+            assert!(unidentified(&e));
+            // The poll session's server run unknown: nothing dropped.
+            let mut h = fixture(None, addr());
+            h.polls.lock().unwrap().note(&run(1_000_000), 3600, 7);
+            assert!(event(&mut h, &row(7, &poll_text, 3, None), mono).is_some());
+            assert_eq!(h.poller.own_dropped, 0);
+        }
+
+        /// Security review of #197, M3: the rows of an ended Discovery
+        /// session pinned for the target are the agent's: its reads are
+        /// charged to the own budget (left out within it, reported past
+        /// it); writes, DDL, statement-text and statistics reads stay
+        /// always reported; a pin is matched on its server run only, and
+        /// expires two polls after its scan.
+        #[test]
+        fn pinned_discovery_sessions_are_the_agents() {
+            let mono = Instant::now();
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            {
+                let mut p = f.pins.lock().unwrap();
+                p.stream_started("t1", Duration::from_secs(1));
+                assert!(p.pin("t1", AGENT, &run(1_000_002), 3600, 9, mono));
+            }
+            let sample = "SELECT `email` FROM `hr`.`customers` LIMIT 10";
+            // Within the budget: left out, and charged.
+            assert!(event(&mut f, &row(9, sample, 6, None), mono).is_none());
+            assert_eq!(f.poller.pinned, 1);
+            let charged = f.usage.lock().unwrap().budgeted_objects();
+            assert!(
+                charged.iter().any(|k| k.ends_with("customers")),
+                "{charged:?}"
+            );
+            // Past it: reported, under the agent's account and address.
+            let e = event(&mut f, &row(9, sample, 6, None), mono).unwrap();
+            assert_eq!(e.principal().account_name(), AGENT);
+            assert!(e.principal().send_name());
+            assert_eq!(e.principal().client(), addr());
+            assert_eq!(e.action(), EventAction::Read);
+            // Writes, DDL, statement-text and statistics reads: always.
+            for (text, action) in [
+                (
+                    "UPDATE hr.customers SET email = 'x' WHERE id = 1",
+                    EventAction::Write,
+                ),
+                ("DROP TABLE hr.customers", EventAction::Ddl),
+                (
+                    "SELECT SQL_TEXT FROM performance_schema.events_statements_history_long",
+                    EventAction::Read,
+                ),
+                (
+                    "SELECT min_value FROM mysql.column_stats",
+                    EventAction::Read,
+                ),
+            ] {
+                let e =
+                    event(&mut f, &row(9, text, 1, None), mono).unwrap_or_else(|| panic!("{text}"));
+                assert_eq!(e.principal().account_name(), AGENT, "{text}");
+                assert_eq!(e.action(), action, "{text}");
+            }
+            // Not pinned, or connected under another account.
+            assert!(unidentified(
+                &event(&mut f, &row(10, sample, 1, None), mono).unwrap()
+            ));
+            // Another server run: not matched.
+            let mut g = fixture(Some(run(1_000_500)), addr());
+            {
+                let mut p = g.pins.lock().unwrap();
+                p.stream_started("t1", Duration::from_secs(1));
+                p.pin("t1", AGENT, &run(1_000_000), 3600, 9, mono);
+            }
+            assert!(unidentified(
+                &event(&mut g, &row(9, sample, 1, None), mono).unwrap()
+            ));
+            // The agent's address unknown: the agent's account, reported.
+            let mut h = fixture(Some(run(1_000_000)), None);
+            {
+                let mut p = h.pins.lock().unwrap();
+                p.stream_started("t1", Duration::from_secs(1));
+                p.pin("t1", AGENT, &run(1_000_000), 3600, 9, mono);
+            }
+            let e = event(&mut h, &row(9, sample, 1, None), mono).unwrap();
+            assert_eq!(e.principal().account_name(), AGENT);
+            // The scan ends: the pin expires two polls later (at least
+            // the shortest pin life).
+            f.pins
+                .lock()
+                .unwrap()
+                .release("t1", &[(run(1_000_000), 9)], mono);
+            let later = mono + crate::audit::own_threads::MIN_PIN_TTL;
+            assert!(unidentified(
+                &event(&mut f, &row(9, "SELECT 1 FROM hr.x", 1, None), later).unwrap()
+            ));
+            // A pinned thread connected under another account is that
+            // account's.
+            let e = event(&mut h, &row(9, sample, 1, Some(info("app"))), mono).unwrap();
+            assert_eq!(e.principal().account_name(), "app");
+        }
+
+        fn digest_row(thread: u64, digest: &str, rows: u64) -> Row {
+            Row {
+                digest: true,
+                ..row(thread, digest, rows, None)
+            }
+        }
+
+        fn pinned(f: &Fixture, account: &str, mono: Instant) {
+            let mut p = f.pins.lock().unwrap();
+            p.stream_started("t1", Duration::from_secs(1));
+            assert!(p.pin("t1", account, &run(1_000_000), 3600, 9, mono));
+        }
+
+        /// The digests of a pinned Discovery session (it has ended, the
+        /// poll reads no `SQL_TEXT`): its pin statement is the agent's own
+        /// `performance_schema` read by its shape, uncharged; an extra
+        /// sampling batch consumes its credit by its shape, uncharged; any
+        /// other statement-text read is reported.
+        #[test]
+        fn digests_of_a_pinned_session_match_the_agents_texts_by_shape() {
+            let mono = Instant::now();
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            pinned(&f, AGENT, mono);
+            let pin_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` \
+                              FROM `performance_schema` . `user_variables_by_thread` `u` WHERE \
+                              `u` . `VARIABLE_NAME` = ? AND `u` . `VARIABLE_VALUE` = @? ";
+            assert!(event(&mut f, &digest_row(9, pin_digest, 1), mono).is_none());
+            assert!(f.usage.lock().unwrap().budgeted_objects().is_empty());
+            // Not pinned: always reported, unidentified.
+            let e = event(&mut f, &digest_row(10, pin_digest, 1), mono).unwrap();
+            assert!(unidentified(&e) && e.always_report());
+            // Another statement-text read on the pinned session: reported.
+            let e = event(
+                &mut f,
+                &digest_row(
+                    9,
+                    "SELECT `u` . `VARIABLE_VALUE` FROM `performance_schema` . \
+                     `user_variables_by_thread` `u`",
+                    3,
+                ),
+                mono,
+            )
+            .unwrap();
+            assert_eq!(e.principal().account_name(), AGENT);
+            assert!(e.always_report());
+            // An extra batch: its credit consumed by shape, no charge.
+            let batch = "SET STATEMENT max_statement_time = 5.000 FOR SELECT `b` FROM \
+                         `hr`.`wide` LIMIT 10";
+            f.credits
+                .lock()
+                .unwrap()
+                .grant(batch, "hr", "wide", Duration::from_secs(5), mono);
+            let batch_digest = "SET STATEMENT MAX_STATEMENT_TIME = ? FOR SELECT `b` FROM `hr` . \
+                                `wide` LIMIT ? ";
+            assert!(event(&mut f, &digest_row(9, batch_digest, 10), mono).is_none());
+            assert!(f.usage.lock().unwrap().budgeted_objects().is_empty());
+            assert_eq!(f.credits.lock().unwrap().len(), 0);
+            // Without a credit: charged (left out within the budget).
+            assert!(event(&mut f, &digest_row(9, batch_digest, 10), mono).is_none());
+            assert_eq!(f.usage.lock().unwrap().budgeted_objects().len(), 1);
+            // The same digests on a session that is not pinned: never.
+            f.credits
+                .lock()
+                .unwrap()
+                .grant(batch, "hr", "wide", Duration::from_secs(5), mono);
+            let e = event(&mut f, &digest_row(10, batch_digest, 10), mono).unwrap();
+            assert!(unidentified(&e));
+            assert_eq!(f.credits.lock().unwrap().len(), 1);
+        }
+
+        /// A pin of another target's scan, under another account: that
+        /// account, named, and not this stream's own (reported).
+        #[test]
+        fn a_pin_of_another_account_is_named_and_reported() {
+            let mono = Instant::now();
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            pinned(&f, "other_agent", mono);
+            let e = event(
+                &mut f,
+                &row(9, "SELECT `email` FROM `hr`.`customers` LIMIT 10", 1, None),
+                mono,
+            )
+            .unwrap();
+            assert_eq!(e.principal().account_name(), "other_agent");
+            assert!(e.principal().send_name());
+            assert!(f.usage.lock().unwrap().budgeted_objects().is_empty());
+        }
+
+        /// A session seen while connected is remembered first: an ended
+        /// pinned thread seen before keeps its real identity.
+        #[test]
+        fn a_remembered_session_comes_before_a_pin() {
+            let mono = Instant::now();
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            {
+                let mut p = f.pins.lock().unwrap();
+                p.stream_started("t1", Duration::from_secs(1));
+                p.pin("t1", AGENT, &run(1_000_000), 3600, 9, mono);
+            }
+            let mut seen = info(AGENT);
+            seen.host = "10.1.1.1".to_owned();
+            let sample = "SELECT `email` FROM `hr`.`customers` LIMIT 1";
+            let e = event(&mut f, &row(9, sample, 1, Some(seen)), mono).unwrap();
+            assert_eq!(e.principal().client(), ClientAddr::parse("10.1.1.1"));
+            let e = event(&mut f, &row(9, sample, 1, None), mono).unwrap();
+            assert_eq!(e.principal().client(), ClientAddr::parse("10.1.1.1"));
+            assert_eq!(f.poller.pinned, 0);
+        }
     }
 }

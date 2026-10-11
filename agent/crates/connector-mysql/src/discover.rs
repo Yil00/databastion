@@ -22,6 +22,7 @@ use databastion_core::config::TargetConfig;
 use databastion_core::{ConnectorError, FailureCode, FindingSink, Paced, ScanCoverage, ScanJob};
 
 use crate::audit::credits::SharedCredits;
+use crate::audit::own_threads::ScanPins;
 
 /// Where Discovery grants its sampling credits, with the scan's statement
 /// timeout (`None`: no Audit stream runs for the target).
@@ -103,9 +104,15 @@ pub(crate) async fn discover(
         job.skip_out_of_time(sink, 1);
         return Ok(());
     }
+    // Each session's thread is pinned for the target's performance_schema
+    // stream, until two polls after the scan ends (`audit::own_threads`):
+    // its samples are then the agent's own reads, also once the session
+    // has ended.
+    let mut pins = ScanPins::new(state.discovery_pins(), &target.id, &target.account);
     let mut first = Session::connect(target, timeouts)
         .await
         .map_err(|e| fail(target, e))?;
+    pins.pin(&mut first).await;
     // Paced (ADR-0035 proposed): the introspection, then each table.
     let tables = match job
         .paced(async {
@@ -162,9 +169,11 @@ pub(crate) async fn discover(
                 if let Some(s) = stale {
                     s.close().await;
                 }
-                Session::connect(target, timeouts)
+                let mut s = Session::connect(target, timeouts)
                     .await
-                    .map_err(|e| fail(target, e))?
+                    .map_err(|e| fail(target, e))?;
+                pins.pin(&mut s).await;
+                s
             }
         };
         job.begin_database(&unit.schema);
@@ -254,6 +263,7 @@ pub(crate) async fn discover(
             let mut s = Session::connect(target, timeouts)
                 .await
                 .map_err(|e| fail(target, e))?;
+            pins.pin(&mut s).await;
             let resumed = match job
                 .paced(resume_table(
                     &mut s,

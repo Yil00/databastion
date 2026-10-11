@@ -975,6 +975,14 @@ static OWN_PS_READS: std::sync::LazyLock<Vec<(Vec<u8>, Vec<&'static str>)>> =
             .collect()
     });
 
+/// The shapes of [`OWN_PS_READS`] (see [`text_shape`]).
+static OWN_PS_SHAPES: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
+    OWN_PS_READS
+        .iter()
+        .filter_map(|(t, _)| text_shape(t))
+        .collect()
+});
+
 /// One statement to turn into an event.
 pub(crate) struct Access<'a> {
     /// Session key (`c<connection id>`, `t<thread id>`).
@@ -1007,6 +1015,94 @@ pub(crate) struct Access<'a> {
     pub(crate) status: u32,
     pub(crate) ts: SystemTime,
     pub(crate) source: EventSource,
+    /// The statement's session is one of the agent's own Discovery
+    /// sessions, proven by a pin (`super::own_threads`), with the agent's
+    /// account: its digests are compared with the agent's own texts by
+    /// their shape ([`text_shape`]), for its own `performance_schema`
+    /// reads and its sampling credits. `performance_schema` only.
+    pub(crate) own_session: bool,
+}
+
+/// The shape of a statement text or digest: its tokens, lower case,
+/// with string and number literals, `?` and user variables (`@x`, `@?`)
+/// each as one placeholder, backquotes and whitespace dropped, plain
+/// comments skipped (optimizer hints kept, as digests keep them). A
+/// `performance_schema` digest has the shape of the statement it digests
+/// (checked against MySQL and MariaDB by the integration tests). `None`
+/// for a text that does not lex (an unterminated quote or comment, a byte
+/// that is not UTF-8).
+pub(crate) fn text_shape(text: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(text).ok()?;
+    let b = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || !c.is_ascii();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    // A quoted run from `i` (the quote) to its closing quote (a doubled
+    // quote inside stays inside): its end, past the closing quote.
+    let quoted = |i: usize, q: u8| -> Option<usize> {
+        let mut j = i + 1;
+        loop {
+            match b.get(j)? {
+                c if *c == q && b.get(j + 1) == Some(&q) => j += 2,
+                c if *c == q => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+    };
+    // A name from `i` (bare or backquoted), lower case, and its end.
+    let name = |i: usize| -> Option<(String, usize)> {
+        if b.get(i) == Some(&b'`') {
+            let end = quoted(i, b'`')?;
+            Some((text[i + 1..end - 1].replace("``", "`").to_lowercase(), end))
+        } else {
+            let mut j = i;
+            while j < b.len() && word(b[j]) {
+                j += 1;
+            }
+            (j > i).then(|| (text[i..j].to_lowercase(), j))
+        }
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'\'' || c == b'"' {
+            i = quoted(i, c)?;
+            out.push("?".to_owned());
+        } else if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                i += 1;
+            }
+            out.push("?".to_owned());
+        } else if c == b'@' && b.get(i + 1) == Some(&b'@') {
+            let (n, end) = name(i + 2)?;
+            out.push(format!("@@{n}"));
+            i = end;
+        } else if c == b'@' {
+            i = match b.get(i + 1) {
+                Some(b'?') => i + 2,
+                Some(b'\'' | b'"') => quoted(i + 1, b[i + 1])?,
+                _ => name(i + 1)?.1,
+            };
+            out.push("@?".to_owned());
+        } else if text[i..].starts_with("/*+") {
+            out.push("/*+".to_owned());
+            i += 3;
+        } else if text[i..].starts_with("*/") {
+            out.push("*/".to_owned());
+            i += 2;
+        } else if text[i..].starts_with("/*") {
+            i = i + 2 + text[i + 2..].find("*/")? + 2;
+        } else if c == b'`' || word(c) {
+            let (n, end) = name(i)?;
+            out.push(n);
+            i = end;
+        } else {
+            out.push(char::from(c).to_string());
+            i += 1;
+        }
+    }
+    Some(out)
 }
 
 /// Whether `text` holds `name` written in another ASCII case than `name`
@@ -1155,7 +1251,17 @@ impl EventBuilder {
         let mut c = credits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((schema, table)) = c.peek(text, mono) else {
+        // The digest of a sampling batch of one of the agent's own
+        // Discovery sessions (a pin): matched by its shape (see
+        // `own_ps_read`).
+        let shape = (a.own_session && a.digest && a.source == EventSource::PerformanceSchema)
+            .then(|| text_shape(text))
+            .flatten();
+        let found = match &shape {
+            Some(shape) => c.peek_shape(shape, mono),
+            None => c.peek(text, mono),
+        };
+        let Some((schema, table)) = found else {
             return false;
         };
         if !a
@@ -1178,7 +1284,10 @@ impl EventBuilder {
         {
             return false;
         }
-        c.take(text, mono)
+        match &shape {
+            Some(shape) => c.take_shape(shape, mono),
+            None => c.take(text, mono),
+        }
     }
 
     /// Whether a statement record is one of the connector's own statements
@@ -1219,6 +1328,19 @@ impl EventBuilder {
         };
         if a.truncated || a.opaque {
             return false;
+        }
+        // A digest of one of the agent's own Discovery sessions (a pin):
+        // the agent sends these texts on such a session (its pin), and
+        // the poll reads only the digest of a session that has ended. The
+        // session is proven the agent's, so its shape is enough; the
+        // identity conditions still apply.
+        if a.own_session
+            && a.digest
+            && a.source == EventSource::PerformanceSchema
+            && a.tables.is_empty()
+            && text_shape(text).is_some_and(|s| OWN_PS_SHAPES.contains(&s))
+        {
+            return true;
         }
         OWN_PS_READS.iter().any(|(t, tables)| {
             text == t.as_slice()
@@ -2318,6 +2440,7 @@ impl EventBuilder {
             status: query.map_or(0, |q| q.status),
             ts: first.ts.unwrap_or(now),
             source,
+            own_session: false,
         };
         if let Some(e) = self.statement(access, now) {
             out.push(e);
@@ -2466,6 +2589,7 @@ mod tests {
             status: 0,
             ts: SystemTime::now(),
             source: EventSource::PerformanceSchema,
+            own_session: false,
         }
     }
 
@@ -3183,6 +3307,7 @@ mod tests {
                 status: 0,
                 ts: future,
                 source: EventSource::PerformanceSchema,
+                own_session: false,
             },
             SystemTime::now(),
         );
@@ -3296,6 +3421,7 @@ mod tests {
                 status: 1142,
                 ts: SystemTime::now(),
                 source: EventSource::PerformanceSchema,
+                own_session: false,
             },
             SystemTime::now(),
         );
@@ -3495,6 +3621,7 @@ mod tests {
             status: 0,
             ts: SystemTime::now(),
             source,
+            own_session: false,
         };
         let ps = b
             .statement(access(EventSource::PerformanceSchema), SystemTime::now())
@@ -7648,5 +7775,80 @@ mod tests {
             ev.iter().map(shown).collect::<Vec<_>>(),
             ["read [\"hr.customers\", \"performance_schema.events_statements_history\"] always"]
         );
+    }
+
+    /// The shape of a text and of its `performance_schema` digest are
+    /// equal (digests as MySQL 8.4 and MariaDB 11.4 render them, the
+    /// latter with a trailing space); other statements' are not.
+    #[test]
+    fn digests_have_the_shape_of_their_text() {
+        let shape = |t: &str| text_shape(t.as_bytes()).unwrap();
+        let pin = crate::sql::PS_OWN_PIN;
+        for digest in [
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? AND `u` . `VARIABLE_VALUE` = @?",
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? AND `u` . `VARIABLE_VALUE` = @? ",
+        ] {
+            assert_eq!(shape(digest), shape(pin), "{digest}");
+        }
+        let mysql = "SELECT /*+ MAX_EXECUTION_TIME(5000) */ `TABLE_NAME`, LEFT(`TABLE_SCHEMA`, \
+                     4096) FROM `information_schema`.`TABLES` LIMIT 1";
+        assert_eq!(
+            shape(mysql),
+            shape(
+                "SELECT /*+ MAX_EXECUTION_TIME (?) */ `TABLE_NAME` , LEFT ( `TABLE_SCHEMA` , ? ) \
+                 FROM `information_schema` . `TABLES` LIMIT ?"
+            )
+        );
+        let mariadb = "SET STATEMENT max_statement_time = 5.000 FOR SELECT `TABLE_NAME`, \
+                       LEFT(`TABLE_SCHEMA`, 4096) FROM `information_schema`.`TABLES` LIMIT 1";
+        assert_eq!(
+            shape(mariadb),
+            shape(
+                "SET STATEMENT MAX_STATEMENT_TIME = ? FOR SELECT `TABLE_NAME` , LEFT ( \
+                 `TABLE_SCHEMA` , ? ) FROM `information_schema` . `TABLES` LIMIT ? "
+            )
+        );
+        // Other statements: other shapes.
+        for other in [
+            "SELECT `u` . `THREAD_ID` , `u` . `VARIABLE_VALUE` FROM `performance_schema` . \
+             `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` = ? AND `u` . \
+             `VARIABLE_VALUE` = @?",
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? OR `u` . `VARIABLE_VALUE` = @?",
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? AND `u` . `VARIABLE_VALUE` = @? UNION SELECT `SQL_TEXT` , ? , ? , ? FROM \
+             `performance_schema` . `events_statements_history_long`",
+        ] {
+            assert_ne!(shape(other), shape(pin), "{other}");
+        }
+        // One quoted name is not two bare words; literals and variables
+        // are placeholders; plain comments are skipped, hints kept.
+        assert_ne!(shape("SELECT `a b` FROM t"), shape("SELECT a b FROM t"));
+        assert_eq!(
+            shape("SELECT a FROM t WHERE b = 'x''y'"),
+            shape("SELECT a FROM t WHERE b = ?")
+        );
+        assert_eq!(shape("SET @x = 1.5"), shape("SET @? = ?"));
+        assert_eq!(shape("SELECT /* c */ a FROM t"), shape("SELECT a FROM t"));
+        assert_ne!(
+            shape("SELECT /*+ X(1) */ a FROM t"),
+            shape("SELECT a FROM t")
+        );
+        assert_ne!(shape("SELECT @@port"), shape("SELECT @port"));
+        // Not lexable: no shape.
+        for bad in [
+            &b"SELECT 'open"[..],
+            b"SELECT `open",
+            b"SELECT /* open",
+            b"SELECT \xff",
+        ] {
+            assert!(text_shape(bad).is_none(), "{bad:?}");
+        }
     }
 }

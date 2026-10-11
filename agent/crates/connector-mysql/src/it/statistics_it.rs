@@ -31,6 +31,8 @@ const ST_USER: &str = "databastion_it_stats";
 const ST_AGENT: &str = "databastion_it_st_agent";
 /// Seeded values: never in an event or a log line (I2).
 const ST_MARK: &str = "7Qz";
+/// MariaDB: an `ALGORITHM=TEMPTABLE` view over `mysql.column_stats`.
+const TEMPTABLE_VIEW: &str = "v_stats_tt";
 
 /// The statistics table of the server's flavor, as listed.
 fn stats_table(flavor: Flavor) -> (&'static str, &'static str) {
@@ -116,6 +118,19 @@ async fn st_fixture(a: &mut Session, flavor: Flavor) {
                      FROM mysql.column_stats c JOIN mysql.table_stats t \
                      ON t.db_name = c.db_name AND t.table_name = c.table_name \
                      WHERE c.db_name = '{ST_DB}'"
+                ),
+            )
+            .await;
+            // A view the server materializes in a temporary table
+            // (security review of #199, Low): checked for a `server_audit`
+            // record under its own name (none on 10.11.19, 11.4.13 and
+            // 11.8.9: only the `column_stats` record, as for `v_stats`).
+            exec(
+                a,
+                &format!(
+                    "CREATE OR REPLACE ALGORITHM=TEMPTABLE VIEW {ST_DB}.{TEMPTABLE_VIEW} AS \
+                     SELECT column_name, min_value FROM mysql.column_stats \
+                     WHERE db_name = '{ST_DB}'"
                 ),
             )
             .await;
@@ -276,13 +291,17 @@ fn plain_read(e: &MaskedEvent) -> bool {
 /// The reader's reads of the views over the statistics (MariaDB): a view
 /// reading `column_stats`, one reading `table_stats` too, one with a
 /// `table_stats` subquery, one joined with a table whose statistics are
-/// loaded (security re-review of #199, N-H1).
+/// loaded (security re-review of #199, N-H1); the `TEMPTABLE` view alone
+/// and joined with a table whose statistics are loaded (security review
+/// of #199, Low).
 fn view_reads() -> Vec<String> {
     vec![
         format!("SELECT * FROM {ST_DB}.v_stats"),
         format!("SELECT * FROM {ST_DB}.v_stats2"),
         format!("SELECT * FROM {ST_DB}.v_stats WHERE EXISTS (SELECT 1 FROM mysql.table_stats)"),
         format!("SELECT * FROM {ST_DB}.v_stats v JOIN {ST_DB}.customers c ON c.id = 1"),
+        format!("SELECT * FROM {ST_DB}.{TEMPTABLE_VIEW}"),
+        format!("SELECT * FROM {ST_DB}.{TEMPTABLE_VIEW} v JOIN {ST_DB}.customers c ON c.id = 1"),
     ]
 }
 
@@ -523,6 +542,46 @@ async fn statistics_reads_on_audit_logs() {
         collect_until(&mut rx, &mut ev, Duration::from_secs(4), |_| false).await;
         task.abort();
         if format == "server_audit" {
+            // The `TEMPTABLE` view: `server_audit` writes no record under
+            // its own name, so it never counts as recorded, and its reads
+            // keep their `column_stats` record (always reported, checked by
+            // `st_check`), also next to a statistics load.
+            let text = std::fs::read(&log).unwrap_or_default();
+            let view_records = text
+                .split(|b| *b == b'\n')
+                .filter(|l| {
+                    let l = String::from_utf8_lossy(l);
+                    l.contains(&format!(",{ST_USER},"))
+                        && !l.contains(",QUERY,")
+                        && l.contains(&format!(",{ST_DB},{TEMPTABLE_VIEW}"))
+                })
+                .count();
+            let version = scalar(&mut a, "SELECT VERSION()").await.unwrap_or_default();
+            eprintln!(
+                "{version}: server_audit records under the TEMPTABLE view's name: {view_records}"
+            );
+            assert_eq!(
+                view_records, 0,
+                "{version}: server_audit wrote a record under the TEMPTABLE view's name: the \
+                 view counts as recorded (docs/08 statistics tables, view residual)"
+            );
+            let tt = |e: &MaskedEvent| {
+                e.objects().iter().any(|o| {
+                    o.database().as_str() == ST_DB && o.object().as_str() == TEMPTABLE_VIEW
+                })
+            };
+            let tt_reads: Vec<&MaskedEvent> = ev.iter().filter(|e| tt(e)).collect();
+            assert_eq!(
+                tt_reads.len(),
+                2,
+                "{version}: {:#?}",
+                ev.iter().map(describe).collect::<Vec<_>>()
+            );
+            assert!(
+                tt_reads.iter().all(|e| stats_read(e, flavor)),
+                "{version}: a TEMPTABLE view read without its statistics table: {:#?}",
+                tt_reads.iter().map(|e| describe(e)).collect::<Vec<_>>()
+            );
             let agent = server.url.user.as_str();
             assert!(
                 !ev.iter()

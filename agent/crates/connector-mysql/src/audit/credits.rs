@@ -36,6 +36,9 @@ pub(crate) const MAX_CREDITS: usize = 4096;
 
 struct Credit {
     text: Vec<u8>,
+    /// The text's shape (`events::text_shape`), for the digests of the
+    /// agent's pinned Discovery sessions (`own_threads`).
+    shape: Option<Vec<String>>,
     schema: String,
     table: String,
     until: Instant,
@@ -87,6 +90,7 @@ impl SampleCredits {
         }
         self.entries.push_back(Credit {
             text: text.as_bytes().to_vec(),
+            shape: super::events::text_shape(text.as_bytes()),
             schema: schema.to_owned(),
             table: table.to_owned(),
             until: now + ttl,
@@ -106,6 +110,36 @@ impl SampleCredits {
     pub(crate) fn take(&mut self, text: &[u8], now: Instant) -> bool {
         self.expire(now);
         match self.entries.iter().position(|c| c.text == text) {
+            Some(i) => {
+                self.entries.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The table of the oldest live credit whose text has `shape` (a
+    /// digest of a pinned Discovery session of the agent), if any.
+    pub(crate) fn peek_shape(
+        &mut self,
+        shape: &[String],
+        now: Instant,
+    ) -> Option<(String, String)> {
+        self.expire(now);
+        self.entries
+            .iter()
+            .find(|c| c.shape.as_deref() == Some(shape))
+            .map(|c| (c.schema.clone(), c.table.clone()))
+    }
+
+    /// Consumes the oldest live credit whose text has `shape`.
+    pub(crate) fn take_shape(&mut self, shape: &[String], now: Instant) -> bool {
+        self.expire(now);
+        match self
+            .entries
+            .iter()
+            .position(|c| c.shape.as_deref() == Some(shape))
+        {
             Some(i) => {
                 self.entries.remove(i);
                 true
