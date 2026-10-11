@@ -124,6 +124,8 @@ pub enum NoteCode {
     AuditAuthRecordsNotSeen,
     /// `audit.authcheck_success_pending`.
     AuditAuthcheckSuccessPending,
+    /// `audit.digest_consumer_disabled`.
+    AuditDigestConsumerDisabled,
     /// `audit.failed_operations_not_logged`.
     AuditFailedOperationsNotLogged,
     /// `audit.full_pending_first_record`.
@@ -170,6 +172,8 @@ pub enum NoteCode {
     AuditSourceNotConfigured,
     /// `audit.statement_consumers_disabled`.
     AuditStatementConsumersDisabled,
+    /// `audit.statement_text_limit_low`.
+    AuditStatementTextLimitLow,
     /// `audit.stream_not_available`.
     AuditStreamNotAvailable,
     /// `audit.stream_stopped`.
@@ -276,6 +280,7 @@ impl NoteCode {
         Self::AuditAuthFailuresNotSeen,
         Self::AuditAuthRecordsNotSeen,
         Self::AuditAuthcheckSuccessPending,
+        Self::AuditDigestConsumerDisabled,
         Self::AuditFailedOperationsNotLogged,
         Self::AuditFullPendingFirstRecord,
         Self::AuditGeneralLogEnabled,
@@ -299,6 +304,7 @@ impl NoteCode {
         Self::AuditSlowOperationsOnly,
         Self::AuditSourceNotConfigured,
         Self::AuditStatementConsumersDisabled,
+        Self::AuditStatementTextLimitLow,
         Self::AuditStreamNotAvailable,
         Self::AuditStreamStopped,
         Self::CheckServerIsMariadb,
@@ -359,6 +365,7 @@ impl NoteCode {
             Self::AuditAuthFailuresNotSeen => "audit.auth_failures_not_seen",
             Self::AuditAuthRecordsNotSeen => "audit.auth_records_not_seen",
             Self::AuditAuthcheckSuccessPending => "audit.authcheck_success_pending",
+            Self::AuditDigestConsumerDisabled => "audit.digest_consumer_disabled",
             Self::AuditFailedOperationsNotLogged => "audit.failed_operations_not_logged",
             Self::AuditFullPendingFirstRecord => "audit.full_pending_first_record",
             Self::AuditGeneralLogEnabled => "audit.general_log_enabled",
@@ -382,6 +389,7 @@ impl NoteCode {
             Self::AuditSlowOperationsOnly => "audit.slow_operations_only",
             Self::AuditSourceNotConfigured => "audit.source_not_configured",
             Self::AuditStatementConsumersDisabled => "audit.statement_consumers_disabled",
+            Self::AuditStatementTextLimitLow => "audit.statement_text_limit_low",
             Self::AuditStreamNotAvailable => "audit.stream_not_available",
             Self::AuditStreamStopped => "audit.stream_stopped",
             Self::CheckServerIsMariadb => "check.server_is_mariadb",

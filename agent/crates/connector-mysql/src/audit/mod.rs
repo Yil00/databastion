@@ -152,7 +152,10 @@ pub(crate) async fn probe_prerequisites(
             .await?
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_QUERY_LIMIT);
-        if limit < sql::CAS_GUARD_MAX_STATEMENT + 2 {
+        let low = limit < sql::CAS_GUARD_MAX_STATEMENT + 2;
+        // `check()` reports it as a closed note while this stream runs.
+        state.note_text_limit(&target.id, EventSource::MariadbServerAudit, limit, low);
+        if low {
             tracing::warn!(
                 target_id = %target.id,
                 limit,
@@ -468,6 +471,12 @@ pub(crate) async fn audit_stream(
                         PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR), own)
                             .await
                             .map_err(MyError::into_connector_error)?;
+                    state.note_text_limit(
+                        &target.id,
+                        EventSource::PerformanceSchema,
+                        poller.text_limit(),
+                        poller.text_limit_low(),
+                    );
                     tracing::info!(
                         target_id = %target.id,
                         table = table.name(),

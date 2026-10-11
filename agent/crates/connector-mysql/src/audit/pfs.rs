@@ -586,6 +586,12 @@ pub(crate) async fn pinned_session_with(
     Ok(own_row(row))
 }
 
+/// Whether a `performance_schema_max_sql_text_length` of `limit` cuts the
+/// agent's longest statement (with room for the server's `...` marker).
+fn text_limit_low(limit: usize) -> bool {
+    limit < sql::CAS_GUARD_MAX_STATEMENT + 4
+}
+
 /// This session's thread is visible in `performance_schema.threads`: the
 /// poll texts find it there by `CONNECTION_ID()` (`sql::PS_OWN_THREAD_EXPR`)
 /// to leave it out; without it the source is unsupported.
@@ -613,7 +619,7 @@ impl PsPoller {
                 .min(MAX_TEXT_BYTES)
         };
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
-        if text_limit < sql::CAS_GUARD_MAX_STATEMENT + 4 {
+        if text_limit_low(text_limit) {
             tracing::warn!(
                 limit = text_limit,
                 "performance_schema_max_sql_text_length below the agent's longest statement: \
@@ -711,6 +717,16 @@ impl PsPoller {
 
     /// Re-attaches the poller to a new session (reconnection): the
     /// cursor is kept, the own thread is read again and noted.
+    /// The `performance_schema_max_sql_text_length` this poller applies.
+    pub(crate) fn text_limit(&self) -> usize {
+        self.text_limit
+    }
+
+    /// Whether [`Self::text_limit`] cuts the agent's longest statement.
+    pub(crate) fn text_limit_low(&self) -> bool {
+        text_limit_low(self.text_limit)
+    }
+
     pub(crate) async fn reattach(&mut self, session: &mut Session) -> Result<(), MyError> {
         let own = own_thread(session).await?;
         self.note_own(own);
