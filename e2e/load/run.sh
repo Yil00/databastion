@@ -455,7 +455,7 @@ fact --argjson tables "$LOAD_TABLES" --argjson rows "$LOAD_ROWS" --argjson mt "$
   --argjson wt "$LOAD_WORKLOAD_TABLES" \
   --argjson base "$LOAD_BASELINE_S" --argjson soak "$LOAD_SOAK_S" --argjson idle "$LOAD_IDLE_S" \
   --arg host_cpus "$(nproc)" --arg pg_audit "$LOAD_PG_AUDIT" \
-  '{kind: "config", pg_audit: $pg_audit, tables: $tables, rows: $rows, mongo_collections: $mt, mongo_documents: $mr,
+  '{kind: "config", pg_audit: $pg_audit, stats_readers: true, tables: $tables, rows: $rows, mongo_collections: $mt, mongo_documents: $mr,
     db_cpus: ($cpus | tonumber), sample_rows: $sample, pg_rate: $pgr, mariadb_rate: $myr,
     clients: $clients, workload_tables: $wt, baseline_s: $base, soak_s: $soak, idle_s: $idle, host_cpus: ($host_cpus | tonumber)}'
 phase_done seed
@@ -682,8 +682,20 @@ phase_done discovery
 # rates, as load_app. Outputs: $W/out/<engine>-<phase>.{summary,tx}. Records the window.
 PG_SCRIPTS=""
 for f in "$W"/workload/pg/*.sql; do PG_SCRIPTS+=" -f /load/$(basename "$f")@1"; done
+# side_facts FILE TARGET PHASE: one `side` fact per "side <account> <issued> <0|1>" line of FILE.
+side_facts() {
+  local file="$1" target="$2" phase="$3" tag account issued failed
+  while read -r tag account issued failed; do
+    if [ "$tag" != side ] || ! [[ "$account" =~ ^[a-z_]+$ ]] || ! [[ "$issued" =~ ^[0-9]+$ ]] \
+        || ! [[ "$failed" =~ ^[01]$ ]]; then
+      continue
+    fi
+    fact --arg target "$target" --arg account "$account" --arg phase "$phase" --argjson n "$issued" \
+      --argjson f "$failed" '{kind: "side", target: $target, account: $account, phase: $phase, issued: $n, failed: $f}'
+  done <"$file"
+}
 run_workload() {
-  local phase="$1" dur="$2" t_start pg_pid sb_pid side_pid pg_rc=0 sb_rc=0 side_rc=0 tag account issued failed
+  local phase="$1" dur="$2" t_start pg_pid sb_pid side_pid pg_side_pid pg_rc=0 sb_rc=0 side_rc=0 pg_side_rc=0
   WL_START_UTC="$(date -u +'%Y-%m-%d %H:%M:%S')"
   log "workload ($phase): pgbench ${LOAD_PG_RATE}/s and sysbench ${LOAD_MARIADB_RATE}/s, ${LOAD_CLIENTS} clients each, ${dur} s"
   t_start="$(now_s)"
@@ -703,27 +715,30 @@ run_workload() {
        --threads='"$LOAD_CLIENTS"' --rate='"$LOAD_MARIADB_RATE"' --time='"$dur"' --percentile=95 run' \
     >"$W/out/mariadb-$phase.summary" 2>&1 &
   sb_pid=$!
-  # The side accounts on target-mariadb (ADR-0045, side-clients.sh): a monitoring-like reader and a
-  # table-less built-in mix, once a second each, in both phases (same load with and without Audit).
+  # The side accounts on target-mariadb (ADR-0045, ADR-0048, side-clients.sh): a monitoring-like
+  # reader and a table-less built-in mix, once a second each, and a mysql.column_stats reader every
+  # 10 s; on target-pg (ADR-0048, pg-side-clients.sh), a bloat estimate on pg_stats every 10 s. In
+  # both phases (same load with and without Audit).
   timeout $((dur + 300)) docker compose -f "$COMPOSE_FILE" --profile tools run --rm -T --no-deps my-side "$dur" \
     >"$W/out/side-$phase.out" 2>&1 &
   side_pid=$!
+  timeout $((dur + 300)) docker compose -f "$COMPOSE_FILE" --profile tools run --rm -T --no-deps pg-side "$dur" \
+    >"$W/out/pg-side-$phase.out" 2>&1 &
+  pg_side_pid=$!
   wait "$pg_pid" || pg_rc=$?
   wait "$sb_pid" || sb_rc=$?
   wait "$side_pid" || side_rc=$?
+  wait "$pg_side_pid" || pg_side_rc=$?
   WL_T0="$(jq -n --argjson t "$t_start" '$t + 5')"
   WL_T1="$(jq -n --argjson t "$t_start" --argjson d "$dur" '$t + $d')"
   WL_END="$(now_s)"
+  WL_END_UTC="$(date -u +'%Y-%m-%d %H:%M:%S')"
   [ "$pg_rc" = 0 ] || { tail -n 20 "$W/out/pg-$phase.summary" >&2; fail "pgbench ($phase) exited $pg_rc"; }
   [ "$sb_rc" = 0 ] || { tail -n 20 "$W/out/mariadb-$phase.summary" >&2; fail "sysbench ($phase) exited $sb_rc"; }
   [ "$side_rc" = 0 ] || { tail -n 20 "$W/out/side-$phase.out" >&2; fail "side clients ($phase) exited $side_rc"; }
-  while read -r tag account issued failed; do
-    if [ "$tag" != side ] || ! [[ "$issued" =~ ^[0-9]+$ ]] || ! [[ "$failed" =~ ^[01]$ ]]; then
-      continue
-    fi
-    fact --arg account "$account" --arg phase "$phase" --argjson n "$issued" --argjson f "$failed" \
-      '{kind: "side", target: "mariadb-load", account: $account, phase: $phase, issued: $n, failed: $f}'
-  done <"$W/out/side-$phase.out"
+  [ "$pg_side_rc" = 0 ] || { tail -n 20 "$W/out/pg-side-$phase.out" >&2; fail "pg side client ($phase) exited $pg_side_rc"; }
+  side_facts "$W/out/side-$phase.out" mariadb-load "$phase"
+  side_facts "$W/out/pg-side-$phase.out" pg-load "$phase"
   fact --arg name "workload_audit_$phase" --argjson t0 "$WL_T0" --argjson t1 "$WL_T1" \
     '{kind: "window", name: $name, t0: $t0, t1: $t1}'
   python3 "$LOADLIB" pgbench --summary "$W/out/pg-$phase.summary" --log "$W/out/pg-$phase.tx" \
@@ -795,6 +810,7 @@ phase_done audit-setup
 run_workload on "$LOAD_SOAK_S"
 SOAK_END="$WL_END"
 SOAK_START_UTC="$WL_START_UTC"
+SOAK_END_UTC="$WL_END_UTC"
 phase_done workload-on
 
 # ------------------------------------------------------------------------------ drain
@@ -878,28 +894,67 @@ if wait_spool_empty "$(now_s)" "after the Audit run"; then
 else
   fact '{kind: "spool_drained", ok: false}'
 fi
-# The side accounts of the MariaDB Audit run (ADR-0045), once the spool is empty: per principal,
-# action, source and object set, the events against the most aggregation windows (60 s, the contract
-# default of audit.configure) their time span can meet; the objects; the non-connect events.
+# The side accounts of the Audit run (ADR-0045 on MariaDB, ADR-0048 on both targets), once the spool
+# is empty: per principal, action, source and object set, the events against the most aggregation
+# windows (60 s, the contract default of audit.configure) their time span can meet; the objects
+# (`database.object`, or `database.schema.object` on PostgreSQL); the non-connect events.
 side_events() {
-  local account="$1" role="$2" expected="$3"
-  console_sql "SELECT json_build_object('kind', 'side_events', 'target', 'mariadb-load',
+  local target="$1" account="$2" role="$3" expected="$4"
+  console_sql "SELECT json_build_object('kind', 'side_events', 'target', '$target',
       'account', '$account', 'role', '$role', 'expected', '$expected'::json, 'window_s', 60,
       'events', coalesce(sum(n), 0), 'received', coalesce(sum(r), 0), 'groups', count(*),
       'max_events_per_group', max(n), 'max_excess', max(n - (floor(span / 60)::int + 2)),
       'non_connect', coalesce(sum(nc), 0),
-      'objects', (SELECT coalesce(json_agg(DISTINCT o->>'database' || '.' || (o->>'object')), '[]')
+      'objects', (SELECT coalesce(json_agg(DISTINCT o->>'database' || '.'
+                    || coalesce((o->>'schema') || '.', '') || (o->>'object')), '[]')
                   FROM access_events e, jsonb_array_elements(e.objects) AS o
-                  WHERE e.agent_id = '$AGENT_ID' AND e.target_id = 'mariadb-load' AND e.db_user = '$account'))
+                  WHERE e.agent_id = '$AGENT_ID' AND e.target_id = '$target' AND e.db_user = '$account'))
     FROM (SELECT count(*) AS n, sum(aggregated_count) AS r,
                  extract(epoch from max(coalesce(ts_last, ts)) - min(ts))::float8 AS span,
                  count(*) FILTER (WHERE action <> 'connect') AS nc
-          FROM access_events WHERE agent_id = '$AGENT_ID' AND target_id = 'mariadb-load' AND db_user = '$account'
+          FROM access_events WHERE agent_id = '$AGENT_ID' AND target_id = '$target' AND db_user = '$account'
           GROUP BY principal_key, action, source, objects) AS g" >>"$FACTS" \
     || fail "cannot read the events of $account"
 }
-side_events load_monitor monitor '["performance_schema.threads", "information_schema.PROCESSLIST"]'
-side_events load_builtins builtins '[]'
+side_events mariadb-load load_monitor monitor '["performance_schema.threads", "information_schema.PROCESSLIST"]'
+side_events mariadb-load load_builtins builtins '[]'
+# ADR-0048: the statistics readers, whose every read is reported (always, whatever min_rows).
+side_events mariadb-load load_colstats stats '["mysql.column_stats"]'
+side_events pg-load load_pgmon stats '["shop.pg_catalog.pg_stats"]'
+# ADR-0048 open question 6: the pgaudit log volume with pgaudit.log_catalog = on (the dev and e2e
+# setting), over the Audit run: every line of the server log, and the pgaudit records per role (the
+# workload, the statistics reader, the agent's own catalog reads of check() and Discovery, others).
+# Counts and byte sizes only, read inside the container; not available in pss mode.
+if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
+  # shellcheck disable=SC2016 # awk program, expanded by the container shell on purpose
+  pg_vol="$(timeout 120 docker compose -f "$COMPOSE_FILE" exec -T target-pg sh -c \
+    'awk -v t0="$0" -v t1="$1" '"'"'{ ts = substr($0, 15, 19) }
+       ts >= t0 && ts < t1 {
+         lines++; bytes += length($0) + 1
+         if (index($0, "\"message\":\"AUDIT: ")) {
+           who = "other"
+           if (index($0, "\"user\":\"load_app\"")) who = "load_app"
+           else if (index($0, "\"user\":\"load_pgmon\"")) who = "load_pgmon"
+           else if (index($0, "\"user\":\"databastion_agent\"")) who = "databastion_agent"
+           n[who]++; b[who] += length($0) + 1
+         }
+       }
+       END {
+         printf "{\"lines\":%d,\"bytes\":%d,\"audit\":{", lines, bytes
+         sep = ""
+         for (w in n) { printf "%s\"%s\":{\"records\":%d,\"bytes\":%d}", sep, w, n[w], b[w]; sep = "," }
+         print "}}"
+       }'"'"' /var/log/databastion/postgresql.json' \
+    "$SOAK_START_UTC" "$SOAK_END_UTC" 2>/dev/null)" || pg_vol=""
+  # The setting as the shop database's sessions see it (ALTER DATABASE, e2e/target-initdb/30-audit.sh).
+  log_catalog="$(timeout 30 docker compose -f "$COMPOSE_FILE" exec -T target-pg psql -XAt -U postgres -d shop \
+    -c "SELECT coalesce(current_setting('pgaudit.log_catalog', true), 'unset')" 2>/dev/null)" || log_catalog=""
+  [[ "$log_catalog" =~ ^(on|off|unset)$ ]] || log_catalog="unknown"
+  if jq -e '.lines >= 0 and (.audit | type == "object")' <<<"${pg_vol:-null}" >/dev/null 2>&1; then
+    fact --argjson v "$pg_vol" --argjson soak "$LOAD_SOAK_S" --arg lc "$log_catalog" \
+      '{kind: "pgaudit_volume", target: "pg-load", log_catalog: $lc, soak_s: $soak} + $v'
+  fi
+fi
 lost="$(timeout 30 docker compose -f "$COMPOSE_FILE" logs --no-color agent 2>/dev/null \
   | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|events dropped|rejected batch items|unreadable spool file' || true)"
 fact --argjson n "$lost" '{kind: "agent_log", lost: $n}'

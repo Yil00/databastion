@@ -481,6 +481,68 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("side", rep)
         self.assertFalse(any(".monitor_" in c["name"] for c in ck.items))
 
+    def test_statistics_readers(self) -> None:
+        # ADR-0048: the pg_stats bloat reader and the mysql.column_stats reader, the pgaudit log volume
+        # with log_catalog = on, and the agent against the release reference.
+        def stats(excess: int = 0, objects: list | None = None, pgmon_records: int = 360,
+                  log_catalog: str = "on", volume: bool = True) -> list[dict]:
+            out = [{"kind": "config", "tables": 40, "rows": 1000000, "db_cpus": 2, "pg_audit": "pgaudit",
+                    "stats_readers": True}]
+            for target, account, exp in (("pg-load", "load_pgmon", ["shop.pg_catalog.pg_stats"]),
+                                         ("mariadb-load", "load_colstats", ["mysql.column_stats"])):
+                out += [
+                    {"kind": "side", "target": target, "account": account, "phase": "on", "issued": 60,
+                     "failed": 0},
+                    {"kind": "side_events", "target": target, "account": account, "role": "stats",
+                     "events": 11, "received": 61, "groups": 2, "max_events_per_group": 10,
+                     "max_excess": excess, "non_connect": 10,
+                     "objects": (exp if objects is None else objects), "expected": exp, "window_s": 60},
+                ]
+            if volume:
+                out.append({"kind": "pgaudit_volume", "target": "pg-load", "log_catalog": log_catalog,
+                            "soak_s": 600, "lines": 400000, "bytes": 120000000,
+                            "audit": {"load_app": {"records": 180000, "bytes": 90000000},
+                                      "load_pgmon": {"records": pgmon_records, "bytes": 400000},
+                                      "databastion_agent": {"records": 1200, "bytes": 900000}}})
+            return out
+
+        facts, samples, hbs = scenario()
+        # The scenario's agent runs at 0.05 core: within the reference only with a wider limit.
+        lim = L.Limits(agent_ref_cpu_cores=0.03)
+        base = [f for f in facts if f["kind"] != "config"]
+        rep, ck = L.build_report(base + stats(), samples, hbs, lim)
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True])
+        names = {c["name"] for c in ck.items}
+        for n in ("audit.pg-load.stats_ran", "audit.pg-load.stats_reported",
+                  "audit.pg-load.stats_one_event_per_window", "audit.mariadb-load.stats_reported",
+                  "audit.mariadb-load.stats_one_event_per_window", "audit.pg-load.pgaudit_catalog_volume_reported",
+                  "agent.cpu_vs_release_reference", "agent.rss_vs_release_reference"):
+            self.assertIn(n, names)
+        v = rep["pgaudit_volume"]
+        self.assertEqual(v["per_role"]["load_pgmon"]["records_per_s"], 0.6)
+        self.assertEqual(v["log_mib_per_hour"], 686.6)
+        md = L.render_markdown(rep)
+        self.assertIn("`pgaudit.log_catalog = on`", md)
+        self.assertIn("| load_pgmon | 360 |", md)
+        self.assertIn("| pg-load/stats | load_pgmon |", md)
+        for kw, failing in ((dict(excess=1), {"audit.pg-load.stats_one_event_per_window",
+                                              "audit.mariadb-load.stats_one_event_per_window"}),
+                            (dict(objects=[]), {"audit.pg-load.stats_reported", "audit.mariadb-load.stats_reported"}),
+                            (dict(pgmon_records=0), {"audit.pg-load.pgaudit_catalog_volume_reported"}),
+                            (dict(log_catalog="off"), {"audit.pg-load.pgaudit_catalog_volume_reported"})):
+            rep, ck = L.build_report(base + stats(**kw), samples, hbs, lim)
+            self.assertEqual(self.names(ck, False), failing, kw)
+        rep, ck = L.build_report(base + stats(volume=False), samples, hbs, lim)
+        self.assertEqual(self.names(ck, None), {"audit.pg-load.pgaudit_catalog_volume_reported"})
+        # The default reference (0.013 core, limit 0.033): the scenario's 0.05 core fails it.
+        rep, ck = L.build_report(base + stats(), samples, hbs, L.Limits())
+        self.assertEqual(self.names(ck, False), {"agent.cpu_vs_release_reference"})
+        rep, ck = L.build_report(base + stats(), samples, hbs, L.Limits(agent_ref_cpu_cores=0.03, agent_ref_rss_mb=20.0))
+        self.assertEqual(self.names(ck, False), {"agent.rss_vs_release_reference"})
+        # Without the statistics readers (an older run, the CAS harness): no reference or volume check.
+        rep, ck = L.build_report(facts, samples, hbs, L.Limits())
+        self.assertFalse(any("reference" in c["name"] or "pgaudit" in c["name"] for c in ck.items))
+
     def test_cas_run(self) -> None:
         # The facts e2e/load/cas.sh writes: the login workload on cas-load (container cas, no scan of
         # its own: the connector reads files), the ticket aggregate's scan on casdb-load (cas-db).

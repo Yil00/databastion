@@ -1,12 +1,14 @@
 #!/bin/bash
-# Side accounts of the MariaDB Audit run (ADR-0045), run by run.sh next to sysbench in the `my-side`
-# service (the target's image, for its `mariadb` client):
+# Side accounts of the MariaDB Audit run (ADR-0045, ADR-0048), run by run.sh next to sysbench in the
+# `my-side` service (the target's image, for its `mariadb` client):
 #   - load_monitor, a monitoring-like reader (PMM / mysqld_exporter style): the digest summary,
 #     `performance_schema.threads` and `information_schema.PROCESSLIST`, once a second;
 #   - load_builtins, an application's table-less built-in calls and driver session probes, once a
-#     second.
+#     second;
+#   - load_colstats, a reader of the engine-independent column statistics (`mysql.column_stats`, which
+#     hold column values: ADR-0048), every 10 seconds, as a scheduled tuning or monitoring check.
 # One session per account, kept for the whole run, as those tools do. The statements are written to
-# the client one second at a time, so it runs them as they come. Prints one line per account:
+# the client one period at a time, so it runs them as they come. Prints one line per account:
 #   side <account> <statements issued> <0 | 1: the client failed>
 #
 #   side-clients.sh DURATION_S
@@ -33,20 +35,24 @@ BUILTINS=(
   "SELECT UTC_TIMESTAMP(), UNIX_TIMESTAMP(), CONCAT('a', 'b'), IFNULL(NULL, 1), COALESCE(NULL, 2);"
   "SELECT 1;"
 )
+COLSTATS=(
+  "SELECT db_name, table_name, column_name, min_value, max_value, nulls_ratio, avg_length, avg_frequency FROM mysql.column_stats WHERE db_name = 'support' ORDER BY table_name, column_name LIMIT 200;"
+)
 
-# feed ACCOUNT STATEMENT...: the statements once a second until the end; the count in /tmp.
+# feed ACCOUNT PERIOD STATEMENT...: the statements every PERIOD seconds until the end; the count in
+# /tmp.
 feed() {
-  local account="$1" n=0
-  shift
+  local account="$1" period="$2" n=0
+  shift 2
   while [ "$(date +%s)" -lt "$end" ]; do
     printf '%s\n' "$@"
     n=$((n + $#))
     printf '%s\n' "$n" >"/tmp/issued.$account"
-    sleep 1
+    sleep "$period"
   done
 }
 
-# run ACCOUNT STATEMENT...: one session of ACCOUNT running what feed writes.
+# run ACCOUNT PERIOD STATEMENT...: one session of ACCOUNT running what feed writes.
 run() {
   local account="$1" rc=0
   printf '0\n' >"/tmp/issued.$account"
@@ -56,9 +62,12 @@ run() {
   printf 'side %s %s %s\n' "$account" "$(cat "/tmp/issued.$account")" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
 }
 
-run load_monitor "${MONITOR[@]}" &
+run load_monitor 1 "${MONITOR[@]}" &
 monitor_pid=$!
-run load_builtins "${BUILTINS[@]}" &
+run load_builtins 1 "${BUILTINS[@]}" &
 builtins_pid=$!
+run load_colstats 10 "${COLSTATS[@]}" &
+colstats_pid=$!
 wait "$monitor_pid"
 wait "$builtins_pid"
+wait "$colstats_pid"
