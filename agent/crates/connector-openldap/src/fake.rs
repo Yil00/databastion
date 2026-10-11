@@ -1008,3 +1008,213 @@ async fn cas_store_guard_over_the_scripted_directory() {
     );
     crate::i2::assert_clean("scan logs", &logs.text(), &values, &[AGENT]);
 }
+
+/// Security review of #197, L3: containers whose DNs normalize to one
+/// name share one own-read budget in the Audit stream. Discovery caps
+/// their pooled sample at `sample_rows` (each search charged at least one
+/// entry, as the stream charges it), so one scan of 120 such containers,
+/// empty or not, is never reported as the agent's own reads over the
+/// budget, and the containers past the cap are not searched.
+#[tokio::test]
+async fn pooled_containers_stay_within_the_agents_budget() {
+    use crate::audit::events::{Context, EventBuilder};
+    use crate::audit::records::parse;
+    use crate::audit::records::tests::{CSN, log_entry};
+    use databastion_classifiers::names::normalize_ldap_dn;
+    use databastion_core::audit::own::{OwnAccount, SharedOwnUsage};
+
+    const SAMPLE: u32 = 50;
+    const CONTAINERS: usize = 120;
+    let name = |i: usize| format!("ou=Jane Doe {i},ou=Teams,dc=example,dc=org");
+    let pooled = normalize_ldap_dn(&name(0));
+    for i in 0..CONTAINERS {
+        // Some written in another case: one budget too.
+        let dn = if i.is_multiple_of(2) {
+            name(i)
+        } else {
+            name(i).replace("ou=Teams", "ou=teams")
+        };
+        assert!(
+            normalize_ldap_dn(&dn)
+                .as_str()
+                .eq_ignore_ascii_case(pooled.as_str()),
+            "{dn}"
+        );
+    }
+    assert!(pooled.as_str().starts_with("ou=*,"), "{}", pooled.as_str());
+    let t = target();
+    // `limits.max_sample_rows` clamps the job's `sample_rows` (and is the
+    // Audit stream's budget).
+    let limits = Limits {
+        max_sample_rows: SAMPLE,
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    };
+    for per_container in [0usize, 7, 500] {
+        let job = ScanJob::new(
+            ScanParams::contract_defaults(),
+            &t,
+            &limits,
+            Arc::new(HmacKey::new(&[7u8; 32]).unwrap()),
+        );
+        assert_eq!(job.sample_rows(), SAMPLE);
+        // (container, size limit, entries returned) of each sampling.
+        let searches: Arc<Mutex<Vec<(String, i64, usize)>>> = Arc::default();
+        let (sink, mut rx) = FindingSink::channel(4096);
+        let seen = Arc::clone(&searches);
+        crate::discover::scan(&job, &sink, &t, move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let (client, _) = serve(directory(AGENT, move |id, req| {
+                    let Request::Search {
+                        base,
+                        scope,
+                        size_limit,
+                        filter,
+                        ..
+                    } = req
+                    else {
+                        return vec![encode::done(id, 53)];
+                    };
+                    match (base.as_str(), scope) {
+                        ("dc=example,dc=org", 2)
+                            if filter.starts_with("(|(objectClass=organizationalUnit)") =>
+                        {
+                            let mut out: Vec<Vec<u8>> = (0..CONTAINERS)
+                                .map(|i| {
+                                    let dn = if i.is_multiple_of(2) {
+                                        name(i)
+                                    } else {
+                                        name(i).replace("ou=Teams", "ou=teams")
+                                    };
+                                    encode::entry(id, &dn, &[])
+                                })
+                                .collect();
+                            out.push(encode::done(id, 0));
+                            out
+                        }
+                        (b, 1) if b.contains("Jane Doe") => {
+                            let limit = usize::try_from(*size_limit).unwrap();
+                            assert!(limit >= 1, "unlimited search");
+                            let n = per_container.min(limit);
+                            let mut out: Vec<Vec<u8>> = (0..n)
+                                .map(|k| {
+                                    let mail = format!("member{k}@example.com");
+                                    encode::entry(
+                                        id,
+                                        &format!("uid=m{k},{b}"),
+                                        &[
+                                            ("structuralObjectClass", &[b"inetOrgPerson"]),
+                                            ("mail", &[mail.as_bytes()]),
+                                        ],
+                                    )
+                                })
+                                .collect();
+                            seen.lock().unwrap().push((b.to_owned(), *size_limit, n));
+                            // More entries than the limit: sizeLimitExceeded.
+                            out.push(encode::done(id, if per_container > n { 4 } else { 0 }));
+                            out
+                        }
+                        _ => tree(id, req),
+                    }
+                }));
+                Session::establish(
+                    client,
+                    timeouts(),
+                    Auth::Simple {
+                        dn: AGENT,
+                        password: "pw",
+                    },
+                )
+                .await
+            }
+        })
+        .await
+        .unwrap();
+        drop(sink);
+        while rx.recv().await.is_some() {}
+        let searches = searches.lock().unwrap().clone();
+        let charged: usize = searches.iter().map(|(_, _, n)| (*n).max(1)).sum();
+        assert!(
+            charged <= SAMPLE as usize,
+            "{per_container}: {charged} charged"
+        );
+        let expected_searches = match per_container {
+            0 => SAMPLE as usize,
+            // 7 each: 7 searches (49), then one of limit 1.
+            7 => 8,
+            _ => 1,
+        };
+        assert_eq!(searches.len(), expected_searches, "{per_container}");
+        assert_eq!(charged, SAMPLE as usize, "{per_container}");
+        // The size limits follow what is left.
+        let mut left = i64::from(SAMPLE);
+        for (_, limit, n) in &searches {
+            assert_eq!(*limit, left);
+            left -= i64::try_from((*n).max(1)).unwrap();
+        }
+        // The Audit stream, fed the log records of these searches, leaves
+        // all of them out (the agent's own sampling, within the budget).
+        let mut b = EventBuilder::new(
+            OwnAccount::new(
+                AGENT,
+                None,
+                None,
+                u64::from(SAMPLE),
+                SharedOwnUsage::default(),
+            ),
+            AGENT.to_owned(),
+            u64::from(SAMPLE),
+            Vec::new(),
+        );
+        b.set_contexts(vec![Context {
+            canon: "dc=example,dc=org".to_owned(),
+            name: normalize_ldap_dn("dc=example,dc=org"),
+        }]);
+        let attrs = ["mail", "objectClass", "structuralObjectClass"];
+        let records: Vec<_> = searches
+            .iter()
+            .map(|(base, limit, n)| {
+                let entries = n.to_string();
+                let size = limit.to_string();
+                let result = if per_container > *n { "4" } else { "0" };
+                parse(&log_entry(&[
+                    ("reqStart", &["20260929202642.000003Z"]),
+                    ("reqType", &["search"]),
+                    ("reqSession", &["7"]),
+                    ("reqAuthzID", &[AGENT]),
+                    ("reqDN", &[base]),
+                    ("reqResult", &[result]),
+                    ("reqScope", &["one"]),
+                    ("reqFilter", &["(objectClass=*)"]),
+                    ("reqAttr", &attrs),
+                    ("reqAttrsOnly", &["FALSE"]),
+                    ("reqEntries", &[&entries]),
+                    ("reqSizeLimit", &[&size]),
+                    ("entryCSN", &[CSN]),
+                ]))
+                .unwrap()
+            })
+            .collect();
+        let reported = b.convert(records, std::time::Instant::now());
+        assert!(reported.is_empty(), "{per_container}: {reported:?}");
+        // One more search of the name, beyond the scan: reported.
+        let more = parse(&log_entry(&[
+            ("reqStart", &["20260929202642.000003Z"]),
+            ("reqType", &["search"]),
+            ("reqSession", &["7"]),
+            ("reqAuthzID", &[AGENT]),
+            ("reqDN", &[name(1).as_str()]),
+            ("reqResult", &["0"]),
+            ("reqScope", &["one"]),
+            ("reqFilter", &["(objectClass=*)"]),
+            ("reqAttr", &attrs),
+            ("reqAttrsOnly", &["FALSE"]),
+            ("reqEntries", &["0"]),
+            ("reqSizeLimit", &["1"]),
+            ("entryCSN", &[CSN]),
+        ]))
+        .unwrap();
+        assert_eq!(b.convert(vec![more], std::time::Instant::now()).len(), 1);
+    }
+}

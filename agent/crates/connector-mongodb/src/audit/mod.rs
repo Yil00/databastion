@@ -640,7 +640,7 @@ fn test_poison(record: &[u8]) {
 /// Whether a record proves that reads are logged (a successful
 /// `authCheck` of a read or write).
 fn proves_reads(r: &Record) -> bool {
-    matches!(r.kind, Kind::Op(c) if !matches!(c, Cmd::Ddl | Cmd::Dcl | Cmd::Other)) && !r.failed
+    matches!(r.kind, Kind::Op(c) if !matches!(c, Cmd::Ddl | Cmd::Dcl | Cmd::Other)) && !r.failed()
 }
 
 /// Tails the log for up to [`REPROBE`]. `Ok(Err(kind))` when the log

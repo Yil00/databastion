@@ -189,6 +189,84 @@ impl Pipeline {
     }
 }
 
+/// How an operation failed, from its numeric error code only: the error
+/// text (`errMsg`, `errName`) is never read nor fetched.
+///
+/// An error text can carry the values an operation read: a failed
+/// conversion quotes the value (`{$toInt: "$email"}`, `ConversionFailure`
+/// 241), so do expression errors, a JavaScript `throw` in `$where` or
+/// `$function` (139), a duplicate key built from a stored value (11000),
+/// and many location-coded errors (security review of #197, L1). Only
+/// codes whose text is known to hold no value read are not
+/// [`Failure::Telling`]; any other code, an unknown one, a code that is
+/// not an integer, or `ok: 0` without a code is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// Refused before running: `Unauthorized` (13, the server checks the
+    /// privileges before the command reads anything), `NamespaceNotFound`
+    /// (26, its text names the namespace the client sent),
+    /// `CommandNotFound` (59) and the command parser's unknown or missing
+    /// field (40414, 40415).
+    Refused,
+    /// Stopped in a way whose text names no value read: time limits
+    /// (`MaxTimeMSExpired` 50, `ExceededTimeLimit` 262, `LockTimeout` 24),
+    /// interruptions (`Interrupted` 11601, `InterruptedAtShutdown` 11600,
+    /// `InterruptedDueToReplStateChange` 11602, `ClientDisconnect` 279,
+    /// `ShutdownInProgress` 91), cursors and plans killed
+    /// (`CursorNotFound` 43, `CursorKilled` 237, `QueryPlanKilled` 175),
+    /// concurrency (`WriteConflict` 112, `NoSuchTransaction` 251), the
+    /// node's role (`PrimarySteppedDown` 189, `NotWritablePrimary` 10107,
+    /// `NotPrimaryNoSecondaryOk` 13435, `NotPrimaryOrSecondary` 13436),
+    /// and memory limits (`ExceededMemoryLimit` 146,
+    /// `QueryExceededMemoryLimitNoDiskUseAllowed` 292). The network time
+    /// limits (`NetworkTimeout` 89, `NetworkInterfaceExceededTimeLimit`
+    /// 202) are not: on sharded paths their text can embed the remote
+    /// command (security review of #207, L1).
+    Quiet,
+    /// Any other failure: its text may show the values read.
+    Telling,
+}
+
+/// Codes of [`Failure::Refused`].
+pub(crate) const REFUSED_CODES: [i64; 5] = [13, 26, 59, 40414, 40415];
+/// Codes of [`Failure::Quiet`].
+pub(crate) const QUIET_CODES: [i64; 19] = [
+    50, 262, 24, 11601, 11600, 11602, 279, 91, 43, 237, 175, 112, 251, 189, 10107, 13435, 13436,
+    146, 292,
+];
+
+/// A field that is present, `null` included (`Some(Value::Null)`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+/// The code of an operation from its `errCode` and `ok` fields: `None`
+/// when it succeeded; `Err(())` (telling) for a code that is not an
+/// integer, or for `ok: 0` (or `false`) without a code.
+pub(crate) fn code_of(
+    err_code: Option<Option<i64>>,
+    ok: Option<Option<f64>>,
+) -> Option<Result<i64, ()>> {
+    match (err_code, ok) {
+        (Some(code), _) => Some(code.ok_or(())),
+        (None, Some(ok)) if ok.is_none_or(|v| v == 0.0) => Some(Err(())),
+        _ => None,
+    }
+}
+
+impl Failure {
+    /// The failure of an error code (`Some(0)` and no code: none). A
+    /// code that is not an integer is [`Failure::Telling`].
+    pub(crate) fn of(code: Option<Result<i64, ()>>) -> Option<Self> {
+        match code? {
+            Ok(0) => None,
+            Ok(c) if REFUSED_CODES.contains(&c) => Some(Self::Refused),
+            Ok(c) if QUIET_CODES.contains(&c) => Some(Self::Quiet),
+            _ => Some(Self::Telling),
+        }
+    }
+}
+
 /// Shape facts of a command (never a value).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Shape {
@@ -237,8 +315,8 @@ pub(crate) struct Record {
     pub(crate) ns: Option<(String, Option<String>)>,
     /// Documents returned (reads) or written (writes).
     pub(crate) rows: Option<u64>,
-    /// The operation failed.
-    pub(crate) failed: bool,
+    /// How the operation failed (`None`: it succeeded).
+    pub(crate) failure: Option<Failure>,
     pub(crate) shape: Shape,
     /// Shape of the command that opened the cursor (`getMore`).
     pub(crate) origin: Option<Shape>,
@@ -252,13 +330,18 @@ impl fmt::Debug for Record {
         f.debug_struct("Record")
             .field("kind", &self.kind)
             .field("rows", &self.rows)
-            .field("failed", &self.failed)
+            .field("failure", &self.failure)
             .field("shape", &self.shape)
             .finish_non_exhaustive()
     }
 }
 
 impl Record {
+    /// The operation failed.
+    pub(crate) fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
+
     pub(crate) fn new(kind: Kind) -> Self {
         Self {
             ts: None,
@@ -269,7 +352,7 @@ impl Record {
             app: None,
             ns: None,
             rows: None,
-            failed: false,
+            failure: None,
             shape: Shape::default(),
             origin: None,
             system: false,
@@ -1118,7 +1201,7 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
         r.conn = client.zip(port).map(|(ip, p)| ConnId::Remote(ip, p));
         r.user.clone_from(&user);
         r.system = system;
-        r.failed = head.result.is_some_and(|c| c != 0);
+        r.failure = Failure::of(head.result.map(Ok));
         r
     };
     let atype = head.atype.as_str();
@@ -1240,8 +1323,12 @@ struct SlowAttr {
     ndeleted: Option<serde_json::Number>,
     #[serde(default, rename = "nUpserted")]
     upserted: Option<serde_json::Number>,
-    #[serde(default, rename = "errCode")]
-    err_code: Option<serde_json::Number>,
+    /// Any JSON value: a code that is not an integer is telling, never a
+    /// dropped line (security review of #207, L4).
+    #[serde(default, rename = "errCode", deserialize_with = "present")]
+    err_code: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    ok: Option<serde_json::Value>,
     #[serde(default)]
     remote: Option<String>,
 }
@@ -1464,7 +1551,13 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             } else {
                 count_of(a.nreturned.as_ref())
             };
-            r.failed = a.err_code.as_ref().is_some_and(|c| c.as_i64() != Some(0));
+            r.failure = Failure::of(code_of(
+                a.err_code.as_ref().map(serde_json::Value::as_i64),
+                a.ok.as_ref().map(|v| match v {
+                    serde_json::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+                    v => v.as_f64(),
+                }),
+            ));
             Some(r)
         }
         ID_ACCEPTED => {
@@ -1605,7 +1698,7 @@ mod tests {
         assert_eq!(r.rows, Some(120));
         assert_eq!(r.shape.filter, Filter::Keys(0));
         assert_eq!(r.client, ClientAddr::parse("172.18.0.1"));
-        assert!(!r.system && !r.failed);
+        assert!(!r.system && !r.failed());
         // A filter with literals: only its key count is kept.
         let line = SLOW_FIND.replace(
             r#""filter":{}"#,
@@ -1642,6 +1735,68 @@ mod tests {
     const ABANDONED_SPECULATIVE: &str = r#"{"t":{"$date":"2026-09-30T07:25:49.712+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn82","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:47742","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"exporter","db":"admin","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected","result":337,"metrics":{"conversation_duration":{"micros":13582,"summary":{"0":{"step":1,"step_total":2,"duration_micros":247}}}},"doc":{},"extraInfo":{}}}"#;
     const ABANDONED_UNNAMED: &str = r#"{"t":{"$date":"2026-09-30T07:25:49.571+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn81","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:47732","isSpeculative":false,"isClusterMember":false,"mechanism":"","user":"","db":"","error":"AuthenticationAbandoned: Authentication session abandoned, client has likely disconnected","result":337,"metrics":{"conversation_duration":{"micros":19107,"summary":{}}},"doc":{},"extraInfo":{}}}"#;
     const USER_NOT_FOUND: &str = r#"{"t":{"$date":"2026-09-30T07:29:25.032+00:00"},"s":"I",  "c":"ACCESS",   "id":5286307, "ctx":"conn328","msg":"Failed to authenticate","attr":{"client":"10.0.0.9:51024","isSpeculative":true,"isClusterMember":false,"mechanism":"SCRAM-SHA-256","user":"nobody","db":"admin","error":"UserNotFound: Could not find user \"nobody\" for db \"admin\"","result":11,"metrics":{"conversation_duration":{"micros":541,"summary":{"0":{"step":1,"step_total":2,"duration_micros":510}}}},"doc":{"application":{"name":"mongosh 2.11.1"}},"extraInfo":{}}}"#;
+
+    #[test]
+    fn failures_are_classified_by_code() {
+        assert_eq!(Failure::of(None), None);
+        assert_eq!(Failure::of(Some(Ok(0))), None);
+        for c in REFUSED_CODES {
+            assert_eq!(Failure::of(Some(Ok(c))), Some(Failure::Refused));
+        }
+        for c in QUIET_CODES {
+            assert_eq!(Failure::of(Some(Ok(c))), Some(Failure::Quiet));
+        }
+        // Codes whose text can show a value read, and unknown ones.
+        for c in [
+            1,
+            2,
+            9,
+            14,
+            139,
+            241,
+            10334,
+            11000,
+            16020,
+            28689,
+            51091,
+            -1,
+            i64::MAX,
+        ] {
+            assert_eq!(Failure::of(Some(Ok(c))), Some(Failure::Telling), "{c}");
+        }
+        assert_eq!(Failure::of(Some(Err(()))), Some(Failure::Telling));
+        // The lists do not overlap.
+        assert!(REFUSED_CODES.iter().all(|c| !QUIET_CODES.contains(c)));
+        // Server log: from `errCode` only, never `errMsg`.
+        let slow = |code: &str| {
+            format!(
+                r#"{{"t":{{"$date":"2026-09-29T10:00:00.000+00:00"}},"s":"I","c":"COMMAND","id":51803,"ctx":"conn1","msg":"Slow query","attr":{{"type":"command","ns":"app.customers","command":{{"find":"customers","$db":"app"}},"errMsg":"Unauthorized","errName":"Unauthorized"{code},"nreturned":0}}}}"#
+            )
+        };
+        let failure = |code: &str| {
+            parse_server_log(slow(code).as_bytes())
+                .unwrap()
+                .unwrap()
+                .failure
+        };
+        assert_eq!(failure(""), None);
+        assert_eq!(failure(r#","errCode":0"#), None);
+        assert_eq!(failure(r#","errCode":13"#), Some(Failure::Refused));
+        assert_eq!(failure(r#","errCode":50"#), Some(Failure::Quiet));
+        assert_eq!(failure(r#","errCode":241"#), Some(Failure::Telling));
+        assert_eq!(failure(r#","errCode":2.5"#), Some(Failure::Telling));
+        // Not a number: telling, never a dropped line (#207, L4).
+        assert_eq!(failure(r#","errCode":"241""#), Some(Failure::Telling));
+        assert_eq!(failure(r#","errCode":null"#), Some(Failure::Telling));
+        // `ok: 0` without a code: telling; `ok: 1`: none.
+        assert_eq!(failure(r#","ok":0"#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":false"#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":"x""#), Some(Failure::Telling));
+        assert_eq!(failure(r#","ok":1"#), None);
+        assert_eq!(failure(r#","ok":0,"errCode":50"#), Some(Failure::Quiet));
+        assert_eq!(failure(r#","ok":0,"errCode":26"#), Some(Failure::Refused));
+        assert_eq!(failure(r#","ok":0,"errCode":89"#), Some(Failure::Telling));
+    }
 
     #[test]
     fn abandoned_authentications_are_not_failed_logins() {
@@ -1826,7 +1981,7 @@ mod tests {
             r.conn,
             Some(ConnId::Remote("10.0.0.9".parse().unwrap(), 51000))
         );
-        assert!(r.rows.is_none() && !r.failed);
+        assert!(r.rows.is_none() && !r.failed());
         // Percona date form.
         let percona = find.replace(
             r#"{ "$date" : "2026-09-29T10:00:00.000+00:00" }"#,
@@ -1836,7 +1991,12 @@ mod tests {
         assert_eq!(secs(r.ts.unwrap()), 1_790_676_000);
         // Refused: failed.
         let refused = find.replace(r#""result" : 0"#, r#""result" : 13"#);
-        assert!(parse_audit_log(refused.as_bytes()).unwrap().unwrap().failed);
+        assert!(
+            parse_audit_log(refused.as_bytes())
+                .unwrap()
+                .unwrap()
+                .failed()
+        );
         // DDL through authCheck is skipped; the DDL record counts.
         let drop = find.replace(r#""command" : "find""#, r#""command" : "drop""#);
         assert!(parse_audit_log(drop.as_bytes()).unwrap().is_none());

@@ -836,3 +836,250 @@ async fn audit_from_the_percona_audit_log() {
     assert_no_own_reads(&events, &format!("{}@{}", url.user, url.auth_source));
     assert_no_marker(&events, &logs);
 }
+
+/// A read whose error text shows a value read: `$toInt` of an e-mail
+/// address fails with `ConversionFailure` (241), "Failed to parse number
+/// '<the address>' in $convert", and returns no document.
+fn telling_read() -> DocBuf {
+    DocBuf::new().str("find", COLLECTION).doc(
+        "filter",
+        DocBuf::new().doc(
+            "$expr",
+            DocBuf::new().array(
+                "$eq",
+                vec![DocBuf::new().str("$toInt", "$email"), DocBuf::new()],
+            ),
+        ),
+    )
+}
+
+/// A read stopped by its `maxTimeMS` (`MaxTimeMSExpired`, 50): no value
+/// in its text.
+fn quiet_read() -> DocBuf {
+    DocBuf::new()
+        .str("find", COLLECTION)
+        .doc(
+            "filter",
+            DocBuf::new().str(
+                "$where",
+                "function(){var d=Date.now(); while(Date.now()-d<50){}; return true}",
+            ),
+        )
+        .i32("maxTimeMS", 5)
+}
+
+/// Runs `command` on `app`, which must fail with `code`.
+async fn fails_with(s: &mut Session, command: DocBuf, code: i32) {
+    let r = run(s, "app", command).await;
+    assert_eq!(r.err(), Some(Some(code)), "unexpected outcome");
+}
+
+/// Phase 8 follow-ups (security review of #197, L1): failed reads that
+/// return no document, against a running stream of `t` (whose account is
+/// `own`): a failure whose text shows the value read is always reported,
+/// from another account and from the agent's own identity; a quiet one
+/// (its `maxTimeMS`) of the agent's is left out; another account's quiet
+/// one is an ordinary event. No value of the error texts in the events or
+/// the logs.
+async fn failed_reads_flow(
+    connector: &Arc<MongodbConnector>,
+    t: &TargetConfig,
+    a: &Url,
+    own: &str,
+    source: EventSource,
+) {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(connector), t, &state.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut agent = Session::connect(t, Timeouts::new(Duration::from_secs(60)))
+        .await
+        .unwrap();
+    // The agent's identity: a quiet failure first (left out), then one
+    // that shows a value (reported).
+    fails_with(&mut agent, quiet_read(), 50).await;
+    fails_with(&mut agent, telling_read(), 241).await;
+    agent.close().await;
+    let mut other = admin_as(a, "mongosh 2.3.0").await;
+    fails_with(&mut other, quiet_read(), 50).await;
+    fails_with(&mut other, telling_read(), 241).await;
+    other.close().await;
+    let admin_name = format!("{}@{}", a.user, a.auth_source);
+    let from = |name: &str, ev: &MaskedEvent| {
+        ev.principal().account_name() == name
+            && ev.action() == EventAction::Read
+            && ev
+                .objects()
+                .iter()
+                .any(|o| o.object().as_str() == COLLECTION)
+    };
+    let mut events = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(60), |ev| {
+        ev.iter().any(|e| from(&admin_name, e) && e.always_report())
+            && ev.iter().any(|e| from(own, e) && e.always_report())
+    })
+    .await;
+    collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+    task.abort();
+    let text: Vec<String> = events.iter().map(describe).collect();
+    assert!(events.iter().all(|e| e.source() == source), "{text:#?}");
+    // Another account: both failures are events; the one that may show
+    // values is always reported, the quiet one is not.
+    let theirs: Vec<&MaskedEvent> = events.iter().filter(|e| from(&admin_name, e)).collect();
+    assert_eq!(theirs.len(), 2, "{text:#?}");
+    assert_eq!(
+        theirs.iter().filter(|e| e.always_report()).count(),
+        1,
+        "{text:#?}"
+    );
+    assert!(theirs.iter().all(|e| e.rows() == Some(0)), "{text:#?}");
+    // The agent's identity: only the failure that may show values.
+    let ours: Vec<&MaskedEvent> = events.iter().filter(|e| from(own, e)).collect();
+    assert_eq!(ours.len(), 1, "{text:#?}");
+    assert!(ours[0].always_report());
+    assert_eq!(ours[0].principal().application(), Some("databastion-agent"));
+    assert_eq!(ours[0].rows(), Some(0));
+    // I2: the error texts quote seeded addresses; none in the events as
+    // the core would send them, nor in the logs.
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    crate::i2::assert_clean(
+        "serialized events",
+        &gt,
+        "app",
+        &crate::i2::serialize_events(&events),
+    );
+    crate::i2::assert_clean("logs", &gt, "app", &logs.text());
+    assert!(
+        !text.iter().any(|t| t.contains("@example.")),
+        "an address in the events"
+    );
+    assert!(!logs.text().contains("@example."), "an address in the logs");
+}
+
+#[tokio::test]
+async fn failed_reads_without_documents_from_the_server_log() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = server() else { return };
+    let Some(a) = admin() else { return };
+    let Some(log) = env_path("DATABASTION_TEST_MONGO_LOG", "mongo-log") else {
+        return;
+    };
+    let extra = format!(
+        ", audit_log: {{path: \"{}\", format: server_log}}",
+        log.display()
+    );
+    let (_dir, t) = target_with(&url, &url.user, &url.password, &url.auth_source, &extra);
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    let from = std::fs::metadata(&log).unwrap().len();
+    failed_reads_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{}@{}", url.user, url.auth_source),
+        EventSource::MongodbLog,
+    )
+    .await;
+    // The premise: the server logged the value in the failure's text
+    // (never printed here).
+    let bytes = std::fs::read(&log).unwrap();
+    let start = usize::try_from(from).unwrap().min(bytes.len());
+    let shown = bytes[start..]
+        .split(|b| *b == b'\n')
+        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+        .filter(|v| v["attr"]["errCode"] == 241)
+        .any(|v| {
+            v["attr"]["errMsg"]
+                .as_str()
+                .is_some_and(|m| m.contains("@example."))
+        });
+    assert!(shown, "the server log shows no value in the error text");
+}
+
+#[tokio::test]
+async fn failed_reads_without_documents_from_the_profiler() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = server() else { return };
+    let Some(a) = admin() else { return };
+    profiler_account(&a).await;
+    let (_dir, t) = target(&url, PROFILER_USER, IT_PASSWORD, "admin");
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MongodbProfiler)
+    );
+    failed_reads_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{PROFILER_USER}@admin"),
+        EventSource::MongodbProfiler,
+    )
+    .await;
+    drop_profiler_account(&a).await;
+}
+
+/// The same on Percona Server for MongoDB (dev `psmdb`), through its
+/// profiler (turned on for `app` here: the service runs with the
+/// `auditLog` only).
+#[tokio::test]
+async fn failed_reads_without_documents_on_percona_server_for_mongodb() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = env_url("DATABASTION_TEST_PSMDB_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(a) = env_url("DATABASTION_TEST_PSMDB_ADMIN_URL", "psmdb-audit") else {
+        return;
+    };
+    profiler_account(&a).await;
+    let mut s = admin_session(&a).await;
+    run(
+        &mut s,
+        "app",
+        DocBuf::new().i32("profile", 1).i32("slowms", 0),
+    )
+    .await
+    .unwrap();
+    s.close().await;
+    let (_dir, t) = target(&url, PROFILER_USER, IT_PASSWORD, "admin");
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MongodbProfiler)
+    );
+    failed_reads_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{PROFILER_USER}@admin"),
+        EventSource::MongodbProfiler,
+    )
+    .await;
+    let mut s = admin_session(&a).await;
+    run(&mut s, "app", DocBuf::new().i32("profile", 0))
+        .await
+        .unwrap();
+    s.close().await;
+    drop_profiler_account(&a).await;
+}
+
+async fn drop_profiler_account(a: &Url) {
+    let mut s = admin_session(a).await;
+    let _ = run(
+        &mut s,
+        "admin",
+        DocBuf::new().str("dropUser", PROFILER_USER),
+    )
+    .await;
+    let _ = run(
+        &mut s,
+        "admin",
+        DocBuf::new().str("dropRole", PROFILER_ROLE),
+    )
+    .await;
+    s.close().await;
+}
