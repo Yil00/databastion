@@ -37,7 +37,9 @@ require_services() {
   done
 }
 
-cargo_it() { (cd agent && cargo test -p "$1" --all-features --locked -- --nocapture "${@:2}"); }
+# Failing tests are also printed as GitHub Actions error annotations (names and panic lines), so an
+# intermittent failure in the engine matrix can be identified from the check run alone.
+cargo_it() { (cd agent && ../scripts/ci/cargo-test-annotate.sh cargo test -p "$1" --all-features --locked -- --nocapture "${@:2}"); }
 
 it_postgres() {
   require_services postgres

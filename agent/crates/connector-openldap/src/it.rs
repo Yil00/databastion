@@ -674,3 +674,360 @@ async fn sasl_external_over_ldapi() {
     assert!(!h.reachable);
     assert_eq!(h.failure, Some(FailureCode::AuthenticationFailed));
 }
+
+/// A minimal administrator client for fixtures (the connector never
+/// writes): a simple bind as [`ADMIN_DN`], then add and delete requests.
+struct AdminWriter {
+    stream: tokio::net::TcpStream,
+    id: i32,
+}
+
+impl AdminWriter {
+    async fn connect(s: &Server, password: &str) -> Self {
+        let stream = tokio::net::TcpStream::connect((s.host.as_str(), s.port))
+            .await
+            .unwrap();
+        let mut w = Self { stream, id: 1 };
+        let bind = crate::proto::bind_simple(1, ADMIN_DN, password);
+        assert_eq!(w.round_trip(bind.as_bytes()).await, 0, "admin bind");
+        w
+    }
+
+    async fn round_trip(&mut self, frame: &[u8]) -> i64 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        self.stream.write_all(frame).await.unwrap();
+        let mut buf = vec![0u8; 2];
+        self.stream.read_exact(&mut buf).await.unwrap();
+        let total = loop {
+            if let Some(t) = crate::ber::message_len(&buf).unwrap() {
+                break t;
+            }
+            let mut b = [0u8; 1];
+            self.stream.read_exact(&mut b).await.unwrap();
+            buf.push(b[0]);
+        };
+        let have = buf.len();
+        buf.resize(total, 0);
+        self.stream.read_exact(&mut buf[have..]).await.unwrap();
+        let mut r = crate::ber::Reader::new(&buf);
+        let mut m = r.nested(crate::ber::SEQUENCE).unwrap();
+        m.int(crate::ber::INTEGER).unwrap();
+        let (_, op) = m.tlv().unwrap();
+        crate::ber::Reader::new(op)
+            .int(crate::ber::ENUMERATED)
+            .unwrap()
+    }
+
+    fn message(&mut self, op: crate::ber::Enc) -> crate::ber::Enc {
+        use crate::ber::{Enc, INTEGER, SEQUENCE};
+        self.id += 1;
+        Enc::constructed(SEQUENCE, &[Enc::int(INTEGER, i64::from(self.id)), op])
+    }
+
+    /// Adds `dn` with `attrs`; the LDAP result code.
+    async fn add(&mut self, dn: &str, attrs: &[(&str, &[&str])]) -> i64 {
+        use crate::ber::{Enc, OCTET_STRING, SEQUENCE, SET, app};
+        let list: Vec<Enc> = attrs
+            .iter()
+            .map(|(name, values)| {
+                let values: Vec<Enc> = values
+                    .iter()
+                    .map(|v| Enc::octets(OCTET_STRING, v.as_bytes()))
+                    .collect();
+                Enc::constructed(
+                    SEQUENCE,
+                    &[
+                        Enc::octets(OCTET_STRING, name.as_bytes()),
+                        Enc::constructed(SET, &values),
+                    ],
+                )
+            })
+            .collect();
+        let op = Enc::constructed(
+            app(8),
+            &[
+                Enc::octets(OCTET_STRING, dn.as_bytes()),
+                Enc::constructed(SEQUENCE, &list),
+            ],
+        );
+        let frame = self.message(op);
+        self.round_trip(frame.as_bytes()).await
+    }
+
+    /// Deletes `dn`; the LDAP result code.
+    async fn delete(&mut self, dn: &str) -> i64 {
+        let op = crate::ber::Enc::octets(crate::ber::app_primitive(10), dn.as_bytes());
+        let frame = self.message(op);
+        self.round_trip(frame.as_bytes()).await
+    }
+}
+
+/// The pooled containers of the test below: `ou=Jane Doe <i>` under
+/// `ou=pool-<run>` (a name of its own per run: the Audit stream's first
+/// start reads one minute of earlier log, an earlier run's searches
+/// included), all normalized to `ou=*,ou=pool-<run>,dc=example,dc=org`;
+/// every other one holds [`POOL_ENTRIES`] people.
+const POOL_CONTAINERS: usize = 30;
+const POOL_ENTRIES: usize = 3;
+
+/// `ou=pool-<letters>,dc=example,dc=org`, the letters from the time.
+fn pool_parent() -> String {
+    let mut n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut run = String::new();
+    for _ in 0..5 {
+        run.push(char::from(b'a' + u8::try_from(n % 26).unwrap_or(0)));
+        n /= 26;
+    }
+    format!("ou=pool-{run},dc=example,dc=org")
+}
+
+fn pool_container(parent: &str, i: usize) -> String {
+    format!("ou=Jane Doe {i},{parent}")
+}
+
+fn pool_entries(i: usize) -> usize {
+    if i.is_multiple_of(2) { POOL_ENTRIES } else { 0 }
+}
+
+async fn drop_pool(w: &mut AdminWriter, parent: &str) {
+    for i in 0..POOL_CONTAINERS {
+        for k in 0..POOL_ENTRIES {
+            let _ = w
+                .delete(&format!("uid=m{k},{}", pool_container(parent, i)))
+                .await;
+        }
+        let _ = w.delete(&pool_container(parent, i)).await;
+    }
+    let _ = w.delete(parent).await;
+}
+
+/// Phase 8 follow-ups (security review of #197, L3): more containers that
+/// normalize to one name than `limits.max_sample_rows` (here 10, the Audit
+/// stream's per-object budget): Discovery caps their pooled sample, so
+/// the agent's own scan is not reported, and it searches only as many of
+/// them as the cap allows.
+#[tokio::test]
+async fn pooled_containers_do_not_get_the_agents_scan_reported() {
+    let _serial = SERIAL.lock().await;
+    let Some(s) = server() else { return };
+    let Some(admin) = admin_password() else {
+        return;
+    };
+    const BUDGET: u32 = 10;
+    let mut w = AdminWriter::connect(&s, &admin).await;
+    // Fixtures an interrupted earlier run left.
+    let (_admin_dir, admin_target) = target(&s, ADMIN_DN, &admin);
+    let mut session = Session::connect(&admin_target, Timeouts::new(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    let mut stale = Vec::new();
+    let list = Search {
+        base: SUFFIX,
+        scope: Scope::One,
+        size_limit: 100,
+        time_limit: 0,
+        types_only: false,
+        filter: Filter::Present("objectClass"),
+        attributes: &["1.1"],
+    };
+    session
+        .search(Stage::Sample, &list, &mut |e: Entry| {
+            if e.dn.to_ascii_lowercase().starts_with("ou=pool-") {
+                stale.push(e.dn.to_string());
+            }
+        })
+        .await
+        .unwrap();
+    session.close().await;
+    for dn in stale {
+        drop_pool(&mut w, &dn).await;
+    }
+    let parent = pool_parent();
+    let parent_ou = parent
+        .strip_prefix("ou=")
+        .and_then(|p| p.split(',').next())
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        w.add(
+            &parent,
+            &[
+                ("objectClass", &["organizationalUnit"]),
+                ("ou", &[&parent_ou])
+            ]
+        )
+        .await,
+        0
+    );
+    for i in 0..POOL_CONTAINERS {
+        let ou = format!("Jane Doe {i}");
+        assert_eq!(
+            w.add(
+                &pool_container(&parent, i),
+                &[("objectClass", &["organizationalUnit"]), ("ou", &[&ou])]
+            )
+            .await,
+            0
+        );
+        for k in 0..pool_entries(i) {
+            let uid = format!("m{k}");
+            let mail = format!("pool.member{i}.{k}@example.org");
+            assert_eq!(
+                w.add(
+                    &format!("uid={uid},{}", pool_container(&parent, i)),
+                    &[
+                        ("objectClass", &["inetOrgPerson"]),
+                        ("uid", &[&uid]),
+                        ("cn", &["Pool Member"]),
+                        ("sn", &["Member"]),
+                        ("mail", &[&mail]),
+                    ]
+                )
+                .await,
+                0
+            );
+        }
+    }
+    let pooled = normalize_ldap_dn(&pool_container(&parent, 0));
+    assert_eq!(pooled.as_str(), format!("ou=*,{parent}"));
+
+    let (dir, t) = target(&s, &service_dn(), &password());
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        max_sample_rows: BUDGET,
+        discovery_duty_cycle_percent: 100,
+        ..Limits::default()
+    };
+    let cfg = AuditConfig::local(&t, 1, &limits).with_state_dir(dir.0.clone());
+    let connector = Arc::new(OpenldapConnector::new());
+    let (sink, mut rx) = EventSink::channel(4096);
+    let stream = {
+        let connector = Arc::clone(&connector);
+        let cfg = cfg.clone();
+        tokio::spawn(async move { connector.audit_stream(&cfg, &sink).await })
+    };
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let since = std::time::SystemTime::now() - Duration::from_secs(1);
+    let logs = Logs::default();
+    {
+        let _guard = logs.capture();
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &limits, key());
+        assert_eq!(job.sample_rows(), BUDGET);
+        let (fsink, mut frx) = FindingSink::channel(4096);
+        connector.discover(&job, &fsink).await.unwrap();
+        drop(fsink);
+        let mut findings = Vec::new();
+        while let Some(f) = frx.recv().await {
+            findings.push(f);
+        }
+        // The pooled group is still covered.
+        assert!(
+            findings.iter().any(|f| f
+                .location()
+                .and_then(|l| l.schema.as_ref())
+                .is_some_and(|s| s.as_str() == pooled.as_str())),
+            "the pooled containers were not sampled"
+        );
+    }
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(e)) => events.push(e),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    stream.abort();
+    events.retain(|e| e.ts() >= since);
+    let agent = crate::dn::canon(&service_dn()).unwrap();
+    // The pooled containers are this run's only (earlier tests' scans in
+    // the minute of log the stream reads first may use up the budget of
+    // the seeded containers).
+    let own: Vec<&MaskedEvent> = events
+        .iter()
+        .filter(|e| {
+            e.principal().account_name() == agent
+                && e.objects()
+                    .iter()
+                    .any(|o| o.schema().is_some_and(|s| s.as_str() == pooled.as_str()))
+        })
+        .collect();
+    assert!(own.is_empty(), "the agent's own scan was reported: {own:?}");
+    // The agent's one-level searches of the pooled containers, from the
+    // log: within the cap, charged as the stream charges them.
+    let mut session = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    let mut charged = 0u64;
+    let mut searched = 0usize;
+    let mut records = 0usize;
+    let attrs = ["reqDN", "reqScope", "reqAuthzID", "reqEntries", "reqStart"];
+    let search = Search {
+        base: "cn=accesslog",
+        scope: Scope::One,
+        size_limit: 10_000,
+        time_limit: 0,
+        types_only: false,
+        // Only the records of this run's containers (the server's size
+        // limit is 1000).
+        filter: Filter::And(vec![
+            Filter::Eq("reqType", "search".to_owned()),
+            Filter::Or(
+                (0..POOL_CONTAINERS)
+                    .map(|i| Filter::Eq("reqDN", pool_container(&parent, i)))
+                    .collect(),
+            ),
+        ]),
+        attributes: &attrs,
+    };
+    session
+        .search(Stage::Sample, &search, &mut |e: Entry| {
+            records += 1;
+            let dn = e
+                .first_str("reqDN")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let who = e.first_str("reqAuthzID").unwrap_or_default();
+            if dn.ends_with(parent.as_str())
+                && dn != parent
+                && e.first_str("reqScope") == Some("one")
+                && crate::dn::canon(who).as_deref() == Some(agent.as_str())
+            {
+                searched += 1;
+                let n: u64 = e
+                    .first_str("reqEntries")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                charged += n.max(1);
+            }
+        })
+        .await
+        .unwrap();
+    session.close().await;
+    assert!(
+        searched > 0,
+        "no search of the pooled containers logged ({records} search records)"
+    );
+    assert!(
+        searched < POOL_CONTAINERS,
+        "every pooled container was searched ({searched})"
+    );
+    assert!(charged <= u64::from(BUDGET), "{charged} charged");
+    // No sampled value and no raw container name in the events or logs.
+    let mut values: Vec<String> = (0..POOL_CONTAINERS)
+        .flat_map(|i| (0..pool_entries(i)).map(move |k| format!("pool.member{i}.{k}@example.org")))
+        .collect();
+    values.push("Jane Doe".to_owned());
+    let agent_dn = service_dn();
+    crate::i2::assert_clean(
+        "serialized events",
+        &crate::i2::events_text(&events),
+        &values,
+        &[&agent_dn],
+    );
+    crate::i2::assert_clean("scan logs", &logs.text(), &values, &[&agent_dn]);
+    drop_pool(&mut w, &parent).await;
+}
