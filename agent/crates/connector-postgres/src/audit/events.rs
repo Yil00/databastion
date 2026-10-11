@@ -875,7 +875,12 @@ pub(crate) enum OwnKind {
 /// replaced by `$n`, numbered in order of appearance after the highest
 /// bound parameter of the statement, everything else verbatim (as
 /// PostgreSQL's `generate_normalized_query` does; checked on PostgreSQL
-/// 16). The connector's bound parameters stay `$1`, `$2`… in place: a
+/// 16 to 18). PostgreSQL 18 also squashes an `ARRAY[…]` or `IN (…)` list
+/// of constants or parameters into one `$n /*, ... */`, which this does
+/// not reproduce: the connector's statements hold no such list (an array
+/// of constants is one literal, `'{r,p}'::pg_catalog."char"[]`; ADR-0049
+/// item 12, test `own_statements_have_no_list_postgresql_18_squashes`).
+/// The connector's bound parameters stay `$1`, `$2`… in place: a
 /// client sending the same statement with constants instead of parameters
 /// gets another `queryid` and another text, and is reported (#76 review
 /// I2).
@@ -2840,6 +2845,66 @@ mod tests {
     const PSS_SET_LOCAL: &str = "SELECT pg_catalog.set_config($4, $1, $5), \
         pg_catalog.set_config($6, $2, $7), pg_catalog.set_config($8, $3, $9), \
         pg_catalog.current_setting($10)";
+
+    /// Whether `pg_stat_statements` 18+ would squash a list of the stored
+    /// text `form` ([`pss_form`]): PostgreSQL 18 stores an `ARRAY[…]` or
+    /// `IN (…)` list of two or more constants or parameters as one
+    /// `$n /*, ... */` (verified on 18.6: `ALL (ARRAY['pg_catalog',
+    /// 'information_schema', 'pg_toast']::pg_catalog.name[])` is stored as
+    /// `ALL (ARRAY[$1 /*, ... */]::pg_catalog.name[])`), which no longer
+    /// equals the form 14 to 17 store. Conservative: a list whose first
+    /// element is a constant or a parameter counts.
+    fn squashable_list(form: &str) -> bool {
+        let upper = form.to_ascii_uppercase();
+        ["ARRAY[", " IN (", " IN("].iter().any(|open| {
+            upper
+                .match_indices(open)
+                .any(|(i, m)| upper[i + m.len()..].trim_start().starts_with('$'))
+        })
+    }
+
+    #[test]
+    fn own_statements_have_no_list_postgresql_18_squashes() {
+        // Texts like the connector's before the fix, which PostgreSQL 18.6
+        // stores squashed.
+        for before in [
+            "SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.<>) ALL \
+             (ARRAY['pg_catalog', 'information_schema', 'pg_toast']::pg_catalog.name[])",
+            "SELECT 1 FROM pg_catalog.pg_proc p WHERE p.oid OPERATOR(pg_catalog.=) ANY (ARRAY[ \
+             'pg_catalog.now()'::pg_catalog.regprocedure, \
+             'pg_catalog.current_schema()'::pg_catalog.regprocedure]::pg_catalog.oid[])",
+            "SELECT 1 FROM pg_class WHERE relname IN ('a', 'b')",
+            "SELECT 1 FROM pg_class WHERE relname IN ($1, $2)",
+        ] {
+            assert!(squashable_list(&pss_form(before).unwrap()), "{before}");
+        }
+        // One array literal is one constant on every major.
+        let literal = pss_form(
+            "SELECT 1 FROM pg_catalog.pg_class c WHERE c.relkind OPERATOR(pg_catalog.=) \
+             ANY ('{r,p}'::pg_catalog.\"char\"[])",
+        )
+        .unwrap();
+        assert!(
+            literal.ends_with("ANY ($2::pg_catalog.\"char\"[])"),
+            "{literal}"
+        );
+        assert!(!squashable_list(&literal));
+        // A list of columns is not squashed.
+        assert!(!squashable_list(
+            "SELECT pg_catalog.unnest(ARRAY[a.x, a.y])"
+        ));
+        let mut own = sql::all_statements();
+        own.extend([
+            sql::pss_probe("public").unwrap(),
+            sql::pss_counters("public", true).unwrap(),
+            sql::pss_texts("public", false).unwrap(),
+        ]);
+        for s in own {
+            if let Some(f) = pss_form(&s) {
+                assert!(!squashable_list(&f), "{s}");
+            }
+        }
+    }
 
     #[test]
     fn pss_form_of_the_own_statements() {

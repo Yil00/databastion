@@ -69,7 +69,7 @@ pub(crate) const SET_LOCAL_TIMEOUTS: &str = "SELECT \
 macro_rules! user_schema {
     () => {
         "n.nspname OPERATOR(pg_catalog.<>) ALL \
-           (ARRAY['pg_catalog', 'information_schema', 'pg_toast']::pg_catalog.name[]) \
+           ('{pg_catalog,information_schema,pg_toast}'::pg_catalog.name[]) \
          AND n.nspname OPERATOR(pg_catalog.!~~) 'pg\\_temp\\_%' \
          AND n.nspname OPERATOR(pg_catalog.!~~) 'pg\\_toast\\_temp\\_%'"
     };
@@ -138,7 +138,7 @@ pub(crate) const INTROSPECT: &str = concat!(
      FROM pg_catalog.pg_class c \
      JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
      WHERE c.relkind OPERATOR(pg_catalog.=) \
-       ANY (ARRAY['r', 'm', 'p', 'f']::pg_catalog.\"char\"[]) AND c.relpersistence OPERATOR(pg_catalog.<>) 't' AND ",
+       ANY ('{r,m,p,f}'::pg_catalog.\"char\"[]) AND c.relpersistence OPERATOR(pg_catalog.<>) 't' AND ",
     user_schema!(),
     " AND ",
     not_extension_member!(),
@@ -174,7 +174,7 @@ pub(crate) const POLICY_TREES: &str = "SELECT p.polrelid, p.polqual::pg_catalog.
        p.polwithcheck::pg_catalog.text \
      FROM pg_catalog.pg_policy p \
      WHERE p.polrelid OPERATOR(pg_catalog.=) ANY ($1) AND p.polcmd OPERATOR(pg_catalog.=) \
-       ANY (ARRAY['r', '*']::pg_catalog.\"char\"[])";
+       ANY ('{r,*}'::pg_catalog.\"char\"[])";
 
 /// A function allowed in a policy expression evaluated by the agent's
 /// session (H1): a `pg_catalog` function, aggregate or not, that is
@@ -190,7 +190,7 @@ macro_rules! policy_function_ok {
             "EXISTS (SELECT 1 FROM pg_catalog.pg_proc p WHERE p.oid OPERATOR(pg_catalog.=) ",
             $f,
             " AND p.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace \
-               AND p.prokind OPERATOR(pg_catalog.=) ANY (ARRAY['f', 'a']::pg_catalog.\"char\"[]) \
+               AND p.prokind OPERATOR(pg_catalog.=) ANY ('{f,a}'::pg_catalog.\"char\"[]) \
                AND ((p.provolatile OPERATOR(pg_catalog.=) 'i' AND p.proname OPERATOR(pg_catalog.!~) \
                      '^(query_to_xml|query_to_xmlschema|query_to_xml_and_xmlschema\
 |cursor_to_xml|cursor_to_xmlschema|table_to_xml|table_to_xmlschema\
@@ -200,13 +200,13 @@ macro_rules! policy_function_ok {
 |set_config|pg_sleep.*|pg_read_.*|pg_ls_.*|pg_stat_file|lo_.*|pg_.*advisory.*\
 |pg_cancel_backend|pg_terminate_backend|pg_notify|pg_reload_conf|pg_rotate_logfile\
 |dblink.*|nextval|setval|currval|lastval|txid_.*|pg_current_.*)$') \
-                    OR p.oid OPERATOR(pg_catalog.=) ANY (ARRAY[ \
-                      'pg_catalog.current_setting(pg_catalog.text)'::pg_catalog.regprocedure, \
-                      'pg_catalog.current_setting(pg_catalog.text, pg_catalog.bool)'\
-                        ::pg_catalog.regprocedure, \
-                      'pg_catalog.now()'::pg_catalog.regprocedure, \
-                      'pg_catalog.current_database()'::pg_catalog.regprocedure, \
-                      'pg_catalog.current_schema()'::pg_catalog.regprocedure]::pg_catalog.oid[])))"
+                    OR p.oid OPERATOR(pg_catalog.=) ANY ('{\
+                      \"pg_catalog.current_setting(pg_catalog.text)\",\
+                      \"pg_catalog.current_setting(pg_catalog.text,pg_catalog.bool)\",\
+                      \"pg_catalog.now()\",\
+                      \"pg_catalog.current_database()\",\
+                      \"pg_catalog.current_schema()\"}'\
+                      ::pg_catalog.regprocedure[]::pg_catalog.oid[])))"
         )
     };
 }
@@ -325,7 +325,7 @@ pub(crate) const CAS_GUARD_COLUMNS: &str = concat!(
     " OPERATOR(pg_catalog.=) ANY ($1)) AS named FROM pg_catalog.pg_class c \
        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
        WHERE c.relkind OPERATOR(pg_catalog.=) \
-         ANY (ARRAY['r', 'p', 'm', 'v', 'f']::pg_catalog.\"char\"[]) AND ",
+         ANY ('{r,p,m,v,f}'::pg_catalog.\"char\"[]) AND ",
     user_schema!(),
     " AND ",
     not_extension_member!(),
@@ -337,7 +337,7 @@ pub(crate) const CAS_GUARD_COLUMNS: &str = concat!(
                AND ",
     name_key!("x.attname"),
     " OPERATOR(pg_catalog.=) \
-               ANY (ARRAY['body', 'json', 'audresource', 'auduser']::pg_catalog.text[]))) \
+               ANY ('{body,json,audresource,auduser}'::pg_catalog.text[]))) \
        ORDER BY named DESC, c.oid LIMIT 257) \
      SELECT c.oid, c.relname, a.attname, \
        pg_catalog.has_column_privilege(c.oid, a.attnum, 'SELECT') \
@@ -366,25 +366,25 @@ pub(crate) const MEMBERSHIPS: &str = "SELECT r.rolname, r.oid OPERATOR(pg_catalo
      LIMIT 1000";
 
 /// Relations of user schemas the role can write to (any write-type
-/// privilege). `{maintain}` is `, MAINTAIN` on PostgreSQL 17+.
+/// privilege), with `, MAINTAIN` on PostgreSQL 17+.
 pub(crate) fn write_privileges(maintain: bool) -> String {
-    format!(
-        concat!(
-            "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
-             JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
-             WHERE ",
-            user_schema!(),
-            " AND ((c.relkind OPERATOR(pg_catalog.=) \
-                     ANY (ARRAY['r', 'p', 'm', 'f', 'v']::pg_catalog.\"char\"[]) \
-                 AND (pg_catalog.has_table_privilege(c.oid, \
-                        'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER{}') \
-                      OR pg_catalog.has_any_column_privilege(c.oid, 'INSERT, UPDATE'))) \
-               OR (CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'S' \
-                        THEN pg_catalog.has_sequence_privilege(c.oid, 'UPDATE') \
-                        ELSE false END))"
-        ),
-        if maintain { ", MAINTAIN" } else { "" }
-    )
+    // Not a format string: the text holds array literals (`'{…}'`).
+    const HEAD: &str = concat!(
+        "SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+         WHERE ",
+        user_schema!(),
+        " AND ((c.relkind OPERATOR(pg_catalog.=) \
+                 ANY ('{r,p,m,f,v}'::pg_catalog.\"char\"[]) \
+             AND (pg_catalog.has_table_privilege(c.oid, \
+                    'INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER"
+    );
+    const TAIL: &str = "') \
+                  OR pg_catalog.has_any_column_privilege(c.oid, 'INSERT, UPDATE'))) \
+           OR (CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'S' \
+                    THEN pg_catalog.has_sequence_privilege(c.oid, 'UPDATE') \
+                    ELSE false END))";
+    [HEAD, if maintain { ", MAINTAIN" } else { "" }, TAIL].concat()
 }
 
 /// Objects owned by the current role.
