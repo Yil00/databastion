@@ -56,11 +56,12 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, PgItemClass, PgListed, QueryAnalysis, RelationName,
+    AnalyzeOptions, CopyEndpoint, PgItemClass, PgListed, PgScan, QueryAnalysis, RelationName,
     StatementInfo, StatementKind, analyze, pg_scan,
 };
 
 use super::records::AuditRecord;
+use super::user_code::{CodeUse, UserCodeHandle, routine_ddl_command};
 use crate::discover::normalize;
 use crate::sql;
 
@@ -99,9 +100,17 @@ pub(crate) struct DbCatalog {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Catalogs {
     dbs: HashMap<String, DbCatalog>,
+    /// The target's collision probes (ADR-0049 decision 8).
+    user_code: UserCodeHandle,
 }
 
 impl Catalogs {
+    /// The target's collision probes, shared with `check()`.
+    pub(crate) fn with_user_code(mut self, user_code: UserCodeHandle) -> Self {
+        self.user_code = user_code;
+        self
+    }
+
     pub(crate) fn insert(&mut self, database: &str, c: DbCatalog) {
         self.dbs.insert(database.to_owned(), c);
     }
@@ -364,6 +373,14 @@ pub(crate) struct TextReads {
     pub(crate) star: bool,
     /// Core-list objects the text names (in the no-text shape or not).
     pub(crate) named: Vec<RelationName>,
+    /// ADR-0049 decision 8: whether every relation the text names is a
+    /// catalog, and the code it uses (decided against the database's
+    /// collision probe when the event is built).
+    pub(crate) code: CodeUse,
+    /// The text creates, alters or drops a function, operator, type,
+    /// domain, cast or extension (or drops with `CASCADE`): the collision
+    /// probe of its database is stale.
+    pub(crate) routine_ddl: bool,
 }
 
 fn push_unique(v: &mut Vec<RelationName>, r: RelationName) {
@@ -382,9 +399,12 @@ pub(crate) fn text_reads(
     cut: bool,
 ) -> TextReads {
     let mut out = TextReads::default();
-    let Some(scan) = pg_scan(text) else {
+    let scan = pg_scan(text);
+    out.code = code_use(analysis, rule, cut, scan.as_ref());
+    let Some(scan) = scan else {
         return out;
     };
+    out.routine_ddl = scan.routine_ddl();
     let mut core: Vec<RelationName> = Vec::new();
     for u in scan.names() {
         if u.call && data_function(&u.name) {
@@ -446,6 +466,75 @@ pub(crate) fn text_reads(
     }
     out.named = core;
     out
+}
+
+/// ADR-0049 decision 8: a query (`SELECT`, `TABLE`, `VALUES`, a write,
+/// `COPY`) whose text lexed and names at least one relation, every one a
+/// catalog (the statistics relations of ADR-0048 are not) or a core-list
+/// entry of decision 1, below the analyzer's relation bound: its code is
+/// judged when the event is built. A text that names no relation is
+/// already a read of `*`.
+fn code_use(
+    analysis: &QueryAnalysis,
+    rule: CatalogRule<'_>,
+    cut: bool,
+    scan: Option<&PgScan>,
+) -> CodeUse {
+    let parts = analysis.parts();
+    let query = parts.iter().any(|p| {
+        matches!(
+            p.kind,
+            StatementKind::Select
+                | StatementKind::Table
+                | StatementKind::Values
+                | StatementKind::Insert
+                | StatementKind::Update
+                | StatementKind::Delete
+                | StatementKind::Merge
+                | StatementKind::Copy
+        )
+    });
+    let named = parts.iter().any(|p| !p.relations.is_empty());
+    let catalogs = parts.iter().all(|p| {
+        !p.relations_full
+            && p.relations.iter().all(|r| {
+                matches!(listed(r, false, rule.pss_schema), Some(Listed::Core(..)))
+                    || (is_catalog(r, rule) && statistics_relation(r).is_none())
+            })
+    });
+    if !(analysis.lexed() && query && named && catalogs) {
+        return CodeUse::NotApplicable;
+    }
+    CodeUse::CatalogOnly {
+        code: scan.map(|s| std::sync::Arc::new(s.code())),
+        cut,
+    }
+}
+
+/// ADR-0049 decision 8, when the event of a read or write is built:
+/// whether the catalog-only statement `reads` describes runs user code in
+/// `database` (`*`, always reported, never the agent's own). The functions
+/// of decisions 1 and 7 are left to those decisions (re-review N4).
+fn user_code_star(
+    reads: &TextReads,
+    catalogs: &Catalogs,
+    database: &str,
+    rule: CatalogRule<'_>,
+) -> bool {
+    let CodeUse::CatalogOnly { code, cut } = &reads.code else {
+        return false;
+    };
+    let excluded = |r: &RelationName| decided_elsewhere(r, rule.pss_schema);
+    catalogs
+        .user_code
+        .decide(database, code.as_deref(), *cut, &excluded)
+}
+
+/// A call left to ADR-0049 decisions 1 and 7, not to decision 8
+/// (re-review N4): a function of the statement-text lists, or of decision
+/// 7.
+pub(crate) fn decided_elsewhere(r: &RelationName, pss_schema: Option<&str>) -> bool {
+    listed(r, true, pss_schema).is_some() || data_function(r)
 }
 
 /// Whether `r` (a relation, from the analysis or a pgaudit record) is a
@@ -1194,6 +1283,18 @@ impl PgauditEvents {
         let rule = self
             .catalogs
             .rule(&first.database, log_catalog != Some(false), &confirmed);
+        // ADR-0049 decision 8: a routine, type, cast or extension DDL makes
+        // the database's collision probe stale, in log order: for the rest
+        // of this statement (a `DO` block) and every statement logged
+        // after it, until a probe that starts later.
+        if group.iter().any(|r| {
+            r.audit.class == "DDL"
+                && (routine_ddl_command(&r.audit.command)
+                    || (r.audit.command.starts_with("DROP")
+                        && pg_scan(&r.audit.statement).is_some_and(|s| s.routine_ddl())))
+        }) {
+            self.catalogs.user_code.mark_stale(&first.database);
+        }
         // Each record is analyzed on its own text (a substatement of a
         // function or DO block logs its own text); consecutive records
         // with the same text reuse the analysis.
@@ -1255,7 +1356,11 @@ impl PgauditEvents {
             for o in &reads.objects {
                 push_unique(&mut part.text_objects, o.clone());
             }
-            part.star |= reads.star;
+            // ADR-0049 decisions 7 and 8 (user code next to catalogs only,
+            // for reads and writes).
+            part.star |= reads.star
+                || (matches!(action, EventAction::Read | EventAction::Write)
+                    && user_code_star(reads, &self.catalogs, &first.database, rule));
             let mut named = false;
             if !r.audit.object_name.is_empty()
                 && is_relation_type(&r.audit.object_type)
@@ -1547,6 +1652,15 @@ pub(crate) fn pss_events_counted(
     // No object names here: unqualified `pg_*` names stay catalogs.
     let none = HashSet::new();
     let mut panicked = Vec::new();
+    // ADR-0049 decision 8: a routine, type, cast or extension DDL seen in
+    // this poll makes its database's collision probe stale before any
+    // statement of the poll is judged (the order within a poll is not
+    // known).
+    for d in deltas {
+        if d.analysis.kind() == StatementKind::Ddl && d.reads.routine_ddl {
+            catalogs.user_code.mark_stale(d.database);
+        }
+    }
     let mut copied: HashMap<&str, HashSet<RelationName>> = HashMap::new();
     for d in deltas {
         let rule = catalogs.rule(d.database, true, &none);
@@ -1659,12 +1773,15 @@ fn pss_event(
     // ADR-0049: the statement-text objects the text reads, and `*` of
     // decision 7, in every action class.
     let reads = d.reads;
+    let rw = matches!(action, EventAction::Read | EventAction::Write);
+    // ADR-0049 decision 8: user code next to catalogs only, `*` like the
+    // functions of decision 7.
+    let reads_star = reads.star || (rw && user_code_star(reads, catalogs, d.database, rule));
     // A core-list entry read in the no-text shape is a catalog read.
     let named_any = named_any || !reads.named.is_empty();
     for o in &reads.objects {
         push_unique(&mut objects, o.clone());
     }
-    let rw = matches!(action, EventAction::Read | EventAction::Write);
     // A text at the analyzer's relation bound may name a statistics
     // relation that was not kept (after 16 catalogs, say): `*`, always
     // reported, never the agent's own (as ADR-0045 decision 4 on MySQL /
@@ -1673,7 +1790,7 @@ fn pss_event(
     // So is a DDL statement (`CREATE TABLE … AS <query>`, `CREATE VIEW
     // … AS`: security re-review of #199, N-L2).
     let bound = (rw || action == EventAction::Ddl) && all.iter().any(|p| p.relations_full);
-    if rw && objects.is_empty() && named_any && !bound && !reads.star {
+    if rw && objects.is_empty() && named_any && !bound && !reads_star {
         return None;
     }
     // COPY counts rows in pg_stat_statements too.
@@ -1693,7 +1810,7 @@ fn pss_event(
     named.sort_by_key(|o| (!reads.objects.contains(o), !is_statistics(o)));
     let statistics = objects.iter().any(is_statistics) || bound;
     let text_read = !reads.objects.is_empty();
-    let star = (rw && objects.is_empty()) || bound || reads.star;
+    let star = (rw && objects.is_empty()) || bound || reads_star;
     // A read or write of unknown objects (`*`) has no useful row count for
     // `min_rows` and never matches `sensitive_objects`: always reported,
     // as on MySQL / MariaDB (security review of #199, M2).
@@ -1725,14 +1842,14 @@ fn pss_event(
     // `queryid`, `audit::pss`), reading nothing else.
     let own_text_query = d.own_text
         && text_read
-        && !reads.star
+        && !reads_star
         && !statistics
         && objects
             .iter()
             .all(|o| o.name == PSS_VIEW && o.schema.as_deref() == rule.pss_schema);
     let kind = if own_text_query {
         OwnKind::StatementText
-    } else if statistics || text_read || reads.star {
+    } else if statistics || text_read || reads_star {
         OwnKind::Never
     } else if objects.is_empty() && !named_any && d.own_text {
         OwnKind::Tableless
@@ -1770,6 +1887,8 @@ mod tests {
         objects: Vec::new(),
         star: false,
         named: Vec::new(),
+        code: CodeUse::NotApplicable,
+        routine_ddl: false,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -2670,7 +2789,7 @@ mod tests {
         let texts = pss_form(&sql::pss_texts("public", true).unwrap()).unwrap();
         // Numbered in order of appearance, as PostgreSQL does.
         assert!(texts.contains("left(s.query, $2)"), "{texts}");
-        assert!(texts.contains(">= $3"), "{texts}");
+        assert!(texts.contains("OPERATOR(pg_catalog.>=) $3"), "{texts}");
         assert!(texts.contains("pg_stat_statements($4)"), "{texts}");
         assert!(texts.ends_with("LIMIT $5"), "{texts}");
         assert!(texts.contains("ANY($1)"), "{texts}");
@@ -5119,9 +5238,16 @@ mod tests {
             "SELECT data FROM pg_logical_slot_peek_changes('s', NULL, NULL), pg_class LIMIT 1";
         assert_text_read(text, "READ", "SELECT", &["shop..*"], true);
         // Not this list: `crm.query_to_xml` is a user function next to
-        // catalogs (decision 8), `pg_ls_dir` and `pg_stat_file` metadata.
+        // catalogs (decision 8: `*` too), `pg_ls_dir` and `pg_stat_file`
+        // metadata.
+        assert_text_read(
+            "SELECT crm.query_to_xml('x') FROM pg_catalog.pg_class LIMIT 1",
+            "READ",
+            "SELECT",
+            &["shop..*"],
+            true,
+        );
         for text in [
-            "SELECT crm.query_to_xml('x') FROM pg_class LIMIT 1",
             "SELECT pg_ls_dir('log') FROM pg_class LIMIT 1",
             "SELECT pg_stat_file('PG_VERSION') FROM pg_class LIMIT 1",
         ] {

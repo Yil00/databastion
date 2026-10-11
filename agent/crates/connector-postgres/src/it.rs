@@ -52,11 +52,11 @@ const MARKERS: [&str; 6] = [
 
 #[derive(Debug, Clone)]
 pub(crate) struct Url {
-    host: String,
-    port: u16,
+    pub(crate) host: String,
+    pub(crate) port: u16,
     pub(crate) user: String,
     pub(crate) password: String,
-    dbname: String,
+    pub(crate) dbname: String,
 }
 
 fn url(var: &str) -> Option<Url> {
@@ -114,10 +114,10 @@ pub(crate) fn admin_url() -> Option<Url> {
 }
 
 /// A private temporary directory holding the target secret file.
-pub(crate) struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -175,7 +175,12 @@ pub(crate) fn target(
     (dir, config.targets[0].clone())
 }
 
-async fn raw_client(u: &Url, user: &str, password: &str, db: &str) -> tokio_postgres::Client {
+pub(crate) async fn raw_client(
+    u: &Url,
+    user: &str,
+    password: &str,
+    db: &str,
+) -> tokio_postgres::Client {
     let mut c = tokio_postgres::Config::new();
     c.host(&u.host)
         .port(u.port)
@@ -1300,7 +1305,7 @@ const AUDIT_MARKER: &str = "it-audit-marker-7Qz@example.test";
 
 /// The pgaudit log files of the test server (`DATABASTION_TEST_PG_AUDIT_LOG`
 /// for jsonlog, `DATABASTION_TEST_PG_AUDIT_CSVLOG` for csvlog).
-fn audit_logs() -> Vec<(PathBuf, &'static str)> {
+pub(crate) fn audit_logs() -> Vec<(PathBuf, &'static str)> {
     // `dev/postgres/local-cluster.sh` run without root writes the log as
     // the test's own user, which the tailer refuses in production.
     databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
@@ -1360,7 +1365,7 @@ fn start_audit(
     start_audit_with(Arc::new(PostgresConnector::new()), t, state)
 }
 
-fn start_audit_with(
+pub(crate) fn start_audit_with(
     connector: Arc<PostgresConnector>,
     t: &TargetConfig,
     state: &std::path::Path,
@@ -1436,7 +1441,7 @@ fn real_pg_dump(adm: &Url) -> bool {
     matches!(out, Ok(o) if o.status.success())
 }
 
-fn describe(e: &databastion_classifiers::masking::MaskedEvent) -> String {
+pub(crate) fn describe(e: &databastion_classifiers::masking::MaskedEvent) -> String {
     format!(
         "{:?} user={} app={:?} objects={:?} rows={:?} signals={:?} source={}",
         e.action(),
@@ -1458,7 +1463,7 @@ fn describe(e: &databastion_classifiers::masking::MaskedEvent) -> String {
 }
 
 /// Collects events until `done` holds or `timeout`.
-async fn collect_until(
+pub(crate) async fn collect_until(
     rx: &mut tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
     out: &mut Vec<databastion_classifiers::masking::MaskedEvent>,
     timeout: Duration,
@@ -2129,7 +2134,7 @@ const TEXT_PASSWORD: &str = "dev-only-it-texts-FAKE";
 const TEXT_MARK: &str = "Tx7Qz-it-text";
 
 /// The schema of `pg_stat_statements` in the test database.
-async fn pss_schema(a: &tokio_postgres::Client) -> Option<String> {
+pub(crate) async fn pss_schema(a: &tokio_postgres::Client) -> Option<String> {
     a.query_opt(
         "SELECT n.nspname::text FROM pg_catalog.pg_extension e \
          JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
@@ -2143,7 +2148,7 @@ async fn pss_schema(a: &tokio_postgres::Client) -> Option<String> {
 
 /// `postgres_exporter`'s activity query (its default `pg_stat_activity`
 /// metric).
-const EXPORTER_ACTIVITY: &str = "SELECT pg_database.datname, tmp.state, \
+pub(crate) const EXPORTER_ACTIVITY: &str = "SELECT pg_database.datname, tmp.state, \
      COALESCE(count,0) as count, COALESCE(max_tx_duration,0) as max_tx_duration \
      FROM ( VALUES ('active'), ('idle'), ('idle in transaction'), \
      ('idle in transaction (aborted)'), ('fastpath function call'), ('disabled') ) AS tmp(state) \

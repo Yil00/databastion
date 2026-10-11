@@ -73,7 +73,9 @@ use zeroize::Zeroizing;
 
 use crate::names;
 
+mod pg_code;
 mod pg_scan;
+pub use pg_code::{MAX_CODE_NAMES, PgCode, PgCodeName, PgOperatorUse};
 pub use pg_scan::{PgItemClass, PgListed, PgNameUse, PgScan, pg_scan};
 
 /// Largest statement text analyzed, in bytes. Longer text is not lexed.

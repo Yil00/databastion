@@ -118,7 +118,7 @@ load otherwise), so a server-wide load is the normal case.
   is a catalog. Every read or write against `*` is always reported. `check()` says `pgaudit.log_catalog = off` in
   its local detail when pgaudit is the source. Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statistics-catalogs).
-- **Statement-text views** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md), part 1).
+- **Statement-text views** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)).
   The core list (`pg_stat_activity`, `pg_stat_get_activity(`,
   `pg_stat_get_backend_activity(`, the extension's `pg_stat_statements`
   view and function: `audit::events::listed`) and the extension list
@@ -131,7 +131,8 @@ load otherwise), so a server-wide load is the normal case.
   `count(*)`, no whole-row reference, no column alias list (whatever
   the alias's word) but on constant `VALUES`, no `NATURAL`, only
   catalogs and listed entries named, and no schema-qualified call
-  outside `pg_catalog` and the lists until decision 8). pgaudit relation records of a listed entry the substatement's
+  outside `pg_catalog` and the lists, refinement item 7, kept with
+  decision 8 as defence in depth). pgaudit relation records of a listed entry the substatement's
   text does not name, or next to a view outside `pg_catalog`, make a text
   read. The `pg_catalog` functions of decision 7 (`DATA_FUNCTIONS`:
   SQL-running, file, logical decoding, large objects) add `*`, also next
@@ -141,9 +142,35 @@ load otherwise), so a server-wide load is the normal case.
   periods end 5 s early for clock skew), never
   otherwise. `check()` says `pg_read_all_stats` is held while pgaudit is
   the source in its local detail. Drift and pinning tests in `it.rs`.
-  Decision 8 (user functions, operators and casts next to catalogs only)
-  is not implemented yet. Details:
+  Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-views).
+- **User code next to catalogs only** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)
+  decision 8, part 2 refinement proposed). In a read or write whose
+  relations are all catalogs (`audit::events::code_use`), a call, an
+  operator (written, or implied by `LIKE`, `IN`, `BETWEEN`…) or a cast
+  that is not built in for that database adds `*`, always reported,
+  never the agent's own (`audit::user_code::user_code`, decided when the
+  event is built, from the code uses that `classifiers::query::PgScan::code`
+  extracts). "Built in": the lists of the server's major version
+  (`builtins/<major>/{functions,operators,types,keywords}.txt`, generated
+  by `builtins/generate.sh` from the engine-matrix images, embedded by
+  `audit::builtins`; a newer major uses the newest lists, with a warning)
+  minus what the collision probe (`sql::USER_CODE_PROBE`, run by `check()`
+  in each declared database at every heartbeat, at most 20 000 rows,
+  names in memory only) finds: user overloads a built-in value or literal
+  reaches, user types named like built-in ones, user-function casts
+  between built-in types (an implicit one: every catalog-only statement
+  is `*`), and, with a `$n` in the text, user overloads whose code is
+  not C. The probes are kept per target in `CheckState` and marked stale
+  by the streams on routine, type, cast and extension DDL (`UserCode`); a
+  failed, cut, stale, old (15 min) or missing probe makes every
+  unqualified call, operator and cast `*`. Every connector statement is
+  written with qualified functions and types and
+  `OPERATOR(pg_catalog.…)` (unit test `statements_never_trigger_decision_8`).
+  Integration tests in `it_user_code.rs` (scenarios on every source, a
+  database with `citext`, `hstore` and 3 000 relations, server facts,
+  list drift). Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#user-code-next-to-catalogs).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first
