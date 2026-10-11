@@ -222,7 +222,7 @@ jobs:
           workspaces: agent
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --all-features --locked
+      - run: $GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh cargo test --all-features --locked
       # Phase 2 exit criterion (ROADMAP P2-F, dev/holdout/README.md): Wilson 95 % lower bound of
       # recall >= 0.90 and precision >= 0.85 per classifier on the held-out corpus. `--check` first
       # (labels.json and the pinned corpus SHA-256 up to date), then write the git-ignored
@@ -364,7 +364,7 @@ jobs:
           # Audit (P4-A): the pgaudit jsonlog of the dev image (bind-mounted, 0644 in dev only).
           export DATABASTION_TEST_PG_AUDIT_LOG="$PWD/../dev/.state/logs/postgres/postgresql.json"
           export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
-          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
+          "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
       - name: Connector integration tests (local cluster, TLS and weak authentication)
         run: |
           if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
@@ -377,7 +377,7 @@ jobs:
           fi
           eval "$(dev/postgres/local-cluster.sh start)"
           export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls,pgaudit-log
-          (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
           dev/postgres/local-cluster.sh stop
       - name: Service logs
         if: failure()
@@ -442,7 +442,7 @@ jobs:
           export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
           export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
           export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
-          (cd agent && cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mysql mariadb percona
@@ -489,14 +489,14 @@ jobs:
           export DATABASTION_TEST_MONGO_DUMP_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongodump --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --archive=/dev/null"
           export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
           export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
       # Phase 7 (#74 review): verify_full against a real TLS-only MongoDB server, with a test CA
       # generated at run time in $RUNNER_TEMP (never committed) and removed afterwards.
       - name: Connector TLS integration test (real server, verify_full, runtime test CA)
         run: |
           eval "$(timeout 300 dev/mongo/tls-test-server.sh start)"
           export DATABASTION_TEST_REQUIRE=mongo-tls
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
       - name: Stop the TLS test server
         if: always()
         run: dev/mongo/tls-test-server.sh stop
@@ -511,7 +511,7 @@ jobs:
           export DATABASTION_TEST_PSMDB_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${PSMDB_PORT}/?authSource=admin"
           export DATABASTION_TEST_PSMDB_AUDIT_LOG="$PWD/dev/.state/logs/psmdb/auditLog.json"
           export DATABASTION_TEST_REQUIRE=psmdb-audit
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
       - name: PSMDB logs and stop
         if: always()
         run: |
@@ -561,7 +561,7 @@ jobs:
           # CAS store guard (ADR-0041 decision 14): the test writes its fixture entries as the admin.
           export DATABASTION_TEST_LDAP_MODIFY_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapmodify -c -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}'"
           export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls,ldap-modify
-          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
       # Phase 7: SASL EXTERNAL over ldapi:// against the real slapd. The socket directory is published
       # to the runner (compose override) and olcAuthzRegexp maps the runner's uid to the service DN.
       - name: SASL EXTERNAL over ldapi:// (runner uid mapped to the service DN)
@@ -576,7 +576,7 @@ jobs:
           export DATABASTION_TEST_LDAPI_PATH="$PWD/dev/.state/ldapi/ldapi"
           export DATABASTION_TEST_LDAPI_DN="cn=databastion,ou=services,dc=example,dc=org"
           export DATABASTION_TEST_REQUIRE=ldapi
-          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 openldap
