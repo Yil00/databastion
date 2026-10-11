@@ -14,16 +14,19 @@
 //!   a sibling stream (another target on the same server) sees the ended
 //!   session's probes and polls with no account: reads of statement-text
 //!   tables by an unidentified principal, always reported. Each poll
-//!   session reads its own thread id when it attaches (`sql::PS_OWN_THREAD`)
+//!   session reads its own thread id when it attaches (`sql::ps_own_thread`)
 //!   and notes it here; every stream on that server run then drops the
-//!   rows of that thread, as the poll text drops its own. A row whose
-//!   thread is still connected under another account is never dropped.
+//!   rows of that thread whose text has the shape of one of the
+//!   connector's own `performance_schema` reads (`events::own_ps_shape`),
+//!   as the poll text drops its own session's. Any other row of that
+//!   thread, and a row whose thread is still connected under another
+//!   account, takes the usual path.
 //! - **Discovery sessions** ([`DiscoveryPins`], per connector): the scan's
 //!   session has usually ended when the next poll reads its samples. While
 //!   the target's Audit stream polls `performance_schema`, each Discovery
 //!   session reads its thread id at its start (by a random nonce in a
-//!   session user variable, `sql::PS_OWN_PIN`: exactly one thread must
-//!   hold it) and pins it, with the target's account, until the scan ends
+//!   session user variable, `sql::ps_own_pin`: exactly one row, the
+//!   session's own thread holding it) and pins it, with the target's account, until the scan ends
 //!   plus two poll intervals of the target's stream ([`MIN_PIN_TTL`] to
 //!   [`MAX_PIN_TTL`]). For every stream on that server run, a row of a
 //!   pinned thread with no account is attributed to the agent's identity
@@ -38,10 +41,10 @@
 //!
 //! **Fail closed.** A thread id is matched only together with the server
 //! run it was read on ([`ServerRun`]): the server's identity (`@@hostname`,
-//! `@@port`, `@@server_id`, read in the same statement as the thread id
-//! on the same session)
-//! and its start time (`Uptime` against the agent's clock, within
-//! [`RUN_TOLERANCE_S`]); `performance_schema` thread ids are not reused
+//! `@@port`, `@@server_id`, and `@@server_uuid` on MySQL) and its start
+//! time (`UNIX_TIMESTAMP()` minus `Uptime`, computed by the server: the
+//! agent's clock plays no part; two readings within [`RUN_TOLERANCE_S`]),
+//! read in the same statement as the thread id, on the same session; `performance_schema` thread ids are not reused
 //! within a server run, but a restarted server counts them from 1 again.
 //! Nothing is noted on a server that started less than [`MIN_UPTIME_S`]
 //! ago, so that a restart after the note never gives a start time within
@@ -81,7 +84,7 @@ pub(crate) struct ServerRun {
 }
 
 impl ServerRun {
-    /// The run from the identity columns of `sql::PS_OWN_THREAD`
+    /// The run from the identity columns of `sql::ps_own_thread`
     /// (`@@hostname`, `@@port`, `@@server_id`) and the start time. `None`
     /// when a column is missing or empty.
     pub(crate) fn new(ident: &[Option<String>], boot: u64) -> Option<Self> {

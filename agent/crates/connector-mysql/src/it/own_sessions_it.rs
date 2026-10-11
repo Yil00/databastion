@@ -315,3 +315,101 @@ async fn the_agents_own_sessions_are_never_unknown_principals() {
         exec(&mut a, &format!("DROP USER IF EXISTS '{OS_USER}'@'%'")).await;
     }
 }
+
+/// Security review of #205, M2: a nonce copied into another session never
+/// pins that session. The agent's pin reads its own thread only (by
+/// `CONNECTION_ID()` in `threads`), also when the agent's thread is not
+/// instrumented. On MySQL 8.4 and MariaDB 10.11 to 11.8 an uninstrumented
+/// thread still shows its user variables, so both copies are visible (the
+/// control count below): without the own-thread condition the pin would
+/// have failed closed on two rows, or pinned the copier if the agent's own
+/// row were missing.
+#[tokio::test]
+async fn a_copied_nonce_never_pins_another_session() {
+    let _serial = SERIAL.lock().await;
+    let mut all = servers();
+    all.extend(percona());
+    for server in all {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let mut a = admin_session(&server, &admin).await;
+        let version = scalar(&mut a, "SELECT VERSION()").await.unwrap_or_default();
+        fixture(&mut a).await;
+        let (_d, t) = super::audit_it::audit_target(&server, OS_USER, IT_PASSWORD, None);
+        for instrumented in [true, false] {
+            let nonce = format!("{:032x}", 0x5eed_u128 + u128::from(instrumented));
+            let mut s = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+                .await
+                .unwrap();
+            let conn = scalar(&mut s, "SELECT CONNECTION_ID()").await.unwrap();
+            let thread_of = |c: &str| {
+                format!(
+                    "SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = {c}"
+                )
+            };
+            let own_thread: u64 = scalar(&mut a, &thread_of(&conn))
+                .await
+                .unwrap()
+                .parse()
+                .unwrap();
+            let admin_conn = scalar(&mut a, "SELECT CONNECTION_ID()").await.unwrap();
+            let admin_thread: u64 = scalar(&mut a, &thread_of(&admin_conn))
+                .await
+                .unwrap()
+                .parse()
+                .unwrap();
+            if !instrumented {
+                exec(
+                    &mut a,
+                    &format!(
+                        "UPDATE performance_schema.threads SET INSTRUMENTED = 'NO' \
+                         WHERE PROCESSLIST_ID = {conn}"
+                    ),
+                )
+                .await;
+            }
+            // The copier holds the nonce before the agent's pin.
+            exec(&mut a, &format!("SET @databastion_pin = '{nonce}'")).await;
+            let pinned =
+                crate::audit::pfs::pinned_session_with(&mut s, Stage::Sample, Some(nonce.clone()))
+                    .await
+                    .unwrap();
+            let copies = scalar(
+                &mut a,
+                &format!(
+                    "SELECT COUNT(*) FROM performance_schema.user_variables_by_thread \
+                     WHERE VARIABLE_NAME = 'databastion_pin' AND VARIABLE_VALUE = '{nonce}'"
+                ),
+            )
+            .await;
+            eprintln!(
+                "{} {version} (agent thread instrumented: {instrumented}): rows holding the \
+                 nonce {copies:?}, pinned {:?}",
+                server.name,
+                pinned.as_ref().map(|p| p.thread)
+            );
+            assert!(
+                pinned.as_ref().is_none_or(|p| p.thread != admin_thread),
+                "{} {version}: the copier's session was pinned",
+                server.name
+            );
+            if instrumented {
+                let p = pinned.unwrap_or_else(|| panic!("{} {version}: no pin", server.name));
+                assert_eq!(p.thread, own_thread, "{} {version}", server.name);
+                assert!(p.run.is_some(), "{} {version}: no server run", server.name);
+                assert!(p.uptime > 0, "{} {version}", server.name);
+            } else {
+                assert!(
+                    pinned.as_ref().is_none_or(|p| p.thread == own_thread),
+                    "{} {version}",
+                    server.name
+                );
+            }
+            exec(&mut a, "SET @databastion_pin = NULL").await;
+            s.close().await;
+        }
+        exec(&mut a, &format!("DROP DATABASE IF EXISTS {OS_DB}")).await;
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OS_USER}'@'%'")).await;
+    }
+}

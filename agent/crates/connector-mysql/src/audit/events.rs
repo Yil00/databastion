@@ -975,13 +975,31 @@ static OWN_PS_READS: std::sync::LazyLock<Vec<(Vec<u8>, Vec<&'static str>)>> =
             .collect()
     });
 
-/// The shapes of [`OWN_PS_READS`] (see [`text_shape`]).
+/// The shapes of [`OWN_PS_READS`] (see [`text_shape`]): the statements
+/// of the agent's poll sessions that read `performance_schema`.
 static OWN_PS_SHAPES: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
     OWN_PS_READS
         .iter()
         .filter_map(|(t, _)| text_shape(t))
         .collect()
 });
+
+/// The shapes of the Discovery pin statement (`sql::ps_own_pin`), the only
+/// own `performance_schema` read a pinned Discovery session sends.
+static OWN_PIN_SHAPES: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
+    [Flavor::Mysql, Flavor::Mariadb]
+        .into_iter()
+        .filter_map(|f| text_shape(crate::sql::ps_own_pin(f).as_bytes()))
+        .collect()
+});
+
+/// Whether `text` (a `performance_schema` `SQL_TEXT` or digest, not cut)
+/// has the shape of one of the connector's own `performance_schema` reads
+/// (`sql::own_performance_schema_reads`): the rows of the agent's ended
+/// poll sessions that are dropped (`pfs`, security review of #205, L1).
+pub(crate) fn own_ps_shape(text: &[u8]) -> bool {
+    text_shape(text).is_some_and(|s| OWN_PS_SHAPES.contains(&s))
+}
 
 /// One statement to turn into an event.
 pub(crate) struct Access<'a> {
@@ -1321,7 +1339,11 @@ impl EventBuilder {
     /// one of the constant texts of `sql::own_performance_schema_reads`,
     /// the record is not marked cut (nor opaque), and its table records
     /// (if any) read only the tables that text names. Never matched by
-    /// prefix, digest or shape: a `DIGEST_TEXT` never equals these texts.
+    /// prefix, and never by digest or shape, with one exception (ADR-0045
+    /// decision 4, refinement of #205, proposed): a digest of a thread
+    /// pinned through the Discovery nonce (`Access::own_session`) with the
+    /// shape of the pin statement (`sql::ps_own_pin`) only; the identity
+    /// conditions still apply.
     fn own_ps_read(a: &Access<'_>) -> bool {
         let Some(text) = a.text else {
             return false;
@@ -1330,15 +1352,15 @@ impl EventBuilder {
             return false;
         }
         // A digest of one of the agent's own Discovery sessions (a pin):
-        // the agent sends these texts on such a session (its pin), and
-        // the poll reads only the digest of a session that has ended. The
-        // session is proven the agent's, so its shape is enough; the
-        // identity conditions still apply.
+        // the poll reads only the digest of a session that has ended, and
+        // the pin statement is the only `performance_schema` read such a
+        // session sends. Its shape only, never the poll texts' (security
+        // review of #205, M1); the identity conditions still apply.
         if a.own_session
             && a.digest
             && a.source == EventSource::PerformanceSchema
             && a.tables.is_empty()
-            && text_shape(text).is_some_and(|s| OWN_PS_SHAPES.contains(&s))
+            && text_shape(text).is_some_and(|s| OWN_PIN_SHAPES.contains(&s))
         {
             return true;
         }
@@ -7177,7 +7199,7 @@ mod tests {
                     "databastion",
                     "10.9.9.9",
                     1,
-                    crate::sql::PS_OWN_THREAD,
+                    crate::sql::PS_OWN_THREAD_ID,
                 )],
                 1024,
             ),
@@ -7783,17 +7805,28 @@ mod tests {
     #[test]
     fn digests_have_the_shape_of_their_text() {
         let shape = |t: &str| text_shape(t.as_bytes()).unwrap();
-        let pin = crate::sql::PS_OWN_PIN;
-        for digest in [
-            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
-             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
-             = ? AND `u` . `VARIABLE_VALUE` = @?",
-            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
-             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
-             = ? AND `u` . `VARIABLE_VALUE` = @? ",
-        ] {
-            assert_eq!(shape(digest), shape(pin), "{digest}");
-        }
+        // As MySQL 8.4.11 and MariaDB 11.4.13 render them (MariaDB adds
+        // a trailing space to some digests).
+        let pin_mysql = crate::sql::ps_own_pin(Flavor::Mysql);
+        let pin_mariadb = crate::sql::ps_own_pin(Flavor::Mariadb);
+        let mysql_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             @@`server_uuid` , `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , \
+             CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` `u` JOIN `performance_schema` . \
+             `global_status` `g` ON `g` . `VARIABLE_NAME` = ? WHERE `u` . `VARIABLE_NAME` = ? AND \
+             `u` . `VARIABLE_VALUE` = @? AND `u` . `THREAD_ID` = ( SELECT `t` . `THREAD_ID` FROM \
+             `performance_schema` . `threads` `t` WHERE `t` . `PROCESSLIST_ID` = `CONNECTION_ID` ( \
+             ) )";
+        let mariadb_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , CAST ( `g` . \
+             `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` `u` JOIN `performance_schema` . \
+             `global_status` `g` ON `g` . `VARIABLE_NAME` = ? WHERE `u` . `VARIABLE_NAME` = ? AND \
+             `u` . `VARIABLE_VALUE` = @? AND `u` . `THREAD_ID` = ( SELECT `t` . `THREAD_ID` FROM \
+             `performance_schema` . `threads` `t` WHERE `t` . `PROCESSLIST_ID` = `CONNECTION_ID` ( \
+             ) ) ";
+        assert_eq!(shape(mysql_digest), shape(&pin_mysql));
+        assert_eq!(shape(mariadb_digest), shape(&pin_mariadb));
+        assert_ne!(shape(&pin_mysql), shape(&pin_mariadb));
+        let pin = pin_mariadb.as_str();
         let mysql = "SELECT /*+ MAX_EXECUTION_TIME(5000) */ `TABLE_NAME`, LEFT(`TABLE_SCHEMA`, \
                      4096) FROM `information_schema`.`TABLES` LIMIT 1";
         assert_eq!(
@@ -7817,6 +7850,12 @@ mod tests {
             "SELECT `u` . `THREAD_ID` , `u` . `VARIABLE_VALUE` FROM `performance_schema` . \
              `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` = ? AND `u` . \
              `VARIABLE_VALUE` = @?",
+            // The pin without its own-thread condition (#205, M2).
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , CAST ( `g` . \
+             `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` \
+             `u` JOIN `performance_schema` . `global_status` `g` ON `g` . `VARIABLE_NAME` = ? \
+             WHERE `u` . `VARIABLE_NAME` = ? AND `u` . `VARIABLE_VALUE` = @?",
             "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
              `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
              = ? OR `u` . `VARIABLE_VALUE` = @?",

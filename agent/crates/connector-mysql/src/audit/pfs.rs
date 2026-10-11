@@ -387,32 +387,73 @@ pub(crate) struct OwnSession {
     pub(crate) uptime: u64,
 }
 
-/// This session's thread id and server run (`sql::PS_OWN_THREAD`, then
-/// `Uptime`). `Ok(None)` when its thread is not readable.
-async fn own_session(session: &mut Session, stage: Stage) -> Result<Option<OwnSession>, MyError> {
-    let rows = match session.query(stage, sql::PS_OWN_THREAD).await {
-        Ok(rows) => rows,
-        Err(e) if !e.fatal => return Ok(None),
-        Err(e) => return Err(e),
+/// A row of `sql::ps_own_thread` / `sql::ps_own_pin`: thread id, the
+/// identity columns, the start time and the uptime (both computed by the
+/// server). `None` without a thread id; no run without a whole identity or
+/// a start time.
+fn own_row(row: &[Option<String>]) -> Option<OwnSession> {
+    let num = |v: Option<&Option<String>>| -> Option<i64> {
+        let v = v?.as_deref()?.trim();
+        v.parse::<i64>().ok().or_else(|| {
+            v.parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(|f| f as i64)
+        })
     };
-    let Some(row) = rows.into_iter().next() else {
-        return Ok(None);
+    let thread = row.first()?.as_deref()?.parse::<u64>().ok()?;
+    let n = row.len();
+    let (boot, uptime) = if n >= 6 {
+        (
+            num(row.get(n - 2))
+                .and_then(|b| u64::try_from(b).ok())
+                .filter(|b| *b > 0),
+            num(row.get(n - 1)).and_then(|u| u64::try_from(u).ok()),
+        )
+    } else {
+        (None, None)
     };
-    let Some(thread) = row
-        .first()
-        .cloned()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    else {
-        return Ok(None);
-    };
-    let uptime = server_uptime(session, stage).await?;
-    let run = uptime.and_then(|u| ServerRun::new(row.get(1..4)?, unix_now().saturating_sub(u)));
-    Ok(Some(OwnSession {
+    let run = boot.and_then(|b| ServerRun::new(row.get(1..n - 2)?, b));
+    Some(OwnSession {
         thread,
         run,
         uptime: uptime.unwrap_or(0),
-    }))
+    })
+}
+
+/// This session's thread id and server run (`sql::ps_own_thread` for the
+/// session's flavor). When that statement fails without ending the
+/// session, the thread id alone (`sql::PS_OWN_THREAD_ID`), with no server
+/// run. `Ok(None)` when its thread is not readable.
+async fn own_session(session: &mut Session, stage: Stage) -> Result<Option<OwnSession>, MyError> {
+    let text = sql::ps_own_thread(session.flavor());
+    let rows = match session.query(stage, &text).await {
+        Ok(rows) => rows,
+        Err(e) if !e.fatal => {
+            tracing::info!(
+                errno = e.errno,
+                "performance_schema: server identity not readable; the agent's ended poll \
+                 sessions are not recognized"
+            );
+            match session.query(stage, sql::PS_OWN_THREAD_ID).await {
+                Ok(rows) => {
+                    let thread = rows
+                        .first()
+                        .and_then(|r| r.first().cloned().flatten())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    return Ok(thread.map(|thread| OwnSession {
+                        thread,
+                        run: None,
+                        uptime: 0,
+                    }));
+                }
+                Err(e) if !e.fatal => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(rows.first().and_then(|r| own_row(r)))
 }
 
 /// Where polling resumes after a restart: `(last, seen, floor)`.
@@ -507,13 +548,23 @@ fn pin_nonce() -> Option<String> {
 }
 
 /// A Discovery session's thread id and server run, through the nonce
-/// variable of [`sql::ps_pin_variable`] (see [`sql::PS_OWN_PIN`]).
+/// variable of [`sql::ps_pin_variable`] (see [`sql::ps_own_pin`]).
 /// `Ok(None)` unless exactly one thread holds the nonce.
 pub(crate) async fn pinned_session(
     session: &mut Session,
     stage: Stage,
 ) -> Result<Option<OwnSession>, MyError> {
-    let Some(set) = pin_nonce().as_deref().and_then(sql::ps_pin_variable) else {
+    pinned_session_with(session, stage, pin_nonce()).await
+}
+
+/// [`pinned_session`] with a given nonce (tests: a nonce copied into
+/// another session).
+pub(crate) async fn pinned_session_with(
+    session: &mut Session,
+    stage: Stage,
+    nonce: Option<String>,
+) -> Result<Option<OwnSession>, MyError> {
+    let Some(set) = nonce.as_deref().and_then(sql::ps_pin_variable) else {
         return Ok(None);
     };
     match session.exec(stage, &set).await {
@@ -521,7 +572,10 @@ pub(crate) async fn pinned_session(
         Err(e) if !e.fatal => return Ok(None),
         Err(e) => return Err(e),
     }
-    let rows = match session.query(stage, sql::PS_OWN_PIN).await {
+    let rows = match session
+        .query(stage, &sql::ps_own_pin(session.flavor()))
+        .await
+    {
         Ok(rows) => rows,
         Err(e) if !e.fatal => return Ok(None),
         Err(e) => return Err(e),
@@ -529,22 +583,7 @@ pub(crate) async fn pinned_session(
     let [row] = rows.as_slice() else {
         return Ok(None);
     };
-    let Some(thread) = row
-        .first()
-        .cloned()
-        .flatten()
-        .and_then(|v| v.parse::<u64>().ok())
-    else {
-        return Ok(None);
-    };
-    let ident = row.get(1..4).map(<[Option<String>]>::to_vec);
-    let uptime = server_uptime(session, stage).await?;
-    let run = uptime.and_then(|u| ServerRun::new(ident.as_deref()?, unix_now().saturating_sub(u)));
-    Ok(Some(OwnSession {
-        thread,
-        run,
-        uptime: uptime.unwrap_or(0),
-    }))
+    Ok(own_row(row))
 }
 
 /// This session's thread is visible in `performance_schema.threads`: the
@@ -679,10 +718,15 @@ impl PsPoller {
     }
 
     /// How the session of a statement row of `thread` is seen (`live`: its
-    /// `threads` row, while it is connected):
+    /// `threads` row, while it is connected; `own_poll`: the row's whole
+    /// text has the shape of one of the agent's own `performance_schema`
+    /// reads, `events::own_ps_shape`):
     /// - one of the agent's poll sessions on this server run, with no
-    ///   account or the agent's: dropped (a session connected under
-    ///   another account is never one of them);
+    ///   account or the agent's, and an own poll statement: dropped (a
+    ///   session connected under another account is never one of them; any
+    ///   other statement of that thread takes the usual path, so that a
+    ///   misidentified server run hides nothing else: security review of
+    ///   #205, L1);
     /// - connected: as it is (and remembered);
     /// - ended: as remembered, else, when the thread is a live Discovery
     ///   pin of this server run, the agent's identity with the account
@@ -691,7 +735,13 @@ impl PsPoller {
     ///
     /// `own` (`Access::own_session`): the thread is a live pin and the
     /// session's account is the pin's.
-    fn identify(&mut self, thread: u64, live: Option<&ThreadInfo>, now: Instant) -> Seen {
+    fn identify(
+        &mut self,
+        thread: u64,
+        live: Option<&ThreadInfo>,
+        own_poll: impl FnOnce() -> bool,
+        now: Instant,
+    ) -> Seen {
         let other_account = live.is_some_and(|i| i.user != self.own.account);
         if let Some(run) = &self.run
             && !other_account
@@ -701,6 +751,7 @@ impl PsPoller {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(run, thread)
+            && own_poll()
         {
             return Seen::Drop;
         }
@@ -936,8 +987,14 @@ impl PsPoller {
         mono: Instant,
         now: SystemTime,
     ) -> Result<Option<databastion_classifiers::masking::MaskedEvent>, ()> {
+        let own_poll = || {
+            !r.truncated
+                && r.text
+                    .as_deref()
+                    .is_some_and(|t| super::events::own_ps_shape(t))
+        };
         let (info, client, own_session) =
-            match self.identify(r.thread, r.thread_info.as_ref(), mono) {
+            match self.identify(r.thread, r.thread_info.as_ref(), own_poll, mono) {
                 Seen::Drop => {
                     self.own_dropped = self.own_dropped.saturating_add(1);
                     return Ok(None);
@@ -1401,9 +1458,39 @@ mod tests {
             // Ended, and still connected under the agent's account.
             assert!(event(&mut f, &row(7, &poll_text, 3, None), mono).is_none());
             assert!(event(&mut f, &row(7, &poll_text, 3, Some(info(AGENT))), mono).is_none());
-            // Any text of that session (it only sends the connector's).
-            assert!(event(&mut f, &row(7, "SELECT 1 FROM hr.customers", 1, None), mono).is_none());
-            assert_eq!(f.poller.own_dropped, 3);
+            // Its other own probes and polls too (the stats text, the
+            // own-thread probe), whatever their table.
+            let stats = crate::sql::ps_stats("events_statements_history_long");
+            assert!(event(&mut f, &row(7, &stats, 1, None), mono).is_none());
+            let own = crate::sql::ps_own_thread(crate::conn::Flavor::Mariadb);
+            assert!(event(&mut f, &row(7, &own, 1, None), mono).is_none());
+            assert_eq!(f.poller.own_dropped, 4);
+            // Any other statement of that thread takes the usual path
+            // (security review of #205, L1): a misidentified server run
+            // hides nothing else. Ended: unidentified, reported; a write
+            // too; a cut poll text too.
+            let e = event(&mut f, &row(7, "SELECT 1 FROM hr.customers", 1, None), mono).unwrap();
+            assert!(unidentified(&e));
+            let e = event(
+                &mut f,
+                &row(
+                    7,
+                    "UPDATE hr.customers SET email = 'x' WHERE id = 1",
+                    1,
+                    None,
+                ),
+                mono,
+            )
+            .unwrap();
+            assert_eq!(e.action(), EventAction::Write);
+            let mut cut = row(7, &poll_text, 3, None);
+            cut.truncated = true;
+            assert!(unidentified(&event(&mut f, &cut, mono).unwrap()));
+            // A digest of a poll text (literals replaced): the same shape.
+            let mut digest = row(7, &poll_text.replace("LIMIT 2000", "LIMIT ?"), 3, None);
+            digest.digest = true;
+            assert!(event(&mut f, &digest, mono).is_none());
+            assert_eq!(f.poller.own_dropped, 5);
             // Connected under another account: not the agent's session.
             let e = event(&mut f, &row(7, &poll_text, 3, Some(info("app"))), mono).unwrap();
             assert_eq!(e.principal().account_name(), "app");
@@ -1536,10 +1623,19 @@ mod tests {
             let mono = Instant::now();
             let mut f = fixture(Some(run(1_000_000)), addr());
             pinned(&f, AGENT, mono);
-            let pin_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` \
-                              FROM `performance_schema` . `user_variables_by_thread` `u` WHERE \
-                              `u` . `VARIABLE_NAME` = ? AND `u` . `VARIABLE_VALUE` = @? ";
+            let pin_text = crate::sql::ps_own_pin(crate::conn::Flavor::Mariadb)
+                .replace("'Uptime'", "?")
+                .replace("'databastion_pin'", "?");
+            let pin_digest = pin_text.as_str();
             assert!(event(&mut f, &digest_row(9, pin_digest, 1), mono).is_none());
+            // The poll texts' shapes are not matched on a pinned session
+            // (security review of #205, M1): a digest with the shape of the
+            // stats text is a statement-text read, reported.
+            let stats = crate::sql::ps_stats("events_statements_history_long")
+                .replace("LIMIT 1", "LIMIT ?");
+            let e = event(&mut f, &digest_row(9, &stats, 1), mono).unwrap();
+            assert_eq!(e.principal().account_name(), AGENT);
+            assert!(e.always_report());
             assert!(f.usage.lock().unwrap().budgeted_objects().is_empty());
             // Not pinned: always reported, unidentified.
             let e = event(&mut f, &digest_row(10, pin_digest, 1), mono).unwrap();
@@ -1599,6 +1695,72 @@ mod tests {
             assert_eq!(e.principal().account_name(), "other_agent");
             assert!(e.principal().send_name());
             assert!(f.usage.lock().unwrap().budgeted_objects().is_empty());
+        }
+
+        /// The server run of an own-thread or pin row: the start time
+        /// computed by the server, the identity columns of the flavor
+        /// (security review of #205, L1); fail closed on anything missing.
+        #[test]
+        fn own_rows_carry_the_server_run() {
+            let cells = |v: &[&str]| -> Vec<Option<String>> {
+                v.iter()
+                    .map(|c| (!c.is_empty()).then(|| (*c).to_owned()))
+                    .collect()
+            };
+            // MySQL: with @@server_uuid.
+            let mysql = own_row(&cells(&[
+                "90",
+                "h",
+                "3306",
+                "1",
+                "uuid-a",
+                "1791718645",
+                "179",
+            ]))
+            .unwrap();
+            assert_eq!((mysql.thread, mysql.uptime), (90, 179));
+            let other_uuid = own_row(&cells(&[
+                "90",
+                "h",
+                "3306",
+                "1",
+                "uuid-b",
+                "1791718645",
+                "179",
+            ]))
+            .unwrap();
+            assert!(
+                !mysql
+                    .run
+                    .as_ref()
+                    .unwrap()
+                    .same(other_uuid.run.as_ref().unwrap())
+            );
+            // MariaDB: no @@server_uuid; a start time read as a decimal.
+            let mariadb = own_row(&cells(&[
+                "92",
+                "h",
+                "3306",
+                "1",
+                "1791718642.000000",
+                "182",
+            ]))
+            .unwrap();
+            assert!(mariadb.run.is_some());
+            assert_eq!(mariadb.uptime, 182);
+            // Missing identity, start time, or a non-positive start: no run.
+            for bad in [
+                cells(&["92", "", "3306", "1", "1791718642", "182"]),
+                cells(&["92", "h", "3306", "1", "", "182"]),
+                cells(&["92", "h", "3306", "1", "-5", "182"]),
+                cells(&["92", "h", "3306", "1", "x", "182"]),
+                cells(&["92"]),
+            ] {
+                let o = own_row(&bad).unwrap();
+                assert!(o.run.is_none(), "{bad:?}");
+            }
+            assert!(own_row(&cells(&["x", "h", "3306", "1", "1", "1"])).is_none());
+            assert!(own_row(&[]).is_none());
         }
 
         /// A session seen while connected is remembered first: an ended
