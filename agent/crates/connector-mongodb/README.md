@@ -149,13 +149,15 @@ values read in its text (`$toInt` of an e-mail address, `ConversionFailure`
 with any count it has, and never left out as the agent's own. On the `auditLog`,
 which logs authorization checks, failed records give no event, as before.
 
-Operations that run server-side JavaScript (a key `$where`, `$function` or
-`$accumulator` at any depth below 64 of the command, its cursor's command
-or the pipeline of the views it reads; `mapReduce`; `system.js`) are always
+Operations that run server-side JavaScript (a key `$where`, `$function`,
+`$accumulator` or `$_internalJs…` at any depth below 64 of the command,
+its cursor's command or the pipeline of the views it reads; `mapReduce`;
+`system.js`) are always
 reported, from every account, and never left out as the agent's own, with
 their usual action and count: a conditional sleep under `maxTimeMS` is a
-one-bit oracle whose outcomes both read 0 documents. Deeper nesting, and a
-command the server cut where a key could have been cut, count as
+one-bit oracle whose outcomes both read 0 documents. Deeper nesting, more than
+64 KiB of command documents, a `getMore` without its opening command, and
+a command the server cut where a key could have been cut, count as
 JavaScript. Only key names are compared (`src/audit/js.rs` on the files,
 one boolean computed by the profiler projection on the server); the code
 is never read. `insert` documents never count. Whether the server allows

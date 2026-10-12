@@ -346,10 +346,38 @@ fn js_key_in(f: &str) -> DocBuf {
             .doc(
                 "in",
                 DocBuf::new().list(
-                    "$in",
+                    "$or",
                     DocBuf::new()
-                        .str("0", "$$q.k")
-                        .doc("1", DocBuf::new().list("$literal", list(&js::JS_KEYS))),
+                        .doc(
+                            "0",
+                            DocBuf::new().list(
+                                "$in",
+                                DocBuf::new()
+                                    .str("0", "$$q.k")
+                                    .doc("1", DocBuf::new().list("$literal", list(&js::JS_KEYS))),
+                            ),
+                        )
+                        // `$_internalJsEmit`, `$_internalJsReduce`, and any
+                        // other name with the prefix (a byte operator).
+                        .doc(
+                            "1",
+                            DocBuf::new().list(
+                                "$eq",
+                                DocBuf::new()
+                                    .doc(
+                                        "0",
+                                        DocBuf::new().list(
+                                            "$indexOfBytes",
+                                            DocBuf::new().str("0", "$$q.k").doc(
+                                                "1",
+                                                DocBuf::new()
+                                                    .str("$literal", js::JS_INTERNAL_PREFIX),
+                                            ),
+                                        ),
+                                    )
+                                    .i32("1", 0),
+                            ),
+                        ),
                 ),
             ),
     );
@@ -402,16 +430,21 @@ fn next_level(f: &str) -> DocBuf {
 /// computed on the server (ADR-0027 refinement of 2026-10-12; the file
 /// sources do the same in `audit::js`):
 ///
-/// - a key `$where`, `$function` or `$accumulator` at any depth below
-///   [`js::MAX_JS_DEPTH`] of `command`, `originatingCommand` or
-///   `resolvedViews` (a view's pipeline), walked level by level (a
-///   `$reduce` over the depths, so the expression itself stays shallow),
-///   or a non-empty object or array at that depth (fail closed);
+/// - a key `$where`, `$function` or `$accumulator`, or one starting with
+///   `$_internalJs`, at any depth below [`js::MAX_JS_DEPTH`] of `command`,
+///   `originatingCommand` or `resolvedViews` (a view's pipeline), walked
+///   level by level (a `$reduce` over the depths, so the expression itself
+///   stays shallow), or a non-empty object or array at that depth (fail
+///   closed);
+/// - these three fields larger than [`js::MAX_JS_BYTES`] together
+///   (`$bsonSize`): not walked (fail closed, bounded cost);
 /// - an `explain` of `mapReduce`;
+/// - a getMore (by `op` or by name) without an `originatingCommand`;
 /// - a command the server truncated (`{$truncated: "<text>"}`) whose text
-///   was cut (it ends with `...`, a key could have been cut), or whose
-///   whole text holds one of the names (or `mapReduce`), or whose
-///   `$truncated` is not a string; only byte operators touch the text
+///   was cut (it ends with `...`, or its length is within 16 bytes of the
+///   51 200-byte cut), or whose whole text holds one of the names (or
+///   `$_internalJs`, `mapReduce`), or whose `$truncated` is not a string;
+///   only byte operators touch the text
 ///   (`$indexOfBytes`, `$strLenBytes`: a cut can split a UTF-8 character,
 ///   on which `$regexMatch` fails the whole `find`), and only a boolean
 ///   crosses the wire;
@@ -541,14 +574,82 @@ fn js_projection() -> DocBuf {
         }
         DocBuf::new().list("$or", l)
     };
+    // A getMore (by `op` or by name) whose opening command is not shown:
+    // its cursor may run JavaScript.
+    let get_more_blind = DocBuf::new().list(
+        "$and",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list(
+                    "$or",
+                    DocBuf::new()
+                        .doc(
+                            "0",
+                            DocBuf::new()
+                                .list("$eq", DocBuf::new().str("0", "$op").str("1", "getmore")),
+                        )
+                        .doc(
+                            "1",
+                            DocBuf::new().list(
+                                "$eq",
+                                DocBuf::new()
+                                    .doc(
+                                        "0",
+                                        let_path(
+                                            "g",
+                                            first_pair(object_or_empty("$command")),
+                                            "$$g.k",
+                                        ),
+                                    )
+                                    .str("1", "getMore"),
+                            ),
+                        ),
+                ),
+            )
+            .doc(
+                "1",
+                DocBuf::new().list(
+                    "$ne",
+                    DocBuf::new()
+                        .doc("0", DocBuf::new().str("$type", "$originatingCommand"))
+                        .str("1", "object"),
+                ),
+            ),
+    );
     let js_of = any(vec![
         walked,
         explain_mr,
+        get_more_blind,
         truncated_js("$command"),
         truncated_js("$originatingCommand"),
         not_object("$command"),
         not_object("$originatingCommand"),
     ]);
+    // The fields walked, larger than the bound together: JavaScript,
+    // without being walked (the cost per entry is bounded).
+    let oversized = DocBuf::new().list(
+        "$gt",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().doc(
+                    "$bsonSize",
+                    DocBuf::new()
+                        .str("c", "$command")
+                        .str("o", "$originatingCommand")
+                        .str("r", "$resolvedViews"),
+                ),
+            )
+            .i64("1", i64::try_from(js::MAX_JS_BYTES).unwrap_or(i64::MAX)),
+    );
+    let js_of = DocBuf::new().list(
+        "$cond",
+        DocBuf::new()
+            .doc("0", oversized)
+            .bool("1", true)
+            .doc("2", js_of),
+    );
     // An insert: never JavaScript.
     let insert = DocBuf::new().list(
         "$eq",
@@ -567,6 +668,9 @@ fn js_projection() -> DocBuf {
             .doc("2", js_of),
     )
 }
+
+/// Length at which the server cuts a profiled command's text (50 KiB).
+const TRUNCATED_TEXT_BYTES: i32 = 51_200;
 
 /// Whether the command at `path` is truncated in a way that may hide
 /// JavaScript (see [`js_projection`]).
@@ -621,13 +725,21 @@ fn truncated_js(path: &str) -> DocBuf {
             )
             .i32("1", 0),
     );
-    let mut named = DocBuf::new().doc("0", cut);
+    // Backstop: a text within 16 bytes of the cut length (51 200 bytes),
+    // whatever its end.
+    let near_cut = DocBuf::new().list(
+        "$gte",
+        DocBuf::new()
+            .doc("0", DocBuf::new().str("$strLenBytes", "$$t"))
+            .i32("1", TRUNCATED_TEXT_BYTES - 16),
+    );
+    let mut named = DocBuf::new().doc("0", cut).doc("1", near_cut);
     for (i, needle) in js::JS_KEYS
         .iter()
-        .chain(["mapReduce", "mapreduce"].iter())
+        .chain([js::JS_INTERNAL_PREFIX, "mapReduce", "mapreduce"].iter())
         .enumerate()
     {
-        named = named.doc(&(i + 1).to_string(), found(needle));
+        named = named.doc(&(i + 2).to_string(), found(needle));
     }
     let insert = DocBuf::new().list(
         "$eq",

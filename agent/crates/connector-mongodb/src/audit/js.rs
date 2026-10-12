@@ -15,8 +15,13 @@
 //!   decoding values: a string is skipped from quote to quote (escapes
 //!   stepped over), so the JavaScript code itself (a string value) and
 //!   every literal are never copied, decoded nor logged. A key is compared
-//!   in place with the three names, its JSON escapes decoded into an
-//!   18-byte buffer at most (a longer key cannot match).
+//!   in place with the three names and the `$_internalJs` prefix (the
+//!   operators `mapReduce` compiles to, `$_internalJsEmit` and
+//!   `$_internalJsReduce`, which a client can write), its JSON escapes
+//!   decoded into an 18-byte buffer at most.
+//! - **Size bound, fail closed.** Command documents of more than
+//!   [`MAX_JS_BYTES`] in one record count as JavaScript without being
+//!   scanned.
 //! - **Depth bound, fail closed.** The command document is depth 0; an
 //!   object or array at depth [`MAX_JS_DEPTH`] or deeper that is not empty
 //!   counts as JavaScript (its keys are not examined). The scanner keeps
@@ -38,6 +43,17 @@ pub(crate) const MAX_JS_DEPTH: usize = 64;
 
 /// The operators that run server-side JavaScript.
 pub(crate) const JS_KEYS: [&str; 3] = ["$where", "$function", "$accumulator"];
+
+/// The prefix of the internal operators that run JavaScript
+/// (`$_internalJsEmit`, `$_internalJsReduce`: what `mapReduce` compiles to
+/// since MongoDB 5.0; MongoDB 8.0 accepts them from a client).
+pub(crate) const JS_INTERNAL_PREFIX: &str = "$_internalJs";
+
+/// Bytes of command documents scanned per record at most: a record whose
+/// command documents are larger counts as JavaScript without being
+/// scanned (the cost per record is bounded; the profiler applies the same
+/// bound to the BSON size of the fields it walks).
+pub(crate) const MAX_JS_BYTES: usize = 64 * 1024;
 
 /// Longest name compared, in bytes (`originatingCommand`; a longer key
 /// matches no name and is not decoded further).
@@ -89,54 +105,67 @@ fn hex(b: u8) -> Option<u32> {
     char::from(b).to_digit(16)
 }
 
-/// Whether the body of a JSON string (between its quotes) is `name`,
-/// escapes decoded on the fly (never into a buffer longer than
-/// [`LONGEST`]).
-fn key_is(raw: &[u8], names: &[&str]) -> bool {
+/// The first [`LONGEST`] bytes of the body of a JSON string (between its
+/// quotes), escapes decoded on the fly, and whether it holds more (or an
+/// escape that is not understood, after which nothing is decoded). A
+/// `\u` escape of a character that is not ASCII is one byte `0xff`: the
+/// names are ASCII, so it matches none of them.
+fn decode_key(raw: &[u8]) -> ([u8; LONGEST], usize, bool) {
     let mut buf = [0u8; LONGEST];
     let mut n = 0;
     let mut i = 0;
     while i < raw.len() {
         let c = if raw[i] == b'\\' {
-            let Some(&e) = raw.get(i + 1) else {
-                return false;
-            };
+            let e = raw.get(i + 1).copied();
             match e {
-                b'"' | b'\\' | b'/' => {
+                Some(e @ (b'"' | b'\\' | b'/')) => {
                     i += 2;
                     e
                 }
-                b'u' => {
+                Some(b'u') => {
                     let Some(v) = raw
                         .get(i + 2..i + 6)
                         .and_then(|h| h.iter().try_fold(0u32, |acc, d| Some(acc * 16 + hex(*d)?)))
                     else {
-                        return false;
+                        return (buf, n, true);
                     };
-                    // The names are ASCII: anything else cannot match.
-                    let Ok(c) = u8::try_from(v) else {
-                        return false;
-                    };
-                    if !c.is_ascii() {
-                        return false;
-                    }
                     i += 6;
-                    c
+                    u8::try_from(v).ok().filter(u8::is_ascii).unwrap_or(0xff)
                 }
                 // Control characters: never in the names.
-                _ => return false,
+                Some(_) => {
+                    i += 2;
+                    0xff
+                }
+                None => return (buf, n, true),
             }
         } else {
             i += 1;
             raw[i - 1]
         };
         if n == LONGEST {
-            return false;
+            return (buf, n, true);
         }
         buf[n] = c;
         n += 1;
     }
-    names.iter().any(|k| k.as_bytes() == &buf[..n])
+    (buf, n, false)
+}
+
+/// Whether the body of a JSON string (between its quotes) is one of
+/// `names`.
+fn key_is(raw: &[u8], names: &[&str]) -> bool {
+    let (buf, n, longer) = decode_key(raw);
+    !longer && names.iter().any(|k| k.as_bytes() == &buf[..n])
+}
+
+/// Whether a key names an operator that runs JavaScript: one of
+/// [`JS_KEYS`], or any name starting with [`JS_INTERNAL_PREFIX`] (the
+/// operators `mapReduce` compiles to since MongoDB 5.0, which a client can
+/// write itself).
+fn is_js_key(raw: &[u8]) -> bool {
+    let (buf, n, _) = decode_key(raw);
+    key_is(raw, &JS_KEYS) || buf[..n].starts_with(JS_INTERNAL_PREFIX.as_bytes())
 }
 
 /// The index just after the JSON value starting at `i` (whitespace before
@@ -234,7 +263,7 @@ pub(crate) fn value_runs_js(b: &[u8]) -> bool {
                 let Some(end) = string_end(b, i) else {
                     return true;
                 };
-                if expect_key && key_is(&b[i + 1..end], &JS_KEYS) {
+                if expect_key && is_js_key(&b[i + 1..end]) {
                     return true;
                 }
                 expect_key = false;
@@ -372,7 +401,9 @@ pub(crate) fn server_log_runs_js(line: &[u8]) -> bool {
             return true;
         }
     }
-    if found.iter().any(|v| value_runs_js(v)) {
+    if found.iter().map(|v| v.len()).sum::<usize>() > MAX_JS_BYTES
+        || found.iter().any(|v| value_runs_js(v))
+    {
         return true;
     }
     found.clear();
@@ -391,7 +422,9 @@ pub(crate) fn audit_log_runs_js(record: &[u8]) -> bool {
     if values_at(record, AUDIT_ARGS, &mut found).is_err() {
         return true;
     }
-    found.iter().any(|v| value_runs_js(v)) || first_key_in(record, AUDIT_EXPLAINED, &MAP_REDUCE)
+    found.iter().map(|v| v.len()).sum::<usize>() > MAX_JS_BYTES
+        || found.iter().any(|v| value_runs_js(v))
+        || first_key_in(record, AUDIT_EXPLAINED, &MAP_REDUCE)
 }
 
 #[cfg(test)]
@@ -587,6 +620,58 @@ mod tests {
         assert!(!audit_log_runs_js(
             br#"{"atype":"createView","param":{"ns":"app.v","pipeline":[{"$match":{"$where":"1"}}]}}"#
         ));
+    }
+
+    /// Security review of #216, H1: the operators `mapReduce` compiles to
+    /// (a client can write them since MongoDB 5.0), by prefix.
+    #[test]
+    fn internal_javascript_operators_are_found_by_prefix() {
+        for f in [
+            r#"{"aggregate":"c","pipeline":[{"$project":{"x":{"$_internalJsEmit":{"eval":"f","this":"$$ROOT"}}}}]}"#,
+            r#"{"aggregate":"c","pipeline":[{"$group":{"_id":null,"x":{"$_internalJsReduce":{"data":1,"eval":"f"}}}}]}"#,
+            r#"{"find":"c","filter":{"$expr":{"$_internalJsSomethingNewAndLong":1}}}"#,
+        ] {
+            assert!(js(f), "{f}");
+        }
+        let esc = |before: &str, hex: &str, after: &str| {
+            format!("{before}{}u{hex}{after}", char::from(BACKSLASH)).into_bytes()
+        };
+        assert!(is_js_key(&esc("", "0024", "_internalJsEmit")));
+        assert!(is_js_key(&esc("$_internalJs", "00e9", "")));
+        assert!(!is_js_key(b"$_internalJ"));
+        assert!(!is_js_key(b"_internalJsEmit"));
+        assert!(!is_js_key(b"$_internalJS"));
+        assert!(!js(r#"{"find":"c","filter":{"a":"$_internalJsEmit"}}"#));
+    }
+
+    /// Security review of #216, M1: command documents over
+    /// MAX_JS_BYTES in one record count, unscanned.
+    #[test]
+    fn the_size_bound_fails_closed() {
+        let cmd = |n: usize| {
+            format!(
+                r#"{{"type":"command","command":{{"find":"c","filter":{{"email":{{"$nin":["{}"]}}}}}}}}"#,
+                "x".repeat(n)
+            )
+        };
+        let under = line(&cmd(MAX_JS_BYTES - 200), "");
+        assert!(!server_log_runs_js(under.as_bytes()));
+        let over = line(&cmd(MAX_JS_BYTES), "");
+        assert!(server_log_runs_js(over.as_bytes()));
+        // Summed over the fields.
+        let half = "x".repeat(MAX_JS_BYTES / 2);
+        let both = line(
+            &format!(
+                r#"{{"type":"command","command":{{"getMore":1,"c":"{half}"}},"originatingCommand":{{"find":"c","f":"{half}"}}}}"#
+            ),
+            "",
+        );
+        assert!(server_log_runs_js(both.as_bytes()));
+        let rec = format!(
+            r#"{{"atype":"authCheck","param":{{"command":"find","ns":"app.c","args":{{"find":"c","f":"{}"}}}},"result":0}}"#,
+            "x".repeat(MAX_JS_BYTES)
+        );
+        assert!(audit_log_runs_js(rec.as_bytes()));
     }
 
     #[test]

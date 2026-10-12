@@ -1549,7 +1549,10 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             };
             let cmd = command.cmd.unwrap_or(Cmd::Other);
             // An insert's documents are stored, never run.
-            let js = cmd != Cmd::Insert && super::js::server_log_runs_js(bytes);
+            let js = cmd != Cmd::Insert && super::js::server_log_runs_js(bytes)
+                // A getMore whose opening command is not shown: its
+                // cursor may run JavaScript (fail closed).
+                || (cmd == Cmd::GetMore && a.origin.is_none());
             // Another command that runs JavaScript (an `explain`): a read
             // of unknown shape.
             let (cmd, shape) = match cmd {

@@ -1849,6 +1849,27 @@ mod tests {
         assert!(ev.iter().all(MaskedEvent::always_report));
     }
 
+    /// Security review of #216, L1: a getMore whose opening command the
+    /// line does not show counts as JavaScript on the server log.
+    #[test]
+    fn get_more_without_its_opening_command() {
+        let mut b = builder();
+        let mut lines = own_conn(2);
+        lines.push(slow(
+            2,
+            r#"{"getMore":7,"collection":"customers","$db":"app"}"#,
+            0,
+        ));
+        lines.push(line(
+            51803,
+            "conn2",
+            r#"{"type":"command","ns":"app.customers","command":{"getMore":8,"collection":"customers","$db":"app"},"originatingCommand":{"find":"customers","filter":{"a":1},"limit":5,"$db":"app"},"nreturned":0}"#,
+        ));
+        let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert!(ev[0].always_report());
+    }
+
     /// The `auditLog`: an authorized command that runs JavaScript is a
     /// read (or write) always reported, never the agent's own, even a
     /// bounded `find` within the budget.

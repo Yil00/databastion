@@ -1179,20 +1179,101 @@ fn too_deep() -> DocBuf {
         .doc("filter", DocBuf::new().doc("$expr", e))
 }
 
-/// Runs the four operations (their outcomes checked).
-async fn javascript_ops(s: &mut Session) {
+/// Runs the operations (their outcomes checked); `through_view`: also a
+/// read through [`JS_VIEW`].
+async fn javascript_ops(s: &mut Session, through_view: bool) {
     fails_with(s, js_where_timeout(), 50).await;
-    for command in [js_function_match(), js_lookup(), too_deep()] {
+    for command in [
+        js_function_match(),
+        js_lookup(),
+        too_deep(),
+        js_internal_emit(),
+    ] {
         run(s, "app", command).await.unwrap();
+    }
+    if through_view {
+        run(s, "app", js_union_with_view()).await.unwrap();
     }
 }
 
-/// The four operations from the agent's identity and from another
-/// account, against a running stream of `t` (account `own`): each is a
-/// read of the collection, always reported (none is left out as the
-/// agent's own), with 0 documents (1 for the `$lookup`) when the source
-/// counts them. No JavaScript code (it holds the marker) in the events or
-/// the logs.
+/// A view of the collection whose pipeline runs JavaScript (no document).
+const JS_VIEW: &str = "databastion_it_js_view";
+
+async fn create_js_view(a: &Url) {
+    let mut s = admin_session(a).await;
+    let _ = run(&mut s, "app", DocBuf::new().str("drop", JS_VIEW)).await;
+    run(
+        &mut s,
+        "app",
+        DocBuf::new()
+            .str("create", JS_VIEW)
+            .str("viewOn", COLLECTION)
+            .array(
+                "pipeline",
+                vec![DocBuf::new().doc(
+                    "$match",
+                    DocBuf::new().doc("$expr", js_function("function() { return false; }", &[])),
+                )],
+            ),
+    )
+    .await
+    .unwrap();
+    s.close().await;
+}
+
+async fn drop_js_view(a: &Url) {
+    let mut s = admin_session(a).await;
+    let _ = run(&mut s, "app", DocBuf::new().str("drop", JS_VIEW)).await;
+    s.close().await;
+}
+
+/// `$_internalJsEmit`, what `mapReduce` compiles to, written by a client
+/// (accepted by MongoDB 8.0; security review of #216, H1). One document.
+fn js_internal_emit() -> DocBuf {
+    DocBuf::new()
+        .str("aggregate", COLLECTION)
+        .array(
+            "pipeline",
+            vec![
+                DocBuf::new().i32("$limit", 1),
+                DocBuf::new().doc(
+                    "$project",
+                    DocBuf::new().doc(
+                        "x",
+                        DocBuf::new().doc(
+                            "$_internalJsEmit",
+                            DocBuf::new()
+                                .str("eval", "function() { emit(this._id, 'needle-7Qz-FAKE'); }")
+                                .str("this", "$$ROOT"),
+                        ),
+                    ),
+                ),
+            ],
+        )
+        .doc("cursor", DocBuf::new())
+}
+
+/// A `$unionWith` into [`JS_VIEW`]: the command names only the view; the
+/// server shows its pipeline in `resolvedViews`. One document.
+fn js_union_with_view() -> DocBuf {
+    DocBuf::new()
+        .str("aggregate", COLLECTION)
+        .array(
+            "pipeline",
+            vec![
+                DocBuf::new().i32("$limit", 1),
+                DocBuf::new().doc("$unionWith", DocBuf::new().str("coll", JS_VIEW)),
+            ],
+        )
+        .doc("cursor", DocBuf::new())
+}
+
+/// The operations of [`javascript_ops`] from the agent's identity and
+/// from another account, against a running stream of `t` (account
+/// `own`): each is a read of the collection, always reported (none is left
+/// out as the agent's own), with 0 documents (1 for the `$lookup`, the
+/// `$_internalJsEmit` and the view read) when the source counts them. No
+/// JavaScript code (it holds the marker) in the events or the logs.
 async fn javascript_flow(
     connector: &Arc<MongodbConnector>,
     t: &TargetConfig,
@@ -1203,16 +1284,21 @@ async fn javascript_flow(
     let logs = Logs::default();
     let _guard = logs.capture();
     let state = TempDir::new();
+    // The `auditLog` shows a view's name only (a documented residual).
+    let through_view = source != EventSource::MongodbAuditLog;
+    let n = if through_view { 6 } else { 5 };
+    create_js_view(a).await;
     let (task, mut rx) = start_audit(Arc::clone(connector), t, &state.0);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let mut agent = Session::connect(t, Timeouts::new(Duration::from_secs(60)))
         .await
         .unwrap();
-    javascript_ops(&mut agent).await;
+    javascript_ops(&mut agent, through_view).await;
     agent.close().await;
     let mut other = admin_as(a, "mongosh 2.3.0").await;
-    javascript_ops(&mut other).await;
+    javascript_ops(&mut other, through_view).await;
     other.close().await;
+    drop_js_view(a).await;
     let admin_name = format!("{}@{}", a.user, a.auth_source);
     let from = |name: &str, ev: &MaskedEvent| {
         ev.principal().account_name() == name
@@ -1223,8 +1309,8 @@ async fn javascript_flow(
     };
     let mut events = Vec::new();
     collect_until(&mut rx, &mut events, Duration::from_secs(60), |ev| {
-        ev.iter().filter(|e| from(&admin_name, e)).count() >= 4
-            && ev.iter().filter(|e| from(own, e)).count() >= 4
+        ev.iter().filter(|e| from(&admin_name, e)).count() >= n
+            && ev.iter().filter(|e| from(own, e)).count() >= n
     })
     .await;
     collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
@@ -1233,7 +1319,7 @@ async fn javascript_flow(
     assert!(events.iter().all(|e| e.source() == source), "{text:#?}");
     for name in [admin_name.as_str(), own] {
         let theirs: Vec<&MaskedEvent> = events.iter().filter(|e| from(name, e)).collect();
-        assert_eq!(theirs.len(), 4, "{name}: {text:#?}");
+        assert_eq!(theirs.len(), n, "{name}: {text:#?}");
         assert!(
             theirs
                 .iter()
@@ -1248,7 +1334,7 @@ async fn javascript_flow(
             rows.sort_unstable();
             assert_eq!(
                 rows,
-                [Some(0), Some(0), Some(0), Some(1)],
+                [Some(0), Some(0), Some(0), Some(1), Some(1), Some(1)],
                 "{name}: {text:#?}"
             );
         }
@@ -1498,7 +1584,108 @@ async fn the_profiler_projection_flags_javascript() {
             find(DocBuf::new().doc("n", DocBuf::new().list("$nin", ints(6000)))),
             false,
         ),
+        // `$_internalJs*` (security review of #216, H1): accepted by the
+        // server from a client.
+        ("internal-emit", js_internal_emit(), true),
+        (
+            "internal-reduce",
+            agg(vec![
+                DocBuf::new().doc(
+                    "$group",
+                    DocBuf::new().null("_id").doc(
+                        "x",
+                        DocBuf::new().doc(
+                            "$_internalJsReduce",
+                            DocBuf::new()
+                                .doc("data", DocBuf::new().i32("k", 1).i32("v", 1))
+                                .str("eval", "function(k, v) { return 1; }"),
+                        ),
+                    ),
+                ),
+            ]),
+            true,
+        ),
+        // Views: their pipeline is in `resolvedViews`, through a view of a
+        // view too (`$lookup`, `$unionWith`).
+        (
+            "view-plain",
+            DocBuf::new()
+                .str("find", PLAIN_VIEW)
+                .doc("filter", DocBuf::new()),
+            false,
+        ),
+        (
+            "view-js-lookup",
+            agg(vec![
+                DocBuf::new().i32("$limit", 1),
+                DocBuf::new().doc(
+                    "$lookup",
+                    DocBuf::new()
+                        .str("from", JS_VIEW)
+                        .str("localField", "_id")
+                        .str("foreignField", "_id")
+                        .str("as", "x"),
+                ),
+            ]),
+            true,
+        ),
+        ("view-js-union", js_union_with_view(), true),
+        (
+            "view-js-of-view",
+            DocBuf::new()
+                .str("find", VIEW_OF_JS_VIEW)
+                .doc("filter", DocBuf::new()),
+            true,
+        ),
+        // Walked fields over 64 KiB together (a large view pipeline): not
+        // walked, JavaScript (M1).
+        (
+            "view-big",
+            DocBuf::new()
+                .str("find", BIG_VIEW)
+                .doc("filter", DocBuf::new()),
+            true,
+        ),
+        // A cursor opened without JavaScript.
+        (
+            "getmore-open",
+            find(DocBuf::new()).i32("batchSize", 1),
+            false,
+        ),
     ];
+    // Views (dropped at the end).
+    for v in [VIEW_OF_JS_VIEW, JS_VIEW, PLAIN_VIEW, BIG_VIEW] {
+        let _ = run(&mut s, "app", DocBuf::new().str("drop", v)).await;
+    }
+    let view = |name: &str, on: &str, stages: Vec<DocBuf>| {
+        DocBuf::new()
+            .str("create", name)
+            .str("viewOn", on)
+            .array("pipeline", stages)
+    };
+    for v in [
+        view(
+            JS_VIEW,
+            COLLECTION,
+            vec![DocBuf::new().doc("$match", DocBuf::new().doc("$expr", f()))],
+        ),
+        view(
+            VIEW_OF_JS_VIEW,
+            JS_VIEW,
+            vec![DocBuf::new().i32("$limit", 1)],
+        ),
+        view(PLAIN_VIEW, COLLECTION, vec![DocBuf::new().i32("$limit", 1)]),
+        view(
+            BIG_VIEW,
+            COLLECTION,
+            vec![DocBuf::new().doc(
+                "$match",
+                DocBuf::new().doc("email", DocBuf::new().list("$nin", big(8000, "x-padding"))),
+            )],
+        ),
+    ] {
+        run(&mut s, "app", v).await.unwrap();
+    }
     // The dev server's level (1, `slowms` 0) is restored at the end.
     let before = run(&mut s, "app", DocBuf::new().i32("profile", -1))
         .await
@@ -1511,16 +1698,108 @@ async fn the_profiler_projection_flags_javascript() {
         .unwrap();
     let expected: Vec<(&str, bool)> = cases.iter().map(|(c, _, js)| (*c, *js)).collect();
     let names: Vec<String> = expected.iter().map(|(c, _)| format!("js-it-{c}")).collect();
+    let names: Vec<String> = names
+        .into_iter()
+        .chain(
+            ["js-it-getmore-plain", "js-it-near-a", "js-it-near-b"]
+                .iter()
+                .map(|c| (*c).to_owned()),
+        )
+        .collect();
     let comments: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut expected = expected;
+    let mut cursor = None;
     for (comment, command, _) in cases {
         // Failures (the `$where` ones) are recorded too.
-        let _ = run(
+        let reply = run(
             &mut s,
             "app",
             command.str("comment", &format!("js-it-{comment}")),
         )
         .await;
+        if comment == "getmore-open" {
+            let reply = reply.unwrap();
+            let d = crate::bson::Doc::new(&reply).unwrap();
+            cursor = d.doc("cursor").unwrap().unwrap().int("id").unwrap();
+        }
     }
+    // A getMore of a cursor opened without JavaScript: its opening command
+    // is in `originatingCommand`, so it does not count (L1).
+    let id = cursor.filter(|id| *id != 0).expect("an open cursor");
+    run(
+        &mut s,
+        "app",
+        DocBuf::new()
+            .i64("getMore", id)
+            .str("collection", COLLECTION)
+            .i32("batchSize", 1)
+            .str("comment", "js-it-getmore-plain"),
+    )
+    .await
+    .unwrap();
+    let _ = run(
+        &mut s,
+        "app",
+        DocBuf::new()
+            .str("killCursors", COLLECTION)
+            .array_i64("cursors", &[id]),
+    )
+    .await;
+    expected.push(("getmore-plain", false));
+    // A whole truncated text within 16 bytes of the cut length (L2): the
+    // probe's text length, then the same command padded to 51 190 bytes.
+    // The text abbreviates long strings: the length is tuned with
+    // integers (three bytes each) and a short string.
+    let padded = |k: usize, r: usize, comment: &str| {
+        let mut ones = DocBuf::new();
+        for i in 0..k {
+            ones = ones.i32(&i.to_string(), 1);
+        }
+        find(
+            DocBuf::new()
+                .str("pad", &"p".repeat(r))
+                .doc("n", DocBuf::new().list("$nin", ints(6000)))
+                .doc("m", DocBuf::new().list("$nin", ones)),
+        )
+        .str("comment", comment)
+    };
+    let length = |comment: &str| {
+        DocBuf::new()
+            .str("find", "system.profile")
+            .doc("filter", DocBuf::new().str("command.comment", comment))
+            .doc("projection", DocBuf::new().doc("l", truncated_len()))
+            .doc("sort", DocBuf::new().i32("$natural", -1))
+            .i64("limit", 1)
+            .bool("singleBatch", true)
+    };
+    let len_of = |reply: &[u8]| {
+        let d = crate::bson::Doc::new(reply).unwrap();
+        let batch = d
+            .doc("cursor")
+            .unwrap()
+            .unwrap()
+            .array("firstBatch")
+            .unwrap()
+            .unwrap();
+        let (_, v) = batch.iter().next().unwrap().unwrap();
+        let crate::bson::Value::Doc(e) = v else {
+            panic!("no entry")
+        };
+        usize::try_from(e.int("l").unwrap().unwrap()).unwrap()
+    };
+    let _ = run(&mut s, "app", padded(0, 0, "js-it-near-a")).await;
+    let len0 = len_of(&run(&mut s, "app", length("js-it-near-a")).await.unwrap());
+    assert!(len0 < 51_000, "{len0}");
+    let k = (51_190 - len0) / 3 - 4;
+    let _ = run(&mut s, "app", padded(k, 0, "js-it-near-c")).await;
+    let len1 = len_of(&run(&mut s, "app", length("js-it-near-c")).await.unwrap());
+    assert!(len1 <= 51_190 && 51_190 - len1 < 40, "{len1}");
+    let _ = run(&mut s, "app", padded(k, 51_190 - len1, "js-it-near-b")).await;
+    let near = run(&mut s, "app", length("js-it-near-b")).await.unwrap();
+    // Not cut (no `...`): only the backstop flags it.
+    assert_eq!(len_of(&near), 51_190);
+    expected.push(("near-a", false));
+    expected.push(("near-b", true));
     // The agent's own poll, profiled as it is sent.
     let _ = run(
         &mut s,
@@ -1556,7 +1835,28 @@ async fn the_profiler_projection_flags_javascript() {
                 "projection",
                 crate::audit::profiler::projection()
                     .str("c", "$command.comment")
-                    .str("pr", "$command.projection.js"),
+                    .str("pr", "$command.projection.js")
+                    .doc(
+                        "rv",
+                        DocBuf::new().list(
+                            "$gt",
+                            DocBuf::new()
+                                .doc(
+                                    "0",
+                                    DocBuf::new().doc(
+                                        "$size",
+                                        DocBuf::new().list(
+                                            "$ifNull",
+                                            DocBuf::new().str("0", "$resolvedViews").doc(
+                                                "1",
+                                                DocBuf::new().list("$literal", DocBuf::new()),
+                                            ),
+                                        ),
+                                    ),
+                                )
+                                .i32("1", 0),
+                        ),
+                    ),
             )
             .i64("limit", 1000)
             .bool("singleBatch", true),
@@ -1572,6 +1872,7 @@ async fn the_profiler_projection_flags_javascript() {
         .unwrap()
         .unwrap();
     let mut flags: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut views: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut own_polls = 0;
     for e in batch.iter() {
         let (_, v) = e.unwrap();
@@ -1581,6 +1882,7 @@ async fn the_profiler_projection_flags_javascript() {
         let js = d.flag("js").unwrap();
         if let Some(c) = d.str("c").unwrap() {
             flags.insert(c.to_owned(), js.unwrap());
+            views.insert(c.to_owned(), d.flag("rv").unwrap().unwrap_or(false));
         } else if d.get("pr").unwrap().is_some() {
             own_polls += 1;
             assert_eq!(js, Some(false), "the agent's own poll is flagged");
@@ -1594,7 +1896,42 @@ async fn the_profiler_projection_flags_javascript() {
             "{comment}: {flags:?}"
         );
     }
+    // The views' pipelines are in `resolvedViews`, through a `$lookup`, a
+    // `$unionWith` and a view of a view.
+    for c in [
+        "view-plain",
+        "view-js-lookup",
+        "view-js-union",
+        "view-js-of-view",
+        "view-big",
+    ] {
+        assert_eq!(
+            views.get(&format!("js-it-{c}")),
+            Some(&true),
+            "{c}: {views:?}"
+        );
+    }
+    for v in [VIEW_OF_JS_VIEW, JS_VIEW, PLAIN_VIEW, BIG_VIEW] {
+        let _ = run(&mut s, "app", DocBuf::new().str("drop", v)).await;
+    }
     s.close().await;
+}
+
+const PLAIN_VIEW: &str = "databastion_it_plain_view";
+const BIG_VIEW: &str = "databastion_it_big_view";
+const VIEW_OF_JS_VIEW: &str = "databastion_it_view_of_js_view";
+
+/// The byte length of a profiled command's `$truncated` text.
+fn truncated_len() -> DocBuf {
+    DocBuf::new().doc(
+        "$strLenBytes",
+        DocBuf::new().doc(
+            "$getField",
+            DocBuf::new()
+                .doc("field", DocBuf::new().str("$literal", "$truncated"))
+                .str("input", "$command"),
+        ),
+    )
 }
 
 #[tokio::test]
