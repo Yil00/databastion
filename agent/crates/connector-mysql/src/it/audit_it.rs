@@ -1217,3 +1217,147 @@ async fn own_zero_row_reads_are_charged_on_performance_schema() {
         exec(&mut a, &format!("DROP USER IF EXISTS '{OWN_USER}'@'%'")).await;
     }
 }
+
+/// Security review of #186, L2: a disabled `statements_digest` consumer is
+/// the closed note `audit.digest_consumer_disabled`, on both servers, for
+/// an account holding the Audit grant on `performance_schema` (ADR-0018;
+/// the dev agent accounts stay minimal).
+#[tokio::test]
+async fn a_disabled_digest_consumer_is_a_closed_note() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let name = server.name;
+        let mut a = admin_session(&server, &admin).await;
+        let enabled = scalar(
+            &mut a,
+            "SELECT ENABLED FROM performance_schema.setup_consumers \
+             WHERE NAME = 'statements_digest'",
+        )
+        .await
+        .unwrap_or_default();
+        if enabled != "YES" {
+            skip(
+                &format!("{name}-digest"),
+                &format!("{name}: the statements_digest consumer is not enabled here"),
+            );
+            a.close().await;
+            continue;
+        }
+        exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{PFS_USER}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON performance_schema.* TO '{PFS_USER}'@'%'"),
+        )
+        .await;
+        let (_d, t) = audit_target(&server, PFS_USER, IT_PASSWORD, None);
+        let digest = |notes: &[TargetNote]| {
+            notes
+                .iter()
+                .any(|n| n.code() == NoteCode::AuditDigestConsumerDisabled)
+        };
+        let before = MysqlConnector::new().check(&t).await;
+        exec(
+            &mut a,
+            "UPDATE performance_schema.setup_consumers SET ENABLED = 'NO' \
+             WHERE NAME = 'statements_digest'",
+        )
+        .await;
+        let off = MysqlConnector::new().check(&t).await;
+        // Restored before any assertion.
+        exec(
+            &mut a,
+            "UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' \
+             WHERE NAME = 'statements_digest'",
+        )
+        .await;
+        let after = MysqlConnector::new().check(&t).await;
+        exec(&mut a, &format!("DROP USER IF EXISTS '{PFS_USER}'@'%'")).await;
+        a.close().await;
+        assert!(before.reachable, "{name}: {before:?}");
+        assert!(
+            !before
+                .notes
+                .iter()
+                .any(|n| n.code() == NoteCode::AuditPerformanceSchemaNotReadable),
+            "{name}: {before:?}"
+        );
+        assert!(!digest(&before.notes), "{name}: {before:?}");
+        assert!(off.reachable, "{name}: {off:?}");
+        assert!(digest(&off.notes), "{name}: {off:?}");
+        assert_eq!(off.audit_level, before.audit_level, "{name}");
+        assert_registered_notes(server.flavor(), &off.notes);
+        assert!(!digest(&after.notes), "{name}: {after:?}");
+    }
+}
+
+/// Review of #165: a `server_audit_query_log_limit` below the agent's
+/// longest statement is the closed note `audit.statement_text_limit_low`
+/// (with the limit as its count) while the stream reads `server_audit`,
+/// and no longer once the limit is raised and re-probed.
+#[tokio::test]
+async fn a_low_server_audit_query_limit_is_a_closed_note() {
+    let _serial = SERIAL.lock().await;
+    let Some(server) = servers().into_iter().find(|s| s.name == "mariadb") else {
+        return;
+    };
+    let Some(admin) = server.admin() else {
+        return;
+    };
+    let Some(log) = env_path("DATABASTION_TEST_MARIADB_AUDIT_LOG", "mariadb-audit") else {
+        return;
+    };
+    let mut a = admin_session(&server, &admin).await;
+    let previous = scalar(&mut a, "SELECT @@GLOBAL.server_audit_query_log_limit")
+        .await
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1024);
+    exec(&mut a, "SET GLOBAL server_audit_query_log_limit = 512").await;
+    let state = TempDir::new();
+    let (_d, t) = audit_target(
+        &server,
+        &server.url.user,
+        &server.url.password,
+        Some((&log, "server_audit")),
+    );
+    let connector = Arc::new(MysqlConnector::new());
+    let first = connector.check(&t).await;
+    let low = |notes: &[TargetNote]| {
+        notes
+            .iter()
+            .find(|n| n.code() == NoteCode::AuditStatementTextLimitLow)
+            .and_then(TargetNote::count)
+    };
+    let (task, _rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let running = connector.check(&t).await;
+    exec(
+        &mut a,
+        &format!(
+            "SET GLOBAL server_audit_query_log_limit = {}",
+            previous.max(1024)
+        ),
+    )
+    .await;
+    a.close().await;
+    task.abort();
+    let _ = task.await;
+    let stopped = connector.check(&t).await;
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MariadbServerAudit),
+        "{running:?}"
+    );
+    // Not before the stream read the limit, nor once it ended.
+    assert_eq!(low(&first.notes), None, "{first:?}");
+    assert_eq!(low(&running.notes), Some(512), "{running:?}");
+    assert_eq!(low(&stopped.notes), None, "{stopped:?}");
+    assert_registered_notes(server.flavor(), &running.notes);
+}

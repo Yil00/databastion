@@ -512,6 +512,16 @@ class Limits:
     cpu_abs_cores: float = 0.05
     cpu_rel: float = 0.5
     spool_max_batches: int = 1000  # peak spooled batches over the run
+    # ADR-0048 load scenario (run.sh with the statistics readers): the agent's CPU and peak RSS against
+    # the 0.6.0 release run (dev 2b55117, CI run 38038485048: 0.013 core, 42 MiB), within
+    # ref + max(abs, rel x ref): the run-to-run noise of the CI runners (0.012 to 0.024 core and 28 to
+    # 42 MiB over the earlier runs).
+    agent_ref_cpu_cores: float = 0.013
+    agent_ref_cpu_abs: float = 0.02
+    agent_ref_cpu_rel: float = 1.0
+    agent_ref_rss_mb: float = 42.0
+    agent_ref_rss_abs_mb: float = 16.0
+    agent_ref_rss_rel: float = 0.25
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "Limits":
@@ -688,7 +698,9 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
 
     # ---- 2b. Side accounts of the Audit run (ADR-0045): a monitoring-like reader of statement-text
     # tables (at most one event per principal, object set and aggregation window) and a table-less
-    # built-in mix (no event but connections). Their statements are not in the workload's count.
+    # built-in mix (no event but connections). ADR-0048: readers of the statistics catalogs (role
+    # `stats`), checked as the monitoring-like reader. Their statements are not in the workload's
+    # count.
     side: dict = {}
     for s in facts_of(facts, "side_events"):
         target, account, role = s.get("target"), s.get("account"), s.get("role")
@@ -703,14 +715,16 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
         side[f"{target}/{role}"] = e
         ck.add(f"audit.{target}.{role}_ran", bool(runs) and issued > 0 and failed == 0,
                {"issued": issued, "failed": failed}, "> 0 issued, 0 failed", f"side account {account}")
-        if role == "monitor":
+        if role in ("monitor", "stats"):
             got = {str(o).lower() for o in (s.get("objects") or [])}
             want = [str(o) for o in (s.get("expected") or [])]
             missing = [o for o in want if o.lower() not in got]
-            ck.add(f"audit.{target}.monitor_reported", bool(want) and not missing, s.get("objects"),
-                   f"names {want}", "reads of statement-text tables name them (ADR-0045 part (a))")
+            ck.add(f"audit.{target}.{role}_reported", bool(want) and not missing, s.get("objects"),
+                   f"names {want}",
+                   "reads of statement-text tables name them (ADR-0045 part (a))" if role == "monitor"
+                   else "reads of the statistics catalogs name them (ADR-0048)")
             ex = s.get("max_excess")
-            ck.add(f"audit.{target}.monitor_one_event_per_window",
+            ck.add(f"audit.{target}.{role}_one_event_per_window",
                    None if ex is None or not s.get("events") else ex <= 0, ex,
                    "<= 0",
                    "per principal, action, source and object set: events - (floor(span / window) + 2), "
@@ -723,6 +737,35 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
                    "account's connection was audited (the stream saw it)")
     if side:
         rep["side"] = side
+
+    # ---- 2c. ADR-0048 open question 6: the pgaudit log volume with pgaudit.log_catalog = on over the
+    # Audit run (reported; the check only asserts that it was measured and that catalog reads are
+    # logged, which the statistics reader's events depend on).
+    vol = one_fact(facts, "pgaudit_volume")
+    if vol is not None:
+        soak = vol.get("soak_s") or 0
+        per = {}
+        for who, v in sorted((vol.get("audit") or {}).items()):
+            rec, by = int(v.get("records") or 0), int(v.get("bytes") or 0)
+            per[who] = {"records": rec, "bytes": by,
+                        "records_per_s": _r(rec / soak, 2) if soak else None,
+                        "kib_per_s": _r(by / 1024 / soak, 2) if soak else None}
+        total_audit = sum(v["bytes"] for v in per.values())
+        lines, total = int(vol.get("lines") or 0), int(vol.get("bytes") or 0)
+        rep["pgaudit_volume"] = {
+            "target": vol.get("target"), "log_catalog": vol.get("log_catalog"), "soak_s": soak,
+            "log_lines": lines, "log_bytes": total,
+            "log_mib_per_hour": _r(total / 2**20 / soak * 3600, 1) if soak else None,
+            "audit_bytes": total_audit, "per_role": per}
+    if cfg and cfg.get("pg_audit") == "pgaudit" and cfg.get("stats_readers"):
+        v = rep.get("pgaudit_volume") or {}
+        pgmon = ((v.get("per_role") or {}).get("load_pgmon") or {}).get("records") or 0
+        ok = None if not v else bool(v.get("log_bytes")) and v.get("log_catalog") == "on" and pgmon > 0
+        ck.add("audit.pg-load.pgaudit_catalog_volume_reported", ok,
+               None if not v else {"log_catalog": v.get("log_catalog"), "log_bytes": v.get("log_bytes"),
+                                   "load_pgmon_records": pgmon},
+               "measured, log_catalog on, > 0 records of the statistics reader",
+               "pgaudit log volume over the Audit run (ADR-0048 open question 6)")
 
     # ---- 3. Agent resources and spool
     agent: dict = {}
@@ -758,6 +801,17 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
     agent["rss_mb_hwm"] = _r(max(hwm), 1) if hwm else None
     ck.add("agent.rss_peak_mb", None if agent["rss_mb_peak"] is None else agent["rss_mb_peak"] <= lim.agent_rss_mb,
            agent["rss_mb_peak"], f"<= {lim.agent_rss_mb}")
+    if cfg and cfg.get("stats_readers"):
+        # ADR-0048: with the statistics readers, the agent's CPU and memory stay those of the release
+        # run (within the runners' noise).
+        cores = agent.get("cpu_cores_audit_on")
+        cpu_max = _r(lim.agent_ref_cpu_cores + max(lim.agent_ref_cpu_abs, lim.agent_ref_cpu_rel * lim.agent_ref_cpu_cores), 4)
+        ck.add("agent.cpu_vs_release_reference", None if cores is None else cores <= cpu_max, cores,
+               f"<= {cpu_max}", f"reference {lim.agent_ref_cpu_cores} core (0.6.0 release run)")
+        peak = agent.get("rss_mb_peak")
+        rss_max = _r(lim.agent_ref_rss_mb + max(lim.agent_ref_rss_abs_mb, lim.agent_ref_rss_rel * lim.agent_ref_rss_mb), 1)
+        ck.add("agent.rss_vs_release_reference", None if peak is None else peak <= rss_max, peak,
+               f"<= {rss_max}", f"reference {lim.agent_ref_rss_mb} MiB peak RSS (0.6.0 release run)")
 
     spools = [h.get("spool") or {} for h in heartbeats]
     batches = [int(s.get("batches", 0)) for s in spools]
@@ -833,14 +887,24 @@ def render_markdown(rep: dict) -> str:
                    f"{fmt(a.get('lag_p95_s'))} | {fmt(a.get('p95_ms_audit_off'))} | {fmt(a.get('p95_ms_audit_on'))} | "
                    f"{fmt(a.get('p95_added_ms'))} | {fmt(a.get('db_cores_audit_off'))} / {fmt(a.get('db_cores_audit_on'))} |")
     if rep.get("side"):
-        out += ["", "Side accounts of the Audit run (not in the workload counts): a monitoring-like reader and a "
-                "table-less built-in mix.", "",
+        out += ["", "Side accounts of the Audit run (not in the workload counts): a monitoring-like reader, a "
+                "table-less built-in mix and the statistics readers (ADR-0048).", "",
                 "| Target / role | Account | Issued (Audit on) | Events | Received | Groups | Most events in a group | Excess over the windows | Non-connect events | Objects |",
                 "|---|---|---|---|---|---|---|---|---|---|"]
         for k, e in sorted(rep["side"].items()):
             out.append(f"| {k} | {fmt(e.get('account'))} | {fmt(e.get('issued_audit_on'))} | {fmt(e.get('events'))} | "
                        f"{fmt(e.get('received'))} | {fmt(e.get('groups'))} | {fmt(e.get('max_events_per_group'))} | "
                        f"{fmt(e.get('max_excess'))} | {fmt(e.get('non_connect'))} | {fmt(e.get('objects'))} |")
+    vol = rep.get("pgaudit_volume")
+    if vol:
+        out += ["", f"pgaudit log volume on {fmt(vol.get('target'))} over the Audit run "
+                f"(`pgaudit.log_catalog = {fmt(vol.get('log_catalog'))}`, {fmt(vol.get('soak_s'))} s): "
+                f"{fmt(vol.get('log_lines'))} lines, {fmt(vol.get('log_bytes'))} bytes "
+                f"({fmt(vol.get('log_mib_per_hour'))} MiB per hour), of which pgaudit records:", "",
+                "| Role | Records | Bytes | Records / s | KiB / s |", "|---|---|---|---|---|"]
+        for who, v in sorted((vol.get("per_role") or {}).items()):
+            out.append(f"| {who} | {fmt(v.get('records'))} | {fmt(v.get('bytes'))} | {fmt(v.get('records_per_s'))} | "
+                       f"{fmt(v.get('kib_per_s'))} |")
     ag = rep.get("agent") or {}
     out += ["", "## 3. Agent resources", ""]
     for k in ("cpu_cores_audit_off", "cpu_cores_audit_on", "cpu_ms_per_1000_statements", "rss_mb_audit_on",
