@@ -79,7 +79,7 @@ fn url(var: &str) -> Option<Url> {
 /// `DATABASTION_TEST_REQUIRE` (comma-separated: `pg`, `admin`, `pss`,
 /// `pgaudit`, `pgaudit-log`, `weak-auth`, `tls`, or `all`), the skip is a failure: CI
 /// lists what each run must exercise.
-fn skip(prerequisite: &str, message: &str) {
+pub(crate) fn skip(prerequisite: &str, message: &str) {
     let required = std::env::var("DATABASTION_TEST_REQUIRE").unwrap_or_default();
     assert!(
         !required
@@ -683,6 +683,12 @@ CREATE TABLE probe.stale (id int, email text) WITH (autovacuum_enabled = false);
 INSERT INTO probe.stale SELECT i, 'stale.user' || i || '@example.com' FROM generate_series(1, 20000) i;
 ANALYZE probe.stale;
 DELETE FROM probe.stale WHERE id > 30;
+-- Stale statistics with one live row in about every page: the short TABLESAMPLE returns a few of
+-- them (almost always at least one), then the plain read all 160; each row is sampled once.
+CREATE TABLE probe.sparse (id int, email text) WITH (autovacuum_enabled = false);
+INSERT INTO probe.sparse SELECT i, 'sparse.user' || i || '@example.com' FROM generate_series(1, 20000) i;
+ANALYZE probe.sparse;
+DELETE FROM probe.sparse WHERE id % 125 <> 1;
 
 -- H1: policies calling pinned built-ins that run SQL text or resolve names at run time
 -- (no pg_depend row): skipped. A policy on allowed built-ins only (current_setting): sampled.
@@ -921,7 +927,11 @@ async fn adr_0012_probes() {
     };
     let big = sampled("big").unwrap();
     assert!(big > 0 && big <= 200, "{big}");
+    // Each live row once, whether or not the short `TABLESAMPLE` picked
+    // the pages that hold them (it picks the first page of `stale` about
+    // once in 25 scans: the former intermittent failure, 60 rows).
     assert_eq!(sampled("stale"), Some(30));
+    assert_eq!(sampled("sparse"), Some(160));
     let pss = admin(&adm, &u.dbname).await;
     if let Ok(row) = pss
         .query_one(
@@ -1329,7 +1339,7 @@ pub(crate) fn audit_logs() -> Vec<(PathBuf, &'static str)> {
 }
 
 /// An audited target `id`, reading `log` when given.
-fn audit_target(
+pub(crate) fn audit_target(
     u: &Url,
     id: &str,
     log: Option<(&std::path::Path, &str)>,

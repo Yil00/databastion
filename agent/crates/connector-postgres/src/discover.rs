@@ -628,9 +628,11 @@ async fn read_member(
     // of the byte budget, and keeps both: the scan's own reads of the
     // relation stay within `limit` rows as the own-account budget charges
     // them, the short sample at least one (security review of #197, L3).
-    // Rows may repeat between the two reads.
+    // When the plain read sees the whole relation, it replaces the short
+    // sample (`merge_fallback`); otherwise rows may repeat between the two
+    // reads.
     let left = fallback_limit(limit, sampled.as_ref().map(|(_, done, _)| *done));
-    let (mut values, done, used) =
+    let (values, done, used) =
         sampled.unwrap_or_else(|| (decoders.iter().map(|_| Vec::new()).collect(), 0, 0));
     if left == 0 {
         return Ok((names_of(cols), values, done));
@@ -647,10 +649,41 @@ async fn read_member(
         MAX_SAMPLE_BYTES.saturating_sub(used),
     )
     .await?;
-    for (out, extra) in values.iter_mut().zip(more) {
+    let whole = fallback_read_whole(left, rows, tx.is_poisoned());
+    let (values, rows) = merge_fallback(values, done, more, rows, whole);
+    Ok((names_of(cols), values, rows))
+}
+
+/// Whether the plain read after a short `TABLESAMPLE` read the whole
+/// relation: it returned fewer rows than its limit `left`, and the byte
+/// budget did not stop it (which cancels the statement and poisons the
+/// transaction).
+pub(crate) fn fallback_read_whole(left: u32, rows: u32, poisoned: bool) -> bool {
+    rows < left && !poisoned
+}
+
+/// The sample after the plain read: when that read saw the whole relation
+/// (`whole`), it holds every row the short `TABLESAMPLE` returned, so the
+/// sample is the plain read alone, with no row counted twice. Otherwise
+/// (the plain read stopped at its limit or its byte budget) both reads
+/// are kept, and rows may repeat between them. Before, a `TABLESAMPLE`
+/// that happened to pick the pages of a small relation's live rows
+/// (stale statistics) counted each of them twice (the intermittent
+/// `it::adr_0012_probes` failure: 60 rows sampled from a relation of 30).
+pub(crate) fn merge_fallback<V>(
+    mut sampled: Vec<Vec<V>>,
+    sampled_rows: u32,
+    plain: Vec<Vec<V>>,
+    plain_rows: u32,
+    whole: bool,
+) -> (Vec<Vec<V>>, u32) {
+    if whole {
+        return (plain, plain_rows);
+    }
+    for (out, extra) in sampled.iter_mut().zip(plain) {
         out.extend(extra);
     }
-    Ok((names_of(cols), values, done.saturating_add(rows)))
+    (sampled, sampled_rows.saturating_add(plain_rows))
 }
 
 /// Row limit of the plain read: `limit`, or after a short `TABLESAMPLE`
@@ -786,6 +819,35 @@ mod tests {
                 assert!(total <= limit.max(1), "{limit} {short}");
             }
         }
+    }
+
+    /// The intermittent `it::adr_0012_probes` failure: a short
+    /// `TABLESAMPLE` that returned some of a small relation's rows, then a
+    /// plain read of all of them, counted those rows twice.
+    #[test]
+    fn a_whole_fallback_read_replaces_the_short_sample() {
+        let col = |r: std::ops::Range<u32>| vec![r.collect::<Vec<u32>>()];
+        // Stale statistics: 30 live rows on the first page, sampled by
+        // chance (3 % of the pages), then read again by the plain read.
+        let whole = fallback_read_whole(fallback_limit(200, Some(30)), 30, false);
+        assert!(whole);
+        let (v, n) = merge_fallback(col(1..31), 30, col(1..31), 30, whole);
+        assert_eq!((v, n), (col(1..31), 30));
+        // The sample came back empty: the plain read alone, as before.
+        let whole = fallback_read_whole(fallback_limit(200, Some(0)), 30, false);
+        let (v, n) = merge_fallback(col(0..0), 0, col(1..31), 30, whole);
+        assert_eq!((v, n), (col(1..31), 30));
+        // The plain read stopped at its limit (a larger relation): both
+        // reads are kept.
+        let left = fallback_limit(200, Some(40));
+        assert_eq!(left, 160);
+        let whole = fallback_read_whole(left, 160, false);
+        assert!(!whole);
+        let (v, n) = merge_fallback(col(1000..1040), 40, col(1..161), 160, whole);
+        assert_eq!(n, 200);
+        assert_eq!(v[0].len(), 200);
+        // Stopped by the byte budget: not the whole relation.
+        assert!(!fallback_read_whole(160, 3, true));
     }
 
     #[test]
