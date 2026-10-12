@@ -264,9 +264,9 @@ async fn wrapped_queries_are_reads_of_their_query() {
     assert!(!text.contains(WRAP_MARK), "a value reached the logs");
 }
 
-/// The error lines the server wrote for `statement` since `from` in its
-/// jsonlog: (SQLSTATE, whether the message quotes `mark`, whether the
-/// `statement` field is the statement). The message is never printed.
+/// The `ERROR` and `FATAL` lines the server wrote with `statement` in
+/// their `statement` field since `from` in its jsonlog: (SQLSTATE,
+/// whether the message quotes `mark`). The message is never printed.
 async fn error_lines(
     path: &std::path::Path,
     from: u64,
@@ -285,8 +285,10 @@ async fn error_lines(
             .split(|b| *b == b'\n')
             .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
             .filter(|v| {
-                v.get("error_severity").and_then(|s| s.as_str()) == Some("ERROR")
-                    && v.get("statement").and_then(|s| s.as_str()) == Some(statement)
+                matches!(
+                    v.get("error_severity").and_then(|s| s.as_str()),
+                    Some("ERROR" | "FATAL")
+                ) && v.get("statement").and_then(|s| s.as_str()) == Some(statement)
             })
             .map(|v| {
                 (
@@ -322,6 +324,41 @@ fn audit_records(path: &std::path::Path, from: u64, statement: &str) -> usize {
         .count()
 }
 
+/// Connects as `user`, reads some rows of `statement`, then closes the
+/// connection in the middle of the result (the socket is dropped, no
+/// `Terminate`): the rows received.
+async fn drop_mid_result(adm: &super::it::Url, user: &str, db: &str, statement: &str) -> usize {
+    let mut c = tokio_postgres::Config::new();
+    c.host(&adm.host)
+        .port(adm.port)
+        .user(user)
+        .password(WRAP_PASSWORD)
+        .dbname(db)
+        .application_name("databastion-it");
+    let (client, conn) = c.connect(tokio_postgres::NoTls).await.unwrap();
+    let task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut rows = 0;
+    {
+        let stream = client
+            .query_raw(statement, std::iter::empty::<i32>())
+            .await
+            .unwrap();
+        let mut stream = std::pin::pin!(stream);
+        while rows < 100 {
+            match stream.next().await {
+                Some(Ok(_)) => rows += 1,
+                _ => break,
+            }
+        }
+    }
+    task.abort();
+    let _ = task.await;
+    drop(client);
+    rows
+}
+
 /// Rows a client received of `statement` before its error, and the
 /// error's SQLSTATE (extended protocol, rows streamed as they come).
 async fn streamed(c: &tokio_postgres::Client, statement: &str) -> (usize, Option<String>) {
@@ -345,7 +382,9 @@ async fn streamed(c: &tokio_postgres::Client, statement: &str) -> (usize, Option
 /// it read (`invalid input syntax for type integer: "<value>"`, SQLSTATE
 /// 22P02), from another role and from the agent's role, and a read that
 /// streams its rows to the client before failing on purpose on the last
-/// one (22012), and a read cancelled by its `statement_timeout` (57014).
+/// one (22012), a read cancelled by its `statement_timeout` and one
+/// cancelled by the client (57014), and a read whose client closes the
+/// connection in the middle of the result (`FATAL` 08006).
 /// What the server writes, and what the agent reports today:
 ///
 /// - with `pgaudit.log_rows = on` (needed for Full), pgaudit writes its
@@ -390,6 +429,13 @@ async fn failed_reads_and_what_is_reported() {
         format!("SELECT id, email, CASE WHEN id = 60 THEN 1 / (id - 60) END FROM crm.{t}")
     };
     let slow_read = |t: &str| format!("SELECT id, email, pg_sleep(0.05) FROM crm.{t}");
+    // Large enough that the server's sends fail once the client is gone.
+    let lost_read = |t: &str| {
+        format!(
+            "SELECT f.id, f.email, repeat('v', 200), g FROM crm.{t} f, \
+             generate_series(1, 20000) g"
+        )
+    };
     let jsonlog = audit_logs()
         .into_iter()
         .find(|(_, f)| *f == "jsonlog")
@@ -446,6 +492,25 @@ async fn failed_reads_and_what_is_reported() {
             .unwrap();
         assert_eq!(run(&f, &slow).await.as_deref(), Some("57014"), "{label}");
         f.batch_execute("RESET statement_timeout").await.unwrap();
+        // A client's cancel request (57014) while the read runs.
+        let cancelled = slow_read("it_fail_control");
+        let cancel = f.cancel_token();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            cancel.cancel_query(tokio_postgres::NoTls).await
+        });
+        assert_eq!(
+            streamed(&f, &cancelled).await.1.as_deref(),
+            Some("57014"),
+            "{label}"
+        );
+        canceller.await.unwrap().unwrap();
+        // A client that closes its connection in the middle of a result
+        // (the server's sends fail: `FATAL` 08006 "connection to client
+        // lost").
+        let lost = lost_read("it_fail");
+        let rows_lost = drop_mid_result(&adm, FAIL_ROLE, &u.dbname, &lost).await;
+        assert!(rows_lost > 0, "{label}: rows received before closing");
         // A control read, so that the stream is known to report.
         assert_eq!(
             run(&f, "SELECT id FROM crm.it_fail_control WHERE id = 5").await,
@@ -476,12 +541,29 @@ async fn failed_reads_and_what_is_reported() {
             assert!(lines.iter().all(|(c, quoted)| c == "22012" && !quoted));
             let lines = error_lines(path, from, &slow, WRAP_MARK, 1).await;
             assert_eq!(lines, [("57014".to_owned(), false)], "{label}");
+            let lines = error_lines(path, from, &cancelled, WRAP_MARK, 1).await;
+            assert_eq!(
+                lines,
+                [("57014".to_owned(), false)],
+                "{label}: client cancel"
+            );
+            // Observed on 16.13: a `FATAL` 08006 line that carries the
+            // statement text (after a `LOG` "could not send data to
+            // client" line, also with it).
+            let lines = error_lines(path, from, &lost, WRAP_MARK, 1).await;
+            assert_eq!(
+                lines,
+                [("08006".to_owned(), false)],
+                "{label}: connection lost"
+            );
             if log_rows.as_deref() == Some("on") {
                 for s in [
                     cast("it_fail", 1),
                     cast("it_fail", 2),
                     late("it_fail"),
                     slow.clone(),
+                    cancelled.clone(),
+                    lost.clone(),
                 ] {
                     assert_eq!(audit_records(path, from, &s), 0, "{label}: {s}");
                 }

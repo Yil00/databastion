@@ -211,12 +211,14 @@ load otherwise), so a server-wide load is the normal case.
   (needed for Full), pgaudit writes a statement's records when it ends,
   so a statement that fails or is cancelled leaves **no** `AUDIT:` record:
   a failed cast whose error quotes the value read (22P02), and a read that
-  streamed its rows to the client before an error on purpose (22012) or a
-  cancel (57014), give no event from any role, the agent's included. The
+  streamed its rows to the client before an error on purpose (22012), a
+  cancel (57014, by `statement_timeout` or the client) or a client that
+  closes its connection mid-result (`FATAL` 08006), give no event from any role, the agent's included. The
   server's `ERROR` line has the SQLSTATE, the statement text and a
   message that can quote values; the connector reads `AUDIT:` lines
   only. With `log_rows = off` the record is written when the statement
-  starts, and the failed read is reported. `pg_stat_statements` counts
+  starts, and the failed read is reported (operators who need these
+  reads reported set `log_rows = off`, at Partial). `pg_stat_statements` counts
   no failed statement. Proposed fix (SQLSTATE classes, never the
   message): [ADR-0037 refinement of 2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-proposed-failed-and-cancelled-statements).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
