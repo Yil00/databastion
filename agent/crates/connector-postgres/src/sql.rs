@@ -963,6 +963,22 @@ mod tests {
         }
     }
 
+    /// ADR-0048, refinement of 2026-10-12: no connector statement wraps a
+    /// query (`EXPLAIN`, `DECLARE … CURSOR`, `PREPARE`): a read through one
+    /// with the agent's identity is never its own. Discovery reads its
+    /// sample through the extended protocol, never a cursor.
+    #[test]
+    fn no_statement_wraps_a_query() {
+        for s in all_statements() {
+            let a = crate::audit::events::analyze_pss(&s, false);
+            assert!(a.parts().iter().all(|p| p.pg_wrapped.is_none()), "{s}");
+            let lower = s.trim_start().to_lowercase();
+            for w in ["explain", "declare", "prepare", "fetch", "move"] {
+                assert!(!lower.starts_with(w), "{s}");
+            }
+        }
+    }
+
     /// ADR-0049 decision 5: every connector statement names no entry of
     /// the statement-text lists, or reads one in the no-text shape
     /// (`pss_counters`), or is the text query (`pss_texts`); the names in

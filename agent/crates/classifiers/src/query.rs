@@ -1280,6 +1280,43 @@ pub struct StatementInfo {
     /// The table or view a [`Self::create_query`] statement creates or
     /// replaces, when its name could be read.
     pub create_target: Option<RelationName>,
+    /// PostgreSQL: the statement wraps a query (`EXPLAIN [ANALYZE]`,
+    /// `DECLARE … CURSOR … FOR`, `PREPARE … AS`), its kind being
+    /// [`StatementKind::Other`]: what the wrapper does with the query and
+    /// the query's own kind (ADR-0048, refinement of 2026-10-12). For
+    /// `DECLARE` and `PREPARE`, whose query returns its rows to the
+    /// client, [`Self::shape`] is the shape of the query.
+    pub pg_wrapped: Option<PgWrapped>,
+}
+
+/// What a PostgreSQL statement that wraps a query does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PgWrapper {
+    /// `EXPLAIN` without `ANALYZE`: the query is planned, not run (the
+    /// plan shows estimates from the statistics, and the planner folds
+    /// immutable and stable calls).
+    Explain,
+    /// `EXPLAIN ANALYZE`, or an option list whose `ANALYZE` is not proven
+    /// off: the query runs, its rows are not sent.
+    ExplainAnalyze,
+    /// `DECLARE c … CURSOR … FOR`: the query runs as the cursor is read
+    /// (`FETCH`, `MOVE`), which names no relation.
+    Declare,
+    /// `PREPARE p … AS`: the query runs at each `EXECUTE`.
+    Prepare,
+}
+
+/// A PostgreSQL statement that wraps a query ([`StatementInfo::pg_wrapped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PgWrapped {
+    /// The outermost wrapper (`EXPLAIN ANALYZE DECLARE … FOR …` is
+    /// [`PgWrapper::ExplainAnalyze`]).
+    pub wrapper: PgWrapper,
+    /// Kind of the wrapped statement, after every wrapper:
+    /// [`StatementKind::Other`] when it is not a query (`EXPLAIN EXECUTE
+    /// p`), or when the wrapper's query could not be found.
+    pub kind: StatementKind,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -3128,6 +3165,10 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         Dialect::Postgres => collect_relations_dialect(s, opts.dialect, &mut relations),
     }
     let explain_statement = opts.dialect == Dialect::Mysql && explain_statement_at(s).is_some();
+    let pg_wrapped = match opts.dialect {
+        Dialect::Postgres if kind == StatementKind::Other => pg_wrapper(s),
+        _ => None,
+    };
     let create = if opts.dialect == Dialect::Mysql {
         create_query(s)
     } else {
@@ -3136,12 +3177,21 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
     let (shape, copy) = if opts.possibly_truncated {
         (None, None)
     } else {
-        match kind {
-            StatementKind::Copy => (None, copy_info(s, opts.large_limit)),
-            k if k.is_read() => (main_shape(s), None),
+        match (kind, pg_wrapped) {
+            (StatementKind::Copy, _) => (None, copy_info(s, opts.large_limit)),
+            (k, _) if k.is_read() => (main_shape(s), None),
+            // A cursor's or a prepared statement's query sends its rows:
+            // its own shape (`shape.full_table_read`).
+            (_, Some((w, start)))
+                if matches!(w.wrapper, PgWrapper::Declare | PgWrapper::Prepare)
+                    && w.kind.is_read() =>
+            {
+                (main_shape(&s[start..]), None)
+            }
             _ => (None, None),
         }
     };
+    let pg_wrapped = pg_wrapped.map(|(w, _)| w);
     let relations_full = relations.len() >= MAX_RELATIONS;
     StatementInfo {
         kind,
@@ -3181,6 +3231,7 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         var_assign: opts.dialect == Dialect::Mysql && has_var_assign(s),
         create_query: create.is_some(),
         create_target: create.and_then(|(target, _)| target),
+        pg_wrapped,
     }
 }
 
@@ -3824,6 +3875,85 @@ fn pg_wrapped_start(s: &[Tok]) -> usize {
         }
     }
     i
+}
+
+/// PostgreSQL: the wrapper of a statement that wraps a query (`EXPLAIN
+/// [ANALYZE | ANALYSE] [VERBOSE] [(…)]`, `DECLARE c … FOR`, `PREPARE p
+/// [(types)] AS`, nested as the grammar allows: `EXPLAIN ANALYZE DECLARE
+/// … FOR …`), and where the wrapped statement starts. `None` when the
+/// statement is not one of them. In an `EXPLAIN` option list, `ANALYZE`
+/// counts unless its value is `false`, `off` or `0` (a string value is
+/// not read: it counts, failing closed).
+fn pg_wrapper(s: &[Tok]) -> Option<(PgWrapped, usize)> {
+    let top = |from: usize, w: &str| -> Option<usize> {
+        let mut d = 0usize;
+        for (k, t) in s.iter().enumerate().skip(from) {
+            match t {
+                Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+                Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+                Tok::Word(x) if d == 0 && x == w => return Some(k),
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut outer: Option<PgWrapper> = None;
+    let mut i = 0usize;
+    for _ in 0..4 {
+        let (wrapper, next) = match word(s.get(i)) {
+            Some("explain") => {
+                let mut j = i + 1;
+                let mut analyze = false;
+                while let Some(w @ ("analyze" | "analyse" | "verbose")) = word(s.get(j)) {
+                    analyze |= w != "verbose";
+                    j += 1;
+                }
+                if is_punct(s.get(j), "(") {
+                    let close = skip_parens(s, j);
+                    for k in j + 1..close.saturating_sub(1) {
+                        if matches!(word(s.get(k)), Some("analyze" | "analyse"))
+                            && !matches!(word(s.get(k + 1)), Some("false" | "off"))
+                            && !matches!(s.get(k + 1), Some(Tok::Int(0)))
+                        {
+                            analyze = true;
+                        }
+                    }
+                    j = close;
+                }
+                let w = if analyze {
+                    PgWrapper::ExplainAnalyze
+                } else {
+                    PgWrapper::Explain
+                };
+                (w, Some(j))
+            }
+            Some("declare") => (PgWrapper::Declare, top(i + 1, "for").map(|k| k + 1)),
+            Some("prepare") => (PgWrapper::Prepare, top(i + 1, "as").map(|k| k + 1)),
+            _ => break,
+        };
+        let outermost = *outer.get_or_insert(wrapper);
+        match next {
+            Some(j) if j < s.len() => i = j,
+            // No query found: the wrapper of an unknown statement.
+            _ => {
+                return Some((
+                    PgWrapped {
+                        wrapper: outermost,
+                        kind: StatementKind::Other,
+                    },
+                    s.len(),
+                ));
+            }
+        }
+    }
+    let wrapper = outer?;
+    Some((
+        PgWrapped {
+            wrapper,
+            kind: first_kind(&s[i..]),
+        },
+        i,
+    ))
 }
 
 /// Names of the CTEs defined by a statement (never reported as relations);
@@ -6638,5 +6768,197 @@ mod tests {
             AnalyzeOptions::mysql(),
         );
         assert!(!a.relations().iter().any(|r| r.name == "x"));
+    }
+    /// ADR-0048, refinement of 2026-10-12: a PostgreSQL statement that
+    /// wraps a query says what it does with it and the query's kind, and
+    /// a cursor's or prepared statement's read has the query's shape.
+    #[test]
+    fn pg_wrappers_and_their_query() {
+        use PgWrapper::{Declare, Explain, ExplainAnalyze, Prepare};
+        use StatementKind::{Ddl, Delete, Insert, Other, Select, Values};
+        let cases: &[(&str, PgWrapper, StatementKind)] = &[
+            (
+                "EXPLAIN SELECT email FROM crm.c WHERE id = 1",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN VERBOSE SELECT 1 FROM t", Explain, Select),
+            (
+                "EXPLAIN (FORMAT JSON, COSTS off) SELECT 1 FROM t",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE false) SELECT 1 FROM t", Explain, Select),
+            (
+                "EXPLAIN (ANALYZE off, BUFFERS) SELECT 1 FROM t",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE 0) SELECT 1 FROM t", Explain, Select),
+            ("EXPLAIN DELETE FROM t WHERE id = 1", Explain, Delete),
+            ("EXPLAIN ANALYZE SELECT 1 FROM t", ExplainAnalyze, Select),
+            (
+                "EXPLAIN ANALYSE VERBOSE SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN VERBOSE ANALYZE SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE) SELECT 1 FROM t", ExplainAnalyze, Select),
+            (
+                "EXPLAIN (FORMAT JSON, ANALYZE) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE true) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE on) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE 1) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            // A string value is not read: fail closed.
+            (
+                "EXPLAIN (ANALYZE 'off') SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN ANALYZE INSERT INTO t SELECT * FROM u",
+                ExplainAnalyze,
+                Insert,
+            ),
+            (
+                "EXPLAIN ANALYZE WITH x AS (SELECT 1) DELETE FROM t",
+                ExplainAnalyze,
+                Delete,
+            ),
+            (
+                "EXPLAIN ANALYZE CREATE TABLE t AS SELECT 1 FROM u",
+                ExplainAnalyze,
+                Ddl,
+            ),
+            (
+                "EXPLAIN ANALYZE DECLARE c CURSOR FOR SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            ("EXPLAIN EXECUTE p(1)", Explain, Other),
+            ("EXPLAIN ANALYZE EXECUTE p", ExplainAnalyze, Other),
+            (
+                "DECLARE c CURSOR FOR SELECT email FROM crm.c",
+                Declare,
+                Select,
+            ),
+            (
+                "DECLARE _psql_cursor NO SCROLL CURSOR FOR\nSELECT * FROM crm.c",
+                Declare,
+                Select,
+            ),
+            (
+                "DECLARE c BINARY SCROLL CURSOR WITH HOLD FOR TABLE t",
+                Declare,
+                StatementKind::Table,
+            ),
+            ("DECLARE c CURSOR FOR VALUES (1)", Declare, Values),
+            ("DECLARE c CURSOR FOR (SELECT 1 FROM t)", Declare, Select),
+            (
+                "DECLARE c CURSOR FOR WITH x AS (SELECT 1) SELECT 1 FROM x",
+                Declare,
+                Select,
+            ),
+            // No query found.
+            ("DECLARE c CURSOR", Declare, Other),
+            (
+                "PREPARE p AS SELECT phone FROM crm.c WHERE id = $1",
+                Prepare,
+                Select,
+            ),
+            (
+                "PREPARE p (integer, text) AS UPDATE t SET a = $2 WHERE id = $1",
+                Prepare,
+                StatementKind::Update,
+            ),
+        ];
+        for (q, wrapper, kind) in cases {
+            let a = analyze(q, AnalyzeOptions::new());
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.kind(), Other, "{q}");
+            assert_eq!(
+                a.parts()[0].pg_wrapped,
+                Some(PgWrapped {
+                    wrapper: *wrapper,
+                    kind: *kind
+                }),
+                "{q}"
+            );
+        }
+        // The relations are the query's; the cursor and statement names
+        // are not relations.
+        let a = analyze(
+            "DECLARE c CURSOR FOR SELECT email FROM crm.c JOIN crm.d ON true",
+            AnalyzeOptions::new(),
+        );
+        let names: Vec<&str> = a.relations().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["c", "d"]);
+        // The shape of a cursor's and a prepared statement's query; none
+        // for an explain (its rows are not sent).
+        for q in [
+            "DECLARE c CURSOR FOR SELECT * FROM crm.c",
+            "PREPARE p AS SELECT * FROM crm.c",
+            "DECLARE c NO SCROLL CURSOR FOR TABLE crm.c",
+        ] {
+            let p = analyze(q, AnalyzeOptions::new()).parts()[0].clone();
+            assert!(
+                p.shape.is_some_and(|s| s.whole_relation(10_001)),
+                "{q}: {:?}",
+                p.shape
+            );
+        }
+        for q in [
+            "DECLARE c CURSOR FOR SELECT * FROM crm.c WHERE id = 1",
+            "PREPARE p AS SELECT * FROM crm.c LIMIT 10",
+        ] {
+            let p = analyze(q, AnalyzeOptions::new()).parts()[0].clone();
+            assert!(p.shape.is_some_and(|s| !s.whole_relation(10_001)), "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT * FROM crm.c",
+            "EXPLAIN ANALYZE SELECT * FROM crm.c",
+            "PREPARE p AS DELETE FROM crm.c",
+        ] {
+            assert_eq!(
+                analyze(q, AnalyzeOptions::new()).parts()[0].shape,
+                None,
+                "{q}"
+            );
+        }
+        // Not wrappers: other statements, and MySQL.
+        for q in [
+            "SELECT 1 FROM t",
+            "FETCH 10 FROM c",
+            "MOVE 5 IN c",
+            "CLOSE c",
+            "EXECUTE p(1)",
+        ] {
+            assert_eq!(
+                analyze(q, AnalyzeOptions::new()).parts()[0].pg_wrapped,
+                None,
+                "{q}"
+            );
+        }
+        let a = analyze("EXPLAIN SELECT 1 FROM t", AnalyzeOptions::mysql());
+        assert_eq!(a.parts()[0].pg_wrapped, None);
     }
 }
