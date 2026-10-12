@@ -445,8 +445,10 @@ struct JsonErrorLine {
     error_severity: Option<String>,
     #[serde(default)]
     state_code: Option<String>,
-    #[serde(default)]
-    statement: Option<String>,
+    /// Deserialized straight into a zeroizing buffer, so that it is wiped
+    /// also when a later key fails the line.
+    #[serde(default, deserialize_with = "zeroizing_string")]
+    statement: Option<Zeroizing<String>>,
     #[serde(default)]
     #[allow(dead_code)]
     message: Option<serde::de::IgnoredAny>,
@@ -463,10 +465,81 @@ struct JsonErrorLine {
     internal_query: Option<serde::de::IgnoredAny>,
 }
 
-/// The backend type of the lines read: errors of other processes
-/// (autovacuum, parallel workers, whose errors their leader re-raises)
-/// are not a client's statement.
-const CLIENT_BACKEND: &str = "client backend";
+/// Backend types (`backend_type`) of the server's own processes, whose
+/// lines are not read: their errors are no client's statement
+/// (autovacuum's "canceling autovacuum task"), or are re-raised by the
+/// leader whose line is read (parallel workers). A closed list: `client
+/// backend`, `walsender` (replication clients), `standalone backend`,
+/// background workers of extensions (`pg_cron`…), a missing and any other
+/// type are read (fails closed).
+const SYSTEM_PROCESSES: [&str; 20] = [
+    "autovacuum launcher",
+    "autovacuum worker",
+    "archiver",
+    "background writer",
+    "checkpointer",
+    "io worker",
+    "logger",
+    "logical replication launcher",
+    "logical replication worker",
+    "logical replication apply worker",
+    "logical replication parallel worker",
+    "logical replication tablesync worker",
+    "parallel worker",
+    "postmaster",
+    "slotsync worker",
+    "startup",
+    "walreceiver",
+    "walsummarizer",
+    "walwriter",
+    "wal summarizer",
+];
+
+/// Whether a line's backend type is one of [`SYSTEM_PROCESSES`].
+pub(crate) fn system_process(backend_type: &str) -> bool {
+    SYSTEM_PROCESSES.contains(&backend_type)
+}
+
+/// Deserializes an optional string straight into a [`Zeroizing`] buffer
+/// (one allocation of the exact size; `serde_json`'s own scratch buffer
+/// for a string with escapes is outside this connector's reach).
+fn zeroizing_string<'de, D>(d: D) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Inner;
+    impl<'de> serde::de::Visitor<'de> for Inner {
+        type Value = Zeroizing<String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let mut out = Zeroizing::new(String::with_capacity(v.len()));
+            out.push_str(v);
+            Ok(out)
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Zeroizing::new(v))
+        }
+    }
+    struct Outer;
+    impl<'de> serde::de::Visitor<'de> for Outer {
+        type Value = Option<Zeroizing<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string or null")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_str(Inner).map(Some)
+        }
+    }
+    d.deserialize_option(Outer)
+}
 
 /// csvlog columns (PostgreSQL 13+).
 mod col {
@@ -514,9 +587,22 @@ pub(crate) struct CsvPick {
 /// [`parse_csv`] that copies only the columns in `pick` out of `record`,
 /// walking every other column in place (the tailer's zeroized buffer):
 /// their text is never copied (I2). Same strictness as [`parse_csv`].
-pub(crate) fn csv_pick(record: &str, pick: &[usize]) -> Option<CsvPick> {
-    let mut picked: Vec<Zeroizing<String>> =
-        pick.iter().map(|_| Zeroizing::new(String::new())).collect();
+///
+/// `reserve`: a picked column (the statement text) whose buffer gets the
+/// record's length as capacity before any character is pushed, so that it
+/// never grows: a reallocation would leave the earlier, shorter copy in
+/// freed memory, not zeroized.
+pub(crate) fn csv_pick(record: &str, pick: &[usize], reserve: Option<usize>) -> Option<CsvPick> {
+    let mut picked: Vec<Zeroizing<String>> = pick
+        .iter()
+        .map(|&c| {
+            Zeroizing::new(if Some(c) == reserve {
+                String::with_capacity(record.len())
+            } else {
+                String::new()
+            })
+        })
+        .collect();
     let mut present = Vec::new();
     let mut index = 0usize;
     // Position in `picked` of the current column, when it is picked.
@@ -623,10 +709,10 @@ pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<E
                 .as_deref()
                 .and_then(is_error_severity)
                 .ok_or(Skip::NotAudit)?;
-            if line.backend_type.as_deref() != Some(CLIENT_BACKEND) {
+            if line.backend_type.as_deref().is_some_and(system_process) {
                 return Ok(None);
             }
-            let statement = line.statement.map(Zeroizing::new);
+            let statement = line.statement;
             Ok(Some(ErrorLine {
                 ts: line.timestamp.as_deref().and_then(parse_log_time),
                 user: line.user.unwrap_or_default(),
@@ -646,7 +732,7 @@ pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<E
                 return Err(Skip::NotAudit);
             }
             let text = std::str::from_utf8(record).map_err(|_| Skip::NotAudit)?;
-            let p = csv_pick(text, &CSV_PICKED).ok_or(Skip::NotAudit)?;
+            let mut p = csv_pick(text, &CSV_PICKED, Some(col::QUERY)).ok_or(Skip::NotAudit)?;
             let field = |c: usize| -> &str {
                 CSV_PICKED
                     .iter()
@@ -656,15 +742,24 @@ pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<E
             let Some(fatal) = is_error_severity(field(col::SEVERITY)) else {
                 return Err(Skip::NotAudit);
             };
-            // Fewer columns than PostgreSQL 13 writes: not a csvlog line
-            // this connector reads (the backend type is needed).
-            if p.present.len() <= col::BACKEND_TYPE {
-                return Err(Skip::Damaged);
-            }
-            if field(col::BACKEND_TYPE) != CLIENT_BACKEND {
+            // A record without the backend type column (before
+            // PostgreSQL 13) is read: an unknown type (fails closed).
+            if system_process(field(col::BACKEND_TYPE)) {
                 return Ok(None);
             }
-            let query = field(col::QUERY);
+            // Moved out of its reserved, zeroizing buffer: never copied.
+            let query = CSV_PICKED
+                .iter()
+                .position(|&x| x == col::QUERY)
+                .map(|k| std::mem::take(&mut *p.picked[k]))
+                .map(Zeroizing::new)
+                .unwrap_or_default();
+            let field = |c: usize| -> &str {
+                CSV_PICKED
+                    .iter()
+                    .position(|&x| x == c)
+                    .map_or("", |k| p.picked[k].as_str())
+            };
             Ok(Some(ErrorLine {
                 ts: parse_log_time(field(col::TIME)),
                 user: field(col::USER).to_owned(),
@@ -676,7 +771,7 @@ pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<E
                 fatal,
                 sqlstate: SqlState::parse(field(col::SQLSTATE)),
                 has_context: p.present.get(col::CONTEXT).copied().unwrap_or(false),
-                statement: (!query.is_empty()).then(|| Zeroizing::new(query.to_owned())),
+                statement: (!query.is_empty()).then_some(query),
             }))
         }
     }

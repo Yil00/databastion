@@ -101,6 +101,11 @@ pub(crate) struct DbCatalog {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Catalogs {
     dbs: HashMap<String, DbCatalog>,
+    /// Databases where the probe proved `log_min_messages` and
+    /// `log_min_error_statement` at `error` or lower (ADR-0037, refinement
+    /// of 2026-10-12, item 6): only there does a `FATAL` line without a
+    /// statement prove that no statement was running (item 9).
+    error_lines_proven: HashSet<String>,
     /// The target's collision probes (ADR-0049 decision 8).
     user_code: UserCodeHandle,
 }
@@ -114,6 +119,17 @@ impl Catalogs {
 
     pub(crate) fn insert(&mut self, database: &str, c: DbCatalog) {
         self.dbs.insert(database.to_owned(), c);
+    }
+
+    /// The probe proved item 6's settings in `database`.
+    pub(crate) fn prove_error_lines(&mut self, database: &str) {
+        self.error_lines_proven.insert(database.to_owned());
+    }
+
+    /// Whether item 6's settings are proven in `database` (a database the
+    /// target does not declare is not probed: not proven).
+    pub(crate) fn error_lines_proven(&self, database: &str) -> bool {
+        self.error_lines_proven.contains(database)
     }
 
     fn get(&self, database: &str) -> Option<&DbCatalog> {
@@ -1945,7 +1961,9 @@ impl PgauditEvents {
     ///   own;
     /// - without a statement text: a read of `*`, always reported (item
     ///   5), unless refused; a `FATAL` line without one ends an idle
-    ///   session (no statement was running): no event (proposed item 9).
+    ///   session when the log settings are proven for its database (no
+    ///   statement was running): no event (proposed item 9); otherwise a
+    ///   read of `*` too.
     fn error_event(&mut self, line: &ErrorLine, now: SystemTime) -> Option<MaskedEvent> {
         #[cfg(test)]
         #[allow(clippy::panic)]
@@ -1964,7 +1982,14 @@ impl PgauditEvents {
             .with_application(&line.application);
         let ts = line.ts.unwrap_or(now);
         let Some(text) = line.statement.as_deref().map(String::as_str) else {
-            if base == Base::Refused || line.fatal {
+            if base == Base::Refused {
+                return None;
+            }
+            // Item 9 (proposed): with `log_min_error_statement` and
+            // `log_min_messages` proven for the database, a `FATAL` line
+            // without a statement ends an idle session; otherwise it may
+            // have hidden its statement, and is item 5's read of `*`.
+            if line.fatal && self.catalogs.error_lines_proven(database) {
                 return None;
             }
             // Item 5: never the agent's own (`*`, `OwnKind::Unknown`).

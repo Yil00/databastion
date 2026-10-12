@@ -34,6 +34,7 @@ fn builder() -> PgauditEvents {
             pgaudit_log_catalog: Some(true),
         },
     );
+    c.prove_error_lines("shop");
     b.set_catalogs(c);
     b
 }
@@ -221,8 +222,12 @@ fn values_quoted_by_the_line_never_leave_it() {
                 ..Line::default()
             };
             let csv = line.csv();
-            let p = crate::audit::records::csv_pick(&csv, &[0, 1, 2, 4, 5, 9, 11, 12, 19, 22, 23])
-                .unwrap();
+            let p = crate::audit::records::csv_pick(
+                &csv,
+                &[0, 1, 2, 4, 5, 9, 11, 12, 19, 22, 23],
+                Some(19),
+            )
+            .unwrap();
             assert!(p.picked.iter().all(|f| !f.contains(MARK)));
             assert!(p.present[18], "context present");
             assert!(p.present[13] && p.present[14] && p.present[15] && p.present[16]);
@@ -749,4 +754,154 @@ fn error_line_throughput() {
             ev.len()
         );
     }
+}
+
+/// Security review of #214, M1: a `FATAL` line without a statement gives
+/// no event only where `check()`'s probe proved the log settings for its
+/// database; elsewhere it is a read of `*`, always reported (item 5).
+#[test]
+fn a_statementless_fatal_needs_the_settings_proven() {
+    for format in FORMATS {
+        let fatal = Line {
+            severity: "FATAL",
+            code: "57P01",
+            ..Line::default()
+        };
+        // Proven for `shop` (the builder's catalogs).
+        assert!(one(format, &fatal).is_empty());
+        // Not proven: no probe of the database, or a probe that failed.
+        let mut b = PgauditEvents::new(own_at(1000));
+        let ev = events(&mut b, vec![entry(format, &fatal)]);
+        assert_eq!(ev.len(), 1, "{format:?}");
+        assert_eq!(objects(&ev[0]), [".*"]);
+        assert!(ev[0].always_report());
+        assert_eq!(ev[0].rows(), None);
+        let mut c = Catalogs::default();
+        c.prove_error_lines("other");
+        b.set_catalogs(c);
+        assert_eq!(events(&mut b, vec![entry(format, &fatal)]).len(), 1);
+        // A connection-level line stays refused either way.
+        let refused = Line {
+            severity: "FATAL",
+            code: "28P01",
+            ..Line::default()
+        };
+        assert!(events(&mut b, vec![entry(format, &refused)]).is_empty());
+    }
+}
+
+/// Security review of #214, L1: only a closed list of the server's own
+/// processes is not read; `walsender`, an unknown type and a missing one
+/// are read (fail closed).
+#[test]
+fn only_the_servers_own_processes_are_skipped() {
+    let raw = Line {
+        statement: Some("SELECT email::integer FROM crm.customers"),
+        ..Line::default()
+    }
+    .json();
+    for skipped in [
+        "autovacuum launcher",
+        "autovacuum worker",
+        "parallel worker",
+        "checkpointer",
+        "background writer",
+        "walwriter",
+        "startup",
+        "archiver",
+        "logger",
+        "logical replication apply worker",
+    ] {
+        let line = raw.replace("client backend", skipped);
+        assert!(
+            parse_error_line(Format::Jsonlog, line.as_bytes())
+                .unwrap()
+                .is_none(),
+            "{skipped}"
+        );
+    }
+    for read in [
+        "client backend",
+        "walsender",
+        "pg_cron scheduler",
+        "something new",
+    ] {
+        let line = raw.replace("client backend", read);
+        assert!(
+            parse_error_line(Format::Jsonlog, line.as_bytes())
+                .unwrap()
+                .is_some(),
+            "{read}"
+        );
+    }
+    let missing = raw.replace(",\"backend_type\":\"client backend\"", "");
+    assert_ne!(missing, raw);
+    assert!(
+        parse_error_line(Format::Jsonlog, missing.as_bytes())
+            .unwrap()
+            .is_some()
+    );
+    // csvlog: the same list, and a record without the column (before
+    // PostgreSQL 13) is read.
+    let csv = Line {
+        statement: Some("SELECT 1"),
+        ..Line::default()
+    }
+    .csv();
+    let auto = csv.replace("\"client backend\"", "\"autovacuum worker\"");
+    assert!(
+        parse_error_line(Format::Csvlog, auto.as_bytes())
+            .unwrap()
+            .is_none()
+    );
+    let sender = csv.replace("\"client backend\"", "walsender");
+    assert!(
+        parse_error_line(Format::Csvlog, sender.as_bytes())
+            .unwrap()
+            .is_some()
+    );
+    let short: Vec<&str> = csv.split(',').take(23).collect();
+    assert!(
+        parse_error_line(Format::Csvlog, short.join(",").as_bytes())
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Security review of #214, L2: the statement's buffer never grows (its
+/// capacity is reserved before any character is pushed), and a jsonlog
+/// statement, escapes or not, is read into a zeroizing buffer.
+#[test]
+fn the_statement_buffer_is_reserved_and_zeroizing() {
+    let text = "SELECT \"email\", 'a,b' FROM crm.customers -- long enough to grow a buffer";
+    let csv = Line {
+        statement: Some(text),
+        ..Line::default()
+    }
+    .csv();
+    let p = crate::audit::records::csv_pick(&csv, &[19, 22], Some(19)).unwrap();
+    assert_eq!(p.picked[0].as_str(), text);
+    assert_eq!(p.picked[0].capacity(), csv.len(), "grown: reallocated");
+    let line = parse_error_line(Format::Csvlog, csv.as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(line.statement.as_deref().map(String::as_str), Some(text));
+    for t in [text, "plain", "tab\there \u{e9}"] {
+        let json = Line {
+            statement: Some(t),
+            ..Line::default()
+        }
+        .json();
+        let line = parse_error_line(Format::Jsonlog, json.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.statement.as_deref().map(String::as_str), Some(t));
+    }
+    let null = Line::default()
+        .json()
+        .replace("\"query_id\":0", "\"query_id\":0,\"statement\":null");
+    let line = parse_error_line(Format::Jsonlog, null.as_bytes())
+        .unwrap()
+        .unwrap();
+    assert!(line.statement.is_none());
 }

@@ -1061,6 +1061,11 @@ pub(crate) async fn prerequisites_with(
         }
         let probe = audit_probe(session, timeouts).await?;
         level = level.max(probe.level(log_readable));
+        // The same proof as `check()`'s cap (`error_lines_detail`), per
+        // database, for the stream's `FATAL` lines (proposed item 9).
+        if probe.error_line_gaps().is_empty() {
+            catalogs.prove_error_lines(database);
+        }
         catalogs.insert(
             database,
             crate::audit::events::DbCatalog {

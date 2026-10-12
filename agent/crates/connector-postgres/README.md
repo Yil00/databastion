@@ -223,10 +223,18 @@ load otherwise), so a server-wide load is the normal case.
     only. `message`, `detail`, `hint`, `context` and `internal_query` are
     skipped as `serde::de::IgnoredAny` in jsonlog and walked without
     being copied inside the tailer's zeroized buffer in csvlog
-    (`csv_pick`); of `context`, only its presence is used. The statement
+    (`csv_pick`, whose statement buffer is reserved at the record's
+    length so it never reallocates); the jsonlog statement is deserialized
+    straight into a `Zeroizing` buffer (`serde_json`'s scratch buffer for
+    a string with escapes stays outside the connector's reach, as for
+    `AUDIT:` messages); of `context`, only its presence is used. The statement
     text is never logged; `ErrorLine`'s `Debug` prints no text and no
-    identity. Lines of other processes (autovacuum, parallel workers,
-    whose errors their leader re-raises) and `LOG` lines (the `LOG` 08006
+    identity. Lines of a closed list of the server's own processes
+    (`records::SYSTEM_PROCESSES`: autovacuum, parallel workers, whose
+    errors their leader re-raises, checkpointer, WAL writer, logical
+    replication workers…) are not read; `walsender`, extensions'
+    background workers, unknown and missing types are (fails closed).
+    `LOG` lines (the `LOG` 08006
     "could not send data to client" before a `FATAL` 08006) are not read.
     A line of that severity that does not parse is counted in
     `audit.records_dropped`. Unit test
@@ -254,7 +262,9 @@ load otherwise), so a server-wide load is the normal case.
     code or rows the text does not name add `*`; transaction control,
     `SET`, `SHOW` and the like give none. An `ERROR` line without a
     statement text is a read of `*`; a `FATAL` line without one ends an
-    idle session and gives none (proposed item 9 of the ADR).
+    idle session and gives none where the stream's probe proved the log
+    settings for its database (`Catalogs::error_lines_proven`), a read of
+    `*` elsewhere (proposed item 9 of the ADR).
   - **Not twice:** a line is not reported when its session's last
     pgaudit record has the same text, the same virtual transaction and no
     row count (written at the statement's start, `log_rows = off`); texts
@@ -286,7 +296,9 @@ load otherwise), so a server-wide load is the normal case.
     no failed statement (Limited); native code that hides its context can
     forge a refused `25P02` / `42601`; any role can add false events with
     `RAISE … USING ERRCODE`; the log settings are read in the agent's
-    session; the core's aggregation adds a failed read with no row count
+    session, so per-role or per-database overrides (superuser only,
+    reported by pgaudit when set) are not seen (`pg_db_role_setting` is
+    never read; ADR item 14, ROADMAP follow-up); the core's aggregation adds a failed read with no row count
     to a successful read of the same group, whose count then stands for
     both.
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
