@@ -460,6 +460,10 @@ pub(crate) fn pss_probe(schema: &str) -> Option<String> {
 /// proof. `pgaudit.log_rows` needs the same proof on its own: pgaudit
 /// before 1.6 (the PostgreSQL 13 builds) does not define it, so a value
 /// set for it there is a placeholder and the records carry no row count.
+/// `log_min_messages` and `log_min_error_statement` (readable by every
+/// role, verified on PostgreSQL 16) decide whether a failed statement gets
+/// an `ERROR` line, and whether that line holds the statement text
+/// (ADR-0037, refinement of 2026-10-12, item 6).
 pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
        pg_catalog.current_setting('pgaudit.log', true), \
        pg_catalog.current_setting('pgaudit.log_rows', true), \
@@ -469,7 +473,9 @@ pub(crate) const PGAUDIT_SETTINGS: &str = "SELECT \
                WHERE s.name OPERATOR(pg_catalog.=) 'pgaudit.log_catalog' AND s.vartype OPERATOR(pg_catalog.=) 'bool'), \
        pg_catalog.current_setting('pgaudit.log_catalog', true), \
        EXISTS (SELECT 1 FROM pg_catalog.pg_settings s \
-               WHERE s.name OPERATOR(pg_catalog.=) 'pgaudit.log_rows' AND s.vartype OPERATOR(pg_catalog.=) 'bool')";
+               WHERE s.name OPERATOR(pg_catalog.=) 'pgaudit.log_rows' AND s.vartype OPERATOR(pg_catalog.=) 'bool'), \
+       pg_catalog.current_setting('log_min_messages', true), \
+       pg_catalog.current_setting('log_min_error_statement', true)";
 
 /// Client address the server sees for this session (`NULL` on a Unix
 /// socket): tells the agent's own statements apart in the audit log.
