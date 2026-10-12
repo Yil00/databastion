@@ -61,6 +61,7 @@ use databastion_classifiers::query::{
 };
 
 use super::failures::{self, Base, Class, SessionTexts};
+use super::overrides::{LogOverridesHandle, changes_overrides};
 use super::records::{AuditRecord, ErrorLine, LogEntry};
 use super::user_code::{CodeUse, UserCodeHandle, Verdict, routine_ddl_command};
 use crate::discover::normalize;
@@ -108,6 +109,9 @@ pub(crate) struct Catalogs {
     error_lines_proven: HashSet<String>,
     /// The target's collision probes (ADR-0049 decision 8).
     user_code: UserCodeHandle,
+    /// The target's proofs of the ADR-0012 refinement of 2026-10-12 (item
+    /// 4: per-role withdrawal of ADR-0037 item 9, stale marks).
+    log_overrides: LogOverridesHandle,
 }
 
 impl Catalogs {
@@ -115,6 +119,21 @@ impl Catalogs {
     pub(crate) fn with_user_code(mut self, user_code: UserCodeHandle) -> Self {
         self.user_code = user_code;
         self
+    }
+
+    /// The target's override proofs, shared with `check()`.
+    pub(crate) fn with_log_overrides(mut self, handle: LogOverridesHandle) -> Self {
+        self.log_overrides = handle;
+        self
+    }
+
+    /// ADR-0037 item 9 as refined by item 4 of the ADR-0012 refinement of
+    /// 2026-10-12: a `FATAL` line without a statement from `user` in
+    /// `database` ends an idle session (no event) only when the session's
+    /// log settings are proven there and the override proof holds for that
+    /// role (not stale, not older than 15 minutes).
+    pub(crate) fn fatal_quiet(&self, database: &str, user: &str) -> bool {
+        self.error_lines_proven(database) && self.log_overrides.fatal_quiet(database, user)
     }
 
     pub(crate) fn insert(&mut self, database: &str, c: DbCatalog) {
@@ -383,6 +402,141 @@ fn listed(r: &RelationName, call: bool, pss_schema: Option<&str>) -> Option<List
     }
 }
 
+// ------------------------------- credential- and value-bearing catalogs (ADR-0050)
+
+/// One entry of the closed list of ADR-0050 decision 1: a relation (or a
+/// set-returning function, named by its view) that holds credentials or
+/// stored values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SecretEntry {
+    /// The name in the text (after folding).
+    pub(crate) name: &'static str,
+    /// Its schema: `pg_catalog` (qualified with it or unqualified) or
+    /// `information_schema` (qualified with it, or unqualified: named as
+    /// the text gives it).
+    pub(crate) schema: &'static str,
+    /// A set-returning function (`name(`), named by its view.
+    pub(crate) function: bool,
+    /// The object named in events (in `schema`).
+    pub(crate) object: &'static str,
+    /// Its secret columns (the no-secret shape of decision 2).
+    pub(crate) columns: &'static [&'static str],
+    /// Quiet in the no-secret shape; otherwise every read is a secret read.
+    pub(crate) shape: bool,
+}
+
+const fn entry(
+    name: &'static str,
+    schema: &'static str,
+    columns: &'static [&'static str],
+    shape: bool,
+) -> SecretEntry {
+    SecretEntry {
+        name,
+        schema,
+        function: false,
+        object: name,
+        columns,
+        shape,
+    }
+}
+
+/// The closed list of ADR-0050 decision 1, identical on PostgreSQL 14 to
+/// 18 (the drift test of decision 8, `it_secrets.rs`).
+pub(crate) const SECRET_RELATIONS: [SecretEntry; 19] = [
+    entry("pg_authid", "pg_catalog", &["rolpassword"], true),
+    entry("pg_shadow", "pg_catalog", &["passwd", "useconfig"], true),
+    entry("pg_roles", "pg_catalog", &["rolconfig"], true),
+    entry("pg_user", "pg_catalog", &["useconfig"], true),
+    entry("pg_db_role_setting", "pg_catalog", &["setconfig"], true),
+    entry("pg_user_mapping", "pg_catalog", &["umoptions"], true),
+    entry("pg_user_mappings", "pg_catalog", &["umoptions"], true),
+    entry("pg_foreign_server", "pg_catalog", &["srvoptions"], true),
+    entry("pg_subscription", "pg_catalog", &["subconninfo"], true),
+    entry("pg_proc", "pg_catalog", &["proconfig"], true),
+    entry("pg_largeobject", "pg_catalog", &[], false),
+    entry("pg_file_settings", "pg_catalog", &[], false),
+    SecretEntry {
+        name: "pg_show_all_file_settings",
+        schema: "pg_catalog",
+        function: true,
+        object: "pg_file_settings",
+        columns: &[],
+        shape: false,
+    },
+    entry("pg_hba_file_rules", "pg_catalog", &[], false),
+    SecretEntry {
+        name: "pg_hba_file_rules",
+        schema: "pg_catalog",
+        function: true,
+        object: "pg_hba_file_rules",
+        columns: &[],
+        shape: false,
+    },
+    entry("user_mapping_options", "information_schema", &[], false),
+    entry("_pg_user_mappings", "information_schema", &[], false),
+    entry("foreign_server_options", "information_schema", &[], false),
+    entry("_pg_foreign_servers", "information_schema", &[], false),
+];
+
+/// The entry `r` (`call`: followed by `(`) names, with the object named in
+/// events. Compared after the analyzer's folding: a quoted `"PG_AUTHID"`
+/// or a `public.pg_authid` is an ordinary relation. An unqualified
+/// `pg_catalog` name is the catalog's (over-reported, never missed); an
+/// unqualified `information_schema` name is named as the text gives it.
+///
+/// A relation name followed by `(` (`call`) that is not a function of the
+/// list is the relation (`COPY pg_authid (rolname) TO …`, `INSERT INTO
+/// pg_authid (…)`; a user function of that name is over-reported).
+pub(crate) fn secret_entry(
+    r: &RelationName,
+    call: bool,
+) -> Option<(&'static SecretEntry, RelationName)> {
+    let e = SECRET_RELATIONS
+        .iter()
+        .find(|e| e.name == r.name && e.function == call)
+        .or_else(|| {
+            SECRET_RELATIONS
+                .iter()
+                .find(|e| call && e.name == r.name && !e.function)
+        })?;
+    match r.schema.as_deref() {
+        Some(s) if s != e.schema => None,
+        _ if e.schema == "pg_catalog" => Some((
+            e,
+            RelationName {
+                schema: Some("pg_catalog".to_owned()),
+                name: e.object.to_owned(),
+            },
+        )),
+        schema => Some((
+            e,
+            RelationName {
+                schema: schema.map(str::to_owned),
+                name: e.object.to_owned(),
+            },
+        )),
+    }
+}
+
+/// Whether `r`, a relation of the analysis or of a pgaudit record, is an
+/// entry of the list (named through [`TextReads::secret`] when read
+/// outside the no-secret shape, a catalog otherwise).
+fn secret_relation(r: &RelationName) -> bool {
+    secret_entry(r, false).is_some()
+}
+
+/// Whether `o`, an object of an event, is an object of the list.
+pub(crate) fn is_secret_object(o: &RelationName) -> bool {
+    SECRET_RELATIONS.iter().any(|e| {
+        e.object == o.name
+            && match o.schema.as_deref() {
+                Some(s) => s == e.schema,
+                None => e.schema == "information_schema",
+            }
+    })
+}
+
 /// What a statement text reads of the statement-text lists (ADR-0049
 /// decisions 1, 2 and 7), decided on the whole text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -407,6 +561,13 @@ pub(crate) struct TextReads {
     /// one of the connector's statements, in a slot of the agent's role
     /// (its role, top level, a declared database).
     pub(crate) own_connector: bool,
+    /// ADR-0050: the entries of the secret list the text names (in the
+    /// no-secret shape or not), as named in events.
+    pub(crate) secret_named: Vec<RelationName>,
+    /// ADR-0050: the entries read outside the no-secret shape (secret
+    /// reads, also in `objects`): named, always reported, never the
+    /// agent's own (except its two-key reads on pgaudit, decision 5).
+    pub(crate) secret: Vec<RelationName>,
 }
 
 fn push_unique(v: &mut Vec<RelationName>, r: RelationName) {
@@ -428,11 +589,24 @@ pub(crate) fn text_reads(
     let scan = pg_scan(text);
     out.code = code_use(analysis, rule, cut, scan.as_ref());
     let Some(scan) = scan else {
+        // ADR-0050, fail closed: a text the scan cannot read (a cut
+        // literal) names its secret entries through the analysis.
+        for p in analysis.parts() {
+            for r in &p.relations {
+                if let Some((_, o)) = secret_entry(r, false) {
+                    push_unique(&mut out.secret_named, o.clone());
+                    push_unique(&mut out.secret, o.clone());
+                    push_unique(&mut out.objects, o);
+                }
+            }
+        }
         return out;
     };
     out.routine_ddl = scan.routine_ddl();
+    let names = scan.names();
+    secret_reads(&scan, &names, analysis, rule, cut, &mut out);
     let mut core: Vec<RelationName> = Vec::new();
-    for u in scan.names() {
+    for u in &names {
         if u.call && data_function(&u.name) {
             out.star = true;
         }
@@ -460,12 +634,15 @@ pub(crate) fn text_reads(
             }
         }
         None if is_catalog(r, rule) && statistics_relation(r).is_none() => PgItemClass::Catalog,
+        // ADR-0050 entries are decided by their own shape.
+        None if secret_relation(r) => PgItemClass::Catalog,
         None => PgItemClass::Other,
     };
     let only_catalogs = analysis.parts().iter().all(|p| {
         !p.relations_full
             && p.relations.iter().all(|r| {
                 matches!(listed(r, false, rule.pss_schema), Some(Listed::Core(..)))
+                    || secret_relation(r)
                     || (is_catalog(r, rule) && statistics_relation(r).is_none())
             })
     });
@@ -474,7 +651,7 @@ pub(crate) fn text_reads(
     // text column without the text naming it): a text read until decision
     // 8 (part 2) reports user functions next to catalogs (security review
     // M1). Unqualified calls are left to decision 8.
-    let user_call = scan.names().iter().any(|u| {
+    let user_call = names.iter().any(|u| {
         u.call
             && u.name.schema.as_deref().is_some_and(|s| s != "pg_catalog")
             && listed(&u.name, true, rule.pss_schema).is_none()
@@ -484,7 +661,7 @@ pub(crate) fn text_reads(
         && !user_call
         && analysis.lexed()
         && only_catalogs
-        && scan.no_text_shape(TEXT_COLUMN, &classify);
+        && scan.no_text_shape(&[TEXT_COLUMN], &classify);
     if !quiet {
         for o in &core {
             push_unique(&mut out.objects, o.clone());
@@ -492,6 +669,99 @@ pub(crate) fn text_reads(
     }
     out.named = core;
     out
+}
+
+/// ADR-0050 decisions 1 and 2 on a scanned text: the entries of the
+/// secret list it names (`out.secret_named`), and, unless every one is
+/// read in the no-secret shape, the secret reads (`out.secret`, also in
+/// `out.objects`). The shape holds only when the text lexed completely,
+/// is not cut, is below the relation bound, names only catalogs, entries
+/// of the list and core-list entries of ADR-0049, calls no schema-qualified
+/// function outside `pg_catalog` and `information_schema` (ADR-0049 item
+/// 7; unqualified calls, operators and casts are decided by ADR-0049
+/// decision 8 when the event is built), and the scan proves no access to a
+/// secret column of the entries it names ([`PgScan::no_secret_shape`]).
+/// An unqualified `pg_*` name of the list is quiet only where the stream
+/// takes it for the catalog (`CatalogRule`): with `pgaudit.log_catalog =
+/// off`, unconfirmed by a record, it is a secret read.
+fn secret_reads(
+    scan: &PgScan,
+    names: &[databastion_classifiers::query::PgNameUse],
+    analysis: &QueryAnalysis,
+    rule: CatalogRule<'_>,
+    cut: bool,
+    out: &mut TextReads,
+) {
+    let mut named: Vec<RelationName> = Vec::new();
+    let mut columns: Vec<&'static str> = Vec::new();
+    let mut always = false;
+    let mut unconfirmed = false;
+    for u in names {
+        if let Some((e, o)) = secret_entry(&u.name, u.call) {
+            push_unique(&mut named, o);
+            always |= !e.shape;
+            for c in e.columns {
+                if !columns.contains(c) {
+                    columns.push(c);
+                }
+            }
+            unconfirmed |=
+                u.name.schema.is_none() && e.schema == "pg_catalog" && !is_catalog(&u.name, rule);
+        }
+    }
+    if named.is_empty() {
+        return;
+    }
+    let classify = |r: &RelationName, call: bool| match secret_entry(r, call) {
+        Some((e, _)) if e.shape => PgItemClass::Listed(PgListed::View),
+        Some(_) => PgItemClass::Listed(PgListed::Always),
+        None => match listed(r, call, rule.pss_schema) {
+            Some(Listed::Core(..)) => PgItemClass::Catalog,
+            Some(Listed::Extension(_) | Listed::Star) => PgItemClass::Other,
+            None if call => {
+                if matches!(
+                    r.schema.as_deref(),
+                    Some("pg_catalog" | "information_schema")
+                ) {
+                    PgItemClass::Catalog
+                } else {
+                    PgItemClass::Other
+                }
+            }
+            None if is_catalog(r, rule) && statistics_relation(r).is_none() => PgItemClass::Catalog,
+            None => PgItemClass::Other,
+        },
+    };
+    let only_catalogs = analysis.parts().iter().all(|p| {
+        !p.relations_full
+            && p.relations.iter().all(|r| {
+                secret_relation(r)
+                    || matches!(listed(r, false, rule.pss_schema), Some(Listed::Core(..)))
+                    || (is_catalog(r, rule) && statistics_relation(r).is_none())
+            })
+    });
+    let user_call = names.iter().any(|u| {
+        u.call
+            && u.name
+                .schema
+                .as_deref()
+                .is_some_and(|s| !matches!(s, "pg_catalog" | "information_schema"))
+            && !data_function(&u.name)
+    });
+    let quiet = !always
+        && !cut
+        && !unconfirmed
+        && !user_call
+        && analysis.lexed()
+        && only_catalogs
+        && scan.no_secret_shape(&columns, &classify);
+    if !quiet {
+        for o in &named {
+            push_unique(&mut out.secret, o.clone());
+            push_unique(&mut out.objects, o.clone());
+        }
+    }
+    out.secret_named = named;
 }
 
 /// ADR-0049 decision 8: a text that lexed and names at least one relation,
@@ -514,6 +784,7 @@ fn code_use(
         !p.relations_full
             && p.relations.iter().all(|r| {
                 matches!(listed(r, false, rule.pss_schema), Some(Listed::Core(..)))
+                    || secret_relation(r)
                     || (is_catalog(r, rule) && statistics_relation(r).is_none())
             })
     });
@@ -563,13 +834,13 @@ pub(crate) fn decided_elsewhere(r: &RelationName, pss_schema: Option<&str>) -> b
 }
 
 /// Whether `r` (a relation, from the analysis or a pgaudit record) is a
-/// relation of the lists, which [`text_reads`] and the relation-record
-/// rule name instead of the catalog rule.
+/// relation of the lists (ADR-0049, ADR-0050), which [`text_reads`] and
+/// the relation-record rules name instead of the catalog rule.
 fn listed_relation(r: &RelationName, rule: CatalogRule<'_>) -> bool {
     matches!(
         listed(r, false, rule.pss_schema),
         Some(Listed::Core(..) | Listed::Extension(_))
-    )
+    ) || secret_relation(r)
 }
 
 /// Splits a pgaudit object name (`schema.table`, parts possibly quoted).
@@ -897,6 +1168,13 @@ impl PssPeriods {
         }
     }
 
+    /// Whether a `pg_stat_statements` stream of the target runs now
+    /// (ADR-0012 refinement of 2026-10-12, item 3: the two-key reads are
+    /// not sent then).
+    pub(crate) fn running(&self) -> bool {
+        self.open.is_some()
+    }
+
     /// Whether `ts` falls within a period.
     pub(crate) fn covers(&self, ts: SystemTime) -> bool {
         self.open.is_some_and(|s| ts >= s) || self.closed.iter().any(|(a, b)| ts >= *a && ts <= *b)
@@ -940,6 +1218,12 @@ pub(crate) enum OwnKind {
     /// The connector's own `pg_stat_statements` text query, matched by
     /// exact text (ADR-0049 decision 5): left out uncharged.
     StatementText,
+    /// One of the connector's two-key reads of `pg_db_role_setting.setconfig`
+    /// and `pg_proc.proconfig` (`sql::ROLE_LOG_OVERRIDES`,
+    /// `sql::FUNCTION_LOG_OVERRIDES`), matched by its exact text as sent,
+    /// constants included, on pgaudit only (ADR-0050 decision 5): left out
+    /// uncharged.
+    LogOverrides,
     /// A read or write whose objects the source does not tell (`*`).
     Unknown,
     /// Never the agent's own: a statistics relation (ADR-0048 decision 4,
@@ -1273,7 +1557,7 @@ impl PgOwn {
         now: Instant,
     ) -> bool {
         match kind {
-            OwnKind::Tableless | OwnKind::StatementText => {
+            OwnKind::Tableless | OwnKind::StatementText | OwnKind::LogOverrides => {
                 self.core.routine_unbudgeted(user, application, client, e)
             }
             OwnKind::Unknown | OwnKind::Never => false,
@@ -1337,6 +1621,12 @@ struct ClassPart {
     rows_unknown: bool,
     /// A record's text wraps a query: never the agent's own.
     wrapped: bool,
+    /// ADR-0050: secret reads of this class (also in `text_objects`).
+    secret: Vec<RelationName>,
+    /// A record of this class has a text other than one of the
+    /// connector's two-key reads (`sql::ROLE_LOG_OVERRIDES`,
+    /// `sql::FUNCTION_LOG_OVERRIDES`; ADR-0050 decision 5).
+    not_override_text: bool,
 }
 
 impl PgauditEvents {
@@ -1495,6 +1785,21 @@ impl PgauditEvents {
         }) {
             self.catalogs.user_code.mark_stale(&first.database);
         }
+        // ADR-0012 refinement of 2026-10-12, item 4: a statement that can
+        // change the overrides of the two log settings makes their proof
+        // stale (every database for a role, database, parameter grant or
+        // server-wide change; the record's own for a function's `SET`
+        // clause), until two probes that start later.
+        for r in &group {
+            match changes_overrides(&r.audit.command, &r.audit.statement) {
+                Some(None) => self.catalogs.log_overrides.mark_stale(None),
+                Some(Some(())) => self
+                    .catalogs
+                    .log_overrides
+                    .mark_stale(Some(&first.database)),
+                None => {}
+            }
+        }
         // Each record is analyzed on its own text (a substatement of a
         // function or DO block logs its own text); consecutive records
         // with the same text reuse the analysis.
@@ -1507,6 +1812,18 @@ impl PgauditEvents {
         let mut text_named: HashMap<u64, Vec<RelationName>> = HashMap::new();
         let mut core_records: Vec<(EventAction, u64, RelationName)> = Vec::new();
         let mut derived_in: HashSet<u64> = HashSet::new();
+        // ADR-0050 decision 3: per substatement, the entries of the secret
+        // list its text names, whether its text names a relation at all,
+        // the secret-list relation records, and whether a record names a
+        // view, materialized view or foreign table outside `pg_catalog`
+        // and `information_schema`.
+        let mut secret_text_named: HashMap<u64, Vec<RelationName>> = HashMap::new();
+        let mut text_names_relation: HashMap<u64, bool> = HashMap::new();
+        let mut secret_records: Vec<(EventAction, u64, RelationName)> = Vec::new();
+        let mut user_derived_in: HashSet<u64> = HashSet::new();
+        // ADR-0050 decision 5: the secret-list objects the group's records
+        // name, whatever the rule makes of them.
+        let mut secret_record_objects: Vec<RelationName> = Vec::new();
         for r in &group {
             let class_action = match r.audit.class.as_str() {
                 "READ" => EventAction::Read,
@@ -1557,6 +1874,15 @@ impl PgauditEvents {
                 .entry(r.audit.substatement_id)
                 .or_default()
                 .extend(reads.named.iter().cloned());
+            secret_text_named
+                .entry(r.audit.substatement_id)
+                .or_default()
+                .extend(reads.secret_named.iter().cloned());
+            *text_names_relation
+                .entry(r.audit.substatement_id)
+                .or_default() |= analysis.parts().iter().any(|p| !p.relations.is_empty())
+                || !reads.named.is_empty()
+                || !reads.secret_named.is_empty();
             let stmts = matching(analysis, Some(r.audit.command.as_str()));
             let (text_relations, named_any) = user_relations(&stmts, rule);
             let own_text = self.own.own_text(text);
@@ -1565,8 +1891,12 @@ impl PgauditEvents {
             part.wrapped |= wrapping.any;
             part.not_own_text |= !own_text;
             part.not_text_query |= !self.own.text_query(text);
+            part.not_override_text |= sql::own_secret_object(text).is_none();
             for o in &reads.objects {
                 push_unique(&mut part.text_objects, o.clone());
+            }
+            for o in &reads.secret {
+                push_unique(&mut part.secret, o.clone());
             }
             // ADR-0049 decisions 7 and 8 (user code next to catalogs only,
             // for reads and writes).
@@ -1579,22 +1909,47 @@ impl PgauditEvents {
                         ClientSeen::Logged(first.remote.as_deref().and_then(ClientAddr::parse)),
                     )
             };
-            part.star |= reads.star
-                || user_code_star(reads, &self.catalogs, &first.database, rule, &own_exact);
+            let code_star =
+                user_code_star(reads, &self.catalogs, &first.database, rule, &own_exact);
+            part.star |= reads.star || code_star;
+            if code_star {
+                // ADR-0050 decision 2: user code next to entries of the
+                // secret list read in the no-secret shape makes them secret
+                // reads.
+                for o in &reads.secret_named {
+                    push_unique(&mut part.text_objects, o.clone());
+                    push_unique(&mut part.secret, o.clone());
+                }
+            }
             let mut named = false;
             if !r.audit.object_name.is_empty()
                 && is_relation_type(&r.audit.object_type)
                 && let Some(rel) = split_object_name(&r.audit.object_name)
             {
                 named = true;
-                if rel.schema.as_deref() != Some("pg_catalog")
-                    && matches!(
-                        r.audit.object_type.as_str(),
-                        "VIEW" | "MATERIALIZED VIEW" | "FOREIGN TABLE"
-                    )
-                    && !listed_relation(&rel, rule)
-                {
+                let derived = matches!(
+                    r.audit.object_type.as_str(),
+                    "VIEW" | "MATERIALIZED VIEW" | "FOREIGN TABLE"
+                ) && !listed_relation(&rel, rule);
+                if rel.schema.as_deref() != Some("pg_catalog") && derived {
                     derived_in.insert(r.audit.substatement_id);
+                }
+                if derived
+                    && !matches!(
+                        rel.schema.as_deref(),
+                        Some("pg_catalog" | "information_schema")
+                    )
+                {
+                    user_derived_in.insert(r.audit.substatement_id);
+                }
+                if let Some((_, o)) = secret_entry(&rel, false)
+                    && rel.schema.is_some()
+                {
+                    // Decided after every record (ADR-0050 decision 3);
+                    // until then, a catalog.
+                    push_unique(&mut secret_record_objects, o.clone());
+                    secret_records.push((action, r.audit.substatement_id, o));
+                    part.catalog_only = true;
                 }
                 match listed(&rel, false, rule.pss_schema) {
                     Some(Listed::Core(o, _)) => {
@@ -1710,6 +2065,26 @@ impl PgauditEvents {
                 push_unique(&mut part.text_objects, o);
             }
         }
+        // ADR-0050 decision 3: a record of a secret-list entry the
+        // substatement's text does not name is a secret read only next to a
+        // user view, materialized view or foreign table (outside
+        // `pg_catalog` and `information_schema`), or when the text names no
+        // relation; the built-in views' own records (`pg_authid` behind
+        // every `pg_roles` read) are not enough alone. An entry the text
+        // names keeps the text's shape decision.
+        for (action, sub, o) in secret_records {
+            let named_by_text = secret_text_named.get(&sub).is_some_and(|v| v.contains(&o));
+            if named_by_text {
+                continue;
+            }
+            let no_relation = !text_names_relation.get(&sub).copied().unwrap_or(false);
+            if (user_derived_in.contains(&sub) || no_relation)
+                && let Some(part) = parts.get_mut(&action)
+            {
+                push_unique(&mut part.text_objects, o.clone());
+                push_unique(&mut part.secret, o);
+            }
+        }
         if parts.is_empty() {
             return;
         }
@@ -1789,6 +2164,31 @@ impl PgauditEvents {
                 e = e.with_signal(Signal::PgDump);
             }
             let client = first.remote.as_deref().and_then(ClientAddr::parse);
+            // ADR-0050 decision 5: one of the connector's two-key reads,
+            // exactly as sent (constants in the text), reading only its own
+            // entry, with no relation record of another entry of the list;
+            // pgaudit only (never `pg_stat_statements`, whose stored text
+            // has its constants as `$n`).
+            let own_override = !part.secret.is_empty()
+                && !part.not_override_text
+                && !part.star
+                && !part.unknown
+                && !statistics
+                && part.text_objects.iter().all(is_secret_object)
+                && {
+                    let allowed = |o: &RelationName| {
+                        o.schema.as_deref() == Some("pg_catalog")
+                            && group
+                                .iter()
+                                .filter_map(|r| {
+                                    let t = r.audit.statement.as_str();
+                                    (t != PREVIOUSLY_LOGGED).then(|| sql::own_secret_object(t))
+                                })
+                                .flatten()
+                                .all(|n| n == o.name)
+                    };
+                    part.objects.iter().all(&allowed) && secret_record_objects.iter().all(&allowed)
+                };
             // ADR-0049 decision 5: the registered text query, exactly, with
             // no other object, within a `pg_stat_statements` period.
             let own_text_query = text_read
@@ -1803,6 +2203,8 @@ impl PgauditEvents {
                 && self.own.in_pss_period(ts);
             let kind = if own_text_query {
                 OwnKind::StatementText
+            } else if own_override {
+                OwnKind::LogOverrides
             } else if statistics || text_read || part.star || part.wrapped {
                 OwnKind::Never
             } else if !part.not_own_text && part.objects.is_empty() {
@@ -1989,7 +2391,7 @@ impl PgauditEvents {
             // `log_min_messages` proven for the database, a `FATAL` line
             // without a statement ends an idle session; otherwise it may
             // have hidden its statement, and is item 5's read of `*`.
-            if line.fatal && self.catalogs.error_lines_proven(database) {
+            if line.fatal && self.catalogs.fatal_quiet(database, &line.user) {
                 return None;
             }
             // Item 5: never the agent's own (`*`, `OwnKind::Unknown`).
@@ -2055,8 +2457,15 @@ impl PgauditEvents {
         let (mut objects, named_any) = user_relations(&all, rule);
         let rw = matches!(action, EventAction::Read | EventAction::Write);
         let reads_star = reads.star || code_star || other_star;
-        let named_any = named_any || !reads.named.is_empty();
-        for o in &reads.objects {
+        let named_any = named_any || !reads.named.is_empty() || !reads.secret_named.is_empty();
+        let mut secret_objects = reads.objects.clone();
+        if code_star {
+            // ADR-0050 decision 2: user code next to secret-list entries.
+            for o in &reads.secret_named {
+                push_unique(&mut secret_objects, o.clone());
+            }
+        }
+        for o in &secret_objects {
             push_unique(&mut objects, o.clone());
         }
         // At the analyzer's relation bound: `*`, always reported (as for
@@ -2068,9 +2477,9 @@ impl PgauditEvents {
         }
         let mut e = MaskedEvent::new(EventSource::Pgaudit, action, principal, ts).with_rows(None);
         let mut named: Vec<&RelationName> = objects.iter().collect();
-        named.sort_by_key(|o| (!reads.objects.contains(o), !is_statistics(o)));
+        named.sort_by_key(|o| (!secret_objects.contains(o), !is_statistics(o)));
         let statistics = objects.iter().any(is_statistics) || bound;
-        let text_read = !reads.objects.is_empty();
+        let text_read = !secret_objects.is_empty();
         let star = (rw && objects.is_empty()) || bound || reads_star;
         let under_filters = class == Class::Telling
             && action == EventAction::Write
@@ -2101,8 +2510,20 @@ impl PgauditEvents {
                 e = e.with_signal(Signal::PgDump);
             }
         }
+        // ADR-0050 decision 5: one of the connector's two-key reads, cut
+        // short (a timeout, a refused read), exactly as sent.
+        let own_override = !reads.secret.is_empty()
+            && sql::own_secret_object(text).is_some_and(|n| {
+                objects
+                    .iter()
+                    .all(|o| o.schema.as_deref() == Some("pg_catalog") && o.name == n)
+            })
+            && !reads_star
+            && !statistics;
         let kind = if class == Class::Telling {
             OwnKind::Never
+        } else if own_override {
+            OwnKind::LogOverrides
         } else if text_read
             && self.own.text_query(text)
             && !reads_star
@@ -2324,9 +2745,17 @@ fn pss_event(
     let reads = d.reads;
     let rw = matches!(action, EventAction::Read | EventAction::Write);
     let reads_star = reads.star || code_star;
-    // A core-list entry read in the no-text shape is a catalog read.
-    let named_any = named_any || !reads.named.is_empty();
-    for o in &reads.objects {
+    // A core-list entry read in the no-text shape is a catalog read, and
+    // so is a secret-list entry read in the no-secret shape (ADR-0050).
+    let named_any = named_any || !reads.named.is_empty() || !reads.secret_named.is_empty();
+    let mut text_objects = reads.objects.clone();
+    if code_star {
+        // ADR-0050 decision 2: user code next to secret-list entries.
+        for o in &reads.secret_named {
+            push_unique(&mut text_objects, o.clone());
+        }
+    }
+    for o in &text_objects {
         push_unique(&mut objects, o.clone());
     }
     // A text at the analyzer's relation bound may name a statistics
@@ -2356,9 +2785,9 @@ fn pss_event(
     // objects at most), always reported (ADR-0048 decision 3, ADR-0049
     // decision 4).
     let mut named: Vec<&RelationName> = objects.iter().collect();
-    named.sort_by_key(|o| (!reads.objects.contains(o), !is_statistics(o)));
+    named.sort_by_key(|o| (!text_objects.contains(o), !is_statistics(o)));
     let statistics = objects.iter().any(is_statistics) || bound;
-    let text_read = !reads.objects.is_empty();
+    let text_read = !text_objects.is_empty();
     let star = (rw && objects.is_empty()) || bound || reads_star;
     // A read or write of unknown objects (`*`) has no useful row count for
     // `min_rows` and never matches `sensitive_objects`: always reported,
@@ -2439,6 +2868,8 @@ mod tests {
         code: CodeUse::NotApplicable,
         routine_ddl: false,
         own_connector: false,
+        secret_named: Vec::new(),
+        secret: Vec::new(),
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -4748,16 +5179,18 @@ mod tests {
         }
         // Sixteen catalogs, then a statistics relation (security review of
         // #199, H1): the catalog-only skip must not hide it.
+        // (No entry of the ADR-0050 secret list: `select *` would make it a
+        // secret read.)
         let catalogs = [
             "pg_class",
             "pg_attribute",
             "pg_namespace",
             "pg_type",
-            "pg_proc",
+            "pg_collation",
             "pg_index",
             "pg_constraint",
             "pg_database",
-            "pg_roles",
+            "pg_inherits",
             "pg_tables",
             "pg_views",
             "pg_am",
@@ -5801,7 +6234,12 @@ mod tests {
         let mut recs = vec![obj_rec(1, "public.v", "VIEW", text)];
         recs.extend(activity_records(1, text));
         let ev = convert(recs, Some(true));
-        assert_eq!(objects_of(&ev[0]), [ACTIVITY, "shop.public.v"]);
+        // ADR-0050 decision 3: the `pg_authid` record behind the view, next
+        // to a user view, is a secret read too.
+        assert_eq!(
+            objects_of(&ev[0]),
+            ["shop.pg_catalog.pg_authid", ACTIVITY, "shop.public.v"]
+        );
         assert!(ev[0].always_report());
         // A view outside `pg_catalog` next to a core-list record the text
         // names in the no-text shape (security re-review N2): a text read.
@@ -6523,3 +6961,7 @@ mod tests {
 #[cfg(test)]
 #[path = "failures_tests.rs"]
 mod failures_tests;
+
+#[cfg(test)]
+#[path = "secrets_tests.rs"]
+mod secrets_tests;

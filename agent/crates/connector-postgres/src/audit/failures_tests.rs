@@ -905,3 +905,100 @@ fn the_statement_buffer_is_reserved_and_zeroizing() {
         .unwrap();
     assert!(line.statement.is_none());
 }
+
+/// ADR-0012 refinement of 2026-10-12, item 4: a `FATAL` line without a
+/// statement from a role whose `log_min_error_statement` is overridden
+/// above `error` is item 5's read of `*`; from another role, quiet; any
+/// role's while the stream has seen an `ALTER ROLE` (or `ALTER DATABASE`,
+/// a function's `SET` clause) since the last probes.
+#[test]
+fn item_4_overriding_roles_and_stale_marks() {
+    use crate::audit::overrides::{
+        DbProof, LogOverridesHandle, Probe, Read, RoleRow, STATEMENT_KEY, SharedLogOverrides, lock,
+    };
+    for format in FORMATS {
+        let shared = SharedLogOverrides::default();
+        let proof = DbProof::evaluate(
+            Read::Rows(vec![RoleRow {
+                every_role: false,
+                role: Some("hider".to_owned()),
+                setting: Some(STATEMENT_KEY.to_owned()),
+                level: Some("panic".to_owned()),
+            }]),
+            Read::Rows(vec![]),
+            None,
+            1000,
+        );
+        lock(&shared).store("shop", std::time::Instant::now(), Probe::Done(proof));
+        let mut c = Catalogs::default()
+            .with_log_overrides(LogOverridesHandle::new(std::sync::Arc::clone(&shared)));
+        c.insert(
+            "shop",
+            DbCatalog {
+                pss_schema: Some("public".to_owned()),
+                pgaudit_log_catalog: Some(true),
+            },
+        );
+        c.prove_error_lines("shop");
+        let mut b = PgauditEvents::new(own_at(1000));
+        b.set_catalogs(c);
+        let fatal = |user: &'static str| Line {
+            severity: "FATAL",
+            code: "57P01",
+            user,
+            ..Line::default()
+        };
+        assert!(events(&mut b, vec![entry(format, &fatal("backup"))]).is_empty());
+        let ev = events(&mut b, vec![entry(format, &fatal("hider"))]);
+        assert_eq!(ev.len(), 1, "{format:?}");
+        assert_eq!(objects(&ev[0]), [".*"]);
+        assert!(ev[0].always_report());
+        // A line with its statement is judged by its text, as before.
+        let with_text = Line {
+            severity: "FATAL",
+            code: "57P01",
+            user: "hider",
+            statement: Some("SELECT c.relname FROM pg_catalog.pg_class c"),
+            ..Line::default()
+        };
+        assert!(events(&mut b, vec![entry(format, &with_text)]).is_empty());
+        // An `ALTER ROLE … SET` record: every role's line is a read of `*`
+        // until two probes that start later.
+        let alter = {
+            let line = serde_json::json!({
+                "timestamp": "2026-10-12 08:00:01.000 UTC", "user": "admin", "dbname": "shop",
+                "error_severity": "LOG", "remote_host": "192.0.2.14",
+                "session_id": "6abadffb.3f0", "application_name": "psql",
+                "message": "AUDIT: SESSION,1,1,ROLE,ALTER ROLE,,,ALTER ROLE app SET log_min_messages = fatal,<not logged>",
+            });
+            crate::audit::records::parse_entry(Format::Jsonlog, line.to_string().as_bytes(), "LOG")
+                .unwrap()
+        };
+        let ev = events(&mut b, vec![alter, entry(format, &fatal("backup"))]);
+        let reads: Vec<&MaskedEvent> = ev
+            .iter()
+            .filter(|e| e.action() == EventAction::Read)
+            .collect();
+        assert_eq!(reads.len(), 1, "{format:?}");
+        assert_eq!(objects(reads[0]), [".*"]);
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            lock(&shared).store(
+                "shop",
+                std::time::Instant::now(),
+                Probe::Done(DbProof::default()),
+            );
+        }
+        assert!(events(&mut b, vec![entry(format, &fatal("backup"))]).is_empty());
+        // Not proven (the read failed): every role.
+        lock(&shared).store(
+            "shop",
+            std::time::Instant::now(),
+            Probe::Done(DbProof::not_proven("test")),
+        );
+        assert_eq!(
+            events(&mut b, vec![entry(format, &fatal("backup"))]).len(),
+            1
+        );
+    }
+}

@@ -10,8 +10,8 @@ documentation (docs/08) builds on.
 
 | Level | Condition (same probe for `check()` and the stream) | Source |
 |---|---|---|
-| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, `log_min_messages` and `log_min_error_statement` proven `error` or lower, **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
-| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows`, a log setting above `error` or not read, or no recent record | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
+| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, `log_min_messages` and `log_min_error_statement` proven `error` or lower in the agent's session and for every role (no override above `error` in `pg_db_role_setting` or a function's `SET` clause, no `SET` / `ALTER SYSTEM` grant on them to another role, 15+), **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
+| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows`, a log setting above `error` or not read, an override or grant found or not read, or no recent record | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
 | Limited | `pg_stat_statements` installed, loaded and showing other roles | `pg_stat_statements` |
 | None | none of the above | — |
 
@@ -148,6 +148,39 @@ load otherwise), so a server-wide load is the normal case.
   the source in its local detail. Drift and pinning tests in `it.rs`.
   Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-views).
+- **Credential-bearing catalogs** ([ADR-0050](../../../docs/adr/0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md)).
+  The closed list `audit::events::SECRET_RELATIONS` (`pg_authid`,
+  `pg_shadow`, `pg_roles`, `pg_user`, `pg_db_role_setting`,
+  `pg_user_mapping(s)`, `pg_foreign_server`, `pg_subscription`, `pg_proc`
+  with their secret columns; `pg_largeobject`, `pg_file_settings`,
+  `pg_hba_file_rules`, their functions and four `information_schema`
+  views with none) is named in events (`pg_catalog.<name>`, the
+  `information_schema` names as written), always reported, in every
+  action class, unless the ten entries with columns are read in the
+  no-secret shape (`secret_reads`, with
+  `classifiers::query::PgScan::no_secret_shape`: the no-text shape on the
+  secret columns of every entry named, plus no `COPY <entry>`, and a CTE
+  defined earlier in the text counts as a catalog; no schema-qualified
+  call outside `pg_catalog` and `information_schema`; an unqualified
+  call, operator or cast that decision 8 does not prove built in makes the
+  entries secret reads). An unqualified `pg_*` entry unconfirmed with
+  `log_catalog = off` is a secret read. A pgaudit record of an entry the
+  substatement's text does not name is a secret read only next to a
+  record of a user view, materialized view or foreign table (outside
+  `pg_catalog` and `information_schema`) or when the text names no
+  relation (decision 3: a user view over `pg_roles` is the accepted
+  over-report). Never the agent's own, except its two-key reads
+  (`sql::ROLE_LOG_OVERRIDES`, `sql::FUNCTION_LOG_OVERRIDES`,
+  `OwnKind::LogOverrides`): on pgaudit only, by exact text as sent, from
+  the agent's identity, no signal, no record of another entry; on
+  `pg_stat_statements` they are always reported (constants are `$n`
+  there). Every other connector statement on `pg_roles` and `pg_proc` has
+  the no-secret shape (unit tests `sql::tests::statements_and_the_secret_list`
+  and `secrets_tests::the_connectors_statements_are_quiet`); the collision
+  probe, the row-level security policy check and the introspection
+  statement were rewritten without column alias lists for it. Drift and
+  pinning tests in `it_secrets.rs`, run on PostgreSQL 14 to 18. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#credential-bearing-catalogs).
 - **User code next to catalogs only** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)
   decision 8, part 2 refinement proposed). In a text whose relations are
   all catalogs (`audit::events::code_use`), whatever its statements
@@ -263,8 +296,16 @@ load otherwise), so a server-wide load is the normal case.
     `SET`, `SHOW` and the like give none. An `ERROR` line without a
     statement text is a read of `*`; a `FATAL` line without one ends an
     idle session and gives none where the stream's probe proved the log
-    settings for its database (`Catalogs::error_lines_proven`), a read of
-    `*` elsewhere (item 9 of the ADR).
+    settings for its database and for the line's role
+    (`Catalogs::fatal_quiet`: `error_lines_proven` and the override proof
+    of `audit::overrides`), a read of `*` elsewhere (item 9 of the ADR, as
+    refined by item 4 of the ADR-0012 refinement of 2026-10-12: a role
+    with an override of `log_min_error_statement` above `error` or a `SET`
+    grant on it; every role for a database-wide override, a function
+    `SET` clause, a `PUBLIC` or `ALTER SYSTEM` grant, a proof not read,
+    and while the stream has seen an `ALTER ROLE`, `ALTER DATABASE`,
+    `ALTER SYSTEM`, parameter grant or function DDL since the last two
+    probes).
   - **Not twice:** a line is not reported when its session's last
     pgaudit record has the same text, the same virtual transaction and no
     row count (written at the statement's start, `log_rows = off`); texts
@@ -274,6 +315,21 @@ load otherwise), so a server-wide load is the normal case.
     `error` or lower in every monitored database where pgaudit is loaded;
     otherwise the target is capped at Partial and the local detail names
     the setting and the database (no target note, no protocol change).
+  - **Overrides for other roles** ([ADR-0012 refinement of 2026-10-12](../../../docs/adr/0012-postgresql-agent-grants.md#refinement-2026-10-12-accepted-a-two-key-read-of-pg_db_role_setting)):
+    in each monitored database whose level would be Full, and only while
+    no `pg_stat_statements` stream of the target runs, `check()` and the
+    stream's probe send `sql::ROLE_LOG_OVERRIDES` and
+    `sql::FUNCTION_LOG_OVERRIDES` (the two keys of `setconfig` and
+    `proconfig`, filtered by the server, literals only, at most 1 000
+    rows) and, on 15+, `sql::PARAMETER_GRANTS` (`audit::overrides`,
+    `check::overrides_probe`). An override above `error`, a grant to a
+    role other than superusers and the agent's, a refused or cut read
+    caps the target at Partial; the local detail names the database, the
+    setting, the roles or functions (normalized, at most 10, then a
+    count), never a level. `sql::OWN_PARAMETER_GRANTS` reports a grant to
+    the agent's own role as an over-privilege (local detail only). The
+    unit test `no_statement_touches_the_catalog_denylist` asserts the two
+    statements' full texts.
   - **Load:** a line costs one parse (about 2 µs) and one analysis of its
     text (about 45 µs, release build), as an `AUDIT:` record does; the
     last text's analysis is cached, so a storm of one failing statement
@@ -295,10 +351,9 @@ load otherwise), so a server-wide load is the normal case.
     own (the postmaster's line is not read); `pg_stat_statements` counts
     no failed statement (Limited); native code that hides its context can
     forge a refused `25P02` / `42601`; any role can add false events with
-    `RAISE … USING ERRCODE`; the log settings are read in the agent's
-    session, so per-role or per-database overrides (superuser only,
-    reported by pgaudit when set) are not seen (`pg_db_role_setting` is
-    never read; ADR item 14, ROADMAP follow-up); the core's aggregation adds a failed read with no row count
+    `RAISE … USING ERRCODE`; a superuser's session `SET` or startup option
+    is not seen, and an override set between two probes hides failures
+    until the next probe unless the stream reads its record; the core's aggregation adds a failed read with no row count
     to a successful read of the same group, whose count then stands for
     both.
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
