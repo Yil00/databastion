@@ -180,6 +180,45 @@ load otherwise), so a server-wide load is the normal case.
   database with `citext`, `hstore` and 3 000 relations, server facts,
   list drift). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#user-code-next-to-catalogs).
+- **Statements that wrap a query** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md#refinement-2026-10-12-proposed-statements-that-wrap-a-query),
+  refinement of 2026-10-12, proposed). `EXPLAIN [ANALYZE]`, `DECLARE …
+  CURSOR … FOR` and `PREPARE … AS` (`classifiers::query::PgWrapped`, on
+  `StatementInfo::pg_wrapped`) are their query: its relations, with every
+  rule a bare query has (catalogs, statistics relations, statement-text
+  views and the no-text shape, user code, the relation bound). Before,
+  `pg_stat_statements` gave no event for these statements (kind `Other`),
+  so a cursor read (psql's `FETCH_COUNT`), an `EXPLAIN ANALYZE` and the
+  `EXECUTE`s of a prepared statement (counted under the `PREPARE` text)
+  went unreported there. The action (`wrapped_action`): a plain
+  `EXPLAIN` reads (planned with the statistics, as ADR-0047 on MySQL /
+  MariaDB; pgaudit's `WRITE` record of a plain `EXPLAIN DELETE` is a read
+  too); `EXPLAIN ANALYZE`, a cursor and a prepared statement act as their
+  query (a write writes, `CREATE … AS` is DDL). Explains and cursors are
+  always reported with no row count (`WrapperUse::rows_unknown`: an
+  explain sends no row, a cursor's rows go out through `FETCH`, which
+  names no relation); a prepared statement's executions keep their rows
+  and the filters. A cursor's or prepared statement's query keeps its
+  `shape.full_table_read`. Never the agent's own (unit test
+  `no_statement_wraps_a_query`). `FETCH`, `MOVE`, `CLOSE` and
+  `DEALLOCATE` give no event (pgaudit logs them in the `misc` class; their
+  `pg_stat_statements` row counts are not attributed). Unit tests
+  `wrapped_queries_are_reads_of_their_query`,
+  `pgaudit_records_of_wrapped_queries`; integration test
+  `it_wrapped::wrapped_queries_are_reads_of_their_query`.
+- **Failed and cancelled statements with `pgaudit.log_rows = on`**
+  (security review of #197, L1; integration test
+  `it_wrapped::failed_reads_and_what_is_reported`). With `log_rows = on`
+  (needed for Full), pgaudit writes a statement's records when it ends,
+  so a statement that fails or is cancelled leaves **no** `AUDIT:` record:
+  a failed cast whose error quotes the value read (22P02), and a read that
+  streamed its rows to the client before an error on purpose (22012) or a
+  cancel (57014), give no event from any role, the agent's included. The
+  server's `ERROR` line has the SQLSTATE, the statement text and a
+  message that can quote values; the connector reads `AUDIT:` lines
+  only. With `log_rows = off` the record is written when the statement
+  starts, and the failed read is reported. `pg_stat_statements` counts
+  no failed statement. Proposed fix (SQLSTATE classes, never the
+  message): [ADR-0037 refinement of 2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-proposed-failed-and-cancelled-statements).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first

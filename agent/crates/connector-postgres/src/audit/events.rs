@@ -56,8 +56,8 @@ use databastion_classifiers::masking::{
 };
 use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::{
-    AnalyzeOptions, CopyEndpoint, PgItemClass, PgListed, PgScan, QueryAnalysis, RelationName,
-    StatementInfo, StatementKind, analyze, pg_scan,
+    AnalyzeOptions, CopyEndpoint, PgItemClass, PgListed, PgScan, PgWrapped, PgWrapper,
+    QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze, pg_scan,
 };
 
 use super::records::AuditRecord;
@@ -692,7 +692,14 @@ fn statement_signals(
                 out.push(Signal::FullTableCopy);
             }
         }
-        if p.kind.is_read()
+        // A cursor's or a prepared statement's query sends its rows: its
+        // shape counts (ADR-0048, refinement of 2026-10-12); an explain
+        // sends none, and has no shape.
+        let sends_rows = p.kind.is_read()
+            || p.pg_wrapped.is_some_and(|w| {
+                matches!(w.wrapper, PgWrapper::Declare | PgWrapper::Prepare) && w.kind.is_read()
+            });
+        if sends_rows
             && p.relations
                 .iter()
                 .any(|r| !is_catalog(r, rule) && !listed_relation(r, rule))
@@ -705,6 +712,62 @@ fn statement_signals(
         out.push(Signal::LargeResult);
     }
     out
+}
+
+/// How a text that wraps a query is reported (ADR-0048, refinement of
+/// 2026-10-12): the wrappers of its statements.
+#[derive(Clone, Copy, Default)]
+struct WrapperUse {
+    /// A statement plans or runs a query whose rows the record's or
+    /// entry's counts do not give (`EXPLAIN [ANALYZE]`: none are sent;
+    /// `DECLARE … CURSOR`: they are sent by `FETCH`, which names no
+    /// relation): no row count, always reported.
+    rows_unknown: bool,
+    /// A statement wraps a query: never the agent's own (the connector
+    /// sends no `EXPLAIN`, `DECLARE` or `PREPARE`; unit test over every
+    /// connector statement).
+    any: bool,
+    /// Every statement is a plain `EXPLAIN` (no `ANALYZE`): its query is
+    /// planned, not run, so an explained write writes nothing.
+    explain_only: bool,
+}
+
+fn wrapper_use(a: &QueryAnalysis) -> WrapperUse {
+    let wrapped: Vec<Option<PgWrapped>> = a.parts().iter().map(|p| p.pg_wrapped).collect();
+    WrapperUse {
+        rows_unknown: wrapped.iter().flatten().any(|w| {
+            matches!(
+                w.wrapper,
+                PgWrapper::Explain | PgWrapper::ExplainAnalyze | PgWrapper::Declare
+            )
+        }),
+        any: wrapped.iter().any(Option::is_some),
+        explain_only: !wrapped.is_empty()
+            && wrapped
+                .iter()
+                .all(|w| w.is_some_and(|w| w.wrapper == PgWrapper::Explain)),
+    }
+}
+
+/// The action of a `pg_stat_statements` entry whose text wraps a query
+/// (ADR-0048, refinement of 2026-10-12): a plain `EXPLAIN` reads (its
+/// query is planned with the statistics, as ADR-0047 on MySQL / MariaDB);
+/// a query that runs (`EXPLAIN ANALYZE`, a cursor, a prepared statement's
+/// executions, which `pg_stat_statements` counts under the `PREPARE`
+/// text) acts as its kind: a write writes, `CREATE … AS` is DDL, anything
+/// else (a read, `EXECUTE`, a query not found) reads.
+fn wrapped_action(w: PgWrapped) -> EventAction {
+    if w.wrapper == PgWrapper::Explain {
+        return EventAction::Read;
+    }
+    match w.kind {
+        StatementKind::Insert
+        | StatementKind::Update
+        | StatementKind::Delete
+        | StatementKind::Merge => EventAction::Write,
+        StatementKind::Ddl => EventAction::Ddl,
+        _ => EventAction::Read,
+    }
 }
 
 /// Relations a statement copies whole to the client.
@@ -1240,6 +1303,12 @@ struct ClassPart {
     /// A record of this class has a text other than one of the registered
     /// `pg_stat_statements` text queries (ADR-0049 decision 5).
     not_text_query: bool,
+    /// A record's text wraps a query whose rows the record does not count
+    /// (`EXPLAIN`, `DECLARE … CURSOR`): no row count, always reported
+    /// (ADR-0048, refinement of 2026-10-12).
+    rows_unknown: bool,
+    /// A record's text wraps a query: never the agent's own.
+    wrapped: bool,
 }
 
 impl PgauditEvents {
@@ -1374,7 +1443,7 @@ impl PgauditEvents {
         let mut core_records: Vec<(EventAction, u64, RelationName)> = Vec::new();
         let mut derived_in: HashSet<u64> = HashSet::new();
         for r in &group {
-            let action = match r.audit.class.as_str() {
+            let class_action = match r.audit.class.as_str() {
                 "READ" => EventAction::Read,
                 "WRITE" => EventAction::Write,
                 "DDL" => EventAction::Ddl,
@@ -1409,6 +1478,16 @@ impl PgauditEvents {
             let Some((_, analysis, reads)) = cached.as_ref() else {
                 continue;
             };
+            // ADR-0048, refinement of 2026-10-12: pgaudit logs the query of
+            // a plain `EXPLAIN` as its class (a `WRITE` record for `EXPLAIN
+            // DELETE …`, verified on PostgreSQL 16 with pgaudit 16.0), but
+            // the query is only planned: a read.
+            let wrapping = wrapper_use(analysis);
+            let action = if class_action == EventAction::Write && wrapping.explain_only {
+                EventAction::Read
+            } else {
+                class_action
+            };
             text_named
                 .entry(r.audit.substatement_id)
                 .or_default()
@@ -1417,6 +1496,8 @@ impl PgauditEvents {
             let (text_relations, named_any) = user_relations(&stmts, rule);
             let own_text = self.own.own_text(text);
             let part = parts.entry(action).or_default();
+            part.rows_unknown |= wrapping.rows_unknown;
+            part.wrapped |= wrapping.any;
             part.not_own_text |= !own_text;
             part.not_text_query |= !self.own.text_query(text);
             for o in &reads.objects {
@@ -1590,6 +1671,11 @@ impl PgauditEvents {
                 // Only catalogs: not application data.
                 continue;
             }
+            // An explain's or a cursor's record counts no row sent
+            // (ADR-0048, refinement of 2026-10-12).
+            if part.rows_unknown {
+                part.rows = None;
+            }
             let mut e = MaskedEvent::new(EventSource::Pgaudit, action, principal.clone(), ts)
                 .with_rows(part.rows);
             // Statistics relations first (an event names 16 objects at
@@ -1610,7 +1696,7 @@ impl PgauditEvents {
             // too: they never match `sensitive_objects` and their row count
             // says nothing of what they read (security review of #199, M2);
             // so are statement-text reads (ADR-0049 decision 4).
-            if statistics || unknown || text_read {
+            if statistics || unknown || text_read || part.rows_unknown {
                 e = e.with_always_report();
             }
             for o in objects.into_iter().take(if unknown { 15 } else { 16 }) {
@@ -1652,7 +1738,7 @@ impl PgauditEvents {
                 && self.own.in_pss_period(ts);
             let kind = if own_text_query {
                 OwnKind::StatementText
-            } else if statistics || text_read || part.star {
+            } else if statistics || text_read || part.star || part.wrapped {
                 OwnKind::Never
             } else if !part.not_own_text && part.objects.is_empty() {
                 OwnKind::Tableless
@@ -1845,12 +1931,19 @@ fn pss_event(
         | StatementKind::Merge => EventAction::Write,
         StatementKind::Ddl => EventAction::Ddl,
         StatementKind::Dcl => EventAction::Dcl,
-        // A statement that wraps a query (`EXPLAIN`, `PREPARE`, `DECLARE …
-        // CURSOR`) and runs user code next to catalogs: a read of `*`
+        // A statement that wraps a query (`EXPLAIN [ANALYZE]`, `DECLARE …
+        // CURSOR`, `PREPARE`, whose executions `pg_stat_statements`
+        // counts under its text): the query's relations, with the action
+        // of `wrapped_action` (ADR-0048, refinement of 2026-10-12). One
+        // that runs user code next to catalogs only is a read of `*`
         // (security review of #211, H1).
-        _ if code_star => EventAction::Read,
-        _ => return None,
+        _ => match a.parts().first().and_then(|p| p.pg_wrapped) {
+            Some(w) => wrapped_action(w),
+            None if code_star => EventAction::Read,
+            None => return None,
+        },
     };
+    let wrapping = wrapper_use(a);
     let (mut objects, named_any) = user_relations(&all, rule);
     // ADR-0049: the statement-text objects the text reads, and `*` of
     // decision 7, in every action class.
@@ -1873,8 +1966,10 @@ fn pss_event(
     if rw && objects.is_empty() && named_any && !bound && !reads_star {
         return None;
     }
-    // COPY counts rows in pg_stat_statements too.
-    let rows = Some(d.rows);
+    // COPY counts rows in pg_stat_statements too. An explain's or a
+    // cursor's entry counts no row sent (the cursor's rows are counted by
+    // its `FETCH` entries, which name no relation).
+    let rows = (!wrapping.rows_unknown).then_some(d.rows);
     let mut e = MaskedEvent::new(
         EventSource::PgStatStatements,
         action,
@@ -1894,7 +1989,7 @@ fn pss_event(
     // A read or write of unknown objects (`*`) has no useful row count for
     // `min_rows` and never matches `sensitive_objects`: always reported,
     // as on MySQL / MariaDB (security review of #199, M2).
-    if statistics || star || text_read {
+    if statistics || star || text_read || wrapping.rows_unknown {
         e = e.with_always_report();
     }
     for o in named.into_iter().take(if star { 15 } else { 16 }) {
@@ -1914,7 +2009,7 @@ fn pss_event(
         {
             e = e.with_signal(Signal::PgDump);
         }
-    } else if d.rows > LARGE_ROWS {
+    } else if rows.is_some_and(|r| r > LARGE_ROWS) {
         e = e.with_signal(Signal::LargeResult);
     }
     // ADR-0049 decision 5: the connector's text query, exactly (`own_text`
@@ -1929,7 +2024,7 @@ fn pss_event(
             .all(|o| o.name == PSS_VIEW && o.schema.as_deref() == rule.pss_schema);
     let kind = if own_text_query {
         OwnKind::StatementText
-    } else if statistics || text_read || reads_star {
+    } else if statistics || text_read || reads_star || wrapping.any {
         OwnKind::Never
     } else if objects.is_empty() && !named_any && d.own_text {
         OwnKind::Tableless
@@ -5659,6 +5754,394 @@ mod tests {
             "SELECT pg_stat_file('PG_VERSION') FROM pg_class LIMIT 1",
         ] {
             assert_quiet(text);
+        }
+    }
+
+    /// ADR-0048, refinement of 2026-10-12 (security review of #199, L3):
+    /// a statement that wraps a query is reported as its query on
+    /// `pg_stat_statements` (before: no event for a statement of kind
+    /// `Other`), and pgaudit's records of it keep no row count that
+    /// misstates what was sent. Explains and cursors are always reported
+    /// with no row count; a prepared statement's executions keep theirs;
+    /// none is ever the agent's own; `FETCH` / `MOVE` give no event.
+    #[test]
+    fn wrapped_queries_are_reads_of_their_query() {
+        let cust = "shop.crm.customers";
+        let notes = "shop.crm.customer_notes";
+        // (text, action, objects, rows kept, always reported, signal)
+        type Case<'a> = (
+            &'a str,
+            EventAction,
+            &'a [&'a str],
+            bool,
+            bool,
+            Option<&'a str>,
+        );
+        let cases: &[Case<'_>] = &[
+            (
+                "DECLARE c1 CURSOR FOR SELECT email FROM crm.customers WHERE id < $1",
+                EventAction::Read,
+                &[cust],
+                false,
+                true,
+                None,
+            ),
+            (
+                "DECLARE _psql_cursor NO SCROLL CURSOR FOR\nSELECT * FROM crm.customers",
+                EventAction::Read,
+                &[cust],
+                false,
+                true,
+                Some("shape.full_table_read"),
+            ),
+            (
+                "EXPLAIN SELECT email FROM crm.customers WHERE id = $1",
+                EventAction::Read,
+                &[cust],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM crm.customers",
+                EventAction::Read,
+                &[cust],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN DELETE FROM crm.customer_notes WHERE id = $1",
+                EventAction::Read,
+                &[notes],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN ANALYZE DELETE FROM crm.customer_notes WHERE id = $1",
+                EventAction::Write,
+                &[notes],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN ANALYZE INSERT INTO crm.customer_notes SELECT * FROM crm.customers",
+                EventAction::Write,
+                &[notes, cust],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN ANALYZE DECLARE c CURSOR FOR SELECT email FROM crm.customers",
+                EventAction::Read,
+                &[cust],
+                false,
+                true,
+                None,
+            ),
+            (
+                "PREPARE p1 AS SELECT phone FROM crm.customers WHERE id = $1",
+                EventAction::Read,
+                &[cust],
+                true,
+                false,
+                None,
+            ),
+            (
+                "PREPARE p2 (integer) AS SELECT * FROM crm.customers",
+                EventAction::Read,
+                &[cust],
+                true,
+                false,
+                Some("shape.full_table_read"),
+            ),
+            (
+                "PREPARE p3 AS UPDATE crm.customers SET city = $1 WHERE id = $2",
+                EventAction::Write,
+                &[cust],
+                true,
+                false,
+                None,
+            ),
+            // `EXPLAIN EXECUTE p`: the prepared query is not in the text.
+            (
+                "EXPLAIN ANALYZE EXECUTE p1(5)",
+                EventAction::Read,
+                &["shop..*"],
+                false,
+                true,
+                None,
+            ),
+            // Statistics relations (ADR-0048) through a cursor and an
+            // explain: named, always reported.
+            (
+                "DECLARE c2 CURSOR FOR SELECT attname, most_common_vals FROM pg_catalog.pg_stats",
+                EventAction::Read,
+                &["shop.pg_catalog.pg_stats"],
+                false,
+                true,
+                None,
+            ),
+            (
+                "EXPLAIN ANALYZE SELECT * FROM pg_stats WHERE tablename = $1",
+                EventAction::Read,
+                &["shop.pg_catalog.pg_stats"],
+                false,
+                true,
+                None,
+            ),
+        ];
+        for (text, action, want, rows_kept, always, signal) in cases {
+            for user in ["app", "databastion"] {
+                let usage = SharedOwnUsage::default();
+                let mut own = own_with(None, 1000, usage.clone());
+                let ev = pss_text_events(text, user, false, &mut own, false);
+                assert_eq!(ev.len(), 1, "{user}: {text}");
+                let e = &ev[0];
+                assert_eq!(e.action(), *action, "{user}: {text}");
+                assert_eq!(objects_of(e), *want, "{user}: {text}");
+                assert_eq!(e.rows(), rows_kept.then_some(2), "{user}: {text}");
+                assert_eq!(e.always_report(), *always, "{user}: {text}");
+                let signals: Vec<&str> = e.signals().iter().map(|s| s.as_str()).collect();
+                assert_eq!(
+                    signals,
+                    signal.iter().copied().collect::<Vec<_>>(),
+                    "{text}"
+                );
+                // Never the agent's own, never charged.
+                assert!(charged_keys(&usage).is_empty(), "{user}: {text}");
+            }
+        }
+        // Catalog-only wrapped queries stay quiet; `FETCH`, `MOVE` and
+        // `CLOSE` name no relation and give no event.
+        for text in [
+            "DECLARE c CURSOR FOR SELECT relname FROM pg_catalog.pg_class",
+            "EXPLAIN ANALYZE SELECT * FROM pg_class",
+            "PREPARE p AS SELECT nspname FROM pg_catalog.pg_namespace WHERE oid = $1",
+            "FETCH 10 FROM c1",
+            "FETCH FORWARD 100 FROM _psql_cursor",
+            "MOVE 5 IN c1",
+            "CLOSE _psql_cursor",
+        ] {
+            for user in ["app", "databastion"] {
+                let ev = pss_text_events(text, user, false, &mut own(), false);
+                assert!(
+                    ev.is_empty(),
+                    "{user}: {text}: {:?}",
+                    ev.iter().map(json).collect::<Vec<_>>()
+                );
+            }
+        }
+        // Statement-text views through a cursor and an explain (ADR-0049):
+        // text reads, on both sources.
+        for text in [
+            "DECLARE c CURSOR FOR SELECT query FROM pg_stat_activity",
+            "EXPLAIN ANALYZE SELECT query FROM pg_catalog.pg_stat_activity",
+            "PREPARE p AS SELECT pid, query FROM pg_stat_activity WHERE state = $1",
+        ] {
+            assert_text_read(
+                text,
+                "READ",
+                "SELECT",
+                &["shop.pg_catalog.pg_stat_activity"],
+                true,
+            );
+        }
+        // The no-text shape holds through a wrapper (its options are not a
+        // column alias list).
+        for text in [
+            "DECLARE c CURSOR FOR SELECT pid FROM pg_stat_activity",
+            "EXPLAIN SELECT state, count(*) FROM pg_stat_activity GROUP BY state",
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT pid FROM pg_catalog.pg_stat_activity",
+            "PREPARE p AS SELECT pid FROM pg_stat_activity WHERE state = $1",
+        ] {
+            assert_quiet(text);
+        }
+    }
+
+    /// The same forms as pgaudit logs them (verified on PostgreSQL 16 with
+    /// pgaudit 16.0 and `pgaudit.log_rows = on`): a cursor gets one `READ`
+    /// record (`DECLARE CURSOR`, no relation, 0 rows), its `FETCH` a `MISC`
+    /// one; an explain gets records of its query's class (`READ SELECT`,
+    /// `WRITE DELETE`, with relations, the plan's or 0 rows) and a `MISC`
+    /// or `WRITE` `EXPLAIN` record; each `EXECUTE` of a prepared statement
+    /// gets `READ SELECT` records with the `PREPARE` text and its rows.
+    #[test]
+    fn pgaudit_records_of_wrapped_queries() {
+        let cust = "shop.crm.customers";
+        let notes = "shop.crm.customer_notes";
+        let declare = "DECLARE c1 CURSOR FOR SELECT * FROM crm.customers WHERE id < 50;";
+        let declare_all = "DECLARE _psql_cursor NO SCROLL CURSOR FOR SELECT * FROM crm.customers";
+        let explain = "EXPLAIN SELECT email FROM crm.customers WHERE id = 7;";
+        let explain_delete = "EXPLAIN DELETE FROM crm.customer_notes WHERE id = -1;";
+        let analyze_delete = "EXPLAIN ANALYZE DELETE FROM crm.customer_notes WHERE id = -1;";
+        let analyze_json = "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM crm.customers;";
+        let prepare = "PREPARE p1 AS SELECT phone FROM crm.customers WHERE id = $1;";
+        let two = "EXPLAIN DELETE FROM crm.customer_notes; DELETE FROM crm.customer_notes;";
+        // (records, action, objects, rows, always reported, signal)
+        type Case = (
+            Vec<(
+                u64,
+                &'static str,
+                &'static str,
+                &'static str,
+                &'static str,
+                Option<u64>,
+            )>,
+            EventAction,
+            Vec<&'static str>,
+            Option<u64>,
+            bool,
+            Option<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                vec![(1, "READ", "DECLARE CURSOR", "", declare, Some(0))],
+                EventAction::Read,
+                vec![cust],
+                None,
+                true,
+                None,
+            ),
+            (
+                vec![(1, "READ", "DECLARE CURSOR", "", declare_all, Some(0))],
+                EventAction::Read,
+                vec![cust],
+                None,
+                true,
+                Some("shape.full_table_read"),
+            ),
+            (
+                vec![
+                    (1, "READ", "SELECT", "crm.customers", explain, Some(0)),
+                    (2, "MISC", "EXPLAIN", "", explain, Some(0)),
+                ],
+                EventAction::Read,
+                vec![cust],
+                None,
+                true,
+                None,
+            ),
+            (
+                vec![(
+                    1,
+                    "READ",
+                    "SELECT",
+                    "crm.customers",
+                    analyze_json,
+                    Some(150),
+                )],
+                EventAction::Read,
+                vec![cust],
+                None,
+                true,
+                None,
+            ),
+            // A plain explain of a write writes nothing: a read.
+            (
+                vec![
+                    (
+                        1,
+                        "WRITE",
+                        "DELETE",
+                        "crm.customer_notes",
+                        explain_delete,
+                        Some(0),
+                    ),
+                    (2, "MISC", "EXPLAIN", "", explain_delete, Some(0)),
+                ],
+                EventAction::Read,
+                vec![notes],
+                None,
+                true,
+                None,
+            ),
+            (
+                vec![
+                    (
+                        1,
+                        "WRITE",
+                        "DELETE",
+                        "crm.customer_notes",
+                        analyze_delete,
+                        Some(0),
+                    ),
+                    (2, "WRITE", "EXPLAIN", "", analyze_delete, Some(0)),
+                ],
+                EventAction::Write,
+                vec![notes],
+                None,
+                true,
+                None,
+            ),
+            (
+                vec![(1, "READ", "SELECT", "crm.customers", prepare, Some(1))],
+                EventAction::Read,
+                vec![cust],
+                Some(1),
+                false,
+                None,
+            ),
+            // Not every statement an explain: the write stays a write.
+            (
+                vec![(1, "WRITE", "DELETE", "crm.customer_notes", two, Some(3))],
+                EventAction::Write,
+                vec![notes],
+                None,
+                true,
+                None,
+            ),
+        ];
+        for (records, action, want, rows, always, signal) in cases {
+            for app in ["psql", crate::conn::APPLICATION_NAME] {
+                let usage = SharedOwnUsage::default();
+                let mut b = PgauditEvents::new(own_with(
+                    ClientAddr::parse("192.0.2.14"),
+                    1000,
+                    usage.clone(),
+                ));
+                b.set_catalogs(shop_catalogs(Some(true)));
+                let recs = records
+                    .iter()
+                    .map(|(sub, class, command, object, text, rows)| {
+                        rec("t1", 1, *sub, class, command, object, text, *rows, app)
+                    })
+                    .collect();
+                let ev = b.convert(recs, SystemTime::now());
+                let what = format!("{app}: {records:?}");
+                assert_eq!(
+                    ev.len(),
+                    1,
+                    "{what}: {:?}",
+                    ev.iter().map(json).collect::<Vec<_>>()
+                );
+                let e = &ev[0];
+                assert_eq!(e.action(), action, "{what}");
+                assert_eq!(objects_of(e), want, "{what}");
+                assert_eq!(e.rows(), rows, "{what}");
+                assert_eq!(e.always_report(), always, "{what}");
+                let signals: Vec<&str> = e.signals().iter().map(|s| s.as_str()).collect();
+                assert_eq!(
+                    signals,
+                    signal.iter().copied().collect::<Vec<_>>(),
+                    "{what}"
+                );
+                assert!(charged_keys(&usage).is_empty(), "{what}");
+            }
+        }
+        // `FETCH` and `MOVE` records (`MISC`, logged with the `misc`
+        // class only) give no event.
+        for (command, text) in [("FETCH", "FETCH 10 FROM c1;"), ("MOVE", "MOVE 5 IN c1;")] {
+            let mut b = PgauditEvents::new(own());
+            b.set_catalogs(shop_catalogs(Some(true)));
+            let ev = b.convert(
+                vec![rec("t1", 1, 1, "MISC", command, "", text, Some(0), "psql")],
+                SystemTime::now(),
+            );
+            assert!(ev.is_empty(), "{text}");
         }
     }
 }
