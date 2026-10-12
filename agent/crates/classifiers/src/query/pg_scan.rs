@@ -962,14 +962,39 @@ fn cte_column_list(s: &[Tok], with: usize) -> bool {
     }
 }
 
+/// The end (exclusive token index) of the scope of a `WITH` at `with`:
+/// the `)` that closes the parentheses enclosing it (a subquery's `WITH`
+/// is visible in that subquery only), or the end of its statement (`;`)
+/// or of the text.
+fn with_scope_end(s: &[Tok], with: usize) -> usize {
+    let mut depth = 0usize;
+    for (j, t) in s.iter().enumerate().skip(with + 1) {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return j,
+            },
+            Tok::Punct(p) if p == ";" && depth == 0 => return j,
+            _ => {}
+        }
+    }
+    s.len()
+}
+
 /// CTEs a text defines, anywhere (a nested `WITH` too): each name with
-/// the token index of its definition. `WITH ORDINALITY` is not one.
-fn cte_defs(s: &[Tok]) -> Vec<(String, usize)> {
+/// the token index of its definition and the end of its scope
+/// ([`with_scope_end`]): a reference counts as the CTE only after its
+/// definition and within the query whose `WITH` defines it, or a query
+/// nested in it (security review of PR #217, L1: a CTE of a sibling
+/// subquery is not visible). `WITH ORDINALITY` is not one.
+fn cte_defs(s: &[Tok]) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
     for (i, t) in s.iter().enumerate() {
         if word(Some(t)) != Some("with") {
             continue;
         }
+        let scope_end = with_scope_end(s, i);
         let mut j = i + 1;
         if word(s.get(j)) == Some("recursive") {
             j += 1;
@@ -985,7 +1010,7 @@ fn cte_defs(s: &[Tok]) -> Vec<(String, usize)> {
             if word(s.get(k)) != Some("as") {
                 break;
             }
-            out.push((name.to_owned(), j));
+            out.push((name.to_owned(), j, scope_end));
             k += 1;
             if word(s.get(k)) == Some("not") {
                 k += 1;
@@ -1049,7 +1074,7 @@ fn segment_shape(
                 && n.name.schema.is_none()
                 && defs
                     .iter()
-                    .any(|(name, at)| *name == n.name.name && *at < n.start)
+                    .any(|(name, at, end)| *name == n.name.name && *at < n.start && n.start < *end)
             {
                 class[item.name] = PgItemClass::Catalog;
             }
@@ -1446,6 +1471,22 @@ mod tests {
                  WHERE p.proowner = me.oid";
         assert!(no_secret(q));
         assert!(!pg_scan(q).unwrap().no_text_shape(&SECRET, &secret_classify));
+        // A CTE of a sibling subquery is not visible: `v` is a relation
+        // (security review of PR #217, L1); an enclosing query's CTE is.
+        for q in [
+            "SELECT r.rolname FROM (WITH v AS (SELECT 1) SELECT 1) q, pg_roles r, v x",
+            "SELECT r.rolname FROM (WITH v AS (SELECT 1) SELECT 1) q, pg_roles r, v",
+            "SELECT (SELECT 1 FROM (WITH v AS (SELECT 1) SELECT 1) q), r.rolname \
+             FROM pg_roles r, v",
+        ] {
+            assert!(!no_secret(q), "{q}");
+        }
+        assert!(no_secret(
+            "WITH v AS (SELECT 1 AS a) SELECT r.rolname FROM pg_roles r, (SELECT v.a FROM v) q"
+        ));
+        assert!(no_secret(
+            "SELECT r.rolname FROM pg_roles r, (WITH v AS (SELECT 1 AS a) SELECT v.a FROM v) q"
+        ));
         // `WITH ORDINALITY` defines no CTE.
         assert!(
             cte_defs(

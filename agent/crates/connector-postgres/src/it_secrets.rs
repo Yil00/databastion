@@ -1089,7 +1089,8 @@ const NOT_SECRET: [(&str, &str); 35] = [
     ("pg_catalog.pg_sequences.start_value", "a sequence bound"),
     (
         "pg_catalog.pg_trigger.tgargs",
-        "trigger arguments: code, as function bodies (ADR-0050 open question 10)",
+        "trigger arguments, readable by every role and able to carry a credential (a webhook \
+         key): left out with pg_proc.prosrc (ADR-0050 open question 10)",
     ),
 ];
 
