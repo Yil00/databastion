@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use databastion_classifiers::masking::ClientAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use super::js;
 use super::records::{
     Cmd, Failure, Filter, Kind, MAX_STAGES, Pipeline, Record, Shape, StageKind, address, bounded,
     code_of, millis_time, namespace,
@@ -84,6 +85,16 @@ fn let_in(var: &str, value: DocBuf, body: DocBuf) -> DocBuf {
         "$let",
         DocBuf::new()
             .doc("vars", DocBuf::new().doc(var, value))
+            .doc("in", body),
+    )
+}
+
+/// `{$let: {vars: {<var>: "<path>"}, in: <body>}}`.
+fn let_var(var: &str, path: &str, body: DocBuf) -> DocBuf {
+    DocBuf::new().doc(
+        "$let",
+        DocBuf::new()
+            .doc("vars", DocBuf::new().str(var, path))
             .doc("in", body),
     )
 }
@@ -189,6 +200,586 @@ fn odd_command(path: &str) -> DocBuf {
         DocBuf::new()
             .doc("0", present_not_object)
             .doc("1", truncated),
+    )
+}
+
+/// `{$in: [{$type: <x>}, ["object", "array"]]}`.
+fn is_container(x: &str) -> DocBuf {
+    DocBuf::new().list(
+        "$in",
+        DocBuf::new()
+            .doc("0", DocBuf::new().str("$type", x))
+            .list("1", list(&["object", "array"])),
+    )
+}
+
+/// `{$cond: [<array at x>, x, []]}`.
+fn array_or_empty(x: &str) -> DocBuf {
+    DocBuf::new().list(
+        "$cond",
+        DocBuf::new()
+            .doc("0", is_type(x, "array"))
+            .str("1", x)
+            .doc("2", DocBuf::new().list("$literal", DocBuf::new())),
+    )
+}
+
+/// `{$size: <pairs of x>} > 0` for an object or array `x`.
+fn non_empty(x: &str) -> DocBuf {
+    let size = |e: DocBuf| {
+        DocBuf::new().list(
+            "$gt",
+            DocBuf::new()
+                .doc("0", DocBuf::new().doc("$size", e))
+                .i32("1", 0),
+        )
+    };
+    DocBuf::new().list(
+        "$or",
+        DocBuf::new()
+            .doc(
+                "0",
+                size(DocBuf::new().doc("$objectToArray", object_or_empty(x))),
+            )
+            .doc("1", size(array_or_empty(x))),
+    )
+}
+
+/// `{$filter: {input: <input>, as: "y", cond: <container>}}`.
+fn containers(input: DocBuf) -> DocBuf {
+    containers_with(DocBuf::new().doc("input", input))
+}
+
+/// The same with an array literal of field paths.
+fn containers_of(paths: &[&str]) -> DocBuf {
+    containers_with(DocBuf::new().list("input", list(paths)))
+}
+
+fn containers_with(input: DocBuf) -> DocBuf {
+    DocBuf::new().doc(
+        "$filter",
+        input.str("as", "y").doc("cond", is_container("$$y")),
+    )
+}
+
+/// Arrays of `$$a` concatenated [`CHUNK`] at a time: one level of the
+/// flattening (a `$reduce` with `$concatArrays` alone copies its
+/// accumulator at each step, quadratic in the number of arrays).
+const CHUNK: i32 = 16;
+
+fn chunk(input: DocBuf) -> DocBuf {
+    let mut parts = DocBuf::new();
+    for j in 0..CHUNK {
+        parts = parts.doc(
+            &j.to_string(),
+            DocBuf::new().list(
+                "$ifNull",
+                DocBuf::new()
+                    .doc(
+                        "0",
+                        DocBuf::new().list(
+                            "$arrayElemAt",
+                            DocBuf::new().str("0", "$$a").doc(
+                                "1",
+                                DocBuf::new()
+                                    .list("$add", DocBuf::new().str("0", "$$i").i32("1", j)),
+                            ),
+                        ),
+                    )
+                    .doc("1", DocBuf::new().list("$literal", DocBuf::new())),
+            ),
+        );
+    }
+    let_in(
+        "a",
+        input,
+        DocBuf::new().doc(
+            "$map",
+            DocBuf::new()
+                .doc(
+                    "input",
+                    DocBuf::new().list(
+                        "$range",
+                        DocBuf::new()
+                            .i32("0", 0)
+                            .doc("1", DocBuf::new().str("$size", "$$a"))
+                            .i32("2", CHUNK),
+                    ),
+                )
+                .str("as", "i")
+                .doc("in", DocBuf::new().list("$concatArrays", parts)),
+        ),
+    )
+}
+
+/// An array of arrays flattened (two chunked levels, then a `$reduce`).
+fn flatten(input: DocBuf) -> DocBuf {
+    DocBuf::new().doc(
+        "$reduce",
+        DocBuf::new()
+            .doc("input", chunk(chunk(input)))
+            .doc(
+                "initialValue",
+                DocBuf::new().list("$literal", DocBuf::new()),
+            )
+            .doc(
+                "in",
+                DocBuf::new().list(
+                    "$concatArrays",
+                    DocBuf::new().str("0", "$$value").str("1", "$$this"),
+                ),
+            ),
+    )
+}
+
+/// Whether a key of an object of the frontier `f` names a JavaScript
+/// operator.
+fn js_key_in(f: &str) -> DocBuf {
+    let keys = DocBuf::new().doc(
+        "$map",
+        DocBuf::new()
+            .doc(
+                "input",
+                DocBuf::new().doc("$objectToArray", object_or_empty("$$x")),
+            )
+            .str("as", "q")
+            .doc(
+                "in",
+                DocBuf::new().list(
+                    "$or",
+                    DocBuf::new()
+                        .doc(
+                            "0",
+                            DocBuf::new().list(
+                                "$in",
+                                DocBuf::new()
+                                    .str("0", "$$q.k")
+                                    .doc("1", DocBuf::new().list("$literal", list(&js::JS_KEYS))),
+                            ),
+                        )
+                        // `$_internalJsEmit`, `$_internalJsReduce`, and any
+                        // other name with the prefix (a byte operator).
+                        .doc(
+                            "1",
+                            DocBuf::new().list(
+                                "$eq",
+                                DocBuf::new()
+                                    .doc(
+                                        "0",
+                                        DocBuf::new().list(
+                                            "$indexOfBytes",
+                                            DocBuf::new().str("0", "$$q.k").doc(
+                                                "1",
+                                                DocBuf::new()
+                                                    .str("$literal", js::JS_INTERNAL_PREFIX),
+                                            ),
+                                        ),
+                                    )
+                                    .i32("1", 0),
+                            ),
+                        ),
+                ),
+            ),
+    );
+    let any =
+        |input: DocBuf| DocBuf::new().list("$in", DocBuf::new().bool("0", true).doc("1", input));
+    any(DocBuf::new().doc(
+        "$map",
+        DocBuf::new()
+            .str("input", f)
+            .str("as", "x")
+            .doc("in", any(keys)),
+    ))
+}
+
+/// The containers one level below the frontier `f`: the values of its
+/// objects and the elements of its arrays that are objects or arrays.
+fn next_level(f: &str) -> DocBuf {
+    let children = containers(
+        DocBuf::new().list(
+            "$concatArrays",
+            DocBuf::new()
+                .doc(
+                    "0",
+                    DocBuf::new().doc(
+                        "$map",
+                        DocBuf::new()
+                            .doc(
+                                "input",
+                                DocBuf::new().doc("$objectToArray", object_or_empty("$$x")),
+                            )
+                            .str("as", "p")
+                            .str("in", "$$p.v"),
+                    ),
+                )
+                .doc("1", array_or_empty("$$x")),
+        ),
+    );
+    flatten(
+        DocBuf::new().doc(
+            "$map",
+            DocBuf::new()
+                .str("input", f)
+                .str("as", "x")
+                .doc("in", children),
+        ),
+    )
+}
+
+/// Whether the command documents of an entry run server-side JavaScript,
+/// computed on the server (ADR-0027 refinement of 2026-10-12; the file
+/// sources do the same in `audit::js`):
+///
+/// - a key `$where`, `$function` or `$accumulator`, or one starting with
+///   `$_internalJs`, at any depth below [`js::MAX_JS_DEPTH`] of `command`,
+///   `originatingCommand` or `resolvedViews` (a view's pipeline), walked
+///   level by level (a `$reduce` over the depths, so the expression itself
+///   stays shallow), or a non-empty object or array at that depth (fail
+///   closed);
+/// - these three fields larger than [`js::MAX_JS_BYTES`] together
+///   (`$bsonSize`): not walked (fail closed, bounded cost);
+/// - an `explain` of `mapReduce`;
+/// - a getMore (by `op` or by name) without an `originatingCommand`;
+/// - a command the server truncated (`{$truncated: "<text>"}`) whose text
+///   was cut (it ends with `...`, or its length is within 16 bytes of the
+///   51 200-byte cut), or whose whole text holds one of the names (or
+///   `$_internalJs`, `mapReduce`), or whose `$truncated` is not a string;
+///   only byte operators touch the text
+///   (`$indexOfBytes`, `$strLenBytes`: a cut can split a UTF-8 character,
+///   on which `$regexMatch` fails the whole `find`), and only a boolean
+///   crosses the wire;
+/// - a `command` or `originatingCommand` that is not an object.
+///
+/// An `insert` is never JavaScript (its documents are stored, not run):
+/// its first key is `insert`, or its truncated text starts with
+/// `{ insert: `.
+fn js_projection() -> DocBuf {
+    let roots = containers_of(&["$command", "$originatingCommand", "$resolvedViews"]);
+    let depth = i32::try_from(js::MAX_JS_DEPTH).unwrap_or(i32::MAX);
+    // One level: `h` once a key matched (then nothing more to walk), `f`
+    // the containers of the next level.
+    let step = let_var(
+        "s",
+        "$$value",
+        let_in(
+            "h",
+            DocBuf::new().list(
+                "$or",
+                DocBuf::new().str("0", "$$s.h").doc("1", js_key_in("$$s.f")),
+            ),
+            DocBuf::new().str("h", "$$h").doc(
+                "f",
+                DocBuf::new().list(
+                    "$cond",
+                    DocBuf::new()
+                        .str("0", "$$h")
+                        .doc("1", DocBuf::new().list("$literal", DocBuf::new()))
+                        .doc("2", next_level("$$s.f")),
+                ),
+            ),
+        ),
+    );
+    let walk = DocBuf::new().doc(
+        "$reduce",
+        DocBuf::new()
+            .doc(
+                "input",
+                DocBuf::new().list("$range", DocBuf::new().i32("0", 0).i32("1", depth)),
+            )
+            .doc(
+                "initialValue",
+                DocBuf::new().doc("f", roots).bool("h", false),
+            )
+            .doc("in", step),
+    );
+    let walked = let_in(
+        "w",
+        walk,
+        DocBuf::new().list(
+            "$or",
+            DocBuf::new().str("0", "$$w.h").doc(
+                "1",
+                DocBuf::new().list(
+                    "$in",
+                    DocBuf::new().bool("0", true).doc(
+                        "1",
+                        DocBuf::new().doc(
+                            "$map",
+                            DocBuf::new()
+                                .str("input", "$$w.f")
+                                .str("as", "y")
+                                .doc("in", non_empty("$$y")),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+    // `explain` of `mapReduce`.
+    let explain_mr = let_in(
+        "e",
+        first_pair(object_or_empty("$command")),
+        DocBuf::new().list(
+            "$and",
+            DocBuf::new()
+                .doc(
+                    "0",
+                    DocBuf::new().list("$eq", DocBuf::new().str("0", "$$e.k").str("1", "explain")),
+                )
+                .doc(
+                    "1",
+                    DocBuf::new().list(
+                        "$in",
+                        DocBuf::new()
+                            .doc(
+                                "0",
+                                let_path("m", first_pair(object_or_empty("$$e.v")), "$$m.k"),
+                            )
+                            .doc(
+                                "1",
+                                DocBuf::new().list("$literal", list(&["mapReduce", "mapreduce"])),
+                            ),
+                    ),
+                ),
+        ),
+    );
+    let not_object = |path: &str| {
+        DocBuf::new().list(
+            "$and",
+            DocBuf::new()
+                .doc(
+                    "0",
+                    DocBuf::new().list(
+                        "$ne",
+                        DocBuf::new()
+                            .doc("0", DocBuf::new().str("$type", path))
+                            .str("1", "missing"),
+                    ),
+                )
+                .doc(
+                    "1",
+                    DocBuf::new().list(
+                        "$ne",
+                        DocBuf::new()
+                            .doc("0", DocBuf::new().str("$type", path))
+                            .str("1", "object"),
+                    ),
+                ),
+        )
+    };
+    let any = |items: Vec<DocBuf>| {
+        let mut l = DocBuf::new();
+        for (i, d) in items.into_iter().enumerate() {
+            l = l.doc(&i.to_string(), d);
+        }
+        DocBuf::new().list("$or", l)
+    };
+    // A getMore (by `op` or by name) whose opening command is not shown:
+    // its cursor may run JavaScript.
+    let get_more_blind = DocBuf::new().list(
+        "$and",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list(
+                    "$or",
+                    DocBuf::new()
+                        .doc(
+                            "0",
+                            DocBuf::new()
+                                .list("$eq", DocBuf::new().str("0", "$op").str("1", "getmore")),
+                        )
+                        .doc(
+                            "1",
+                            DocBuf::new().list(
+                                "$eq",
+                                DocBuf::new()
+                                    .doc(
+                                        "0",
+                                        let_path(
+                                            "g",
+                                            first_pair(object_or_empty("$command")),
+                                            "$$g.k",
+                                        ),
+                                    )
+                                    .str("1", "getMore"),
+                            ),
+                        ),
+                ),
+            )
+            .doc(
+                "1",
+                DocBuf::new().list(
+                    "$ne",
+                    DocBuf::new()
+                        .doc("0", DocBuf::new().str("$type", "$originatingCommand"))
+                        .str("1", "object"),
+                ),
+            ),
+    );
+    let js_of = any(vec![
+        walked,
+        explain_mr,
+        get_more_blind,
+        truncated_js("$command"),
+        truncated_js("$originatingCommand"),
+        not_object("$command"),
+        not_object("$originatingCommand"),
+    ]);
+    // The fields walked, larger than the bound together: JavaScript,
+    // without being walked (the cost per entry is bounded).
+    let oversized = DocBuf::new().list(
+        "$gt",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().doc(
+                    "$bsonSize",
+                    DocBuf::new()
+                        .str("c", "$command")
+                        .str("o", "$originatingCommand")
+                        .str("r", "$resolvedViews"),
+                ),
+            )
+            .i64("1", i64::try_from(js::MAX_JS_BYTES).unwrap_or(i64::MAX)),
+    );
+    let js_of = DocBuf::new().list(
+        "$cond",
+        DocBuf::new()
+            .doc("0", oversized)
+            .bool("1", true)
+            .doc("2", js_of),
+    );
+    // An insert: never JavaScript.
+    let insert = DocBuf::new().list(
+        "$eq",
+        DocBuf::new()
+            .doc(
+                "0",
+                let_path("f", first_pair(object_or_empty("$command")), "$$f.k"),
+            )
+            .str("1", "insert"),
+    );
+    DocBuf::new().list(
+        "$cond",
+        DocBuf::new()
+            .doc("0", insert)
+            .bool("1", false)
+            .doc("2", js_of),
+    )
+}
+
+/// Length at which the server cuts a profiled command's text (50 KiB).
+const TRUNCATED_TEXT_BYTES: i32 = 51_200;
+
+/// Whether the command at `path` is truncated in a way that may hide
+/// JavaScript (see [`js_projection`]).
+fn truncated_js(path: &str) -> DocBuf {
+    let text = DocBuf::new().doc(
+        "$getField",
+        DocBuf::new()
+            .doc("field", DocBuf::new().str("$literal", "$truncated"))
+            .doc("input", object_or_empty(path)),
+    );
+    let found = |needle: &str| {
+        DocBuf::new().list(
+            "$gte",
+            DocBuf::new()
+                .doc(
+                    "0",
+                    DocBuf::new().list(
+                        "$indexOfBytes",
+                        DocBuf::new()
+                            .str("0", "$$t")
+                            .doc("1", DocBuf::new().str("$literal", needle)),
+                    ),
+                )
+                .i32("1", 0),
+        )
+    };
+    // Cut: the text ends with `...` (the server overwrites its last three
+    // bytes when it cuts it).
+    let cut = DocBuf::new().list(
+        "$gte",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list(
+                    "$indexOfBytes",
+                    DocBuf::new().str("0", "$$t").str("1", "...").doc(
+                        "2",
+                        DocBuf::new().list(
+                            "$max",
+                            DocBuf::new().i32("0", 0).doc(
+                                "1",
+                                DocBuf::new().list(
+                                    "$subtract",
+                                    DocBuf::new()
+                                        .doc("0", DocBuf::new().str("$strLenBytes", "$$t"))
+                                        .i32("1", 3),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            .i32("1", 0),
+    );
+    // Backstop: a text within 16 bytes of the cut length (51 200 bytes),
+    // whatever its end.
+    let near_cut = DocBuf::new().list(
+        "$gte",
+        DocBuf::new()
+            .doc("0", DocBuf::new().str("$strLenBytes", "$$t"))
+            .i32("1", TRUNCATED_TEXT_BYTES - 16),
+    );
+    let mut named = DocBuf::new().doc("0", cut).doc("1", near_cut);
+    for (i, needle) in js::JS_KEYS
+        .iter()
+        .chain([js::JS_INTERNAL_PREFIX, "mapReduce", "mapreduce"].iter())
+        .enumerate()
+    {
+        named = named.doc(&(i + 2).to_string(), found(needle));
+    }
+    let insert = DocBuf::new().list(
+        "$eq",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list(
+                    "$indexOfBytes",
+                    DocBuf::new().str("0", "$$t").str("1", "{ insert: "),
+                ),
+            )
+            .i32("1", 0),
+    );
+    let string = DocBuf::new().list(
+        "$and",
+        DocBuf::new()
+            .doc(
+                "0",
+                DocBuf::new().list("$not", DocBuf::new().doc("0", insert)),
+            )
+            .doc("1", DocBuf::new().list("$or", named)),
+    );
+    let_in(
+        "t",
+        text,
+        DocBuf::new().list(
+            "$cond",
+            DocBuf::new()
+                .doc("0", is_type("$$t", "string"))
+                .doc("1", string)
+                .doc(
+                    "2",
+                    DocBuf::new().list(
+                        "$ne",
+                        DocBuf::new()
+                            .doc("0", DocBuf::new().str("$type", "$$t"))
+                            .str("1", "missing"),
+                    ),
+                ),
+        ),
     )
 }
 
@@ -323,6 +914,7 @@ pub(crate) fn projection() -> DocBuf {
     );
     p.doc("cmd", cmd)
         .doc("tr", tr)
+        .doc("js", js_projection())
         .doc("kp", kp)
         .doc("fk", fk)
         .doc("lim", lim)
@@ -481,6 +1073,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
     // Truncated (or not an object): the shape is unknown.
     let odd = doc.flag("tr")?.unwrap_or(false);
     let key_probe = doc.flag("kp")?.unwrap_or(false);
+    // Server-side JavaScript, computed by the projection; an entry without
+    // the flag (or with a flag that is not a boolean) fails closed.
+    let js = !matches!(doc.get("js")?, Some(Value::Bool(false)));
     let written = [
         count(doc, "ninserted")?,
         count(doc, "nModified")?,
@@ -512,6 +1107,9 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
             // Its failure may show the values read (security review of
             // #197, L1): a read of unknown shape too.
             _ if odd && failure == Some(Failure::Telling) => Cmd::Find,
+            // Another command that runs JavaScript (an `explain`), or one
+            // cut where JavaScript may be: a read of unknown shape.
+            _ if js => Cmd::Find,
             _ => Cmd::Other,
         },
         _ => Cmd::Other,
@@ -531,6 +1129,7 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
         .and_then(address)
         .map(|(ip, _)| ClientAddr::Ip(ip));
     r.failure = failure;
+    r.js = js;
     r.rows = match cmd {
         Cmd::Insert | Cmd::Update | Cmd::Delete | Cmd::FindAndModify | Cmd::BulkWrite => written
             .iter()
@@ -571,12 +1170,11 @@ pub(crate) fn record_of(doc: &Doc<'_>) -> Result<Option<(i64, Record)>, Malforme
             None => None,
         },
     };
-    if odd {
-        r.shape = Shape {
-            filter: Filter::Unknown,
-            limit: None,
-            pipeline: None,
-        };
+    // Truncated, or not a command of a known name: the shape is unknown.
+    let named =
+        op != "command" || string(doc, "cmd")?.is_some_and(|c| Cmd::from_name(&c) != Cmd::Other);
+    if odd || !named {
+        r.shape = Shape::UNKNOWN;
     }
     if cmd == Cmd::GetMore {
         // The projection took the opening command's shape.
@@ -776,6 +1374,7 @@ mod tests {
         let entry = |kp: Option<bool>| {
             let mut d = DocBuf::new()
                 .date("ts", 5)
+                .bool("js", false)
                 .str("op", "command")
                 .str("ns", "app.customers")
                 .i32("nreturned", 1)
@@ -833,6 +1432,7 @@ mod tests {
         let entry = |op: &str, cmd: Option<&str>, tr: bool| {
             let mut d = DocBuf::new()
                 .date("ts", 5)
+                .bool("js", false)
                 .str("op", op)
                 .str("ns", "app.customers")
                 .i32("nreturned", 20_000)
@@ -883,6 +1483,7 @@ mod tests {
         // A truncated command that did nothing: no event.
         let nothing = DocBuf::new()
             .date("ts", 5)
+            .bool("js", false)
             .str("op", "command")
             .str("cmd", "$truncated")
             .bool("tr", true)
@@ -899,6 +1500,7 @@ mod tests {
         let with = |f: fn(DocBuf) -> DocBuf| {
             let entry = DocBuf::new()
                 .date("ts", 5)
+                .bool("js", false)
                 .str("op", "command")
                 .str("cmd", "find")
                 .str("ns", "app.customers")
@@ -933,6 +1535,7 @@ mod tests {
         let cut = |code: i32| {
             DocBuf::new()
                 .date("ts", 5)
+                .bool("js", false)
                 .str("op", "command")
                 .str("cmd", "$truncated")
                 .str("ns", "app.customers")
@@ -956,6 +1559,7 @@ mod tests {
     fn entries_become_records() {
         let bytes = DocBuf::new()
             .date("ts", 1_790_676_000_000)
+            .bool("js", false)
             .str("op", "query")
             .str("ns", "app.customers")
             .i32("nreturned", 150)
@@ -976,6 +1580,7 @@ mod tests {
         assert_eq!(r.user.as_ref().map(|u| u.as_str()), Some("alice@admin"));
         let bytes = DocBuf::new()
             .date("ts", 1)
+            .bool("js", false)
             .str("op", "command")
             .str("ns", "app.customers")
             .str("cmd", "aggregate")
@@ -988,6 +1593,7 @@ mod tests {
         assert!(!r.shape.pipeline.unwrap().pass_through);
         let bytes = DocBuf::new()
             .date("ts", 1)
+            .bool("js", false)
             .str("op", "getmore")
             .str("ns", "app.customers")
             .i32("fk", 0)
@@ -1054,5 +1660,108 @@ mod tests {
             })
             .collect();
         assert!(encode_cursors(&cursors).unwrap().len() <= 64 * 1024);
+    }
+
+    /// The deepest container of a BSON document (the document is 0), and
+    /// whether a key names a JavaScript operator.
+    fn depth_and_js_keys(d: Doc<'_>, level: usize) -> (usize, bool) {
+        let mut deepest = level;
+        let mut js_key = false;
+        for e in d.iter() {
+            let (k, v) = e.unwrap();
+            js_key |= js::JS_KEYS.iter().any(|n| n.as_bytes() == k);
+            if let Value::Doc(d) | Value::Array(d) = v {
+                let (n, j) = depth_and_js_keys(d, level + 1);
+                deepest = deepest.max(n);
+                js_key |= j;
+            }
+        }
+        (deepest, js_key)
+    }
+
+    /// The agent's own polls are profiled too: their command must never
+    /// look like JavaScript to the projection (no operator name as a key,
+    /// shallower than the bound), or every poll would be reported.
+    #[test]
+    fn the_poll_command_never_looks_like_javascript() {
+        for cmd in [poll_command(&DbCursor::after(5)), newest_command()] {
+            let bytes = cmd.finish();
+            let (depth, js_key) = depth_and_js_keys(Doc::new(&bytes).unwrap(), 0);
+            assert!(!js_key);
+            assert!(depth + 8 < js::MAX_JS_DEPTH, "{depth}");
+        }
+        // The walk covers the bound, and the truncated text is only ever
+        // touched by byte operators (`$regexMatch` fails on a cut UTF-8
+        // character, which would fail the whole poll).
+        let p = projection().finish();
+        let js = Doc::new(&p).unwrap().doc("js").unwrap().unwrap();
+        let text = doc_text(js.as_bytes());
+        assert!(text.contains("$indexOfBytes") && text.contains("$strLenBytes"));
+        assert!(!text.contains("$regex"));
+        assert!(text.contains("$range") && text.contains("$reduce"));
+        assert!(text.contains("$literal$truncated"));
+        let range = String::from_utf8_lossy(js.as_bytes()).into_owned();
+        assert!(range.contains("$where") && range.contains("$accumulator"));
+    }
+
+    fn js_entry(op: &str, cmd: &str, js: Option<bool>) -> Vec<u8> {
+        let mut d = DocBuf::new()
+            .date("ts", 5)
+            .str("op", op)
+            .str("ns", "app.customers")
+            .i32("nreturned", 0)
+            .str("user", "alice@admin")
+            .str("cmd", cmd)
+            .i32("fk", 0)
+            .null("lim")
+            .null("st")
+            .bool("tr", false);
+        if let Some(js) = js {
+            d = d.bool("js", js);
+        }
+        d.finish()
+    }
+
+    fn rec(bytes: &[u8]) -> Record {
+        record_of(&Doc::new(bytes).unwrap()).unwrap().unwrap().1
+    }
+
+    /// The projection's `js` flag on the record; an entry without it (or
+    /// with a flag that is not a boolean) fails closed; a command of
+    /// another name that runs JavaScript (an `explain`) is a read of
+    /// unknown shape.
+    #[test]
+    fn the_javascript_flag_reaches_the_record() {
+        let r = rec(&js_entry("query", "find", Some(true)));
+        assert!(r.js);
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert_eq!(r.shape.filter, Filter::Keys(0));
+        assert!(!rec(&js_entry("query", "find", Some(false))).js);
+        assert!(rec(&js_entry("query", "find", None)).js);
+        let odd = DocBuf::new()
+            .date("ts", 5)
+            .str("op", "query")
+            .str("ns", "app.customers")
+            .i32("js", 0)
+            .finish();
+        assert!(rec(&odd).js);
+        let r = rec(&js_entry("command", "explain", Some(true)));
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert!(r.js);
+        assert_eq!(r.shape, Shape::UNKNOWN);
+        assert_eq!(
+            rec(&js_entry("command", "explain", Some(false))).kind,
+            Kind::Op(Cmd::Other)
+        );
+        // A truncated command whose name was cut, flagged (a key could
+        // have been cut): a read of unknown shape.
+        let r = rec(&js_entry("command", "$truncated", Some(true)));
+        assert_eq!(r.kind, Kind::Op(Cmd::Find));
+        assert_eq!(r.shape, Shape::UNKNOWN);
+        // `$out` aggregations are profiled with `op: insert`: the flag
+        // comes from the command, not the `op`.
+        let r = rec(&js_entry("insert", "aggregate", Some(true)));
+        assert_eq!(r.kind, Kind::Op(Cmd::Insert));
+        assert!(r.js);
     }
 }

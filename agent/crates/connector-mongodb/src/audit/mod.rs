@@ -24,6 +24,7 @@
 //! - Delivery is at most once, as for the other connectors.
 
 pub(crate) mod events;
+pub(crate) mod js;
 pub(crate) mod profiler;
 pub(crate) mod records;
 

@@ -276,6 +276,16 @@ pub(crate) struct Shape {
     pub(crate) pipeline: Option<Pipeline>,
 }
 
+impl Shape {
+    /// The shape of a command whose shape is not known (a command of
+    /// another name that runs JavaScript, a truncated one).
+    pub(crate) const UNKNOWN: Self = Self {
+        filter: Filter::Unknown,
+        limit: None,
+        pipeline: None,
+    };
+}
+
 /// Which connection a record belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConnId {
@@ -322,6 +332,11 @@ pub(crate) struct Record {
     pub(crate) origin: Option<Shape>,
     /// The server's own activity (internal thread, system user).
     pub(crate) system: bool,
+    /// The operation runs server-side JavaScript (`$where`, `$function`,
+    /// `$accumulator` at any depth of its command documents, fail closed
+    /// beyond the depth bound or when the server cut a key; `audit::js`,
+    /// the profiler projection): always reported, never the agent's own.
+    pub(crate) js: bool,
 }
 
 impl fmt::Debug for Record {
@@ -332,6 +347,7 @@ impl fmt::Debug for Record {
             .field("rows", &self.rows)
             .field("failure", &self.failure)
             .field("shape", &self.shape)
+            .field("js", &self.js)
             .finish_non_exhaustive()
     }
 }
@@ -356,6 +372,7 @@ impl Record {
             shape: Shape::default(),
             origin: None,
             system: false,
+            js: false,
         }
     }
 }
@@ -1210,17 +1227,25 @@ pub(crate) fn parse_audit_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             let line: AuthCheckLine = serde_json::from_slice(bytes).map_err(|_| ())?;
             let cmd = Cmd::from_name(&line.param.command);
             // DDL and DCL come from their own records (decision 4).
-            if matches!(cmd, Cmd::Ddl | Cmd::Dcl | Cmd::Other) {
+            if matches!(cmd, Cmd::Ddl | Cmd::Dcl) {
                 return Ok(None);
             }
+            // An insert's documents are stored, never run.
+            let js = cmd != Cmd::Insert && super::js::audit_log_runs_js(bytes);
+            // Another command that runs JavaScript (an `explain`): a read
+            // of unknown shape.
+            let (cmd, shape) = match (cmd, line.param.args) {
+                (Cmd::Other, _) if !js => return Ok(None),
+                (Cmd::Other, _) => (Cmd::Find, Shape::UNKNOWN),
+                (cmd, args) => (cmd, args.map(|a| a.shape).unwrap_or_default()),
+            };
             let mut r = base(Kind::Op(cmd));
             r.ns = match line.param.ns.as_deref() {
                 Some(ns) => Some(namespace(ns).ok_or(())?),
                 None => None,
             };
-            if let Some(args) = line.param.args {
-                r.shape = args.shape;
-            }
+            r.shape = shape;
+            r.js = js;
             Some(r)
         }
         "authenticate" => {
@@ -1523,10 +1548,20 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
                 return Ok(None);
             };
             let cmd = command.cmd.unwrap_or(Cmd::Other);
-            if cmd == Cmd::Other {
-                return Ok(None);
-            }
+            // An insert's documents are stored, never run.
+            let js = cmd != Cmd::Insert && super::js::server_log_runs_js(bytes)
+                // A getMore whose opening command is not shown: its
+                // cursor may run JavaScript (fail closed).
+                || (cmd == Cmd::GetMore && a.origin.is_none());
+            // Another command that runs JavaScript (an `explain`): a read
+            // of unknown shape.
+            let (cmd, shape) = match cmd {
+                Cmd::Other if !js => return Ok(None),
+                Cmd::Other => (Cmd::Find, Shape::UNKNOWN),
+                cmd => (cmd, command.shape),
+            };
             let mut r = base(Kind::Op(cmd));
+            r.js = js;
             r.ns = match a.ns.as_deref() {
                 Some(ns) => Some(namespace(ns).ok_or(())?),
                 None => None,
@@ -1535,7 +1570,7 @@ pub(crate) fn parse_server_log(bytes: &[u8]) -> Result<Option<Record>, ()> {
             // record (an application name with a NUL must not hide it).
             r.app = a.app.as_deref().and_then(bounded);
             r.client = client_of(a.remote.as_deref());
-            r.shape = command.shape;
+            r.shape = shape;
             r.origin = a.origin.map(|o| o.shape);
             r.rows = if matches!(
                 cmd,
