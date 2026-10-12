@@ -44,6 +44,11 @@ Breaking one of the security invariants I1 to I5 is a vulnerability: report it p
 
 Also particularly sensitive: bypassing agent or console authentication, tampering with the console audit log or the agent-integrity alerts, and agent privilege escalation on the monitored databases.
 
+## Known issues
+Known defects of the supported `0.6.x` line, with their workaround, until a release fixes them.
+
+- **PostgreSQL Audit at Full does not report failed or cancelled reads.** PostgreSQL Audit at Full (`pgaudit.log_rows = on`) does not report a read that ends in an error or is cancelled, including a read that already streamed rows to the client, a client cancel, a statement timeout and a connection lost mid-result, from any role; this affects 0.4.0 and later. Workaround: set `pgaudit.log_rows = off` (the target then shows Partial, and such reads are reported without row counts). The fix is planned for the next release ([ADR-0037 refinement of 2026-10-12](docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements); [docs/08](docs/08-engine-capabilities.md#known-limits)).
+
 ## Known limitations and residual risks
 These are known and documented; reporting them again is not needed, but a way to go beyond what is described is a vulnerability. Details are in [docs/05-security.md](docs/05-security.md), [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md) and the linked ADRs; the release notes list them under "Known limitations" ([CHANGELOG.md](CHANGELOG.md)).
 

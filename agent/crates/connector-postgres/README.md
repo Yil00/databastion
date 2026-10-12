@@ -180,8 +180,8 @@ load otherwise), so a server-wide load is the normal case.
   database with `citext`, `hstore` and 3 000 relations, server facts,
   list drift). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#user-code-next-to-catalogs).
-- **Statements that wrap a query** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md#refinement-2026-10-12-proposed-statements-that-wrap-a-query),
-  refinement of 2026-10-12, proposed). `EXPLAIN [ANALYZE]`, `DECLARE …
+- **Statements that wrap a query** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md#refinement-2026-10-12-accepted-statements-that-wrap-a-query),
+  refinement of 2026-10-12, accepted). `EXPLAIN [ANALYZE]`, `DECLARE …
   CURSOR … FOR` and `PREPARE … AS` (`classifiers::query::PgWrapped`, on
   `StatementInfo::pg_wrapped`) are their query: its relations, with every
   rule a bare query has (catalogs, statistics relations, statement-text
@@ -219,8 +219,8 @@ load otherwise), so a server-wide load is the normal case.
   only. With `log_rows = off` the record is written when the statement
   starts, and the failed read is reported (operators who need these
   reads reported set `log_rows = off`, at Partial). `pg_stat_statements` counts
-  no failed statement. Proposed fix (SQLSTATE classes, never the
-  message): [ADR-0037 refinement of 2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-proposed-failed-and-cancelled-statements).
+  no failed statement. Decided fix (SQLSTATE classes, never the
+  message, accepted on 2026-10-12, a release gate for the next release): [ADR-0037 refinement of 2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements).
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first
