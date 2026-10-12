@@ -264,7 +264,7 @@ load otherwise), so a server-wide load is the normal case.
     statement text is a read of `*`; a `FATAL` line without one ends an
     idle session and gives none where the stream's probe proved the log
     settings for its database (`Catalogs::error_lines_proven`), a read of
-    `*` elsewhere (proposed item 9 of the ADR).
+    `*` elsewhere (item 9 of the ADR).
   - **Not twice:** a line is not reported when its session's last
     pgaudit record has the same text, the same virtual transaction and no
     row count (written at the statement's start, `log_rows = off`); texts
