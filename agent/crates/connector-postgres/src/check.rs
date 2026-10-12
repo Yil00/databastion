@@ -316,6 +316,10 @@ pub(crate) struct CheckState {
     /// Per target: when its `pg_stat_statements` streams ran (ADR-0049
     /// decision 5).
     pss_periods: Mutex<HashMap<String, crate::audit::events::SharedPssPeriods>>,
+    /// Per target: the collision probes of its databases (ADR-0049
+    /// decision 8), stored by `check()`, read and marked stale by the
+    /// Audit streams.
+    user_code: Mutex<HashMap<String, crate::audit::user_code::SharedUserCode>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -389,6 +393,18 @@ impl CheckState {
     pub(crate) fn pss_periods(&self, target_id: &str) -> crate::audit::events::SharedPssPeriods {
         std::sync::Arc::clone(
             self.pss_periods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The collision probes of `target_id`'s databases, kept for the life
+    /// of the connector (in memory only).
+    pub(crate) fn user_code(&self, target_id: &str) -> crate::audit::user_code::SharedUserCode {
+        std::sync::Arc::clone(
+            self.user_code
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .entry(target_id.to_owned())
@@ -597,6 +613,49 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 codes.add(guard_not_evaluated_note());
             }
         }
+        // ADR-0049 decision 8: the collision probe of this database, at
+        // every heartbeat (names kept in memory only, never logged).
+        let started = Instant::now();
+        let names = match user_code_probe(&session, timeouts).await {
+            Ok(Some(names)) => Some(names),
+            Ok(None) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    "user code collision probe cut at its row bound (or a name not UTF-8): \
+                     catalog-only statements with unqualified calls, operators or casts are \
+                     reported as reads of * in this database"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    stage = e.stage.as_str(),
+                    sqlstate = e.sqlstate(),
+                    "user code collision probe failed: catalog-only statements with \
+                     unqualified calls, operators or casts are reported as reads of * in this \
+                     database"
+                );
+                if e.fatal {
+                    crate::audit::user_code::lock(&state.user_code(&target.id)).store(
+                        database,
+                        started,
+                        session.server_version_num(),
+                        None,
+                    );
+                    return unreachable(&e);
+                }
+                None
+            }
+        };
+        crate::audit::user_code::lock(&state.user_code(&target.id)).store(
+            database,
+            started,
+            session.server_version_num(),
+            names,
+        );
         level = level.max(probe.level(log_readable));
         stats_reader |= probe.stats_visible;
         if probe.reads_without_row_counts() {
@@ -1061,6 +1120,28 @@ pub(crate) async fn cas_guard_readable(
         readable: count,
         complete,
     })
+}
+
+/// The collision probe of ADR-0049 decision 8 in the session's database
+/// (`sql::USER_CODE_PROBE`): `Ok(None)` when cut at its row bound or when a
+/// name is not UTF-8 (fail closed).
+pub(crate) async fn user_code_probe(
+    session: &Session,
+    timeouts: Timeouts,
+) -> Result<Option<crate::audit::user_code::ProbeNames>, PgError> {
+    let rows = probe(session, timeouts, sql::USER_CODE_PROBE).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Check);
+        let (Some(kind), Some(name)) = (
+            crate::wire::catalog_text(r, 0).map_err(get)?,
+            crate::wire::catalog_text(r, 1).map_err(get)?,
+        ) else {
+            return Ok(None);
+        };
+        out.push((kind, name));
+    }
+    Ok(crate::audit::user_code::ProbeNames::from_rows(out))
 }
 
 /// Runs one statement in its own read-only transaction (a failing probe

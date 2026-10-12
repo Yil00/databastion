@@ -35,6 +35,8 @@ mod wire;
 mod it;
 #[cfg(test)]
 mod it_cas_guard;
+#[cfg(test)]
+mod it_user_code;
 
 use async_trait::async_trait;
 use databastion_core::config::TargetConfig;

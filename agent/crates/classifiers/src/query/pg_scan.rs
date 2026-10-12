@@ -66,11 +66,11 @@ pub struct PgNameUse {
 
 /// A name with its token range.
 #[derive(Clone)]
-struct NameAt {
-    name: RelationName,
-    call: bool,
-    start: usize,
-    end: usize,
+pub(super) struct NameAt {
+    pub(super) name: RelationName,
+    pub(super) call: bool,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 /// A `FROM` item of a segment.
@@ -84,9 +84,9 @@ struct FromItem {
 }
 
 /// One token sequence: the text, or the body of its `DO` block.
-struct Segment {
-    tokens: Vec<Tok>,
-    names: Vec<NameAt>,
+pub(super) struct Segment {
+    pub(super) tokens: Vec<Tok>,
+    pub(super) names: Vec<NameAt>,
     items: Vec<FromItem>,
     /// Aliases of parenthesized joins (`(a JOIN b ON …) AS j`): a whole-row
     /// reference to one reads every column of the joined items.
@@ -95,12 +95,14 @@ struct Segment {
     /// subquery) is followed by `(`: a column alias list, whatever the
     /// alias's word (security review H1).
     column_list: bool,
+    /// Token index of every alias the `FROM` parser recorded.
+    pub(super) aliases: Vec<usize>,
 }
 
 /// The scan of a PostgreSQL text ([`pg_scan`]). Holds identifier tokens
 /// only (no literal, no comment); its `Debug` prints nothing of them.
 pub struct PgScan {
-    segments: Vec<Segment>,
+    pub(super) segments: Vec<Segment>,
 }
 
 impl fmt::Debug for PgScan {
@@ -126,13 +128,14 @@ pub fn pg_scan(text: &str) -> Option<PgScan> {
     let mut segments = Vec::with_capacity(1 + bodies.len());
     for t in std::iter::once(tokens).chain(bodies) {
         let names = names_of(&t);
-        let (items, join_aliases, column_list) = from_items(&t, &names);
+        let (items, join_aliases, column_list, aliases) = from_items(&t, &names);
         segments.push(Segment {
             tokens: t,
             names,
             items,
             join_aliases,
             column_list,
+            aliases,
         });
     }
     Some(PgScan { segments })
@@ -205,7 +208,7 @@ impl PgScan {
 }
 
 /// The name of an identifier token (folded or decoded).
-fn ident(t: Option<&Tok>) -> Option<&str> {
+pub(super) fn ident(t: Option<&Tok>) -> Option<&str> {
     match t {
         Some(Tok::Word(w) | Tok::Quoted(w)) => Some(w.as_str()),
         _ => None,
@@ -377,7 +380,7 @@ fn listed_columns(s: &[Tok], alias: Option<usize>) -> bool {
 /// The `FROM` items of `s`, the aliases of its parenthesized joins, and
 /// whether a recorded alias has a column alias list (one on a subquery of
 /// constant `VALUES` rows excepted, ADR-0049 refinement of 2026-10-11).
-fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) {
+fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool, Vec<usize>) {
     let by_start: HashMap<usize, usize> = names
         .iter()
         .enumerate()
@@ -386,6 +389,8 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) 
     let mut items: Vec<FromItem> = Vec::new();
     let mut joins: Vec<usize> = Vec::new();
     let mut column_list = false;
+    // Every alias the parser recorded (of an item, a join or a subquery).
+    let mut aliases: Vec<usize> = Vec::new();
     let mut frames = vec![Frame {
         open: Open::Group,
         in_from: false,
@@ -463,6 +468,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) 
                 } else {
                     let (alias, next) = alias_at(s, n.end);
                     column_list |= listed_columns(s, alias);
+                    aliases.extend(alias);
                     items[idx].alias = alias;
                     i = next;
                 }
@@ -503,6 +509,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) 
                         After::Items(v) => {
                             let (alias, next) = alias_at(s, i);
                             column_list |= listed_columns(s, alias);
+                            aliases.extend(alias);
                             for k in v {
                                 items[k].alias = alias;
                             }
@@ -511,11 +518,13 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) 
                         After::Join => {
                             let (alias, next) = alias_at(s, i);
                             column_list |= listed_columns(s, alias);
+                            aliases.extend(alias);
                             joins.extend(alias);
                             i = next;
                         }
                         After::Subquery => {
                             let (alias, next) = alias_at(s, i);
+                            aliases.extend(alias);
                             column_list |=
                                 listed_columns(s, alias) && !constant_values(s, f.start, i - 1);
                             i = next;
@@ -565,7 +574,7 @@ fn from_items(s: &[Tok], names: &[NameAt]) -> (Vec<FromItem>, Vec<usize>, bool) 
             _ => i += 1,
         }
     }
-    (items, joins, column_list)
+    (items, joins, column_list, aliases)
 }
 
 /// Keywords after which `<name> (` is a call, not an alias with a column
@@ -742,7 +751,7 @@ fn open_of(s: &[Tok], close: usize) -> Option<usize> {
 }
 
 /// Index after the `)` matching the `(` at `open`.
-fn close_of(s: &[Tok], open: usize) -> usize {
+pub(super) fn close_of(s: &[Tok], open: usize) -> usize {
     let mut depth = 0usize;
     for (j, t) in s.iter().enumerate().skip(open) {
         match t {

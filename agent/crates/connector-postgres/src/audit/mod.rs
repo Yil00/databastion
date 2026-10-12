@@ -20,9 +20,11 @@
 //!   to the core, which aggregates them for up to `aggregation_window_s`
 //!   before spooling; an agent crash in that window loses those events.
 
+pub(crate) mod builtins;
 pub(crate) mod events;
 pub(crate) mod pss;
 pub(crate) mod records;
+pub(crate) mod user_code;
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -104,6 +106,18 @@ fn own_account(
     PgOwn::new(core, state.own_statements(&target.id)).with_periods(state.pss_periods(&target.id))
 }
 
+/// The catalog facts of the stream: the probe's per-database facts and the
+/// target's collision probes of `check()` (ADR-0049 decision 8).
+fn catalogs_of(
+    pre: &check::Prerequisites,
+    state: &CheckState,
+    target_id: &str,
+) -> events::Catalogs {
+    pre.catalogs
+        .clone()
+        .with_user_code(user_code::UserCodeHandle::new(state.user_code(target_id)))
+}
+
 /// State kept across source re-evaluations.
 struct PgauditState {
     tailer: Option<Tailer>,
@@ -167,7 +181,8 @@ pub(crate) async fn audit_stream(
                         })
                     }
                 };
-                st.builder.set_catalogs(pre.catalogs.clone());
+                st.builder
+                    .set_catalogs(catalogs_of(&pre, state, &target.id));
                 if let Err(kind) = pgaudit_run(cfg, target, sink, state, st, &pre.severity).await? {
                     tracing::warn!(
                         target_id = %target.id,
@@ -206,7 +221,7 @@ pub(crate) async fn audit_stream(
                     pss_session = Some(conn);
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
-                    poller.set_catalogs(pre.catalogs.clone());
+                    poller.set_catalogs(catalogs_of(&pre, state, &target.id));
                     pss_run(cfg, target, sink, session, poller, timeouts).await?;
                 }
             }

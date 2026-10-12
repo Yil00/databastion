@@ -73,7 +73,9 @@ use zeroize::Zeroizing;
 
 use crate::names;
 
+mod pg_code;
 mod pg_scan;
+pub use pg_code::{MAX_CODE_NAMES, PgCode, PgCodeName, PgOperatorUse};
 pub use pg_scan::{PgItemClass, PgListed, PgNameUse, PgScan, pg_scan};
 
 /// Largest statement text analyzed, in bytes. Longer text is not lexed.
@@ -1559,7 +1561,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map_or(StatementKind::Other, |s| first_kind(s));
     let mut relations = Vec::new();
     for s in &statements {
-        collect_relations(s, &mut relations);
+        collect_relations(s, &mut relations, true);
     }
     let mut parts: Vec<StatementInfo> = statements
         .iter()
@@ -3747,10 +3749,89 @@ fn push_relation(parts: Vec<String>, out: &mut Vec<RelationName>) {
     }
 }
 
-/// Names of the CTEs defined by a statement (never reported as relations).
-fn cte_names(s: &[Tok]) -> Vec<String> {
-    let mut out = Vec::new();
+/// PostgreSQL: where the query of a statement that wraps one starts
+/// (`EXPLAIN [ANALYZE] [VERBOSE] [(…)]`, `PREPARE p [(types)] AS`,
+/// `DECLARE c … FOR`, `CREATE … TABLE / MATERIALIZED VIEW … AS`, as
+/// `pg_code`'s scope does: ADR-0049, re-review of #211, R-M1), so that
+/// its common table expressions are recognized as for a bare query.
+/// Leading `(` skipped; the statement's own start otherwise.
+fn pg_wrapped_start(s: &[Tok]) -> usize {
     let mut i = 0;
+    for _ in 0..8 {
+        while is_punct(s.get(i), "(") {
+            i += 1;
+        }
+        let top = |from: usize, pick: &dyn Fn(usize) -> bool| -> Option<usize> {
+            let mut d = 0usize;
+            for (k, t) in s.iter().enumerate().skip(from) {
+                match t {
+                    Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+                    Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+                    _ if d == 0 && pick(k) => return Some(k),
+                    _ => {}
+                }
+            }
+            None
+        };
+        let next = match word(s.get(i)) {
+            Some("explain") => {
+                let mut j = i + 1;
+                while matches!(word(s.get(j)), Some("analyze" | "analyse" | "verbose")) {
+                    j += 1;
+                }
+                if is_punct(s.get(j), "(") {
+                    let mut d = 0usize;
+                    while j < s.len() {
+                        match &s[j] {
+                            Tok::Punct(p) if p == "(" => d += 1,
+                            Tok::Punct(p) if p == ")" => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                Some(j)
+            }
+            Some("prepare") => top(i + 1, &|k| word(s.get(k)) == Some("as")).map(|k| k + 1),
+            Some("declare") => top(i + 1, &|k| word(s.get(k)) == Some("for")).map(|k| k + 1),
+            Some("create")
+                if s.iter()
+                    .skip(i)
+                    .take(8)
+                    .any(|t| matches!(word(Some(t)), Some("table" | "materialized"))) =>
+            {
+                top(i + 1, &|k| {
+                    word(s.get(k)) == Some("as")
+                        && (is_punct(s.get(k + 1), "(")
+                            || matches!(
+                                word(s.get(k + 1)),
+                                Some("select" | "with" | "values" | "table" | "execute")
+                            ))
+                })
+                .map(|k| k + 1)
+            }
+            _ => None,
+        };
+        match next {
+            Some(j) if j < s.len() && j > i => i = j,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Names of the CTEs defined by a statement (never reported as relations);
+/// with `pg_wrappers`, also those of the query a PostgreSQL statement wraps
+/// ([`pg_wrapped_start`]).
+fn cte_names(s: &[Tok], pg_wrappers: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = if pg_wrappers { pg_wrapped_start(s) } else { 0 };
     while is_punct(s.get(i), "(") {
         i += 1;
     }
@@ -3788,7 +3869,9 @@ fn cte_names(s: &[Tok]) -> Vec<String> {
 /// TABLE|VIEW t`, `SHOW COLUMNS|FIELDS|INDEX … FROM t` (through `FROM`),
 /// `LOCK TABLES t …, u …` and `HANDLER t …`.
 fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<RelationName>) {
-    collect_relations(s, out);
+    // MySQL finds the query of `EXPLAIN` and `CREATE … AS` itself
+    // (`my_statement_relations`) before this.
+    collect_relations(s, out, dialect == Dialect::Postgres);
     if dialect != Dialect::Mysql {
         return;
     }
@@ -3851,12 +3934,12 @@ fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<Relation
 /// Collects the relations named after `FROM` (and its comma list),
 /// `JOIN`, `UPDATE`, `INTO`, `COPY`, `USING`, and `TABLE` at a statement
 /// or subquery start, outside function-call parentheses.
-fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
+fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>, pg_wrappers: bool) {
     struct Frame {
         call: bool,
         in_from: bool,
     }
-    let ctes = cte_names(s);
+    let ctes = cte_names(s, pg_wrappers);
     let mut frames = vec![Frame {
         call: false,
         in_from: false,
@@ -6520,5 +6603,40 @@ mod tests {
             ["crm.a"]
         );
         assert_eq!(rels("select * from t where x in (crm.y)"), [".t"]);
+    }
+
+    /// ADR-0049, re-review of #211, R-M1: the CTEs of a query that a
+    /// PostgreSQL statement wraps are not relations, as for a bare query.
+    #[test]
+    fn pg_wrapped_query_ctes_are_not_relations() {
+        for q in [
+            "DECLARE c CURSOR FOR WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "DECLARE c NO SCROLL CURSOR WITH HOLD FOR WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "PREPARE p AS WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "PREPARE p (integer) AS WITH RECURSIVE x (n) AS (SELECT 1) SELECT 1 FROM x",
+            "EXPLAIN (ANALYZE, BUFFERS) WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "EXPLAIN ANALYZE VERBOSE WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "CREATE TABLE t AS WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "CREATE MATERIALIZED VIEW m AS WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "EXPLAIN ANALYZE CREATE TABLE t AS WITH x AS (SELECT 1) SELECT 1 FROM x",
+        ] {
+            let a = analyze(q, AnalyzeOptions::new());
+            assert!(
+                a.parts()
+                    .iter()
+                    .all(|p| p.relations.iter().all(|r| r.name != "x")),
+                "{q}"
+            );
+        }
+        // A relation named after the wrapper's own words is still one.
+        let a = analyze("PREPARE p AS SELECT 1 FROM x", AnalyzeOptions::new());
+        assert!(a.parts()[0].relations.iter().any(|r| r.name == "x"));
+        // MySQL is unchanged by this rule (it extracts the query of
+        // `EXPLAIN` and `CREATE … AS` itself).
+        let a = analyze(
+            "EXPLAIN WITH x AS (SELECT 1) SELECT 1 FROM x",
+            AnalyzeOptions::mysql(),
+        );
+        assert!(!a.relations().iter().any(|r| r.name == "x"));
     }
 }
