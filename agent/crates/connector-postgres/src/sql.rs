@@ -96,10 +96,12 @@ macro_rules! not_extension_member {
 /// policy of the relation depends on an object that is neither in
 /// `pg_catalog` nor the relation itself (obligation 2: a function, operator
 /// or type outside `pg_catalog`, or any other relation, e.g. a subquery on a
-/// view).
+/// view). No column alias list (the CTE's columns are named in its first
+/// query): it reads `pg_proc` in the no-secret shape of ADR-0050 decision
+/// 2.
 pub(crate) const INTROSPECT: &str = concat!(
-    "WITH RECURSIVE anc(rel, ancestor) AS ( \
-       SELECT i.inhrelid, i.inhparent FROM pg_catalog.pg_inherits i \
+    "WITH RECURSIVE anc AS ( \
+       SELECT i.inhrelid AS rel, i.inhparent AS ancestor FROM pg_catalog.pg_inherits i \
        UNION \
        SELECT a.rel, i.inhparent FROM anc a \
          JOIN pg_catalog.pg_inherits i ON i.inhrelid OPERATOR(pg_catalog.=) a.ancestor) \
@@ -120,8 +122,8 @@ pub(crate) const INTROSPECT: &str = concat!(
                      AND d.refobjid OPERATOR(pg_catalog.=) p.polrelid) \
             AND NOT ( \
               (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass AND EXISTS ( \
-                 SELECT 1 FROM pg_catalog.pg_proc x WHERE x.oid OPERATOR(pg_catalog.=) d.refobjid \
-                   AND x.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace)) \
+                 SELECT 1 FROM pg_catalog.pg_proc xp WHERE xp.oid OPERATOR(pg_catalog.=) d.refobjid \
+                   AND xp.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace)) \
               OR (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass AND EXISTS ( \
                  SELECT 1 FROM pg_catalog.pg_operator x WHERE x.oid OPERATOR(pg_catalog.=) d.refobjid \
                    AND x.oprnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace)) \
@@ -214,17 +216,19 @@ macro_rules! policy_function_ok {
 /// Counts the policy references (`$1` functions, `$2` operators, `$3` I/O
 /// coercion result types, `oid[]`) that are not allowed: functions per
 /// `policy_function_ok`, operators and types in `pg_catalog` whose
-/// function (`oprcode`, `typinput`) is allowed.
+/// function (`oprcode`, `typinput`) is allowed. Single-column function
+/// aliases without a column alias list (`AS f`, then `f.f`): it reads
+/// `pg_proc` in the no-secret shape of ADR-0050 decision 2.
 pub(crate) const POLICY_REFS_REJECTED: &str = concat!(
-    "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($1::pg_catalog.oid[]) AS f(o) \
+    "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($1::pg_catalog.oid[]) AS f \
              WHERE NOT ",
-    policy_function_ok!("f.o"),
-    ") OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($2::pg_catalog.oid[]) AS x(o) \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_operator op WHERE op.oid OPERATOR(pg_catalog.=) x.o \
+    policy_function_ok!("f.f"),
+    ") OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($2::pg_catalog.oid[]) AS x \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_operator op WHERE op.oid OPERATOR(pg_catalog.=) x.x \
                AND op.oprnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace AND ",
     policy_function_ok!("op.oprcode"),
-    ")) OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($3::pg_catalog.oid[]) AS t(o) \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type ty WHERE ty.oid OPERATOR(pg_catalog.=) t.o \
+    ")) OPERATOR(pg_catalog.+) (SELECT pg_catalog.count(*) FROM pg_catalog.unnest($3::pg_catalog.oid[]) AS t \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_type ty WHERE ty.oid OPERATOR(pg_catalog.=) t.t \
                AND ty.typnamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace AND ",
     policy_function_ok!("ty.typinput"),
     "))"
@@ -591,7 +595,12 @@ macro_rules! probe_native {
 ///
 /// Every operator is written `OPERATOR(pg_catalog.…)` and every function
 /// and type is qualified, so that the probe itself never triggers decision
-/// 8. `pg_catalog` is written as its oid, `'11'` (`PG_CATALOG_NAMESPACE`,
+/// 8. It has no column alias list (single-column function aliases without
+/// a list, `AS sf`, `AS a`, `AS k`, `AS i`, CTE columns named in their
+/// first query, a `UNION ALL` instead of a `VALUES` of column references):
+/// it reads `pg_proc` in the no-secret shape of ADR-0050 decision 2, so it
+/// stays a catalog read for every account with no own-statement rule
+/// (decision 5). `pg_catalog` is written as its oid, `'11'` (`PG_CATALOG_NAMESPACE`,
 /// the same on every version; pinned by the facts test of
 /// `it_user_code.rs`): a constant keeps the planner's estimates, which a
 /// subquery does not, and the text short enough for the
@@ -608,8 +617,8 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
              badagg AS (SELECT a.aggfnoid FROM pg_catalog.pg_aggregate a \
                , pg_catalog.unnest(ARRAY[a.aggtransfn, a.aggfinalfn, \
                  a.aggcombinefn, a.aggserialfn, a.aggdeserialfn, a.aggmtransfn, \
-                 a.aggminvtransfn, a.aggmfinalfn]::pg_catalog.oid[]) AS s(f) \
-               JOIN pg_catalog.pg_proc q ON q.oid OPERATOR(pg_catalog.=) s.f \
+                 a.aggminvtransfn, a.aggmfinalfn]::pg_catalog.oid[]) AS sf \
+               JOIN pg_catalog.pg_proc q ON q.oid OPERATOR(pg_catalog.=) sf.sf \
               WHERE NOT q.prolang OPERATOR(pg_catalog.=) ANY (TABLE lang)), \
              uf AS ( \
                SELECT p.oid, p.proname AS name, p.proargtypes AS args, \
@@ -618,8 +627,8 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
                  FROM pg_catalog.pg_proc p \
                 WHERE ",
     probe_user_ns!("p.pronamespace"),
-    " AND p.proname OPERATOR(pg_catalog.=) ANY (SELECT b.proname FROM pg_catalog.pg_proc b \
-                    WHERE b.pronamespace OPERATOR(pg_catalog.=) '11')), \
+    " AND p.proname OPERATOR(pg_catalog.=) ANY (SELECT bp.proname FROM pg_catalog.pg_proc bp \
+                    WHERE bp.pronamespace OPERATOR(pg_catalog.=) '11')), \
              uo AS ( \
                SELECT o.oid, o.oprname AS name, o.oprleft AS l, o.oprright AS r, o.oprcode \
                  FROM pg_catalog.pg_operator o \
@@ -628,12 +637,12 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
     " AND o.oprname OPERATOR(pg_catalog.=) ANY (SELECT b.oprname \
                     FROM pg_catalog.pg_operator b WHERE b.oprnamespace OPERATOR(pg_catalog.=) '11')), \
              argt AS ( \
-               SELECT a.t FROM uf, \
-                      pg_catalog.unnest(uf.args::pg_catalog.oid[]) AS a(t) \
+               SELECT a.a AS t FROM uf, \
+                      pg_catalog.unnest(uf.args::pg_catalog.oid[]) AS a \
                UNION SELECT uo.l FROM uo WHERE uo.l OPERATOR(pg_catalog.<>) '0' \
                UNION SELECT uo.r FROM uo), \
-             chain(root, cur, depth) AS ( \
-               SELECT argt.t, argt.t, 0 FROM argt \
+             chain AS ( \
+               SELECT argt.t AS root, argt.t AS cur, 0 AS depth FROM argt \
                UNION ALL \
                SELECT c.root, \
                       CASE WHEN y.typtype OPERATOR(pg_catalog.=) 'd' THEN y.typbasetype \
@@ -657,28 +666,28 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
                          AND s.typnamespace OPERATOR(pg_catalog.=) '11')), \
              fk AS ( \
                SELECT uf.name, uf.args, uf.variadic, k.k \
-                 FROM uf CROSS JOIN pg_catalog.generate_series(0, 100) AS k(k) \
+                 FROM uf CROSS JOIN pg_catalog.generate_series(0, 100) AS k \
                 WHERE k.k OPERATOR(pg_catalog.>=) (uf.n OPERATOR(pg_catalog.-) uf.d) \
                   AND k.k OPERATOR(pg_catalog.<=) uf.n) \
              SELECT DISTINCT 'f'::pg_catalog.text, fk.name::pg_catalog.text FROM fk \
               WHERE fk.variadic OR NOT ( \
-                EXISTS (SELECT 1 FROM pg_catalog.generate_series(0, 99) AS i(i) \
+                EXISTS (SELECT 1 FROM pg_catalog.generate_series(0, 99) AS i \
                          WHERE i.i OPERATOR(pg_catalog.<) fk.k AND NOT ",
     probe_reached!("fk.args[i.i]"),
     ") \
-                AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc b \
-                  WHERE b.pronamespace OPERATOR(pg_catalog.=) '11' \
-                    AND b.proname OPERATOR(pg_catalog.=) fk.name \
-                    AND b.provariadic OPERATOR(pg_catalog.=) '0' \
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc bp \
+                  WHERE bp.pronamespace OPERATOR(pg_catalog.=) '11' \
+                    AND bp.proname OPERATOR(pg_catalog.=) fk.name \
+                    AND bp.provariadic OPERATOR(pg_catalog.=) '0' \
                     AND fk.k OPERATOR(pg_catalog.>=) \
-                        (b.pronargs OPERATOR(pg_catalog.-) b.pronargdefaults) \
-                    AND fk.k OPERATOR(pg_catalog.<=) b.pronargs \
+                        (bp.pronargs OPERATOR(pg_catalog.-) bp.pronargdefaults) \
+                    AND fk.k OPERATOR(pg_catalog.<=) bp.pronargs \
                     AND NOT EXISTS ( \
-                      SELECT 1 FROM pg_catalog.generate_series(0, 99) AS i(i) \
+                      SELECT 1 FROM pg_catalog.generate_series(0, 99) AS i \
                         JOIN pg_catalog.pg_type ut ON i.i OPERATOR(pg_catalog.<) fk.k \
                          AND ut.oid OPERATOR(pg_catalog.=) fk.args[i.i] \
                         JOIN pg_catalog.pg_type bt \
-                          ON bt.oid OPERATOR(pg_catalog.=) b.proargtypes[i.i] \
+                          ON bt.oid OPERATOR(pg_catalog.=) bp.proargtypes[i.i] \
                        WHERE NOT ",
     probe_co_candidate!(),
     "))) \
@@ -695,7 +704,8 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
                     AND (b.oprleft OPERATOR(pg_catalog.=) '0') \
                         OPERATOR(pg_catalog.=) (uo.l OPERATOR(pg_catalog.=) '0') \
                     AND NOT EXISTS ( \
-                      SELECT 1 FROM (VALUES (uo.l, b.oprleft), (uo.r, b.oprright)) AS v(u, b) \
+                      SELECT 1 FROM (SELECT uo.l AS u, b.oprleft AS b \
+                                     UNION ALL SELECT uo.r, b.oprright) AS v \
                         JOIN pg_catalog.pg_type ut ON ut.oid OPERATOR(pg_catalog.=) v.u \
                         JOIN pg_catalog.pg_type bt ON bt.oid OPERATOR(pg_catalog.=) v.b \
                        WHERE NOT ",
@@ -759,6 +769,106 @@ pub(crate) const USER_CODE_PROBE: &str = concat!(
     ")))) \
              LIMIT 20001"
 );
+
+/// The overrides of the two log settings in `pg_db_role_setting` that
+/// apply to this session's database: role-wide, database-wide and
+/// role-in-database entries (ADR-0012 refinement of 2026-10-12, item 1).
+/// Rows of (in a database, every role, role name, setting, level cut at
+/// 16 characters), at most 1 000 + 1.
+///
+/// The only connector statement that reads `pg_db_role_setting.setconfig`
+/// (the denylist exception of item 5): the server keeps the two keys in
+/// the same statement, so no other entry, which can hold a secret
+/// (ADR-0050), leaves the server. Its constants are literals, never bound
+/// parameters: pgaudit logs the text as sent and never the parameters, so
+/// only literals tell this statement from a replay that reads other keys
+/// (ADR-0050 decision 5: left out as the agent's own on pgaudit only, by
+/// this exact text). Sent only while the target's level would be Full and
+/// no `pg_stat_statements` stream of the target runs (`check.rs`).
+pub(crate) const ROLE_LOG_OVERRIDES: &str = "SELECT s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid AS in_database, \
+       s.setrole OPERATOR(pg_catalog.=) 0::pg_catalog.oid AS every_role, \
+       CASE WHEN s.setrole OPERATOR(pg_catalog.<>) 0::pg_catalog.oid \
+            THEN pg_catalog.pg_get_userbyid(s.setrole) END AS role_name, \
+       pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name, \
+       pg_catalog.\"left\"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level \
+  FROM pg_catalog.pg_db_role_setting s \
+ CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS c(item) \
+ WHERE (s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+        OR s.setdatabase OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d \
+             WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())) \
+   AND pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) \
+       OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) \
+ ORDER BY role_name, setting_name \
+ LIMIT 1001";
+
+/// The `SET` clauses of the functions of this session's database on the
+/// two log settings, from `pg_proc.proconfig` (ADR-0012 refinement of
+/// 2026-10-12, item 1, function `SET` clauses): rows of (schema, function,
+/// setting, level cut at 16 characters), at most 1 000 + 1. The same rules
+/// as [`ROLE_LOG_OVERRIDES`]: the server keeps the two keys, literals only,
+/// the only connector statement that names `proconfig`.
+pub(crate) const FUNCTION_LOG_OVERRIDES: &str = "SELECT n.nspname AS schema_name, p.proname AS function_name, \
+       pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name, \
+       pg_catalog.\"left\"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level \
+  FROM pg_catalog.pg_proc p \
+  JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
+ CROSS JOIN LATERAL pg_catalog.unnest(p.proconfig) AS c(item) \
+ WHERE pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) \
+       OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) \
+ ORDER BY schema_name, function_name, setting_name \
+ LIMIT 1001";
+
+/// `SET` and `ALTER SYSTEM` grants on the two log settings
+/// (`pg_parameter_acl`, PostgreSQL 15+) to roles other than the agent's
+/// and superusers, a `PUBLIC` grant included (ADR-0012 refinement of
+/// 2026-10-12, item 1, grants): rows of (a `PUBLIC` grant, role name,
+/// setting, privilege), at most 1 000 + 1. Parameter names and ACLs, no
+/// secret; it reads `pg_roles` with named columns only (the no-secret
+/// shape of ADR-0050 decision 2). Not sent on PostgreSQL 14 (no such
+/// catalog, and only superusers can set the two settings there).
+pub(crate) const PARAMETER_GRANTS: &str = "SELECT a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid AS public_grant, \
+       CASE WHEN a.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid \
+            THEN pg_catalog.pg_get_userbyid(a.grantee) END AS role_name, \
+       p.parname AS setting_name, \
+       a.privilege_type \
+  FROM pg_catalog.pg_parameter_acl p \
+ CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a \
+ WHERE p.parname OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) \
+   AND a.grantee OPERATOR(pg_catalog.<>) (SELECT r.oid FROM pg_catalog.pg_roles r \
+        WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
+   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles s \
+        WHERE s.oid OPERATOR(pg_catalog.=) a.grantee AND s.rolsuper) \
+ ORDER BY role_name, setting_name, a.privilege_type \
+ LIMIT 1001";
+
+/// `SET` or `ALTER SYSTEM` grants on the two log settings held by the
+/// agent's own role, directly or through a role (PostgreSQL 15+): an
+/// over-privilege (ADR-0012 obligation 6 as extended by its refinement of
+/// 2026-10-12, item 1), which `PARAMETER_GRANTS` leaves out of the proof.
+pub(crate) const OWN_PARAMETER_GRANTS: &str = "SELECT pg_catalog.count(*) \
+  FROM pg_catalog.pg_parameter_acl p \
+ CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a \
+ WHERE p.parname OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) \
+   AND a.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid \
+   AND pg_catalog.pg_has_role(CURRENT_USER, a.grantee, 'MEMBER')";
+
+/// Most rows of the three statements above; one more tells a cut (not
+/// proven).
+pub(crate) const LOG_OVERRIDES_MAX_ROWS: usize = 1000;
+
+/// The secret-list entry (ADR-0050) one of the connector's two-key reads
+/// reads, when `text` is exactly that statement as sent: the only texts
+/// the Audit stream leaves out as the agent's own secret reads, on
+/// pgaudit only (ADR-0050 decision 5).
+pub(crate) fn own_secret_object(text: &str) -> Option<&'static str> {
+    if text == ROLE_LOG_OVERRIDES {
+        Some("pg_db_role_setting")
+    } else if text == FUNCTION_LOG_OVERRIDES {
+        Some("pg_proc")
+    } else {
+        None
+    }
+}
 
 /// The agent role's oid, the oids of the declared databases (`$1`,
 /// `text[]`) and of this session's database: the `pg_stat_statements`
@@ -835,6 +945,10 @@ pub(crate) fn connector_statements() -> Vec<String> {
         USER_CODE_PROBE.to_owned(),
         ALL_COLUMNS.to_owned(),
         CAS_GUARD_COLUMNS.to_owned(),
+        ROLE_LOG_OVERRIDES.to_owned(),
+        FUNCTION_LOG_OVERRIDES.to_owned(),
+        PARAMETER_GRANTS.to_owned(),
+        OWN_PARAMETER_GRANTS.to_owned(),
     ]
 }
 
@@ -874,6 +988,10 @@ pub(crate) fn all_statements() -> Vec<String> {
         CAS_GUARD_COLUMNS.to_owned(),
         sample_statement("s", "t", &["c"], true).unwrap(),
         sample_statement("s", "t", &["c"], false).unwrap(),
+        ROLE_LOG_OVERRIDES.to_owned(),
+        FUNCTION_LOG_OVERRIDES.to_owned(),
+        PARAMETER_GRANTS.to_owned(),
+        OWN_PARAMETER_GRANTS.to_owned(),
     ]
 }
 
@@ -915,9 +1033,20 @@ mod tests {
         assert!(sample_statement("crm", "t", &[], false).is_none());
     }
 
+    /// The full texts of the two exceptions to the catalog denylist (ADR-0012
+    /// refinement of 2026-10-12, item 5): any change to either fails this
+    /// test and needs a `security-reviewer` review.
+    const ROLE_LOG_OVERRIDES_TEXT: &str = "SELECT s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid AS in_database, s.setrole OPERATOR(pg_catalog.=) 0::pg_catalog.oid AS every_role, CASE WHEN s.setrole OPERATOR(pg_catalog.<>) 0::pg_catalog.oid THEN pg_catalog.pg_get_userbyid(s.setrole) END AS role_name, pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name, pg_catalog.\"left\"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level FROM pg_catalog.pg_db_role_setting s CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS c(item) WHERE (s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid OR s.setdatabase OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())) AND pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) ORDER BY role_name, setting_name LIMIT 1001";
+    const FUNCTION_LOG_OVERRIDES_TEXT: &str = "SELECT n.nspname AS schema_name, p.proname AS function_name, pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name, pg_catalog.\"left\"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace CROSS JOIN LATERAL pg_catalog.unnest(p.proconfig) AS c(item) WHERE pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[]) ORDER BY schema_name, function_name, setting_name LIMIT 1001";
+
     #[test]
     fn no_statement_touches_the_catalog_denylist() {
-        // ADR-0012 obligation 1.
+        // ADR-0012 obligation 1, with the exceptions of its refinement of
+        // 2026-10-12 (item 5): `setconfig` / `pg_db_role_setting` only in
+        // `ROLE_LOG_OVERRIDES`, `proconfig` only in
+        // `FUNCTION_LOG_OVERRIDES`, both asserted in full.
+        assert_eq!(ROLE_LOG_OVERRIDES, ROLE_LOG_OVERRIDES_TEXT);
+        assert_eq!(FUNCTION_LOG_OVERRIDES, FUNCTION_LOG_OVERRIDES_TEXT);
         let denied = [
             "pg_authid",
             "pg_shadow",
@@ -933,10 +1062,20 @@ mod tests {
             "lo_",
             "rolpassword",
             "rolconfig",
+            "useconfig",
+            "proconfig",
+            "umoptions",
+            "subconninfo",
+            "pg_file_settings",
+            "pg_show_all_file_settings",
+            "pg_hba_file_rules",
+            "user_mapping_options",
+            "foreign_server_options",
             "pg_read_file",
             "pg_ls_",
             "dblink",
         ];
+        let mut exempt = 0;
         for s in all_statements() {
             // The policy-function denylist regex names denied functions.
             let mut s = s;
@@ -946,11 +1085,93 @@ mod tests {
                 }
                 s = format!("{}{}", &s[..a], &s[b + 3..]);
             }
+            let allowed: &[&str] = if s == ROLE_LOG_OVERRIDES_TEXT {
+                exempt += 1;
+                &["setconfig", "pg_db_role_setting"]
+            } else if s == FUNCTION_LOG_OVERRIDES_TEXT {
+                exempt += 1;
+                &["proconfig"]
+            } else {
+                &[]
+            };
             let lower = s.to_lowercase();
             for d in denied {
+                if allowed.contains(&d) {
+                    continue;
+                }
                 assert!(!lower.contains(d), "{d} in {s}");
             }
+            // The exceptions read the two keys only, filtered by the
+            // server, with literals (no bound parameter).
+            if !allowed.is_empty() {
+                assert!(lower.contains(
+                    "any ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[])"
+                ));
+                assert!(!s.contains('$'), "{s}");
+            }
         }
+        assert_eq!(exempt, 2);
+        assert_eq!(
+            own_secret_object(ROLE_LOG_OVERRIDES),
+            Some("pg_db_role_setting")
+        );
+        assert_eq!(own_secret_object(FUNCTION_LOG_OVERRIDES), Some("pg_proc"));
+        assert_eq!(own_secret_object(PARAMETER_GRANTS), None);
+        assert_eq!(own_secret_object(&format!("{ROLE_LOG_OVERRIDES} ")), None);
+        assert!(!PARAMETER_GRANTS.contains('$'));
+    }
+
+    /// ADR-0050 decision 5: every connector statement names no entry of
+    /// the secret list, or reads its entries in the no-secret shape (the
+    /// four `pg_roles` statements, `PARAMETER_GRANTS`, every `pg_proc`
+    /// statement, the collision probe included), or is exactly one of the
+    /// two-key reads, which are secret reads of their own entry only.
+    #[test]
+    fn statements_and_the_secret_list() {
+        use crate::audit::events::{Catalogs, DbCatalog, analyze_pss, text_reads};
+        let mut shaped = 0;
+        for pss_schema in [Some("public"), None] {
+            for log_catalog in [Some(true), Some(false), None] {
+                let mut catalogs = Catalogs::default();
+                catalogs.insert(
+                    "shop",
+                    DbCatalog {
+                        pss_schema: pss_schema.map(str::to_owned),
+                        pgaudit_log_catalog: log_catalog,
+                    },
+                );
+                let none = std::collections::HashSet::new();
+                for unqualified_pg in [true, false] {
+                    let rule = catalogs.rule("shop", unqualified_pg, &none);
+                    for s in all_statements() {
+                        let a = analyze_pss(&s, false);
+                        let reads = text_reads(&s, &a, rule, false);
+                        let names: Vec<String> = reads
+                            .secret
+                            .iter()
+                            .map(|o| format!("{:?}.{}", o.schema, o.name))
+                            .collect();
+                        match own_secret_object(&s) {
+                            Some(entry) => {
+                                assert_eq!(
+                                    names,
+                                    vec![format!("{:?}.{entry}", Some("pg_catalog"))],
+                                    "{s}"
+                                );
+                            }
+                            None => assert!(names.is_empty(), "{names:?}: {s}"),
+                        }
+                        if own_secret_object(&s).is_none() && !reads.secret_named.is_empty() {
+                            shaped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // ROLE_ATTRIBUTES, MEMBERSHIPS, OWNERSHIP, OWN_OIDS,
+        // PARAMETER_GRANTS, INTROSPECT, POLICY_REFS_REJECTED,
+        // PSS_FUNCTION_SCHEMA, USER_CODE_PROBE: 9 statements, 12 settings.
+        assert_eq!(shaped, 9 * 12);
     }
 
     /// ADR-0048 decision 4: the connector names no statistics relation
@@ -1015,6 +1236,10 @@ mod tests {
                     if texts && pss_schema.is_some() {
                         assert_eq!(reads.objects.len(), 1, "{s}");
                         assert_eq!(reads.objects[0].name, "pg_stat_statements");
+                    } else if own_secret_object(&s).is_some() {
+                        // ADR-0050: the two-key reads are secret reads of
+                        // their own entry, nothing of these lists.
+                        assert_eq!(reads.objects, reads.secret, "{s}");
                     } else {
                         assert!(reads.objects.is_empty(), "{s}: {:?}", reads.objects);
                     }

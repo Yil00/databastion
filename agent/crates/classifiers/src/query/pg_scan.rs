@@ -2,7 +2,9 @@
 //! their own name lists (ADR-0049): the names the text uses (qualified or
 //! not, called or not, as a `FROM` item or elsewhere), and the facts of the
 //! "no-text shape" of ADR-0049 decision 2, decided against the caller's
-//! list ([`PgScan::no_text_shape`]).
+//! list ([`PgScan::no_text_shape`]), and the "no-secret shape" of ADR-0050
+//! decision 2, the same rules on a set of secret columns
+//! ([`PgScan::no_secret_shape`]).
 //!
 //! Like [`super::analyze`], the scan reads identifier tokens only, never
 //! the content of a literal or a comment, and keeps no text: names are
@@ -174,7 +176,7 @@ impl PgScan {
     }
 
     /// Whether every listed name the text uses is read in the no-text
-    /// shape of ADR-0049 decision 2, `column` being the text column
+    /// shape of ADR-0049 decision 2, `columns` being the text columns
     /// (compared after folding). `classify(name, call)` places a name.
     /// `true` also when the text uses no listed name.
     ///
@@ -182,7 +184,7 @@ impl PgScan {
     /// - a name listed [`PgListed::Always`], anywhere;
     /// - a `FROM` item classified [`PgItemClass::Other`] next to a listed
     ///   one (the text decides only on catalogs and listed entries);
-    /// - an identifier token equal to `column`, anywhere;
+    /// - an identifier token equal to one of `columns`, anywhere;
     /// - a `*` token, except in the exact sequence `count(*)`;
     /// - a whole-row reference: an occurrence of a listed view or function
     ///   name, of the alias of a listed `FROM` item, or of a parenthesized
@@ -194,16 +196,39 @@ impl PgScan {
     ///   alias the `FROM` parser recorded, or any identifier after `AS`,
     ///   followed by `(`), except on a parenthesized `VALUES` list of
     ///   constants (ADR-0049 refinement of 2026-10-11);
-    /// - `NATURAL`.
+    /// - `NATURAL`;
+    /// - `COPY` of a listed name (`COPY <entry> TO …` copies every column;
+    ///   ADR-0050 decision 2).
     #[must_use]
     pub fn no_text_shape(
         &self,
-        column: &str,
+        columns: &[&str],
         classify: &dyn Fn(&RelationName, bool) -> PgItemClass,
     ) -> bool {
         self.segments
             .iter()
-            .all(|s| segment_shape(s, column, classify))
+            .all(|s| segment_shape(s, columns, classify, false))
+    }
+
+    /// [`Self::no_text_shape`] for the "no-secret shape" of ADR-0050
+    /// decision 2 (`columns`: the secret columns of every listed entry the
+    /// text names), with one addition: a `FROM` item that is an unqualified
+    /// reference to a CTE the text defines **before** it (`WITH me AS
+    /// (…) … FROM … , me`) is not an item the text cannot decide on: its
+    /// query is part of the text and is held to the same rules (its
+    /// columns, `*`, whole rows, aliases), so it counts as a catalog when
+    /// the caller places it as [`PgItemClass::Other`]. A name used before
+    /// any CTE of that name is defined (`WITH a AS (SELECT … FROM b), b AS
+    /// …`: the first `b` is a relation) is the caller's.
+    #[must_use]
+    pub fn no_secret_shape(
+        &self,
+        columns: &[&str],
+        classify: &dyn Fn(&RelationName, bool) -> PgItemClass,
+    ) -> bool {
+        self.segments
+            .iter()
+            .all(|s| segment_shape(s, columns, classify, true))
     }
 }
 
@@ -937,14 +962,99 @@ fn cte_column_list(s: &[Tok], with: usize) -> bool {
     }
 }
 
-/// [`PgScan::no_text_shape`] on one segment.
+/// CTEs a text defines, anywhere (a nested `WITH` too): each name with
+/// the token index of its definition. `WITH ORDINALITY` is not one.
+fn cte_defs(s: &[Tok]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for (i, t) in s.iter().enumerate() {
+        if word(Some(t)) != Some("with") {
+            continue;
+        }
+        let mut j = i + 1;
+        if word(s.get(j)) == Some("recursive") {
+            j += 1;
+        }
+        'list: while let Some(name) = ident(s.get(j)) {
+            if name == "ordinality" {
+                break;
+            }
+            let mut k = j + 1;
+            if is_punct(s.get(k), "(") {
+                k = close_of(s, k);
+            }
+            if word(s.get(k)) != Some("as") {
+                break;
+            }
+            out.push((name.to_owned(), j));
+            k += 1;
+            if word(s.get(k)) == Some("not") {
+                k += 1;
+            }
+            if word(s.get(k)) == Some("materialized") {
+                k += 1;
+            }
+            if !is_punct(s.get(k), "(") {
+                break;
+            }
+            k = close_of(s, k);
+            // `SEARCH … SET …`, `CYCLE … USING …`, then `,` and the next
+            // CTE, or the main statement.
+            loop {
+                match s.get(k) {
+                    Some(Tok::Punct(p)) if p == "," => {
+                        j = k + 1;
+                        continue 'list;
+                    }
+                    Some(Tok::Punct(p)) if p == "(" || p == ")" || p == ";" => break 'list,
+                    Some(Tok::Word(w))
+                        if matches!(
+                            w.as_str(),
+                            "select"
+                                | "insert"
+                                | "update"
+                                | "delete"
+                                | "merge"
+                                | "values"
+                                | "table"
+                        ) =>
+                    {
+                        break 'list;
+                    }
+                    None => break 'list,
+                    _ => k += 1,
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`PgScan::no_text_shape`] (and, with `ctes`, [`PgScan::no_secret_shape`])
+/// on one segment.
 fn segment_shape(
     s: &Segment,
-    column: &str,
+    columns: &[&str],
     classify: &dyn Fn(&RelationName, bool) -> PgItemClass,
+    ctes: bool,
 ) -> bool {
     let t = &s.tokens;
-    let class: Vec<PgItemClass> = s.names.iter().map(|n| classify(&n.name, n.call)).collect();
+    let mut class: Vec<PgItemClass> = s.names.iter().map(|n| classify(&n.name, n.call)).collect();
+    if ctes {
+        // An unqualified reference to a CTE defined earlier in the text.
+        let defs = cte_defs(t);
+        for item in &s.items {
+            let n = &s.names[item.name];
+            if class[item.name] == PgItemClass::Other
+                && !n.call
+                && n.name.schema.is_none()
+                && defs
+                    .iter()
+                    .any(|(name, at)| *name == n.name.name && *at < n.start)
+            {
+                class[item.name] = PgItemClass::Catalog;
+            }
+        }
+    }
     let listed = |k: usize| matches!(class[k], PgItemClass::Listed(_));
     if !(0..s.names.len()).any(listed) {
         return true;
@@ -957,9 +1067,21 @@ fn segment_shape(
     if s.items.iter().any(|i| class[i.name] == PgItemClass::Other) {
         return false;
     }
-    // The text column, anywhere.
-    if t.iter().any(|x| ident(Some(x)) == Some(column)) {
+    // The text columns, anywhere.
+    if t.iter()
+        .any(|x| ident(Some(x)).is_some_and(|w| columns.contains(&w)))
+    {
         return false;
+    }
+    // `COPY <listed entry>` (old syntax `COPY BINARY <entry>` too).
+    for (k, n) in s.names.iter().enumerate() {
+        if !listed(k) {
+            continue;
+        }
+        let before = |d: usize| word(n.start.checked_sub(d).and_then(|j| t.get(j)));
+        if before(1) == Some("copy") || (before(1) == Some("binary") && before(2) == Some("copy")) {
+            return false;
+        }
     }
     // `*`, except `count(*)`.
     for (i, x) in t.iter().enumerate() {
@@ -1015,9 +1137,9 @@ fn segment_shape(
         if own.contains(&i) || !vars.contains(name) {
             continue;
         }
-        // `<var>.<column>`, the column not being the text column.
-        let column_ref =
-            is_punct(t.get(i + 1), ".") && ident(t.get(i + 2)).is_some_and(|c| c != column);
+        // `<var>.<column>`, the column not being a text column.
+        let column_ref = is_punct(t.get(i + 1), ".")
+            && ident(t.get(i + 2)).is_some_and(|c| !columns.contains(&c));
         if !column_ref {
             return false;
         }
@@ -1048,7 +1170,7 @@ mod tests {
     }
 
     fn quiet(text: &str) -> bool {
-        pg_scan(text).unwrap().no_text_shape("query", &classify)
+        pg_scan(text).unwrap().no_text_shape(&["query"], &classify)
     }
 
     #[test]
@@ -1233,5 +1355,106 @@ mod tests {
         assert!(!quiet(
             "SELECT materialized.c FROM pg_stat_activity AS materialized (c)"
         ));
+    }
+
+    fn secret_classify(r: &RelationName, call: bool) -> PgItemClass {
+        let schema = r.schema.as_deref();
+        match (schema, r.name.as_str(), call) {
+            (
+                None | Some("pg_catalog"),
+                "pg_roles" | "pg_authid" | "pg_proc" | "pg_db_role_setting",
+                // A relation followed by `(` (`COPY pg_authid (rolname)`).
+                _,
+            ) => PgItemClass::Listed(PgListed::View),
+            (None | Some("pg_catalog"), "pg_largeobject", false) => {
+                PgItemClass::Listed(PgListed::Always)
+            }
+            (Some("pg_catalog"), _, _) => PgItemClass::Catalog,
+            (None, n, false) if n.starts_with("pg_") => PgItemClass::Catalog,
+            _ => PgItemClass::Other,
+        }
+    }
+
+    const SECRET: [&str; 5] = [
+        "rolpassword",
+        "rolconfig",
+        "proconfig",
+        "setconfig",
+        "passwd",
+    ];
+
+    fn no_secret(text: &str) -> bool {
+        pg_scan(text)
+            .unwrap()
+            .no_secret_shape(&SECRET, &secret_classify)
+    }
+
+    /// ADR-0050 decision 2: the no-secret shape on a set of columns, with
+    /// `COPY` refused and earlier CTEs counted as catalogs.
+    #[test]
+    fn the_no_secret_shape() {
+        for q in [
+            "SELECT r.rolname FROM pg_roles r WHERE r.rolsuper",
+            "SELECT rolname, rolsuper FROM pg_catalog.pg_roles ORDER BY 1",
+            "SELECT p.proname, p.prorettype FROM pg_proc p",
+            "SELECT count(*) FROM pg_authid",
+            "WITH me AS (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = CURRENT_USER) \
+             SELECT (SELECT count(*) FROM pg_catalog.pg_class c, me WHERE c.relowner = me.oid)",
+            "WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT c.n + 1 FROM c WHERE c.n < 3) \
+             SELECT p.proname FROM pg_proc p, c WHERE p.pronargs = c.n",
+            "COPY (SELECT r.rolname FROM pg_roles r) TO STDOUT",
+            "SELECT f FROM pg_catalog.unnest(ARRAY[1]) AS f JOIN pg_proc q ON q.oid = f",
+        ] {
+            assert!(no_secret(q), "{q}");
+        }
+        for q in [
+            "SELECT rolconfig FROM pg_roles",
+            "SELECT r.rolname FROM pg_roles r ORDER BY r.rolconfig",
+            "SELECT a.rolname FROM pg_authid a WHERE a.rolpassword LIKE 'md5%'",
+            "SELECT s.setconfig AS x FROM pg_db_role_setting s",
+            "SELECT 1 AS setconfig FROM pg_db_role_setting s",
+            "SELECT 1 FROM pg_roles JOIN pg_db_role_setting USING (setconfig)",
+            "SELECT * FROM pg_roles",
+            "SELECT r.* FROM pg_roles r",
+            "SELECT row_to_json(r) FROM pg_roles r",
+            "SELECT r::text FROM pg_roles r",
+            "SELECT (r).* FROM pg_roles r",
+            "SELECT pg_db_role_setting FROM pg_db_role_setting",
+            "SELECT r.c FROM pg_roles r (c)",
+            "SELECT b.rolname FROM pg_roles a NATURAL JOIN pg_roles b",
+            "TABLE pg_roles",
+            "COPY pg_catalog.pg_authid TO STDOUT",
+            "COPY pg_authid (rolname) TO STDOUT",
+            "COPY BINARY pg_db_role_setting TO STDOUT",
+            "SELECT r.rolname FROM pg_roles r, public.v",
+            "SELECT r.rolname FROM pg_roles r, f() x",
+            "SELECT l.loid FROM pg_largeobject l",
+            // A CTE named after its use is a relation; a CTE that reads a
+            // whole row or a secret column, or has a column list, fails.
+            "WITH a AS (SELECT b.x FROM b), b AS (SELECT 1 AS y) \
+             SELECT r.rolname FROM a, pg_roles r",
+            "WITH x AS (SELECT r FROM pg_roles r) SELECT 1 FROM x",
+            "WITH x AS (SELECT r.rolconfig FROM pg_roles r) SELECT 1 FROM x",
+            "WITH x (c) AS (SELECT r.oid FROM pg_roles r) SELECT x.c FROM x",
+            "WITH x AS (SELECT t.c FROM app.t t) SELECT r.rolname FROM pg_roles r, x",
+        ] {
+            assert!(!no_secret(q), "{q}");
+        }
+        // The no-text shape keeps CTE references as items it cannot decide
+        // on (ADR-0049 unchanged).
+        let q = "WITH me AS (SELECT r.oid FROM pg_roles r) SELECT 1 FROM pg_proc p, me \
+                 WHERE p.proowner = me.oid";
+        assert!(no_secret(q));
+        assert!(!pg_scan(q).unwrap().no_text_shape(&SECRET, &secret_classify));
+        // `WITH ORDINALITY` defines no CTE.
+        assert!(
+            cte_defs(
+                &pg_scan("SELECT 1 FROM f() WITH ORDINALITY AS o, o")
+                    .unwrap()
+                    .segments[0]
+                    .tokens
+            )
+            .is_empty()
+        );
     }
 }

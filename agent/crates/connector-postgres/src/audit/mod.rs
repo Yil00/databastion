@@ -26,6 +26,7 @@
 pub(crate) mod builtins;
 pub(crate) mod events;
 pub(crate) mod failures;
+pub(crate) mod overrides;
 pub(crate) mod pss;
 pub(crate) mod records;
 pub(crate) mod user_code;
@@ -120,6 +121,9 @@ fn catalogs_of(
     pre.catalogs
         .clone()
         .with_user_code(user_code::UserCodeHandle::new(state.user_code(target_id)))
+        .with_log_overrides(overrides::LogOverridesHandle::new(
+            state.log_overrides(target_id),
+        ))
 }
 
 /// State kept across source re-evaluations.
@@ -158,7 +162,7 @@ pub(crate) async fn audit_stream(
             pss_idle = Some(poller);
         }
         let held = pss_session.as_ref().map(|(s, p)| (p.database(), s));
-        let pre = check::prerequisites_with(target, timeouts, held)
+        let pre = check::prerequisites_with(target, timeouts, held, Some(state))
             .await
             .map_err(PgError::into_connector_error)?;
         match source_for(pre.level) {

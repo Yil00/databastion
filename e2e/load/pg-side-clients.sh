@@ -1,12 +1,18 @@
 #!/bin/bash
-# Side account of the PostgreSQL Audit run (ADR-0048), run by run.sh next to pgbench in the `pg-side`
-# service (the target's image, for its `psql` client):
+# Side accounts of the PostgreSQL Audit run (ADR-0048, ADR-0050), run by run.sh next to pgbench in
+# the `pg-side` service (the target's image, for its `psql` client):
 #   - load_pgmon, a monitoring-like account (member of pg_monitor) running a table bloat estimate on
 #     `pg_stats` every 10 seconds, as check_postgres, pgwatch or the widely copied ioguix queries do:
 #     `avg_width` and `null_frac` only, no value column, but the relation is `pg_stats`, a statistics
-#     view that holds column values (ADR-0048: every read of it is reported).
-# One session, kept for the whole run, as those tools do. The statement is written to the client one
-# period at a time, so it runs it as it comes. Prints one line:
+#     view that holds column values (ADR-0048: every read of it is reported);
+#   - load_pgexp, an exporter-like account (no grant) reading `pg_roles`, `pg_proc` and
+#     `pg_subscription` without their secret columns every 5 seconds (ADR-0050: the no-secret
+#     shape, no event);
+#   - load_pgbouncer, a PgBouncer-like account (member of pg_read_all_data) running PgBouncer's
+#     default `auth_query` on `pg_shadow` every second (ADR-0050: a secret read, at most one event
+#     per principal, object set and aggregation window).
+# One session per account, kept for the whole run, as those tools do. The statements are written to
+# the client one period at a time, so it runs them as they come. Prints one line per account:
 #   side <account> <statements issued> <0 | 1: the client failed>
 #
 #   pg-side-clients.sh DURATION_S
@@ -46,4 +52,20 @@ run() {
   printf 'side %s %s %s\n' "$account" "$(cat "/tmp/issued.$account")" "$([ "$rc" = 0 ] && echo 0 || echo 1)"
 }
 
-run load_pgmon 10 "${BLOAT[@]}"
+# An exporter's role, function and subscription metrics (postgres_exporter-style queries): names
+# and attributes, never rolconfig, proconfig or subconninfo.
+EXPORTER=(
+  "SELECT r.rolname, r.rolsuper, r.rolcanlogin, r.rolconnlimit FROM pg_catalog.pg_roles r;"
+  "SELECT n.nspname, p.proname, p.prokind FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema');"
+  "SELECT subname, subenabled FROM pg_subscription;"
+)
+# PgBouncer's default auth_query (its documentation), for the workload's account.
+AUTH_QUERY=("SELECT usename, passwd FROM pg_shadow WHERE usename='load_app';")
+
+run load_pgmon 10 "${BLOAT[@]}" &
+mon=$!
+run load_pgexp 5 "${EXPORTER[@]}" &
+exp=$!
+run load_pgbouncer 1 "${AUTH_QUERY[@]}" &
+bouncer=$!
+wait "$mon" "$exp" "$bouncer"

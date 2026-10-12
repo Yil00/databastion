@@ -921,6 +921,11 @@ side_events mariadb-load load_builtins builtins '[]'
 # ADR-0048: the statistics readers, whose every read is reported (always, whatever min_rows).
 side_events mariadb-load load_colstats stats '["mysql.column_stats"]'
 side_events pg-load load_pgmon stats '["shop.pg_catalog.pg_stats"]'
+# ADR-0050: the exporter-like reader of pg_roles, pg_proc and pg_subscription without their secret
+# columns (no event), and the PgBouncer-like auth_query on pg_shadow (always reported, at most one
+# event per principal, object set and aggregation window).
+side_events pg-load load_pgexp catalogs '[]'
+side_events pg-load load_pgbouncer secrets '["shop.pg_catalog.pg_shadow"]'
 # ADR-0048 open question 6: the pgaudit log volume with pgaudit.log_catalog = on (the dev and e2e
 # setting), over the Audit run: every line of the server log, and the pgaudit records per role (the
 # workload, the statistics reader, the agent's own catalog reads of check() and Discovery, others).
@@ -935,6 +940,8 @@ if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
            who = "other"
            if (index($0, "\"user\":\"load_app\"")) who = "load_app"
            else if (index($0, "\"user\":\"load_pgmon\"")) who = "load_pgmon"
+           else if (index($0, "\"user\":\"load_pgexp\"")) who = "load_pgexp"
+           else if (index($0, "\"user\":\"load_pgbouncer\"")) who = "load_pgbouncer"
            else if (index($0, "\"user\":\"databastion_agent\"")) who = "databastion_agent"
            n[who]++; b[who] += length($0) + 1
          }

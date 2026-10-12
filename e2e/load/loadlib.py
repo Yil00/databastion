@@ -699,8 +699,10 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
     # ---- 2b. Side accounts of the Audit run (ADR-0045): a monitoring-like reader of statement-text
     # tables (at most one event per principal, object set and aggregation window) and a table-less
     # built-in mix (no event but connections). ADR-0048: readers of the statistics catalogs (role
-    # `stats`), checked as the monitoring-like reader. Their statements are not in the workload's
-    # count.
+    # `stats`), checked as the monitoring-like reader. ADR-0050: a PgBouncer-like reader of
+    # `pg_shadow` (role `secrets`, checked as the monitoring-like reader) and an exporter-like reader
+    # of the catalogs without their secret columns (role `catalogs`: no event). Their statements are
+    # not in the workload's count.
     side: dict = {}
     for s in facts_of(facts, "side_events"):
         target, account, role = s.get("target"), s.get("account"), s.get("role")
@@ -715,20 +717,29 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
         side[f"{target}/{role}"] = e
         ck.add(f"audit.{target}.{role}_ran", bool(runs) and issued > 0 and failed == 0,
                {"issued": issued, "failed": failed}, "> 0 issued, 0 failed", f"side account {account}")
-        if role in ("monitor", "stats"):
+        if role in ("monitor", "stats", "secrets"):
             got = {str(o).lower() for o in (s.get("objects") or [])}
             want = [str(o) for o in (s.get("expected") or [])]
             missing = [o for o in want if o.lower() not in got]
+            why = {
+                "monitor": "reads of statement-text tables name them (ADR-0045 part (a))",
+                "stats": "reads of the statistics catalogs name them (ADR-0048)",
+                "secrets": "reads of the credential-bearing catalogs name them (ADR-0050)",
+            }[role]
             ck.add(f"audit.{target}.{role}_reported", bool(want) and not missing, s.get("objects"),
-                   f"names {want}",
-                   "reads of statement-text tables name them (ADR-0045 part (a))" if role == "monitor"
-                   else "reads of the statistics catalogs name them (ADR-0048)")
+                   f"names {want}", why)
             ex = s.get("max_excess")
             ck.add(f"audit.{target}.{role}_one_event_per_window",
                    None if ex is None or not s.get("events") else ex <= 0, ex,
                    "<= 0",
                    "per principal, action, source and object set: events - (floor(span / window) + 2), "
                    "the most windows of the agent's aggregator that span can meet")
+        elif role == "catalogs":
+            nc = s.get("non_connect")
+            ck.add(f"audit.{target}.catalogs_no_event", None if nc is None else nc == 0,
+                   {"non_connect": nc, "events": s.get("events")}, "0 non-connect",
+                   "reads of pg_roles, pg_proc and pg_subscription without their secret columns "
+                   "(ADR-0050, the no-secret shape): no event")
         elif role == "builtins":
             nc, n = s.get("non_connect"), s.get("events")
             ck.add(f"audit.{target}.builtins_no_event", None if nc is None or n is None else nc == 0 and n >= 1,

@@ -481,6 +481,42 @@ class ReportTest(unittest.TestCase):
         self.assertNotIn("side", rep)
         self.assertFalse(any(".monitor_" in c["name"] for c in ck.items))
 
+    def test_secret_catalog_readers(self) -> None:
+        # ADR-0050: the PgBouncer-like auth_query on pg_shadow (reported, one event per window) and
+        # the exporter-like reader of pg_roles, pg_proc and pg_subscription without secret columns
+        # (no event).
+        def side(excess: int = 0, objects: list | None = None, exporter_events: int = 0) -> list[dict]:
+            exp = ["shop.pg_catalog.pg_shadow"]
+            return [
+                {"kind": "side", "target": "pg-load", "account": "load_pgbouncer", "phase": "on",
+                 "issued": 600, "failed": 0},
+                {"kind": "side_events", "target": "pg-load", "account": "load_pgbouncer", "role": "secrets",
+                 "events": 11, "received": 600, "groups": 1, "max_events_per_group": 11,
+                 "max_excess": excess, "non_connect": 11,
+                 "objects": (exp if objects is None else objects), "expected": exp, "window_s": 60},
+                {"kind": "side", "target": "pg-load", "account": "load_pgexp", "phase": "on",
+                 "issued": 360, "failed": 0},
+                {"kind": "side_events", "target": "pg-load", "account": "load_pgexp", "role": "catalogs",
+                 "events": exporter_events, "received": exporter_events, "groups": 0,
+                 "max_events_per_group": None, "max_excess": None, "non_connect": exporter_events,
+                 "objects": [], "expected": [], "window_s": 60},
+            ]
+
+        facts, samples, hbs = scenario()
+        lim = L.Limits(agent_ref_cpu_cores=0.03)
+        rep, ck = L.build_report(facts + side(), samples, hbs, lim)
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True])
+        names = {c["name"] for c in ck.items}
+        for n in ("audit.pg-load.secrets_ran", "audit.pg-load.secrets_reported",
+                  "audit.pg-load.secrets_one_event_per_window", "audit.pg-load.catalogs_ran",
+                  "audit.pg-load.catalogs_no_event"):
+            self.assertIn(n, names)
+        for kw, failing in ((dict(excess=1), {"audit.pg-load.secrets_one_event_per_window"}),
+                            (dict(objects=[]), {"audit.pg-load.secrets_reported"}),
+                            (dict(exporter_events=3), {"audit.pg-load.catalogs_no_event"})):
+            rep, ck = L.build_report(facts + side(**kw), samples, hbs, lim)
+            self.assertEqual(self.names(ck, False), failing, kw)
+
     def test_statistics_readers(self) -> None:
         # ADR-0048: the pg_stats bloat reader and the mysql.column_stats reader, the pgaudit log volume
         # with log_catalog = on, and the agent against the release reference.
