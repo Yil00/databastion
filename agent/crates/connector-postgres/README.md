@@ -10,8 +10,8 @@ documentation (docs/08) builds on.
 
 | Level | Condition (same probe for `check()` and the stream) | Source |
 |---|---|---|
-| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log |
-| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows` or no recent record | pgaudit log |
+| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, `log_min_messages` and `log_min_error_statement` proven `error` or lower, **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
+| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows`, a log setting above `error` or not read, or no recent record | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
 | Limited | `pg_stat_statements` installed, loaded and showing other roles | `pg_stat_statements` |
 | None | none of the above | — |
 
@@ -56,12 +56,16 @@ load otherwise), so a server-wide load is the normal case.
 - **Forged records.** Any role can write `AUDIT: …` lines into the server
   log (`RAISE LOG` in PL/pgSQL). The connector drops records whose severity
   is not `pgaudit.log_level` or that carry an error context (pgaudit hides
-  its context; `RAISE` always has one). Still forgeable by roles that can
-  hide the context (`log_error_verbosity = terse` is superuser-only) or run
-  native code (C extensions, untrusted PLs). **A server-wide
-  `log_error_verbosity = terse` removes every context, and with it this
-  protection**: keep it at `default`. A forged record can add false
-  events; it cannot remove real ones. Records dropped because their
+  its context; `RAISE` always has one). Still forgeable by native code
+  that hides its context (C extensions, untrusted PLs).
+  `log_error_verbosity = terse` does not remove the context from jsonlog
+  nor csvlog (verified on PostgreSQL 16.13 for the failed statements
+  work: a `RAISE` line keeps its context with `terse`). A forged record
+  can add false events; it cannot remove real ones, except that such
+  native code could also write a record with no row count and the text of
+  a statement that fails next in its own session, which then reports the
+  failed read from the forged record (item 4 of the failed statements,
+  below). Records dropped because their
   severity is not `pgaudit.log_level` (likely genuine: the setting differs
   per database or role) are counted, logged, and noted in `check()` (for 24 h).
 - **Server-side exports hidden in dynamic SQL.** A `COPY` record whose text
@@ -205,22 +209,98 @@ load otherwise), so a server-wide load is the normal case.
   `wrapped_queries_are_reads_of_their_query`,
   `pgaudit_records_of_wrapped_queries`; integration test
   `it_wrapped::wrapped_queries_are_reads_of_their_query`.
-- **Failed and cancelled statements with `pgaudit.log_rows = on`**
-  (security review of #197, L1; integration test
-  `it_wrapped::failed_reads_and_what_is_reported`). With `log_rows = on`
-  (needed for Full), pgaudit writes a statement's records when it ends,
-  so a statement that fails or is cancelled leaves **no** `AUDIT:` record:
-  a failed cast whose error quotes the value read (22P02), and a read that
-  streamed its rows to the client before an error on purpose (22012), a
-  cancel (57014, by `statement_timeout` or the client) or a client that
-  closes its connection mid-result (`FATAL` 08006), give no event from any role, the agent's included. The
-  server's `ERROR` line has the SQLSTATE, the statement text and a
-  message that can quote values; the connector reads `AUDIT:` lines
-  only. With `log_rows = off` the record is written when the statement
-  starts, and the failed read is reported (operators who need these
-  reads reported set `log_rows = off`, at Partial). `pg_stat_statements` counts
-  no failed statement. Decided fix (SQLSTATE classes, never the
-  message, accepted on 2026-10-12, a release gate for the next release): [ADR-0037 refinement of 2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements).
+- **Failed and cancelled statements** ([ADR-0037 refinement of
+  2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements),
+  `audit/failures.rs`, `audit/records.rs`, `PgauditEvents::error_event`).
+  With `pgaudit.log_rows = on` (needed for Full), pgaudit writes a
+  statement's records when it ends, so a statement that fails or is
+  cancelled leaves no `AUDIT:` record. When the pgaudit log is the source
+  (Full or Partial), the stream therefore also parses the server's `ERROR`
+  lines, and `FATAL` lines that carry a statement, of client backends,
+  from the same file, cursor and tailer.
+  - **Read (I2):** severity, SQLSTATE, user, database, application, client
+    address, session, virtual transaction, time and the statement text
+    only. `message`, `detail`, `hint`, `context` and `internal_query` are
+    skipped as `serde::de::IgnoredAny` in jsonlog and walked without
+    being copied inside the tailer's zeroized buffer in csvlog
+    (`csv_pick`, whose statement buffer is reserved at the record's
+    length so it never reallocates); the jsonlog statement is deserialized
+    straight into a `Zeroizing` buffer (`serde_json`'s scratch buffer for
+    a string with escapes stays outside the connector's reach, as for
+    `AUDIT:` messages); of `context`, only its presence is used. The statement
+    text is never logged; `ErrorLine`'s `Debug` prints no text and no
+    identity. Lines of a closed list of the server's own processes
+    (`records::SYSTEM_PROCESSES`: autovacuum, parallel workers, whose
+    errors their leader re-raises, checkpointer, WAL writer, logical
+    replication workers…) are not read; `walsender`, extensions'
+    background workers, unknown and missing types are (fails closed).
+    `LOG` lines (the `LOG` 08006
+    "could not send data to client" before a `FATAL` 08006) are not read.
+    A line of that severity that does not parse is counted in
+    `audit.records_dropped`. Unit test
+    `values_quoted_by_the_line_never_leave_it`.
+  - **Classes, by SQLSTATE only** (`failures::base_class`). Refused (no
+    event): `25P02` without a context field whose text calls only
+    built-in code (ADR-0049 decision 8's lists and collision probe; a
+    text that cannot be scanned keeps the line), `28xxx` / `3D000` without
+    a statement, and `42601` without a context whose text does not lex
+    and holds none of `( : $` or an operator character. Quiet: every
+    other code of classes `42`, `3F`, `0A`, `25`, and `57014`, `57P01` to
+    `57P05`, `40001`, `40P01`, `55P03`, classes `53`, `54`, `08`, `58`.
+    Telling: every other code, a missing or malformed one included.
+  - **Event:** the text is analyzed like a pgaudit record's (relations,
+    catalogs skipped, statistics catalogs, statement-text views, user
+    code next to catalogs, wrapped queries, shape signals); an
+    unqualified `pg_*` name is not a catalog here (no record confirms
+    it). Never a row count. Quiet: a read (a DDL or DCL keeps its
+    action), always reported; from the agent's identity charged the
+    whole budget like an unknown row count. Telling: the statement's
+    action (the read first in a multi-statement text), always reported
+    except a plain `INSERT … VALUES` (one relation, no query,
+    `RETURNING` or `ON CONFLICT`, only built-in code), never the agent's
+    own. `DO`, `CALL`, `EXECUTE`, `FETCH` and any other statement whose
+    code or rows the text does not name add `*`; transaction control,
+    `SET`, `SHOW` and the like give none. An `ERROR` line without a
+    statement text is a read of `*`; a `FATAL` line without one ends an
+    idle session and gives none where the stream's probe proved the log
+    settings for its database (`Catalogs::error_lines_proven`), a read of
+    `*` elsewhere (item 9 of the ADR).
+  - **Not twice:** a line is not reported when its session's last
+    pgaudit record has the same text, the same virtual transaction and no
+    row count (written at the statement's start, `log_rows = off`); texts
+    are compared as hashes keyed per stream, 4096 sessions followed.
+  - **`check()`:** `log_min_messages` and `log_min_error_statement`
+    (readable by every role, read with the pgaudit settings) must be
+    `error` or lower in every monitored database where pgaudit is loaded;
+    otherwise the target is capped at Partial and the local detail names
+    the setting and the database (no target note, no protocol change).
+  - **Load:** a line costs one parse (about 2 µs) and one analysis of its
+    text (about 45 µs, release build), as an `AUDIT:` record does; the
+    last text's analysis is cached, so a storm of one failing statement
+    (an application looping on a missing table, 42P01) costs about 15 µs
+    per line (ignored test `error_line_throughput`), and the core's
+    aggregator merges its events into one per principal, action, objects
+    and window (at most 10 000 groups per window before an early flush,
+    then the bounded spool).
+  - Integration tests `it_wrapped::failed_reads_and_what_is_reported`
+    (22P02 quoting the value, 59 of 60 rows then 22012, 57014 by timeout
+    and by the client, `FATAL` 08006 mid-result, from another role and
+    the agent's role, `log_rows` on and off, jsonlog and csvlog) and
+    `it_wrapped::forced_25p02_and_42601_through_user_code` (F1: `25P02`
+    and `42601` raised after rows were sent through a view, a row-level
+    security policy, a user operator, a user cast and a domain `CHECK`,
+    from another role and the agent's role, reported; a genuine `25P02`
+    and `42601`, no event).
+  - Residuals: a backend that crashes during a read writes nothing of its
+    own (the postmaster's line is not read); `pg_stat_statements` counts
+    no failed statement (Limited); native code that hides its context can
+    forge a refused `25P02` / `42601`; any role can add false events with
+    `RAISE … USING ERRCODE`; the log settings are read in the agent's
+    session, so per-role or per-database overrides (superuser only,
+    reported by pgaudit when set) are not seen (`pg_db_role_setting` is
+    never read; ADR item 14, ROADMAP follow-up); the core's aggregation adds a failed read with no row count
+    to a successful read of the same group, whose count then stands for
+    both.
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first

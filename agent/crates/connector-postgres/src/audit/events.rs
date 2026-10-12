@@ -60,7 +60,8 @@ use databastion_classifiers::query::{
     QueryAnalysis, RelationName, StatementInfo, StatementKind, analyze, pg_scan,
 };
 
-use super::records::AuditRecord;
+use super::failures::{self, Base, Class, SessionTexts};
+use super::records::{AuditRecord, ErrorLine, LogEntry};
 use super::user_code::{CodeUse, UserCodeHandle, Verdict, routine_ddl_command};
 use crate::discover::normalize;
 use crate::sql;
@@ -100,6 +101,11 @@ pub(crate) struct DbCatalog {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Catalogs {
     dbs: HashMap<String, DbCatalog>,
+    /// Databases where the probe proved `log_min_messages` and
+    /// `log_min_error_statement` at `error` or lower (ADR-0037, refinement
+    /// of 2026-10-12, item 6): only there does a `FATAL` line without a
+    /// statement prove that no statement was running (item 9).
+    error_lines_proven: HashSet<String>,
     /// The target's collision probes (ADR-0049 decision 8).
     user_code: UserCodeHandle,
 }
@@ -113,6 +119,17 @@ impl Catalogs {
 
     pub(crate) fn insert(&mut self, database: &str, c: DbCatalog) {
         self.dbs.insert(database.to_owned(), c);
+    }
+
+    /// The probe proved item 6's settings in `database`.
+    pub(crate) fn prove_error_lines(&mut self, database: &str) {
+        self.error_lines_proven.insert(database.to_owned());
+    }
+
+    /// Whether item 6's settings are proven in `database` (a database the
+    /// target does not declare is not probed: not proven).
+    pub(crate) fn error_lines_proven(&self, database: &str) -> bool {
+        self.error_lines_proven.contains(database)
     }
 
     fn get(&self, database: &str) -> Option<&DbCatalog> {
@@ -1264,11 +1281,22 @@ impl PgOwn {
         }
     }
 }
-/// Builds events from pgaudit records.
+/// The cached analysis of a failed statement's text: database, keyed hash
+/// of the text, analysis.
+type FailedText = (String, u64, std::sync::Arc<(QueryAnalysis, TextReads)>);
+
+/// Builds events from pgaudit records and from the server's `ERROR` and
+/// `FATAL` lines (ADR-0037, refinement of 2026-10-12).
 pub(crate) struct PgauditEvents {
     own: PgOwn,
     dumps: DumpTracker,
     catalogs: Catalogs,
+    /// Item 4: each session's last pgaudit record.
+    sessions: SessionTexts,
+    /// The analysis of the last `ERROR` / `FATAL` line's text, keyed by
+    /// its database and the keyed hash of its text (a storm of one failing
+    /// statement is analyzed once).
+    last_failed: Option<FailedText>,
     /// Records dropped because their conversion panicked.
     pub(crate) panicked: u64,
 }
@@ -1317,6 +1345,8 @@ impl PgauditEvents {
             own,
             dumps: DumpTracker::default(),
             catalogs: Catalogs::default(),
+            sessions: SessionTexts::default(),
+            last_failed: None,
             panicked: 0,
         }
     }
@@ -1346,27 +1376,62 @@ impl PgauditEvents {
         self.catalogs = catalogs;
     }
 
-    /// Converts records (in log order) to events: one statement (same
-    /// session and statement id, `SESSION` and `OBJECT` records merged)
-    /// gives one event per action class (`read`, `write`, `ddl`, `dcl`).
+    /// Converts pgaudit records (in log order) to events (see
+    /// [`Self::convert_entries`]).
+    #[cfg(test)]
     pub(crate) fn convert(
         &mut self,
         records: Vec<AuditRecord>,
         now: SystemTime,
     ) -> Vec<MaskedEvent> {
+        self.convert_entries(records.into_iter().map(LogEntry::Audit).collect(), now)
+    }
+
+    /// Converts log entries (in log order) to events: one statement of
+    /// pgaudit records (same session and statement id, `SESSION` and
+    /// `OBJECT` records merged) gives one event per action class (`read`,
+    /// `write`, `ddl`, `dcl`); an `ERROR` or `FATAL` line gives at most one
+    /// event ([`Self::error_event`]), unless it repeats its session's last
+    /// pgaudit record (item 4). Lines are converted after the records of
+    /// the same read, so a routine DDL logged after a line also makes the
+    /// collision probe stale for it (fails closed).
+    pub(crate) fn convert_entries(
+        &mut self,
+        entries: Vec<LogEntry>,
+        now: SystemTime,
+    ) -> Vec<MaskedEvent> {
         let mut out = Vec::new();
         let mut group: Vec<AuditRecord> = Vec::new();
-        for r in records {
-            let same = group.first().is_some_and(|g| {
-                g.session == r.session && g.audit.statement_id == r.audit.statement_id
-            });
-            if !same && !group.is_empty() {
-                self.flush_isolated(std::mem::take(&mut group), now, &mut out);
+        let mut lines: Vec<ErrorLine> = Vec::new();
+        for entry in entries {
+            match entry {
+                LogEntry::Audit(r) => {
+                    self.sessions.record(&r, PREVIOUSLY_LOGGED);
+                    let same = group.first().is_some_and(|g| {
+                        g.session == r.session && g.audit.statement_id == r.audit.statement_id
+                    });
+                    if !same && !group.is_empty() {
+                        self.flush_isolated(std::mem::take(&mut group), now, &mut out);
+                    }
+                    group.push(r);
+                }
+                LogEntry::Error(line) => {
+                    if !self.sessions.duplicate(&line) {
+                        lines.push(line);
+                    }
+                }
             }
-            group.push(r);
         }
         if !group.is_empty() {
             self.flush_isolated(group, now, &mut out);
+        }
+        for line in lines {
+            // Per-line isolation, as per statement (PR #83 re-review M-A).
+            match databastion_core::isolate(|| self.error_event(&line, now)) {
+                Some(Some(e)) => out.push(e),
+                Some(None) => {}
+                None => self.panicked = self.panicked.saturating_add(1),
+            }
         }
         out
     }
@@ -1759,6 +1824,315 @@ impl PgauditEvents {
             }
             out.push(e);
         }
+    }
+}
+
+/// Lead words of statements that read and write no data (transaction
+/// control, settings, session state): a failed one gives no event.
+fn no_data_statement(p: &StatementInfo) -> bool {
+    let w = |i: usize| p.lead.get(i).map(String::as_str);
+    match w(0) {
+        Some(
+            "begin" | "start" | "commit" | "end" | "rollback" | "abort" | "savepoint" | "release"
+            | "set" | "reset" | "show" | "discard" | "deallocate" | "close" | "listen" | "unlisten"
+            | "checkpoint",
+        ) => true,
+        Some("prepare") => w(1) == Some("transaction"),
+        _ => false,
+    }
+}
+
+/// What a failed statement's text does, part by part: the action of its
+/// event (a read first: it may have sent rows) and whether it runs code
+/// whose objects the text does not show (`*`). `None`: nothing but
+/// statements of [`no_data_statement`].
+fn failed_action(a: &QueryAnalysis, code_star: bool) -> Option<(EventAction, bool)> {
+    let mut actions: Vec<EventAction> = Vec::new();
+    let mut star = false;
+    for p in a.parts() {
+        let action = match p.kind {
+            StatementKind::Select | StatementKind::Table | StatementKind::Values => {
+                EventAction::Read
+            }
+            StatementKind::Copy => {
+                if p.copy.is_some_and(|c| c.to) {
+                    EventAction::Read
+                } else {
+                    EventAction::Write
+                }
+            }
+            StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge => EventAction::Write,
+            StatementKind::Ddl => EventAction::Ddl,
+            StatementKind::Dcl => EventAction::Dcl,
+            _ => match p.pg_wrapped {
+                Some(w) => wrapped_action(w),
+                None if no_data_statement(p) => continue,
+                // `DO`, `CALL`, `EXECUTE`, `FETCH`, `LOCK`…: code or rows
+                // the text does not name.
+                None => {
+                    star = true;
+                    EventAction::Read
+                }
+            },
+        };
+        actions.push(action);
+    }
+    if a.parts().is_empty() {
+        // A text that did not lex: unknown.
+        return Some((EventAction::Read, true));
+    }
+    if actions.is_empty() {
+        return code_star.then_some((EventAction::Read, true));
+    }
+    let rank = |x: &EventAction| match x {
+        EventAction::Read => 0,
+        EventAction::Write => 1,
+        EventAction::Ddl => 2,
+        _ => 3,
+    };
+    let action = actions.iter().copied().min_by_key(rank)?;
+    Some((action, star))
+}
+
+/// Names of a text that make an `INSERT` read or return more than its own
+/// values.
+const INSERT_READ_WORDS: [&str; 5] = ["select", "table", "with", "returning", "conflict"];
+
+impl PgauditEvents {
+    /// Item 3, telling class: a plain `INSERT … VALUES` (one statement, one
+    /// relation, no query, no `RETURNING`, no `ON CONFLICT`, only built-in
+    /// code) is an ordinary write event under the filters; any other
+    /// telling failure is always reported.
+    fn plain_insert(&self, a: &QueryAnalysis, text: &str, database: &str) -> bool {
+        let [p] = a.parts() else {
+            return false;
+        };
+        if p.kind != StatementKind::Insert || p.nested || p.relations.len() > 1 {
+            return false;
+        }
+        let Some(scan) = pg_scan(text) else {
+            return false;
+        };
+        if scan
+            .names()
+            .iter()
+            .any(|u| u.name.schema.is_none() && INSERT_READ_WORDS.contains(&u.name.name.as_str()))
+        {
+            return false;
+        }
+        let code = scan.code();
+        let none = |_: &RelationName| false;
+        self.catalogs
+            .user_code
+            .decide(database, Some(&code), false, &none)
+            == Verdict::BuiltIn
+    }
+
+    /// Item 3: whether a `25P02` line without a context is refused: its
+    /// text calls only built-in code (ADR-0049 decision 8's lists and
+    /// collision probe; a text that cannot be scanned keeps the line).
+    fn refused_25p02(&self, text: &str, database: &str) -> bool {
+        let Some(scan) = pg_scan(text) else {
+            return false;
+        };
+        let code = scan.code();
+        let none = |_: &RelationName| false;
+        self.catalogs
+            .user_code
+            .decide(database, Some(&code), false, &none)
+            == Verdict::BuiltIn
+    }
+
+    /// The event of a failed or cancelled statement (ADR-0037, refinement
+    /// of 2026-10-12), from its SQLSTATE and statement text only: never
+    /// from its message, detail, hint, context or internal query (I2).
+    /// The text is analyzed like a pgaudit record's: relations named
+    /// (catalogs aside), the statistics and statement-text rules, ADR-0049
+    /// decision 8, wrapped queries. Every event has no row count.
+    ///
+    /// - quiet: a read of the statement's relations (a DDL or DCL keeps
+    ///   its action), always reported; from the agent's identity, charged
+    ///   the whole budget like an unknown row count (`PgOwn`);
+    /// - telling: the statement's action, always reported (a plain
+    ///   `INSERT … VALUES` aside, under the filters), never the agent's
+    ///   own;
+    /// - without a statement text: a read of `*`, always reported (item
+    ///   5), unless refused; a `FATAL` line without one ends an idle
+    ///   session when the log settings are proven for its database (no
+    ///   statement was running): no event (proposed item 9); otherwise a
+    ///   read of `*` too.
+    fn error_event(&mut self, line: &ErrorLine, now: SystemTime) -> Option<MaskedEvent> {
+        #[cfg(test)]
+        #[allow(clippy::panic)]
+        if line.user == TEST_POISON_USER {
+            panic!("conversion bug on a line");
+        }
+        // Lines before authentication have no user nor database.
+        if line.user.is_empty() || line.database.is_empty() {
+            return None;
+        }
+        let database = line.database.as_str();
+        let base = failures::base_class(line.sqlstate, line.has_context, line.statement.is_some());
+        let client = line.remote.as_deref().and_then(ClientAddr::parse);
+        let principal = EventPrincipal::account(&line.user)
+            .with_client(client)
+            .with_application(&line.application);
+        let ts = line.ts.unwrap_or(now);
+        let Some(text) = line.statement.as_deref().map(String::as_str) else {
+            if base == Base::Refused {
+                return None;
+            }
+            // Item 9 (proposed): with `log_min_error_statement` and
+            // `log_min_messages` proven for the database, a `FATAL` line
+            // without a statement ends an idle session; otherwise it may
+            // have hidden its statement, and is item 5's read of `*`.
+            if line.fatal && self.catalogs.error_lines_proven(database) {
+                return None;
+            }
+            // Item 5: never the agent's own (`*`, `OwnKind::Unknown`).
+            return Some(
+                MaskedEvent::new(EventSource::Pgaudit, EventAction::Read, principal, ts)
+                    .with_rows(None)
+                    .with_always_report()
+                    .with_object(unknown_object(database)),
+            );
+        };
+        // Unqualified `pg_*` names are not catalogs here: no pgaudit
+        // record confirms them (fails closed, over-reports).
+        let none = HashSet::new();
+        let rule = self.catalogs.rule(database, false, &none);
+        let key = self.sessions.text_key(text);
+        let cached = match &self.last_failed {
+            Some((db, k, a)) if db == database && *k == key => std::sync::Arc::clone(a),
+            _ => {
+                let analysis = analyze(text, analyze_opts(false));
+                let reads = text_reads(text, &analysis, rule, false);
+                let a = std::sync::Arc::new((analysis, reads));
+                self.last_failed = Some((database.to_owned(), key, std::sync::Arc::clone(&a)));
+                a
+            }
+        };
+        let (analysis, reads) = (&cached.0, &cached.1);
+        let class = match base {
+            Base::Refused => return None,
+            Base::RefusedUnlessUserCode => {
+                if self.refused_25p02(text, database) {
+                    return None;
+                }
+                Class::Quiet
+            }
+            Base::RefusedIfUnlexable => {
+                if failures::unlexable_plain(text, analysis.lexed()) {
+                    return None;
+                }
+                Class::Quiet
+            }
+            Base::Quiet => Class::Quiet,
+            Base::Telling => Class::Telling,
+        };
+        let own = &self.own;
+        let own_exact = || {
+            own.connector_sent(text, rule.pss_schema)
+                && own.agent_identity(
+                    &line.user,
+                    Some(&line.application),
+                    ClientSeen::Logged(client),
+                )
+        };
+        let code_star = user_code_star(reads, &self.catalogs, database, rule, &own_exact);
+        let (statement_action, other_star) = failed_action(analysis, code_star)?;
+        let action = match (class, statement_action) {
+            (Class::Quiet, EventAction::Ddl | EventAction::Dcl) | (Class::Telling, _) => {
+                statement_action
+            }
+            (Class::Quiet, _) => EventAction::Read,
+        };
+        let wrapping = wrapper_use(analysis);
+        let all: Vec<&StatementInfo> = analysis.parts().iter().collect();
+        let (mut objects, named_any) = user_relations(&all, rule);
+        let rw = matches!(action, EventAction::Read | EventAction::Write);
+        let reads_star = reads.star || code_star || other_star;
+        let named_any = named_any || !reads.named.is_empty();
+        for o in &reads.objects {
+            push_unique(&mut objects, o.clone());
+        }
+        // At the analyzer's relation bound: `*`, always reported (as for
+        // pgaudit records and `pg_stat_statements`).
+        let bound = (rw || action == EventAction::Ddl) && all.iter().any(|p| p.relations_full);
+        if rw && objects.is_empty() && named_any && !bound && !reads_star {
+            // Only catalogs: not application data (as when it succeeds).
+            return None;
+        }
+        let mut e = MaskedEvent::new(EventSource::Pgaudit, action, principal, ts).with_rows(None);
+        let mut named: Vec<&RelationName> = objects.iter().collect();
+        named.sort_by_key(|o| (!reads.objects.contains(o), !is_statistics(o)));
+        let statistics = objects.iter().any(is_statistics) || bound;
+        let text_read = !reads.objects.is_empty();
+        let star = (rw && objects.is_empty()) || bound || reads_star;
+        let under_filters = class == Class::Telling
+            && action == EventAction::Write
+            && !statistics
+            && !star
+            && !text_read
+            && self.plain_insert(analysis, text, database);
+        if !under_filters {
+            e = e.with_always_report();
+        }
+        for o in named.into_iter().take(if star { 15 } else { 16 }) {
+            e = e.with_object(object(database, o));
+        }
+        if star {
+            e = e.with_object(unknown_object(database));
+        }
+        if action == EventAction::Read {
+            for s in statement_signals(&all, None, rule) {
+                e = e.with_signal(s);
+            }
+            let copied = copied_to_client(&all, rule);
+            let dump = !copied.is_empty() && self.dumps.copied(&line.session, &copied);
+            if dump
+                || (is_dump_application(&line.application)
+                    && (e.signals().contains(&Signal::FullTableCopy)
+                        || e.signals().contains(&Signal::FullTableRead)))
+            {
+                e = e.with_signal(Signal::PgDump);
+            }
+        }
+        let kind = if class == Class::Telling {
+            OwnKind::Never
+        } else if text_read
+            && self.own.text_query(text)
+            && !reads_star
+            && !statistics
+            && objects
+                .iter()
+                .all(|o| o.name == PSS_VIEW && o.schema.as_deref() == rule.pss_schema)
+            && self.own.in_pss_period(ts)
+        {
+            OwnKind::StatementText
+        } else if statistics || text_read || reads_star || wrapping.any {
+            OwnKind::Never
+        } else if objects.is_empty() && !named_any && self.own.own_text(text) {
+            OwnKind::Tableless
+        } else if rw && objects.is_empty() {
+            OwnKind::Unknown
+        } else {
+            OwnKind::Named
+        };
+        if self.own.routine(
+            &line.user,
+            Some(&line.application),
+            ClientSeen::Logged(client),
+            &e,
+            kind,
+            Instant::now(),
+        ) {
+            return None;
+        }
+        Some(e)
     }
 }
 
@@ -6145,3 +6519,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "failures_tests.rs"]
+mod failures_tests;

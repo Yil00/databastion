@@ -170,7 +170,7 @@ Every item is checked on the `dev` commit that becomes the release (and on the `
 
 ### Open release gates
 Gates that hold back the next release containing a given change; removed from this list once met.
-- [ ] **ADR-0037 refinement of 2026-10-12 implemented (PostgreSQL failed and cancelled reads from the server's ERROR lines) before the next release** (security review of #213, C1; [ADR-0037](docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements), [ROADMAP](docs/ROADMAP.md#phase-8-follow-ups)).
+- [x] **ADR-0037 refinement of 2026-10-12 implemented (PostgreSQL failed and cancelled reads from the server's ERROR lines) before the next release** (security review of #213, C1; [ADR-0037](docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements), [ROADMAP](docs/ROADMAP.md#phase-8-follow-ups)). **Met** by this PR (`feat/p8-pg-failed-reads`), once merged on `dev` after its `security-reviewer` review.
 - [x] **ADR-0049 part 2 merged before a release containing part 1** (security review of #208, M1): ADR-0049 part 1 (#208, PostgreSQL statement-text view reads) catches a user function next to a statement-text view only when it is schema-qualified (ADR-0049 refinement item 7). The next release that contains #208 waits until decision 8 (user functions, operators and casts next to catalogs, [ADR-0049](docs/adr/0049-postgresql-statement-text-views-as-reads.md)) is merged on `dev` ([ROADMAP](docs/ROADMAP.md#phase-8-follow-ups)). **Met** by this PR (ADR-0049 part 2, decision 8), once merged on `dev`.
 
 ### Additional items for v0.1.0

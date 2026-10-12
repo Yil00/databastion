@@ -378,26 +378,26 @@ async fn streamed(c: &tokio_postgres::Client, statement: &str) -> (usize, Option
     (rows, None)
 }
 
-/// Security review of #197, L1: a failed read whose error quotes the value
-/// it read (`invalid input syntax for type integer: "<value>"`, SQLSTATE
-/// 22P02), from another role and from the agent's role, and a read that
-/// streams its rows to the client before failing on purpose on the last
-/// one (22012), a read cancelled by its `statement_timeout` and one
-/// cancelled by the client (57014), and a read whose client closes the
-/// connection in the middle of the result (`FATAL` 08006).
-/// What the server writes, and what the agent reports today:
+/// Security review of #197, L1, and ADR-0037's refinement of 2026-10-12: a
+/// failed read whose error quotes the value it read (`invalid input syntax
+/// for type integer: "<value>"`, SQLSTATE 22P02), from another role and
+/// from the agent's role, a read that streams its rows to the client before
+/// failing on purpose on the last one (22012), a read cancelled by its
+/// `statement_timeout` and one cancelled by the client (57014), and a read
+/// whose client closes the connection in the middle of the result (`FATAL`
+/// 08006). What the server writes, and what the agent reports:
 ///
 /// - with `pgaudit.log_rows = on` (needed for Full), pgaudit writes its
 ///   record when the statement ends, so a failed statement leaves **no**
-///   `AUDIT:` record, only the server's `ERROR` line, whose message holds
-///   the value and whose `statement` field holds the text: **no event**,
-///   from any role, for the failed cast, the rows streamed before the
-///   error, nor the cancelled read;
+///   `AUDIT:` record, only the server's `ERROR` (or `FATAL`) line, whose
+///   message holds the value and whose `statement` field holds the text:
+///   each failed read is reported from that line, a read of its relation
+///   with no row count, always reported, and the value is nowhere;
 /// - with `pgaudit.log_rows = off`, the record is written when the
-///   statement starts: the failed read is reported (no row count);
-/// - `pg_stat_statements` counts no failed statement: no event.
-///
-/// The proposed fix is in ADR-0037's refinement of 2026-10-12 (proposed).
+///   statement starts: the failed read is reported once (the line repeats
+///   the record, item 4), with no row count;
+/// - `pg_stat_statements` counts no failed statement: no event (Limited,
+///   documented).
 #[tokio::test]
 async fn failed_reads_and_what_is_reported() {
     let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
@@ -422,8 +422,22 @@ async fn failed_reads_and_what_is_reported() {
         .await
         .unwrap();
     }
-    tables(&a, &["it_fail", "it_fail_control"], &[FAIL_ROLE]).await;
-    tables(&a, &["it_fail_norows"], &[FAIL_NOROWS_ROLE]).await;
+    // One table per case, so that each case's event is told apart.
+    let cases = [
+        "it_fail_cast",
+        "it_fail_late",
+        "it_fail_timeout",
+        "it_fail_cancel",
+        "it_fail_lost",
+        "it_fail_control",
+    ];
+    tables(&a, &cases, &[FAIL_ROLE]).await;
+    tables(
+        &a,
+        &["it_fail_norows", "it_fail_norows_late"],
+        &[FAIL_NOROWS_ROLE],
+    )
+    .await;
     let cast = |t: &str, id: u32| format!("SELECT email::integer FROM crm.{t} WHERE id = {id}");
     let late = |t: &str| {
         format!("SELECT id, email, CASE WHEN id = 60 THEN 1 / (id - 60) END FROM crm.{t}")
@@ -453,6 +467,19 @@ async fn failed_reads_and_what_is_reported() {
             super::it::skip("pss", "pg_stat_statements is not usable by the agent role");
             continue;
         }
+        if pgaudit && pgaudit_loaded {
+            // The log settings are proven (item 6): Full with row counts,
+            // or Partial before the first record was read.
+            assert!(
+                matches!(health.audit_level, AuditLevel::Full | AuditLevel::Partial),
+                "{label}: {health:?}"
+            );
+            let detail = health.detail.clone().unwrap_or_default();
+            assert!(
+                !detail.contains("log_min_messages") && !detail.contains("log_min_error_statement"),
+                "{label}: {detail}"
+            );
+        }
         let state = TempDir::new();
         let (task, mut rx) = start_audit_with(Arc::clone(&connector), &t, &state.0);
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -466,8 +493,8 @@ async fn failed_reads_and_what_is_reported() {
         // The failed cast quotes the value; the client gets it in the
         // error message (not printed here).
         let failing = [
-            (&f, FAIL_ROLE, cast("it_fail", 1)),
-            (&g, u.user.as_str(), cast("it_fail", 2)),
+            (&f, FAIL_ROLE, cast("it_fail_cast", 1)),
+            (&g, u.user.as_str(), cast("it_fail_cast", 2)),
             (&n, FAIL_NOROWS_ROLE, cast("it_fail_norows", 3)),
         ];
         for (c, who, s) in &failing {
@@ -479,21 +506,28 @@ async fn failed_reads_and_what_is_reported() {
                 "{label} {who}: the error quotes the value"
             );
         }
-        // Rows streamed to the client, then an error on purpose.
-        let (rows_f, code_f) = streamed(&f, &late("it_fail")).await;
-        let (rows_g, code_g) = streamed(&g, &late("it_fail")).await;
+        // Rows streamed to the client, then an error on purpose (extended
+        // protocol), from the three roles.
+        let (rows_f, code_f) = streamed(&f, &late("it_fail_late")).await;
+        let (rows_g, code_g) = streamed(&g, &late("it_fail_late")).await;
+        let (rows_n, code_n) = streamed(&n, &late("it_fail_norows_late")).await;
         assert_eq!(code_f.as_deref(), Some("22012"), "{label}");
         assert_eq!(code_g.as_deref(), Some("22012"), "{label}");
-        assert_eq!((rows_f, rows_g), (59, 59), "{label}: rows received");
+        assert_eq!(code_n.as_deref(), Some("22012"), "{label}");
+        assert_eq!(
+            (rows_f, rows_g, rows_n),
+            (59, 59, 59),
+            "{label}: rows received"
+        );
         // A read cancelled by its `statement_timeout` (57014).
-        let slow = slow_read("it_fail");
+        let slow = slow_read("it_fail_timeout");
         f.batch_execute("SET statement_timeout = 500")
             .await
             .unwrap();
         assert_eq!(run(&f, &slow).await.as_deref(), Some("57014"), "{label}");
         f.batch_execute("RESET statement_timeout").await.unwrap();
         // A client's cancel request (57014) while the read runs.
-        let cancelled = slow_read("it_fail_control");
+        let cancelled = slow_read("it_fail_cancel");
         let cancel = f.cancel_token();
         let canceller = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -508,7 +542,7 @@ async fn failed_reads_and_what_is_reported() {
         // A client that closes its connection in the middle of a result
         // (the server's sends fail: `FATAL` 08006 "connection to client
         // lost").
-        let lost = lost_read("it_fail");
+        let lost = lost_read("it_fail_lost");
         let rows_lost = drop_mid_result(&adm, FAIL_ROLE, &u.dbname, &lost).await;
         assert!(rows_lost > 0, "{label}: rows received before closing");
         // A control read, so that the stream is known to report.
@@ -516,9 +550,19 @@ async fn failed_reads_and_what_is_reported() {
             run(&f, "SELECT id FROM crm.it_fail_control WHERE id = 5").await,
             None
         );
-        let control = |ev: &[MaskedEvent]| read_of(ev, FAIL_ROLE, "it_fail_control").is_some();
+        let reported = |ev: &[MaskedEvent]| {
+            read_of(ev, FAIL_ROLE, "it_fail_control").is_some()
+                && (!pgaudit
+                    || !pgaudit_loaded
+                    || (cases[..5]
+                        .iter()
+                        .all(|t| read_of(ev, FAIL_ROLE, t).is_some())
+                        && read_of(ev, &u.user, "it_fail_cast").is_some()
+                        && read_of(ev, &u.user, "it_fail_late").is_some()
+                        && read_of(ev, FAIL_NOROWS_ROLE, "it_fail_norows_late").is_some()))
+        };
         let mut events = Vec::new();
-        collect_until(&mut rx, &mut events, Duration::from_secs(30), control).await;
+        collect_until(&mut rx, &mut events, Duration::from_secs(30), reported).await;
         collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
         task.abort();
         let described: Vec<String> = events.iter().map(describe).collect();
@@ -527,7 +571,7 @@ async fn failed_reads_and_what_is_reported() {
             described.len(),
             described.join("\n")
         );
-        assert!(control(&events), "{label}: {described:#?}");
+        assert!(reported(&events), "{label}: {described:#?}");
         // The server's log (jsonlog): an `ERROR` line with the statement
         // and a message that quotes the value; no pgaudit record of a
         // statement that failed with `log_rows = on`, one with `off`.
@@ -536,7 +580,7 @@ async fn failed_reads_and_what_is_reported() {
                 let lines = error_lines(path, from, s, WRAP_MARK, 1).await;
                 assert_eq!(lines, [("22P02".to_owned(), true)], "{label} {who}");
             }
-            let lines = error_lines(path, from, &late("it_fail"), WRAP_MARK, 2).await;
+            let lines = error_lines(path, from, &late("it_fail_late"), WRAP_MARK, 2).await;
             assert_eq!(lines.len(), 2, "{label}: {lines:?}");
             assert!(lines.iter().all(|(c, quoted)| c == "22012" && !quoted));
             let lines = error_lines(path, from, &slow, WRAP_MARK, 1).await;
@@ -549,7 +593,7 @@ async fn failed_reads_and_what_is_reported() {
             );
             // Observed on 16.13: a `FATAL` 08006 line that carries the
             // statement text (after a `LOG` "could not send data to
-            // client" line, also with it).
+            // client" line, also with it, which is not read).
             let lines = error_lines(path, from, &lost, WRAP_MARK, 1).await;
             assert_eq!(
                 lines,
@@ -558,9 +602,9 @@ async fn failed_reads_and_what_is_reported() {
             );
             if log_rows.as_deref() == Some("on") {
                 for s in [
-                    cast("it_fail", 1),
-                    cast("it_fail", 2),
-                    late("it_fail"),
+                    cast("it_fail_cast", 1),
+                    cast("it_fail_cast", 2),
+                    late("it_fail_late"),
                     slow.clone(),
                     cancelled.clone(),
                     lost.clone(),
@@ -568,25 +612,55 @@ async fn failed_reads_and_what_is_reported() {
                     assert_eq!(audit_records(path, from, &s), 0, "{label}: {s}");
                 }
             }
-            assert!(
-                audit_records(path, from, &cast("it_fail_norows", 3)) > 0,
-                "{label}: log_rows = off writes the record at the start"
-            );
+            for s in [cast("it_fail_norows", 3), late("it_fail_norows_late")] {
+                assert!(
+                    audit_records(path, from, &s) > 0,
+                    "{label}: log_rows = off writes the record at the start"
+                );
+            }
         }
-        // What the agent reports today: nothing of the failed reads with
-        // `log_rows = on` or on `pg_stat_statements` (no record, no
-        // counter), from any role, the rows streamed before the error
-        // included; with `log_rows = off` on pgaudit, a read with no row
-        // count.
-        assert!(
-            !events.iter().any(|e| names_table(e, "it_fail")),
-            "{label}: {described:#?}"
-        );
         let norows = read_of(&events, FAIL_NOROWS_ROLE, "it_fail_norows");
         if pgaudit && pgaudit_loaded {
+            // Every failed read is reported, from its `ERROR` / `FATAL`
+            // line: a read of its relation, with no row count, always
+            // reported; from another role and the agent's role.
+            for (who, t) in [
+                (FAIL_ROLE, "it_fail_cast"),
+                (FAIL_ROLE, "it_fail_late"),
+                (FAIL_ROLE, "it_fail_timeout"),
+                (FAIL_ROLE, "it_fail_cancel"),
+                (FAIL_ROLE, "it_fail_lost"),
+                (u.user.as_str(), "it_fail_cast"),
+                (u.user.as_str(), "it_fail_late"),
+            ] {
+                let e = read_of(&events, who, t)
+                    .unwrap_or_else(|| panic!("{label} {who} {t}: {described:#?}"));
+                assert_eq!(e.rows(), None, "{label} {who} {t}");
+                assert!(e.always_report(), "{label} {who} {t}");
+                assert_eq!(e.objects().len(), 1, "{label} {who} {t}: {described:#?}");
+            }
+            // `log_rows = off`: reported once, from the record written at
+            // the start (the line repeats it, item 4), simple and extended
+            // protocols.
+            for t in ["it_fail_norows", "it_fail_norows_late"] {
+                let n = events
+                    .iter()
+                    .filter(|e| {
+                        e.principal().account_name() == FAIL_NOROWS_ROLE && names_table(e, t)
+                    })
+                    .count();
+                assert_eq!(n, 1, "{label} {t}: {described:#?}");
+            }
             let e = norows.unwrap_or_else(|| panic!("{label}: {described:#?}"));
             assert_eq!(e.rows(), None, "{label}");
         } else {
+            // `pg_stat_statements` counts no failed statement (Limited).
+            for t in &cases[..5] {
+                assert!(
+                    !events.iter().any(|e| names_table(e, t)),
+                    "{label}: {described:#?}"
+                );
+            }
             assert!(norows.is_none(), "{label}: {described:#?}");
         }
         assert!(!described.iter().any(|d| d.contains(WRAP_MARK)), "{label}");
@@ -596,13 +670,279 @@ async fn failed_reads_and_what_is_reported() {
             .await
             .unwrap();
     }
-    for t in ["it_fail", "it_fail_control", "it_fail_norows"] {
+    for t in cases
+        .iter()
+        .chain(&["it_fail_norows", "it_fail_norows_late"])
+    {
         a.batch_execute(&format!("DROP TABLE IF EXISTS crm.{t}"))
             .await
             .unwrap();
     }
     drop_role(&a, FAIL_ROLE, &u.dbname).await;
     drop_role(&a, FAIL_NOROWS_ROLE, &u.dbname).await;
+    let text = logs.text();
+    assert!(!text.contains(WRAP_MARK), "a value reached the logs");
+}
+
+/// A role whose reads raise `25P02` / `42601` through user code (F1).
+const F1_ROLE: &str = "databastion_it_f1";
+/// A role that sends a genuine `25P02` and a genuine `42601`.
+const F1_GENUINE_ROLE: &str = "databastion_it_f1_genuine";
+/// The ways user code runs next to an application table without the
+/// statement text showing it.
+const F1_WAYS: [&str; 5] = ["view", "rls", "operator", "cast", "domain"];
+
+/// ADR-0037, refinement of 2026-10-12, F1 (security review of PR #213): a
+/// `25P02` or `42601` raised with `RAISE … USING ERRCODE` after rows were
+/// sent, from a function called through a view, a row-level security
+/// policy, a user operator, a user cast and a domain `CHECK`, each next to
+/// an application table, from another role and from the agent's role: the
+/// line has a context, so it is reported (a read of the relations the
+/// text names). A genuine `25P02` (a statement sent in an aborted
+/// transaction) and a genuine `42601` (a text that does not lex): no
+/// event.
+#[tokio::test]
+async fn forced_25p02_and_42601_through_user_code() {
+    let (Some(u), Some(adm)) = (agent_url(), admin_url()) else {
+        return;
+    };
+    let logs_dirs = audit_logs();
+    if logs_dirs.is_empty() {
+        return;
+    }
+    let _serial = SERIAL.lock().await;
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let a = admin(&adm, &u.dbname).await;
+    if a.query_one("SELECT current_setting('pgaudit.log_rows', true)", &[])
+        .await
+        .unwrap()
+        .get::<_, Option<String>>(0)
+        .is_none()
+    {
+        super::it::skip("pgaudit", "pgaudit is not loaded");
+        return;
+    }
+    create_role(&a, F1_ROLE, &u.dbname).await;
+    create_role(&a, F1_GENUINE_ROLE, &u.dbname).await;
+    let codes = [("25", "25P02"), ("42", "42601")];
+    // Left over by an interrupted run.
+    a.batch_execute("DROP VIEW IF EXISTS crm.it_f1_v_25, crm.it_f1_v_42")
+        .await
+        .unwrap();
+    // The function raises the code once 59 rows went through.
+    for (c, code) in codes {
+        a.batch_execute(&format!(
+            "CREATE OR REPLACE FUNCTION crm.it_f1_raise_{c}(i integer) RETURNS integer \
+               LANGUAGE plpgsql AS $$ BEGIN \
+                 IF i = 60 THEN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END IF; \
+                 RETURN i; END $$; \
+             CREATE OR REPLACE FUNCTION crm.it_f1_op_{c}(i integer, j integer) RETURNS boolean \
+               LANGUAGE plpgsql AS $$ BEGIN RETURN crm.it_f1_raise_{c}(i) >= j; END $$; \
+             DROP OPERATOR IF EXISTS crm.### (integer, integer) CASCADE; \
+             DROP TYPE IF EXISTS crm.it_f1_box_{c} CASCADE; \
+             CREATE TYPE crm.it_f1_box_{c} AS (v integer); \
+             CREATE OR REPLACE FUNCTION crm.it_f1_cast_{c}(i integer) RETURNS crm.it_f1_box_{c} \
+               LANGUAGE plpgsql AS $$ BEGIN RETURN ROW(crm.it_f1_raise_{c}(i)); END $$; \
+             CREATE CAST (integer AS crm.it_f1_box_{c}) WITH FUNCTION crm.it_f1_cast_{c}(integer); \
+             DROP DOMAIN IF EXISTS crm.it_f1_dom_{c} CASCADE; \
+             CREATE DOMAIN crm.it_f1_dom_{c} AS integer CHECK (crm.it_f1_raise_{c}(VALUE) > 0);"
+        ))
+        .await
+        .unwrap();
+    }
+    let mut all_tables: Vec<String> = Vec::new();
+    for (c, _) in codes {
+        for way in F1_WAYS {
+            all_tables.push(format!("it_f1_{way}_{c}"));
+        }
+    }
+    let table_names: Vec<&str> = all_tables.iter().map(String::as_str).collect();
+    tables(&a, &table_names, &[F1_ROLE]).await;
+    tables(
+        &a,
+        &["it_f1_genuine", "it_f1_genuine_abort", "it_f1_genuine42"],
+        &[F1_GENUINE_ROLE],
+    )
+    .await;
+    // The operator symbol is per code.
+    let ops = [("25", "###"), ("42", "#@#")];
+    for ((c, _), (_, op)) in codes.iter().zip(ops) {
+        a.batch_execute(&format!(
+            "CREATE OR REPLACE VIEW crm.it_f1_v_{c} AS \
+               SELECT id, email, crm.it_f1_raise_{c}(id) AS r FROM crm.it_f1_view_{c}; \
+             GRANT SELECT ON crm.it_f1_v_{c} TO {F1_ROLE}; \
+             ALTER TABLE crm.it_f1_rls_{c} ENABLE ROW LEVEL SECURITY; \
+             DROP POLICY IF EXISTS p ON crm.it_f1_rls_{c}; \
+             CREATE POLICY p ON crm.it_f1_rls_{c} USING (crm.it_f1_raise_{c}(id) > 0); \
+             DROP OPERATOR IF EXISTS crm.{op} (integer, integer); \
+             CREATE OPERATOR crm.{op} (LEFTARG = integer, RIGHTARG = integer, \
+               FUNCTION = crm.it_f1_op_{c});"
+        ))
+        .await
+        .unwrap();
+    }
+    // The statements: the application table (or its view) named, the user
+    // code out of sight (the view, the policy) or in plain sight (the
+    // operator, the cast, the domain).
+    let statements = |c: &str, op: &str| -> Vec<(String, String)> {
+        vec![
+            (
+                format!("it_f1_v_{c}"),
+                format!("SELECT id, email, r FROM crm.it_f1_v_{c}"),
+            ),
+            (
+                format!("it_f1_rls_{c}"),
+                format!("SELECT id, email FROM crm.it_f1_rls_{c}"),
+            ),
+            (
+                format!("it_f1_operator_{c}"),
+                format!(
+                    "SELECT id, email FROM crm.it_f1_operator_{c} \
+                     WHERE id OPERATOR(crm.{op}) 0"
+                ),
+            ),
+            (
+                format!("it_f1_cast_{c}"),
+                format!("SELECT id, email, id::crm.it_f1_box_{c} FROM crm.it_f1_cast_{c}"),
+            ),
+            (
+                format!("it_f1_domain_{c}"),
+                format!("SELECT id, email, id::crm.it_f1_dom_{c} FROM crm.it_f1_domain_{c}"),
+            ),
+        ]
+    };
+    for (i, (path, format)) in logs_dirs.into_iter().enumerate() {
+        let label = format!("pgaudit {format}");
+        let (_dir, t) = audit_target(&u, &format!("pg-f1-{i}"), Some((path.as_path(), format)));
+        let connector = Arc::new(PostgresConnector::new());
+        let _ = connector.check(&t).await;
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit_with(Arc::clone(&connector), &t, &state.0);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let r = raw_client(&adm, F1_ROLE, WRAP_PASSWORD, &u.dbname).await;
+        let g = raw_client(&adm, &u.user, &u.password, &u.dbname).await;
+        let mut want: Vec<(String, String)> = Vec::new();
+        for ((c, code), (_, op)) in codes.iter().zip(ops) {
+            for (table, s) in statements(c, op) {
+                for (client, who) in [(&r, F1_ROLE), (&g, u.user.as_str())] {
+                    let (rows, got) = streamed(client, &s).await;
+                    assert_eq!(got.as_deref(), Some(*code), "{label} {who}: {s}");
+                    assert!(rows > 0, "{label} {who} {s}: rows sent before the error");
+                    want.push((who.to_owned(), table.clone()));
+                }
+            }
+        }
+        // A genuine `25P02` (a statement in an aborted transaction) and a
+        // genuine `42601` (a text that does not lex).
+        let x = raw_client(&adm, F1_GENUINE_ROLE, WRAP_PASSWORD, &u.dbname).await;
+        assert_eq!(run(&x, "BEGIN").await, None);
+        assert_eq!(
+            run(&x, "SELECT email::integer FROM crm.it_f1_genuine_abort")
+                .await
+                .as_deref(),
+            Some("22P02")
+        );
+        assert_eq!(
+            run(&x, "SELECT email FROM crm.it_f1_genuine")
+                .await
+                .as_deref(),
+            Some("25P02")
+        );
+        assert_eq!(run(&x, "ROLLBACK").await, None);
+        assert_eq!(
+            run(&x, "SELECT email FROM crm.it_f1_genuine42 'unterminated")
+                .await
+                .as_deref(),
+            Some("42601")
+        );
+        // A control read of that role.
+        assert_eq!(
+            run(&x, "SELECT id FROM crm.it_f1_genuine42 WHERE id = 1").await,
+            None
+        );
+        let done = |ev: &[MaskedEvent]| {
+            want.iter().all(|(who, t)| read_of(ev, who, t).is_some())
+                && ev.iter().any(|e| {
+                    e.principal().account_name() == F1_GENUINE_ROLE
+                        && names_table(e, "it_f1_genuine42")
+                })
+        };
+        let mut events = Vec::new();
+        collect_until(&mut rx, &mut events, Duration::from_secs(40), done).await;
+        collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+        task.abort();
+        let described: Vec<String> = events.iter().map(describe).collect();
+        eprintln!(
+            "{label} events ({}):\n{}",
+            described.len(),
+            described.join("\n")
+        );
+        for (who, t) in &want {
+            let e = read_of(&events, who, t)
+                .unwrap_or_else(|| panic!("{label} {who} {t}: {described:#?}"));
+            assert!(e.always_report(), "{label} {who} {t}");
+            assert_eq!(e.rows(), None, "{label} {who} {t}");
+        }
+        // The genuine ones: no event; the role's only events are the
+        // failed cast that aborted its transaction and the control read.
+        for e in events
+            .iter()
+            .filter(|e| e.principal().account_name() == F1_GENUINE_ROLE)
+        {
+            assert!(
+                names_table(e, "it_f1_genuine_abort") || names_table(e, "it_f1_genuine42"),
+                "{label}: {}",
+                describe(e)
+            );
+            assert!(!names(e).iter().any(|n| n.ends_with('*')), "{label}");
+        }
+        assert!(
+            !events.iter().any(|e| names_table(e, "it_f1_genuine")),
+            "{label}: {described:#?}"
+        );
+        // The control read is a success; the unterminated text names
+        // nothing.
+        let n42 = events
+            .iter()
+            .filter(|e| {
+                e.principal().account_name() == F1_GENUINE_ROLE && names_table(e, "it_f1_genuine42")
+            })
+            .count();
+        assert_eq!(n42, 1, "{label}: {described:#?}");
+        assert!(!described.iter().any(|d| d.contains(WRAP_MARK)), "{label}");
+    }
+    for (c, _) in codes {
+        a.batch_execute(&format!(
+            "DROP VIEW IF EXISTS crm.it_f1_v_{c}; \
+             DROP DOMAIN IF EXISTS crm.it_f1_dom_{c} CASCADE; \
+             DROP TYPE IF EXISTS crm.it_f1_box_{c} CASCADE;"
+        ))
+        .await
+        .unwrap();
+    }
+    for t in all_tables.iter().map(String::as_str).chain([
+        "it_f1_genuine",
+        "it_f1_genuine_abort",
+        "it_f1_genuine42",
+    ]) {
+        a.batch_execute(&format!("DROP TABLE IF EXISTS crm.{t} CASCADE"))
+            .await
+            .unwrap();
+    }
+    for (c, _) in codes {
+        a.batch_execute(&format!(
+            "DROP OPERATOR IF EXISTS crm.### (integer, integer); \
+             DROP OPERATOR IF EXISTS crm.#@# (integer, integer); \
+             DROP FUNCTION IF EXISTS crm.it_f1_op_{c}(integer, integer); \
+             DROP FUNCTION IF EXISTS crm.it_f1_cast_{c}(integer); \
+             DROP FUNCTION IF EXISTS crm.it_f1_raise_{c}(integer);"
+        ))
+        .await
+        .unwrap();
+    }
+    drop_role(&a, F1_ROLE, &u.dbname).await;
+    drop_role(&a, F1_GENUINE_ROLE, &u.dbname).await;
     let text = logs.text();
     assert!(!text.contains(WRAP_MARK), "a value reached the logs");
 }

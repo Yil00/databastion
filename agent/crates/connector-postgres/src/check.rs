@@ -97,6 +97,33 @@ pub(crate) struct AuditProbe {
     pub(crate) pgaudit_log_catalog: Option<bool>,
     /// Schema of the `pg_stat_statements` extension (its info view).
     pub(crate) pss_schema: Option<String>,
+    /// `log_min_messages` in the agent's session (`None`: not read).
+    pub(crate) log_min_messages: Option<String>,
+    /// `log_min_error_statement` in the agent's session.
+    pub(crate) log_min_error_statement: Option<String>,
+}
+
+/// Whether a server log level is `error` or lower (`debug5` to `error`):
+/// the level at which `ERROR` lines are written (`log_min_messages`) and
+/// carry their statement text (`log_min_error_statement`). Anything else
+/// (`log`, `fatal`, `panic`, a form this connector does not know, a
+/// setting not read) is not proven (fails closed).
+pub(crate) fn logs_errors(level: Option<&str>) -> bool {
+    level.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "debug5"
+                | "debug4"
+                | "debug3"
+                | "debug2"
+                | "debug1"
+                | "debug"
+                | "info"
+                | "notice"
+                | "warning"
+                | "error"
+        )
+    })
 }
 
 /// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
@@ -119,6 +146,20 @@ pub(crate) fn pgaudit_rows_on(library: bool, defined: bool, value: Option<&str>)
 }
 
 impl AuditProbe {
+    /// ADR-0037, refinement of 2026-10-12, item 6: the settings that are
+    /// not proven to give every failed or cancelled statement an `ERROR`
+    /// line with its statement text (empty when both are proven).
+    pub(crate) fn error_line_gaps(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !logs_errors(self.log_min_messages.as_deref()) {
+            out.push("log_min_messages");
+        }
+        if !logs_errors(self.log_min_error_statement.as_deref()) {
+            out.push("log_min_error_statement");
+        }
+        out
+    }
+
     /// pgaudit is loaded and logs reads in this database, but its records carry no row count.
     pub(crate) fn reads_without_row_counts(&self) -> bool {
         self.pgaudit_loaded == Some(true) && self.pgaudit_reads && !self.pgaudit_rows
@@ -557,6 +598,10 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     // whose pgaudit settings could not be read, caps the target at Partial, whatever the other
     // databases reach.
     let mut rows_gap = false;
+    // ADR-0037, refinement of 2026-10-12, item 6: a monitored database where pgaudit is loaded
+    // and the server is not proven to write an `ERROR` line with its statement text for every
+    // failed or cancelled statement caps the target at Partial.
+    let mut errors_gap = false;
     // ADR-0049 decision 11: the role reads every role's statement texts.
     let mut stats_reader = false;
     for database in &settings.databases {
@@ -674,6 +719,10 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 normalize(database).as_str()
             ));
         }
+        if let Some(detail) = error_lines_detail(&probe, database) {
+            errors_gap = true;
+            notes.push(detail);
+        }
         let (text, probe_codes) = probe_notes(
             &probe,
             settings.audit_log.is_some(),
@@ -708,7 +757,7 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             report_notes(&r, &mut codes);
         }
     }
-    level = capped_without_row_counts(level, rows_gap);
+    level = capped_without_row_counts(level, rows_gap || errors_gap);
     notes.extend(stats_reader_detail(level, stats_reader));
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
         // ADR-0015 decision 4: Full once the log is actually read.
@@ -834,8 +883,25 @@ fn stats_reader_detail(level: AuditLevel, stats_visible: bool) -> Option<String>
     })
 }
 
+/// ADR-0037, refinement of 2026-10-12, item 6: the local detail (no closed note, no protocol
+/// change) when pgaudit is loaded in `database` and `log_min_messages` or
+/// `log_min_error_statement` is not proven `error` or lower; `Some` caps the target at Partial.
+fn error_lines_detail(probe: &AuditProbe, database: &str) -> Option<String> {
+    if probe.pgaudit_loaded != Some(true) {
+        return None;
+    }
+    let gaps = probe.error_line_gaps();
+    (!gaps.is_empty()).then(|| {
+        format!(
+            "database {}: {} not proven at error or lower, so a statement that fails or is              cancelled may leave no ERROR line with its statement text, and with              pgaudit.log_rows = on no pgaudit record either: failed and cancelled reads are not              proven reported, so the target cannot reach Full (set it to error or lower)",
+            normalize(database).as_str(),
+            gaps.join(" and ")
+        )
+    })
+}
+
 /// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
-/// also logs their row counts.
+/// also logs their row counts (and, refinement of 2026-10-12, item 6, every failed statement).
 fn capped_without_row_counts(level: AuditLevel, rows_gap: bool) -> AuditLevel {
     if level == AuditLevel::Full && rows_gap {
         AuditLevel::Partial
@@ -995,6 +1061,11 @@ pub(crate) async fn prerequisites_with(
         }
         let probe = audit_probe(session, timeouts).await?;
         level = level.max(probe.level(log_readable));
+        // The same proof as `check()`'s cap (`error_lines_detail`), per
+        // database, for the stream's `FATAL` lines (proposed item 9).
+        if probe.error_line_gaps().is_empty() {
+            catalogs.prove_error_lines(database);
+        }
         catalogs.insert(
             database,
             crate::audit::events::DbCatalog {
@@ -1234,6 +1305,8 @@ pub(crate) async fn audit_probe(
                 .unwrap_or(false);
             p.pgaudit_rows = pgaudit_rows_on(library, rows_defined, setting(1)?.as_deref());
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
+            p.log_min_messages = setting(7)?;
+            p.log_min_error_statement = setting(8)?;
             p.pgaudit_log_level = setting(3)?;
             if p.pgaudit_loaded == Some(true) {
                 p.pgaudit_log_catalog = setting(5)?.map(|v| v.eq_ignore_ascii_case("on"));
@@ -1716,6 +1789,8 @@ mod tests {
             pgaudit_log_level: None,
             pgaudit_log_catalog: None,
             pss_schema: None,
+            log_min_messages: Some("warning".to_owned()),
+            log_min_error_statement: Some("error".to_owned()),
         };
         // pgaudit reads and pg_stat_statements, no pgaudit.log_rows: Partial
         // (ADR-0037). The Full stream reads the pgaudit log only, so
@@ -1946,5 +2021,86 @@ mod tests {
             merged.extend(notes);
         }
         assert_eq!(codes(merged.as_slice()), ["audit.log_without_row_counts"]);
+    }
+
+    /// ADR-0037, refinement of 2026-10-12, item 6: both log settings must
+    /// be proven `error` or lower; otherwise the target is capped at
+    /// Partial and the local detail names the setting and the database.
+    #[test]
+    fn error_lines_need_both_log_settings_proven() {
+        for ok in [
+            "debug5",
+            "debug1",
+            "info",
+            "notice",
+            "warning",
+            "error",
+            "ERROR",
+            " warning ",
+        ] {
+            assert!(logs_errors(Some(ok)), "{ok}");
+        }
+        for bad in [
+            "log",
+            "fatal",
+            "panic",
+            "",
+            "warning, autovacuum:debug1",
+            "x",
+        ] {
+            assert!(!logs_errors(Some(bad)), "{bad}");
+        }
+        assert!(!logs_errors(None));
+        let full = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            pgaudit_rows: true,
+            log_min_messages: Some("warning".to_owned()),
+            log_min_error_statement: Some("error".to_owned()),
+            ..AuditProbe::default()
+        };
+        assert_eq!(full.level(true), AuditLevel::Full);
+        assert!(full.error_line_gaps().is_empty());
+        assert!(error_lines_detail(&full, "shop").is_none());
+        for (messages, statement, want) in [
+            (Some("log"), Some("error"), vec!["log_min_messages"]),
+            (
+                Some("warning"),
+                Some("fatal"),
+                vec!["log_min_error_statement"],
+            ),
+            (
+                Some("panic"),
+                Some("panic"),
+                vec!["log_min_messages", "log_min_error_statement"],
+            ),
+            (None, Some("error"), vec!["log_min_messages"]),
+            (Some("error"), None, vec!["log_min_error_statement"]),
+        ] {
+            let p = AuditProbe {
+                log_min_messages: messages.map(str::to_owned),
+                log_min_error_statement: statement.map(str::to_owned),
+                ..full.clone()
+            };
+            assert_eq!(p.error_line_gaps(), want);
+            let d = error_lines_detail(&p, "shop").unwrap();
+            assert!(d.contains("database shop"), "{d}");
+            for w in &want {
+                assert!(d.contains(w), "{d}");
+            }
+            // The cap: Full becomes Partial; lower levels are unchanged.
+            assert_eq!(
+                capped_without_row_counts(p.level(true), true),
+                AuditLevel::Partial
+            );
+        }
+        // Without pgaudit loaded, no detail (the pgaudit log is not the
+        // source); settings not read are capped by the row-count rule.
+        let no_pgaudit = AuditProbe {
+            pgaudit_loaded: Some(false),
+            ..AuditProbe::default()
+        };
+        assert!(error_lines_detail(&no_pgaudit, "shop").is_none());
     }
 }
