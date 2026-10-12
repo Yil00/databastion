@@ -10,6 +10,16 @@
 all-features = true
 exclude-dev = false
 
+[advisories]
+# RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained): see deny.toml. Beyond
+# the core's `agent.yaml`, the full graph reaches it through test tooling
+# only: `serde_yaml_ng` as connector-cas's differential oracle
+# (dev-dependency, fuzz target `cas_registry_yaml_diff`) and in
+# protocol-codegen (developer tool and drift test, never linked into the agent).
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml_ng: agent.yaml (ADR-0046 decision 5), CAS differential oracle and protocol-codegen (test / build tooling)" },
+]
+
 [licenses]
 allow = [
     "Apache-2.0",
