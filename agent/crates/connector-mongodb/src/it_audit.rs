@@ -854,15 +854,29 @@ fn telling_read() -> DocBuf {
 }
 
 /// A read stopped by its `maxTimeMS` (`MaxTimeMSExpired`, 50): no value
-/// in its text.
+/// in its text, and no JavaScript (a `$where` would always be reported,
+/// ADR-0027 refinement of 2026-10-12): a long expression per document.
 fn quiet_read() -> DocBuf {
+    let sum = DocBuf::new().doc(
+        "$reduce",
+        DocBuf::new()
+            .doc(
+                "input",
+                DocBuf::new().list("$range", DocBuf::new().i32("0", 0).i32("1", 200_000)),
+            )
+            .i32("initialValue", 0)
+            .doc(
+                "in",
+                DocBuf::new().list("$add", DocBuf::new().str("0", "$$value").i32("1", 1)),
+            ),
+    );
     DocBuf::new()
         .str("find", COLLECTION)
         .doc(
             "filter",
-            DocBuf::new().str(
-                "$where",
-                "function(){var d=Date.now(); while(Date.now()-d<50){}; return true}",
+            DocBuf::new().doc(
+                "$expr",
+                DocBuf::new().list("$gt", DocBuf::new().doc("0", sum).i32("1", 0)),
             ),
         )
         .i32("maxTimeMS", 5)
@@ -1082,4 +1096,577 @@ async fn drop_profiler_account(a: &Url) {
     )
     .await;
     s.close().await;
+}
+
+// ---- Server-side JavaScript (security review of #207, M3). ----
+
+/// A `$function` operator whose code holds [`MARKER`] (never copied).
+fn js_function(body: &str, args: &[&str]) -> DocBuf {
+    DocBuf::new().doc(
+        "$function",
+        DocBuf::new()
+            .str("body", body)
+            .array_str("args", args)
+            .str("lang", "js"),
+    )
+}
+
+/// A `$where` that sleeps past its `maxTimeMS` (`MaxTimeMSExpired`, 50):
+/// the "slow" outcome of a one-bit oracle.
+fn js_where_timeout() -> DocBuf {
+    DocBuf::new()
+        .str("find", COLLECTION)
+        .doc(
+            "filter",
+            DocBuf::new().str("$where", "sleep(100) || 'needle-7Qz-FAKE'"),
+        )
+        .i32("maxTimeMS", 50)
+}
+
+/// A `$function` match that returns no document: the "fast" outcome.
+fn js_function_match() -> DocBuf {
+    DocBuf::new()
+        .str("aggregate", COLLECTION)
+        .array(
+            "pipeline",
+            vec![DocBuf::new().doc(
+                "$match",
+                DocBuf::new().doc(
+                    "$expr",
+                    js_function(
+                        "function(e) { return e === 'needle-7Qz-FAKE'; }",
+                        &["$email"],
+                    ),
+                ),
+            )],
+        )
+        .doc("cursor", DocBuf::new())
+}
+
+/// `$function` in a `$lookup` sub-pipeline (one document returned).
+fn js_lookup() -> DocBuf {
+    let sub = DocBuf::new().doc(
+        "$match",
+        DocBuf::new().doc("$expr", js_function("function() { return false; }", &[])),
+    );
+    DocBuf::new()
+        .str("aggregate", COLLECTION)
+        .array(
+            "pipeline",
+            vec![
+                DocBuf::new().i32("$limit", 1),
+                DocBuf::new().doc(
+                    "$lookup",
+                    DocBuf::new()
+                        .str("from", COLLECTION)
+                        .array("pipeline", vec![sub])
+                        .str("as", "x"),
+                ),
+            ],
+        )
+        .doc("cursor", DocBuf::new())
+}
+
+/// No JavaScript, but nested past the detection bound (`$and` of `$and`
+/// …): fails closed. No document.
+fn too_deep() -> DocBuf {
+    let mut e = DocBuf::new().list("$eq", DocBuf::new().i32("0", 1).i32("1", 0));
+    for _ in 0..40 {
+        e = DocBuf::new().list("$and", DocBuf::new().doc("0", e));
+    }
+    DocBuf::new()
+        .str("find", COLLECTION)
+        .doc("filter", DocBuf::new().doc("$expr", e))
+}
+
+/// Runs the four operations (their outcomes checked).
+async fn javascript_ops(s: &mut Session) {
+    fails_with(s, js_where_timeout(), 50).await;
+    for command in [js_function_match(), js_lookup(), too_deep()] {
+        run(s, "app", command).await.unwrap();
+    }
+}
+
+/// The four operations from the agent's identity and from another
+/// account, against a running stream of `t` (account `own`): each is a
+/// read of the collection, always reported (none is left out as the
+/// agent's own), with 0 documents (1 for the `$lookup`) when the source
+/// counts them. No JavaScript code (it holds the marker) in the events or
+/// the logs.
+async fn javascript_flow(
+    connector: &Arc<MongodbConnector>,
+    t: &TargetConfig,
+    a: &Url,
+    own: &str,
+    source: EventSource,
+) {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(connector), t, &state.0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut agent = Session::connect(t, Timeouts::new(Duration::from_secs(60)))
+        .await
+        .unwrap();
+    javascript_ops(&mut agent).await;
+    agent.close().await;
+    let mut other = admin_as(a, "mongosh 2.3.0").await;
+    javascript_ops(&mut other).await;
+    other.close().await;
+    let admin_name = format!("{}@{}", a.user, a.auth_source);
+    let from = |name: &str, ev: &MaskedEvent| {
+        ev.principal().account_name() == name
+            && ev
+                .objects()
+                .iter()
+                .any(|o| o.object().as_str() == COLLECTION)
+    };
+    let mut events = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(60), |ev| {
+        ev.iter().filter(|e| from(&admin_name, e)).count() >= 4
+            && ev.iter().filter(|e| from(own, e)).count() >= 4
+    })
+    .await;
+    collect_until(&mut rx, &mut events, Duration::from_secs(3), |_| false).await;
+    task.abort();
+    let text: Vec<String> = events.iter().map(describe).collect();
+    assert!(events.iter().all(|e| e.source() == source), "{text:#?}");
+    for name in [admin_name.as_str(), own] {
+        let theirs: Vec<&MaskedEvent> = events.iter().filter(|e| from(name, e)).collect();
+        assert_eq!(theirs.len(), 4, "{name}: {text:#?}");
+        assert!(
+            theirs
+                .iter()
+                .all(|e| e.always_report() && e.action() == EventAction::Read),
+            "{name}: {text:#?}"
+        );
+        if source == EventSource::MongodbAuditLog {
+            // No count on this source.
+            assert!(theirs.iter().all(|e| e.rows().is_none()), "{text:#?}");
+        } else {
+            let mut rows: Vec<Option<u64>> = theirs.iter().map(|e| e.rows()).collect();
+            rows.sort_unstable();
+            assert_eq!(
+                rows,
+                [Some(0), Some(0), Some(0), Some(1)],
+                "{name}: {text:#?}"
+            );
+        }
+    }
+    // The `auditLog` names the application only when the server audits the
+    // client metadata (`audit_from_the_percona_audit_log`).
+    if source != EventSource::MongodbAuditLog {
+        let ours = events.iter().find(|e| from(own, e)).unwrap();
+        assert_eq!(ours.principal().application(), Some("databastion-agent"));
+    }
+    // I2: no ground-truth value and no JavaScript code in the events as the
+    // core would send them, nor in the logs.
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    crate::i2::assert_clean(
+        "serialized events",
+        &gt,
+        "app",
+        &crate::i2::serialize_events(&events),
+    );
+    crate::i2::assert_clean("logs", &gt, "app", &logs.text());
+    assert_no_marker(&events, &logs);
+    for code in ["sleep(", "function(", "$where", "$function"] {
+        assert!(
+            !text.iter().any(|t| t.contains(code)),
+            "{code} in the events"
+        );
+        assert!(!logs.text().contains(code), "{code} in the logs");
+    }
+}
+
+#[tokio::test]
+async fn javascript_from_the_server_log() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = server() else { return };
+    let Some(a) = admin() else { return };
+    let Some(log) = env_path("DATABASTION_TEST_MONGO_LOG", "mongo-log") else {
+        return;
+    };
+    let extra = format!(
+        ", audit_log: {{path: \"{}\", format: server_log}}",
+        log.display()
+    );
+    let (_dir, t) = target_with(&url, &url.user, &url.password, &url.auth_source, &extra);
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    javascript_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{}@{}", url.user, url.auth_source),
+        EventSource::MongodbLog,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn javascript_from_the_profiler() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = server() else { return };
+    let Some(a) = admin() else { return };
+    profiler_account(&a).await;
+    let (_dir, t) = target(&url, PROFILER_USER, IT_PASSWORD, "admin");
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MongodbProfiler)
+    );
+    javascript_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{PROFILER_USER}@admin"),
+        EventSource::MongodbProfiler,
+    )
+    .await;
+    drop_profiler_account(&a).await;
+}
+
+/// The server computes the `js` flag of the projection: the forms of the
+/// ADR-0027 refinement of 2026-10-12, the depth bound, truncated
+/// commands (cut, or whole with the name in their text, `{ insert: `
+/// excepted), a cut that splits a UTF-8 character (byte operators only),
+/// and the agent's own poll. Checked against what the dev server
+/// recorded, by reading the flag the projection computes for entries
+/// marked by a `comment`.
+#[tokio::test]
+async fn the_profiler_projection_flags_javascript() {
+    let _serial = SERIAL.lock().await;
+    let Some(a) = admin() else { return };
+    let mut s = admin_session(&a).await;
+    let f = || js_function("function() { return false; }", &[]);
+    let nest = |n: usize, inner: DocBuf| {
+        let mut e = inner;
+        for _ in 0..n {
+            e = DocBuf::new().list("$and", DocBuf::new().doc("0", e));
+        }
+        e
+    };
+    let big = |n: usize, item: &str| {
+        let mut l = DocBuf::new();
+        for i in 0..n {
+            l = l.str(&i.to_string(), item);
+        }
+        l
+    };
+    let ints = |n: usize| {
+        let mut l = DocBuf::new();
+        for i in 0..n {
+            l = l.i32(&i.to_string(), i32::try_from(i % 10).unwrap());
+        }
+        l
+    };
+    let find = |filter: DocBuf| DocBuf::new().str("find", COLLECTION).doc("filter", filter);
+    let euros = |pad: &str| {
+        find(DocBuf::new().str("pad", pad).doc(
+            "email",
+            DocBuf::new().list(
+                "$nin",
+                big(6000, "\u{20ac}\u{20ac}\u{20ac}\u{20ac}\u{20ac}"),
+            ),
+        ))
+    };
+    let agg = |stages: Vec<DocBuf>| {
+        DocBuf::new()
+            .str("aggregate", COLLECTION)
+            .array("pipeline", stages)
+            .doc("cursor", DocBuf::new())
+    };
+    // (comment, command, expected flag)
+    let cases: Vec<(&str, DocBuf, bool)> = vec![
+        ("plain", find(DocBuf::new().str("email", "$where")), false),
+        ("where", find(DocBuf::new().str("$where", "false")), true),
+        ("function", find(DocBuf::new().doc("$expr", f())), true),
+        (
+            "accumulator",
+            agg(vec![
+                DocBuf::new().doc(
+                    "$group",
+                    DocBuf::new().null("_id").doc(
+                        "n",
+                        DocBuf::new().doc(
+                            "$accumulator",
+                            DocBuf::new()
+                                .str("init", "function() { return 0; }")
+                                .str("accumulate", "function(s) { return s; }")
+                                .array("accumulateArgs", Vec::new())
+                                .str("merge", "function(a, b) { return a; }")
+                                .str("lang", "js"),
+                        ),
+                    ),
+                ),
+            ]),
+            true,
+        ),
+        (
+            "facet",
+            agg(vec![DocBuf::new().doc(
+                "$facet",
+                DocBuf::new().array(
+                    "a",
+                    vec![DocBuf::new().doc("$match", DocBuf::new().doc("$expr", f()))],
+                ),
+            )]),
+            true,
+        ),
+        (
+            "projection",
+            DocBuf::new()
+                .str("find", COLLECTION)
+                .doc("filter", DocBuf::new())
+                .doc("projection", DocBuf::new().doc("e", f()))
+                .i32("limit", 1),
+            true,
+        ),
+        (
+            "mapreduce-explain",
+            DocBuf::new()
+                .doc(
+                    "explain",
+                    DocBuf::new()
+                        .str("mapReduce", COLLECTION)
+                        .str("map", "function() { emit(1, 1); }")
+                        .str("reduce", "function(k, v) { return 1; }")
+                        .doc("out", DocBuf::new().i32("inline", 1)),
+                )
+                .str("verbosity", "queryPlanner"),
+            true,
+        ),
+        // At the bound: keys at depth 63 examined; a container at 64 not.
+        (
+            "deep-ok",
+            find(DocBuf::new().doc(
+                "$expr",
+                nest(
+                    29,
+                    DocBuf::new().list("$eq", DocBuf::new().i32("0", 1).i32("1", 0)),
+                ),
+            )),
+            false,
+        ),
+        (
+            "deep-js",
+            find(DocBuf::new().doc("$expr", nest(29, f()))),
+            true,
+        ),
+        (
+            "deep-over",
+            find(DocBuf::new().doc(
+                "$expr",
+                nest(
+                    31,
+                    DocBuf::new().list("$eq", DocBuf::new().i32("0", 1).i32("1", 0)),
+                ),
+            )),
+            true,
+        ),
+        // Truncated by the profiler (over 50 KiB): cut, the name lost.
+        (
+            "cut",
+            find(
+                DocBuf::new()
+                    .doc("email", DocBuf::new().list("$nin", big(6000, "x-padding")))
+                    .str("$where", "false"),
+            ),
+            true,
+        ),
+        // Truncated, cut inside a 3-byte UTF-8 character (one of the
+        // three pads splits one).
+        ("cut-utf8-0", euros(""), true),
+        ("cut-utf8-1", euros("x"), true),
+        ("cut-utf8-2", euros("xx"), true),
+        // Truncated but whole (its text is shorter than its BSON): the
+        // name is in the text, or not.
+        (
+            "whole-js",
+            find(
+                DocBuf::new()
+                    .str("$where", "false")
+                    .doc("n", DocBuf::new().list("$nin", ints(6000))),
+            ),
+            true,
+        ),
+        (
+            "whole-plain",
+            find(DocBuf::new().doc("n", DocBuf::new().list("$nin", ints(6000)))),
+            false,
+        ),
+    ];
+    // The dev server's level (1, `slowms` 0) is restored at the end.
+    let before = run(&mut s, "app", DocBuf::new().i32("profile", -1))
+        .await
+        .unwrap();
+    let before = crate::bson::Doc::new(&before).unwrap();
+    let was = i32::try_from(before.int("was").unwrap().unwrap()).unwrap();
+    let slowms = i32::try_from(before.int("slowms").unwrap().unwrap()).unwrap();
+    run(&mut s, "app", DocBuf::new().i32("profile", 2))
+        .await
+        .unwrap();
+    let expected: Vec<(&str, bool)> = cases.iter().map(|(c, _, js)| (*c, *js)).collect();
+    let names: Vec<String> = expected.iter().map(|(c, _)| format!("js-it-{c}")).collect();
+    let comments: Vec<&str> = names.iter().map(String::as_str).collect();
+    for (comment, command, _) in cases {
+        // Failures (the `$where` ones) are recorded too.
+        let _ = run(
+            &mut s,
+            "app",
+            command.str("comment", &format!("js-it-{comment}")),
+        )
+        .await;
+    }
+    // The agent's own poll, profiled as it is sent.
+    let _ = run(
+        &mut s,
+        "app",
+        crate::audit::profiler::poll_command(&crate::audit::profiler::DbCursor::after(0)),
+    )
+    .await;
+    run(
+        &mut s,
+        "app",
+        DocBuf::new().i32("profile", was).i32("slowms", slowms),
+    )
+    .await
+    .unwrap();
+    let reply = run(
+        &mut s,
+        "app",
+        DocBuf::new()
+            .str("find", "system.profile")
+            .doc(
+                "filter",
+                DocBuf::new().array(
+                    "$or",
+                    vec![
+                        DocBuf::new()
+                            .doc("command.comment", DocBuf::new().array_str("$in", &comments)),
+                        DocBuf::new()
+                            .doc("command.projection.js", DocBuf::new().bool("$exists", true)),
+                    ],
+                ),
+            )
+            .doc(
+                "projection",
+                crate::audit::profiler::projection()
+                    .str("c", "$command.comment")
+                    .str("pr", "$command.projection.js"),
+            )
+            .i64("limit", 1000)
+            .bool("singleBatch", true),
+    )
+    .await
+    .unwrap();
+    let reply = crate::bson::Doc::new(&reply).unwrap();
+    let batch = reply
+        .doc("cursor")
+        .unwrap()
+        .unwrap()
+        .array("firstBatch")
+        .unwrap()
+        .unwrap();
+    let mut flags: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut own_polls = 0;
+    for e in batch.iter() {
+        let (_, v) = e.unwrap();
+        let crate::bson::Value::Doc(d) = v else {
+            continue;
+        };
+        let js = d.flag("js").unwrap();
+        if let Some(c) = d.str("c").unwrap() {
+            flags.insert(c.to_owned(), js.unwrap());
+        } else if d.get("pr").unwrap().is_some() {
+            own_polls += 1;
+            assert_eq!(js, Some(false), "the agent's own poll is flagged");
+        }
+    }
+    assert!(own_polls >= 1, "the poll was not profiled");
+    for (comment, js) in expected {
+        assert_eq!(
+            flags.get(&format!("js-it-{comment}")),
+            Some(&js),
+            "{comment}: {flags:?}"
+        );
+    }
+    s.close().await;
+}
+
+#[tokio::test]
+async fn javascript_on_percona_server_for_mongodb() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = env_url("DATABASTION_TEST_PSMDB_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(a) = env_url("DATABASTION_TEST_PSMDB_ADMIN_URL", "psmdb-audit") else {
+        return;
+    };
+    profiler_account(&a).await;
+    let mut s = admin_session(&a).await;
+    run(
+        &mut s,
+        "app",
+        DocBuf::new().i32("profile", 1).i32("slowms", 0),
+    )
+    .await
+    .unwrap();
+    s.close().await;
+    let (_dir, t) = target(&url, PROFILER_USER, IT_PASSWORD, "admin");
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    assert_eq!(
+        connector.audit_source(&t),
+        Some(EventSource::MongodbProfiler)
+    );
+    javascript_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{PROFILER_USER}@admin"),
+        EventSource::MongodbProfiler,
+    )
+    .await;
+    let mut s = admin_session(&a).await;
+    run(&mut s, "app", DocBuf::new().i32("profile", 0))
+        .await
+        .unwrap();
+    s.close().await;
+    drop_profiler_account(&a).await;
+}
+
+/// The `auditLog` carries the whole command (`param.args`) of every
+/// authorized operation, JavaScript included, but no count and not how it
+/// ended.
+#[tokio::test]
+async fn javascript_on_the_percona_audit_log() {
+    let _serial = SERIAL.lock().await;
+    let Some(url) = env_url("DATABASTION_TEST_PSMDB_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(a) = env_url("DATABASTION_TEST_PSMDB_ADMIN_URL", "psmdb-audit") else {
+        return;
+    };
+    let Some(log) = env_path("DATABASTION_TEST_PSMDB_AUDIT_LOG", "psmdb-audit") else {
+        return;
+    };
+    let extra = format!(
+        ", audit_log: {{path: \"{}\", format: audit_log}}",
+        log.display()
+    );
+    let (_dir, t) = target_with(&url, &url.user, &url.password, &url.auth_source, &extra);
+    let connector = Arc::new(MongodbConnector::new());
+    assert!(connector.check(&t).await.reachable);
+    javascript_flow(
+        &connector,
+        &t,
+        &a,
+        &format!("{}@{}", url.user, url.auth_source),
+        EventSource::MongodbAuditLog,
+    )
+    .await;
 }

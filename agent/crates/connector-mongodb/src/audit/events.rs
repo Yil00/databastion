@@ -158,6 +158,18 @@ fn action(cmd: Cmd, shape: &Shape) -> Option<EventAction> {
     })
 }
 
+/// Whether an operation runs server-side JavaScript: its record says so
+/// (`Record::js`), it is a `mapReduce` (its map, reduce and finalize
+/// functions are JavaScript), or it reads or writes `<db>.system.js`, the
+/// stored functions the server loads into a JavaScript scope (on the
+/// `auditLog`, the only trace of a view whose pipeline runs JavaScript).
+fn runs_js(cmd: Cmd, r: &Record) -> bool {
+    r.js || cmd == Cmd::MapReduce
+        || r.ns
+            .as_ref()
+            .is_some_and(|(_, c)| c.as_deref() == Some("system.js"))
+}
+
 /// Turns records into events.
 pub(crate) struct EventBuilder {
     own: OwnAccount,
@@ -393,6 +405,13 @@ impl EventBuilder {
         let telling = source != EventSource::MongodbAuditLog
             && failure == Some(Failure::Telling)
             && !matches!(cmd, Cmd::Insert | Cmd::Dcl);
+        // It runs server-side JavaScript (security review of #207, M3):
+        // JavaScript can throw, loop, sleep or log what it reads, so an
+        // operation reading no document still answers a question (a
+        // conditional sleep under `maxTimeMS` is a one-bit oracle whose
+        // two outcomes both read 0 documents). Always reported, from every
+        // account, never left out as the agent's own (it never runs any).
+        let js = runs_js(cmd, r);
         let mut principal = match &r.user {
             Some(u) => EventPrincipal::account(u.as_str()),
             None => EventPrincipal::unidentified(),
@@ -416,7 +435,7 @@ impl EventBuilder {
             // logged no count.
             e = e.with_rows(r.rows.or(failure.filter(|_| empty).map(|_| 0)));
         }
-        if telling {
+        if telling || js {
             // Never dropped by `min_rows` nor by `sensitive_objects`; a
             // count it has is kept.
             e = e.with_always_report();
@@ -441,8 +460,8 @@ impl EventBuilder {
         // the agent only reads (I4). So is a failure whose text may show
         // values: it would be charged its documents only, and
         // the agent's own reads fail only in quiet ways (its `maxTimeMS`,
-        // a closed connection, a refused privilege).
-        if user != self.own_user || action != EventAction::Read || telling {
+        // a closed connection, a refused privilege). So is JavaScript.
+        if user != self.own_user || action != EventAction::Read || telling || js {
             return Some(e);
         }
         let client = ClientSeen::Logged(r.client);
@@ -893,7 +912,7 @@ mod tests {
                 true,
             ),
             (
-                r#"{"delete":"customers","deletes":[{"q":{"$where":"throw this.email"},"limit":0}],"$db":"app"}"#,
+                r#"{"delete":"customers","deletes":[{"q":{"$expr":{"$eq":[{"$toInt":"$email"},1]}},"limit":0}],"$db":"app"}"#,
                 EventAction::Write,
                 true,
             ),
@@ -1623,5 +1642,282 @@ mod tests {
         assert!(whole_read(Cmd::Aggregate, &agg, None));
         assert!(whole_read(Cmd::GetMore, &Shape::default(), Some(&agg)));
         assert!(!whole_read(Cmd::GetMore, &Shape::default(), None));
+    }
+
+    /// The server-side JavaScript forms of the ADR-0027 refinement of
+    /// 2026-10-12, as the server log writes them.
+    const JS_FORMS: [(&str, EventAction); 14] = [
+        (
+            r#"{"find":"customers","filter":{"$where":"sleep(100) || true"},"maxTimeMS":50,"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$match":{"$expr":{"$function":{"body":"function(e){return false}","args":["$email"],"lang":"js"}}}}],"cursor":{},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$group":{"_id":null,"n":{"$accumulator":{"init":"function(){return 0}","accumulate":"function(s){return s}","accumulateArgs":[],"merge":"function(a,b){return a}","lang":"js"}}}}],"cursor":{},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$lookup":{"from":"customers","pipeline":[{"$match":{"$expr":{"$function":{"body":"f","args":[],"lang":"js"}}}}],"as":"x"}}],"cursor":{},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$facet":{"a":[{"$match":{"$expr":{"$function":{"body":"f","args":[],"lang":"js"}}}}]}}],"cursor":{},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$unionWith":{"coll":"customers","pipeline":[{"$match":{"$expr":{"$function":{"body":"f","args":[],"lang":"js"}}}}]}},{"$out":"copy"}],"cursor":{},"$db":"app"}"#,
+            EventAction::Write,
+        ),
+        (
+            r#"{"aggregate":"customers","pipeline":[{"$match":{"$where":"true"}},{"$merge":{"into":"copy"}}],"cursor":{},"$db":"app"}"#,
+            EventAction::Write,
+        ),
+        (
+            r#"{"update":"customers","updates":[{"q":{"email":"none"},"u":[{"$set":{"y":{"$function":{"body":"f","args":[],"lang":"js"}}}}]}],"$db":"app"}"#,
+            EventAction::Write,
+        ),
+        (
+            r#"{"findAndModify":"customers","query":{"$where":"true"},"update":{"$set":{"x":1}},"$db":"app"}"#,
+            EventAction::Write,
+        ),
+        (
+            r#"{"count":"customers","query":{"$where":"true"},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"distinct":"customers","key":"email","query":{"$expr":{"$function":{"body":"f","args":[],"lang":"js"}}},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"mapReduce":"customers","map":"function(){emit(1,1)}","reduce":"function(k,v){return 1}","out":{"inline":1},"$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"explain":{"find":"customers","filter":{"$where":"true"}},"verbosity":"executionStats","$db":"app"}"#,
+            EventAction::Read,
+        ),
+        (
+            r#"{"explain":{"mapReduce":"customers","map":"f","reduce":"g","out":{"inline":1}},"verbosity":"executionStats","$db":"app"}"#,
+            EventAction::Read,
+        ),
+    ];
+
+    /// The agent's connection (its account, address and application name).
+    fn own_conn(conn: u64) -> Vec<String> {
+        vec![
+            accepted(conn, AGENT),
+            meta(conn, "databastion-agent"),
+            auth(conn, "databastion", true).replace("10.0.0.9", AGENT),
+        ]
+    }
+
+    /// Another account's connection.
+    fn other_conn(conn: u64) -> Vec<String> {
+        vec![
+            accepted(conn, "10.0.0.9"),
+            meta(conn, "mongosh 2.3.0"),
+            auth(conn, "alice", true),
+        ]
+    }
+
+    fn ops(ev: Vec<MaskedEvent>) -> Vec<MaskedEvent> {
+        ev.into_iter()
+            .filter(|e| e.action() != EventAction::Connect)
+            .collect()
+    }
+
+    /// Security review of #207, M3: an operation that runs server-side
+    /// JavaScript is always reported, from every account, the agent's own
+    /// included, whether it returned documents, none, or stopped on its
+    /// `maxTimeMS`; with its usual action and object. Refused before
+    /// running, it gives no event.
+    #[test]
+    fn javascript_is_always_reported_from_every_account() {
+        for (command, action) in JS_FORMS {
+            for (conn, own) in [(other_conn(1), false), (own_conn(2), true)] {
+                let id = if own { 2 } else { 1 };
+                let mut b = builder();
+                let mut lines = conn.clone();
+                // A success with no document, then a quiet stop.
+                lines.push(slow(id, command, 0));
+                lines.push(failed(id, command, "50"));
+                lines.push(failed(id, command, "13"));
+                let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+                assert_eq!(ev.len(), 2, "{command} own={own}: {ev:?}");
+                for e in &ev {
+                    assert_eq!(e.action(), action, "{command}");
+                    assert!(e.always_report(), "{command}");
+                    assert_eq!(e.rows(), Some(0), "{command}");
+                    assert_eq!(e.objects()[0].object().as_str(), "customers");
+                    assert_eq!(
+                        e.principal().account_name(),
+                        if own {
+                            "databastion@admin"
+                        } else {
+                            "alice@admin"
+                        }
+                    );
+                    // A shape of a command of another name is unknown:
+                    // no whole-collection signal from the `explain`.
+                    assert!(e.signals().is_empty(), "{command}: {e:?}");
+                }
+            }
+        }
+    }
+
+    /// The same reads without JavaScript, from the agent's identity: left
+    /// out (charged), as before; from another account: ordinary events.
+    #[test]
+    fn reads_without_javascript_are_unchanged() {
+        let plain =
+            r#"{"find":"customers","filter":{"email":"$where"},"maxTimeMS":50,"$db":"app"}"#;
+        let mut b = builder();
+        let mut lines = own_conn(2);
+        lines.push(slow(2, plain, 0));
+        lines.push(failed(2, plain, "50"));
+        assert!(ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now())).is_empty());
+        let mut lines = other_conn(1);
+        lines.push(slow(1, plain, 0));
+        let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+        assert_eq!(ev.len(), 1);
+        assert!(!ev[0].always_report());
+        // An `explain` without JavaScript: metadata, no event.
+        let explain = r#"{"explain":{"find":"customers","filter":{}},"verbosity":"queryPlanner","$db":"app"}"#;
+        let mut lines = other_conn(3);
+        lines.push(slow(3, explain, 1));
+        assert!(ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now())).is_empty());
+    }
+
+    /// An insert's documents are stored, not run: a `$where` key in one is
+    /// an ordinary write. A write to `system.js` (stored functions) and the
+    /// server's read of it for a JavaScript scope are always reported.
+    #[test]
+    fn inserts_and_stored_functions() {
+        let mut b = builder();
+        let mut lines = other_conn(1);
+        lines.push(slow(
+            1,
+            r#"{"insert":"customers","documents":[{"$where":"x","f":{"$function":1}}],"$db":"app"}"#,
+            0,
+        ));
+        let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].action(), EventAction::Write);
+        assert!(!ev[0].always_report());
+        let system_js = |command: &str| {
+            line(
+                51803,
+                "conn2",
+                &format!(
+                    r#"{{"type":"command","ns":"app.system.js","command":{command},"nreturned":0}}"#
+                ),
+            )
+        };
+        let mut lines = own_conn(2);
+        lines.push(system_js(
+            r#"{"find":"system.js","readConcern":{},"$readPreference":{"mode":"secondaryPreferred"},"$db":"app"}"#,
+        ));
+        lines.push(system_js(
+            r#"{"insert":"system.js","documents":[{"_id":"f","value":"x"}],"$db":"app"}"#,
+        ));
+        let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert!(ev.iter().all(MaskedEvent::always_report));
+    }
+
+    /// A getMore of a cursor whose command runs JavaScript (the server
+    /// runs it again for each batch), and a view whose pipeline does.
+    #[test]
+    fn cursors_and_views_that_run_javascript() {
+        let mut b = builder();
+        let mut lines = own_conn(2);
+        lines.push(line(
+            51803,
+            "conn2",
+            r#"{"type":"command","ns":"app.customers","command":{"getMore":7,"collection":"customers","$db":"app"},"originatingCommand":{"find":"customers","filter":{"$where":"true"},"$db":"app"},"nreturned":0}"#,
+        ));
+        lines.push(line(
+            51803,
+            "conn2",
+            r#"{"type":"command","ns":"app.v","command":{"find":"v","filter":{},"limit":1,"$db":"app"},"resolvedViews":[{"viewNamespace":"app.v","dependencyChain":["v","customers"],"resolvedPipeline":[{"$match":{"$expr":{"$function":{"body":"f","args":[],"lang":"js"}}}}]}],"nreturned":0}"#,
+        ));
+        let ev = ops(b.convert(log(&lines), EventSource::MongodbLog, SystemTime::now()));
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert!(ev.iter().all(MaskedEvent::always_report));
+    }
+
+    /// The `auditLog`: an authorized command that runs JavaScript is a
+    /// read (or write) always reported, never the agent's own, even a
+    /// bounded `find` within the budget.
+    #[test]
+    fn javascript_in_the_audit_log() {
+        let rec = |user: &str, command: &str, ns: &str, args: &str| {
+            format!(
+                r#"{{"atype":"authCheck","ts":{{"$date":"2026-10-12T10:00:00.000+00:00"}},"remote":{{"ip":"{AGENT}","port":5000}},"users":[{{"user":"{user}","db":"admin"}}],"param":{{"command":"{command}","ns":"{ns}","args":{args}}},"result":0}}"#
+            )
+        };
+        let mut b = builder();
+        let records: Vec<Record> = [
+            rec(
+                "databastion",
+                "find",
+                "app.customers",
+                r#"{"find":"customers","filter":{"$where":"true"},"limit":1,"$db":"app"}"#,
+            ),
+            rec(
+                "databastion",
+                "find",
+                "app.customers",
+                r#"{"find":"customers","filter":{},"limit":1,"$db":"app"}"#,
+            ),
+            rec(
+                "alice",
+                "explain",
+                "app.customers",
+                r#"{"explain":{"find":"customers","filter":{"$where":"true"}},"verbosity":"executionStats","$db":"app"}"#,
+            ),
+            rec(
+                "alice",
+                "explain",
+                "app.customers",
+                r#"{"explain":{"find":"customers","filter":{}},"$db":"app"}"#,
+            ),
+            rec(
+                "alice",
+                "mapReduce",
+                "app.customers",
+                r#"{"mapReduce":"customers","map":"f","reduce":"g","out":{"inline":1},"$db":"app"}"#,
+            ),
+        ]
+        .iter()
+        .filter_map(|l| super::super::records::parse_audit_log(l.as_bytes()).unwrap())
+        .collect();
+        let ev = b.convert(records, EventSource::MongodbAuditLog, SystemTime::now());
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert!(ev.iter().all(MaskedEvent::always_report));
+        assert_eq!(ev[0].principal().account_name(), "databastion@admin");
+        assert!(ev.iter().all(|e| e.action() == EventAction::Read));
+    }
+
+    /// A profiler entry flagged by the projection.
+    #[test]
+    fn javascript_from_the_profiler() {
+        let app = Some("databastion-agent");
+        let mut b = builder();
+        let mut r = own_record(Cmd::Find, "customers", Some(0), app);
+        r.js = true;
+        let mut quiet = r.clone();
+        quiet.failure = Some(Failure::Quiet);
+        let plain = own_record(Cmd::Find, "customers", Some(0), app);
+        let ev = b.convert(
+            vec![r, quiet, plain],
+            EventSource::MongodbProfiler,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert!(ev.iter().all(MaskedEvent::always_report));
     }
 }
