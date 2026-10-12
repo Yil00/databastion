@@ -162,7 +162,7 @@ JavaScript. Only key names are compared (`src/audit/js.rs` on the files,
 one boolean computed by the profiler projection on the server); the code
 is never read. `insert` documents never count. Whether the server allows
 JavaScript cannot be read with the agent's grants and is not shown
-(ADR-0027 refinement of 2026-10-12, proposed).
+(ADR-0027 refinement of 2026-10-12, accepted).
 
 ## Target settings
 
