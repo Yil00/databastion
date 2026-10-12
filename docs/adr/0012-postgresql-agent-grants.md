@@ -187,3 +187,118 @@ The agent reads the pgaudit / `jsonlog` files locally (docs/08), through the fil
 - **Revoke `TEMP` from `PUBLIC` on the database**: would close temporary tables for the agent, but changes the behavior of every other role; read-only transactions already block them for the connector.
 - **A denylist of secret-bearing statements** (the first draft of obligation 5): any statement kind not on the list (`COPY … PROGRAM`, `DO`, `COMMENT`, `SET`, new syntax in a later release) would leave with its literals. An allow-list of normalized DML fails closed.
 - **Sampling partitioned tables and inheritance parents through their root**: the scan reaches foreign leaves and children, and the database connects to another host (I5).
+
+## Refinement (2026-10-12, accepted): a two-key read of `pg_db_role_setting`
+
+**Status: accepted by the maintainer on 2026-10-12**, with the recommended answers to open questions 1 to 7. Proposed and amended on 2026-10-12 after the security review of the proposal, PR #215 (C1: the function-`SET` statement named, item 1; M1: grants on the two parameters read from `pg_parameter_acl` and capping Full; L3: never sent while a `pg_stat_statements` stream runs) (ROADMAP [phase 8 follow-ups](../ROADMAP.md#phase-8-follow-ups); security review of #214, M2; [ADR-0037](0037-postgresql-full-requires-pgaudit-log-rows.md) refinement items 6 and 14). It adds one exception to the catalog denylist of obligation 1 and extends obligation 6 (`check()` reports honestly) for the Full level. The grant sets are unchanged. Accepted together with [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md), which reports other roles' reads of `pg_db_role_setting.setconfig`.
+
+- **Context** (verified on PostgreSQL 16.13 with pgaudit 16.0 and `pg_stat_statements` 1.10 on 2026-10-12, in the throwaway cluster described in [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md#what-the-servers-expose-verified-on-postgresql-1613-on-2026-10-12); not run on 14, 15, 17 and 18):
+  - ADR-0037 item 6 reads `log_min_messages` and `log_min_error_statement` in the agent's session of each monitored database. That session sees the server-wide value, a database-wide `ALTER DATABASE … SET` and the agent role's own overrides, but **not another role's** `ALTER ROLE … SET` or `ALTER ROLE … IN DATABASE … SET` (verified: the agent's session showed `warning` and `error` while other roles had overrides). Verified effects: with `ALTER ROLE other IN DATABASE postgres SET log_min_messages = fatal`, a failed `SELECT 1/0` by `other` wrote **no `ERROR` line**; with `ALTER ROLE app SET log_min_error_statement = panic`, `app`'s failure wrote an `ERROR` line **without its statement**. So a target reports Full while a role's failed and cancelled reads leave no line (or one without text): the ADR-0037 item 14 residual.
+  - `pg_db_role_setting` is readable by every role (the second verification above; again on 16.13: the agent role of the minimal variant, `pg_read_all_stats` only, read every entry, including the fake `app.api_key` and `app.jwt_secret` values). It holds **every** per-role, per-database and per-role-in-database setting, and those can be secrets ([ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md)), which is why obligation 1 forbids reading it.
+  - Setting names are stored in their canonical form: `ALTER ROLE app SET "LOG_MIN_ERROR_STATEMENT" = 'PANIC'` is stored as `log_min_error_statement=PANIC` (name in lower case, value as given).
+  - Who can set them: superusers, and since PostgreSQL 15 a role granted `SET` on the parameter, which can then `SET` it in its own sessions (verified: no `ERROR` line) and `ALTER ROLE <itself> SET` it (verified: stored in `pg_db_role_setting`). Grants are listed in `pg_parameter_acl` (15+, readable by every role; verified). A function created with `SET log_min_messages = fatal` (`pg_proc.proconfig`) hid the `ERROR` line of a caller's failure inside it (verified). Since PostgreSQL 15, `GRANT ALTER SYSTEM ON PARAMETER` lets a non-superuser change the server-wide value (verified: `ALTER SYSTEM SET log_min_error_statement = panic` by a grantee); a `SET` grantee can also pass the setting in the startup packet (`options=-c log_min_messages=fatal`), which leaves nothing persistent. A second throwaway cluster of the same build verified the grant facts and the statement of item 2 below, and was deleted.
+- **Decision.**
+  1. **The exact statement.** A new constant of `sql.rs`, `ROLE_LOG_OVERRIDES`, sent as one statement with no bound parameter:
+
+     ```sql
+     SELECT s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid AS in_database,
+            s.setrole OPERATOR(pg_catalog.=) 0::pg_catalog.oid AS every_role,
+            CASE WHEN s.setrole OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                 THEN pg_catalog.pg_get_userbyid(s.setrole) END AS role_name,
+            pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name,
+            pg_catalog."left"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level
+       FROM pg_catalog.pg_db_role_setting s
+      CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS c(item)
+      WHERE (s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+             OR s.setdatabase OPERATOR(pg_catalog.=) (SELECT d.oid FROM pg_catalog.pg_database d
+                  WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()))
+        AND pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1))
+            OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[])
+      ORDER BY role_name, setting_name
+      LIMIT 1001
+     ```
+
+     - **Only the two keys leave the server.** The `WHERE` is evaluated by the server in the same statement, so no other `setconfig` entry is sent: it is not in the wire buffer, the agent's memory or its logs (verified: as the minimal-variant role, the statement returned the four overrides of the two keys and none of the `app.*` or `search_path` entries). Each row carries two booleans, a role name (already readable by every role in `pg_roles`; `pg_get_userbyid` reads no relation and returns a name only), a key and its level, lower-cased and cut at 16 characters.
+     - **Scope**: role-wide entries (`setdatabase = 0`), database-wide entries and role-in-database entries for the session's database. It runs in each monitored database, in the session that reads `PGAUDIT_SETTINGS`.
+     - **Form**: the connector's rules hold (qualified functions, `OPERATOR(pg_catalog.…)`, one array literal rather than a list, `ORDER BY` on names, under the 8 192-character `pg_stat_statements` read bound: [ADR-0049](0049-postgresql-statement-text-views-as-reads.md) refinement items 12 and 16). Its constants are **literals in the text, never bound parameters**: pgaudit logs the text as sent and never the parameters (`pgaudit.log_parameter = off`, the Audit log files section above), so only literals let the exact-text rule of [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) decision 5 tell this statement from a replay that reads other keys.
+     - **Bound**: a 1 001st row means the result is not proven (fail closed, item 3).
+
+     **Function `SET` clauses** (open question 3, accepted; security review C1). In the same probe, a third constant, `FUNCTION_LOG_OVERRIDES`, reads the two keys of `pg_proc.proconfig` in the session's database, filtered by the server, literals only, with the same rules of form and the same bound:
+
+     ```sql
+     SELECT n.nspname AS schema_name, p.proname AS function_name,
+            pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1)) AS setting_name,
+            pg_catalog."left"(pg_catalog.lower(pg_catalog.split_part(c.item, '=', 2)), 16) AS setting_level
+       FROM pg_catalog.pg_proc p
+       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
+      CROSS JOIN LATERAL pg_catalog.unnest(p.proconfig) AS c(item)
+      WHERE pg_catalog.lower(pg_catalog.split_part(c.item, '=', 1))
+            OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[])
+      ORDER BY schema_name, function_name, setting_name
+      LIMIT 1001
+     ```
+
+     No other `proconfig` entry leaves the server. A function whose `SET` clause raises either key above `error` makes the database not proven (item 3), and the local detail names the functions (schema and name, normalized, at most 10, then a count). Like `ROLE_LOG_OVERRIDES`, it names a secret column of [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) (`proconfig`), so it is left out as the agent's own only by exact text on pgaudit with the agent's identity, never on `pg_stat_statements`, and it is not sent while a `pg_stat_statements` stream of the target runs (item 3).
+
+     **Grants on the two parameters** (PostgreSQL 15+; security review of PR #215, M1). In the same probe, a fourth statement, `PARAMETER_GRANTS`, reads `pg_parameter_acl` (readable by every role, verified; it holds parameter names and ACLs, no secret), with the same rules of form:
+
+     ```sql
+     SELECT a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid AS public_grant,
+            CASE WHEN a.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                 THEN pg_catalog.pg_get_userbyid(a.grantee) END AS role_name,
+            p.parname AS setting_name,
+            a.privilege_type
+       FROM pg_catalog.pg_parameter_acl p
+      CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) AS a
+      WHERE p.parname OPERATOR(pg_catalog.=) ANY ('{log_min_messages,log_min_error_statement}'::pg_catalog.text[])
+        AND a.grantee OPERATOR(pg_catalog.<>) (SELECT r.oid FROM pg_catalog.pg_roles r
+             WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)
+        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles s
+             WHERE s.oid OPERATOR(pg_catalog.=) a.grantee AND s.rolsuper)
+      ORDER BY role_name, setting_name, a.privilege_type
+      LIMIT 1001
+     ```
+
+     It returns the `SET` and `ALTER SYSTEM` grants on the two parameters to any role other than the agent's and other than superusers, a `PUBLIC` grant included (verified: as the minimal-variant role, it returned a `SET` grant and an `ALTER SYSTEM` grant to `app`, and left out the same grant to a superuser and to the agent's role). Superusers are not flagged: they can hide their failures in any case, and so can turn pgaudit off. A grant to the agent's own role is an over-privilege: it is added to the list of obligation 6 (`check()` warns), not to this proof. On PostgreSQL 14 the catalog does not exist and only superusers can set the parameters: the statement is not sent and nothing is missing from the proof. It reads `pg_roles` with named columns only, so it has the no-secret shape of [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) decision 2 and needs no own-statement rule.
+  2. **Readable without a grant.** `pg_db_role_setting` is readable by `PUBLIC` by default (verified above), so neither variant gains a grant. The operator verifies it with `SELECT pg_catalog.has_table_privilege('databastion_agent', 'pg_catalog.pg_db_role_setting', 'SELECT')`; the integration test asserts it with the minimal-variant role. An operator who revoked it from `PUBLIC` can grant `SELECT` on it to the agent's role (the default exposure); otherwise item 3 fails closed.
+  3. **What `check()` does with the result.**
+     - **When it runs**: in each monitored database where pgaudit is loaded, only while the target's level before this check would be **Full**, the only level it can change, so that pgaudit is the source, and **only when no `pg_stat_statements` stream of the target runs** (security review of PR #215, L3): [ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) decision 5 never leaves `ROLE_LOG_OVERRIDES` out on that source, so while such a stream runs (during a source change, or a stream kept for another database) the statement would be reported there at every probe. While one runs, the database is not proven (fail closed). It runs in `check()` and in the stream's 5-minute probe ([ADR-0037](0037-postgresql-full-requires-pgaudit-log-rows.md) item 9). `FUNCTION_LOG_OVERRIDES` follows the same condition for the same reason; `PARAMETER_GRANTS` names no secret column and runs under the same condition, to keep the probe one unit.
+     - **Proof**: a level is proven when it is `debug5` to `error` (the existing `logs_errors` rule); `log`, `fatal`, `panic` or any other value is above `error`. Any override of either key above `error` in a scope that applies to the database, any function `SET` clause above `error` (`FUNCTION_LOG_OVERRIDES`), **any `SET` or `ALTER SYSTEM` grant returned by `PARAMETER_GRANTS`** (a grantee can hide its failures with a session `SET` or a startup option, which nothing persistent shows, or raise the server-wide value), a statement that fails or is refused, or a cut result (1 001 rows) means the database is **not proven**.
+     - **Level**: a database not proven caps the target **from Full to Partial**, as ADR-0037 item 6 does for the session's own values (item 13's cap): item 6's proof now covers every role, not only the agent's session.
+     - **Shown**: the agent's local detail only (no target note, no `shared/protocol/` change; the console shows the level), as for item 6: the database (normalized name, [ADR-0009](0009-name-normalization-and-item-sanitization.md)), the setting, and the scope: "every role" for a database-wide entry, or the roles, by name, at most 10, then a count; for a grant, the grantee roles (or "every role" for `PUBLIC`), the privilege (`SET` or `ALTER SYSTEM`) and the setting. The detail never quotes a level or any other value; it says "above error" or "not proven".
+  4. **ADR-0037 item 9, per role.** Item 9 gives no event for a `FATAL` line without a statement when item 6 is proven for its database. A role with an override of `log_min_error_statement` above `error` in that database writes its `FATAL` lines without the statement even while one runs, so for a line whose user is such a role, item 9's exemption is withdrawn and the line is item 5's read of `*`, always reported. The role is matched by the name the line carries. When the stream reads a pgaudit record of `ALTER ROLE … SET`, `RESET` or `RENAME`, or `ALTER DATABASE … SET` or `RESET`, it marks that database's override list stale until the next probe, and item 9's exemption is withdrawn for the whole database meanwhile (over-reported, never missed). This also covers a role renamed between two probes.
+  5. **The denylist exception.** Obligation 1 now reads: the connector never reads `pg_db_role_setting.setconfig`, **except through `ROLE_LOG_OVERRIDES`**, and `pg_proc.proconfig` (listed by ADR-0050) **joins the denylist**, read only through `FUNCTION_LOG_OVERRIDES`. The unit test `no_statement_touches_the_catalog_denylist` adds `proconfig` to its list, exempts exactly these two constants and asserts their full texts, so any change to it fails the test and needs a `security-reviewer` review; every other statement is still refused on `setconfig`, `pg_db_role_setting`, `rolconfig` and the rest of the list. The extended-variant integration test of the Consequences (no catalog marker in agent output) adds a fake secret in `ALTER ROLE … SET` and in `ALTER DATABASE … SET` and asserts it appears in no uplink payload, log line or metric, and that every row of `ROLE_LOG_OVERRIDES` and `FUNCTION_LOG_OVERRIDES` holds one of the two keys (with a fake secret in a function's `SET` clause too).
+  6. **Why the exception is safe.**
+     - **I2**: no other `setconfig` entry reaches the agent, so none can leave it; what the agent keeps is a proven or not-proven flag per database and role names for its local detail. Nothing new is sent to the console: the level was already sent.
+     - **I3**: the statement reads other roles' settings, not the agent's credentials; the credentials stay on the agent host as before.
+     - **`PARAMETER_GRANTS`** reads parameter names and ACLs, which hold no secret, from a catalog every role can read; it is not an exception to the denylist.
+     - **I4**: a read-only `SELECT` on a catalog every role can read, in the connector's read-only transactions, with no new grant and no user code (built-in functions only).
+     - **A stolen agent credential gains nothing**: every role can already read `pg_db_role_setting`. With ADR-0050, any read of it is reported except this exact text on pgaudit, which returns the two keys only.
+  7. **ADR-0037 items 6 and 14.** Item 6 is unchanged for the session and extended by item 3 to every role. Item 14's residual narrows to what `pg_db_role_setting` does not show (residuals below).
+- **Consequences.**
+  - **Code** (`agent-engineer`, `security-reviewer` review): `connector-postgres/src/sql.rs` (`ROLE_LOG_OVERRIDES`, `FUNCTION_LOG_OVERRIDES`, `PARAMETER_GRANTS`, the denylist test), `check.rs` (the probe, the cap, the local detail), the stream's probe and `audit/events.rs` (item 4: per-role exemption, stale marking). No `shared/protocol/` change.
+  - **Tests**: unit tests for the row parsing (levels proven or not, unknown values, 1 001 rows, a refused statement: not proven), the cap and the detail, and item 4 (a `FATAL` line without a statement from an overriding role is a read of `*`; from another role, quiet; any line while stale, a read of `*`); integration tests on PostgreSQL 16 with pgaudit and on the engine matrix: `ALTER ROLE other SET log_min_messages = fatal`, `ALTER ROLE other IN DATABASE … SET log_min_error_statement = panic` and `ALTER DATABASE … SET log_min_messages = log` each cap a Full target at Partial with the detail, and `RESET` restores Full at the next probe; `REVOKE SELECT ON pg_catalog.pg_db_role_setting FROM PUBLIC` caps it too; on 15+, `GRANT SET ON PARAMETER log_min_messages TO other` and `GRANT ALTER SYSTEM ON PARAMETER log_min_error_statement TO other` each cap it, the same grant to a superuser or to `PUBLIC` is respectively ignored and capping, and `REVOKE` restores Full; with a `pg_stat_statements` stream running for the target, neither statement is sent; the minimal-variant role reads the catalog with no grant; fake secrets in other `setconfig` entries appear in no agent output.
+  - **Load**: three statements per monitored database and probe (two on 14), on catalogs of usually a few dozen rows; nothing when the target is not at Full.
+  - **Documentation** (`docs-keeper`, after the implementation): [08-engine-capabilities.md](../08-engine-capabilities.md#known-limits) narrows the overrides limit to the residuals below; [05-security.md](../05-security.md#recommended-database-accounts-read-only) says the agent reads the two keys of `pg_db_role_setting`, filtered by the server; [10-user-guide.md](../10-user-guide.md) tells operators to reset such overrides to get Full.
+  - **Estimated size**: about 120 lines of production code, 250 lines of tests; one day with one review round.
+- **Residual risks.**
+  - A session-level `SET log_min_messages` (or `log_min_error_statement`) or a startup option (`options=-c …`) by a **superuser** is not seen; by a `SET` grantee, the grant caps the target (item 3).
+  - A function created with such a `SET` clause between two probes hides failures inside it until the next probe.
+  - An override set between two probes hides failures until the next probe (at most the probe interval), unless the stream reads its `ALTER ROLE` record (item 4).
+  - The server facts were verified on 16.13 only; the integration test runs them on the engine matrix.
+- **Alternatives considered.** Reading the whole `setconfig` and filtering in the agent: every secret of every role and database would reach the agent's memory and wire buffers, and a later bug could log or send it. Reading `pg_roles.rolconfig`: the same values (role-wide only), the same exposure. Reading other roles' values through `SET ROLE`: needs memberships that obligation 6 forbids. Keeping the residual: the target would report Full while a role's failed reads leave no line, against the rule that a degraded audit never passes for a full one.
+- **Open questions** (each with the answer this refinement recommends; **decided on 2026-10-12: the maintainer accepted the recommended answers to questions 1 to 7**):
+  1. Cap the target from Full to Partial for an override above `error` (item 3), or only name it in the local detail and keep Full?
+     **Recommended**: cap, as ADR-0037 item 6 does for the same settings in the session. A role whose failures leave no line is not covered, and Full says they are. Some operators set `log_min_error_statement` higher for an application role to keep statement texts out of the server log; they get Partial and the detail tells them why.
+  2. Count role-wide, database-wide and role-in-database entries for the session's database (item 1), and nothing for databases the target does not monitor?
+     **Recommended**: yes. Database-wide entries are already seen by the session, unless the agent's role has its own override, which only a superuser can set; counting them again costs nothing. Undeclared databases are not probed, as ADR-0037 already says.
+  3. Function `SET` clauses (`pg_proc.proconfig`, readable by every role, which can hold other secrets too): add a second statement of the same form (the two keys filtered by the server, functions of the session's database), with the same cap?
+     **Recommended**: yes, in the same change. It is the same hiding mechanism, verified, and only a superuser or a `SET` grantee can create such a function; the same exact-text rules apply to the second statement.
+  4. Roles granted `SET` or `ALTER SYSTEM` on these parameters (`pg_parameter_acl`, PostgreSQL 15+, readable by every role, no secret in it): cap Full at Partial like an override, or name them in the local detail only?
+     **Recommended** (changed after the security review of PR #215, M1): **cap**, with the roles named in the local detail, superusers and the agent's role excluded. A grantee can hide its own failed reads in every session with a `SET` or a startup option, leaving nothing persistent, and an `ALTER SYSTEM` grantee can change the server-wide value; the grant is the only persistent trace, so it is what the proof can check.
+  5. `pg_db_role_setting` not readable (the operator revoked it from `PUBLIC`): fail closed (cap), with a detail that suggests granting `SELECT` on it to the agent's role?
+     **Recommended**: yes. An unread setting is not proven, as item 6 already rules for the session's values.
+  6. Item 4 (per-role withdrawal of item 9's exemption, stale marking on `ALTER ROLE` and `ALTER DATABASE` records)?
+     **Recommended**: yes. Without it, an overriding role's `FATAL` lines would still be taken for idle-session ends at Partial, where the target is not capped further.
+  7. Send the statements only while the level would otherwise be Full and no `pg_stat_statements` stream of the target runs (item 3), the database being not proven otherwise?
+     **Recommended**: yes. The proof changes nothing at a lower level, and on `pg_stat_statements` the stored text of `ROLE_LOG_OVERRIDES` cannot be told from a replay with other keys ([ADR-0050](0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) decision 5), so it would be reported there at every probe (security review of PR #215, L3).
