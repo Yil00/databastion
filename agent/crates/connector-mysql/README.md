@@ -38,6 +38,16 @@ The XML and CSV `audit_log` formats and the syslog outputs are not
 supported (the configuration refuses them; a server writing them is noted by
 `check()` and not used).
 
+Since 0.7.0, two audit settings are reported as target notes, besides
+`check()`'s local detail: `audit.digest_consumer_disabled` when
+`performance_schema` is on, its consumers are readable by the agent's
+account and the `statements_digest` consumer is disabled (whatever the Audit
+source), and `audit.statement_text_limit_low`, with the limit in bytes as
+its count, when `server_audit_query_log_limit` or
+`performance_schema_max_sql_text_length` is below the agent's longest
+statement while the Audit stream reads that source. Keep the consumer
+enabled and both limits at 1024 or more.
+
 ## Grants and file access
 
 - **Audit-log sources: no database grant.** The agent reads the file
