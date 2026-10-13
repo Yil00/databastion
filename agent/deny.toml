@@ -12,6 +12,20 @@ all-features = true
 # the graph checked here.
 exclude-dev = true
 
+[advisories]
+# RUSTSEC-2024-0449: `unsafe-libyaml` is unmaintained (archived by its
+# author). The shipped binary reaches it only through `serde_yaml_ng`, used
+# by databastion-core to read `agent.yaml`, a root-owned file (ADR-0046
+# decision 5). CAS YAML registries use the agent's own parser (ADR-0046
+# decision 1). The workspace tool protocol-codegen (a dev-dependency of the
+# protocol crate, never linked into the agent) reaches it the same way.
+# Scoped by ADR-0046 decision 6; remove this ignore when
+# `agent.yaml` moves off `serde_yaml_ng`. cargo-deny ignores by id only;
+# the dependency paths are guarded by the `wrappers` entries under [bans].
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml only via serde_yaml_ng for the root-owned agent.yaml and the protocol-codegen tool, paths guarded by [bans] wrappers (ADR-0046 decisions 5 and 6)" },
+]
+
 [licenses]
 # Licenses compatible with distributing the agent under Apache-2.0 (ADR-0005).
 allow = [
@@ -36,6 +50,12 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 deny = [
+    # ADR-0046: `unsafe-libyaml` (RUSTSEC-2024-0449, ignored under
+    # [advisories]) only through `serde_yaml_ng`, and `serde_yaml_ng` only
+    # in the core (`agent.yaml`, decision 5) and the protocol-codegen tool.
+    # A new normal-graph user of either crate fails this check.
+    { crate = "serde_yaml_ng", wrappers = ["databastion-core", "databastion-protocol-codegen"], reason = "ADR-0046 decision 5: agent.yaml only" },
+    { crate = "unsafe-libyaml", wrappers = ["serde_yaml_ng"], reason = "ADR-0046: only through serde_yaml_ng" },
     # TLS: rustls only (AGENTS.md).
     { name = "openssl", reason = "rustls only" },
     { name = "openssl-sys", reason = "rustls only" },

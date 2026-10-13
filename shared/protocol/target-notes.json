@@ -41,6 +41,13 @@
       "mongodb"
     ]
   },
+  "audit.digest_consumer_disabled": {
+    "description": "The performance_schema statements_digest consumer is disabled: no statement has a digest, so a performance_schema poll reads every statement's full text (SQL_TEXT, with its literals): the agent's own, when performance_schema is the Audit source, and a replay of it with the agent's credential, address and program name, which is left out like the agent's. Enable the consumer.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
   "audit.failed_operations_not_logged": {
     "description": "{count} naming context(s) where no failed operation is proven to be logged in cn=accesslog in the last 24 h: the agent's read of a missing entry left no record (olcAccessLogSuccess: TRUE logs successful operations only), or it could not be checked yet. Capped or failed exports may go unseen; the level is at most Partial.",
     "engines": [
@@ -195,6 +202,13 @@
   },
   "audit.statement_consumers_disabled": {
     "description": "The performance_schema consumers the statement history depends on (global_instrumentation, thread_instrumentation, events_statements_current) are disabled.",
+    "engines": [
+      "mysql",
+      "mariadb"
+    ]
+  },
+  "audit.statement_text_limit_low": {
+    "description": "The audit source cuts statement texts at {count} bytes (server_audit_query_log_limit or performance_schema_max_sql_text_length), below the agent's longest statement: the agent's own statements, such as its CAS store guard queries, are cut and reported as reads of * by its account (loud, never quiet). Keep the limit at 1024 or more.",
     "engines": [
       "mysql",
       "mariadb"

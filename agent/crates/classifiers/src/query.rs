@@ -73,6 +73,11 @@ use zeroize::Zeroizing;
 
 use crate::names;
 
+mod pg_code;
+mod pg_scan;
+pub use pg_code::{MAX_CODE_NAMES, PgCode, PgCodeName, PgOperatorUse};
+pub use pg_scan::{PgItemClass, PgListed, PgNameUse, PgScan, pg_scan};
+
 /// Largest statement text analyzed, in bytes. Longer text is not lexed.
 pub const MAX_QUERY_BYTES: usize = 1024 * 1024;
 /// Longest normalized text, in characters (cut at a token boundary).
@@ -261,6 +266,10 @@ struct TokFlags {
     /// A [`Tok::Literal`] that the servers read as a name starting with
     /// digits (`1f`, [`my_digit_name`]).
     digit_name: bool,
+    /// A [`Tok::Word`] written with an upper-case ASCII letter (the token
+    /// holds it lower-cased): the literal probe shape compares the
+    /// `performance_schema` name exactly (re-review of #195, L2).
+    upper: bool,
 }
 
 /// The tokens of a MySQL text, with their [`TokFlags`].
@@ -278,6 +287,7 @@ impl MyLexed {
         self.flags.push(TokFlags {
             spaced: start != self.last_end,
             digit_name: false,
+            upper: false,
         });
         self.last_end = end;
     }
@@ -456,6 +466,9 @@ fn lex_mysql_range(
                     i += 1;
                 }
                 out.push(Tok::Word(text[from..i].to_ascii_lowercase()), tok_start, i);
+                if let Some(f) = out.flags.last_mut() {
+                    f.upper = text[from..i].bytes().any(|b| b.is_ascii_uppercase());
+                }
             }
             _ if is_my_op_char(c) => {
                 let from = i;
@@ -675,9 +688,14 @@ fn lex(text: &str, scs: bool) -> Result<Vec<Tok>, LexError> {
                     continue;
                 }
                 Some(b'"') => {
-                    let (end, name) = quoted_ident(text, i + 2)?;
+                    // Decoded as the server decodes it, so that names are
+                    // compared on what they are (`U&"\0070g_stats"` is
+                    // `pg_stats`: security review of #199, M2); an escape
+                    // the server would refuse does not lex (fail closed).
+                    let (end, raw) = quoted_ident(text, i + 2)?;
+                    let (end, escape) = uescape(b, end)?;
                     i = end;
-                    out.push(Tok::Quoted(name));
+                    out.push(Tok::Quoted(decode_unicode_ident(&raw, escape)?));
                     continue;
                 }
                 _ => {}
@@ -814,6 +832,98 @@ fn quoted_ident(text: &str, start: usize) -> Result<(usize, String), LexError> {
             }
         }
     }
+}
+
+/// The optional `UESCAPE '<c>'` clause after a PostgreSQL `U&"…"`
+/// identifier ending at `b[end]` (exclusive): the index after the clause
+/// and the escape character (`\` by default). Only whitespace may come
+/// between the identifier and the clause; a malformed clause or escape
+/// character (a hexadecimal digit, `+`, `'`, `"` or whitespace, which the
+/// server refuses) does not lex.
+fn uescape(b: &[u8], end: usize) -> Result<(usize, char), LexError> {
+    let mut j = end;
+    while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+        j += 1;
+    }
+    let word = b.get(j..j + 7);
+    if !word.is_some_and(|w| w.eq_ignore_ascii_case(b"uescape"))
+        || b.get(j + 7)
+            .copied()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Ok((end, '\\'));
+    }
+    j += 7;
+    while b.get(j).is_some_and(u8::is_ascii_whitespace) {
+        j += 1;
+    }
+    match (b.get(j), b.get(j + 1), b.get(j + 2)) {
+        (Some(b'\''), Some(&c), Some(b'\''))
+            if c.is_ascii()
+                && !c.is_ascii_hexdigit()
+                && !c.is_ascii_whitespace()
+                && !matches!(c, b'+' | b'\'' | b'"') =>
+        {
+            Ok((j + 3, char::from(c)))
+        }
+        _ => Err(LexError::Unterminated),
+    }
+}
+
+/// Decodes the escapes of a PostgreSQL `U&"…"` identifier: `<e>XXXX` (4
+/// hexadecimal digits), `<e>+XXXXXX` (6), `<e><e>` (the escape character
+/// itself), with UTF-16 surrogate pairs combined, as the server does. Any
+/// other escape, an invalid code point or a lone surrogate does not lex.
+fn decode_unicode_ident(raw: &str, escape: char) -> Result<String, LexError> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != escape {
+            if high.is_some() {
+                return Err(LexError::Unterminated);
+            }
+            out.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&escape) {
+            chars.next();
+            if high.is_some() {
+                return Err(LexError::Unterminated);
+            }
+            out.push(escape);
+            continue;
+        }
+        let digits = if chars.peek() == Some(&'+') {
+            chars.next();
+            6
+        } else {
+            4
+        };
+        let mut v: u32 = 0;
+        for _ in 0..digits {
+            let d = chars
+                .next()
+                .and_then(|d| d.to_digit(16))
+                .ok_or(LexError::Unterminated)?;
+            v = v * 16 + d;
+        }
+        match (high.take(), v) {
+            (None, 0xD800..=0xDBFF) => high = Some(v),
+            (Some(h), 0xDC00..=0xDFFF) => {
+                let cp = 0x10000 + ((h - 0xD800) << 10) + (v - 0xDC00);
+                out.push(char::from_u32(cp).ok_or(LexError::Unterminated)?);
+            }
+            (None, 0) | (Some(_), _) | (None, 0xDC00..=0xDFFF) => {
+                return Err(LexError::Unterminated);
+            }
+            (None, v) => out.push(char::from_u32(v).ok_or(LexError::Unterminated)?),
+        }
+    }
+    if high.is_some() {
+        return Err(LexError::Unterminated);
+    }
+    Ok(out)
 }
 
 /// End index of a dollar-quote tag `$tag$` / `$$` starting at `b[i]`.
@@ -1116,10 +1226,97 @@ pub struct StatementInfo {
     /// 8.4's `FORMAT=TREE` show its conditions with their literals: a read
     /// of another session's statement text (ADR-0045 open question 3).
     pub explain_connection: bool,
+    /// MySQL: an *explain of a statement* (ADR-0047 decision 1): `EXPLAIN`
+    /// / `DESCRIBE` / `DESC`, with no `ANALYZE` and no `FOR` before its
+    /// statement, and its statement keyword (`SELECT`, `TABLE`, `WITH`,
+    /// `VALUES`, `(`, `UPDATE`, `DELETE`, `INSERT`, `REPLACE`) within the
+    /// first [`MAX_EXPLAIN_PREFIX_TOKENS`] tokens, whatever options come
+    /// before it. The optimizer reads `const` and `system` tables and
+    /// evaluates uncorrelated scalar subqueries while it plans: a read of
+    /// the relations the explained statement names, which
+    /// [`Self::relations`] holds. The table form (`DESCRIBE t`, `EXPLAIN
+    /// t`) is not one.
+    pub explain_statement: bool,
+    /// MySQL: the literal probe shape (ADR-0047 decision 5): the whole
+    /// statement is exactly `EXPLAIN | DESCRIBE | DESC`, `SELECT`, one
+    /// integer literal (or the digest placeholder `?`), `FROM` and one
+    /// `performance_schema` table, schema-qualified (plain or backquoted;
+    /// no view can be created there: security review of #195, H1), with
+    /// no wrapper. It shows no column value on any verified server. Implies
+    /// [`Self::explain_statement`].
+    pub explain_probe: bool,
+    /// MySQL: an explain of a statement with a default schema before its
+    /// statement (`EXPLAIN FOR SCHEMA | DATABASE name <statement>`): its
+    /// unqualified relations are in `name` ([`Self::relations`]); what
+    /// the server resolves them to is not proven, so callers add `*`
+    /// (security review of #195, L2).
+    pub explain_schema: bool,
+    /// MySQL: the literal probe shape but for the case of its schema name
+    /// (`PERFORMANCE_SCHEMA.v`, `` `Performance_Schema`.`v` ``): an
+    /// explain of a statement, whose relation callers keep even though it
+    /// reads as a system schema (re-review of #195, L2).
+    pub explain_probe_case: bool,
     /// [`Self::relations`] reached [`MAX_RELATIONS`]: the statement may
     /// name more relations than were kept (a caller that must see every
     /// name fails closed).
     pub relations_full: bool,
+    /// MySQL: a read that stores its result into variables rather than
+    /// sending it to the client: `SELECT … INTO @v` / `INTO @a, @b`, the
+    /// trailing form `SELECT … FROM t WHERE … INTO @v` (MySQL 8.0.20+),
+    /// and `INTO` local variables (`DECLARE`d, without `@`, inside stored
+    /// programs). Not `INTO OUTFILE` / `INTO DUMPFILE` ([`Self::outfile`]).
+    /// The variable names are never taken for relations.
+    pub into_var: bool,
+    /// MySQL: the statement assigns a user variable inside an expression
+    /// (`@v := …`), so it keeps a value in the session whatever it sends.
+    pub var_assign: bool,
+    /// MySQL: `CREATE [OR REPLACE] [TEMPORARY] TABLE x … [AS] <query>`
+    /// (`SELECT`, `TABLE t`, `VALUES`, `WITH`, `(`) and `CREATE [OR
+    /// REPLACE] … VIEW` / `ALTER … VIEW v … AS <query>`: [`Self::relations`]
+    /// holds the source relations of the query (its common table
+    /// expressions aside), and [`Self::create_target`] the created table or
+    /// view.
+    pub create_query: bool,
+    /// The table or view a [`Self::create_query`] statement creates or
+    /// replaces, when its name could be read.
+    pub create_target: Option<RelationName>,
+    /// PostgreSQL: the statement wraps a query (`EXPLAIN [ANALYZE]`,
+    /// `DECLARE … CURSOR … FOR`, `PREPARE … AS`), its kind being
+    /// [`StatementKind::Other`]: what the wrapper does with the query and
+    /// the query's own kind (ADR-0048, refinement of 2026-10-12). For
+    /// `DECLARE` and `PREPARE`, whose query returns its rows to the
+    /// client, [`Self::shape`] is the shape of the query.
+    pub pg_wrapped: Option<PgWrapped>,
+}
+
+/// What a PostgreSQL statement that wraps a query does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PgWrapper {
+    /// `EXPLAIN` without `ANALYZE`: the query is planned, not run (the
+    /// plan shows estimates from the statistics, and the planner folds
+    /// immutable and stable calls).
+    Explain,
+    /// `EXPLAIN ANALYZE`, or an option list whose `ANALYZE` is not proven
+    /// off: the query runs, its rows are not sent.
+    ExplainAnalyze,
+    /// `DECLARE c … CURSOR … FOR`: the query runs as the cursor is read
+    /// (`FETCH`, `MOVE`), which names no relation.
+    Declare,
+    /// `PREPARE p … AS`: the query runs at each `EXECUTE`.
+    Prepare,
+}
+
+/// A PostgreSQL statement that wraps a query ([`StatementInfo::pg_wrapped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PgWrapped {
+    /// The outermost wrapper (`EXPLAIN ANALYZE DECLARE … FOR …` is
+    /// [`PgWrapper::ExplainAnalyze`]).
+    pub wrapper: PgWrapper,
+    /// Kind of the wrapped statement, after every wrapper:
+    /// [`StatementKind::Other`] when it is not a query (`EXPLAIN EXECUTE
+    /// p`), or when the wrapper's query could not be found.
+    pub kind: StatementKind,
 }
 
 /// Most leading words kept in [`StatementInfo::lead`].
@@ -1140,6 +1337,8 @@ pub struct QueryAnalysis {
     file_read: bool,
     non_ascii_call: bool,
     unknown_call: bool,
+    create_unread: bool,
+    create_unread_relations: Vec<RelationName>,
 }
 
 impl QueryAnalysis {
@@ -1157,7 +1356,29 @@ impl QueryAnalysis {
             file_read: false,
             non_ascii_call: false,
             unknown_call: false,
+            create_unread: false,
+            create_unread_relations: Vec::new(),
         }
+    }
+
+    /// MySQL: a text that did not lex unambiguously ([`Self::lexed`] is
+    /// `false`) one of whose readings is a `CREATE … AS <query>`
+    /// ([`StatementInfo::create_query`]), such as `CREATE /*!99999
+    /// TEMPORARY*/ TABLE t AS SELECT …`: the relations it reads cannot be
+    /// told (callers add `*`).
+    #[must_use]
+    pub fn create_unread(&self) -> bool {
+        self.create_unread
+    }
+
+    /// For a [`Self::create_unread`] text: the relations that **every**
+    /// reading names (created table or view and sources, the
+    /// intersection, never the union: a name in one reading may be the
+    /// content of a literal or a comment in another, I2). Empty when a
+    /// reading does not lex.
+    #[must_use]
+    pub fn create_unread_relations(&self) -> &[RelationName] {
+        &self.create_unread_relations
     }
 
     /// MySQL: the text calls an unqualified name that is not a built-in
@@ -1377,7 +1598,7 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map_or(StatementKind::Other, |s| first_kind(s));
     let mut relations = Vec::new();
     for s in &statements {
-        collect_relations(s, &mut relations);
+        collect_relations(s, &mut relations, true);
     }
     let mut parts: Vec<StatementInfo> = statements
         .iter()
@@ -1431,6 +1652,8 @@ pub fn analyze(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         file_read: false,
         non_ascii_call: false,
         unknown_call: false,
+        create_unread: false,
+        create_unread_relations: Vec::new(),
     }
 }
 
@@ -1509,6 +1732,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 for (f, o) in flags.iter_mut().zip(&r.flags) {
                     f.spaced |= o.spaced;
                     f.digit_name |= o.digit_name;
+                    f.upper |= o.upper;
                 }
             }
             (t.toks.clone(), flags)
@@ -1527,7 +1751,16 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                     },
                 )
             });
-            return my_unparsed(text, kind, opts);
+            let mut a = my_unparsed(text, kind, opts);
+            a.create_unread = readings.iter().flatten().any(|r| {
+                split_statements(&r.toks)
+                    .iter()
+                    .any(|s| create_query(my_set_statement_body(s).unwrap_or(s)).is_some())
+            });
+            if a.create_unread {
+                a.create_unread_relations = common_relations(&readings);
+            }
+            return a;
         }
     };
     // MariaDB `SET STATEMENT var = value[, …] FOR <statement>`: the
@@ -1542,7 +1775,7 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         .map_or(StatementKind::Other, |s| my_kind(s));
     let mut relations = Vec::new();
     for s in &statements {
-        collect_relations_dialect(s, Dialect::Mysql, &mut relations);
+        my_statement_relations(s, &mut relations);
     }
     let parts: Vec<StatementInfo> = statements
         .iter()
@@ -1566,6 +1799,12 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
                 || explain_analyze(original)
                 || explain_analyze(s);
             info.compound = wrappers.contains(&Wrapper::Compound);
+            // `SET STATEMENT … FOR`, `EXPLAIN ANALYZE … INTO @x`: the
+            // wrappers too.
+            info.var_assign |= has_var_assign(original);
+            info.explain_probe = info.explain_statement && explain_probe(original, o_flags);
+            info.explain_probe_case =
+                info.explain_statement && probe_shape(original, o_flags) == Some(false);
             info
         })
         .collect();
@@ -1593,7 +1832,41 @@ fn analyze_mysql(text: &str, opts: AnalyzeOptions) -> QueryAnalysis {
         file_read: false,
         non_ascii_call: false,
         unknown_call: false,
+        create_unread: false,
+        create_unread_relations: Vec::new(),
     }
+}
+
+/// The relations every reading names (each reading: the created table or
+/// view and the relations of each statement), in the order of the first;
+/// empty when a reading does not lex.
+fn common_relations(readings: &[Result<MyLexed, LexError>]) -> Vec<RelationName> {
+    let mut per = Vec::new();
+    for r in readings {
+        let Ok(l) = r else {
+            return Vec::new();
+        };
+        let mut v: Vec<RelationName> = Vec::new();
+        for s in split_statements(&l.toks) {
+            let body = my_set_statement_body(s).unwrap_or(s);
+            if let Some((Some(target), _)) = create_query(body)
+                && v.len() < MAX_RELATIONS
+                && !v.contains(&target)
+            {
+                v.push(target);
+            }
+            my_statement_relations(body, &mut v);
+        }
+        per.push(v);
+    }
+    let Some((first, rest)) = per.split_first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .filter(|r| rest.iter().all(|o| o.contains(r)))
+        .cloned()
+        .collect()
 }
 
 /// Most nested wrapper levels unwrapped (`SET STATEMENT … FOR`,
@@ -1629,9 +1902,49 @@ fn explain_analyze(s: &[Tok]) -> bool {
     let end = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
         .find(|&j| runs_statement_at(s, j, true))
         .unwrap_or(s.len().min(MAX_EXPLAIN_PREFIX_TOKENS));
-    s[1..end]
-        .iter()
-        .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
+    prefix_keyword(s, 1, end, "analyze")
+}
+
+/// Whether `s[from..to]` holds the keyword `w`: a word that is not a
+/// variable name (a word right after `@` or `@@`: `INTO @analyze`,
+/// `INTO @for`; security review of #195, M1).
+fn prefix_keyword(s: &[Tok], from: usize, to: usize, w: &str) -> bool {
+    (from..to.min(s.len())).any(|j| {
+        matches!(&s[j], Tok::Word(x) if x == w)
+            && !is_punct(j.checked_sub(1).and_then(|k| s.get(k)), "@")
+    })
+}
+
+/// The schema name of `FOR SCHEMA | DATABASE name` at `j` (MySQL: the
+/// default schema of the explained statement), `None` when the `FOR` at
+/// `j` is something else.
+fn for_schema_at(s: &[Tok], j: usize) -> Option<&str> {
+    if word(s.get(j)) != Some("for")
+        || is_punct(j.checked_sub(1).and_then(|k| s.get(k)), "@")
+        || !matches!(word(s.get(j + 1)), Some("schema" | "database"))
+    {
+        return None;
+    }
+    match s.get(j + 2) {
+        Some(Tok::Word(n) | Tok::Quoted(n)) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `s[from..to]` holds a `FOR` keyword other than `FOR SCHEMA |
+/// DATABASE name`: `… FOR CONNECTION id` (the plan of another session).
+fn prefix_for_connection(s: &[Tok], from: usize, to: usize) -> bool {
+    (from..to.min(s.len()))
+        .any(|j| prefix_keyword(s, j, j + 1, "for") && for_schema_at(s, j).is_none())
+}
+
+/// The default schema an explain of a statement names before its
+/// statement (`EXPLAIN FOR SCHEMA hr SELECT …`, security review of #195,
+/// L2).
+fn explain_schema_name(s: &[Tok]) -> Option<&str> {
+    let lead = s.iter().take_while(|t| is_punct(Some(t), "(")).count();
+    let start = explain_statement_at(s)?;
+    (lead + 1..start).find_map(|j| for_schema_at(s, j))
 }
 
 /// Whether an `EXPLAIN` / `DESCRIBE` / `DESC` has more than
@@ -1648,6 +1961,102 @@ fn explain_unbounded(s: &[Tok]) -> bool {
         && !(1..MAX_EXPLAIN_PREFIX_TOKENS).any(|j| runs_statement_at(s, j, true))
 }
 
+/// The position of the statement an `EXPLAIN` / `DESCRIBE` / `DESC` of a
+/// statement explains ([`StatementInfo::explain_statement`]): `None` for
+/// any other statement, the table form (`DESCRIBE t`, `EXPLAIN t`), an
+/// `ANALYZE` or a `FOR` before the statement (`EXPLAIN ANALYZE` runs it,
+/// `… FOR CONNECTION` keeps its own rule), and a statement past
+/// [`MAX_EXPLAIN_PREFIX_TOKENS`] (`explain_unbounded`). Leading
+/// parentheses are skipped (not valid SQL; fail closed).
+fn explain_statement_at(s: &[Tok]) -> Option<usize> {
+    let lead = s.iter().take_while(|t| is_punct(Some(t), "(")).count();
+    let e = &s[lead..];
+    if !matches!(word(e.first()), Some("explain" | "describe" | "desc")) {
+        return None;
+    }
+    let start =
+        (1..e.len().min(MAX_EXPLAIN_PREFIX_TOKENS)).find(|&j| runs_statement_at(e, j, true))?;
+    (!prefix_keyword(e, 1, start, "analyze") && !prefix_for_connection(e, 1, start))
+        .then_some(lead + start)
+}
+
+/// See [`StatementInfo::explain_probe`]. Comments are not tokens (a
+/// version comment that a server may run gives readings that differ, so
+/// the text keeps only its kind and never gets here); a hint is a comment.
+fn explain_probe(s: &[Tok], flags: &[TokFlags]) -> bool {
+    probe_shape(s, flags) == Some(true)
+}
+
+/// The literal probe shape with `performance_schema` compared
+/// ASCII-case-insensitively: `Some(exact)`, where `exact` says whether
+/// the schema is written `performance_schema` (plain or backquoted);
+/// `None` for any other statement.
+fn probe_shape(s: &[Tok], flags: &[TokFlags]) -> Option<bool> {
+    let name = |t: Option<&Tok>| matches!(t, Some(Tok::Word(_) | Tok::Quoted(_)));
+    // `performance_schema` only, qualified (security review of #195, H1):
+    // no account can create a view there, so the table is a base table
+    // with no condition; a view elsewhere is merged, and its `ON` /
+    // `WHERE` const reads happen while it is planned. Compared exactly
+    // (re-review of #195, L2): the agent's texts and the digests are
+    // lower case, and a schema named otherwise may exist where names are
+    // case-sensitive.
+    let exact = match s.get(4) {
+        Some(Tok::Word(n)) if n == "performance_schema" => !flags.get(4).is_some_and(|f| f.upper),
+        Some(Tok::Quoted(n)) if n.eq_ignore_ascii_case("performance_schema") => {
+            n == "performance_schema"
+        }
+        _ => return None,
+    };
+    (s.len() == 7
+        && matches!(word(s.first()), Some("explain" | "describe" | "desc"))
+        && word(s.get(1)) == Some("select")
+        && matches!(s.get(2), Some(Tok::Int(_) | Tok::Param))
+        && word(s.get(3)) == Some("from")
+        && is_punct(s.get(5), ".")
+        && name(s.get(6)))
+    .then_some(exact)
+}
+
+/// The relations of a MySQL statement ([`collect_relations_dialect`]);
+/// for an explain of a statement, those of the explained statement read
+/// on its own (`EXPLAIN TABLE t`, `EXPLAIN REPLACE t SELECT …` and the
+/// common table expressions of `EXPLAIN WITH …` are told by its lead
+/// words), ADR-0047 decision 2. The prefix (`FORMAT = x`, `INTO @var`)
+/// names no relation.
+fn my_statement_relations(s: &[Tok], out: &mut Vec<RelationName>) {
+    let Some(start) = explain_statement_at(s) else {
+        // `CREATE TABLE … AS <query>`, `CREATE | ALTER VIEW … AS <query>`:
+        // the relations of the query, read on its own (its common table
+        // expressions are not tables, `AS TABLE t` names `t`).
+        if let Some((_, q)) = create_query(s) {
+            collect_relations_dialect(&s[q..], Dialect::Mysql, out);
+            return;
+        }
+        // `SELECT … INTO @a, v`: variables, not relations.
+        if let Some((from, to)) = into_var_at(s).filter(|_| my_kind(s).is_read()) {
+            let rest: Vec<Tok> = s[..from].iter().chain(&s[to..]).cloned().collect();
+            collect_relations_dialect(&rest, Dialect::Mysql, out);
+            return;
+        }
+        collect_relations_dialect(s, Dialect::Mysql, out);
+        return;
+    };
+    // `EXPLAIN FOR SCHEMA hr SELECT … FROM t`: `t` is `hr.t`.
+    let schema = explain_schema_name(s);
+    let mut inner = Vec::new();
+    collect_relations_dialect(&s[start..], Dialect::Mysql, &mut inner);
+    for mut r in inner {
+        if r.schema.is_none()
+            && let Some(db) = schema
+        {
+            r.schema = Some(db.to_owned());
+        }
+        if out.len() < MAX_RELATIONS && !out.contains(&r) {
+            out.push(r);
+        }
+    }
+}
+
 /// See [`StatementInfo::explain_connection`]. An `EXPLAIN` whose
 /// statement is not found within [`MAX_EXPLAIN_PREFIX_TOKENS`] is searched
 /// for `FOR` up to that bound (`explain_unbounded` covers the rest).
@@ -1659,9 +2068,7 @@ fn explain_connection(s: &[Tok]) -> bool {
             let end = (1..bound)
                 .find(|&j| runs_statement_at(s, j, true))
                 .unwrap_or(bound);
-            s[1..end]
-                .iter()
-                .any(|t| matches!(t, Tok::Word(w) if w == "for"))
+            prefix_for_connection(s, 1, end)
         }
         _ => false,
     }
@@ -1715,10 +2122,7 @@ fn wrapper_level(s: &[Tok]) -> Option<(&[Tok], Wrapper)> {
         (Some("explain" | "describe" | "desc"), _) => {
             let start = (1..s.len().min(MAX_EXPLAIN_PREFIX_TOKENS))
                 .find(|&j| runs_statement_at(s, j, true))?;
-            s[1..start]
-                .iter()
-                .any(|t| matches!(t, Tok::Word(w) if w == "analyze"))
-                .then(|| (&s[start..], Wrapper::Analyze))
+            prefix_keyword(s, 1, start, "analyze").then(|| (&s[start..], Wrapper::Analyze))
         }
         // `ANALYZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE …` stays a utility.
         (Some("analyze"), _) => {
@@ -2756,16 +3160,38 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         Dialect::Postgres => first_kind(s),
     };
     let mut relations = Vec::new();
-    collect_relations_dialect(s, opts.dialect, &mut relations);
+    match opts.dialect {
+        Dialect::Mysql => my_statement_relations(s, &mut relations),
+        Dialect::Postgres => collect_relations_dialect(s, opts.dialect, &mut relations),
+    }
+    let explain_statement = opts.dialect == Dialect::Mysql && explain_statement_at(s).is_some();
+    let pg_wrapped = match opts.dialect {
+        Dialect::Postgres if kind == StatementKind::Other => pg_wrapper(s),
+        _ => None,
+    };
+    let create = if opts.dialect == Dialect::Mysql {
+        create_query(s)
+    } else {
+        None
+    };
     let (shape, copy) = if opts.possibly_truncated {
         (None, None)
     } else {
-        match kind {
-            StatementKind::Copy => (None, copy_info(s, opts.large_limit)),
-            k if k.is_read() => (main_shape(s), None),
+        match (kind, pg_wrapped) {
+            (StatementKind::Copy, _) => (None, copy_info(s, opts.large_limit)),
+            (k, _) if k.is_read() => (main_shape(s), None),
+            // A cursor's or a prepared statement's query sends its rows:
+            // its own shape (`shape.full_table_read`).
+            (_, Some((w, start)))
+                if matches!(w.wrapper, PgWrapper::Declare | PgWrapper::Prepare)
+                    && w.kind.is_read() =>
+            {
+                (main_shape(&s[start..]), None)
+            }
             _ => (None, None),
         }
     };
+    let pg_wrapped = pg_wrapped.map(|(w, _)| w);
     let relations_full = relations.len() >= MAX_RELATIONS;
     StatementInfo {
         kind,
@@ -2774,7 +3200,9 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         shape,
         copy,
         nested,
-        outfile: opts.dialect == Dialect::Mysql && has_outfile(s),
+        // An explained `SELECT … INTO OUTFILE` writes no file (ADR-0047
+        // decision 2: no signal of the explained statement).
+        outfile: opts.dialect == Dialect::Mysql && !explain_statement && has_outfile(s),
         lead: lead_words(s),
         routine_call: opts.dialect == Dialect::Mysql && has_qualified_call(s, kind),
         // Set by `analyze_mysql`, which has the spacing of the tokens.
@@ -2790,7 +3218,236 @@ fn statement_info(s: &[Tok], opts: AnalyzeOptions, nested: bool) -> StatementInf
         non_ascii_call: opts.dialect == Dialect::Mysql && has_non_ascii_call(s, kind),
         explain_unbounded: opts.dialect == Dialect::Mysql && explain_unbounded(s),
         explain_connection: opts.dialect == Dialect::Mysql && explain_connection(s),
+        explain_statement,
+        explain_schema: opts.dialect == Dialect::Mysql && explain_schema_name(s).is_some(),
+        explain_probe_case: false,
+        // Set by `analyze_mysql`, on the statement before its wrappers
+        // (the whole token sequence must be the shape).
+        explain_probe: false,
+        into_var: opts.dialect == Dialect::Mysql
+            && !explain_statement
+            && kind.is_read()
+            && into_var_at(s).is_some(),
+        var_assign: opts.dialect == Dialect::Mysql && has_var_assign(s),
+        create_query: create.is_some(),
+        create_target: create.and_then(|(target, _)| target),
+        pg_wrapped,
     }
+}
+
+/// `INTO` a variable list in a MySQL statement (`SELECT … INTO @a, @b`,
+/// `INTO v`): the range of the list (from `INTO` to the token after it),
+/// `None` when there is none. `INTO OUTFILE` / `INTO DUMPFILE` are not
+/// one. The caller checks that the statement is a read: elsewhere `INTO`
+/// names a table (`INSERT INTO`, `LOAD DATA … INTO TABLE`) or, before an
+/// explained statement, the variable that takes the plan.
+fn into_var_at(s: &[Tok]) -> Option<(usize, usize)> {
+    let at = (0..s.len()).find(|&i| {
+        word(s.get(i)) == Some("into")
+            && !is_punct(i.checked_sub(1).and_then(|j| s.get(j)), "@")
+            && !matches!(word(s.get(i + 1)), Some("outfile" | "dumpfile"))
+    })?;
+    // `@a`, `@'a'`, `` @`a` ``, `@"a"`, `@a.b`, `v` (a local variable),
+    // `?` (a digest), separated by commas.
+    let mut j = at + 1;
+    loop {
+        if is_punct(s.get(j), "@") {
+            j += 1;
+        }
+        if !matches!(
+            s.get(j),
+            Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Literal | Tok::DQuoted { .. } | Tok::Param)
+        ) {
+            break;
+        }
+        j += 1;
+        while is_punct(s.get(j), ".") && matches!(s.get(j + 1), Some(Tok::Word(_) | Tok::Quoted(_)))
+        {
+            j += 2;
+        }
+        if !is_punct(s.get(j), ",") {
+            break;
+        }
+        j += 1;
+    }
+    Some((at, j))
+}
+
+/// `@v := …` (`:=` anywhere): an assignment inside an expression, the
+/// only use of `:=` in MySQL / MariaDB.
+fn has_var_assign(s: &[Tok]) -> bool {
+    s.windows(2)
+        .any(|w| is_punct(w.first(), ":") && is_punct(w.get(1), "="))
+}
+
+/// Most tokens between `CREATE` / `ALTER` and `VIEW` (`ALGORITHM = x`,
+/// `DEFINER = user`, `SQL SECURITY x`).
+const MAX_VIEW_PREFIX_TOKENS: usize = 24;
+
+/// A `CREATE TABLE … [AS] <query>` or `CREATE` / `ALTER … VIEW … AS
+/// <query>` ([`StatementInfo::create_query`]): the created table or view
+/// (when its name reads) and the position of the query. `None` for any
+/// other statement, `CREATE TABLE … LIKE`, and a `CREATE TABLE` with no
+/// query.
+fn create_query(s: &[Tok]) -> Option<(Option<RelationName>, usize)> {
+    let lead = word(s.first())?;
+    if !matches!(lead, "create" | "alter") {
+        return None;
+    }
+    let mut i = 1;
+    if lead == "create" && word(s.get(1)) == Some("or") && word(s.get(2)) == Some("replace") {
+        i = 3;
+    }
+    if lead == "create" {
+        let t = if word(s.get(i)) == Some("temporary") {
+            i + 1
+        } else {
+            i
+        };
+        if word(s.get(t)) == Some("table") {
+            return create_table_query(s, t + 1);
+        }
+    }
+    let view = view_keyword_at(s, i)?;
+    let (target, mut j) = created_name(s, view + 1);
+    // `[(columns)]`, then `AS`.
+    if is_punct(s.get(j), "(") {
+        j = skip_parens(s, j);
+    }
+    if word(s.get(j)) != Some("as") || !query_starts_at(s, j + 1) {
+        return None;
+    }
+    Some((target, j + 1))
+}
+
+/// The position of `VIEW` after `CREATE [OR REPLACE]` / `ALTER` at `i`,
+/// past the view options (`ALGORITHM = x`, `DEFINER = user`, `SQL
+/// SECURITY x`); `None` when anything else comes first (`CREATE DEFINER =
+/// u PROCEDURE …`).
+fn view_keyword_at(s: &[Tok], mut i: usize) -> Option<usize> {
+    let end = s.len().min(MAX_VIEW_PREFIX_TOKENS);
+    while i < end {
+        match word(s.get(i)) {
+            Some("view") => return Some(i),
+            Some("algorithm") if is_punct(s.get(i + 1), "=") => i += 3,
+            Some("sql") if word(s.get(i + 1)) == Some("security") => i += 3,
+            Some("definer") if is_punct(s.get(i + 1), "=") => {
+                // The user (`CURRENT_USER[()]`, `name`, `name@host`,
+                // `'name'@'host'`): up to the next option or `VIEW` that
+                // does not follow `=` or `@`.
+                i += 2;
+                let from = i;
+                while i < end {
+                    let after_name =
+                        i > from && !is_punct(s.get(i - 1), "@") && !is_punct(s.get(i - 1), "=");
+                    if after_name && matches!(word(s.get(i)), Some("view" | "sql" | "algorithm")) {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The name of a created table or view at `i` (after `IF NOT EXISTS`),
+/// and the position after it.
+fn created_name(s: &[Tok], mut i: usize) -> (Option<RelationName>, usize) {
+    if word(s.get(i)) == Some("if")
+        && word(s.get(i + 1)) == Some("not")
+        && word(s.get(i + 2)) == Some("exists")
+    {
+        i += 3;
+    }
+    let mut parts = Vec::new();
+    let mut j = i;
+    while let Some(Tok::Word(w) | Tok::Quoted(w)) = s.get(j) {
+        parts.push(w.clone());
+        j += 1;
+        if is_punct(s.get(j), ".") && parts.len() < 2 {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(name) = parts.pop() else {
+        return (None, i);
+    };
+    (
+        Some(RelationName {
+            schema: parts.pop(),
+            name,
+        }),
+        j,
+    )
+}
+
+/// The position after the parenthesized group opening at `i`.
+fn skip_parens(s: &[Tok], i: usize) -> usize {
+    let mut depth = 0usize;
+    for (j, t) in s.iter().enumerate().skip(i) {
+        match t {
+            Tok::Punct(p) if p == "(" => depth += 1,
+            Tok::Punct(p) if p == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    s.len()
+}
+
+/// Whether a query starts at `i`: `SELECT`, `TABLE`, `VALUES`, `WITH`
+/// (not MariaDB's `WITH SYSTEM VERSIONING` table option), or parentheses
+/// opening one of them. A word right after `@` is a variable name.
+fn query_starts_at(s: &[Tok], i: usize) -> bool {
+    if is_punct(i.checked_sub(1).and_then(|j| s.get(j)), "@") {
+        return false;
+    }
+    let mut k = i;
+    while is_punct(s.get(k), "(") {
+        k += 1;
+    }
+    match word(s.get(k)) {
+        Some("select" | "table" | "values") => true,
+        // A common table expression may be named `system`: only MariaDB's
+        // `WITH SYSTEM VERSIONING` table option is not a query (security
+        // review of #196, L2).
+        Some("with") => {
+            !(word(s.get(k + 1)) == Some("system") && word(s.get(k + 2)) == Some("versioning"))
+        }
+        _ => false,
+    }
+}
+
+/// `CREATE [OR REPLACE] [TEMPORARY] TABLE` at `i` (after `TABLE`): `[IF
+/// NOT EXISTS] name [(definitions)] [options] [IGNORE | REPLACE] [AS]
+/// <query>`. The query is the first one found at the top level after the
+/// name, parenthesized groups that do not open a query (definitions,
+/// partitions, `UNION = (…)`) skipped.
+fn create_table_query(s: &[Tok], i: usize) -> Option<(Option<RelationName>, usize)> {
+    let (target, mut j) = created_name(s, i);
+    while j < s.len() {
+        if query_starts_at(s, j) {
+            return Some((target, j));
+        }
+        match &s[j] {
+            Tok::Word(w) if w == "like" => return None,
+            Tok::Punct(p) if p == "(" => {
+                if word(s.get(j + 1)) == Some("like") {
+                    return None;
+                }
+                j = skip_parens(s, j);
+            }
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 /// The body of `DO [LANGUAGE x] $tag$ body $tag$` (dollar quoting only).
@@ -3143,10 +3800,168 @@ fn push_relation(parts: Vec<String>, out: &mut Vec<RelationName>) {
     }
 }
 
-/// Names of the CTEs defined by a statement (never reported as relations).
-fn cte_names(s: &[Tok]) -> Vec<String> {
-    let mut out = Vec::new();
+/// PostgreSQL: where the query of a statement that wraps one starts
+/// (`EXPLAIN [ANALYZE] [VERBOSE] [(…)]`, `PREPARE p [(types)] AS`,
+/// `DECLARE c … FOR`, `CREATE … TABLE / MATERIALIZED VIEW … AS`, as
+/// `pg_code`'s scope does: ADR-0049, re-review of #211, R-M1), so that
+/// its common table expressions are recognized as for a bare query.
+/// Leading `(` skipped; the statement's own start otherwise.
+fn pg_wrapped_start(s: &[Tok]) -> usize {
     let mut i = 0;
+    for _ in 0..8 {
+        while is_punct(s.get(i), "(") {
+            i += 1;
+        }
+        let top = |from: usize, pick: &dyn Fn(usize) -> bool| -> Option<usize> {
+            let mut d = 0usize;
+            for (k, t) in s.iter().enumerate().skip(from) {
+                match t {
+                    Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+                    Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+                    _ if d == 0 && pick(k) => return Some(k),
+                    _ => {}
+                }
+            }
+            None
+        };
+        let next = match word(s.get(i)) {
+            Some("explain") => {
+                let mut j = i + 1;
+                while matches!(word(s.get(j)), Some("analyze" | "analyse" | "verbose")) {
+                    j += 1;
+                }
+                if is_punct(s.get(j), "(") {
+                    let mut d = 0usize;
+                    while j < s.len() {
+                        match &s[j] {
+                            Tok::Punct(p) if p == "(" => d += 1,
+                            Tok::Punct(p) if p == ")" => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    j += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                Some(j)
+            }
+            Some("prepare") => top(i + 1, &|k| word(s.get(k)) == Some("as")).map(|k| k + 1),
+            Some("declare") => top(i + 1, &|k| word(s.get(k)) == Some("for")).map(|k| k + 1),
+            Some("create")
+                if s.iter()
+                    .skip(i)
+                    .take(8)
+                    .any(|t| matches!(word(Some(t)), Some("table" | "materialized"))) =>
+            {
+                top(i + 1, &|k| {
+                    word(s.get(k)) == Some("as")
+                        && (is_punct(s.get(k + 1), "(")
+                            || matches!(
+                                word(s.get(k + 1)),
+                                Some("select" | "with" | "values" | "table" | "execute")
+                            ))
+                })
+                .map(|k| k + 1)
+            }
+            _ => None,
+        };
+        match next {
+            Some(j) if j < s.len() && j > i => i = j,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// PostgreSQL: the wrapper of a statement that wraps a query (`EXPLAIN
+/// [ANALYZE | ANALYSE] [VERBOSE] [(…)]`, `DECLARE c … FOR`, `PREPARE p
+/// [(types)] AS`, nested as the grammar allows: `EXPLAIN ANALYZE DECLARE
+/// … FOR …`), and where the wrapped statement starts. `None` when the
+/// statement is not one of them. In an `EXPLAIN` option list, `ANALYZE`
+/// counts unless its value is `false`, `off` or `0` (a string value is
+/// not read: it counts, failing closed).
+fn pg_wrapper(s: &[Tok]) -> Option<(PgWrapped, usize)> {
+    let top = |from: usize, w: &str| -> Option<usize> {
+        let mut d = 0usize;
+        for (k, t) in s.iter().enumerate().skip(from) {
+            match t {
+                Tok::Punct(p) if p == "(" || p == "[" => d += 1,
+                Tok::Punct(p) if p == ")" || p == "]" => d = d.saturating_sub(1),
+                Tok::Word(x) if d == 0 && x == w => return Some(k),
+                _ => {}
+            }
+        }
+        None
+    };
+    let mut outer: Option<PgWrapper> = None;
+    let mut i = 0usize;
+    for _ in 0..4 {
+        let (wrapper, next) = match word(s.get(i)) {
+            Some("explain") => {
+                let mut j = i + 1;
+                let mut analyze = false;
+                while let Some(w @ ("analyze" | "analyse" | "verbose")) = word(s.get(j)) {
+                    analyze |= w != "verbose";
+                    j += 1;
+                }
+                if is_punct(s.get(j), "(") {
+                    let close = skip_parens(s, j);
+                    for k in j + 1..close.saturating_sub(1) {
+                        if matches!(word(s.get(k)), Some("analyze" | "analyse"))
+                            && !matches!(word(s.get(k + 1)), Some("false" | "off"))
+                            && !matches!(s.get(k + 1), Some(Tok::Int(0)))
+                        {
+                            analyze = true;
+                        }
+                    }
+                    j = close;
+                }
+                let w = if analyze {
+                    PgWrapper::ExplainAnalyze
+                } else {
+                    PgWrapper::Explain
+                };
+                (w, Some(j))
+            }
+            Some("declare") => (PgWrapper::Declare, top(i + 1, "for").map(|k| k + 1)),
+            Some("prepare") => (PgWrapper::Prepare, top(i + 1, "as").map(|k| k + 1)),
+            _ => break,
+        };
+        let outermost = *outer.get_or_insert(wrapper);
+        match next {
+            Some(j) if j < s.len() => i = j,
+            // No query found: the wrapper of an unknown statement.
+            _ => {
+                return Some((
+                    PgWrapped {
+                        wrapper: outermost,
+                        kind: StatementKind::Other,
+                    },
+                    s.len(),
+                ));
+            }
+        }
+    }
+    let wrapper = outer?;
+    Some((
+        PgWrapped {
+            wrapper,
+            kind: first_kind(&s[i..]),
+        },
+        i,
+    ))
+}
+
+/// Names of the CTEs defined by a statement (never reported as relations);
+/// with `pg_wrappers`, also those of the query a PostgreSQL statement wraps
+/// ([`pg_wrapped_start`]).
+fn cte_names(s: &[Tok], pg_wrappers: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = if pg_wrappers { pg_wrapped_start(s) } else { 0 };
     while is_punct(s.get(i), "(") {
         i += 1;
     }
@@ -3184,7 +3999,9 @@ fn cte_names(s: &[Tok]) -> Vec<String> {
 /// TABLE|VIEW t`, `SHOW COLUMNS|FIELDS|INDEX … FROM t` (through `FROM`),
 /// `LOCK TABLES t …, u …` and `HANDLER t …`.
 fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<RelationName>) {
-    collect_relations(s, out);
+    // MySQL finds the query of `EXPLAIN` and `CREATE … AS` itself
+    // (`my_statement_relations`) before this.
+    collect_relations(s, out, dialect == Dialect::Postgres);
     if dialect != Dialect::Mysql {
         return;
     }
@@ -3247,12 +4064,12 @@ fn collect_relations_dialect(s: &[Tok], dialect: Dialect, out: &mut Vec<Relation
 /// Collects the relations named after `FROM` (and its comma list),
 /// `JOIN`, `UPDATE`, `INTO`, `COPY`, `USING`, and `TABLE` at a statement
 /// or subquery start, outside function-call parentheses.
-fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
+fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>, pg_wrappers: bool) {
     struct Frame {
         call: bool,
         in_from: bool,
     }
-    let ctes = cte_names(s);
+    let ctes = cte_names(s, pg_wrappers);
     let mut frames = vec![Frame {
         call: false,
         in_from: false,
@@ -3274,13 +4091,25 @@ fn collect_relations(s: &[Tok], out: &mut Vec<RelationName>) {
                             Some(Tok::Quoted(_)) => true,
                             _ => false,
                         });
+                // A parenthesized join in a `FROM` list (`FROM (a JOIN b ON
+                // …)`, `JOIN ((a JOIN b …) …)`): its first item is a
+                // relation too (ADR-0049 implementation).
+                let prev = i.checked_sub(1).and_then(|j| s.get(j));
+                let in_from = frames.last().is_some_and(|f| f.in_from);
+                let join_group = !subquery
+                    && !call
+                    && (matches!(word(prev), Some("from" | "join" | "lateral" | "only"))
+                        || (in_from && (is_punct(prev, ",") || is_punct(prev, "("))));
                 if frames.len() < MAX_DEPTH {
                     frames.push(Frame {
                         call,
-                        in_from: false,
+                        in_from: join_group,
                     });
                 }
                 i += 1;
+                if join_group {
+                    i = read_relation(s, i, &ctes, false, out);
+                }
             }
             Tok::Punct(p) if p == ")" => {
                 if frames.len() > 1 {
@@ -3368,6 +4197,14 @@ fn read_relation(
 ) -> usize {
     while matches!(word(s.get(i)), Some("only" | "lateral")) {
         i += 1;
+    }
+    // PostgreSQL `ROWS FROM (f(…), …)`: function calls, not a relation
+    // named `rows` (ADR-0049).
+    if word(s.get(i)) == Some("rows")
+        && word(s.get(i + 1)) == Some("from")
+        && is_punct(s.get(i + 2), "(")
+    {
+        return i + 1;
     }
     // MySQL `UPDATE [LOW_PRIORITY] [IGNORE] t …`: modifiers, not names.
     if word(i.checked_sub(1).and_then(|j| s.get(j))) == Some("update") {
@@ -4826,6 +5663,340 @@ mod tests {
         assert!(a.parts()[0].analyze_wrapped);
     }
 
+    fn rels_of(p: &StatementInfo) -> Vec<String> {
+        p.relations
+            .iter()
+            .map(|r| match &r.schema {
+                Some(s) => format!("{s}.{}", r.name),
+                None => r.name.clone(),
+            })
+            .collect()
+    }
+
+    /// ADR-0047 decisions 1 and 2: every lead word, option and explained
+    /// statement is an explain of a statement naming the explained
+    /// statement's relations (targets of explained writes included).
+    #[test]
+    fn mysql_explain_of_a_statement() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "EXPLAIN SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "DESCRIBE SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "desc select email from customers where id = 1",
+                &["customers"],
+            ),
+            (
+                "EXPLAIN EXTENDED SELECT * FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN PARTITIONS SELECT * FROM hr.customers",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT=TRADITIONAL SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT = JSON SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "DESC FORMAT=TREE SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN FORMAT=JSON INTO @x SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT o.note FROM hr.orders o JOIN hr.customers c ON c.id = o.cid WHERE o.oid = 1",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT * FROM (SELECT * FROM hr.customers WHERE id = 42) d",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN WITH c AS (SELECT * FROM hr.customers WHERE id = 42) SELECT * FROM c",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN SELECT * FROM hr.orders WHERE note = (SELECT iban FROM hr.customers WHERE id = 42)",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN (SELECT * FROM hr.customers WHERE id = 42)",
+                &["hr.customers"],
+            ),
+            ("EXPLAIN VALUES ROW(1)", &[]),
+            ("EXPLAIN TABLE hr.customers", &["hr.customers"]),
+            ("DESCRIBE TABLE hr.customers", &["hr.customers"]),
+            (
+                "EXPLAIN UPDATE hr.customers SET name = 'x' WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN UPDATE hr.orders o, hr.customers c SET o.note = 'x' WHERE c.email = 'a@b' AND o.cid = c.id",
+                &["hr.orders", "hr.customers"],
+            ),
+            (
+                "EXPLAIN DELETE FROM hr.customers WHERE id = 42",
+                &["hr.customers"],
+            ),
+            (
+                "EXPLAIN INSERT INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.archive", "hr.orders"],
+            ),
+            (
+                "EXPLAIN REPLACE hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.orders", "hr.archive"],
+            ),
+            (
+                "EXPLAIN REPLACE INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                &["hr.archive", "hr.orders"],
+            ),
+            ("EXPLAIN SELECT 1", &[]),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR EXPLAIN SELECT * FROM hr.customers WHERE id = 1",
+                &["hr.customers"],
+            ),
+            // `performance_schema` digests.
+            (
+                "EXPLAIN SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+                &["hr.customers"],
+            ),
+            (
+                "DESC SELECT * FROM hr . customers WHERE id = ?",
+                &["hr.customers"],
+            ),
+        ];
+        for (q, want) in cases {
+            let a = analyze(q, AnalyzeOptions::mysql().digest(q.contains(" . ")));
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.parts().len(), 1, "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement, "{q}");
+            assert!(!p.explain_probe, "{q}");
+            assert!(
+                !p.analyze_wrapped && !p.explain_connection && !p.explain_unbounded,
+                "{q}"
+            );
+            assert_eq!(p.kind, StatementKind::Other, "{q}");
+            assert!(!p.outfile && p.shape.is_none(), "{q}");
+            let got = rels_of(p);
+            assert_eq!(got.len(), want.len(), "{q}: {got:?}");
+            let top: Vec<String> = a
+                .relations()
+                .iter()
+                .map(|r| match &r.schema {
+                    Some(s) => format!("{s}.{}", r.name),
+                    None => r.name.clone(),
+                })
+                .collect();
+            for w in *want {
+                assert!(got.iter().any(|g| g == w), "{q}: {got:?}");
+                assert!(top.iter().any(|g| g == w), "{q}: {top:?}");
+            }
+        }
+        // An explained `INTO OUTFILE` writes no file.
+        let a = my("EXPLAIN SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'");
+        assert!(a.parts()[0].explain_statement && !a.parts()[0].outfile);
+        assert!(my("SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'").parts()[0].outfile);
+        // Not an explain of a statement: the table form, the other
+        // connection, `ANALYZE` (the statement runs), no explain at all.
+        for q in [
+            "DESCRIBE hr.customers",
+            "DESCRIBE hr.customers email",
+            "DESC hr.customers 'e%'",
+            "EXPLAIN hr.customers",
+            "DESC t",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN FORMAT=JSON FOR CONNECTION 12",
+            "EXPLAIN ANALYZE SELECT * FROM hr.customers",
+            "EXPLAIN FORMAT=TREE INTO @x ANALYZE SELECT * FROM hr.customers",
+            "ANALYZE SELECT * FROM hr.customers",
+            "SHOW COLUMNS FROM hr.customers",
+            "SHOW EXPLAIN FOR 12",
+            "SELECT * FROM hr.customers",
+            "SELECT 'EXPLAIN SELECT 1 FROM t'",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            assert!(!a.parts()[0].explain_statement, "{q}");
+            assert!(!a.parts()[0].explain_probe, "{q}");
+        }
+        // The table form of a digest.
+        let a = analyze(
+            "EXPLAIN `hr` . `customers`",
+            AnalyzeOptions::mysql().digest(true),
+        );
+        assert!(!a.parts()[0].explain_statement);
+        // Past the prefix bound: its own rule.
+        let far = format!("EXPLAIN {}SELECT * FROM t", "FORMAT = TREE ".repeat(11));
+        let a = my(&far);
+        assert!(a.parts()[0].explain_unbounded && !a.parts()[0].explain_statement);
+        // Security review of #195, L2: `FOR SCHEMA | DATABASE name` gives
+        // the default schema of unqualified names; not another connection.
+        for (q, want) in [
+            (
+                "EXPLAIN FOR SCHEMA hr SELECT * FROM customers WHERE id = 1",
+                &["hr.customers"][..],
+            ),
+            (
+                "EXPLAIN FORMAT=TREE FOR DATABASE `hr` SELECT * FROM customers c JOIN shop.orders o ON o.cid = c.id",
+                &["hr.customers", "shop.orders"][..],
+            ),
+            (
+                "explain for schema hr update customers set a = 1 where id = 2",
+                &["hr.customers"][..],
+            ),
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement && p.explain_schema, "{q}");
+            assert!(!p.explain_connection && !p.explain_probe, "{q}");
+            assert_eq!(rels_of(p), want, "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT * FROM hr.customers",
+            "EXPLAIN FOR CONNECTION 12",
+            "EXPLAIN FORMAT=JSON INTO @for SELECT 1 FROM t",
+        ] {
+            assert!(!my(q).parts()[0].explain_schema, "{q}");
+        }
+        assert!(my("EXPLAIN FOR CONNECTION 12").parts()[0].explain_connection);
+        assert!(my("EXPLAIN FOR SCHEMA hr FOR CONNECTION 12").parts()[0].explain_connection);
+    }
+
+    /// ADR-0047 decision 5: the literal probe shape, and one-step
+    /// variations of it.
+    #[test]
+    fn mysql_explain_probe_shape() {
+        for q in [
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long",
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history",
+            "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current",
+            "DESCRIBE SELECT 1 FROM performance_schema.threads",
+            "desc select 0 from performance_schema.setup_consumers",
+            "EXPLAIN SELECT 1 FROM `performance_schema`.`threads`;",
+            "EXPLAIN /* plain comment */ SELECT 1 FROM performance_schema.threads",
+            "EXPLAIN SELECT /*+ NO_INDEX(t) */ 1 FROM performance_schema.threads",
+            // Digests.
+            "EXPLAIN SELECT ? FROM performance_schema . events_statements_history_long",
+            "EXPLAIN SELECT ? FROM `performance_schema` . `events_statements_history_long`",
+        ] {
+            let a = analyze(q, AnalyzeOptions::mysql().digest(q.contains(" . ")));
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.parts().len(), 1, "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement && p.explain_probe, "{q}");
+            assert_eq!(p.relations.len(), 1, "{q}");
+        }
+        for q in [
+            // Security review of #195, H1: any table outside
+            // `performance_schema` (a view there is merged, with its
+            // const reads), qualified or not.
+            "EXPLAIN SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.v",
+            "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+            "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
+            "DESCRIBE SELECT 1 FROM `hr`.`customers`",
+            "desc select 0 from customers",
+            "EXPLAIN SELECT 1 FROM t",
+            "EXPLAIN SELECT 1 FROM threads",
+            "EXPLAIN SELECT 1 FROM `performance_schema`",
+            "EXPLAIN SELECT 1 FROM performance_schemax.threads",
+            "EXPLAIN SELECT 1 FROM hr.performance_schema",
+            "EXPLAIN SELECT 1 FROM performance_schema.threads WHERE THREAD_ID = 1",
+            "EXPLAIN SELECT 1 FROM hr.customers WHERE id = 42",
+            "EXPLAIN SELECT 1 FROM hr.customers, hr.orders",
+            "EXPLAIN SELECT 1 FROM hr.customers JOIN hr.orders",
+            "EXPLAIN SELECT 1 FROM hr.customers c",
+            "EXPLAIN SELECT * FROM hr.customers",
+            "EXPLAIN SELECT id FROM hr.customers",
+            "EXPLAIN SELECT 'x' FROM hr.customers",
+            "EXPLAIN SELECT 1.5 FROM hr.customers",
+            "EXPLAIN SELECT -1 FROM hr.customers",
+            "EXPLAIN SELECT 1, 2 FROM hr.customers",
+            "EXPLAIN FORMAT=JSON SELECT 1 FROM hr.customers",
+            "EXPLAIN EXTENDED SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT (SELECT 1 FROM hr.orders) FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.customers LIMIT 1",
+            "EXPLAIN SELECT 1 FROM hr.customers FOR UPDATE",
+            "EXPLAIN SELECT 1 FROM a.b.c",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN SELECT 1 FROM \"t\"",
+            "EXPLAIN (SELECT 1 FROM t)",
+            "EXPLAIN TABLE t",
+            "SELECT 1 FROM t",
+            "SET STATEMENT max_statement_time = 1 FOR EXPLAIN SELECT 1 FROM t",
+            "EXPLAIN ANALYZE SELECT 1 FROM t",
+        ] {
+            assert!(my(q).parts().iter().all(|p| !p.explain_probe), "{q}");
+        }
+        // Re-review of #195, L2: the schema name is compared exactly.
+        for q in [
+            "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+            "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
+        ] {
+            let a = my(q);
+            let p = &a.parts()[0];
+            assert!(
+                p.explain_statement && !p.explain_probe && p.explain_probe_case,
+                "{q}"
+            );
+        }
+        assert!(!my("EXPLAIN SELECT 1 FROM performance_schema.v").parts()[0].explain_probe_case);
+        // Security review of #195, M1: a variable named like a keyword is
+        // not the keyword.
+        for q in [
+            "EXPLAIN FORMAT=JSON INTO @analyze SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @ANALYZE SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @`analyze` SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @@analyze SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @for SELECT * FROM hr.customers WHERE id = 1",
+            "EXPLAIN FORMAT=JSON INTO @FOR SELECT * FROM hr.customers WHERE id = 1",
+        ] {
+            let a = my(q);
+            assert!(a.lexed(), "{q}");
+            let p = &a.parts()[0];
+            assert!(p.explain_statement, "{q}");
+            assert!(!p.analyze_wrapped && !p.explain_connection, "{q}");
+            assert_eq!(p.kind, StatementKind::Other, "{q}");
+            assert_eq!(rels_of(p), ["hr.customers"], "{q}");
+        }
+        // A real `ANALYZE` after the variable still runs the statement.
+        let a = my("EXPLAIN FORMAT=JSON INTO @analyze ANALYZE SELECT * FROM hr.customers");
+        assert!(a.parts()[0].analyze_wrapped && !a.parts()[0].explain_statement);
+        // L3: `EXPLAIN ANALYZE … INTO OUTFILE` runs: it keeps `outfile`.
+        for q in [
+            "EXPLAIN ANALYZE SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+            "ANALYZE SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+        ] {
+            let a = my(q);
+            assert!(a.parts()[0].analyze_wrapped && a.parts()[0].outfile, "{q}");
+        }
+        // A version comment every supported server runs is code; one that
+        // a server may run gives readings that differ: only the kind.
+        let a = my("EXPLAIN SELECT /*!50000 * */ 1 FROM t");
+        assert!(a.lexed() && !a.parts()[0].explain_probe);
+        for q in [
+            "EXPLAIN SELECT /*!99999 * */ 1 FROM t",
+            "EXPLAIN SELECT 1 FROM t /*M!100000 WHERE id = 1 */",
+        ] {
+            let a = my(q);
+            assert!(!a.lexed() && a.parts().is_empty(), "{q}");
+        }
+    }
+
     /// A statement naming [`MAX_RELATIONS`] relations or more says so: the
     /// later ones are not kept.
     #[test]
@@ -5239,5 +6410,555 @@ mod tests {
             assert_eq!(with.relations(), without.relations(), "{q}");
             assert_eq!(with.kind(), without.kind(), "{q}");
         }
+    }
+
+    fn part0(q: &str) -> StatementInfo {
+        let a = my(q);
+        assert!(a.lexed(), "{q}");
+        a.parts()[0].clone()
+    }
+
+    /// `SELECT … INTO` variables (#195 review M2): flagged, never
+    /// `OUTFILE` / `DUMPFILE`, and the variables are not relations.
+    #[test]
+    fn mysql_into_variables() {
+        for q in [
+            "SELECT email INTO @v FROM hr.customers WHERE id = 1",
+            "SELECT email FROM hr.customers WHERE id = 1 INTO @v",
+            "SELECT email, name INTO @a, @b FROM hr.customers WHERE id = 1",
+            "SELECT email FROM hr.customers WHERE id = 1 FOR UPDATE INTO @a",
+            "SELECT email INTO @'v', @`w`, @\"x\", @v.y FROM hr.customers",
+            "SELECT email INTO v_email FROM hr.customers WHERE id = 1",
+            "SELECT email INTO v_email, `w` FROM hr.customers",
+            "(SELECT email FROM hr.customers WHERE id = 1) INTO @v",
+            "SELECT email FROM hr.customers UNION SELECT 'x' INTO @v",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT email INTO @v FROM hr.customers",
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+            "SELECT `email` INTO ? FROM `hr` . `customers` WHERE `id` = ?",
+            "TABLE hr.customers LIMIT 1 INTO @a, @b, @c, @d",
+        ] {
+            let p = part0(q);
+            assert!(p.into_var && !p.outfile, "{q}");
+            assert_eq!(rels_of(&p), ["hr.customers"], "{q}");
+        }
+        for q in [
+            "SELECT email INTO OUTFILE '/tmp/x' FROM hr.customers",
+            "SELECT email FROM hr.customers INTO DUMPFILE '/tmp/x'",
+            "INSERT INTO hr.t SELECT email FROM hr.customers",
+            "REPLACE INTO hr.t SELECT email FROM hr.customers",
+            "EXPLAIN FORMAT=JSON INTO @x SELECT email FROM hr.customers WHERE id = 1",
+            "SELECT @into FROM hr.customers",
+            "SET @v = 1",
+            "LOAD DATA LOCAL INFILE 'x' INTO TABLE hr.t",
+        ] {
+            assert!(!part0(q).into_var, "{q}");
+        }
+        // The variable that takes `EXPLAIN ANALYZE`'s plan is no relation.
+        let p = part0("EXPLAIN ANALYZE FORMAT=JSON INTO @x SELECT email FROM hr.customers");
+        assert_eq!(rels_of(&p), ["hr.customers"]);
+    }
+
+    /// `:=` assigns a user variable inside an expression.
+    #[test]
+    fn mysql_variable_assignments() {
+        for q in [
+            "SELECT @v := email FROM hr.customers WHERE id = 1",
+            "SELECT 1 FROM hr.customers WHERE id = 1 AND (@v:=email) IS NULL",
+            "DO @v := (SELECT email FROM hr.customers WHERE id = 1)",
+            "SET @v := (SELECT email FROM hr.customers WHERE id = 1)",
+        ] {
+            let p = part0(q);
+            assert!(p.var_assign, "{q}");
+            assert_eq!(rels_of(&p), ["hr.customers"], "{q}");
+        }
+        for q in [
+            "SELECT email FROM hr.customers WHERE id = 1",
+            "SET @v = 1",
+            "SELECT ':=' FROM hr.customers",
+        ] {
+            assert!(!part0(q).var_assign, "{q}");
+        }
+    }
+
+    /// `CREATE TABLE … AS <query>` and `CREATE | ALTER VIEW … AS <query>`
+    /// (#186 review L4): the created table or view, and the relations of
+    /// the query only.
+    #[test]
+    fn mysql_create_from_a_query() {
+        let target = |p: &StatementInfo| {
+            p.create_target.as_ref().map(|r| match &r.schema {
+                Some(s) => format!("{s}.{}", r.name),
+                None => r.name.clone(),
+            })
+        };
+        for (q, t, sources) in [
+            (
+                "CREATE TABLE db.copy AS SELECT * FROM db.t",
+                "db.copy",
+                &["db.t"][..],
+            ),
+            (
+                "CREATE TABLE db.copy SELECT * FROM db.t",
+                "db.copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TEMPORARY TABLE copy AS SELECT a FROM db.t JOIN db.u ON 1",
+                "copy",
+                &["db.t", "db.u"],
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS copy (a INT, b TEXT, KEY (a)) ENGINE=InnoDB IGNORE SELECT a, b FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy (a INT) REPLACE AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy PARTITION BY RANGE (a) (PARTITION p VALUES LESS THAN (10)) AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS (SELECT a FROM db.t)",
+                "copy",
+                &["db.t"],
+            ),
+            ("CREATE TABLE copy AS TABLE db.t", "copy", &["db.t"]),
+            ("CREATE TABLE copy TABLE db.t", "copy", &["db.t"]),
+            ("CREATE TABLE copy AS VALUES ROW(1), ROW(2)", "copy", &[]),
+            (
+                "CREATE TABLE copy AS WITH c AS (SELECT a FROM db.t) SELECT * FROM c",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE OR REPLACE TABLE copy SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy (a INT) WITH SYSTEM VERSIONING SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS WITH system AS (SELECT a FROM db.t) SELECT * FROM system",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS ( WITH system AS (SELECT a FROM db.t) SELECT * FROM system )",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy WITH system (x) AS (SELECT a FROM db.t) SELECT * FROM system",
+                "copy",
+                &["db.t"],
+            ),
+            (
+                "CREATE VIEW v AS WITH system AS (TABLE db.t) SELECT * FROM system",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE TABLE copy AS SELECT sql_text FROM performance_schema.events_statements_history_long",
+                "copy",
+                &["performance_schema.events_statements_history_long"],
+            ),
+            (
+                "CREATE TABLE `db` . `copy` AS SELECT * FROM `db` . `t` WHERE `a` = ?",
+                "db.copy",
+                &["db.t"],
+            ),
+            ("CREATE VIEW db.v AS SELECT a FROM db.t", "db.v", &["db.t"]),
+            (
+                "CREATE VIEW v (x, y) AS SELECT a, b FROM db.t WITH CASCADED CHECK OPTION",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = 'root'@'%' SQL SECURITY INVOKER VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = CURRENT_USER() VIEW v AS (SELECT a FROM db.t)",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = root@localhost VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            (
+                "CREATE DEFINER = view@sql VIEW v AS SELECT a FROM db.t",
+                "v",
+                &["db.t"],
+            ),
+            ("CREATE VIEW IF NOT EXISTS v AS TABLE db.t", "v", &["db.t"]),
+            ("ALTER VIEW db.v AS SELECT a FROM db.t", "db.v", &["db.t"]),
+            (
+                "ALTER ALGORITHM = TEMPTABLE DEFINER = x SQL SECURITY DEFINER VIEW v AS WITH c AS (TABLE db.t) SELECT * FROM c, db.u",
+                "v",
+                &["db.t", "db.u"],
+            ),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR CREATE TABLE copy AS SELECT a FROM db.t",
+                "copy",
+                &["db.t"],
+            ),
+        ] {
+            let p = part0(q);
+            assert!(p.create_query, "{q}");
+            assert_eq!(p.kind, StatementKind::Ddl, "{q}");
+            assert_eq!(target(&p).as_deref(), Some(t), "{q}");
+            assert_eq!(rels_of(&p), sources, "{q}");
+        }
+        // A version comment a server may skip: readings that differ, one
+        // of them a `CREATE … AS <query>` (security review of #196, L2).
+        for q in [
+            "CREATE /*!99999 TEMPORARY*/ TABLE copy AS SELECT a FROM db.t",
+            "CREATE /*M!100000 OR REPLACE */ TABLE copy SELECT a FROM db.t",
+        ] {
+            let a = my(q);
+            assert!(!a.lexed() && a.create_unread(), "{q}");
+            let names: Vec<String> = a
+                .create_unread_relations()
+                .iter()
+                .map(|r| format!("{}.{}", r.schema.as_deref().unwrap_or("-"), r.name))
+                .collect();
+            assert_eq!(names, ["-.copy", "db.t"], "{q}");
+        }
+        // A name that one reading takes from a literal is never kept: the
+        // intersection of the readings, not their union (I2).
+        let a = my("CREATE TABLE hr.copy AS SELECT 'a\\' FROM jane_doe, hr.customers -- '");
+        assert!(!a.lexed() && a.create_unread());
+        assert!(
+            a.create_unread_relations()
+                .iter()
+                .all(|r| r.name != "jane_doe" && r.name != "customers"),
+            "{:?}",
+            a.create_unread_relations()
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(!my("CREATE /*!99999 TEMPORARY*/ TABLE copy (a INT)").create_unread());
+        for q in [
+            "CREATE TABLE copy LIKE db.t",
+            "CREATE TABLE copy (LIKE db.t)",
+            "CREATE TABLE copy (a INT, b TEXT)",
+            "CREATE TABLE copy (a INT CHECK (a IN (1, 2)))",
+            "CREATE INDEX i ON db.t (a)",
+            "CREATE DEFINER = root PROCEDURE p() SELECT a FROM db.t",
+            "CREATE DEFINER = root FUNCTION f() RETURNS INT RETURN (SELECT 1)",
+            "CREATE TRIGGER tr BEFORE INSERT ON db.t FOR EACH ROW SET @x = 1",
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO SELECT a FROM db.t",
+            "ALTER TABLE db.t ADD COLUMN b INT",
+            "CREATE VIEW v",
+        ] {
+            assert!(!part0(q).create_query, "{q}");
+        }
+    }
+
+    /// PostgreSQL `U&"…"` identifiers are compared decoded (security
+    /// review of #199, M2); an escape the server refuses does not lex.
+    #[test]
+    fn unicode_escaped_identifiers_are_decoded() {
+        let s = |n: &str| (Some("pg_catalog".to_owned()), n.to_owned());
+        assert_eq!(
+            rels(r#"select * from U&"\0070g_stats""#),
+            [(None, "pg_stats".to_owned())]
+        );
+        assert_eq!(
+            rels(r#"select * from pg_catalog.u&"pg_st\+000061ts""#),
+            [s("pg_stats")]
+        );
+        assert_eq!(
+            rels(r#"select * from U&"!0070g_stat!!s" UESCAPE '!'"#),
+            [(None, "pg_stat!s".to_owned())]
+        );
+        assert_eq!(
+            rels(r#"select * from U&"pg_st\\ats""#),
+            [(None, "pg_st\\ats".to_owned())]
+        );
+        // A surrogate pair is one character.
+        assert_eq!(
+            rels(r#"select * from U&"a\D83D\DE00""#),
+            [(None, "a\u{1F600}".to_owned())]
+        );
+        for bad in [
+            r#"select * from U&"\00""#,
+            r#"select * from U&"\D83D""#,
+            r#"select * from U&"\zzzz""#,
+            r#"select * from U&"!0070" UESCAPE '+'"#,
+            r#"select * from U&"\0000x""#,
+        ] {
+            let a = analyze(bad, AnalyzeOptions::new());
+            assert!(!a.lexed(), "{bad}");
+        }
+    }
+
+    /// ADR-0049 implementation: the first item of a parenthesized join is
+    /// a relation, and `ROWS FROM (…)` names none.
+    #[test]
+    fn parenthesized_joins_and_rows_from() {
+        let rels = |t: &str| -> Vec<String> {
+            analyze(t, AnalyzeOptions::new())
+                .relations()
+                .iter()
+                .map(|r| format!("{}.{}", r.schema.as_deref().unwrap_or(""), r.name))
+                .collect()
+        };
+        assert_eq!(
+            rels("select * from (crm.a x join crm.b y on true)"),
+            ["crm.a", "crm.b"]
+        );
+        assert_eq!(
+            rels("select * from t, ((crm.a x join crm.b y on true) join crm.c on true)"),
+            [".t", "crm.a", "crm.b", "crm.c"]
+        );
+        assert_eq!(
+            rels("select * from (select 1) x, (values (1)) v"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            rels("select * from rows from (f(1), g(2)) with ordinality r, crm.a"),
+            ["crm.a"]
+        );
+        assert_eq!(rels("select * from t where x in (crm.y)"), [".t"]);
+    }
+
+    /// ADR-0049, re-review of #211, R-M1: the CTEs of a query that a
+    /// PostgreSQL statement wraps are not relations, as for a bare query.
+    #[test]
+    fn pg_wrapped_query_ctes_are_not_relations() {
+        for q in [
+            "DECLARE c CURSOR FOR WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "DECLARE c NO SCROLL CURSOR WITH HOLD FOR WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "PREPARE p AS WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "PREPARE p (integer) AS WITH RECURSIVE x (n) AS (SELECT 1) SELECT 1 FROM x",
+            "EXPLAIN (ANALYZE, BUFFERS) WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "EXPLAIN ANALYZE VERBOSE WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "CREATE TABLE t AS WITH x AS (SELECT 1) SELECT 1 FROM pg_catalog.pg_class, x",
+            "CREATE MATERIALIZED VIEW m AS WITH x AS (SELECT 1) SELECT 1 FROM x",
+            "EXPLAIN ANALYZE CREATE TABLE t AS WITH x AS (SELECT 1) SELECT 1 FROM x",
+        ] {
+            let a = analyze(q, AnalyzeOptions::new());
+            assert!(
+                a.parts()
+                    .iter()
+                    .all(|p| p.relations.iter().all(|r| r.name != "x")),
+                "{q}"
+            );
+        }
+        // A relation named after the wrapper's own words is still one.
+        let a = analyze("PREPARE p AS SELECT 1 FROM x", AnalyzeOptions::new());
+        assert!(a.parts()[0].relations.iter().any(|r| r.name == "x"));
+        // MySQL is unchanged by this rule (it extracts the query of
+        // `EXPLAIN` and `CREATE … AS` itself).
+        let a = analyze(
+            "EXPLAIN WITH x AS (SELECT 1) SELECT 1 FROM x",
+            AnalyzeOptions::mysql(),
+        );
+        assert!(!a.relations().iter().any(|r| r.name == "x"));
+    }
+    /// ADR-0048, refinement of 2026-10-12: a PostgreSQL statement that
+    /// wraps a query says what it does with it and the query's kind, and
+    /// a cursor's or prepared statement's read has the query's shape.
+    #[test]
+    fn pg_wrappers_and_their_query() {
+        use PgWrapper::{Declare, Explain, ExplainAnalyze, Prepare};
+        use StatementKind::{Ddl, Delete, Insert, Other, Select, Values};
+        let cases: &[(&str, PgWrapper, StatementKind)] = &[
+            (
+                "EXPLAIN SELECT email FROM crm.c WHERE id = 1",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN VERBOSE SELECT 1 FROM t", Explain, Select),
+            (
+                "EXPLAIN (FORMAT JSON, COSTS off) SELECT 1 FROM t",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE false) SELECT 1 FROM t", Explain, Select),
+            (
+                "EXPLAIN (ANALYZE off, BUFFERS) SELECT 1 FROM t",
+                Explain,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE 0) SELECT 1 FROM t", Explain, Select),
+            ("EXPLAIN DELETE FROM t WHERE id = 1", Explain, Delete),
+            ("EXPLAIN ANALYZE SELECT 1 FROM t", ExplainAnalyze, Select),
+            (
+                "EXPLAIN ANALYSE VERBOSE SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN VERBOSE ANALYZE SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            ("EXPLAIN (ANALYZE) SELECT 1 FROM t", ExplainAnalyze, Select),
+            (
+                "EXPLAIN (FORMAT JSON, ANALYZE) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE true) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE on) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN (ANALYZE 1) SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            // A string value is not read: fail closed.
+            (
+                "EXPLAIN (ANALYZE 'off') SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            (
+                "EXPLAIN ANALYZE INSERT INTO t SELECT * FROM u",
+                ExplainAnalyze,
+                Insert,
+            ),
+            (
+                "EXPLAIN ANALYZE WITH x AS (SELECT 1) DELETE FROM t",
+                ExplainAnalyze,
+                Delete,
+            ),
+            (
+                "EXPLAIN ANALYZE CREATE TABLE t AS SELECT 1 FROM u",
+                ExplainAnalyze,
+                Ddl,
+            ),
+            (
+                "EXPLAIN ANALYZE DECLARE c CURSOR FOR SELECT 1 FROM t",
+                ExplainAnalyze,
+                Select,
+            ),
+            ("EXPLAIN EXECUTE p(1)", Explain, Other),
+            ("EXPLAIN ANALYZE EXECUTE p", ExplainAnalyze, Other),
+            (
+                "DECLARE c CURSOR FOR SELECT email FROM crm.c",
+                Declare,
+                Select,
+            ),
+            (
+                "DECLARE _psql_cursor NO SCROLL CURSOR FOR\nSELECT * FROM crm.c",
+                Declare,
+                Select,
+            ),
+            (
+                "DECLARE c BINARY SCROLL CURSOR WITH HOLD FOR TABLE t",
+                Declare,
+                StatementKind::Table,
+            ),
+            ("DECLARE c CURSOR FOR VALUES (1)", Declare, Values),
+            ("DECLARE c CURSOR FOR (SELECT 1 FROM t)", Declare, Select),
+            (
+                "DECLARE c CURSOR FOR WITH x AS (SELECT 1) SELECT 1 FROM x",
+                Declare,
+                Select,
+            ),
+            // No query found.
+            ("DECLARE c CURSOR", Declare, Other),
+            (
+                "PREPARE p AS SELECT phone FROM crm.c WHERE id = $1",
+                Prepare,
+                Select,
+            ),
+            (
+                "PREPARE p (integer, text) AS UPDATE t SET a = $2 WHERE id = $1",
+                Prepare,
+                StatementKind::Update,
+            ),
+        ];
+        for (q, wrapper, kind) in cases {
+            let a = analyze(q, AnalyzeOptions::new());
+            assert!(a.lexed(), "{q}");
+            assert_eq!(a.kind(), Other, "{q}");
+            assert_eq!(
+                a.parts()[0].pg_wrapped,
+                Some(PgWrapped {
+                    wrapper: *wrapper,
+                    kind: *kind
+                }),
+                "{q}"
+            );
+        }
+        // The relations are the query's; the cursor and statement names
+        // are not relations.
+        let a = analyze(
+            "DECLARE c CURSOR FOR SELECT email FROM crm.c JOIN crm.d ON true",
+            AnalyzeOptions::new(),
+        );
+        let names: Vec<&str> = a.relations().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["c", "d"]);
+        // The shape of a cursor's and a prepared statement's query; none
+        // for an explain (its rows are not sent).
+        for q in [
+            "DECLARE c CURSOR FOR SELECT * FROM crm.c",
+            "PREPARE p AS SELECT * FROM crm.c",
+            "DECLARE c NO SCROLL CURSOR FOR TABLE crm.c",
+        ] {
+            let p = analyze(q, AnalyzeOptions::new()).parts()[0].clone();
+            assert!(
+                p.shape.is_some_and(|s| s.whole_relation(10_001)),
+                "{q}: {:?}",
+                p.shape
+            );
+        }
+        for q in [
+            "DECLARE c CURSOR FOR SELECT * FROM crm.c WHERE id = 1",
+            "PREPARE p AS SELECT * FROM crm.c LIMIT 10",
+        ] {
+            let p = analyze(q, AnalyzeOptions::new()).parts()[0].clone();
+            assert!(p.shape.is_some_and(|s| !s.whole_relation(10_001)), "{q}");
+        }
+        for q in [
+            "EXPLAIN SELECT * FROM crm.c",
+            "EXPLAIN ANALYZE SELECT * FROM crm.c",
+            "PREPARE p AS DELETE FROM crm.c",
+        ] {
+            assert_eq!(
+                analyze(q, AnalyzeOptions::new()).parts()[0].shape,
+                None,
+                "{q}"
+            );
+        }
+        // Not wrappers: other statements, and MySQL.
+        for q in [
+            "SELECT 1 FROM t",
+            "FETCH 10 FROM c",
+            "MOVE 5 IN c",
+            "CLOSE c",
+            "EXECUTE p(1)",
+        ] {
+            assert_eq!(
+                analyze(q, AnalyzeOptions::new()).parts()[0].pg_wrapped,
+                None,
+                "{q}"
+            );
+        }
+        let a = analyze("EXPLAIN SELECT 1 FROM t", AnalyzeOptions::mysql());
+        assert_eq!(a.parts()[0].pg_wrapped, None);
     }
 }

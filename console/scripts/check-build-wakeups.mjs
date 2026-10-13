@@ -9,21 +9,28 @@
 // wake-up was ever sent. The sender now lives on `globalThis` (src/server/process-global.ts); this
 // script fails when any compiled copy of those functions is empty again.
 //
-// It reads the Turbopack server chunks (`.next/server/**/*.js`) and finds every export site of the
-// functions below (`"name",0,<function or identifier>`), resolving an identifier to its definition
-// in the same module. It fails when an export resolves to an empty body, when a definition cannot
-// be resolved, or when a function is not found at all (the check would be vacuous).
+// Since Next.js 16.4, production builds shorten ("mangle") the export names modules expose to each
+// other (`experimental.turbopackMangleExportNames`, on by default): `requestPolicyEvaluation` is
+// exported as e.g. `"f",0,function(){return t.request()}`, so the functions cannot be found by
+// their names. The check is anchored on the process slot names instead (`"policyJobSender"`,
+// `"notificationJobSender"`), string literals that the queue modules pass to `wakeUp()` at runtime
+// and that no minifier can rename. For every Turbopack module (`<id>,<param>=>{…}`) that holds
+// one, it reads the module's export call (`<param>.s([<key>,0,<value>,…])`), resolves each value
+// to its function (inline, or an identifier defined in the same module) and:
+// - fails when an exported function has an empty body;
+// - counts the setters (body calls `.setSender(`) and the requesters (body calls `.request(`).
+// It fails when a slot has no setter or no requester at all (the check would be vacuous), or when
+// an export call cannot be parsed. Works the same with export names mangled or not.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".next", "server");
-const CHECKED = [
-  "requestPolicyEvaluation",
-  "setPolicyJobSender",
-  "requestNotificationDelivery",
-  "setNotificationJobSender",
-];
+/** Process slot name (src/server/policy-queue.ts, notification-queue.ts) → source function names. */
+const SLOTS = {
+  policyJobSender: { setter: "setPolicyJobSender", requester: "requestPolicyEvaluation" },
+  notificationJobSender: { setter: "setNotificationJobSender", requester: "requestNotificationDelivery" },
+};
 
 function jsFiles(dir) {
   const out = [];
@@ -36,22 +43,72 @@ function jsFiles(dir) {
 }
 
 const IDENT = /^[A-Za-z_$][\w$]*/;
+const OPEN = { "(": ")", "[": "]", "{": "}" };
 
-/** Index of the character after the `)` matching the `(` at `open` (no strings in parameter lists). */
-function closeParen(src, open) {
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === "(") depth++;
-    else if (src[i] === ")" && --depth === 0) return i + 1;
+/**
+ * Index just past the string literal starting at `i` (`'`, `"` or a template without nested
+ * templates inside `${…}`).
+ */
+function skipString(src, i) {
+  const quote = src[i];
+  for (let j = i + 1; j < src.length; j++) {
+    if (src[j] === "\\") j++;
+    else if (src[j] === quote) return j + 1;
+  }
+  return src.length;
+}
+
+/** Index just past the bracket matching the one at `open` (string-aware). -1 when unbalanced. */
+function closeBracket(src, open) {
+  const stack = [];
+  for (let i = open; i < src.length; ) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") {
+      i = skipString(src, i);
+      continue;
+    }
+    if (OPEN[c]) stack.push(OPEN[c]);
+    else if (c === ")" || c === "]" || c === "}") {
+      if (stack.pop() !== c) return -1;
+      if (stack.length === 0) return i + 1;
+    }
+    i++;
   }
   return -1;
 }
 
+/** Top-level comma-separated elements of the array literal whose `[` is at `open` (trimmed). */
+function arrayElements(src, open) {
+  const end = closeBracket(src, open);
+  if (end < 0) return null;
+  const out = [];
+  let start = open + 1;
+  let depth = 0;
+  for (let i = open + 1; i < end - 1; ) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") {
+      i = skipString(src, i);
+      continue;
+    }
+    if (OPEN[c]) depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      out.push(src.slice(start, i).trim());
+      start = i + 1;
+    }
+    i++;
+  }
+  const last = src.slice(start, end - 1).trim();
+  if (last !== "" || out.length > 0) out.push(last);
+  return out;
+}
+
 /**
- * Body of the function expression starting at `at`: "empty", "non-empty" or null when `at` is
- * not a function. Handles `function x(…){…}`, `async function(…){…}`, `(…)=>{…}`, `x=>…`.
+ * Function expression starting at `at`: `{ empty, text }`, or null when `at` is not a function.
+ * Handles `function x(…){…}`, `async function(…){…}`, `(…)=>{…}`, `x=>…` (expression bodies are
+ * non-empty and run to the end of `src`, which callers bound to one element).
  */
-function bodyAt(src, at) {
+function functionAt(src, at) {
   let i = at;
   const skipWs = () => {
     while (/\s/.test(src[i] ?? "")) i++;
@@ -71,9 +128,9 @@ function bodyAt(src, at) {
     if (name) i += name[0].length;
     skipWs();
     if (src[i] !== "(") return null;
-    i = closeParen(src, i);
+    i = closeBracket(src, i);
   } else if (src[i] === "(") {
-    i = closeParen(src, i);
+    i = closeBracket(src, i);
     arrow = true;
   } else {
     const name = IDENT.exec(src.slice(i));
@@ -87,23 +144,17 @@ function bodyAt(src, at) {
     if (!src.startsWith("=>", i)) return null;
     i += 2;
     skipWs();
-    if (src[i] !== "{") return "non-empty"; // expression body
+    if (src[i] !== "{") return { empty: false, text: src.slice(at) }; // expression body
   }
   if (src[i] !== "{") return null;
-  i++;
-  skipWs();
-  return src[i] === "}" ? "empty" : "non-empty";
+  const end = closeBracket(src, i);
+  if (end < 0) return null;
+  const body = src.slice(i + 1, end - 1);
+  return { empty: body.trim() === "", text: src.slice(at, end) };
 }
 
-/** Module text around `pos`: from the previous `"use strict"` to the next one. */
-function moduleAround(src, pos) {
-  const start = src.lastIndexOf('"use strict"', pos);
-  const next = src.indexOf('"use strict"', pos);
-  return { text: src.slice(Math.max(0, start), next < 0 ? src.length : next), offset: Math.max(0, start) };
-}
-
-function resolveIdentifier(src, pos, ident) {
-  const { text } = moduleAround(src, pos);
+/** Functions bound to `ident` in `moduleText` (`function ident(…)` or `ident=<function>`). */
+function resolveIdentifier(moduleText, ident) {
   const esc = ident.replace(/\$/g, "\\$");
   const patterns = [
     new RegExp(`(?:async\\s+)?function\\s*\\*?\\s*${esc}\\s*\\(`, "g"),
@@ -112,16 +163,28 @@ function resolveIdentifier(src, pos, ident) {
   const results = [];
   for (const re of patterns) {
     let m;
-    while ((m = re.exec(text))) {
-      const at = m[0].startsWith("async") || m[0].includes("function") ? m.index : m.index + m[0].length;
-      const body = bodyAt(text, at);
-      if (body) results.push(body);
+    while ((m = re.exec(moduleText))) {
+      const at = m[0].includes("function") ? m.index : m.index + m[0].length;
+      const fn = functionAt(moduleText, at);
+      if (fn) results.push(fn);
     }
   }
   return results;
 }
 
-const found = Object.fromEntries(CHECKED.map((n) => [n, 0]));
+// A Turbopack module factory in a chunk: `<id>,<param>=>` right after `[`, `,` or the start.
+const MODULE_START = /(?:^|[[,])\s*\d+\s*,\s*([A-Za-z_$][\w$]*)\s*=>/g;
+
+/** Start index and factory parameter of the module holding `pos`, or null. */
+function moduleAt(src, pos) {
+  let found = null;
+  MODULE_START.lastIndex = 0;
+  let m;
+  while ((m = MODULE_START.exec(src)) && m.index < pos) found = { start: m.index, param: m[1] };
+  return found;
+}
+
+const counts = Object.fromEntries(Object.keys(SLOTS).map((s) => [s, { setter: 0, requester: 0 }]));
 const failures = [];
 let files;
 try {
@@ -132,35 +195,68 @@ try {
 }
 for (const file of files) {
   const src = readFileSync(file, "utf8");
-  for (const name of CHECKED) {
-    const re = new RegExp(`"${name}",\\s*0,\\s*`, "g");
+  for (const slot of Object.keys(SLOTS)) {
+    const re = new RegExp(`["'\`]${slot}["'\`]`, "g");
+    const seenModules = new Set();
     let m;
     while ((m = re.exec(src))) {
-      found[name]++;
-      const at = m.index + m[0].length;
       const where = `${path.relative(ROOT, file)} @${m.index}`;
-      let body = bodyAt(src, at);
-      if (body === null) {
-        const ident = IDENT.exec(src.slice(at))?.[0];
-        const bodies = ident ? resolveIdentifier(src, m.index, ident) : [];
-        if (bodies.length === 0) {
-          failures.push(`${name}: cannot resolve the exported function (${where})`);
-          continue;
-        }
-        body = bodies.includes("empty") ? "empty" : "non-empty";
+      const mod = moduleAt(src, m.index);
+      if (!mod) {
+        failures.push(`${slot}: no Turbopack module around the slot name (${where})`);
+        continue;
       }
-      if (body === "empty") failures.push(`${name}: compiled to an empty function (${where})`);
+      if (seenModules.has(mod.start)) continue;
+      seenModules.add(mod.start);
+      const exportCall = new RegExp(`(?:^|[^\\w$.])${mod.param.replace(/\$/g, "\\$")}\\.s\\(\\[`, "g");
+      exportCall.lastIndex = m.index;
+      const call = exportCall.exec(src);
+      if (!call) {
+        failures.push(`${slot}: no export call in the module (${where})`);
+        continue;
+      }
+      const open = call.index + call[0].length - 1;
+      const elements = arrayElements(src, open);
+      if (!elements || elements.length % 3 !== 0) {
+        failures.push(`${slot}: cannot parse the module's export call (${where})`);
+        continue;
+      }
+      // Up to the next module factory: a function declaration may be hoisted after the export call.
+      MODULE_START.lastIndex = open;
+      const nextModule = MODULE_START.exec(src);
+      const moduleText = src.slice(mod.start, nextModule ? nextModule.index : src.length);
+      for (let k = 0; k < elements.length; k += 3) {
+        const key = elements[k];
+        const value = elements[k + 2];
+        let fns;
+        const inline = functionAt(value, 0);
+        if (inline) fns = [inline];
+        else if (IDENT.exec(value)?.[0] === value) fns = resolveIdentifier(moduleText, value);
+        else fns = [];
+        // Constants (the queue name) resolve to no function and are not checked.
+        for (const fn of fns) {
+          if (fn.empty) failures.push(`${slot}: export ${key} compiled to an empty function (${where})`);
+          if (fn.text.includes(".setSender(")) counts[slot].setter++;
+          if (fn.text.includes(".request(")) counts[slot].requester++;
+        }
+      }
     }
   }
 }
-for (const [name, count] of Object.entries(found)) {
-  if (count === 0) failures.push(`${name}: not found in the server chunks (check not applicable to this build?)`);
+for (const [slot, names] of Object.entries(SLOTS)) {
+  for (const role of ["setter", "requester"]) {
+    if (counts[slot][role] === 0) {
+      failures.push(
+        `${names[role]}: not found in the server chunks (no ${role} for slot ${slot}; check not applicable to this build?)`,
+      );
+    }
+  }
 }
 if (failures.length > 0) {
   process.stderr.write(`check-build-wakeups: FAILED\n${failures.map((f) => `  - ${f}\n`).join("")}`);
   process.exit(1);
 }
-const summary = Object.entries(found)
-  .map(([n, c]) => `${n} x${c}`)
+const summary = Object.entries(SLOTS)
+  .flatMap(([slot, names]) => [`${names.setter} x${counts[slot].setter}`, `${names.requester} x${counts[slot].requester}`])
   .join(", ");
 process.stdout.write(`check-build-wakeups: OK (${summary})\n`);

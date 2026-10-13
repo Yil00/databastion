@@ -85,7 +85,7 @@ local `e2e/run.sh`).
 | `LOAD_DRAIN_TIMEOUT_S` | 300 | Longest wait for the Audit run's events after the workload |
 | `LOAD_PG_AUDIT` | `pgaudit` | `pss`: local runs without the pgaudit image (above) |
 | `LOAD_HTTPS_PORT` | 8543 | Port of the TLS proxy on 127.0.0.1 |
-| `LOAD_LIMIT_<NAME>` | see below | Every field of `loadlib.Limits`, upper case, e.g. `LOAD_LIMIT_DISCOVERY_PCT=2.0`, `LOAD_LIMIT_DRAIN_S=240` |
+| `LOAD_LIMIT_<NAME>` | see below | Every field of `loadlib.Limits`, upper case, e.g. `LOAD_LIMIT_DISCOVERY_PCT=2.0`, `LOAD_LIMIT_DRAIN_S=240`, `LOAD_LIMIT_AGENT_REF_CPU_CORES=0.013` (the release reference of the agent checks) |
 
 ## Flow
 1. Secrets, test CA, `agent.yaml` (targets `pg-load`, `mariadb-load`, `mongo-load`, the e2e accounts:
@@ -132,7 +132,19 @@ local `e2e/run.sh`).
    `events_statements_summary_by_digest`, `performance_schema.threads` and
    `information_schema.PROCESSLIST`; `load_builtins` (no privilege), a table-less built-in mix
    (`NOW()`, `LAST_INSERT_ID()`, `DATABASE()`, a Connector/J-style `@@session` probe,
-   `CONNECTION_ID()`, `VERSION()`, `USER()`, `SET NAMES`, `SELECT 1`). They run in both phases, so
+   `CONNECTION_ID()`, `VERSION()`, `USER()`, `SET NAMES`, `SELECT 1`). Next to them, the **statistics
+   readers** of [ADR-0048](../../docs/adr/0048-statistics-catalogs-as-reads.md), one session each,
+   every 10 s: on `target-mariadb`, `load_colstats` (`SELECT` on `mysql.column_stats` only) reads
+   the engine-independent column statistics of `support`, minimum and maximum values included; on
+   `target-pg` ([`pg-side-clients.sh`](pg-side-clients.sh), service `pg-side`, the target image's
+   `psql`), `load_pgmon`, a monitoring-like account (member of `pg_monitor`), runs a table bloat
+   estimate on `pg_stats` (`avg_width`, `null_frac`, joined with `pg_class` and `pg_namespace`, as
+   check_postgres or pgwatch do). Next to it, the readers of the **credential-bearing catalogs** of
+   [ADR-0050](../../docs/adr/0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md):
+   `load_pgexp`, an exporter-like account with no grant, reads `pg_roles`, `pg_proc` and
+   `pg_subscription` without their secret columns every 5 s (the no-secret shape: no event), and
+   `load_pgbouncer`, a PgBouncer-like account (member of `pg_read_all_data`), runs PgBouncer's
+   default `auth_query` on `pg_shadow` every second (a secret read). They run in both phases, so
    the latency comparison sees the same load; their statements are not in the workload counts.
 9. Audit on for `pg-load` and `mariadb-load` (`audit.configure` through the user API, contract
    defaults: aggregation 60 s, poll 10 s, no `min_rows`, so every event is reported); wait for the
@@ -190,12 +202,24 @@ resolution shows), and the agent account's own statement time from the engine's 
 | `audit.mariadb-load.monitor_ran`, `.builtins_ran` | issued > 0, 0 failed | the side accounts ran in both phases (statements counted for the Audit run) |
 | `audit.mariadb-load.monitor_reported` | `threads` and `PROCESSLIST` named | the reader's reads of [statement-text tables](../../docs/08-engine-capabilities.md#statement-text-tables) are events naming them (ADR-0045 part (a); the digest summary has no statement text on MariaDB and stays quiet) |
 | `audit.mariadb-load.monitor_one_event_per_window` | ≤ 0 | per principal, action, source and object set: events − (⌊span / 60 s⌋ + 2), where span is first `ts` → last `ts_last`. The agent's aggregation windows last at least 60 s (the contract default) and follow each other, so that is the most windows such a span can meet: at most one event per window. It catches an unaggregated stream (one event per statement), not a single extra event |
+| `audit.<target>.stats_ran`, `.stats_reported`, `.stats_one_event_per_window` | as `monitor_*` | the statistics readers of [ADR-0048](../../docs/adr/0048-statistics-catalogs-as-reads.md) (`pg-load`: `load_pgmon`, expected object `shop.pg_catalog.pg_stats`; `mariadb-load`: `load_colstats`, `mysql.column_stats`): ran without failure, their reads are events naming the statistics relation, and at most one event per principal, action, source and object set per aggregation window (same bound as `monitor_one_event_per_window`) |
+| `audit.pg-load.secrets_ran`, `.secrets_reported`, `.secrets_one_event_per_window` | as `monitor_*` | the PgBouncer-like `auth_query` of [ADR-0050](../../docs/adr/0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md) (`load_pgbouncer`, expected object `shop.pg_catalog.pg_shadow`): ran without failure, its reads are events naming `pg_shadow`, at most one per principal, action, source and object set per aggregation window |
+| `audit.pg-load.catalogs_ran`, `.catalogs_no_event` | ran, 0 non-connect events | the exporter-like reader of `pg_roles`, `pg_proc` and `pg_subscription` without their secret columns (`load_pgexp`, ADR-0050 decision 2) ran without failure and gave no event |
+| `audit.pg-load.pgaudit_catalog_volume_reported` | measured, `log_catalog` on, > 0 reader records | the pgaudit log volume over the Audit run was measured with `pgaudit.log_catalog = on` (as the database's sessions see it) and holds the statistics reader's records (pgaudit mode only); the volume itself is reported, not asserted |
 | `audit.mariadb-load.builtins_no_event` | 0, with ≥ 1 event | events of `load_builtins` other than its connection: table-less built-in calls are never unknown calls (ADR-0045 part (b)); its connection event must be there, so that the check cannot pass on a stream that never saw the account |
 | `agent.spool_bounded` | ≤ 1000 batches | peak `spool.batches` over the heartbeats of the run |
 | `agent.spool_drained` | 0 | a heartbeat after the drain reports an empty spool |
 | `agent.no_dropped_batches` | 0 | `spool.dropped_batches` and `dropped_items` (the documented drops happen only when the spool is full, `spool` in [`agent.example.yaml`](../../agent/agent.example.yaml)) |
 | `agent.<counter>` | 0 | `events_lost_total`, `findings_lost_total`, `audit_stream_failures_total`, `audit_records_skipped_total`, `audit_record_panics_total`, `connector_panics_total`, `batches_rejected_total` |
 | `agent.log_no_lost_batches` | 0 lines | the agent log has no lost / dropped / rejected batch line (as e2e) |
+
+**pgaudit log volume** (pgaudit mode, ADR-0048 open question 6): over the Audit run (workload start to
+end, by the log lines' timestamps), the lines and bytes of the server's `jsonlog` file, its MiB per
+hour, and the pgaudit records and bytes per role: `load_app` (the workload), `load_pgmon` (the
+statistics reader: catalog-only statements, logged because `log_catalog = on`), `load_pgexp` and
+`load_pgbouncer` (the ADR-0050 readers), `databastion_agent`
+(the agent's own `check()` and Discovery catalog reads, logged for the same reason) and `other`.
+Counts and sizes only, read inside the container.
 
 Reported without assertion: the workload's statements found in the target's own audit log (received
 > source means the agent counted some twice; source > issued, that the server logged more), the
@@ -211,6 +235,8 @@ lag p95 (`received_at - ts_last`), the agent's CPU per 1000 statements.
 | `agent.rss_peak_mb` | ≤ 256 MiB | peak `VmRSS` of the agent process over the whole run |
 | `agent.rss_no_monotonic_growth` | see below | `VmRSS` over the Audit run |
 | `agent.cpu_no_monotonic_growth` | see below | CPU rate over 30 segments of the Audit run |
+| `agent.cpu_vs_release_reference` | ≤ 0.033 core | ADR-0048: with the statistics readers, the agent's CPU over the Audit run against the 0.6.0 release run (0.013 core, `dev` `2b55117`, run 38038485048): reference + max(0.02 core, 100 %), the noise between CI runs (0.012 to 0.024 core so far) |
+| `agent.rss_vs_release_reference` | ≤ 58 MiB | the same for the peak `VmRSS` (reference 42 MiB): + max(16 MiB, 25 %) |
 
 Growth verdict: the first 20 % of the run is a warm-up; the rest is cut into three equal parts. It
 fails when the three medians strictly increase **and** the last exceeds the first by more than

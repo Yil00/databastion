@@ -226,6 +226,7 @@ where
     let mut attributes: Vec<&str> = requested.iter().map(String::as_str).collect();
     attributes.extend(["objectClass", "structuralObjectClass"]);
     let mut totals = Totals::default();
+    let mut pooled = Pooled::new(u64::from(job.sample_rows().max(1)));
     for (suffix, database) in planned_contexts(job, &dse.naming_contexts, &accesslog) {
         totals.contexts += 1;
         // The pause owed is paid (`turn`) before a session is checked or
@@ -296,7 +297,18 @@ where
             .map(|c| (normalize_ldap_dn(&c), c))
             .filter(|(name, _)| job.includes_schema(name.as_str()))
             .collect();
-        ordered.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        // Names that differ only in case are adjacent: they share one
+        // pooled sample (`Pooled`).
+        ordered.sort_by(|a, b| {
+            let (x, y) = (a.0.as_str(), b.0.as_str());
+            x.to_lowercase()
+                .cmp(&y.to_lowercase())
+                .then_with(|| x.cmp(y))
+        });
+        // Another first container within each name at each scan, so the
+        // containers past a full pooled sample are sampled over time
+        // (security review of #207, L5).
+        rotate_within_names(job, &mut ordered);
         // Another starting container at each scan (security review of
         // #93, M3), at a boundary between normalized names so a pooled
         // group stays in one run.
@@ -309,6 +321,13 @@ where
             {
                 flush(job, sink, &database, &name, groups, &mut totals).await?;
             }
+            // The pooled sample of the containers that share this
+            // normalized name is full: the others are not searched.
+            let Some(limit) = pooled.allowance(&container) else {
+                pooled.skip(target, &database, &container, sink);
+                totals.skipped += 1;
+                continue;
+            };
             if job.turn().await? == Paced::OutOfTime {
                 job.skip_out_of_time(sink, total - i);
                 break;
@@ -325,7 +344,7 @@ where
                         &schema,
                         &raw,
                         &attributes,
-                        n,
+                        (n, limit),
                         job,
                         groups,
                     ))
@@ -333,11 +352,23 @@ where
                 {
                     Paced::Done(r) => r,
                     Paced::OutOfTime => {
+                        // Cut while reading: what it read is not known.
+                        pooled.charge(&container, limit);
                         job.skip_out_of_time(sink, total - i);
                         break;
                     }
                 }
             };
+            // As the Audit stream charges the search's log record: its
+            // entries, at least one; a search that failed may have
+            // returned entries first, so it is charged its whole limit.
+            pooled.charge(
+                &container,
+                match &read {
+                    Ok((entries, _)) => (*entries).max(1),
+                    Err(_) => limit,
+                },
+            );
             match read {
                 Ok((entries, references)) => {
                     totals.entries += entries;
@@ -439,21 +470,116 @@ fn rotate_groups<T>(job: &ScanJob, ordered: &mut [(NormalizedName, T)]) {
     }
 }
 
-/// One one-level search of `container`, its entries added to `groups`.
-/// Returns the entries and continuation references read.
+/// The entries the scan may still read from the containers that share one
+/// normalized name (security review of #197, L3).
+///
+/// The Audit stream charges the agent's own one-level searches to one
+/// budget per normalized container (`limits.max_sample_rows` per rolling
+/// 24 h, each search at least one entry, names compared without case), so
+/// containers whose DNs normalize to one name (`ou=<person>,ou=teams,…`
+/// all become `ou=*,ou=teams,…`) share it. Their pooled sample is capped
+/// here at the job's `sample_rows` (at most `limits.max_sample_rows`):
+/// each search asks for at most what is left, and once the charges reach
+/// it the other containers of the name are not searched (`skipped_limit`).
+/// One scan therefore never charges more than the budget of any object,
+/// however many containers share a name, and the agent's own scans are
+/// not reported. The budget is not split per raw container: that would let
+/// the agent's credentials read the budget once per container unreported.
+struct Pooled {
+    sample: u64,
+    /// Lower-cased normalized container name -> entries charged.
+    charged: HashMap<String, u64>,
+    /// Names whose cap was logged (once per name and scan).
+    logged: std::collections::HashSet<String>,
+}
+
+impl Pooled {
+    fn new(sample: u64) -> Self {
+        Self {
+            sample,
+            charged: HashMap::new(),
+            logged: std::collections::HashSet::new(),
+        }
+    }
+
+    fn key(container: &NormalizedName) -> String {
+        container.as_str().to_lowercase()
+    }
+
+    /// The size limit of the next search of a container of this name,
+    /// `None` when the pooled sample is full (never 0: a size limit of 0
+    /// is unlimited in LDAP).
+    fn allowance(&self, container: &NormalizedName) -> Option<u64> {
+        let used = self
+            .charged
+            .get(&Self::key(container))
+            .copied()
+            .unwrap_or(0);
+        Some(self.sample.saturating_sub(used)).filter(|left| *left > 0)
+    }
+
+    fn charge(&mut self, container: &NormalizedName, entries: u64) {
+        let used = self.charged.entry(Self::key(container)).or_default();
+        *used = used.saturating_add(entries);
+    }
+
+    /// A container not searched: counted (`skipped_limit`), logged once per
+    /// name.
+    fn skip(
+        &mut self,
+        target: &TargetConfig,
+        database: &NormalizedName,
+        container: &NormalizedName,
+        sink: &FindingSink,
+    ) {
+        sink.add_coverage(ScanCoverage {
+            limit: 1,
+            ..ScanCoverage::default()
+        });
+        if self.logged.insert(Self::key(container)) {
+            tracing::warn!(
+                target_id = %target.id,
+                database = database.as_str(),
+                container = container.as_str(),
+                sample_rows = self.sample,
+                "pooled sample of containers sharing this name is full: the others are not searched"
+            );
+        }
+    }
+}
+
+/// Rotates the containers of each run of names that are equal without
+/// case (`ordered` sorted that way) by the scan's rotation offset for
+/// the run's length, so that the containers a full pooled sample leaves
+/// out ([`Pooled`]) change from scan to scan. The order of the runs is
+/// unchanged.
+fn rotate_within_names<T>(job: &ScanJob, ordered: &mut [(NormalizedName, T)]) {
+    let same = |a: &(NormalizedName, T), b: &(NormalizedName, T)| {
+        a.0.as_str().to_lowercase() == b.0.as_str().to_lowercase()
+    };
+    for run in ordered.chunk_by_mut(same) {
+        if let Some(k) = job.rotation_offset(run.len()) {
+            run.rotate_left(k);
+        }
+    }
+}
+
+/// One one-level search of `container`, its entries added to `groups`
+/// (`n` values per attribute and group, at most `limit` entries). Returns
+/// the entries and continuation references read.
 async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut Session<S>,
     schema: &Schema,
     container: &str,
     attributes: &[&str],
-    n: usize,
+    (n, limit): (usize, u64),
     job: &ScanJob,
     groups: &mut Groups,
 ) -> Result<(u64, u64), LdError> {
     let search = Search {
         base: container,
         scope: Scope::One,
-        size_limit: u32::try_from(n).unwrap_or(u32::MAX),
+        size_limit: u32::try_from(limit.max(1)).unwrap_or(u32::MAX),
         time_limit: 0,
         types_only: false,
         filter: Filter::Present("objectClass"),
@@ -614,6 +740,48 @@ mod tests {
         // Offset 2 is inside the `b` group: moved on to `c`.
         assert_eq!(order(2), [4, 0, 1, 2, 3]);
         assert_eq!(order(1), [1, 2, 3, 4, 0]);
+    }
+
+    /// Security review of #207, L5: within one normalized name (without
+    /// case), the containers start at a position that changes with the
+    /// job's seed, so those past a full pooled sample are read later.
+    #[test]
+    fn containers_rotate_within_a_name() {
+        use databastion_classifiers::names::normalize_path;
+        let job = |seed: u64| {
+            ScanJob::new(
+                databastion_core::ScanParams::contract_defaults(),
+                &databastion_core::AgentConfig::parse(
+                    "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                     engine: openldap, host: 127.0.0.1, account: a, secret: {env: PW}, \
+                     openldap: {tls: disable}}]}",
+                )
+                .unwrap()
+                .targets[0],
+                &databastion_core::config::Limits::default(),
+                std::sync::Arc::new(
+                    databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap(),
+                ),
+            )
+            .with_rotation(seed)
+        };
+        let names = ["a", "b", "b", "B", "c", "c"];
+        let order = |seed: u64| {
+            let mut v: Vec<(NormalizedName, usize)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (normalize_path(n), i))
+                .collect();
+            rotate_within_names(&job(seed), &mut v);
+            v.into_iter().map(|(_, i)| i).collect::<Vec<_>>()
+        };
+        assert_eq!(order(0), [0, 1, 2, 3, 4, 5]);
+        // `a` alone; `b b B` (one name without case) by 1; `c c` by 1.
+        assert_eq!(order(1), [0, 2, 3, 1, 5, 4]);
+        assert_eq!(order(2), [0, 3, 1, 2, 4, 5]);
+        // Over successive scans, every container of a run comes first.
+        let firsts: std::collections::BTreeSet<usize> = (0..3).map(|s| order(s)[1]).collect();
+        assert_eq!(firsts.into_iter().collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     /// Security review of #93, R1: the naming contexts start at a position

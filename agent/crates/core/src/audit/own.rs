@@ -8,7 +8,7 @@
 //! client address (when the source logs one) is the agent's own address as
 //! the server sees it, the event carries no signal, and the agent's reads
 //! of each object stay within one Discovery scan's row budget over a
-//! rolling 24 h. With stolen agent credentials, reads from elsewhere, reads
+//! rolling 24 h (each statement charged at least one row). With stolen agent credentials, reads from elsewhere, reads
 //! that look like exports, and reading more of a table than one Discovery
 //! scan per day are still reported.
 
@@ -140,6 +140,9 @@ impl OwnUsage {
     /// objects are taken.
     fn merge(&mut self, file: OwnFile, current: u64) {
         for (key, hours) in file.o {
+            // Files written before keys were lowercased: folded the same
+            // way, so a restart after the upgrade keeps the charges.
+            let key = key.to_lowercase();
             if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
                 break;
             }
@@ -281,6 +284,50 @@ fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration)
     });
 }
 
+/// Rows charged to each object of an event of the agent's account: its
+/// row count, but **at least one row per statement** the event stands for
+/// (its aggregated count: one, or the calls of a `pg_stat_statements`
+/// delta), and the whole `budget` when the source has no count.
+///
+/// A read that returns no row can still show values: through a warning
+/// (MySQL 1292 `Truncated incorrect … value: '<value>'` on a 0-row
+/// `SELECT 1 FROM t WHERE id = n AND email = 0`), or an error after one,
+/// or by the mere fact that it found nothing (a filter walk). Charged 0,
+/// such statements with the agent's identity were left out without
+/// limit; charged one each, a walk is capped at `budget` statements per
+/// object and 24 h, then reported (security review of #196, Low). The
+/// agent's own Discovery sends a bounded number of such statements per
+/// object and scan (an empty table's sample, a short `TABLESAMPLE`
+/// before the plain read, an empty LDAP container's one-level search), so
+/// its routine traffic stays far within the budget.
+///
+/// An aggregated event of `n` statements and `r` rows in total is charged
+/// `max(r, 1) + n - 1`: the largest the sum of `max(rᵢ, 1)` over its
+/// statements can be (one statement may have sent every row, each other
+/// none), so one large call cannot hide many empty ones (security review
+/// of #197, L2a: one call of 500 rows and 500 empty calls cost 1000).
+fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
+    let calls = e.aggregated_count().max(1);
+    e.rows()
+        .map_or(budget, |r| r.max(1).saturating_add(calls - 1))
+}
+
+/// The budget key of an object (`database NUL schema NUL object`), each
+/// part Unicode-lowercased on every engine (security review of #197, M2):
+/// names that differ only in case (`` `HR`.`Customers` `` with
+/// `lower_case_table_names` 1 or 2, an LDAP container written in another
+/// case, a quoted PostgreSQL identifier or a MongoDB collection) share
+/// one budget. Two objects that really differ by case then share it too,
+/// which only reports sooner (fails closed).
+fn budget_key(database: &str, schema: &str, object: &str) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        database.to_lowercase(),
+        schema.to_lowercase(),
+        object.to_lowercase()
+    )
+}
+
 /// The agent's own activity, which may be left out of the events.
 #[derive(Debug)]
 pub struct OwnAccount {
@@ -393,9 +440,10 @@ impl OwnAccount {
     /// logged value), its own client address (when the source logs
     /// addresses; the agent's address must be known), no signal, and at
     /// most `budget` rows per object over 24 hours (unknown rows are
-    /// charged the whole budget). The rows are charged whenever the account
-    /// is the agent's. When the agent's own address is unknown, nothing is
-    /// left out.
+    /// charged the whole budget, and every statement at least one row:
+    /// [`charged_rows`]). The rows are charged whenever the account is the
+    /// agent's. When the agent's own address is unknown, nothing is left
+    /// out.
     pub fn routine(
         &mut self,
         user: &str,
@@ -409,15 +457,14 @@ impl OwnAccount {
         if user != self.account || !matches!(e.action(), EventAction::Read | EventAction::Connect) {
             return false;
         }
-        let rows = e.rows().unwrap_or(self.budget);
+        let rows = charged_rows(e, self.budget);
         let identity = self.identity(application, client);
         let mut over = false;
         for o in e.objects() {
-            let key = format!(
-                "{}\u{0}{}\u{0}{}",
+            let key = budget_key(
                 o.database().as_str(),
                 o.schema().map_or("", |s| s.as_str()),
-                o.object().as_str()
+                o.object().as_str(),
             );
             over |= self.charge(key, rows, now);
         }
@@ -614,6 +661,177 @@ mod tests {
         let mut o = own(Some("192.0.2.14"));
         assert!(!o.charge(key(), 600, t0));
         assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600)));
+    }
+
+    /// A read that returns no row is charged one row (security review of
+    /// #196, Low): budget-many of them are left out, the next is reported.
+    #[test]
+    fn zero_row_own_reads_are_charged_one_row_each() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("192.0.2.14"),
+            5,
+            std::sync::Arc::clone(&usage),
+        );
+        for i in 0..5 {
+            assert!(
+                o.routine(
+                    "databastion",
+                    Some("databastion-agent"),
+                    logged,
+                    &ev(Some(0)),
+                    now
+                ),
+                "read {i}"
+            );
+        }
+        assert!(!o.routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &ev(Some(0)),
+            now
+        ));
+        let guard = usage.lock().unwrap();
+        let charged: u64 = guard.usage["shop\u{0}crm\u{0}t"]
+            .iter()
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(charged, 6);
+        drop(guard);
+        // Another object has its own budget.
+        let other = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("databastion"),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_object(EventObject::new(
+            normalize_path("shop"),
+            Some(normalize_path("crm")),
+            normalize_path("u"),
+        ))
+        .with_rows(Some(0));
+        assert!(o.routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &other,
+            now
+        ));
+    }
+
+    /// One row per statement of an aggregated event (a
+    /// `pg_stat_statements` delta of `calls` executions), the row count
+    /// when larger, the whole budget when unknown; a connection names no
+    /// object and charges nothing.
+    #[test]
+    fn charged_rows_count_each_statement_at_least_once() {
+        assert_eq!(charged_rows(&ev(Some(0)), 1000), 1);
+        assert_eq!(charged_rows(&ev(Some(7)), 1000), 7);
+        assert_eq!(charged_rows(&ev(None), 1000), 1000);
+        let agg = |rows| ev(rows).with_aggregate(40, SystemTime::UNIX_EPOCH);
+        assert_eq!(charged_rows(&agg(Some(0)), 1000), 40);
+        assert_eq!(charged_rows(&agg(Some(3)), 1000), 42);
+        assert_eq!(charged_rows(&agg(Some(500)), 1000), 539);
+        // One call of 500 rows and 500 empty calls: 1000, not 501 (L2a).
+        let mixed = ev(Some(500)).with_aggregate(501, SystemTime::UNIX_EPOCH);
+        assert_eq!(charged_rows(&mixed, 5000), 1000);
+
+        assert_eq!(charged_rows(&agg(None), 1000), 1000);
+        // 25 executions of a 0-row statement in one delta use up a budget
+        // of 25.
+        let now = Instant::now();
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            None,
+            ClientAddr::parse("192.0.2.14"),
+            25,
+            std::sync::Arc::clone(&usage),
+        );
+        let delta = ev(Some(0)).with_aggregate(25, SystemTime::UNIX_EPOCH);
+        assert!(o.routine("databastion", None, ClientSeen::NotVisible, &delta, now));
+        let one = ev(Some(0));
+        assert!(!o.routine("databastion", None, ClientSeen::NotVisible, &one, now));
+        let connect = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Connect,
+            EventPrincipal::account("databastion"),
+            SystemTime::UNIX_EPOCH,
+        );
+        let fresh = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            None,
+            ClientAddr::parse("192.0.2.14"),
+            1,
+            std::sync::Arc::clone(&fresh),
+        );
+        for _ in 0..3 {
+            assert!(o.routine("databastion", None, ClientSeen::NotVisible, &connect, now));
+        }
+        assert!(fresh.lock().unwrap().budgeted_objects().is_empty());
+    }
+
+    /// Names that differ only in case share one budget (security review
+    /// of #197, M2), and persisted keys are folded the same way.
+    #[test]
+    fn budget_keys_ignore_case() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("192.0.2.14"),
+            2,
+            std::sync::Arc::clone(&usage),
+        );
+        let read = |db: &str, schema: &str, t: &str| {
+            MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("databastion"),
+                SystemTime::UNIX_EPOCH,
+            )
+            .with_object(EventObject::new(
+                normalize_path(db),
+                Some(normalize_path(schema)),
+                normalize_path(t),
+            ))
+            .with_rows(Some(0))
+        };
+        let agent = Some("databastion-agent");
+        assert!(o.routine("databastion", agent, logged, &read("Shop", "CRM", "T"), now));
+        assert!(o.routine("databastion", agent, logged, &read("shop", "crm", "t"), now));
+        assert!(!o.routine("databastion", agent, logged, &read("SHOP", "Crm", "t"), now));
+        assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
+        assert_eq!(budget_key("Ä", "Ω", "Straße"), "ä\u{0}ω\u{0}straße");
+        // A file written before the fold: its keys merge into one.
+        let mut u = OwnUsage::default();
+        let current = u.hour(now);
+        u.merge(
+            OwnFile {
+                v: OWN_FILE_VERSION,
+                o: vec![
+                    ("HR\u{0}\u{0}Customers".to_owned(), vec![(current, 3)]),
+                    ("hr\u{0}\u{0}customers".to_owned(), vec![(current, 4)]),
+                ],
+            },
+            current,
+        );
+        assert_eq!(
+            u.usage["hr\u{0}\u{0}customers"]
+                .iter()
+                .map(|(_, n)| n)
+                .sum::<u64>(),
+            7
+        );
     }
 
     #[test]

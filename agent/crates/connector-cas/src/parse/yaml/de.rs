@@ -920,6 +920,46 @@ mod tests {
         b.as_ptr() as usize..b.as_ptr() as usize + b.len()
     }
 
+    /// The variable that tells a child process of the test binary which
+    /// test it runs alone (see [`alone_in_own_process`]).
+    #[cfg(target_os = "linux")]
+    const ALONE_ENV: &str = "DATABASTION_CAS_TEST_ALONE";
+
+    /// Runs `body` as the only test of a child process of the test binary
+    /// (`test` is the test's path in the binary, run with `--exact` and one
+    /// test thread), and fails if that child fails or ran no test. Called in
+    /// the child (`ALONE_ENV` names `test`), runs `body` itself.
+    ///
+    /// A search of freed memory needs the process to itself: glibc's
+    /// `realloc` grows a block in the arena that allocated it, whichever
+    /// thread calls it, so a test running in parallel (a `regex` cache made
+    /// by an earlier test, grown by another) can allocate over a block this
+    /// test's thread freed, and its unmappings fail the reads of whole
+    /// chunks. Either hides a freed copy from the search: a control not
+    /// found, or a leak missed.
+    #[cfg(target_os = "linux")]
+    fn alone_in_own_process(test: &str, body: impl FnOnce()) {
+        if std::env::var_os(ALONE_ENV).is_some_and(|v| v == test) {
+            body();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ALONE_ENV, test)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{test} failed alone:\n{text}");
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "{test} did not run alone:\n{text}"
+        );
+    }
+
     /// ADR-0046 decision 3: no copy of a credential value outlives the
     /// parse. A counting allocator would need `unsafe impl GlobalAlloc`,
     /// which `unsafe_code = "forbid"` rules out in every target of the
@@ -932,10 +972,23 @@ mod tests {
     /// marker: a copy freed without being wiped would be found there. The
     /// controls (an unwiped `String` copy of each size, small, medium and
     /// over the allocator's small-block limit, dropped) show the search
-    /// finds such a copy, each size on its own.
+    /// finds such a copy, each size on its own. It runs alone in its own
+    /// process ([`alone_in_own_process`]): no other thread allocates over
+    /// a freed copy, the controls' or a leak's, before the search reads it.
     #[cfg(target_os = "linux")]
     #[test]
     fn no_unwiped_copy_of_a_credential_value_survives_parsing() {
+        let test = concat!(
+            module_path!(),
+            "::no_unwiped_copy_of_a_credential_value_survives_parsing"
+        );
+        let test = test.split_once("::").map_or(test, |(_, path)| path);
+        alone_in_own_process(test, credential_copies_search);
+    }
+
+    /// The body of [`no_unwiped_copy_of_a_credential_value_survives_parsing`].
+    #[cfg(target_os = "linux")]
+    fn credential_copies_search() {
         // 48 bytes from a run-time seed, never a literal; the needle is the
         // last 32 (an allocator may reuse the first 16 bytes of a freed
         // block for its own links).

@@ -97,6 +97,33 @@ pub(crate) struct AuditProbe {
     pub(crate) pgaudit_log_catalog: Option<bool>,
     /// Schema of the `pg_stat_statements` extension (its info view).
     pub(crate) pss_schema: Option<String>,
+    /// `log_min_messages` in the agent's session (`None`: not read).
+    pub(crate) log_min_messages: Option<String>,
+    /// `log_min_error_statement` in the agent's session.
+    pub(crate) log_min_error_statement: Option<String>,
+}
+
+/// Whether a server log level is `error` or lower (`debug5` to `error`):
+/// the level at which `ERROR` lines are written (`log_min_messages`) and
+/// carry their statement text (`log_min_error_statement`). Anything else
+/// (`log`, `fatal`, `panic`, a form this connector does not know, a
+/// setting not read) is not proven (fails closed).
+pub(crate) fn logs_errors(level: Option<&str>) -> bool {
+    level.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "debug5"
+                | "debug4"
+                | "debug3"
+                | "debug2"
+                | "debug1"
+                | "debug"
+                | "info"
+                | "notice"
+                | "warning"
+                | "error"
+        )
+    })
 }
 
 /// Whether a `pgaudit.log` value enables the `read` class: `read` or `all`
@@ -119,6 +146,20 @@ pub(crate) fn pgaudit_rows_on(library: bool, defined: bool, value: Option<&str>)
 }
 
 impl AuditProbe {
+    /// ADR-0037, refinement of 2026-10-12, item 6: the settings that are
+    /// not proven to give every failed or cancelled statement an `ERROR`
+    /// line with its statement text (empty when both are proven).
+    pub(crate) fn error_line_gaps(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !logs_errors(self.log_min_messages.as_deref()) {
+            out.push("log_min_messages");
+        }
+        if !logs_errors(self.log_min_error_statement.as_deref()) {
+            out.push("log_min_error_statement");
+        }
+        out
+    }
+
     /// pgaudit is loaded and logs reads in this database, but its records carry no row count.
     pub(crate) fn reads_without_row_counts(&self) -> bool {
         self.pgaudit_loaded == Some(true) && self.pgaudit_reads && !self.pgaudit_rows
@@ -247,6 +288,11 @@ pub(crate) fn evaluate_privileges(
     (over, expected, notes)
 }
 
+/// The local over-privilege label of a `SET` or `ALTER SYSTEM` grant on
+/// `log_min_messages` or `log_min_error_statement` to the agent's role.
+pub(crate) const PARAMETER_GRANT_LABEL: &str =
+    "SET or ALTER SYSTEM granted on log_min_messages or log_min_error_statement";
+
 /// Notes of one database's report, merged into `notes`: per-database
 /// counts are added up, cluster-wide facts kept once.
 fn report_notes(r: &Report, notes: &mut Notes) {
@@ -313,6 +359,17 @@ pub(crate) struct CheckState {
     /// Per target: the table-less statements registered by its streams
     /// (see `audit::events::PgOwn`).
     own_statements: Mutex<HashMap<String, crate::audit::events::SharedOwnStatements>>,
+    /// Per target: when its `pg_stat_statements` streams ran (ADR-0049
+    /// decision 5).
+    pss_periods: Mutex<HashMap<String, crate::audit::events::SharedPssPeriods>>,
+    /// Per target: the collision probes of its databases (ADR-0049
+    /// decision 8), stored by `check()`, read and marked stale by the
+    /// Audit streams.
+    user_code: Mutex<HashMap<String, crate::audit::user_code::SharedUserCode>>,
+    /// Per target: the proofs of the log-setting overrides of its databases
+    /// (ADR-0012 refinement of 2026-10-12), stored by `check()` and the
+    /// stream's probe, read and marked stale by the stream.
+    log_overrides: Mutex<HashMap<String, crate::audit::overrides::SharedLogOverrides>>,
 }
 
 /// Full needs a pgaudit record parsed within this period.
@@ -379,6 +436,53 @@ impl CheckState {
                 .entry(target_id.to_owned())
                 .or_default(),
         )
+    }
+
+    /// The `pg_stat_statements` periods of `target_id`, kept for the life
+    /// of the connector (in memory only).
+    pub(crate) fn pss_periods(&self, target_id: &str) -> crate::audit::events::SharedPssPeriods {
+        std::sync::Arc::clone(
+            self.pss_periods
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The collision probes of `target_id`'s databases, kept for the life
+    /// of the connector (in memory only).
+    pub(crate) fn user_code(&self, target_id: &str) -> crate::audit::user_code::SharedUserCode {
+        std::sync::Arc::clone(
+            self.user_code
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// The override proofs of `target_id`'s databases, kept for the life of
+    /// the connector (in memory only).
+    pub(crate) fn log_overrides(
+        &self,
+        target_id: &str,
+    ) -> crate::audit::overrides::SharedLogOverrides {
+        std::sync::Arc::clone(
+            self.log_overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(target_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Whether a `pg_stat_statements` stream of `target_id` runs now.
+    pub(crate) fn pss_running(&self, target_id: &str) -> bool {
+        self.pss_periods(target_id)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running()
     }
 
     /// Records of `target_id` dropped for a severity other than
@@ -526,6 +630,17 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
     // whose pgaudit settings could not be read, caps the target at Partial, whatever the other
     // databases reach.
     let mut rows_gap = false;
+    // ADR-0037, refinement of 2026-10-12, item 6: a monitored database where pgaudit is loaded
+    // and the server is not proven to write an `ERROR` line with its statement text for every
+    // failed or cancelled statement caps the target at Partial.
+    let mut errors_gap = false;
+    // ADR-0049 decision 11: the role reads every role's statement texts.
+    let mut stats_reader = false;
+    // ADR-0012 refinement of 2026-10-12, item 3: a monitored database whose
+    // per-role, per-database or per-function overrides of the two log
+    // settings (or grants on them) are not proven caps the target at
+    // Partial.
+    let mut overrides_gap = false;
     for database in &settings.databases {
         let session = match Session::connect(target, database, timeouts).await {
             Ok(s) => s,
@@ -580,7 +695,51 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 codes.add(guard_not_evaluated_note());
             }
         }
+        // ADR-0049 decision 8: the collision probe of this database, at
+        // every heartbeat (names kept in memory only, never logged).
+        let started = Instant::now();
+        let names = match user_code_probe(&session, timeouts).await {
+            Ok(Some(names)) => Some(names),
+            Ok(None) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    "user code collision probe cut at its row bound (or a name not UTF-8): \
+                     catalog-only statements with unqualified calls, operators or casts are \
+                     reported as reads of * in this database"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target_id = %target.id,
+                    database = normalize(database).as_str(),
+                    stage = e.stage.as_str(),
+                    sqlstate = e.sqlstate(),
+                    "user code collision probe failed: catalog-only statements with \
+                     unqualified calls, operators or casts are reported as reads of * in this \
+                     database"
+                );
+                if e.fatal {
+                    crate::audit::user_code::lock(&state.user_code(&target.id)).store(
+                        database,
+                        started,
+                        session.server_version_num(),
+                        None,
+                    );
+                    return unreachable(&e);
+                }
+                None
+            }
+        };
+        crate::audit::user_code::lock(&state.user_code(&target.id)).store(
+            database,
+            started,
+            session.server_version_num(),
+            names,
+        );
         level = level.max(probe.level(log_readable));
+        stats_reader |= probe.stats_visible;
         if probe.reads_without_row_counts() {
             rows_gap = true;
             notes.push(format!(
@@ -597,6 +756,41 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
                 normalize(database).as_str()
             ));
         }
+        if let Some(detail) = error_lines_detail(&probe, database) {
+            errors_gap = true;
+            notes.push(detail);
+        }
+        let started = Instant::now();
+        let overrides = match overrides_probe(
+            state,
+            &target.id,
+            &session,
+            timeouts,
+            &probe,
+            log_readable,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                crate::audit::overrides::lock(&state.log_overrides(&target.id)).store(
+                    database,
+                    started,
+                    crate::audit::overrides::Probe::Done(
+                        crate::audit::overrides::DbProof::not_proven("the connection failed"),
+                    ),
+                );
+                return unreachable(&e);
+            }
+        };
+        if let crate::audit::overrides::Probe::Done(p) = &overrides
+            && let Some(detail) = p.detail(database)
+        {
+            overrides_gap = true;
+            notes.push(detail);
+        }
+        crate::audit::overrides::lock(&state.log_overrides(&target.id))
+            .store(database, started, overrides);
         let (text, probe_codes) = probe_notes(
             &probe,
             settings.audit_log.is_some(),
@@ -604,6 +798,11 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
         );
         notes.extend(text);
         codes.extend(probe_codes);
+        notes.extend(log_catalog_detail(
+            &probe,
+            settings.audit_log.is_some() && log_readable,
+            database,
+        ));
         let key = (target.id.clone(), database.clone());
         if state.due(&key) {
             match report(&session, timeouts, settings.extended_grants).await {
@@ -626,7 +825,8 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> TargetHealth 
             report_notes(&r, &mut codes);
         }
     }
-    level = capped_without_row_counts(level, rows_gap);
+    level = capped_without_row_counts(level, rows_gap || errors_gap || overrides_gap);
+    notes.extend(stats_reader_detail(level, stats_reader));
     if level == AuditLevel::Full && !state.recent_record(&target.id) {
         // ADR-0015 decision 4: Full once the log is actually read.
         level = AuditLevel::Partial;
@@ -716,8 +916,60 @@ fn probe_notes(
     (text, codes)
 }
 
+/// ADR-0048 decision 5: the local detail (never a closed note, no level
+/// change) when pgaudit is the source (`log_read`) and `pgaudit.log_catalog`
+/// is proven off in `database`: a statement that reads only `pg_catalog`
+/// relations is not logged, so a read of the statistics relations alone
+/// gives no event, nor a read of `pg_stat_activity` alone (ADR-0049
+/// decision 6).
+fn log_catalog_detail(probe: &AuditProbe, log_read: bool, database: &str) -> Option<String> {
+    (log_read && probe.pgaudit_loaded == Some(true) && probe.pgaudit_log_catalog == Some(false))
+        .then(|| {
+            format!(
+                "database {}: pgaudit.log_catalog is off, so a statement that reads only \
+                 catalogs is not logged: a read of the statistics catalogs alone (pg_stats, \
+                 pg_statistic and their extended forms) or of pg_stat_activity alone (other \
+                 sessions' statement texts) gives no event; set pgaudit.log_catalog = on",
+                normalize(database).as_str()
+            )
+        })
+}
+
+/// ADR-0049 decision 11: the local detail (never a closed note, no level
+/// change) when pgaudit is the source (Full or Partial) and the agent's
+/// role is a member of `pg_read_all_stats` (or a superuser): the grant then
+/// serves only the fallback to `pg_stat_statements`, and still lets
+/// whoever holds the agent's credentials read every role's statement
+/// texts. `stats_visible`: membership, or superuser.
+fn stats_reader_detail(level: AuditLevel, stats_visible: bool) -> Option<String> {
+    (stats_visible && matches!(level, AuditLevel::Full | AuditLevel::Partial)).then(|| {
+        "the agent's role is a member of pg_read_all_stats (or a superuser) while pgaudit is \
+         the source: the grant only serves the pg_stat_statements fallback, and lets whoever \
+         holds the agent's credentials read every role's statement texts \
+         (pg_stat_activity, pg_stat_statements); revoke it if the fallback is not needed"
+            .to_owned()
+    })
+}
+
+/// ADR-0037, refinement of 2026-10-12, item 6: the local detail (no closed note, no protocol
+/// change) when pgaudit is loaded in `database` and `log_min_messages` or
+/// `log_min_error_statement` is not proven `error` or lower; `Some` caps the target at Partial.
+fn error_lines_detail(probe: &AuditProbe, database: &str) -> Option<String> {
+    if probe.pgaudit_loaded != Some(true) {
+        return None;
+    }
+    let gaps = probe.error_line_gaps();
+    (!gaps.is_empty()).then(|| {
+        format!(
+            "database {}: {} not proven at error or lower, so a statement that fails or is              cancelled may leave no ERROR line with its statement text, and with              pgaudit.log_rows = on no pgaudit record either: failed and cancelled reads are not              proven reported, so the target cannot reach Full (set it to error or lower)",
+            normalize(database).as_str(),
+            gaps.join(" and ")
+        )
+    })
+}
+
 /// ADR-0037 decision 4: Full only when every monitored database logging reads through pgaudit
-/// also logs their row counts.
+/// also logs their row counts (and, refinement of 2026-10-12, item 6, every failed statement).
 fn capped_without_row_counts(level: AuditLevel, rows_gap: bool) -> AuditLevel {
     if level == AuditLevel::Full && rows_gap {
         AuditLevel::Partial
@@ -833,16 +1085,19 @@ pub(crate) async fn prerequisites(
     target: &TargetConfig,
     timeouts: Timeouts,
 ) -> Result<Prerequisites, PgError> {
-    prerequisites_with(target, timeouts, None).await
+    prerequisites_with(target, timeouts, None, None).await
 }
 
 /// [`prerequisites`], probing the database of `held` (the held
 /// `pg_stat_statements` session and its database) on that session rather
-/// than on a new connection (phase 7, ADR-0025 decision 11).
+/// than on a new connection (phase 7, ADR-0025 decision 11). With `state`
+/// (the Audit stream's 5-minute probe), the override proofs of the
+/// ADR-0012 refinement of 2026-10-12 are refreshed too (ADR-0037 item 9).
 pub(crate) async fn prerequisites_with(
     target: &TargetConfig,
     timeouts: Timeouts,
     held: Option<(&str, &Session)>,
+    state: Option<&CheckState>,
 ) -> Result<Prerequisites, PgError> {
     let log_readable = crate::audit::log_readable(target).await;
     let mut level = AuditLevel::None;
@@ -877,6 +1132,18 @@ pub(crate) async fn prerequisites_with(
         }
         let probe = audit_probe(session, timeouts).await?;
         level = level.max(probe.level(log_readable));
+        // The same proof as `check()`'s cap (`error_lines_detail`), per
+        // database, for the stream's `FATAL` lines (proposed item 9).
+        if probe.error_line_gaps().is_empty() {
+            catalogs.prove_error_lines(database);
+        }
+        if let Some(state) = state {
+            let started = Instant::now();
+            let overrides =
+                overrides_probe(state, &target.id, session, timeouts, &probe, log_readable).await?;
+            crate::audit::overrides::lock(&state.log_overrides(&target.id))
+                .store(database, started, overrides);
+        }
         catalogs.insert(
             database,
             crate::audit::events::DbCatalog {
@@ -1004,6 +1271,127 @@ pub(crate) async fn cas_guard_readable(
     })
 }
 
+/// The collision probe of ADR-0049 decision 8 in the session's database
+/// (`sql::USER_CODE_PROBE`): `Ok(None)` when cut at its row bound or when a
+/// name is not UTF-8 (fail closed).
+pub(crate) async fn user_code_probe(
+    session: &Session,
+    timeouts: Timeouts,
+) -> Result<Option<crate::audit::user_code::ProbeNames>, PgError> {
+    let rows = probe(session, timeouts, sql::USER_CODE_PROBE).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let get = |e: tokio_postgres::Error| PgError::from_driver(&e, Stage::Check);
+        let (Some(kind), Some(name)) = (
+            crate::wire::catalog_text(r, 0).map_err(get)?,
+            crate::wire::catalog_text(r, 1).map_err(get)?,
+        ) else {
+            return Ok(None);
+        };
+        out.push((kind, name));
+    }
+    Ok(crate::audit::user_code::ProbeNames::from_rows(out))
+}
+
+/// ADR-0012 refinement of 2026-10-12, item 3: the override proof of the
+/// session's database. The three statements are sent only while the
+/// database's level would be Full (pgaudit loaded and logging reads with
+/// row counts, the log readable, `log_min_messages` and
+/// `log_min_error_statement` proven in the session) and no
+/// `pg_stat_statements` stream of the target runs (on that source the
+/// two-key reads cannot be told from a replay, ADR-0050 decision 5):
+/// otherwise [`Probe::NotApplicable`] below Full, and not proven while such
+/// a stream runs. Only a fatal error is returned.
+///
+/// [`Probe::NotApplicable`]: crate::audit::overrides::Probe::NotApplicable
+async fn overrides_probe(
+    state: &CheckState,
+    target_id: &str,
+    session: &Session,
+    timeouts: Timeouts,
+    probe: &AuditProbe,
+    log_readable: bool,
+) -> Result<crate::audit::overrides::Probe, PgError> {
+    use crate::audit::overrides::{DbProof, Probe};
+    if probe.level(log_readable) != AuditLevel::Full || !probe.error_line_gaps().is_empty() {
+        return Ok(Probe::NotApplicable);
+    }
+    if state.pss_running(target_id) {
+        return Ok(Probe::Done(DbProof::not_proven(
+            "a pg_stat_statements stream of the target runs, so the overrides are not read",
+        )));
+    }
+    Ok(Probe::Done(log_overrides_probe(session, timeouts).await?))
+}
+
+/// Reads the overrides of the two log settings in the session's database
+/// (`sql::ROLE_LOG_OVERRIDES`, `sql::FUNCTION_LOG_OVERRIDES`, and on
+/// PostgreSQL 15+ `sql::PARAMETER_GRANTS`), each in its own read-only
+/// transaction. A statement refused or failed, or a row that does not
+/// decode, makes the database not proven; only a fatal error is returned.
+pub(crate) async fn log_overrides_probe(
+    session: &Session,
+    timeouts: Timeouts,
+) -> Result<crate::audit::overrides::DbProof, PgError> {
+    use crate::audit::overrides::{DbProof, FunctionRow, GrantRow, Read, RoleRow};
+    type Decode<T> = fn(&tokio_postgres::Row) -> Result<T, tokio_postgres::Error>;
+    async fn read<T>(
+        session: &Session,
+        timeouts: Timeouts,
+        statement: &str,
+        decode: Decode<T>,
+    ) -> Result<Read<T>, PgError> {
+        match probe(session, timeouts, statement).await {
+            Ok(rows) => Ok(rows
+                .iter()
+                .map(decode)
+                .collect::<Result<Vec<T>, _>>()
+                .map_or_else(|_| Read::Failed(None), Read::Rows)),
+            Err(e) if e.fatal => Err(e),
+            Err(e) => Ok(Read::Failed(e.sqlstate().map(str::to_owned))),
+        }
+    }
+    let roles = read(session, timeouts, sql::ROLE_LOG_OVERRIDES, |r| {
+        Ok(RoleRow {
+            every_role: r.try_get(1)?,
+            role: crate::wire::catalog_text(r, 2)?,
+            setting: crate::wire::catalog_text(r, 3)?,
+            level: crate::wire::catalog_text(r, 4)?,
+        })
+    })
+    .await?;
+    let functions = read(session, timeouts, sql::FUNCTION_LOG_OVERRIDES, |r| {
+        Ok(FunctionRow {
+            schema: crate::wire::catalog_text(r, 0)?,
+            name: crate::wire::catalog_text(r, 1)?,
+            setting: crate::wire::catalog_text(r, 2)?,
+            level: crate::wire::catalog_text(r, 3)?,
+        })
+    })
+    .await?;
+    let grants = if session.server_version_num() >= 150_000 {
+        Some(
+            read(session, timeouts, sql::PARAMETER_GRANTS, |r| {
+                Ok(GrantRow {
+                    public: r.try_get(0)?,
+                    role: crate::wire::catalog_text(r, 1)?,
+                    setting: crate::wire::catalog_text(r, 2)?,
+                    privilege: crate::wire::catalog_text(r, 3)?,
+                })
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(DbProof::evaluate(
+        roles,
+        functions,
+        grants,
+        sql::LOG_OVERRIDES_MAX_ROWS,
+    ))
+}
+
 /// Runs one statement in its own read-only transaction (a failing probe
 /// does not abort the others).
 async fn probe(
@@ -1094,6 +1482,8 @@ pub(crate) async fn audit_probe(
                 .unwrap_or(false);
             p.pgaudit_rows = pgaudit_rows_on(library, rows_defined, setting(1)?.as_deref());
             p.pgaudit_object_audit = setting(2)?.is_some_and(|v| !v.trim().is_empty());
+            p.log_min_messages = setting(7)?;
+            p.log_min_error_statement = setting(8)?;
             p.pgaudit_log_level = setting(3)?;
             if p.pgaudit_loaded == Some(true) {
                 p.pgaudit_log_catalog = setting(5)?.map(|v| v.eq_ignore_ascii_case("on"));
@@ -1139,6 +1529,10 @@ async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result
     let owned = count(probe(session, timeouts, sql::OWNERSHIP).await?)?;
     let login_event_trigger =
         pg17 && count(probe(session, timeouts, sql::LOGIN_EVENT_TRIGGERS).await?)? > 0;
+    // ADR-0012 refinement of 2026-10-12, item 1: a `SET` or `ALTER SYSTEM`
+    // grant on the two log settings to the agent's role (15+).
+    let parameter_grants = session.server_version_num() >= 150_000
+        && count(probe(session, timeouts, sql::OWN_PARAMETER_GRANTS).await?)? > 0;
     let mut schemas_not_covered = Vec::new();
     for r in probe(session, timeouts, sql::SCHEMAS_WITHOUT_USAGE).await? {
         schemas_not_covered.push(
@@ -1161,8 +1555,13 @@ async fn report(session: &Session, timeouts: Timeouts, extended: bool) -> Result
         }
     };
     let (_, coverage) = catalog::plan(&relations, |_, _| true);
-    let (over_privileged, expected, privilege_notes) =
+    let (mut over_privileged, expected, privilege_notes) =
         evaluate_privileges(attrs, &memberships, writes, owned, extended);
+    if parameter_grants && !attrs.superuser {
+        // A local warning only: no registered note label for it (a
+        // protocol registry change, left to a follow-up).
+        over_privileged.push(PARAMETER_GRANT_LABEL.to_owned());
+    }
     Ok(Report {
         over_privileged,
         expected,
@@ -1503,6 +1902,64 @@ mod tests {
         assert!(!pgaudit_rows_on(false, true, Some("on")));
     }
 
+    /// ADR-0049 decision 11 and open question 5: `pg_read_all_stats` with
+    /// pgaudit as the source is said in the local detail only.
+    #[test]
+    fn stats_reader_with_pgaudit_is_a_local_detail() {
+        for level in [AuditLevel::Full, AuditLevel::Partial] {
+            let d = stats_reader_detail(level, true).unwrap();
+            assert!(d.contains("pg_read_all_stats"), "{d}");
+            assert!(stats_reader_detail(level, false).is_none());
+        }
+        // `pg_stat_statements` is the source: the grant is the one it needs.
+        for level in [AuditLevel::Limited, AuditLevel::None] {
+            assert!(stats_reader_detail(level, true).is_none());
+        }
+    }
+
+    /// ADR-0048 decision 5 and open question 5: `pgaudit.log_catalog = off`
+    /// is said in the local detail only, when pgaudit is the source; no
+    /// note, no level change.
+    #[test]
+    fn log_catalog_off_is_a_local_detail() {
+        let p = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            pgaudit_rows: true,
+            pgaudit_log_catalog: Some(false),
+            ..AuditProbe::default()
+        };
+        let d = log_catalog_detail(&p, true, "shop").unwrap();
+        assert!(
+            d.contains("pgaudit.log_catalog")
+                && d.contains("shop")
+                && d.contains("pg_stat_activity"),
+            "{d}"
+        );
+        assert_eq!(p.level(true), AuditLevel::Full);
+        let (_, notes) = probe_notes(&p, true, true);
+        assert!(notes.is_empty(), "{notes:?}");
+        // Not the source, on, unknown, or pgaudit not loaded: nothing.
+        assert!(log_catalog_detail(&p, false, "shop").is_none());
+        for probe in [
+            AuditProbe {
+                pgaudit_log_catalog: Some(true),
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_log_catalog: None,
+                ..p.clone()
+            },
+            AuditProbe {
+                pgaudit_loaded: Some(false),
+                ..p.clone()
+            },
+        ] {
+            assert!(log_catalog_detail(&probe, true, "shop").is_none());
+        }
+    }
+
     #[test]
     fn audit_level_is_proven_not_assumed() {
         let full_prereqs = AuditProbe {
@@ -1518,6 +1975,8 @@ mod tests {
             pgaudit_log_level: None,
             pgaudit_log_catalog: None,
             pss_schema: None,
+            log_min_messages: Some("warning".to_owned()),
+            log_min_error_statement: Some("error".to_owned()),
         };
         // pgaudit reads and pg_stat_statements, no pgaudit.log_rows: Partial
         // (ADR-0037). The Full stream reads the pgaudit log only, so
@@ -1748,5 +2207,86 @@ mod tests {
             merged.extend(notes);
         }
         assert_eq!(codes(merged.as_slice()), ["audit.log_without_row_counts"]);
+    }
+
+    /// ADR-0037, refinement of 2026-10-12, item 6: both log settings must
+    /// be proven `error` or lower; otherwise the target is capped at
+    /// Partial and the local detail names the setting and the database.
+    #[test]
+    fn error_lines_need_both_log_settings_proven() {
+        for ok in [
+            "debug5",
+            "debug1",
+            "info",
+            "notice",
+            "warning",
+            "error",
+            "ERROR",
+            " warning ",
+        ] {
+            assert!(logs_errors(Some(ok)), "{ok}");
+        }
+        for bad in [
+            "log",
+            "fatal",
+            "panic",
+            "",
+            "warning, autovacuum:debug1",
+            "x",
+        ] {
+            assert!(!logs_errors(Some(bad)), "{bad}");
+        }
+        assert!(!logs_errors(None));
+        let full = AuditProbe {
+            pgaudit_installed: true,
+            pgaudit_loaded: Some(true),
+            pgaudit_reads: true,
+            pgaudit_rows: true,
+            log_min_messages: Some("warning".to_owned()),
+            log_min_error_statement: Some("error".to_owned()),
+            ..AuditProbe::default()
+        };
+        assert_eq!(full.level(true), AuditLevel::Full);
+        assert!(full.error_line_gaps().is_empty());
+        assert!(error_lines_detail(&full, "shop").is_none());
+        for (messages, statement, want) in [
+            (Some("log"), Some("error"), vec!["log_min_messages"]),
+            (
+                Some("warning"),
+                Some("fatal"),
+                vec!["log_min_error_statement"],
+            ),
+            (
+                Some("panic"),
+                Some("panic"),
+                vec!["log_min_messages", "log_min_error_statement"],
+            ),
+            (None, Some("error"), vec!["log_min_messages"]),
+            (Some("error"), None, vec!["log_min_error_statement"]),
+        ] {
+            let p = AuditProbe {
+                log_min_messages: messages.map(str::to_owned),
+                log_min_error_statement: statement.map(str::to_owned),
+                ..full.clone()
+            };
+            assert_eq!(p.error_line_gaps(), want);
+            let d = error_lines_detail(&p, "shop").unwrap();
+            assert!(d.contains("database shop"), "{d}");
+            for w in &want {
+                assert!(d.contains(w), "{d}");
+            }
+            // The cap: Full becomes Partial; lower levels are unchanged.
+            assert_eq!(
+                capped_without_row_counts(p.level(true), true),
+                AuditLevel::Partial
+            );
+        }
+        // Without pgaudit loaded, no detail (the pgaudit log is not the
+        // source); settings not read are capped by the row-count rule.
+        let no_pgaudit = AuditProbe {
+            pgaudit_loaded: Some(false),
+            ..AuditProbe::default()
+        };
+        assert!(error_lines_detail(&no_pgaudit, "shop").is_none());
     }
 }

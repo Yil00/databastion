@@ -38,6 +38,16 @@ The XML and CSV `audit_log` formats and the syslog outputs are not
 supported (the configuration refuses them; a server writing them is noted by
 `check()` and not used).
 
+Since 0.7.0, two audit settings are reported as target notes, besides
+`check()`'s local detail: `audit.digest_consumer_disabled` when
+`performance_schema` is on, its consumers are readable by the agent's
+account and the `statements_digest` consumer is disabled (whatever the Audit
+source), and `audit.statement_text_limit_low`, with the limit in bytes as
+its count, when `server_audit_query_log_limit` or
+`performance_schema_max_sql_text_length` is below the agent's longest
+statement while the Audit stream reads that source. Keep the consumer
+enabled and both limits at 1024 or more.
+
 ## Grants and file access
 
 - **Audit-log sources: no database grant.** The agent reads the file
@@ -194,7 +204,14 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   (the legacy `audit_log` and `performance_schema` log no table), for reads
   and writes only: DDL and DCL events take no name from the text (it can
   hold program bodies, such as MySQL JavaScript routines, that the SQL
-  lexer does not delimit). An unqualified name is in the statement's
+  lexer does not delimit), except `CREATE TABLE … AS <query>` and
+  `CREATE` / `ALTER … VIEW … AS <query>`, which hold no body: one DDL
+  event names the created table or view and the sources of the query, as
+  an `INSERT … SELECT` write names its target and sources. A read whose
+  values go into variables (`SELECT … INTO @v`, `@v := …`, `SET` / `DO`
+  with a subquery) is always reported (with no row count when it sent no
+  row) and never the
+  agent's own (docs/08). An unqualified name is in the statement's
   current database. A name holding
   a dot is sent as `*` (as in Discovery). A text that does not lex (cut at
   the server's limit, an ambiguous `sql_mode` reading) and `CALL` are
@@ -268,6 +285,37 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   holding the agent's credentials on the agent host, spoofing its
   `program_name` and reading at most that many rows per table and day with
   filtered queries stays unreported.
+- **The agent's own ended sessions on `performance_schema`**
+  (`audit::own_threads`; security reviews of #186, L1, and of #197, M3).
+  A row of a session that ended before the poll has no account. Each poll
+  session reads its own thread id with the server's identity
+  (`@@hostname`, `@@port`, `@@server_id`, and `@@server_uuid` on MySQL)
+  and its start time computed by the server (`UNIX_TIMESTAMP()` minus
+  `Uptime` from `global_status`) when it attaches (`sql::ps_own_thread`;
+  `sql::PS_OWN_THREAD_ID` alone when that fails, and then nothing is
+  recognized). Every stream of the connector on that server run (identity,
+  start time within 2 s) drops the rows of that thread whose text or digest
+  has the shape of one of the connector's own `performance_schema` reads,
+  unless the thread is connected under another account; any other
+  statement of that thread takes the usual path. While a target's stream
+  polls `performance_schema`, each Discovery session pins its thread at its
+  start (a random nonce in `@databastion_pin`, then `sql::ps_own_pin`:
+  exactly one row of `user_variables_by_thread` holding the nonce **and**
+  equal to the session's own thread, with the identity and start time). A
+  row of an ended pinned thread is attributed to the agent's identity (the
+  pinning target's account, the agent's address, its `program_name`),
+  charged to the own budget, and takes every always-report rule; the pin
+  expires two poll intervals after the scan ends (30 s to 15 min). A pinned
+  session's digests (the poll reads no `SQL_TEXT` of an ended session) are
+  matched by shape (`events::text_shape`) with the pin statement and the
+  target's sampling credits only, not with the poll texts (those are
+  matched by shape only to drop the ended poll sessions' rows, above;
+  ADR-0045 decision 4, refinement of 2026-10-11, accepted). Nothing is noted or
+  pinned on a server up for less than 10 s, or without a readable identity
+  or start time. In memory only: after an agent restart, the earlier
+  sessions' statements that the persisted cursor reads again are reported
+  as before. Two agents sharing one account on one server each report the
+  other's ended sessions as unidentified reads (noise).
 - **Statement-text tables** (ADR-0045 part (a)): reads of the system
   tables that hold other sessions' statement texts
   (`audit::events::STATEMENT_TEXT_TABLES`: `performance_schema`
@@ -281,9 +329,33 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   `SQL_TEXT` threshold; only the cursor is a session user variable,
   `sql::ps_poll_variables`), left out uncharged only by their whole uncut
   text with table records of their own tables
-  (`sql::own_performance_schema_reads`); its readability probes are
+  (`sql::own_performance_schema_reads`, which also lists the own-thread
+  probe and the Discovery pin; a pinned Discovery session's digest by its
+  shape, above); its readability probes are
   `EXPLAIN`s (the same privilege, no row read, quiet). Details:
   [docs/08](../../../docs/08-engine-capabilities.md#statement-text-tables).
+- **Statistics tables** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)):
+  `information_schema.COLUMN_STATISTICS` and `mysql.column_stats`
+  (`audit::events::STATISTICS_TABLES`) hold column values. Named by the
+  statement text on every source, they are objects of reads (as listed),
+  always reported and never the agent's own (it names neither: `sql.rs`
+  unit test). Table records alone do not name them: MariaDB writes
+  `server_audit` `READ` records of `mysql.column_stats`, `table_stats` and
+  `index_stats` under the reader's account when it loads a table's
+  statistics: such a `column_stats` record is dropped when it comes with
+  the load's `table_stats` record and a text read whole, and names
+  `mysql.column_stats` otherwise (code out of sight, an unreadable or cut
+  text, `HANDLER`, no `table_stats` record, or a relation of the text with
+  no table record of its own, such as a view, which is then named too;
+  a record counts only for its exact name, so a text writing a name in
+  another case over-reports under `lower_case_table_names = 1`, and a
+  text creating or dropping a temporary table counts none). An
+  `ALGORITHM=TEMPTABLE` view gets no `server_audit` record under its own
+  name either (MariaDB 10.11.19, 11.4.13, 11.8.9): only the
+  `column_stats` record, so it never counts as recorded. Code out of sight adds `*` whatever its table
+  records. Drift
+  test and server facts: `it::statistics_it`. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statistics-tables).
 - **Forged records**: the audit logs are written by the server only; a
   client can put any text in a statement, but not a newline (escaped by
   `server_audit`, JSON-encoded by `audit_log`), so it cannot add records.
@@ -329,3 +401,11 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   and a second account's reads of `events_statements_history_long` and
   `information_schema.PROCESSLIST` reported, while the agent's own probes
   and polls (two targets on one server) are not.
+- The agent's own ended sessions (`src/it/own_sessions_it.rs`): two
+  targets on one server (MySQL, MariaDB, Percona), a Discovery scan run
+  between two polls of the first stream, then that stream reconnecting and
+  the sibling stream restarting from its saved cursor: no unknown-principal
+  event (the dev healthchecks' `hr.employees` reads aside), no event of
+  the agent's account, the scanned tables charged to both targets' own
+  budgets (on `events_statements_history_long`), no value in an event or
+  a log line.

@@ -315,7 +315,8 @@ async fn statement_text_reads_are_named_and_the_agents_own_are_not() {
             assert_eq!(own.len(), 1, "{} {label}: {all:#?}", server.name);
             // No other principal names a statement-text table: the
             // heartbeat sessions of `check()` end before the poll (no
-            // account), and their readability probes are `EXPLAIN`s.
+            // account), and their readability probes have the literal
+            // probe shape of ADR-0047 (quiet for every account).
             assert!(
                 ev.iter()
                     .filter(|e| {
@@ -371,11 +372,32 @@ async fn own_performance_schema_texts_run_and_their_threshold_is_the_rust_one() 
         let mut a = admin_session(&server, &admin).await;
         let version = scalar(&mut a, "SELECT VERSION()").await.unwrap_or_default();
         exec(&mut a, &crate::sql::ps_poll_variables(0)).await;
+        exec(
+            &mut a,
+            &crate::sql::ps_pin_variable(&"0".repeat(32)).unwrap(),
+        )
+        .await;
         for (text, _) in crate::sql::own_performance_schema_reads() {
+            // The own-thread and pin texts are per flavor: MariaDB has no
+            // `@@server_uuid` (the agent sends the MySQL text to MySQL
+            // only, and falls back to the thread id alone otherwise).
+            if server.flavor() == Flavor::Mariadb && text.contains("@@server_uuid") {
+                let e = a.query(Stage::Check, &text).await.unwrap_err();
+                assert_eq!(e.errno, Some(1193), "{} {version}: {text}", server.name);
+                assert!(!e.fatal);
+                continue;
+            }
             if let Err(e) = a.query(Stage::Check, &text).await {
                 panic!("{} {version}: {e:?}: {text}", server.name);
             }
         }
+        // The pin finds this session's own thread (one row).
+        let rows = a
+            .query(Stage::Check, &crate::sql::ps_own_pin(server.flavor()))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{} {version}", server.name);
+        exec(&mut a, "SET @databastion_pin = NULL").await;
         let limit = |v: Option<String>| {
             v.and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1024)

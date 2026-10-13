@@ -10,8 +10,8 @@ documentation (docs/08) builds on.
 
 | Level | Condition (same probe for `check()` and the stream) | Source |
 |---|---|---|
-| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log |
-| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows` or no recent record | pgaudit log |
+| Full | `postgres.audit_log` readable by the agent, pgaudit loaded with the `read` class, `pgaudit.log_rows` proven on, `log_min_messages` and `log_min_error_statement` proven `error` or lower in the agent's session and for every role (no override above `error` in `pg_db_role_setting` or a function's `SET` clause, no `SET` / `ALTER SYSTEM` grant on them to another role, 15+), **and** a pgaudit record parsed by the stream in the last 24 h | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
+| Partial | log readable and pgaudit logging reads (or object audit through `pgaudit.role`), but no `pgaudit.log_rows`, a log setting above `error` or not read, an override or grant found or not read, or no recent record | pgaudit log (`AUDIT:` records and `ERROR` / `FATAL` lines) |
 | Limited | `pg_stat_statements` installed, loaded and showing other roles | `pg_stat_statements` |
 | None | none of the above | — |
 
@@ -56,12 +56,16 @@ load otherwise), so a server-wide load is the normal case.
 - **Forged records.** Any role can write `AUDIT: …` lines into the server
   log (`RAISE LOG` in PL/pgSQL). The connector drops records whose severity
   is not `pgaudit.log_level` or that carry an error context (pgaudit hides
-  its context; `RAISE` always has one). Still forgeable by roles that can
-  hide the context (`log_error_verbosity = terse` is superuser-only) or run
-  native code (C extensions, untrusted PLs). **A server-wide
-  `log_error_verbosity = terse` removes every context, and with it this
-  protection**: keep it at `default`. A forged record can add false
-  events; it cannot remove real ones. Records dropped because their
+  its context; `RAISE` always has one). Still forgeable by native code
+  that hides its context (C extensions, untrusted PLs).
+  `log_error_verbosity = terse` does not remove the context from jsonlog
+  nor csvlog (verified on PostgreSQL 16.13 for the failed statements
+  work: a `RAISE` line keeps its context with `terse`). A forged record
+  can add false events; it cannot remove real ones, except that such
+  native code could also write a record with no row count and the text of
+  a statement that fails next in its own session, which then reports the
+  failed read from the forged record (item 4 of the failed statements,
+  below). Records dropped because their
   severity is not `pgaudit.log_level` (likely genuine: the setting differs
   per database or role) are counted, logged, and noted in `check()` (for 24 h).
 - **Server-side exports hidden in dynamic SQL.** A `COPY` record whose text
@@ -94,10 +98,264 @@ load otherwise), so a server-wide load is the normal case.
     and reads it later by its unqualified name is not reported for that
     later read (the copy itself reads the source relation and is
     reported). With pgaudit, `pgaudit.log_relation = on` names every
-    relation with its schema and closes this; so does `log_catalog = off`.
+    relation with its schema and closes this (`log_catalog = off` is no
+    longer advised: it hides reads of the statistics catalogs alone).
     An unqualified `pg_stat_statements` / `pg_stat_statements_info` counts
     as a catalog when the extension is installed in the database (the same
     residual for a shadowing relation earlier in the search path).
+- **Statistics catalogs** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md)).
+  `pg_stats`, `pg_stats_ext`, `pg_stats_ext_exprs`, `pg_statistic` and
+  `pg_statistic_ext_data` (`audit::events::STATISTICS_RELATIONS`) hold
+  sampled column values and are not catalogs for these rules: named by a
+  pgaudit relation record in `pg_catalog`, or by the text qualified with
+  `pg_catalog` or unqualified, they are objects named
+  `pg_catalog.<name>`, always reported and never the agent's own (it
+  sends no statement naming them: `sql.rs` unit test). With relation
+  records, the text's statistics relations are added to the events of
+  every action class too; an unqualified one is left out only with
+  `pgaudit.log_catalog = on`, when a record of the same substatement
+  names it in another schema and none in `pg_catalog` (shadowing). `U&"…"` names are compared decoded. A text
+  that decides (relation records naming no `pg_catalog` relation of the
+  substatement included) and reaches the analyzer's 16-relation bound,
+  DDL included, adds `*`,
+  always reported, never the agent's own, even when every kept relation
+  is a catalog. Every read or write against `*` is always reported. `check()` says `pgaudit.log_catalog = off` in
+  its local detail when pgaudit is the source. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statistics-catalogs).
+- **Statement-text views** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)).
+  The core list (`pg_stat_activity`, `pg_stat_get_activity(`,
+  `pg_stat_get_backend_activity(`, the extension's `pg_stat_statements`
+  view and function: `audit::events::listed`) and the extension list
+  (`pg_stat_monitor`, `pg_store_plans`, `pg_show_plans`, `pg_qualstats*`,
+  in any schema) are named in events (`pg_catalog.pg_stat_activity`,
+  `<ext>.pg_stat_statements`, the extension names as written), always
+  reported, in every action class, unless a core-list read has the
+  no-text shape (`text_reads`, with the token scan
+  `classifiers::query::pg_scan`: no `query` identifier, no `*` but
+  `count(*)`, no whole-row reference, no column alias list (whatever
+  the alias's word) but on constant `VALUES`, no `NATURAL`, only
+  catalogs and listed entries named, and no schema-qualified call
+  outside `pg_catalog` and the lists, refinement item 7, kept with
+  decision 8 as defence in depth). pgaudit relation records of a listed entry the substatement's
+  text does not name, or next to a view outside `pg_catalog`, make a text
+  read. The `pg_catalog` functions of decision 7 (`DATA_FUNCTIONS`:
+  SQL-running, file, logical decoding, large objects) add `*`, also next
+  to catalogs only. The connector's `pss_texts` is left out only by exact
+  text (`OwnKind::StatementText`; on pgaudit only within a
+  `pg_stat_statements` period of the target, `PssPeriods`, whose closed
+  periods end 5 s early for clock skew), never
+  otherwise. `check()` says `pg_read_all_stats` is held while pgaudit is
+  the source in its local detail. Drift and pinning tests in `it.rs`.
+  Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#statement-text-views).
+- **Credential-bearing catalogs** ([ADR-0050](../../../docs/adr/0050-postgresql-credential-and-value-bearing-catalogs-as-reads.md)).
+  The closed list `audit::events::SECRET_RELATIONS` (`pg_authid`,
+  `pg_shadow`, `pg_roles`, `pg_user`, `pg_db_role_setting`,
+  `pg_user_mapping(s)`, `pg_foreign_server`, `pg_subscription`, `pg_proc`
+  with their secret columns; `pg_largeobject`, `pg_file_settings`,
+  `pg_hba_file_rules`, their functions and four `information_schema`
+  views with none) is named in events (`pg_catalog.<name>`, the
+  `information_schema` names as written), always reported, in every
+  action class, unless the ten entries with columns are read in the
+  no-secret shape (`secret_reads`, with
+  `classifiers::query::PgScan::no_secret_shape`: the no-text shape on the
+  secret columns of every entry named, plus no `COPY <entry>`, and a CTE
+  defined earlier in the text counts as a catalog; no schema-qualified
+  call outside `pg_catalog` and `information_schema`; an unqualified
+  call, operator or cast that decision 8 does not prove built in makes the
+  entries secret reads). An unqualified `pg_*` entry unconfirmed with
+  `log_catalog = off` is a secret read. A pgaudit record of an entry the
+  substatement's text does not name is a secret read only next to a
+  record of a user view, materialized view or foreign table (outside
+  `pg_catalog` and `information_schema`) or when the text names no
+  relation (decision 3: a user view over `pg_roles` is the accepted
+  over-report). Never the agent's own, except its two-key reads
+  (`sql::ROLE_LOG_OVERRIDES`, `sql::FUNCTION_LOG_OVERRIDES`,
+  `OwnKind::LogOverrides`): on pgaudit only, by exact text as sent, from
+  the agent's identity, no signal, no record of another entry; on
+  `pg_stat_statements` they are always reported (constants are `$n`
+  there). Every other connector statement on `pg_roles` and `pg_proc` has
+  the no-secret shape (unit tests `sql::tests::statements_and_the_secret_list`
+  and `secrets_tests::the_connectors_statements_are_quiet`); the collision
+  probe, the row-level security policy check and the introspection
+  statement were rewritten without column alias lists for it. Drift and
+  pinning tests in `it_secrets.rs`, run on PostgreSQL 14 to 18. Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#credential-bearing-catalogs).
+- **User code next to catalogs only** ([ADR-0049](../../../docs/adr/0049-postgresql-statement-text-views-as-reads.md)
+  decision 8, part 2 refinement proposed). In a text whose relations are
+  all catalogs (`audit::events::code_use`), whatever its statements
+  (a statement that wraps a query, `EXPLAIN`, `PREPARE … AS`,
+  `DECLARE … CURSOR FOR`, `CREATE … AS`, is scanned from its query; any
+  other is scanned whole), a call, an operator (written, or implied by
+  `LIKE`, `IN`, `BETWEEN`…) or a cast that is not built in for that
+  database adds `*` in every action class, always reported, never the
+  agent's own (`audit::user_code::user_code`, decided when the
+  event is built, from the code uses that `classifiers::query::PgScan::code`
+  extracts). "Built in": the lists of the server's major version
+  (`builtins/<major>/{functions,operators,types,keywords}.txt`, generated
+  by `builtins/generate.sh` from the engine-matrix images, embedded by
+  `audit::builtins`; a newer major uses the newest lists, with a warning)
+  minus what the collision probe (`sql::USER_CODE_PROBE`, run by `check()`
+  in each declared database at every heartbeat, at most 20 000 rows,
+  names in memory only) finds: user overloads a built-in value or literal
+  reaches, user types named like built-in ones, user-function casts
+  between built-in types (an implicit one: every catalog-only statement
+  is `*`), and, with a `$n` in the text, user overloads whose code is
+  not C, and user domains whose `CHECK` runs non-C code (a parameterized
+  statement is then `*` unless it is exactly a connector statement from
+  the agent's identity: `PgOwn::connector_sent`, `agent_identity`, and on
+  `pg_stat_statements` `connector_pss_form` in the agent's slot). The
+  probes are kept per target in `CheckState` and marked stale by the
+  streams on routine, type, cast and extension DDL (`UserCode`), until
+  two probes that started after the mark; a failed, cut, stale, old
+  (15 min) or missing probe makes every unqualified call, operator and
+  cast `*`. Every connector statement stays under the 8 192-character
+  `pg_stat_statements` read bound (unit test). Every connector statement is
+  written with qualified functions and types and
+  `OPERATOR(pg_catalog.…)` (unit test `statements_never_trigger_decision_8`).
+  Integration tests in `it_user_code.rs` (scenarios on every source, a
+  database with `citext`, `hstore` and 3 000 relations, server facts,
+  list drift). Details:
+  [docs/08](../../../docs/08-engine-capabilities.md#user-code-next-to-catalogs).
+- **Statements that wrap a query** ([ADR-0048](../../../docs/adr/0048-statistics-catalogs-as-reads.md#refinement-2026-10-12-accepted-statements-that-wrap-a-query),
+  refinement of 2026-10-12, accepted). `EXPLAIN [ANALYZE]`, `DECLARE …
+  CURSOR … FOR` and `PREPARE … AS` (`classifiers::query::PgWrapped`, on
+  `StatementInfo::pg_wrapped`) are their query: its relations, with every
+  rule a bare query has (catalogs, statistics relations, statement-text
+  views and the no-text shape, user code, the relation bound). Before,
+  `pg_stat_statements` gave no event for these statements (kind `Other`),
+  so a cursor read (psql's `FETCH_COUNT`), an `EXPLAIN ANALYZE` and the
+  `EXECUTE`s of a prepared statement (counted under the `PREPARE` text)
+  went unreported there. The action (`wrapped_action`): a plain
+  `EXPLAIN` reads (planned with the statistics, as ADR-0047 on MySQL /
+  MariaDB; pgaudit's `WRITE` record of a plain `EXPLAIN DELETE` is a read
+  too); `EXPLAIN ANALYZE`, a cursor and a prepared statement act as their
+  query (a write writes, `CREATE … AS` is DDL). Explains and cursors are
+  always reported with no row count (`WrapperUse::rows_unknown`: an
+  explain sends no row, a cursor's rows go out through `FETCH`, which
+  names no relation); a prepared statement's executions keep their rows
+  and the filters. A cursor's or prepared statement's query keeps its
+  `shape.full_table_read`. Never the agent's own (unit test
+  `no_statement_wraps_a_query`). `FETCH`, `MOVE`, `CLOSE` and
+  `DEALLOCATE` give no event (pgaudit logs them in the `misc` class; their
+  `pg_stat_statements` row counts are not attributed). Unit tests
+  `wrapped_queries_are_reads_of_their_query`,
+  `pgaudit_records_of_wrapped_queries`; integration test
+  `it_wrapped::wrapped_queries_are_reads_of_their_query`.
+- **Failed and cancelled statements** ([ADR-0037 refinement of
+  2026-10-12](../../../docs/adr/0037-postgresql-full-requires-pgaudit-log-rows.md#refinement-2026-10-12-accepted-failed-and-cancelled-statements),
+  `audit/failures.rs`, `audit/records.rs`, `PgauditEvents::error_event`).
+  With `pgaudit.log_rows = on` (needed for Full), pgaudit writes a
+  statement's records when it ends, so a statement that fails or is
+  cancelled leaves no `AUDIT:` record. When the pgaudit log is the source
+  (Full or Partial), the stream therefore also parses the server's `ERROR`
+  lines, and `FATAL` lines that carry a statement, of client backends,
+  from the same file, cursor and tailer.
+  - **Read (I2):** severity, SQLSTATE, user, database, application, client
+    address, session, virtual transaction, time and the statement text
+    only. `message`, `detail`, `hint`, `context` and `internal_query` are
+    skipped as `serde::de::IgnoredAny` in jsonlog and walked without
+    being copied inside the tailer's zeroized buffer in csvlog
+    (`csv_pick`, whose statement buffer is reserved at the record's
+    length so it never reallocates); the jsonlog statement is deserialized
+    straight into a `Zeroizing` buffer (`serde_json`'s scratch buffer for
+    a string with escapes stays outside the connector's reach, as for
+    `AUDIT:` messages); of `context`, only its presence is used. The statement
+    text is never logged; `ErrorLine`'s `Debug` prints no text and no
+    identity. Lines of a closed list of the server's own processes
+    (`records::SYSTEM_PROCESSES`: autovacuum, parallel workers, whose
+    errors their leader re-raises, checkpointer, WAL writer, logical
+    replication workers…) are not read; `walsender`, extensions'
+    background workers, unknown and missing types are (fails closed).
+    `LOG` lines (the `LOG` 08006
+    "could not send data to client" before a `FATAL` 08006) are not read.
+    A line of that severity that does not parse is counted in
+    `audit.records_dropped`. Unit test
+    `values_quoted_by_the_line_never_leave_it`.
+  - **Classes, by SQLSTATE only** (`failures::base_class`). Refused (no
+    event): `25P02` without a context field whose text calls only
+    built-in code (ADR-0049 decision 8's lists and collision probe; a
+    text that cannot be scanned keeps the line), `28xxx` / `3D000` without
+    a statement, and `42601` without a context whose text does not lex
+    and holds none of `( : $` or an operator character. Quiet: every
+    other code of classes `42`, `3F`, `0A`, `25`, and `57014`, `57P01` to
+    `57P05`, `40001`, `40P01`, `55P03`, classes `53`, `54`, `08`, `58`.
+    Telling: every other code, a missing or malformed one included.
+  - **Event:** the text is analyzed like a pgaudit record's (relations,
+    catalogs skipped, statistics catalogs, statement-text views, user
+    code next to catalogs, wrapped queries, shape signals); an
+    unqualified `pg_*` name is not a catalog here (no record confirms
+    it). Never a row count. Quiet: a read (a DDL or DCL keeps its
+    action), always reported; from the agent's identity charged the
+    whole budget like an unknown row count. Telling: the statement's
+    action (the read first in a multi-statement text), always reported
+    except a plain `INSERT … VALUES` (one relation, no query,
+    `RETURNING` or `ON CONFLICT`, only built-in code), never the agent's
+    own. `DO`, `CALL`, `EXECUTE`, `FETCH` and any other statement whose
+    code or rows the text does not name add `*`; transaction control,
+    `SET`, `SHOW` and the like give none. An `ERROR` line without a
+    statement text is a read of `*`; a `FATAL` line without one ends an
+    idle session and gives none where the stream's probe proved the log
+    settings for its database and for the line's role
+    (`Catalogs::fatal_quiet`: `error_lines_proven` and the override proof
+    of `audit::overrides`), a read of `*` elsewhere (item 9 of the ADR, as
+    refined by item 4 of the ADR-0012 refinement of 2026-10-12: a role
+    with an override of `log_min_error_statement` above `error` or a `SET`
+    grant on it; every role for a database-wide override, a function
+    `SET` clause, a `PUBLIC` or `ALTER SYSTEM` grant, a proof not read,
+    and while the stream has seen an `ALTER ROLE`, `ALTER DATABASE`,
+    `ALTER SYSTEM`, parameter grant or function DDL since the last two
+    probes).
+  - **Not twice:** a line is not reported when its session's last
+    pgaudit record has the same text, the same virtual transaction and no
+    row count (written at the statement's start, `log_rows = off`); texts
+    are compared as hashes keyed per stream, 4096 sessions followed.
+  - **`check()`:** `log_min_messages` and `log_min_error_statement`
+    (readable by every role, read with the pgaudit settings) must be
+    `error` or lower in every monitored database where pgaudit is loaded;
+    otherwise the target is capped at Partial and the local detail names
+    the setting and the database (no target note, no protocol change).
+  - **Overrides for other roles** ([ADR-0012 refinement of 2026-10-12](../../../docs/adr/0012-postgresql-agent-grants.md#refinement-2026-10-12-accepted-a-two-key-read-of-pg_db_role_setting)):
+    in each monitored database whose level would be Full, and only while
+    no `pg_stat_statements` stream of the target runs, `check()` and the
+    stream's probe send `sql::ROLE_LOG_OVERRIDES` and
+    `sql::FUNCTION_LOG_OVERRIDES` (the two keys of `setconfig` and
+    `proconfig`, filtered by the server, literals only, at most 1 000
+    rows) and, on 15+, `sql::PARAMETER_GRANTS` (`audit::overrides`,
+    `check::overrides_probe`). An override above `error`, a grant to a
+    role other than superusers and the agent's, a refused or cut read
+    caps the target at Partial; the local detail names the database, the
+    setting, the roles or functions (normalized, at most 10, then a
+    count), never a level. `sql::OWN_PARAMETER_GRANTS` reports a grant to
+    the agent's own role as an over-privilege (local detail only). The
+    unit test `no_statement_touches_the_catalog_denylist` asserts the two
+    statements' full texts.
+  - **Load:** a line costs one parse (about 2 µs) and one analysis of its
+    text (about 45 µs, release build), as an `AUDIT:` record does; the
+    last text's analysis is cached, so a storm of one failing statement
+    (an application looping on a missing table, 42P01) costs about 15 µs
+    per line (ignored test `error_line_throughput`), and the core's
+    aggregator merges its events into one per principal, action, objects
+    and window (at most 10 000 groups per window before an early flush,
+    then the bounded spool).
+  - Integration tests `it_wrapped::failed_reads_and_what_is_reported`
+    (22P02 quoting the value, 59 of 60 rows then 22012, 57014 by timeout
+    and by the client, `FATAL` 08006 mid-result, from another role and
+    the agent's role, `log_rows` on and off, jsonlog and csvlog) and
+    `it_wrapped::forced_25p02_and_42601_through_user_code` (F1: `25P02`
+    and `42601` raised after rows were sent through a view, a row-level
+    security policy, a user operator, a user cast and a domain `CHECK`,
+    from another role and the agent's role, reported; a genuine `25P02`
+    and `42601`, no event).
+  - Residuals: a backend that crashes during a read writes nothing of its
+    own (the postmaster's line is not read); `pg_stat_statements` counts
+    no failed statement (Limited); native code that hides its context can
+    forge a refused `25P02` / `42601`; any role can add false events with
+    `RAISE … USING ERRCODE`; a superuser's session `SET` or startup option
+    is not seen, and an override set between two probes hides failures
+    until the next probe unless the stream reads its record; the core's aggregation adds a failed read with no row count
+    to a successful read of the same group, whose count then stands for
+    both.
 - **`pgaudit.log_statement_once = on`.** Only the first record of a
   statement and substatement carries the text; later ones carry
   `<previously logged>`. The connector analyzes those with the first

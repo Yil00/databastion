@@ -603,29 +603,95 @@ async fn read_member(
     let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
     let decoders: Vec<Decoder> = cols.iter().map(|(_, d)| *d).collect();
     let limit_param = i64::from(limit);
+    let names_of = |cols: Vec<(String, Decoder)>| cols.into_iter().map(|(n, _)| n).collect();
+    let mut sampled: Option<(Vec<Vec<RawValue>>, u32, usize)> = None;
     if let Some(pct) = tablesample_percent(member.reltuples, limit) {
         let statement = sql::sample_statement(&member.schema, &member.name, &names, true).ok_or(
             PgError::new(databastion_core::FailureCode::Internal, Stage::Sample),
         )?;
-        let (values, rows) = read_rows(
+        let (values, rows, bytes) = read_rows(
             tx,
             &statement,
             &[(&pct, Type::FLOAT4), (&limit_param, Type::INT8)],
             &decoders,
+            MAX_SAMPLE_BYTES,
         )
         .await?;
         // A short sample (stale statistics, clustered free space): fall
         // back to a plain bounded read, unless the byte budget stopped it.
         if rows.saturating_mul(2) >= limit || tx.is_poisoned() {
-            return Ok((cols.into_iter().map(|(n, _)| n).collect(), values, rows));
+            return Ok((names_of(cols), values, rows));
         }
+        sampled = Some((values, rows, bytes));
+    }
+    // The fallback reads what the short sample left of the row limit and
+    // of the byte budget, and keeps both: the scan's own reads of the
+    // relation stay within `limit` rows as the own-account budget charges
+    // them, the short sample at least one (security review of #197, L3).
+    // When the plain read sees the whole relation, it replaces the short
+    // sample (`merge_fallback`); otherwise rows may repeat between the two
+    // reads.
+    let left = fallback_limit(limit, sampled.as_ref().map(|(_, done, _)| *done));
+    let (values, done, used) =
+        sampled.unwrap_or_else(|| (decoders.iter().map(|_| Vec::new()).collect(), 0, 0));
+    if left == 0 {
+        return Ok((names_of(cols), values, done));
     }
     let statement = sql::sample_statement(&member.schema, &member.name, &names, false).ok_or(
         PgError::new(databastion_core::FailureCode::Internal, Stage::Sample),
     )?;
-    let (values, rows) =
-        read_rows(tx, &statement, &[(&limit_param, Type::INT8)], &decoders).await?;
-    Ok((cols.into_iter().map(|(n, _)| n).collect(), values, rows))
+    let left_param = i64::from(left);
+    let (more, rows, _) = read_rows(
+        tx,
+        &statement,
+        &[(&left_param, Type::INT8)],
+        &decoders,
+        MAX_SAMPLE_BYTES.saturating_sub(used),
+    )
+    .await?;
+    let whole = fallback_read_whole(left, rows, tx.is_poisoned());
+    let (values, rows) = merge_fallback(values, done, more, rows, whole);
+    Ok((names_of(cols), values, rows))
+}
+
+/// Whether the plain read after a short `TABLESAMPLE` read the whole
+/// relation: it returned fewer rows than its limit `left`, and the byte
+/// budget did not stop it (which cancels the statement and poisons the
+/// transaction).
+pub(crate) fn fallback_read_whole(left: u32, rows: u32, poisoned: bool) -> bool {
+    rows < left && !poisoned
+}
+
+/// The sample after the plain read: when that read saw the whole relation
+/// (`whole`), it holds every row the short `TABLESAMPLE` returned, so the
+/// sample is the plain read alone, with no row counted twice. Otherwise
+/// (the plain read stopped at its limit or its byte budget) both reads
+/// are kept, and rows may repeat between them. Before, a `TABLESAMPLE`
+/// that happened to pick the pages of a small relation's live rows
+/// (stale statistics) counted each of them twice (the intermittent
+/// `it::adr_0012_probes` failure: 60 rows sampled from a relation of 30).
+pub(crate) fn merge_fallback<V>(
+    mut sampled: Vec<Vec<V>>,
+    sampled_rows: u32,
+    plain: Vec<Vec<V>>,
+    plain_rows: u32,
+    whole: bool,
+) -> (Vec<Vec<V>>, u32) {
+    if whole {
+        return (plain, plain_rows);
+    }
+    for (out, extra) in sampled.iter_mut().zip(plain) {
+        out.extend(extra);
+    }
+    (sampled, sampled_rows.saturating_add(plain_rows))
+}
+
+/// Row limit of the plain read: `limit`, or after a short `TABLESAMPLE`
+/// of `short` rows what it left, counting it at least one row as the
+/// own-account budget does (`databastion_core::audit::own`). 0: no
+/// fallback (a limit of 1 after an empty `TABLESAMPLE`).
+pub(crate) fn fallback_limit(limit: u32, short: Option<u32>) -> u32 {
+    short.map_or(limit, |done| limit.saturating_sub(done.max(1)))
 }
 
 /// Streams the rows of a sampling statement and decodes them per column.
@@ -634,7 +700,8 @@ async fn read_rows(
     statement: &str,
     params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)],
     decoders: &[Decoder],
-) -> Result<(Vec<Vec<RawValue>>, u32), PgError> {
+    byte_cap: usize,
+) -> Result<(Vec<Vec<RawValue>>, u32, usize), PgError> {
     tx.query_stream(Stage::Sample, statement, params, |stream| async move {
         let mut stream = std::pin::pin!(stream);
         let mut values: Vec<Vec<RawValue>> = decoders.iter().map(|_| Vec::new()).collect();
@@ -653,9 +720,9 @@ async fn read_rows(
             // itself was already received whole by the driver: one row is
             // the residual peak. The statement is cancelled, the rest is
             // not read.
-            if bytes.saturating_add(row_bytes) > MAX_SAMPLE_BYTES {
+            if bytes.saturating_add(row_bytes) > byte_cap {
                 tracing::info!(rows, "sample byte budget reached: statement cancelled");
-                return Ok(Streamed::Stopped((values, rows)));
+                return Ok(Streamed::Stopped((values, rows, bytes)));
             }
             bytes += row_bytes;
             rows += 1;
@@ -665,7 +732,7 @@ async fn read_rows(
                 }
             }
         }
-        Ok(Streamed::Complete((values, rows)))
+        Ok(Streamed::Complete((values, rows, bytes)))
     })
     .await
 }
@@ -735,6 +802,52 @@ mod tests {
         assert_eq!(normalize("archive_lucas_martin").as_str(), "*");
         assert_eq!(normalize("jane.doe@example.com").as_str(), "*");
         assert_eq!(normalize("a.b").as_str(), "*");
+    }
+
+    /// The scan's own reads of a relation stay within its row limit as
+    /// the own budget charges them: a short `TABLESAMPLE` (at least one
+    /// row) plus the plain read (security review of #197, L3).
+    #[test]
+    fn the_fallback_read_takes_what_the_short_sample_left() {
+        assert_eq!(fallback_limit(1000, None), 1000);
+        assert_eq!(fallback_limit(1000, Some(0)), 999);
+        assert_eq!(fallback_limit(1000, Some(499)), 501);
+        assert_eq!(fallback_limit(1, Some(0)), 0);
+        for limit in [1u32, 2, 200, 1000, 10_000] {
+            for short in [0, 1, limit / 2 - limit.min(1) / 2] {
+                let total = short.max(1) + fallback_limit(limit, Some(short));
+                assert!(total <= limit.max(1), "{limit} {short}");
+            }
+        }
+    }
+
+    /// The intermittent `it::adr_0012_probes` failure: a short
+    /// `TABLESAMPLE` that returned some of a small relation's rows, then a
+    /// plain read of all of them, counted those rows twice.
+    #[test]
+    fn a_whole_fallback_read_replaces_the_short_sample() {
+        let col = |r: std::ops::Range<u32>| vec![r.collect::<Vec<u32>>()];
+        // Stale statistics: 30 live rows on the first page, sampled by
+        // chance (3 % of the pages), then read again by the plain read.
+        let whole = fallback_read_whole(fallback_limit(200, Some(30)), 30, false);
+        assert!(whole);
+        let (v, n) = merge_fallback(col(1..31), 30, col(1..31), 30, whole);
+        assert_eq!((v, n), (col(1..31), 30));
+        // The sample came back empty: the plain read alone, as before.
+        let whole = fallback_read_whole(fallback_limit(200, Some(0)), 30, false);
+        let (v, n) = merge_fallback(col(0..0), 0, col(1..31), 30, whole);
+        assert_eq!((v, n), (col(1..31), 30));
+        // The plain read stopped at its limit (a larger relation): both
+        // reads are kept.
+        let left = fallback_limit(200, Some(40));
+        assert_eq!(left, 160);
+        let whole = fallback_read_whole(left, 160, false);
+        assert!(!whole);
+        let (v, n) = merge_fallback(col(1000..1040), 40, col(1..161), 160, whole);
+        assert_eq!(n, 200);
+        assert_eq!(v[0].len(), 200);
+        // Stopped by the byte budget: not the whole relation.
+        assert!(!fallback_read_whole(160, 3, true));
     }
 
     #[test]

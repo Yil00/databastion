@@ -5,6 +5,12 @@
 #
 # load_app: LOGIN, no other attribute; pgbench connects with it (never with the agent's account).
 # Its SELECT grants on the scaled tables are given by run.sh once it has created them.
+# load_pgmon (ADR-0048 load scenario, pg-side-clients.sh): a monitoring-like account, LOGIN and a
+# member of pg_monitor, running a bloat estimate on pg_stats; same password.
+# load_pgexp (ADR-0050 load scenario): an exporter-like account, LOGIN with no grant, reading
+# pg_roles, pg_proc and pg_subscription without their secret columns; same password.
+# load_pgbouncer (ADR-0050 load scenario): a PgBouncer-like account, LOGIN and a member of
+# pg_read_all_data (to read pg_shadow), running PgBouncer's default auth_query; same password.
 # The password is read by psql itself from the Docker secret and passed as a quoted literal
 # (as e2e/target-initdb/01-agent-role.sh): never on a command line nor in the environment, and
 # not recorded (pgaudit is not set for the database yet, pg_stat_statements does not track this
@@ -16,6 +22,14 @@ SET log_min_error_statement = panic;
 \set load_password `cat /run/secrets/load_client_password`
 CREATE ROLE load_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   PASSWORD :'load_password';
+CREATE ROLE load_pgmon LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'load_password';
+CREATE ROLE load_pgexp LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'load_password';
+CREATE ROLE load_pgbouncer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'load_password';
 \unset load_password
-GRANT CONNECT ON DATABASE :"DBNAME" TO load_app;
+GRANT CONNECT ON DATABASE :"DBNAME" TO load_app, load_pgmon, load_pgexp, load_pgbouncer;
+GRANT pg_monitor TO load_pgmon;
+GRANT pg_read_all_data TO load_pgbouncer;
 SQL

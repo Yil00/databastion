@@ -51,7 +51,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA crm, billing, ops T
 ALTER DATABASE :"DBNAME" SET pgaudit.log = 'read, write, role';
 ALTER DATABASE :"DBNAME" SET pgaudit.role = 'databastion_auditor';
 ALTER DATABASE :"DBNAME" SET pgaudit.log_relation = on;
-ALTER DATABASE :"DBNAME" SET pgaudit.log_catalog = off;
+ALTER DATABASE :"DBNAME" SET pgaudit.log_catalog = on;
 ALTER DATABASE :"DBNAME" SET pgaudit.log_parameter = off;
 ALTER DATABASE :"DBNAME" SET pgaudit.log_rows = on;
 \endif

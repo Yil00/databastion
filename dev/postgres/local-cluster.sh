@@ -107,7 +107,7 @@ start() {
       audit_opts="-c logging_collector=on -c log_destination=jsonlog,csvlog \
         -c log_directory=$DIR/log -c log_filename=postgresql.log -c log_file_mode=0644 \
         -c log_connections=on -c pgaudit.log=none -c pgaudit.role=databastion_auditor \
-        -c pgaudit.log_relation=on -c pgaudit.log_catalog=off -c pgaudit.log_parameter=off \
+        -c pgaudit.log_relation=on -c pgaudit.log_catalog=on -c pgaudit.log_parameter=off \
         -c pgaudit.log_rows=on -c pg_stat_statements.track=all"
     fi
     as_owner "$BIN/pg_ctl" -D "$DATA" -l "$DIR/server.log" -w start -o \

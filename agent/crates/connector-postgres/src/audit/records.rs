@@ -1,5 +1,7 @@
 //! Server log records: splitting (jsonlog, csvlog), and parsing of the
-//! pgaudit `AUDIT:` records only (ADR-0012 obligation 7).
+//! pgaudit `AUDIT:` records (ADR-0012 obligation 7) and of the server's
+//! `ERROR` and `FATAL` lines of client backends (ADR-0037, refinement of
+//! 2026-10-12: failed and cancelled statements, [`ErrorLine`]).
 //!
 //! - Records are split out of the byte stream by the core's tailer
 //!   (`databastion_core::audit::tail`), with a bound: a longer record is
@@ -9,8 +11,17 @@
 //!   client address, application, session) plus the pgaudit fields; the
 //!   statement text is kept in a zeroizing buffer for the local analysis
 //!   (`classifiers::query`) and never logged. `detail`, `hint`,
-//!   `context`, `internal_query`, the error `statement` of other records
-//!   and the pgaudit parameter field are never read.
+//!   `context`, `internal_query` and the pgaudit parameter field are never
+//!   read.
+//! - From an `ERROR` or `FATAL` line, only the severity, the SQLSTATE, the
+//!   identity fields (time, user, database, client address, application,
+//!   session, virtual transaction) and the statement text are kept (I2,
+//!   ADR-0037 refinement item 2): `message`, `detail`, `hint`, `context`
+//!   and `internal_query`, which can quote values, are never copied. In
+//!   jsonlog they are skipped as `serde::de::IgnoredAny`; in csvlog their
+//!   columns are walked inside the tailer's zeroized buffer without being
+//!   copied ([`csv_pick`]). Of `context`, only its presence is tested
+//!   (F1).
 //! - A record (or a pgaudit payload) whose CSV does not parse is dropped.
 
 use std::fmt;
@@ -178,6 +189,8 @@ pub(crate) struct AuditRecord {
     pub(crate) remote: Option<String>,
     pub(crate) application: String,
     pub(crate) session: String,
+    /// Virtual transaction id (`backend/local`), empty when not logged.
+    pub(crate) vxid: String,
     pub(crate) audit: PgAudit,
 }
 
@@ -204,6 +217,8 @@ struct JsonLine {
     remote_host: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    vxid: Option<String>,
     #[serde(default)]
     application_name: Option<String>,
     #[serde(default)]
@@ -241,10 +256,10 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// error context hidden, so a record whose severity differs from
 /// `severity` (see [`expected_severity`]) or that carries a context (a
 /// `RAISE` always has one, `… at RAISE`) is dropped. What remains forgeable
-/// needs a role that can hide the context (`log_error_verbosity = terse`
-/// is superuser-only, but a server-wide `log_error_verbosity = terse`
-/// removes every context and with it this protection) or native code (C
-/// extensions, untrusted PLs).
+/// needs native code that hides the context (C
+/// extensions, untrusted PLs). `log_error_verbosity = terse` does not
+/// remove it from jsonlog nor csvlog (verified on PostgreSQL 16.13: a
+/// `RAISE` line still has its context with `terse`).
 #[cfg(test)]
 pub(crate) fn parse_record(format: Format, record: &[u8], severity: &str) -> Option<AuditRecord> {
     parse_record_checked(format, record, severity).ok()
@@ -261,6 +276,8 @@ pub(crate) enum Skip {
     /// `pgaudit.log_level`: likely genuine (the setting changed, or it
     /// differs per database or role). Counted and warned.
     Severity,
+    /// An `ERROR` or `FATAL` line that cannot be read: counted as dropped.
+    Damaged,
 }
 
 /// [`parse_record`] with the reason a record is dropped.
@@ -295,6 +312,7 @@ pub(crate) fn parse_record_checked(
                 remote: line.remote_host,
                 application: line.application_name.unwrap_or_default(),
                 session: line.session_id.unwrap_or_default(),
+                vxid: line.vxid.unwrap_or_default(),
                 audit,
             })
         }
@@ -311,18 +329,7 @@ pub(crate) fn parse_record_checked(
             // error_severity (11), context (18).
             check(Some(f[11].as_str()), !f[18].is_empty())?;
             // `connection_from` is `host:port` or `[local]`.
-            let from = f[4].as_str();
-            let remote = if from.is_empty() {
-                None
-            } else if from == "[local]" {
-                Some(from.to_owned())
-            } else {
-                Some(
-                    from.rsplit_once(':')
-                        .map_or(from, |(host, _port)| host)
-                        .to_owned(),
-                )
-            };
+            let remote = csv_remote(f[4].as_str());
             Ok(AuditRecord {
                 ts: parse_log_time(&f[0]),
                 user: f[1].to_string(),
@@ -330,10 +337,458 @@ pub(crate) fn parse_record_checked(
                 remote,
                 application: f[22].to_string(),
                 session: f[5].to_string(),
+                vxid: f[9].to_string(),
                 audit,
             })
         }
     }
+}
+
+/// A SQLSTATE: five characters of `[0-9A-Z]`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SqlState([u8; 5]);
+
+impl SqlState {
+    /// `None` unless `s` is five characters of `[0-9A-Z]`.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        let b: [u8; 5] = s.as_bytes().try_into().ok()?;
+        b.iter()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+            .then_some(Self(b))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // Five ASCII bytes, checked by `parse`.
+        std::str::from_utf8(&self.0).unwrap_or("XX000")
+    }
+
+    /// The class: the first two characters.
+    pub(crate) fn class(&self) -> &str {
+        self.as_str().get(..2).unwrap_or("XX")
+    }
+}
+
+impl fmt::Debug for SqlState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An `ERROR` or `FATAL` line of a client backend (ADR-0037, refinement of
+/// 2026-10-12, item 1): the fields that cannot quote a value, and the
+/// statement text, kept for the local analysis only.
+pub(crate) struct ErrorLine {
+    pub(crate) ts: Option<SystemTime>,
+    pub(crate) user: String,
+    pub(crate) database: String,
+    /// Client host as logged (see [`AuditRecord::remote`]).
+    pub(crate) remote: Option<String>,
+    pub(crate) application: String,
+    pub(crate) session: String,
+    /// Virtual transaction id (`backend/local`): ties a line to the
+    /// pgaudit record of the same statement (item 4).
+    pub(crate) vxid: String,
+    /// `FATAL` rather than `ERROR`.
+    pub(crate) fatal: bool,
+    /// `None`: missing or malformed (an unknown code, fail closed).
+    pub(crate) sqlstate: Option<SqlState>,
+    /// The line has an error context (only its presence is read, F1).
+    pub(crate) has_context: bool,
+    /// Statement text (`statement` in jsonlog, `query` in csvlog): local
+    /// analysis only, never logged or sent. `None` when not logged.
+    pub(crate) statement: Option<Zeroizing<String>>,
+}
+
+impl fmt::Debug for ErrorLine {
+    // No statement text, no identity (they can hold anything).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ErrorLine")
+            .field("fatal", &self.fatal)
+            .field("sqlstate", &self.sqlstate)
+            .field("has_context", &self.has_context)
+            .field("statement", &self.statement.as_ref().map(|s| s.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+/// One parsed log record.
+#[derive(Debug)]
+pub(crate) enum LogEntry {
+    Audit(AuditRecord),
+    Error(ErrorLine),
+}
+
+/// The jsonlog keys of an `ERROR` or `FATAL` line. `message`, `detail`,
+/// `hint`, `context` and `internal_query` can quote values (I2): they are
+/// declared only to be skipped as [`serde::de::IgnoredAny`], which reads
+/// past a value without copying it; `context` is only tested for presence
+/// (F1). Any other key is skipped the same way by serde.
+#[derive(serde::Deserialize)]
+struct JsonErrorLine {
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    dbname: Option<String>,
+    #[serde(default)]
+    remote_host: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    vxid: Option<String>,
+    #[serde(default)]
+    application_name: Option<String>,
+    #[serde(default)]
+    backend_type: Option<String>,
+    #[serde(default)]
+    error_severity: Option<String>,
+    #[serde(default)]
+    state_code: Option<String>,
+    /// Deserialized straight into a zeroizing buffer, so that it is wiped
+    /// also when a later key fails the line.
+    #[serde(default, deserialize_with = "zeroizing_string")]
+    statement: Option<Zeroizing<String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    message: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    detail: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    hint: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    context: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    internal_query: Option<serde::de::IgnoredAny>,
+}
+
+/// Backend types (`backend_type`) of the server's own processes, whose
+/// lines are not read: their errors are no client's statement
+/// (autovacuum's "canceling autovacuum task"), or are re-raised by the
+/// leader whose line is read (parallel workers). A closed list: `client
+/// backend`, `walsender` (replication clients), `standalone backend`,
+/// background workers of extensions (`pg_cron`…), a missing and any other
+/// type are read (fails closed).
+const SYSTEM_PROCESSES: [&str; 20] = [
+    "autovacuum launcher",
+    "autovacuum worker",
+    "archiver",
+    "background writer",
+    "checkpointer",
+    "io worker",
+    "logger",
+    "logical replication launcher",
+    "logical replication worker",
+    "logical replication apply worker",
+    "logical replication parallel worker",
+    "logical replication tablesync worker",
+    "parallel worker",
+    "postmaster",
+    "slotsync worker",
+    "startup",
+    "walreceiver",
+    "walsummarizer",
+    "walwriter",
+    "wal summarizer",
+];
+
+/// Whether a line's backend type is one of [`SYSTEM_PROCESSES`].
+pub(crate) fn system_process(backend_type: &str) -> bool {
+    SYSTEM_PROCESSES.contains(&backend_type)
+}
+
+/// Deserializes an optional string straight into a [`Zeroizing`] buffer
+/// (one allocation of the exact size; `serde_json`'s own scratch buffer
+/// for a string with escapes is outside this connector's reach).
+fn zeroizing_string<'de, D>(d: D) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Inner;
+    impl<'de> serde::de::Visitor<'de> for Inner {
+        type Value = Zeroizing<String>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let mut out = Zeroizing::new(String::with_capacity(v.len()));
+            out.push_str(v);
+            Ok(out)
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Zeroizing::new(v))
+        }
+    }
+    struct Outer;
+    impl<'de> serde::de::Visitor<'de> for Outer {
+        type Value = Option<Zeroizing<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string or null")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_str(Inner).map(Some)
+        }
+    }
+    d.deserialize_option(Outer)
+}
+
+/// csvlog columns (PostgreSQL 13+).
+mod col {
+    pub(super) const TIME: usize = 0;
+    pub(super) const USER: usize = 1;
+    pub(super) const DATABASE: usize = 2;
+    pub(super) const FROM: usize = 4;
+    pub(super) const SESSION: usize = 5;
+    pub(super) const VXID: usize = 9;
+    pub(super) const SEVERITY: usize = 11;
+    pub(super) const SQLSTATE: usize = 12;
+    pub(super) const CONTEXT: usize = 18;
+    pub(super) const QUERY: usize = 19;
+    pub(super) const APPLICATION: usize = 22;
+    pub(super) const BACKEND_TYPE: usize = 23;
+}
+
+/// The columns copied out of a csvlog `ERROR` / `FATAL` line, in this
+/// order. `message` (13), `detail` (14), `hint` (15), `internal_query`
+/// (16) and `context` (18) are not among them.
+const CSV_PICKED: [usize; 11] = [
+    col::TIME,
+    col::USER,
+    col::DATABASE,
+    col::FROM,
+    col::SESSION,
+    col::VXID,
+    col::SEVERITY,
+    col::SQLSTATE,
+    col::QUERY,
+    col::APPLICATION,
+    col::BACKEND_TYPE,
+];
+
+/// The picked columns of a CSV record, and whether each column is present
+/// (quoted, or not empty).
+pub(crate) struct CsvPick {
+    /// One per picked column, in the order asked; empty when the record
+    /// has fewer columns.
+    pub(crate) picked: Vec<Zeroizing<String>>,
+    /// Per column of the record: present.
+    pub(crate) present: Vec<bool>,
+}
+
+/// [`parse_csv`] that copies only the columns in `pick` out of `record`,
+/// walking every other column in place (the tailer's zeroized buffer):
+/// their text is never copied (I2). Same strictness as [`parse_csv`].
+///
+/// `reserve`: a picked column (the statement text) whose buffer gets the
+/// record's length as capacity before any character is pushed, so that it
+/// never grows: a reallocation would leave the earlier, shorter copy in
+/// freed memory, not zeroized.
+pub(crate) fn csv_pick(record: &str, pick: &[usize], reserve: Option<usize>) -> Option<CsvPick> {
+    let mut picked: Vec<Zeroizing<String>> = pick
+        .iter()
+        .map(|&c| {
+            Zeroizing::new(if Some(c) == reserve {
+                String::with_capacity(record.len())
+            } else {
+                String::new()
+            })
+        })
+        .collect();
+    let mut present = Vec::new();
+    let mut index = 0usize;
+    // Position in `picked` of the current column, when it is picked.
+    let slot = |i: usize| pick.iter().position(|&p| p == i);
+    let mut current = slot(0);
+    let mut field_present = false;
+    let mut chars = record.chars().peekable();
+    let mut quoted = false;
+    let mut at_start = true;
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    if let Some(k) = current {
+                        picked[k].push('"');
+                    }
+                } else {
+                    quoted = false;
+                    closed = true;
+                }
+            } else if let Some(k) = current {
+                picked[k].push(c);
+            }
+            continue;
+        }
+        match c {
+            ',' => {
+                present.push(field_present);
+                index += 1;
+                if index > MAX_FIELDS {
+                    return None;
+                }
+                current = slot(index);
+                field_present = false;
+                at_start = true;
+                closed = false;
+            }
+            '"' if at_start => {
+                quoted = true;
+                field_present = true;
+                at_start = false;
+            }
+            _ if closed || c == '"' => return None,
+            _ => {
+                if let Some(k) = current {
+                    picked[k].push(c);
+                }
+                field_present = true;
+                at_start = false;
+            }
+        }
+    }
+    if quoted {
+        return None;
+    }
+    present.push(field_present);
+    Some(CsvPick { picked, present })
+}
+
+/// The client address of a csvlog `connection_from` (`host:port` or
+/// `[local]`).
+fn csv_remote(from: &str) -> Option<String> {
+    if from.is_empty() {
+        None
+    } else if from == "[local]" {
+        Some(from.to_owned())
+    } else {
+        Some(
+            from.rsplit_once(':')
+                .map_or(from, |(host, _port)| host)
+                .to_owned(),
+        )
+    }
+}
+
+/// `Some(fatal)` for the severities of the lines read.
+pub(crate) fn is_error_severity(sev: &str) -> Option<bool> {
+    match sev {
+        "ERROR" => Some(false),
+        "FATAL" => Some(true),
+        _ => None,
+    }
+}
+
+/// Parses an `ERROR` or `FATAL` line of a client backend. `Ok(None)` for
+/// a line of that severity from another process; `Err(NotAudit)` for any
+/// other record; `Err(Damaged)` for a line of that severity that cannot be
+/// read (counted as dropped: never a silent loss).
+pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<ErrorLine>, Skip> {
+    match format {
+        Format::Jsonlog => {
+            // Cheap pre-filter: a `"` inside a jsonlog value is escaped, so
+            // these bytes are the key and its value.
+            if !contains(record, b"\"error_severity\":\"ERROR\"")
+                && !contains(record, b"\"error_severity\":\"FATAL\"")
+            {
+                return Err(Skip::NotAudit);
+            }
+            let line: JsonErrorLine = serde_json::from_slice(record).map_err(|_| Skip::Damaged)?;
+            let fatal = line
+                .error_severity
+                .as_deref()
+                .and_then(is_error_severity)
+                .ok_or(Skip::NotAudit)?;
+            if line.backend_type.as_deref().is_some_and(system_process) {
+                return Ok(None);
+            }
+            let statement = line.statement;
+            Ok(Some(ErrorLine {
+                ts: line.timestamp.as_deref().and_then(parse_log_time),
+                user: line.user.unwrap_or_default(),
+                database: line.dbname.unwrap_or_default(),
+                remote: line.remote_host,
+                application: line.application_name.unwrap_or_default(),
+                session: line.session_id.unwrap_or_default(),
+                vxid: line.vxid.unwrap_or_default(),
+                fatal,
+                sqlstate: line.state_code.as_deref().and_then(SqlState::parse),
+                has_context: line.context.is_some(),
+                statement,
+            }))
+        }
+        Format::Csvlog => {
+            if !contains(record, b",ERROR,") && !contains(record, b",FATAL,") {
+                return Err(Skip::NotAudit);
+            }
+            let text = std::str::from_utf8(record).map_err(|_| Skip::NotAudit)?;
+            let mut p = csv_pick(text, &CSV_PICKED, Some(col::QUERY)).ok_or(Skip::NotAudit)?;
+            let field = |c: usize| -> &str {
+                CSV_PICKED
+                    .iter()
+                    .position(|&x| x == c)
+                    .map_or("", |k| p.picked[k].as_str())
+            };
+            let Some(fatal) = is_error_severity(field(col::SEVERITY)) else {
+                return Err(Skip::NotAudit);
+            };
+            // A record without the backend type column (before
+            // PostgreSQL 13) is read: an unknown type (fails closed).
+            if system_process(field(col::BACKEND_TYPE)) {
+                return Ok(None);
+            }
+            // Moved out of its reserved, zeroizing buffer: never copied.
+            let query = CSV_PICKED
+                .iter()
+                .position(|&x| x == col::QUERY)
+                .map(|k| std::mem::take(&mut *p.picked[k]))
+                .map(Zeroizing::new)
+                .unwrap_or_default();
+            let field = |c: usize| -> &str {
+                CSV_PICKED
+                    .iter()
+                    .position(|&x| x == c)
+                    .map_or("", |k| p.picked[k].as_str())
+            };
+            Ok(Some(ErrorLine {
+                ts: parse_log_time(field(col::TIME)),
+                user: field(col::USER).to_owned(),
+                database: field(col::DATABASE).to_owned(),
+                remote: csv_remote(field(col::FROM)),
+                application: field(col::APPLICATION).to_owned(),
+                session: field(col::SESSION).to_owned(),
+                vxid: field(col::VXID).to_owned(),
+                fatal,
+                sqlstate: SqlState::parse(field(col::SQLSTATE)),
+                has_context: p.present.get(col::CONTEXT).copied().unwrap_or(false),
+                statement: (!query.is_empty()).then_some(query),
+            }))
+        }
+    }
+}
+
+/// Parses one log record: an `ERROR` / `FATAL` line of a client backend
+/// ([`parse_error_line`]; pgaudit never logs at those severities, its
+/// `log_level` cannot be set to them), else a pgaudit record
+/// ([`parse_record_checked`]).
+pub(crate) fn parse_entry(format: Format, record: &[u8], severity: &str) -> Result<LogEntry, Skip> {
+    match parse_error_line(format, record) {
+        Ok(Some(line)) => return Ok(LogEntry::Error(line)),
+        Ok(None) => return Err(Skip::NotAudit),
+        Err(Skip::NotAudit) => {}
+        Err(other) => return Err(other),
+    }
+    parse_record_checked(format, record, severity).map(LogEntry::Audit)
 }
 
 /// Days from 1970-01-01 to a civil date (proleptic Gregorian).
@@ -399,6 +854,55 @@ pub(crate) fn parse_log_time(s: &str) -> Option<SystemTime> {
     Some(
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_nanos(u64::from(nanos)),
     )
+}
+
+/// Tests: a pgaudit record of `session` with `text` (statement 1).
+#[cfg(test)]
+pub(crate) fn tests_audit_record(session: &str, text: &str, rows: Option<u64>) -> AuditRecord {
+    let rows = rows.map_or(String::new(), |r| format!(",{r}"));
+    let line = serde_json::json!({
+        "timestamp": "2026-09-28 21:45:31.320 UTC", "user": "backup", "dbname": "shop",
+        "error_severity": "LOG", "remote_host": "192.0.2.14", "session_id": session,
+        "application_name": "psql", "backend_type": "client backend",
+        "message": format!(
+            "AUDIT: SESSION,1,1,READ,SELECT,,,\"{}\",<not logged>{rows}",
+            text.replace('"', "\"\"")
+        ),
+    });
+    parse_record(Format::Jsonlog, line.to_string().as_bytes(), "LOG").unwrap_or_else(|| {
+        #[allow(clippy::panic)]
+        {
+            panic!("test record does not parse")
+        }
+    })
+}
+
+/// Tests: an `ERROR` line of `session` with `code` and `text`.
+#[cfg(test)]
+pub(crate) fn tests_error_line(
+    session: &str,
+    code: &str,
+    text: Option<&str>,
+    vxid: &str,
+) -> ErrorLine {
+    let mut v = serde_json::json!({
+        "timestamp": "2026-09-28 21:45:32.000 UTC", "user": "backup", "dbname": "shop",
+        "error_severity": "ERROR", "state_code": code, "remote_host": "192.0.2.14",
+        "session_id": session, "vxid": vxid, "application_name": "psql",
+        "backend_type": "client backend", "message": "m",
+    });
+    if let Some(t) = text {
+        v["statement"] = serde_json::Value::from(t);
+    }
+    parse_error_line(Format::Jsonlog, v.to_string().as_bytes())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| {
+            #[allow(clippy::panic)]
+            {
+                panic!("test line does not parse")
+            }
+        })
 }
 
 #[cfg(test)]

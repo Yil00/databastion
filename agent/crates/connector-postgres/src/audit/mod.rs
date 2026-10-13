@@ -5,8 +5,11 @@
 //! - The pgaudit log is read locally from `targets[].postgres.audit_log`
 //!   (`jsonlog` or `csvlog`), incrementally, with a cursor persisted
 //!   through the core (`databastion_core::audit::tail`); only `AUDIT:`
-//!   records are parsed
-//!   ([`records`], ADR-0012 obligation 7).
+//!   records ([`records`], ADR-0012 obligation 7) and the `ERROR` /
+//!   `FATAL` lines of client backends are parsed: a statement that fails
+//!   or is cancelled leaves no `AUDIT:` record with `pgaudit.log_rows =
+//!   on`, and its line is reported by SQLSTATE class, never by its message
+//!   ([`failures`], ADR-0037 refinement of 2026-10-12).
 //! - Statement text never leaves the agent (the contract `AccessEvent` has
 //!   no field for it): it is only analyzed locally by
 //!   `classifiers::query` (literal-free tokens) to name objects the log
@@ -20,9 +23,13 @@
 //!   to the core, which aggregates them for up to `aggregation_window_s`
 //!   before spooling; an agent crash in that window loses those events.
 
+pub(crate) mod builtins;
 pub(crate) mod events;
+pub(crate) mod failures;
+pub(crate) mod overrides;
 pub(crate) mod pss;
 pub(crate) mod records;
+pub(crate) mod user_code;
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,7 +42,7 @@ use crate::error::{PgError, Stage};
 use databastion_core::audit::own::OwnAccount;
 use databastion_core::audit::tail::{self, TailError, Tailer};
 use events::PgOwn;
-use records::{AuditRecord, Format, Skip, parse_record_checked};
+use records::{Format, LogEntry, Skip, parse_entry};
 
 /// Name of the pgaudit cursor in the core's cursor store.
 const CURSOR: &str = "pgaudit";
@@ -101,7 +108,22 @@ fn own_account(
         state.own_usage(&target.id),
     )
     .persisted(cfg);
-    PgOwn::new(core, state.own_statements(&target.id))
+    PgOwn::new(core, state.own_statements(&target.id)).with_periods(state.pss_periods(&target.id))
+}
+
+/// The catalog facts of the stream: the probe's per-database facts and the
+/// target's collision probes of `check()` (ADR-0049 decision 8).
+fn catalogs_of(
+    pre: &check::Prerequisites,
+    state: &CheckState,
+    target_id: &str,
+) -> events::Catalogs {
+    pre.catalogs
+        .clone()
+        .with_user_code(user_code::UserCodeHandle::new(state.user_code(target_id)))
+        .with_log_overrides(overrides::LogOverridesHandle::new(
+            state.log_overrides(target_id),
+        ))
 }
 
 /// State kept across source re-evaluations.
@@ -140,7 +162,7 @@ pub(crate) async fn audit_stream(
             pss_idle = Some(poller);
         }
         let held = pss_session.as_ref().map(|(s, p)| (p.database(), s));
-        let pre = check::prerequisites_with(target, timeouts, held)
+        let pre = check::prerequisites_with(target, timeouts, held, Some(state))
             .await
             .map_err(PgError::into_connector_error)?;
         match source_for(pre.level) {
@@ -167,7 +189,8 @@ pub(crate) async fn audit_stream(
                         })
                     }
                 };
-                st.builder.set_catalogs(pre.catalogs.clone());
+                st.builder
+                    .set_catalogs(catalogs_of(&pre, state, &target.id));
                 if let Err(kind) = pgaudit_run(cfg, target, sink, state, st, &pre.severity).await? {
                     tracing::warn!(
                         target_id = %target.id,
@@ -187,15 +210,26 @@ pub(crate) async fn audit_stream(
                     pss_session = Some((session, poller));
                 }
                 if pss_session.is_none() {
-                    let conn =
-                        pss::connect(target, timeouts, own_account(cfg, target, &pre, state))
-                            .await
-                            .map_err(PgError::into_connector_error)?;
+                    // The period of this `pg_stat_statements` stream (ADR-0049
+                    // decision 5) ends when the poller is dropped (source
+                    // switch, error, stop), plus the statement timeout.
+                    let period = events::PssPeriodGuard::start(
+                        state.pss_periods(&target.id),
+                        cfg.statement_timeout().min(Duration::from_secs(30)),
+                    );
+                    let conn = pss::connect(
+                        target,
+                        timeouts,
+                        own_account(cfg, target, &pre, state),
+                        period,
+                    )
+                    .await
+                    .map_err(PgError::into_connector_error)?;
                     tracing::info!(target_id = %target.id, "audit source: pg_stat_statements (Limited)");
                     pss_session = Some(conn);
                 }
                 if let Some((session, poller)) = pss_session.as_mut() {
-                    poller.set_catalogs(pre.catalogs.clone());
+                    poller.set_catalogs(catalogs_of(&pre, state, &target.id));
                     pss_run(cfg, target, sink, session, poller, timeouts).await?;
                 }
             }
@@ -229,21 +263,35 @@ async fn pgaudit_run(
                 let mut mismatched = 0u64;
                 let mut forged = 0u64;
                 let mut panicked = 0u64;
-                let mut records: Vec<AuditRecord> = Vec::new();
+                let mut damaged = 0u64;
+                let mut audit_records = 0u64;
+                let mut entries: Vec<LogEntry> = Vec::new();
                 for r in &p.records {
                     // Per-record isolation: a record that makes the parser
                     // panic is dropped alone (phase-7 review H1).
-                    match databastion_core::isolate(|| {
-                        parse_record_checked(format, r, &severity_owned)
-                    }) {
-                        Some(Ok(rec)) => records.push(rec),
+                    match databastion_core::isolate(|| parse_entry(format, r, &severity_owned)) {
+                        Some(Ok(entry)) => {
+                            if matches!(entry, LogEntry::Audit(_)) {
+                                audit_records += 1;
+                            }
+                            entries.push(entry);
+                        }
                         Some(Err(Skip::Severity)) => mismatched += 1,
                         Some(Err(Skip::Context)) => forged += 1,
+                        Some(Err(Skip::Damaged)) => damaged += 1,
                         Some(Err(Skip::NotAudit)) => {}
                         None => panicked += 1,
                     }
                 }
-                (records, more, mismatched, forged, panicked)
+                (
+                    entries,
+                    more,
+                    mismatched,
+                    forged,
+                    panicked,
+                    damaged,
+                    audit_records,
+                )
             });
             (t, polled)
         })
@@ -254,7 +302,7 @@ async fn pgaudit_run(
             let _ = databastion_core::resume_panic(e);
             internal()
         })?;
-        let (records, more, mismatched, forged, panicked) = match polled {
+        let (entries, more, mismatched, forged, panicked, damaged, audit_records) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => return Ok(Err(kind)),
         };
@@ -283,7 +331,15 @@ async fn pgaudit_run(
                 "AUDIT records with an error context dropped (not written by pgaudit)"
             );
         }
-        if !records.is_empty() {
+        if damaged > 0 {
+            state.note_dropped(&target.id, damaged);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = damaged,
+                "ERROR or FATAL log lines that cannot be read dropped"
+            );
+        }
+        if audit_records > 0 {
             state.note_record(&target.id);
         }
         if t.oversized > st.reported_oversized {
@@ -296,7 +352,7 @@ async fn pgaudit_run(
             st.reported_oversized = t.oversized;
         }
         let panicked_before = st.builder.panicked;
-        let events = st.builder.convert(records, SystemTime::now());
+        let events = st.builder.convert_entries(entries, SystemTime::now());
         {
             let panicked = st.builder.panicked.saturating_sub(panicked_before);
             if panicked > 0 {
@@ -304,7 +360,8 @@ async fn pgaudit_run(
                 tracing::warn!(
                     target_id = %target.id,
                     dropped = panicked,
-                    "audit records whose conversion failed dropped (internal error)"
+                    "audit records or error lines whose conversion failed dropped (internal \
+                     error)"
                 );
             }
         }

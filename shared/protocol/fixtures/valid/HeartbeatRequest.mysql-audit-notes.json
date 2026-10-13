@@ -1,0 +1,34 @@
+{
+  "ts": "2026-10-11T09:30:00Z",
+  "agent_version": "0.6.0",
+  "uptime_s": 7200,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "mysql"
+  ],
+  "targets": [
+    {
+      "target_id": "mariadb-crm",
+      "engine": "mariadb",
+      "server_version": "11.4.4",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "performance_schema",
+      "notes": [
+        {
+          "code": "audit.digest_consumer_disabled"
+        },
+        {
+          "code": "audit.statement_text_limit_low",
+          "count": 512
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

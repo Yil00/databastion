@@ -299,13 +299,15 @@ impl AuditProbe {
             codes.push(TargetNote::new(NoteCode::AuditHistoryNotReadable));
         }
         if self.ps_enabled && self.consumers_readable && self.digest_disabled {
-            // No closed note code fits (`shared/protocol` unchanged): the
-            // local detail only.
+            // Security review of #186, L2: a closed note as well as the
+            // local detail.
+            codes.push(TargetNote::new(NoteCode::AuditDigestConsumerDisabled));
             out.push(
                 "performance_schema statements_digest consumer disabled: no statement has a \
-                 digest, so the performance_schema Audit poll reads every statement's text \
-                 (SQL_TEXT, with its literals), and so does whoever replays the poll with \
-                 the agent's credential"
+                 digest, so a performance_schema poll reads every statement's full text \
+                 (SQL_TEXT, with its literals): the agent's own, when performance_schema is \
+                 the Audit source, and a replay of it with the agent's credential, address \
+                 and program name, which is left out like the agent's; enable the consumer"
                     .to_owned(),
             );
         }
@@ -572,9 +574,20 @@ pub(crate) struct CheckState {
     /// Per target: credits for the extra sampling statements of Discovery
     /// (`audit::credits`).
     sample_credits: Mutex<HashMap<String, crate::audit::credits::SharedCredits>>,
+    /// The agent's `performance_schema` poll sessions, per server run,
+    /// for every stream of the connector (`audit::own_threads`).
+    poll_threads: crate::audit::own_threads::SharedPollThreads,
+    /// The threads of the agent's Discovery sessions, per server run
+    /// (`audit::own_threads`).
+    discovery_pins: crate::audit::own_threads::SharedPins,
     /// Per target: audit log records dropped (not parsable, oversized or
     /// damaged), and when the count started (reported for 24 h).
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
+    /// Per target: the statement text limit of the running stream's source
+    /// (`server_audit_query_log_limit`, `performance_schema_max_sql_text_length`)
+    /// when it is below the agent's longest statement, with that source
+    /// (review of #165: a closed note rather than a log warning only).
+    text_limits: Mutex<HashMap<String, (EventSource, usize)>>,
 }
 
 /// An audit log record parsed within this period makes the log source
@@ -598,6 +611,11 @@ impl Drop for StreamGuard<'_> {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 map.remove(&self.target_id);
+                self.state
+                    .text_limits
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&self.target_id);
             }
         }
         self.state.invalidate(&self.target_id);
@@ -659,6 +677,43 @@ impl CheckState {
         entry.0 = entry.0.saturating_add(n);
     }
 
+    /// The Audit stream of `target_id` reads `source`, whose statement
+    /// texts are cut at `limit` bytes; `low`: below the agent's longest
+    /// statement (its own statements are then cut, and reported as reads
+    /// of `*` by its account).
+    pub(crate) fn note_text_limit(
+        &self,
+        target_id: &str,
+        source: EventSource,
+        limit: usize,
+        low: bool,
+    ) {
+        let mut map = self
+            .text_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if low {
+            map.insert(target_id.to_owned(), (source, limit));
+        } else if map.get(target_id).is_some_and(|(s, _)| *s == source) {
+            map.remove(target_id);
+        }
+    }
+
+    /// The low statement text limit of `target_id`'s source, when its
+    /// Audit stream runs and reads `source` (the source `check()` chose).
+    fn low_text_limit(&self, target_id: &str, source: Option<EventSource>) -> Option<usize> {
+        let source = source?;
+        if !self.stream_running(target_id) {
+            return None;
+        }
+        self.text_limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .filter(|(s, _)| *s == source)
+            .map(|(_, limit)| *limit)
+    }
+
     fn dropped(&self, target_id: &str) -> u64 {
         self.dropped
             .lock()
@@ -687,6 +742,16 @@ impl CheckState {
                 .entry(target_id.to_owned())
                 .or_default(),
         )
+    }
+
+    /// The agent's poll sessions on every server (`audit::own_threads`).
+    pub(crate) fn poll_threads(&self) -> crate::audit::own_threads::SharedPollThreads {
+        std::sync::Arc::clone(&self.poll_threads)
+    }
+
+    /// The Discovery pins of every target (`audit::own_threads`).
+    pub(crate) fn discovery_pins(&self) -> crate::audit::own_threads::SharedPins {
+        std::sync::Arc::clone(&self.discovery_pins)
     }
 
     pub(crate) fn own_usage(&self, target_id: &str) -> SharedOwnUsage {
@@ -871,6 +936,14 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
              damaged)"
         ));
         codes.add(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(dropped));
+    }
+    if let Some(limit) = state.low_text_limit(&target.id, source.event_source()) {
+        notes.push(format!(
+            "the audit source cuts statement texts at {limit} bytes, below the agent's longest \
+             statement: its own statements are cut and reported as reads of * (keep the limit \
+             at 1024 or more)"
+        ));
+        codes.add(TargetNote::new(NoteCode::AuditStatementTextLimitLow).with_count(limit as u64));
     }
     // CAS store guard (ADR-0041 decision 6): at every heartbeat, so a
     // ticket table recreated with a table grant is reported at once.
@@ -2450,8 +2523,9 @@ mod tests {
     }
 
     /// Security review of #186, H1: a disabled `statements_digest`
-    /// consumer is shown (local detail; no closed note code fits) and
-    /// changes neither the level nor the notes.
+    /// consumer is shown, in the local detail and (review L2) as the
+    /// closed note `audit.digest_consumer_disabled`, and does not change
+    /// the level.
     #[test]
     fn a_disabled_digest_consumer_is_shown() {
         let on = ps_probe();
@@ -2467,8 +2541,65 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("statements_digest consumer disabled"))
         );
-        assert_eq!(codes_on, codes_off);
+        let digest = |codes: &[TargetNote]| {
+            codes
+                .iter()
+                .filter(|n| n.code() == NoteCode::AuditDigestConsumerDisabled)
+                .count()
+        };
+        assert_eq!(digest(&codes_on), 0);
+        assert_eq!(digest(&codes_off), 1);
+        let others: Vec<_> = codes_off
+            .iter()
+            .filter(|n| n.code() != NoteCode::AuditDigestConsumerDisabled)
+            .cloned()
+            .collect();
+        assert_eq!(codes_on, others);
         assert_eq!(on.level(), off.level());
+        // Not shown when performance_schema is not readable (nothing is
+        // known of the consumers) or off.
+        for probe in [
+            AuditProbe {
+                consumers_readable: false,
+                ..off.clone()
+            },
+            AuditProbe {
+                ps_enabled: false,
+                ..off.clone()
+            },
+        ] {
+            assert_eq!(digest(&probe.explain(None).1), 0);
+        }
+    }
+
+    /// Review of #165: a statement text limit below the agent's longest
+    /// statement is a closed note while the stream reads that source, and
+    /// only then.
+    #[test]
+    fn a_low_text_limit_is_noted_for_the_running_source_only() {
+        let state = CheckState::default();
+        let ps = Some(EventSource::PerformanceSchema);
+        let file = Some(EventSource::MariadbServerAudit);
+        state.note_text_limit("t", EventSource::PerformanceSchema, 512, true);
+        // No stream running: nothing.
+        assert_eq!(state.low_text_limit("t", ps), None);
+        let guard = state.stream_started("t");
+        assert_eq!(state.low_text_limit("t", ps), Some(512));
+        assert_eq!(state.low_text_limit("t", file), None);
+        assert_eq!(state.low_text_limit("t", None), None);
+        assert_eq!(state.low_text_limit("other", ps), None);
+        // A limit raised on another source keeps this one.
+        state.note_text_limit("t", EventSource::MariadbServerAudit, 2048, false);
+        assert_eq!(state.low_text_limit("t", ps), Some(512));
+        // Raised on the same source: cleared.
+        state.note_text_limit("t", EventSource::PerformanceSchema, 1024, false);
+        assert_eq!(state.low_text_limit("t", ps), None);
+        // Cleared when the stream ends.
+        state.note_text_limit("t", EventSource::MariadbServerAudit, 600, true);
+        assert_eq!(state.low_text_limit("t", file), Some(600));
+        drop(guard);
+        let _again = state.stream_started("t");
+        assert_eq!(state.low_text_limit("t", file), None);
     }
 
     #[test]

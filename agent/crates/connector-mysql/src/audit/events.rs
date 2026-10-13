@@ -39,7 +39,12 @@
 //! `performance_schema` source off), and so does a table record that
 //! writes a system schema table, whatever the statement's action. The
 //! `mysql` schema is kept for reads and writes (reading `mysql.user` is an
-//! access worth reporting). Server configuration changes (`SET GLOBAL` /
+//! access worth reporting). Two exceptions keep their names in reads,
+//! always reported and never the agent's own: the statement-text tables
+//! (ADR-0045) and the statistics tables that hold column values
+//! (`information_schema.COLUMN_STATISTICS`, `mysql.column_stats`:
+//! ADR-0048), the latter only when the statement text names them, since
+//! MariaDB writes `column_stats` read records for its own statistics loads. Server configuration changes (`SET GLOBAL` /
 //! `PERSIST`, `INSTALL` / `UNINSTALL`, `TRUNCATE`) are DDL events. A
 //! text that only kept its kind (opaque, ambiguous readings, not
 //! lexable) is reported against `*` with the most reportable kind of its
@@ -58,6 +63,16 @@
 //! (text that does not lex, `CALL`) is reported against `*`. Statements
 //! that failed are skipped, except `INTO OUTFILE` attempts; a statement the
 //! server could not parse (error 1064 / 1149) never yields an event.
+//!
+//! An explain of a statement (`EXPLAIN` / `DESCRIBE` / `DESC` followed by
+//! the statement it plans, ADR-0047) is a read of the relations the
+//! explained statement names, explained writes included: the optimizer
+//! reads `const` and `system` tables while it plans. It is always reported,
+//! with no row count and no signal of the explained statement, and never
+//! the agent's own. The table form (`DESCRIBE t`, `EXPLAIN t`) stays quiet,
+//! and so does the literal probe shape (`EXPLAIN SELECT 1 FROM t`, the
+//! agent's readability probes) from any account, unless its table records
+//! read another table.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -256,6 +271,42 @@ pub(crate) fn statement_text_table(
         .map(|(d, t, _)| (*d, *t))
 }
 
+/// The statistics tables that hold column values (ADR-0048 decision 1):
+/// MySQL's histograms (`information_schema.COLUMN_STATISTICS`, `HISTOGRAM`:
+/// every distinct value of a singleton histogram, bucket bounds otherwise,
+/// strings base64-encoded) and MariaDB's engine-independent statistics
+/// (`mysql.column_stats`: `min_value`, `max_value` in clear, and `JSON_HB`
+/// bucket start values). As listed: (schema, table). Both are listed for
+/// both flavors: the flavor comes from a version string a proxy can
+/// rewrite. `mysql.table_stats`, `index_stats`, `innodb_table_stats`,
+/// `innodb_index_stats` and `information_schema.STATISTICS` hold no value
+/// and are not listed; `mysql.column_statistics` is refused to every
+/// account (error 3554).
+pub(crate) const STATISTICS_TABLES: &[(&str, &str)] = &[
+    ("information_schema", "COLUMN_STATISTICS"),
+    ("mysql", "column_stats"),
+];
+
+/// The statistics table `db`.`table` is, as listed (compared
+/// ASCII-case-insensitively).
+pub(crate) fn statistics_table(db: &str, table: &str) -> Option<(&'static str, &'static str)> {
+    STATISTICS_TABLES
+        .iter()
+        .find(|(d, t)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
+        .map(|(d, t)| (*d, *t))
+}
+
+/// A table whose reads are named, always reported and never the agent's
+/// own: a statement-text table (ADR-0045) or a statistics table
+/// (ADR-0048), as listed.
+pub(crate) fn listed_table(
+    flavor: Option<Flavor>,
+    db: &str,
+    table: &str,
+) -> Option<(&'static str, &'static str)> {
+    statement_text_table(flavor, db, table).or_else(|| statistics_table(db, table))
+}
+
 /// A `USE` with another statement in one text, in either order (security
 /// review of #186, M1): unqualified names after it resolve in the database
 /// it sets, and the database a source logs for the whole text may be the
@@ -279,12 +330,15 @@ fn use_then(x: &QueryAnalysis) -> bool {
 /// performance_schema` in an earlier record, or a connect database, then
 /// `SELECT … FROM events_statements_history_long`). It keeps the name the
 /// source shows (`processlist` is in three schemas), and is marked like a
-/// listed table: always reported, never the agent's own.
+/// listed table: always reported, never the agent's own. The same holds
+/// for the name of a statistics table (ADR-0048).
 fn unresolved_text_table(flavor: Option<Flavor>, db: &str, table: &str) -> bool {
     db.is_empty()
-        && STATEMENT_TEXT_TABLES.iter().any(|(d, t, _)| {
+        && (STATEMENT_TEXT_TABLES.iter().any(|(d, t, _)| {
             t.eq_ignore_ascii_case(table) && statement_text_table(flavor, d, t).is_some()
-        })
+        }) || STATISTICS_TABLES
+            .iter()
+            .any(|(_, t)| t.eq_ignore_ascii_case(table)))
 }
 
 /// `SHOW [FULL] PROCESSLIST`: a read of `information_schema.PROCESSLIST`
@@ -337,11 +391,14 @@ fn is_audit_table(db: &str, table: &str) -> bool {
 /// function call or `LOAD_FILE` (`SET NAMES`,
 /// `SET CHARACTER SET`, `SET TRANSACTION`, `SET autocommit = 1`…), `USE`,
 /// `BEGIN` (not `BEGIN NOT ATOMIC`), `START TRANSACTION`, `COMMIT`,
-/// `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SHOW`, `EXPLAIN` / `DESCRIBE` /
-/// `DESC` without `ANALYZE` (and with its statement within the prefix
-/// bound), `LOCK` / `UNLOCK TABLES`, `FLUSH`, `ANALYZE`
-/// / `OPTIMIZE` / `CHECK` / `CHECKSUM` / `REPAIR TABLE`, `KILL`,
-/// `DEALLOCATE PREPARE`.
+/// `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `SHOW` (`SHOW [FULL] COLUMNS`,
+/// `SHOW INDEX`, `SHOW CREATE TABLE`, `SHOW WARNINGS`…), the table form of
+/// `EXPLAIN` / `DESCRIBE` / `DESC` (`DESCRIBE t [column | 'pattern']`,
+/// `EXPLAIN t`: column definitions only) and the literal probe shape
+/// (`EXPLAIN SELECT 1 FROM t`, ADR-0047 decision 5), `LOCK` / `UNLOCK
+/// TABLES`, `FLUSH`, `ANALYZE` / `OPTIMIZE` / `CHECK` / `CHECKSUM` /
+/// `REPAIR TABLE`, `KILL`, `DEALLOCATE PREPARE`. An explain of a
+/// statement is not on it: a read of the relations it names (ADR-0047).
 pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
     if p.subquery
         || p.compound
@@ -362,12 +419,16 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
         // an audit function or `LOAD_FILE` (excluded above).
         ["set", ..] => !p.routine_call && p.relations.is_empty(),
         ["begin"] | ["begin", "work"] => true,
+        // The optimizer reads `const` and `system` tables while it plans
+        // an explained statement (ADR-0047): only the table form and the
+        // literal probe shape are quiet.
+        ["explain" | "describe" | "desc", ..] => !p.explain_statement || p.explain_probe,
         ["start", "transaction", ..]
         | [
             "commit" | "rollback" | "savepoint" | "release" | "use" | "kill" | "flush",
             ..,
         ]
-        | ["show" | "explain" | "describe" | "desc", ..]
+        | ["show", ..]
         | ["lock" | "unlock", "table" | "tables", ..]
         | ["deallocate", "prepare", ..] => true,
         [
@@ -380,6 +441,73 @@ pub(crate) fn is_quiet(p: &StatementInfo) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a raw statement text starts with `EXPLAIN`, `DESCRIBE` or
+/// `DESC`, compared ASCII-case-insensitively: for texts that did not lex
+/// (ADR-0047). ASCII whitespace, opening parentheses, `/* … */` and `#` /
+/// `-- ` comments before the word are skipped. An executable comment
+/// (`/*!…`, `/*M!…`) is read both ways: its content as code (after its
+/// version digits) and skipped whole, since a server may run it or not;
+/// either reading that reaches an explain word counts (security review of
+/// #195, L1).
+fn explain_lead(text: &[u8]) -> bool {
+    explain_lead_at(text, 0, 0)
+}
+
+/// Most executable comments [`explain_lead`] reads both ways.
+const MAX_LEAD_BRANCHES: u8 = 4;
+
+fn explain_lead_at(text: &[u8], mut i: usize, depth: u8) -> bool {
+    let n = text.len();
+    while i < n {
+        let rest = &text[i..];
+        if rest[0].is_ascii_whitespace() || rest[0] == b'(' {
+            i += 1;
+        } else if rest.starts_with(b"/*!") || rest.starts_with(b"/*M!") {
+            // Past the branch bound, fail closed: taken as an explain
+            // (security review of #195).
+            if depth >= MAX_LEAD_BRANCHES {
+                return true;
+            }
+            // Skipped whole (a server that does not run it).
+            if depth < MAX_LEAD_BRANCHES
+                && let Some(k) = rest[2..].windows(2).position(|w| w == b"*/")
+                && explain_lead_at(text, i + 2 + k + 2, depth + 1)
+            {
+                return true;
+            }
+            // Read as code.
+            i += if rest[2] == b'!' { 3 } else { 4 };
+            while i < n && text[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if rest.starts_with(b"/*") {
+            match rest[2..].windows(2).position(|w| w == b"*/") {
+                Some(k) => i += 2 + k + 2,
+                None => return false,
+            }
+        } else if rest.starts_with(b"*/") {
+            // The end of an executable comment read inside.
+            i += 2;
+        } else if rest[0] == b'#'
+            || (rest.starts_with(b"--") && rest.get(2).is_none_or(u8::is_ascii_whitespace))
+        {
+            match rest.iter().position(|b| *b == b'\n') {
+                Some(k) => i += k + 1,
+                None => return false,
+            }
+        } else {
+            break;
+        }
+    }
+    let word: Vec<u8> = text[i.min(n)..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .take(9)
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    matches!(word.as_slice(), b"explain" | b"describe" | b"desc")
 }
 
 /// A statement kind that changes something: rows, schema or privileges.
@@ -847,6 +975,32 @@ static OWN_PS_READS: std::sync::LazyLock<Vec<(Vec<u8>, Vec<&'static str>)>> =
             .collect()
     });
 
+/// The shapes of [`OWN_PS_READS`] (see [`text_shape`]): the statements
+/// of the agent's poll sessions that read `performance_schema`.
+static OWN_PS_SHAPES: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
+    OWN_PS_READS
+        .iter()
+        .filter_map(|(t, _)| text_shape(t))
+        .collect()
+});
+
+/// The shapes of the Discovery pin statement (`sql::ps_own_pin`), the only
+/// own `performance_schema` read a pinned Discovery session sends.
+static OWN_PIN_SHAPES: std::sync::LazyLock<Vec<Vec<String>>> = std::sync::LazyLock::new(|| {
+    [Flavor::Mysql, Flavor::Mariadb]
+        .into_iter()
+        .filter_map(|f| text_shape(crate::sql::ps_own_pin(f).as_bytes()))
+        .collect()
+});
+
+/// Whether `text` (a `performance_schema` `SQL_TEXT` or digest, not cut)
+/// has the shape of one of the connector's own `performance_schema` reads
+/// (`sql::own_performance_schema_reads`): the rows of the agent's ended
+/// poll sessions that are dropped (`pfs`, security review of #205, L1).
+pub(crate) fn own_ps_shape(text: &[u8]) -> bool {
+    text_shape(text).is_some_and(|s| OWN_PS_SHAPES.contains(&s))
+}
+
 /// One statement to turn into an event.
 pub(crate) struct Access<'a> {
     /// Session key (`c<connection id>`, `t<thread id>`).
@@ -879,6 +1033,104 @@ pub(crate) struct Access<'a> {
     pub(crate) status: u32,
     pub(crate) ts: SystemTime,
     pub(crate) source: EventSource,
+    /// The statement's session is one of the agent's own Discovery
+    /// sessions, proven by a pin (`super::own_threads`), with the agent's
+    /// account: its digests are compared with the agent's own texts by
+    /// their shape ([`text_shape`]), for its own `performance_schema`
+    /// reads and its sampling credits. `performance_schema` only.
+    pub(crate) own_session: bool,
+}
+
+/// The shape of a statement text or digest: its tokens, lower case,
+/// with string and number literals, `?` and user variables (`@x`, `@?`)
+/// each as one placeholder, backquotes and whitespace dropped, plain
+/// comments skipped (optimizer hints kept, as digests keep them). A
+/// `performance_schema` digest has the shape of the statement it digests
+/// (checked against MySQL and MariaDB by the integration tests). `None`
+/// for a text that does not lex (an unterminated quote or comment, a byte
+/// that is not UTF-8).
+pub(crate) fn text_shape(text: &[u8]) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(text).ok()?;
+    let b = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || !c.is_ascii();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    // A quoted run from `i` (the quote) to its closing quote (a doubled
+    // quote inside stays inside): its end, past the closing quote.
+    let quoted = |i: usize, q: u8| -> Option<usize> {
+        let mut j = i + 1;
+        loop {
+            match b.get(j)? {
+                c if *c == q && b.get(j + 1) == Some(&q) => j += 2,
+                c if *c == q => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+    };
+    // A name from `i` (bare or backquoted), lower case, and its end.
+    let name = |i: usize| -> Option<(String, usize)> {
+        if b.get(i) == Some(&b'`') {
+            let end = quoted(i, b'`')?;
+            Some((text[i + 1..end - 1].replace("``", "`").to_lowercase(), end))
+        } else {
+            let mut j = i;
+            while j < b.len() && word(b[j]) {
+                j += 1;
+            }
+            (j > i).then(|| (text[i..j].to_lowercase(), j))
+        }
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'\'' || c == b'"' {
+            i = quoted(i, c)?;
+            out.push("?".to_owned());
+        } else if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                i += 1;
+            }
+            out.push("?".to_owned());
+        } else if c == b'@' && b.get(i + 1) == Some(&b'@') {
+            let (n, end) = name(i + 2)?;
+            out.push(format!("@@{n}"));
+            i = end;
+        } else if c == b'@' {
+            i = match b.get(i + 1) {
+                Some(b'?') => i + 2,
+                Some(b'\'' | b'"') => quoted(i + 1, b[i + 1])?,
+                _ => name(i + 1)?.1,
+            };
+            out.push("@?".to_owned());
+        } else if text[i..].starts_with("/*+") {
+            out.push("/*+".to_owned());
+            i += 3;
+        } else if text[i..].starts_with("*/") {
+            out.push("*/".to_owned());
+            i += 2;
+        } else if text[i..].starts_with("/*") {
+            i = i + 2 + text[i + 2..].find("*/")? + 2;
+        } else if c == b'`' || word(c) {
+            let (n, end) = name(i)?;
+            out.push(n);
+            i = end;
+        } else {
+            out.push(char::from(c).to_string());
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Whether `text` holds `name` written in another ASCII case than `name`
+/// (anywhere: a name, a literal or a comment; fails closed).
+fn case_variant_in(text: &[u8], name: &str) -> bool {
+    let n = name.as_bytes();
+    !n.is_empty()
+        && text
+            .windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n) && w != n)
 }
 
 fn object(database: &str, name: &str) -> EventObject {
@@ -1017,7 +1269,17 @@ impl EventBuilder {
         let mut c = credits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((schema, table)) = c.peek(text, mono) else {
+        // The digest of a sampling batch of one of the agent's own
+        // Discovery sessions (a pin): matched by its shape (see
+        // `own_ps_read`).
+        let shape = (a.own_session && a.digest && a.source == EventSource::PerformanceSchema)
+            .then(|| text_shape(text))
+            .flatten();
+        let found = match &shape {
+            Some(shape) => c.peek_shape(shape, mono),
+            None => c.peek(text, mono),
+        };
+        let Some((schema, table)) = found else {
             return false;
         };
         if !a
@@ -1040,7 +1302,10 @@ impl EventBuilder {
         {
             return false;
         }
-        c.take(text, mono)
+        match &shape {
+            Some(shape) => c.take_shape(shape, mono),
+            None => c.take(text, mono),
+        }
     }
 
     /// Whether a statement record is one of the connector's own statements
@@ -1064,7 +1329,7 @@ impl EventBuilder {
             && a.tables.iter().all(|(db, table, op)| {
                 *op == TableOp::Read
                     && db.eq_ignore_ascii_case("information_schema")
-                    && statement_text_table(None, db, table).is_none()
+                    && listed_table(None, db, table).is_none()
             })
     }
 
@@ -1074,13 +1339,30 @@ impl EventBuilder {
     /// one of the constant texts of `sql::own_performance_schema_reads`,
     /// the record is not marked cut (nor opaque), and its table records
     /// (if any) read only the tables that text names. Never matched by
-    /// prefix, digest or shape: a `DIGEST_TEXT` never equals these texts.
+    /// prefix, and never by digest or shape, with one exception (ADR-0045
+    /// decision 4, refinement of #205, proposed): a digest of a thread
+    /// pinned through the Discovery nonce (`Access::own_session`) with the
+    /// shape of the pin statement (`sql::ps_own_pin`) only; the identity
+    /// conditions still apply.
     fn own_ps_read(a: &Access<'_>) -> bool {
         let Some(text) = a.text else {
             return false;
         };
         if a.truncated || a.opaque {
             return false;
+        }
+        // A digest of one of the agent's own Discovery sessions (a pin):
+        // the poll reads only the digest of a session that has ended, and
+        // the pin statement is the only `performance_schema` read such a
+        // session sends. Its shape only, never the poll texts' (security
+        // review of #205, M1); the identity conditions still apply.
+        if a.own_session
+            && a.digest
+            && a.source == EventSource::PerformanceSchema
+            && a.tables.is_empty()
+            && text_shape(text).is_some_and(|s| OWN_PIN_SHAPES.contains(&s))
+        {
+            return true;
         }
         OWN_PS_READS.iter().any(|(t, tables)| {
             text == t.as_slice()
@@ -1230,6 +1512,46 @@ impl EventBuilder {
                 return None;
             }
         }
+        // The literal probe shape (ADR-0047 decision 5: `EXPLAIN SELECT 1
+        // FROM t`, the agent's readability probes among them), from any
+        // account, on every source: it shows no column value. Every
+        // statement of the text (and of its digest) has the shape, the text
+        // was read whole, and its table records (if any) read only the
+        // table it names; otherwise the usual path decides.
+        if parsed
+            && !unparsed
+            && !cut_blind
+            && parts.iter().all(|p| p.explain_probe)
+            && analysis
+                .iter()
+                .chain(&alt_analysis)
+                .all(|x| x.statements() == x.parts().len())
+            && a.tables.iter().all(|(db, table, op)| {
+                *op == TableOp::Read
+                    && parts.iter().all(|p| {
+                        p.relations.iter().all(|r| {
+                            r.name.eq_ignore_ascii_case(table)
+                                && r.schema
+                                    .as_deref()
+                                    .unwrap_or(a.database)
+                                    .eq_ignore_ascii_case(db)
+                        })
+                    })
+            })
+        {
+            return None;
+        }
+        // An explain of a statement (ADR-0047 decisions 1 to 3, 6): a read
+        // of the relations the explained statement names, always reported
+        // with no row count (a plan's `ROWS_SENT` counts plan rows, and the
+        // const reads that matter examine none), never the agent's own (it
+        // sends no explain but the probe shape). The probe shape that the
+        // rule above did not leave out (in a longer text, or with table
+        // records of another table) is one too. So is a text that cannot
+        // be read but starts with an explain word, when its table records
+        // decide (fail closed: they name what it read, not that it ran).
+        let explain = parts.iter().any(|p| p.explain_statement)
+            || (unparsed && !parsed && a.text.is_some_and(explain_lead));
         let table_action = if a.tables.iter().any(|t| t.2 == TableOp::Read) {
             Some(EventAction::Read)
         } else if a.tables.iter().any(|t| t.2 == TableOp::Write) {
@@ -1280,6 +1602,7 @@ impl EventBuilder {
                 || p.unknown_call
                 || p.explain_unbounded
                 || p.relations_full
+                || p.explain_schema
                 || shows_session_text(p)
         }) || analysis
             .iter()
@@ -1351,19 +1674,38 @@ impl EventBuilder {
         // or recognized reads).
         let loud_other = parts
             .iter()
-            .any(|p| p.kind == StatementKind::Other && !is_quiet(p));
+            .any(|p| p.kind == StatementKind::Other && !is_quiet(p) && !p.explain_statement);
         // `ANALYZE` / `EXPLAIN ANALYZE` run their statement; the agent
         // never sends them.
         let analyze_wrapped = parts.iter().any(|p| p.analyze_wrapped);
         // `SHOW [FULL] PROCESSLIST`: a read of
         // `information_schema.PROCESSLIST` (ADR-0045 decision 2).
         let processlist = parts.iter().any(is_show_processlist);
+        // A read whose values go into session variables rather than to the
+        // client (#195 review M2): `SELECT … INTO @v` (or `INTO` local
+        // variables), an `@v := …` assignment in any expression, and a
+        // `SET` or `DO` that reads tables through a subquery (`SET @v =
+        // (SELECT … FROM t WHERE …)`). The file sources have no row
+        // count and `performance_schema` counts at most the one row of an
+        // `INTO` (`ROWS_SENT` 1 on MySQL 8.4.11 and MariaDB 11.4.13, 0 for
+        // a `SET` or `DO`), so a `min_rows` setting would drop a key walk:
+        // always reported, with no row count on a read that sent none, and
+        // never the agent's own (it sends none of them).
+        let stored = parts.iter().any(|p| {
+            p.into_var
+                || p.var_assign
+                || (p.kind == StatementKind::Other
+                    && matches!(p.lead.first().map(String::as_str), Some("set" | "do"))
+                    && (p.subquery || !p.relations.is_empty()))
+        });
         let changes = is_change_kind(kind)
+            || stored
             || parts.iter().any(|p| is_change_kind(p.kind))
             || call
             || dquoted
             || loud_other
             || analyze_wrapped
+            || explain
             || blind
             || cut_blind
             || a.tables
@@ -1380,7 +1722,7 @@ impl EventBuilder {
             | StatementKind::Merge => EventAction::Write,
             StatementKind::Ddl => EventAction::Ddl,
             StatementKind::Dcl => EventAction::Dcl,
-            _ if call || processlist => EventAction::Read,
+            _ if call || processlist || explain => EventAction::Read,
             _ => match (table_action, unparsed) {
                 (Some(t), _) => t,
                 // A text that cannot be read: reported against `*`.
@@ -1403,13 +1745,15 @@ impl EventBuilder {
                 // A write names its system tables (`UPDATE
                 // performance_schema.setup_consumers …` turns the
                 // `performance_schema` source off): only reads skip them.
-                let keep_system = write || is_write_kind(p.kind);
+                // So does the probe shape with its schema name in another
+                // case (re-review of #195, L2).
+                let keep_system = write || is_write_kind(p.kind) || p.explain_probe_case;
                 for r in &p.relations {
                     named_any = true;
                     let db = r.schema.as_deref().unwrap_or(a.database);
                     // A statement-text table keeps its name, as listed
                     // (ADR-0045 decision 1).
-                    let text_table = statement_text_table(self.flavor, db, &r.name);
+                    let text_table = listed_table(self.flavor, db, &r.name);
                     if is_dual(r)
                         || (!keep_system
                             && text_table.is_none()
@@ -1437,17 +1781,113 @@ impl EventBuilder {
                 unknown = true;
             }
         } else {
+            // Whether a `READ` record of `mysql.column_stats` may be a read
+            // of the statistics rather than the server's own load of them
+            // (security review of #199, H2): the text cannot be read whole
+            // or runs code out of sight (a procedure, a prepared
+            // statement, a stored function, a version comment, a cut
+            // text), it is a `HANDLER` read (whose text names an alias),
+            // or the record does not come with the `table_stats` record
+            // every statistics load writes (a view over the table). Such a
+            // record names `mysql.column_stats`, always reported and never
+            // the agent's own.
+            let loads_table_stats = a.tables.iter().any(|(db, table, op)| {
+                *op == TableOp::Read
+                    && db.eq_ignore_ascii_case("mysql")
+                    && table.eq_ignore_ascii_case("table_stats")
+            });
+            let reads_column_stats = a.tables.iter().any(|(db, table, op)| {
+                *op == TableOp::Read && statistics_table(db, table).is_some()
+            });
+            // The relations the text names outside the server's own
+            // schemas that have no table record of their own: a view
+            // (`server_audit` writes no record for it, only for the tables
+            // it reads) or anything the source did not record. Next to a
+            // `column_stats` read record, one of them may be a view over
+            // the statistics, whatever other records come with it (a view
+            // reading `table_stats` too, a `table_stats` subquery, a
+            // statistics load of a joined table): the record is kept, and
+            // the relation named too (security re-review of #199, N-H1).
+            //
+            // A relation is recorded only by a record of exactly its name:
+            // `server_audit` logs names as stored, and with
+            // `lower_case_table_names = 0` (the Linux default) `hr.V_stats`
+            // and `hr.v_stats` are two relations. With
+            // `lower_case_table_names = 1` a text naming a table in
+            // another case than stored over-reports (security review of
+            // #199, R3-M1). A text that creates or drops a temporary table
+            // records nothing for sure: a temporary table may hide a
+            // permanent one of the same name, before and after it (R3-L2),
+            // so every relation of the text counts as unrecorded.
+            let temporary = parts.iter().any(|p| {
+                matches!(p.lead.first().map(String::as_str), Some("create" | "drop"))
+                    && p.lead.iter().take(4).any(|w| w == "temporary")
+            });
+            let mut unrecorded: Vec<(String, String)> = Vec::new();
+            if reads_column_stats {
+                for p in parts {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        if is_dual(r) || is_system_relation(r, a.database) {
+                            continue;
+                        }
+                        // The analyzer folds unquoted names to lower case:
+                        // a name written in another case anywhere in the
+                        // text (`hr.V_stats`, `HR.v_stats`) may be another
+                        // relation than the record's.
+                        let variant = |n: &str| {
+                            [a.text, a.alt_text]
+                                .into_iter()
+                                .flatten()
+                                .any(|t| case_variant_in(t, n))
+                        };
+                        let recorded = !temporary
+                            && !variant(&r.name)
+                            && r.schema.as_deref().is_none_or(|s| !variant(s))
+                            && a.tables
+                                .iter()
+                                .any(|(d, t, _)| *d == db && *t == r.name.as_str());
+                        let o = (db.to_owned(), r.name.clone());
+                        if !recorded && !unrecorded.contains(&o) {
+                            unrecorded.push(o);
+                        }
+                    }
+                }
+            }
+            let stats_record_kept = unparsed
+                || call
+                || dquoted
+                || cut_blind
+                || !loads_table_stats
+                || !unrecorded.is_empty()
+                || parts.iter().any(|p| p.kind == StatementKind::Handler);
             for (db, table, op) in &a.tables {
+                if *op == TableOp::Read
+                    && stats_record_kept
+                    && let Some((d, t)) = statistics_table(db, table)
+                {
+                    let o = (d.to_owned(), t.to_owned());
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                    continue;
+                }
                 // System tables are skipped from reads only: a write
                 // statement names every table it touched, and a table
                 // record that writes or changes a system schema table
                 // names it whatever the statement's action (a `CALL`).
+                // A read record of an internal statistics table is
+                // dropped whatever the statement's action: MariaDB writes
+                // `READ,mysql,column_stats` (and `table_stats`,
+                // `index_stats`) under the reader's account whenever it
+                // loads a table's statistics (ADR-0048 decision 2). A
+                // statistics table the text names is added below.
                 let text_table = statement_text_table(self.flavor, db, table);
                 let system = (is_system_schema(db)
                     && !write
                     && *op == TableOp::Read
                     && text_table.is_none())
-                    || (is_internal_table(db, table) && !write)
+                    || (is_internal_table(db, table) && (!write || *op == TableOp::Read))
                     || (!rw && db.eq_ignore_ascii_case("mysql"));
                 let o = text_table.map_or_else(
                     || ((*db).to_owned(), (*table).to_owned()),
@@ -1457,29 +1897,178 @@ impl EventBuilder {
                     objects.push(o);
                 }
             }
+            for o in unrecorded {
+                if !objects.contains(&o) {
+                    objects.push(o);
+                }
+            }
+            // An explain's records may not name every relation the
+            // explained statement names (`audit_log_filter` writes none for
+            // a `performance_schema` table; an explained write has no
+            // write record): its text names them too (ADR-0047 decision
+            // 2), filtered like a read's.
+            if explain && rw {
+                for p in parts.iter().filter(|p| p.explain_statement) {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        let text_table = listed_table(self.flavor, db, &r.name);
+                        if is_dual(r)
+                            || (!write
+                                && !p.explain_probe_case
+                                && text_table.is_none()
+                                && is_system_relation(r, a.database))
+                        {
+                            continue;
+                        }
+                        let o = text_table.map_or_else(
+                            || (db.to_owned(), r.name.clone()),
+                            |(d, t)| (d.to_owned(), t.to_owned()),
+                        );
+                        if !objects.contains(&o) {
+                            objects.push(o);
+                        }
+                    }
+                }
+            }
+            // A statistics table the text names (ADR-0048 decision 2):
+            // its table records are not enough (the server's own loads
+            // write them, above), and `audit_log_filter` writes no
+            // `table_access` record for `information_schema` nor
+            // `performance_schema`, so a statement-text table the text
+            // names is added too (security review of #199, M3).
+            if rw {
+                for p in parts {
+                    for r in &p.relations {
+                        let db = r.schema.as_deref().unwrap_or(a.database);
+                        if let Some((d, t)) = listed_table(self.flavor, db, &r.name) {
+                            let o = (d.to_owned(), t.to_owned());
+                            if !objects.contains(&o) {
+                                objects.push(o);
+                            }
+                        }
+                    }
+                }
+            }
             // The table records do not name the server file `LOAD_FILE`
-            // read, nor what a cut text hid past the cut.
-            unknown = (hidden || cut_blind) && rw;
+            // read, nor what a cut text hid past the cut, nor what code
+            // out of sight read on a source that writes no record for it
+            // (`audit_log_filter` and `information_schema`; security
+            // review of #199, H2).
+            unknown = (hidden || cut_blind || call) && rw;
         }
+        // `CREATE TABLE … AS <query>`, `CREATE | ALTER VIEW … AS <query>`
+        // (#186 review L4): one DDL event naming the created table or view
+        // and the source relations of its query, as a write event of
+        // `INSERT … SELECT` names its target and its sources. These
+        // statements hold no program body, so their names are taken from
+        // the text (a refinement of ADR-0023 decision 7), with the table
+        // records' when the source has them. Sources are filtered as a
+        // read's: system tables are dropped but the statement-text tables
+        // (ADR-0045), named as listed. Code that runs out of sight, a cut
+        // text or a statement at the relation bound adds `*`.
+        let create = action == EventAction::Ddl && parts.iter().any(|p| p.create_query);
+        if create {
+            for p in parts.iter().filter(|p| p.create_query) {
+                if let Some(t) = &p.create_target {
+                    let o = (
+                        t.schema.as_deref().unwrap_or(a.database).to_owned(),
+                        t.name.clone(),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+                for r in &p.relations {
+                    let db = r.schema.as_deref().unwrap_or(a.database);
+                    let text_table = listed_table(self.flavor, db, &r.name);
+                    if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
+                        continue;
+                    }
+                    let o = text_table.map_or_else(
+                        || (db.to_owned(), r.name.clone()),
+                        |(d, t)| (d.to_owned(), t.to_owned()),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
+            unknown = unknown
+                || call
+                || cut_blind
+                || parts
+                    .iter()
+                    .any(|p| p.create_query && (p.relations_full || p.create_target.is_none()));
+        }
+        // A text whose readings differ, one of them a `CREATE … AS
+        // <query>` (`CREATE /*!99999 TEMPORARY*/ TABLE t AS SELECT …`): what
+        // it reads cannot be told, so it adds `*` (security review of #196,
+        // L2).
+        let create_unread = action == EventAction::Ddl
+            && analysis
+                .iter()
+                .chain(&alt_analysis)
+                .any(QueryAnalysis::create_unread);
+        if create_unread {
+            unknown = true;
+            // The relations every reading names (never their union: a name
+            // in one reading may be a literal in another, I2), filtered as
+            // a read's sources.
+            for x in analysis.iter().chain(&alt_analysis) {
+                for r in x.create_unread_relations() {
+                    let db = r.schema.as_deref().unwrap_or(a.database);
+                    let text_table = listed_table(self.flavor, db, &r.name);
+                    if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
+                        continue;
+                    }
+                    let o = text_table.map_or_else(
+                        || (db.to_owned(), r.name.clone()),
+                        |(d, t)| (d.to_owned(), t.to_owned()),
+                    );
+                    if !objects.contains(&o) {
+                        objects.push(o);
+                    }
+                }
+            }
+        }
+        // A failed statement that is still reported (not refused before
+        // reading anything, above) and sent no row: its error or warning
+        // text can carry the values it read (`EXTRACTVALUE(1, CONCAT(0x7e,
+        // (SELECT email …)))`, error 1105; a JSON error, 3141), which a row
+        // count of 0 would let `min_rows` drop (security review of #196,
+        // L3). Reads, and writes holding a subquery (a duplicate key on a
+        // plain `INSERT` stays under the filter).
+        let failed_unsent = a.status != 0
+            && a.rows.unwrap_or(0) == 0
+            && (action == EventAction::Read
+                || (action == EventAction::Write && parts.iter().any(|p| p.subquery)));
+        // Such a failure is never the agent's own either (security
+        // re-review of #196, M2): with 0 rows it would be charged nothing
+        // and left out indefinitely. The agent's own statements fail only
+        // in ways that carry no value: its statement timeout
+        // (`max_execution_time`, 3024; MariaDB `max_statement_time`,
+        // 1969), its server-side cancel (`KILL QUERY`, 1317) and its lock
+        // wait timeouts (`lock_wait_timeout` / `innodb_lock_wait_timeout`,
+        // 1205), all set by `sql::session_setup`.
+        let failed_leak = failed_unsent && !matches!(a.status, 3024 | 1969 | 1317 | 1205);
         if processlist && rw {
             let o = ("information_schema".to_owned(), "PROCESSLIST".to_owned());
             if !objects.contains(&o) {
                 objects.push(o);
             }
         }
-        // Reads of statement-text tables (ADR-0045 decisions 1 to 4):
-        // named first (an event names 16 objects at most), always
-        // reported, and never the agent's own (its exact texts are left
-        // out above).
+        // Reads of statement-text tables (ADR-0045 decisions 1 to 4) and
+        // of statistics tables (ADR-0048 decisions 1 to 4): named first
+        // (an event names 16 objects at most), always reported, and never
+        // the agent's own (its exact texts are left out above; it names
+        // no statistics table).
         let text_tables = objects.iter().any(|(db, t)| {
-            statement_text_table(self.flavor, db, t).is_some()
-                || unresolved_text_table(self.flavor, db, t)
+            listed_table(self.flavor, db, t).is_some() || unresolved_text_table(self.flavor, db, t)
         });
         if text_tables {
             let flavor = self.flavor;
             objects.sort_by_key(|(db, t)| {
-                statement_text_table(flavor, db, t).is_none()
-                    && !unresolved_text_table(flavor, db, t)
+                listed_table(flavor, db, t).is_none() && !unresolved_text_table(flavor, db, t)
             });
         }
         if rw && objects.is_empty() && !unknown && !dquoted {
@@ -1488,7 +2077,28 @@ impl EventBuilder {
             return None;
         }
         let ts = a.ts.min(now);
-        let mut e = MaskedEvent::new(a.source, action, a.principal.clone(), ts).with_rows(a.rows);
+        // An explain's row count is the plan's, not the data's; so is
+        // that of `EXPLAIN ANALYZE` / MariaDB `ANALYZE`, which shows the
+        // same const values (security review of #195, M2).
+        // Writes run by `EXPLAIN ANALYZE` / `ANALYZE` keep their affected
+        // rows (security review of #195, L3).
+        // A read stored into variables that sent no row (above) has no
+        // count; one that sent rows (a `SELECT *, @x := 1` dump, a text
+        // with a `SET` after its read) keeps them, and `volume.*` with
+        // them (security review of #196, H1).
+        let stored_unsent = stored && a.rows.unwrap_or(0) == 0;
+        // An explain known only from the lead word of a text that cannot
+        // be read (`/*!99999 EXPLAIN */ SELECT …`, which a server may run
+        // as a `SELECT`) keeps its rows (security re-review of #196, M1).
+        let parsed_explain = parts.iter().any(|p| p.explain_statement);
+        let rows = if parsed_explain
+            || ((analyze_wrapped || stored_unsent) && action == EventAction::Read)
+        {
+            None
+        } else {
+            a.rows
+        };
+        let mut e = MaskedEvent::new(a.source, action, a.principal.clone(), ts).with_rows(rows);
         // An event names 16 objects at most: `*` keeps its place.
         let star = unknown || (dquoted && rw);
         for (db, name) in objects.iter().take(if star { 15 } else { 16 }) {
@@ -1528,7 +2138,19 @@ impl EventBuilder {
         // Also reads of `*`: code that runs out of sight or a text that
         // cannot be read never matches `sensitive_objects` and has no
         // useful row count, so `min_rows` would drop it.
-        if touches_system || configuration || call || blind || cut_blind || text_tables {
+        if touches_system
+            || configuration
+            || call
+            || blind
+            || cut_blind
+            || text_tables
+            || explain
+            || analyze_wrapped
+            || stored
+            || create
+            || create_unread
+            || failed_unsent
+        {
             e = e.with_always_report();
         }
         // Read signals per read statement, whatever the event's action (a
@@ -1565,11 +2187,12 @@ impl EventBuilder {
                 }
             }
         }
-        if a.rows.is_some_and(|r| r > LARGE_ROWS) {
+        if rows.is_some_and(|r| r > LARGE_ROWS) {
             e = e.with_signal(Signal::LargeResult);
         }
         if !changes
             && !text_tables
+            && !failed_leak
             && self
                 .own
                 .routine(a.user, a.application, a.client, &e, Instant::now())
@@ -1839,6 +2462,7 @@ impl EventBuilder {
             status: query.map_or(0, |q| q.status),
             ts: first.ts.unwrap_or(now),
             source,
+            own_session: false,
         };
         if let Some(e) = self.statement(access, now) {
             out.push(e);
@@ -1987,6 +2611,7 @@ mod tests {
             status: 0,
             ts: SystemTime::now(),
             source: EventSource::PerformanceSchema,
+            own_session: false,
         }
     }
 
@@ -2704,6 +3329,7 @@ mod tests {
                 status: 0,
                 ts: future,
                 source: EventSource::PerformanceSchema,
+                own_session: false,
             },
             SystemTime::now(),
         );
@@ -2723,7 +3349,16 @@ mod tests {
                 r"20260929 09:41:34,h,app,10.0.0.5,37,2,QUERY,support,'create table t2 as select * from tickets',0",
             ]),
         );
-        assert_eq!(out, ["ddl [] None []", "ddl [] None []"], "{out:#?}");
+        // `CREATE TABLE … AS SELECT` names its table and its sources
+        // (#186 review L4): no program body there.
+        assert_eq!(
+            out,
+            [
+                "ddl [] None []",
+                "ddl [\"support.t2\", \"support.tickets\"] None []"
+            ],
+            "{out:#?}"
+        );
     }
 
     #[test]
@@ -2808,10 +3443,160 @@ mod tests {
                 status: 1142,
                 ts: SystemTime::now(),
                 source: EventSource::PerformanceSchema,
+                own_session: false,
             },
             SystemTime::now(),
         );
         assert_eq!(ev.unwrap().rows(), Some(99));
+    }
+
+    /// Security review of #196, L3: a reported failed read that sent no
+    /// row may carry values in its error or warning text: always reported.
+    #[test]
+    fn failed_reads_that_sent_no_row_are_always_reported() {
+        // With the agent's identity (security re-review of #196, M2): a
+        // failure that can show a value is never its own; its timeouts,
+        // cancels and lock waits are, as before.
+        for (text, status, left_out) in [
+            (
+                "SELECT EXTRACTVALUE(1, CONCAT(0x7e, email)) FROM hr.customers WHERE id = 1",
+                1105,
+                false,
+            ),
+            (
+                "SELECT JSON_EXTRACT(email, '$') FROM hr.customers WHERE id = 1",
+                3141,
+                false,
+            ),
+            ("SELECT email FROM hr.customers LIMIT 10", 3024, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1969, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1317, true),
+            ("SELECT email FROM hr.customers LIMIT 10", 1205, true),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+            access.status = status;
+            access.rows = Some(0);
+            let ev = b.statement(access, SystemTime::now());
+            assert_eq!(ev.is_none(), left_out, "{status}: {text}");
+            if let Some(e) = ev {
+                assert!(e.always_report(), "{status}");
+            }
+        }
+        let run = |text: &str, status: u32, rows: Option<u64>| {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            access.status = status;
+            access.rows = rows;
+            b.statement(access, SystemTime::now())
+        };
+        for (text, status) in [
+            (
+                "SELECT EXTRACTVALUE(1, CONCAT(0x7e, (SELECT email FROM hr.customers WHERE id = 1)))",
+                1105,
+            ),
+            (
+                "SELECT JSON_EXTRACT((SELECT email FROM hr.customers WHERE id = 1), '$')",
+                3141,
+            ),
+            ("SELECT email FROM hr.customers WHERE id > 0", 3024),
+            (
+                "INSERT INTO hr.t SELECT EXTRACTVALUE(1, CONCAT(0x7e, (SELECT email FROM hr.customers WHERE id = 1)))",
+                1105,
+            ),
+        ] {
+            for rows in [Some(0), None] {
+                let e = run(text, status, rows).expect(text);
+                assert!(e.always_report(), "{rows:?}: {text}");
+                assert!(
+                    e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "customers"),
+                    "{text}"
+                );
+            }
+        }
+        // Rows sent before the error, a success, or a plain write that
+        // failed (duplicate key): the filter applies as before.
+        for (text, status, rows) in [
+            ("SELECT email FROM hr.customers WHERE id > 0", 3024, Some(5)),
+            ("SELECT email FROM hr.customers WHERE id = 1", 0, Some(0)),
+            ("INSERT INTO hr.customers VALUES (1, 'x')", 1062, Some(0)),
+        ] {
+            let e = run(text, status, rows).expect(text);
+            assert!(!e.always_report(), "{text}");
+        }
+        // Refused before reading anything: no event, as before.
+        assert!(run("SELECT email FROM hr.customers", 1142, Some(0)).is_none());
+    }
+
+    /// A 0-row read of the agent's identity is charged one row (security
+    /// review of #196, Low): a value walk through warnings (1292 on a
+    /// successful 0-row read, or before an exempt 3024 / 1969 / 1317 /
+    /// 1205 failure) is left out for at most the per-object budget of
+    /// statements, then reported.
+    #[test]
+    fn own_zero_row_reads_are_charged_one_row_each() {
+        for status in [0, 3024, 1969, 1317, 1205] {
+            let usage = SharedOwnUsage::default();
+            let mut b = EventBuilder::new(OwnAccount::new(
+                "databastion",
+                Some("databastion-agent"),
+                ClientAddr::parse("172.18.0.1"),
+                3,
+                usage.clone(),
+            ));
+            let texts: Vec<String> = (1..=5)
+                .map(|n| format!("SELECT 1 FROM hr.customers WHERE id = {n} AND email = 0"))
+                .collect();
+            let reported: Vec<bool> = texts
+                .iter()
+                .map(|t| {
+                    let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+                    access.status = status;
+                    access.rows = Some(0);
+                    b.statement(access, SystemTime::now()).is_some()
+                })
+                .collect();
+            assert_eq!(reported, [false, false, false, true, true], "{status}");
+            // The other tables keep their own budget.
+            let mut access = pfs_access(b"SELECT 1 FROM hr.orders WHERE id = 1", false, Vec::new());
+            access.status = status;
+            access.rows = Some(0);
+            assert!(b.statement(access, SystemTime::now()).is_none(), "{status}");
+            assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 2);
+        }
+    }
+
+    /// Names that differ only in case share one budget (security review
+    /// of #197, M2): with `lower_case_table_names` 1 or 2 they are the
+    /// same table.
+    #[test]
+    fn own_budget_ignores_the_case_of_names() {
+        let usage = SharedOwnUsage::default();
+        let mut b = EventBuilder::new(OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("172.18.0.1"),
+            2,
+            usage.clone(),
+        ));
+        let reported: Vec<bool> = [
+            "SELECT 1 FROM hr.customers WHERE id = 1",
+            "SELECT 1 FROM `HR`.`Customers` WHERE id = 2",
+            "SELECT 1 FROM Hr.CUSTOMERS WHERE id = 3",
+        ]
+        .iter()
+        .map(|t| {
+            let mut access = pfs_access(t.as_bytes(), false, Vec::new());
+            access.rows = Some(0);
+            b.statement(access, SystemTime::now()).is_some()
+        })
+        .collect();
+        assert_eq!(reported, [false, false, true]);
+        assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
     }
 
     #[test]
@@ -2858,6 +3643,7 @@ mod tests {
             status: 0,
             ts: SystemTime::now(),
             source,
+            own_session: false,
         };
         let ps = b
             .statement(access(EventSource::PerformanceSchema), SystemTime::now())
@@ -3144,7 +3930,12 @@ mod tests {
             ],
             t1,
         );
-        assert_eq!(out, ["read [\"shop.salaries\"] None []"], "{out:#?}");
+        // A `CALL` adds `*` (security review of #199, H2).
+        assert_eq!(
+            out,
+            ["read [\"shop.*\", \"shop.salaries\"] None []"],
+            "{out:#?}"
+        );
         // A continuation that times out too is reported, and remembered
         // with every table so far.
         assert!(at(&mut b, &[rd(2, 41, "a")], t1).is_empty());
@@ -3460,9 +4251,10 @@ mod tests {
                 1024,
             ),
         );
+        // A `CALL` adds `*` (security review of #199, H2).
         assert_eq!(
             out,
-            ["read [\"performance_schema.setup_consumers\"] None []"]
+            ["read [\"performance_schema.setup_consumers\", \"shop.*\"] None []"]
         );
         // The agent's own MariaDB sample on performance_schema: a read of
         // the sampled table, within the row budget.
@@ -4318,9 +5110,13 @@ mod tests {
                 });
             }
         }
-        // Within the bound: quiet, as before.
+        // Within the bound: an explain of a statement is a read of what it
+        // names (ADR-0047); the table form and a table-less statement give
+        // no event.
+        expect_everywhere("EXPLAIN SELECT * FROM hr.customers", |_| {
+            "read [\"hr.customers\"] always".to_owned()
+        });
         for text in [
-            "EXPLAIN SELECT * FROM hr.customers",
             "DESCRIBE hr.customers",
             &format!("EXPLAIN {}SELECT 1", "FORMAT = TREE ".repeat(10)),
         ] {
@@ -4603,7 +5399,9 @@ mod tests {
             "SET @x = CONCAT('a', (SELECT GROUP_CONCAT(email) FROM hr.customers))",
             "SET STATEMENT max_statement_time = 1 FOR SET @x = (SELECT email FROM hr.customers LIMIT 1)",
         ] {
-            expect_everywhere(text, |_| "read [\"hr.customers\"]".to_owned());
+            // Their values stay in the session: always reported (#195
+            // review M2).
+            expect_everywhere(text, |_| "read [\"hr.customers\"] always".to_owned());
         }
         // A subquery inside a function call of a read names its table.
         for (source, ev) in on_every_source(
@@ -4616,15 +5414,11 @@ mod tests {
                 "{source:?}"
             );
         }
-        // Already a read (and the agent's own within its budget).
-        for (source, ev) in on_every_source("app", "SELECT email INTO @x FROM hr.customers LIMIT 1")
-        {
-            assert_eq!(
-                ev.as_ref().map(shown).as_deref(),
-                Some("read [\"hr.customers\"]"),
-                "{source:?}"
-            );
-        }
+        // Already a read; stored into a variable, so always reported and
+        // never the agent's own (#195 review M2).
+        expect_everywhere("SELECT email INTO @x FROM hr.customers LIMIT 1", |_| {
+            "read [\"hr.customers\"] always".to_owned()
+        });
         // A subquery without a user table: a read of `*` (fail closed);
         // of a statement-text table: a read of it, always (ADR-0045).
         for text in [
@@ -4634,7 +5428,7 @@ mod tests {
             for (source, ev) in on_every_source("app", text) {
                 assert_eq!(
                     ev.as_ref().map(shown).as_deref(),
-                    Some(format!("read [{:?}]", star(source)).as_str()),
+                    Some(format!("read [{:?}] always", star(source)).as_str()),
                     "{source:?}: {text}"
                 );
             }
@@ -4649,7 +5443,7 @@ mod tests {
             "SHOW CREATE TABLE hr.customers",
             "SHOW COLUMNS FROM hr.customers",
             "LOCK TABLES hr.customers READ",
-            "EXPLAIN SELECT * FROM hr.customers",
+            "DESCRIBE hr.customers",
             "FLUSH TABLES hr.customers",
         ] {
             for (source, ev) in on_every_source("app", text) {
@@ -4716,15 +5510,15 @@ mod tests {
             ),
             (
                 "ANALYZE DELETE FROM hr.customers",
-                "write [\"hr.customers\"]",
+                "write [\"hr.customers\"] always",
             ),
             (
                 "ANALYZE SELECT * FROM hr.customers",
-                "read [\"hr.customers\"]",
+                "read [\"hr.customers\"] always",
             ),
             (
                 "DESCRIBE ANALYZE SELECT * FROM hr.customers",
-                "read [\"hr.customers\"]",
+                "read [\"hr.customers\"] always",
             ),
             (
                 "EXPLAIN ANALYZE UPDATE performance_schema.setup_consumers c, performance_schema.setup_instruments i SET c.ENABLED='NO'",
@@ -4784,8 +5578,8 @@ mod tests {
             "RELEASE SAVEPOINT s",
             "SHOW TABLES",
             "SHOW GRANTS FOR CURRENT_USER()",
-            "EXPLAIN SELECT * FROM hr.customers",
             "DESCRIBE hr.customers",
+            "EXPLAIN SELECT 1 FROM performance_schema.threads",
             "LOCK TABLES hr.customers READ",
             "UNLOCK TABLES",
             "FLUSH PRIVILEGES",
@@ -4839,7 +5633,7 @@ mod tests {
         }
         expect_everywhere(
             "EXPLAIN FORMAT=JSON INTO @select ANALYZE DELETE FROM hr.t",
-            |_| "write [\"hr.t\"]".to_owned(),
+            |_| "write [\"hr.t\"] always".to_owned(),
         );
         for (source, ev) in on_every_source(
             "databastion",
@@ -4874,6 +5668,1062 @@ mod tests {
         expect_everywhere("SET @x = audit_log_rotate()", |_| {
             "ddl [] always".to_owned()
         });
+    }
+
+    /// A `performance_schema` record of `text` (a digest when `digest`),
+    /// by `user` or with no account (`None`: the session had ended), with
+    /// `rows` plan rows.
+    fn pfs_record(
+        b: &mut EventBuilder,
+        user: Option<&str>,
+        text: &str,
+        digest: bool,
+        rows: u64,
+    ) -> Option<MaskedEvent> {
+        let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+        match user {
+            Some(u) => {
+                access.user = u;
+                access.principal = EventPrincipal::account(u);
+            }
+            None => {
+                access.user = "";
+                access.principal = EventPrincipal::unidentified();
+                access.application = None;
+            }
+        }
+        access.digest = digest;
+        access.rows = Some(rows);
+        b.statement(access, SystemTime::now())
+    }
+
+    /// The Percona `audit_log_filter` JSON records of a statement: its
+    /// `table_access` read records, then its `general` record.
+    fn filter_json(
+        user: &str,
+        ip: &str,
+        c: u64,
+        tables: &[(&str, &str)],
+        text: &str,
+    ) -> Vec<FileRecord> {
+        let q = serde_json::to_string(text).unwrap();
+        let mut v: Vec<FileRecord> = tables
+            .iter()
+            .map(|(db, t)| {
+                let rec = format!(
+                    r#"{{"timestamp":"2026-09-29 10:06:12","class":"table_access","event":"read","connection_id":{c},"login":{{"user":"{user}","ip":"{ip}"}},"table_access_data":{{"db":"{db}","table":"{t}","query":{q}}}}}"#
+                );
+                parse_json(rec.as_bytes()).unwrap()
+            })
+            .collect();
+        v.push(json_query(user, ip, c, text));
+        v
+    }
+
+    /// ADR-0047 decisions 1 to 3 and 6: an explain of a statement, in
+    /// every form, is a read of the relations the explained statement
+    /// names, always reported, with no row count and no signal of the
+    /// explained statement, never the agent's own, on every source.
+    #[test]
+    fn explains_of_a_statement_are_always_reported_reads() {
+        let cust = "read [\"hr.customers\"] always";
+        for lead in ["EXPLAIN", "DESCRIBE", "DESC", "explain"] {
+            for opt in [
+                "",
+                "EXTENDED ",
+                "PARTITIONS ",
+                "FORMAT=TRADITIONAL ",
+                "FORMAT = JSON ",
+                "FORMAT=TREE ",
+                "FORMAT=JSON INTO @x ",
+            ] {
+                for stmt in [
+                    "SELECT * FROM hr.customers WHERE id = 42",
+                    "SELECT email FROM hr.customers WHERE email = 'bob@example.org'",
+                    "SELECT * FROM hr.customers",
+                    "TABLE hr.customers",
+                    "WITH c AS (SELECT * FROM hr.customers WHERE id = 42) SELECT * FROM c",
+                    "SELECT * FROM (SELECT * FROM hr.customers WHERE id = 42) d",
+                    "UPDATE hr.customers SET name = 'x' WHERE id = 42",
+                    "DELETE FROM hr.customers WHERE id = 42",
+                ] {
+                    let text = format!("{lead} {opt}{stmt}");
+                    expect_everywhere(&text, |_| cust.to_owned());
+                }
+            }
+        }
+        // `EXPLAIN (` reads as a call of a name that is not built in
+        // (ADR-0045 part (b), unchanged): `*` is added.
+        expect_everywhere(
+            "EXPLAIN (SELECT * FROM hr.customers WHERE id = 42)",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
+        );
+        // Joins, subqueries and explained writes name every relation, the
+        // target included (decision 2, open question 4).
+        for (text, want) in [
+            (
+                "EXPLAIN SELECT o.note FROM hr.orders o JOIN hr.customers c ON c.id = o.cid WHERE o.oid = 1",
+                "read [\"hr.customers\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN SELECT * FROM hr.orders WHERE note = (SELECT iban FROM hr.customers WHERE id = 42)",
+                "read [\"hr.customers\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN UPDATE hr.orders o JOIN hr.customers c ON o.cid = c.id SET o.note = 'x' WHERE c.email = 'a@b'",
+                "read [\"hr.customers\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN INSERT INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                "read [\"hr.archive\", \"hr.orders\"] always",
+            ),
+            (
+                "DESCRIBE REPLACE INTO hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                "read [\"hr.archive\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN REPLACE hr.archive SELECT * FROM hr.orders WHERE oid = 1",
+                "read [\"hr.archive\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN SELECT * FROM mysql.user WHERE user = 'root'",
+                "read [\"mysql.user\"] always",
+            ),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR EXPLAIN SELECT * FROM hr.customers WHERE id = 1",
+                cust,
+            ),
+        ] {
+            expect_everywhere(text, |_| want.to_owned());
+        }
+        // A statement-text table keeps its name; other system tables and
+        // `DUAL` are dropped, and an explain left with no object gives no
+        // event.
+        expect_everywhere(
+            "EXPLAIN SELECT * FROM hr.customers c JOIN information_schema.TABLES t ON t.TABLE_NAME = c.name JOIN performance_schema.events_statements_history_long h ON h.THREAD_ID = c.id",
+            |_| {
+                "read [\"hr.customers\", \"performance_schema.events_statements_history_long\"] always"
+                    .to_owned()
+            },
+        );
+        for text in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN SELECT 1 FROM DUAL WHERE 1 = 1",
+            "EXPLAIN SELECT * FROM information_schema.TABLES WHERE TABLE_NAME = 'x'",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        // No row count and no signal of the explained statement: a plan of
+        // a whole-table read by a dump program, with 50 000 plan rows.
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(
+            b"EXPLAIN SELECT /*!40001 SQL_NO_CACHE */ * FROM hr.customers INTO OUTFILE '/tmp/x'",
+            false,
+            Vec::new(),
+        );
+        access.user = "app";
+        access.principal = EventPrincipal::account("app");
+        access.application = Some("mysqldump");
+        access.rows = Some(50_000);
+        let e = b.statement(access, SystemTime::now()).unwrap();
+        assert_eq!(show(&e), "read [\"hr.customers\"] None []");
+        assert!(e.always_report());
+        // The agent's identity, address and program: never its own, never
+        // charged (a hundred of them, far past nothing).
+        let usage = SharedOwnUsage::default();
+        for _ in 0..100 {
+            for (source, ev) in own_sources(
+                &usage,
+                "databastion",
+                "EXPLAIN SELECT * FROM hr.customers WHERE id = 42",
+                false,
+                &[],
+            ) {
+                assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust), "{source:?}");
+            }
+        }
+        // `performance_schema` digests (MariaDB digests `DESCRIBE SELECT`
+        // as `EXPLAIN SELECT`), with and without an account.
+        for digest in [
+            "EXPLAIN SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+            "EXPLAIN SELECT * FROM hr . customers WHERE id = ?",
+            "DESC SELECT * FROM hr . customers WHERE id = ?",
+            "EXPLAIN FORMAT = JSON SELECT * FROM hr . customers WHERE id = ?",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, digest, true, 1).expect(digest);
+                assert_eq!(shown(&e), cust, "{user:?}: {digest}");
+                assert_eq!(e.rows(), None);
+            }
+        }
+        for ev in on_pfs_digest(
+            "databastion",
+            "EXPLAIN SELECT * FROM hr.customers WHERE id = 42",
+            "EXPLAIN SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+        ) {
+            assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust));
+        }
+        // Table records: `server_audit` `TABLE` events and
+        // `audit_log_filter` `table_access` records give the objects, with
+        // the relations of the text (an explained write's target), always
+        // reported, never the agent's own.
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = file(
+                &mut b,
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "customers")],
+                        "EXPLAIN EXTENDED SELECT * FROM hr.customers WHERE id = 42",
+                    ),
+                    1024,
+                ),
+            );
+            assert_eq!(out, ["read [\"hr.customers\"] None []"], "{user}");
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "customers")],
+                        "EXPLAIN UPDATE hr.orders o, hr.customers c SET o.note = 'x' WHERE c.id = 42 AND o.cid = c.id",
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{user}");
+            assert_eq!(
+                shown(&ev[0]),
+                "read [\"hr.customers\", \"hr.orders\"] always",
+                "{user}"
+            );
+            let ip = if user == "databastion" {
+                "172.18.0.1"
+            } else {
+                "10.0.0.5"
+            };
+            for tables in [&[("hr", "customers")][..], &[]] {
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    filter_json(
+                        user,
+                        ip,
+                        7,
+                        tables,
+                        "DESCRIBE SELECT * FROM hr.customers WHERE id = 42",
+                    ),
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.iter().map(shown).collect::<Vec<_>>(),
+                    [cust],
+                    "{user} {tables:?}"
+                );
+            }
+        }
+        // Refused before reading anything (1142): no event.
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(
+            b"EXPLAIN SELECT * FROM hr.customers WHERE id = 42",
+            false,
+            Vec::new(),
+        );
+        access.user = "app";
+        access.principal = EventPrincipal::account("app");
+        access.status = 1142;
+        access.rows = Some(0);
+        assert!(b.statement(access, SystemTime::now()).is_none());
+        // `EXPLAIN ANALYZE` runs its statement and shows the same const
+        // values: always reported, with no row count (security review of
+        // #195, M2); the plan of another connection is a read of `*`.
+        expect_everywhere(
+            "EXPLAIN ANALYZE SELECT * FROM hr.customers WHERE id = 42",
+            |_| "read [\"hr.customers\"] always".to_owned(),
+        );
+        for user in [Some("app"), Some("databastion")] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(
+                &mut b,
+                user,
+                "EXPLAIN ANALYZE SELECT * FROM hr.customers WHERE id = 42",
+                false,
+                50_000,
+            )
+            .unwrap();
+            assert!(e.always_report() && e.rows().is_none(), "{user:?}");
+        }
+        // `EXPLAIN FOR SCHEMA name` (security review of #195, L2): the
+        // relations in `name`, and `*`.
+        expect_everywhere(
+            "EXPLAIN FOR SCHEMA hr SELECT * FROM customers WHERE id = 42",
+            |s| match star(s) {
+                "*.*" => "read [\"*.*\", \"hr.customers\"] always".to_owned(),
+                st => format!("read [\"hr.customers\", {st:?}] always"),
+            },
+        );
+        expect_everywhere("EXPLAIN FORMAT=JSON FOR CONNECTION 12", |s| {
+            format!("read [{:?}] always", star(s))
+        });
+    }
+
+    /// #195 review M2: a read whose values go into session variables
+    /// (`SELECT … INTO @v`, `@v := …`, `SET` / `DO` with a subquery) is
+    /// always reported, never the agent's own, on every source; with no row
+    /// count when it sent none (`ROWS_SENT` 0 for a `SET`; 1 for an `INTO`
+    /// on MySQL 8.4.11 and MariaDB 11.4.13, kept).
+    #[test]
+    fn reads_stored_into_variables_are_always_reported() {
+        let cust = "read [\"hr.customers\"] always";
+        for text in [
+            "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "SELECT email FROM hr.customers WHERE id = 42 INTO @v",
+            "SELECT email, name INTO @a, @b FROM hr.customers WHERE id = 42",
+            "select email from hr.customers where id = 42 for update into @a",
+            "SELECT email INTO @`v` FROM hr.customers WHERE id = 42",
+            "SELECT email INTO v_email FROM hr.customers WHERE id = 42",
+            "(SELECT email FROM hr.customers WHERE id = 42) INTO @v",
+            "SELECT email FROM hr.customers WHERE id = 42 UNION SELECT 'x' INTO @v",
+            "SET STATEMENT max_statement_time = 1 FOR SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "TABLE hr.customers LIMIT 1 INTO @a, @b, @c, @d",
+            "SELECT @v := email FROM hr.customers WHERE id = 42",
+            "SELECT 1 FROM hr.customers WHERE id = 42 AND (@v := email) IS NULL",
+            "SET @v = (SELECT email FROM hr.customers WHERE id = 42)",
+            "SET @v := (SELECT email FROM hr.customers WHERE id = 42)",
+            "SET @a = 1, @v = (SELECT email FROM hr.customers WHERE id = 42)",
+            "DO @v := (SELECT email FROM hr.customers WHERE id = 42)",
+            "DO (SELECT email FROM hr.customers WHERE id = 42)",
+        ] {
+            expect_everywhere(text, |_| cust.to_owned());
+            // `performance_schema`, with or without an account: no row
+            // count when none was sent, the count otherwise.
+            for user in [Some("app"), Some("databastion"), None] {
+                for (sent, rows) in [(0, None), (1, Some(1))] {
+                    let mut b = EventBuilder::new(own());
+                    let e = pfs_record(&mut b, user, text, false, sent).expect(text);
+                    assert_eq!(shown(&e), cust, "{user:?}: {text}");
+                    assert_eq!(e.rows(), rows, "{user:?}: {text}");
+                }
+            }
+        }
+        // Digests, alone (the session ended) or next to the text.
+        for digest in [
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+            "SELECT `email` FROM `hr` . `customers` WHERE `id` = ? INTO @v",
+            "SELECT `email` INTO ? FROM `hr` . `customers` WHERE `id` = ?",
+            "SET @v = ( SELECT `email` FROM `hr` . `customers` WHERE `id` = ? )",
+            "SELECT @v := `email` FROM `hr` . `customers` WHERE `id` = ?",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, digest, true, 0).expect(digest);
+                assert_eq!(shown(&e), cust, "{user:?}: {digest}");
+                assert_eq!(e.rows(), None);
+            }
+        }
+        for ev in on_pfs_digest(
+            "databastion",
+            "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+            "SELECT `email` INTO @v FROM `hr` . `customers` WHERE `id` = ?",
+        ) {
+            assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust));
+        }
+        // Table records (`server_audit` `TABLE`, `audit_log_filter`
+        // `table_access`).
+        for user in ["app", "databastion"] {
+            let text = "SELECT email INTO @v FROM hr.customers WHERE id = 42";
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(user, &[("READ", "hr", "customers")], text),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [cust], "{user}");
+            assert_eq!(ev[0].rows(), None);
+            let ip = if user == "databastion" {
+                "172.18.0.1"
+            } else {
+                "10.0.0.5"
+            };
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, ip, 7, &[("hr", "customers")], text),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [cust], "{user}");
+        }
+        // The agent's identity, address and program: never its own, never
+        // charged, a hundred times over.
+        let usage = SharedOwnUsage::default();
+        for _ in 0..100 {
+            for (source, ev) in own_sources(
+                &usage,
+                "databastion",
+                "SELECT email INTO @v FROM hr.customers WHERE id = 42",
+                false,
+                &[],
+            ) {
+                assert_eq!(ev.as_ref().map(shown).as_deref(), Some(cust), "{source:?}");
+            }
+        }
+        // A stored read that sent rows keeps them, and `volume.*` with
+        // them: an assignment or a trailing `SET` does not hide a dump
+        // (security review of #196, H1).
+        for text in [
+            "SELECT *, @x := 1 FROM hr.customers",
+            "SELECT * FROM hr.customers WHERE id > 0 AND (@x := 1)",
+            "SELECT * FROM hr.customers; SET @y = (SELECT 1)",
+            "SELECT * FROM hr.customers; SET @y = (SELECT email FROM hr.customers WHERE id = 1)",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, text, false, 500_000).expect(text);
+                assert_eq!(e.rows(), Some(500_000), "{user:?}: {text}");
+                assert!(
+                    e.signals().contains(&Signal::LargeResult) && e.always_report(),
+                    "{user:?}: {text}"
+                );
+                assert!(
+                    e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "customers"),
+                    "{user:?}: {text}"
+                );
+            }
+        }
+        // Unchanged: a read sent to the client keeps its rows and the
+        // filter; `INTO OUTFILE` keeps its signal; a statement with no
+        // table, or a session `SET` without one, gives no event; a write
+        // keeps its affected rows.
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "SELECT email FROM hr.customers WHERE id = 42",
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(!e.always_report() && e.rows() == Some(1));
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "SELECT * FROM hr.customers INTO OUTFILE '/tmp/x'",
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            show(&e),
+            "read [\"hr.customers\"] Some(0) [\"shape.full_table_read\", \"signature.into_outfile\"]"
+        );
+        for text in [
+            "SELECT 1 INTO @v",
+            "SELECT @v := 1",
+            "SET @v := 1",
+            "SET @v = NOW()",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            Some("app"),
+            "UPDATE hr.customers SET name = name WHERE id = 42 AND (@v := email) IS NOT NULL",
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(show(&e), "write [\"hr.customers\"] Some(0) []");
+        assert!(e.always_report());
+    }
+
+    /// #186 review L4: `CREATE TABLE … AS <query>` and `CREATE | ALTER
+    /// VIEW … AS <query>` are one DDL event naming the created table or
+    /// view and the sources of the query (as `INSERT … SELECT` names its
+    /// target and sources), always reported, never the agent's own, on
+    /// every source.
+    #[test]
+    fn creates_from_a_query_name_their_sources() {
+        let copy = "ddl [\"hr.copy\", \"hr.customers\"] always";
+        for text in [
+            "CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy SELECT email FROM hr.customers WHERE id = 42",
+            "CREATE TEMPORARY TABLE hr.copy AS SELECT * FROM hr.customers",
+            "CREATE TABLE IF NOT EXISTS hr.copy (a INT, KEY (a)) ENGINE=InnoDB IGNORE SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy REPLACE AS SELECT * FROM hr.customers",
+            "CREATE TABLE hr.copy AS (SELECT * FROM hr.customers)",
+            "CREATE TABLE hr.copy AS TABLE hr.customers",
+            "CREATE TABLE hr.copy AS WITH c AS (SELECT * FROM hr.customers) SELECT * FROM c",
+            "CREATE OR REPLACE TABLE hr.copy SELECT * FROM hr.customers",
+            "create or replace table hr.copy as select * from hr.customers",
+            "SET STATEMENT max_statement_time = 1 FOR CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+        ] {
+            expect_everywhere(text, |_| copy.to_owned());
+        }
+        let view = "ddl [\"hr.customers\", \"hr.v\"] always";
+        for text in [
+            "CREATE VIEW hr.v AS SELECT email FROM hr.customers",
+            "CREATE VIEW hr.v (e) AS SELECT email FROM hr.customers WHERE id > 0 WITH CHECK OPTION",
+            "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = 'app'@'%' SQL SECURITY DEFINER VIEW hr.v AS SELECT email FROM hr.customers",
+            "CREATE DEFINER = CURRENT_USER VIEW hr.v AS TABLE hr.customers",
+            "ALTER VIEW hr.v AS SELECT email FROM hr.customers",
+            "ALTER ALGORITHM = UNDEFINED SQL SECURITY INVOKER VIEW hr.v AS SELECT email FROM hr.customers",
+        ] {
+            expect_everywhere(text, |_| view.to_owned());
+        }
+        // The values form names the table only.
+        expect_everywhere("CREATE TABLE hr.copy AS VALUES ROW(1), ROW(2)", |_| {
+            "ddl [\"hr.copy\"] always".to_owned()
+        });
+        // Unqualified names are in the session's database (`shop` in the
+        // `server_audit` lines, none in the other test records).
+        expect_everywhere(
+            "CREATE TABLE copy AS SELECT * FROM customers",
+            |s| match s {
+                EventSource::MariadbServerAudit => {
+                    "ddl [\"shop.copy\", \"shop.customers\"] always".to_owned()
+                }
+                _ => "ddl [\"*.copy\", \"*.customers\"] always".to_owned(),
+            },
+        );
+        // Statement-text tables keep their listed name; the other
+        // system tables and `DUAL` are dropped.
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS SELECT h.sql_text FROM performance_schema.events_statements_history_long h JOIN information_schema.TABLES t JOIN hr.customers",
+            |_| {
+                "ddl [\"hr.copy\", \"hr.customers\", \"performance_schema.events_statements_history_long\"] always"
+                    .to_owned()
+            },
+        );
+        expect_everywhere("CREATE VIEW hr.v AS SELECT 1 FROM DUAL", |_| {
+            "ddl [\"hr.v\"] always".to_owned()
+        });
+        // Code that runs out of sight adds `*`.
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS SELECT hr.f(email) FROM hr.customers",
+            |s| match star(s) {
+                "*.*" => "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always".to_owned(),
+                st => format!("ddl [\"hr.copy\", \"hr.customers\", {st:?}] always"),
+            },
+        );
+        // A `WITH` named `system` is a query (security review of #196,
+        // L2).
+        expect_everywhere(
+            "CREATE TABLE hr.copy AS ( WITH system AS (SELECT email FROM hr.customers) SELECT * FROM system )",
+            |_| copy.to_owned(),
+        );
+        // Readings that differ, one a `CREATE … AS SELECT`: what every
+        // reading names, and `*` (security re-review of #196).
+        expect_everywhere(
+            "CREATE /*!99999 TEMPORARY*/ TABLE hr.copy AS SELECT * FROM hr.customers",
+            |s| match star(s) {
+                "*.*" => "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always".to_owned(),
+                st => format!("ddl [\"hr.copy\", \"hr.customers\", {st:?}] always"),
+            },
+        );
+        // Never a name that one reading takes from a literal (I2): with
+        // backslash escapes, `jane_doe` is inside the literal.
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(
+                user,
+                "CREATE TABLE hr.copy AS SELECT 'a\\' FROM jane_doe, hr.customers -- '",
+            ) {
+                let e = ev.expect("reported");
+                let got = shown(&e);
+                assert!(
+                    e.action() == EventAction::Ddl
+                        && e.always_report()
+                        && !got.contains("jane_doe")
+                        && !got.contains("customers")
+                        && got.contains("hr.copy")
+                        && got.contains('*'),
+                    "{user} {source:?}: {got}"
+                );
+            }
+        }
+        // Other DDL still takes no name from the text (ADR-0023 decision
+        // 7).
+        for text in [
+            "CREATE TABLE hr.copy LIKE hr.customers",
+            "CREATE TABLE hr.copy (a INT)",
+            "CREATE DEFINER = app PROCEDURE hr.p() SELECT email FROM hr.customers",
+            "CREATE EVENT hr.e ON SCHEDULE EVERY 1 DAY DO CREATE TABLE hr.copy AS SELECT * FROM hr.customers",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let e = ev.expect(text);
+                    assert!(
+                        e.action() == EventAction::Ddl && e.objects().is_empty(),
+                        "{user} {source:?}: {text}"
+                    );
+                }
+            }
+        }
+        // Digests, with or without an account.
+        for (digest, want) in [
+            (
+                "CREATE TABLE `hr` . `copy` AS SELECT * FROM `hr` . `customers` WHERE `id` = ?",
+                copy,
+            ),
+            (
+                "CREATE VIEW `hr` . `v` AS SELECT `email` FROM `hr` . `customers`",
+                view,
+            ),
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, digest, true, 3).expect(digest);
+                assert_eq!(shown(&e), want, "{user:?}: {digest}");
+            }
+        }
+        // A cut text adds `*`.
+        let mut b = EventBuilder::new(own());
+        let mut access = pfs_access(
+            b"CREATE TABLE hr.copy AS SELECT * FROM hr.customers WHERE id IN (1, 2",
+            true,
+            Vec::new(),
+        );
+        access.user = "app";
+        access.principal = EventPrincipal::account("app");
+        let e = b.statement(access, SystemTime::now()).unwrap();
+        assert_eq!(
+            shown(&e),
+            "ddl [\"*.*\", \"hr.copy\", \"hr.customers\"] always"
+        );
+        // Table records: their tables and the text's.
+        for user in ["app", "databastion"] {
+            let text = "CREATE TABLE hr.copy AS SELECT * FROM hr.customers";
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("CREATE", "hr", "copy"), ("READ", "hr", "customers")],
+                        text,
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [copy], "{user}");
+            let ip = if user == "databastion" {
+                "172.18.0.1"
+            } else {
+                "10.0.0.5"
+            };
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, ip, 7, &[("hr", "customers")], text),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.iter().map(shown).collect::<Vec<_>>(), [copy], "{user}");
+        }
+    }
+
+    /// ADR-0047, fail closed: an explain whose text cannot be read (the
+    /// multibyte rule) and whose table records all read is decided by its
+    /// records, always reported, with no row count, never the agent's own.
+    #[test]
+    fn unreadable_explains_with_read_records_are_always_reported() {
+        // An explain word only a server may run (a version comment): the
+        // text keeps its rows, and `volume.large_result` (security re-review
+        // of #196, M1).
+        for text in [
+            "/*!99999 EXPLAIN */ SELECT * FROM hr.customers WHERE id > 0",
+            "/*M!100000 EXPLAIN */ SELECT * FROM hr.customers WHERE id > 0",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                let e = pfs_record(&mut b, user, text, false, 500_000).expect(text);
+                assert_eq!(e.rows(), Some(500_000), "{user:?}: {text}");
+                assert!(
+                    e.signals().contains(&Signal::LargeResult) && e.always_report(),
+                    "{user:?}: {text}"
+                );
+            }
+        }
+        let text = "EXPLAIN SELECT * FROM `hr`.`caf\u{e9}` WHERE id = 1";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        for user in ["app", "databastion"] {
+            let lines = [
+                format!("20260929 09:40:35,h,{user},172.18.0.1,30,1,READ,hr,caf\u{e9},"),
+                sa_line(user, "172.18.0.1", 1, text),
+            ];
+            let mut b = EventBuilder::new(own());
+            let out = b.convert_file(
+                sa_at(&lines, 4096),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(out.len(), 1, "{user}");
+            assert!(out[0].always_report() && out[0].rows().is_none(), "{user}");
+            assert_eq!(out[0].action(), EventAction::Read, "{user}");
+        }
+        // Re-review of #195, L1: an executable comment a server may skip
+        // before the explain word (readings differ: not lexed).
+        let text = "/*!99999 x */ EXPLAIN SELECT * FROM hr.customers WHERE id = 1";
+        assert!(!analyze_raw(text.as_bytes(), analyze_opts(false)).lexed());
+        let lines = [
+            "20260929 09:40:35,h,app,172.18.0.1,30,1,READ,hr,customers,".to_owned(),
+            sa_line("app", "172.18.0.1", 1, text),
+        ];
+        let mut b = EventBuilder::new(own());
+        let out = b.convert_file(
+            sa_at(&lines, 4096),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].always_report() && out[0].rows().is_none());
+        // Re-review of #195, L3: writes run by `ANALYZE` keep their
+        // affected rows, always reported; reads have none.
+        for (text, action, rows) in [
+            (
+                "ANALYZE DELETE FROM hr.customers WHERE id = 1",
+                EventAction::Write,
+                Some(7),
+            ),
+            (
+                "EXPLAIN ANALYZE UPDATE hr.customers SET a = 1",
+                EventAction::Write,
+                Some(7),
+            ),
+            (
+                "EXPLAIN ANALYZE SELECT * FROM hr.customers",
+                EventAction::Read,
+                None,
+            ),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(&mut b, Some("app"), text, false, 7).unwrap();
+            assert_eq!(e.action(), action, "{text}");
+            assert_eq!(e.rows(), rows, "{text}");
+            assert!(e.always_report(), "{text}");
+        }
+        for (t, want) in [
+            (&b"EXPLAIN x"[..], true),
+            (b"  (describe x", true),
+            (b"DESC", true),
+            (b"\tdEsC t", true),
+            (b"DESCRIPTION", false),
+            (b"EXPLAINED", false),
+            (b"SELECT 1", false),
+            // Security review of #195, L1: leading comments.
+            (b"/* x */ EXPLAIN", true),
+            (b"/* x */ /* y */\n EXPLAIN", true),
+            (b"/*!50000 EXPLAIN */ SELECT", true),
+            (b"/*M!100000 describe */", true),
+            (b"/*!*/ desc t", true),
+            (b"-- note\nEXPLAIN", true),
+            (b"--\tnote\r\nEXPLAIN", true),
+            (b"# note\n(EXPLAIN", true),
+            (b"/* x EXPLAIN", false),
+            (b"-- EXPLAIN", false),
+            (b"--x\nEXPLAIN", false),
+            (b"/* EXPLAIN */ SELECT", false),
+            // Re-review of #195, L1: an executable comment skipped whole.
+            (b"/*!99999 x */ EXPLAIN SELECT 1", true),
+            (
+                b"/*!99999 a */ /*!99999 b */ /*!99999 c */ /*!99999 d */ /*!99999 e */ EXPLAIN SELECT 1",
+                true,
+            ),
+            (
+                b"/*!99999 a */ /*!99999 b */ /*!99999 c */ /*!99999 d */ /*!99999 e */ SELECT 1",
+                true,
+            ),
+            (b"/*M!999999 x */ desc t", true),
+            (b"/*!99999 x */ SELECT 1", false),
+            (b"", false),
+        ] {
+            assert_eq!(explain_lead(t), want, "{t:?}");
+        }
+    }
+
+    /// ADR-0047 decisions 4 and 5: the metadata forms and the literal
+    /// probe shape stay quiet for every account on every source; each
+    /// one-step variation of the shape is an explain of a statement.
+    #[test]
+    fn explain_metadata_forms_and_the_probe_shape_stay_quiet() {
+        for text in [
+            "DESCRIBE hr.customers",
+            "DESCRIBE hr.customers email",
+            "DESC hr.customers 'e%'",
+            "DESC customers",
+            "EXPLAIN hr.customers",
+            "SHOW COLUMNS FROM hr.customers",
+            "SHOW FULL COLUMNS FROM hr.customers",
+            "SHOW FIELDS FROM hr.customers",
+            "SHOW INDEX FROM hr.customers",
+            "SHOW CREATE TABLE hr.customers",
+            "SHOW WARNINGS",
+            crate::sql::PS_HISTORY_LONG,
+            crate::sql::PS_HISTORY,
+            crate::sql::PS_CURRENT,
+            "DESCRIBE SELECT 1 FROM `performance_schema`.`threads`;",
+            "desc select 7 from performance_schema.setup_consumers",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        // Digests, with and without an account (the probe's heartbeat
+        // session has ended when the poll sees it).
+        for digest in [
+            "EXPLAIN SELECT ? FROM `performance_schema` . `events_statements_history_long`",
+            "EXPLAIN SELECT ? FROM performance_schema . events_statements_history_long",
+            "EXPLAIN SELECT ? FROM performance_schema . events_statements_history",
+            "EXPLAIN SELECT ? FROM performance_schema . events_statements_current",
+            "EXPLAIN hr . customers",
+            "EXPLAIN `hr` . `customers`",
+            "DESC `customers`",
+        ] {
+            for user in [Some("app"), Some("databastion"), None] {
+                let mut b = EventBuilder::new(own());
+                assert!(
+                    pfs_record(&mut b, user, digest, true, 10_000).is_none(),
+                    "{user:?}: {digest}"
+                );
+            }
+        }
+        // `server_audit` and `audit_log_filter` records of the probe's own
+        // table: quiet; of another table: the rule does not apply.
+        for user in ["app", "databastion"] {
+            let mut b = EventBuilder::new(own());
+            let out = file(
+                &mut b,
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[(
+                            "READ",
+                            "performance_schema",
+                            "events_statements_history_long",
+                        )],
+                        crate::sql::PS_HISTORY_LONG,
+                    ),
+                    1024,
+                ),
+            );
+            assert!(out.is_empty(), "{user}: {out:?}");
+            let mut b = EventBuilder::new(own());
+            let out = file(
+                &mut b,
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "customers")],
+                        "EXPLAIN SELECT 1 FROM customers",
+                    ),
+                    1024,
+                ),
+            );
+            // `sa_with_records` logs database `shop`: the records decide,
+            // with the text's `shop.customers`.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "customers")],
+                        "EXPLAIN SELECT 1 FROM customers",
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.customers\", \"shop.customers\"] always"],
+                "{user}: {out:?}"
+            );
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(
+                    user,
+                    "10.0.0.5",
+                    7,
+                    &[("hr", "customers")],
+                    "EXPLAIN SELECT 1 FROM hr.customers",
+                ),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.customers\"] always"],
+                "{user}"
+            );
+            // The probe on the JSON log: no `table_access` record for a
+            // `performance_schema` table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                filter_json(user, "10.0.0.5", 7, &[], crate::sql::PS_HISTORY),
+                EventSource::MysqlAuditLog,
+                SystemTime::now(),
+            );
+            assert!(ev.is_empty(), "{user}");
+            // Security review of #195, H1: a view (merged, with its const
+            // reads), with the records of the view and its base table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &sa_with_records(
+                        user,
+                        &[("READ", "hr", "v"), ("READ", "hr", "customers")],
+                        "EXPLAIN SELECT 1 FROM hr.v",
+                    ),
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"hr.customers\", \"hr.v\"] always"],
+                "{user}"
+            );
+        }
+        // Security review of #195, H1: the literal shape on any table
+        // outside `performance_schema`, qualified or not, is a read; the
+        // schema name is compared exactly (re-review, L2).
+        for (text, want) in [
+            (
+                "EXPLAIN SELECT 1 FROM PERFORMANCE_SCHEMA.v",
+                "PERFORMANCE_SCHEMA.v",
+            ),
+            (
+                "EXPLAIN SELECT 1 FROM `Performance_Schema`.`v`",
+                "Performance_Schema.v",
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let e = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert!(e.always_report(), "{user} {source:?}: {text}");
+                    assert!(
+                        shown(&e).to_lowercase().contains(&want.to_lowercase()),
+                        "{user} {source:?}: {}",
+                        shown(&e)
+                    );
+                }
+            }
+        }
+        for text in [
+            "EXPLAIN SELECT 1 FROM hr.customers",
+            "EXPLAIN SELECT 1 FROM hr.v",
+            "DESCRIBE SELECT 1 FROM `hr`.`customers`;",
+        ] {
+            let want = if text.contains("hr.v") {
+                "hr.v"
+            } else {
+                "hr.customers"
+            };
+            expect_everywhere(text, |_| format!("read [{want:?}] always"));
+        }
+        for user in ["app", "databastion"] {
+            for (source, ev) in on_every_source(user, "EXPLAIN SELECT 1 FROM t") {
+                let e = ev.unwrap_or_else(|| panic!("{user} {source:?}"));
+                assert!(e.always_report(), "{user} {source:?}");
+                assert_eq!(e.action(), EventAction::Read);
+                assert!(
+                    e.objects().iter().any(|o| o.object().as_str() == "t"),
+                    "{user} {source:?}: {}",
+                    shown(&e)
+                );
+            }
+        }
+        for user in [Some("app"), None] {
+            let mut b = EventBuilder::new(own());
+            let e = pfs_record(&mut b, user, "EXPLAIN SELECT ? FROM hr . v", true, 1).unwrap();
+            assert_eq!(shown(&e), "read [\"hr.v\"] always", "{user:?}");
+        }
+
+        // One step from the shape: an explain of a statement.
+        for (text, want) in [
+            (
+                "EXPLAIN SELECT 1 FROM hr.customers WHERE id = 42",
+                "read [\"hr.customers\"] always",
+            ),
+            (
+                "EXPLAIN SELECT 1 FROM hr.customers, hr.orders",
+                "read [\"hr.customers\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN SELECT * FROM hr.customers",
+                "read [\"hr.customers\"] always",
+            ),
+            (
+                "EXPLAIN SELECT email FROM hr.customers",
+                "read [\"hr.customers\"] always",
+            ),
+            (
+                "EXPLAIN FORMAT=JSON SELECT 1 FROM hr.customers",
+                "read [\"hr.customers\"] always",
+            ),
+            (
+                "EXPLAIN SELECT (SELECT 1 FROM hr.orders) FROM hr.customers",
+                "read [\"hr.customers\", \"hr.orders\"] always",
+            ),
+            (
+                "EXPLAIN SELECT 'x' FROM hr.customers",
+                "read [\"hr.customers\"] always",
+            ),
+            (
+                "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long WHERE THREAD_ID = 5",
+                "read [\"performance_schema.events_statements_history_long\"] always",
+            ),
+            (
+                "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long; EXPLAIN SELECT * FROM hr.customers",
+                "read [\"hr.customers\", \"performance_schema.events_statements_history_long\"] always",
+            ),
+        ] {
+            expect_everywhere(text, |_| want.to_owned());
+        }
+        // A version comment a server may run: only the kind is kept, a
+        // read of `*`.
+        expect_everywhere("EXPLAIN SELECT /*!99999 * */ 1 FROM hr.customers", |s| {
+            format!("read [{:?}] always", star(s))
+        });
+        // The same shape after a digest-less statement-text read: reported.
+        let mut b = EventBuilder::new(own());
+        let e = pfs_record(
+            &mut b,
+            None,
+            "EXPLAIN SELECT * FROM performance_schema . events_statements_history_long WHERE THREAD_ID = ?",
+            true,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            shown(&e),
+            "read [\"performance_schema.events_statements_history_long\"] always"
+        );
     }
 
     /// The canonical `db.table` of a statement-text table event object.
@@ -5118,7 +6968,6 @@ mod tests {
             "SHOW ENGINE PERFORMANCE_SCHEMA STATUS",
             "SHOW ENGINES",
             "SHOW PROCEDURE STATUS",
-            "EXPLAIN SELECT * FROM performance_schema.threads",
         ] {
             for user in ["app", "databastion"] {
                 for (source, ev) in on_every_source(user, text) {
@@ -5126,6 +6975,11 @@ mod tests {
                 }
             }
         }
+        // An explain of a statement naming a statement-text table is a read
+        // of it (ADR-0047), from every account.
+        expect_everywhere("EXPLAIN SELECT * FROM performance_schema.threads", |_| {
+            "read [\"performance_schema.threads\"] always".to_owned()
+        });
     }
 
     /// Security review of #186: a `USE` with another statement in one
@@ -5345,7 +7199,7 @@ mod tests {
                     "databastion",
                     "10.9.9.9",
                     1,
-                    crate::sql::PS_OWN_THREAD,
+                    crate::sql::PS_OWN_THREAD_ID,
                 )],
                 1024,
             ),
@@ -5385,5 +7239,655 @@ mod tests {
         }
         assert!(!is_dump_program("mysql"));
         assert!(!is_dump_program("databastion-agent"));
+    }
+
+    /// ADR-0048 decisions 1 to 4 and open question 4: every statistics
+    /// table, qualified, backquoted, in any case, whole-row or naming no
+    /// value column, in a `JOIN`, in a subquery, is a read naming it (as
+    /// listed), always reported, from any account, the agent's included,
+    /// on every source.
+    #[test]
+    fn statistics_tables_are_named_and_always_reported() {
+        for (db, table) in STATISTICS_TABLES {
+            let named = format!("{db}.{table}");
+            let want = format!("read [{named:?}] always");
+            for text in [
+                format!("SELECT * FROM {db}.{table}"),
+                format!("select * from `{db}`.`{table}` where 1 = 1 limit 5"),
+                format!(
+                    "SELECT COUNT(*) FROM {}.{}",
+                    db.to_ascii_uppercase(),
+                    table.to_ascii_uppercase()
+                ),
+                format!(
+                    "SELECT {}, {} FROM {}.{}",
+                    "COLUMN_NAME",
+                    "TABLE_NAME",
+                    db.to_ascii_lowercase(),
+                    table.to_ascii_lowercase()
+                ),
+                format!("SELECT s.* FROM {db}.{table} s"),
+                format!("SELECT JSON_OBJECT('a', s.TABLE_NAME) FROM {db}.{table} AS s"),
+                format!("TABLE {db}.{table}"),
+                format!("SET @x = (SELECT COUNT(*) FROM {db}.{table})"),
+                format!("SELECT 1 FROM DUAL WHERE EXISTS (SELECT 1 FROM {db}.{table})"),
+                format!("SELECT * FROM (SELECT * FROM {db}.{table}) AS d"),
+            ] {
+                expect_everywhere(&text, |_| want.clone());
+            }
+            // With an application table: both, in a `JOIN` or a subquery.
+            let mut both = [named.clone(), "hr.customers".to_owned()];
+            both.sort();
+            for text in [
+                format!("SELECT * FROM hr.customers c JOIN {db}.{table} s ON 1 = 1"),
+                format!("SELECT * FROM hr.customers WHERE id IN (SELECT 1 FROM {db}.{table})"),
+            ] {
+                expect_everywhere(&text, |_| format!("read {both:?} always"));
+            }
+            // Unqualified, in the statement's current database.
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let out = file(
+                    &mut b,
+                    sa_at(
+                        &[sa_in(
+                            user,
+                            "172.18.0.1",
+                            1,
+                            db,
+                            &format!("SELECT * FROM `{table}`"),
+                        )],
+                        1024,
+                    ),
+                );
+                assert_eq!(out, [format!("read [{named:?}] None []")], "{user}");
+                let mut b = EventBuilder::new(own());
+                let text = format!("SELECT * FROM {table}");
+                let mut access = pfs_access(text.as_bytes(), false, Vec::new());
+                access.user = user;
+                access.principal = EventPrincipal::account(user);
+                access.database = db;
+                access.rows = Some(1);
+                let e = b.statement(access, SystemTime::now()).expect(user);
+                assert!(e.always_report());
+                assert_eq!(show(&e), format!("read [{named:?}] Some(1) []"), "{user}");
+                // In an unknown database (the `audit_log` JSON records):
+                // the name the source shows, always reported.
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    vec![json_query(user, "172.18.0.1", 1, &text)],
+                    EventSource::MysqlAuditLog,
+                    SystemTime::now(),
+                );
+                assert_eq!(ev.len(), 1, "{user}");
+                assert!(ev[0].always_report(), "{user}");
+            }
+            // The same name in another schema is an ordinary table.
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(
+                    &[sa_line(
+                        "app",
+                        "10.0.0.5",
+                        1,
+                        &format!("SELECT * FROM hr.{table} WHERE id = 1"),
+                    )],
+                    1024,
+                ),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [format!("read [\"hr.{}\"]", table.to_ascii_lowercase())]
+            );
+        }
+        // Writes name them too, always reported.
+        expect_everywhere(
+            "UPDATE mysql.column_stats SET min_value = NULL WHERE 1 = 0",
+            |_| "write [\"mysql.column_stats\"] always".to_owned(),
+        );
+    }
+
+    /// ADR-0048: the `performance_schema` digests name the statistics
+    /// table (the table it describes is a `?`).
+    #[test]
+    fn statistics_tables_are_named_in_digests() {
+        for (digest, named) in [
+            (
+                "SELECT COLUMN_NAME , `min_value` , `max_value` FROM `mysql` . `column_stats` WHERE TABLE_NAME = ?",
+                "mysql.column_stats",
+            ),
+            (
+                "SELECT `HISTOGRAM` FROM `information_schema` . `COLUMN_STATISTICS` WHERE SCHEMA_NAME = ? AND TABLE_NAME = ?",
+                "information_schema.COLUMN_STATISTICS",
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                let mut b = EventBuilder::new(own());
+                let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+                access.user = user;
+                access.principal = EventPrincipal::account(user);
+                access.digest = true;
+                access.rows = Some(2);
+                let e = b.statement(access, SystemTime::now()).expect(user);
+                assert!(e.always_report(), "{user}");
+                assert_eq!(show(&e), format!("read [{named:?}] Some(2) []"), "{user}");
+            }
+        }
+    }
+
+    /// ADR-0048 decision 2 and open question 7: MariaDB writes
+    /// `READ,mysql,column_stats` (and `table_stats`, `index_stats`) records
+    /// under the reader's account when it loads a table's statistics
+    /// (verified after `FLUSH TABLES` on 11.4.13). Without a text that
+    /// names a statistics table they stay dropped, whatever the statement
+    /// does; with one, the table is named.
+    #[test]
+    fn mariadb_statistics_loads_are_not_statistics_reads() {
+        let loads = |user: &str, q: u64| -> Vec<String> {
+            ["table_stats", "column_stats", "index_stats"]
+                .iter()
+                .map(|t| format!("20260929 09:40:35,h,{user},10.0.0.5,30,{q},READ,mysql,{t},"))
+                .collect()
+        };
+        // A read of an application table.
+        let mut lines = vec!["20260929 09:40:35,h,app,10.0.0.5,30,1,READ,hr,customers,".to_owned()];
+        lines.extend(loads("app", 1));
+        lines.push(sa_line("app", "10.0.0.5", 1, "SELECT * FROM hr.customers"));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\"]"]
+        );
+        // A write reading an application table.
+        let mut lines = vec![
+            "20260929 09:40:35,h,app,10.0.0.5,30,2,READ,hr,customers,".to_owned(),
+            "20260929 09:40:35,h,app,10.0.0.5,30,2,WRITE,hr,archive,".to_owned(),
+        ];
+        lines.extend(loads("app", 2));
+        lines.push(sa_line(
+            "app",
+            "10.0.0.5",
+            2,
+            "INSERT INTO hr.archive SELECT * FROM hr.customers",
+        ));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1);
+        let names: Vec<String> = ev[0]
+            .objects()
+            .iter()
+            .map(|o| o.object().as_str().to_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.ends_with("_stats")), "{names:?}");
+        // Load records alone: no event.
+        let mut lines = loads("app", 3);
+        lines.push(sa_line("app", "10.0.0.5", 3, "SELECT 1"));
+        let mut b = EventBuilder::new(own());
+        assert!(
+            b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        // The agent's own Discovery sample with load records: left out as
+        // its own (charged to `hr.customers`), no statistics object.
+        let mut lines =
+            vec!["20260929 09:40:35,h,databastion,172.18.0.1,30,4,READ,hr,customers,".to_owned()];
+        lines.extend(loads("databastion", 4));
+        lines.push(sa_line(
+            "databastion",
+            "172.18.0.1",
+            4,
+            "SELECT `email` FROM `hr`.`customers` LIMIT 100",
+        ));
+        let mut b = EventBuilder::new(own());
+        assert!(
+            b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
+        // A text naming `mysql.column_stats`, with its record: named,
+        // always reported, from any account.
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            let mut lines = loads(user, 5);
+            lines.push(sa_line(
+                user,
+                ip,
+                5,
+                "SELECT COLUMN_NAME, min_value, max_value FROM mysql.column_stats WHERE table_name = 1",
+            ));
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                ["read [\"mysql.column_stats\"] always"],
+                "{user}"
+            );
+        }
+        // Percona `audit_log_filter`: no `table_access` record for
+        // `information_schema`, but one for the application table of a
+        // `JOIN`: the text names the statistics table.
+        let recs = filter_json(
+            "app",
+            "10.0.0.5",
+            6,
+            &[("hr", "customers")],
+            "SELECT * FROM hr.customers c JOIN information_schema.COLUMN_STATISTICS s ON s.TABLE_NAME = 'customers'",
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"information_schema.COLUMN_STATISTICS\"] always"]
+        );
+    }
+
+    /// ADR-0048: the dictionary and the statistics that hold no value stay
+    /// quiet, from any account, on every source.
+    #[test]
+    fn dictionary_and_counter_statistics_stay_quiet() {
+        for text in [
+            "SELECT * FROM mysql.table_stats",
+            "SELECT * FROM mysql.index_stats",
+            "SELECT * FROM mysql.innodb_table_stats",
+            "SELECT * FROM mysql.innodb_index_stats",
+            "SELECT * FROM information_schema.STATISTICS",
+            "SELECT * FROM information_schema.COLUMNS",
+            "SELECT * FROM information_schema.TABLE_STATISTICS",
+            "SHOW INDEX FROM hr.customers",
+            "ANALYZE TABLE hr.customers",
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert!(ev.is_none(), "{user} {source:?}: {text}");
+                }
+            }
+        }
+        assert!(statistics_table("MYSQL", "COLUMN_STATS").is_some());
+        assert!(statistics_table("information_schema", "column_statistics").is_some());
+        assert!(statistics_table("mysql", "column_statistics").is_none());
+        assert!(statistics_table("hr", "column_stats").is_none());
+    }
+
+    /// Security review of #199, H2: a `READ,mysql,column_stats` record
+    /// with a text that cannot be read whole, that runs code out of sight,
+    /// that is a `HANDLER` read, or without the `table_stats` record of a
+    /// statistics load (a view), names `mysql.column_stats`, always
+    /// reported and never the agent's own; a `CALL` adds `*` whatever its
+    /// records, on `server_audit` and `audit_log_filter` alike.
+    #[test]
+    fn statistics_records_behind_unreadable_or_hidden_code_are_kept() {
+        let rec = |user: &str, ip: &str, q: u64, t: &str| {
+            format!("20260929 09:40:35,h,{user},{ip},30,{q},READ,mysql,{t},")
+        };
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            let all = ["table_stats", "column_stats", "index_stats"];
+            for (text, tables, star) in [
+                ("CALL hr.dump_stats()", &all[..], true),
+                ("EXECUTE s", &all[..], true),
+                ("SELECT hr.f()", &all[..], true),
+                ("/*M!100000 SELECT * FROM hr.customers */", &all[..], false),
+                ("/*!80000 SELECT * FROM hr.customers */", &all[..], false),
+                ("HANDLER h READ FIRST", &["column_stats"][..], false),
+                ("HANDLER h READ NEXT", &all[..], false),
+                ("SELECT * FROM hr.v_stats", &["column_stats"][..], false),
+            ] {
+                let mut lines: Vec<String> = tables.iter().map(|t| rec(user, ip, 7, t)).collect();
+                lines.push(sa_line(user, ip, 7, text));
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    sa_at(&lines, 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.len(),
+                    1,
+                    "{user}: {text}: {:?}",
+                    ev.iter().map(shown).collect::<Vec<_>>()
+                );
+                let e = &ev[0];
+                let names: Vec<String> = e
+                    .objects()
+                    .iter()
+                    .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    .collect();
+                assert!(e.always_report(), "{user}: {text}");
+                assert!(
+                    names.iter().any(|n| n == "mysql.column_stats"),
+                    "{user}: {text}: {names:?}"
+                );
+                if star {
+                    assert!(names.iter().any(|n| n.ends_with(".*")), "{text}: {names:?}");
+                }
+            }
+        }
+        // Percona `audit_log_filter`: a `CALL` with a `table_access`
+        // record adds `*` (the procedure may read `COLUMN_STATISTICS`,
+        // which gets no record).
+        let recs = filter_json("app", "10.0.0.5", 8, &[("hr", "customers")], "CALL hr.p()");
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].always_report());
+        assert!(
+            ev[0].objects().iter().any(|o| o.object().as_str() == "*"),
+            "{}",
+            shown(&ev[0])
+        );
+    }
+
+    /// Security re-review of #199, N-H1: a view over `mysql.column_stats`
+    /// gets no `server_audit` record of its own, so a `column_stats` read
+    /// record is kept, naming it and the view, whenever the text names a
+    /// relation outside the server's schemas with no table record, whatever
+    /// `table_stats` records come with it.
+    #[test]
+    fn statistics_records_next_to_unrecorded_relations_are_kept() {
+        let rec = |user: &str, ip: &str, q: u64, db: &str, t: &str| {
+            format!("20260929 09:40:35,h,{user},{ip},30,{q},READ,{db},{t},")
+        };
+        for user in ["app", "databastion"] {
+            let ip = if user == "app" {
+                "10.0.0.5"
+            } else {
+                "172.18.0.1"
+            };
+            for (text, records, want) in [
+                // (1) The view reads `column_stats` and `table_stats`.
+                (
+                    "SELECT * FROM hr.v_stats",
+                    &[("mysql", "column_stats"), ("mysql", "table_stats")][..],
+                    &["hr.v_stats", "mysql.column_stats"][..],
+                ),
+                // (2) A `table_stats` subquery next to the view.
+                (
+                    "SELECT * FROM hr.v_stats WHERE EXISTS (SELECT 1 FROM mysql.table_stats)",
+                    &[("mysql", "column_stats"), ("mysql", "table_stats")][..],
+                    &["hr.v_stats", "mysql.column_stats"][..],
+                ),
+                // (3) The view joined with a table whose statistics are
+                // loaded (a cold cache).
+                (
+                    "SELECT * FROM hr.v_stats JOIN hr.customers",
+                    &[
+                        ("hr", "customers"),
+                        ("mysql", "table_stats"),
+                        ("mysql", "column_stats"),
+                        ("mysql", "index_stats"),
+                    ][..],
+                    &["hr.customers", "hr.v_stats", "mysql.column_stats"][..],
+                ),
+            ] {
+                let mut lines: Vec<String> = records
+                    .iter()
+                    .map(|(d, t)| rec(user, ip, 11, d, t))
+                    .collect();
+                lines.push(sa_line(user, ip, 11, text));
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    sa_at(&lines, 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.len(),
+                    1,
+                    "{user}: {text}: {:?}",
+                    ev.iter().map(shown).collect::<Vec<_>>()
+                );
+                let mut names: Vec<String> = ev[0]
+                    .objects()
+                    .iter()
+                    .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                    .collect();
+                names.sort();
+                assert_eq!(names, want, "{user}: {text}");
+                assert!(ev[0].always_report(), "{user}: {text}");
+            }
+        }
+        // Every relation recorded (a join with loads): the loads stay
+        // dropped.
+        let mut lines = vec![
+            rec("app", "10.0.0.5", 12, "hr", "customers"),
+            rec("app", "10.0.0.5", 12, "hr", "orders"),
+            rec("app", "10.0.0.5", 12, "mysql", "table_stats"),
+            rec("app", "10.0.0.5", 12, "mysql", "column_stats"),
+        ];
+        lines.push(sa_line(
+            "app",
+            "10.0.0.5",
+            12,
+            "WITH x AS (SELECT * FROM hr.orders) SELECT * FROM hr.customers c JOIN x ON 1 = 1",
+        ));
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"hr.orders\"]"]
+        );
+    }
+
+    /// Security review of #199, R3-M1 and R3-L2: a relation is recorded
+    /// only by a record of exactly its name, in a text that writes it in
+    /// no other case (`lower_case_table_names = 0`: `hr.V_stats` is not
+    /// `hr.v_stats`; unquoted names are folded by the analyzer, so named
+    /// in lower case), and not at all in a text that creates or drops a
+    /// temporary table.
+    #[test]
+    fn statistics_records_next_to_case_variants_and_temporary_tables() {
+        let rec = |q: u64, db: &str, t: &str| {
+            format!("20260929 09:40:35,h,app,10.0.0.5,30,{q},READ,{db},{t},")
+        };
+        for (q, text, want) in [
+            (
+                21,
+                "SELECT * FROM hr.V_stats JOIN hr.v_stats ON 1=1",
+                &["hr.v_stats", "mysql.column_stats"][..],
+            ),
+            (
+                22,
+                "SELECT * FROM `hr`.`V_STATS`",
+                &["hr.V_STATS", "hr.v_stats", "mysql.column_stats"][..],
+            ),
+            (
+                23,
+                "SELECT * FROM HR.v_stats",
+                &["hr.v_stats", "mysql.column_stats"][..],
+            ),
+        ] {
+            let lines = vec![
+                rec(q, "hr", "v_stats"),
+                rec(q, "mysql", "column_stats"),
+                rec(q, "mysql", "table_stats"),
+                sa_line("app", "10.0.0.5", q, text),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(ev.len(), 1, "{text}");
+            let mut names: Vec<String> = ev[0]
+                .objects()
+                .iter()
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect();
+            names.sort();
+            assert_eq!(names, want, "{text}");
+            assert!(ev[0].always_report(), "{text}");
+        }
+        // A temporary table of the view's name, created and dropped in the
+        // same text: its records do not tell which relation was read.
+        let text = "CREATE TEMPORARY TABLE hr.v_stats (a INT); \
+                    DROP TEMPORARY TABLE hr.v_stats; SELECT * FROM hr.v_stats";
+        let lines = vec![
+            rec(24, "hr", "v_stats"),
+            rec(24, "mysql", "column_stats"),
+            rec(24, "mysql", "table_stats"),
+            sa_line("app", "10.0.0.5", 24, text),
+        ];
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert!(!ev.is_empty());
+        assert!(
+            ev.iter().any(|e| e.always_report()
+                && e.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "column_stats")),
+            "{:?}",
+            ev.iter().map(shown).collect::<Vec<_>>()
+        );
+    }
+
+    /// Security review of #199, M3: on the `table_access` path, a
+    /// statement-text table the text names is named too (Percona writes no
+    /// record for `performance_schema`), always reported.
+    #[test]
+    fn statement_text_tables_named_by_the_text_with_table_records() {
+        let recs = filter_json(
+            "app",
+            "10.0.0.5",
+            9,
+            &[("hr", "customers")],
+            "SELECT c.*, t.SQL_TEXT FROM hr.customers c JOIN performance_schema.events_statements_history t ON 1 = 1",
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(
+            ev.iter().map(shown).collect::<Vec<_>>(),
+            ["read [\"hr.customers\", \"performance_schema.events_statements_history\"] always"]
+        );
+    }
+
+    /// The shape of a text and of its `performance_schema` digest are
+    /// equal (digests as MySQL 8.4 and MariaDB 11.4 render them, the
+    /// latter with a trailing space); other statements' are not.
+    #[test]
+    fn digests_have_the_shape_of_their_text() {
+        let shape = |t: &str| text_shape(t.as_bytes()).unwrap();
+        // As MySQL 8.4.11 and MariaDB 11.4.13 render them (MariaDB adds
+        // a trailing space to some digests).
+        let pin_mysql = crate::sql::ps_own_pin(Flavor::Mysql);
+        let pin_mariadb = crate::sql::ps_own_pin(Flavor::Mariadb);
+        let mysql_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             @@`server_uuid` , `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , \
+             CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` `u` JOIN `performance_schema` . \
+             `global_status` `g` ON `g` . `VARIABLE_NAME` = ? WHERE `u` . `VARIABLE_NAME` = ? AND \
+             `u` . `VARIABLE_VALUE` = @? AND `u` . `THREAD_ID` = ( SELECT `t` . `THREAD_ID` FROM \
+             `performance_schema` . `threads` `t` WHERE `t` . `PROCESSLIST_ID` = `CONNECTION_ID` ( \
+             ) )";
+        let mariadb_digest = "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , CAST ( `g` . \
+             `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` `u` JOIN `performance_schema` . \
+             `global_status` `g` ON `g` . `VARIABLE_NAME` = ? WHERE `u` . `VARIABLE_NAME` = ? AND \
+             `u` . `VARIABLE_VALUE` = @? AND `u` . `THREAD_ID` = ( SELECT `t` . `THREAD_ID` FROM \
+             `performance_schema` . `threads` `t` WHERE `t` . `PROCESSLIST_ID` = `CONNECTION_ID` ( \
+             ) ) ";
+        assert_eq!(shape(mysql_digest), shape(&pin_mysql));
+        assert_eq!(shape(mariadb_digest), shape(&pin_mariadb));
+        assert_ne!(shape(&pin_mysql), shape(&pin_mariadb));
+        let pin = pin_mariadb.as_str();
+        let mysql = "SELECT /*+ MAX_EXECUTION_TIME(5000) */ `TABLE_NAME`, LEFT(`TABLE_SCHEMA`, \
+                     4096) FROM `information_schema`.`TABLES` LIMIT 1";
+        assert_eq!(
+            shape(mysql),
+            shape(
+                "SELECT /*+ MAX_EXECUTION_TIME (?) */ `TABLE_NAME` , LEFT ( `TABLE_SCHEMA` , ? ) \
+                 FROM `information_schema` . `TABLES` LIMIT ?"
+            )
+        );
+        let mariadb = "SET STATEMENT max_statement_time = 5.000 FOR SELECT `TABLE_NAME`, \
+                       LEFT(`TABLE_SCHEMA`, 4096) FROM `information_schema`.`TABLES` LIMIT 1";
+        assert_eq!(
+            shape(mariadb),
+            shape(
+                "SET STATEMENT MAX_STATEMENT_TIME = ? FOR SELECT `TABLE_NAME` , LEFT ( \
+                 `TABLE_SCHEMA` , ? ) FROM `information_schema` . `TABLES` LIMIT ? "
+            )
+        );
+        // Other statements: other shapes.
+        for other in [
+            "SELECT `u` . `THREAD_ID` , `u` . `VARIABLE_VALUE` FROM `performance_schema` . \
+             `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` = ? AND `u` . \
+             `VARIABLE_VALUE` = @?",
+            // The pin without its own-thread condition (#205, M2).
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` , \
+             `UNIX_TIMESTAMP` ( ) - CAST ( `g` . `VARIABLE_VALUE` AS SIGNED ) , CAST ( `g` . \
+             `VARIABLE_VALUE` AS SIGNED ) FROM `performance_schema` . `user_variables_by_thread` \
+             `u` JOIN `performance_schema` . `global_status` `g` ON `g` . `VARIABLE_NAME` = ? \
+             WHERE `u` . `VARIABLE_NAME` = ? AND `u` . `VARIABLE_VALUE` = @?",
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? OR `u` . `VARIABLE_VALUE` = @?",
+            "SELECT `u` . `THREAD_ID` , @@`hostname` , @@PORT , @@`server_id` FROM \
+             `performance_schema` . `user_variables_by_thread` `u` WHERE `u` . `VARIABLE_NAME` \
+             = ? AND `u` . `VARIABLE_VALUE` = @? UNION SELECT `SQL_TEXT` , ? , ? , ? FROM \
+             `performance_schema` . `events_statements_history_long`",
+        ] {
+            assert_ne!(shape(other), shape(pin), "{other}");
+        }
+        // One quoted name is not two bare words; literals and variables
+        // are placeholders; plain comments are skipped, hints kept.
+        assert_ne!(shape("SELECT `a b` FROM t"), shape("SELECT a b FROM t"));
+        assert_eq!(
+            shape("SELECT a FROM t WHERE b = 'x''y'"),
+            shape("SELECT a FROM t WHERE b = ?")
+        );
+        assert_eq!(shape("SET @x = 1.5"), shape("SET @? = ?"));
+        assert_eq!(shape("SELECT /* c */ a FROM t"), shape("SELECT a FROM t"));
+        assert_ne!(
+            shape("SELECT /*+ X(1) */ a FROM t"),
+            shape("SELECT a FROM t")
+        );
+        assert_ne!(shape("SELECT @@port"), shape("SELECT @port"));
+        // Not lexable: no shape.
+        for bad in [
+            &b"SELECT 'open"[..],
+            b"SELECT `open",
+            b"SELECT /* open",
+            b"SELECT \xff",
+        ] {
+            assert!(text_shape(bad).is_none(), "{bad:?}");
+        }
     }
 }

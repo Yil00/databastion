@@ -1236,6 +1236,7 @@ async fn profiler_truncated_and_odd_entries() {
         .str("user", "alice@admin")
         .str("cmd", "$truncated")
         .bool("tr", true)
+        .bool("js", false)
         .i32("fk", 0)
         .finish();
     // A time, then a string whose length runs past the document.
@@ -1314,6 +1315,7 @@ fn profile_entry(ts: i64, user: &str, app: &str, filter_keys: i32) -> Vec<u8> {
         .str("user", user)
         .str("cmd", "find")
         .i32("fk", filter_keys)
+        .bool("js", false)
         .finish()
 }
 

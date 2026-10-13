@@ -137,6 +137,33 @@ out only from its account, its address and its application name
 DDL and DCL with its identity are always reported. On the `auditLog` (no
 counts), only a `find` with a limit within the budget is left out.
 
+Failed operations that returned no document (server log and profiler) are
+classified by their numeric `errCode` only (`errMsg` is never read): refused
+before reading (`Unauthorized` 13, `NamespaceNotFound` 26,
+`CommandNotFound` 59, parser errors 40414 / 40415) give no event; quiet failures whose text holds no value (time limits, interruptions,
+killed cursors, write conflicts, topology changes, memory limits) are
+operations of 0 documents, charged one to the agent's budget; any other
+code (a non-integer one, or `ok: 0` without a code, included) may show the
+values read in its text (`$toInt` of an e-mail address, `ConversionFailure`
+241) and is always reported for reads, document-reading writes and DDL,
+with any count it has, and never left out as the agent's own. On the `auditLog`,
+which logs authorization checks, failed records give no event, as before.
+
+Operations that run server-side JavaScript (a key `$where`, `$function`,
+`$accumulator` or `$_internalJs…` at any depth below 64 of the command,
+its cursor's command or the pipeline of the views it reads; `mapReduce`;
+`system.js`) are always
+reported, from every account, and never left out as the agent's own, with
+their usual action and count: a conditional sleep under `maxTimeMS` is a
+one-bit oracle whose outcomes both read 0 documents. Deeper nesting, more than
+64 KiB of command documents, a `getMore` without its opening command, and
+a command the server cut where a key could have been cut, count as
+JavaScript. Only key names are compared (`src/audit/js.rs` on the files,
+one boolean computed by the profiler projection on the server); the code
+is never read. `insert` documents never count. Whether the server allows
+JavaScript cannot be read with the agent's grants and is not shown
+(ADR-0027 refinement of 2026-10-12, accepted).
+
 ## Target settings
 
 ```yaml

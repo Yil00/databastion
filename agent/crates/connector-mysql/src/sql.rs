@@ -807,8 +807,11 @@ pub(crate) const PS_CONSUMERS: &str = "SELECT c.NAME, c.ENABLED \
 /// row. Not a read of a statement-text table (ADR-0045): `check()` sends
 /// these on a short heartbeat session that has ended when a
 /// `performance_schema` poll sees them (no account, a digest only), so a
-/// `SELECT` there could not be recognized as the agent's own; an
-/// `EXPLAIN` is quiet for every account.
+/// `SELECT` there could not be recognized as the agent's own. Each is the
+/// literal probe shape of ADR-0047 decision 5 (`EXPLAIN SELECT 1 FROM t`:
+/// no condition, so no `const` table, and a literal select list), quiet
+/// for every account on every source, digests included; any other
+/// `EXPLAIN` is a read of what it names, never the agent's own.
 pub(crate) const PS_HISTORY_LONG: &str =
     "EXPLAIN SELECT 1 FROM performance_schema.events_statements_history_long";
 pub(crate) const PS_HISTORY: &str =
@@ -816,9 +819,81 @@ pub(crate) const PS_HISTORY: &str =
 pub(crate) const PS_CURRENT: &str =
     "EXPLAIN SELECT 1 FROM performance_schema.events_statements_current";
 
-/// Thread id of this session in `performance_schema` (Audit).
-pub(crate) const PS_OWN_THREAD: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
+/// The server's identity columns (`audit::own_threads::ServerRun`):
+/// `@@hostname`, `@@port`, `@@server_id`, and on MySQL `@@server_uuid`
+/// (MariaDB has none; a MariaDB behind a version string that says MySQL
+/// fails the statement, and nothing is noted).
+const fn identity_columns(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Mysql => "@@hostname, @@port, @@server_id, @@server_uuid",
+        Flavor::Mariadb => "@@hostname, @@port, @@server_id",
+    }
+}
+
+/// The server's start time and uptime, computed by the server (its clock
+/// and its `Uptime`, so that the agent's clock plays no part), from the
+/// `global_status` row joined as `g`.
+const SERVER_START_COLUMNS: &str =
+    "UNIX_TIMESTAMP() - CAST(g.VARIABLE_VALUE AS SIGNED), CAST(g.VARIABLE_VALUE AS SIGNED)";
+
+/// The `Uptime` row of `performance_schema.global_status`, as `g`.
+const UPTIME_JOIN: &str = "JOIN performance_schema.global_status g ON g.VARIABLE_NAME = 'Uptime'";
+
+/// Thread id of this session in `performance_schema`, with the server's
+/// identity and start time read in the same statement
+/// (`audit::own_threads::ServerRun`): sent once per Audit poll session
+/// (and again after a server restart). A constant text per flavor.
+/// Columns: thread id, the identity columns, start time, uptime.
+#[must_use]
+pub(crate) fn ps_own_thread(flavor: Flavor) -> String {
+    format!(
+        "SELECT t.THREAD_ID, {}, {SERVER_START_COLUMNS} FROM performance_schema.threads t \
+         {UPTIME_JOIN} WHERE t.PROCESSLIST_ID = CONNECTION_ID()",
+        identity_columns(flavor)
+    )
+}
+
+/// Thread id of this session alone: sent instead of [`ps_own_thread`]
+/// when that fails (`global_status` not readable, a flavor misread), so
+/// that the source stays usable; no server run is then known and none of
+/// the agent's own sessions is recognized (fail closed).
+pub(crate) const PS_OWN_THREAD_ID: &str = "SELECT t.THREAD_ID FROM performance_schema.threads t \
      WHERE t.PROCESSLIST_ID = CONNECTION_ID()";
+
+/// A Discovery session's pin (`audit::own_threads`), sent right before
+/// [`ps_own_pin`]: a session user variable holding a random nonce (32
+/// hexadecimal digits). A session `SET` of a user variable produces no
+/// event (`audit::events::is_quiet`).
+#[must_use]
+pub(crate) fn ps_pin_variable(nonce: &str) -> Option<String> {
+    (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| format!("SET @databastion_pin = '{nonce}'"))
+}
+
+/// A Discovery session's `performance_schema` thread id, found by the
+/// nonce of [`ps_pin_variable`] in `user_variables_by_thread` **and**
+/// required to be this session's own thread (found by `CONNECTION_ID()` in
+/// `threads`: a nonce copied into another session never pins that
+/// session; security review of #205, M2), with the server's identity and
+/// start time, in one statement. MariaDB has no `PS_CURRENT_THREAD_ID()`.
+/// Both `user_variables_by_thread` and `threads` are statement-text tables
+/// (`audit::events::STATEMENT_TEXT_TABLES`): a Discovery session that has
+/// ended when the poll reads this statement shows its digest only, which
+/// the poll recognizes by its shape, for a pinned thread only (ADR-0045
+/// decision 4, refinement of #205). The pin needs exactly one row. A
+/// constant text per flavor. Columns: thread id, the identity columns,
+/// start time, uptime.
+#[must_use]
+pub(crate) fn ps_own_pin(flavor: Flavor) -> String {
+    format!(
+        "SELECT u.THREAD_ID, {}, {SERVER_START_COLUMNS} \
+         FROM performance_schema.user_variables_by_thread u {UPTIME_JOIN} \
+         WHERE u.VARIABLE_NAME = 'databastion_pin' AND u.VARIABLE_VALUE = @databastion_pin \
+         AND u.THREAD_ID = (SELECT t.THREAD_ID FROM performance_schema.threads t \
+         WHERE t.PROCESSLIST_ID = CONNECTION_ID())",
+        identity_columns(flavor)
+    )
+}
 
 /// Seconds since the server started (`SHOW GLOBAL STATUS` needs no
 /// privilege). With the agent's clock it gives the server's start time,
@@ -940,8 +1015,9 @@ pub(crate) fn ps_statements(table: &str, with_program: bool) -> String {
 /// its table records (if any) read only these tables; any other read of a
 /// statement-text table by the agent's identity is reported. Every text
 /// is constant: the probes of `check()` and of the Audit re-probe (the
-/// readability probes are `EXPLAIN`s, quiet in any case, listed for
-/// completeness), the own-thread probe sent once per Audit session, and
+/// readability probes have the literal probe shape of ADR-0047, quiet in
+/// any case, listed for completeness), the own-thread probe sent once per
+/// Audit session, and
 /// the poll and stats texts of each statement table.
 #[must_use]
 pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)> {
@@ -953,8 +1029,15 @@ pub(crate) fn own_performance_schema_reads() -> Vec<(String, Vec<&'static str>)>
         ),
         (PS_HISTORY.to_owned(), vec!["events_statements_history"]),
         (PS_CURRENT.to_owned(), vec!["events_statements_current"]),
-        (PS_OWN_THREAD.to_owned(), vec!["threads"]),
+        (PS_OWN_THREAD_ID.to_owned(), vec!["threads"]),
     ];
+    for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+        v.push((ps_own_thread(flavor), vec!["threads", "global_status"]));
+        v.push((
+            ps_own_pin(flavor),
+            vec!["user_variables_by_thread", "global_status", "threads"],
+        ));
+    }
     for table in PS_POLL_TABLES {
         v.push((
             ps_stats(table),
@@ -1345,7 +1428,7 @@ mod tests {
             PS_HISTORY_LONG,
             PS_HISTORY,
             PS_CURRENT,
-            PS_OWN_THREAD,
+            PS_OWN_THREAD_ID,
             SERVER_UPTIME,
             PS_TEXT_LIMIT,
             PS_DIGEST_LIMIT,
@@ -1369,6 +1452,7 @@ mod tests {
         }
         all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
         all.push(ps_poll_variables(u64::MAX));
+        all.extend(ps_pin_variable(&"f".repeat(32)));
         all.push(kill_query(u32::MAX));
         all.extend(cas_guard_statement_texts(None).unwrap());
         for roles in role_lists() {
@@ -1415,6 +1499,11 @@ mod tests {
             "digest_text",
             "processlist",
             "session_connect_attrs",
+            // The statistics tables that hold column values (ADR-0048
+            // decision 4: never the agent's own, so it sends none).
+            "column_stat",
+            "table_stats",
+            "index_stats",
         ];
         for s in all_statements() {
             let lower = s.to_lowercase();
@@ -1440,6 +1529,27 @@ mod tests {
                     continue;
                 }
                 assert!(!lower.contains(d), "{d} in {s}");
+            }
+        }
+    }
+
+    /// ADR-0048 decision 4: no statement of the agent, its
+    /// `performance_schema` polls and probes included, names a statistics
+    /// table (`COLUMN_STATISTICS`, `mysql.column_stats`).
+    #[test]
+    fn no_statement_names_a_statistics_table() {
+        let mut all = all_statements();
+        all.extend(own_performance_schema_reads().into_iter().map(|(t, _)| t));
+        for with_program in [true, false] {
+            all.push(ps_statements(
+                "events_statements_history_long",
+                with_program,
+            ));
+        }
+        for s in &all {
+            let lower = s.to_lowercase();
+            for (db, t) in crate::audit::events::STATISTICS_TABLES {
+                assert!(!lower.contains(&t.to_lowercase()), "{db}.{t} in {s}");
             }
         }
     }
@@ -1499,7 +1609,7 @@ mod tests {
     fn the_poll_texts_are_constant_and_their_tables_listed() {
         use databastion_classifiers::query::{AnalyzeOptions, analyze};
         let own = own_performance_schema_reads();
-        assert_eq!(own.len(), 5 + 3 * 3);
+        assert_eq!(own.len(), 5 + 2 * 2 + 3 * 3);
         let texts: std::collections::HashSet<&str> = own.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(texts.len(), own.len(), "texts are distinct");
         for (text, tables) in &own {
@@ -1545,6 +1655,21 @@ mod tests {
             }
             assert!(server_audit_escaped_len(&set) <= MAX_OWN_STATEMENT);
         }
+        // The Discovery pin's variable: a nonce of 32 hexadecimal digits
+        // only, quiet, naming no table.
+        let nonce = "0123456789abcdef0123456789ABCDEF";
+        let set = ps_pin_variable(nonce).unwrap();
+        assert_eq!(set, format!("SET @databastion_pin = '{nonce}'"));
+        let a = analyze(&set, AnalyzeOptions::mysql());
+        assert!(a.lexed(), "{set}");
+        for p in a.parts() {
+            assert!(p.relations.is_empty(), "{set}");
+            assert!(crate::audit::events::is_quiet(p), "{set}");
+        }
+        for bad in ["", "abc", "0123456789abcdef0123456789abcdeg", "x' OR '1"] {
+            assert!(ps_pin_variable(bad).is_none(), "{bad}");
+        }
+        assert!(ps_pin_variable(&"0".repeat(33)).is_none());
         assert_eq!(
             PS_POLL_TABLES.map(|t| t.to_owned()),
             [
@@ -1635,7 +1760,14 @@ mod tests {
                     let read = matches!(p.kind, StatementKind::Select | StatementKind::Table);
                     let quiet = p.kind == StatementKind::Other && crate::audit::events::is_quiet(p);
                     assert!(read || quiet, "{s}");
+                    // ADR-0047 decision 6: the agent sends no explain of a
+                    // statement but the literal probe shape.
+                    assert!(!p.explain_statement || p.explain_probe, "{s}");
                     assert!(!p.routine_call && !p.compound && !p.analyze_wrapped, "{s}");
+                    // No read into variables (#195 review M2) and no
+                    // `CREATE … AS SELECT` (#186 review L4): never the
+                    // agent's own.
+                    assert!(!p.into_var && !p.var_assign && !p.create_query, "{s}");
                 }
                 checked += 1;
             }

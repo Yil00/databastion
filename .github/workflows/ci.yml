@@ -140,7 +140,7 @@ jobs:
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: console/package.json
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -213,7 +213,7 @@ jobs:
         working-directory: agent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -222,7 +222,7 @@ jobs:
           workspaces: agent
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --all-features --locked
+      - run: $GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh cargo test --all-features --locked
       # Phase 2 exit criterion (ROADMAP P2-F, dev/holdout/README.md): Wilson 95 % lower bound of
       # recall >= 0.90 and precision >= 0.85 per classifier on the held-out corpus. `--check` first
       # (labels.json and the pinned corpus SHA-256 up to date), then write the git-ignored
@@ -236,7 +236,7 @@ jobs:
           cargo test -p databastion-classifiers --test holdout --all-features --locked -- --ignored --nocapture
       - name: Minimal build (no connector)
         run: cargo build --no-default-features --locked
-      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-deny@0.20.2
       # Policy in agent/deny.toml: banned crates (OpenSSL, native-tls, HTTP servers…),
@@ -269,7 +269,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -300,7 +300,7 @@ jobs:
             echo "::error file=shared/protocol/openapi.yaml::the protocol contract is missing"
             exit 1
           fi
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - run: npx --yes @redocly/cli@2.54.3 lint shared/protocol/openapi.yaml
@@ -341,7 +341,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -364,7 +364,7 @@ jobs:
           # Audit (P4-A): the pgaudit jsonlog of the dev image (bind-mounted, 0644 in dev only).
           export DATABASTION_TEST_PG_AUDIT_LOG="$PWD/../dev/.state/logs/postgres/postgresql.json"
           export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
-          cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
+          "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture
       - name: Connector integration tests (local cluster, TLS and weak authentication)
         run: |
           if ! ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1; then
@@ -377,7 +377,7 @@ jobs:
           fi
           eval "$(dev/postgres/local-cluster.sh start)"
           export DATABASTION_TEST_REQUIRE=pg,admin,pss,weak-auth,tls,pgaudit-log
-          (cd agent && cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-postgres --all-features --locked -- --nocapture)
           dev/postgres/local-cluster.sh stop
       - name: Service logs
         if: failure()
@@ -403,7 +403,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -442,7 +442,7 @@ jobs:
           export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
           export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
           export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
-          (cd agent && cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mysql --all-features --locked -- --nocapture)
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 mysql mariadb percona
@@ -466,7 +466,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -489,14 +489,14 @@ jobs:
           export DATABASTION_TEST_MONGO_DUMP_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongodump --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --archive=/dev/null"
           export DATABASTION_TEST_MONGO_EXPORT_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
           export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked -- --nocapture)
       # Phase 7 (#74 review): verify_full against a real TLS-only MongoDB server, with a test CA
       # generated at run time in $RUNNER_TEMP (never committed) and removed afterwards.
       - name: Connector TLS integration test (real server, verify_full, runtime test CA)
         run: |
           eval "$(timeout 300 dev/mongo/tls-test-server.sh start)"
           export DATABASTION_TEST_REQUIRE=mongo-tls
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked tls_real_server -- --nocapture)
       - name: Stop the TLS test server
         if: always()
         run: dev/mongo/tls-test-server.sh stop
@@ -511,7 +511,7 @@ jobs:
           export DATABASTION_TEST_PSMDB_ADMIN_URL="mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:${PSMDB_PORT}/?authSource=admin"
           export DATABASTION_TEST_PSMDB_AUDIT_LOG="$PWD/dev/.state/logs/psmdb/auditLog.json"
           export DATABASTION_TEST_REQUIRE=psmdb-audit
-          (cd agent && cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-mongodb --all-features --locked audit_from_the_percona_audit_log -- --nocapture)
       - name: PSMDB logs and stop
         if: always()
         run: |
@@ -534,7 +534,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -561,7 +561,7 @@ jobs:
           # CAS store guard (ADR-0041 decision 14): the test writes its fixture entries as the admin.
           export DATABASTION_TEST_LDAP_MODIFY_CMD="docker compose -f $PWD/dev/docker-compose.yml exec -T openldap ldapmodify -c -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}'"
           export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls,ldap-modify
-          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-openldap --all-features --locked -- --nocapture --test-threads 1)
       # Phase 7: SASL EXTERNAL over ldapi:// against the real slapd. The socket directory is published
       # to the runner (compose override) and olcAuthzRegexp maps the runner's uid to the service DN.
       - name: SASL EXTERNAL over ldapi:// (runner uid mapped to the service DN)
@@ -576,7 +576,7 @@ jobs:
           export DATABASTION_TEST_LDAPI_PATH="$PWD/dev/.state/ldapi/ldapi"
           export DATABASTION_TEST_LDAPI_DN="cn=databastion,ou=services,dc=example,dc=org"
           export DATABASTION_TEST_REQUIRE=ldapi
-          (cd agent && cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
+          (cd agent && "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-openldap --all-features --locked sasl_external_over_ldapi -- --nocapture)
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 openldap
@@ -597,7 +597,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -646,7 +646,7 @@ jobs:
       # itself only holds needle ids and file names.
       - name: Upload container logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs
           path: e2e-logs/
@@ -688,7 +688,7 @@ jobs:
       # on exit, whatever the result (and masks the secrets in the job log).
       - name: Upload container logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-oidc-logs
           path: e2e-oidc-logs/
@@ -735,12 +735,26 @@ jobs:
       # failed login from the logs on exit, whatever the result (and masks them in the job log).
       - name: Upload container logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-cas-logs
           path: e2e-cas-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+  # RELEASE.md section 7 "Compatibility": e2e/run.sh with the console from this PR and the agent of
+  # the previous release (its signed image, verified with the exact tag identity and pulled by
+  # digest; .github/workflows/e2e-compat.yml, e2e/README.md "Compatibility with the previous agent").
+  # Pull requests into main (release PRs) only, required through ci-result there: a console that
+  # breaks agent N-1 must not be released. Pull requests into dev run it with the `e2e-compat` label,
+  # through e2e-compat.yml's own trigger (not required).
+  e2e-compat:
+    name: E2E compatibility
+    needs: detect
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    uses: ./.github/workflows/e2e-compat.yml
+    permissions:
+      contents: read
 
   # Agent .deb (reproducible build, install in Debian 12 / Ubuntu 24.04 containers, systemd unit
   # checks) and the "Installation < 15 min" test on the runner (deploy/README.md), when packaging
@@ -758,15 +772,22 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: All jobs are green or skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          COMPAT: ${{ needs.e2e-compat.result }}
+          INTO_MAIN: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
         run: |
           echo "results: $RESULTS"
           for r in $RESULTS; do
             case "$r" in success|skipped) ;; *) exit 1 ;; esac
           done
+          # Release PRs: the agent N-1 compatibility run must have run, not been skipped.
+          if [ "$INTO_MAIN" = true ] && [ "$COMPAT" != success ]; then
+            echo "::error::E2E compatibility (console N, agent N-1) did not succeed on a PR into main: $COMPAT"
+            exit 1
+          fi
