@@ -14,7 +14,8 @@ gates** of phase 7; and a password-bearing DCL statement on the Audit path (Post
 / `ALTER ROLE … PASSWORD`, MariaDB `CREATE USER` / `ALTER USER … IDENTIFIED BY`, phase 7); see also
 [Adding an Audit target](#adding-an-audit-target). The console's OIDC login against Keycloak (P8-D)
 is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario), and so
-is the Apereo CAS target (P8-D): [CAS target](#cas-target).
+is the Apereo CAS target (P8-D): [CAS target](#cas-target). The same `run.sh` also runs with the
+previous release's agent: [Compatibility with the previous agent](#compatibility-with-the-previous-agent).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
 It runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/`, `dev/seed/out/`,
@@ -353,6 +354,38 @@ agent reports the Limited level from that source, the Audit steps run the same w
 recognized by its `COPY … TO STDOUT` of several whole tables), and the pgaudit-only checks (level,
 source, literal positive control in the target's log) are replaced or skipped, as printed. It is not
 a substitute for the CI run.
+
+## Compatibility with the previous agent
+[RELEASE.md § 7](../RELEASE.md#7-pre-release-checklist) "Compatibility": a console `X.Y` accepts
+agents `X.Y` and `X.(Y-1)` ([§ 2](../RELEASE.md#compatibility)). The CI job "E2E compatibility
+(console N, agent N-1)" ([`.github/workflows/e2e-compat.yml`](../.github/workflows/e2e-compat.yml))
+runs `run.sh` with the console, the targets and the harness of the pull request, and the agent of
+the previous release: the latest final `X.Y.Z` tag reachable from the PR base (the rule of
+[RELEASE.md § 8](../RELEASE.md#8-holdout-seed-rotation)). Before `run.sh` starts, the job
+downloads that release's `SHA256SUMS`, `SHA256SUMS.cosign.bundle` and `image-digests.txt`, and
+verifies them as [deploy/README.md](../deploy/README.md#verify-the-artifacts) documents, with the
+exact certificate identity of that tag's publish run: `SHA256SUMS` with its bundle,
+`image-digests.txt` against it (listed exactly once), then the agent image's signature by digest;
+it then pulls `ghcr.io/yil00/databastion-agent@sha256:<digest>`.
+
+- **When**: on every pull request into `main` (release PRs), called from `ci.yml` and required
+  through `CI result`; on pull requests into `dev` with the `e2e-compat` label (to try it before a
+  release), through the workflow's own trigger, not required. A `labeled` event starts it only when
+  the label added is `e2e-compat`; the label stays across new commits (remove and re-apply it after
+  reviewing new commits from a fork).
+- **`E2E_PREVIOUS_AGENT_IMAGE`** (with `E2E_PREVIOUS_AGENT_VERSION=X.Y.Z`): the only image override
+  `run.sh` accepts under GitHub Actions, and only as
+  `ghcr.io/yil00/databastion-agent@sha256:<64 hex digits>`. The image must already be local (the
+  workflow pulls it after verifying it; `run.sh` never pulls nor builds it), the agent is not built,
+  and `agent --version` must print `databastion-agent X.Y.Z` (so the run cannot silently test the
+  tree's agent). Everything else, assertions included, is unchanged: the run checks the previous
+  agent against today's console, targets and I2 scans. A failure caused by a deliberate change of
+  the test environment (not of the console) is fixed in the harness, with a comment, in compatibility
+  mode only.
+- Locally, after verifying and pulling the image as above:
+  `E2E_PREVIOUS_AGENT_IMAGE=ghcr.io/yil00/databastion-agent@sha256:<digest> E2E_PREVIOUS_AGENT_VERSION=<X.Y.Z> e2e/run.sh`.
+
+The CAS scenario ([`cas.sh`](cas.sh)) does not run with the previous agent.
 
 ## OIDC login scenario
 ROADMAP P8-D: the console's single sign-on ([ADR-0038](../docs/adr/0038-console-oidc-login.md))

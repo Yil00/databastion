@@ -1,0 +1,140 @@
+name: E2E compatibility
+
+# RELEASE.md section 7 "Compatibility" (a console X.Y accepts agents X.Y and X.(Y-1), section 2):
+# e2e/run.sh with the console, the targets and everything else built from the pull request, and the
+# agent of the previous release: the latest final X.Y.Z tag reachable from the PR base (the rule of
+# pr-checks.yml and RELEASE.md section 8). Its image is taken from the release assets
+# (image-digests.txt), verified as deploy/README.md "Verify the artifacts" documents (SHA256SUMS
+# with its cosign bundle and the exact tag identity, image-digests.txt against it, the agent image
+# signature), then pulled by digest (e2e/README.md "Compatibility with the previous agent").
+#
+# Two entry points, one job:
+# - pull requests into main (release PRs): called by ci.yml, required through its "CI result" check;
+# - pull requests into dev labelled `e2e-compat` (to try it before a release): this workflow's own
+#   pull_request trigger, NOT required. Its own file because ci.yml would need the `labeled` type,
+#   which would re-run every CI job on any label and, with ci.yml's cancel-in-progress concurrency,
+#   cancel the CI run in progress.
+# workflow_dispatch is not usable: a new workflow is only dispatchable from the default branch (main).
+on:
+  workflow_call:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-compat:
+    name: E2E compatibility (console N, agent N-1)
+    # Pull requests into main (only through ci.yml: this file's own trigger is for dev); pull requests
+    # into dev only with the `e2e-compat` label, and on a `labeled` event only when that label is the
+    # one added. The label stays across new commits: remove and re-apply it after reviewing new
+    # commits from a fork (as load.yml's `load-test`).
+    if: >-
+      github.event_name == 'pull_request' && (github.base_ref == 'main'
+      || (contains(github.event.pull_request.labels.*.name, 'e2e-compat')
+          && (github.event.action != 'labeled' || github.event.label.name == 'e2e-compat')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    # New commits cancel the run in progress. A `labeled` event for another label lands in a group of
+    # its own (its job is skipped), so it cannot cancel a real run.
+    concurrency:
+      group: e2e-compat-${{ github.event.pull_request.number }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'e2e-compat') && 'other-label' || 'run' }}
+      cancel-in-progress: true
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-compat-logs
+    steps:
+      # The PR merge commit, with the history and tags (git describe below).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Previous release
+        id: prev
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --force --tags --quiet origin
+          tag="$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' --exclude '*-*' "$BASE" 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            echo "::error::No final release tag reachable from the PR base: no previous agent to test with."
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected previous release tag."
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+          echo "### Previous release (agent N-1): \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # Release files are untrusted data until verified: their own empty directory, read with
+      # grep / awk only. The token is read-only (contents: read) and only in this step.
+      - name: Download the previous release's checksums and image references
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prev.outputs.version }}
+        run: |
+          dir="$RUNNER_TEMP/prev-release"
+          rm -rf "$dir" && mkdir -p "$dir"
+          gh release download "$VERSION" --repo Yil00/databastion --dir "$dir" \
+            --pattern SHA256SUMS --pattern SHA256SUMS.cosign.bundle --pattern image-digests.txt
+          ls -l "$dir"
+      # deploy/README.md "Verify the artifacts": the exact certificate identity of the tag-push run of
+      # publish.yml for that version (ADR-0034), never a pattern.
+      - name: Verify SHA256SUMS, image-digests.txt and the agent image signature
+        id: verify
+        env:
+          VERSION: ${{ steps.prev.outputs.version }}
+        run: |
+          cd "$RUNNER_TEMP/prev-release"
+          ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/${VERSION}"
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+              --certificate-github-workflow-trigger push
+              --certificate-github-workflow-repository Yil00/databastion)
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle "${ID[@]}"
+          # image-digests.txt must be listed, exactly once (sha256sum --ignore-missing would pass
+          # a list that leaves it out), and match.
+          [ "$(grep -cE '^[0-9a-f]{64}  image-digests\.txt$' SHA256SUMS)" = 1 ] \
+            || { echo "::error::SHA256SUMS does not list image-digests.txt exactly once"; exit 1; }
+          grep -E '^[0-9a-f]{64}  image-digests\.txt$' SHA256SUMS | sha256sum --check --strict -
+          # The agent line: <repo>:<version>@sha256:<digest>, exactly one.
+          v_re="${VERSION//./\\.}"
+          lines="$(grep -cE "^ghcr\.io/yil00/databastion-agent:${v_re}@sha256:[0-9a-f]{64}\$" image-digests.txt || true)"
+          [ "$lines" = 1 ] || { echo "::error::image-digests.txt has $lines agent line(s) for $VERSION, expected 1"; exit 1; }
+          digest="$(grep -E "^ghcr\.io/yil00/databastion-agent:${v_re}@sha256:[0-9a-f]{64}\$" image-digests.txt | sed 's/.*@//')"
+          ref="ghcr.io/yil00/databastion-agent@${digest}"
+          cosign verify "$ref" "${ID[@]}" >/dev/null
+          echo "cosign verify: OK ($ref)"
+          echo "image=$ref" >> "$GITHUB_OUTPUT"
+          echo "Agent image: \`$ref\` (signature verified)" >> "$GITHUB_STEP_SUMMARY"
+      # By digest: the content the signature covers. Public package, no registry login.
+      - name: Pull the agent image
+        env:
+          IMAGE: ${{ steps.verify.outputs.image }}
+        run: timeout 300 docker pull -q "$IMAGE"
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+      - name: Run e2e/run.sh (agent N-1)
+        env:
+          E2E_PREVIOUS_AGENT_IMAGE: ${{ steps.verify.outputs.image }}
+          E2E_PREVIOUS_AGENT_VERSION: ${{ steps.prev.outputs.version }}
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 2640 e2e/run.sh
+      # As the e2e job of ci.yml: run.sh redacts every generated secret from the logs on exit,
+      # whatever the result (and masks them in the job log); the secrets are random, for this run
+      # only. If the I2 check fails, the logs may hold seeded values: they are fake and already public.
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-compat-logs
+          path: e2e-compat-logs/
+          retention-days: 7
+          if-no-files-found: ignore

@@ -742,6 +742,20 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # RELEASE.md section 7 "Compatibility": e2e/run.sh with the console from this PR and the agent of
+  # the previous release (its signed image, verified with the exact tag identity and pulled by
+  # digest; .github/workflows/e2e-compat.yml, e2e/README.md "Compatibility with the previous agent").
+  # Pull requests into main (release PRs) only, required through ci-result there: a console that
+  # breaks agent N-1 must not be released. Pull requests into dev run it with the `e2e-compat` label,
+  # through e2e-compat.yml's own trigger (not required).
+  e2e-compat:
+    name: E2E compatibility
+    needs: detect
+    if: github.event_name == 'pull_request' && github.base_ref == 'main' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    uses: ./.github/workflows/e2e-compat.yml
+    permissions:
+      contents: read
+
   # Agent .deb (reproducible build, install in Debian 12 / Ubuntu 24.04 containers, systemd unit
   # checks) and the "Installation < 15 min" test on the runner (deploy/README.md), when packaging
   # files change. Required through ci-result.
@@ -758,7 +772,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
