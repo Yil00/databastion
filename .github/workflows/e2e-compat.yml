@@ -93,7 +93,8 @@ jobs:
           ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/${VERSION}"
               --certificate-oidc-issuer https://token.actions.githubusercontent.com
               --certificate-github-workflow-trigger push
-              --certificate-github-workflow-repository Yil00/databastion)
+              --certificate-github-workflow-repository Yil00/databastion
+              --certificate-github-workflow-sha "$(git -C "$GITHUB_WORKSPACE" rev-parse "refs/tags/${VERSION}^{commit}")")
           cosign verify-blob SHA256SUMS --bundle SHA256SUMS.cosign.bundle "${ID[@]}"
           # image-digests.txt must be listed, exactly once (sha256sum --ignore-missing would pass
           # a list that leaves it out), and match.

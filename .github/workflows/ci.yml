@@ -779,8 +779,15 @@ jobs:
       - name: All jobs are green or skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          COMPAT: ${{ needs.e2e-compat.result }}
+          INTO_MAIN: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
         run: |
           echo "results: $RESULTS"
           for r in $RESULTS; do
             case "$r" in success|skipped) ;; *) exit 1 ;; esac
           done
+          # Release PRs: the agent N-1 compatibility run must have run, not been skipped.
+          if [ "$INTO_MAIN" = true ] && [ "$COMPAT" != success ]; then
+            echo "::error::E2E compatibility (console N, agent N-1) did not succeed on a PR into main: $COMPAT"
+            exit 1
+          fi
