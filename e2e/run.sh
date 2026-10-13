@@ -92,6 +92,24 @@ case "$E2E_PG_AUDIT" in
   *) fail "E2E_PG_AUDIT must be pgaudit or pss" ;;
 esac
 
+# Compatibility mode (RELEASE.md section 7 "Compatibility": console N with agent N-1; CI job
+# "E2E compatibility (console N, agent N-1)", .github/workflows/e2e-compat.yml): the console, the
+# targets and everything else from the tree, the agent from the previous release's published image,
+# pinned by digest. The workflow verifies that image's cosign signature with the release's exact tag
+# identity and pulls it before this script starts; here it is never pulled nor built. The only image
+# override accepted under GitHub Actions, and only in this exact form (no tag, no other registry or
+# repository). E2E_PREVIOUS_AGENT_VERSION is the release (X.Y.Z): `agent --version` must print it.
+E2E_COMPAT=0
+if [ -n "${E2E_PREVIOUS_AGENT_IMAGE:-}" ]; then
+  [[ "$E2E_PREVIOUS_AGENT_IMAGE" =~ ^ghcr\.io/yil00/databastion-agent@sha256:[0-9a-f]{64}$ ]] \
+    || fail "E2E_PREVIOUS_AGENT_IMAGE must be ghcr.io/yil00/databastion-agent@sha256:<64 hex digits>"
+  [[ "${E2E_PREVIOUS_AGENT_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || fail "E2E_PREVIOUS_AGENT_IMAGE needs E2E_PREVIOUS_AGENT_VERSION (X.Y.Z, the previous release)"
+  [ -z "${E2E_AGENT_IMAGE:-}" ] || [ "${GITHUB_ACTIONS:-}" = true ] \
+    || fail "set E2E_PREVIOUS_AGENT_IMAGE or E2E_AGENT_IMAGE, not both"
+  E2E_COMPAT=1
+fi
+
 for tool in docker openssl curl jq timeout python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing tool: $tool"
 done
@@ -474,13 +492,26 @@ body_of() { tail -n +2 <<<"$1"; }
 # --------------------------------------------------------------------------- build + start
 # E2E_SKIP_BUILD=1 (local runs only): use the console, agent and (pgaudit mode) target PostgreSQL
 # images as already built, e.g. behind a TLS-intercepting proxy that the Dockerfiles cannot trust;
-# E2E_CONSOLE_IMAGE / E2E_AGENT_IMAGE / E2E_TARGET_PG_IMAGE name other tags. CI always builds.
+# E2E_CONSOLE_IMAGE / E2E_AGENT_IMAGE / E2E_TARGET_PG_IMAGE name other tags. CI always builds,
+# except the agent in compatibility mode (E2E_PREVIOUS_AGENT_IMAGE, above).
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
   unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_TARGET_PG_IMAGE E2E_TARGET_LDAP_IMAGE
 fi
-BUILT_IMAGES=("${E2E_CONSOLE_IMAGE:-databastion-console:e2e}" "${E2E_AGENT_IMAGE:-databastion-agent:e2e}"
+BUILT_IMAGES=("${E2E_CONSOLE_IMAGE:-databastion-console:e2e}"
   "${E2E_TARGET_LDAP_IMAGE:-databastion-dev/openldap:bookworm-20260918}")
-BUILD_SERVICES=(web agent target-ldap)
+BUILD_SERVICES=(web target-ldap)
+if [ "$E2E_COMPAT" = 1 ]; then
+  # docker-compose.yml names the agent image from E2E_AGENT_IMAGE. It must already be local (pulled
+  # by digest after its signature was verified): with the service's `build:` section, Compose would
+  # otherwise pull it or build the tree's agent under that name.
+  export E2E_AGENT_IMAGE="$E2E_PREVIOUS_AGENT_IMAGE"
+  docker image inspect "$E2E_AGENT_IMAGE" >/dev/null 2>&1 \
+    || fail "compatibility mode: $E2E_AGENT_IMAGE is not pulled (the workflow verifies and pulls it)"
+  log "compatibility mode: agent $E2E_PREVIOUS_AGENT_VERSION from $E2E_AGENT_IMAGE (not built); console and targets from the tree"
+else
+  BUILT_IMAGES+=("${E2E_AGENT_IMAGE:-databastion-agent:e2e}")
+  BUILD_SERVICES+=(agent)
+fi
 if [ "$E2E_PG_AUDIT" = pgaudit ]; then
   BUILT_IMAGES+=("${E2E_TARGET_PG_IMAGE:-databastion-dev/postgres:17.11-pgaudit}")
   BUILD_SERVICES+=(target-pg)
@@ -602,6 +633,13 @@ register_secret enrollment_token "$ENROLLMENT_TOKEN"
 log "creating the agent state volume from the image (checks its owner and mode)"
 timeout 60 docker compose -f "$HERE/docker-compose.yml" run --rm -T --no-deps agent --version \
   >"$E2E_LOG_DIR/agent-version.log" 2>&1 || fail "agent --version failed"
+# Compatibility mode: the agent that runs is the previous release's (positive control: the run tests
+# agent N-1, not the tree's agent under that name).
+if [ "$E2E_COMPAT" = 1 ]; then
+  grep -qxF "databastion-agent $E2E_PREVIOUS_AGENT_VERSION" "$E2E_LOG_DIR/agent-version.log" \
+    || fail "compatibility mode: the agent image does not report version $E2E_PREVIOUS_AGENT_VERSION (agent-version.log)"
+  log "compatibility mode: the agent reports version $E2E_PREVIOUS_AGENT_VERSION"
+fi
 state_mode="$(files_root 'stat -c "%u:%g %a" /state')"
 [ "$state_mode" = "10001:10001 700" ] || fail "state volume is '$state_mode', expected '10001:10001 700'"
 files_root 'chmod 0700 /secrets && chown 10001:10001 /secrets'
