@@ -226,7 +226,7 @@ agent-deny: ## cargo-deny bans / licenses / sources, dev-dependencies too (CI; n
 	cd agent && timeout 600 cargo deny --locked check bans licenses sources
 	cd agent && timeout 600 cargo deny --config deny-dev.toml --locked check licenses sources
 
-agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|all
+agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|redis|all (redis: after `make dev-redis`)
 	timeout $(CARGO_TIMEOUT) dev/agent-it.sh $(ENGINE)
 
 agent-fuzz: ## Fuzz smoke run of the parser targets, FUZZ_SECONDS each (CI: 10)

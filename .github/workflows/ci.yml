@@ -584,6 +584,81 @@ jobs:
         if: always()
         run: docker compose -f dev/docker-compose.yml down -v
 
+  # Redis / Valkey connector integration tests (P9-B, P9-D, ADR-0052) against the opt-in dev profile
+  # `redis`: Valkey 9.0 and Redis 8.10, TLS only with the dev CA of redis-tls-init, the seeded
+  # keyspace and the agent's ACL users (dev/redis/entrypoint.sh). One Redis and one Valkey version
+  # here (ADR-0052 open question 7); every maintained line runs weekly in engine-matrix.yml. The
+  # commands and variables are those of `dev/agent-it.sh redis` (DATABASTION_IT_REDIS=1, one test
+  # thread: the tests share the scratch databases and read ACL LOG).
+  agent-redis:
+    name: Agent Redis / Valkey integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROFILES: redis
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev Valkey and Redis services
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 valkey redis
+          timeout 60 docker compose -f dev/docker-compose.yml images valkey redis
+      - name: Connector integration tests (dev images, Valkey and Redis over TLS)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/agent-it.sh redis 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 redis-tls-init valkey redis
+      # Last before Stop, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+      - name: Stop
+        if: always()
+        run: timeout 120 docker compose -f dev/docker-compose.yml down -v
+
+  # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
+  # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
+  # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
+  # up. Ignored in debug builds (5 to 11 minutes there), about 20 s in release. A job of its own so
+  # that the release build neither shares the debug cache nor eats the Agent job's time budget.
+  agent-keys-sweep:
+    name: Agent key-pattern code-point sweep (release)
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+          key: release-sweep
+      - name: Code-point sweep (keys_contract, release)
+        run: timeout 600 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test --release --locked -p databastion-classifiers --test keys_contract -- --include-ignored
+
   # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
   # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,
   # accesslog entries. Coverage-instrumented, no sanitizer (nightly only), 10 s per target.
@@ -772,7 +847,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
