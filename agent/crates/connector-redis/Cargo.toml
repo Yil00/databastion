@@ -1,0 +1,45 @@
+[package]
+name = "databastion-connector-redis"
+description = "DataBastion agent: Redis / Valkey connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rule: a connector depends on `databastion-core` (trait, sinks)
+# and `databastion-classifiers` (masking) only. Never on an HTTP client: it has
+# no access to the uplink (checked by crates/agent/tests/architecture.rs).
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Own client for a closed subset of RESP3 (`resp`, `cmd`, `conn`), no Redis
+# client crate (ADR-0052 decision 1): bounded replies, no write command, no
+# server text kept, no topology following.
+# TLS: rustls only, `ring` provider, system roots or a pinned CA file.
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+# The client key opened with O_NOFOLLOW and checked with fstat (ADR-0043,
+# security review L8); the agent's effective uid for the socket peer check.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+
+[dev-dependencies]
+databastion-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
