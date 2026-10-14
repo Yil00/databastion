@@ -54,6 +54,9 @@ jobs:
           - { target: openldap_message, seconds: 180 }
           - { target: openldap_filter, seconds: 180 }
           - { target: openldap_accesslog, seconds: 180 }
+          - { target: redis_resp_decoder, seconds: 300 }
+          - { target: redis_info, seconds: 120 }
+          - { target: redis_key_pattern, seconds: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

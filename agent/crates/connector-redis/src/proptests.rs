@@ -123,3 +123,17 @@ proptest! {
         prop_assert!(decode_all(w.as_bytes(), L).is_err());
     }
 }
+
+#[cfg(feature = "fuzzing")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// The fuzz entry points on arbitrary input (a short local smoke run;
+    /// the coverage-guided runs are in `agent/fuzz`).
+    #[test]
+    fn fuzz_entry_points_never_panic(data in prop::collection::vec(any::<u8>(), 0..256)) {
+        crate::fuzz::resp_decoder(&data);
+        crate::fuzz::info(&data);
+        crate::fuzz::key_pattern(&data);
+    }
+}

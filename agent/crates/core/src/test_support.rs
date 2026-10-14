@@ -62,3 +62,13 @@ pub fn contract_events_json(events: &[MaskedEvent], key: &HmacKey) -> String {
         accept_bytes: true,
     }))
 }
+
+/// The coverage a connector reported through `sink` so far (zero when
+/// none).
+#[must_use]
+pub fn coverage_of(sink: &crate::FindingSink) -> crate::ScanCoverage {
+    sink.coverage_cell()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_default()
+}

@@ -98,15 +98,22 @@ fn class(pattern: &[u8], start: usize, c: u8) -> Option<usize> {
     (hit != negate).then_some(i - start)
 }
 
-/// A constant key matching `pattern` (for `ACL DRYRUN … type <key>`,
-/// decision 4), verified with [`matches`]; `None` when none is found.
+/// A constant, non-empty key matching `pattern` (for `ACL DRYRUN … type
+/// <key>`, decision 4), verified with [`matches`]; `None` when none is
+/// found.
 pub(crate) fn example(pattern: &[u8]) -> Option<Vec<u8>> {
     const CANDIDATES: &[u8] = b"a0_zZ:x9.-";
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(&b) = pattern.get(i) {
         match b {
-            b'*' => i += 1,
+            // One byte for a run: `ACL DRYRUN` takes no empty key.
+            b'*' => {
+                if out.last() != Some(&b'x') || pattern.get(i.wrapping_sub(1)) != Some(&b'*') {
+                    out.push(b'x');
+                }
+                i += 1;
+            }
             b'?' => {
                 out.push(b'a');
                 i += 1;
@@ -169,7 +176,7 @@ mod tests {
             b"customer:[a-z]*:x",
         ] {
             let k = example(p).unwrap();
-            assert!(matches(p, &k), "{p:?}");
+            assert!(matches(p, &k) && !k.is_empty(), "{p:?}");
         }
     }
 }

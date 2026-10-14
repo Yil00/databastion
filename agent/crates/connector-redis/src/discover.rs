@@ -606,11 +606,12 @@ async fn sample_database(
 }
 
 /// The hint given to the classifier for a value field: the pattern's last
-/// literal token (`customer:*:email` -> `email`).
+/// literal segment (`customer:*:email` -> `email`,
+/// `integration:*:secret_access_key` -> `secret_access_key`).
 fn hint(pattern: &str) -> &str {
     pattern
-        .rsplit([':', '/', '|', '.', '_', '-', '#'])
-        .find(|t| !t.is_empty() && *t != "*")
+        .rsplit([':', '/', '|', '.'])
+        .find(|t| !t.is_empty() && !t.contains('*'))
         .unwrap_or("value")
 }
 
@@ -874,6 +875,7 @@ mod tests {
         assert_eq!(hint("customer:*:email"), "email");
         assert_eq!(hint("user:*:profile"), "profile");
         assert_eq!(hint("*"), "value");
+        assert_eq!(hint("integration:*:secret_access_key"), "secret_access_key");
         assert_eq!(value_text(b"abc").unwrap().as_str(), "abc");
         assert!(value_text(&[0xff, 0xfe]).is_none());
         let mut long = "é".repeat(3000).into_bytes();
