@@ -87,7 +87,8 @@ class Outputs(unittest.TestCase):
     def test_ground_truth_shape(self):
         locs = self.truth["locations"]
         engines = {loc["engine"] for loc in locs}
-        self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap", "cas"})
+        self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap", "cas",
+                                   "sqlserver", "valkey", "redis"})
         for loc in locs:
             for key in ("engine", "database", "object", "expected_classifiers", "negative_control",
                         "name_contains_value"):
@@ -124,15 +125,54 @@ class Outputs(unittest.TestCase):
 
     def test_positive_values_are_in_seed_files(self):
         seed_file = {"postgresql": "postgres.sql", "mysql": "mysql.sql", "mariadb": "mariadb.sql",
-                     "mongodb": "mongo.json"}
+                     "mongodb": "mongo.json", "sqlserver": "sqlserver.sql", "valkey": "redis.txt",
+                     "redis": "redis.txt"}
         for loc in self.truth["locations"]:
             if loc["engine"] not in seed_file:
                 continue  # LDIF: non-ASCII values are base64-encoded
             content = self.files["seed/out/" + seed_file[loc["engine"]]]
             for v in loc.get("values", []):
-                needle = v if loc["engine"] == "mongodb" else v.replace("'", "''")
+                if loc["engine"] == "mongodb":
+                    needle = v
+                elif loc["engine"] in g.REDIS_ENGINES:
+                    needle = v.replace("\\", "\\\\").replace('"', '\\"')
+                else:
+                    needle = v.replace("'", "''")
                 if needle not in content:
                     self.fail(f"{loc['engine']} {loc['object']}.{loc['field']}: value not in seed file")
+
+class SqlServerAndRedis(unittest.TestCase):
+    """The opt-in SQL Server, Valkey and Redis seeds (ADR-0051 decision 9, ADR-0052 decision 13)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = g.build()
+        cls.truth = json.loads(cls.files["ground-truth.json"])
+
+    def test_sqlserver_two_schemas_and_fixtures(self):
+        locs = [loc for loc in self.truth["locations"] if loc["engine"] == "sqlserver"]
+        pii = {loc["container"] for loc in locs if loc["expected_classifiers"]}
+        self.assertEqual(pii, {"crm", "finance"})
+        sql = self.files["seed/out/sqlserver.sql"]
+        for fixture in ("MASKED WITH", "ENCRYPTED WITH", "SYSTEM_VERSIONING = ON", "CREATE SECURITY POLICY",
+                        "AS finance.fn_iban_prefix", "CREATE SYNONYM", "archive.invalid", "cas.cas_tickets"):
+            self.assertIn(fixture, sql)
+        # No batch of the seed may exceed SQL Server's 1000-row VALUES limit.
+        self.assertTrue(all(chunk.count("\n  (") < 1000 for chunk in sql.split("INSERT INTO")))
+
+    def test_redis_types_and_names(self):
+        for engine in g.REDIS_ENGINES:
+            locs = [loc for loc in self.truth["locations"] if loc["engine"] == engine]
+            self.assertEqual({loc["container"] for loc in locs},
+                             {"string", "hash", "set", "zset", "list", "stream"})
+            named = [v for loc in locs if loc["name_contains_value"] for v in loc["name_values"]]
+            self.assertTrue(any("@" in v for v in named) and any(v.isdigit() for v in named))
+        text = self.files["seed/out/redis.txt"]
+        commands = [line for line in text.splitlines() if not line.startswith("#")]
+        self.assertTrue(all(line.startswith('"') for line in commands))
+        for name in ("SET", "HSET", "SADD", "ZADD", "RPUSH", "XADD", "SELECT"):
+            self.assertIn(f'"{name}" ', text)
+
 
 class CasRegistry(unittest.TestCase):
     """dev/cas/services (opt-in CAS dev service) against the ground truth and the CAS config."""

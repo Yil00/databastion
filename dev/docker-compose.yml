@@ -399,6 +399,108 @@ services:
     security_opt: ["no-new-privileges:true"]
     restart: "no"
 
+  # Microsoft SQL Server (phase 9, P9-D): the target of the SQL Server connector (ADR-0051
+  # decision 9). Opt-in (profile `sqlserver`): `make dev-sqlserver`; about 2 GiB of memory and a
+  # 2.3 GB image, amd64 only. Express edition (MSSQL_PID=Express) until the maintainer confirms
+  # the Developer license terms for CI (ADR-0051 open question 13). sqlserver/entrypoint.sh creates
+  # the dev CA and a server certificate naming the host, forces encryption, and on the first start
+  # loads seed/out/sqlserver.sql, the agent login (minimal variant) and the audit setup (server
+  # audit, specification with AUDIT_CHANGE_GROUP, Extended Events session). The image runs as
+  # `mssql` (uid 10001). `DATABASTION_DEV_SQLSERVER_IMAGE` selects another version (2019, 2025).
+  sqlserver:
+    image: ${DATABASTION_DEV_SQLSERVER_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718}
+    profiles: [sqlserver]
+    entrypoint: ["/bin/bash", "/databastion/entrypoint.sh"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Express
+      MSSQL_SA_PASSWORD: ${SQLSERVER_SA_PASSWORD:-dev-only-SqlServer-sa-1}
+      # SQL Server's password policy (CHECK_POLICY = ON) needs three character classes, which the
+      # shared DATABASTION_DB_PASSWORD does not have.
+      DATABASTION_SQLSERVER_PASSWORD: ${SQLSERVER_DATABASTION_PASSWORD:-dev-only-Agent-ReadOnly-1}
+      DATABASTION_DEV_SQLSERVER_FORCE_STRICT: ${DATABASTION_DEV_SQLSERVER_FORCE_STRICT:-0}
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+    ports:
+      - "127.0.0.1:${SQLSERVER_PORT:-1433}:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+      - ./sqlserver/entrypoint.sh:/databastion/entrypoint.sh:ro
+      - ./sqlserver/initdb:/databastion/initdb:ro
+      - ./seed/out/sqlserver.sql:/databastion/seed/10-seed.sql:ro
+    cap_drop: [ALL]
+    # sqlservr carries the file capability cap_net_bind_service: its exec fails (EPERM) when the
+    # capability is outside the bounding set.
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # A marker written once the seed is applied and the server answers, then a bare TCP connect:
+      # no login, so no audit record and no Extended Events event.
+      test: ["CMD", "bash", "-c", "test -f /var/opt/mssql/.databastion-ready && exec 3<>/dev/tcp/127.0.0.1/1433"]
+      <<: *healthcheck
+      start_period: 120s
+
+  # Valkey and Redis (phase 9, P9-D): the targets of the Redis / Valkey connector (ADR-0052
+  # decision 13). Opt-in (profile `redis`): `make dev-redis`. Valkey is the default service (BSD-3);
+  # Redis 8 is licensed RSALv2 / SSPLv1 / AGPLv3 (dev/README.md). Both load the same keyspace
+  # (seed/out/redis.txt) with the agent's ACL users (redis/entrypoint.sh), TLS only on TCP with
+  # the dev CA of redis-tls-init, `default` user off, and the slow log at every command.
+  redis-tls-init:
+    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    profiles: [redis]
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["sh", "/usr/local/bin/tls-init.sh"]
+    volumes:
+      - ./redis/tls-init.sh:/usr/local/bin/tls-init.sh:ro
+      - redis-tls:/tls
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  valkey:
+    image: ${DATABASTION_DEV_VALKEY_IMAGE:-valkey/valkey:9.0.6@sha256:63346cb24a61221e76bdf41acce99b3968a9fa83d8122144deab45394b27b4f2}
+    profiles: [redis]
+    depends_on:
+      redis-tls-init: { condition: service_completed_successfully }
+    user: "999:999"
+    entrypoint: ["/bin/bash", "/usr/local/bin/databastion-entrypoint.sh"]
+    environment: &redis-env
+      DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:-dev-only-redis-admin}
+      DATABASTION_DEV_REDIS_SLOWLOG_US: ${DATABASTION_DEV_REDIS_SLOWLOG_US:-0}
+    ports:
+      - "127.0.0.1:${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkey-data:/data
+      - redis-tls:/tls:ro
+      - ./redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
+      - ./seed/out/redis.txt:/seed/redis.txt:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck: &redis-healthcheck
+      test: ["CMD", "bash", "-c", "test -f /tmp/databastion-ready && exec 3<>/dev/tcp/127.0.0.1/6379"]
+      <<: *healthcheck
+
+  redis:
+    image: ${DATABASTION_DEV_REDIS_IMAGE:-redis:8.10.2@sha256:2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6}
+    profiles: [redis]
+    depends_on:
+      redis-tls-init: { condition: service_completed_successfully }
+    user: "999:999"
+    entrypoint: ["/bin/bash", "/usr/local/bin/databastion-entrypoint.sh"]
+    environment: *redis-env
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6389}:6379"
+    volumes:
+      - redis-data:/data
+      - redis-tls:/tls:ro
+      - ./redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
+      - ./seed/out/redis.txt:/seed/redis.txt:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck: *redis-healthcheck
+
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     environment:
@@ -486,3 +588,7 @@ volumes:
   prometheus-data:
   prometheus-secrets:
   grafana-data:
+  sqlserver-data:
+  valkey-data:
+  redis-data:
+  redis-tls:
