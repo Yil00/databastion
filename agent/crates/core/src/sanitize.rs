@@ -9,7 +9,8 @@
 //! | Keyword | Where | Here |
 //! |---------|-------|------|
 //! | `not` (Identifier) | location / object names | name replaced by `*` |
-//! | `ObjectName` other than an `Identifier` (a `KeyPattern`) | location / event objects | name replaced by `*` (no connector builds key patterns yet, ADR-0052) |
+//! | `if` / `then` / `else` on `Location.engine` (`KeyPattern` for `redis` / `valkey`, `Identifier` otherwise) | location objects | name replaced by `*` (the `KeyPattern` pattern and every `not` rule, `keys::is_key_pattern`) |
+//! | `ObjectName` other than an `Identifier` on an event object | event objects | name replaced by `*` (no connector builds Redis / Valkey events yet, ADR-0052) |
 //! | `minimum` / `maximum` on numbers | `confidence` | item dropped (NaN, < 0, > 1) |
 //! | `minimum` / `maximum` on integers | `sampled`, `matched`, `aggregated_count`, `Count` | item dropped, or optional field omitted |
 //! | `maxItems` | `masked_samples` (5), `fingerprints` (50), `objects` (16), `signals` (16) | truncated |
@@ -28,10 +29,11 @@
 
 use std::collections::HashSet;
 
+use databastion_classifiers::keys::is_key_pattern;
 use databastion_classifiers::masking::{HmacKey, RawSample};
 use databastion_classifiers::names::{is_forbidden_char, violates_numeric_rule};
 use databastion_protocol::{
-    AccessEvent, AccessEventAction, ClientAddress, Count, Finding, Fingerprint, Identifier,
+    AccessEvent, AccessEventAction, ClientAddress, Count, Engine, Finding, Fingerprint, Identifier,
     ObjectName, Principal, PrincipalVariant0Application, PrincipalVariant0DbUser,
     PrincipalVariant1Application,
 };
@@ -185,11 +187,11 @@ pub(crate) fn clamped_count(n: u64) -> Count {
     Count(i64::try_from(n).map_or(MAX_COUNT, |v| v.min(MAX_COUNT)))
 }
 
-/// Sanitizes an object name in place. An `Identifier` goes through
-/// [`fix_identifier`]. A name that is only a `KeyPattern` (Redis / Valkey,
-/// ADR-0052 decision 7) becomes `*`: no connector builds key patterns yet,
-/// and its engine-dependent rules (`KeyPattern`'s `not` rule, Redis /
-/// Valkey only) are not enforced here yet (fail closed).
+/// Sanitizes an object name in place outside a Redis / Valkey location.
+/// An `Identifier` goes through [`fix_identifier`]. A name that is only a
+/// `KeyPattern` becomes `*`: on an event object (no Redis / Valkey Audit
+/// yet, ADR-0052 decision 8) or on another engine's location (fail
+/// closed).
 fn fix_object_name(name: &mut ObjectName) -> bool {
     match name {
         ObjectName::Variant0(id) => fix_identifier(id),
@@ -203,11 +205,38 @@ fn fix_object_name(name: &mut ObjectName) -> bool {
     }
 }
 
+/// Whether a location of `engine` names its object with a `KeyPattern`
+/// (contract `Location`: `if engine in [redis, valkey]`).
+pub(crate) fn uses_key_patterns(engine: Engine) -> bool {
+    matches!(engine, Engine::Redis | Engine::Valkey)
+}
+
+/// Sanitizes the object of a location in place, by its engine: a Redis /
+/// Valkey object must be a contract `KeyPattern` (its pattern, length and
+/// every `not` rule: digit runs per segment and across separators, IPv4,
+/// IPv6, MAC, percent escapes, URL-scheme first segment), any other
+/// engine's an `Identifier`; anything else becomes `*` (ADR-0009).
+fn fix_location_object(name: &mut ObjectName, engine: Engine) -> bool {
+    if !uses_key_patterns(engine) {
+        return fix_object_name(name);
+    }
+    if is_key_pattern(&name.to_string()) {
+        return true;
+    }
+    match wildcard() {
+        Some(w) => {
+            *name = ObjectName::Variant0(w);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Validates and sanitizes a finding in place. `false`: drop it.
 pub(crate) fn check_finding(f: &mut Finding) -> bool {
     let l = &mut f.location;
     let names_ok = fix_identifier(&mut l.database)
-        && fix_object_name(&mut l.object)
+        && fix_location_object(&mut l.object, l.engine)
         && fix_identifier(&mut l.field)
         && l.schema.as_mut().is_none_or(fix_identifier);
     if !names_ok {
@@ -339,10 +368,100 @@ pub(crate) mod tests {
         assert_eq!(e.bytes.map(|c| c.0), Some(0));
     }
 
+    fn redis_finding(engine: &str, object: &str) -> Finding {
+        let mut f = finding();
+        f.location = serde_json::from_value(serde_json::json!({
+            "engine": engine, "database": "db0", "schema": "hash",
+            "object": "x", "field": "#key"
+        }))
+        .unwrap();
+        f.location.object = object.parse().unwrap();
+        f
+    }
+
+    #[test]
+    fn key_patterns_are_checked_by_engine() {
+        for engine in ["redis", "valkey"] {
+            for kept in [
+                "user:*:email",
+                "session:*",
+                "cache:page:about",
+                "orders",
+                "*",
+            ] {
+                let mut f = redis_finding(engine, kept);
+                assert!(check_finding(&mut f));
+                assert_eq!(f.location.object.to_string(), kept, "{engine}");
+            }
+            // Valid under the generated pattern, refused by a `not` rule.
+            for masked in [
+                "host:10.0.0.1",
+                "tel:06.12.34.56.78",
+                "user:jane%40example",
+                "javascript:x",
+                "device:00:1a:2b:3c:4d:5e",
+                "tel:06_12_34_56_78",
+                "phone:\u{ff10}\u{ff16}\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}",
+                "123456789",
+            ] {
+                let mut f = redis_finding(engine, masked);
+                assert!(check_finding(&mut f));
+                assert_eq!(f.location.object.to_string(), "*", "{engine} {masked}");
+            }
+        }
+        // Another engine: a key pattern is never sent as such.
+        let mut f = redis_finding("mongodb", "user:*:email");
+        assert!(check_finding(&mut f));
+        assert_eq!(f.location.object.to_string(), "*");
+    }
+
+    /// The contract's `KeyPattern` `not` rule, compiled with `regress`.
+    static NOT: std::sync::LazyLock<regress::Regex> = std::sync::LazyLock::new(|| {
+        let yaml =
+            std::fs::read_to_string(databastion_protocol_codegen::default_openapi_path()).unwrap();
+        let schema = databastion_protocol_codegen::json_schema_from_openapi(&yaml).unwrap();
+        let not = schema["$defs"]["KeyPattern"]["not"]["pattern"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        regress::Regex::with_flags(&not, "u").unwrap()
+    });
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1500))]
+
+        /// A Redis / Valkey object is kept exactly when the contract accepts
+        /// it (generated `KeyPattern` type, then the `not` rule); every
+        /// object the sanitizer lets through is valid.
+        #[test]
+        fn sanitizer_mirrors_the_contract_key_pattern(
+            pieces in proptest::collection::vec(proptest::sample::select(vec![
+                "a", "Z", "f", "0", "7", "42", ":", "/", "|", ".", "-", "_", "+", " ", "%",
+                "%4", "@", "*", "{", "#", "\u{ff10}", "\u{ff0e}", "\u{a0}", "\u{2010}",
+                "http", "mailto", "00:1a", "db8", ",",
+            ]), 1..20)
+        ) {
+            let s: String = pieces.concat();
+            let Ok(object) = s.parse::<ObjectName>() else { return Ok(()); };
+            let mut f = redis_finding("valkey", "x");
+            f.location.object = object;
+            proptest::prop_assert!(check_finding(&mut f));
+            let out = f.location.object.to_string();
+            let contract = databastion_protocol::KeyPattern::try_from(s.as_str()).is_ok()
+                && NOT.find(&s).is_none();
+            if contract {
+                proptest::prop_assert_eq!(&out, &s);
+            } else {
+                proptest::prop_assert_eq!(out.as_str(), "*");
+            }
+        }
+    }
+
     #[test]
     fn key_patterns_and_unrecorded_accounts_are_not_sent_yet() {
-        // No connector builds them yet (ADR-0052): a key pattern object
-        // becomes `*`, an `account_not_recorded` principal drops the event.
+        // No Redis / Valkey Audit yet (ADR-0052 decision 8): a key pattern
+        // event object becomes `*`, an `account_not_recorded` principal
+        // drops the event.
         let mut e = event("read", 1);
         e.objects[0].object = "session:*".parse().unwrap();
         assert!(check_event(&mut e));
@@ -385,8 +504,7 @@ pub(crate) mod tests {
         assert!(check_finding(&mut f));
         assert_eq!(f.location.object.to_string(), "*");
 
-        // A key pattern (Redis / Valkey only): no connector builds one yet,
-        // so it never leaves as such.
+        // A key pattern on a PostgreSQL location never leaves as such.
         let mut f = finding();
         f.location.object = "user:*:email".parse().unwrap();
         assert!(matches!(f.location.object, ObjectName::Variant1(_)));

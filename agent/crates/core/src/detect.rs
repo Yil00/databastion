@@ -4,10 +4,10 @@
 //! - a fixed list of Unix socket paths (contract `UnixSocketPath`
 //!   directories: `/run`, `/var/run`, `/tmp`, `/var/lib/mysql`);
 //! - `LISTEN` entries of `/proc/net/tcp` and `/proc/net/tcp6` for the ports
-//!   5432, 3306, 27017, 389, 636 (only the port is kept; the listening
+//!   5432, 3306, 27017, 389, 636, 6379 (only the port is kept; the listening
 //!   address is never reported);
 //! - `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`, `mongod`,
-//!   `slapd` (the process name only: the command line may contain secrets
+//!   `slapd`, `redis-server`, `valkey-server` (the process name only: the command line may contain secrets
 //!   and is never read).
 //!
 //! The agent never connects to a detected engine. Engines already declared
@@ -47,6 +47,14 @@ const SOCKETS: &[(&str, Engine)] = &[
     ("/var/run/slapd/ldapi", Engine::Openldap),
     ("/run/openldap/ldapi", Engine::Openldap),
     ("/var/run/ldapi", Engine::Openldap),
+    // ADR-0052 decision 11: the distributions' default paths. A Redis path
+    // is reported as `redis` unless only `valkey-server` runs.
+    ("/run/redis/redis-server.sock", Engine::Redis),
+    ("/var/run/redis/redis-server.sock", Engine::Redis),
+    ("/run/redis/redis.sock", Engine::Redis),
+    ("/tmp/redis.sock", Engine::Redis),
+    ("/run/valkey/valkey.sock", Engine::Valkey),
+    ("/var/run/valkey/valkey.sock", Engine::Valkey),
 ];
 
 const PORTS: &[(u16, Engine)] = &[
@@ -55,6 +63,9 @@ const PORTS: &[(u16, Engine)] = &[
     (27017, Engine::Mongodb),
     (389, Engine::Openldap),
     (636, Engine::Openldap),
+    // Port 6379 cannot tell Redis from Valkey: `redis` unless only
+    // `valkey-server` runs. The Sentinel port 26379 is never reported.
+    (6379, Engine::Redis),
 ];
 
 const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
@@ -67,6 +78,19 @@ const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
     ("mariadbd", DetectedTargetProcess::Mariadbd, Engine::Mariadb),
     ("mongod", DetectedTargetProcess::Mongod, Engine::Mongodb),
     ("slapd", DetectedTargetProcess::Slapd, Engine::Openldap),
+    // Process names only: `redis-sentinel` and `valkey-sentinel` are never
+    // reported (ADR-0052 decision 11). A Valkey server started as
+    // `redis-server` (compatibility name) is reported as `redis`.
+    (
+        "redis-server",
+        DetectedTargetProcess::RedisServer,
+        Engine::Redis,
+    ),
+    (
+        "valkey-server",
+        DetectedTargetProcess::ValkeyServer,
+        Engine::Valkey,
+    ),
 ];
 
 /// Where to look. Production: `/` and `std::os::unix::fs::FileTypeExt`.
@@ -93,10 +117,10 @@ fn family(engine: Engine) -> u8 {
         // Never detected (ADR-0041 decision 3: no local detection of CAS,
         // whose `java` command line carries secrets); its own family.
         Engine::Cas => 4,
-        // Not detected yet (local detection comes with the connectors,
-        // ADR-0051 decision 7, ADR-0052 decision 11); their own families,
-        // Redis and Valkey one family as MySQL and MariaDB.
+        // Not detected yet (local detection comes with its connector,
+        // ADR-0051 decision 7); its own family.
         Engine::Sqlserver => 5,
+        // ADR-0052 decision 11: one family, as MySQL and MariaDB.
         Engine::Redis | Engine::Valkey => 6,
     }
 }
@@ -108,6 +132,7 @@ fn target_family(engine: TargetEngine) -> u8 {
         TargetEngine::Mongodb => 2,
         TargetEngine::Openldap => 3,
         TargetEngine::Cas => 4,
+        TargetEngine::Redis | TargetEngine::Valkey => 6,
     }
 }
 
@@ -128,6 +153,7 @@ fn default_port(engine: TargetEngine) -> u16 {
         TargetEngine::Openldap => 389,
         // Never detected (no port of its own here; ADR-0041 decision 3).
         TargetEngine::Cas => 0,
+        TargetEngine::Redis | TargetEngine::Valkey => crate::config::redis::DEFAULT_PORT,
     }
 }
 
@@ -185,9 +211,13 @@ pub(crate) fn detect(view: &HostView<'_>, targets: &[TargetConfig]) -> Vec<Detec
     let procs = processes(view.root);
     let mariadb_only = procs.iter().any(|(_, e)| *e == Engine::Mariadb)
         && !procs.iter().any(|(_, e)| *e == Engine::Mysql);
+    let valkey_only = procs.iter().any(|(_, e)| *e == Engine::Valkey)
+        && !procs.iter().any(|(_, e)| *e == Engine::Redis);
     let refine = |e: Engine| {
         if e == Engine::Mysql && mariadb_only {
             Engine::Mariadb
+        } else if e == Engine::Redis && valkey_only {
+            Engine::Valkey
         } else {
             e
         }

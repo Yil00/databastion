@@ -105,6 +105,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Mongodb => ProtoConnector::Mongodb,
         Engine::Openldap => ProtoConnector::Openldap,
         Engine::Cas => ProtoConnector::Cas,
+        Engine::Redis => ProtoConnector::Redis,
     }
 }
 
@@ -3320,6 +3321,8 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Mongodb => databastion_protocol::Engine::Mongodb,
         TargetEngine::Openldap => databastion_protocol::Engine::Openldap,
         TargetEngine::Cas => databastion_protocol::Engine::Cas,
+        TargetEngine::Redis => databastion_protocol::Engine::Redis,
+        TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
     }
 }
 
