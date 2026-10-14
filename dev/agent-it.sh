@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Connector integration tests against the running dev environment (`make dev`), one engine at a
 # time, with the same variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the
-# matching CI job (.github/workflows/ci.yml: agent-pg, agent-mysql, agent-mongodb, agent-openldap).
+# matching CI job (.github/workflows/ci.yml: agent-pg, agent-mysql, agent-mongodb, agent-openldap,
+# agent-redis).
 #
-#   dev/agent-it.sh postgres|mysql|mongodb|openldap|all     (or: make agent-it [ENGINE=...])
+#   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|all     (or: make agent-it [ENGINE=...])
+#
+# `redis` needs the opt-in profile (`make dev-redis`: Valkey and Redis) and is not part of `all`.
 #
 # Not covered here (CI-only extra steps, see ci.yml): the PostgreSQL local cluster (TLS, weak
 # authentication), the MongoDB verify_full TLS server and the Percona Server for MongoDB auditLog
@@ -118,9 +121,25 @@ it_openldap() {
   cargo_it databastion-connector-openldap --test-threads 1
 }
 
+# Valkey and Redis (ADR-0052, opt-in profile `redis`): both services, over TLS with the dev CA of
+# redis-tls-init (shared by both), the ACL users `databastion` / `databastion_scoped`
+# (DATABASTION_DB_PASSWORD) and `admin` for the fixtures (REDIS_ADMIN_PASSWORD), from dev/.env like
+# VALKEY_PORT and REDIS_PORT. The tests are gated by DATABASTION_IT_REDIS=1 rather than
+# DATABASTION_TEST_REQUIRE: once set, every test runs against both servers. One test thread: the
+# tests share the scratch databases and read the servers' ACL LOG.
+it_redis() {
+  export COMPOSE_PROFILES=redis
+  require_services valkey redis
+  mkdir -p dev/.state/tls
+  compose exec -T valkey cat /tls/ca.pem > dev/.state/tls/redis-ca.pem
+  export DATABASTION_IT_REDIS=1
+  export DATABASTION_IT_REDIS_CA="$ROOT/dev/.state/tls/redis-ca.pem"
+  cargo_it databastion-connector-redis --test-threads 1
+}
+
 case "$ENGINE" in
-  postgres | mysql | mongodb | openldap) "it_$ENGINE" ;;
+  postgres | mysql | mongodb | openldap | redis) "it_$ENGINE" ;;
   # Subshells: each engine exports its own DATABASTION_TEST_REQUIRE.
   all) for e in postgres mysql mongodb openldap; do (echo "== $e"; "it_$e"); done ;;
-  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap or all)" >&2; exit 2 ;;
+  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis or all)" >&2; exit 2 ;;
 esac
