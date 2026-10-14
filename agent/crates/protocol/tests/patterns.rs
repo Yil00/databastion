@@ -53,10 +53,24 @@ fn every_contract_pattern_compiles_in_unicode_mode() {
         "tel:06\u{a0}12\u{a0}34\u{a0}56\u{a0}78",
         "user:jane%40example",
         "javascript:x",
+        "host:10.0.0.1",
+        "host.10.0.0.1",
+        "device:00-1a-2b-3c-4d-5e",
+        "device:001a.2b3c.4d5e",
+        "tel:06\u{2010}12\u{2010}34\u{2010}56\u{2010}78",
+        "tel:06\u{ff0e}12\u{ff0e}34\u{ff0e}56\u{ff0e}78",
     ] {
         assert!(re.find(rejected).is_some(), "{rejected}");
     }
-    for kept in ["user:*:email", "cafe:babe:dead:beef", "order_*_*", "db0"] {
+    for kept in [
+        "user:*:email",
+        "session:*",
+        "cache:v2:page",
+        "api:v1:item:42",
+        "cafe:babe:dead:beef",
+        "order_*_*",
+        "db0",
+    ] {
         assert!(re.find(kept).is_none(), "{kept}");
     }
 }

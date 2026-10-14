@@ -111,6 +111,30 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "not (KeyPattern)",
     ),
     (
+        "FindingsBatch.redis-key-pattern-ipv4.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv4-dot-separated.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac-dashes.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac-dotted.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-dash-punctuation-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-fullwidth-stop-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
         "FindingsBatch.redis-key-pattern-ipv6.json",
         "not (KeyPattern)",
     ),

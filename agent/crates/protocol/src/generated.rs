@@ -1815,13 +1815,22 @@ pub struct ErrorDetail {
 keyword of a console-side check (see "Console-side checks" in the description of this
 contract):
 - `const`: a value that must equal the job's (`/classifiers_version`,
-  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`), or an
+  access event source that does not serve its target's engine (`/events/<i>/source`);
 - `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
   `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
 - `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
 - `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
   or a classifier id not registered for the batch's version or outside the job's
-  `params.classifiers` (`/findings/<i>/classifier`);
+  `params.classifiers` (`/findings/<i>/classifier`); or an engine-gated value whose
+  token the console does not list (engine-token gate: `/connectors/<i>`,
+  `/targets/<i>/engine`, `/targets/<i>/audit_source`, `/detected_targets/<i>/engine`,
+  `/detected_targets/<i>/process`, `/findings/<i>/location/engine`,
+  `/events/<i>/source`; the agent holds the findings and events items, ADR-0042);
+- `not`: an `account_not_recorded` principal on an event of a target other than
+  `redis` or `valkey` (`/events/<i>/principal`);
+- `pattern`: an access event object name that is not an `Identifier` on a target
+  other than `redis` or `valkey` (`/events/<i>/objects/<j>/object`);
 - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
 - `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
   update, `/events/<i>/ts`, `/events/<i>/ts_last`);
@@ -1838,13 +1847,22 @@ contract):
 keyword of a console-side check (see "Console-side checks" in the description of this
 contract):
 - `const`: a value that must equal the job's (`/classifiers_version`,
-  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+  `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`), or an
+  access event source that does not serve its target's engine (`/events/<i>/source`);
 - `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
   `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
 - `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
 - `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
   or a classifier id not registered for the batch's version or outside the job's
-  `params.classifiers` (`/findings/<i>/classifier`);
+  `params.classifiers` (`/findings/<i>/classifier`); or an engine-gated value whose
+  token the console does not list (engine-token gate: `/connectors/<i>`,
+  `/targets/<i>/engine`, `/targets/<i>/audit_source`, `/detected_targets/<i>/engine`,
+  `/detected_targets/<i>/process`, `/findings/<i>/location/engine`,
+  `/events/<i>/source`; the agent holds the findings and events items, ADR-0042);
+- `not`: an `account_not_recorded` principal on an event of a target other than
+  `redis` or `valkey` (`/events/<i>/principal`);
+- `pattern`: an access event object name that is not an `Identifier` on a target
+  other than `redis` or `valkey` (`/events/<i>/objects/<j>/object`);
 - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
 - `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
   update, `/events/<i>/ts`, `/events/<i>/ts_last`);
@@ -2751,7 +2769,7 @@ impl ::std::convert::TryFrom<::std::string::String> for JobStatusUpdateStatus {
         value.parse()
     }
 }
-#[doc = "**Normalized** Redis / Valkey key pattern (ADR-0052 decision 7): the `object` of a\n`Location` whose `engine` is `redis` or `valkey`, and of the `ObjectRef`s of their access\nevents. Never a raw key name, never a fingerprint of one.\n\nNormalization (`x-databastion-normalized-name`), applied by the agent before the uplink: the\nkey name is split into segments on `:`, `/`, `|` and `.`; a segment that touches a classifier\nmatch, holds a digit run, is high-entropy, matches the first-name list, is an IP address\nor has a character this schema forbids becomes `*`, and so does a segment position with\ntoo many distinct values or record-like values (cardinality and record-id rules). A first\nsegment naming a URL scheme becomes `*`. A pattern that still does not match this schema\nis replaced by `*`. E.g. `user:42:email` -> `user:*:email`.\n\nSchema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or\ntrailing separator), each a plain name of `Identifier` (no `@ = ; \\ ' \"`, backquote,\n`< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:\n- no segment made only of 9 or more digits, spaces, `_`, `+` and `-` (`Identifier`'s\n  digit-run rule, applied per segment), and no run of 9 or more characters made of\n  digits, separators, spaces, `_`, `+` and `-` that starts and ends with a digit (a phone\n  or card number split across segments or tokens, `06.12.34.56.78`, `06_12_34_56_78`).\n  A digit is any Unicode decimal digit (`\\p{Nd}`, so fullwidth digits too) and a space\n  any Unicode space separator (`\\p{Zs}`, so a no-break space too);\n- no percent-encoded byte (`%` followed by two hexadecimal digits, e.g. `%40`);\n- no run of 4 or more `:`-separated groups of 1 to 4 hexadecimal digits, one of which\n  holds a digit (an IPv6 address without `::`, a MAC address: `2001:db8:0:1`,\n  `00:1a:2b:3c:4d:5e`);\n- no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,\n  `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.\n\n**Rendering rule** (console): a key pattern is shown only as escaped text, never as a link\nor `href`, never auto-linked (no linkifier or markdown link detection may turn it, or\nany part of it such as `x:javascript:…`, into a link), never unescaped in e-mail HTML,\nand in webhook payloads only as a JSON string. In plain-text e-mails and in chat\nwebhook messages (Slack, Teams, Mattermost text), it is wrapped in code formatting\n(inline code), so that the receiving client does not auto-link it. CSV exports guard it\nagainst formula injection: a value starting with `=`, `+`, `-`, `@`, a tab or a\ncarriage return is prefixed (with `'`). The URL-scheme rule of the schema only covers a\nscheme in the first segment: this rendering rule is what protects a scheme later in\nthe pattern.\n"]
+#[doc = "**Normalized** Redis / Valkey key pattern (ADR-0052 decision 7): the `object` of a\n`Location` whose `engine` is `redis` or `valkey`, and of the `ObjectRef`s of their access\nevents. Never a raw key name, never a fingerprint of one.\n\nNormalization (`x-databastion-normalized-name`), applied by the agent before the uplink: the\nkey name is split into segments on `:`, `/`, `|` and `.`; a segment that touches a classifier\nmatch, holds a digit run, is high-entropy, matches the first-name list, is an IP address\nor has a character this schema forbids becomes `*`, and so does a segment position with\ntoo many distinct values or record-like values (cardinality and record-id rules). A first\nsegment naming a URL scheme becomes `*`. A pattern that still does not match this schema\nis replaced by `*`. E.g. `user:42:email` -> `user:*:email`.\n\nSchema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or\ntrailing separator), each a plain name of `Identifier` (no `@ = ; \\ ' \"`, backquote,\n`< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:\n- no segment made only of 9 or more digits, spaces, `_`, `+` and `-` (`Identifier`'s\n  digit-run rule, applied per segment), and no run of 9 or more characters made of\n  digits, separators, spaces, `_`, `+` and `-` that starts and ends with a digit (a phone\n  or card number split across segments or tokens, `06.12.34.56.78`, `06_12_34_56_78`).\n  A digit is any Unicode decimal digit (`\\p{Nd}`, so fullwidth digits too), a space any\n  Unicode space separator (`\\p{Zs}`, so a no-break space too), and any Unicode dash\n  (`\\p{Pd}`) or the fullwidth full stop (U+FF0E) also separates;\n- no IPv4 address as whole segments (`host:10.0.0.1`, `host.10.0.0.1`);\n- no percent-encoded byte (`%` followed by two hexadecimal digits, e.g. `%40`);\n- no run of 4 or more `:`-separated groups of 1 to 4 hexadecimal digits, one of which\n  holds a digit (an IPv6 address without `::`, a MAC address: `2001:db8:0:1`,\n  `00:1a:2b:3c:4d:5e`), and no MAC address written with `-` (`00-1a-2b-3c-4d-5e`) or in\n  the dotted form (`001a.2b3c.4d5e`, as whole segments);\n- no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,\n  `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.\n\n**Rendering rule** (console): a key pattern is shown only as escaped text, never as a link\nor `href`, never auto-linked (no linkifier or markdown link detection may turn it, or\nany part of it such as `x:javascript:…`, into a link), never unescaped in e-mail HTML,\nand in webhook payloads only as a JSON string. In plain-text e-mails and in chat\nwebhook messages (Slack, Teams, Mattermost text), it is wrapped in code formatting\n(inline code), so that the receiving client does not auto-link it. CSV exports guard it\nagainst formula injection: a value starting with `=`, `+`, `-`, `@`, a tab or a\ncarriage return is prefixed (with `'`). The URL-scheme rule of the schema only covers a\nscheme in the first segment: this rendering rule is what protects a scheme later in\nthe pattern.\n"]
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]
 pub struct KeyPattern(::std::string::String);
