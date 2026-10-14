@@ -46,7 +46,7 @@ import {
 
 import * as cryptoModule from "@/server/crypto";
 import { ipBucket } from "@/server/request";
-import { CONSOLE_ACCEPTS } from "@/server/agent-api/capabilities";
+import { CONSOLE_ACCEPTS, unlistedEngineDetails } from "@/server/agent-api/capabilities";
 
 import {
   cheapFailuresPerIp,
@@ -181,6 +181,17 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       // Fixture tokens are well-formed but unknown: validation passes, the token lookup fails.
       const res = await handleEnroll(agentRequest("POST", "/enroll", { body }));
       expect(res.status).toBe(401);
+    });
+
+    it("refuses connectors of an engine whose token is unlisted (400 enum, ADR-0042 decision 1)", async () => {
+      const body = { token: `dbe_${"A".repeat(43)}`, hostname: "h", agent_version: "0.1.0", connectors: ["postgres", "sqlserver", "redis"] };
+      expect(validateSchema("EnrollRequest", body).ok).toBe(true);
+      const res = await handleEnroll(agentRequest("POST", "/enroll", { body }));
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, body)).details).toEqual([
+        { pointer: "/connectors/1", keyword: "enum" },
+        { pointer: "/connectors/2", keyword: "enum" },
+      ]);
     });
 
     it.each(fixtures("invalid", "EnrollRequest"))("invalid fixture %s -> 400", async (_f, body) => {
@@ -733,7 +744,58 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
   });
 
   describe("POST /heartbeat", () => {
-    it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
+    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (P9-C review H1).
+    const unlistedHeartbeat = ([, body]: [string, unknown]) => unlistedEngineDetails("HeartbeatRequest", body).length > 0;
+
+    it.todo("stores the sqlserver and redis-valkey heartbeat fixtures once CONSOLE_ACCEPTS lists their engine tokens (P9-E)");
+
+    it.each(fixtures("valid", "HeartbeatRequest").filter(unlistedHeartbeat))(
+      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
+      async (_f, body) => {
+        const auth = await enroll();
+        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err.code).toBe("invalid_request");
+        const details = err.details as { pointer: string; keyword: string }[];
+        expect(details.length).toBeGreaterThan(0);
+        expect(details.every((d) => d.keyword === "enum")).toBe(true);
+        expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
+      },
+    );
+
+    it("refuses each unlisted connector, target, audit source and detected target with an item pointer (ADR-0042)", async () => {
+      const auth = await enroll();
+      const body = {
+        ...MINIMAL_HEARTBEAT,
+        connectors: ["postgres", "redis", "cas", "sqlserver"],
+        targets: [
+          { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited" },
+          { target_id: "pg-odd", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
+          { target_id: "cache", engine: "valkey", reachable: true, audit_level: "none" },
+        ],
+        detected_targets: [
+          { engine: "postgres", port: 5432 },
+          { engine: "sqlserver", port: 1433, process: "sqlservr" },
+          { engine: "postgres", process: "redis-server" },
+        ],
+      };
+      expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, body)).details).toEqual([
+        { pointer: "/connectors/1", keyword: "enum" },
+        { pointer: "/connectors/3", keyword: "enum" },
+        { pointer: "/targets/1/audit_source", keyword: "enum" },
+        { pointer: "/targets/2/engine", keyword: "enum" },
+        { pointer: "/detected_targets/1/engine", keyword: "enum" },
+        { pointer: "/detected_targets/1/process", keyword: "enum" },
+        { pointer: "/detected_targets/2/process", keyword: "enum" },
+      ]);
+      expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
+    });
+
+    it.each(fixtures("valid", "HeartbeatRequest").filter((f) => !unlistedHeartbeat(f)))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);
