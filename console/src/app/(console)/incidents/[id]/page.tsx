@@ -92,7 +92,12 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                   {access.overflow ? (
                     "several: the policy reached its hourly limit of new incidents, the further matches of the hour are counted here"
                   ) : (
-                    <PrincipalLabel principal={access.principal} fingerprinted={isFingerprint(access.principal)} engine={incident.engine} />
+                    <PrincipalLabel
+                      principal={access.principal}
+                      fingerprinted={isFingerprint(access.principal)}
+                      engine={incident.engine}
+                      notRecorded={access.principal === ""}
+                    />
                   )}
                 </dd>
                 <dt className="text-muted-foreground first-letter:uppercase">{locationPartLabels(incident.engine).database}</dt>

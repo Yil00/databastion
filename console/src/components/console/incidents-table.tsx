@@ -39,7 +39,11 @@ export function incidentLocation(i: Pick<IncidentView, "location" | "access" | "
   const ldap = isLdapEngine(i.engine);
   const cas = isCasEngine(i.engine);
   if (i.access) {
-    const who = isFingerprint(i.access.principal)
+    // An empty principal on a non-overflow access incident: the source recorded no account
+    // (Redis / Valkey, ADR-0052 decision 8); `db_user` and fingerprints are never empty.
+    const who = i.access.principal === ""
+      ? "account not recorded"
+      : isFingerprint(i.access.principal)
       ? ldap
         ? "fingerprinted LDAP principal"
         : cas

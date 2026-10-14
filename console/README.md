@@ -179,7 +179,10 @@ lower-case identifiers only.
 
 The final schema is the one of `0027`. Rule for new migrations: a constraint added to a table
 that may be large is written `NOT VALID` in a custom migration and listed in
-`DEFERRED_VALIDATIONS`, never validated in the migration itself.
+`DEFERRED_VALIDATIONS`, never validated in the migration itself. Migration `0040` (P9-E) follows
+it: it adds `access_events.account_not_recorded` (constant default, catalog only) and replaces the
+`access_events_principal` CHECK (exactly one of `db_user`, `db_user_fingerprint` and
+`account_not_recorded`) `NOT VALID`; the runner validates it afterwards.
 
 ### Upgrading an existing deployment
 Deployments created before the role split (single `POSTGRES_USER` role used by everything; the
@@ -450,13 +453,15 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
 90 s) / revoked / locked, last seen, targets with audit level and their number of notes),
-`/agents/{id}` (targets with their notes, see "Target notes"; admin:
+`/agents/{id}` (targets with their engine names and notes, see "Target notes"; the engines the agent
+detected on its host but does not declare (ADR-0006), each with a setup hint: what to declare in
+`agent.yaml` on the agent host, never anything the console configures; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
 `dbe_…` token is shown once with a copy button; list; revoke), `/users` (admin: local users,
 roles, disable / enable, pending single sign-on logins), `/account` (own account, linked single
 sign-on identities, "Link single sign-on"), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
-`?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
+`?agent=&target=&classifier=&engine=`, false positives hidden unless `fp=1`; "False positive" toggle per
 row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
 (most recently seen first within each), so one noisy agent or target cannot hide the others; the
 counts show at most 1000 (target, classifier) groups, fetched round-robin over agents then over
@@ -698,7 +703,10 @@ notes clears them. The agent page renders each note from the phrase catalog gene
 `shared/protocol/target-notes.json` (`src/generated/protocol/target-notes.gen.ts`, renderer
 `src/lib/target-notes.ts`): templates looked up with `Object.hasOwn`, `{count}` replaced by the
 integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQL role attributes
-and MySQL / MariaDB privileges in upper case, the other labels as sent), in one non-recursive pass;
+and MySQL / MariaDB privileges in upper case, SQL Server permissions in upper case with spaces,
+SQL Server fixed roles as SQL Server names them, `##MS_…##` for the SQL Server 2022 roles, the
+other labels as sent; the SQL Server labels are those of revision
+`target_status.note_labels.2026_10`, which the console lists in `accepts`), in one non-recursive pass;
 a code this console does not know is shown raw with its count and labels. Everything is rendered as
 text (escaped). The console never derives a decision from notes.
 
@@ -933,6 +941,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
   `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
   and any printable character in `db_user`).
+- **Redis / Valkey key patterns** (P9-E, contract `KeyPattern` rendering rule, ADR-0052 decision
+  7): object names of `redis` / `valkey` findings and of `redis_*` events are shown as escaped text
+  in `<code>` (`KeyPatternText`), never as a link, an `href` or a URL parameter; in the plain-text
+  e-mail they are wrapped in inline code (`src/lib/key-pattern.ts`) so that mail clients do not
+  auto-link `x:javascript:…` or `www.example/…`; in the webhook body they are JSON strings. The
+  console sends no chat-format webhook and has no HTML e-mail and no CSV export.
 - **OpenLDAP labels and principal fingerprints** (P7, ADR-0029 decision 6): for an OpenLDAP
   target (from the event's audit source `openldap_accesslog`, else the target's engine) the
   findings, events and incident views name the location parts as LDAP does: `database` is the
@@ -959,7 +973,8 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - **Score** = sensitivity x log10(1 + rows), 0 when the source reports no `rows` or no object is
   sensitive. For an event pre-aggregated by the agent, `rows` is the total of the merged events.
 - **Baselines** per (agent, target, principal), over the events that report `rows` (never
-  `connect` nor `auth_failure`, so failed logins with random account names create none): exponentially
+  `connect` nor `auth_failure`, so failed logins with random account names create none, and never
+  an event without a recorded account, `account_not_recorded`, Redis / Valkey only): exponentially
   weighted mean and variance of `ln(1 + rows)`, weight `max(0.05, 1/n)` (the plain mean for the first
   20 events, then about the last 20). Warm after 20 events. A warm baseline flags an event as an
   **anomaly** when `rows >= 1000` and `ln(1 + rows) > mean + max(ln 10, 3 sd)` (ten times the
@@ -1006,7 +1021,10 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot
-  open one incident each. Every other event is keyed by its principal key (the name, or the
+  open one incident each. An event without a recorded account (`account_not_recorded`, Redis /
+  Valkey, ADR-0052 decision 8) is keyed `unknown:<sha256 of the client network>`, `unknown:local`
+  or `unknown:none` (no address), whatever its action; its `principal_key` (events view filter) is
+  the SHA-256 of `n\0` and that network. Every other event is keyed by its principal key (the name, or the
   fingerprint sent in its place: a non-conforming account name, an OpenLDAP DN not listed in
   `clear_principals`, an unidentified account), ADR-0031
   decision 1, end-of-phase-6 review M1: two fingerprinted principals never share an incident,
@@ -1086,7 +1104,9 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
   has `source: "access_event"` and, instead of the classifier, location and counts: `principal`,
-  `principal_fingerprinted`, `database`, `hour` and `access` (the first event's `ts`, action,
+  `principal_fingerprinted`, `principal_not_recorded` (P9-E: the source recorded no account, Redis
+  / Valkey only; `principal` is then empty; absent in rows written before P9-E), `database`,
+  `hour` and `access` (the first event's `ts`, action,
   source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
   missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
