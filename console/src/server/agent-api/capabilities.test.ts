@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import bundle from "@/generated/protocol/schemas.gen.json";
 import { validateSchema } from "@/lib/protocol/validate";
 
+import { auditSourceEngines } from "@/lib/location-labels";
 import { AUDIT_SOURCES, ENGINES } from "@/lib/protocol/enums";
 import { fixtures } from "@/test/helpers";
 
@@ -174,5 +175,20 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     const findings = { findings: [{ location: { engine: "valkey" } }] };
     expect(unlistedEngineDetails("FindingsBatch", findings, ["engine.valkey"])).toEqual([]);
     expect(unlistedEngineDetails("FindingsBatch", findings, ["engine.redis"])).toEqual([{ pointer: "/findings/0/location/engine", keyword: "enum" }]);
+  });
+});
+
+describe("source-to-engine table (contract `AuditSource`, Heartbeat target checks, P9-E)", () => {
+  it("the console's SOURCE_ENGINES is the contract's table, for every AuditSource value", () => {
+    const description = String((defs.AuditSource as { description?: string } | undefined)?.description ?? "");
+    const table = new Map<string, string[]>();
+    for (const line of description.split("\n")) {
+      const m = /^- (.+) -> (.+)[;.]$/.exec(line.trim());
+      if (!m) continue;
+      const engines = [...(m[2] ?? "").matchAll(/`([a-z_]+)`/g)].map((x) => x[1] ?? "");
+      for (const s of (m[1] ?? "").matchAll(/`([a-z_]+)`/g)) table.set(s[1] ?? "", engines);
+    }
+    expect([...table.keys()].sort()).toEqual([...AUDIT_SOURCES].sort());
+    for (const s of AUDIT_SOURCES) expect([...auditSourceEngines(s)].sort(), s).toEqual([...(table.get(s) ?? [])].sort());
   });
 });

@@ -439,7 +439,8 @@ export function exceptionCoversEvent(
  *   `local` kept), so random account names or rotating addresses cannot open one incident each
  *   (security review H1, re-review N2);
  * - events without a recorded account (`account_not_recorded`, Redis / Valkey, ADR-0052 decision
- *   8): `unknown:<sha256 of the client network>`, `unknown:local` or `unknown:none` (no address);
+ *   8): `unrecorded:<sha256 of the client network>`, `unrecorded:local` or `unrecorded:none` (no
+ *   address): a prefix of their own, never the `unknown:` key of failed logins (P9-E review M1);
  * - every other event: its principal key (SHA-256 of the name, or of the fingerprint sent in its
  *   place), so distinct principals are never merged (ADR-0031 decision 1, end-of-phase-6 review
  *   M1: on OpenLDAP nearly every principal is fingerprinted and has no client address, so the
@@ -474,8 +475,10 @@ export function coarsePrincipal(e: { action: string }): boolean {
  * the principal, `networkHash` = SHA-256 of the client network: hashes only, never agent text.
  *
  * An event without a recorded account (`accountNotRecorded`, Redis / Valkey only, ADR-0052
- * decision 8, contract `Principal`): `unknown:<SHA-256 of the client network>`, `unknown:local`
- * for a local client, or `unknown:none` without a client address, whatever its action. Never its
+ * decision 8, contract `Principal`): `unrecorded:<SHA-256 of the client network>`,
+ * `unrecorded:local` for a local client, or `unrecorded:none` without a client address, whatever
+ * its action. Its own prefix (P9-E review M1): a failed login of the same network
+ * (`unknown:<hash>`) never opens the incident an unrecorded read or full sync is attached to. Never its
  * principal key alone: such events of one network share one incident per policy, database and
  * hour, and never the incident of a named or fingerprinted principal.
  */
@@ -487,9 +490,9 @@ export function dedupPrincipal(e: {
   clientAddr?: string | null;
 }): string {
   if (e.accountNotRecorded === true) {
-    if (e.clientAddr === null || e.clientAddr === undefined) return "unknown:none";
-    if (e.clientAddr === "local") return "unknown:local";
-    return `unknown:${e.networkHash}`;
+    if (e.clientAddr === null || e.clientAddr === undefined) return "unrecorded:none";
+    if (e.clientAddr === "local") return "unrecorded:local";
+    return `unrecorded:${e.networkHash}`;
   }
   return coarsePrincipal(e) ? `unknown:${e.networkHash}` : e.principalKey;
 }
@@ -501,7 +504,8 @@ export function eventDedupKey(k: {
   targetId: string;
   /**
    * The principal key, or `unknown:<sha256 of the client network>` for a coarse principal, or
-   * `unknown:local` / `unknown:none` for an event without a recorded account.
+   * `unrecorded:<hash>` / `unrecorded:local` / `unrecorded:none` for an event without a recorded
+   * account.
    */
   principalKey: string;
   /** SHA-256 (hex) of the database name, or `-`. */

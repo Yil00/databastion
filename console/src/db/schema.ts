@@ -885,7 +885,7 @@ export const accessEvents = pgTable(
      * Contract `Principal.account_not_recorded` (P9-E): the source records no account for this
      * access (Redis / Valkey slow-log entries of closed connections, full synchronizations). No
      * per-principal baseline is built for such an event, and its dedup principal is
-     * `unknown:<SHA-256 of the client network>`, `unknown:local` or `unknown:none`.
+     * `unrecorded:<SHA-256 of the client network>`, `unrecorded:local` or `unrecorded:none`.
      */
     accountNotRecorded: boolean("account_not_recorded").notNull().default(false),
     clientAddr: text("client_addr"),

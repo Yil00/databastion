@@ -1022,8 +1022,10 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot
   open one incident each. An event without a recorded account (`account_not_recorded`, Redis /
-  Valkey, ADR-0052 decision 8) is keyed `unknown:<sha256 of the client network>`, `unknown:local`
-  or `unknown:none` (no address), whatever its action; its `principal_key` (events view filter) is
+  Valkey, ADR-0052 decision 8) is keyed `unrecorded:<sha256 of the client network>`,
+  `unrecorded:local` or `unrecorded:none` (no address), whatever its action: a prefix of its own,
+  so a failed login of the same network never opens the incident such an event is added to (P9-E
+  review M1); its `principal_key` (events view filter) is
   the SHA-256 of `n\0` and that network. Every other event is keyed by its principal key (the name, or the
   fingerprint sent in its place: a non-conforming account name, an OpenLDAP DN not listed in
   `clear_principals`, an unidentified account), ADR-0031

@@ -295,6 +295,16 @@ describe("dedup scope", () => {
     for (const action of ["read", "write", "connect", "ddl", "dcl"]) expect(dedupPrincipal({ action, principalKey: pk, networkHash: net })).toBe(pk);
   });
 
+  it("principal part of an unrecorded account: its own unrecorded: prefix, never the unknown: key of failed logins (P9-E review M1)", () => {
+    const net = "n".repeat(64);
+    const pk = "a".repeat(64);
+    const u = (clientAddr: string | null) => dedupPrincipal({ action: "read", principalKey: pk, networkHash: net, accountNotRecorded: true, clientAddr });
+    expect(u("198.51.100.7")).toBe(`unrecorded:${net}`);
+    expect(u("local")).toBe("unrecorded:local");
+    expect(u(null)).toBe("unrecorded:none");
+    expect(u("198.51.100.7")).not.toBe(dedupPrincipal({ action: "auth_failure", principalKey: pk, networkHash: net }));
+  });
+
   it("after a false positive only a new signature signal or a strictly higher score is worse (end-of-phase-6 M1)", () => {
     const fp = { eventScore: 10, eventSignals: ["signature.pg_dump", "shape.full_table_copy"] };
     const e = { score: 10, anomaly: true, signals: ["signature.pg_dump", "shape.full_table_read"] };

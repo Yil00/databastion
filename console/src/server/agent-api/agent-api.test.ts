@@ -6,11 +6,11 @@ import { PgBoss } from "pg-boss";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb, getPool } from "@/db/client";
-import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
+import { agents, agentTargets, auditLog, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import schemasBundle from "@/generated/protocol/schemas.gen.json";
 import { MAX_TARGET_NOTES_BYTES } from "@/lib/target-notes";
-import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent } from "@/server/agents";
+import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceDetails } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
@@ -766,7 +766,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       }
     });
 
-    it("refuses an audit source that does not serve its target's engine: 400 const on /targets/<i>/audit_source, nothing stored (P9-E)", async () => {
+    it("stores a target whose audit source does not serve its engine without the source, with an integrity event; 200 (P9-E review M2)", async () => {
       const auth = await enroll();
       const body = {
         ...MINIMAL_HEARTBEAT,
@@ -781,18 +781,37 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         ],
       };
       expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
-      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
-      expect(res.status).toBe(400);
-      expect((await expectConformingError(res, body)).details).toEqual([
+      expect(targetSourceDetails(body as never)).toEqual([
         { pointer: "/targets/1/audit_source", keyword: "const" },
         { pointer: "/targets/4/audit_source", keyword: "const" },
         { pointer: "/targets/5/audit_source", keyword: "const" },
       ]);
-      expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
-      // Without the mismatched targets, the same heartbeat is stored.
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(200);
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+      expect(Object.fromEntries(stored.map((t) => [t.targetId, t.auditSource]))).toEqual({
+        "pg-prod-1": "pg_stat_statements",
+        "pg-odd": null,
+        cache: "redis_commandlog",
+        maria: "performance_schema",
+        sales: null,
+        "cache-2": null,
+      });
+      const events = await getDb()
+        .select()
+        .from(securityEvents)
+        .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
+      expect(events).toHaveLength(1);
+      expect(events[0]?.details).toMatchObject({ endpoint: "heartbeat", status: 200, details_count: 3, pointer: "/targets/1/audit_source", keyword: "const" });
+      // A conforming heartbeat records no integrity event.
       const ok = { ...body, targets: body.targets.filter((_t, i) => ![1, 4, 5].includes(i)) };
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: ok }))).status).toBe(200);
-      expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(3);
+      expect(
+        await getDb()
+          .select()
+          .from(securityEvents)
+          .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch"))),
+      ).toHaveLength(1);
     });
 
     it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {

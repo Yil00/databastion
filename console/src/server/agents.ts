@@ -120,13 +120,14 @@ async function auditEnrollFailure(db: Database, ip: string | null): Promise<void
 }
 
 /**
- * Heartbeat target checks against the target's engine (P9-E, the heartbeat counterpart of the
- * `/events` source check of P9-C review H1): a target's `audit_source` must serve its `engine`
- * (`/targets/<i>/audit_source`, keyword `const`; the MySQL / MariaDB sources serve both engines,
- * the `redis_*` sources Redis and Valkey). The schema cannot express it (`TargetStatus` names
- * both values independently). A conforming agent reports the source it reads for the engine it
- * declared, so a mismatch is a non-conforming agent: the whole heartbeat is refused (`400`) and
- * nothing of it is stored, as for the engine-token gate, which runs first.
+ * Heartbeat target checks against the target's engine (P9-E, contract "Heartbeat target checks"):
+ * a target's `audit_source` must serve its `engine` (`/targets/<i>/audit_source`, keyword
+ * `const`; the MySQL / MariaDB sources serve both engines, the `redis_*` sources Redis and
+ * Valkey). The schema cannot express it (`TargetStatus` names both values independently). A
+ * conforming agent reports the source it reads for the engine it declared, so a mismatch is an
+ * agent-integrity event; per target (P9-E review M2): the target is stored **without**
+ * `audit_source` ({@link withoutMismatchedSources}) and the rest of the heartbeat is processed
+ * (no `400`, so a non-conforming target never makes the agent look silent).
  */
 export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targets">): ValidationDetail[] {
   const details: ValidationDetail[] = [];
@@ -144,6 +145,20 @@ export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targe
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
+/** The heartbeat with `audit_source` removed from the targets pointed at by `details`. */
+export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], details: readonly ValidationDetail[]): Schemas["HeartbeatRequest"] {
+  if (details.length === 0) return hb;
+  const drop = new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
+  return {
+    ...hb,
+    targets: hb.targets.map((t, i) => {
+      if (!drop.has(i)) return t;
+      const { audit_source: _dropped, ...rest } = t;
+      return rest;
+    }),
+  };
+}
+
 export async function recordHeartbeat(
   db: Database,
   agentId: string,

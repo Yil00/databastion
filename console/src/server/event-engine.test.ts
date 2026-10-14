@@ -685,7 +685,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       ...over,
     });
 
-    it("dedup principal unknown:<network> / unknown:local / unknown:none, no baseline, principal shown as not recorded", async () => {
+    it("dedup principal unrecorded:<network> / unrecorded:local / unrecorded:none, no baseline, principal shown as not recorded", async () => {
       const auth = await enroll();
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HEARTBEAT }))).status).toBe(200);
       await policy({ event_actions: ["read"], sources: ["redis_slowlog", "redis_sync"] });
@@ -704,13 +704,13 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const list = await incidentsOf(auth.agentId);
       const principalPart = (k: string) => /\|principal:([^|]+)\|/.exec(k)?.[1];
       const byPrincipal = new Map(list.map((i) => [principalPart(i.dedupKey), i]));
-      const net = (n: string) => `unknown:${sha256Hex(n)}`;
+      const net = (n: string) => `unrecorded:${sha256Hex(n)}`;
       expect([...byPrincipal.keys()].sort()).toEqual(
-        [net("198.51.100.0/24"), net("203.0.113.0/24"), "unknown:local", "unknown:none", principalKey({ db_user: "app" })].sort(),
+        [net("198.51.100.0/24"), net("203.0.113.0/24"), "unrecorded:local", "unrecorded:none", principalKey({ db_user: "app" })].sort(),
       );
       expect(byPrincipal.get(net("198.51.100.0/24"))?.matchCount).toBe(2);
-      expect(byPrincipal.get("unknown:none")?.matchCount).toBe(2);
-      expect(byPrincipal.get("unknown:local")?.matchCount).toBe(1);
+      expect(byPrincipal.get("unrecorded:none")?.matchCount).toBe(2);
+      expect(byPrincipal.get("unrecorded:local")?.matchCount).toBe(1);
       // Never the hash of an empty fingerprint, never agent text in a key.
       for (const i of list) {
         expect(i.dedupKey).not.toContain(principalKey({ db_user_fingerprint: "" } as never));
@@ -728,7 +728,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const [delivery] = await getDb()
         .select()
         .from(notificationDeliveries)
-        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get("unknown:none")?.id)));
+        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get("unrecorded:none")?.id)));
       expect(delivery?.payload).toMatchObject({ principal: "", principal_fingerprinted: false, principal_not_recorded: true });
       const [named] = await getDb()
         .select()
@@ -740,6 +740,34 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(views.filter((v) => v.accountNotRecorded).every((v) => v.principal === "" && !v.fingerprinted)).toBe(true);
       const key = principalKey({ account_not_recorded: true, client_addr: "198.51.100.31" });
       expect(await listEvents(getDb(), { agentId: auth.agentId, principalKey: key })).toHaveLength(2);
+    });
+
+    it("review M1: a failed login and an unrecorded event of the same /24 never share an incident", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HEARTBEAT }))).status).toBe(200);
+      await policy({ event_actions: ["read", "auth_failure"] });
+      await send(auth, [
+        // The attacker fails an AUTH on purpose first (ACL LOG, fingerprinted name tried)...
+        slowRead(0, { db_user_fingerprint: `hmac-sha256:${randomBytes(32).toString("hex")}`, client_addr: "198.51.100.9" }, {
+          action: "auth_failure",
+          source: "redis_acl_log",
+          objects: [],
+          rows: undefined,
+        }),
+        // ...then a full synchronization from the same network.
+        slowRead(1, { account_not_recorded: true, client_addr: "198.51.100.10" }, {
+          source: "redis_sync",
+          objects: [{ database: "*", object: "*" }],
+          rows: undefined,
+          signals: ["signature.full_sync"],
+        }),
+      ]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      const keys = list.map((i) => /\|principal:([^|]+)\|/.exec(i.dedupKey)?.[1]).sort();
+      expect(keys).toEqual([`unknown:${sha256Hex("198.51.100.0/24")}`, `unrecorded:${sha256Hex("198.51.100.0/24")}`].sort());
+      expect(list.every((i) => i.matchCount === 1)).toBe(true);
     });
   });
 
