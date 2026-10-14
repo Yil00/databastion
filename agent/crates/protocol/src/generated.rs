@@ -3,16 +3,26 @@
 //
 // Keywords not expressible by typify, removed before generation. Enforced by
 // the console's Ajv validation; agent-side checks are a future step (P1-B, P2):
+// - #/$defs/AccessEvent/allOf/0/else
+// - #/$defs/AccessEvent/allOf/0/if
+// - #/$defs/AccessEvent/allOf/0/then
+// - #/$defs/AccessEvent/allOf/1/if
+// - #/$defs/AccessEvent/allOf/1/then
 // - #/$defs/AccessEvent/if
 // - #/$defs/AccessEvent/then
 // - #/$defs/JobStatusUpdate/else
 // - #/$defs/JobStatusUpdate/if
 // - #/$defs/JobStatusUpdate/then
+// - #/$defs/Location/else
+// - #/$defs/Location/if
+// - #/$defs/Location/then
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
+// - #/$defs/KeyPattern/not
+// - #/$defs/ObjectName/oneOf/1/allOf/1/not
 //
-// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 22.
+// Patterns compiled with the ECMAScript `u` flag, as in Ajv: 25.
 //
 // `const: X` rewritten as `enum: [X]` (typify ignores string `const`):
 // - #/$defs/AgentConfigReloadJob/properties/type/const
@@ -20,8 +30,9 @@
 // - #/$defs/AuditConfigureJob/properties/type/const
 // - #/$defs/ClientAddress/anyOf/2/const
 // - #/$defs/DiscoveryScanJob/properties/type/const
+// - #/$defs/Principal/properties/account_not_recorded/const
 //
-// Patterns wrapped as `^[\s\S]*?(?:P)` (search semantics, same language): 27.
+// Patterns wrapped as `^[\s\S]*?(?:P)` (search semantics, same language): 29.
 //
 // Optional arrays with `minItems >= 1` generated as `Option<Vec<_>>` (absent != empty;
 // `Some([])` is accepted by serde and must be rejected by the agent-side mapping):
@@ -496,8 +507,18 @@ impl ::std::convert::TryFrom<::std::string::String> for AuditLevel {
         value.parse()
     }
 }
-/**Native source used for Audit on a target. `cas_audit_log` (the CAS JSON audit log file,
-ADR-0041 decision 7) is sent only when the console listed `engine.cas` (see `Engine`).
+/**Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only
+under their engine's token (see `Engine`):
+- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;
+- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through
+  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's
+  `event_file` target), `sqlserver_query_stats` (plan cache statistics,
+  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;
+- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),
+  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`
+  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
+  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
+  **both** `engine.redis` and `engine.valkey` are listed.
 */
 #[derive(
     ::serde::Deserialize,
@@ -534,6 +555,20 @@ pub enum AuditSource {
     OpenldapAccesslog,
     #[serde(rename = "cas_audit_log")]
     CasAuditLog,
+    #[serde(rename = "sqlserver_audit")]
+    SqlserverAudit,
+    #[serde(rename = "sqlserver_xevents")]
+    SqlserverXevents,
+    #[serde(rename = "sqlserver_query_stats")]
+    SqlserverQueryStats,
+    #[serde(rename = "redis_slowlog")]
+    RedisSlowlog,
+    #[serde(rename = "redis_commandlog")]
+    RedisCommandlog,
+    #[serde(rename = "redis_acl_log")]
+    RedisAclLog,
+    #[serde(rename = "redis_sync")]
+    RedisSync,
 }
 impl ::std::fmt::Display for AuditSource {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -549,6 +584,13 @@ impl ::std::fmt::Display for AuditSource {
             Self::MongodbLog => f.write_str("mongodb_log"),
             Self::OpenldapAccesslog => f.write_str("openldap_accesslog"),
             Self::CasAuditLog => f.write_str("cas_audit_log"),
+            Self::SqlserverAudit => f.write_str("sqlserver_audit"),
+            Self::SqlserverXevents => f.write_str("sqlserver_xevents"),
+            Self::SqlserverQueryStats => f.write_str("sqlserver_query_stats"),
+            Self::RedisSlowlog => f.write_str("redis_slowlog"),
+            Self::RedisCommandlog => f.write_str("redis_commandlog"),
+            Self::RedisAclLog => f.write_str("redis_acl_log"),
+            Self::RedisSync => f.write_str("redis_sync"),
         }
     }
 }
@@ -569,6 +611,13 @@ impl ::std::str::FromStr for AuditSource {
             "mongodb_log" => Ok(Self::MongodbLog),
             "openldap_accesslog" => Ok(Self::OpenldapAccesslog),
             "cas_audit_log" => Ok(Self::CasAuditLog),
+            "sqlserver_audit" => Ok(Self::SqlserverAudit),
+            "sqlserver_xevents" => Ok(Self::SqlserverXevents),
+            "sqlserver_query_stats" => Ok(Self::SqlserverQueryStats),
+            "redis_slowlog" => Ok(Self::RedisSlowlog),
+            "redis_commandlog" => Ok(Self::RedisCommandlog),
+            "redis_acl_log" => Ok(Self::RedisAclLog),
+            "redis_sync" => Ok(Self::RedisSync),
             _ => Err("invalid value".into()),
         }
     }
@@ -924,8 +973,10 @@ impl ::std::convert::TryFrom<::std::string::String> for ClientAddressVariant2 {
         value.parse()
     }
 }
-/**Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB. `cas` is sent only when the
-console listed `engine.cas` (see `Engine`).
+/**Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
+Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
+only when it listed `engine.sqlserver`, and `redis` only when it listed **both**
+`engine.redis` and `engine.valkey` (see `Engine`).
 */
 #[derive(
     ::serde::Deserialize,
@@ -950,6 +1001,10 @@ pub enum Connector {
     Openldap,
     #[serde(rename = "cas")]
     Cas,
+    #[serde(rename = "sqlserver")]
+    Sqlserver,
+    #[serde(rename = "redis")]
+    Redis,
 }
 impl ::std::fmt::Display for Connector {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -959,6 +1014,8 @@ impl ::std::fmt::Display for Connector {
             Self::Mongodb => f.write_str("mongodb"),
             Self::Openldap => f.write_str("openldap"),
             Self::Cas => f.write_str("cas"),
+            Self::Sqlserver => f.write_str("sqlserver"),
+            Self::Redis => f.write_str("redis"),
         }
     }
 }
@@ -973,6 +1030,8 @@ impl ::std::str::FromStr for Connector {
             "mongodb" => Ok(Self::Mongodb),
             "openldap" => Ok(Self::Openldap),
             "cas" => Ok(Self::Cas),
+            "sqlserver" => Ok(Self::Sqlserver),
+            "redis" => Ok(Self::Redis),
             _ => Err("invalid value".into()),
         }
     }
@@ -1070,13 +1129,21 @@ pub struct DetectedTarget {
     ///Local listening TCP port. The listening address is not reported.
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub port: ::std::option::Option<::std::num::NonZeroU64>,
-    ///Process name only (the command line may contain secrets and is never read or sent).
+    /**Process name only (the command line may contain secrets and is never read or sent).
+`sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
+`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
+`Engine`): a detected target of such an engine is not sent before the token is listed.
+*/
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub process: ::std::option::Option<DetectedTargetProcess>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub unix_socket: ::std::option::Option<UnixSocketPath>,
 }
-///Process name only (the command line may contain secrets and is never read or sent).
+/**Process name only (the command line may contain secrets and is never read or sent).
+`sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
+`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
+`Engine`): a detected target of such an engine is not sent before the token is listed.
+*/
 #[derive(
     ::serde::Deserialize,
     ::serde::Serialize,
@@ -1100,6 +1167,12 @@ pub enum DetectedTargetProcess {
     Mongod,
     #[serde(rename = "slapd")]
     Slapd,
+    #[serde(rename = "sqlservr")]
+    Sqlservr,
+    #[serde(rename = "redis-server")]
+    RedisServer,
+    #[serde(rename = "valkey-server")]
+    ValkeyServer,
 }
 impl ::std::fmt::Display for DetectedTargetProcess {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1109,6 +1182,9 @@ impl ::std::fmt::Display for DetectedTargetProcess {
             Self::Mariadbd => f.write_str("mariadbd"),
             Self::Mongod => f.write_str("mongod"),
             Self::Slapd => f.write_str("slapd"),
+            Self::Sqlservr => f.write_str("sqlservr"),
+            Self::RedisServer => f.write_str("redis-server"),
+            Self::ValkeyServer => f.write_str("valkey-server"),
         }
     }
 }
@@ -1123,6 +1199,9 @@ impl ::std::str::FromStr for DetectedTargetProcess {
             "mariadbd" => Ok(Self::Mariadbd),
             "mongod" => Ok(Self::Mongod),
             "slapd" => Ok(Self::Slapd),
+            "sqlservr" => Ok(Self::Sqlservr),
+            "redis-server" => Ok(Self::RedisServer),
+            "valkey-server" => Ok(Self::ValkeyServer),
             _ => Err("invalid value".into()),
         }
     }
@@ -1325,7 +1404,9 @@ pub struct EmptyParams {}
 protocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the
 capability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent
 handling in ADR-0042). Every later engine value follows the
-same rule with its own `engine.<value>` token.
+same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
+ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
+and `engine.valkey`.
 */
 #[derive(
     ::serde::Deserialize,
@@ -1352,6 +1433,12 @@ pub enum Engine {
     Openldap,
     #[serde(rename = "cas")]
     Cas,
+    #[serde(rename = "sqlserver")]
+    Sqlserver,
+    #[serde(rename = "redis")]
+    Redis,
+    #[serde(rename = "valkey")]
+    Valkey,
 }
 impl ::std::fmt::Display for Engine {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1362,6 +1449,9 @@ impl ::std::fmt::Display for Engine {
             Self::Mongodb => f.write_str("mongodb"),
             Self::Openldap => f.write_str("openldap"),
             Self::Cas => f.write_str("cas"),
+            Self::Sqlserver => f.write_str("sqlserver"),
+            Self::Redis => f.write_str("redis"),
+            Self::Valkey => f.write_str("valkey"),
         }
     }
 }
@@ -1377,6 +1467,9 @@ impl ::std::str::FromStr for Engine {
             "mongodb" => Ok(Self::Mongodb),
             "openldap" => Ok(Self::Openldap),
             "cas" => Ok(Self::Cas),
+            "sqlserver" => Ok(Self::Sqlserver),
+            "redis" => Ok(Self::Redis),
+            "valkey" => Ok(Self::Valkey),
             _ => Err("invalid value".into()),
         }
     }
@@ -2658,6 +2751,77 @@ impl ::std::convert::TryFrom<::std::string::String> for JobStatusUpdateStatus {
         value.parse()
     }
 }
+#[doc = "**Normalized** Redis / Valkey key pattern (ADR-0052 decision 7): the `object` of a\n`Location` whose `engine` is `redis` or `valkey`, and of the `ObjectRef`s of their access\nevents. Never a raw key name, never a fingerprint of one.\n\nNormalization (`x-databastion-normalized-name`), applied by the agent before the uplink: the\nkey name is split into segments on `:`, `/`, `|` and `.`; a segment that touches a classifier\nmatch, holds a digit run, is high-entropy, matches the first-name list, is an IP address\nor has a character this schema forbids becomes `*`, and so does a segment position with\ntoo many distinct values or record-like values (cardinality and record-id rules). A first\nsegment naming a URL scheme becomes `*`. A pattern that still does not match this schema\nis replaced by `*`. E.g. `user:42:email` -> `user:*:email`.\n\nSchema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or\ntrailing separator), each a plain name of `Identifier` (no `@ = ; \\ ' \"`, backquote,\n`< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:\n- no segment made only of 9 or more digits and the characters space, `+` and `-`\n  (`Identifier`'s digit-run rule, applied per segment), and no run of 9 or more\n  characters made of digits, separators, spaces, `+` and `-` that starts and ends with a\n  digit (a phone or card number split across segments, `06.12.34.56.78`);\n- no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,\n  `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.\n\n**Rendering rule** (console): a key pattern is shown only as escaped text, never as a link\nor `href`, never unescaped in e-mail HTML, and in webhook payloads only as a JSON string.\nCSV exports guard it against formula injection: a value starting with `=`, `+`, `-`, `@`,\na tab or a carriage return is prefixed (with `'`).\n"]
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct KeyPattern(::std::string::String);
+impl ::std::ops::Deref for KeyPattern {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<KeyPattern> for ::std::string::String {
+    fn from(value: KeyPattern) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for KeyPattern {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 256usize {
+            return Err("longer than 256 characters".into());
+        }
+        if value.chars().count() < 1usize {
+            return Err("shorter than 1 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags(
+                    "^[\\s\\S]*?(?:^[^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+([:/|.][^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+)*$)",
+                    "u",
+                )
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^[^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+([:/|.][^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+)*$)\""
+                    .into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for KeyPattern {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for KeyPattern {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for KeyPattern {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
 /**Where the data lives, down to the column / field / attribute; never a record. All names are
 normalized (see `Identifier`).
 PostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).
@@ -2672,6 +2836,16 @@ e.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database`
 `audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential
 field (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another
 engine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.
+SQL Server (ADR-0051 decision 5): database, schema, table, column.
+Redis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type
+(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern
+(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and
+sorted-set members, the normalized field name for hash fields and stream entry fields, or
+`#key` / `#field` for values found in key names / hash field names.
+
+`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
+every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
+`/` is still rejected).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -2679,7 +2853,7 @@ pub struct Location {
     pub database: Identifier,
     pub engine: Engine,
     pub field: Identifier,
-    pub object: Identifier,
+    pub object: ObjectName,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
 }
@@ -2853,6 +3027,142 @@ impl<'de> ::serde::Deserialize<'de> for MetricsMapKey {
             })
     }
 }
+/**Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the
+`redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
+`engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit
+sources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also
+checks each event's objects against the schema of the **target's** engine (a `KeyPattern`
+that is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).
+
+Written as "exactly one of `Identifier`, or `KeyPattern` but not `Identifier`", which
+accepts exactly the union of the two (a name valid under both, such as `orders` or `*`,
+matches the first branch only).
+*/
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum ObjectName {
+    Variant0(Identifier),
+    Variant1(ObjectNameVariant1),
+}
+impl ::std::fmt::Display for ObjectName {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Variant0(x) => x.fmt(f),
+            Self::Variant1(x) => x.fmt(f),
+        }
+    }
+}
+impl ::std::str::FromStr for ObjectName {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if let Ok(v) = value.parse() {
+            Ok(Self::Variant0(v))
+        } else if let Ok(v) = value.parse() {
+            Ok(Self::Variant1(v))
+        } else {
+            Err("string conversion failed for all variants".into())
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for ObjectName {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for ObjectName {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::From<Identifier> for ObjectName {
+    fn from(value: Identifier) -> Self {
+        Self::Variant0(value)
+    }
+}
+impl ::std::convert::From<ObjectNameVariant1> for ObjectName {
+    fn from(value: ObjectNameVariant1) -> Self {
+        Self::Variant1(value)
+    }
+}
+///`ObjectNameVariant1`
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct ObjectNameVariant1(::std::string::String);
+impl ::std::ops::Deref for ObjectNameVariant1 {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<ObjectNameVariant1> for ::std::string::String {
+    fn from(value: ObjectNameVariant1) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for ObjectNameVariant1 {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 256usize {
+            return Err("longer than 256 characters".into());
+        }
+        if value.chars().count() < 1usize {
+            return Err("shorter than 1 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags(
+                    "^[\\s\\S]*?(?:^[^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+([:/|.][^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+)*$)",
+                    "u",
+                )
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^[^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+([:/|.][^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+)*$)\""
+                    .into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for ObjectNameVariant1 {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for ObjectNameVariant1 {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for ObjectNameVariant1 {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
 /**Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
 
 **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
@@ -2875,16 +3185,24 @@ schema when `schema` is absent), usually none, so its score is usually 0; the ev
 still matches conditions that do not depend on objects (signals, principals, rows,
 anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
 therefore does not see such accesses: signal, volume and anomaly conditions do.
+
+**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log
+entry is reported under the pattern learned by the last scan, its longest learned literal
+prefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.
+`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its
+`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),
+and by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`
+targets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectRef {
     pub database: Identifier,
-    pub object: Identifier,
+    pub object: ObjectName,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
 }
-/**Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with
+/**Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
 an account that does not exist on the target (the attempted name may be a mistyped password), and
 for any account name that does not match the `db_user` pattern, the agent sends
 `db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so
@@ -2901,6 +3219,19 @@ failed authentications of one client address (beyond 16 distinct principals in 1
 when its bounded window is full, then without `client_addr`) into one event per address and
 minute; `aggregated_count` is the number of failures merged. No other event carries `db_user`
 `*`. The console escapes `db_user` and `application` on display.
+
+**No recorded account (Redis / Valkey only, ADR-0052 decision 8).** `account_not_recorded:
+true`, with neither `db_user` nor `db_user_fingerprint`, means that the source records no
+account for this access (a slow-log or command-log entry whose connection had closed
+before the agent could attribute it, a full synchronization). It is not `db_user` `*`
+(several accounts, CAS only) and never a wildcard. `client_addr` and `application` are
+sent when known. Accepted only on events of a `redis_*` source (checked by this schema)
+and of a `redis` or `valkey` target (checked by the console from the target's engine),
+and never on `auth_failure` events (checked by this schema: a failed authentication always
+names, or fingerprints, the name tried). Console rules (ADR-0021 decision 6, P9-E): the
+dedup key's principal part is `unknown:<SHA-256 of the client network>`, `unknown:local`,
+or `unknown:none` without `client_addr`; no per-principal baseline is built for it. Sent
+only under the Redis / Valkey engine tokens, as every value of those engines.
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(untagged, deny_unknown_fields)]
@@ -2928,6 +3259,19 @@ character outside `[A-Za-z0-9 ._:/+-]` with `_` and truncates to 64 characters.
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         client_addr: ::std::option::Option<ClientAddress>,
         db_user_fingerprint: Fingerprint,
+    },
+    Variant2 {
+        /**The source records no account for this access (Redis / Valkey only; see above). Only
+`true` is valid; absent otherwise.
+*/
+        account_not_recorded: bool,
+        /**Client-declared application name (`application_name`, `appName`). The agent replaces every
+character outside `[A-Za-z0-9 ._:/+-]` with `_` and truncates to 64 characters.
+*/
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        application: ::std::option::Option<PrincipalVariant2Application>,
+        #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+        client_addr: ::std::option::Option<ClientAddress>,
     },
 }
 /**Client-declared application name (`application_name`, `appName`). The agent replaces every
@@ -3125,6 +3469,72 @@ impl ::std::convert::TryFrom<::std::string::String> for PrincipalVariant1Applica
     }
 }
 impl<'de> ::serde::Deserialize<'de> for PrincipalVariant1Application {
+    fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+    where
+        D: ::serde::Deserializer<'de>,
+    {
+        ::std::string::String::deserialize(deserializer)?
+            .parse()
+            .map_err(|e: self::error::ConversionError| {
+                <D::Error as ::serde::de::Error>::custom(e.to_string())
+            })
+    }
+}
+/**Client-declared application name (`application_name`, `appName`). The agent replaces every
+character outside `[A-Za-z0-9 ._:/+-]` with `_` and truncates to 64 characters.
+*/
+#[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[serde(transparent)]
+pub struct PrincipalVariant2Application(::std::string::String);
+impl ::std::ops::Deref for PrincipalVariant2Application {
+    type Target = ::std::string::String;
+    fn deref(&self) -> &::std::string::String {
+        &self.0
+    }
+}
+impl ::std::convert::From<PrincipalVariant2Application> for ::std::string::String {
+    fn from(value: PrincipalVariant2Application) -> Self {
+        value.0
+    }
+}
+impl ::std::str::FromStr for PrincipalVariant2Application {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        if value.chars().count() > 64usize {
+            return Err("longer than 64 characters".into());
+        }
+        static PATTERN: ::std::sync::LazyLock<::regress::Regex> = ::std::sync::LazyLock::new(||
+        {
+            ::regress::Regex::with_flags("^[\\s\\S]*?(?:^[A-Za-z0-9 ._:/+-]*$)", "u")
+                .unwrap()
+        });
+        if PATTERN.find(value).is_none() {
+            return Err(
+                "doesn't match pattern \"^[\\s\\S]*?(?:^[A-Za-z0-9 ._:/+-]*$)\"".into(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+}
+impl ::std::convert::TryFrom<&str> for PrincipalVariant2Application {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for PrincipalVariant2Application {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl<'de> ::serde::Deserialize<'de> for PrincipalVariant2Application {
     fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
     where
         D: ::serde::Deserializer<'de>,
@@ -3565,6 +3975,18 @@ is sent as `other`. A new value is a
 change of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`
 lists `target_status.note_labels.<revision>` for a revision that includes it (see
 ADR-0022), and sends `other` otherwise.
+
+Revisions:
+- protocol 0.1.0 (no token): every value down to `stage_kill`;
+- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server
+  labels below `stage_kill`. SQL Server permission names are lowercased with spaces
+  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in
+  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are
+  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->
+  `ms_login_manager`). SQL Server permissions whose name is already a value above
+  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,
+  `shutdown`…) use that value, with no token. A console that lists the token renders
+  every value of the revision.
 */
 #[derive(
     ::serde::Deserialize,
@@ -3803,6 +4225,130 @@ pub enum TargetNoteLabel {
     StageAudit,
     #[serde(rename = "stage_kill")]
     StageKill,
+    #[serde(rename = "sysadmin")]
+    Sysadmin,
+    #[serde(rename = "securityadmin")]
+    Securityadmin,
+    #[serde(rename = "serveradmin")]
+    Serveradmin,
+    #[serde(rename = "setupadmin")]
+    Setupadmin,
+    #[serde(rename = "processadmin")]
+    Processadmin,
+    #[serde(rename = "diskadmin")]
+    Diskadmin,
+    #[serde(rename = "dbcreator")]
+    Dbcreator,
+    #[serde(rename = "bulkadmin")]
+    Bulkadmin,
+    #[serde(rename = "ms_database_connector")]
+    MsDatabaseConnector,
+    #[serde(rename = "ms_database_manager")]
+    MsDatabaseManager,
+    #[serde(rename = "ms_definition_reader")]
+    MsDefinitionReader,
+    #[serde(rename = "ms_login_manager")]
+    MsLoginManager,
+    #[serde(rename = "ms_performance_definition_reader")]
+    MsPerformanceDefinitionReader,
+    #[serde(rename = "ms_security_definition_reader")]
+    MsSecurityDefinitionReader,
+    #[serde(rename = "ms_server_performance_state_reader")]
+    MsServerPerformanceStateReader,
+    #[serde(rename = "ms_server_security_state_reader")]
+    MsServerSecurityStateReader,
+    #[serde(rename = "ms_server_state_manager")]
+    MsServerStateManager,
+    #[serde(rename = "ms_server_state_reader")]
+    MsServerStateReader,
+    #[serde(rename = "db_owner")]
+    DbOwner,
+    #[serde(rename = "db_securityadmin")]
+    DbSecurityadmin,
+    #[serde(rename = "db_accessadmin")]
+    DbAccessadmin,
+    #[serde(rename = "db_backupoperator")]
+    DbBackupoperator,
+    #[serde(rename = "db_ddladmin")]
+    DbDdladmin,
+    #[serde(rename = "db_datawriter")]
+    DbDatawriter,
+    #[serde(rename = "db_datareader")]
+    DbDatareader,
+    #[serde(rename = "db_denydatareader")]
+    DbDenydatareader,
+    #[serde(rename = "db_denydatawriter")]
+    DbDenydatawriter,
+    #[serde(rename = "control_server")]
+    ControlServer,
+    #[serde(rename = "alter_any_server_audit")]
+    AlterAnyServerAudit,
+    #[serde(rename = "alter_any_event_session")]
+    AlterAnyEventSession,
+    #[serde(rename = "alter_any_event_session_enable")]
+    AlterAnyEventSessionEnable,
+    #[serde(rename = "alter_any_event_session_disable")]
+    AlterAnyEventSessionDisable,
+    #[serde(rename = "alter_any_event_session_add_event")]
+    AlterAnyEventSessionAddEvent,
+    #[serde(rename = "alter_any_event_session_drop_event")]
+    AlterAnyEventSessionDropEvent,
+    #[serde(rename = "alter_any_event_session_add_target")]
+    AlterAnyEventSessionAddTarget,
+    #[serde(rename = "alter_any_event_session_drop_target")]
+    AlterAnyEventSessionDropTarget,
+    #[serde(rename = "alter_any_event_session_option")]
+    AlterAnyEventSessionOption,
+    #[serde(rename = "create_any_event_session")]
+    CreateAnyEventSession,
+    #[serde(rename = "drop_any_event_session")]
+    DropAnyEventSession,
+    #[serde(rename = "alter_any_login")]
+    AlterAnyLogin,
+    #[serde(rename = "alter_any_server_role")]
+    AlterAnyServerRole,
+    #[serde(rename = "impersonate_any_login")]
+    ImpersonateAnyLogin,
+    #[serde(rename = "view_any_cryptographically_secured_definition")]
+    ViewAnyCryptographicallySecuredDefinition,
+    #[serde(rename = "view_any_definition")]
+    ViewAnyDefinition,
+    #[serde(rename = "view_any_security_definition")]
+    ViewAnySecurityDefinition,
+    #[serde(rename = "administer_bulk_operations")]
+    AdministerBulkOperations,
+    #[serde(rename = "alter_any_linked_server")]
+    AlterAnyLinkedServer,
+    #[serde(rename = "alter_trace")]
+    AlterTrace,
+    #[serde(rename = "view_server_state")]
+    ViewServerState,
+    #[serde(rename = "view_server_performance_state")]
+    ViewServerPerformanceState,
+    #[serde(rename = "view_server_security_audit")]
+    ViewServerSecurityAudit,
+    #[serde(rename = "view_server_security_state")]
+    ViewServerSecurityState,
+    #[serde(rename = "control")]
+    Control,
+    #[serde(rename = "impersonate")]
+    Impersonate,
+    #[serde(rename = "take_ownership")]
+    TakeOwnership,
+    #[serde(rename = "alter_any_database_audit")]
+    AlterAnyDatabaseAudit,
+    #[serde(rename = "view_database_security_audit")]
+    ViewDatabaseSecurityAudit,
+    #[serde(rename = "unmask")]
+    Unmask,
+    #[serde(rename = "view_definition")]
+    ViewDefinition,
+    #[serde(rename = "view_database_state")]
+    ViewDatabaseState,
+    #[serde(rename = "showplan")]
+    Showplan,
+    #[serde(rename = "password_hash_probe")]
+    PasswordHashProbe,
 }
 impl ::std::fmt::Display for TargetNoteLabel {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -3921,6 +4467,98 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::StageCheck => f.write_str("stage_check"),
             Self::StageAudit => f.write_str("stage_audit"),
             Self::StageKill => f.write_str("stage_kill"),
+            Self::Sysadmin => f.write_str("sysadmin"),
+            Self::Securityadmin => f.write_str("securityadmin"),
+            Self::Serveradmin => f.write_str("serveradmin"),
+            Self::Setupadmin => f.write_str("setupadmin"),
+            Self::Processadmin => f.write_str("processadmin"),
+            Self::Diskadmin => f.write_str("diskadmin"),
+            Self::Dbcreator => f.write_str("dbcreator"),
+            Self::Bulkadmin => f.write_str("bulkadmin"),
+            Self::MsDatabaseConnector => f.write_str("ms_database_connector"),
+            Self::MsDatabaseManager => f.write_str("ms_database_manager"),
+            Self::MsDefinitionReader => f.write_str("ms_definition_reader"),
+            Self::MsLoginManager => f.write_str("ms_login_manager"),
+            Self::MsPerformanceDefinitionReader => {
+                f.write_str("ms_performance_definition_reader")
+            }
+            Self::MsSecurityDefinitionReader => {
+                f.write_str("ms_security_definition_reader")
+            }
+            Self::MsServerPerformanceStateReader => {
+                f.write_str("ms_server_performance_state_reader")
+            }
+            Self::MsServerSecurityStateReader => {
+                f.write_str("ms_server_security_state_reader")
+            }
+            Self::MsServerStateManager => f.write_str("ms_server_state_manager"),
+            Self::MsServerStateReader => f.write_str("ms_server_state_reader"),
+            Self::DbOwner => f.write_str("db_owner"),
+            Self::DbSecurityadmin => f.write_str("db_securityadmin"),
+            Self::DbAccessadmin => f.write_str("db_accessadmin"),
+            Self::DbBackupoperator => f.write_str("db_backupoperator"),
+            Self::DbDdladmin => f.write_str("db_ddladmin"),
+            Self::DbDatawriter => f.write_str("db_datawriter"),
+            Self::DbDatareader => f.write_str("db_datareader"),
+            Self::DbDenydatareader => f.write_str("db_denydatareader"),
+            Self::DbDenydatawriter => f.write_str("db_denydatawriter"),
+            Self::ControlServer => f.write_str("control_server"),
+            Self::AlterAnyServerAudit => f.write_str("alter_any_server_audit"),
+            Self::AlterAnyEventSession => f.write_str("alter_any_event_session"),
+            Self::AlterAnyEventSessionEnable => {
+                f.write_str("alter_any_event_session_enable")
+            }
+            Self::AlterAnyEventSessionDisable => {
+                f.write_str("alter_any_event_session_disable")
+            }
+            Self::AlterAnyEventSessionAddEvent => {
+                f.write_str("alter_any_event_session_add_event")
+            }
+            Self::AlterAnyEventSessionDropEvent => {
+                f.write_str("alter_any_event_session_drop_event")
+            }
+            Self::AlterAnyEventSessionAddTarget => {
+                f.write_str("alter_any_event_session_add_target")
+            }
+            Self::AlterAnyEventSessionDropTarget => {
+                f.write_str("alter_any_event_session_drop_target")
+            }
+            Self::AlterAnyEventSessionOption => {
+                f.write_str("alter_any_event_session_option")
+            }
+            Self::CreateAnyEventSession => f.write_str("create_any_event_session"),
+            Self::DropAnyEventSession => f.write_str("drop_any_event_session"),
+            Self::AlterAnyLogin => f.write_str("alter_any_login"),
+            Self::AlterAnyServerRole => f.write_str("alter_any_server_role"),
+            Self::ImpersonateAnyLogin => f.write_str("impersonate_any_login"),
+            Self::ViewAnyCryptographicallySecuredDefinition => {
+                f.write_str("view_any_cryptographically_secured_definition")
+            }
+            Self::ViewAnyDefinition => f.write_str("view_any_definition"),
+            Self::ViewAnySecurityDefinition => {
+                f.write_str("view_any_security_definition")
+            }
+            Self::AdministerBulkOperations => f.write_str("administer_bulk_operations"),
+            Self::AlterAnyLinkedServer => f.write_str("alter_any_linked_server"),
+            Self::AlterTrace => f.write_str("alter_trace"),
+            Self::ViewServerState => f.write_str("view_server_state"),
+            Self::ViewServerPerformanceState => {
+                f.write_str("view_server_performance_state")
+            }
+            Self::ViewServerSecurityAudit => f.write_str("view_server_security_audit"),
+            Self::ViewServerSecurityState => f.write_str("view_server_security_state"),
+            Self::Control => f.write_str("control"),
+            Self::Impersonate => f.write_str("impersonate"),
+            Self::TakeOwnership => f.write_str("take_ownership"),
+            Self::AlterAnyDatabaseAudit => f.write_str("alter_any_database_audit"),
+            Self::ViewDatabaseSecurityAudit => {
+                f.write_str("view_database_security_audit")
+            }
+            Self::Unmask => f.write_str("unmask"),
+            Self::ViewDefinition => f.write_str("view_definition"),
+            Self::ViewDatabaseState => f.write_str("view_database_state"),
+            Self::Showplan => f.write_str("showplan"),
+            Self::PasswordHashProbe => f.write_str("password_hash_probe"),
         }
     }
 }
@@ -4042,6 +4680,78 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "stage_check" => Ok(Self::StageCheck),
             "stage_audit" => Ok(Self::StageAudit),
             "stage_kill" => Ok(Self::StageKill),
+            "sysadmin" => Ok(Self::Sysadmin),
+            "securityadmin" => Ok(Self::Securityadmin),
+            "serveradmin" => Ok(Self::Serveradmin),
+            "setupadmin" => Ok(Self::Setupadmin),
+            "processadmin" => Ok(Self::Processadmin),
+            "diskadmin" => Ok(Self::Diskadmin),
+            "dbcreator" => Ok(Self::Dbcreator),
+            "bulkadmin" => Ok(Self::Bulkadmin),
+            "ms_database_connector" => Ok(Self::MsDatabaseConnector),
+            "ms_database_manager" => Ok(Self::MsDatabaseManager),
+            "ms_definition_reader" => Ok(Self::MsDefinitionReader),
+            "ms_login_manager" => Ok(Self::MsLoginManager),
+            "ms_performance_definition_reader" => Ok(Self::MsPerformanceDefinitionReader),
+            "ms_security_definition_reader" => Ok(Self::MsSecurityDefinitionReader),
+            "ms_server_performance_state_reader" => {
+                Ok(Self::MsServerPerformanceStateReader)
+            }
+            "ms_server_security_state_reader" => Ok(Self::MsServerSecurityStateReader),
+            "ms_server_state_manager" => Ok(Self::MsServerStateManager),
+            "ms_server_state_reader" => Ok(Self::MsServerStateReader),
+            "db_owner" => Ok(Self::DbOwner),
+            "db_securityadmin" => Ok(Self::DbSecurityadmin),
+            "db_accessadmin" => Ok(Self::DbAccessadmin),
+            "db_backupoperator" => Ok(Self::DbBackupoperator),
+            "db_ddladmin" => Ok(Self::DbDdladmin),
+            "db_datawriter" => Ok(Self::DbDatawriter),
+            "db_datareader" => Ok(Self::DbDatareader),
+            "db_denydatareader" => Ok(Self::DbDenydatareader),
+            "db_denydatawriter" => Ok(Self::DbDenydatawriter),
+            "control_server" => Ok(Self::ControlServer),
+            "alter_any_server_audit" => Ok(Self::AlterAnyServerAudit),
+            "alter_any_event_session" => Ok(Self::AlterAnyEventSession),
+            "alter_any_event_session_enable" => Ok(Self::AlterAnyEventSessionEnable),
+            "alter_any_event_session_disable" => Ok(Self::AlterAnyEventSessionDisable),
+            "alter_any_event_session_add_event" => Ok(Self::AlterAnyEventSessionAddEvent),
+            "alter_any_event_session_drop_event" => {
+                Ok(Self::AlterAnyEventSessionDropEvent)
+            }
+            "alter_any_event_session_add_target" => {
+                Ok(Self::AlterAnyEventSessionAddTarget)
+            }
+            "alter_any_event_session_drop_target" => {
+                Ok(Self::AlterAnyEventSessionDropTarget)
+            }
+            "alter_any_event_session_option" => Ok(Self::AlterAnyEventSessionOption),
+            "create_any_event_session" => Ok(Self::CreateAnyEventSession),
+            "drop_any_event_session" => Ok(Self::DropAnyEventSession),
+            "alter_any_login" => Ok(Self::AlterAnyLogin),
+            "alter_any_server_role" => Ok(Self::AlterAnyServerRole),
+            "impersonate_any_login" => Ok(Self::ImpersonateAnyLogin),
+            "view_any_cryptographically_secured_definition" => {
+                Ok(Self::ViewAnyCryptographicallySecuredDefinition)
+            }
+            "view_any_definition" => Ok(Self::ViewAnyDefinition),
+            "view_any_security_definition" => Ok(Self::ViewAnySecurityDefinition),
+            "administer_bulk_operations" => Ok(Self::AdministerBulkOperations),
+            "alter_any_linked_server" => Ok(Self::AlterAnyLinkedServer),
+            "alter_trace" => Ok(Self::AlterTrace),
+            "view_server_state" => Ok(Self::ViewServerState),
+            "view_server_performance_state" => Ok(Self::ViewServerPerformanceState),
+            "view_server_security_audit" => Ok(Self::ViewServerSecurityAudit),
+            "view_server_security_state" => Ok(Self::ViewServerSecurityState),
+            "control" => Ok(Self::Control),
+            "impersonate" => Ok(Self::Impersonate),
+            "take_ownership" => Ok(Self::TakeOwnership),
+            "alter_any_database_audit" => Ok(Self::AlterAnyDatabaseAudit),
+            "view_database_security_audit" => Ok(Self::ViewDatabaseSecurityAudit),
+            "unmask" => Ok(Self::Unmask),
+            "view_definition" => Ok(Self::ViewDefinition),
+            "view_database_state" => Ok(Self::ViewDatabaseState),
+            "showplan" => Ok(Self::Showplan),
+            "password_hash_probe" => Ok(Self::PasswordHashProbe),
             _ => Err("invalid value".into()),
         }
     }
@@ -4086,15 +4796,19 @@ Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes
     pub notes: ::std::vec::Vec<TargetNote>,
     ///Whether the last connection attempt with the configured read-only account succeeded.
     pub reachable: bool,
-    /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted
-when the reported string does not match this pattern.
+    /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
+Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
+or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+not match this pattern.
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub server_version: ::std::option::Option<TargetStatusServerVersion>,
     pub target_id: TargetId,
 }
-/**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted
-when the reported string does not match this pattern.
+/**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
+Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
+or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+not match this pattern.
 */
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]

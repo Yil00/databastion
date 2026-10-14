@@ -36,17 +36,34 @@ const HEARTBEAT = {
   agent_version: "0.1.0",
   uptime_s: 12,
   classifiers_version: "2026.09.1",
-  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas"],
+  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis"],
   targets: [
     { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" },
     { target_id: "mysql-crm", engine: "mysql", reachable: true, audit_level: "partial" },
     { target_id: "mongo-app", engine: "mongodb", reachable: true, audit_level: "limited" },
     { target_id: "ldap-main", engine: "openldap", reachable: true, audit_level: "full" },
     { target_id: "cas-prod", engine: "cas", reachable: true, audit_level: "partial", audit_source: "cas_audit_log" },
+    // Engines of phase 9 (P9-C): in the contract, not listed by CONSOLE_ACCEPTS until P9-E.
+    { target_id: "mssql-prod", engine: "sqlserver", reachable: true, audit_level: "partial", audit_source: "sqlserver_audit" },
+    { target_id: "mssql-2019", engine: "sqlserver", reachable: true, audit_level: "limited", audit_source: "sqlserver_xevents" },
+    { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
+    { target_id: "sessions-valkey", engine: "valkey", reachable: true, audit_level: "none" },
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
 };
+
+/**
+ * Valid contract fixtures that this console does not store yet: the `account_not_recorded`
+ * principal (Redis / Valkey, ADR-0052 decision 8) has no storage before P9-E (the
+ * `access_events_principal` check). A conforming agent sends none before the console lists
+ * `engine.redis` and `engine.valkey`, which only P9-E adds.
+ */
+const NOT_STORED_BEFORE_P9E = new Set(["EventsBatch.redis-account-not-recorded.json"]);
+
+function storableFixtures(): [string, unknown][] {
+  return fixtures("valid", "EventsBatch").filter(([name]) => !NOT_STORED_BEFORE_P9E.has(name));
+}
 
 const PG_DUMP = {
   target_id: "pg-prod-1",
@@ -112,7 +129,8 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
   afterEach(() => setPolicyJobSender(null));
 
   describe("contract fixtures", () => {
-    it.each(fixtures("valid", "EventsBatch"))("accepts %s and stores exactly the contract fields", async (_name, body) => {
+    it.todo("stores the `account_not_recorded` principal of Redis / Valkey events (P9-E, ADR-0052 decision 8)");
+    it.each(storableFixtures())("accepts %s and stores exactly the contract fields", async (_name, body) => {
       const auth = await agentWithTargets();
       const res = await post(auth, body);
       expect(res.status).toBe(202);
@@ -583,7 +601,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       events: [{ ...PG_DUMP, query: "COPY public.clients TO STDOUT WHERE email = 'jane.doe@example.com'" }],
     };
     expect((await post(auth, raw)).status).toBe(400);
-    for (const [, body] of fixtures("valid", "EventsBatch")) {
+    for (const [, body] of storableFixtures()) {
       expect((await post(auth, { ...(body as Batch), batch_id: uuidv7() })).status).toBe(202);
     }
     const dump = await databaseDump();

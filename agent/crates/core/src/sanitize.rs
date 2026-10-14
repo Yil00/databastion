@@ -9,12 +9,14 @@
 //! | Keyword | Where | Here |
 //! |---------|-------|------|
 //! | `not` (Identifier) | location / object names | name replaced by `*` |
+//! | `ObjectName` other than an `Identifier` (a `KeyPattern`) | location / event objects | name replaced by `*` (no connector builds key patterns yet, ADR-0052) |
 //! | `minimum` / `maximum` on numbers | `confidence` | item dropped (NaN, < 0, > 1) |
 //! | `minimum` / `maximum` on integers | `sampled`, `matched`, `aggregated_count`, `Count` | item dropped, or optional field omitted |
 //! | `maxItems` | `masked_samples` (5), `fingerprints` (50), `objects` (16), `signals` (16) | truncated |
 //! | `uniqueItems` | `fingerprints`, `signals` | deduplicated |
 //! | `if` / `then` | `read` / `write` events need an object | item dropped |
 //! | cross-field | `matched <= sampled` | item dropped |
+//! | `if` / `then` | `account_not_recorded` principal (Redis / Valkey sources only, never `auth_failure`) | item dropped (no connector builds it yet, ADR-0052) |
 //! | `minItems` / `maxItems` of the batch, 1 MiB | envelope | enforced by the batch builder in `uplink` |
 //!
 //! Raw strings that are not names (`db_user`, `application`) go through
@@ -30,7 +32,8 @@ use databastion_classifiers::masking::{HmacKey, RawSample};
 use databastion_classifiers::names::{is_forbidden_char, violates_numeric_rule};
 use databastion_protocol::{
     AccessEvent, AccessEventAction, ClientAddress, Count, Finding, Fingerprint, Identifier,
-    Principal, PrincipalVariant0Application, PrincipalVariant0DbUser, PrincipalVariant1Application,
+    ObjectName, Principal, PrincipalVariant0Application, PrincipalVariant0DbUser,
+    PrincipalVariant1Application,
 };
 
 /// Contract `Count` maximum (JavaScript safe integer).
@@ -182,11 +185,29 @@ pub(crate) fn clamped_count(n: u64) -> Count {
     Count(i64::try_from(n).map_or(MAX_COUNT, |v| v.min(MAX_COUNT)))
 }
 
+/// Sanitizes an object name in place. An `Identifier` goes through
+/// [`fix_identifier`]. A name that is only a `KeyPattern` (Redis / Valkey,
+/// ADR-0052 decision 7) becomes `*`: no connector builds key patterns yet,
+/// and its engine-dependent rules (`KeyPattern`'s `not` rule, Redis /
+/// Valkey only) are not enforced here yet (fail closed).
+fn fix_object_name(name: &mut ObjectName) -> bool {
+    match name {
+        ObjectName::Variant0(id) => fix_identifier(id),
+        ObjectName::Variant1(_) => match wildcard() {
+            Some(w) => {
+                *name = ObjectName::Variant0(w);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 /// Validates and sanitizes a finding in place. `false`: drop it.
 pub(crate) fn check_finding(f: &mut Finding) -> bool {
     let l = &mut f.location;
     let names_ok = fix_identifier(&mut l.database)
-        && fix_identifier(&mut l.object)
+        && fix_object_name(&mut l.object)
         && fix_identifier(&mut l.field)
         && l.schema.as_mut().is_none_or(fix_identifier);
     if !names_ok {
@@ -219,10 +240,16 @@ pub(crate) fn check_finding(f: &mut Finding) -> bool {
 
 /// Validates and sanitizes an access event in place. `false`: drop it.
 pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
+    // `account_not_recorded` is valid only on Redis / Valkey sources and
+    // never on `auth_failure` (contract `Principal`); no connector builds it
+    // yet (ADR-0052 decision 8), so it is refused here (fail closed).
+    if matches!(e.principal, Principal::Variant2 { .. }) {
+        return false;
+    }
     e.objects.truncate(MAX_OBJECTS);
     for o in &mut e.objects {
         let ok = fix_identifier(&mut o.database)
-            && fix_identifier(&mut o.object)
+            && fix_object_name(&mut o.object)
             && o.schema.as_mut().is_none_or(fix_identifier);
         if !ok {
             return false;
@@ -313,6 +340,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn key_patterns_and_unrecorded_accounts_are_not_sent_yet() {
+        // No connector builds them yet (ADR-0052): a key pattern object
+        // becomes `*`, an `account_not_recorded` principal drops the event.
+        let mut e = event("read", 1);
+        e.objects[0].object = "session:*".parse().unwrap();
+        assert!(check_event(&mut e));
+        assert_eq!(e.objects[0].object.to_string(), "*");
+        let mut e = event("read", 1);
+        e.principal = serde_json::from_value(serde_json::json!({
+            "account_not_recorded": true, "client_addr": "198.51.100.7"
+        }))
+        .unwrap();
+        assert!(matches!(e.principal, Principal::Variant2 { .. }));
+        assert!(!check_event(&mut e));
+    }
+
+    #[test]
     fn built_counts_saturate_at_the_contract_bound() {
         assert_eq!(clamped_count(0).0, 0);
         assert_eq!(clamped_count(42).0, 42);
@@ -337,9 +381,17 @@ pub(crate) mod tests {
         assert_eq!(f.fingerprints.as_ref().unwrap().len(), 1);
 
         let mut f = finding();
-        f.location.object = Identifier::try_from("4111 1111 1111 1111").unwrap();
+        f.location.object = Identifier::try_from("4111 1111 1111 1111").unwrap().into();
         assert!(check_finding(&mut f));
-        assert_eq!(f.location.object.as_str(), "*");
+        assert_eq!(f.location.object.to_string(), "*");
+
+        // A key pattern (Redis / Valkey only): no connector builds one yet,
+        // so it never leaves as such.
+        let mut f = finding();
+        f.location.object = "user:*:email".parse().unwrap();
+        assert!(matches!(f.location.object, ObjectName::Variant1(_)));
+        assert!(check_finding(&mut f));
+        assert_eq!(f.location.object.to_string(), "*");
 
         for (confidence, matched) in [(1.5, 5), (-0.1, 5), (f64::NAN, 5), (0.5, 11)] {
             let mut f = finding();
@@ -361,7 +413,7 @@ pub(crate) mod tests {
         let mut e = event("read", 20);
         assert!(check_event(&mut e));
         assert_eq!(e.objects.len(), 16);
-        assert_eq!(e.objects[0].object.as_str(), "*");
+        assert_eq!(e.objects[0].object.to_string(), "*");
         assert_eq!(e.signals.as_ref().unwrap().len(), 1);
         assert!(!check_event(&mut event("write", 0)));
         assert!(check_event(&mut event("connect", 0)));

@@ -122,6 +122,41 @@
       },
       "x-databastion-normalized-name": true
     },
+    "KeyPattern": {
+      "description": "**Normalized** Redis / Valkey key pattern (ADR-0052 decision 7): the `object` of a\n`Location` whose `engine` is `redis` or `valkey`, and of the `ObjectRef`s of their access\nevents. Never a raw key name, never a fingerprint of one.\n\nNormalization (`x-databastion-normalized-name`), applied by the agent before the uplink: the\nkey name is split into segments on `:`, `/`, `|` and `.`; a segment that touches a classifier\nmatch, holds a digit run, is high-entropy, matches the first-name list, is an IP address\nor has a character this schema forbids becomes `*`, and so does a segment position with\ntoo many distinct values or record-like values (cardinality and record-id rules). A first\nsegment naming a URL scheme becomes `*`. A pattern that still does not match this schema\nis replaced by `*`. E.g. `user:42:email` -> `user:*:email`.\n\nSchema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or\ntrailing separator), each a plain name of `Identifier` (no `@ = ; \\ ' \"`, backquote,\n`< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:\n- no segment made only of 9 or more digits and the characters space, `+` and `-`\n  (`Identifier`'s digit-run rule, applied per segment), and no run of 9 or more\n  characters made of digits, separators, spaces, `+` and `-` that starts and ends with a\n  digit (a phone or card number split across segments, `06.12.34.56.78`);\n- no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,\n  `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.\n\n**Rendering rule** (console): a key pattern is shown only as escaped text, never as a link\nor `href`, never unescaped in e-mail HTML, and in webhook payloads only as a JSON string.\nCSV exports guard it against formula injection: a value starting with `=`, `+`, `-`, `@`,\na tab or a carriage return is prefixed (with `'`).\n",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+([:/|.][^@=:;/|.\\\\'\"`<>(),\\p{Cc}\\p{Cf}\\p{Co}\\p{Zl}\\p{Zp}]+)*$",
+      "not": {
+        "description": "No segment of 9 or more digits, spaces, `+` or `-`; no digit-to-digit run of 9 or more\ndigits and separators; no first segment naming a URL scheme.\n",
+        "type": "string",
+        "pattern": "(^|[:/|.])[0-9 +-]{9,}([:/|.]|$)|[0-9][0-9 +.:/|-]{7,}[0-9]|^ *([Jj][Aa][Vv][Aa][Ss][Cc][Rr][Ii][Pp][Tt]|[Dd][Aa][Tt][Aa]|[Vv][Bb][Ss][Cc][Rr][Ii][Pp][Tt]|[Ff][Ii][Ll][Ee]|[Hh][Tt][Tt][Pp][Ss]?|[Mm][Aa][Ii][Ll][Tt][Oo]) *([:/|.]|$)"
+      },
+      "x-databastion-normalized-name": true
+    },
+    "ObjectName": {
+      "description": "Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the\n`redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its\n`engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit\nsources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also\nchecks each event's objects against the schema of the **target's** engine (a `KeyPattern`\nthat is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).\n\nWritten as \"exactly one of `Identifier`, or `KeyPattern` but not `Identifier`\", which\naccepts exactly the union of the two (a name valid under both, such as `orders` or `*`,\nmatches the first branch only).\n",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Identifier"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/KeyPattern"
+            },
+            {
+              "type": "string",
+              "maxLength": 256,
+              "not": {
+                "$ref": "#/$defs/Identifier"
+              }
+            }
+          ]
+        }
+      ]
+    },
     "IdentifierPattern": {
       "description": "Console-provided filter on object names: an exact name, or a glob with `*` and `?`. The agent\ntreats it as a name filter only and never interpolates it into a query.\n",
       "type": "string",
@@ -163,7 +198,7 @@
       ]
     },
     "Engine": {
-      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token.\n",
+      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,\nADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`\nand `engine.valkey`.\n",
       "type": "string",
       "enum": [
         "postgres",
@@ -171,18 +206,23 @@
         "mariadb",
         "mongodb",
         "openldap",
-        "cas"
+        "cas",
+        "sqlserver",
+        "redis",
+        "valkey"
       ]
     },
     "Connector": {
-      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB. `cas` is sent only when the\nconsole listed `engine.cas` (see `Engine`).\n",
+      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and\nValkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`\nonly when it listed `engine.sqlserver`, and `redis` only when it listed **both**\n`engine.redis` and `engine.valkey` (see `Engine`).\n",
       "type": "string",
       "enum": [
         "postgres",
         "mysql",
         "mongodb",
         "openldap",
-        "cas"
+        "cas",
+        "sqlserver",
+        "redis"
       ]
     },
     "ConnectorList": {
@@ -205,7 +245,7 @@
       ]
     },
     "AuditSource": {
-      "description": "Native source used for Audit on a target. `cas_audit_log` (the CAS JSON audit log file,\nADR-0041 decision 7) is sent only when the console listed `engine.cas` (see `Engine`).\n",
+      "description": "Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only\nunder their engine's token (see `Engine`):\n- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;\n- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through\n  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's\n  `event_file` target), `sqlserver_query_stats` (plan cache statistics,\n  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;\n- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),\n  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`\n  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)\n  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when\n  **both** `engine.redis` and `engine.valkey` are listed.\n",
       "type": "string",
       "enum": [
         "pgaudit",
@@ -218,7 +258,14 @@
         "mongodb_profiler",
         "mongodb_log",
         "openldap_accesslog",
-        "cas_audit_log"
+        "cas_audit_log",
+        "sqlserver_audit",
+        "sqlserver_xevents",
+        "sqlserver_query_stats",
+        "redis_slowlog",
+        "redis_commandlog",
+        "redis_acl_log",
+        "redis_sync"
       ]
     },
     "Edition": {
@@ -525,7 +572,7 @@
           "$ref": "#/$defs/Edition"
         },
         "server_version": {
-          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted\nwhen the reported string does not match this pattern.\n",
+          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL\nServer's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`\nor Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does\nnot match this pattern.\n",
           "type": "string",
           "maxLength": 32,
           "pattern": "^[0-9A-Za-z._+-]+$"
@@ -590,7 +637,7 @@
       "pattern": "^(audit|coverage|privilege|security|check)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$"
     },
     "TargetNoteLabel": {
-      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n",
+      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n\nRevisions:\n- protocol 0.1.0 (no token): every value down to `stage_kill`;\n- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server\n  labels below `stage_kill`. SQL Server permission names are lowercased with spaces\n  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in\n  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are\n  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->\n  `ms_login_manager`). SQL Server permissions whose name is already a value above\n  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,\n  `shutdown`…) use that value, with no token. A console that lists the token renders\n  every value of the revision.\n",
       "type": "string",
       "enum": [
         "other",
@@ -704,7 +751,69 @@
         "stage_sample",
         "stage_check",
         "stage_audit",
-        "stage_kill"
+        "stage_kill",
+        "sysadmin",
+        "securityadmin",
+        "serveradmin",
+        "setupadmin",
+        "processadmin",
+        "diskadmin",
+        "dbcreator",
+        "bulkadmin",
+        "ms_database_connector",
+        "ms_database_manager",
+        "ms_definition_reader",
+        "ms_login_manager",
+        "ms_performance_definition_reader",
+        "ms_security_definition_reader",
+        "ms_server_performance_state_reader",
+        "ms_server_security_state_reader",
+        "ms_server_state_manager",
+        "ms_server_state_reader",
+        "db_owner",
+        "db_securityadmin",
+        "db_accessadmin",
+        "db_backupoperator",
+        "db_ddladmin",
+        "db_datawriter",
+        "db_datareader",
+        "db_denydatareader",
+        "db_denydatawriter",
+        "control_server",
+        "alter_any_server_audit",
+        "alter_any_event_session",
+        "alter_any_event_session_enable",
+        "alter_any_event_session_disable",
+        "alter_any_event_session_add_event",
+        "alter_any_event_session_drop_event",
+        "alter_any_event_session_add_target",
+        "alter_any_event_session_drop_target",
+        "alter_any_event_session_option",
+        "create_any_event_session",
+        "drop_any_event_session",
+        "alter_any_login",
+        "alter_any_server_role",
+        "impersonate_any_login",
+        "view_any_cryptographically_secured_definition",
+        "view_any_definition",
+        "view_any_security_definition",
+        "administer_bulk_operations",
+        "alter_any_linked_server",
+        "alter_trace",
+        "view_server_state",
+        "view_server_performance_state",
+        "view_server_security_audit",
+        "view_server_security_state",
+        "control",
+        "impersonate",
+        "take_ownership",
+        "alter_any_database_audit",
+        "view_database_security_audit",
+        "unmask",
+        "view_definition",
+        "view_database_state",
+        "showplan",
+        "password_hash_probe"
       ]
     },
     "DetectedTarget": {
@@ -729,14 +838,17 @@
           "maximum": 65535
         },
         "process": {
-          "description": "Process name only (the command line may contain secrets and is never read or sent).",
+          "description": "Process name only (the command line may contain secrets and is never read or sent).\n`sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and\n`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see\n`Engine`): a detected target of such an engine is not sent before the token is listed.\n",
           "type": "string",
           "enum": [
             "postgres",
             "mysqld",
             "mariadbd",
             "mongod",
-            "slapd"
+            "slapd",
+            "sqlservr",
+            "redis-server",
+            "valkey-server"
           ]
         }
       }
@@ -1383,7 +1495,7 @@
       }
     },
     "Location": {
-      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\n",
+      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\nSQL Server (ADR-0051 decision 5): database, schema, table, column.\nRedis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type\n(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern\n(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and\nsorted-set members, the normalized field name for hash fields and stream entry fields, or\n`#key` / `#field` for values found in key names / hash field names.\n\n`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on\nevery other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or\n`/` is still rejected).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1403,10 +1515,37 @@
           "$ref": "#/$defs/Identifier"
         },
         "object": {
-          "$ref": "#/$defs/Identifier"
+          "$ref": "#/$defs/ObjectName"
         },
         "field": {
           "$ref": "#/$defs/Identifier"
+        }
+      },
+      "if": {
+        "required": [
+          "engine"
+        ],
+        "properties": {
+          "engine": {
+            "enum": [
+              "redis",
+              "valkey"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "object": {
+            "$ref": "#/$defs/KeyPattern"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "object": {
+            "$ref": "#/$defs/Identifier"
+          }
         }
       }
     },
@@ -1527,10 +1666,127 @@
             "minItems": 1
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "description": "Redis / Valkey sources (ADR-0052): their objects are `KeyPattern`s. Every other source:\nobjects are `Identifier`s, and the principal is never `account_not_recorded`.\n",
+          "if": {
+            "required": [
+              "source"
+            ],
+            "properties": {
+              "source": {
+                "enum": [
+                  "redis_slowlog",
+                  "redis_commandlog",
+                  "redis_acl_log",
+                  "redis_sync"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "objects": {
+                "type": "array",
+                "items": {
+                  "description": "`ObjectRef` with `object` as a `KeyPattern` (keep in step with `ObjectRef`).",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "database",
+                    "object"
+                  ],
+                  "properties": {
+                    "database": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "schema": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "object": {
+                      "$ref": "#/$defs/KeyPattern"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "principal": {
+                "type": "object",
+                "not": {
+                  "required": [
+                    "account_not_recorded"
+                  ],
+                  "properties": {
+                    "account_not_recorded": {
+                      "const": true
+                    }
+                  }
+                }
+              },
+              "objects": {
+                "type": "array",
+                "items": {
+                  "description": "`ObjectRef` with `object` as a `Identifier` (keep in step with `ObjectRef`).",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "database",
+                    "object"
+                  ],
+                  "properties": {
+                    "database": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "schema": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "object": {
+                      "$ref": "#/$defs/Identifier"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "A failed authentication always names, or fingerprints, the name tried: never\n`account_not_recorded` (ADR-0052 implementation obligations).\n",
+          "if": {
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "const": "auth_failure"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "principal": {
+                "type": "object",
+                "not": {
+                  "required": [
+                    "account_not_recorded"
+                  ],
+                  "properties": {
+                    "account_not_recorded": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "Principal": {
-      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so\nthe agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN\nand the DNs listed in its `openldap.clear_principals`. On CAS (ADR-0041 decision 7), principals\nare end users: every principal is sent as `db_user_fingerprint` except the names listed in the\ntarget's `cas.clear_principals`, and the name of a failed authentication is always\nfingerprinted.\n\n**The `*` aggregate (CAS only).** `db_user` equal to `*` means \"several accounts\", never an\naccount named `*` nor a wildcard: it appears only on `cas` targets, only on `auth_failure`\nevents carrying the signal `volume.failed_logins_many_accounts`, when the agent aggregates the\nfailed authentications of one client address (beyond 16 distinct principals in 10 minutes, or\nwhen its bounded window is full, then without `client_addr`) into one event per address and\nminute; `aggregated_count` is the number of failures merged. No other event carries `db_user`\n`*`. The console escapes `db_user` and `application` on display.\n",
+      "description": "Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with\nan account that does not exist on the target (the attempted name may be a mistyped password), and\nfor any account name that does not match the `db_user` pattern, the agent sends\n`db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so\nthe agent sends every principal as `db_user_fingerprint` except `anonymous`, the agent's own DN\nand the DNs listed in its `openldap.clear_principals`. On CAS (ADR-0041 decision 7), principals\nare end users: every principal is sent as `db_user_fingerprint` except the names listed in the\ntarget's `cas.clear_principals`, and the name of a failed authentication is always\nfingerprinted.\n\n**The `*` aggregate (CAS only).** `db_user` equal to `*` means \"several accounts\", never an\naccount named `*` nor a wildcard: it appears only on `cas` targets, only on `auth_failure`\nevents carrying the signal `volume.failed_logins_many_accounts`, when the agent aggregates the\nfailed authentications of one client address (beyond 16 distinct principals in 10 minutes, or\nwhen its bounded window is full, then without `client_addr`) into one event per address and\nminute; `aggregated_count` is the number of failures merged. No other event carries `db_user`\n`*`. The console escapes `db_user` and `application` on display.\n\n**No recorded account (Redis / Valkey only, ADR-0052 decision 8).** `account_not_recorded:\ntrue`, with neither `db_user` nor `db_user_fingerprint`, means that the source records no\naccount for this access (a slow-log or command-log entry whose connection had closed\nbefore the agent could attribute it, a full synchronization). It is not `db_user` `*`\n(several accounts, CAS only) and never a wildcard. `client_addr` and `application` are\nsent when known. Accepted only on events of a `redis_*` source (checked by this schema)\nand of a `redis` or `valkey` target (checked by the console from the target's engine),\nand never on `auth_failure` events (checked by this schema: a failed authentication always\nnames, or fingerprints, the name tried). Console rules (ADR-0021 decision 6, P9-E): the\ndedup key's principal part is `unknown:<SHA-256 of the client network>`, `unknown:local`,\nor `unknown:none` without `client_addr`; no per-principal baseline is built for it. Sent\nonly under the Redis / Valkey engine tokens, as every value of those engines.\n",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1543,6 +1799,11 @@
         },
         "db_user_fingerprint": {
           "$ref": "#/$defs/Fingerprint"
+        },
+        "account_not_recorded": {
+          "description": "The source records no account for this access (Redis / Valkey only; see above). Only\n`true` is valid; absent otherwise.\n",
+          "type": "boolean",
+          "const": true
         },
         "client_addr": {
           "$ref": "#/$defs/ClientAddress"
@@ -1564,11 +1825,16 @@
           "required": [
             "db_user_fingerprint"
           ]
+        },
+        {
+          "required": [
+            "account_not_recorded"
+          ]
         }
       ]
     },
     "ObjectRef": {
-      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of two reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`.\n\nIn both cases `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n",
+      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of two reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`.\n\nIn both cases `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n\n**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log\nentry is reported under the pattern learned by the last scan, its longest learned literal\nprefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.\n`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its\n`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),\nand by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`\ntargets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1583,7 +1849,7 @@
           "$ref": "#/$defs/Identifier"
         },
         "object": {
-          "$ref": "#/$defs/Identifier"
+          "$ref": "#/$defs/ObjectName"
         }
       }
     }

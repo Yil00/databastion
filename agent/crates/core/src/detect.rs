@@ -93,6 +93,11 @@ fn family(engine: Engine) -> u8 {
         // Never detected (ADR-0041 decision 3: no local detection of CAS,
         // whose `java` command line carries secrets); its own family.
         Engine::Cas => 4,
+        // Not detected yet (local detection comes with the connectors,
+        // ADR-0051 decision 7, ADR-0052 decision 11); their own families,
+        // Redis and Valkey one family as MySQL and MariaDB.
+        Engine::Sqlserver => 5,
+        Engine::Redis | Engine::Valkey => 6,
     }
 }
 

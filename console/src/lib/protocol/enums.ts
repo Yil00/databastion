@@ -42,10 +42,27 @@ export const AUDIT_SOURCES = exhaustive<AuditSource>()([
   "mongodb_log",
   "openldap_accesslog",
   "cas_audit_log",
+  "sqlserver_audit",
+  "sqlserver_xevents",
+  "sqlserver_query_stats",
+  "redis_slowlog",
+  "redis_commandlog",
+  "redis_acl_log",
+  "redis_sync",
 ]);
 
 /** Every contract `Engine`, in contract order. */
-export const ENGINES = exhaustive<Engine>()(["postgres", "mysql", "mariadb", "mongodb", "openldap", "cas"]);
+export const ENGINES = exhaustive<Engine>()([
+  "postgres",
+  "mysql",
+  "mariadb",
+  "mongodb",
+  "openldap",
+  "cas",
+  "sqlserver",
+  "redis",
+  "valkey",
+]);
 
 /** Every contract `AccessEvent.action`, in contract order. */
 export const EVENT_ACTIONS = exhaustive<EventAction>()(["connect", "auth_failure", "read", "write", "ddl", "dcl"]);

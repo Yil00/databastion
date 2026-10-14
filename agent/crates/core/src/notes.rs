@@ -461,6 +461,77 @@ impl NoteCode {
     }
 }
 
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10` (Microsoft SQL Server, ADR-0051
+/// decision 4). Until the agent negotiates that token (with the SQL Server
+/// connector), [`NoteLabel::parse`] maps them to `other`: a console built
+/// before the revision rejects them (ADR-0022 decision 4), and a MySQL /
+/// MariaDB server could name a dynamic privilege after one of them.
+pub(crate) const LABELS_REVISION_2026_10: &[&str] = &[
+    "sysadmin",
+    "securityadmin",
+    "serveradmin",
+    "setupadmin",
+    "processadmin",
+    "diskadmin",
+    "dbcreator",
+    "bulkadmin",
+    "ms_database_connector",
+    "ms_database_manager",
+    "ms_definition_reader",
+    "ms_login_manager",
+    "ms_performance_definition_reader",
+    "ms_security_definition_reader",
+    "ms_server_performance_state_reader",
+    "ms_server_security_state_reader",
+    "ms_server_state_manager",
+    "ms_server_state_reader",
+    "db_owner",
+    "db_securityadmin",
+    "db_accessadmin",
+    "db_backupoperator",
+    "db_ddladmin",
+    "db_datawriter",
+    "db_datareader",
+    "db_denydatareader",
+    "db_denydatawriter",
+    "control_server",
+    "alter_any_server_audit",
+    "alter_any_event_session",
+    "alter_any_event_session_enable",
+    "alter_any_event_session_disable",
+    "alter_any_event_session_add_event",
+    "alter_any_event_session_drop_event",
+    "alter_any_event_session_add_target",
+    "alter_any_event_session_drop_target",
+    "alter_any_event_session_option",
+    "create_any_event_session",
+    "drop_any_event_session",
+    "alter_any_login",
+    "alter_any_server_role",
+    "impersonate_any_login",
+    "view_any_cryptographically_secured_definition",
+    "view_any_definition",
+    "view_any_security_definition",
+    "administer_bulk_operations",
+    "alter_any_linked_server",
+    "alter_trace",
+    "view_server_state",
+    "view_server_performance_state",
+    "view_server_security_audit",
+    "view_server_security_state",
+    "control",
+    "impersonate",
+    "take_ownership",
+    "alter_any_database_audit",
+    "view_database_security_audit",
+    "unmask",
+    "view_definition",
+    "view_database_state",
+    "showplan",
+    "password_hash_probe",
+];
+
 /// Closed label of a note: a value of the contract `TargetNoteLabel` enum.
 /// Anything that does not map to it is `other`, so a label never carries
 /// text from the engine.
@@ -477,9 +548,14 @@ impl NoteLabel {
     pub const OTHER: Self = Self(TargetNoteLabel::Other);
 
     /// A label given as its exact contract value (lower snake case, e.g.
-    /// `bypassrls`, `pg_monitor`, `logging_on`); anything else is `other`.
+    /// `bypassrls`, `pg_monitor`, `logging_on`); anything else is `other`,
+    /// and so are the values of a revision this build does not negotiate
+    /// yet ([`LABELS_REVISION_2026_10`]).
     #[must_use]
     pub fn parse(value: &str) -> Self {
+        if LABELS_REVISION_2026_10.contains(&value) {
+            return Self::OTHER;
+        }
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
@@ -721,6 +797,32 @@ mod tests {
             assert!(seen.insert(c.as_str()), "{} listed twice", c.as_str());
             databastion_protocol::TargetNoteCode::try_from(c.as_str()).unwrap();
         }
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values after `stage_kill`.
+        let contract = include_str!("../../../../shared/protocol/openapi.yaml");
+        let start = contract
+            .find("        - stage_kill\n")
+            .expect("TargetNoteLabel ends its 0.1.0 values with stage_kill");
+        let after = &contract[start..];
+        let end = after
+            .find("    DetectedTarget:")
+            .expect("DetectedTarget follows TargetNoteLabel");
+        let revision: Vec<&str> = after[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.strip_prefix("        - "))
+            .collect();
+        assert_eq!(revision, super::LABELS_REVISION_2026_10);
+        for value in super::LABELS_REVISION_2026_10 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+        }
+        // A MySQL / MariaDB privilege named like one of them.
+        assert!(super::NoteLabel::privilege("CONTROL SERVER").is_other());
+        assert!(super::NoteLabel::privilege("SHOW VIEW").as_str() == "show_view");
     }
 
     #[test]

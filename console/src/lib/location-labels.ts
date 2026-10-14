@@ -54,7 +54,8 @@ export function locationPartLabels(engine: string | null | undefined, database: 
 
 /**
  * Engine of a contract `AuditSource`, when the source alone tells it (`null` for the sources that
- * MySQL and MariaDB share). Exhaustive: a new contract source fails `tsc` until it is listed.
+ * MySQL and MariaDB share, and for those Redis and Valkey share). Exhaustive: a new contract source
+ * fails `tsc` until it is listed.
  */
 const SOURCE_ENGINE: Record<AuditSource, Engine | null> = {
   pgaudit: "postgres",
@@ -68,6 +69,13 @@ const SOURCE_ENGINE: Record<AuditSource, Engine | null> = {
   mongodb_log: "mongodb",
   openldap_accesslog: "openldap",
   cas_audit_log: "cas",
+  sqlserver_audit: "sqlserver",
+  sqlserver_xevents: "sqlserver",
+  sqlserver_query_stats: "sqlserver",
+  redis_slowlog: null,
+  redis_commandlog: null,
+  redis_acl_log: null,
+  redis_sync: null,
 };
 
 export function auditSourceEngine(source: string): Engine | null {

@@ -9,6 +9,19 @@ export const TARGET_NOTE_REGISTRY = {
       "openldap"
     ]
   },
+  "audit.acl_log_only": {
+    "description": "Only ACL LOG is readable: failed authentications and denied commands are seen, reads are not (audit level None).",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
+  "audit.audit_changes_not_audited": {
+    "description": "No enabled server audit specification records audit changes (AUDIT_CHANGE_GROUP): the audit could be stopped, filtered and restarted without a record, so the audit level is at most Limited.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
   "audit.audit_log_filter_not_read": {
     "description": "The audit_log_filter component is active, but its log file is not configured in agent.yaml (mysql.audit_log), so the agent does not read it.",
     "engines": [
@@ -52,6 +65,12 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "audit.failed_logins_not_audited": {
+    "description": "No enabled audit specification records failed logins (FAILED_LOGIN_GROUP): failed authentications are not seen.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
   "audit.failed_operations_not_logged": {
     "description": "{count} naming context(s) where no failed operation is proven to be logged in cn=accesslog in the last 24 h: the agent's read of a missing entry left no record (olcAccessLogSuccess: TRUE logs successful operations only), or it could not be checked yet. Capped or failed exports may go unseen; the level is at most Partial.",
     "engines": [
@@ -86,10 +105,12 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.limited_pending_first_record": {
-    "description": "Limited once the Audit stream has read a record of its source (MongoDB server log or profiler, CAS audit log; none in the last 24 h): reported None until then.",
+    "description": "Limited once the Audit stream has read a record of its source (MongoDB server log or profiler, CAS audit log, Redis / Valkey slow log or command log; none in the last 24 h): reported None until then.",
     "engines": [
       "mongodb",
-      "cas"
+      "cas",
+      "redis",
+      "valkey"
     ]
   },
   "audit.log_format_unsupported": {
@@ -99,13 +120,15 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.log_not_readable": {
-    "description": "The audit log file configured in agent.yaml is not readable by the agent (on CAS, also when it is refused because the agent could write it or one of its parent directories).",
+    "description": "The audit log configured for the target is not readable by the agent: the file configured in agent.yaml (on CAS, also when it is refused because the agent could write it or one of its parent directories), or on Redis / Valkey none of SLOWLOG, COMMANDLOG and ACL LOG.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
       "mongodb",
-      "cas"
+      "cas",
+      "redis",
+      "valkey"
     ]
   },
   "audit.log_plugin_mismatch": {
@@ -121,14 +144,16 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "sqlserver"
     ]
   },
   "audit.partial_pending_first_record": {
     "description": "Partial once the Audit stream has read a record of the audit log (none in the last 24 h): reported Limited until then.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
     ]
   },
   "audit.performance_schema_not_readable": {
@@ -157,26 +182,36 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.reads_not_logged": {
-    "description": "{count} naming context(s) with no search record in cn=accesslog in the last 24 h, even after a probe search by the agent: reads there are not logged (olcAccessLogOps without reads, no accesslog overlay on that database, or an olcAccessLogBase that excludes it).",
+    "description": "{count} database(s) or naming context(s) whose reads the audit source does not log. OpenLDAP: no search record in cn=accesslog in the last 24 h, even after a probe search by the agent (olcAccessLogOps without reads, no accesslog overlay on that database, or an olcAccessLogBase that excludes it). SQL Server: no enabled audit specification records reads there (SCHEMA_OBJECT_ACCESS_GROUP, or SELECT on the database).",
     "engines": [
-      "openldap"
+      "openldap",
+      "sqlserver"
     ]
   },
   "audit.records_dropped": {
-    "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged.",
+    "description": "{count} audit log record(s) dropped in the last 24 h: not parsable, oversized or damaged, or (SQL Server, Redis / Valkey) lost before the agent read them: rotated or overwritten, or the audit source restarted.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
       "mongodb",
       "openldap",
-      "cas"
+      "cas",
+      "sqlserver",
+      "redis",
+      "valkey"
     ]
   },
   "audit.records_dropped_severity": {
     "description": "{count} pgaudit record(s) dropped in the last 24 h: their severity differs from pgaudit.log_level.",
     "engines": [
       "postgres"
+    ]
+  },
+  "audit.server_audit_filtered": {
+    "description": "The server audit has a WHERE predicate, which can exclude principals or objects: the audit level is at most Limited.",
+    "engines": [
+      "sqlserver"
     ]
   },
   "audit.server_audit_not_read": {
@@ -193,15 +228,24 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.slow_operations_only": {
-    "description": "The audit source only records the operations the server logs or profiles (slower than slowms, or sampled): fast reads, such as a quick dump of a small collection, can go unseen.",
+    "description": "The audit source only records the operations the server logs or profiles (MongoDB: slower than slowms, or sampled; Redis / Valkey: the slow log and the command log): fast reads, such as a quick dump of a small collection or keyspace, can go unseen.",
     "engines": [
-      "mongodb"
+      "mongodb",
+      "redis",
+      "valkey"
     ]
   },
   "audit.source_not_configured": {
-    "description": "No MongoDB Audit source: declare the auditLog or the server log file in agent.yaml (mongodb.audit_log), or grant find on system.profile of the monitored databases.",
+    "description": "No usable Audit source is configured for the target. MongoDB: declare the auditLog or the server log file in agent.yaml (mongodb.audit_log), or grant find on system.profile of the monitored databases. SQL Server: no running Extended Events session with an event_file target, nor an enabled server audit with a FILE target, is named in agent.yaml (sqlserver.audit).",
     "engines": [
-      "mongodb"
+      "mongodb",
+      "sqlserver"
+    ]
+  },
+  "audit.sqlserver_audit_needs_control_server": {
+    "description": "An enabled SQL Server Audit is not an Audit source on SQL Server 2019: reading it through sys.fn_get_audit_file needs CONTROL SERVER, which the agent's account must never hold. An Extended Events session is used instead when one is configured.",
+    "engines": [
+      "sqlserver"
     ]
   },
   "audit.statement_consumers_disabled": {
@@ -219,9 +263,11 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.stream_not_available": {
-    "description": "The connector has no Audit stream in this agent build: the audit level is reported None, whatever the server logs or profiles.",
+    "description": "No Audit stream runs for the target: the connector has none in this agent build, or (Redis / Valkey) Audit is not configured or is refused because of the account's privileges. The audit level is reported None, whatever the server logs or profiles.",
     "engines": [
-      "mongodb"
+      "mongodb",
+      "redis",
+      "valkey"
     ]
   },
   "audit.stream_stopped": {
@@ -232,7 +278,28 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb",
       "mongodb",
       "openldap",
-      "cas"
+      "cas",
+      "sqlserver",
+      "redis",
+      "valkey"
+    ]
+  },
+  "audit.xe_causality_off": {
+    "description": "The Extended Events session runs without TRACK_CAUSALITY: statements are grouped with their request by session and event order instead (no effect on the audit level).",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "audit.xe_events_missing": {
+    "description": "The Extended Events session lacks events or actions the agent needs: {count}. The audit level is at most Limited.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "audit.xe_session_filtered": {
+    "description": "The Extended Events session filters the events the agent reads, so some statements are not recorded: the audit level is at most Limited.",
+    "engines": [
+      "sqlserver"
     ]
   },
   "check.server_is_mariadb": {
@@ -247,6 +314,18 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "check.server_is_redis": {
+    "description": "The server is Redis while the target is declared as valkey.",
+    "engines": [
+      "valkey"
+    ]
+  },
+  "check.server_is_valkey": {
+    "description": "The server is Valkey while the target is declared as redis.",
+    "engines": [
+      "redis"
+    ]
+  },
   "check.stage_failed": {
     "description": "check() failed at stage {labels} (a stage_* label); the cause is last_error.",
     "engines": [
@@ -255,7 +334,10 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb",
       "mongodb",
       "openldap",
-      "cas"
+      "cas",
+      "sqlserver",
+      "redis",
+      "valkey"
     ]
   },
   "check.timed_out": {
@@ -266,7 +348,10 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb",
       "mongodb",
       "openldap",
-      "cas"
+      "cas",
+      "sqlserver",
+      "redis",
+      "valkey"
     ]
   },
   "coverage.cas_guard_tripped": {
@@ -276,7 +361,42 @@ export const TARGET_NOTE_REGISTRY = {
       "mysql",
       "mariadb",
       "mongodb",
-      "openldap"
+      "openldap",
+      "sqlserver",
+      "redis",
+      "valkey"
+    ]
+  },
+  "coverage.cluster_node_only": {
+    "description": "Cluster node: only the keys of this node ({count}) are read; declare each node as a target to cover the whole cluster.",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
+  "coverage.computed_columns_not_sampled": {
+    "description": "{count} computed column(s) not sampled: reading them can run user code (a function in the column's expression).",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "coverage.encrypted_columns": {
+    "description": "{count} Always Encrypted column(s) not sampled: the server holds their ciphertext only.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "coverage.masked_columns": {
+    "description": "{count} column(s) under dynamic data masking were sampled as the agent's account sees them, masked: finding nothing there does not mean that they hold no sensitive data.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "coverage.module_types_not_sampled": {
+    "description": "{count} key pattern(s) of module types (JSON documents, time series, Bloom filters, vector sets…) not sampled.",
+    "engines": [
+      "redis",
+      "valkey"
     ]
   },
   "coverage.other_engine_tables": {
@@ -295,7 +415,8 @@ export const TARGET_NOTE_REGISTRY = {
   "coverage.relations_rls_skipped": {
     "description": "{count} relation(s) skipped because of row-level security (ADR-0012).",
     "engines": [
-      "postgres"
+      "postgres",
+      "sqlserver"
     ]
   },
   "coverage.relations_without_select": {
@@ -305,10 +426,17 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "coverage.remote_engine_tables": {
-    "description": "{count} table(s) with a remote-access storage engine, never read (I5).",
+    "description": "{count} table(s) whose rows live on another server, never read (I5): a remote-access storage engine on MySQL / MariaDB; external tables or Stretch Database tables on SQL Server.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
+    ]
+  },
+  "coverage.rls_not_verifiable": {
+    "description": "{count} database(s) whose row-level security policies are not visible to the agent's account: every table there was skipped, since the agent cannot tell which ones run a security predicate.",
+    "engines": [
+      "sqlserver"
     ]
   },
   "coverage.schemas_without_usage": {
@@ -328,7 +456,8 @@ export const TARGET_NOTE_REGISTRY = {
     "engines": [
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "sqlserver"
     ]
   },
   "privilege.accesslog_without_audit": {
@@ -337,17 +466,31 @@ export const TARGET_NOTE_REGISTRY = {
       "openldap"
     ]
   },
+  "privilege.admin_commands": {
+    "description": "{count} administration command(s) allowed to the account (for example CONFIG SET, MODULE LOAD, DEBUG, ACL SETUSER, REPLICAOF, MIGRATE): with any command of the refusal list, Discovery and Audit do not run for this target.",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
   "privilege.any_database": {
     "description": "A privilege applies to every database (for example readAnyDatabase, or a resource with an empty database name): databases created later are readable too.",
     "engines": [
       "mongodb"
     ]
   },
+  "privilege.audit_grant_without_audit": {
+    "description": "The account holds an Audit permission ({labels}) while no Audit stream uses it: revoke it, or configure Audit for the target.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
   "privilege.beyond_select": {
     "description": "{count} privilege(s) beyond SELECT on databases, tables or columns; the most severe: {labels}.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
     ]
   },
   "privilege.cluster_actions": {
@@ -363,19 +506,34 @@ export const TARGET_NOTE_REGISTRY = {
       "cas"
     ]
   },
+  "privilege.database_roles": {
+    "description": "{count} database role membership(s) other than public (and db_datareader when extended_grants is set); the most severe: {labels}.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "privilege.declared_keys_not_readable": {
+    "description": "{count} declared key pattern(s) or database(s) the account cannot read: Discovery skips them (check redis.key_patterns and redis.databases in agent.yaml against the account's ACL).",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
   "privilege.extended_variant": {
     "description": "Extended-variant grants, expected because extended_grants is set: {labels}.",
     "engines": [
       "postgres",
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
     ]
   },
   "privilege.global_privileges": {
-    "description": "{count} global privilege(s) other than SELECT and USAGE; the most severe: {labels}.",
+    "description": "{count} global or server-level privilege(s) beyond those the agent needs (MySQL / MariaDB: other than SELECT and USAGE; SQL Server: server permissions other than CONNECT SQL and VIEW ANY DATABASE); the most severe: {labels}.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
     ]
   },
   "privilege.global_select": {
@@ -389,16 +547,20 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "A privilege of the account is WITH GRANT OPTION.",
     "engines": [
       "mysql",
-      "mariadb"
+      "mariadb",
+      "sqlserver"
     ]
   },
   "privilege.not_evaluated": {
-    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable; on PostgreSQL, the CAS store guard's candidate relation or column list cut at its limit, a name not UTF-8, or its query failed).",
+    "description": "Privileges not evaluated: the account name could not be matched, or a privilege list could not be fully read (cut at its limit, or rows skipped; on MongoDB, connectionStatus not readable; on PostgreSQL, the CAS store guard's candidate relation or column list cut at its limit, a name not UTF-8, or its query failed); on SQL Server, a check probe that could not run, such as the password-hash probe; on Redis 6.2, the ACL (no ACL DRYRUN).",
     "engines": [
       "mysql",
       "mariadb",
       "mongodb",
-      "postgres"
+      "postgres",
+      "sqlserver",
+      "redis",
+      "valkey"
     ]
   },
   "privilege.other_roles": {
@@ -410,7 +572,8 @@ export const TARGET_NOTE_REGISTRY = {
   "privilege.owner_of_objects": {
     "description": "Owner of {count} object(s).",
     "engines": [
-      "postgres"
+      "postgres",
+      "sqlserver"
     ]
   },
   "privilege.password_attributes_readable": {
@@ -439,10 +602,25 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres"
     ]
   },
-  "privilege.read_beyond_discovery": {
-    "description": "{count} read action(s) beyond find and listCollections (for example changeStream, which streams every future write, dbHash or listIndexes).",
+  "privilege.pubsub_channels": {
+    "description": "{count} pub/sub command(s) allowed to the account (PUBLISH, SUBSCRIBE): set resetchannels.",
     "engines": [
-      "mongodb"
+      "redis",
+      "valkey"
+    ]
+  },
+  "privilege.read_beyond_discovery": {
+    "description": "{count} read action(s) or command(s) beyond those Discovery uses (MongoDB: beyond find and listCollections, for example changeStream, which streams every future write, dbHash or listIndexes; Redis / Valkey: for example GET, HGETALL, KEYS or DUMP).",
+    "engines": [
+      "mongodb",
+      "redis",
+      "valkey"
+    ]
+  },
+  "privilege.refused": {
+    "description": "The agent's account holds a right it must never hold ({labels}): Discovery and Audit do not run for this target until it is revoked.",
+    "engines": [
+      "sqlserver"
     ]
   },
   "privilege.registry_writable": {
@@ -464,6 +642,19 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "privilege.scripting": {
+    "description": "{count} scripting command(s) allowed to the account (EVAL, EVALSHA, FCALL, FUNCTION LOAD…): server-side code execution, so Discovery and Audit do not run for this target.",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
+  "privilege.server_roles": {
+    "description": "{count} server role membership(s) other than public; the most severe: {labels}.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
   "privilege.system_collections": {
     "description": "Access to system collections or to the admin, local or config databases: credentials, the oplog, other users' profiled queries or stored JavaScript may be readable.",
     "engines": [
@@ -478,18 +669,23 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.ticket_credentials_readable": {
-    "description": "The agent's account can read credential columns of a CAS ticket registry or audit trail (ticket ids, bodies, principals, attributes, AUD_RESOURCE, AUD_HEADERS), directly, through a role or PUBLIC, or through a schema- or database-wide grant: grant SELECT on the metadata columns only. The agent never reads them.",
+    "description": "The agent's account can read credential columns of a CAS ticket registry or audit trail (ticket ids, bodies, principals, attributes, AUD_RESOURCE, AUD_HEADERS), directly, through a role or PUBLIC, or through a schema- or database-wide grant: grant SELECT on the metadata columns only (Redis / Valkey: guarded keys, so declare positive key patterns). The agent never reads them.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "sqlserver",
+      "redis",
+      "valkey"
     ]
   },
   "privilege.write_actions": {
     "description": "{count} write or administration action(s) (for example insert, update, remove, drop, index, user or role management).",
     "engines": [
-      "mongodb"
+      "mongodb",
+      "redis",
+      "valkey"
     ]
   },
   "privilege.write_not_evaluated": {
@@ -516,6 +712,13 @@ export const TARGET_NOTE_REGISTRY = {
       "cas"
     ]
   },
+  "security.default_user_nopass": {
+    "description": "The server's default user is enabled without a password: anyone who reaches the server has its rights ({count} command(s) of the agent's refusal list allowed to it).",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
   "security.init_connect": {
     "description": "init_connect is set: SQL runs at every login of the agent's account.",
     "engines": [
@@ -526,7 +729,8 @@ export const TARGET_NOTE_REGISTRY = {
   "security.login_event_trigger": {
     "description": "An enabled login event trigger runs user code at every connection of the agent.",
     "engines": [
-      "postgres"
+      "postgres",
+      "sqlserver"
     ]
   },
   "security.ticket_registry_unencrypted": {
@@ -535,7 +739,8 @@ export const TARGET_NOTE_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "sqlserver"
     ]
   },
   "security.tls_disabled": {

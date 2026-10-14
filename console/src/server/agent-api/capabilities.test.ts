@@ -69,8 +69,11 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
 
   it("lists every engine added after protocol 0.1.0", () => {
     const v010 = ["postgres", "mysql", "mariadb", "mongodb", "openldap"];
+    // In the contract since P9-C (ADR-0051, ADR-0052), listed by the console from P9-E on.
+    const notListedYet = ["sqlserver", "redis", "valkey"];
     const listed = CONSOLE_ACCEPTS.filter(isEngineToken).map((t) => ENGINE_TOKENS[t].engine);
-    expect(enumOf("Engine").filter((e) => !v010.includes(e))).toEqual(listed);
+    expect(enumOf("Engine").filter((e) => !v010.includes(e) && !notListedYet.includes(e))).toEqual(listed);
+    for (const e of notListedYet) expect(CONSOLE_ACCEPTS).not.toContain(`engine.${e}`);
   });
 
   it("is a valid HeartbeatResponse.accepts", () => {
