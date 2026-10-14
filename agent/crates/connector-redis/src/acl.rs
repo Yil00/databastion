@@ -193,6 +193,22 @@ pub(crate) struct Evaluation {
 }
 
 impl Evaluation {
+    /// The worse of two nodes' evaluations: every count at its highest,
+    /// a feature only when both nodes grant it.
+    pub(crate) fn worst(&self, other: &Self) -> Self {
+        Self {
+            writes: self.writes.max(other.writes),
+            read_beyond: self.read_beyond.max(other.read_beyond),
+            admin: self.admin.max(other.admin),
+            scripting: self.scripting.max(other.scripting),
+            pubsub: self.pubsub.max(other.pubsub),
+            not_evaluated: self.not_evaluated.max(other.not_evaluated),
+            refused: self.refused.max(other.refused),
+            no_touch: self.no_touch && other.no_touch,
+            readonly: self.readonly && other.readonly,
+        }
+    }
+
     /// Folds the verdicts of [`PROBES`], in order.
     pub(crate) fn of(verdicts: &[Verdict]) -> Self {
         let mut e = Self::default();

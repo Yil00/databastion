@@ -191,19 +191,32 @@ pub(crate) async fn discover(
             "Redis / Valkey: redis.discovery_node does not report a replica role"
         );
     }
-    // The account's evaluation, on the target's node (where the ACL is
-    // declared); refused targets do not run (decision 4).
-    let report = match state.reports.fresh(&target.id) {
-        Some(r) => r,
-        None => {
-            let r = node::evaluate(&mut session, target, info.server, timeout)
-                .await
-                .map_err(RdError::into_connector_error)?;
-            state.reports.store(&target.id, r.clone());
-            r
+    // The account's evaluation on the node Discovery reads and, with a
+    // declared Discovery node, on the target's node too: ACLs are per node
+    // (not replicated), so Discovery runs only when neither node refuses
+    // (decision 4; security review M2).
+    let report = match state
+        .reports
+        .of_session(&mut session, target, Which::Discovery, info.server, timeout)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            session.close().await;
+            return Err(e.into_connector_error());
         }
     };
-    if let Some(refusal) = report.refusal(&settings, info.server) {
+    let mut refusal = report.refusal(&settings, info.server);
+    if refusal.is_none() && settings.discovery_node.is_some() {
+        match state.reports.of_target(target, timeout).await {
+            Ok((t, server)) => refusal = t.refusal(&settings, server),
+            Err(e) => {
+                session.close().await;
+                return Err(e.into_connector_error());
+            }
+        }
+    }
+    if let Some(refusal) = refusal {
         session.close().await;
         tracing::warn!(
             target_id = target.id.as_str(),
@@ -510,6 +523,19 @@ struct Pool {
 }
 
 impl Pool {
+    /// A hash or stream keyed by data (more than 16 distinct field names
+    /// across the pattern's keys, or one hash of more than 16 fields):
+    /// every field becomes `*` (decision 7's cardinality rule on field
+    /// names).
+    fn collapse_fields(&mut self, cap: usize) {
+        let fields = std::mem::take(&mut self.fields);
+        for (_, values) in fields {
+            for v in values {
+                self.push("*", v, cap);
+            }
+        }
+    }
+
     fn push(&mut self, field: &str, value: Zeroizing<String>, cap: usize) {
         let slot = self.fields.entry(field.to_owned()).or_default();
         if slot.len() < cap {
@@ -683,6 +709,8 @@ async fn sample_pattern(
     let timeout = job.statement_timeout();
     let mut pool = Pool::default();
     let mut distinct_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // A hash of more than 16 fields: keyed by data (H2).
+    let mut data_keyed = false;
     for key in pattern.group.samples.iter().take(cap) {
         let s = conn.get(job).await.map_err(Walk::Failed)?;
         let k = key.expose();
@@ -744,9 +772,13 @@ async fn sample_pattern(
                     continue;
                 }
                 let Value::Array(fields) = r else { continue };
+                if fields.len() > keys::COLLAPSE_THRESHOLD {
+                    data_keyed = true;
+                }
                 let fields: Vec<SecretBytes> = fields
                     .iter()
                     .filter_map(Value::as_bytes)
+                    .take(MEMBERS_PER_KEY as usize)
                     .map(SecretBytes::new)
                     .collect();
                 if fields.is_empty() {
@@ -842,15 +874,8 @@ async fn sample_pattern(
             pool.push(&field, value, cap);
         }
     }
-    // A hash or stream keyed by data: more than 16 distinct field names
-    // collapse to `*` (decision 7's cardinality rule on field names).
-    if distinct_fields.len() > keys::COLLAPSE_THRESHOLD {
-        let fields = std::mem::take(&mut pool.fields);
-        for (_, values) in fields {
-            for v in values {
-                pool.push("*", v, cap);
-            }
-        }
+    if data_keyed || distinct_fields.len() > keys::COLLAPSE_THRESHOLD {
+        pool.collapse_fields(cap);
     }
     Ok(pool)
 }
@@ -868,6 +893,17 @@ fn noperm_or_skip(v: &Value) -> Result<Option<ErrorWord>, Walk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_data_keyed_hash_keeps_no_field_name() {
+        let mut pool = Pool::default();
+        for name in ["jdupont", "amartin", "lucas"] {
+            pool.push(name, Zeroizing::new("v".to_owned()), 16);
+        }
+        pool.collapse_fields(16);
+        assert_eq!(pool.fields.keys().collect::<Vec<_>>(), ["*"]);
+        assert_eq!(pool.fields["*"].len(), 3);
+    }
 
     #[test]
     fn hints_and_values() {

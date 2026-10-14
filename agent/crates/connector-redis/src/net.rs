@@ -84,9 +84,9 @@ impl Endpoint {
                 if tls.is_some() {
                     return Err(RdError::new(FailureCode::Internal, Stage::Tls));
                 }
-                let expected = expected_uid(path, *server_uid)?;
+                let (expected, path) = expected_uid(path, *server_uid)?;
                 let stream =
-                    tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path))
+                    tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(&path))
                         .await
                         .map_err(|_| RdError::io(&timed_out(), Stage::Connect))?
                         .map_err(|e| RdError::io(&e, Stage::Connect))?;
@@ -109,14 +109,58 @@ impl Endpoint {
     }
 }
 
-/// The uid the server on `path` must run as (re-review N2): `server_uid`
-/// when declared; otherwise the socket file's owner, trusted only when no
-/// other user can write to the socket's directory and the owner is not
-/// the agent's own uid. Otherwise the declaration is required: refused as
-/// `unsupported` (a configuration error).
-fn expected_uid(path: &Path, server_uid: Option<u32>) -> Result<u32, RdError> {
+/// What the trust rule looks at in one file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owned {
+    uid: u32,
+    mode: u32,
+}
+
+/// The trust rule of a socket whose server user is not declared
+/// (re-review N2, security review M3), on facts gathered without following
+/// a final symlink: the path must be a socket; its owner must not be the
+/// agent's own user; its directory must be owned by root or the socket's
+/// owner and writable by no one else; every further ancestor must be owned
+/// by root or the socket's owner and, when others may write to it, be
+/// sticky (so no other user can rename what it holds). Returns the
+/// expected uid, or why the owner cannot be trusted.
+fn judge(
+    socket: Option<Owned>,
+    parent: Owned,
+    ancestors: &[Owned],
+    agent: u32,
+) -> Result<u32, &'static str> {
+    let socket = socket.ok_or("the path is not a socket (a symlink is never followed)")?;
+    if socket.uid == agent {
+        return Err("the socket is owned by the agent's own user");
+    }
+    let trusted_owner = |d: &Owned| d.uid == 0 || d.uid == socket.uid;
+    if !trusted_owner(&parent) {
+        return Err("the socket's directory is owned by another user");
+    }
+    if parent.mode & 0o022 != 0 {
+        return Err("other users can write to the socket's directory");
+    }
+    for a in ancestors {
+        if !trusted_owner(a) {
+            return Err("an ancestor directory is owned by another user");
+        }
+        if a.mode & 0o022 != 0 && a.mode & 0o1000 == 0 {
+            return Err("other users can write to an ancestor directory");
+        }
+    }
+    Ok(socket.uid)
+}
+
+/// The uid the server on `path` must run as, and the path to connect to:
+/// `server_uid` and `path` when declared; otherwise the socket file's
+/// owner under [`judge`]'s rule, and the path with its directory resolved
+/// (the directories checked are the ones connected through). Otherwise the
+/// declaration is required: refused as `unsupported` (a configuration
+/// error).
+fn expected_uid(path: &Path, server_uid: Option<u32>) -> Result<(u32, PathBuf), RdError> {
     if let Some(uid) = server_uid {
-        return Ok(uid);
+        return Ok((uid, path.to_path_buf()));
     }
     let refuse = |why: &'static str| {
         tracing::warn!(
@@ -125,23 +169,52 @@ fn expected_uid(path: &Path, server_uid: Option<u32>) -> Result<u32, RdError> {
         );
         RdError::new(FailureCode::Unsupported, Stage::Connect)
     };
-    let meta = std::fs::symlink_metadata(path).map_err(|e| RdError::io(&e, Stage::Connect))?;
-    let dir = path
-        .parent()
-        .ok_or_else(|| refuse("the socket has no parent directory"))?;
-    let dir_meta = std::fs::metadata(dir).map_err(|e| RdError::io(&e, Stage::Connect))?;
-    if dir_meta.mode() & 0o022 != 0 {
-        return Err(refuse("other users can write to the socket's directory"));
+    let io_err = |e: io::Error| RdError::io(&e, Stage::Connect);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("the socket has no parent directory"));
+    };
+    let dir = std::fs::canonicalize(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    })
+    .map_err(io_err)?;
+    let resolved = dir.join(name);
+    let owned = |m: &std::fs::Metadata| Owned {
+        uid: m.uid(),
+        mode: m.mode(),
+    };
+    let meta = std::fs::symlink_metadata(&resolved).map_err(io_err)?;
+    let socket = {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_socket().then(|| owned(&meta))
+    };
+    let parent = owned(&std::fs::symlink_metadata(&dir).map_err(io_err)?);
+    let mut ancestors = Vec::new();
+    for a in dir.ancestors().skip(1) {
+        ancestors.push(owned(&std::fs::symlink_metadata(a).map_err(io_err)?));
     }
-    if meta.uid() == rustix::process::geteuid().as_raw() {
-        return Err(refuse("the socket is owned by the agent's own user"));
-    }
-    Ok(meta.uid())
+    let uid = judge(
+        socket,
+        parent,
+        &ancestors,
+        rustix::process::geteuid().as_raw(),
+    )
+    .map_err(refuse)?;
+    Ok((uid, resolved))
 }
 
 /// The rustls configuration of `verify_full` (decision 3): TLS 1.2 or 1.3,
 /// the pinned CA (then the only root) or the system store, and the
 /// optional client certificate.
+///
+/// Zeroization residuals (security review L2): the client key's PEM is read
+/// into zeroized memory, but `PrivateKeyDer` and the signing key rustls
+/// builds from it keep their own copies for the configuration's lifetime,
+/// and rustls copies every record it sends (the `AUTH` password included)
+/// into its own send buffers, which are not zeroized when freed. The
+/// connector's own request buffers are sized once and zeroized
+/// ([`crate::cmd::Request`]).
 pub(crate) fn tls_config(
     ca_file: Option<&Path>,
     client: Option<(&Path, &Path)>,
@@ -308,14 +381,109 @@ mod tests {
     fn socket_owner_is_trusted_only_in_a_private_directory() {
         let dir = tmp();
         let sock = dir.join("redis.sock");
-        std::fs::write(&sock, b"").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         // Owned by the test's own user: never trusted by default.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(expected_uid(&sock, None).is_err());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(expected_uid(&sock, None).is_err());
-        assert_eq!(expected_uid(&sock, Some(999)).unwrap(), 999);
+        assert_eq!(expected_uid(&sock, Some(999)).unwrap().0, 999);
+        // A regular file or a symlink is never a trusted socket.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.join("file.sock");
+        std::fs::write(&file, b"").unwrap();
+        assert!(expected_uid(&file, None).is_err());
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&sock, &link).unwrap();
+        assert!(expected_uid(&link, None).is_err());
+        drop(listener);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Security review M3: the directory's owner and every ancestor count.
+    #[test]
+    fn socket_trust_rule() {
+        let agent = 1000;
+        let redis = 999;
+        let attacker = 1001;
+        let sock = Some(Owned {
+            uid: redis,
+            mode: 0o140_777,
+        });
+        let root_dir = |mode| Owned { uid: 0, mode };
+        let tmp = root_dir(0o41_777);
+        // /run/redis (redis, 0755) under /run (root, 0755): trusted.
+        assert_eq!(
+            judge(
+                sock,
+                Owned {
+                    uid: redis,
+                    mode: 0o40_755
+                },
+                &[root_dir(0o40_755)],
+                agent
+            ),
+            Ok(redis)
+        );
+        // /tmp/redis made by an attacker (0755): refused.
+        assert!(
+            judge(
+                sock,
+                Owned {
+                    uid: attacker,
+                    mode: 0o40_755
+                },
+                &[tmp],
+                agent
+            )
+            .is_err()
+        );
+        // /tmp/redis made by redis under sticky /tmp: trusted.
+        assert_eq!(
+            judge(
+                sock,
+                Owned {
+                    uid: redis,
+                    mode: 0o40_750
+                },
+                &[tmp],
+                agent
+            ),
+            Ok(redis)
+        );
+        // An ancestor owned by another user, or writable without the
+        // sticky bit: refused.
+        let parent = Owned {
+            uid: redis,
+            mode: 0o40_755,
+        };
+        assert!(
+            judge(
+                sock,
+                parent,
+                &[Owned {
+                    uid: attacker,
+                    mode: 0o40_755
+                }],
+                agent
+            )
+            .is_err()
+        );
+        assert!(judge(sock, parent, &[root_dir(0o40_777)], agent).is_err());
+        // A group-writable directory, the agent's own socket, not a socket.
+        assert!(
+            judge(
+                sock,
+                Owned {
+                    uid: redis,
+                    mode: 0o40_775
+                },
+                &[],
+                agent
+            )
+            .is_err()
+        );
+        assert!(judge(sock, parent, &[], redis).is_err());
+        assert!(judge(None, parent, &[], agent).is_err());
     }
 }

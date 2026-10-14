@@ -106,25 +106,70 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     if info.cluster {
         notes.push(TargetNote::new(NoteCode::CoverageClusterNodeOnly).with_count(1));
     }
-    let report = match state.reports.fresh(&target.id) {
-        Some(r) => r,
-        None => match node::evaluate(&mut session, target, info.server, CHECK_OP_TIMEOUT).await {
-            Ok(r) => {
-                state.reports.store(&target.id, r.clone());
-                r
-            }
-            Err(e) => {
-                session.close().await;
-                return failed(e, notes);
-            }
-        },
+    let report = match state
+        .reports
+        .of_session(
+            &mut session,
+            target,
+            Which::Target,
+            info.server,
+            CHECK_OP_TIMEOUT,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            session.close().await;
+            return failed(e, notes);
+        }
     };
     session.close().await;
+    let mut refusal = report.refusal(&settings, info.server);
+    let mut report = report;
+    let mut has_dryrun = info.server.has_dryrun();
+
+    // The Discovery node: a replica (decision 5), and the account's
+    // evaluation there too, since ACLs are per node: the target is refused
+    // when either node refuses, and the notes show the worse of the two
+    // (security review M2).
+    if settings.discovery_node.is_some() {
+        match node::open(target, Which::Discovery, CHECK_OP_TIMEOUT).await {
+            Ok((mut s, dinfo)) => {
+                if !dinfo.replica {
+                    tracing::warn!(
+                        "Redis / Valkey: redis.discovery_node does not report a replica role"
+                    );
+                    notes.push(stage_note(Stage::Check));
+                }
+                let d = state
+                    .reports
+                    .of_session(
+                        &mut s,
+                        target,
+                        Which::Discovery,
+                        dinfo.server,
+                        CHECK_OP_TIMEOUT,
+                    )
+                    .await;
+                s.close().await;
+                match d {
+                    Ok(d) => {
+                        refusal = refusal.or(d.refusal(&settings, dinfo.server));
+                        report = report.worst(&d);
+                        has_dryrun = has_dryrun && dinfo.server.has_dryrun();
+                    }
+                    Err(e) => return failed(e, notes),
+                }
+            }
+            Err(e) => return failed(e, notes),
+        }
+    }
+
     let scan = state.scan(&target.id);
     privilege_notes(
         &report,
         &settings,
-        info.server.has_dryrun(),
+        has_dryrun,
         scan.declared_not_readable,
         &mut notes,
     );
@@ -135,37 +180,33 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         );
     }
 
-    // The `default` user probe (decision 4).
-    if let Some(open) = default_user_probe(target).await {
-        let mut note = TargetNote::new(NoteCode::SecurityDefaultUserNopass);
-        if open && info.server.has_dryrun() {
-            note = note.with_count(default_user_grade(target).await.unwrap_or(0));
+    // The `default` user probe (decision 4), cached like the report (L3);
+    // graded only when the account may run `ACL DRYRUN`, so the grade
+    // never writes `ACL LOG` entries.
+    let default_user = match state.reports.default_user(&target.id) {
+        Some(d) => d,
+        None => {
+            let open = default_user_probe(target).await;
+            let grade = if open == Some(true) && info.server.has_dryrun() && report.dryrun_granted {
+                default_user_grade(target).await
+            } else {
+                None
+            };
+            let d = node::DefaultUser { open, grade };
+            state.reports.store_default_user(&target.id, d);
+            d
         }
-        if open {
-            notes.push(note);
-        }
-    }
-
-    // The Discovery node: a replica (decision 5).
-    if settings.discovery_node.is_some() {
-        match node::open(target, Which::Discovery, CHECK_OP_TIMEOUT).await {
-            Ok((s, dinfo)) => {
-                s.close().await;
-                if !dinfo.replica {
-                    tracing::warn!(
-                        "Redis / Valkey: redis.discovery_node does not report a replica role"
-                    );
-                    notes.push(stage_note(Stage::Check));
-                }
-            }
-            Err(e) => notes.push(stage_note(e.stage)),
-        }
+    };
+    if default_user.open == Some(true) {
+        notes.push(
+            TargetNote::new(NoteCode::SecurityDefaultUserNopass)
+                .with_count(default_user.grade.unwrap_or(0)),
+        );
     }
 
     // Audit is not implemented in this version: None.
     notes.push(TargetNote::new(NoteCode::AuditStreamNotAvailable));
 
-    let refusal = report.refusal(&settings, info.server);
     let failure = match refusal {
         None => None,
         Some(Refusal::Listed) => Some(FailureCode::PermissionDenied),

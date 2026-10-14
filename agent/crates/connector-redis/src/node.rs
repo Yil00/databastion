@@ -22,7 +22,7 @@ use crate::resp::Value;
 pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Which declared node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Which {
     /// The target's node (`check()`, Audit).
     Target,
@@ -176,9 +176,45 @@ pub(crate) struct Report {
     /// CAS-guarded probe keys the account could read (`None`: not
     /// evaluated).
     pub(crate) ticket_keys_readable: Option<u64>,
+    /// The account may run `ACL DRYRUN` (the first probe was answered).
+    pub(crate) dryrun_granted: bool,
+}
+
+/// The union of two optional index lists (`None` when either is).
+fn union<T: Ord + Clone>(a: Option<&Vec<T>>, b: Option<&Vec<T>>) -> Option<Vec<T>> {
+    let (a, b) = (a?, b?);
+    let mut out: Vec<T> = a.iter().chain(b).cloned().collect();
+    out.sort();
+    out.dedup();
+    Some(out)
 }
 
 impl Report {
+    /// The worse of two nodes' reports (the target's node and the
+    /// Discovery node, security review M2): what either node allows or
+    /// leaves unevaluated counts.
+    pub(crate) fn worst(&self, other: &Self) -> Self {
+        Self {
+            eval: match (&self.eval, &other.eval) {
+                (Some(a), Some(b)) => Some(a.worst(b)),
+                _ => None,
+            },
+            patterns_not_readable: union(
+                self.patterns_not_readable.as_ref(),
+                other.patterns_not_readable.as_ref(),
+            ),
+            databases_not_readable: union(
+                self.databases_not_readable.as_ref(),
+                other.databases_not_readable.as_ref(),
+            ),
+            ticket_keys_readable: match (self.ticket_keys_readable, other.ticket_keys_readable) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            },
+            dryrun_granted: self.dryrun_granted && other.dryrun_granted,
+        }
+    }
+
     /// Why Discovery must not run, if it must not.
     pub(crate) fn refusal(&self, settings: &RedisTargetConfig, server: Server) -> Option<Refusal> {
         let opt_in = settings.unevaluated_acl == Some(UnevaluatedAcl::Accept);
@@ -326,28 +362,114 @@ pub(crate) async fn evaluate(
         patterns_not_readable: Some(not_readable),
         databases_not_readable,
         ticket_keys_readable: Some(readable),
+        dryrun_granted: true,
     })
 }
 
-/// Reports per target, at most every [`REPORT_INTERVAL`].
+/// The node a report belongs to: the Discovery node when one is declared,
+/// else the target's node for both.
+fn node_of(target: &TargetConfig, which: Which) -> Which {
+    match which {
+        Which::Discovery if target.redis_settings().discovery_node.is_some() => Which::Discovery,
+        _ => Which::Target,
+    }
+}
+
+/// What the `default` user probe found (decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultUser {
+    /// `None`: the probe could not run.
+    pub(crate) open: Option<bool>,
+    /// Refusal-list commands the `default` user may run (`None`: not
+    /// graded).
+    pub(crate) grade: Option<u64>,
+}
+
+type Cached<T> = Mutex<HashMap<String, (Instant, T)>>;
+/// A node's report and the server it was read on.
+type NodeReports = Mutex<HashMap<(String, Which), (Instant, Report, Server)>>;
+
+/// Reports per target and node, and the `default` user probe per target,
+/// each recomputed at most every [`REPORT_INTERVAL`] (security review M2,
+/// L3).
 #[derive(Default)]
-pub(crate) struct Reports(Mutex<HashMap<String, (Instant, Report)>>);
+pub(crate) struct Reports {
+    nodes: NodeReports,
+    default_user: Cached<DefaultUser>,
+}
 
 impl Reports {
-    pub(crate) fn fresh(&self, target_id: &str) -> Option<Report> {
-        self.0
+    fn fresh(&self, target_id: &str, which: Which) -> Option<(Report, Server)> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(target_id.to_owned(), which))
+            .filter(|(at, _, _)| at.elapsed() < REPORT_INTERVAL)
+            .map(|(_, r, s)| (r.clone(), *s))
+    }
+
+    fn store(&self, target_id: &str, which: Which, report: Report, server: Server) {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (target_id.to_owned(), which),
+                (Instant::now(), report, server),
+            );
+    }
+
+    /// The account's report on the node `session` is open on (`which`),
+    /// from the cache or evaluated now.
+    pub(crate) async fn of_session(
+        &self,
+        session: &mut Session,
+        target: &TargetConfig,
+        which: Which,
+        server: Server,
+        timeout: Duration,
+    ) -> Result<Report, RdError> {
+        let which = node_of(target, which);
+        if let Some((r, _)) = self.fresh(&target.id, which) {
+            return Ok(r);
+        }
+        let r = evaluate(session, target, server, timeout).await?;
+        self.store(&target.id, which, r.clone(), server);
+        Ok(r)
+    }
+
+    /// The account's report on the target's node, from the cache or on a
+    /// session opened for it, with the server it was read on.
+    pub(crate) async fn of_target(
+        &self,
+        target: &TargetConfig,
+        timeout: Duration,
+    ) -> Result<(Report, Server), RdError> {
+        if let Some(x) = self.fresh(&target.id, Which::Target) {
+            return Ok(x);
+        }
+        let (mut s, info) = open(target, Which::Target, timeout).await?;
+        let r = evaluate(&mut s, target, info.server, timeout).await;
+        s.close().await;
+        let r = r?;
+        self.store(&target.id, Which::Target, r.clone(), info.server);
+        Ok((r, info.server))
+    }
+
+    /// The cached `default` user probe of a target, if fresh.
+    pub(crate) fn default_user(&self, target_id: &str) -> Option<DefaultUser> {
+        self.default_user
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(target_id)
             .filter(|(at, _)| at.elapsed() < REPORT_INTERVAL)
-            .map(|(_, r)| r.clone())
+            .map(|(_, d)| *d)
     }
 
-    pub(crate) fn store(&self, target_id: &str, report: Report) {
-        self.0
+    pub(crate) fn store_default_user(&self, target_id: &str, d: DefaultUser) {
+        self.default_user
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(target_id.to_owned(), (Instant::now(), report));
+            .insert(target_id.to_owned(), (Instant::now(), d));
     }
 }
 
@@ -357,5 +479,50 @@ pub(crate) fn engine_mismatch(target: &TargetConfig, server: Server) -> Option<b
         (TargetEngine::Redis, true) => Some(true),
         (TargetEngine::Valkey, false) => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::info::Version;
+
+    fn clean() -> Report {
+        Report {
+            eval: Some(Evaluation::default()),
+            patterns_not_readable: Some(vec![1]),
+            databases_not_readable: Some(Vec::new()),
+            ticket_keys_readable: Some(0),
+            dryrun_granted: true,
+        }
+    }
+
+    /// Security review M2: a refusal on either node refuses the target,
+    /// and the notes show the worse node.
+    #[test]
+    fn the_worse_node_counts() {
+        let settings = RedisTargetConfig::default();
+        let server = Server::Valkey(Version(9, 0, 0));
+        let target = clean();
+        let mut discovery = clean();
+        discovery.eval = Some(Evaluation {
+            writes: 2,
+            refused: 1,
+            no_touch: true,
+            ..Evaluation::default()
+        });
+        discovery.patterns_not_readable = Some(vec![0, 1]);
+        discovery.ticket_keys_readable = Some(1);
+        assert_eq!(target.refusal(&settings, server), None);
+        assert_eq!(discovery.refusal(&settings, server), Some(Refusal::Listed));
+        let w = target.worst(&discovery);
+        assert_eq!(w.refusal(&settings, server), Some(Refusal::Listed));
+        let e = w.eval.unwrap();
+        assert_eq!((e.writes, e.no_touch), (2, false));
+        assert_eq!(w.patterns_not_readable, Some(vec![0, 1]));
+        assert_eq!(w.ticket_keys_readable, Some(1));
+        // A node not evaluated leaves the merge not evaluated.
+        assert_eq!(target.worst(&Report::default()).eval, None);
+        assert!(!target.worst(&Report::default()).dryrun_granted);
     }
 }

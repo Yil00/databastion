@@ -14,6 +14,13 @@ use crate::resp::{self, Limits, MAX_LINE, MAX_REPLY_BYTES};
 pub(crate) const CLIENT_NAME: &str = "databastion-agent";
 /// Members, fields and entries read per key (decision 6).
 pub(crate) const MEMBERS_PER_KEY: u32 = 16;
+/// Field names asked of a hash: one more than the collapse threshold, so a
+/// hash keyed by data shows it has more than 16 fields even when it is the
+/// pattern's only key (security review H2). Only [`MEMBERS_PER_KEY`] of
+/// them are read.
+pub(crate) const HASH_FIELDS_ASKED: u32 = 17;
+const _: () =
+    assert!(HASH_FIELDS_ASKED as usize == databastion_classifiers::keys::COLLAPSE_THRESHOLD + 1);
 /// Bytes of a string read per key, and the largest hash value read.
 pub(crate) const VALUE_BYTES: usize = 4096;
 /// Longest key or field name kept; longer ones are read and discarded.
@@ -182,7 +189,7 @@ impl Cmd<'_> {
             },
             Self::HRandField(_) => Limits {
                 bulk: MAX_NAME_BYTES,
-                items: members,
+                items: HASH_FIELDS_ASKED as usize,
                 skip_oversized: true,
                 reply: MAX_REPLY_BYTES,
             },
@@ -215,7 +222,7 @@ impl Cmd<'_> {
 
     /// Encodes the request into `out` (a zeroized buffer: `AUTH` writes the
     /// password into it).
-    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut impl resp::Out) {
         let n = MEMBERS_PER_KEY.to_string();
         let last = (MEMBERS_PER_KEY - 1).to_string();
         let value_end = (VALUE_BYTES - 1).to_string();
@@ -241,7 +248,10 @@ impl Cmd<'_> {
             Self::GetRange(k) => {
                 resp::encode(&[b"GETRANGE", k, b"0", value_end.as_bytes()], out);
             }
-            Self::HRandField(k) => resp::encode(&[b"HRANDFIELD", k, n.as_bytes()], out),
+            Self::HRandField(k) => resp::encode(
+                &[b"HRANDFIELD", k, HASH_FIELDS_ASKED.to_string().as_bytes()],
+                out,
+            ),
             Self::HStrLen(k, f) => resp::encode(&[b"HSTRLEN", k, f], out),
             Self::HMGet(k, fields) => {
                 let mut args: Vec<&[u8]> = vec![b"HMGET", k];
@@ -290,9 +300,26 @@ impl Cmd<'_> {
     }
 }
 
-/// A request buffer zeroized on drop.
-#[derive(Default)]
+/// A request buffer zeroized on drop, sized once for its commands so it
+/// never reallocates (a reallocation would free a copy of an `AUTH`
+/// password without zeroizing it; security review L2).
 pub(crate) struct Request(pub(crate) Vec<u8>);
+
+impl Request {
+    /// The encoding of `cmds`.
+    pub(crate) fn of(cmds: &[Cmd<'_>]) -> Self {
+        let mut count = resp::Count::default();
+        for c in cmds {
+            c.encode(&mut count);
+        }
+        let mut out = Vec::with_capacity(count.0);
+        for c in cmds {
+            c.encode(&mut out);
+        }
+        debug_assert_eq!(out.capacity(), count.0);
+        Self(out)
+    }
+}
 
 impl Drop for Request {
     fn drop(&mut self) {
@@ -303,6 +330,24 @@ impl Drop for Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_buffers_are_sized_once() {
+        let cmds = [
+            Cmd::Auth {
+                user: "databastion",
+                password: "a-long-password-of-some-length",
+            },
+            Cmd::Hello,
+        ];
+        let r = Request::of(&cmds);
+        assert_eq!(r.0.len(), r.0.capacity());
+        let mut plain = Vec::new();
+        for c in &cmds {
+            c.encode(&mut plain);
+        }
+        assert_eq!(r.0, plain);
+    }
 
     #[test]
     fn requests_are_arrays_of_bulk_strings() {

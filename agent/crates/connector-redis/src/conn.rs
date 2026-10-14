@@ -136,10 +136,7 @@ impl Session {
     }
 
     async fn exchange(&mut self, cmds: &[Cmd<'_>], stage: Stage) -> Result<Vec<Value>, RdError> {
-        let mut req = Request::default();
-        for c in cmds {
-            c.encode(&mut req.0);
-        }
+        let req = Request::of(cmds);
         self.io
             .write_all(&req.0)
             .await

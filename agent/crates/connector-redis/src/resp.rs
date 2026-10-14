@@ -18,8 +18,9 @@
 //! - an aggregate at most the request's `items` elements (a map counts
 //!   twice its pairs), never preallocated from the announced count, nested
 //!   at most [`MAX_DEPTH`] levels;
-//! - at most the request's `reply` bytes buffered per reply, and at most
-//!   [`WIRE_BUDGET`] bytes read per reply, skipped bytes included;
+//! - at most the request's `reply` bytes buffered per reply, strings and
+//!   the in-memory size of every element counted (a map pair twice), and
+//!   at most [`WIRE_BUDGET`] bytes read per reply, skipped bytes included;
 //! - push (`>`) and attribute (`|`) frames, streamed lengths (`$?`, `*?`,
 //!   `;` chunks), negative lengths other than `-1` and unknown types are
 //!   refused ([`DecodeError::Push`], [`DecodeError::Protocol`]).
@@ -38,6 +39,10 @@ pub(crate) const MAX_DEPTH: usize = 4;
 pub(crate) const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 /// Most bytes read per reply, discarded ones included.
 pub(crate) const WIRE_BUDGET: usize = 64 * 1024 * 1024;
+
+/// What one decoded element counts against the reply cap: its in-memory
+/// size, whatever its wire size (a null is 3 bytes on the wire).
+const ELEMENT_BYTES: usize = std::mem::size_of::<Value>();
 
 /// The bounds of one request's reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,7 +417,8 @@ impl Decoder {
             None
         } else {
             self.account(len)?;
-            Some(Vec::new())
+            // Sized once: no reallocation leaves a copy behind (L2).
+            Some(Vec::with_capacity(len))
         };
         if len == 0 {
             self.state = State::Crlf { kind, got: 0, buf };
@@ -504,6 +510,13 @@ impl Decoder {
     fn complete(&mut self, value: Value) -> Result<Option<Value>, DecodeError> {
         let mut value = value;
         loop {
+            if self.stack.is_empty() {
+                return Ok(Some(value));
+            }
+            // Every element counts against the reply cap, strings or not, so
+            // nested aggregates of nulls cannot amplify the wire budget
+            // (security review M1; a map pair counts twice).
+            self.account(ELEMENT_BYTES)?;
             let Some(top) = self.stack.last_mut() else {
                 return Ok(Some(value));
             };
@@ -530,16 +543,39 @@ impl Decoder {
 
 /// Encodes a request: an array of bulk strings. Crate-private, reached only
 /// through [`crate::cmd::Cmd`], the closed command set.
-pub(crate) fn encode(args: &[&[u8]], out: &mut Vec<u8>) {
-    out.push(b'*');
-    out.extend_from_slice(args.len().to_string().as_bytes());
-    out.extend_from_slice(b"\r\n");
+pub(crate) fn encode(args: &[&[u8]], out: &mut impl Out) {
+    out.put(b"*");
+    out.put(args.len().to_string().as_bytes());
+    out.put(b"\r\n");
     for a in args {
-        out.push(b'$');
-        out.extend_from_slice(a.len().to_string().as_bytes());
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(a);
-        out.extend_from_slice(b"\r\n");
+        out.put(b"$");
+        out.put(a.len().to_string().as_bytes());
+        out.put(b"\r\n");
+        out.put(a);
+        out.put(b"\r\n");
+    }
+}
+
+/// Where a request is encoded: a buffer, or a byte count (so a request
+/// buffer is sized once and never reallocated, leaving no copy of an
+/// `AUTH` password behind; security review L2).
+pub(crate) trait Out {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+impl Out for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// Counts the bytes of an encoding.
+#[derive(Default)]
+pub(crate) struct Count(pub(crate) usize);
+
+impl Out for Count {
+    fn put(&mut self, bytes: &[u8]) {
+        self.0 = self.0.saturating_add(bytes.len());
     }
 }
 
@@ -682,6 +718,63 @@ mod tests {
         let (used, v) = d.feed(b"$100000\r\n").unwrap();
         assert_eq!((used, v), (9, None));
         assert!(matches!(d.state, State::Bulk { buf: None, .. }));
+    }
+
+    /// Security review M1: 64 MiB of nested nulls once decoded into
+    /// hundreds of MiB; every element now counts against the reply cap.
+    #[test]
+    fn elements_count_against_the_reply_cap() {
+        let limits = Limits {
+            bulk: 16,
+            items: 1000,
+            skip_oversized: false,
+            reply: 64 * 1024,
+        };
+        let mut d = Decoder::new(limits);
+        let mut wire = Vec::new();
+        for _ in 0..3 {
+            wire.extend_from_slice(b"*1000\r\n");
+        }
+        for _ in 0..1_000_000 {
+            wire.extend_from_slice(b"_\r\n");
+        }
+        let mut fed = 0;
+        let err = loop {
+            let chunk = wire.get(fed..(fed + 4096).min(wire.len())).unwrap();
+            match d.feed(chunk) {
+                Ok((used, None)) => fed += used,
+                Ok((_, Some(_))) => panic!("decoded"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, DecodeError::Limit);
+        // At most the cap's worth of elements was decoded.
+        let most = limits.reply / ELEMENT_BYTES;
+        assert!(fed <= (most + 1) * 3 + 64, "{fed}");
+        assert!(d.buffered <= limits.reply + ELEMENT_BYTES);
+        // The HELLO probe's limits: a hostile unauthenticated reply stops
+        // within its 64 KiB.
+        let hello = crate::cmd::Cmd::HelloProbe.limits();
+        let mut d = Decoder::new(hello);
+        fn tree(depth: usize, out: &mut Vec<u8>) {
+            if depth == 0 {
+                out.extend_from_slice(b"_\r\n");
+                return;
+            }
+            out.extend_from_slice(b"*64\r\n");
+            for _ in 0..64 {
+                tree(depth - 1, out);
+            }
+        }
+        // A map of two pairs whose values are full trees three levels deep
+        // (the depth cap): 2 x 64^3 nulls in 1.5 MiB of wire.
+        let mut wire = b"%2\r\n".to_vec();
+        for _ in 0..2 {
+            tree(0, &mut wire);
+            tree(3, &mut wire);
+        }
+        assert_eq!(d.feed(&wire).unwrap_err(), DecodeError::Limit);
+        assert!(d.buffered <= hello.reply + ELEMENT_BYTES);
     }
 
     #[test]
