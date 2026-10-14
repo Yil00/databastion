@@ -381,7 +381,17 @@ mod tests {
     fn socket_owner_is_trusted_only_in_a_private_directory() {
         let dir = tmp();
         let sock = dir.join("redis.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // The socket file is made by a separate process: agent code never
+        // binds a socket (I1, crates/agent/tests/architecture.rs).
+        let made = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])",
+            ])
+            .arg(&sock)
+            .status()
+            .expect("python3 is needed to make a test socket");
+        assert!(made.success());
         // Owned by the test's own user: never trusted by default.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(expected_uid(&sock, None).is_err());
@@ -396,7 +406,6 @@ mod tests {
         let link = dir.join("link.sock");
         std::os::unix::fs::symlink(&sock, &link).unwrap();
         assert!(expected_uid(&link, None).is_err());
-        drop(listener);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
