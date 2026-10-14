@@ -416,6 +416,63 @@ mod tests {
     }
 
     #[test]
+    fn redis_and_valkey_are_detected_without_sentinels() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proc/net")).unwrap();
+        // 6379 and the Sentinel port 26379 (0x66AB) listening.
+        fs::write(
+            root.join("proc/net/tcp"),
+            "  sl  local_address rem_address   st\n\
+   0: 0100007F:18EB 00000000:0000 0A 0\n\
+   1: 0100007F:66AB 00000000:0000 0A 0\n",
+        )
+        .unwrap();
+        for (pid, comm) in [
+            ("10", "valkey-server"),
+            ("11", "valkey-sentinel"),
+            ("12", "redis-sentinel"),
+        ] {
+            fs::create_dir_all(root.join("proc").join(pid)).unwrap();
+            fs::write(
+                root.join("proc").join(pid).join("comm"),
+                format!("{comm}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(root.join("run/valkey")).unwrap();
+        fs::write(root.join("run/valkey/valkey.sock"), "").unwrap();
+        let view = HostView {
+            root,
+            is_socket: exists,
+        };
+        let json = serde_json::to_string(&detect(&view, &[])).unwrap();
+        // Only valkey-server runs: the port is reported as valkey.
+        assert!(
+            json.contains(r#"{"engine":"valkey","port":6379}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"engine":"valkey","process":"valkey-server"}"#),
+            "{json}"
+        );
+        assert!(json.contains("/run/valkey/valkey.sock"), "{json}");
+        assert!(
+            !json.contains("26379") && !json.contains("sentinel"),
+            "{json}"
+        );
+        // A declared local Valkey target excludes its family's process.
+        let t = target(
+            "{id: v, engine: valkey, host: 127.0.0.1, account: a, secret: {env: X}, redis: {tls: disable}}",
+        );
+        let json = serde_json::to_string(&detect(&view, &[t])).unwrap();
+        assert!(
+            !json.contains(r#""port":6379"#) && !json.contains("valkey-server"),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn missing_proc_yields_nothing() {
         let dir = TempDir::new();
         let view = HostView {

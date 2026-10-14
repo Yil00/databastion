@@ -120,8 +120,14 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         },
     };
     session.close().await;
-    privilege_notes(&report, &settings, info.server.has_dryrun(), &mut notes);
     let scan = state.scan(&target.id);
+    privilege_notes(
+        &report,
+        &settings,
+        info.server.has_dryrun(),
+        scan.declared_not_readable,
+        &mut notes,
+    );
     if scan.module_patterns > 0 {
         notes.push(
             TargetNote::new(NoteCode::CoverageModuleTypesNotSampled)
@@ -199,6 +205,7 @@ fn privilege_notes(
     report: &node::Report,
     settings: &RedisTargetConfig,
     has_dryrun: bool,
+    scan_not_readable: u64,
     notes: &mut Vec<TargetNote>,
 ) {
     let mut add = |code: NoteCode, n: u64| {
@@ -227,7 +234,10 @@ fn privilege_notes(
     add(NoteCode::PrivilegeNotEvaluated, eval.not_evaluated);
     let declared = report.patterns_not_readable.as_ref().map_or(0, Vec::len)
         + report.databases_not_readable.as_ref().map_or(0, Vec::len);
-    add(NoteCode::PrivilegeDeclaredKeysNotReadable, declared as u64);
+    add(
+        NoteCode::PrivilegeDeclaredKeysNotReadable,
+        (declared as u64).saturating_add(scan_not_readable),
+    );
     add(
         NoteCode::PrivilegeTicketCredentialsReadable,
         report.ticket_keys_readable.unwrap_or(0),

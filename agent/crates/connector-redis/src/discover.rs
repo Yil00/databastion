@@ -272,10 +272,9 @@ pub(crate) async fn discover(
         no_touch,
         readonly,
     };
-    let mut facts = ScanFacts {
-        module_patterns: 0,
-        declared_not_readable: not_readable.len() as u64,
-    };
+    // Databases whose walk or sampling an unexpected NOPERM ended (the
+    // declared patterns not confirmed by `check()` are in its report).
+    let mut facts = ScanFacts::default();
     for (i, db) in databases.iter().enumerate() {
         if job.out_of_time() {
             job.skip_out_of_time(sink, databases.len() - i);
@@ -300,6 +299,7 @@ pub(crate) async fn discover(
         }
         let walked = walk(&mut conn, job, sink, &patterns, &settings, &info).await?;
         let Some(emitted) = walked else {
+            facts.declared_not_readable += 1;
             continue;
         };
         sample_database(&mut conn, job, sink, &name, emitted, &mut facts).await?;
@@ -312,8 +312,7 @@ pub(crate) async fn discover(
 }
 
 /// Walks one database (decision 6). `None` when the walk ended on an
-/// unexpected `NOPERM` (the database counts in `skipped_not_readable`) or
-/// the scan ran out of time before any batch.
+/// unexpected `NOPERM` (the database counts in `skipped_not_readable`).
 async fn walk(
     conn: &mut Conn<'_>,
     job: &ScanJob,
