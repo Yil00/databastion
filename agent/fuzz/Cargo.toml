@@ -1,7 +1,7 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
 # server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
-# cn=accesslog entries; CAS service definitions (JSON and YAML, the YAML parser also against
+# cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
 # serde_yaml_ng as a differential oracle) and JSON audit log lines. See
 # README.md.
 #
@@ -23,6 +23,7 @@ libfuzzer-sys = "0.4"
 databastion-connector-mongodb = { path = "../crates/connector-mongodb", features = ["fuzzing"] }
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
+databastion-connector-redis = { path = "../crates/connector-redis", features = ["fuzzing"] }
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
@@ -120,6 +121,27 @@ bench = false
 [[bin]]
 name = "cas_audit_log"
 path = "fuzz_targets/cas_audit_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_resp_decoder"
+path = "fuzz_targets/redis_resp_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_info"
+path = "fuzz_targets/redis_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_key_pattern"
+path = "fuzz_targets/redis_key_pattern.rs"
 test = false
 doc = false
 bench = false

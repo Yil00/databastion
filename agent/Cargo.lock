@@ -242,6 +242,7 @@ dependencies = [
  "databastion-connector-mysql",
  "databastion-connector-openldap",
  "databastion-connector-postgres",
+ "databastion-connector-redis",
  "databastion-core",
  "serde_json",
  "tokio",
@@ -255,10 +256,12 @@ name = "databastion-classifiers"
 version = "0.7.0"
 dependencies = [
  "databastion-protocol",
+ "databastion-protocol-codegen",
  "getrandom 0.4.3",
  "hmac",
  "proptest",
  "regex",
+ "regress",
  "serde_json",
  "sha2",
  "unicode-normalization",
@@ -377,6 +380,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "databastion-connector-redis"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "databastion-classifiers",
+ "databastion-core",
+ "proptest",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "databastion-core"
 version = "0.7.0"
 dependencies = [
@@ -385,9 +407,11 @@ dependencies = [
  "chrono",
  "databastion-classifiers",
  "databastion-protocol",
+ "databastion-protocol-codegen",
  "futures-util",
  "getrandom 0.4.3",
  "proptest",
+ "regress",
  "reqwest",
  "rustix",
  "serde",

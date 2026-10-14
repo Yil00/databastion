@@ -24,6 +24,7 @@ pub mod column;
 pub mod detect;
 pub mod hints;
 pub mod id;
+pub mod keys;
 mod lexicon;
 pub mod masking;
 pub mod names;

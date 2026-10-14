@@ -24,7 +24,8 @@ use std::collections::BTreeSet;
 use std::sync::RwLock;
 
 use databastion_protocol::{
-    AuditSource, CapabilityList, Connector, ConnectorList, Engine, HeartbeatRequest, TargetId,
+    AuditSource, CapabilityList, Connector, ConnectorList, DetectedTargetProcess, Engine,
+    HeartbeatRequest, TargetId,
 };
 
 /// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
@@ -75,6 +76,26 @@ pub(crate) fn engine_token(engine: Engine) -> &'static [&'static str] {
         Engine::Sqlserver => SQLSERVER,
         Engine::Redis => &[token::ENGINE_REDIS],
         Engine::Valkey => &[token::ENGINE_VALKEY],
+    }
+}
+
+/// The tokens gating a `DetectedTarget.process` value: those of the
+/// engines the process can belong to, as the console checks them (contract
+/// "Engine-token gate"). A detected target is sent only when both its
+/// engine's and its process's tokens are listed (P9-C L1: a Valkey server
+/// running as `redis-server` is a `valkey` target with a `redis` process,
+/// which a console listing only `engine.valkey` refuses, with the whole
+/// heartbeat).
+pub(crate) fn process_token(process: DetectedTargetProcess) -> &'static [&'static str] {
+    match process {
+        DetectedTargetProcess::Postgres
+        | DetectedTargetProcess::Mysqld
+        | DetectedTargetProcess::Mariadbd
+        | DetectedTargetProcess::Mongod
+        | DetectedTargetProcess::Slapd => UNGATED,
+        DetectedTargetProcess::Sqlservr => SQLSERVER,
+        DetectedTargetProcess::RedisServer => &[token::ENGINE_REDIS],
+        DetectedTargetProcess::ValkeyServer => &[token::ENGINE_VALKEY],
     }
 }
 
@@ -208,9 +229,11 @@ pub(crate) fn withhold_unaccepted_engines(
             t.audit_source = None;
         }
     }
-    heartbeat
-        .detected_targets
-        .retain(|d| caps.accepts_engine(d.engine));
+    heartbeat.detected_targets.retain(|d| {
+        caps.accepts_engine(d.engine)
+            && d.process
+                .is_none_or(|p| caps.accepts_gate(process_token(p)))
+    });
     withheld
 }
 
@@ -441,6 +464,48 @@ mod tests {
         let before = serde_json::to_value(&hb).unwrap();
         assert!(withhold_unaccepted_engines(&mut hb, &caps).is_empty());
         assert_eq!(serde_json::to_value(&hb).unwrap(), before);
+    }
+
+    #[test]
+    fn detected_targets_wait_for_their_process_token_too() {
+        // A Valkey server started as `redis-server`: a `valkey` detected
+        // target with a `redis-server` process (P9-C L1).
+        let mut hb: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "agent_version": "0.7.0",
+            "connectors": ["redis"],
+            "targets": [],
+            "detected_targets": [
+                {"engine": "valkey", "process": "redis-server"},
+                {"engine": "valkey", "process": "valkey-server"},
+                {"engine": "redis", "port": 6379},
+                {"engine": "postgres", "process": "postgres"}
+            ],
+            "ts": "2026-10-14T00:00:00Z",
+            "uptime_s": 1,
+            "spool": {"bytes": 0, "max_bytes": 1, "batches": 0}
+        }))
+        .unwrap();
+        let caps = ConsoleCapabilities::default();
+        caps.record(Some(&list(&[token::ENGINE_VALKEY])));
+        let mut only_valkey = hb.clone();
+        withhold_unaccepted_engines(&mut only_valkey, &caps);
+        let json = serde_json::to_string(&only_valkey.detected_targets).unwrap();
+        assert!(!json.contains("redis-server"), "{json}");
+        assert!(json.contains("valkey-server"), "{json}");
+        assert!(!json.contains(r#""engine":"redis""#), "{json}");
+        assert!(json.contains("postgres"), "{json}");
+        // The shared connector needs both tokens.
+        assert!(only_valkey.connectors.0.is_empty());
+
+        caps.record(Some(&list(&[token::ENGINE_VALKEY, token::ENGINE_REDIS])));
+        withhold_unaccepted_engines(&mut hb, &caps);
+        assert_eq!(hb.detected_targets.len(), 4);
+        assert_eq!(hb.connectors.0, vec![Connector::Redis]);
+        assert_eq!(
+            process_token(DetectedTargetProcess::RedisServer),
+            [token::ENGINE_REDIS]
+        );
+        assert!(process_token(DetectedTargetProcess::Slapd).is_empty());
     }
 
     #[test]

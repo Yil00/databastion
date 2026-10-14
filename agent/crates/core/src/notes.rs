@@ -268,6 +268,26 @@ pub enum NoteCode {
     SecurityTicketRegistryUnencrypted,
     /// `security.tls_disabled`.
     SecurityTlsDisabled,
+    /// `security.default_user_nopass`.
+    SecurityDefaultUserNopass,
+    /// `privilege.admin_commands`.
+    PrivilegeAdminCommands,
+    /// `privilege.scripting`.
+    PrivilegeScripting,
+    /// `privilege.pubsub_channels`.
+    PrivilegePubsubChannels,
+    /// `privilege.declared_keys_not_readable`.
+    PrivilegeDeclaredKeysNotReadable,
+    /// `coverage.cluster_node_only`.
+    CoverageClusterNodeOnly,
+    /// `coverage.module_types_not_sampled`.
+    CoverageModuleTypesNotSampled,
+    /// `audit.acl_log_only`.
+    AuditAclLogOnly,
+    /// `check.server_is_valkey`.
+    CheckServerIsValkey,
+    /// `check.server_is_redis`.
+    CheckServerIsRedis,
 }
 
 impl NoteCode {
@@ -352,6 +372,16 @@ impl NoteCode {
         Self::SecurityLoginEventTrigger,
         Self::SecurityTicketRegistryUnencrypted,
         Self::SecurityTlsDisabled,
+        Self::SecurityDefaultUserNopass,
+        Self::PrivilegeAdminCommands,
+        Self::PrivilegeScripting,
+        Self::PrivilegePubsubChannels,
+        Self::PrivilegeDeclaredKeysNotReadable,
+        Self::CoverageClusterNodeOnly,
+        Self::CoverageModuleTypesNotSampled,
+        Self::AuditAclLogOnly,
+        Self::CheckServerIsValkey,
+        Self::CheckServerIsRedis,
     ];
 
     /// The registered code.
@@ -439,6 +469,16 @@ impl NoteCode {
             Self::SecurityLoginEventTrigger => "security.login_event_trigger",
             Self::SecurityTicketRegistryUnencrypted => "security.ticket_registry_unencrypted",
             Self::SecurityTlsDisabled => "security.tls_disabled",
+            Self::SecurityDefaultUserNopass => "security.default_user_nopass",
+            Self::PrivilegeAdminCommands => "privilege.admin_commands",
+            Self::PrivilegeScripting => "privilege.scripting",
+            Self::PrivilegePubsubChannels => "privilege.pubsub_channels",
+            Self::PrivilegeDeclaredKeysNotReadable => "privilege.declared_keys_not_readable",
+            Self::CoverageClusterNodeOnly => "coverage.cluster_node_only",
+            Self::CoverageModuleTypesNotSampled => "coverage.module_types_not_sampled",
+            Self::AuditAclLogOnly => "audit.acl_log_only",
+            Self::CheckServerIsValkey => "check.server_is_valkey",
+            Self::CheckServerIsRedis => "check.server_is_redis",
         }
     }
 

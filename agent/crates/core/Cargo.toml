@@ -42,6 +42,10 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 test-support = []
 
 [dev-dependencies]
+# sanitize.rs tests: the sanitizer's KeyPattern rules against the
+# contract's patterns compiled with `regress` (the generated types' engine).
+regress = "0.12"
+databastion-protocol-codegen.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
 # HTTP mock server for tests only (bound to 127.0.0.1 by wiremock). It pulls
 # hyper's `server` feature: deny.toml excludes dev-dependencies from the

@@ -21,6 +21,7 @@ use serde::Deserialize;
 use crate::engine::Engine;
 
 pub mod cas;
+pub mod redis;
 
 /// Hard upper bound on the rows sampled per object (contract `sample_rows`
 /// range is `1..=10000`).
@@ -261,6 +262,10 @@ pub enum TargetEngine {
     Openldap,
     /// Apereo CAS: local files only (`cas:` block; ADR-0041).
     Cas,
+    /// Redis (Redis / Valkey connector, ADR-0052).
+    Redis,
+    /// Valkey (Redis / Valkey connector, ADR-0052).
+    Valkey,
 }
 
 impl TargetEngine {
@@ -273,6 +278,7 @@ impl TargetEngine {
             Self::Mongodb => Engine::Mongodb,
             Self::Openldap => Engine::Openldap,
             Self::Cas => Engine::Cas,
+            Self::Redis | Self::Valkey => Engine::Redis,
         }
     }
 }
@@ -323,6 +329,9 @@ pub struct TargetConfig {
     /// OpenLDAP settings (`engine: openldap` only).
     #[serde(default)]
     pub openldap: Option<OpenldapTargetConfig>,
+    /// Redis / Valkey settings (`engine: redis` or `valkey` only).
+    #[serde(default)]
+    pub redis: Option<redis::RedisTargetConfig>,
     /// Apereo CAS settings (`engine: cas` only, required there): local
     /// paths only.
     #[serde(default)]
@@ -746,6 +755,7 @@ impl TargetConfig {
             TargetEngine::Mysql | TargetEngine::Mariadb => self.mysql.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Mongodb => self.mongodb.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Redis | TargetEngine::Valkey => self.redis.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Cas => None,
         }
     }
@@ -757,6 +767,12 @@ impl TargetConfig {
     #[must_use]
     pub fn cas_settings(&self) -> Option<&cas::CasSettings> {
         self.cas_resolved.as_ref()
+    }
+
+    /// Redis / Valkey settings, defaults when absent.
+    #[must_use]
+    pub fn redis_settings(&self) -> redis::RedisTargetConfig {
+        self.redis.clone().unwrap_or_default()
     }
 
     /// OpenLDAP settings, defaults when absent.
@@ -778,6 +794,7 @@ impl TargetConfig {
             TargetEngine::Postgres => 5432,
             TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
             TargetEngine::Mongodb => 27017,
+            TargetEngine::Redis | TargetEngine::Valkey => redis::DEFAULT_PORT,
             TargetEngine::Openldap => {
                 if self.openldap_settings().tls == OpenldapTlsMode::VerifyFull {
                     636
@@ -976,6 +993,19 @@ const KNOWN_KEYS: &[&str] = &[
     "clear",
     "truncated",
     "omitted",
+    "redis",
+    "valkey",
+    "client_cert",
+    "client_key",
+    "max_keys",
+    "discovery_node",
+    "key_patterns",
+    "server_uid",
+    "unevaluated_acl",
+    "accept",
+    "cas_stores",
+    "ticket_registry",
+    "audit_trail",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -1257,6 +1287,14 @@ impl TargetConfig {
         if self.engine == TargetEngine::Cas {
             return self.validate_cas(i);
         }
+        if self.redis.is_some()
+            && !matches!(self.engine, TargetEngine::Redis | TargetEngine::Valkey)
+        {
+            return Err(invalid(f("redis"), "only for engine redis or valkey"));
+        }
+        if matches!(self.engine, TargetEngine::Redis | TargetEngine::Valkey) {
+            self.validate_redis(i)?;
+        }
         match (&self.host, &self.socket) {
             (Some(host), None) => {
                 if host.is_empty() || host.len() > 253 || host.chars().any(char::is_control) {
@@ -1394,6 +1432,7 @@ impl TargetConfig {
             ("mysql", self.mysql.is_some()),
             ("mongodb", self.mongodb.is_some()),
             ("openldap", self.openldap.is_some()),
+            ("redis", self.redis.is_some()),
         ];
         if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
             return Err(invalid(
@@ -1405,6 +1444,34 @@ impl TargetConfig {
             return Err(invalid(f("cas"), "required for engine cas"));
         }
         Ok(())
+    }
+
+    /// A Redis / Valkey target (ADR-0052 decision 3): a named ACL user with
+    /// a password (never `default`), `disable` only on a Unix socket or a
+    /// loopback IP literal, and the `redis` block's own rules.
+    fn validate_redis(&self, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].{name}");
+        if self.account == "default" {
+            return Err(invalid(
+                f("account"),
+                "the server's `default` user is never the agent's account: create a named ACL \
+                 user (ADR-0052 decision 3)",
+            ));
+        }
+        let settings = self.redis_settings();
+        redis::validate_endpoint(
+            self.host.as_deref(),
+            self.port,
+            self.socket.as_deref(),
+            settings.tls,
+        )
+        .map_err(|(key, reason)| {
+            let field = if key == "tls" { f("redis.tls") } else { f(key) };
+            invalid(field, reason)
+        })?;
+        settings
+            .validate()
+            .map_err(|(key, reason)| invalid(f(&format!("redis.{key}")), reason))
     }
 
     fn validate_postgres_tls(&self, i: usize) -> Result<(), ConfigError> {

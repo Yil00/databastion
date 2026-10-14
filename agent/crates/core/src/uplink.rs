@@ -1113,7 +1113,14 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             database: id(&loc.database)?,
             engine,
             field: id(&loc.field)?,
-            object: id(&loc.object)?.into(),
+            // A Redis / Valkey key pattern (contract `KeyPattern`, checked
+            // with its `not` rules by the sanitizer); an `Identifier` on
+            // every other engine.
+            object: if crate::sanitize::uses_key_patterns(engine) {
+                loc.object.as_str().parse().ok()?
+            } else {
+                id(&loc.object)?.into()
+            },
             schema: match &loc.schema {
                 Some(s) => Some(id(s)?),
                 None => None,

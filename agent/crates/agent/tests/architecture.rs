@@ -19,12 +19,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 5] = [
+const CONNECTORS: [&str; 6] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
     "connector-openldap",
     "connector-cas",
+    "connector-redis",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).

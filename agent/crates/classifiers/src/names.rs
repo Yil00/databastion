@@ -81,7 +81,9 @@ pub const MAX_TOTAL_DIGITS: usize = 8;
 const CONTAINER_TYPES: [&str; 6] = ["ou", "dc", "o", "c", "l", "st"];
 
 /// A name that went through this module. Always matches the contract
-/// `Identifier` schema. No public constructor from a string.
+/// `Identifier` schema, except a Redis / Valkey key pattern built by
+/// [`crate::keys`], which matches the contract `KeyPattern` schema
+/// instead. No public constructor from a string.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedName(String);
 
@@ -115,6 +117,30 @@ impl NormalizedName {
             Self::wildcard()
         }
     }
+}
+
+impl NormalizedName {
+    /// A Redis / Valkey key pattern ([`crate::keys`]), through the final
+    /// gate of the contract `KeyPattern` (pattern and `not` rules,
+    /// [`crate::keys::is_key_pattern`]); `*` otherwise. Only that module
+    /// builds key patterns; the core sends one only for a `redis` or
+    /// `valkey` location, and replaces it by `*` on any other engine.
+    pub(crate) fn key_pattern(candidate: String) -> Self {
+        if crate::keys::is_key_pattern(&candidate) {
+            Self(candidate)
+        } else {
+            Self::wildcard()
+        }
+    }
+}
+
+/// The value spans of a key name ([`crate::keys`]): `s` longer than the
+/// detectors' bound has none (the caller refuses such names first).
+pub(crate) fn key_value_spans(s: &str) -> Vec<Range<usize>> {
+    if s.len() > MAX_INPUT_BYTES {
+        return Vec::new();
+    }
+    value_spans(s)
 }
 
 impl fmt::Debug for NormalizedName {

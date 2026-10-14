@@ -15,6 +15,9 @@ tests of each connector (`src/proptests.rs`).
 | `openldap_message` | `…::fuzz::message` | One `LDAPMessage`; an entry is also reduced as an accesslog entry |
 | `openldap_filter` | `…::fuzz::search_filter` | One logged search filter (`reqFilter`) |
 | `openldap_accesslog` | `…::fuzz::accesslog` | One `cn=accesslog` entry, NUL-separated attribute values |
+| `redis_resp_decoder` | `databastion_connector_redis::fuzz::resp_decoder` | Server bytes after a selector byte (a request's reply limits and a chunk size): the streaming RESP3 decoder fed chunk by chunk, several replies, each decoded reply read as a `HELLO` map and an `ACL DRYRUN` verdict ([ADR-0052](../../docs/adr/0052-redis-valkey-connector.md) decision 1) |
+| `redis_info` | `…::fuzz::info` | An `INFO` reply text: engine, version, mode, role and keyspace parsers |
+| `redis_key_pattern` | `…::fuzz::key_pattern` | A key name: the key-pattern normalizer (`classifiers::keys`; its output must pass the contract `KeyPattern` gate, else it panics), the Redis glob matcher and example key, the CAS guard |
 | `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
 | `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the crate's own YAML parser and the same visitor |
 | `cas_registry_yaml_diff` | `…::fuzz::registry_yaml_diff` | Differential ([ADR-0046](../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md)): on every file the pre-scan accepts, the crate's YAML parser and `serde_yaml_ng` (the oracle, a dependency of this harness only) must read the same values and the same definition, or both fail; a disagreement panics |

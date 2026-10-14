@@ -1160,7 +1160,9 @@ def gen_redis(f: Fake, t: Truth) -> str:
         names.append(f"{p['first']} {p['last']}")
         cmds.append(["SET", f"phone:{k}", names[-1]])
     loc("db0", "string", "phone:*", "value", ["pii.person_name"], names, name_values=phones,
-        name_value_classifiers=["pii.phone"], normalized="phone:*", note="key names are phone numbers")
+        name_value_classifiers=["pii.phone"], normalized="*:*",
+        note="key names are phone numbers; `phone` and `addressbook` precede the same suffix `*`, so the "
+             "record-id rule masks the first segment too (ADR-0052 decision 7)")
 
     # Hashes keyed by data: field names are e-mail addresses, values phone numbers.
     field_emails, field_phones = [], []
@@ -1173,22 +1175,26 @@ def gen_redis(f: Fake, t: Truth) -> str:
             field_emails.append(em)
             field_phones.append(ph)
         cmds.append(args)
-    kw = dict(name_values=field_emails, name_value_classifiers=["pii.email"], normalized="addressbook:*",
-              note="hash field names are e-mail addresses")
+    kw = dict(name_values=field_emails, name_value_classifiers=["pii.email"], normalized="*:*",
+              note="hash field names are e-mail addresses; first segment masked as for `phone:*`")
     loc("db0", "hash", "addressbook:*", "*", ["pii.phone"], field_phones, **kw)
     loc("db0", "hash", "addressbook:*", "#field", ["pii.email"], field_emails, **kw)
 
     # A set, a sorted set, a list and a stream.
     subs = [f.person()["email"] for _ in range(60)]
     cmds.append(["SADD", "newsletter:subscribers", *subs])
-    loc("db0", "set", "newsletter:subscribers", "value", ["pii.email"], subs)
+    # Two-segment names share the first position with `phone:<n>` and `addressbook:<n>`: once
+    # that position collapses (record-id rule), `*:subscribers`, `*:leaderboard` and
+    # `*:payments` are records too (ADR-0052 decision 7 as written; over-masking accepted).
+    two = dict(normalized="*:*")
+    loc("db0", "set", "newsletter:subscribers", "value", ["pii.email"], subs, **two)
     board = [f"{p['first']} {p['last']}" for p in (f.person() for _ in range(40))]
     args = ["ZADD", "loyalty:leaderboard"]
     for name in board:
         args += [str(f.r.randint(0, 5000)), name]
     cmds.append(args)
     loc("db0", "zset", "loyalty:leaderboard", "value", ["pii.person_name"], board,
-        note="members only; scores are not read")
+        note="members only; scores are not read", **two)
     sms = []
     for _ in range(30):
         ph = f.fr_phone()
@@ -1202,16 +1208,19 @@ def gen_redis(f: Fake, t: Truth) -> str:
         ibans.append(p["iban"])
         cmds.append(["XADD", "events:payments", "*", "card_number", p["card"], "iban", p["iban"],
                      "amount_cents", str(f.r.randint(500, 90000))])
-    loc("db0", "stream", "events:payments", "card_number", ["pii.card_number"], cards)
-    loc("db0", "stream", "events:payments", "iban", ["pii.iban"], ibans)
-    loc("db0", "stream", "events:payments", "amount_cents", [], negative_control=True)
+    loc("db0", "stream", "events:payments", "card_number", ["pii.card_number"], cards, **two)
+    loc("db0", "stream", "events:payments", "iban", ["pii.iban"], ibans, **two)
+    loc("db0", "stream", "events:payments", "amount_cents", [], negative_control=True, **two)
 
     # Secrets.
     a, k = f.aws_key_pair()
     cmds.append(["SET", "integration:s3:access_key_id", a])
     cmds.append(["SET", "integration:s3:secret_access_key", k])
-    loc("db0", "string", "integration:s3:access_key_id", "value", ["secret.aws_key"], [a])
-    loc("db0", "string", "integration:s3:secret_access_key", "value", ["secret.aws_key"], [k])
+    # `s3` holds a digit: a value by the per-key rules (ADR-0052 decision 7).
+    loc("db0", "string", "integration:s3:access_key_id", "value", ["secret.aws_key"], [a],
+        normalized="integration:*:access_key_id")
+    loc("db0", "string", "integration:s3:secret_access_key", "value", ["secret.aws_key"], [k],
+        normalized="integration:*:secret_access_key")
 
     # Look-alikes: many fixed names under one prefix (cardinality collapse), counters, flags.
     for slug in ("home", "about", "contact", "pricing", "faq", "careers", "press", "blog", "terms",

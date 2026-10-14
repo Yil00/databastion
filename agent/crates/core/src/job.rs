@@ -628,6 +628,14 @@ impl ScanJob {
         self.guard.begin_database(database);
     }
 
+    /// Records that the CAS store guard kept one more object out of the
+    /// scan by its **name** or by a value the connector's own tripwire
+    /// matched (Redis / Valkey keys, ADR-0052 decision 6): counted in
+    /// `coverage.cas_guard_tripped`, never named.
+    pub fn record_cas_guard_trip(&self) {
+        self.guard.trip();
+    }
+
     /// What the CAS store guard saw in this scan so far.
     #[must_use]
     pub fn cas_guard(&self) -> &Arc<crate::cas_guard::ScanGuard> {
