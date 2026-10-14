@@ -1,6 +1,6 @@
 # ADR-0052: Redis / Valkey connector: own RESP client, maintained versions, ACL allow-list, one declared node, key patterns, Limited Audit from the servers' own logs
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-10-14). **Accepted** by the maintainer on 2026-10-14 with every recommendation of the open questions.
 - **Date**: 2026-10-14
 - **Revised**: 2026-10-14, after the P9-F security review of the first draft (verdict "not ready yet": H1 to H3 folded in, M1 to M6 folded in or recorded with a recommendation, L1 to L9 recorded as [implementation obligations](#implementation-obligations-p9-b)).
 - **Relies on**: [ADR-0039](0039-engine-scope-expansion.md) decision 1 (accepted, end-of-life versions not supported) and decision 8 (accepted, new engines as capability tokens, with [ADR-0042](0042-hold-items-of-unlisted-engines.md)). It applies, and **proposes for acceptance for Redis and Valkey only**, ADR-0039 decisions 3 (ceilings, Redis / Valkey row), 4 (client criteria), 5 (least privilege, Redis / Valkey item, with the changes of decision 4 below), 6 (transport), 7 (I5, local detection, key names) and 9 (test obligations). Where this ADR differs from ADR-0039's text (the allow-list, the version floor), it says so and why.
