@@ -107,6 +107,34 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
     // (P9-C): the console's Ajv validation enforces these; the agent's
     // sanitizer never sends a key pattern nor that principal yet.
     (
+        "FindingsBatch.redis-key-pattern-fullwidth-digits.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv6.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv6-after-prefix.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-nbsp-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-percent-encoded.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-underscore-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
         "EventsBatch.account-not-recorded-false.json",
         "const: true on a boolean (generated as bool)",
     ),

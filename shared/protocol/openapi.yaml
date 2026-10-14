@@ -1037,27 +1037,40 @@ components:
         Schema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or
         trailing separator), each a plain name of `Identifier` (no `@ = ; \ ' "`, backquote,
         `< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:
-        - no segment made only of 9 or more digits and the characters space, `+` and `-`
-          (`Identifier`'s digit-run rule, applied per segment), and no run of 9 or more
-          characters made of digits, separators, spaces, `+` and `-` that starts and ends with a
-          digit (a phone or card number split across segments, `06.12.34.56.78`);
+        - no segment made only of 9 or more digits, spaces, `_`, `+` and `-` (`Identifier`'s
+          digit-run rule, applied per segment), and no run of 9 or more characters made of
+          digits, separators, spaces, `_`, `+` and `-` that starts and ends with a digit (a phone
+          or card number split across segments or tokens, `06.12.34.56.78`, `06_12_34_56_78`).
+          A digit is any Unicode decimal digit (`\p{Nd}`, so fullwidth digits too) and a space
+          any Unicode space separator (`\p{Zs}`, so a no-break space too);
+        - no percent-encoded byte (`%` followed by two hexadecimal digits, e.g. `%40`);
+        - no run of 4 or more `:`-separated groups of 1 to 4 hexadecimal digits, one of which
+          holds a digit (an IPv6 address without `::`, a MAC address: `2001:db8:0:1`,
+          `00:1a:2b:3c:4d:5e`);
         - no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,
           `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.
 
         **Rendering rule** (console): a key pattern is shown only as escaped text, never as a link
-        or `href`, never unescaped in e-mail HTML, and in webhook payloads only as a JSON string.
-        CSV exports guard it against formula injection: a value starting with `=`, `+`, `-`, `@`,
-        a tab or a carriage return is prefixed (with `'`).
+        or `href`, never auto-linked (no linkifier or markdown link detection may turn it, or
+        any part of it such as `x:javascript:…`, into a link), never unescaped in e-mail HTML,
+        and in webhook payloads only as a JSON string. In plain-text e-mails and in chat
+        webhook messages (Slack, Teams, Mattermost text), it is wrapped in code formatting
+        (inline code), so that the receiving client does not auto-link it. CSV exports guard it
+        against formula injection: a value starting with `=`, `+`, `-`, `@`, a tab or a
+        carriage return is prefixed (with `'`). The URL-scheme rule of the schema only covers a
+        scheme in the first segment: this rendering rule is what protects a scheme later in
+        the pattern.
       type: string
       minLength: 1
       maxLength: 256
       pattern: '^[^@=:;/|.\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+([:/|.][^@=:;/|.\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+)*$'
       not:
         description: |
-          No segment of 9 or more digits, spaces, `+` or `-`; no digit-to-digit run of 9 or more
-          digits and separators; no first segment naming a URL scheme.
+          No segment of 9 or more digits, spaces, `_`, `+` or `-`; no digit-to-digit run of 9 or
+          more digits and separators; no percent-encoded byte; no IPv6 or MAC address; no first
+          segment naming a URL scheme.
         type: string
-        pattern: '(^|[:/|.])[0-9 +-]{9,}([:/|.]|$)|[0-9][0-9 +.:/|-]{7,}[0-9]|^ *([Jj][Aa][Vv][Aa][Ss][Cc][Rr][Ii][Pp][Tt]|[Dd][Aa][Tt][Aa]|[Vv][Bb][Ss][Cc][Rr][Ii][Pp][Tt]|[Ff][Ii][Ll][Ee]|[Hh][Tt][Tt][Pp][Ss]?|[Mm][Aa][Ii][Ll][Tt][Oo]) *([:/|.]|$)'
+        pattern: '(^|[:/|.])[0-9\p{Nd}\p{Zs}_+-]{9,}([:/|.]|$)|[0-9\p{Nd}][0-9\p{Nd}\p{Zs}_+.:/|-]{7,}[0-9\p{Nd}]|%[0-9A-Fa-f]{2}|(^|[:/|.])((?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]))([:/|.]|$)|^ *([Jj][Aa][Vv][Aa][Ss][Cc][Rr][Ii][Pp][Tt]|[Dd][Aa][Tt][Aa]|[Vv][Bb][Ss][Cc][Rr][Ii][Pp][Tt]|[Ff][Ii][Ll][Ee]|[Hh][Tt][Tt][Pp][Ss]?|[Mm][Aa][Ii][Ll][Tt][Oo]) *([:/|.]|$)'
       x-databastion-normalized-name: true
     ObjectName:
       description: |

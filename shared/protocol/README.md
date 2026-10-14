@@ -27,6 +27,7 @@ Engines added after protocol 0.1.0 follow the same rule ([ADR-0041](../../docs/a
 | `fixtures/invalid-expectations.json` | For each invalid fixture, the JSON Schema keyword it must fail on (so it fails for the intended reason) |
 | `scripts/schema-lint.mjs` | Closure / bounds lint of every schema (used by `validate-fixtures.mjs`) |
 | `scripts/schema-lint.test.mjs` | Self-test: the contract passes the lint, and known mutations (`{}`, `true`, nullable unbounded types, open objects…) are caught |
+| `scripts/inline-objectref.test.mjs` | Drift test: the two `ObjectRef` shapes inlined in `AccessEvent`'s `source` conditional keep `ObjectRef`'s properties, `required` and `additionalProperties` (only `object` differs: `KeyPattern` / `Identifier`); known mutations are caught |
 | `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + classifier, signal and target-note registry checks |
 | `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schemas) shared by the scripts |
 | `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, published versions unchanged (lock), valid fixtures only use ids registered for their `classifiers_version` |

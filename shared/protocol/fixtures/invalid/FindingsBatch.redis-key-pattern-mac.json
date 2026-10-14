@@ -1,0 +1,24 @@
+{
+  "batch_id": "01925a1c-3b40-7d2e-9a11-4c5d6e7f8091",
+  "job_id": "01925a1b-7f00-7a3c-8b22-1d2e3f4a5b6c",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "t-1",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "string",
+        "object": "device:00:1a:2b:3c:4d:5e",
+        "field": "value"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.9,
+      "sampled": 16,
+      "matched": 8,
+      "masked_samples": [
+        "j*******@e******.com"
+      ]
+    }
+  ]
+}
