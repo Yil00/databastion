@@ -40,8 +40,11 @@ export const THRESHOLD_FIELDS = [
 export const EVENT_LIST_FIELDS = [
   { name: "signals", label: "Signals, e.g. signature.pg_dump, signature.mongodump, shape.full_table_read, volume.large_result, or families such as signature.* (any when empty)" },
   { name: "event_actions", label: `Actions: ${EVENT_ACTIONS.join(", ")} (any when empty)` },
-  { name: "principals", label: "Principals, globs (any when empty)" },
-  { name: "exclude_principals", label: "Except principals, globs" },
+  {
+    name: "principals",
+    label: "Principals, globs (any when empty; an event whose account the source did not record, Redis / Valkey, only matches *)",
+  },
+  { name: "exclude_principals", label: "Except principals, globs (never hides an event whose account the source did not record)" },
   { name: "sources", label: "Audit sources such as pgaudit or mongodb_audit_log (any when empty)" },
   { name: "target_ids", label: "Targets (all when empty)" },
   { name: "engines", label: "Engines (all when empty)" },

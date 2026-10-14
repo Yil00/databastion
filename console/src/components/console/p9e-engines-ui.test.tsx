@@ -13,9 +13,10 @@ import type { EventView } from "@/server/events";
 import type { FindingView } from "@/server/findings";
 import type { IncidentView } from "@/server/incidents";
 
+import { formatManualObjects, parseManualObjects } from "./audit-form";
 import { EventsTable, objectsLabel, PrincipalLabel } from "./events-table";
 import { findingsHref, FindingsTable, locationLabel } from "./findings-table";
-import { incidentLocation } from "./incidents-table";
+import { incidentLocation, IncidentsTable } from "./incidents-table";
 
 /**
  * P9-E: Redis / Valkey key patterns (contract `KeyPattern` rendering rule), principals without a
@@ -306,5 +307,60 @@ describe("engines (P9-E)", () => {
     }
     expect(setupHint("sqlserver")).toMatch(/sysadmin/);
     expect(setupHint("redis")).toMatch(/cannot tell Redis from Valkey/);
+  });
+});
+
+describe("Audit manual objects on key-pattern engines (P9-E review M3)", () => {
+  it("split on `;` only, never on `/` or `:`", () => {
+    const text = "db0; user:*:email; pii.email, pii.phone\ndb0; cache/v2|x.y; pii.email";
+    const r = parseManualObjects(text, true);
+    expect(r).toEqual({
+      ok: true,
+      objects: [
+        { database: "db0", object: "user:*:email", classifiers: ["pii.email", "pii.phone"] },
+        { database: "db0", object: "cache/v2|x.y", classifiers: ["pii.email"] },
+      ],
+    });
+    if (r.ok) expect(parseManualObjects(formatManualObjects(r.objects, true), true)).toEqual(r);
+    expect(parseManualObjects("db0/user:*:email: pii.email", true)).toEqual({ ok: false, line: 1 });
+    expect(parseManualObjects("db0; a; b; pii.email", true)).toEqual({ ok: false, line: 1 });
+    // The other engines keep their format.
+    expect(parseManualObjects("crm/public/clients: pii.email")).toMatchObject({ ok: true });
+  });
+});
+
+describe("incidents table (P9-E review L3)", () => {
+  it("a Redis finding incident shows its key pattern as escaped inline code, never in an href", () => {
+    const incident = {
+      id: "01890a5d-ac96-774b-bcce-b302099a8057",
+      status: "open",
+      severity: "high",
+      policyId: null,
+      policyName: "Keys",
+      policyRevision: 1,
+      source: "finding",
+      findingId: "01890a5d-ac96-774b-bcce-b302099a8002",
+      agentId: AGENT,
+      agentName: "cache-host",
+      targetId: "cache-redis",
+      classifier: "pii.email",
+      engine: "redis",
+      location: { databaseName: "db0", schemaName: "hash", objectName: "x:javascript:alert", fieldName: "email" },
+      findingMatched: 9,
+      matchCount: 1,
+      notifyChannels: [],
+      access: null,
+      createdAt: new Date(NOW - 60_000),
+      updatedAt: new Date(NOW - 60_000),
+      acknowledgedAt: null,
+      acknowledgedBy: null,
+      resolvedAt: null,
+      resolvedBy: null,
+      falsePositiveAt: null,
+      falsePositiveBy: null,
+    } as unknown as IncidentView;
+    const html = renderToStaticMarkup(<IncidentsTable incidents={[incident]} now={NOW} />);
+    expect(html).toContain('data-key-pattern="">x:javascript:alert</code>');
+    for (const h of hrefs(html)) expect(h).not.toContain("javascript");
   });
 });

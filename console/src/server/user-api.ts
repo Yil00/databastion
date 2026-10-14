@@ -597,9 +597,12 @@ export function handleConfigureAudit(req: Request, agentId: string, targetId: st
     });
     switch (r.outcome) {
       case "queued":
-        return json({ job_id: r.jobId, ...counts(r.change), truncated_objects: r.truncated }, 202);
+        return json({ job_id: r.jobId, ...counts(r.change), truncated_objects: r.truncated, skipped_key_patterns: r.skippedKeyPatterns }, 202);
       case "confirmation_required":
-        return json({ error: "confirmation_required", ...counts(r.change), truncated_objects: r.truncated, digest: r.digest }, 409);
+        return json(
+          { error: "confirmation_required", ...counts(r.change), truncated_objects: r.truncated, skipped_key_patterns: r.skippedKeyPatterns, digest: r.digest },
+          409,
+        );
       case "invalid":
         return error(400, "invalid_params");
       case "not_found":

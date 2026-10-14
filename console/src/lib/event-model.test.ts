@@ -221,6 +221,12 @@ describe("access_event conditions", () => {
     expect(eventMatches({ signals: ["signature.*"], event_actions: ["write"] }, FACTS)).toBeNull();
     expect(eventMatches({ principals: ["BACK*"] }, FACTS)).toEqual([0, 1]);
     expect(eventMatches({ principals: ["*"], exclude_principals: ["backup"] }, FACTS)).toBeNull();
+    // P9-E review L1: an unrecorded account only matches `*`, and exclusions never hide it.
+    const unrecorded = { ...FACTS, principal: "", accountNotRecorded: true };
+    expect(eventMatches({ principals: ["*"] }, unrecorded)).toEqual([0, 1]);
+    expect(eventMatches({ principals: ["backup*"] }, unrecorded)).toBeNull();
+    expect(eventMatches({ principals: ["?*"] }, unrecorded)).toBeNull();
+    expect(eventMatches({ principals: ["*"], exclude_principals: ["*"] }, unrecorded)).toEqual([0, 1]);
     expect(eventMatches({ min_rows: 2_000_000 }, FACTS)).toBeNull();
     expect(eventMatches({ min_rows: 1 }, { ...FACTS, rows: null })).toBeNull();
     expect(eventMatches({ min_score: 64.1 }, FACTS)).toEqual([0, 1]);

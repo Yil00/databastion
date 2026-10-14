@@ -343,8 +343,13 @@ export interface EventFacts {
   targetId: string;
   /** Engine last reported for the target. */
   engine: string | null;
-  /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place. */
+  /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place; empty when not recorded. */
   principal: string;
+  /**
+   * The source recorded no account (Redis / Valkey, ADR-0052 decision 8): `principals` globs other
+   * than `*` never match it, and `exclude_principals` never hides it (P9-E review L1).
+   */
+  accountNotRecorded?: boolean;
   action: string;
   source: string;
   objects: readonly EventObject[];
@@ -381,7 +386,7 @@ export function eventMatches(c: EventConditions, e: EventFacts): number[] | null
   if (c.event_actions && !c.event_actions.includes(e.action)) return null;
   if (c.signals && !e.signals.some((s) => signalSelected(c.signals as string[], s))) return null;
   if (c.principals && !c.principals.some((g) => globMatch(g, e.principal))) return null;
-  if (c.exclude_principals && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
+  if (c.exclude_principals && e.accountNotRecorded !== true && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.min_rows !== undefined && (e.rows === null || e.rows < c.min_rows)) return null;
   if (c.min_score !== undefined && e.score < c.min_score) return null;
   if (c.min_sensitivity !== undefined && e.sensitivity < c.min_sensitivity) return null;

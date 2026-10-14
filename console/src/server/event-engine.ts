@@ -688,6 +688,7 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         targetId: e.targetId,
         engine: engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
+        accountNotRecorded: e.accountNotRecorded,
         action: e.action,
         source: e.source,
         objects: e.objects,
