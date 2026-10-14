@@ -29,6 +29,7 @@ import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
 import { configureAudit } from "./audit-config";
+import { sha256Hex } from "./crypto";
 import * as engine from "./event-engine";
 import { EVENT_CHUNK, EVENT_CHUNK_PER_AGENT, evaluateChunk } from "./event-engine";
 import { BASELINES_CAP_VAR, EVENT_INCIDENTS_CAP_VAR, getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
@@ -660,6 +661,85 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       } finally {
         spy.mockRestore();
       }
+    });
+  });
+
+  describe("P9-E: events without a recorded account (Redis / Valkey, ADR-0052 decision 8)", () => {
+    const REDIS_HEARTBEAT = {
+      ...HEARTBEAT,
+      connectors: [...HEARTBEAT.connectors, "redis"],
+      targets: [
+        ...HEARTBEAT.targets,
+        { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
+      ],
+    };
+    const slowRead = (i: number, principal: Record<string, unknown>, over: Record<string, unknown> = {}) => ({
+      target_id: "cache-redis",
+      ts: at(i * 1000),
+      principal,
+      action: "read",
+      objects: [{ database: "db0", object: "user:*:profile" }],
+      rows: 50_000,
+      source: "redis_slowlog",
+      aggregated_count: 1,
+      ...over,
+    });
+
+    it("dedup principal unknown:<network> / unknown:local / unknown:none, no baseline, principal shown as not recorded", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HEARTBEAT }))).status).toBe(200);
+      await policy({ event_actions: ["read"], sources: ["redis_slowlog", "redis_sync"] });
+      const none = { account_not_recorded: true };
+      await send(auth, [
+        slowRead(0, { account_not_recorded: true, client_addr: "198.51.100.31" }),
+        slowRead(1, { account_not_recorded: true, client_addr: "198.51.100.77", application: "redis-cli" }),
+        slowRead(2, { account_not_recorded: true, client_addr: "203.0.113.40" }),
+        slowRead(3, { account_not_recorded: true, client_addr: "local" }),
+        slowRead(4, none, { source: "redis_sync", objects: [{ database: "*", object: "*" }], signals: ["signature.full_sync"] }),
+        slowRead(5, none, { source: "redis_sync", objects: [{ database: "*", object: "*" }], signals: ["signature.full_sync"] }),
+        // A named account of the same network is never merged with the unrecorded ones.
+        slowRead(6, { db_user: "app", client_addr: "198.51.100.31" }),
+      ]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      const principalPart = (k: string) => /\|principal:([^|]+)\|/.exec(k)?.[1];
+      const byPrincipal = new Map(list.map((i) => [principalPart(i.dedupKey), i]));
+      const net = (n: string) => `unknown:${sha256Hex(n)}`;
+      expect([...byPrincipal.keys()].sort()).toEqual(
+        [net("198.51.100.0/24"), net("203.0.113.0/24"), "unknown:local", "unknown:none", principalKey({ db_user: "app" })].sort(),
+      );
+      expect(byPrincipal.get(net("198.51.100.0/24"))?.matchCount).toBe(2);
+      expect(byPrincipal.get("unknown:none")?.matchCount).toBe(2);
+      expect(byPrincipal.get("unknown:local")?.matchCount).toBe(1);
+      // Never the hash of an empty fingerprint, never agent text in a key.
+      for (const i of list) {
+        expect(i.dedupKey).not.toContain(principalKey({ db_user_fingerprint: "" } as never));
+        expect(i.dedupKey).not.toContain("198.51.100");
+      }
+      const unrecorded = list.filter((i) => i.principal === "");
+      expect(unrecorded).toHaveLength(4);
+      expect(byPrincipal.get(principalKey({ db_user: "app" }))?.principal).toBe("app");
+      // No per-principal baseline for the unrecorded events: only `app` has one.
+      const baselines = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
+      expect(baselines.map((b) => b.dbUser)).toEqual(["app"]);
+      const events = await eventsOf(auth.agentId);
+      expect(events.filter((e) => e.accountNotRecorded).every((e) => e.anomaly === false && e.baselineRows === null)).toBe(true);
+      // Notifications: no principal, flagged as not recorded, never fingerprinted.
+      const [delivery] = await getDb()
+        .select()
+        .from(notificationDeliveries)
+        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get("unknown:none")?.id)));
+      expect(delivery?.payload).toMatchObject({ principal: "", principal_fingerprinted: false, principal_not_recorded: true });
+      const [named] = await getDb()
+        .select()
+        .from(notificationDeliveries)
+        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get(principalKey({ db_user: "app" }))?.id)));
+      expect(named?.payload).toMatchObject({ principal: "app", principal_fingerprinted: false, principal_not_recorded: false });
+      // Views: the events carry the flag; filtering on the network key lists that network only.
+      const views = await listEvents(getDb(), { agentId: auth.agentId, targetId: "cache-redis" });
+      expect(views.filter((v) => v.accountNotRecorded).every((v) => v.principal === "" && !v.fingerprinted)).toBe(true);
+      const key = principalKey({ account_not_recorded: true, client_addr: "198.51.100.31" });
+      expect(await listEvents(getDb(), { agentId: auth.agentId, principalKey: key })).toHaveLength(2);
     });
   });
 

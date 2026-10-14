@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
-import { enrollAgent, recordHeartbeat } from "@/server/agents";
+import { enrollAgent, recordHeartbeat, targetSourceDetails } from "@/server/agents";
 import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
@@ -104,6 +104,9 @@ export function handleHeartbeat(req: Request): Promise<Response> {
     // whole heartbeat, as a console built before the value would), never stored.
     const unlisted = unlistedEngineDetails("HeartbeatRequest", body.value);
     if (unlisted.length > 0) return invalidRequest(unlisted);
+    // P9-E: a target's audit source serves its engine (`400` `const`, the whole heartbeat).
+    const mismatched = targetSourceDetails(body.value);
+    if (mismatched.length > 0) return invalidRequest(mismatched);
     await recordHeartbeat(getDb(), auth.agent.id, body.value);
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,

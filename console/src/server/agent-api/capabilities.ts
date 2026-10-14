@@ -22,11 +22,28 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
  * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):
  * `cas` targets, connectors, findings (service registry and audit log locations) and `cas_audit_log`
- * events are validated, stored and rendered like those of any engine. `engine.sqlserver`,
- * `engine.redis` and `engine.valkey` (ADR-0051, ADR-0052) are in the contract but not listed before
- * P9-E: the agent API refuses their values (`unlistedEngineDetails`, P9-C review H1).
+ * events are validated, stored and rendered like those of any engine. `engine.sqlserver`
+ * (ADR-0051 decision 8) and `engine.redis` with `engine.valkey` (ADR-0052 decision 12) are listed
+ * since P9-E, Redis and Valkey together (the `redis` connector and the `redis_*` sources need both):
+ * their targets, connectors, detected targets, findings (`KeyPattern` objects for Redis / Valkey)
+ * and events (`account_not_recorded` principals included, ADR-0052 decision 8) are validated,
+ * stored and rendered like those of any engine. The gate (`unlistedEngineDetails`, P9-C review H1)
+ * stays for any engine token added to the contract later.
+ *
+ * `target_status.note_labels.2026_10` (ADR-0051 decision 4, ADR-0022 decision 4): the SQL Server
+ * `TargetNoteLabel` values of that revision are accepted and rendered with their display names
+ * (`src/lib/target-notes.ts`).
  */
-export const CONSOLE_ACCEPTS = ["access_event.bytes", "engine.cas", "job_progress.coverage", "target_status.notes"] as const;
+export const CONSOLE_ACCEPTS = [
+  "access_event.bytes",
+  "engine.cas",
+  "engine.redis",
+  "engine.sqlserver",
+  "engine.valkey",
+  "job_progress.coverage",
+  "target_status.note_labels.2026_10",
+  "target_status.notes",
+] as const;
 
 export type ConsoleCapability = (typeof CONSOLE_ACCEPTS)[number];
 

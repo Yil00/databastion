@@ -36,6 +36,8 @@ import type { Pool, PoolClient } from "pg";
 /** Constraints validated outside the migration transaction, in this order. Owner-defined names. */
 export const DEFERRED_VALIDATIONS: readonly { table: string; constraint: string }[] = [
   { table: "access_events", constraint: "access_events_bytes" },
+  // Migration 0040 (P9-E): the principal CHECK with `account_not_recorded`, added NOT VALID.
+  { table: "access_events", constraint: "access_events_principal" },
 ];
 
 const PLAIN_NAME = /^[a-z_][a-z0-9_]{0,62}$/;

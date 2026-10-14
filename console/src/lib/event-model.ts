@@ -106,9 +106,12 @@ export function eventScore(sensitivity: number, rows: number | null | undefined)
 /**
  * Only events that report a volume and read or change data feed a baseline: never `connect` or
  * `auth_failure` (security review H1: a login attempt with a random account name must not create
- * a baseline).
+ * a baseline), and never an event without a recorded account (`account_not_recorded`, ADR-0052
+ * decision 8, ADR-0021 decision 6): such events have no principal to learn, so the anomaly part
+ * of their score is not computed.
  */
-export function baselineEligible(e: { action: string; rows: number | null | undefined }): boolean {
+export function baselineEligible(e: { action: string; rows: number | null | undefined; accountNotRecorded?: boolean }): boolean {
+  if (e.accountNotRecorded === true) return false;
   return e.rows !== null && e.rows !== undefined && e.rows >= 0 && e.action !== "connect" && e.action !== "auth_failure";
 }
 
@@ -435,6 +438,8 @@ export function exceptionCoversEvent(
  *   (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
  *   `local` kept), so random account names or rotating addresses cannot open one incident each
  *   (security review H1, re-review N2);
+ * - events without a recorded account (`account_not_recorded`, Redis / Valkey, ADR-0052 decision
+ *   8): `unknown:<sha256 of the client network>`, `unknown:local` or `unknown:none` (no address);
  * - every other event: its principal key (SHA-256 of the name, or of the fingerprint sent in its
  *   place), so distinct principals are never merged (ADR-0031 decision 1, end-of-phase-6 review
  *   M1: on OpenLDAP nearly every principal is fingerprinted and has no client address, so the
@@ -467,8 +472,25 @@ export function coarsePrincipal(e: { action: string }): boolean {
 /**
  * Principal part of the dedup key (see above, ADR-0031 decision 1). `principalKey` = SHA-256 of
  * the principal, `networkHash` = SHA-256 of the client network: hashes only, never agent text.
+ *
+ * An event without a recorded account (`accountNotRecorded`, Redis / Valkey only, ADR-0052
+ * decision 8, contract `Principal`): `unknown:<SHA-256 of the client network>`, `unknown:local`
+ * for a local client, or `unknown:none` without a client address, whatever its action. Never its
+ * principal key alone: such events of one network share one incident per policy, database and
+ * hour, and never the incident of a named or fingerprinted principal.
  */
-export function dedupPrincipal(e: { action: string; principalKey: string; networkHash: string }): string {
+export function dedupPrincipal(e: {
+  action: string;
+  principalKey: string;
+  networkHash: string;
+  accountNotRecorded?: boolean;
+  clientAddr?: string | null;
+}): string {
+  if (e.accountNotRecorded === true) {
+    if (e.clientAddr === null || e.clientAddr === undefined) return "unknown:none";
+    if (e.clientAddr === "local") return "unknown:local";
+    return `unknown:${e.networkHash}`;
+  }
   return coarsePrincipal(e) ? `unknown:${e.networkHash}` : e.principalKey;
 }
 
@@ -477,7 +499,10 @@ export function eventDedupKey(k: {
   policyId: string;
   agentId: string;
   targetId: string;
-  /** The principal key, or `unknown:<sha256 of client_addr>` for a coarse principal. */
+  /**
+   * The principal key, or `unknown:<sha256 of the client network>` for a coarse principal, or
+   * `unknown:local` / `unknown:none` for an event without a recorded account.
+   */
   principalKey: string;
   /** SHA-256 (hex) of the database name, or `-`. */
   databaseKey: string;

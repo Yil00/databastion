@@ -21,9 +21,11 @@ const defs = bundle.$defs as Record<string, Def>;
 
 type Token = (typeof CONSOLE_ACCEPTS)[number];
 type EngineToken = Extract<Token, `engine.${string}`>;
+/** Enum revision tokens (ADR-0022 decision 4): `<object>.<field>.<revision>`. */
+type RevisionToken = Extract<Token, `target_status.note_labels.${string}`>;
 
 /** The contract fields each field capability token stands for (ADR-0022). */
-const FIELDS: Record<Exclude<Token, EngineToken>, [schema: string, ...properties: string[]]> = {
+const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: string, ...properties: string[]]> = {
   "access_event.bytes": ["AccessEvent", "bytes"],
   "job_progress.coverage": [
     "JobProgress",
@@ -41,10 +43,18 @@ const FIELDS: Record<Exclude<Token, EngineToken>, [schema: string, ...properties
 /** The contract values each engine token stands for (ADR-0039 decision 8, ADR-0041 decision 12). */
 const ENGINE_TOKENS: Record<EngineToken, { engine: string; connector?: string; sources: string[] }> = {
   "engine.cas": { engine: "cas", connector: "cas", sources: ["cas_audit_log"] },
+  "engine.sqlserver": { engine: "sqlserver", connector: "sqlserver", sources: ["sqlserver_audit", "sqlserver_xevents", "sqlserver_query_stats"] },
+  // One connector and four sources serve both Redis and Valkey (ADR-0052 decision 12).
+  "engine.redis": { engine: "redis", connector: "redis", sources: ["redis_slowlog", "redis_commandlog", "redis_acl_log", "redis_sync"] },
+  "engine.valkey": { engine: "valkey", connector: "redis", sources: ["redis_slowlog", "redis_commandlog", "redis_acl_log", "redis_sync"] },
 };
 
 function isEngineToken(token: Token): token is EngineToken {
   return token.startsWith("engine.");
+}
+
+function isRevisionToken(token: Token): token is RevisionToken {
+  return token.startsWith("target_status.note_labels.");
 }
 
 function enumOf(schema: string): string[] {
@@ -59,7 +69,7 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
 
   it("names only fields that the generated contract schemas accept", () => {
     for (const token of CONSOLE_ACCEPTS) {
-      if (isEngineToken(token)) continue;
+      if (isEngineToken(token) || isRevisionToken(token)) continue;
       const [schema, ...properties] = FIELDS[token];
       const def = defs[schema];
       expect(def, schema).toBeDefined();
@@ -80,11 +90,21 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
 
   it("lists every engine added after protocol 0.1.0", () => {
     const v010 = ["postgres", "mysql", "mariadb", "mongodb", "openldap"];
-    // In the contract since P9-C (ADR-0051, ADR-0052), listed by the console from P9-E on.
-    const notListedYet = ["sqlserver", "redis", "valkey"];
     const listed = CONSOLE_ACCEPTS.filter(isEngineToken).map((t) => ENGINE_TOKENS[t].engine);
-    expect(enumOf("Engine").filter((e) => !v010.includes(e) && !notListedYet.includes(e))).toEqual(listed);
-    for (const e of notListedYet) expect(CONSOLE_ACCEPTS).not.toContain(`engine.${e}`);
+    expect(enumOf("Engine").filter((e) => !v010.includes(e)).sort()).toEqual([...listed].sort());
+  });
+
+  it("lists engine.redis and engine.valkey together (ADR-0052 decision 12: the shared values need both)", () => {
+    expect(CONSOLE_ACCEPTS).toContain("engine.redis");
+    expect(CONSOLE_ACCEPTS).toContain("engine.valkey");
+    expect(CONSOLE_ACCEPTS).toContain("engine.sqlserver");
+  });
+
+  it("lists the SQL Server note-label revision, whose labels are contract TargetNoteLabel values (ADR-0051 decision 4)", () => {
+    expect(CONSOLE_ACCEPTS.filter(isRevisionToken)).toEqual(["target_status.note_labels.2026_10"]);
+    for (const label of ["sysadmin", "db_owner", "ms_login_manager", "control_server", "password_hash_probe"]) {
+      expect(enumOf("TargetNoteLabel"), label).toContain(label);
+    }
   });
 
   it("is a valid HeartbeatResponse.accepts", () => {
@@ -93,7 +113,7 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
   });
 });
 
-/** Every engine token of the contract, as P9-E will list them. */
+/** Every engine token of the contract, all listed since P9-E. */
 const ALL_ENGINE_TOKENS: ContractEngineToken[] = ["engine.cas", "engine.sqlserver", "engine.redis", "engine.valkey"];
 
 describe("engine token gate (ADR-0042, P9-C review H1)", () => {
@@ -125,12 +145,19 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     expect(validateSchema("CapabilityList", ALL_ENGINE_TOKENS).ok).toBe(true);
   });
 
-  it("refuses every value of an engine CONSOLE_ACCEPTS does not list, and nothing once every token is listed", () => {
-    const all = [...CONSOLE_ACCEPTS, ...ALL_ENGINE_TOKENS];
+  it("lets every valid fixture through with CONSOLE_ACCEPTS (P9-E lists every engine token of the contract)", () => {
+    for (const t of ALL_ENGINE_TOKENS) expect(CONSOLE_ACCEPTS as readonly string[]).toContain(t);
+    for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
+      for (const [file, body] of fixtures("valid", name)) expect(unlistedEngineDetails(name, body), file).toEqual([]);
+    }
+  });
+
+  it("still refuses, with enum, every value of an engine a token list leaves out (the gate for later engines)", () => {
+    // The list of a console built before P9-E.
+    const before = ["access_event.bytes", "engine.cas", "job_progress.coverage", "target_status.notes"];
     for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
       for (const [file, body] of fixtures("valid", name)) {
-        expect(unlistedEngineDetails(name, body, all), file).toEqual([]);
-        const unlisted = unlistedEngineDetails(name, body);
+        const unlisted = unlistedEngineDetails(name, body, before);
         expect(unlisted.length > 0, file).toBe(/sqlserver|redis|valkey/.test(file));
         for (const d of unlisted) expect(d.keyword).toBe("enum");
       }

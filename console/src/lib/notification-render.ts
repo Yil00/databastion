@@ -1,10 +1,14 @@
+import { inlineCode, isKeyPatternSource } from "@/lib/key-pattern";
+import { isKeyPatternEngine } from "@/lib/location-labels";
 import { SYSTEM_ALERT_EVENTS, type SystemAlertEvent } from "@/lib/notification-model";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 
 /**
  * Notification contents (P3-C): the payload stored in the outbox, the webhook JSON body and the
  * plain-text e-mail. Payloads hold identifiers, counts, normalized names and console URLs only:
- * never a sampled value, masked or not (I2), never a secret.
+ * never a sampled value, masked or not (I2), never a secret. Redis / Valkey key patterns follow the
+ * contract's `KeyPattern` rendering rule: a JSON string in the webhook body, inline code in the
+ * e-mail text (`src/lib/key-pattern.ts`).
  */
 
 export interface IncidentOpenedPayload {
@@ -46,9 +50,17 @@ export interface AccessIncidentOpenedPayload {
    * incidents; the further matches of the hour are counted in this one (`principal` is empty).
    */
   overflow: { limit_per_hour: number } | null;
-  /** `db_user`, or the `hmac-sha256:` fingerprint the agent sent in its place. */
+  /**
+   * `db_user`, or the `hmac-sha256:` fingerprint the agent sent in its place; empty when the
+   * source recorded no account (`principal_not_recorded`) and on the overflow incident.
+   */
   principal: string;
   principal_fingerprinted: boolean;
+  /**
+   * The source records no account for this access (contract `Principal.account_not_recorded`,
+   * Redis / Valkey only, ADR-0052 decision 8). Absent in rows written before P9-E.
+   */
+  principal_not_recorded?: boolean;
   /** Database of the dedup scope (null for an event without object). */
   database: string | null;
   /** Start of the UTC hour of the dedup scope. */
@@ -233,7 +245,17 @@ function one(v: string, max = 200): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+/** A Redis / Valkey key pattern in plain text: one line, bounded, then inline code (`KeyPattern`). */
+function keyPatternText(v: string): string {
+  return inlineCode(one(v, 128));
+}
+
 function locationText(l: IncidentOpenedPayload["location"]): string {
+  if (isKeyPatternEngine(l.engine)) {
+    // Redis / Valkey: `db<n>`, type, key pattern (inline code), field; never joined by `.`, a
+    // separator of key patterns.
+    return [one(l.database, 128), ...(l.schema !== null ? [one(l.schema, 128)] : []), keyPatternText(l.object), one(l.field, 128)].join(" / ");
+  }
   return [l.database, l.schema, l.object, l.field].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
 }
 
@@ -249,14 +271,29 @@ const SYSTEM_ALERT_LABEL: Record<SystemAlertEvent, string> = {
 
 const FOOTER = "\n--\nSent by DataBastion. No data value, masked or not, is ever included in notifications.\n";
 
-function objectText(o: AccessIncidentOpenedPayload["access"]["objects"][number]): string {
+function objectText(o: AccessIncidentOpenedPayload["access"]["objects"][number], keyPatterns: boolean): string {
+  if (keyPatterns) return [one(o.database, 128), ...(o.schema !== null ? [one(o.schema, 128)] : []), keyPatternText(o.object)].join(" / ");
   return [o.database, o.schema, o.object].filter((x): x is string => x !== null).map((x) => one(x, 128)).join(".");
+}
+
+function principalText(p: AccessIncidentOpenedPayload): string {
+  if (p.overflow) return "several";
+  if (p.principal_not_recorded === true) {
+    return "not recorded by the source (a connection closed before it was attributed, or a full synchronization; grouped by client network)";
+  }
+  return `${one(p.principal, 128)}${p.principal_fingerprinted ? " (fingerprint of an unknown or non-conforming account name)" : ""}`;
 }
 
 function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { subject: string; text: string } {
   const a = p.access;
   const unregistered = new Set(a.unregistered_signals ?? unregisteredSignals(a.signals));
-  const objects = a.objects.slice(0, 5).map(objectText).join(", ") + (a.objects.length > 5 ? `, and ${a.objects.length - 5} more` : "");
+  // Redis / Valkey sources: object names are key patterns (inline code, `KeyPattern` rule).
+  const keyPatterns = isKeyPatternSource(a.source);
+  const objects =
+    a.objects
+      .slice(0, 5)
+      .map((o) => objectText(o, keyPatterns))
+      .join(", ") + (a.objects.length > 5 ? `, and ${a.objects.length - 5} more` : "");
   const lines = [
     p.overflow
       ? `The policy reached its limit of ${p.overflow.limit_per_hour} new incidents this hour: the further matches of the hour are counted in this incident. The event below is the first of them.`
@@ -269,7 +306,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     `Policy:     ${one(p.policy.name, 100)} (rev. ${p.policy.revision}, ${p.policy.id})`,
     `Agent:      ${p.agent_id}`,
     `Target:     ${one(p.target_id, 128)}`,
-    `Principal:  ${p.overflow ? "several" : `${one(p.principal, 128)}${p.principal_fingerprinted ? " (fingerprint of an unknown or non-conforming account name)" : ""}`}`,
+    `Principal:  ${principalText(p)}`,
     `Database:   ${p.database === null ? "none" : one(p.database, 128)} (hour starting ${p.hour})`,
     `Access:     ${one(a.action, 16)} at ${a.ts} (${one(a.source, 32)})`,
     `Objects:    ${objects || "none"}`,
@@ -279,7 +316,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     `Opened at:  ${p.occurred_at}`,
   ];
   return {
-    subject: `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)} (${p.overflow ? "hourly limit reached" : one(p.principal, 64)})`,
+    subject: `[DataBastion] ${p.incident.severity.toUpperCase()} incident: ${one(p.policy.name, 100)} (${p.overflow ? "hourly limit reached" : p.principal_not_recorded === true ? "account not recorded" : one(p.principal, 64)})`,
     text: `${lines.join("\n")}\n${link}${FOOTER}`,
   };
 }
