@@ -96,8 +96,16 @@ async fn scan(t: &TargetConfig) -> Scan {
     }
 }
 
-/// A test-only raw command (the connector cannot encode it).
+/// A test-only raw command (the connector cannot encode it), as the
+/// target's account.
 async fn raw(t: &TargetConfig, args: &[&[u8]]) -> Value {
+    let password = t.secret.read().unwrap();
+    let mut out = raw_as(t, &t.account, &password, &[args.to_vec()]).await;
+    out.pop().unwrap()
+}
+
+/// Test-only raw commands as `user`, on one connection; their replies.
+async fn raw_as(t: &TargetConfig, user: &str, password: &str, cmds: &[Vec<&[u8]>]) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
     let ep = Endpoint::Tcp {
@@ -105,26 +113,24 @@ async fn raw(t: &TargetConfig, args: &[&[u8]]) -> Value {
         port: t.port.unwrap(),
     };
     let mut io = ep.open(tls).await.unwrap();
-    let password = t.secret.read().unwrap();
     let mut req = Vec::new();
-    crate::resp::encode(
-        &[b"AUTH", t.account.as_bytes(), password.as_bytes()],
-        &mut req,
-    );
+    crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
     crate::resp::encode(&[b"HELLO", b"3"], &mut req);
-    crate::resp::encode(args, &mut req);
+    for c in cmds {
+        crate::resp::encode(c, &mut req);
+    }
     io.write_all(&req).await.unwrap();
     let limits = RespLimits {
         bulk: 1 << 20,
-        items: 4096,
+        items: 1 << 16,
         skip_oversized: false,
-        reply: 8 << 20,
+        reply: 64 << 20,
     };
     let mut d = Decoder::new(limits);
     let mut buf = vec![0u8; 65536];
     let mut replies = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
-    while replies.len() < 3 {
+    while replies.len() < cmds.len() + 2 {
         let n = io.read(&mut buf).await.unwrap();
         assert!(n > 0, "connection closed");
         pending.extend_from_slice(&buf[..n]);
@@ -137,7 +143,15 @@ async fn raw(t: &TargetConfig, args: &[&[u8]]) -> Value {
             }
         }
     }
-    replies.pop().unwrap()
+    assert!(replies[0].error().is_none(), "AUTH as {user}");
+    replies.split_off(2)
+}
+
+/// Commands as the dev `admin` user (seeding the scratch databases).
+async fn admin(t: &TargetConfig, cmds: &[Vec<&[u8]>]) -> Vec<Value> {
+    let password =
+        std::env::var("REDIS_ADMIN_PASSWORD").unwrap_or_else(|_| "dev-only-redis-admin".to_owned());
+    raw_as(t, "admin", &password, cmds).await
 }
 
 /// `ACL LOG` entries of `user` (their `count` summed).
@@ -256,16 +270,6 @@ fn findings_json(findings: &[MaskedFinding], engine: TargetEngine) -> Vec<serde_
         .collect()
 }
 
-/// Whether the emitted `pattern` covers the expected one: equal, or `*`
-/// where the expected one has a literal (the ADR's rules may mask more than
-/// the ground truth expects, never less).
-fn covers(pattern: &str, expected: &str) -> bool {
-    let split =
-        |s: &str| -> Vec<String> { s.split([':', '/', '|', '.']).map(str::to_owned).collect() };
-    let (p, e) = (split(pattern), split(expected));
-    pattern == "*" || (p.len() == e.len() && p.iter().zip(&e).all(|(a, b)| a == "*" || a == b))
-}
-
 async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
     let t = target(name, engine, "databastion", "");
     let s = scan(&t).await;
@@ -295,9 +299,10 @@ async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
                 }
             }
         }
-        let object = l["object"]
+        // The pattern expected on the uplink (exact).
+        let object = l["expected_normalized_name"]
             .as_str()
-            .or(l["expected_normalized_name"].as_str())
+            .or(l["object"].as_str())
             .unwrap();
         for c in l["expected_classifiers"].as_array().unwrap() {
             let found = json.iter().any(|f| {
@@ -306,7 +311,7 @@ async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
                     && loc["database"] == l["database"]
                     && loc["schema"] == l["container"]
                     && loc["field"] == l["field"]
-                    && covers(loc["object"].as_str().unwrap(), object)
+                    && loc["object"] == object
             });
             if !found {
                 missing.push(format!("{} {} {} {}", l["database"], object, l["field"], c));
@@ -322,13 +327,11 @@ async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
     for expected in [
         "customer:*:email",
         "user:*:profile",
-        "phone:*",
-        "addressbook:*",
+        // `phone:<n>` and `addressbook:<n>`: the record-id rule at the
+        // first position too (security review H1).
+        "*:*",
         "session:*",
         "queue:sms_outbox",
-        "events:payments",
-        "newsletter:subscribers",
-        "loyalty:leaderboard",
         "integration:*:secret_access_key",
     ] {
         assert!(
@@ -336,6 +339,18 @@ async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
             "{name}: {expected} in {objects:?}"
         );
     }
+    // Every two-segment name of db0 shares `*:*` with `phone:<n>`
+    // (one per Redis type).
+    let two: std::collections::BTreeSet<&str> = json
+        .iter()
+        .filter(|f| f["location"]["object"] == "*:*")
+        .filter_map(|f| f["location"]["schema"].as_str())
+        .collect();
+    assert_eq!(
+        two.into_iter().collect::<Vec<_>>(),
+        ["hash", "set", "stream", "string", "zset"],
+        "{name}"
+    );
     // Every value-carrying key name gave a `#key` or `#field` finding.
     assert!(json.iter().any(|f| f["location"]["field"] == "#key"));
     assert!(json.iter().any(|f| f["location"]["field"] == "#field"));
@@ -440,5 +455,135 @@ async fn the_password_never_reaches_the_slow_log() {
         );
         // HELLO carried no credential; the agent's own commands are there.
         assert!(text.windows(5).any(|w| w == b"HELLO"), "{name}");
+    }
+}
+
+/// A small deterministic generator (test only).
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((self.0 >> 33) % n as u64) as usize
+    }
+
+    fn string(&mut self, alphabet: &[u8], max: usize) -> Vec<u8> {
+        let len = self.next(max) + 1;
+        (0..len)
+            .map(|_| alphabet[self.next(alphabet.len())])
+            .collect()
+    }
+}
+
+/// ADR-0052 obligation (security review M5): the local glob matcher agrees
+/// with the server's `SCAN … MATCH` on generated names and patterns
+/// (classes, ranges, negation, escapes, malformed classes), on both
+/// engines. Uses the scratch database 15, seeded and flushed by `admin`.
+#[tokio::test]
+async fn local_glob_matcher_agrees_with_scan_match() {
+    if !enabled() {
+        return;
+    }
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = target(name, engine, "databastion", "");
+        let mut rng = Lcg(0x5eed_0052 ^ u64::from(port(engine)));
+        let keys: Vec<Vec<u8>> = {
+            let mut k: Vec<Vec<u8>> = (0..300).map(|_| rng.string(b"abc:-x^]\\[*?", 7)).collect();
+            k.sort();
+            k.dedup();
+            k
+        };
+        let mut seed: Vec<Vec<&[u8]>> = vec![vec![b"SELECT", b"15"], vec![b"FLUSHDB"]];
+        for k in &keys {
+            seed.push(vec![b"SET", k, b"v"]);
+        }
+        admin(&t, &seed).await;
+        let patterns: Vec<Vec<u8>> = (0..300).map(|_| rng.string(b"abc:-x*?[]^\\", 6)).collect();
+        let mut cmds: Vec<Vec<&[u8]>> = vec![vec![b"SELECT", b"15"]];
+        for p in &patterns {
+            cmds.push(vec![b"SCAN", b"0", b"MATCH", p, b"COUNT", b"100000"]);
+        }
+        let replies = admin(&t, &cmds).await;
+        let mut disagree = Vec::new();
+        for (p, r) in patterns.iter().zip(replies.iter().skip(1)) {
+            let Value::Array(parts) = r else {
+                panic!("SCAN reply")
+            };
+            assert_eq!(parts[0].as_bytes(), Some(&b"0"[..]), "one SCAN call");
+            let Value::Array(found) = &parts[1] else {
+                panic!("SCAN keys")
+            };
+            let mut server: Vec<&[u8]> = found.iter().filter_map(Value::as_bytes).collect();
+            server.sort_unstable();
+            let local: Vec<&[u8]> = keys
+                .iter()
+                .filter(|k| crate::glob::matches(p, k))
+                .map(Vec::as_slice)
+                .collect();
+            if server != local {
+                disagree.push(String::from_utf8_lossy(p).into_owned());
+            }
+        }
+        admin(&t, &[vec![b"SELECT", b"15"], vec![b"FLUSHDB"]]).await;
+        assert!(
+            disagree.is_empty(),
+            "{name}: {} patterns disagree: {disagree:?}",
+            disagree.len()
+        );
+    }
+}
+
+/// Security review H2: a hash keyed by data, alone in its pattern, keeps
+/// none of its field names (it has more than 16). Scratch database 14.
+#[tokio::test]
+async fn a_large_data_keyed_hash_reports_no_field_name() {
+    if !enabled() {
+        return;
+    }
+    let names = [
+        "jdupont", "amartin", "lucas", "bernard", "dubois", "thomas", "robert", "richard", "petit",
+        "durand", "leroy", "moreau", "simon", "laurent", "lefebvre", "michel", "garcia", "david",
+        "bertrand", "roux", "vincent", "fournier", "morel", "girard", "andre",
+    ];
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = target(name, engine, "databastion", "databases: [14]");
+        let values: Vec<String> = (0..names.len())
+            .map(|i| format!("support.desk{i}@example.org"))
+            .collect();
+        let mut hset: Vec<&[u8]> = vec![b"HSET", b"accounts:directory"];
+        for (n, v) in names.iter().zip(&values) {
+            hset.push(n.as_bytes());
+            hset.push(v.as_bytes());
+        }
+        admin(&t, &[vec![b"SELECT", b"14"], vec![b"FLUSHDB"], hset]).await;
+        let s = scan(&t).await;
+        admin(&t, &[vec![b"SELECT", b"14"], vec![b"FLUSHDB"]]).await;
+        assert!(s.result.is_ok(), "{:?}", s.result);
+        let json = findings_json(&s.findings, engine);
+        let text = serde_json::to_string(&json).unwrap();
+        let ours: Vec<&serde_json::Value> = json
+            .iter()
+            .filter(|f| f["location"]["object"] == "accounts:directory")
+            .collect();
+        assert!(!ours.is_empty(), "{name}: no finding on the hash");
+        // Values under `*`; field names that look like values themselves
+        // (first names here) only as masked `#field` findings.
+        assert!(ours.iter().any(|f| f["location"]["field"] == "*"), "{name}");
+        for f in &ours {
+            let field = f["location"]["field"].as_str().unwrap();
+            assert!(field == "*" || field == "#field", "{name}: {field}");
+        }
+        for n in names {
+            assert!(!text.contains(n), "{name}: a field name left in clear");
+        }
     }
 }
