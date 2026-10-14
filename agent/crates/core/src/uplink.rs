@@ -535,14 +535,15 @@ pub(crate) fn held_back(
     !gates.iter().all(|t| caps.console_accepts(t))
 }
 
-/// The token gating a finding: that of its location's engine.
-fn finding_gate(f: &Finding) -> Option<&'static str> {
+/// The tokens gating a finding: those of its location's engine.
+fn finding_gate(f: &Finding) -> &'static [&'static str] {
     crate::capabilities::engine_token(f.location.engine)
 }
 
-/// The token gating an event: that of its source (an event names no
-/// engine; every source belongs to one).
-fn event_gate(e: &AccessEvent) -> Option<&'static str> {
+/// The tokens gating an event: those of its source (an event names no
+/// engine; every source belongs to one engine, or to both Redis and
+/// Valkey).
+fn event_gate(e: &AccessEvent) -> &'static [&'static str] {
     crate::capabilities::audit_source_token(e.source)
 }
 
@@ -601,8 +602,16 @@ impl Parsed {
 
     fn gates(&self) -> Vec<&'static str> {
         let mut gates: Vec<&'static str> = match self {
-            Self::Findings(b) => b.findings.iter().filter_map(finding_gate).collect(),
-            Self::Events(b) => b.events.iter().filter_map(event_gate).collect(),
+            Self::Findings(b) => b
+                .findings
+                .iter()
+                .flat_map(|f| finding_gate(f).iter().copied())
+                .collect(),
+            Self::Events(b) => b
+                .events
+                .iter()
+                .flat_map(|e| event_gate(e).iter().copied())
+                .collect(),
         };
         gates.sort_unstable();
         gates.dedup();
@@ -802,7 +811,7 @@ impl ResultBatch {
                         }
                         let keep = keep_values
                             && unknown_value.binary_search(i).is_ok()
-                            && finding_gate(f).is_some();
+                            && !finding_gate(f).is_empty();
                         kept_values |= keep;
                         keep
                     })
@@ -821,7 +830,7 @@ impl ResultBatch {
                     let field = unknown.binary_search(&i).is_ok() && event_carries_gated(&e);
                     let value = keep_values
                         && unknown_value.binary_search(&i).is_ok()
-                        && event_gate(&e).is_some();
+                        && !event_gate(&e).is_empty();
                     if rejected.binary_search(&i).is_ok() {
                         if !field && !value {
                             left_out += 1;
@@ -1034,7 +1043,7 @@ fn event_item(
     for o in e.objects() {
         objects.push(ObjectRef {
             database: id(o.database())?,
-            object: id(o.object())?,
+            object: id(o.object())?.into(),
             schema: match o.schema() {
                 Some(s) => Some(id(s)?),
                 None => None,
@@ -1104,7 +1113,7 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             database: id(&loc.database)?,
             engine,
             field: id(&loc.field)?,
-            object: id(&loc.object)?,
+            object: id(&loc.object)?.into(),
             schema: match &loc.schema {
                 Some(s) => Some(id(s)?),
                 None => None,

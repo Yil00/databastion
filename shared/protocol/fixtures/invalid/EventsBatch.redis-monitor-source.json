@@ -1,0 +1,21 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1b",
+  "events": [
+    {
+      "target_id": "t-1",
+      "ts": "2026-10-14T09:01:00Z",
+      "principal": {
+        "db_user": "app"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "db0",
+          "object": "*"
+        }
+      ],
+      "source": "redis_monitor",
+      "aggregated_count": 1
+    }
+  ]
+}

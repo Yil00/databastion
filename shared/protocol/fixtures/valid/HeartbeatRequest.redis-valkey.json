@@ -1,0 +1,129 @@
+{
+  "ts": "2026-10-14T09:00:00Z",
+  "agent_version": "0.8.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "redis"
+  ],
+  "targets": [
+    {
+      "target_id": "cache-redis",
+      "engine": "redis",
+      "server_version": "7.4.11",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "redis_slowlog",
+      "notes": [
+        {
+          "code": "audit.slow_operations_only"
+        },
+        {
+          "code": "audit.records_dropped",
+          "count": 40
+        },
+        {
+          "code": "coverage.cluster_node_only",
+          "count": 1
+        },
+        {
+          "code": "coverage.module_types_not_sampled",
+          "count": 2
+        },
+        {
+          "code": "coverage.cas_guard_tripped",
+          "count": 1
+        },
+        {
+          "code": "privilege.read_beyond_discovery",
+          "count": 2
+        },
+        {
+          "code": "privilege.pubsub_channels",
+          "count": 2
+        },
+        {
+          "code": "privilege.ticket_credentials_readable"
+        },
+        {
+          "code": "security.default_user_nopass",
+          "count": 0
+        },
+        {
+          "code": "check.server_is_valkey"
+        }
+      ]
+    },
+    {
+      "target_id": "sessions-valkey",
+      "engine": "valkey",
+      "server_version": "8.1.0-rc1",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "audit.acl_log_only"
+        },
+        {
+          "code": "audit.limited_pending_first_record"
+        },
+        {
+          "code": "privilege.declared_keys_not_readable",
+          "count": 1
+        },
+        {
+          "code": "privilege.write_actions",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "target_id": "legacy-redis",
+      "engine": "redis",
+      "server_version": "6.2.24",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "privilege.admin_commands",
+          "count": 4
+        },
+        {
+          "code": "privilege.scripting",
+          "count": 2
+        },
+        {
+          "code": "privilege.not_evaluated"
+        },
+        {
+          "code": "audit.stream_not_available"
+        },
+        {
+          "code": "audit.log_not_readable"
+        }
+      ]
+    }
+  ],
+  "detected_targets": [
+    {
+      "engine": "redis",
+      "port": 6379
+    },
+    {
+      "engine": "valkey",
+      "unix_socket": "/run/valkey/valkey.sock",
+      "process": "valkey-server"
+    },
+    {
+      "engine": "redis",
+      "unix_socket": "/run/redis/redis-server.sock",
+      "process": "redis-server"
+    }
+  ],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

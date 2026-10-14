@@ -112,11 +112,14 @@ info:
     Tokens are `Capability` values; unknown tokens are ignored. New enum values in a request
     (e.g. `TargetNoteLabel`) are negotiated the same way, with a revision token. **Engines
     added after protocol 0.1.0** are negotiated with the token `engine.<value>` (`engine.cas`,
-    ADR-0041 decision 12, applying ADR-0039 decision 8; agent handling in ADR-0042): until the
-    console's latest heartbeat response lists it, the agent sends no `Connector`, `Engine` or
+    ADR-0041 decision 12, applying ADR-0039 decision 8; `engine.sqlserver`, ADR-0051 decision 8;
+    `engine.redis` and `engine.valkey`, ADR-0052 decision 12; agent handling in ADR-0042): until
+    the console's latest heartbeat response lists it, the agent sends no `Connector`, `Engine` or
     `AuditSource` value of that engine (no target, detected target, finding or event of it, and
     no such connector in `/enroll`, which precedes every heartbeat), so a `ConnectorList` longer
-    than the four 0.1.0 connectors only reaches a console that accepts it. A console running
+    than the four 0.1.0 connectors only reaches a console that accepts it. A value shared by
+    several engines (the `redis` connector and the `redis_*` audit sources serve Redis and
+    Valkey) is sent only when **every** one of their tokens is listed. A console running
     several replicas lists such a token only once every replica accepts the value (ADR-0022
     decision 8). Registries whose
     ids are checked for form only (`signals.json`, `target-notes.json`) need no negotiation: an
@@ -139,6 +142,27 @@ info:
       detect clock skew;
     - in each masked sample, at least 50 % of the non-separator characters (letters, digits and `*`)
       are `*` (e.g. `06 ** ** ** 78`: 6 of 10; keyword `maskRatio`).
+
+    **Engine-token gate** (ADR-0039 decision 8, ADR-0042; P9-C review H1). The schema accepts every
+    `Engine`, `Connector`, `AuditSource` and `DetectedTarget.process` value of the contract, but the
+    console refuses a value whose engine token it does not list in `HeartbeatResponse.accepts`,
+    exactly as a console built before the value would: `400` `invalid_request`, keyword `enum`,
+    one detail per value (up to 20). A value serving several engines needs **every** one of their
+    tokens: the `redis` connector and the `redis_*` sources need both `engine.redis` and
+    `engine.valkey`; a process needs the tokens of the engines it can belong to. Checked right after
+    schema validation, before anything is read from or written to the database:
+    - `POST /enroll`: `/connectors/<i>`;
+    - `POST /heartbeat`: `/connectors/<i>`, `/targets/<i>/engine`, `/targets/<i>/audit_source`,
+      `/detected_targets/<i>/engine` and `/detected_targets/<i>/process`. The **whole heartbeat**
+      is refused and nothing of it is stored;
+    - `POST /findings`: `/findings/<i>/location/engine` (before the stored-batch rate and every
+      check of the list below);
+    - `POST /events`: `/events/<i>/source` (after the body checks of step 2 below, before
+      back-pressure).
+    On `/findings` and `/events` such a refusal is an agent-integrity event (`batch_rejected`): a
+    conforming agent never sends these values before the token is listed. The agent keeps the items
+    pointed at with `enum` on exactly those engine pointers and holds them in its spool until a
+    heartbeat response lists the tokens (ADR-0042 decision 3).
 
     `POST /findings`, in this order, after the duplicate check of "Idempotency":
     1. **Job.** `job_id` is a `discovery.scan` job assigned to the calling agent that accepts findings
@@ -189,9 +213,21 @@ info:
        `batch_conflict`). The batches of one agent are ingested one at a time.
     6. **Targets.** Every `target_id` belongs to the calling agent (`404`, `/events/<i>/target_id`,
        `notFound`).
-    7. **Future timestamps.** `ts` or `ts_last` more than **5 min** ahead of the console clock
+    7. **Target engine** (P9-C review H1, ADR-0052 decision 7). Each event is checked against its
+       target's engine as last reported by the agent's heartbeats, whatever tokens the console
+       lists (`400`, item pointers, reported together, up to 20 details):
+       - the event's `source` serves the target's engine (`/events/<i>/source`, keyword `const`):
+         the schema chooses the object-name schema from the source, so a `redis_*` source on a
+         PostgreSQL target would otherwise carry names with `:` and `/`;
+       - `account_not_recorded` only on a `redis` or `valkey` target (`/events/<i>/principal`,
+         keyword `not`);
+       - on any target other than `redis` and `valkey`, every object name is an `Identifier`
+         (`/events/<i>/objects/<j>/object`, keyword `pattern`): `ObjectRef` names no engine.
+       These keywords are not `enum`: the agent drops the items pointed at (generic item-pointer
+       rule), it never holds them.
+    8. **Future timestamps.** `ts` or `ts_last` more than **5 min** ahead of the console clock
        (`400`, `/events/<i>/ts` or `/events/<i>/ts_last`, keyword `formatMaximum`).
-    8. **Retention.** Only when step 7 found nothing: `ts` older than the console's event
+    9. **Retention.** Only when step 8 found nothing: `ts` older than the console's event
        retention (`DATABASTION_EVENTS_RETENTION_DAYS`, default 90 days, accepted 7 to 3650)
        (`400`, `/events/<i>/ts`, keyword `formatMinimum`). Such an event would be purged at once.
        A conforming agent with an old spool can hit this check: the console counts it and raises
@@ -201,7 +237,7 @@ info:
 
     Every item-level answer above carries item pointers (`/events/<i>/...`), so the agent drops
     only the offending events. A batch holding both a future and an expired event is first
-    answered on the future one (step 7), then, once resent without it, on the expired one.
+    answered on the future one (step 8), then, once resent without it, on the expired one.
 
     **`429` on `POST /events`** (`rate_limited`, no `details`, `Retry-After` always present, in
     seconds): `30` for back-pressure (step 3); the time left in the current one-minute window,
@@ -243,6 +279,7 @@ info:
     form-only `TargetNoteCode` schema, conforming agents send registered codes only).
 
     Every string coming from an agent is escaped on display and in exports (no HTML, CSV or log injection).
+    Redis / Valkey key patterns (`KeyPattern`) have their own rendering rule, below `KeyPattern`.
 servers:
   - url: https://{console_host}/api/agent/v1
     description: DataBastion console, agent API version 1.
@@ -1016,6 +1053,81 @@ components:
         type: string
         pattern: '^[0-9 +.-]{9,}$|(^|\.)[0-9 +-]{9,}(\.|$)'
       x-databastion-normalized-name: true
+    KeyPattern:
+      description: |
+        **Normalized** Redis / Valkey key pattern (ADR-0052 decision 7): the `object` of a
+        `Location` whose `engine` is `redis` or `valkey`, and of the `ObjectRef`s of their access
+        events. Never a raw key name, never a fingerprint of one.
+
+        Normalization (`x-databastion-normalized-name`), applied by the agent before the uplink: the
+        key name is split into segments on `:`, `/`, `|` and `.`; a segment that touches a classifier
+        match, holds a digit run, is high-entropy, matches the first-name list, is an IP address
+        or has a character this schema forbids becomes `*`, and so does a segment position with
+        too many distinct values or record-like values (cardinality and record-id rules). A first
+        segment naming a URL scheme becomes `*`. A pattern that still does not match this schema
+        is replaced by `*`. E.g. `user:42:email` -> `user:*:email`.
+
+        Schema: segments separated by `:`, `/`, `|` or `.`, each non-empty (no `//`, no leading or
+        trailing separator), each a plain name of `Identifier` (no `@ = ; \ ' "`, backquote,
+        `< > ( ) ,`, control or format character); at most 256 characters; and, as `not` rules:
+        - no segment made only of 9 or more digits, spaces, `_`, `+` and `-` (`Identifier`'s
+          digit-run rule, applied per segment), and no run of 9 or more characters made of
+          digits, separators, spaces, `_`, `+` and `-` that starts and ends with a digit (a phone
+          or card number split across segments or tokens, `06.12.34.56.78`, `06_12_34_56_78`).
+          A digit is any Unicode decimal digit (`\p{Nd}`, so fullwidth digits too), a space any
+          Unicode space separator (`\p{Zs}`, so a no-break space too), and any Unicode dash
+          (`\p{Pd}`) or the fullwidth full stop (U+FF0E) also separates;
+        - no IPv4 address as whole segments (`host:10.0.0.1`, `host.10.0.0.1`);
+        - no percent-encoded byte (`%` followed by two hexadecimal digits, e.g. `%40`);
+        - no run of 4 or more `:`-separated groups of 1 to 4 hexadecimal digits, one of which
+          holds a digit (an IPv6 address without `::`, a MAC address: `2001:db8:0:1`,
+          `00:1a:2b:3c:4d:5e`), and no MAC address written with `-` (`00-1a-2b-3c-4d-5e`) or in
+          the dotted form (`001a.2b3c.4d5e`, as whole segments);
+        - no first segment, after leading spaces, that is a URL scheme: `javascript`, `data`,
+          `vbscript`, `file`, `http`, `https`, `mailto`, compared without case.
+
+        **Rendering rule** (console): a key pattern is shown only as escaped text, never as a link
+        or `href`, never auto-linked (no linkifier or markdown link detection may turn it, or
+        any part of it such as `x:javascript:…`, into a link), never unescaped in e-mail HTML,
+        and in webhook payloads only as a JSON string. In plain-text e-mails and in chat
+        webhook messages (Slack, Teams, Mattermost text), it is wrapped in code formatting
+        (inline code), so that the receiving client does not auto-link it. CSV exports guard it
+        against formula injection: a value starting with `=`, `+`, `-`, `@`, a tab or a
+        carriage return is prefixed (with `'`). The URL-scheme rule of the schema only covers a
+        scheme in the first segment: this rendering rule is what protects a scheme later in
+        the pattern.
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: '^[^@=:;/|.\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+([:/|.][^@=:;/|.\\''"`<>(),\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+)*$'
+      not:
+        description: |
+          No segment of 9 or more digits, spaces, `_`, `+` or `-`; no digit-to-digit run of 9 or
+          more digits and separators; no percent-encoded byte; no IPv4, IPv6 or MAC address; no
+          first segment naming a URL scheme.
+        type: string
+        pattern: '(^|[:/|.])[0-9\p{Nd}\p{Zs}_+-]{9,}([:/|.]|$)|[0-9\p{Nd}][0-9\p{Nd}\p{Zs}\p{Pd}_+.\uFF0E:/|-]{7,}[0-9\p{Nd}]|(^|[:/|.])[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([:/|.]|$)|[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}|(^|[:/|.])[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}([:/|.]|$)|%[0-9A-Fa-f]{2}|(^|[:/|.])((?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]):[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:(?:[0-9][0-9A-Fa-f]{0,3}|[A-Fa-f][0-9][0-9A-Fa-f]{0,2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]?|[A-Fa-f]{3}[0-9]))([:/|.]|$)|^ *([Jj][Aa][Vv][Aa][Ss][Cc][Rr][Ii][Pp][Tt]|[Dd][Aa][Tt][Aa]|[Vv][Bb][Ss][Cc][Rr][Ii][Pp][Tt]|[Ff][Ii][Ll][Ee]|[Hh][Tt][Tt][Pp][Ss]?|[Mm][Aa][Ii][Ll][Tt][Oo]) *([:/|.]|$)'
+      x-databastion-normalized-name: true
+    ObjectName:
+      description: |
+        Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the
+        `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
+        `engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit
+        sources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also
+        checks each event's objects against the schema of the **target's** engine (a `KeyPattern`
+        that is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).
+
+        Written as "exactly one of `Identifier`, or `KeyPattern` but not `Identifier`", which
+        accepts exactly the union of the two (a name valid under both, such as `orders` or `*`,
+        matches the first branch only).
+      oneOf:
+        - $ref: "#/components/schemas/Identifier"
+        - allOf:
+            - $ref: "#/components/schemas/KeyPattern"
+            - type: string
+              maxLength: 256
+              not:
+                $ref: "#/components/schemas/Identifier"
     IdentifierPattern:
       description: |
         Console-provided filter on object names: an exact name, or a glob with `*` and `?`. The agent
@@ -1078,15 +1190,19 @@ components:
         protocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the
         capability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent
         handling in ADR-0042). Every later engine value follows the
-        same rule with its own `engine.<value>` token.
+        same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
+        ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
+        and `engine.valkey`.
       type: string
-      enum: [postgres, mysql, mariadb, mongodb, openldap, cas]
+      enum: [postgres, mysql, mariadb, mongodb, openldap, cas, sqlserver, redis, valkey]
     Connector:
       description: |
-        Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB. `cas` is sent only when the
-        console listed `engine.cas` (see `Engine`).
+        Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
+        Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
+        only when it listed `engine.sqlserver`, and `redis` only when it listed **both**
+        `engine.redis` and `engine.valkey` (see `Engine`).
       type: string
-      enum: [postgres, mysql, mongodb, openldap, cas]
+      enum: [postgres, mysql, mongodb, openldap, cas, sqlserver, redis]
     ConnectorList:
       description: |
         Connectors compiled in and enabled in this agent. A connector of an engine added after
@@ -1107,8 +1223,18 @@ components:
       enum: [full, partial, limited, none]
     AuditSource:
       description: |
-        Native source used for Audit on a target. `cas_audit_log` (the CAS JSON audit log file,
-        ADR-0041 decision 7) is sent only when the console listed `engine.cas` (see `Engine`).
+        Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only
+        under their engine's token (see `Engine`):
+        - `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;
+        - `sqlserver_audit` (SQL Server Audit, `FILE` target, read through
+          `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's
+          `event_file` target), `sqlserver_query_stats` (plan cache statistics,
+          `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;
+        - `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),
+          `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`
+          (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
+          (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
+          **both** `engine.redis` and `engine.valkey` are listed.
       type: string
       enum:
         - pgaudit
@@ -1122,6 +1248,13 @@ components:
         - mongodb_log
         - openldap_accesslog
         - cas_audit_log
+        - sqlserver_audit
+        - sqlserver_xevents
+        - sqlserver_query_stats
+        - redis_slowlog
+        - redis_commandlog
+        - redis_acl_log
+        - redis_sync
     Edition:
       description: Engine edition or distribution, when the agent can tell.
       type: string
@@ -1212,13 +1345,22 @@ components:
             keyword of a console-side check (see "Console-side checks" in the description of this
             contract):
             - `const`: a value that must equal the job's (`/classifiers_version`,
-              `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`);
+              `/findings/<i>/target_id`) or the target's (`/findings/<i>/location/engine`), or an
+              access event source that does not serve its target's engine (`/events/<i>/source`);
             - `notFound`: unknown job or target, or one not assigned to the calling agent (`/job_id`,
               `/findings/<i>/target_id`, `/events/<i>/target_id`), with `404`;
             - `maximum`: `matched > sampled`, or `sampled` above the job's `params.sample_rows`;
             - `enum`: `classifiers_version` not in the classifier registry (`/classifiers_version`),
               or a classifier id not registered for the batch's version or outside the job's
-              `params.classifiers` (`/findings/<i>/classifier`);
+              `params.classifiers` (`/findings/<i>/classifier`); or an engine-gated value whose
+              token the console does not list (engine-token gate: `/connectors/<i>`,
+              `/targets/<i>/engine`, `/targets/<i>/audit_source`, `/detected_targets/<i>/engine`,
+              `/detected_targets/<i>/process`, `/findings/<i>/location/engine`,
+              `/events/<i>/source`; the agent holds the findings and events items, ADR-0042);
+            - `not`: an `account_not_recorded` principal on an event of a target other than
+              `redis` or `valkey` (`/events/<i>/principal`);
+            - `pattern`: an access event object name that is not an `Identifier` on a target
+              other than `redis` or `valkey` (`/events/<i>/objects/<j>/object`);
             - `maxItems`: the per-job findings cap would be exceeded (`/findings`);
             - `formatMaximum`: a timestamp more than 5 min in the future (`/ts` of a status
               update, `/events/<i>/ts`, `/events/<i>/ts_last`);
@@ -1391,8 +1533,10 @@ components:
           $ref: "#/components/schemas/Edition"
         server_version:
           description: |
-            Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`). Omitted
-            when the reported string does not match this pattern.
+            Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
+            Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
+            or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+            not match this pattern.
           type: string
           maxLength: 32
           pattern: "^[0-9A-Za-z._+-]+$"
@@ -1466,6 +1610,18 @@ components:
         change of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`
         lists `target_status.note_labels.<revision>` for a revision that includes it (see
         ADR-0022), and sends `other` otherwise.
+
+        Revisions:
+        - protocol 0.1.0 (no token): every value down to `stage_kill`;
+        - `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server
+          labels below `stage_kill`. SQL Server permission names are lowercased with spaces
+          replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in
+          lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are
+          written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->
+          `ms_login_manager`). SQL Server permissions whose name is already a value above
+          (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,
+          `shutdown`…) use that value, with no token. A console that lists the token renders
+          every value of the revision.
       type: string
       enum:
         - other
@@ -1586,6 +1742,75 @@ components:
         - stage_check
         - stage_audit
         - stage_kill
+        # Revision target_status.note_labels.2026_10 (ADR-0051 decision 4): Microsoft SQL Server.
+        # SQL Server fixed server roles
+        - sysadmin
+        - securityadmin
+        - serveradmin
+        - setupadmin
+        - processadmin
+        - diskadmin
+        - dbcreator
+        - bulkadmin
+        # SQL Server 2022 fixed server roles (##MS_*##)
+        - ms_database_connector
+        - ms_database_manager
+        - ms_definition_reader
+        - ms_login_manager
+        - ms_performance_definition_reader
+        - ms_security_definition_reader
+        - ms_server_performance_state_reader
+        - ms_server_security_state_reader
+        - ms_server_state_manager
+        - ms_server_state_reader
+        # SQL Server fixed database roles
+        - db_owner
+        - db_securityadmin
+        - db_accessadmin
+        - db_backupoperator
+        - db_ddladmin
+        - db_datawriter
+        - db_datareader
+        - db_denydatareader
+        - db_denydatawriter
+        # SQL Server server permissions
+        - control_server
+        - alter_any_server_audit
+        - alter_any_event_session
+        - alter_any_event_session_enable
+        - alter_any_event_session_disable
+        - alter_any_event_session_add_event
+        - alter_any_event_session_drop_event
+        - alter_any_event_session_add_target
+        - alter_any_event_session_drop_target
+        - alter_any_event_session_option
+        - create_any_event_session
+        - drop_any_event_session
+        - alter_any_login
+        - alter_any_server_role
+        - impersonate_any_login
+        - view_any_cryptographically_secured_definition
+        - view_any_definition
+        - view_any_security_definition
+        - administer_bulk_operations
+        - alter_any_linked_server
+        - alter_trace
+        - view_server_state
+        - view_server_performance_state
+        - view_server_security_audit
+        - view_server_security_state
+        # SQL Server database and securable permissions
+        - control
+        - impersonate
+        - take_ownership
+        - alter_any_database_audit
+        - view_database_security_audit
+        - unmask
+        - view_definition
+        - view_database_state
+        - showplan
+        # SQL Server check() probes
+        - password_hash_probe
     DetectedTarget:
       description: |
         A local engine spotted by a Unix socket, a local listening port or a process name. At least one
@@ -1605,9 +1830,13 @@ components:
           minimum: 1
           maximum: 65535
         process:
-          description: Process name only (the command line may contain secrets and is never read or sent).
+          description: |
+            Process name only (the command line may contain secrets and is never read or sent).
+            `sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
+            `valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
+            `Engine`): a detected target of such an engine is not sent before the token is listed.
           type: string
-          enum: [postgres, mysqld, mariadbd, mongod, slapd]
+          enum: [postgres, mysqld, mariadbd, mongod, slapd, sqlservr, redis-server, valkey-server]
     SpoolStatus:
       type: object
       additionalProperties: false
@@ -2116,6 +2345,16 @@ components:
         `audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential
         field (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another
         engine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.
+        SQL Server (ADR-0051 decision 5): database, schema, table, column.
+        Redis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type
+        (`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern
+        (`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and
+        sorted-set members, the normalized field name for hash fields and stream entry fields, or
+        `#key` / `#field` for values found in key names / hash field names.
+
+        `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
+        every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
+        `/` is still rejected).
       type: object
       additionalProperties: false
       required: [engine, database, object, field]
@@ -2127,9 +2366,22 @@ components:
         schema:
           $ref: "#/components/schemas/Identifier"
         object:
-          $ref: "#/components/schemas/Identifier"
+          $ref: "#/components/schemas/ObjectName"
         field:
           $ref: "#/components/schemas/Identifier"
+      if:
+        required: [engine]
+        properties:
+          engine:
+            enum: [redis, valkey]
+      then:
+        properties:
+          object:
+            $ref: "#/components/schemas/KeyPattern"
+      else:
+        properties:
+          object:
+            $ref: "#/components/schemas/Identifier"
     EventsBatch:
       description: Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).
       type: object
@@ -2210,9 +2462,74 @@ components:
           objects:
             type: array
             minItems: 1
+      allOf:
+        - description: |
+            Redis / Valkey sources (ADR-0052): their objects are `KeyPattern`s. Every other source:
+            objects are `Identifier`s, and the principal is never `account_not_recorded`.
+          if:
+            required: [source]
+            properties:
+              source:
+                enum: [redis_slowlog, redis_commandlog, redis_acl_log, redis_sync]
+          then:
+            properties:
+              objects:
+                type: array
+                items:
+                  description: "`ObjectRef` with `object` as a `KeyPattern` (keep in step with `ObjectRef`)."
+                  type: object
+                  additionalProperties: false
+                  required: [database, object]
+                  properties:
+                    database:
+                      $ref: "#/components/schemas/Identifier"
+                    schema:
+                      $ref: "#/components/schemas/Identifier"
+                    object:
+                      $ref: "#/components/schemas/KeyPattern"
+          else:
+            properties:
+              principal:
+                type: object
+                not:
+                  required: [account_not_recorded]
+                  properties:
+                    account_not_recorded:
+                      const: true
+              objects:
+                type: array
+                items:
+                  description: "`ObjectRef` with `object` as a `Identifier` (keep in step with `ObjectRef`)."
+                  type: object
+                  additionalProperties: false
+                  required: [database, object]
+                  properties:
+                    database:
+                      $ref: "#/components/schemas/Identifier"
+                    schema:
+                      $ref: "#/components/schemas/Identifier"
+                    object:
+                      $ref: "#/components/schemas/Identifier"
+        - description: |
+            A failed authentication always names, or fingerprints, the name tried: never
+            `account_not_recorded` (ADR-0052 implementation obligations).
+          if:
+            required: [action]
+            properties:
+              action:
+                const: auth_failure
+          then:
+            properties:
+              principal:
+                type: object
+                not:
+                  required: [account_not_recorded]
+                  properties:
+                    account_not_recorded:
+                      const: true
     Principal:
       description: |
-        Who accessed. Exactly one of `db_user` / `db_user_fingerprint`. For a failed authentication with
+        Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
         an account that does not exist on the target (the attempted name may be a mistyped password), and
         for any account name that does not match the `db_user` pattern, the agent sends
         `db_user_fingerprint` instead of the name. On OpenLDAP, principal DNs usually name a person, so
@@ -2229,6 +2546,19 @@ components:
         when its bounded window is full, then without `client_addr`) into one event per address and
         minute; `aggregated_count` is the number of failures merged. No other event carries `db_user`
         `*`. The console escapes `db_user` and `application` on display.
+
+        **No recorded account (Redis / Valkey only, ADR-0052 decision 8).** `account_not_recorded:
+        true`, with neither `db_user` nor `db_user_fingerprint`, means that the source records no
+        account for this access (a slow-log or command-log entry whose connection had closed
+        before the agent could attribute it, a full synchronization). It is not `db_user` `*`
+        (several accounts, CAS only) and never a wildcard. `client_addr` and `application` are
+        sent when known. Accepted only on events of a `redis_*` source (checked by this schema)
+        and of a `redis` or `valkey` target (checked by the console from the target's engine),
+        and never on `auth_failure` events (checked by this schema: a failed authentication always
+        names, or fingerprints, the name tried). Console rules (ADR-0021 decision 6, P9-E): the
+        dedup key's principal part is `unknown:<SHA-256 of the client network>`, `unknown:local`,
+        or `unknown:none` without `client_addr`; no per-principal baseline is built for it. Sent
+        only under the Redis / Valkey engine tokens, as every value of those engines.
       type: object
       additionalProperties: false
       properties:
@@ -2243,6 +2573,12 @@ components:
           pattern: '^[^\p{Cc}\p{Cf}\p{Co}\p{Zl}\p{Zp}]+$'
         db_user_fingerprint:
           $ref: "#/components/schemas/Fingerprint"
+        account_not_recorded:
+          description: |
+            The source records no account for this access (Redis / Valkey only; see above). Only
+            `true` is valid; absent otherwise.
+          type: boolean
+          const: true
         client_addr:
           $ref: "#/components/schemas/ClientAddress"
         application:
@@ -2255,6 +2591,7 @@ components:
       oneOf:
         - required: [db_user]
         - required: [db_user_fingerprint]
+        - required: [account_not_recorded]
     ObjectRef:
       description: |
         Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
@@ -2279,6 +2616,14 @@ components:
         still matches conditions that do not depend on objects (signals, principals, rows,
         anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
         therefore does not see such accesses: signal, volume and anomaly conditions do.
+
+        **Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log
+        entry is reported under the pattern learned by the last scan, its longest learned literal
+        prefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.
+        `ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its
+        `source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),
+        and by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`
+        targets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.
       type: object
       additionalProperties: false
       required: [database, object]
@@ -2288,4 +2633,4 @@ components:
         schema:
           $ref: "#/components/schemas/Identifier"
         object:
-          $ref: "#/components/schemas/Identifier"
+          $ref: "#/components/schemas/ObjectName"

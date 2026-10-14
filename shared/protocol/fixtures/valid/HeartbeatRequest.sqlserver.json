@@ -1,0 +1,170 @@
+{
+  "ts": "2026-10-14T09:00:00Z",
+  "agent_version": "0.8.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap",
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-prod",
+      "engine": "sqlserver",
+      "server_version": "16.0.4305.5",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "sqlserver_audit",
+      "notes": [
+        {
+          "code": "audit.failed_logins_not_audited"
+        },
+        {
+          "code": "audit.reads_not_logged",
+          "count": 1
+        },
+        {
+          "code": "coverage.masked_columns",
+          "count": 4
+        },
+        {
+          "code": "coverage.encrypted_columns",
+          "count": 2
+        },
+        {
+          "code": "coverage.computed_columns_not_sampled",
+          "count": 3
+        },
+        {
+          "code": "coverage.relations_rls_skipped",
+          "count": 1
+        },
+        {
+          "code": "privilege.global_privileges",
+          "count": 2,
+          "labels": [
+            "view_any_definition",
+            "view_server_state"
+          ]
+        },
+        {
+          "code": "privilege.beyond_select",
+          "count": 2,
+          "labels": [
+            "showplan",
+            "unmask"
+          ]
+        },
+        {
+          "code": "privilege.database_roles",
+          "count": 1,
+          "labels": [
+            "db_ddladmin"
+          ]
+        },
+        {
+          "code": "privilege.not_evaluated",
+          "labels": [
+            "password_hash_probe"
+          ]
+        },
+        {
+          "code": "security.login_event_trigger"
+        }
+      ]
+    },
+    {
+      "target_id": "mssql-2019",
+      "engine": "sqlserver",
+      "server_version": "15.0.4500.2",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "sqlserver_xevents",
+      "notes": [
+        {
+          "code": "audit.sqlserver_audit_needs_control_server"
+        },
+        {
+          "code": "audit.xe_events_missing",
+          "count": 1
+        },
+        {
+          "code": "audit.xe_causality_off"
+        },
+        {
+          "code": "audit.xe_session_filtered"
+        },
+        {
+          "code": "audit.records_dropped",
+          "count": 12
+        },
+        {
+          "code": "coverage.rls_not_verifiable",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "target_id": "mssql-dba",
+      "engine": "sqlserver",
+      "server_version": "17.0.5015.4",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "privilege.refused",
+          "labels": [
+            "control_server",
+            "db_owner",
+            "impersonate",
+            "sysadmin"
+          ]
+        },
+        {
+          "code": "privilege.server_roles",
+          "count": 2,
+          "labels": [
+            "ms_login_manager",
+            "sysadmin"
+          ]
+        },
+        {
+          "code": "privilege.audit_grant_without_audit",
+          "labels": [
+            "view_server_security_audit"
+          ]
+        },
+        {
+          "code": "audit.server_audit_filtered"
+        },
+        {
+          "code": "audit.audit_changes_not_audited"
+        },
+        {
+          "code": "audit.source_not_configured"
+        },
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_tls"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [
+    {
+      "engine": "sqlserver",
+      "port": 1433,
+      "process": "sqlservr"
+    }
+  ],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

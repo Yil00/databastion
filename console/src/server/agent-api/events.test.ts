@@ -17,6 +17,7 @@ import {
   ingestEvents,
   principalKey,
   purgeAccessEvents,
+  targetEngineDetails,
 } from "@/server/events";
 import { integrityWriteBudget } from "@/server/integrity";
 import { collectMetrics } from "@/server/metrics";
@@ -25,6 +26,7 @@ import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
+import { unlistedEngineDetails } from "./capabilities";
 import { eventsPerAgent, eventsRequestsPerAgent, handleEvents, handleHeartbeat } from "./handlers";
 import { MAX_FUTURE_SKEW_MS } from "./pipeline";
 
@@ -43,10 +45,28 @@ const HEARTBEAT = {
     { target_id: "mongo-app", engine: "mongodb", reachable: true, audit_level: "limited" },
     { target_id: "ldap-main", engine: "openldap", reachable: true, audit_level: "full" },
     { target_id: "cas-prod", engine: "cas", reachable: true, audit_level: "partial", audit_source: "cas_audit_log" },
+    // No sqlserver, redis or valkey target (P9-C): their tokens are not listed by CONSOLE_ACCEPTS
+    // until P9-E, so a heartbeat reporting one is refused.
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
 };
+
+/**
+ * Valid contract fixtures whose sources this console does not list yet (P9-C review H1): the
+ * `sqlserver_*` sources until `engine.sqlserver`, the `redis_*` sources (and with them the
+ * `account_not_recorded` principal, ADR-0052 decision 8) until both `engine.redis` and
+ * `engine.valkey`, which only P9-E adds. They are refused with `400` `enum` on their source.
+ */
+const isUnlisted = ([, body]: [string, unknown]) => unlistedEngineDetails("EventsBatch", body).length > 0;
+
+function storableFixtures(): [string, unknown][] {
+  return fixtures("valid", "EventsBatch").filter((f) => !isUnlisted(f));
+}
+
+function unlistedFixtures(): [string, unknown][] {
+  return fixtures("valid", "EventsBatch").filter(isUnlisted);
+}
 
 const PG_DUMP = {
   target_id: "pg-prod-1",
@@ -112,7 +132,35 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
   afterEach(() => setPolicyJobSender(null));
 
   describe("contract fixtures", () => {
-    it.each(fixtures("valid", "EventsBatch"))("accepts %s and stores exactly the contract fields", async (_name, body) => {
+    it.todo("stores the `account_not_recorded` principal of Redis / Valkey events (P9-E, ADR-0052 decision 8)");
+    it.todo("stores the sqlserver and redis-valkey fixtures once CONSOLE_ACCEPTS lists their engine tokens (P9-E)");
+
+    it("leaves fixtures of every unlisted engine to refuse", () => {
+      expect(unlistedFixtures().map(([name]) => name).sort()).toEqual([
+        "EventsBatch.redis-account-not-recorded.json",
+        "EventsBatch.redis-valkey.json",
+        "EventsBatch.sqlserver.json",
+      ]);
+    });
+
+    it.each(unlistedFixtures())(
+      "refuses %s while its engine tokens are unlisted: 400 enum on each source, integrity event, nothing stored",
+      async (_name, body) => {
+        const auth = await agentWithTargets();
+        const res = await post(auth, body);
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err.code).toBe("invalid_request");
+        const b = body as Batch;
+        expect(err.details).toEqual(b.events.map((_e, i) => ({ pointer: `/events/${i}/source`, keyword: "enum" })));
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+        expect(await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId))).toHaveLength(0);
+        const events = await integrityRows(auth.agentId, "agent.batch_rejected");
+        expect(events).toHaveLength(1);
+        expect(events[0]?.details).toMatchObject({ endpoint: "events", status: 400 });
+      },
+    );
+    it.each(storableFixtures())("accepts %s and stores exactly the contract fields", async (_name, body) => {
       const auth = await agentWithTargets();
       const res = await post(auth, body);
       expect(res.status).toBe(202);
@@ -196,6 +244,102 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
   });
 
   describe("console-side checks", () => {
+    describe("engine of the source and of the target (P9-C review H1)", () => {
+      const REDIS_ON_PG = {
+        ...PG_DUMP,
+        principal: { db_user: "app" },
+        objects: [{ database: "db0", object: "a:b/c" }],
+        signals: [],
+        source: "redis_slowlog",
+      };
+
+      it("refuses a redis_* source with a key-pattern object on a postgres target: 400 enum on the source, nothing stored", async () => {
+        const auth = await agentWithTargets();
+        const body = batch([PG_DUMP, REDIS_ON_PG]);
+        expect(validateSchema("EventsBatch", body).ok).toBe(true);
+        const res = await post(auth, body);
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err).toMatchObject({ code: "invalid_request", details: [{ pointer: "/events/1/source", keyword: "enum" }] });
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+        const [ev] = await integrityRows(auth.agentId, "agent.batch_rejected");
+        expect(ev?.details).toMatchObject({ endpoint: "events", status: 400, pointer: "/events/1/source" });
+      });
+
+      it("refuses an unlisted sqlserver_* source: 400 enum on the source", async () => {
+        const auth = await agentWithTargets();
+        const res = await post(auth, batch([{ ...PG_DUMP, signals: [], source: "sqlserver_audit" }]));
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ details: [{ pointer: "/events/0/source", keyword: "enum" }] });
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+      });
+
+      it("refuses a listed source of another engine than the target's: 400 const on the source, integrity event", async () => {
+        const auth = await agentWithTargets();
+        const mongoOnPg = { ...PG_DUMP, signals: [], source: "mongodb_profiler" };
+        const casOnMysql = { ...PG_DUMP, target_id: "mysql-crm", signals: [], source: "cas_audit_log" };
+        const mysqlOnMysql = { ...PG_DUMP, target_id: "mysql-crm", signals: [], source: "performance_schema" };
+        const res = await post(auth, batch([PG_DUMP, mongoOnPg, casOnMysql, mysqlOnMysql]));
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, {});
+        expect(err.details).toEqual([
+          { pointer: "/events/1/source", keyword: "const" },
+          { pointer: "/events/2/source", keyword: "const" },
+        ]);
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+        expect(await integrityRows(auth.agentId, "agent.batch_rejected")).toHaveLength(1);
+        // The shared MySQL / MariaDB sources fit both engines.
+        expect((await post(auth, batch([PG_DUMP, mysqlOnMysql]))).status).toBe(202);
+      });
+
+      it("refuses account_not_recorded on a non-Redis target with 400, never 503", async () => {
+        const auth = await agentWithTargets();
+        const unrecorded = { ...REDIS_ON_PG, objects: [{ database: "db0", object: "*" }], principal: { account_not_recorded: true } };
+        const res = await post(auth, batch([unrecorded]));
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ code: "invalid_request" });
+        // On a 0.1.0 source the schema itself refuses it.
+        const onPgaudit = { ...PG_DUMP, principal: { account_not_recorded: true } };
+        expect((await post(auth, batch([onPgaudit]))).status).toBe(400);
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+      });
+
+      it("checks the source, the principal and the object names against the target's engine whatever the tokens (ingestEvents)", async () => {
+        const auth = await agentWithTargets();
+        const unrecorded = { ...REDIS_ON_PG, principal: { account_not_recorded: true } };
+        // Past the token gate (as once P9-E lists the tokens): the target checks still refuse.
+        const outcome = await ingestEvents(getDb(), auth.agentId, batch([PG_DUMP, REDIS_ON_PG, unrecorded]) as never);
+        expect(outcome).toEqual({
+          kind: "invalid",
+          details: [
+            { pointer: "/events/1/source", keyword: "const" },
+            { pointer: "/events/1/objects/0/object", keyword: "pattern" },
+            { pointer: "/events/2/source", keyword: "const" },
+            { pointer: "/events/2/principal", keyword: "not" },
+            { pointer: "/events/2/objects/0/object", keyword: "pattern" },
+          ],
+        });
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+      });
+
+      it("lets Redis / Valkey sources, key patterns and account_not_recorded through on redis and valkey targets", () => {
+        const engines = new Map([
+          ["cache-redis", "redis"],
+          ["sessions-valkey", "valkey"],
+          ["pg-prod-1", "postgres"],
+        ]);
+        const fixture = (name: string) => fixtures("valid", "EventsBatch").find(([n]) => n === name)?.[1] as never;
+        expect(targetEngineDetails(fixture("EventsBatch.redis-valkey.json"), engines)).toEqual([]);
+        expect(targetEngineDetails(fixture("EventsBatch.redis-account-not-recorded.json"), engines)).toEqual([]);
+        expect(targetEngineDetails(fixture("EventsBatch.pg-dump.json"), engines)).toEqual([]);
+        const swapped = new Map([["cache-redis", "postgres"], ["sessions-valkey", "redis"]]);
+        expect(targetEngineDetails(fixture("EventsBatch.redis-account-not-recorded.json"), swapped)).toContainEqual({
+          pointer: "/events/0/principal",
+          keyword: "not",
+        });
+      });
+    });
+
     it("404 with item pointers for targets the agent does not own (integrity event)", async () => {
       const auth = await agentWithTargets();
       const res = await post(auth, batch([PG_DUMP, { ...PG_DUMP, target_id: "pg-elsewhere" }, { ...PG_DUMP, target_id: "other" }]));
@@ -258,8 +402,8 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       await getDb().execute(sql`insert into audit_configs (agent_id, target_id, enabled, aggregation_window_s, poll_interval_s)
         values (${auth.agentId}, 'mongo-app', false, 60, 10)`);
       const before = eventStats.unexpectedTarget;
-      const other = (target_id: string) => ({ ...PG_DUMP, target_id });
-      expect((await post(auth, batch([PG_DUMP, other("mysql-crm"), other("mongo-app")]))).status).toBe(202);
+      const other = (target_id: string, source: string) => ({ ...PG_DUMP, target_id, source });
+      expect((await post(auth, batch([PG_DUMP, other("mysql-crm", "performance_schema"), other("mongo-app", "mongodb_profiler")]))).status).toBe(202);
       expect((await storedEvents(auth.agentId)).map((r) => r.unexpectedTarget)).toEqual([false, true, true]);
       expect(eventStats.unexpectedTarget - before).toBe(2);
     });
@@ -333,7 +477,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
     it("counts unexpected targets and unregistered signals after the commit only (duplicate, aborted)", async () => {
       const auth = await agentWithTargets();
       await getDb().execute(sql`update agent_targets set present = false where agent_id = ${auth.agentId} and target_id = 'mysql-crm'`);
-      const odd = { ...PG_DUMP, target_id: "mysql-crm", signals: ["signature.unregistered_example"] };
+      const odd = { ...PG_DUMP, target_id: "mysql-crm", source: "performance_schema", signals: ["signature.unregistered_example"] };
       const counters = () => ({ unexpected: eventStats.unexpectedTarget, unregistered: eventStats.unregisteredSignals });
       const b = batch([odd]);
       const before = counters();
@@ -583,7 +727,7 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       events: [{ ...PG_DUMP, query: "COPY public.clients TO STDOUT WHERE email = 'jane.doe@example.com'" }],
     };
     expect((await post(auth, raw)).status).toBe(400);
-    for (const [, body] of fixtures("valid", "EventsBatch")) {
+    for (const [, body] of storableFixtures()) {
       expect((await post(auth, { ...(body as Batch), batch_id: uuidv7() })).status).toBe(202);
     }
     const dump = await databaseDump();

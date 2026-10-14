@@ -4,9 +4,9 @@ import type { Database } from "@/db/client";
 import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
-import { auditSourceEngine } from "@/lib/location-labels";
+import { auditSourceEngine, auditSourceEngines, isKeyPatternEngine } from "@/lib/location-labels";
 import { unregisteredSignals } from "@/lib/protocol/signals";
-import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
+import { MAX_VALIDATION_DETAILS, validateSchema, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
 import { ipv6Groups, mappedIPv4 } from "./net-guard";
@@ -37,7 +37,11 @@ export type EventsIngestOutcome =
   | { kind: "batch_conflict" }
   /** `target_id` not reported by this agent: pointers `/events/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
-  /** Console-side checks (timestamps more than 5 min in the future). */
+  /**
+   * Console-side checks: a source that does not serve the target's engine, an
+   * `account_not_recorded` principal or a key-pattern object on a target that is not Redis /
+   * Valkey, timestamps more than 5 min in the future.
+   */
   | { kind: "invalid"; details: ValidationDetail[] }
   /**
    * Events older than the retention period (L1): `400`, `/events/<i>/ts`, `formatMinimum`. A
@@ -108,6 +112,41 @@ function futureDetails(batch: EventsBatch, now: number): ValidationDetail[] {
   return details;
 }
 
+/**
+ * Checks of each event against its **target's** engine as last reported by the agent (P9-C review
+ * H1, ADR-0052 decision 7), kept whatever capability tokens the console lists:
+ * - the event's `source` serves the target's engine (`/events/<i>/source`, `const`): the schema
+ *   chooses the object-name schema from the source (`KeyPattern` for the `redis_*` sources), so a
+ *   `redis_*` source on a PostgreSQL target would otherwise carry names with `:` and `/`;
+ * - `account_not_recorded` only on a `redis` or `valkey` target (`/events/<i>/principal`, `not`,
+ *   the keyword of the schema's own refusal on the other sources); it never reaches storage;
+ * - on any other target, every object name is an `Identifier` (`/events/<i>/objects/<j>/object`,
+ *   `pattern`): the contract's "enforced twice" rule for `ObjectRef`, which names no engine.
+ * `const` and `not` are not `enum`, so a conforming agent drops such items (ADR-0042 decision 3).
+ */
+export function targetEngineDetails(batch: EventsBatch, engines: ReadonlyMap<string, string>): ValidationDetail[] {
+  const details: ValidationDetail[] = [];
+  const push = (d: ValidationDetail) => {
+    if (details.length < MAX_VALIDATION_DETAILS) details.push(d);
+  };
+  batch.events.forEach((e, i) => {
+    const engine = engines.get(e.target_id) ?? null;
+    const keyPatterns = isKeyPatternEngine(engine);
+    if (engine === null || !(auditSourceEngines(e.source) as readonly string[]).includes(engine)) {
+      push({ pointer: `/events/${i}/source`, keyword: "const" });
+    }
+    if (e.principal.account_not_recorded !== undefined && !keyPatterns) {
+      push({ pointer: `/events/${i}/principal`, keyword: "not" });
+    }
+    if (!keyPatterns) {
+      e.objects.forEach((o, j) => {
+        if (!validateSchema("Identifier", o.object).ok) push({ pointer: `/events/${i}/objects/${j}/object`, keyword: "pattern" });
+      });
+    }
+  });
+  return details;
+}
+
 /** Events whose `ts` is older than the retention period (they would be purged at once). */
 function expiredDetails(batch: EventsBatch, now: number, retentionDays: number): ValidationDetail[] {
   const details: ValidationDetail[] = [];
@@ -153,8 +192,10 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
  * 1. idempotency on `(agent_id, batch_id)`: same content -> duplicate, other content -> conflict
  *    (before every check below, so a replay reaching this step is always acknowledged);
  * 2. every `target_id` was reported by the agent (`404`, item pointers `/events/<i>/target_id`);
- * 3. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
- * 4. storage of the events (pending evaluation by the worker) + the batch record.
+ * 3. every event's source, principal and object names fit its target's engine (`400`, item
+ *    pointers, see `targetEngineDetails`);
+ * 4. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
+ * 5. storage of the events (pending evaluation by the worker) + the batch record.
  * Batches of one agent are serialized (transaction-scoped advisory lock).
  */
 export async function ingestEvents(
@@ -180,7 +221,12 @@ export async function ingestEvents(
 
     const targetIds = [...new Set(batch.events.map((e) => e.target_id))];
     const owned = await tx
-      .select({ targetId: agentTargets.targetId, present: agentTargets.present, auditEnabled: auditConfigs.enabled })
+      .select({
+        targetId: agentTargets.targetId,
+        engine: agentTargets.engine,
+        present: agentTargets.present,
+        auditEnabled: auditConfigs.enabled,
+      })
       .from(agentTargets)
       .leftJoin(auditConfigs, and(eq(auditConfigs.agentId, agentTargets.agentId), eq(auditConfigs.targetId, agentTargets.targetId)))
       .where(and(eq(agentTargets.agentId, agentId), inArray(agentTargets.targetId, targetIds)));
@@ -195,6 +241,8 @@ export async function ingestEvents(
     });
     if (foreign.length > 0) return { kind: "foreign_target" as const, details: foreign };
 
+    const mismatched = targetEngineDetails(batch, new Map(owned.map((t) => [t.targetId, t.engine])));
+    if (mismatched.length > 0) return { kind: "invalid" as const, details: mismatched };
     const future = futureDetails(batch, now);
     if (future.length > 0) return { kind: "invalid" as const, details: future };
     const expired = expiredDetails(batch, now, retentionDays);

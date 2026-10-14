@@ -103,6 +103,117 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "JobStatusUpdate.running-with-error.json",
         "false schema (via if/else, removed before generation)",
     ),
+    // Redis / Valkey key patterns and the `account_not_recorded` principal
+    // (P9-C): the console's Ajv validation enforces these; the agent's
+    // sanitizer never sends a key pattern nor that principal yet.
+    (
+        "FindingsBatch.redis-key-pattern-fullwidth-digits.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv4.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv4-dot-separated.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac-dashes.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac-dotted.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-dash-punctuation-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-fullwidth-stop-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv6.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-ipv6-after-prefix.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mac.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-nbsp-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-percent-encoded.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-underscore-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "EventsBatch.account-not-recorded-false.json",
+        "const: true on a boolean (generated as bool)",
+    ),
+    (
+        "EventsBatch.account-not-recorded-on-auth-failure.json",
+        "not (via if/then, removed before generation)",
+    ),
+    (
+        "EventsBatch.account-not-recorded-on-postgres-source.json",
+        "not (via if/then/else, removed before generation)",
+    ),
+    (
+        "EventsBatch.postgres-key-pattern-in-object.json",
+        "pattern (via if/then/else on source, removed before generation; ObjectName)",
+    ),
+    (
+        "EventsBatch.redis-key-pattern-digit-run.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "EventsBatch.redis-key-pattern-url-scheme.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "EventsBatch.sqlserver-colon-in-object.json",
+        "pattern (via if/then/else on source, removed before generation; ObjectName)",
+    ),
+    (
+        "FindingsBatch.mysql-colon-in-object.json",
+        "pattern (via if/then/else on engine, removed before generation; ObjectName)",
+    ),
+    (
+        "FindingsBatch.postgres-key-pattern-in-object.json",
+        "pattern (via if/then/else on engine, removed before generation; ObjectName)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-digit-run.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-mixed-case-scheme.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-split-phone.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.redis-key-pattern-url-scheme.json",
+        "not (KeyPattern)",
+    ),
+    (
+        "FindingsBatch.sqlserver-slash-in-object.json",
+        "pattern (via if/then/else on engine, removed before generation; ObjectName)",
+    ),
 ];
 
 fn fixtures_dir(kind: &str) -> PathBuf {

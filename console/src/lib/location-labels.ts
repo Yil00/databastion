@@ -53,25 +53,52 @@ export function locationPartLabels(engine: string | null | undefined, database: 
 }
 
 /**
- * Engine of a contract `AuditSource`, when the source alone tells it (`null` for the sources that
- * MySQL and MariaDB share). Exhaustive: a new contract source fails `tsc` until it is listed.
+ * Engines a contract `AuditSource` can serve: one engine, except the sources that MySQL and
+ * MariaDB share and those that Redis and Valkey share (ADR-0052 decision 8). Exhaustive: a new
+ * contract source fails `tsc` until it is listed. The agent API refuses an event whose source does
+ * not serve its target's engine (P9-C review H1), and the engine-token gate of a source is the
+ * union of its engines' tokens (`agent-api/capabilities.ts`).
  */
-const SOURCE_ENGINE: Record<AuditSource, Engine | null> = {
-  pgaudit: "postgres",
-  pg_stat_statements: "postgres",
-  pg_stat_activity: "postgres",
-  mariadb_server_audit: null,
-  mysql_audit_log: null,
-  performance_schema: null,
-  mongodb_audit_log: "mongodb",
-  mongodb_profiler: "mongodb",
-  mongodb_log: "mongodb",
-  openldap_accesslog: "openldap",
-  cas_audit_log: "cas",
+const SOURCE_ENGINES: Record<AuditSource, readonly Engine[]> = {
+  pgaudit: ["postgres"],
+  pg_stat_statements: ["postgres"],
+  pg_stat_activity: ["postgres"],
+  mariadb_server_audit: ["mysql", "mariadb"],
+  mysql_audit_log: ["mysql", "mariadb"],
+  performance_schema: ["mysql", "mariadb"],
+  mongodb_audit_log: ["mongodb"],
+  mongodb_profiler: ["mongodb"],
+  mongodb_log: ["mongodb"],
+  openldap_accesslog: ["openldap"],
+  cas_audit_log: ["cas"],
+  sqlserver_audit: ["sqlserver"],
+  sqlserver_xevents: ["sqlserver"],
+  sqlserver_query_stats: ["sqlserver"],
+  redis_slowlog: ["redis", "valkey"],
+  redis_commandlog: ["redis", "valkey"],
+  redis_acl_log: ["redis", "valkey"],
+  redis_sync: ["redis", "valkey"],
 };
 
+/** Engines served by a contract `AuditSource` (empty for a string that is not one). */
+export function auditSourceEngines(source: string): readonly Engine[] {
+  return Object.hasOwn(SOURCE_ENGINES, source) ? SOURCE_ENGINES[source as AuditSource] : [];
+}
+
+/**
+ * Engine of a contract `AuditSource`, when the source alone tells it (`null` for the sources that
+ * MySQL and MariaDB share, and for those Redis and Valkey share).
+ */
 export function auditSourceEngine(source: string): Engine | null {
-  return Object.hasOwn(SOURCE_ENGINE, source) ? SOURCE_ENGINE[source as AuditSource] : null;
+  const engines = auditSourceEngines(source);
+  return engines.length === 1 ? (engines[0] ?? null) : null;
+}
+
+/** Engines whose object names are `KeyPattern`s (contract `ObjectName`, ADR-0052 decision 7). */
+export const KEY_PATTERN_ENGINES: readonly Engine[] = ["redis", "valkey"];
+
+export function isKeyPatternEngine(engine: string | null | undefined): boolean {
+  return (KEY_PATTERN_ENGINES as readonly string[]).includes(engine ?? "");
 }
 
 /** Contract `db_user_fingerprint` prefix (`^hmac-sha256:[0-9a-f]{64}$`). */
