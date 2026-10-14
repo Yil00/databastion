@@ -15,8 +15,11 @@
 //!    text is kept, zeroized, to be classified as a value under the field
 //!    `#key` ([`KeyUnits::name_values`]). A token becomes `*` when it holds
 //!    a digit (record identifiers of any length: `user:42:email` gives
-//!    `user:*:email`), looks generated (hexadecimal or high-entropy, 16
-//!    characters or more), holds a character `Identifier` forbids, is a
+//!    `user:*:email`), looks generated (hexadecimal, mixed case or
+//!    high-entropy, 16 characters or more, checked on the whole segment
+//!    with its `_` and `-` too; a lowercase run no word has), holds a
+//!    character `Identifier` forbids or one unassigned in the agent's
+//!    Unicode tables, is a
 //!    common first name, or otherwise looks like a value
 //!    ([`crate::names::segment_looks_like_value`]); a first segment naming
 //!    a URL scheme becomes `*`.
@@ -25,11 +28,16 @@
 //!    tokens before it as its prefix and the shape of the name) holding
 //!    more than [`COLLAPSE_THRESHOLD`] distinct values becomes `*`
 //!    (cardinality), and so does a position where 2 or more distinct values
-//!    precede the same suffix (record-id rule: `session:jdupont` and
-//!    `session:amartin` give `session:*`). At most 17 distinct literals are
-//!    tracked per position and prefix during the walk, in zeroized memory;
-//!    patterns are emitted only by [`PatternBuilder::finish`], after the
-//!    walk, with at most 4 rounds of collapse and merge.
+//!    precede the same suffix (record-id rule, at every position, the
+//!    first included: `session:jdupont` and `session:amartin` give
+//!    `session:*`, `phone:1` and `addressbook:2` give `*:*`). During the
+//!    walk the builder keeps, per position, at most 17 keyed hashes of its
+//!    distinct literals (no key-name text), for at most [`MAX_POSITIONS`]
+//!    positions (past it a new position is `*`, fail closed) and
+//!    [`MAX_TEMPLATES`] templates (a key whose template cannot be kept is
+//!    not tracked); patterns are emitted only by
+//!    [`PatternBuilder::finish`], after the walk, with at most 4 rounds of
+//!    collapse and merge.
 //!
 //! Every emitted pattern passes the final gate [`is_key_pattern`]: the
 //! contract `KeyPattern` pattern **and** its `not` rules (digit runs per
@@ -38,8 +46,9 @@
 //! this module but as the sample keys the connector reads, in zeroized
 //! buffers.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::{Hash, Hasher};
+use std::collections::hash_map::RandomState;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::LazyLock;
 
 use unicode_normalization::UnicodeNormalization;
@@ -90,7 +99,20 @@ pub fn is_key_pattern(s: &str) -> bool {
         return false;
     }
     let (pattern, not) = &*GATE;
-    pattern.is_match(s) && !not.is_match(s)
+    pattern.is_match(s) && !not.is_match(s) && !has_unassigned(s)
+}
+
+/// Code points unassigned in this agent's Unicode tables (`\p{Cn}`).
+#[allow(clippy::expect_used, reason = "constant pattern, compiled in tests")]
+static UNASSIGNED: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\p{Cn}").expect("unassigned class compiles"));
+
+/// Whether `s` holds a code point unassigned in this agent's Unicode
+/// tables. The console's engine may know it (as a digit, say: U+11DE0 to
+/// U+11DE9 are `Nd` in Unicode 17), so the gate refuses it rather than
+/// guess (security review L1); the normalizer treats it as a value.
+fn has_unassigned(s: &str) -> bool {
+    UNASSIGNED.is_match(s)
 }
 
 /// URL schemes refused as a first segment (contract `KeyPattern`).
@@ -251,25 +273,38 @@ fn token_is_value(token: &str) -> bool {
     }) {
         return true;
     }
-    if looks_generated(token) {
+    if has_unassigned(token) || looks_generated(token) {
         return true;
     }
     names::segment_looks_like_value(token)
 }
 
-/// Hexadecimal or base64-like tokens of 16 characters or more that look
-/// generated: mixed case with many case changes, or a high character
-/// entropy.
+/// Whether a token, or a whole segment with its `_` and `-` (so a
+/// base64url string is not first cut into ordinary-looking tokens), looks
+/// generated (security review M4):
+/// - 16 characters or more of `[A-Za-z0-9_-]` that are all hexadecimal,
+///   or mix case with 3 or more lower-to-upper changes, or whose
+///   character entropy reaches 90 % of the most a string of that length
+///   over its alphabet can have (`log2(min(n, alphabet))`);
+/// - a run of 8 or more lowercase letters that no word has: 5 consonants
+///   in a row, or (12 letters or more) fewer than 20 % vowels (`y`
+///   counted as a vowel).
 fn looks_generated(token: &str) -> bool {
+    if lowercase_runs_look_generated(token) {
+        return true;
+    }
     let n = token.chars().count();
     if n < 16 {
         return false;
     }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return false;
+    }
     if token.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
-    }
-    if !token.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
     }
     let changes = token
         .chars()
@@ -279,19 +314,50 @@ fn looks_generated(token: &str) -> bool {
     if changes >= 3 {
         return true;
     }
+    let has = |f: fn(&char) -> bool| token.chars().any(|c| f(&c));
+    let alphabet = usize::from(has(char::is_ascii_lowercase)) * 26
+        + usize::from(has(char::is_ascii_uppercase)) * 26
+        + usize::from(has(char::is_ascii_digit)) * 10
+        + usize::from(has(|c| *c == '_' || *c == '-')) * 2;
     let mut counts: BTreeMap<char, usize> = BTreeMap::new();
     for c in token.chars() {
         *counts.entry(c).or_default() += 1;
     }
     #[allow(clippy::cast_precision_loss, reason = "lengths far below 2^52")]
-    let entropy: f64 = counts
-        .values()
-        .map(|&k| {
-            let p = k as f64 / n as f64;
-            -p * p.log2()
+    let (entropy, ceiling) = (
+        counts
+            .values()
+            .map(|&k| {
+                let p = k as f64 / n as f64;
+                -p * p.log2()
+            })
+            .sum::<f64>(),
+        (n.min(alphabet.max(2)) as f64).log2(),
+    );
+    entropy >= 0.9 * ceiling
+}
+
+/// The lowercase heuristic of [`looks_generated`].
+fn lowercase_runs_look_generated(token: &str) -> bool {
+    let is_vowel = |c: char| matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y');
+    token
+        .split(|c: char| !c.is_ascii_lowercase())
+        .filter(|run| run.len() >= 8)
+        .any(|run| {
+            let mut consonants = 0usize;
+            let mut longest = 0usize;
+            let mut vowels = 0usize;
+            for c in run.chars() {
+                if is_vowel(c) {
+                    vowels += 1;
+                    consonants = 0;
+                } else {
+                    consonants += 1;
+                    longest = longest.max(consonants);
+                }
+            }
+            longest >= 5 || (run.len() >= 12 && vowels * 5 < run.len())
         })
-        .sum();
-    entropy >= 3.9
 }
 
 /// Applies the per-key rules (see the module documentation).
@@ -409,6 +475,14 @@ fn split_folded(s: &str) -> KeyUnits {
             });
             continue;
         }
+        // A generated-looking segment, `_` and `-` included, is one `*`.
+        if looks_generated(text) {
+            units.push(Unit {
+                sep,
+                tok: Tok::Wild,
+            });
+            continue;
+        }
         // Tokens of the segment.
         let mut tok_sep = sep;
         let mut tok_start: Option<usize> = None;
@@ -503,38 +577,71 @@ pub struct EmittedPattern {
     pub group: Group,
 }
 
-/// Position key: the shape (separators of every unit, unit count), the
-/// position, and the units before it.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct PosKey {
-    shape: Vec<String>,
-    pos: usize,
-    prefix: Vec<Tok>,
+/// The position ids of one name, left to right: a keyed hash of the name's
+/// shape (the separators of every unit, so the unit count), the position
+/// and the tokens before it. Ids only, never the literals themselves: what
+/// the walk keeps per position is bounded and holds no key-name text.
+/// A collision can only merge two positions' counts, so it can only make
+/// more positions collapse (fail closed); the per-builder random key keeps
+/// a crafted keyspace from aiming one.
+struct Positions {
+    prefix: std::collections::hash_map::DefaultHasher,
 }
 
-fn shape_of(units: &[Unit]) -> Vec<String> {
-    units.iter().map(|u| u.sep.clone()).collect()
+impl Positions {
+    fn new(state: &RandomState, units: &[Unit]) -> Self {
+        let mut prefix = state.build_hasher();
+        units.len().hash(&mut prefix);
+        for u in units {
+            u.sep.hash(&mut prefix);
+        }
+        Self { prefix }
+    }
+
+    /// The id of position `pos`, the tokens before it pushed.
+    fn id(&self, pos: usize) -> u64 {
+        let mut h = self.prefix.clone();
+        pos.hash(&mut h);
+        h.finish()
+    }
+
+    /// Adds the token of the current position to the prefix.
+    fn push(&mut self, tok: &Tok) {
+        tok.hash(&mut self.prefix);
+    }
 }
+
+/// Most position entries (tracked or collapsed) of one walk. Past it, a
+/// literal at a position not seen yet becomes `*` (fail closed): the
+/// walk's memory stays bounded whatever the keyspace (security review H3).
+pub const MAX_POSITIONS: usize = 16 * MAX_TEMPLATES;
 
 /// Builds the patterns of one database walk (see the module
-/// documentation). Bounded: at most [`MAX_TEMPLATES`] templates and
-/// [`MAX_TRACKED_LITERALS`] literals per position and prefix.
+/// documentation). Bounded: at most [`MAX_TEMPLATES`] templates,
+/// [`MAX_POSITIONS`] positions and [`MAX_TRACKED_LITERALS`] literal hashes
+/// per position.
 pub struct PatternBuilder {
     samples: usize,
+    state: RandomState,
     templates: HashMap<(Vec<Unit>, u8), Group>,
-    /// Distinct literals seen per position (up to the tracked bound).
-    literals: HashMap<PosKey, BTreeSet<Secret>>,
-    /// Positions collapsed by cardinality during the walk.
-    collapsed: std::collections::HashSet<PosKey>,
+    /// Keyed hashes of the distinct literals seen per position id (at most
+    /// [`MAX_TRACKED_LITERALS`] each).
+    literals: HashMap<u64, Vec<u64>>,
+    /// Position ids collapsed by cardinality during the walk.
+    collapsed: HashSet<u64>,
     /// Keys whose template could not be kept (template bound).
     overflow: u64,
+    /// Literals turned into `*` by the position bound.
+    position_bound: u64,
 }
 
 impl std::fmt::Debug for PatternBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PatternBuilder")
             .field("templates", &self.templates.len())
+            .field("positions", &self.positions())
             .field("overflow", &self.overflow)
+            .field("position_bound", &self.position_bound)
             .finish_non_exhaustive()
     }
 }
@@ -546,10 +653,12 @@ impl PatternBuilder {
     pub fn new(samples: usize) -> Self {
         Self {
             samples,
+            state: RandomState::new(),
             templates: HashMap::new(),
             literals: HashMap::new(),
-            collapsed: std::collections::HashSet::new(),
+            collapsed: HashSet::new(),
             overflow: 0,
+            position_bound: 0,
         }
     }
 
@@ -559,10 +668,28 @@ impl PatternBuilder {
         self.overflow
     }
 
+    /// Literals turned into `*` because the position bound was reached.
+    #[must_use]
+    pub fn position_bound_hits(&self) -> u64 {
+        self.position_bound
+    }
+
     /// Distinct templates kept so far.
     #[must_use]
     pub fn templates(&self) -> usize {
         self.templates.len()
+    }
+
+    /// Position entries kept so far (tracked and collapsed).
+    #[must_use]
+    pub fn positions(&self) -> usize {
+        self.literals.len().saturating_add(self.collapsed.len())
+    }
+
+    /// Literal hashes kept so far, over every position.
+    #[must_use]
+    pub fn tracked_literals(&self) -> usize {
+        self.literals.values().map(Vec::len).sum()
     }
 
     /// Applies the positions already collapsed to `units`, left to right.
@@ -570,18 +697,12 @@ impl PatternBuilder {
         if self.collapsed.is_empty() {
             return;
         }
-        let shape = shape_of(units);
-        for pos in 0..units.len() {
-            let key = PosKey {
-                shape: shape.clone(),
-                pos,
-                prefix: units.iter().take(pos).map(|u| u.tok.clone()).collect(),
-            };
-            if self.collapsed.contains(&key)
-                && let Some(u) = units.get_mut(pos)
-            {
+        let mut ids = Positions::new(&self.state, units);
+        for (pos, u) in units.iter_mut().enumerate() {
+            if self.collapsed.contains(&ids.id(pos)) {
                 u.tok = Tok::Wild;
             }
+            ids.push(&u.tok);
         }
     }
 
@@ -594,33 +715,49 @@ impl PatternBuilder {
             name_values,
         } = key;
         self.apply_collapsed(&mut units);
+        // A key whose template cannot be kept is not tracked either.
+        if self.templates.len() >= MAX_TEMPLATES
+            && !self.templates.contains_key(&(units.clone(), kind))
+        {
+            self.overflow = self.overflow.saturating_add(1);
+            return;
+        }
         // Cardinality, tracked while walking (bounded).
-        let shape = shape_of(&units);
         let mut newly = Vec::new();
-        for pos in 0..units.len() {
-            let Some(Unit {
-                tok: Tok::Lit(lit), ..
-            }) = units.get(pos)
-            else {
-                continue;
-            };
-            let key = PosKey {
-                shape: shape.clone(),
-                pos,
-                prefix: units.iter().take(pos).map(|u| u.tok.clone()).collect(),
-            };
-            let set = self.literals.entry(key.clone()).or_default();
-            if set.len() < MAX_TRACKED_LITERALS {
-                set.insert(lit.clone());
-            }
-            if set.len() > COLLAPSE_THRESHOLD {
-                newly.push(key);
+        {
+            let Self {
+                state,
+                literals,
+                collapsed,
+                position_bound,
+                ..
+            } = self;
+            let mut ids = Positions::new(state, &units);
+            for (pos, u) in units.iter_mut().enumerate() {
+                if let Tok::Lit(lit) = &u.tok {
+                    let id = ids.id(pos);
+                    let lit = state.hash_one(lit.expose());
+                    if let Some(set) = literals.get_mut(&id) {
+                        if set.len() < MAX_TRACKED_LITERALS && !set.contains(&lit) {
+                            set.push(lit);
+                        }
+                        if set.len() > COLLAPSE_THRESHOLD {
+                            newly.push(id);
+                        }
+                    } else if literals.len().saturating_add(collapsed.len()) >= MAX_POSITIONS {
+                        u.tok = Tok::Wild;
+                        *position_bound = position_bound.saturating_add(1);
+                    } else {
+                        literals.insert(id, vec![lit]);
+                    }
+                }
+                ids.push(&u.tok);
             }
         }
         if !newly.is_empty() {
-            for key in newly {
-                self.literals.remove(&key);
-                self.collapsed.insert(key);
+            for id in newly {
+                self.literals.remove(&id);
+                self.collapsed.insert(id);
             }
             self.apply_collapsed(&mut units);
             self.rebuild();
@@ -660,52 +797,45 @@ impl PatternBuilder {
 
     /// Positions to collapse by the walk's rules over the kept templates:
     /// cardinality, and the record-id rule (2 or more distinct values
-    /// before the same suffix; at the first position only when the suffix
-    /// is empty or holds a literal, so that `phone:*` and `addressbook:*`
-    /// keep their prefixes).
-    fn decide(&self) -> Vec<PosKey> {
-        let mut by_pos: HashMap<PosKey, BTreeMap<Vec<Tok>, BTreeSet<&Secret>>> = HashMap::new();
-        let mut distinct: HashMap<PosKey, BTreeSet<&Secret>> = HashMap::new();
+    /// before the same suffix, at every position, the first included:
+    /// `phone:1` and `addressbook:2` give `*:*`, decision 7 as written;
+    /// over-masking is accepted, ADR-0009).
+    fn decide(&self) -> Vec<u64> {
+        let mut distinct: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut by_suffix: HashMap<(u64, u64), HashSet<u64>> = HashMap::new();
         for (units, _) in self.templates.keys() {
-            let shape = shape_of(units);
+            // Suffix hashes, right to left.
+            let mut suffix = vec![0u64; units.len()];
+            let mut h = self.state.hash_one(units.len());
+            for (pos, u) in units.iter().enumerate().rev() {
+                if let Some(slot) = suffix.get_mut(pos) {
+                    *slot = h;
+                }
+                h = self.state.hash_one((h, &u.sep, &u.tok));
+            }
+            let mut ids = Positions::new(&self.state, units);
             for (pos, u) in units.iter().enumerate() {
-                let Tok::Lit(lit) = &u.tok else { continue };
-                let key = PosKey {
-                    shape: shape.clone(),
-                    pos,
-                    prefix: units.iter().take(pos).map(|x| x.tok.clone()).collect(),
-                };
-                let suffix: Vec<Tok> = units.iter().skip(pos + 1).map(|x| x.tok.clone()).collect();
-                distinct.entry(key.clone()).or_default().insert(lit);
-                by_pos
-                    .entry(key)
-                    .or_default()
-                    .entry(suffix)
-                    .or_default()
-                    .insert(lit);
+                if let Tok::Lit(lit) = &u.tok {
+                    let id = ids.id(pos);
+                    let lit = self.state.hash_one(lit.expose());
+                    distinct.entry(id).or_default().insert(lit);
+                    let suf = suffix.get(pos).copied().unwrap_or_default();
+                    by_suffix.entry((id, suf)).or_default().insert(lit);
+                }
+                ids.push(&u.tok);
             }
         }
-        let mut out = Vec::new();
-        for (key, values) in &distinct {
-            if values.len() > COLLAPSE_THRESHOLD {
-                out.push(key.clone());
+        let mut out: HashSet<u64> = distinct
+            .into_iter()
+            .filter(|(_, values)| values.len() > COLLAPSE_THRESHOLD)
+            .map(|(id, _)| id)
+            .collect();
+        for ((id, _), values) in by_suffix {
+            if values.len() >= 2 {
+                out.insert(id);
             }
         }
-        for (key, suffixes) in by_pos {
-            if out.contains(&key) {
-                continue;
-            }
-            let record = suffixes.iter().any(|(suffix, values)| {
-                values.len() >= 2
-                    && (key.pos > 0
-                        || suffix.is_empty()
-                        || suffix.iter().any(|t| matches!(t, Tok::Lit(_))))
-            });
-            if record {
-                out.push(key);
-            }
-        }
-        out
+        out.into_iter().collect()
     }
 
     /// Ends the walk: applies the walk's rules (at most 4 rounds), then
@@ -718,9 +848,7 @@ impl PatternBuilder {
             if decided.is_empty() {
                 break;
             }
-            for key in decided {
-                self.collapsed.insert(key);
-            }
+            self.collapsed.extend(decided);
             self.rebuild();
         }
         let cap = self.samples;
@@ -822,10 +950,15 @@ mod tests {
         );
         // A single-key family keeps its literals (documented residual).
         assert_eq!(walk(&["user:jdupont:email"]), ["user:jdupont:email"]);
-        // Different prefixes with a wildcard suffix keep their names.
-        let mut got = walk(&["phone:1", "addressbook:2"]);
-        got.sort();
-        assert_eq!(got, ["addressbook:*", "phone:*"]);
+        // Different first segments before the same suffix are records too,
+        // the first position included (decision 7 as written; security
+        // review H1): over-masking is accepted.
+        assert_eq!(walk(&["phone:1", "addressbook:2"]), ["*:*"]);
+        // The measured leaks of the former first-position exception.
+        assert_eq!(walk(&["jdupont:42", "amartin:17"]), ["*:*"]);
+        assert_eq!(walk(&["jdupont:42:cart", "amartin:17:cart"]), ["*:*:cart"]);
+        assert_eq!(walk(&["jdupont_42", "amartin_17", "lucas_9"]), ["*_*"]);
+        assert_eq!(walk(&["jdupont:42", "amartin:x7"]), ["*:*"]);
         // Two one-segment keys are records.
         assert_eq!(walk(&["jdupont", "amartin"]), ["*"]);
         // Token by token.
@@ -849,10 +982,119 @@ mod tests {
         }
         assert!(b.templates() <= 2, "{}", b.templates());
         assert!(b.literals.values().all(|s| s.len() <= MAX_TRACKED_LITERALS));
+        assert!(b.positions() <= 4, "{}", b.positions());
         let out = b.finish();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].pattern.as_str(), "cache:*");
         assert_eq!(out[0].group.count, 5000);
+    }
+
+    /// Security review H3: 100 000 slug-like keys (each its own template
+    /// once the template bound is hit) and 20-token names keep the walk's
+    /// state within its bounds, and no key-name text in it.
+    #[test]
+    fn walk_state_is_bounded_whatever_the_keyspace() {
+        let mut b = PatternBuilder::new(1);
+        for i in 0..100_000 {
+            // Slugs: letters only, which the per-key rules keep (built
+            // directly: this test is about the walk, not the per-key rules).
+            let t = [word(i), word(i / 3), word(i / 7)];
+            let k = t.join(":");
+            b.add(k.as_bytes(), literals(&t, ":"), 0);
+        }
+        assert!(b.templates() <= MAX_TEMPLATES, "{}", b.templates());
+        assert!(b.positions() <= MAX_POSITIONS, "{}", b.positions());
+        assert!(
+            b.tracked_literals() <= MAX_POSITIONS * MAX_TRACKED_LITERALS,
+            "{}",
+            b.tracked_literals()
+        );
+        let mut b = PatternBuilder::new(1);
+        for i in 0..100_000 {
+            let t: Vec<String> = (0..20).map(|t| word(i * 20 + t)).collect();
+            let k = t.join("_");
+            b.add(k.as_bytes(), literals(&t, "_"), 0);
+        }
+        assert!(b.templates() <= MAX_TEMPLATES, "{}", b.templates());
+        assert!(b.positions() <= MAX_POSITIONS, "{}", b.positions());
+        assert!(b.tracked_literals() <= MAX_POSITIONS * MAX_TRACKED_LITERALS);
+        // Whatever was kept, the emitted patterns still pass the gate.
+        for p in b.finish() {
+            assert!(is_key_pattern(p.pattern.as_str()) || p.pattern.as_str() == "*");
+        }
+    }
+
+    /// Units of literal tokens joined by `sep`.
+    fn literals(tokens: &[String], sep: &str) -> KeyUnits {
+        KeyUnits {
+            units: tokens
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Unit {
+                    sep: if i == 0 {
+                        String::new()
+                    } else {
+                        sep.to_owned()
+                    },
+                    tok: Tok::Lit(Secret(t.clone())),
+                })
+                .collect(),
+            name_values: Vec::new(),
+        }
+    }
+
+    /// Past the position bound, new positions are `*` (fail closed).
+    #[test]
+    fn position_bound_masks_new_positions() {
+        let mut b = PatternBuilder::new(1);
+        // Distinct shapes (unit counts) so that every key opens positions.
+        let mut i = 0;
+        while b.positions() < MAX_POSITIONS {
+            let n = 1 + i % 60;
+            let k: Vec<String> = (0..n).map(|t| word(i * 64 + t)).collect();
+            let k = k.join("/");
+            b.add(k.as_bytes(), split_key(k.as_bytes()), 0);
+            i += 1;
+            assert!(i < 1_000_000);
+        }
+        let before = b.position_bound_hits();
+        b.add(b"zzzq/www/vvv", split_key(b"zzzq/www/vvv"), 1);
+        assert!(b.position_bound_hits() > before);
+        assert_eq!(b.positions(), MAX_POSITIONS);
+    }
+
+    #[test]
+    fn generated_segments_are_values() {
+        // Security review M4.
+        assert_eq!(one("reset:qzkqfwmxqtrqlvha"), "reset:*");
+        assert_eq!(one("api:Hk_QwErTy-ZxCvBnM_PoIuYtRe"), "api:*");
+        assert_eq!(one("tok:aZ3_kq9-Lm2pX8_wQ4-vR7nC"), "tok:*");
+        assert_eq!(one("x:hjkwqrtz"), "x:*");
+        assert_eq!(one("x:bcdfghjklmnpqrstvwxz"), "x:*");
+        assert_eq!(one("k:0f9e8d7c6b5a4f3e"), "k:*");
+        // Words and ordinary compound names are kept.
+        for keep in [
+            "integration:aws:secret_access_key",
+            "queue:sms_outbox",
+            "newsletter:subscribers",
+            "loyalty:leaderboard",
+            "events:payments",
+            "user_profile_settings_backup",
+            "customer:internationalization",
+            "app:responsibilities",
+            "cache:customerprofilesbackup",
+        ] {
+            assert_eq!(one(keep), keep);
+        }
+    }
+
+    #[test]
+    fn unassigned_code_points_are_values() {
+        // Unassigned in this agent's tables, a digit to the console's.
+        let k = "\u{11de0}".repeat(9);
+        assert!(!is_key_pattern(&k));
+        assert_eq!(one(&format!("x:{k}")), "x:*");
+        assert_eq!(one("x:a\u{378}b"), "x:*");
     }
 
     fn word(mut i: usize) -> String {

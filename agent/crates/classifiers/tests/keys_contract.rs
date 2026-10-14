@@ -145,3 +145,50 @@ proptest! {
         prop_assert!(contract_accepts(re, &p), "{:?}", p);
     }
 }
+
+/// Every Unicode scalar value, in the shapes the rules look at (a plain
+/// segment, a digit run, a separator run): the agent's gate never accepts
+/// what the contract refuses (L1, Unicode version drift between the
+/// `regex` crate and `regress`). The emitted patterns are checked on the
+/// same inputs. About 5 to 11 minutes in debug mode, seconds in release:
+/// `cargo test --release -p databastion-classifiers --test keys_contract
+/// -- --include-ignored`.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "full code-point sweep: run in release mode"
+)]
+fn gate_never_accepts_what_the_contract_refuses_on_any_code_point() {
+    let re = not_rule();
+    let mut drift = Vec::new();
+    let mut emitted = Vec::new();
+    for c in (0..=0x10_FFFF_u32).filter_map(char::from_u32) {
+        let shapes = [
+            format!("a{c}b"),
+            c.to_string().repeat(9),
+            format!("1{}2", c.to_string().repeat(7)),
+            format!("k:{c}"),
+        ];
+        for s in &shapes {
+            if keys::is_key_pattern(s) && !contract_accepts(re, s) {
+                drift.push(format!("U+{:04X} {:?}", u32::from(c), s.chars().count()));
+            }
+        }
+        let p = keys::fuzz_normalize(shapes[0].as_bytes());
+        if !contract_accepts(re, &p) {
+            emitted.push(format!("U+{:04X}", u32::from(c)));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "gate drift: {} {:?}",
+        drift.len(),
+        &drift[..drift.len().min(40)]
+    );
+    assert!(
+        emitted.is_empty(),
+        "emitted: {} {:?}",
+        emitted.len(),
+        &emitted[..emitted.len().min(40)]
+    );
+}

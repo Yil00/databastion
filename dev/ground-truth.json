@@ -7253,7 +7253,7 @@
    "expected_classifiers": [
     "pii.person_name"
    ],
-   "expected_normalized_name": "phone:*",
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -7287,7 +7287,7 @@
     "33536499074"
    ],
    "negative_control": false,
-   "note": "key names are phone numbers",
+   "note": "key names are phone numbers; `phone` and `addressbook` precede the same suffix `*`, so the record-id rule masks the first segment too (ADR-0052 decision 7)",
    "object": "phone:*",
    "values": [
     "Aiden Evans",
@@ -7324,7 +7324,7 @@
    "expected_classifiers": [
     "pii.phone"
    ],
-   "expected_normalized_name": "addressbook:*",
+   "expected_normalized_name": "*:*",
    "field": "*",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -7363,7 +7363,7 @@
     "ines.leroy@example.net"
    ],
    "negative_control": false,
-   "note": "hash field names are e-mail addresses",
+   "note": "hash field names are e-mail addresses; first segment masked as for `phone:*`",
    "object": "addressbook:*",
    "values": [
     "01 99 00 18 19",
@@ -7405,7 +7405,7 @@
    "expected_classifiers": [
     "pii.email"
    ],
-   "expected_normalized_name": "addressbook:*",
+   "expected_normalized_name": "*:*",
    "field": "#field",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -7444,7 +7444,7 @@
     "ines.leroy@example.net"
    ],
    "negative_control": false,
-   "note": "hash field names are e-mail addresses",
+   "note": "hash field names are e-mail addresses; first segment masked as for `phone:*`",
    "object": "addressbook:*",
    "values": [
     "amelia.novak@example.com",
@@ -7486,6 +7486,7 @@
    "expected_classifiers": [
     "pii.email"
    ],
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -7560,6 +7561,7 @@
    "expected_classifiers": [
     "pii.person_name"
    ],
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -7659,6 +7661,7 @@
    "expected_classifiers": [
     "pii.card_number"
    ],
+   "expected_normalized_name": "*:*",
    "field": "card_number",
    "name_contains_value": false,
    "negative_control": false,
@@ -7703,6 +7706,7 @@
    "expected_classifiers": [
     "pii.iban"
    ],
+   "expected_normalized_name": "*:*",
    "field": "iban",
    "name_contains_value": false,
    "negative_control": false,
@@ -7745,6 +7749,7 @@
    "database": "db0",
    "engine": "valkey",
    "expected_classifiers": [],
+   "expected_normalized_name": "*:*",
    "field": "amount_cents",
    "name_contains_value": false,
    "negative_control": true,
@@ -7757,6 +7762,7 @@
    "expected_classifiers": [
     "secret.aws_key"
    ],
+   "expected_normalized_name": "integration:*:access_key_id",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -7772,6 +7778,7 @@
    "expected_classifiers": [
     "secret.aws_key"
    ],
+   "expected_normalized_name": "integration:*:secret_access_key",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -8328,7 +8335,7 @@
    "expected_classifiers": [
     "pii.person_name"
    ],
-   "expected_normalized_name": "phone:*",
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -8362,7 +8369,7 @@
     "33536499074"
    ],
    "negative_control": false,
-   "note": "key names are phone numbers",
+   "note": "key names are phone numbers; `phone` and `addressbook` precede the same suffix `*`, so the record-id rule masks the first segment too (ADR-0052 decision 7)",
    "object": "phone:*",
    "values": [
     "Aiden Evans",
@@ -8399,7 +8406,7 @@
    "expected_classifiers": [
     "pii.phone"
    ],
-   "expected_normalized_name": "addressbook:*",
+   "expected_normalized_name": "*:*",
    "field": "*",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -8438,7 +8445,7 @@
     "ines.leroy@example.net"
    ],
    "negative_control": false,
-   "note": "hash field names are e-mail addresses",
+   "note": "hash field names are e-mail addresses; first segment masked as for `phone:*`",
    "object": "addressbook:*",
    "values": [
     "01 99 00 18 19",
@@ -8480,7 +8487,7 @@
    "expected_classifiers": [
     "pii.email"
    ],
-   "expected_normalized_name": "addressbook:*",
+   "expected_normalized_name": "*:*",
    "field": "#field",
    "name_contains_value": true,
    "name_value_classifiers": [
@@ -8519,7 +8526,7 @@
     "ines.leroy@example.net"
    ],
    "negative_control": false,
-   "note": "hash field names are e-mail addresses",
+   "note": "hash field names are e-mail addresses; first segment masked as for `phone:*`",
    "object": "addressbook:*",
    "values": [
     "amelia.novak@example.com",
@@ -8561,6 +8568,7 @@
    "expected_classifiers": [
     "pii.email"
    ],
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -8635,6 +8643,7 @@
    "expected_classifiers": [
     "pii.person_name"
    ],
+   "expected_normalized_name": "*:*",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -8734,6 +8743,7 @@
    "expected_classifiers": [
     "pii.card_number"
    ],
+   "expected_normalized_name": "*:*",
    "field": "card_number",
    "name_contains_value": false,
    "negative_control": false,
@@ -8778,6 +8788,7 @@
    "expected_classifiers": [
     "pii.iban"
    ],
+   "expected_normalized_name": "*:*",
    "field": "iban",
    "name_contains_value": false,
    "negative_control": false,
@@ -8820,6 +8831,7 @@
    "database": "db0",
    "engine": "redis",
    "expected_classifiers": [],
+   "expected_normalized_name": "*:*",
    "field": "amount_cents",
    "name_contains_value": false,
    "negative_control": true,
@@ -8832,6 +8844,7 @@
    "expected_classifiers": [
     "secret.aws_key"
    ],
+   "expected_normalized_name": "integration:*:access_key_id",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
@@ -8847,6 +8860,7 @@
    "expected_classifiers": [
     "secret.aws_key"
    ],
+   "expected_normalized_name": "integration:*:secret_access_key",
    "field": "value",
    "name_contains_value": false,
    "negative_control": false,
