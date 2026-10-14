@@ -1,10 +1,13 @@
+import { ENGINES, type Engine } from "@/lib/protocol/enums";
 import { validateSchema } from "@/lib/protocol/validate";
 
-/** Filter of the findings view (`/findings?agent=&target=&classifier=&fp=1`). */
+/** Filter of the findings view (`/findings?agent=&target=&classifier=&engine=&fp=1`). */
 export interface FindingFilter {
   agentId?: string;
   targetId?: string;
   classifier?: string;
+  /** A contract `Engine` (the finding's `Location.engine`). */
+  engine?: Engine;
   includeFalsePositives?: boolean;
 }
 
@@ -19,10 +22,12 @@ export function parseFindingFilter(sp: SearchParams): FindingFilter {
   const agent = one(sp.agent);
   const target = one(sp.target);
   const classifier = one(sp.classifier);
+  const engine = one(sp.engine);
   return {
     agentId: agent && UUID.test(agent) ? agent : undefined,
     targetId: target && validateSchema("TargetId", target).ok ? target : undefined,
     classifier: classifier && validateSchema("ClassifierId", classifier).ok ? classifier : undefined,
+    engine: engine && (ENGINES as readonly string[]).includes(engine) ? (engine as Engine) : undefined,
     includeFalsePositives: one(sp.fp) === "1",
   };
 }

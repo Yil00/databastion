@@ -164,6 +164,17 @@ info:
     pointed at with `enum` on exactly those engine pointers and holds them in its spool until a
     heartbeat response lists the tokens (ADR-0042 decision 3).
 
+    **Heartbeat target checks** (P9-E). A target whose `audit_source` does not serve its
+    `engine` is stored without `audit_source` and an agent-integrity event is recorded; the rest
+    of the heartbeat is processed (no `400`). The engines each `AuditSource` serves:
+    - `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;
+    - `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;
+    - `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;
+    - `openldap_accesslog` -> `openldap`;
+    - `cas_audit_log` -> `cas`;
+    - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
+    - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+
     `POST /findings`, in this order, after the duplicate check of "Idempotency":
     1. **Job.** `job_id` is a `discovery.scan` job assigned to the calling agent that accepts findings
        (`404`, pointer `/job_id`, keyword `notFound`; the agent drops the batch). A scan job accepts
@@ -1235,6 +1246,16 @@ components:
           (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
           (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
           **both** `engine.redis` and `engine.valkey` are listed.
+
+        The engines each source serves (a source is reported only for a target of one of them;
+        see "Heartbeat target checks" and, for access events, "Target engine" under `POST /events`):
+        - `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;
+        - `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;
+        - `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;
+        - `openldap_accesslog` -> `openldap`;
+        - `cas_audit_log` -> `cas`;
+        - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
+        - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
       type: string
       enum:
         - pgaudit
@@ -2556,8 +2577,11 @@ components:
         and of a `redis` or `valkey` target (checked by the console from the target's engine),
         and never on `auth_failure` events (checked by this schema: a failed authentication always
         names, or fingerprints, the name tried). Console rules (ADR-0021 decision 6, P9-E): the
-        dedup key's principal part is `unknown:<SHA-256 of the client network>`, `unknown:local`,
-        or `unknown:none` without `client_addr`; no per-principal baseline is built for it. Sent
+        dedup key's principal part is `unrecorded:<SHA-256 of the client network>`,
+        `unrecorded:local`, or `unrecorded:none` without `client_addr`: a prefix of its own,
+        distinct from the `unknown:` key of failed authentications, so a failed authentication
+        of the same network never opens the incident such an event is added to (P9-E review
+        M1); no per-principal baseline is built for it. Sent
         only under the Redis / Valkey engine tokens, as every value of those engines.
       type: object
       additionalProperties: false

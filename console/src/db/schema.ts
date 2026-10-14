@@ -854,8 +854,12 @@ export const eventsBatches = pgTable(
  * contract has no field for them and the console rejects unknown fields. Columns hold the principal
  * (`db_user` or its fingerprint, client address, application), the action, the normalized object
  * names, counts, signals and the source, all bounded by the contract and escaped on display.
- * `principal_key` = SHA-256 of `u\0<db_user>` or `f\0<fingerprint>`: the grouping key of baselines
- * and dedup keys, so agent-provided text never appears in a key.
+ * `principal_key` = SHA-256 of `u\0<db_user>` or `f\0<fingerprint>`, or for an event without a
+ * recorded account (`account_not_recorded`, Redis / Valkey only, ADR-0052 decision 8) SHA-256 of
+ * `n\0<client network>` (`local`, `none` without an address): the grouping key of the events
+ * view and of baselines and dedup keys, so agent-provided text never appears in a key. Exactly one
+ * of `db_user`, `db_user_fingerprint` and `account_not_recorded` is set (`access_events_principal`,
+ * migration 0040, validated outside the migration transaction).
  *
  * The runtime role may only INSERT and SELECT, plus UPDATE of the evaluation columns
  * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`) written by the worker:
@@ -877,6 +881,13 @@ export const accessEvents = pgTable(
     principalKey: text("principal_key").notNull(),
     dbUser: text("db_user"),
     dbUserFingerprint: text("db_user_fingerprint"),
+    /**
+     * Contract `Principal.account_not_recorded` (P9-E): the source records no account for this
+     * access (Redis / Valkey slow-log entries of closed connections, full synchronizations). No
+     * per-principal baseline is built for such an event, and its dedup principal is
+     * `unrecorded:<SHA-256 of the client network>`, `unrecorded:local` or `unrecorded:none`.
+     */
+    accountNotRecorded: boolean("account_not_recorded").notNull().default(false),
     clientAddr: text("client_addr"),
     application: text("application"),
     action: text("action").notNull(),
@@ -922,7 +933,7 @@ export const accessEvents = pgTable(
     index("access_events_pending_idx")
       .on(t.agentId, t.receivedAt, t.itemIndex, t.id)
       .where(sql`${t.evaluatedAt} is null`),
-    check("access_events_principal", sql`(${t.dbUser} is null) <> (${t.dbUserFingerprint} is null)`),
+    check("access_events_principal", sql`num_nonnulls(${t.dbUser}, ${t.dbUserFingerprint}) + ${t.accountNotRecorded}::int = 1`),
     check("access_events_principal_key_format", sql`${t.principalKey} ~ '^[0-9a-f]{64}$'`),
     check("access_events_action", sql`${t.action} in ('connect', 'auth_failure', 'read', 'write', 'ddl', 'dcl')`),
     check("access_events_counts", sql`${t.aggregatedCount} >= 1 and (${t.rows} is null or ${t.rows} >= 0)`),

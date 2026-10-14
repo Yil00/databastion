@@ -11,7 +11,9 @@ import { notifyIntegrityEvent } from "./system-alerts";
 /**
  * Agent-integrity events of the results endpoints (docs/09-agent-protocol.md, ADR-0009): a rejected
  * (`400`) findings batch, a `batch_conflict` (`409`) and a finding for a target the agent does not
- * own (`404`) cannot come from a conforming agent. Each one writes a `security_events` row, an
+ * own (`404`) cannot come from a conforming agent; nor can a heartbeat target whose
+ * `audit_source` does not serve its `engine` (`target_mismatch`, P9-E review M2: the target is
+ * stored without the source and the heartbeat is accepted, status `200`). Each one writes a `security_events` row, an
  * `audit_log` entry and (P3-C) the notifications of the system-alert channels, in one transaction.
  *
  * Details are console-computed scalars only: the endpoint, the HTTP status, the number of error
@@ -22,12 +24,13 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * (`integrityWriteBudget`); beyond it, events are only counted (`integrityStats.suppressed`) and
  * logged at most once per window per agent.
  */
-export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target";
+export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target" | "target_mismatch";
 
 const ACTION: Record<IntegrityKind, AuditAction> = {
   batch_rejected: "agent.batch_rejected",
   batch_conflict: "agent.batch_conflict",
   foreign_target: "agent.foreign_target",
+  target_mismatch: "agent.target_mismatch",
 };
 
 /**
@@ -49,7 +52,7 @@ const MAX_SUPPRESSED_KEYS = 10_000;
 export interface IntegrityEvent {
   agentId: string;
   kind: IntegrityKind;
-  endpoint: "findings" | "events";
+  endpoint: "findings" | "events" | "heartbeat";
   status: number;
   details?: readonly ValidationDetail[];
   ip: string | null;

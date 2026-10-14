@@ -26,7 +26,7 @@ export const LIST_FIELDS = [
 export const LOCATION_FIELDS = [
   { name: "location.database", label: "Database" },
   { name: "location.schema", label: "Schema" },
-  { name: "location.object", label: "Object (table, collection, container)" },
+  { name: "location.object", label: "Object (table, collection, container, key pattern)" },
   { name: "location.field", label: "Field (column, path, attribute)" },
 ] as const;
 
@@ -40,8 +40,11 @@ export const THRESHOLD_FIELDS = [
 export const EVENT_LIST_FIELDS = [
   { name: "signals", label: "Signals, e.g. signature.pg_dump, signature.mongodump, shape.full_table_read, volume.large_result, or families such as signature.* (any when empty)" },
   { name: "event_actions", label: `Actions: ${EVENT_ACTIONS.join(", ")} (any when empty)` },
-  { name: "principals", label: "Principals, globs (any when empty)" },
-  { name: "exclude_principals", label: "Except principals, globs" },
+  {
+    name: "principals",
+    label: "Principals, globs (any when empty; an event whose account the source did not record, Redis / Valkey, only matches *)",
+  },
+  { name: "exclude_principals", label: "Except principals, globs (never hides an event whose account the source did not record)" },
   { name: "sources", label: "Audit sources such as pgaudit or mongodb_audit_log (any when empty)" },
   { name: "target_ids", label: "Targets (all when empty)" },
   { name: "engines", label: "Engines (all when empty)" },
@@ -51,7 +54,7 @@ export const EVENT_LIST_FIELDS = [
 export const EVENT_OBJECT_FIELDS = [
   { name: "objects.database", label: "Database" },
   { name: "objects.schema", label: "Schema" },
-  { name: "objects.object", label: "Object (table, collection, container)" },
+  { name: "objects.object", label: "Object (table, collection, container, key pattern)" },
 ] as const;
 
 export const EVENT_THRESHOLD_FIELDS = [

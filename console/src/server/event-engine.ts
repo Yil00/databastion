@@ -133,6 +133,7 @@ const PENDING_COLUMNS = {
   principalKey: accessEvents.principalKey,
   dbUser: accessEvents.dbUser,
   dbUserFingerprint: accessEvents.dbUserFingerprint,
+  accountNotRecorded: accessEvents.accountNotRecorded,
   clientAddr: accessEvents.clientAddr,
   action: accessEvents.action,
   objects: accessEvents.objects,
@@ -149,6 +150,8 @@ type PendingEvent = {
   principalKey: string;
   dbUser: string | null;
   dbUserFingerprint: string | null;
+  /** No recorded account (Redis / Valkey): no baseline, `unknown:*` dedup principal. */
+  accountNotRecorded: boolean;
   clientAddr: string | null;
   action: string;
   objects: EventObject[];
@@ -468,6 +471,8 @@ async function applyEventPolicy(
       action: e.action,
       principalKey: e.principalKey,
       networkHash: sha256Hex(clientNetwork(e.clientAddr)),
+      accountNotRecorded: e.accountNotRecorded,
+      clientAddr: e.clientAddr,
     }),
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
@@ -573,7 +578,8 @@ async function applyEventPolicy(
     agent_id: e.agentId,
     target_id: e.targetId,
     principal: principal ?? "",
-    principal_fingerprinted: e.dbUser === null,
+    principal_fingerprinted: e.dbUserFingerprint !== null,
+    principal_not_recorded: !overflow && e.accountNotRecorded,
     database: overflow ? null : database,
     hour: (overflow ? state.hour : bucket).toISOString(),
     overflow: overflow ? { limit_per_hour: state.cap } : null,
@@ -682,6 +688,7 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         targetId: e.targetId,
         engine: engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
+        accountNotRecorded: e.accountNotRecorded,
         action: e.action,
         source: e.source,
         objects: e.objects,

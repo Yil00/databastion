@@ -2,7 +2,9 @@ import { and, desc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
-import type { Schemas } from "@/lib/protocol/validate";
+import { auditSourceEngines } from "@/lib/location-labels";
+import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
+import { parseDetectedTargets } from "@/lib/detected-targets";
 import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
@@ -118,10 +120,45 @@ async function auditEnrollFailure(db: Database, ip: string | null): Promise<void
 }
 
 /**
+ * Heartbeat target checks against the target's engine (P9-E, contract "Heartbeat target checks"):
+ * a target's `audit_source` must serve its `engine` (`/targets/<i>/audit_source`, keyword
+ * `const`; the MySQL / MariaDB sources serve both engines, the `redis_*` sources Redis and
+ * Valkey). The schema cannot express it (`TargetStatus` names both values independently). A
+ * conforming agent reports the source it reads for the engine it declared, so a mismatch is an
+ * agent-integrity event; per target (P9-E review M2): the target is stored **without**
+ * `audit_source` ({@link withoutMismatchedSources}) and the rest of the heartbeat is processed
+ * (no `400`, so a non-conforming target never makes the agent look silent).
+ */
+export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targets">): ValidationDetail[] {
+  const details: ValidationDetail[] = [];
+  hb.targets.forEach((t, i) => {
+    if (details.length >= MAX_VALIDATION_DETAILS || t.audit_source === undefined) return;
+    if (!(auditSourceEngines(t.audit_source) as readonly string[]).includes(t.engine)) {
+      details.push({ pointer: `/targets/${i}/audit_source`, keyword: "const" });
+    }
+  });
+  return details;
+}
+
+/**
  * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
+/** The heartbeat with `audit_source` removed from the targets pointed at by `details`. */
+export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], details: readonly ValidationDetail[]): Schemas["HeartbeatRequest"] {
+  if (details.length === 0) return hb;
+  const drop = new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
+  return {
+    ...hb,
+    targets: hb.targets.map((t, i) => {
+      if (!drop.has(i)) return t;
+      const { audit_source: _dropped, ...rest } = t;
+      return rest;
+    }),
+  };
+}
+
 export async function recordHeartbeat(
   db: Database,
   agentId: string,
@@ -332,6 +369,7 @@ export async function getAgentDetail(db: Database, agentId: string) {
       auditStreamStopsUnalerted: agents.auditStreamStopsUnalerted,
       auditStreamStopsSince: agents.auditStreamStopsSince,
       auditStreamStopsAlertedAt: agents.auditStreamStopsAlertedAt,
+      detectedTargets: agents.detectedTargets,
     })
     .from(agents)
     .where(eq(agents.id, agentId))
@@ -382,5 +420,12 @@ export async function getAgentDetail(db: Database, agentId: string) {
     .from(agentTargets)
     .where(eq(agentTargets.agentId, agentId))
     .orderBy(agentTargets.targetId);
-  return { ...agent, droppedAlerts, streamStopAlerts, targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })) };
+  return {
+    ...agent,
+    // ADR-0006: local engines the agent spotted but that are not declared (re-checked on read).
+    detectedTargets: parseDetectedTargets(agent.detectedTargets),
+    droppedAlerts,
+    streamStopAlerts,
+    targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })),
+  };
 }

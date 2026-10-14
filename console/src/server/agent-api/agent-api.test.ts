@@ -6,11 +6,11 @@ import { PgBoss } from "pg-boss";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb, getPool } from "@/db/client";
-import { agents, agentTargets, auditLog, enrollmentTokens, jobs } from "@/db/schema";
+import { agents, agentTargets, auditLog, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import schemasBundle from "@/generated/protocol/schemas.gen.json";
 import { MAX_TARGET_NOTES_BYTES } from "@/lib/target-notes";
-import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent } from "@/server/agents";
+import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceDetails } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
@@ -183,15 +183,13 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(res.status).toBe(401);
     });
 
-    it("refuses connectors of an engine whose token is unlisted (400 enum, ADR-0042 decision 1)", async () => {
+    it("lets connectors of the engines listed since P9-E past the engine-token gate (ADR-0042 decision 1)", async () => {
       const body = { token: `dbe_${"A".repeat(43)}`, hostname: "h", agent_version: "0.1.0", connectors: ["postgres", "sqlserver", "redis"] };
       expect(validateSchema("EnrollRequest", body).ok).toBe(true);
+      expect(unlistedEngineDetails("EnrollRequest", body)).toEqual([]);
+      // Past the gate: the unknown token is what fails.
       const res = await handleEnroll(agentRequest("POST", "/enroll", { body }));
-      expect(res.status).toBe(400);
-      expect((await expectConformingError(res, body)).details).toEqual([
-        { pointer: "/connectors/1", keyword: "enum" },
-        { pointer: "/connectors/2", keyword: "enum" },
-      ]);
+      expect(res.status).toBe(401);
     });
 
     it.each(fixtures("invalid", "EnrollRequest"))("invalid fixture %s -> 400", async (_f, body) => {
@@ -744,58 +742,79 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
   });
 
   describe("POST /heartbeat", () => {
-    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (P9-C review H1).
-    const unlistedHeartbeat = ([, body]: [string, unknown]) => unlistedEngineDetails("HeartbeatRequest", body).length > 0;
-
-    it.todo("stores the sqlserver and redis-valkey heartbeat fixtures once CONSOLE_ACCEPTS lists their engine tokens (P9-E)");
-
-    it.each(fixtures("valid", "HeartbeatRequest").filter(unlistedHeartbeat))(
-      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
-      async (_f, body) => {
+    it("stores the sqlserver and redis-valkey heartbeat fixtures: targets, engines, sources, notes and detected targets (P9-E)", async () => {
+      for (const name of ["HeartbeatRequest.sqlserver.json", "HeartbeatRequest.redis-valkey.json"]) {
+        const [, body] = fixtures("valid", "HeartbeatRequest").find(([f]) => f === name) ?? [];
+        expect(body, name).toBeDefined();
+        const hb = body as {
+          connectors: string[];
+          targets: { target_id: string; engine: string; audit_source?: string; notes?: unknown[] }[];
+          detected_targets: unknown[];
+        };
+        expect(unlistedEngineDetails("HeartbeatRequest", hb), name).toEqual([]);
         const auth = await enroll();
-        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
-        expect(res.status).toBe(400);
-        const err = await expectConformingError(res, body);
-        expect(err.code).toBe("invalid_request");
-        const details = err.details as { pointer: string; keyword: string }[];
-        expect(details.length).toBeGreaterThan(0);
-        expect(details.every((d) => d.keyword === "enum")).toBe(true);
-        expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
-      },
-    );
+        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }));
+        expect(res.status, name).toBe(200);
+        const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+        const sent = [...hb.targets].sort((a, b) => (a.target_id < b.target_id ? -1 : 1));
+        expect(stored.map((t) => [t.targetId, t.engine, t.auditSource, t.notes])).toEqual(
+          sent.map((t) => [t.target_id, t.engine, t.audit_source ?? null, t.notes ?? null]),
+        );
+        const detail = await getAgentDetail(getDb(), auth.agentId);
+        expect(detail?.connectors).toEqual(hb.connectors);
+        expect(detail?.detectedTargets).toEqual(hb.detected_targets);
+      }
+    });
 
-    it("refuses each unlisted connector, target, audit source and detected target with an item pointer (ADR-0042)", async () => {
+    it("stores a target whose audit source does not serve its engine without the source, with an integrity event; 200 (P9-E review M2)", async () => {
       const auth = await enroll();
       const body = {
         ...MINIMAL_HEARTBEAT,
-        connectors: ["postgres", "redis", "cas", "sqlserver"],
+        connectors: ["postgres", "mysql", "redis", "sqlserver"],
         targets: [
-          { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited" },
+          { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "pg_stat_statements" },
           { target_id: "pg-odd", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
-          { target_id: "cache", engine: "valkey", reachable: true, audit_level: "none" },
-        ],
-        detected_targets: [
-          { engine: "postgres", port: 5432 },
-          { engine: "sqlserver", port: 1433, process: "sqlservr" },
-          { engine: "postgres", process: "redis-server" },
+          { target_id: "cache", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+          { target_id: "maria", engine: "mariadb", reachable: true, audit_level: "partial", audit_source: "performance_schema" },
+          { target_id: "sales", engine: "sqlserver", reachable: true, audit_level: "partial", audit_source: "pgaudit" },
+          { target_id: "cache-2", engine: "redis", reachable: true, audit_level: "limited", audit_source: "sqlserver_xevents" },
         ],
       };
       expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
-      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
-      expect(res.status).toBe(400);
-      expect((await expectConformingError(res, body)).details).toEqual([
-        { pointer: "/connectors/1", keyword: "enum" },
-        { pointer: "/connectors/3", keyword: "enum" },
-        { pointer: "/targets/1/audit_source", keyword: "enum" },
-        { pointer: "/targets/2/engine", keyword: "enum" },
-        { pointer: "/detected_targets/1/engine", keyword: "enum" },
-        { pointer: "/detected_targets/1/process", keyword: "enum" },
-        { pointer: "/detected_targets/2/process", keyword: "enum" },
+      expect(targetSourceDetails(body as never)).toEqual([
+        { pointer: "/targets/1/audit_source", keyword: "const" },
+        { pointer: "/targets/4/audit_source", keyword: "const" },
+        { pointer: "/targets/5/audit_source", keyword: "const" },
       ]);
-      expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(200);
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+      expect(Object.fromEntries(stored.map((t) => [t.targetId, t.auditSource]))).toEqual({
+        "pg-prod-1": "pg_stat_statements",
+        "pg-odd": null,
+        cache: "redis_commandlog",
+        maria: "performance_schema",
+        sales: null,
+        "cache-2": null,
+      });
+      const events = await getDb()
+        .select()
+        .from(securityEvents)
+        .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
+      expect(events).toHaveLength(1);
+      expect(events[0]?.details).toMatchObject({ endpoint: "heartbeat", status: 200, details_count: 3, pointer: "/targets/1/audit_source", keyword: "const" });
+      // A conforming heartbeat records no integrity event.
+      const ok = { ...body, targets: body.targets.filter((_t, i) => ![1, 4, 5].includes(i)) };
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: ok }))).status).toBe(200);
+      expect(
+        await getDb()
+          .select()
+          .from(securityEvents)
+          .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch"))),
+      ).toHaveLength(1);
     });
 
-    it.each(fixtures("valid", "HeartbeatRequest").filter((f) => !unlistedHeartbeat(f)))("valid fixture %s -> 200", async (_f, body) => {
+    it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);

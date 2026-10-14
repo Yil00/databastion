@@ -4,11 +4,11 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { incidentsHref } from "@/lib/incidents-filter";
-import { isAggregatePrincipal, isCasEngine, isFingerprint, isLdapEngine } from "@/lib/location-labels";
+import { isAggregatePrincipal, isCasEngine, isFingerprint, isKeyPatternEngine, isLdapEngine } from "@/lib/location-labels";
 import type { IncidentStatus, Severity } from "@/lib/incident-lifecycle";
 import type { IncidentView } from "@/server/incidents";
 
-import { locationLabel } from "./findings-table";
+import { LocationCell, locationLabel } from "./findings-table";
 
 /**
  * Incidents view parts (server components). Agent-provided strings (target ids, names) and
@@ -39,7 +39,11 @@ export function incidentLocation(i: Pick<IncidentView, "location" | "access" | "
   const ldap = isLdapEngine(i.engine);
   const cas = isCasEngine(i.engine);
   if (i.access) {
-    const who = isFingerprint(i.access.principal)
+    // An empty principal on a non-overflow access incident: the source recorded no account
+    // (Redis / Valkey, ADR-0052 decision 8); `db_user` and fingerprints are never empty.
+    const who = i.access.principal === ""
+      ? "account not recorded"
+      : isFingerprint(i.access.principal)
       ? ldap
         ? "fingerprinted LDAP principal"
         : cas
@@ -98,7 +102,10 @@ export function IncidentsTable({ incidents, now }: { incidents: IncidentView[]; 
                 (i.targetId ?? "")
               )}
             </TableCell>
-            <TableCell className="max-w-64 break-all whitespace-normal">{incidentLocation(i)}</TableCell>
+            <TableCell className="max-w-64 break-all whitespace-normal">
+              {/* Redis / Valkey finding locations: the key pattern as escaped inline code, never a link. */}
+              {!i.access && i.location && isKeyPatternEngine(i.engine) ? <LocationCell location={i.location} engine={i.engine} /> : incidentLocation(i)}
+            </TableCell>
             <TableCell>{i.access ? `score ${i.access.score ?? 0}` : (i.classifier ?? "")}</TableCell>
             <TableCell>{formatAge(i.createdAt, now)}</TableCell>
             <TableCell>{i.matchCount}</TableCell>

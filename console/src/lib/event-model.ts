@@ -106,9 +106,12 @@ export function eventScore(sensitivity: number, rows: number | null | undefined)
 /**
  * Only events that report a volume and read or change data feed a baseline: never `connect` or
  * `auth_failure` (security review H1: a login attempt with a random account name must not create
- * a baseline).
+ * a baseline), and never an event without a recorded account (`account_not_recorded`, ADR-0052
+ * decision 8, ADR-0021 decision 6): such events have no principal to learn, so the anomaly part
+ * of their score is not computed.
  */
-export function baselineEligible(e: { action: string; rows: number | null | undefined }): boolean {
+export function baselineEligible(e: { action: string; rows: number | null | undefined; accountNotRecorded?: boolean }): boolean {
+  if (e.accountNotRecorded === true) return false;
   return e.rows !== null && e.rows !== undefined && e.rows >= 0 && e.action !== "connect" && e.action !== "auth_failure";
 }
 
@@ -340,8 +343,13 @@ export interface EventFacts {
   targetId: string;
   /** Engine last reported for the target. */
   engine: string | null;
-  /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place. */
+  /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place; empty when not recorded. */
   principal: string;
+  /**
+   * The source recorded no account (Redis / Valkey, ADR-0052 decision 8): `principals` globs other
+   * than `*` never match it, and `exclude_principals` never hides it (P9-E review L1).
+   */
+  accountNotRecorded?: boolean;
   action: string;
   source: string;
   objects: readonly EventObject[];
@@ -378,7 +386,7 @@ export function eventMatches(c: EventConditions, e: EventFacts): number[] | null
   if (c.event_actions && !c.event_actions.includes(e.action)) return null;
   if (c.signals && !e.signals.some((s) => signalSelected(c.signals as string[], s))) return null;
   if (c.principals && !c.principals.some((g) => globMatch(g, e.principal))) return null;
-  if (c.exclude_principals && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
+  if (c.exclude_principals && e.accountNotRecorded !== true && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.min_rows !== undefined && (e.rows === null || e.rows < c.min_rows)) return null;
   if (c.min_score !== undefined && e.score < c.min_score) return null;
   if (c.min_sensitivity !== undefined && e.sensitivity < c.min_sensitivity) return null;
@@ -435,6 +443,9 @@ export function exceptionCoversEvent(
  *   (`unknown:<sha256 of the client network>`: IPv4 /24, IPv6 /64, IPv4-mapped IPv6 as IPv4,
  *   `local` kept), so random account names or rotating addresses cannot open one incident each
  *   (security review H1, re-review N2);
+ * - events without a recorded account (`account_not_recorded`, Redis / Valkey, ADR-0052 decision
+ *   8): `unrecorded:<sha256 of the client network>`, `unrecorded:local` or `unrecorded:none` (no
+ *   address): a prefix of their own, never the `unknown:` key of failed logins (P9-E review M1);
  * - every other event: its principal key (SHA-256 of the name, or of the fingerprint sent in its
  *   place), so distinct principals are never merged (ADR-0031 decision 1, end-of-phase-6 review
  *   M1: on OpenLDAP nearly every principal is fingerprinted and has no client address, so the
@@ -467,8 +478,27 @@ export function coarsePrincipal(e: { action: string }): boolean {
 /**
  * Principal part of the dedup key (see above, ADR-0031 decision 1). `principalKey` = SHA-256 of
  * the principal, `networkHash` = SHA-256 of the client network: hashes only, never agent text.
+ *
+ * An event without a recorded account (`accountNotRecorded`, Redis / Valkey only, ADR-0052
+ * decision 8, contract `Principal`): `unrecorded:<SHA-256 of the client network>`,
+ * `unrecorded:local` for a local client, or `unrecorded:none` without a client address, whatever
+ * its action. Its own prefix (P9-E review M1): a failed login of the same network
+ * (`unknown:<hash>`) never opens the incident an unrecorded read or full sync is attached to. Never its
+ * principal key alone: such events of one network share one incident per policy, database and
+ * hour, and never the incident of a named or fingerprinted principal.
  */
-export function dedupPrincipal(e: { action: string; principalKey: string; networkHash: string }): string {
+export function dedupPrincipal(e: {
+  action: string;
+  principalKey: string;
+  networkHash: string;
+  accountNotRecorded?: boolean;
+  clientAddr?: string | null;
+}): string {
+  if (e.accountNotRecorded === true) {
+    if (e.clientAddr === null || e.clientAddr === undefined) return "unrecorded:none";
+    if (e.clientAddr === "local") return "unrecorded:local";
+    return `unrecorded:${e.networkHash}`;
+  }
   return coarsePrincipal(e) ? `unknown:${e.networkHash}` : e.principalKey;
 }
 
@@ -477,7 +507,11 @@ export function eventDedupKey(k: {
   policyId: string;
   agentId: string;
   targetId: string;
-  /** The principal key, or `unknown:<sha256 of client_addr>` for a coarse principal. */
+  /**
+   * The principal key, or `unknown:<sha256 of the client network>` for a coarse principal, or
+   * `unrecorded:<hash>` / `unrecorded:local` / `unrecorded:none` for an event without a recorded
+   * account.
+   */
   principalKey: string;
   /** SHA-256 (hex) of the database name, or `-`. */
   databaseKey: string;

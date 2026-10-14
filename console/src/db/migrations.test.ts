@@ -8,7 +8,7 @@ import { readMigrationFiles } from "drizzle-orm/migrator";
 import { Client, Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { applyAccessEventsBytesOnline, ONLINE_0027_TAG, quotePlainIdentifier, validateDeferredConstraints } from "@/db/online-constraints";
+import { applyAccessEventsBytesOnline, DEFERRED_VALIDATIONS, ONLINE_0027_TAG, quotePlainIdentifier, validateDeferredConstraints } from "@/db/online-constraints";
 import { MIGRATION_LOCK_KEY, MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
 import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
@@ -387,6 +387,50 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         expect((await c.query(constraintSql)).rows[0]).toEqual({ def: "CHECK (((bytes IS NULL) OR (bytes >= 0)))", validated: true });
         await c.query("delete from agents where name = 'ae'");
       });
+    });
+
+    it("0040: an install at 0039 with events gets access_events_principal NOT VALID, then validated outside the migration (P9-E)", async () => {
+      const suffix = randomBytes(6).toString("hex");
+      const db = `u_${suffix}`;
+      const owner = `uo_${suffix}`;
+      await adminQuery(`create role ${owner} login nosuperuser nocreatedb nocreaterole`);
+      await adminQuery(`create database ${db} owner ${owner}`);
+      const before = folderBefore("0040_p9e_account_not_recorded");
+      const principalSql = `
+        select pg_get_constraintdef(c.oid) as def, c.convalidated as validated
+          from pg_constraint c where c.conname = 'access_events_principal' and c.conrelid = 'public.access_events'::regclass`;
+      try {
+        const url = roleUrl(owner, db);
+        await runMigrations(url, before.folder);
+        await withClient(url, (c) => seedEvents(c, 2000));
+        // The migration adds the CHECK NOT VALID (no scan under its lock); the runner validates it.
+        const sqlText = readFileSync(path.join(MIGRATIONS_FOLDER, "0040_p9e_account_not_recorded.sql"), "utf8");
+        expect(sqlText).toMatch(/ADD CONSTRAINT "access_events_principal" CHECK \(.*\) NOT VALID;/);
+        expect(DEFERRED_VALIDATIONS).toContainEqual({ table: "access_events", constraint: "access_events_principal" });
+        await runMigrations(url);
+        const fresh = await withClient(ownerUrl, async (c) => (await c.query(principalSql)).rows);
+        await withClient(url, async (c) => {
+          expect((await c.query(principalSql)).rows).toEqual(fresh);
+          expect(fresh).toEqual([
+            {
+              def: "CHECK (((num_nonnulls(db_user, db_user_fingerprint) + (account_not_recorded)::integer) = 1))",
+              validated: true,
+            },
+          ]);
+          const n = await c.query<{ n: number; unrecorded: number }>(
+            "select count(*)::int as n, count(*) filter (where account_not_recorded)::int as unrecorded from access_events",
+          );
+          expect(n.rows[0]).toEqual({ n: 2000, unrecorded: 0 });
+          await expect(c.query("update access_events set account_not_recorded = true where item_index = 1")).rejects.toThrow(
+            /access_events_principal/,
+          );
+          await c.query("update access_events set account_not_recorded = true, db_user = null where item_index = 1");
+        });
+      } finally {
+        before.cleanup();
+        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminQuery(`drop role if exists ${owner}`);
+      }
     });
   });
 

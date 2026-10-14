@@ -221,6 +221,12 @@ describe("access_event conditions", () => {
     expect(eventMatches({ signals: ["signature.*"], event_actions: ["write"] }, FACTS)).toBeNull();
     expect(eventMatches({ principals: ["BACK*"] }, FACTS)).toEqual([0, 1]);
     expect(eventMatches({ principals: ["*"], exclude_principals: ["backup"] }, FACTS)).toBeNull();
+    // P9-E review L1: an unrecorded account only matches `*`, and exclusions never hide it.
+    const unrecorded = { ...FACTS, principal: "", accountNotRecorded: true };
+    expect(eventMatches({ principals: ["*"] }, unrecorded)).toEqual([0, 1]);
+    expect(eventMatches({ principals: ["backup*"] }, unrecorded)).toBeNull();
+    expect(eventMatches({ principals: ["?*"] }, unrecorded)).toBeNull();
+    expect(eventMatches({ principals: ["*"], exclude_principals: ["*"] }, unrecorded)).toEqual([0, 1]);
     expect(eventMatches({ min_rows: 2_000_000 }, FACTS)).toBeNull();
     expect(eventMatches({ min_rows: 1 }, { ...FACTS, rows: null })).toBeNull();
     expect(eventMatches({ min_score: 64.1 }, FACTS)).toEqual([0, 1]);
@@ -293,6 +299,16 @@ describe("dedup scope", () => {
     const pk = "a".repeat(64);
     expect(dedupPrincipal({ action: "auth_failure", principalKey: pk, networkHash: net })).toBe(`unknown:${net}`);
     for (const action of ["read", "write", "connect", "ddl", "dcl"]) expect(dedupPrincipal({ action, principalKey: pk, networkHash: net })).toBe(pk);
+  });
+
+  it("principal part of an unrecorded account: its own unrecorded: prefix, never the unknown: key of failed logins (P9-E review M1)", () => {
+    const net = "n".repeat(64);
+    const pk = "a".repeat(64);
+    const u = (clientAddr: string | null) => dedupPrincipal({ action: "read", principalKey: pk, networkHash: net, accountNotRecorded: true, clientAddr });
+    expect(u("198.51.100.7")).toBe(`unrecorded:${net}`);
+    expect(u("local")).toBe("unrecorded:local");
+    expect(u(null)).toBe("unrecorded:none");
+    expect(u("198.51.100.7")).not.toBe(dedupPrincipal({ action: "auth_failure", principalKey: pk, networkHash: net }));
   });
 
   it("after a false positive only a new signature signal or a strictly higher score is worse (end-of-phase-6 M1)", () => {

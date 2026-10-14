@@ -70,11 +70,35 @@ export function eventsBatchSha256(batch: EventsBatch): string {
 }
 
 /**
- * Grouping key of a principal (baselines, dedup): SHA-256 of `u\0<db_user>` or
+ * Grouping key of a principal (events view, baselines, dedup): SHA-256 of `u\0<db_user>` or
  * `f\0<fingerprint>`, so that a name and a fingerprint never collide and no key holds agent text.
+ * An event without a recorded account (`account_not_recorded`, Redis / Valkey only, ADR-0052
+ * decision 8) is keyed by its client network instead: SHA-256 of `n\0<network>`, where the
+ * network is {@link unrecordedNetwork} (`local`, `none`, or the /24 or /64): never the hash of an
+ * empty fingerprint, so such events are not merged with a principal of another kind. The schema
+ * guarantees exactly one of the three (`Principal.oneOf`); anything else is a programming error.
  */
-export function principalKey(p: { db_user?: string; db_user_fingerprint?: string }): string {
-  return p.db_user !== undefined ? sha256Hex(`u\u0000${p.db_user}`) : sha256Hex(`f\u0000${p.db_user_fingerprint ?? ""}`);
+export function principalKey(p: {
+  db_user?: string;
+  db_user_fingerprint?: string;
+  account_not_recorded?: boolean;
+  client_addr?: string;
+}): string {
+  if (p.db_user !== undefined) return sha256Hex(`u\u0000${p.db_user}`);
+  if (p.db_user_fingerprint !== undefined) return sha256Hex(`f\u0000${p.db_user_fingerprint}`);
+  if (p.account_not_recorded === true) return sha256Hex(`n\u0000${unrecordedNetwork(p.client_addr ?? null)}`);
+  throw new Error("principal without db_user, db_user_fingerprint or account_not_recorded");
+}
+
+/**
+ * Network of an event without a recorded account (ADR-0052 decision 8, ADR-0021 decision 6):
+ * `none` without a client address (e.g. a full synchronization without a replica entry), `local`
+ * for a local client, else the client network of {@link clientNetwork}.
+ */
+export function unrecordedNetwork(addr: string | null): string {
+  if (addr === null) return "none";
+  if (addr === "local") return "local";
+  return clientNetwork(addr);
 }
 
 /**
@@ -92,7 +116,12 @@ export function clientNetwork(addr: string | null): string {
   return addr;
 }
 
-/** Principal as displayed and matched by policies: `db_user`, or its fingerprint. */
+/**
+ * Principal as displayed and matched by policies: `db_user`, or its fingerprint; the empty string
+ * for an event without a recorded account (`account_not_recorded`: never a name, so a policy's
+ * `principals` globs other than `*` never match it). `db_user` and fingerprints are never empty
+ * (contract `minLength`), so an empty label on a non-overflow access incident means "not recorded".
+ */
 export function principalLabel(p: { dbUser: string | null; dbUserFingerprint: string | null }): string {
   return p.dbUser ?? p.dbUserFingerprint ?? "";
 }
@@ -170,6 +199,7 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
     principalKey: principalKey(e.principal),
     dbUser: e.principal.db_user ?? null,
     dbUserFingerprint: e.principal.db_user_fingerprint ?? null,
+    accountNotRecorded: e.principal.account_not_recorded === true,
     clientAddr: e.principal.client_addr ?? null,
     application: e.principal.application ?? null,
     action: e.action,
@@ -354,6 +384,8 @@ export interface EventView {
   principalKey: string;
   principal: string;
   fingerprinted: boolean;
+  /** The source records no account for this access (Redis / Valkey, ADR-0052 decision 8). */
+  accountNotRecorded: boolean;
   clientAddr: string | null;
   application: string | null;
   action: string;
@@ -409,6 +441,7 @@ const EVENT_COLUMNS = {
   principalKey: accessEvents.principalKey,
   dbUser: accessEvents.dbUser,
   dbUserFingerprint: accessEvents.dbUserFingerprint,
+  accountNotRecorded: accessEvents.accountNotRecorded,
   clientAddr: accessEvents.clientAddr,
   application: accessEvents.application,
   action: accessEvents.action,
@@ -448,7 +481,7 @@ function toEventView({ dbUser, dbUserFingerprint, evaluatedAt, targetEngine, ...
     ...r,
     engine: auditSourceEngine(r.source) ?? targetEngine ?? null,
     principal: principalLabel({ dbUser, dbUserFingerprint }),
-    fingerprinted: dbUser === null,
+    fingerprinted: dbUser === null && dbUserFingerprint !== null,
     evaluated: evaluatedAt !== null,
     incidentIds: r.incidentIds ?? [],
   };
