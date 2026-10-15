@@ -28,6 +28,7 @@ jobs:
       packaging: ${{ steps.e2e.outputs.packaging }}
       oidc: ${{ steps.e2e.outputs.oidc }}
       cas: ${{ steps.e2e.outputs.cas }}
+      sqlserver: ${{ steps.e2e.outputs.sqlserver }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,6 +87,14 @@ jobs:
             cas=false
           fi
           echo "cas=$cas" | tee -a "$GITHUB_OUTPUT"
+          # SQL Server connector (agent-sqlserver, a 2.3 GB image): the agent, the SQL Server dev
+          # service and its seed, the compose file (image pin), the test script and this workflow.
+          if [ -z "$changed" ] || grep -qE '^(agent/|dev/sqlserver/|dev/seed/out/sqlserver\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|dev/agent-it\.sh$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            sqlserver=true
+          else
+            sqlserver=false
+          fi
+          echo "sqlserver=$sqlserver" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
               || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
@@ -631,6 +640,59 @@ jobs:
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
 
+  # SQL Server connector integration tests (P9-A, P9-D, ADR-0051) against the opt-in dev profile
+  # `sqlserver`: SQL Server 2022 Express (MSSQL_PID=Express, set by docker-compose.yml: the
+  # maintainer's choice until the Developer license terms are confirmed for CI, ADR-0051 open
+  # question 13), TLS with the dev CA of dev/sqlserver/entrypoint.sh, the seeded `retail` database
+  # and the agent login of the minimal variant. On 2022 for Linux the tests assert `mandatory`
+  # and the `auto` fallback (refinement item 3); 2019 and 2025 strict run weekly in
+  # engine-matrix.yml. The commands and variables are those of `dev/agent-it.sh sqlserver`
+  # (DATABASTION_IT_SQLSERVER=1, the dev CA, the dev/.env passwords, the throwaway password; one
+  # test thread: the tests change logins and grants on one server). The image is amd64 only, about
+  # 2.3 GB: the job runs when the agent, the SQL Server dev service or this workflow changes.
+  agent-sqlserver:
+    name: Agent SQL Server integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true' && needs.detect.outputs.sqlserver == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      COMPOSE_PROFILES: sqlserver
+      # The major version the server must report (2022): a wrong image fails the tests.
+      DATABASTION_IT_SQLSERVER_MAJOR: "16"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Start the dev SQL Server service
+        run: |
+          cp dev/.env.example dev/.env
+          make dev-dirs
+          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 sqlserver
+          timeout 60 docker compose -f dev/docker-compose.yml images sqlserver
+      - name: Connector integration tests (dev image, SQL Server 2022 Express over TLS)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/agent-it.sh sqlserver 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Service logs
+        if: failure()
+        run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 sqlserver
+      # Last before Stop, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+      - name: Stop
+        if: always()
+        run: timeout 120 docker compose -f dev/docker-compose.yml down -v
+
   # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
   # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
   # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
@@ -847,7 +909,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
