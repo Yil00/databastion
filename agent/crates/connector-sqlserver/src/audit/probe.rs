@@ -59,6 +59,8 @@ pub(crate) struct Probe {
     pub(crate) on_failure: i64,
     pub(crate) guid: String,
     pub(crate) folder: String,
+    /// The audit's name as the catalog writes it.
+    pub(crate) name: String,
     pub(crate) queue_delay: Duration,
     pub(crate) reads_server: bool,
     pub(crate) audit_change: bool,
@@ -70,9 +72,10 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
-    /// The quoted file pattern of the poll (`sql::audit_pattern`).
-    pub(crate) fn pattern(&self, name: &str) -> Option<String> {
-        sql::audit_pattern(&self.folder, name, &self.guid)
+    /// The quoted file pattern of the poll (`sql::audit_pattern`), from
+    /// the catalog's folder, name and GUID.
+    pub(crate) fn pattern(&self) -> Option<String> {
+        sql::audit_pattern(&self.folder, &self.name, &self.guid)
     }
 }
 
@@ -100,7 +103,7 @@ pub(crate) async fn probe(
     let audit = sql::quote_literal(name)
         .and_then(|q| sql::render(sql::AUDIT_FILE, &[("audit", &q)]))
         .ok_or(SsError::new(databastion_core::FailureCode::Internal, stage))?;
-    let rows = match s.rows(&audit, stage, Shape::rows(6, 2)).await {
+    let rows = match s.rows(&audit, stage, Shape::rows(7, 2)).await {
         Ok(r) => r,
         Err(e) if !e.fatal => {
             p.incomplete = true;
@@ -120,6 +123,7 @@ pub(crate) async fn probe(
     p.guid = text(3).to_owned();
     p.folder = text(4).to_owned();
     p.queue_delay = Duration::from_millis(u64::try_from(int(5).unwrap_or(1000)).unwrap_or(1000));
+    p.name = text(6).to_owned();
     let Some(guid) = sql::quote_guid(&p.guid) else {
         p.incomplete = true;
         return Ok(p);
@@ -334,11 +338,15 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         out.notes
             .push(TargetNote::new(NoteCode::AuditRecordsDropped).with_count(i.stream.dropped));
     }
-    out.level = if proofs && i.stream.fresh {
+    // Partial only while a stream reads the audit (review L2): records read
+    // before a stream stopped prove nothing about now.
+    out.level = if proofs && i.stream.fresh && i.stream.running {
         AuditLevel::Partial
     } else if proofs {
-        out.notes
-            .push(TargetNote::new(NoteCode::AuditPartialPendingFirstRecord));
+        if !i.stream.fresh {
+            out.notes
+                .push(TargetNote::new(NoteCode::AuditPartialPendingFirstRecord));
+        }
         AuditLevel::Limited
     } else if i.stream.fresh {
         AuditLevel::Limited
@@ -368,6 +376,7 @@ mod tests {
             on_failure: 1,
             guid: "B5BEF79B-88AC-4A47-91AE-0081BBD71D51".into(),
             folder: "/var/opt/mssql/audit/".into(),
+            name: "a".into(),
             queue_delay: Duration::from_secs(1),
             reads_server: true,
             audit_change: true,
@@ -406,6 +415,10 @@ mod tests {
         let l = level(&i);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // No stream running: Limited at most (review L2).
+        i.stream.running = false;
+        assert_eq!(level(&i).level, AuditLevel::Limited);
+        i.stream.running = true;
         i.stream.fresh = false;
         let l = level(&i);
         assert_eq!(l.level, AuditLevel::Limited);

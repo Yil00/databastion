@@ -601,7 +601,7 @@ impl<'a> Lexer<'a> {
             // Comments.
             if c == '-' && self.peek_char() == Some('-') {
                 for (_, d) in self.chars.by_ref() {
-                    if d == '\n' {
+                    if d == '\n' || d == '\r' {
                         break;
                     }
                 }
@@ -805,9 +805,7 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
                 let procedure = t.ident().is_some_and(credential_procedure);
                 toks.push(t);
                 if procedure {
-                    let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
-                    a.credential = true;
-                    return a;
+                    return at_credential_procedure(&toks);
                 }
                 let words: Vec<&str> = toks.iter().filter_map(Tok::word).collect();
                 if credential_prefix(&words) {
@@ -832,9 +830,7 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
                     let stop = t.ident().is_some_and(credential_procedure);
                     toks.push(t);
                     if stop {
-                        let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
-                        a.credential = true;
-                        return a;
+                        return at_credential_procedure(&toks);
                     }
                 }
                 Err(LexEnd::Done) => break,
@@ -844,14 +840,6 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
                 }
             }
         }
-    }
-    if toks
-        .iter()
-        .any(|t| t.ident().is_some_and(credential_procedure))
-    {
-        let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
-        a.credential = true;
-        return a;
     }
     let kind = main_kind(&toks).unwrap_or_else(|| {
         let mut words = toks.iter().filter_map(Tok::word);
@@ -865,6 +853,42 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
         return a;
     }
     analyze_tokens(&toks, kind)
+}
+
+/// The lexer stopped at the name of a password-taking procedure (the last
+/// token of `toks`). Called at the head of the statement (`[EXEC[UTE]
+/// [@rc =]] [db.][schema.]proc`): the password-bearing class, kind only.
+/// Anywhere else (a column alias, a table or a later call named so): the
+/// rest is not read (its arguments may be a password), and the text keeps
+/// its kind only as **not lexed**, so the event names `*` and is always
+/// reported (security review of P9-A lot 2, M1).
+fn at_credential_procedure(toks: &[Tok]) -> TsqlAnalysis {
+    let mut i = 0;
+    if toks
+        .first()
+        .is_some_and(|t| t.is("exec") || t.is("execute"))
+    {
+        i = 1;
+        if matches!(toks.get(1), Some(Tok::Var(_))) && toks.get(2).is_some_and(|t| t.punct('=')) {
+            i = 3;
+        }
+    }
+    let name = toks.get(i..).unwrap_or_default();
+    // Only the parts of a dotted name (`master..sp_x` included).
+    // and no two names in a row (`SELECT sp_addlogin` is not a call).
+    let head = !name.is_empty()
+        && name.iter().all(|t| t.ident().is_some() || t.punct('.'))
+        && name
+            .windows(2)
+            .all(|w| !(w[0].ident().is_some() && w[1].ident().is_some()));
+    if head {
+        let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
+        a.credential = true;
+        return a;
+    }
+    let mut words = toks.iter().filter_map(Tok::word);
+    let kind = main_kind(toks).unwrap_or_else(|| kind_of(words.next(), words.next()));
+    TsqlAnalysis::kind_only(kind)
 }
 
 /// The kind of the main statement, after a `WITH` CTE list.
@@ -1419,8 +1443,8 @@ mod tests {
             "EXECUTE master.dbo.sp_addlinkedsrvlogin 'srv', 'false', NULL, 'u', 'S3cret-marker'",
             "exec @rc = sp_password NULL, 'S3cret-marker', 'jane'",
             "sp_setapprole 'r', 'S3cret-marker'",
-            "SELECT 1; EXEC msdb.dbo.sysmail_add_account_sp @account_name = 'a', @password = Pa55word",
             "EXEC sp_addlinkedserver @server = 's', @provstr = 'Password=S3cret-marker'",
+            "EXEC master..sp_addlinkedsrvlogin 's', 'false'",
         ] {
             let a = an(t);
             assert!(a.credential, "{t}");
@@ -1428,6 +1452,17 @@ mod tests {
             assert!(a.listed.is_empty() && a.shape.is_none(), "{t}");
         }
         assert!(!an("SELECT login FROM crm.logins").credential);
+        // A password-taking procedure's name elsewhere (review M1): not the
+        // class, the rest unread, so not lexed (the event names `*`).
+        for t in [
+            "SELECT * FROM crm.customers AS sp_password",
+            "SELECT 1; EXEC msdb.dbo.sysmail_add_account_sp @account_name = 'a', @password = Pa55word",
+            "SELECT sp_addlogin FROM t",
+        ] {
+            let a = an(t);
+            assert!(!a.credential && !a.lexed && !a.usable(), "{t}");
+            assert_eq!(a.kind, TsqlKind::Select, "{t}");
+        }
         // A function taking a password: kind and objects, no text signal.
         let a = an("SELECT name FROM sys.sql_logins WHERE PWDCOMPARE('pw', password_hash) = 1");
         assert!(a.credential_function && !a.usable());
@@ -1456,6 +1491,9 @@ mod tests {
             assert!(!a.lexed && a.kind == TsqlKind::Select, "{t}");
         }
         assert!(!analyze_tsql("SELECT * FROM t", true).lexed);
+        // `--` comments end at `\r` too (review L7).
+        let a = an("SELECT a FROM t -- x\rWHERE b = 1");
+        assert!(a.shape.unwrap().filtered);
     }
 
     #[test]
@@ -1584,6 +1622,14 @@ mod tests {
     }
 
     #[test]
+    fn exec_arguments_end_at_a_statement() {
+        // A keyword ends the arguments; a call after it is analysed (fail
+        // closed: a user function).
+        assert!(an("EXEC crm.report if .a(").user_function);
+        assert!(!an("EXEC crm.report x.a(").user_function);
+    }
+
+    #[test]
     fn kinds() {
         assert_eq!(
             an("WITH c AS (SELECT 1 a) DELETE FROM t").kind,
@@ -1624,7 +1670,7 @@ mod proptests {
             let reference = analyze_tsql("SELECT a FROM crm.t WHERE b = N'x'", false);
             let a = analyze_tsql(&format!("SELECT a FROM crm.t WHERE b = {lit}"), false);
             prop_assert_eq!(&a, &reference);
-            let comment = inner.replace("*/", "").replace("/*", "");
+            let comment: String = inner.chars().filter(|c| !matches!(c, '*' | '/')).collect();
             let a = analyze_tsql(&format!("SELECT a FROM crm.t /* {comment} */ WHERE b = 1"), false);
             prop_assert_eq!(&a, &reference);
         }
@@ -1641,9 +1687,12 @@ mod proptests {
             prop_assert!(a.listed.is_empty() && a.shape.is_none() && !a.usable());
         }
 
-        /// Arguments of `EXEC` are never names.
+        /// Arguments of `EXEC` are never names. The generator has no letter
+        /// from `f` on, so no statement keyword (`if`, `select`…), which
+        /// ends the arguments: what follows one is analysed as a new
+        /// statement, fail closed (`exec_arguments_end_at_a_statement`).
         #[test]
-        fn exec_arguments_never_named(args in "[a-z_.,() ]{0,80}") {
+        fn exec_arguments_never_named(args in "[a-e_.,() ]{0,80}") {
             let a = analyze_tsql(&format!("EXEC crm.report {args}"), false);
             prop_assert!(!a.user_function);
             prop_assert!(a.listed.is_empty());

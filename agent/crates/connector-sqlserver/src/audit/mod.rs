@@ -12,15 +12,20 @@
 //!   a given catalog state: the file pattern (from the catalog's folder,
 //!   the audit's name and GUID) is a literal of the text, never a
 //!   parameter (M1); the file name, the buffer offset and the row bound
-//!   are parameters. At most [`BATCH`] records per read; a full read is
-//!   followed by another, within [`CATCH_UP`]. Each poll gets a credit
+//!   are parameters. At most [`BATCH`] records per read (halved after a
+//!   response over [`POLL_BYTES`]), each turned into a record as its row
+//!   ends; a full read is followed by another, within [`CATCH_UP`] (and
+//!   [`HISTORY_READS`] reads while the first start skips the history). Each poll gets a credit
 //!   (its own record is left out only for this session and this text).
 //! - **Position** (M4), persisted through the core: the file and the
 //!   offset of the last buffer read whole (a read starts after it,
 //!   measured), and how many records of the next buffer were already
-//!   handled. A position the server refuses (error 33225: the file left
-//!   the set, rolled over) restarts at the oldest file, skipping what was
-//!   read, and is a gap. The audit's own start and stop records (`AUSC`)
+//!   handled, and the file pattern it belongs to. Another pattern (the
+//!   folder moved, the audit renamed or recreated) is another file set:
+//!   read from its start, a gap. A position the server refuses (error
+//!   33225) in the same set (rolled over) restarts at the oldest file,
+//!   skipping what was read by file key (partition, timestamp) and
+//!   offset, never by path; a gap. An unreadable cursor is a gap too. The audit's own start and stop records (`AUSC`)
 //!   after the position are gaps too: `audit.records_dropped` and Limited
 //!   for 24 h. The first start skips the audit's history (no replay).
 //! - **Records** ([`records`]): one event per statement, objects from the
@@ -32,7 +37,12 @@
 //!   or poll text; sampling is charged the whole per-object budget. Its
 //!   writes, DDL and DCL are always reported.
 //! - Per-record panic isolation: each row is parsed, and each statement
-//!   converted, under `databastion_core::isolate`.
+//!   converted, under `databastion_core::isolate`, so a parser panic costs
+//!   that record and is counted (`audit.records_dropped`). The core's
+//!   isolation mode (`CursorStore::isolate`, a save after every record)
+//!   is not followed: the position is a buffer of the audit file, not a
+//!   record, so it cannot be saved between two records of one buffer; a
+//!   skip the core asks for drops the first statement of the next read.
 
 pub(crate) mod own;
 pub(crate) mod probe;
@@ -57,15 +67,24 @@ use crate::tls;
 use crate::token::Value;
 use records::{Mapped, Record, Statement};
 
-/// Records read per poll (decision 6).
-pub(crate) const BATCH: usize = 1000;
+/// Records read per poll (decision 6: at most 1 000). A record is at most
+/// about 9.3 KiB on the wire (an `nvarchar(4000)` statement, five
+/// `nvarchar(128)` names, a 260-character file name and the numbers), so a
+/// read of `BATCH + MAX_SKIP` rows stays under [`POLL_BYTES`] (security
+/// review of P9-A lot 2, L5: the agent's measured peak RSS is 42 MiB).
+pub(crate) const BATCH: usize = 500;
 /// Records of one buffer handled across polls at most; beyond, the rest
-/// of that buffer is dropped (counted).
-const MAX_SKIP: u32 = 4000;
+/// of that buffer is dropped (a gap).
+pub(crate) const MAX_SKIP: u32 = 500;
+/// Smallest read after responses over [`POLL_BYTES`] (the read halves).
+const MIN_BATCH: usize = 16;
 /// Time spent catching up (full reads one after the other) per cycle.
 const CATCH_UP: Duration = Duration::from_secs(20);
+/// Reads of the audit's history (first start) per cycle: the scan to the
+/// end of the file set is spread over cycles.
+const HISTORY_READS: usize = 20;
 /// Bound of one poll's response.
-const POLL_BYTES: usize = 48 * 1024 * 1024;
+const POLL_BYTES: usize = 12 * 1024 * 1024;
 /// The catalog proofs are read again this often (decision 6).
 const REPROBE: Duration = Duration::from_secs(300);
 /// The account's evaluation (refusal list) is read again this often.
@@ -227,11 +246,12 @@ pub(crate) struct Cursor {
     pub(crate) offset: i64,
     /// Records of the buffer after it already handled.
     pub(crate) skip: u32,
-    /// The audit's GUID the position belongs to.
-    pub(crate) guid: Option<String>,
-    /// After a refused position: records at or before this (file, offset)
-    /// were read already.
-    pub(crate) after: Option<(String, i64)>,
+    /// The file pattern (folder, audit name and GUID) the position belongs
+    /// to: positions are never compared across file sets.
+    pub(crate) pattern: Option<String>,
+    /// After a refused position in the same file set: records at or before
+    /// this (file key, offset) were read already ([`file_key`]).
+    pub(crate) after: Option<((i64, i64), i64)>,
     /// First start: records older than this (server µs) are history, not
     /// reported.
     pub(crate) history_us: Option<i64>,
@@ -256,14 +276,14 @@ impl Cursor {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = String::from("v1\n");
         out.push_str(&format!(
-            "file {}\noffset {}\nskip {}\nguid {}\n",
+            "file {}\noffset {}\nskip {}\npattern {}\n",
             self.file.as_deref().map_or("-".to_owned(), hex),
             self.offset,
             self.skip,
-            self.guid.as_deref().unwrap_or("-"),
+            self.pattern.as_deref().map_or("-".to_owned(), hex),
         ));
-        if let Some((f, o)) = &self.after {
-            out.push_str(&format!("after {} {o}\n", hex(f)));
+        if let Some(((part, ts), o)) = &self.after {
+            out.push_str(&format!("after {part} {ts} {o}\n"));
         }
         if let Some(h) = self.history_us {
             out.push_str(&format!("history {h}\n"));
@@ -285,9 +305,14 @@ impl Cursor {
                 ("file", f) => c.file = Some(unhex(f)?),
                 ("offset", o) => c.offset = o.parse().ok()?,
                 ("skip", s) => c.skip = s.parse::<u32>().ok()?.min(MAX_SKIP),
-                ("guid", "-") => c.guid = None,
-                ("guid", g) => c.guid = Some(sql::quote_guid(g).map(|_| g.to_owned())?),
-                ("after", f) => c.after = Some((unhex(f)?, p.next()?.parse().ok()?)),
+                ("pattern", "-") => c.pattern = None,
+                ("pattern", f) => c.pattern = Some(unhex(f)?),
+                ("after", part) => {
+                    c.after = Some((
+                        (part.parse().ok()?, p.next()?.parse().ok()?),
+                        p.next()?.parse().ok()?,
+                    ));
+                }
                 ("history", h) => c.history_us = Some(h.parse().ok()?),
                 _ => return None,
             }
@@ -331,6 +356,127 @@ pub(crate) fn advance(cursor: &Cursor, positions: &[(String, i64)], top: usize) 
     next
 }
 
+/// The order key of an audit file of one file set:
+/// `…_<partition>_<timestamp>.sqlaudit` (measured: the name of the audit
+/// and its GUID, then the partition and an 18-digit timestamp). Within one
+/// set, files are ordered by this key, never by their path string (review
+/// H1). `None` when the name has another form.
+pub(crate) fn file_key(name: &str) -> Option<(i64, i64)> {
+    let stem = name.strip_suffix(".sqlaudit")?;
+    let (rest, ts) = stem.rsplit_once('_')?;
+    let (_, part) = rest.rsplit_once('_')?;
+    let num = |s: &str| {
+        (!s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
+    Some((num(part)?, num(ts)?))
+}
+
+/// The catalog's file pattern seen by a reprobe. Another pattern (the
+/// folder moved, the audit renamed or recreated) is another file set: the
+/// position, and any refused-position filter, are dropped and the stream
+/// reads the new set from its start; `true` (a gap) when a position of
+/// another set was held (review H1).
+pub(crate) fn on_pattern(cursor: &mut Cursor, pattern: &str) -> bool {
+    let changed = cursor.pattern.as_deref().is_some_and(|p| p != pattern);
+    if changed {
+        cursor.file = None;
+        cursor.offset = 0;
+        cursor.skip = 0;
+        cursor.after = None;
+    }
+    cursor.pattern = Some(pattern.to_owned());
+    changed
+}
+
+/// A position the server refused (error 33225) in the same file set: read
+/// from the oldest file again, leaving out what was read up to the
+/// position, by file key and offset. A file name of another form keeps no
+/// filter (what was read is read again: loud, never lost).
+pub(crate) fn on_bad_position(cursor: &mut Cursor) {
+    cursor.after = cursor
+        .file
+        .as_deref()
+        .and_then(file_key)
+        .map(|k| (k, cursor.offset));
+    cursor.file = None;
+    cursor.offset = 0;
+    cursor.skip = 0;
+}
+
+/// What one read gives: the records to handle, the next position, and
+/// the gap (records lost) it reveals.
+#[derive(Debug)]
+pub(crate) struct Batch {
+    pub(crate) kept: Vec<Record>,
+    pub(crate) next: Cursor,
+    /// A buffer above [`MAX_SKIP`] records: the rest of it is lost.
+    pub(crate) gap: bool,
+    pub(crate) full: bool,
+}
+
+/// The records of a read (`returned` rows asked with `top`) from `cursor`:
+/// the records of the first buffer already handled skipped, those at or
+/// before a refused position left out, the next position, and the gaps.
+pub(crate) fn batch(cursor: &Cursor, records: Vec<Record>, returned: usize, top: usize) -> Batch {
+    let positions: Vec<(String, i64)> =
+        records.iter().map(|r| (r.file.clone(), r.offset)).collect();
+    let mut skip_first = cursor.skip as usize;
+    let first = positions.first().cloned();
+    let mut kept: Vec<Record> = records
+        .into_iter()
+        .filter(|r| {
+            if skip_first > 0
+                && first
+                    .as_ref()
+                    .is_some_and(|(f, o)| *f == r.file && *o == r.offset)
+            {
+                skip_first -= 1;
+                return false;
+            }
+            true
+        })
+        .collect();
+    if let Some((key, offset)) = cursor.after {
+        // A record of another form of name is kept (read again, loud).
+        kept.retain(|r| file_key(&r.file).is_none_or(|k| (k, r.offset) > (key, offset)));
+    }
+    let full = returned >= top;
+    let mut next = advance(cursor, &positions, top);
+    // The filter ends once the read passed it, and after any read that is
+    // not full (the set was read to its end).
+    let passed = cursor.after.is_some_and(|(key, offset)| {
+        positions
+            .last()
+            .and_then(|(f, o)| file_key(f).map(|k| (k, *o)))
+            .is_some_and(|last| last > (key, offset))
+    });
+    if passed || !full {
+        next.after = None;
+    }
+    let mut gap = false;
+    if next.skip > MAX_SKIP {
+        // One buffer larger than the bound: the rest of it is dropped.
+        if let Some((f, o)) = positions.last() {
+            next.file = Some(f.clone());
+            next.offset = *o;
+        }
+        next.skip = 0;
+        gap = true;
+    }
+    if !full {
+        // Caught up: no history any more.
+        next.history_us = None;
+    }
+    Batch {
+        kept,
+        next,
+        gap,
+        full,
+    }
+}
+
 /// The stream's per-run state.
 struct Stream<'a> {
     target: &'a TargetConfig,
@@ -341,12 +487,16 @@ struct Stream<'a> {
     cursor: Cursor,
     saved: Option<Vec<u8>>,
     skip: u32,
+    /// The audit named in `agent.yaml` (the catalog's name is used for the
+    /// file pattern, review L6).
     name: String,
     probe: Option<probe::Probe>,
     poll_start: String,
     poll_from: String,
     reprobe_at: Instant,
     evaluated_at: Option<Instant>,
+    /// Records asked per read (halved after an oversized response).
+    batch: usize,
 }
 
 impl Stream<'_> {
@@ -489,7 +639,7 @@ pub(crate) async fn audit_stream(
         return Err(target_error(FailureCode::Unsupported));
     };
     let _running = state.audit.started(&target.id);
-    let _streaming = own::stream_started(&target.id, cfg.poll_interval());
+    let _streaming = own::stream_started(&target.id);
     let own_store = cfg.counters(OWN_SESSIONS);
     if let Some(Ok(Some(bytes))) = own_store.as_ref().map(CursorStore::load)
         && let Some(persisted) = own::decode(&bytes)
@@ -498,9 +648,21 @@ pub(crate) async fn audit_stream(
     }
     let store = cfg.cursor(CURSOR);
     let loaded = match store.as_ref().map(CursorStore::load) {
-        Some(Ok(Some(bytes))) => Cursor::decode(&bytes),
+        Some(Ok(Some(bytes))) => {
+            let c = Cursor::decode(&bytes);
+            if c.is_none() {
+                // A position that cannot be used: what was not read is
+                // lost (review L1).
+                tracing::warn!(target_id = %target.id, "SQL Server Audit cursor not understood: starting at the end of the audit (a gap)");
+                state.audit.note_gap(&target.id);
+                state.audit.note_dropped(&target.id, 1);
+            }
+            c
+        }
         Some(Err(e)) => {
-            tracing::warn!(error = %e, "SQL Server Audit cursor not readable: the audit's history is skipped");
+            tracing::warn!(error = %e, "SQL Server Audit cursor not readable: starting at the end of the audit (a gap)");
+            state.audit.note_gap(&target.id);
+            state.audit.note_dropped(&target.id, 1);
             None
         }
         _ => None,
@@ -518,6 +680,7 @@ pub(crate) async fn audit_stream(
         cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
     }
     let mut st = Stream {
+        name,
         target,
         state,
         own: OwnAccount::new(
@@ -533,12 +696,12 @@ pub(crate) async fn audit_stream(
         cursor,
         saved: None,
         skip,
-        name,
         probe: None,
         poll_start: String::new(),
         poll_from: String::new(),
         reprobe_at: Instant::now(),
         evaluated_at: None,
+        batch: BATCH,
     };
     loop {
         if session.is_poisoned() || session.is_stale() {
@@ -597,10 +760,13 @@ async fn cycle(
         reprobe(st, s).await?;
     }
     let started = Instant::now();
+    let mut history_reads = 0usize;
     loop {
+        let in_history = st.cursor.history_us.is_some();
         let full = read(st, s, sink).await?;
         st.save();
-        if !full || started.elapsed() >= CATCH_UP {
+        history_reads += usize::from(in_history);
+        if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
             break;
         }
         if st.probe.is_none() {
@@ -623,7 +789,7 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
         tracing::warn!(target_id = %target.id, "SQL Server Audit: the named server audit has no FILE target or is invisible");
         return Err(target_error(FailureCode::Unsupported));
     }
-    let Some(pattern) = p.pattern(&st.name) else {
+    let Some(pattern) = p.pattern() else {
         tracing::warn!(target_id = %target.id, "SQL Server Audit: the audit's folder or name cannot be used in a file pattern");
         return Err(target_error(FailureCode::Unsupported));
     };
@@ -633,22 +799,14 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     ) else {
         return Err(target_error(FailureCode::Internal));
     };
-    if st
-        .cursor
-        .guid
-        .as_deref()
-        .is_some_and(|g| !g.eq_ignore_ascii_case(&p.guid))
-    {
-        // Another audit under that name: its files are another set.
-        tracing::warn!(target_id = %target.id, "SQL Server Audit: the server audit was recreated (new GUID): reading its files from the start");
-        st.cursor.file = None;
-        st.cursor.skip = 0;
-        st.cursor.after = None;
+    if on_pattern(&mut st.cursor, &pattern) {
+        // Another file set (the folder moved, the audit recreated or
+        // renamed): read from its start; what was written meanwhile in
+        // the old set after the position is lost (review H1).
+        tracing::warn!(target_id = %target.id, "SQL Server Audit: the audit's file set changed (folder, name or GUID): reading the new set from its start");
         st.state.audit.note_gap(&target.id);
         st.state.audit.note_dropped(&target.id, 1);
     }
-    st.cursor.guid = Some(p.guid.clone());
-    own::set_queue_delay(&target.id, p.queue_delay);
     st.poll_start = start;
     st.poll_from = from;
     st.probe = Some(p);
@@ -656,23 +814,35 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     Ok(())
 }
 
-/// Sends one poll and returns its rows.
-async fn poll_rows(
+/// What one poll returned: the records, the rows, the malformed rows.
+struct Polled {
+    records: Vec<Record>,
+    returned: usize,
+    malformed: u64,
+}
+
+/// Sends one poll; each row becomes a record as it ends (review L5: no
+/// copy of the rows is held), alone under panic isolation.
+async fn poll_records(
     s: &mut Session,
     text: &str,
     kind: own::PollKind,
     file: &str,
     offset: i64,
     top: usize,
-) -> Result<Vec<Vec<Value>>, SsError> {
+) -> Result<Polled, SsError> {
     let params = [
         Param::NVarChar(file.to_owned()),
         Param::BigInt(offset),
         Param::BigInt(i64::try_from(top).unwrap_or(i64::MAX)),
     ];
     s.credit_poll(text, kind);
-    let mut rows = Vec::new();
-    let mut row = Vec::with_capacity(sql::AUDIT_POLL_COLUMNS);
+    let mut out = Polled {
+        records: Vec::new(),
+        returned: 0,
+        malformed: 0,
+    };
+    let mut row: Vec<Value> = Vec::with_capacity(sql::AUDIT_POLL_COLUMNS);
     s.rpc(
         text,
         &params,
@@ -686,13 +856,20 @@ async fn poll_rows(
         |cell| {
             match cell {
                 Cell::Value(_, v) => row.push(v),
-                Cell::RowEnd => rows.push(std::mem::take(&mut row)),
+                Cell::RowEnd => {
+                    out.returned += 1;
+                    let r = std::mem::take(&mut row);
+                    match databastion_core::isolate(|| Record::from_row(r)) {
+                        Some(Ok(rec)) => out.records.push(rec),
+                        _ => out.malformed += 1,
+                    }
+                }
             }
             Flow::Continue
         },
     )
     .await?;
-    Ok(rows)
+    Ok(out)
 }
 
 /// One read from the position; `true` when it was full (more to read).
@@ -702,11 +879,11 @@ async fn read(
     sink: &EventSink,
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
-    let top = BATCH + st.cursor.skip as usize;
-    let rows = match st.cursor.file.clone() {
-        None => poll_rows(s, &st.poll_start.clone(), own::PollKind::Start, "", 0, top).await,
+    let top = st.batch + st.cursor.skip as usize;
+    let polled = match st.cursor.file.clone() {
+        None => poll_records(s, &st.poll_start.clone(), own::PollKind::Start, "", 0, top).await,
         Some(f) => {
-            poll_rows(
+            poll_records(
                 s,
                 &st.poll_from.clone(),
                 own::PollKind::From,
@@ -717,59 +894,40 @@ async fn read(
             .await
         }
     };
-    let rows = match rows {
-        Ok(r) => r,
+    let polled = match polled {
+        Ok(p) => {
+            st.batch = (st.batch * 2).min(BATCH);
+            p
+        }
         Err(e) if e.number == Some(ERR_BAD_POSITION) && st.cursor.file.is_some() => {
-            // The position left the file set (rolled over, deleted) or
-            // the file changed: from the oldest file, skipping what was
-            // read; whatever was between is lost (M4).
-            tracing::warn!(target_id = %target_id, "SQL Server Audit: the saved position is no longer in the audit's file set (rollover): reading from the oldest file");
-            st.cursor.after = st.cursor.file.clone().map(|f| (f, st.cursor.offset));
-            st.cursor.file = None;
-            st.cursor.skip = 0;
-            st.state.audit.note_gap(&target_id);
-            st.state.audit.note_dropped(&target_id, 1);
+            // The position is no longer in the file set. Another set (the
+            // folder moved…) is found by the proofs first; in the same set
+            // (rolled over), read from the oldest file, leaving out what
+            // was read; whatever was between is lost (M4, review H1).
+            let before = st.cursor.pattern.clone();
+            reprobe(st, s).await?;
+            if st.cursor.pattern == before && st.cursor.file.is_some() {
+                tracing::warn!(target_id = %target_id, "SQL Server Audit: the saved position is no longer in the audit's file set (rollover): reading from the oldest file");
+                on_bad_position(&mut st.cursor);
+                st.state.audit.note_gap(&target_id);
+                st.state.audit.note_dropped(&target_id, 1);
+            }
+            return Ok(true);
+        }
+        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
+            // A response over the bound: smaller reads.
+            st.batch = (st.batch / 2).max(MIN_BATCH);
             return Ok(true);
         }
         Err(e) => return Err(e.into_connector_error()),
     };
-    let returned = rows.len();
-    // Parse each row alone.
-    let mut parsed: Vec<Record> = Vec::with_capacity(rows.len());
-    let mut malformed = 0u64;
-    for row in rows {
-        match databastion_core::isolate(|| Record::from_row(row)) {
-            Some(Ok(r)) => parsed.push(r),
-            _ => malformed += 1,
-        }
-    }
-    st.state.audit.note_dropped(&target_id, malformed);
-    let positions: Vec<(String, i64)> = parsed.iter().map(|r| (r.file.clone(), r.offset)).collect();
-    // The records of the first buffer already handled.
-    let mut skip_first = st.cursor.skip as usize;
-    let first = positions.first().cloned();
-    parsed.retain(|r| {
-        if skip_first > 0 && Some((&r.file, r.offset)) == first.as_ref().map(|(f, o)| (f, *o)) {
-            skip_first -= 1;
-            return false;
-        }
-        true
-    });
-    // Records already read before a refused position.
-    if let Some((f, o)) = st.cursor.after.clone() {
-        parsed.retain(|r| (r.file.as_str(), r.offset) > (f.as_str(), o));
-    }
-    let next = advance(&st.cursor, &positions, top);
-    let after_done = st
-        .cursor
-        .after
-        .as_ref()
-        .is_some_and(|(f, o)| positions.last().is_some_and(|(lf, lo)| (lf, *lo) > (f, *o)));
-    if !parsed.is_empty() {
+    st.state.audit.note_dropped(&target_id, polled.malformed);
+    let b = batch(&st.cursor, polled.records, polled.returned, top);
+    if !b.kept.is_empty() || polled.returned > 0 {
         st.state.audit.note_record(&target_id);
     }
     let history = st.cursor.history_us;
-    let mut statements = records::group(records::reassemble(parsed));
+    let mut statements = records::group(records::reassemble(b.kept));
     if st.skip > 0 {
         let n = (st.skip as usize).min(statements.len());
         statements.drain(..n);
@@ -807,29 +965,17 @@ async fn read(
             None => st.state.audit.note_dropped(&target_id, 1),
         }
     }
-    st.cursor = next;
-    if after_done {
-        st.cursor.after = None;
-    }
-    let full = returned >= top;
-    if st.cursor.skip > MAX_SKIP {
-        // One buffer larger than the bound: the rest of it is dropped.
-        if let Some((f, o)) = positions.last() {
-            st.cursor.file = Some(f.clone());
-            st.cursor.offset = *o;
-        }
-        st.cursor.skip = 0;
+    st.cursor = b.next;
+    if b.gap {
+        tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
+        st.state.audit.note_gap(&target_id);
         st.state.audit.note_dropped(&target_id, 1);
-    }
-    if !full {
-        // Caught up: no history any more.
-        st.cursor.history_us = None;
     }
     if reprobe {
         // An AUDIT_CHANGE_GROUP record: the proofs at once (re-review N3).
         st.probe = None;
     }
-    Ok(full)
+    Ok(b.full)
 }
 
 #[cfg(test)]

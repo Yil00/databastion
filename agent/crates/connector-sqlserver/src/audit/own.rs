@@ -25,12 +25,14 @@
 //! with a credit of the same session for exactly its text whose window
 //! holds the record's time, consumed once. Credits are granted only while
 //! an Audit stream reads the target ([`stream_started`]). A credit's
-//! window runs, on the server's clock, from the moment it is granted to
-//! two poll intervals plus the statement timeout and the audit's
-//! `QUEUE_DELAY` later, within [`MIN_CREDIT_TTL`] and [`MAX_CREDIT_TTL`]:
-//! it is checked against the record's `event_time`, so a stream that
-//! reads late still matches it, and a replay outside the window never
-//! does. At most [`MAX_CREDITS`] per target (the oldest are dropped: their
+//! window runs, on the server's clock, from 1 s before the moment it is
+//! granted to the statement timeout plus [`CREDIT_SLACK`] later (at most
+//! [`MAX_CREDIT_TTL`]): it is checked against the record's `event_time`
+//! (when the statement ran, not when the record is read), so the window
+//! only has to cover the statement's run, and a stream that reads late
+//! still matches it (security review of P9-A lot 2, L3). A credit covers
+//! the records of one execution, by transaction id; a record without one
+//! (0) consumes it once. At most [`MAX_CREDITS`] per target (the oldest are dropped: their
 //! statements are then reported, fail closed); credits are forgotten an
 //! hour after their window. A credit holds a keyed hash of the text
 //! (SipHash with a per-process random key), never the text. Poll credits
@@ -51,14 +53,18 @@ pub(crate) const KEEP_US: i64 = 48 * 3600 * 1_000_000;
 const WARN_SESSIONS: usize = 100_000;
 /// Grace after a lost connection, on top of the statement timeout.
 pub(crate) const LOST_GRACE: Duration = Duration::from_secs(5);
+/// A persisted session still open at its last save ends this long after
+/// that save: the longest statement timeout of the connector (30 s, a
+/// Discovery sample) plus [`LOST_GRACE`].
+const OPEN_AT_SAVE_GRACE: Duration = Duration::from_secs(35);
 /// `login_time` is a `datetime` (3.33 ms steps): the start is moved back
 /// this much.
 const START_SLACK_US: i64 = 10_000;
 /// Shortest and longest lifetime of a credit.
-pub(crate) const MIN_CREDIT_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_CREDIT_TTL: Duration = Duration::from_secs(900);
-/// Poll interval assumed before the stream sets it.
-const DEFAULT_POLL: Duration = Duration::from_secs(60);
+/// Slack after a credited statement's timeout (clock steps of the
+/// server's `event_time`).
+pub(crate) const CREDIT_SLACK: Duration = Duration::from_secs(5);
 /// Credits held per target at most.
 pub(crate) const MAX_CREDITS: usize = 4096;
 
@@ -115,8 +121,6 @@ struct Target {
     sessions: Vec<OwnSession>,
     credits: VecDeque<Credit>,
     streams: usize,
-    poll: Option<Duration>,
-    queue_delay: Duration,
     /// Server time minus agent time (µs), last measured.
     offset_us: i64,
     warned: bool,
@@ -202,8 +206,7 @@ impl Handle {
         if t.streams == 0 {
             return;
         }
-        let ttl = (t.poll.unwrap_or(DEFAULT_POLL) * 2 + statement_timeout + t.queue_delay)
-            .clamp(MIN_CREDIT_TTL, MAX_CREDIT_TTL);
+        let ttl = (statement_timeout + CREDIT_SLACK).min(MAX_CREDIT_TTL);
         expire(&mut t.credits, now_us);
         while t.credits.len() >= MAX_CREDITS {
             t.credits.pop_front();
@@ -323,7 +326,9 @@ pub(crate) fn take_credit(
                 None => poll.is_some() && c.poll == poll,
             }
     };
-    if t.credits.iter().any(|c| same(c) && c.used_tx == Some(tx)) {
+    // Another record of the same execution; a record without a
+    // transaction id (0) never shares a credit (review L3).
+    if tx != 0 && t.credits.iter().any(|c| same(c) && c.used_tx == Some(tx)) {
         return true;
     }
     match t
@@ -356,23 +361,13 @@ impl Drop for Streaming {
     }
 }
 
-/// Registers a running stream with its poll interval and the audit's
-/// `QUEUE_DELAY` (part of a credit's lifetime).
-pub(crate) fn stream_started(target_id: &str, poll: Duration) -> Streaming {
+/// Registers a running stream (credits are granted while one runs).
+pub(crate) fn stream_started(target_id: &str) -> Streaming {
     let mut reg = lock();
     let t = reg.targets.entry(target_id.to_owned()).or_default();
     t.streams += 1;
-    t.poll = Some(poll);
     Streaming {
         target: target_id.to_owned(),
-    }
-}
-
-/// Sets the audit's `QUEUE_DELAY` (at most 5 minutes counted).
-pub(crate) fn set_queue_delay(target_id: &str, delay: Duration) {
-    let mut reg = lock();
-    if let Some(t) = reg.targets.get_mut(target_id) {
-        t.queue_delay = delay.min(Duration::from_secs(300));
     }
 }
 
@@ -385,7 +380,8 @@ pub(crate) fn encode(target_id: &str, max_bytes: usize) -> Vec<u8> {
         return b"v1\noffset 0\n".to_vec();
     };
     prune(t, agent_now_us().saturating_add(t.offset_us));
-    let head = format!("v1\noffset {}\n", t.offset_us);
+    let saved_us = agent_now_us().saturating_add(t.offset_us);
+    let head = format!("v1\noffset {}\nsaved {saved_us}\n", t.offset_us);
     let lines: Vec<String> = t
         .sessions
         .iter()
@@ -441,6 +437,8 @@ pub(crate) fn encode(target_id: &str, max_bytes: usize) -> Vec<u8> {
 #[derive(Debug, Default)]
 pub(crate) struct Persisted {
     pub(crate) offset_us: i64,
+    /// The server time of the save.
+    pub(crate) saved_us: Option<i64>,
     pub(crate) sessions: Vec<OwnSession>,
     polls: Vec<Credit>,
 }
@@ -456,7 +454,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
     let offset_us = lines.next()?.strip_prefix("offset ")?.parse().ok()?;
     let mut out = Vec::new();
     let mut polls = Vec::new();
+    let mut saved_us = None;
     for l in lines {
+        if let Some(v) = l.strip_prefix("saved ") {
+            saved_us = Some(v.parse().ok()?);
+            continue;
+        }
         if let Some(rest) = l.strip_prefix("p ") {
             let mut p = rest.split(' ');
             let spid = p.next()?.parse().ok()?;
@@ -502,6 +505,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
     }
     Some(Persisted {
         offset_us,
+        saved_us,
         sessions: out,
         polls,
     })
@@ -513,10 +517,18 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
 pub(crate) fn restore(target_id: &str, persisted: Persisted) {
     let Persisted {
         offset_us,
+        saved_us,
         sessions,
         polls,
     } = persisted;
     let restart_us = agent_now_us().saturating_add(offset_us);
+    // A session open at the last save ends at that save plus the grace of
+    // a lost connection, not at the restart (review L4): what it did after
+    // the save is reported.
+    let open_end = saved_us.map_or(restart_us, |s| {
+        s.saturating_add(i64::try_from((OPEN_AT_SAVE_GRACE).as_micros()).unwrap_or(0))
+            .min(restart_us)
+    });
     let mut reg = lock();
     let t = reg.targets.entry(target_id.to_owned()).or_default();
     for c in polls {
@@ -537,7 +549,7 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
         })
         .map(|mut s| {
             if s.end_us.is_none() {
-                s.end_us = Some(restart_us);
+                s.end_us = Some(open_end);
             }
             s
         })
@@ -602,7 +614,7 @@ mod tests {
         let q = "SELECT TOP (10) x FROM [d].[s].[t]";
         h.credit(q, Duration::from_secs(5), None);
         assert!(!take_credit(t, 80, q, None, now, 1), "no stream");
-        let s = stream_started(t, Duration::from_secs(10));
+        let s = stream_started(t);
         h.credit(q, Duration::from_secs(5), None);
         assert!(!take_credit(t, 81, q, None, now, 1), "another session");
         assert!(
@@ -626,6 +638,13 @@ mod tests {
             !take_credit(t, 80, q, None, now + 1_000_000, 8),
             "consumed once"
         );
+        // Without a transaction id, a credit is consumed once (review L3).
+        h.credit(q, Duration::from_secs(5), None);
+        assert!(take_credit(t, 80, q, None, now + 1, 0));
+        assert!(!take_credit(t, 80, q, None, now + 1, 0));
+        // The window covers the statement's run, not a late read.
+        h.credit(q, Duration::from_secs(5), None);
+        assert!(!take_credit(t, 80, q, None, now + 60_000_000, 9));
         for _ in 0..MAX_CREDITS + 5 {
             h.credit("x", Duration::from_secs(5), None);
         }
@@ -679,6 +698,7 @@ mod tests {
         assert!(text.starts_with("v1\noffset "));
         let p = decode(&bytes).unwrap();
         assert_eq!(p.sessions.len(), 2);
+        let p_saved = p.saved_us;
         let other = "own-test-persist-2";
         reset(other);
         restore(other, p);
@@ -688,12 +708,15 @@ mod tests {
             .find(|s| s.spid == 91)
             .copied()
             .unwrap();
+        let end = s91.end_us.unwrap();
+        let saved = p_saved.unwrap();
         assert!(
-            s91.end_us.is_some(),
-            "an open session is closed at the restart"
+            end <= saved + 35_000_000,
+            "an open session ends at its last save plus the grace (review L4)"
         );
         assert!(decode(b"v2\n").is_none());
         assert!(decode(b"v1\noffset 0\n1 2 - x\n").is_none());
+        assert!(decode(b"v1\noffset 0\nsaved x\n").is_none());
         // Cut from the oldest.
         let small = encode(t, 40);
         assert!(decode(&small).unwrap().sessions.len() <= 1);
@@ -707,6 +730,7 @@ mod tests {
             t,
             Persisted {
                 offset_us: 0,
+                saved_us: None,
                 sessions: vec![OwnSession {
                     spid: 1,
                     start_us: 0,

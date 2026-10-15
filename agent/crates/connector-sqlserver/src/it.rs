@@ -1324,14 +1324,39 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
                 .is_err()
         );
     }
-    // Credential DCL: its password never leaves the agent.
-    let marker = "Cred-Marker-7Zq9-only-in-dcl";
+    // Credential DCL and password-taking calls in forms the server does
+    // not mask itself: the marker never leaves the agent.
+    let marker = "CredMarker7Zq9xYz";
+    drop_login(&mut s, "it_cred2").await;
+    exec(&mut s, &format!("EXEC sp_addlogin it_cred2, {marker}")).await;
+    exec_ok(&mut s, "DROP CREDENTIAL it_cred_c").await;
     exec(
         &mut s,
-        &format!("CREATE LOGIN [it_cred] WITH PASSWORD = N'{marker}', CHECK_POLICY = OFF"),
+        &format!("CREATE CREDENTIAL it_cred_c WITH IDENTITY = 'i', SECRET = '{marker}'"),
     )
     .await;
-    drop_login(&mut s, "it_cred").await;
+    exec(&mut s, "DROP CREDENTIAL it_cred_c").await;
+    drop_login(&mut s, "it_cred2").await;
+    {
+        let mut d = foreign_session("it_dump", "DATABASTION_IT_SQLSERVER_THROWAWAY").await;
+        try_rows(
+            &mut d,
+            &format!(
+                "SELECT TOP (1) id FROM retail.crm.customers WHERE \
+                 ENCRYPTBYPASSPHRASE('{marker}', N'x') IS NOT NULL"
+            ),
+            1,
+        )
+        .await;
+        d.close().await;
+    }
+    // The server's internal statement of fn_my_permissions, which the
+    // agent's own sessions produce, from a session that is not its own.
+    {
+        let mut f = foreign_session("databastion", "SQLSERVER_DATABASTION_PASSWORD").await;
+        try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1).await;
+        f.close().await;
+    }
 
     tokio::time::sleep(Duration::from_secs(6)).await;
     let h = c.check(&t).await;
@@ -1391,10 +1416,11 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
         by("sa").iter().any(|e| e.action() == EventAction::Dcl),
         "no DCL reported"
     );
-    // The agent's login: only the foreign session's statements (its
-    // session read-back and its read, which are the agent's constant and
-    // a plain read, but from a session that is not the agent's), nothing
-    // of the agent's own check(), Discovery or polls.
+    // The agent's login: only the foreign sessions' statements (their
+    // session read-backs, a read, and the agent's own permission read with
+    // the statement the server runs inside fn_my_permissions: constants of
+    // the agent, but from sessions that are not its own), nothing of the
+    // agent's own check(), Discovery or polls.
     let agent_events = by("databastion");
     assert!(
         agent_events
@@ -1402,17 +1428,28 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
             .any(|e| names_of(e) == ["retail.crm.customers"]),
         "the agent's login from another session must be reported"
     );
+    assert!(
+        agent_events
+            .iter()
+            .any(|e| names_of(e) == ["master.sys.fn_builtin_permissions"]),
+        "the server's internal statement from another session must be reported"
+    );
     for e in &agent_events {
         assert!(
-            (names_of(e) == ["retail.crm.customers"]
-                || names_of(e) == ["master.sys.dm_exec_sessions"])
+            [
+                vec!["retail.crm.customers".to_owned()],
+                vec!["master.sys.dm_exec_sessions".to_owned()],
+                vec!["master.sys.fn_builtin_permissions".to_owned()],
+                vec!["master.sys.fn_my_permissions".to_owned()],
+            ]
+            .contains(&names_of(e))
                 && e.action() == EventAction::Read,
             "an own statement reported: {:?} {:?}",
             e.action(),
             names_of(e)
         );
     }
-    assert_eq!(agent_events.len(), 2, "own statements reported");
+    assert!(agent_events.len() <= 6, "own statements reported");
     // Not vacuous: the agent's own catalog reads, sampling and polls were
     // in the audit and were left out.
     let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);

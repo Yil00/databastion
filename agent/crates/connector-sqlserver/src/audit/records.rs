@@ -358,8 +358,14 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
     let analysis = (matches!(action, EventAction::Read | EventAction::Write)
         && !h.statement.trim().is_empty())
     .then(|| tsql::analyze_tsql(&h.statement, h.cut));
-    // A password-taking procedure called: DCL, kind only.
-    if analysis.as_ref().is_some_and(|a| a.credential) {
+    // A password-taking procedure called (at the head of the text, or the
+    // record's own object is that procedure): DCL, kind only. Its name
+    // anywhere else leaves the text unread (`*`, below; review M1).
+    let procedure_record = h.action == "EX"
+        && s.objects
+            .iter()
+            .any(|(_, _, o, _)| tsql::CREDENTIAL_PROCEDURES.contains(&o.to_lowercase().as_str()));
+    if analysis.as_ref().is_some_and(|a| a.credential) || procedure_record {
         action = EventAction::Dcl;
     }
     let mut ev = MaskedEvent::new(EventSource::SqlserverAudit, action, principal, ts);
@@ -398,9 +404,13 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
         ev = ev.with_signal(Signal::Bcp);
     }
     if let Some(a) = &analysis {
-        if a.credential || a.credential_function {
+        if a.credential {
             // Kind and the records' objects only (decision 6, M6).
-            always |= a.credential_function;
+        } else if a.credential_function {
+            // A password-taking function: no text-derived signal, and what
+            // else the text names is not used: `*`, always reported.
+            star = true;
+            always = true;
         } else if !a.usable() {
             // A cut, unlexable or ambiguous text: what it names cannot be
             // known (the ADR-0045 #181 rule).
@@ -653,8 +663,11 @@ pub(crate) mod tests {
         let (ev, a) = one(vec![r.clone()]);
         assert_eq!(ev.action(), EventAction::AuthFailure);
         assert!(!ev.principal().send_name() && a.is_none());
-        r.principal.clear();
+        // 17830 with a name tried is still a failed login (review L11).
         r.error = Some(17_830);
+        let (ev, _) = one(vec![r.clone()]);
+        assert_eq!(ev.action(), EventAction::AuthFailure);
+        r.principal.clear();
         assert!(convert(&group(vec![r])[0]).is_none());
     }
 

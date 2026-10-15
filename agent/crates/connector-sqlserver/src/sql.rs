@@ -49,12 +49,14 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
 /// (a'), M4), read from `sys.server_file_audits` (a `FILE` target only;
 /// never `sys.server_audits`): enabled, **whether** it has a predicate
 /// (never the predicate's text), `ON_FAILURE`, its GUID and folder (used
-/// only to build the poll's file pattern) and `QUEUE_DELAY`. Visible with
+/// only to build the poll's file pattern), `QUEUE_DELAY` and its name as
+/// the catalog writes it (the file names use it, whatever the case of the
+/// name in `agent.yaml`; review L6). Visible with
 /// `VIEW ANY SECURITY DEFINITION` (measured on 2022).
 pub(crate) const AUDIT_FILE: &str = "SELECT TOP (2) CONVERT(int, is_state_enabled), \
 CONVERT(int, CASE WHEN predicate IS NULL THEN 1 ELSE 0 END), CONVERT(int, on_failure), \
-CONVERT(nvarchar(36), audit_guid), CONVERT(nvarchar(260), log_file_path), CONVERT(int, queue_delay) \
-FROM sys.server_file_audits WHERE name = {audit}";
+CONVERT(nvarchar(36), audit_guid), CONVERT(nvarchar(260), log_file_path), CONVERT(int, queue_delay), \
+CONVERT(nvarchar(128), name) FROM sys.server_file_audits WHERE name = {audit}";
 
 /// The action groups of the enabled server audit specifications of the
 /// audit (decision 6 proofs 3 and 4): group names and audited results, a
@@ -312,6 +314,7 @@ pub(crate) fn audit_pattern(folder: &str, name: &str, guid: &str) -> Option<Stri
         || name.is_empty()
         || name.chars().count() > 128
         || !plain(name)
+        || name.contains(['/', '\\'])
     {
         return None;
     }
@@ -844,6 +847,9 @@ mod tests {
         );
         assert!(audit_pattern("/x/*", "a", "B5BEF79B-88AC-4A47-91AE-0081BBD71D51").is_none());
         assert!(audit_pattern("/x/", "a", "not-a-guid").is_none());
+        for bad in ["../a", "a/b", "a\\b"] {
+            assert!(audit_pattern("/x/", bad, "B5BEF79B-88AC-4A47-91AE-0081BBD71D51").is_none());
+        }
         assert!(
             audit_pattern("C:\\Audit", "a", "B5BEF79B-88AC-4A47-91AE-0081BBD71D51")
                 .unwrap()
