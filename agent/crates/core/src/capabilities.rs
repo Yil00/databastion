@@ -50,6 +50,12 @@ pub(crate) mod token {
     /// The `TargetNoteLabel` values of the Microsoft SQL Server revision
     /// (ADR-0051 decision 4, ADR-0022 decision 4).
     pub(crate) const NOTE_LABELS_2026_10: &str = "target_status.note_labels.2026_10";
+    /// The `TargetNoteLabel` values of the second Microsoft SQL Server
+    /// revision (ADR-0051 refinement of 2026-10-14, items 5 to 7; ADR-0022
+    /// decision 4): database-scoped event-session permissions, the other
+    /// permissions the connector judges by name, and the `check()` reads
+    /// named with `privilege.not_evaluated`.
+    pub(crate) const NOTE_LABELS_2026_10_B: &str = "target_status.note_labels.2026_10_b";
     /// The `redis` value of `Engine` (ADR-0052 decision 12).
     pub(crate) const ENGINE_REDIS: &str = "engine.redis";
     /// The `valkey` value of `Engine` (ADR-0052 decision 12).

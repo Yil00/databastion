@@ -278,7 +278,7 @@
       ]
     },
     "FailureCode": {
-      "description": "Closed set of failure causes. Driver or engine messages are never sent (they can contain values\nor query text); `engine_code` may carry the engine's numeric / SQLSTATE code.\n",
+      "description": "Closed set of failure causes. Driver or engine messages are never sent (they can contain values\nor query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no\nTLS-specific code: on every engine, a failed TLS handshake or certificate verification is\n`target_unreachable` (`timeout` when the handshake times out; on SQL Server, `unsupported`\nwhen the server offers no encryption mode the agent accepts), and the target's\n`check.stage_failed` note names the stage (`stage_tls`).\n",
       "type": "string",
       "enum": [
         "target_unreachable",
@@ -637,7 +637,7 @@
       "pattern": "^(audit|coverage|privilege|security|check)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$"
     },
     "TargetNoteLabel": {
-      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n\nRevisions:\n- protocol 0.1.0 (no token): every value down to `stage_kill`;\n- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server\n  labels below `stage_kill`. SQL Server permission names are lowercased with spaces\n  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in\n  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are\n  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->\n  `ms_login_manager`). SQL Server permissions whose name is already a value above\n  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,\n  `shutdown`…) use that value, with no token. A console that lists the token renders\n  every value of the revision.\n",
+      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n\nRevisions:\n- protocol 0.1.0 (no token): every value down to `stage_kill`;\n- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server\n  labels below `stage_kill`. SQL Server permission names are lowercased with spaces\n  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in\n  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are\n  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->\n  `ms_login_manager`). SQL Server permissions whose name is already a value above\n  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,\n  `shutdown`…) use that value, with no token. A console that lists the token renders\n  every value of the revision.\n- `target_status.note_labels.2026_10_b` (ADR-0051 refinement of 2026-10-14, items 5 to\n  7): the SQL Server labels below `password_hash_probe`, written by the same rule: the\n  database-scoped event-session permissions of the refusal list (`ALTER ANY DATABASE\n  EVENT SESSION` and its granular forms, `CREATE` / `DROP ANY DATABASE EVENT SESSION`),\n  the other database and server permissions the SQL Server connector judges by name\n  (`VIEW SECURITY DEFINITION`, `VIEW DATABASE SECURITY STATE`, `VIEW ANY PERFORMANCE\n  DEFINITION`…), and the `check()` reads named with `privilege.not_evaluated` when they\n  cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the\n  minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,\n  so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's\n  column read cut or failed). Each revision is negotiated on its own: a value is sent\n  only when the token of its own revision is listed.\n",
       "type": "string",
       "enum": [
         "other",
@@ -813,7 +813,27 @@
         "view_definition",
         "view_database_state",
         "showplan",
-        "password_hash_probe"
+        "password_hash_probe",
+        "alter_any_database_event_session",
+        "alter_any_database_event_session_enable",
+        "alter_any_database_event_session_disable",
+        "alter_any_database_event_session_add_event",
+        "alter_any_database_event_session_drop_event",
+        "alter_any_database_event_session_add_target",
+        "alter_any_database_event_session_drop_target",
+        "alter_any_database_event_session_option",
+        "create_any_database_event_session",
+        "drop_any_database_event_session",
+        "view_any_performance_definition",
+        "view_security_definition",
+        "view_performance_definition",
+        "view_database_security_state",
+        "view_database_performance_state",
+        "view_any_column_encryption_key_definition",
+        "view_any_column_master_key_definition",
+        "logon_trigger_probe",
+        "refusal_list_probe",
+        "cas_store_guard_probe"
       ]
     },
     "DetectedTarget": {
