@@ -52,7 +52,8 @@ spool:
 
 targets:
   - id: pg-main                # slug reported to the console (no host name)
-    engine: postgres           # postgres | mysql | mariadb | mongodb | openldap
+    engine: postgres           # postgres | mysql | mariadb | mongodb | openldap | cas
+                               # (redis | valkey | sqlserver: in development, below)
     host: 127.0.0.1            # or `socket: /var/run/postgresql/.s.PGSQL.5432`
     port: 5432
     account: databastion       # dedicated read-only account (docs/05-security.md)
@@ -190,6 +191,74 @@ targets:
       # clear_principals: [svc-monitoring]
       # Client addresses: truncated (default: IPv4 /24, IPv6 /56), clear, omitted
       client_addr: truncated
+
+  # Redis / Valkey (ADR-0052; in development, not released yet: results reach a
+  # console that lists engine.redis and engine.valkey only). One node per
+  # target; Cluster nodes are separate targets, Sentinel is refused. Redis
+  # 6.2.7+ and Valkey 7.2+.
+  # - id: cache-eu-1
+  #   engine: valkey             # or redis: same connector, checked as what the server is
+  #   host: cache-eu-1.internal  # or `socket: /run/valkey/valkey.sock` (with tls: disable)
+  #   port: 6379
+  #   account: databastion       # a named ACL user, never `default` (docs/05-security.md)
+  #   secret:
+  #     file: /etc/databastion/secrets/cache-eu-1   # 0600, owned by the agent user
+  #   redis:
+  #     # verify_full (default): TLS from the first byte, certificate + host name
+  #     # disable: Unix socket or loopback IP literal only (required for a socket)
+  #     # There is no disable_insecure: AUTH sends the password itself.
+  #     tls: verify_full
+  #     # ca_file: /etc/databastion/cache-ca.pem      # only trusted root for this target
+  #     # client_cert: /etc/databastion/agent.pem     # servers with tls-auth-clients yes
+  #     # client_key: /etc/databastion/agent.key      # owned by the agent user, 0600
+  #     # The ACL user's read key patterns (server glob syntax, at most 64;
+  #     # default ["*"]): the agent never sends a command the ACL refuses.
+  #     key_patterns: ["app:*", "session:*"]
+  #     # databases: [0, 1]        # database indexes (default: every database)
+  #     max_keys: 100000           # 1000..=10000000; keys examined per database and scan
+  #     # A replica Discovery reads instead of this node (recommended).
+  #     # discovery_node: {host: cache-eu-1-replica.internal, port: 6379}
+  #     # Known replica addresses, compared for full synchronizations only.
+  #     # replicas: [10.0.4.12]
+  #     # server_uid: 999          # Unix socket only: expected uid of the server
+  #     # unevaluated_acl: accept  # Redis 6.2 only (no ACL DRYRUN); an error elsewhere
+  #     # cas_stores:
+  #     #   ticket_registry: ["CAS_TICKET:*"]
+  # Microsoft SQL Server (ADR-0051; in development, not released yet: results
+  # reach a console that lists engine.sqlserver only). SQL Server 2019, 2022 and
+  # 2025; one host and port over TCP (no socket, no SQL Server Browser); a SQL
+  # login (no Windows or Entra ID authentication).
+  # - id: erp-eu-1
+  #   engine: sqlserver
+  #   host: erp-db-1.internal    # a name or IP literal in the server certificate
+  #   port: 1433
+  #   account: databastion_agent # least-privilege SQL login (docs/05-security.md)
+  #   secret:
+  #     env: DATABASTION_ERP_EU_1_PASSWORD
+  #   sqlserver:
+  #     # Every mode verifies the certificate and the host; there is no
+  #     # unencrypted mode.
+  #     # auto (default): TDS 8.0 strict first, one fallback to mandatory when
+  #     #   the strict handshake fails, never after a strict session was seen
+  #     # strict: TDS 8.0 only (on Linux, SQL Server 2025)
+  #     # mandatory: TDS 7.x, encryption required (SQL Server 2019, 2022 on Linux)
+  #     tls: auto
+  #     # ca_file: /etc/databastion/sqlserver-ca.pem  # only trusted root for this target
+  #     # databases: [app]         # default: every user database the login can access
+  #     # Row-level security opt-in: database VIEW DEFINITION in each monitored
+  #     # database. Without it, Discovery samples nothing.
+  #     # rls_visibility: view_definition
+  #     # db_datareader instead of per-schema SELECT: reported as expected.
+  #     extended_grants: false
+  #     # max_tables: 16384        # 1..=16384; tables read per database and scan
+  #     # cas_stores:
+  #     #   ticket_registry: [sso_tickets]
+  #     # Audit (SQL Server 2022+): an operator-created server audit with a FILE
+  #     # target; the agent never creates or alters it. Needs VIEW SERVER
+  #     # SECURITY AUDIT and VIEW ANY SECURITY DEFINITION (docs/10-user-guide.md).
+  #     # source: auto (default) | sqlserver_audit | sqlserver_xevents (not
+  #     #   implemented yet: the target reports None)
+  #     # audit: {source: sqlserver_audit, audit_name: databastion_audit}
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
