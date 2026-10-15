@@ -29,6 +29,7 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
     ("database_grants", DATABASE_GRANTS),
     ("rls_view_definition", RLS_VIEW_DEFINITION),
     ("rls_denies", RLS_DENIES),
+    ("rls_server_denies", RLS_SERVER_DENIES),
     ("rls_tables", RLS_TABLES),
     ("unsampled_objects", UNSAMPLED_OBJECTS),
     ("column_counts", COLUMN_COUNTS),
@@ -135,6 +136,15 @@ p.permission_name IN (N'VIEW DEFINITION', N'VIEW SECURITY DEFINITION', N'CONTROL
 (p.grantee_principal_id = 0 OR p.grantee_principal_id IN (SELECT principal_id FROM me) OR \
 p.grantee_principal_id IN (SELECT id FROM roles)))), CONVERT(int, (SELECT COUNT(DISTINCT id) FROM \
 roles)), CONVERT(int, (SELECT COUNT(*) FROM me)) OPTION (MAXRECURSION 64)";
+
+/// RLS tier (ii), server-scope proof (security review M4): `DENY` rows
+/// of the server definition-visibility permissions to the login, its
+/// server roles and `public` (a member of every login). A count only.
+pub(crate) const RLS_SERVER_DENIES: &str = "SELECT CONVERT(int, COUNT(*)) FROM \
+sys.server_permissions p WHERE p.state = 'D' AND p.permission_name IN (N'VIEW ANY DEFINITION', \
+N'VIEW ANY SECURITY DEFINITION', N'VIEW SERVER SECURITY STATE', N'CONTROL SERVER') AND \
+(p.grantee_principal_id = SUSER_ID() OR p.grantee_principal_id IN (SELECT r.principal_id FROM \
+sys.server_principals r WHERE r.type = 'R' AND IS_SRVROLEMEMBER(r.name) = 1))";
 
 /// Tables with an enabled RLS predicate (never `predicate_definition`).
 pub(crate) const RLS_TABLES: &str = "SELECT DISTINCT TOP (16385) \

@@ -554,6 +554,32 @@ pub(crate) async fn rls_tier(
              this database",
         ));
     }
+    // Server scope first (security review M4): a DENY of the server
+    // definition-visibility permissions to the login, its server roles or
+    // `public` can hide a policy whatever the database grants say.
+    let server = match s
+        .rows(sql::RLS_SERVER_DENIES, Stage::Check, Shape::rows(1, 1))
+        .await
+    {
+        Ok(rows) => rows.first().and_then(|r| r.first()).and_then(Value::as_int),
+        Err(e) if !e.fatal => None,
+        Err(e) => return Err(e),
+    };
+    match server {
+        Some(0) => {}
+        Some(_) => {
+            return Ok(RlsTier::NotVerifiable(
+                "a server-level DENY of VIEW ANY DEFINITION, VIEW ANY SECURITY DEFINITION, VIEW \
+                 SERVER SECURITY STATE or CONTROL SERVER to the login, one of its server roles or \
+                 public can hide a policy",
+            ));
+        }
+        None => {
+            return Ok(RlsTier::NotVerifiable(
+                "the server-level DENY proof could not be read",
+            ));
+        }
+    }
     let row = match s
         .rows(&probe(sql::RLS_DENIES)?, Stage::Check, Shape::rows(3, 1))
         .await

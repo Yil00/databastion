@@ -466,6 +466,15 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
         )
         .await;
     }
+    // Server scope (review M4): a DENY of VIEW ANY DEFINITION to the login.
+    exec(&mut s, &format!("DENY VIEW ANY DEFINITION TO [{name}]")).await;
+    let h = c.check(&t).await;
+    assert!(
+        has(&h, NoteCode::CoverageRlsNotVerifiable),
+        "server DENY: {:?}",
+        codes(&h)
+    );
+    exec(&mut s, &format!("REVOKE VIEW ANY DEFINITION TO [{name}]")).await;
     drop_login(&mut s, name).await;
     exec_ok(&mut s, &in_db("retail", "DROP ROLE it_rls_role")).await;
 }
