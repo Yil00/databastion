@@ -353,7 +353,12 @@ pub(crate) fn sample_statement(
     let (n, select, from) = (n.to_string(), select.join(", "), from(db, schema, table)?);
     render(
         SAMPLE,
-        &[("n", &n), ("select", &select), ("from", &from), ("sample", &sample)],
+        &[
+            ("n", &n),
+            ("select", &select),
+            ("from", &from),
+            ("sample", &sample),
+        ],
     )
 }
 

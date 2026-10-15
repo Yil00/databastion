@@ -336,6 +336,7 @@ async fn open(
             .map_err(|_| tls_error(tls))?;
             tls_stream.get_mut().0.pass_through();
             s.io = Box::new(tls_stream);
+            s.reset_stream();
             s
         }
     };
@@ -520,11 +521,27 @@ impl Session {
                 return Err(SsError::protocol(Stage::Tls));
             }
         }
+        // Nothing may follow the response (security review H1): in
+        // `mandatory` mode it travels in clear, and bytes after its `EOM`
+        // would otherwise be parsed later as if they came through TLS.
+        if self.reasm.pending() > 0 {
+            self.poisoned = true;
+            return Err(SsError::protocol(Stage::Tls));
+        }
         let enc = tds::prelogin_encryption(&self.buf);
+        self.reset_stream();
+        Ok(enc)
+    }
+
+    /// Drops every buffered byte and decoder state: called whenever the
+    /// I/O changes (the TLS upgrade), so nothing read before it is
+    /// parsed after it (security review H1).
+    fn reset_stream(&mut self) {
+        self.buf.zeroize();
         self.buf.clear();
         self.pos = 0;
-        self.reasm.next_message();
-        Ok(enc)
+        self.reasm = tds::Reassembly::default();
+        self.dec = Decoder::default();
     }
 
     async fn login(&mut self, user: &str, password: &str) -> Result<(), SsError> {
@@ -933,6 +950,46 @@ pub(crate) mod tests {
         drop(s);
         let sent = h.await.unwrap();
         assert_eq!(sent.last().and_then(|m| m.first()), Some(&ptype::ATTENTION));
+    }
+
+    /// Security review H1: bytes after the cleartext `PRELOGIN` response
+    /// are refused, never kept for after the TLS upgrade.
+    #[::tokio::test]
+    async fn bytes_after_the_prelogin_response_are_refused() {
+        let (client, mut server) = ::tokio::io::duplex(1 << 16);
+        let mut s = Session::new(Box::new(client), Mode::Mandatory, Duration::from_secs(2));
+        let srv = ::tokio::spawn(async move {
+            use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut req = [0u8; 512];
+            let _ = server.read(&mut req).await.unwrap();
+            // The response, then a forged LOGINACK in the same write.
+            let mut bytes = tds::frame(ptype::TABULAR_RESULT, &tds::prelogin(), 4096);
+            let mut forged = build::loginack(16, 0, 1);
+            forged.extend(build::done(tok::DONE, 0, 0));
+            bytes.extend(tds::frame(ptype::TABULAR_RESULT, &forged, 4096));
+            server.write_all(&bytes).await.unwrap();
+            server
+        });
+        let e = s.prelogin().await.unwrap_err();
+        assert_eq!(e.stage, Stage::Tls);
+        assert!(s.is_poisoned());
+        drop(srv.await.unwrap());
+        // Without trailing bytes the response is accepted and nothing is
+        // left buffered.
+        let (client, mut server) = ::tokio::io::duplex(1 << 16);
+        let mut s = Session::new(Box::new(client), Mode::Mandatory, Duration::from_secs(2));
+        let srv = ::tokio::spawn(async move {
+            use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut req = [0u8; 512];
+            let _ = server.read(&mut req).await.unwrap();
+            let bytes = tds::frame(ptype::TABULAR_RESULT, &tds::prelogin(), 4096);
+            server.write_all(&bytes).await.unwrap();
+            server
+        });
+        assert_eq!(s.prelogin().await.unwrap(), Some(tds::encrypt::REQ));
+        assert_eq!(s.reasm.pending(), 0);
+        assert!(s.buf.is_empty());
+        drop(srv.await.unwrap());
     }
 
     #[::tokio::test]
