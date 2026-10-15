@@ -1890,8 +1890,9 @@ audit_verify() {
 
   # Events and incidents of the target against the ground truth and the agent's own account.
   console_sql "SELECT coalesce(json_agg(json_build_object('db_user', db_user,
-      'db_user_fingerprint', db_user_fingerprint, 'action', action, 'objects', objects,
-      'signals', signals, 'rows', rows, 'source', source, 'aggregated_count', aggregated_count)
+      'db_user_fingerprint', db_user_fingerprint, 'account_not_recorded', account_not_recorded,
+      'action', action, 'objects', objects, 'signals', signals, 'rows', rows, 'bytes', bytes,
+      'source', source, 'aggregated_count', aggregated_count)
       ORDER BY ts), '[]')
     FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
     >"$E2E_WORK_DIR/audit-events.json" || fail "cannot read the access events of $target"

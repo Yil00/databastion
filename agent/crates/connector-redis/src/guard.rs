@@ -57,6 +57,46 @@ pub(crate) fn key_guarded(key: &[u8], stores: Option<&CasStores>) -> bool {
         })
 }
 
+/// The strict ticket prefixes (re-review N5): the generic `[A-Z]{2,4}`
+/// shape alone does not set `signature.cas_ticket_read`.
+const STRICT_PREFIXES: [&[u8]; 7] = [b"TGT", b"ST", b"PT", b"PGT", b"OC", b"AT", b"RT"];
+
+/// Whether `bytes` hold `<strict prefix>-<digits>-` (the uppercase run
+/// before the dash exactly one of [`STRICT_PREFIXES`]).
+fn has_strict_ticket(bytes: &[u8]) -> bool {
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'-' {
+            return false;
+        }
+        let before = bytes.get(..i).unwrap_or_default();
+        let letters = before
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_uppercase())
+            .count();
+        let run = before.get(before.len() - letters..).unwrap_or_default();
+        if !STRICT_PREFIXES.contains(&run) {
+            return false;
+        }
+        let after = bytes.get(i + 1..).unwrap_or_default();
+        let digits = after.iter().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0 && after.get(digits) == Some(&b'-')
+    })
+}
+
+/// Whether a guarded key read in Audit sets `signature.cas_ticket_read`
+/// (decision 6, re-review N5): a name-guard match (the CAS prefix or a
+/// `cas_stores` pattern) or a strict ticket prefix.
+pub(crate) fn ticket_read_signal(key: &[u8], stores: Option<&CasStores>) -> bool {
+    has_strict_ticket(key)
+        || contains_ignore_case(key, CAS_PREFIX)
+        || stores.is_some_and(|s| {
+            s.ticket_registry
+                .iter()
+                .any(|p| crate::glob::matches(p.as_bytes(), key))
+        })
+}
+
 /// Whether a value guards its key (the unanchored tripwire, N5).
 pub(crate) fn value_trips(value: &[u8]) -> bool {
     has_ticket_shape(value.get(..VALUE_WINDOW.min(value.len())).unwrap_or(value))
@@ -92,6 +132,15 @@ mod tests {
             audit_trail: Vec::new(),
         };
         assert!(key_guarded(b"tickets:abc", Some(&stores)));
+    }
+
+    #[test]
+    fn the_signal_needs_a_strict_prefix_or_a_name_guard() {
+        assert!(ticket_read_signal(b"sso:TGT-3-x", None));
+        assert!(ticket_read_signal(b"xST-1-y", None));
+        assert!(ticket_read_signal(b"CAS_TICKET:abc", None));
+        assert!(!ticket_read_signal(b"orders:ABCD-12-x", None));
+        assert!(!ticket_read_signal(b"ABTGT-1-x", None));
     }
 
     #[test]

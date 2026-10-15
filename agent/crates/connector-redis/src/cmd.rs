@@ -33,6 +33,34 @@ const SCAN_SLACK: usize = 500;
 const INFO_BYTES: usize = 1024 * 1024;
 /// Most elements of a `HELLO` reply aggregate (the `modules` array cap).
 const HELLO_ITEMS: usize = 64;
+/// Entries asked of `SLOWLOG GET` / `COMMANDLOG GET` per poll (security
+/// review M5: 512 entries of at most 32 arguments of 128 bytes stay under
+/// the 4 MiB reply cap).
+pub(crate) const LOG_ENTRIES: u32 = 512;
+/// Entries asked of `ACL LOG` (its default length).
+pub(crate) const ACL_LOG_ENTRIES: u32 = 128;
+/// Longest log argument or `ACL LOG` field kept; longer ones are read,
+/// discarded and become `*` (decision 1).
+const LOG_ARG_BYTES: usize = 64 * 1024;
+/// Most elements of one log-reply aggregate.
+const LOG_ITEMS: usize = 512;
+
+/// A Valkey command-log type read by Audit (decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandLog {
+    Slow,
+    LargeReply,
+}
+
+impl CommandLog {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::LargeReply => "large-reply",
+        }
+    }
+}
+
 /// Most fields of one stream entry read (an entry with more closes the
 /// connection: counted as an error for its key).
 const STREAM_FIELDS: usize = 512;
@@ -44,6 +72,7 @@ pub(crate) enum InfoSection {
     Replication,
     Keyspace,
     Cluster,
+    Stats,
 }
 
 impl InfoSection {
@@ -53,6 +82,7 @@ impl InfoSection {
             Self::Replication => "replication",
             Self::Keyspace => "keyspace",
             Self::Cluster => "cluster",
+            Self::Stats => "stats",
         }
     }
 }
@@ -118,6 +148,14 @@ pub(crate) enum Cmd<'a> {
     ClientNoTouchOn,
     /// `READONLY` (a Cluster replica).
     ReadOnly,
+    /// `SLOWLOG GET 512` (Audit).
+    SlowlogGet,
+    /// `COMMANDLOG GET 512 slow|large-reply` (Audit, Valkey 8.1+).
+    CommandlogGet(CommandLog),
+    /// `ACL LOG 128` (Audit).
+    AclLog,
+    /// `CLIENT LIST` (Audit attribution).
+    ClientList,
 }
 
 impl std::fmt::Debug for Cmd<'_> {
@@ -150,6 +188,10 @@ impl Cmd<'_> {
             }
             Self::ClientNoTouchOn => "CLIENT NO-TOUCH",
             Self::ReadOnly => "READONLY",
+            Self::SlowlogGet => "SLOWLOG GET",
+            Self::CommandlogGet(_) => "COMMANDLOG GET",
+            Self::AclLog => "ACL LOG",
+            Self::ClientList => "CLIENT LIST",
         }
     }
 
@@ -216,6 +258,21 @@ impl Cmd<'_> {
                 items: 0,
                 skip_oversized: false,
                 reply: 2048,
+            },
+            // An oversized argument or field is discarded without
+            // buffering and becomes `*` (decision 1, M5).
+            Self::SlowlogGet | Self::CommandlogGet(_) | Self::AclLog => Limits {
+                bulk: LOG_ARG_BYTES,
+                items: LOG_ITEMS,
+                skip_oversized: true,
+                reply: MAX_REPLY_BYTES,
+            },
+            // Over 4 MiB: discarded, entries not attributed.
+            Self::ClientList => Limits {
+                bulk: MAX_REPLY_BYTES,
+                items: 0,
+                skip_oversized: true,
+                reply: MAX_REPLY_BYTES + 1024,
             },
         }
     }
@@ -296,6 +353,24 @@ impl Cmd<'_> {
             ),
             Self::ClientNoTouchOn => resp::encode(&[b"CLIENT", b"NO-TOUCH", b"ON"], out),
             Self::ReadOnly => resp::encode(&[b"READONLY"], out),
+            Self::SlowlogGet => resp::encode(
+                &[b"SLOWLOG", b"GET", LOG_ENTRIES.to_string().as_bytes()],
+                out,
+            ),
+            Self::CommandlogGet(t) => resp::encode(
+                &[
+                    b"COMMANDLOG",
+                    b"GET",
+                    LOG_ENTRIES.to_string().as_bytes(),
+                    t.as_str().as_bytes(),
+                ],
+                out,
+            ),
+            Self::AclLog => resp::encode(
+                &[b"ACL", b"LOG", ACL_LOG_ENTRIES.to_string().as_bytes()],
+                out,
+            ),
+            Self::ClientList => resp::encode(&[b"CLIENT", b"LIST"], out),
         }
     }
 }

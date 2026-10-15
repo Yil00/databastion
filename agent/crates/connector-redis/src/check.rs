@@ -1,8 +1,8 @@
 //! `check()` (ADR-0052 decision 9): reachability (socket peer, TLS,
 //! `AUTH`, `HELLO 3`), engine and version, mode, role and the Discovery
 //! node's role, the account's evaluation (decision 4), the `default` user
-//! probe, the CAS guard's key privilege, and the Audit level: None in this
-//! version (Audit comes with a later lot), noted `audit.stream_not_available`.
+//! probe, the CAS guard's key privilege, and the Audit level of decision 8
+//! (Limited at best, `crate::audit::level`).
 //! 3 s per command, 9 s in total; the privilege report is recomputed at most
 //! every 10 minutes per target. Every explanation is a closed note.
 
@@ -32,11 +32,13 @@ pub(crate) struct ScanFacts {
     pub(crate) declared_not_readable: u64,
 }
 
-/// Per-target state shared by `check()` and Discovery.
+/// Per-target state shared by `check()`, Discovery and Audit.
 #[derive(Default)]
 pub(crate) struct CheckState {
     pub(crate) reports: Reports,
     scans: Mutex<HashMap<String, ScanFacts>>,
+    pub(crate) audit: crate::audit::state::Shared,
+    levels: Mutex<HashMap<String, AuditLevel>>,
 }
 
 impl CheckState {
@@ -45,6 +47,16 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(target_id.to_owned(), facts);
+    }
+
+    /// The Audit level `check()` last reported.
+    pub(crate) fn level(&self, target_id: &str) -> AuditLevel {
+        self.levels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .copied()
+            .unwrap_or(AuditLevel::None)
     }
 
     fn scan(&self, target_id: &str) -> ScanFacts {
@@ -170,7 +182,8 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         &report,
         &settings,
         has_dryrun,
-        scan.declared_not_readable,
+        scan.declared_not_readable
+            .saturating_add(state.audit.own_denials(&target.id)),
         &mut notes,
     );
     if scan.module_patterns > 0 {
@@ -204,8 +217,19 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         );
     }
 
-    // Audit is not implemented in this version: None.
-    notes.push(TargetNote::new(NoteCode::AuditStreamNotAvailable));
+    // Audit (decision 8): Limited at best; None with the refusal list.
+    let (audit_level, audit_notes) = crate::audit::level(
+        state,
+        &target.id,
+        info.server.has_dryrun().then_some(report.audit),
+        refusal.is_some(),
+    );
+    notes.extend(audit_notes);
+    state
+        .levels
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(target.id.clone(), audit_level);
 
     let failure = match refusal {
         None => None,
@@ -221,7 +245,7 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     }
     TargetHealth {
         reachable: true,
-        audit_level: AuditLevel::None,
+        audit_level,
         failure,
         detail: refusal.map(|r| {
             match r {

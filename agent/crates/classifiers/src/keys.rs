@@ -873,6 +873,330 @@ impl PatternBuilder {
     }
 }
 
+/// Most patterns kept per learned set (16 databases' worth of
+/// [`MAX_TEMPLATES`]); beyond, the rest is not kept (Audit objects only get
+/// coarser).
+pub const MAX_LEARNED: usize = 16 * MAX_TEMPLATES;
+/// Most units of a key name a learned-pattern match looks at.
+const MAX_MATCH_UNITS: usize = 4 * MAX_UNITS;
+
+/// One unit of a learned pattern or of a key name met in Audit: the
+/// separators before it and its token (`None`: `*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LUnit {
+    sep: String,
+    tok: Option<String>,
+}
+
+impl Drop for LUnit {
+    fn drop(&mut self) {
+        // Units of key names met in Audit are other clients' arguments.
+        self.sep.zeroize();
+        if let Some(t) = self.tok.as_mut() {
+            t.zeroize();
+        }
+    }
+}
+
+/// Splits `s` into units on the segment and token separators. `None` when
+/// it has more than `max` units. Trailing separators (no token after
+/// them) are returned apart.
+fn units_of(s: &str, max: usize, star_is_wild: bool) -> Option<(Vec<LUnit>, String)> {
+    let mut units: Vec<LUnit> = Vec::new();
+    let mut sep = String::new();
+    let mut tok = String::new();
+    for c in s.chars() {
+        if is_segment_sep(c) || is_token_sep(c) {
+            if !tok.is_empty() {
+                if units.len() >= max {
+                    sep.zeroize();
+                    tok.zeroize();
+                    return None;
+                }
+                let t = std::mem::take(&mut tok);
+                let wild = star_is_wild && t == "*";
+                units.push(LUnit {
+                    sep: std::mem::take(&mut sep),
+                    tok: (!wild).then_some(t),
+                });
+            }
+            sep.push(c);
+        } else {
+            tok.push(c);
+        }
+    }
+    if !tok.is_empty() {
+        if units.len() >= max {
+            sep.zeroize();
+            tok.zeroize();
+            return None;
+        }
+        let wild = star_is_wild && tok == "*";
+        units.push(LUnit {
+            sep: std::mem::take(&mut sep),
+            tok: (!wild).then_some(tok),
+        });
+    }
+    Some((units, sep))
+}
+
+/// Whether `pattern` matches all of `key`: a literal token equals the
+/// key's token, `*` stands for one or more whole units of the key, and
+/// every separator run before a pattern unit equals the key's.
+fn matches_units(pattern: &[LUnit], key: &[LUnit]) -> bool {
+    let (m, n) = (pattern.len(), key.len());
+    // ok[i][j]: pattern[i..] matches key[j..].
+    let mut ok = vec![vec![false; n + 1]; m + 1];
+    if let Some(row) = ok.get_mut(m)
+        && let Some(cell) = row.get_mut(n)
+    {
+        *cell = true;
+    }
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            let (Some(p), Some(k)) = (pattern.get(i), key.get(j)) else {
+                continue;
+            };
+            if p.sep != k.sep {
+                continue;
+            }
+            let v = match &p.tok {
+                Some(lit) => {
+                    k.tok.as_deref() == Some(lit.as_str())
+                        && ok
+                            .get(i + 1)
+                            .and_then(|r| r.get(j + 1))
+                            .copied()
+                            .unwrap_or(false)
+                }
+                // `*` takes key[j..j + len] for some len >= 1.
+                None => (j + 1..=n).any(|e| {
+                    ok.get(i + 1)
+                        .and_then(|r| r.get(e))
+                        .copied()
+                        .unwrap_or(false)
+                }),
+            };
+            if let Some(cell) = ok.get_mut(i).and_then(|r| r.get_mut(j)) {
+                *cell = v;
+            }
+        }
+    }
+    ok.first().and_then(|r| r.first()).copied().unwrap_or(false)
+}
+
+/// The patterns learned by the last completed walk of one database, as
+/// Audit uses them (ADR-0052 decision 8, security review H1): a key name
+/// read from a log entry is reported under a learned pattern it matches,
+/// or under its longest learned **literal** prefix followed by `*`, or as
+/// `*`; never under a literal the walk did not emit. Every result then
+/// goes through the per-key rules again ([`split_key`], the second gate)
+/// and the contract gate ([`is_key_pattern`]).
+///
+/// Holds only emitted patterns (contract `KeyPattern`s, no key-name
+/// text); at most [`MAX_LEARNED`].
+#[derive(Debug, Default, Clone)]
+pub struct LearnedPatterns {
+    /// The patterns, as emitted, sorted and unique.
+    texts: Vec<String>,
+    /// Their units.
+    parsed: Vec<Vec<LUnit>>,
+    /// Indices of the patterns by their first token (`None`: `*` first).
+    by_first: HashMap<Option<String>, Vec<usize>>,
+    /// Every literal prefix (whole units, before the first `*`) of every
+    /// pattern, rendered.
+    prefixes: HashSet<String>,
+}
+
+impl LearnedPatterns {
+    /// The learned set of `patterns`; those that are not contract
+    /// `KeyPattern`s, and `*`, are ignored.
+    #[must_use]
+    pub fn new<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut texts: Vec<String> = patterns
+            .into_iter()
+            .filter(|p| *p != "*" && is_key_pattern(p))
+            .map(str::to_owned)
+            .collect();
+        texts.sort_unstable();
+        texts.dedup();
+        texts.truncate(MAX_LEARNED);
+        let mut out = Self::default();
+        for t in texts {
+            let Some((units, tail)) = units_of(&t, MAX_UNITS, true) else {
+                continue;
+            };
+            if !tail.is_empty() || units.is_empty() {
+                continue;
+            }
+            let idx = out.parsed.len();
+            let mut prefix = String::new();
+            for u in &units {
+                let Some(lit) = &u.tok else { break };
+                prefix.push_str(&u.sep);
+                prefix.push_str(lit);
+                out.prefixes.insert(prefix.clone());
+            }
+            out.by_first
+                .entry(units.first().and_then(|u| u.tok.clone()))
+                .or_default()
+                .push(idx);
+            out.parsed.push(units);
+            out.texts.push(t);
+        }
+        out
+    }
+
+    /// The patterns, sorted.
+    #[must_use]
+    pub fn patterns(&self) -> &[String] {
+        &self.texts
+    }
+
+    /// Number of patterns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.texts.len()
+    }
+
+    /// Whether no pattern was learned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.texts.is_empty()
+    }
+
+    /// The patterns learned in every one of `sets` (a log entry whose
+    /// database is not known); empty when `sets` is.
+    #[must_use]
+    pub fn intersection(sets: &[&Self]) -> Self {
+        let Some((first, rest)) = sets.split_first() else {
+            return Self::default();
+        };
+        Self::new(
+            first
+                .texts
+                .iter()
+                .filter(|t| rest.iter().all(|s| s.texts.binary_search(t).is_ok()))
+                .map(String::as_str),
+        )
+    }
+
+    /// The object of a key name `raw` read from a log entry. `cut`: the
+    /// server cut the argument (its last unit is incomplete): only the
+    /// literal-prefix rule applies, on the complete units.
+    #[must_use]
+    pub fn object(&self, raw: &[u8], cut: bool) -> NormalizedName {
+        if raw.is_empty() || raw.len() > MAX_KEY_BYTES {
+            return NormalizedName::wildcard();
+        }
+        let Ok(text) = std::str::from_utf8(raw) else {
+            return NormalizedName::wildcard();
+        };
+        let mut folded: String = text.nfkc().collect();
+        let found = self.find(&folded, cut);
+        folded.zeroize();
+        match found {
+            // The second gate: the per-key rules again, then the contract
+            // gate; they only ever turn literals into `*`.
+            Some(mut p) => {
+                let gated = split_key(p.as_bytes()).pattern();
+                p.zeroize();
+                gated
+            }
+            None => NormalizedName::wildcard(),
+        }
+    }
+
+    fn find(&self, folded: &str, cut: bool) -> Option<String> {
+        let (units, tail) = units_of(folded, MAX_MATCH_UNITS, false)?;
+        // The best full match: (literal tokens, index).
+        let mut full: Option<(usize, usize)> = None;
+        if !cut && tail.is_empty() && !units.is_empty() {
+            let first = units.first().and_then(|u| u.tok.clone());
+            let candidates = self
+                .by_first
+                .get(&first)
+                .into_iter()
+                .chain(self.by_first.get(&None))
+                .flatten();
+            // The most specific match: most literal tokens, then fewest
+            // `*`, then the first in order (deterministic).
+            let mut best: Option<(usize, usize, usize)> = None;
+            for &i in candidates {
+                let Some(p) = self.parsed.get(i) else {
+                    continue;
+                };
+                if !matches_units(p, &units) {
+                    continue;
+                }
+                let lits = p.iter().filter(|u| u.tok.is_some()).count();
+                let wilds = p.len() - lits;
+                let better = best.is_none_or(|(bl, bw, bi)| {
+                    (lits, std::cmp::Reverse(wilds), std::cmp::Reverse(i))
+                        > (bl, std::cmp::Reverse(bw), std::cmp::Reverse(bi))
+                });
+                if better {
+                    best = Some((lits, wilds, i));
+                }
+            }
+            if let Some((lits, _, i)) = best {
+                full = Some((lits, i));
+            }
+        }
+        // The longest learned literal prefix of the key, then `*`: the
+        // prefix covers whole units, and at least one unit of the key is
+        // left for the `*` (the last, incomplete one of a cut argument is
+        // never part of the prefix).
+        let complete = if cut {
+            units.len().saturating_sub(1)
+        } else {
+            units.len()
+        };
+        let mut rendered: Vec<String> = Vec::with_capacity(complete);
+        let mut acc = String::new();
+        for u in units.iter().take(complete) {
+            acc.push_str(&u.sep);
+            acc.push_str(u.tok.as_deref().unwrap_or("*"));
+            rendered.push(acc.clone());
+        }
+        acc.zeroize();
+        let mut prefixed = None;
+        for k in (1..=rendered.len()).rev() {
+            let Some(next) = units.get(k) else { continue };
+            if let Some(prefix) = rendered.get(k - 1)
+                && self.prefixes.contains(prefix)
+            {
+                prefixed = Some((k, format!("{prefix}{}*", next.sep)));
+                break;
+            }
+        }
+        for mut r in rendered {
+            r.zeroize();
+        }
+        // The one naming more learned literals; a full match on a tie.
+        match (full, prefixed) {
+            (Some((lits, i)), Some((k, _))) if lits >= k => self.texts.get(i).cloned(),
+            (_, Some((_, p))) => Some(p),
+            (Some((_, i)), None) => self.texts.get(i).cloned(),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Fuzz entry point: a learned set from `patterns` (one per line of the
+/// first half of `data`), then the object of a key (the second half);
+/// the result must always pass the contract gate.
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_learned(data: &[u8]) -> String {
+    let mid = data.len() / 2;
+    let (pats, key) = data.split_at(mid);
+    let text = String::from_utf8_lossy(pats);
+    let learned = LearnedPatterns::new(text.lines());
+    let cut = key.first().is_some_and(|b| b & 1 == 1);
+    learned.object(key, cut).as_str().to_owned()
+}
+
 /// Fuzz entry point: the per-key rules then a walk of one key; the
 /// emitted pattern must always pass the final gate (or be `*`).
 #[doc(hidden)]
@@ -1135,5 +1459,86 @@ mod tests {
             assert!(!is_key_pattern(bad), "{bad}");
         }
         assert!(!is_key_pattern(&"a".repeat(257)));
+    }
+    fn learned(p: &[&str]) -> LearnedPatterns {
+        LearnedPatterns::new(p.iter().copied())
+    }
+
+    fn obj(l: &LearnedPatterns, key: &str) -> String {
+        l.object(key.as_bytes(), false).as_str().to_owned()
+    }
+
+    #[test]
+    fn audit_keys_map_to_learned_patterns_only() {
+        let l = learned(&[
+            "user:*:email",
+            "session:*",
+            "cache:page:about",
+            "order_*_*",
+            "*:*",
+        ]);
+        assert_eq!(obj(&l, "user:42:email"), "user:*:email");
+        assert_eq!(obj(&l, "user:jane.doe@example.com:email"), "user:*:email");
+        assert_eq!(obj(&l, "session:jdupont"), "session:*");
+        assert_eq!(obj(&l, "cache:page:about"), "cache:page:about");
+        // A literal the walk did not emit never reaches the object (H1):
+        // the longest learned literal prefix, then `*`.
+        assert_eq!(obj(&l, "cache:page:jdupont"), "cache:page:*");
+        assert_eq!(obj(&l, "cache:jdupont"), "cache:*");
+        assert_eq!(obj(&l, "order_jdupont_2024"), "order_*_*");
+        // `*:*` matches any two-unit name; the most specific wins.
+        assert_eq!(obj(&l, "jdupont:amartin"), "*:*");
+        // No learned prefix: `*`.
+        let l = learned(&["session:*"]);
+        assert_eq!(obj(&l, "jdupont"), "*");
+        assert_eq!(obj(&l, "accounts:jdupont"), "*");
+        assert_eq!(obj(&LearnedPatterns::default(), "session:jdupont"), "*");
+        // Non-UTF-8 and empty names.
+        assert_eq!(l.object(&[0xff, b':', b'x'], false).as_str(), "*");
+        assert_eq!(l.object(b"", false).as_str(), "*");
+    }
+
+    #[test]
+    fn cut_arguments_use_complete_units_only() {
+        let l = learned(&["session:*", "cache:page:about"]);
+        assert_eq!(
+            l.object(b"session:jdupont-and-mo", true).as_str(),
+            "session:*"
+        );
+        // The last unit may be cut: `cache:page:about` is not matched.
+        assert_eq!(l.object(b"cache:page:about", true).as_str(), "cache:page:*");
+        assert_eq!(l.object(b"cache", true).as_str(), "*");
+    }
+
+    #[test]
+    fn learned_literals_still_pass_the_second_gate() {
+        // A pattern that is not a contract `KeyPattern` is never learned.
+        let l = learned(&["user:123456789", "a::b", "*"]);
+        assert!(l.is_empty());
+        // The intersection keeps what every set learned.
+        let a = learned(&["session:*", "user:*:email"]);
+        let b = learned(&["session:*", "cart:*"]);
+        let i = LearnedPatterns::intersection(&[&a, &b]);
+        assert_eq!(i.patterns(), ["session:*"]);
+        assert!(LearnedPatterns::intersection(&[]).is_empty());
+    }
+
+    proptest::proptest! {
+        /// Whatever the key, the object is `*` or a contract `KeyPattern`
+        /// made of learned literals only.
+        #[test]
+        fn audit_objects_hold_learned_literals_only(
+            key in "[a-z0-9:_.@-]{0,40}",
+            cut in proptest::bool::ANY,
+        ) {
+            let l = learned(&["user:*:email", "session:*", "cache:page:about", "a_b_*"]);
+            let o = l.object(key.as_bytes(), cut);
+            let o = o.as_str();
+            proptest::prop_assert!(o == "*" || is_key_pattern(o));
+            let allowed = ["user", "email", "session", "cache", "page", "about", "a", "b", "*"];
+            for tok in o.split(|c: char| is_segment_sep(c) || is_token_sep(c)) {
+                proptest::prop_assert!(tok.is_empty() || allowed.contains(&tok), "{} in {}", tok, o);
+            }
+        }
     }
 }

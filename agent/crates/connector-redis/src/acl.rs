@@ -128,6 +128,62 @@ pub(crate) const PROBES: &[Probe] = &[
     p(&["readonly"], Class::Feature, false),
 ];
 
+/// An Audit read (decision 4): evaluated apart from [`PROBES`] (a missing
+/// Audit grant is not an over-privilege nor "not evaluated"), so Audit
+/// never sends a command the ACL refuses (H3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditRead {
+    Slowlog,
+    AclLog,
+    ClientList,
+    /// Valkey 8.1+ only.
+    Commandlog,
+}
+
+impl AuditRead {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Slowlog,
+        Self::AclLog,
+        Self::ClientList,
+        Self::Commandlog,
+    ];
+
+    /// The `ACL DRYRUN` arguments.
+    pub(crate) const fn probe(self) -> &'static Probe {
+        const SLOWLOG: Probe = p(&["slowlog", "get", "1"], Class::Feature, false);
+        const ACL_LOG: Probe = p(&["acl", "log", "1"], Class::Feature, false);
+        const CLIENT_LIST: Probe = p(&["client", "list"], Class::Feature, false);
+        const COMMANDLOG: Probe = p(&["commandlog", "get", "1", "slow"], Class::Feature, false);
+        match self {
+            Self::Slowlog => &SLOWLOG,
+            Self::AclLog => &ACL_LOG,
+            Self::ClientList => &CLIENT_LIST,
+            Self::Commandlog => &COMMANDLOG,
+        }
+    }
+}
+
+/// Which Audit reads the account may run (`None`: not evaluated: Redis
+/// 6.2, or a `DRYRUN` answer not understood).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AuditGrants {
+    pub(crate) slowlog: Option<bool>,
+    pub(crate) acl_log: Option<bool>,
+    pub(crate) client_list: Option<bool>,
+    pub(crate) commandlog: Option<bool>,
+}
+
+impl AuditGrants {
+    pub(crate) fn set(&mut self, read: AuditRead, v: Option<bool>) {
+        match read {
+            AuditRead::Slowlog => self.slowlog = v,
+            AuditRead::AclLog => self.acl_log = v,
+            AuditRead::ClientList => self.client_list = v,
+            AuditRead::Commandlog => self.commandlog = v,
+        }
+    }
+}
+
 /// The answer to one probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {

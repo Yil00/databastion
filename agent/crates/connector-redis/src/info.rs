@@ -71,6 +71,12 @@ impl Server {
         }
     }
 
+    /// Valkey's command log (`COMMANDLOG`, Valkey 8.1+; P9-D facts): there
+    /// `SLOWLOG GET` and `COMMANDLOG GET … slow` read the same log.
+    pub(crate) fn has_commandlog(self) -> bool {
+        matches!(self, Self::Valkey(v) if v >= Version(8, 1, 0))
+    }
+
     /// Per-database ACL permissions (`db=`, Valkey 9.1+).
     pub(crate) fn has_db_acl(self) -> bool {
         matches!(self, Self::Valkey(v) if v >= Version(9, 1, 0))
