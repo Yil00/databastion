@@ -4,9 +4,10 @@
 # matching CI job (.github/workflows/ci.yml: agent-pg, agent-mysql, agent-mongodb, agent-openldap,
 # agent-redis).
 #
-#   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|all     (or: make agent-it [ENGINE=...])
+#   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|sqlserver|all   (or: make agent-it [ENGINE=...])
 #
-# `redis` needs the opt-in profile (`make dev-redis`: Valkey and Redis) and is not part of `all`.
+# `redis` needs the opt-in profile (`make dev-redis`: Valkey and Redis) and is not part of `all`;
+# `sqlserver` needs `make dev-sqlserver` and is not part of `all` either.
 #
 # Not covered here (CI-only extra steps, see ci.yml): the PostgreSQL local cluster (TLS, weak
 # authentication), the MongoDB verify_full TLS server and the Percona Server for MongoDB auditLog
@@ -139,9 +140,21 @@ it_redis() {
   cargo_it databastion-connector-redis --test-threads 1
 }
 
+it_sqlserver() {
+  export COMPOSE_PROFILES=sqlserver
+  require_services sqlserver
+  mkdir -p dev/.state/tls
+  compose exec -T sqlserver cat /var/opt/mssql/databastion-tls/ca.pem > dev/.state/tls/sqlserver-ca.pem
+  export DATABASTION_IT_SQLSERVER=1
+  export DATABASTION_IT_SQLSERVER_CA="$ROOT/dev/.state/tls/sqlserver-ca.pem"
+  # The fake password of the throwaway logins the tests create as `sa` (refusal list, RLS tiers).
+  export DATABASTION_IT_SQLSERVER_THROWAWAY=Fake-IT-Passw0rd-marker
+  cargo_it databastion-connector-sqlserver --test-threads 1
+}
+
 case "$ENGINE" in
-  postgres | mysql | mongodb | openldap | redis) "it_$ENGINE" ;;
+  postgres | mysql | mongodb | openldap | redis | sqlserver) "it_$ENGINE" ;;
   # Subshells: each engine exports its own DATABASTION_TEST_REQUIRE.
   all) for e in postgres mysql mongodb openldap; do (echo "== $e"; "it_$e"); done ;;
-  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis or all)" >&2; exit 2 ;;
+  *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis, sqlserver or all)" >&2; exit 2 ;;
 esac

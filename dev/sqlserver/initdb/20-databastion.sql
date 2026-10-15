@@ -5,6 +5,10 @@
 -- Audit is enabled in dev, so the Audit grant of decision 4 is given for the server's version:
 -- VIEW SERVER SECURITY AUDIT (2022+, SQL Server Audit source) and VIEW SERVER PERFORMANCE STATE
 -- (2022+, Extended Events source); VIEW SERVER STATE on 2019 (Extended Events only).
+-- Row-level security visibility (ADR-0051 refinement item 2, option (iv), open question 5): the
+-- dev and E2E account holds database VIEW DEFINITION in `retail` and its targets declare
+-- `sqlserver.rls_visibility: view_definition`, so Discovery is tested; the integration tests
+-- revoke it to check the minimal variant's whole-database skip.
 SET NOCOUNT ON;
 USE master;
 CREATE LOGIN databastion WITH PASSWORD = N'$(DATABASTION_PASSWORD)', CHECK_POLICY = ON, DEFAULT_DATABASE = retail;
@@ -24,4 +28,5 @@ CREATE USER databastion FOR LOGIN databastion;
 GRANT SELECT ON SCHEMA::crm TO databastion;
 GRANT SELECT ON SCHEMA::finance TO databastion;
 GRANT SELECT ON cas.cas_tickets (type, creation_time, expiration_time) TO databastion;
+GRANT VIEW DEFINITION TO databastion;
 GO
