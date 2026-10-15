@@ -442,7 +442,14 @@ impl Stream<'_> {
                 } else {
                     None
                 };
-                if !own::take_credit(&self.target.id, h.session_id, &h.statement, poll, h.time_us) {
+                if !own::take_credit(
+                    &self.target.id,
+                    h.session_id,
+                    &h.statement,
+                    poll,
+                    h.time_us,
+                    h.transaction,
+                ) {
                     return Err("no credit for this text");
                 }
                 if poll.is_some() {

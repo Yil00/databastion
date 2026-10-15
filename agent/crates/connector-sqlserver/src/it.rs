@@ -1500,5 +1500,8 @@ async fn sys_function_list_matches_the_server() {
         .filter(|n| !list.contains(&n.as_str()))
         .collect();
     assert!(rows.len() > 100, "{}", rows.len());
-    assert!(missing.is_empty(), "sys functions not in SYS_FUNCTIONS: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "sys functions not in SYS_FUNCTIONS: {missing:?}"
+    );
 }

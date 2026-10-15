@@ -99,6 +99,10 @@ struct Credit {
     /// Window on the server's clock (µs).
     from_us: i64,
     until_us: i64,
+    /// Consumed by the records of the statement with this transaction id:
+    /// further records of that one execution (another object, or a part
+    /// read in the next poll) match it again, no other execution does.
+    used_tx: Option<i64>,
 }
 
 /// A credit's window starts this much before its grant (clock steps).
@@ -210,6 +214,7 @@ impl Handle {
             poll,
             from_us: now_us.saturating_sub(CREDIT_SLACK_US),
             until_us: now_us.saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX / 4)),
+            used_tx: None,
         });
     }
 }
@@ -291,22 +296,25 @@ pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64) -> Option<OwnSe
 }
 
 /// Consumes the oldest credit of session `spid` for exactly `text` whose
-/// window holds `at_us` (the record's time). `poll`: the text is the
-/// stream's current poll text of that kind (restored poll credits carry
-/// no hash and match by kind).
+/// window holds `at_us` (the record's time), for the execution with the
+/// transaction id `tx`; a credit already consumed by that execution
+/// matches again (its other records). `poll`: the text is the stream's
+/// current poll text of that kind (restored poll credits carry no hash and
+/// match by kind).
 pub(crate) fn take_credit(
     target_id: &str,
     spid: i64,
     text: &str,
     poll: Option<PollKind>,
     at_us: i64,
+    tx: i64,
 ) -> bool {
     let mut reg = lock();
     let Some(t) = reg.targets.get_mut(target_id) else {
         return false;
     };
     let h = text_hash(text);
-    let found = t.credits.iter().position(|c| {
+    let same = |c: &Credit| {
         c.spid == spid
             && c.from_us <= at_us
             && at_us <= c.until_us
@@ -314,10 +322,17 @@ pub(crate) fn take_credit(
                 Some(ch) => ch == h,
                 None => poll.is_some() && c.poll == poll,
             }
-    });
-    match found {
-        Some(i) => {
-            t.credits.remove(i);
+    };
+    if t.credits.iter().any(|c| same(c) && c.used_tx == Some(tx)) {
+        return true;
+    }
+    match t
+        .credits
+        .iter_mut()
+        .find(|c| same(c) && c.used_tx.is_none())
+    {
+        Some(c) => {
+            c.used_tx = Some(tx);
             true
         }
         None => false,
@@ -400,7 +415,13 @@ pub(crate) fn encode(target_id: &str, max_bytes: usize) -> Vec<u8> {
         );
     }
     let mut out = head.into_bytes();
-    for c in t.credits.iter().filter(|c| c.poll.is_some()).rev().take(16) {
+    for c in t
+        .credits
+        .iter()
+        .filter(|c| c.poll.is_some() && c.used_tx.is_none())
+        .rev()
+        .take(16)
+    {
         let kind = if c.poll == Some(PollKind::Start) {
             "start"
         } else {
@@ -453,6 +474,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
                     poll: Some(poll),
                     from_us,
                     until_us,
+                    used_tx: None,
                 });
             }
             continue;
@@ -579,25 +601,29 @@ mod tests {
         let h = opened(t, 80, now, 0, None, Instant::now());
         let q = "SELECT TOP (10) x FROM [d].[s].[t]";
         h.credit(q, Duration::from_secs(5), None);
-        assert!(!take_credit(t, 80, q, None, now), "no stream");
+        assert!(!take_credit(t, 80, q, None, now, 1), "no stream");
         let s = stream_started(t, Duration::from_secs(10));
         h.credit(q, Duration::from_secs(5), None);
-        assert!(!take_credit(t, 81, q, None, now), "another session");
+        assert!(!take_credit(t, 81, q, None, now, 1), "another session");
         assert!(
-            !take_credit(t, 80, "SELECT TOP (11) x FROM [d].[s].[t]", None, now),
+            !take_credit(t, 80, "SELECT TOP (11) x FROM [d].[s].[t]", None, now, 1),
             "another text"
         );
         assert!(
-            !take_credit(t, 80, q, None, now - 60_000_000),
+            !take_credit(t, 80, q, None, now - 60_000_000, 1),
             "before the window"
         );
         assert!(
-            !take_credit(t, 80, q, None, now + 3_600_000_000),
+            !take_credit(t, 80, q, None, now + 3_600_000_000, 1),
             "after the window"
         );
-        assert!(take_credit(t, 80, q, None, now + 1_000_000));
+        assert!(take_credit(t, 80, q, None, now + 1_000_000, 7));
         assert!(
-            !take_credit(t, 80, q, None, now + 1_000_000),
+            take_credit(t, 80, q, None, now + 1_000_500, 7),
+            "the same execution's other records"
+        );
+        assert!(
+            !take_credit(t, 80, q, None, now + 1_000_000, 8),
             "consumed once"
         );
         for _ in 0..MAX_CREDITS + 5 {
@@ -613,16 +639,24 @@ mod tests {
         reset(other);
         restore(other, decode(&bytes).unwrap());
         assert!(
-            !take_credit(other, 80, "any", Some(PollKind::Start), now),
+            !take_credit(other, 80, "any", Some(PollKind::Start), now, 1),
             "another kind"
         );
-        assert!(take_credit(other, 80, "any", Some(PollKind::From), now + 1));
+        assert!(take_credit(
+            other,
+            80,
+            "any",
+            Some(PollKind::From),
+            now + 1,
+            1
+        ));
         assert!(take_credit(
             t,
             80,
             "poll text",
             Some(PollKind::From),
-            now + 1
+            now + 1,
+            2
         ));
     }
 

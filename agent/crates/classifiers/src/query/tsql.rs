@@ -182,7 +182,8 @@ pub const CREDENTIAL_FUNCTIONS: &[&str] = &[
 
 /// Statement-text objects (decision 6, M2; ADR-0045 part (a) counterpart),
 /// with `fn_sqlagent_jobsteps` (the job step texts of `sysjobsteps`
-/// through a `sys` function, measured on 2022).
+/// through a `sys` function, measured on 2022) and `fn_get_audit_file_v2`
+/// (SQL Server 2025).
 pub const STATEMENT_TEXT_OBJECTS: &[&str] = &[
     "dm_exec_sql_text",
     "dm_exec_input_buffer",
@@ -196,6 +197,7 @@ pub const STATEMENT_TEXT_OBJECTS: &[&str] = &[
     "query_store_query_text",
     "query_store_plan",
     "fn_get_audit_file",
+    "fn_get_audit_file_v2",
     "fn_xe_file_target_read_file",
     "dm_xe_session_targets",
     "fn_trace_gettable",
@@ -255,14 +257,16 @@ pub const VALUE_OBJECTS: &[&str] = &[
 
 /// The `sys` functions of SQL Server 2019, 2022 and 2025 (P9-A obligation
 /// L4): a schema-qualified `sys.f(` is a built-in only when `f` is listed.
-/// Measured on 2022 (16.0.4305.5) from `sys.all_objects` (types `FN`,
-/// `IF`, `TF`, `FS`, `FT`, `AF`); the integration drift test compares it
-/// with each matrix image.
+/// Measured from `sys.all_objects` (types `FN`, `IF`, `TF`, `FS`, `FT`,
+/// `AF`) on 2022 (16.0.4305.5) and 2025 (17.0.5015.4: four more, marked);
+/// the integration drift test compares it with each matrix image.
 pub const SYS_FUNCTIONS: &[&str] = &[
     "dm_cryptographic_provider_algorithms",
     "dm_cryptographic_provider_keys",
     "dm_cryptographic_provider_sessions",
+    "dm_db_column_store_redirected_lobs", // 2025
     "dm_db_database_page_allocations",
+    "dm_db_exec_cursors", // 2025
     "dm_db_incremental_stats_properties",
     "dm_db_index_operational_stats",
     "dm_db_index_physical_stats",
@@ -334,12 +338,14 @@ pub const SYS_FUNCTIONS: &[&str] = &[
     "fn_fiscoltracked",
     "fn_full_dblog",
     "fn_get_audit_file",
+    "fn_get_audit_file_v2", // 2025
     "fn_get_sql",
     "fn_getcurrentprincipal",
     "fn_getproviderstring",
     "fn_getrowsetidfromrowdump",
     "fn_getserverportfromproviderstring",
     "fn_hadr_backup_is_preferred_replica",
+    "fn_has_change_feed_permissions", // 2025
     "fn_hadr_distributed_ag_database_replica",
     "fn_hadr_distributed_ag_replica",
     "fn_hadr_is_primary_replica",
