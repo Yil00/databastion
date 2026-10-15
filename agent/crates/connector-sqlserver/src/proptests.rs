@@ -128,9 +128,15 @@ fn prelogin_wrap_fuzz_entry_runs_a_handshake() {
     input.extend([5, 0, 0, 3]);
     input.extend(b"raw");
     input.extend([1, 0, 4, 1]);
-    crate::fuzz_entry::prelogin_wrap(&input);
+    // Review L4: the handshake bytes went through, both ways, then the raw
+    // bytes after the handshake.
+    let run = crate::fuzz_entry::prelogin_wrap(&input);
+    assert_eq!(run.read, b"server-hello");
+    assert_eq!(run.sent, b"client-hello");
+    assert_eq!(run.raw, b"raw");
     // A packet of another type: the read fails and the run ends.
     let mut input = vec![4u8, 2, 8, 0x17, 3, 3, 0, 20, 0, 0, 0, 3, 7];
     input.extend([0, 1, b'x']);
-    crate::fuzz_entry::prelogin_wrap(&input);
+    let run = crate::fuzz_entry::prelogin_wrap(&input);
+    assert!(run.read.is_empty() && run.sent.is_empty());
 }

@@ -91,7 +91,28 @@ pub fn prelogin_tls_framing(data: &[u8]) {
 /// is on, what the client reads is a prefix of the payloads of the
 /// server's valid packets, and what the server receives is `PRELOGIN`
 /// packets whose payloads are a prefix of what the client wrote.
-pub fn prelogin_wrap(data: &[u8]) {
+///
+/// Returns what went through (review L4: a test can check that a
+/// handshake actually happened); the fuzz target ignores it.
+pub fn prelogin_wrap(data: &[u8]) -> PreloginWrapRun {
+    let mut run = PreloginWrapRun::default();
+    prelogin_wrap_into(data, &mut run);
+    run
+}
+
+/// What a [`prelogin_wrap`] run moved through the adapter.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PreloginWrapRun {
+    /// Bytes the client read through the adapter while it framed.
+    pub read: Vec<u8>,
+    /// Payloads of the `PRELOGIN` packets the server received while the
+    /// adapter framed.
+    pub sent: Vec<u8>,
+    /// Bytes the server received after the handshake ended.
+    pub raw: Vec<u8>,
+}
+
+fn prelogin_wrap_into(data: &[u8], run: &mut PreloginWrapRun) {
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -105,7 +126,7 @@ pub fn prelogin_wrap(data: &[u8]) {
     // What the server sent, what the client read through the adapter,
     // what the client wrote into it and what reached the server.
     let mut fed = Vec::new();
-    let mut read = Vec::new();
+    let read = &mut run.read;
     let mut written = Vec::new();
     let mut on_wire = Vec::new();
     let mut framing = true;
@@ -156,7 +177,8 @@ pub fn prelogin_wrap(data: &[u8]) {
                             read.extend_from_slice(buf.filled());
                         }
                     }
-                    Poll::Ready(Ok(())) => on_wire.extend_from_slice(buf.filled()),
+                    Poll::Ready(Ok(())) if framing => on_wire.extend_from_slice(buf.filled()),
+                    Poll::Ready(Ok(())) => run.raw.extend_from_slice(buf.filled()),
                     Poll::Pending => {}
                 }
             }
@@ -167,13 +189,15 @@ pub fn prelogin_wrap(data: &[u8]) {
         }
         if framing {
             assert!(
-                unwrapped(&fed).starts_with(&read),
+                unwrapped(&fed).starts_with(read),
                 "read bytes that are not packet payloads"
             );
+            let sent = sent_payloads(&on_wire);
             assert!(
-                written.starts_with(&sent_payloads(&on_wire)),
+                written.starts_with(&sent),
                 "sent bytes that were not written"
             );
+            run.sent = sent;
         }
     }
 }

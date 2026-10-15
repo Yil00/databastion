@@ -18,9 +18,8 @@
 //!   engine matrix cannot silently test another image.
 //!
 //! The TLS mode reached is asserted per version (ADR-0051 refinement item
-//! 3): `mandatory` and the `auto` fallback on 2019 and 2022 (and 2025
-//! without forced strict), `strict` and `auto` reaching strict on 2025
-//! with forced strict.
+//! 3): `mandatory` and the `auto` fallback on 2019 and 2022, `strict` and
+//! `auto` reaching strict on 2025 with forced strict.
 //!
 //! `sa` is used by the tests only, to create throwaway logins and grants
 //! (the refusal tests, the RLS tiers); the connector never uses it (P9-A
@@ -457,10 +456,11 @@ async fn tls_modes_by_version() {
         s.close().await;
         assert!(!mark.exists(), "strict seen not cleared by tls: strict");
     } else {
-        // 2019, 2022 (and 2025 without forced strict) on Linux: no strict
-        // encryption. `strict` fails with the local detail, `mandatory`
-        // works, `auto` falls back once to `mandatory`, never marks the
-        // target, and connects in `mandatory` directly within the hour.
+        // 2019 and 2022 on Linux: no strict encryption. `strict` fails
+        // with the local detail, `mandatory` works, `auto` falls back once
+        // to `mandatory`, never marks the target, and connects in
+        // `mandatory` directly within the hour. (2025 without forced
+        // strict is not covered: no CI entry runs it.)
         let h = c.check(&with("strict")).await;
         assert!(!h.reachable, "strict on {major}");
         let detail = h.detail.unwrap();
@@ -721,6 +721,11 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
         .await;
         // The DENY lifted: the tier is proven again.
         let h = c.check(&t).await;
+        assert!(
+            h.reachable,
+            "after the server DENY to {grantee}: {:?}",
+            h.detail
+        );
         assert!(
             !has(&h, NoteCode::CoverageRlsNotVerifiable),
             "after the server DENY to {grantee}: {:?}",

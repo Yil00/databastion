@@ -5,5 +5,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     databastion_connector_sqlserver::fuzz::prelogin_tls_framing(data);
-    databastion_connector_sqlserver::fuzz::prelogin_wrap(data);
+    let _ = databastion_connector_sqlserver::fuzz::prelogin_wrap(data);
 });
