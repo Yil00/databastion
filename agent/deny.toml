@@ -61,6 +61,10 @@ deny = [
     { name = "openssl-sys", reason = "rustls only" },
     { name = "openssl-src", reason = "rustls only" },
     { name = "native-tls", reason = "rustls only" },
+    # ADR-0051 decision 1 (security review L12): a single crypto provider,
+    # `ring`; no C-based second provider compiled in unnoticed.
+    { name = "aws-lc-rs", reason = "single ring provider, ADR-0051 decision 1" },
+    { name = "aws-lc-sys", reason = "single ring provider, ADR-0051 decision 1" },
     # I1: the agent opens no inbound port, so no HTTP / RPC server frameworks.
     { name = "axum", reason = "I1: no inbound port" },
     { name = "actix-web", reason = "I1: no inbound port" },

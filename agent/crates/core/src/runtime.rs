@@ -106,6 +106,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Openldap => ProtoConnector::Openldap,
         Engine::Cas => ProtoConnector::Cas,
         Engine::Redis => ProtoConnector::Redis,
+        Engine::Sqlserver => ProtoConnector::Sqlserver,
     }
 }
 
@@ -1167,7 +1168,11 @@ impl Runtime {
             .console_caps
             .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
         {
-            crate::notes::to_protocol(&notes)
+            crate::notes::to_protocol(
+                &notes,
+                self.console_caps
+                    .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10),
+            )
         } else {
             Vec::new()
         };
@@ -1180,7 +1185,9 @@ impl Runtime {
             metrics: None,
             notes,
             reachable,
-            server_version: None,
+            server_version: connector
+                .and_then(|c| c.server_version(target))
+                .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
             target_id,
         };
         (status, outcome)
@@ -3323,6 +3330,7 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Cas => databastion_protocol::Engine::Cas,
         TargetEngine::Redis => databastion_protocol::Engine::Redis,
         TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
+        TargetEngine::Sqlserver => databastion_protocol::Engine::Sqlserver,
     }
 }
 

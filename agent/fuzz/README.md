@@ -21,6 +21,10 @@ tests of each connector (`src/proptests.rs`).
 | `redis_slowlog_entry` | `…::fuzz::slowlog_entry` | A `SLOWLOG GET` / `COMMANDLOG GET` reply: decoded under its limits, each entry reduced at parse time (closed command table, key positions, learned patterns, CAS guard); every object must be `*` or a contract `KeyPattern` ([ADR-0052](../../docs/adr/0052-redis-valkey-connector.md) decision 8) |
 | `redis_acl_log_entry` | `…::fuzz::acl_log_entry` | An `ACL LOG` reply (entries and their `client-info`) and the same bytes as a `CLIENT LIST` line |
 | `redis_learned_patterns` | `…::fuzz::learned_patterns` | Learned patterns (first half, one per line) and a key name (second half): the Audit object must pass the contract `KeyPattern` gate |
+| `sqlserver_token_stream` | `databastion_connector_sqlserver::fuzz::token_stream` | Server bytes after a selector byte (slice size, PLP cap, discard mode): the TDS token stream decoder fed slice by slice; every step must make progress ([ADR-0051](../../docs/adr/0051-sqlserver-connector.md) decision 1) |
+| `sqlserver_packets` | `…::fuzz::packets` | TDS packet reassembly (headers checked before bodies) and the `PRELOGIN` response parser |
+| `sqlserver_prelogin_tls` | `…::fuzz::prelogin_tls_framing` | The packet header check of the TLS handshake wrapped in `PRELOGIN` packets |
+| `sqlserver_plp` | `…::fuzz::plp` | The body of an `nvarchar(max)` row: PLP chunks reassembled under their cap (obligation L1) |
 | `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
 | `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the crate's own YAML parser and the same visitor |
 | `cas_registry_yaml_diff` | `…::fuzz::registry_yaml_diff` | Differential ([ADR-0046](../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md)): on every file the pre-scan accepts, the crate's YAML parser and `serde_yaml_ng` (the oracle, a dependency of this harness only) must read the same values and the same definition, or both fail; a disagreement panics |

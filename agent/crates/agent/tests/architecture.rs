@@ -19,13 +19,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 6] = [
+const CONNECTORS: [&str; 7] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
     "connector-openldap",
     "connector-cas",
     "connector-redis",
+    "connector-sqlserver",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
@@ -191,9 +192,16 @@ fn regex_keeps_unicode_case() {
 }
 
 #[test]
-fn lockfile_has_no_openssl_or_native_tls() {
+fn lockfile_has_no_openssl_native_tls_or_aws_lc() {
     let lock = fs::read_to_string(workspace_root().join("Cargo.lock")).unwrap();
-    for banned in ["openssl", "openssl-sys", "openssl-src", "native-tls"] {
+    for banned in [
+        "openssl",
+        "openssl-sys",
+        "openssl-src",
+        "native-tls",
+        "aws-lc-rs",
+        "aws-lc-sys",
+    ] {
         let entry = format!("name = \"{banned}\"");
         assert!(!lock.contains(&entry), "Cargo.lock contains {banned}");
     }
@@ -444,4 +452,59 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
         !code_lines(normal).any(|l| l.contains("test-support")),
         "the agent binary enables a test-support feature"
     );
+}
+
+/// ADR-0051 refinement item 7 (M4): the SQL Server connector never reads
+/// module bodies or definition-bearing columns. Its statements are a
+/// reviewed allow-list (`connector-sqlserver/src/sql.rs`, `STATEMENTS`);
+/// every text is checked on its skeleton (quoted identifiers and literals
+/// emptied, as the session checks each text it sends at run time) against
+/// this list **and** the crate's own `DENIED`, which must contain it.
+#[cfg(feature = "sqlserver")]
+#[test]
+fn sqlserver_statements_never_read_definitions() {
+    const DENIED: [&str; 14] = [
+        "sql_modules",
+        "syscomments",
+        "numbered_procedures",
+        "object_definition",
+        "sp_helptext",
+        "computed_columns",
+        "check_constraints",
+        "default_constraints",
+        "partition_range_values",
+        "predicate_definition",
+        "filter_definition",
+        "provider_string",
+        "data_source",
+        "server_audits",
+    ];
+    let shared = databastion_connector_sqlserver::statement_deny_list();
+    for d in DENIED {
+        assert!(shared.contains(&d), "sql::DENIED lacks {d}");
+    }
+    let list = databastion_connector_sqlserver::statement_allow_list();
+    assert!(list.len() >= 20, "allow-list looks empty");
+    for (name, text) in list {
+        let skeleton = databastion_connector_sqlserver::statement_skeleton(text);
+        for d in shared.iter().chain(DENIED.iter()) {
+            // The one exempt text: the exact one-bit password_hash probe.
+            if *name == "password_hash_probe" && (*d == "password_hash") {
+                continue;
+            }
+            assert!(!skeleton.contains(d), "{name} names {d}");
+        }
+        assert!(
+            databastion_connector_sqlserver::statement_checked(text),
+            "{name}"
+        );
+    }
+    // The skeleton ignores names: a user's column called `definition` is
+    // sampled, a catalog read of it is not.
+    assert!(databastion_connector_sqlserver::statement_checked(
+        "SELECT TOP (1) CONVERT(nvarchar(4000), LEFT([definition], 4000)) FROM [d].[s].[t]"
+    ));
+    assert!(!databastion_connector_sqlserver::statement_checked(
+        "SELECT definition FROM sys.sql_modules"
+    ));
 }

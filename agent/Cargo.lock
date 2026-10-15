@@ -243,6 +243,7 @@ dependencies = [
  "databastion-connector-openldap",
  "databastion-connector-postgres",
  "databastion-connector-redis",
+ "databastion-connector-sqlserver",
  "databastion-core",
  "serde_json",
  "tokio",
@@ -393,6 +394,24 @@ dependencies = [
  "rustls-pki-types",
  "serde_json",
  "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "databastion-connector-sqlserver"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "databastion-classifiers",
+ "databastion-core",
+ "proptest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",

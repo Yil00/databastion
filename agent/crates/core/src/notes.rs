@@ -28,6 +28,25 @@ const MAX_LABELS: usize = 16;
 const SEVERITY: &[TargetNoteLabel] = {
     use TargetNoteLabel as L;
     &[
+        // Microsoft SQL Server refusal list (ADR-0051 decision 4): the
+        // password_hash probe and the rights that own the server or a
+        // database first, so a long refusal never loses them.
+        L::PasswordHashProbe,
+        L::Sysadmin,
+        L::ControlServer,
+        L::DbOwner,
+        L::Control,
+        L::Securityadmin,
+        L::MsLoginManager,
+        L::ImpersonateAnyLogin,
+        L::Impersonate,
+        L::AlterAnyLogin,
+        L::AlterAnyServerRole,
+        L::AlterAnyServerAudit,
+        L::AlterAnyDatabaseAudit,
+        L::ViewAnyCryptographicallySecuredDefinition,
+        L::AlterAnyEventSession,
+        L::TakeOwnership,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -288,6 +307,36 @@ pub enum NoteCode {
     CheckServerIsValkey,
     /// `check.server_is_redis`.
     CheckServerIsRedis,
+    /// `audit.audit_changes_not_audited` (Microsoft SQL Server, ADR-0051).
+    AuditAuditChangesNotAudited,
+    /// `audit.failed_logins_not_audited` (Microsoft SQL Server, ADR-0051).
+    AuditFailedLoginsNotAudited,
+    /// `audit.server_audit_filtered` (Microsoft SQL Server, ADR-0051).
+    AuditServerAuditFiltered,
+    /// `audit.sqlserver_audit_needs_control_server` (Microsoft SQL Server, ADR-0051).
+    AuditSqlserverAuditNeedsControlServer,
+    /// `audit.xe_causality_off` (Microsoft SQL Server, ADR-0051).
+    AuditXeCausalityOff,
+    /// `audit.xe_events_missing` (Microsoft SQL Server, ADR-0051).
+    AuditXeEventsMissing,
+    /// `audit.xe_session_filtered` (Microsoft SQL Server, ADR-0051).
+    AuditXeSessionFiltered,
+    /// `coverage.computed_columns_not_sampled` (Microsoft SQL Server, ADR-0051).
+    CoverageComputedColumnsNotSampled,
+    /// `coverage.encrypted_columns` (Microsoft SQL Server, ADR-0051).
+    CoverageEncryptedColumns,
+    /// `coverage.masked_columns` (Microsoft SQL Server, ADR-0051).
+    CoverageMaskedColumns,
+    /// `coverage.rls_not_verifiable` (Microsoft SQL Server, ADR-0051).
+    CoverageRlsNotVerifiable,
+    /// `privilege.audit_grant_without_audit` (Microsoft SQL Server, ADR-0051).
+    PrivilegeAuditGrantWithoutAudit,
+    /// `privilege.database_roles` (Microsoft SQL Server, ADR-0051).
+    PrivilegeDatabaseRoles,
+    /// `privilege.refused` (Microsoft SQL Server, ADR-0051).
+    PrivilegeRefused,
+    /// `privilege.server_roles` (Microsoft SQL Server, ADR-0051).
+    PrivilegeServerRoles,
 }
 
 impl NoteCode {
@@ -382,6 +431,21 @@ impl NoteCode {
         Self::AuditAclLogOnly,
         Self::CheckServerIsValkey,
         Self::CheckServerIsRedis,
+        Self::AuditAuditChangesNotAudited,
+        Self::AuditFailedLoginsNotAudited,
+        Self::AuditServerAuditFiltered,
+        Self::AuditSqlserverAuditNeedsControlServer,
+        Self::AuditXeCausalityOff,
+        Self::AuditXeEventsMissing,
+        Self::AuditXeSessionFiltered,
+        Self::CoverageComputedColumnsNotSampled,
+        Self::CoverageEncryptedColumns,
+        Self::CoverageMaskedColumns,
+        Self::CoverageRlsNotVerifiable,
+        Self::PrivilegeAuditGrantWithoutAudit,
+        Self::PrivilegeDatabaseRoles,
+        Self::PrivilegeRefused,
+        Self::PrivilegeServerRoles,
     ];
 
     /// The registered code.
@@ -479,6 +543,23 @@ impl NoteCode {
             Self::AuditAclLogOnly => "audit.acl_log_only",
             Self::CheckServerIsValkey => "check.server_is_valkey",
             Self::CheckServerIsRedis => "check.server_is_redis",
+            Self::AuditAuditChangesNotAudited => "audit.audit_changes_not_audited",
+            Self::AuditFailedLoginsNotAudited => "audit.failed_logins_not_audited",
+            Self::AuditServerAuditFiltered => "audit.server_audit_filtered",
+            Self::AuditSqlserverAuditNeedsControlServer => {
+                "audit.sqlserver_audit_needs_control_server"
+            }
+            Self::AuditXeCausalityOff => "audit.xe_causality_off",
+            Self::AuditXeEventsMissing => "audit.xe_events_missing",
+            Self::AuditXeSessionFiltered => "audit.xe_session_filtered",
+            Self::CoverageComputedColumnsNotSampled => "coverage.computed_columns_not_sampled",
+            Self::CoverageEncryptedColumns => "coverage.encrypted_columns",
+            Self::CoverageMaskedColumns => "coverage.masked_columns",
+            Self::CoverageRlsNotVerifiable => "coverage.rls_not_verifiable",
+            Self::PrivilegeAuditGrantWithoutAudit => "privilege.audit_grant_without_audit",
+            Self::PrivilegeDatabaseRoles => "privilege.database_roles",
+            Self::PrivilegeRefused => "privilege.refused",
+            Self::PrivilegeServerRoles => "privilege.server_roles",
         }
     }
 
@@ -648,6 +729,74 @@ impl NoteLabel {
         })
     }
 
+    /// A Microsoft SQL Server label (ADR-0051 decision 4): any contract
+    /// value, the revision `target_status.note_labels.2026_10` included
+    /// (sent as `other` until the console lists the token, see
+    /// [`to_protocol`]); anything else is `other`.
+    #[must_use]
+    pub fn sqlserver(value: &str) -> Self {
+        value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
+    }
+
+    /// A SQL Server permission or role name as the server lists it
+    /// (`CONTROL SERVER`, `db_owner`, `##MS_LoginManager##`), mapped by the
+    /// contract rule: permissions lowercased with spaces replaced by `_`;
+    /// fixed roles in lower case; `##MS_Name##` as `ms_` and the name in
+    /// lower snake case. Anything else (longer than 64 bytes, characters
+    /// outside `[A-Za-z_ #]`, an unknown value) is `other`.
+    #[must_use]
+    pub fn sqlserver_name(name: &str) -> Self {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b' ' || b == b'#')
+        {
+            return Self::OTHER;
+        }
+        if let Some(inner) = name
+            .strip_prefix("##MS_")
+            .and_then(|n| n.strip_suffix("##"))
+        {
+            let mut out = String::from("ms");
+            for c in inner.chars() {
+                if c.is_ascii_uppercase() {
+                    out.push('_');
+                    out.push(c.to_ascii_lowercase());
+                } else if c.is_ascii_lowercase() {
+                    out.push(c);
+                } else {
+                    return Self::OTHER;
+                }
+            }
+            return Self::sqlserver(&out);
+        }
+        if name.contains('#') {
+            return Self::OTHER;
+        }
+        let normalized: String = name
+            .chars()
+            .map(|c| {
+                if c == ' ' {
+                    '_'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        Self::sqlserver(&normalized)
+    }
+
+    /// This label as sent: a value of the revision 2026_10 becomes `other`
+    /// unless the console negotiated it.
+    fn negotiated(self, revision_2026_10: bool) -> Self {
+        if !revision_2026_10 && LABELS_REVISION_2026_10.contains(&self.0.to_string().as_str()) {
+            Self::OTHER
+        } else {
+            self
+        }
+    }
+
     /// Whether this is the fallback `other`.
     #[must_use]
     pub fn is_other(self) -> bool {
@@ -804,7 +953,14 @@ impl IntoIterator for Notes {
 /// first one kept), at most [`MAX_NOTES`], insecure settings, check
 /// failures and privileges kept first; counts saturated at the contract
 /// bound.
-pub(crate) fn to_protocol(notes: &[TargetNote]) -> Vec<databastion_protocol::TargetNote> {
+///
+/// The labels of the revision `target_status.note_labels.2026_10`
+/// ([`LABELS_REVISION_2026_10`]) are sent only when `revision_2026_10`
+/// (the console listed the token), `other` otherwise (ADR-0022 decision 4).
+pub(crate) fn to_protocol(
+    notes: &[TargetNote],
+    revision_2026_10: bool,
+) -> Vec<databastion_protocol::TargetNote> {
     let mut kept: Vec<&TargetNote> = Vec::with_capacity(notes.len().min(MAX_NOTES));
     for n in notes {
         if !kept.iter().any(|k| k.code == n.code) {
@@ -818,8 +974,17 @@ pub(crate) fn to_protocol(notes: &[TargetNote]) -> Vec<databastion_protocol::Tar
             Some(databastion_protocol::TargetNote {
                 code: databastion_protocol::TargetNoteCode::try_from(n.code.as_str()).ok()?,
                 count: n.count.map(crate::sanitize::clamped_count),
-                labels: (!n.labels.is_empty())
-                    .then(|| n.labels.iter().take(MAX_LABELS).map(|l| l.0).collect()),
+                labels: (!n.labels.is_empty()).then(|| {
+                    let mut labels: Vec<TargetNoteLabel> = n
+                        .labels
+                        .iter()
+                        .take(MAX_LABELS)
+                        .map(|l| l.negotiated(revision_2026_10).0)
+                        .collect();
+                    labels.sort_unstable();
+                    labels.dedup();
+                    labels
+                }),
             })
         })
         .collect()
@@ -862,6 +1027,37 @@ mod tests {
         }
         // A MySQL / MariaDB privilege named like one of them.
         assert!(super::NoteLabel::privilege("CONTROL SERVER").is_other());
+        // SQL Server names keep their label in the agent, and are sent
+        // only once the console lists the revision token.
+        let l = super::NoteLabel::sqlserver_name("CONTROL SERVER");
+        assert_eq!(l.as_str(), "control_server");
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("##MS_LoginManager##").as_str(),
+            "ms_login_manager"
+        );
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("db_owner").as_str(),
+            "db_owner"
+        );
+        assert!(super::NoteLabel::sqlserver_name("##MS_Unknown##").is_other());
+        assert!(super::NoteLabel::sqlserver_name("ALTER ANY DATABASE EVENT SESSION").is_other());
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("SELECT").as_str(),
+            "select"
+        );
+        let note = super::TargetNote::new(super::NoteCode::PrivilegeRefused)
+            .with_labels([l, super::NoteLabel::sqlserver_name("SELECT")]);
+        let sent = |rev| {
+            super::to_protocol(std::slice::from_ref(&note), rev)[0]
+                .labels
+                .clone()
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sent(false), vec!["other", "select"]);
+        assert_eq!(sent(true), vec!["select", "control_server"]);
         assert!(super::NoteLabel::privilege("SHOW VIEW").as_str() == "show_view");
     }
 
@@ -1016,7 +1212,7 @@ mod tests {
             .map(|c| TargetNote::new(*c).with_count(u64::MAX))
             .collect();
         notes.push(TargetNote::new(NoteCode::SecurityTlsDisabled));
-        let out = to_protocol(&notes);
+        let out = to_protocol(&notes, false);
         assert_eq!(out.len(), MAX_NOTES);
         // Security and check notes are never the ones cut.
         for c in NoteCode::ALL {
@@ -1037,7 +1233,7 @@ mod tests {
             );
         }
         // No labels: the field is omitted.
-        let one = to_protocol(&[TargetNote::new(NoteCode::CheckTimedOut)]);
+        let one = to_protocol(&[TargetNote::new(NoteCode::CheckTimedOut)], false);
         assert_eq!(
             serde_json::to_value(&one).unwrap(),
             serde_json::json!([{"code": "check.timed_out"}])

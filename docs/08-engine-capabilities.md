@@ -962,6 +962,23 @@ An entry is the agent's only when its connection is one of the agent's own (conn
 - **Excluded sources**: `MONITOR` (every argument, values included, and a throughput cost), keyspace notifications (writes only, through pub/sub) and `LATENCY` (no client, no key).
 - **Not yet tested end to end** nor in the load harness: no Redis / Valkey target in `e2e/` and no load run yet (ROADMAP P9-D).
 
+## Microsoft SQL Server Discovery
+
+*In development (P9-A, [ADR-0051](adr/0051-sqlserver-connector.md)), not released yet. A minimal section; the docs-keeper completes it (P9-G). Measured on SQL Server 2022 Express ([phase 9 engine facts](measurements/phase9-engine-facts.md)).*
+
+### Row-level security and the opt-in
+
+No table-level flag tells a table with a row-level security policy from one without, and the minimal account cannot see the policy catalog. **Without the local opt-in `sqlserver.rls_visibility: view_definition` (database `VIEW DEFINITION` in each monitored database, proven effective and not hidden by a `DENY` at database or server scope), Discovery samples nothing**: every table of the database is skipped (`skipped_row_level_security`) and `check()` reports `coverage.rls_not_verifiable` from the first heartbeat. The opt-in makes the module bodies of the database (procedures, views, functions, triggers) readable by whoever holds the agent's credentials; the connector itself never reads them.
+
+### What a stolen agent credential reads
+
+Measured with the minimal account, beyond the tables it is granted:
+
+- **Always Encrypted key metadata**, through `public`'s default `VIEW ANY COLUMN ENCRYPTION KEY DEFINITION` and `VIEW ANY COLUMN MASTER KEY DEFINITION`: the encrypted column encryption key values (`sys.column_encryption_key_values`) and the column master key paths (`sys.column_master_keys`). The keys stay encrypted by the column master key, which is outside the server. `check()` accepts these two permissions only when they come from `public`; granted to the agent's login, user or roles they are reported as `privilege.beyond_select`.
+- **Linked servers' `sys.servers.data_source`** (host names of linked servers; `provider_string` was empty in the measurement and is never read by the agent).
+- With the RLS opt-in: the module bodies of the monitored databases (`sys.sql_modules.definition`) and the security policies.
+- Not readable: password hashes of other logins, credentials, linked logins, keys and certificates, logon triggers, `msdb` mail and proxy tables, other sessions.
+
 ## Known export signatures
 | Tool | Observable signature | Engine |
 |-------|---------------------|--------|

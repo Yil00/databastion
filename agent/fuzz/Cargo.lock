@@ -263,6 +263,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "databastion-connector-sqlserver"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "databastion-classifiers",
+ "databastion-core",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "databastion-core"
 version = "0.7.0"
 dependencies = [
@@ -292,6 +308,7 @@ dependencies = [
  "databastion-connector-mongodb",
  "databastion-connector-openldap",
  "databastion-connector-redis",
+ "databastion-connector-sqlserver",
  "libfuzzer-sys",
  "serde_yaml_ng",
 ]
