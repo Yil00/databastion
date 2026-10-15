@@ -101,9 +101,33 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
     expect(CONSOLE_ACCEPTS).toContain("engine.sqlserver");
   });
 
-  it("lists the SQL Server note-label revision, whose labels are contract TargetNoteLabel values (ADR-0051 decision 4)", () => {
-    expect(CONSOLE_ACCEPTS.filter(isRevisionToken)).toEqual(["target_status.note_labels.2026_10"]);
+  it("lists the SQL Server note-label revisions, whose labels are contract TargetNoteLabel values (ADR-0051 decision 4 and refinement)", () => {
+    expect(CONSOLE_ACCEPTS.filter(isRevisionToken)).toEqual(["target_status.note_labels.2026_10", "target_status.note_labels.2026_10_b"]);
     for (const label of ["sysadmin", "db_owner", "ms_login_manager", "control_server", "password_hash_probe"]) {
+      expect(enumOf("TargetNoteLabel"), label).toContain(label);
+    }
+    for (const label of [
+      "alter_any_database_event_session",
+      "alter_any_database_event_session_enable",
+      "alter_any_database_event_session_disable",
+      "alter_any_database_event_session_add_event",
+      "alter_any_database_event_session_drop_event",
+      "alter_any_database_event_session_add_target",
+      "alter_any_database_event_session_drop_target",
+      "alter_any_database_event_session_option",
+      "create_any_database_event_session",
+      "drop_any_database_event_session",
+      "view_any_performance_definition",
+      "view_security_definition",
+      "view_performance_definition",
+      "view_database_security_state",
+      "view_database_performance_state",
+      "view_any_column_encryption_key_definition",
+      "view_any_column_master_key_definition",
+      "logon_trigger_probe",
+      "refusal_list_probe",
+      "cas_store_guard_probe",
+    ]) {
       expect(enumOf("TargetNoteLabel"), label).toContain(label);
     }
   });

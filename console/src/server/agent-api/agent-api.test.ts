@@ -743,7 +743,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
 
   describe("POST /heartbeat", () => {
     it("stores the sqlserver and redis-valkey heartbeat fixtures: targets, engines, sources, notes and detected targets (P9-E)", async () => {
-      for (const name of ["HeartbeatRequest.sqlserver.json", "HeartbeatRequest.redis-valkey.json"]) {
+      for (const name of ["HeartbeatRequest.sqlserver.json", "HeartbeatRequest.sqlserver-labels-2026-10-b.json", "HeartbeatRequest.redis-valkey.json"]) {
         const [, body] = fixtures("valid", "HeartbeatRequest").find(([f]) => f === name) ?? [];
         expect(body, name).toBeDefined();
         const hb = body as {

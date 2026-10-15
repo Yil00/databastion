@@ -269,6 +269,19 @@ describe("engines (P9-E)", () => {
     expect(labelDisplayName("pg_monitor")).toBe("pg_monitor");
   });
 
+  it("SQL Server note labels of revision 2026_10_b have display names", () => {
+    expect(labelDisplayName("alter_any_database_event_session")).toBe("ALTER ANY DATABASE EVENT SESSION");
+    expect(labelDisplayName("alter_any_database_event_session_add_target")).toBe("ALTER ANY DATABASE EVENT SESSION ADD TARGET");
+    expect(labelDisplayName("create_any_database_event_session")).toBe("CREATE ANY DATABASE EVENT SESSION");
+    expect(labelDisplayName("view_any_column_master_key_definition")).toBe("VIEW ANY COLUMN MASTER KEY DEFINITION");
+    for (const probe of ["logon_trigger_probe", "refusal_list_probe", "cas_store_guard_probe"]) expect(labelDisplayName(probe)).toBe(probe);
+    const notEvaluated = renderTargetNote({ code: "privilege.not_evaluated", labels: ["password_hash_probe", "logon_trigger_probe"] });
+    expect(notEvaluated.known).toBe(true);
+    expect(notEvaluated.text).toContain("password_hash_probe, logon_trigger_probe");
+    const refused = renderTargetNote({ code: "privilege.refused", labels: ["alter_any_database_event_session"] });
+    expect(refused.text).toContain("(ALTER ANY DATABASE EVENT SESSION)");
+  });
+
   it("the new target notes render from the catalog", () => {
     for (const code of [
       "privilege.server_roles",
