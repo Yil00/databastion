@@ -19,6 +19,8 @@ pub enum Engine {
     Cas,
     /// Redis and Valkey (one connector, ADR-0052).
     Redis,
+    /// Microsoft SQL Server (ADR-0051).
+    Sqlserver,
 }
 
 impl Engine {
@@ -32,6 +34,7 @@ impl Engine {
             Self::Openldap => "openldap",
             Self::Cas => "cas",
             Self::Redis => "redis",
+            Self::Sqlserver => "sqlserver",
         }
     }
 }

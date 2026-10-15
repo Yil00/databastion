@@ -47,6 +47,9 @@ pub(crate) mod token {
     /// The `sqlserver` values of `Engine` and `Connector`, and the
     /// `sqlserver_*` values of `AuditSource` (ADR-0051 decision 8).
     pub(crate) const ENGINE_SQLSERVER: &str = "engine.sqlserver";
+    /// The `TargetNoteLabel` values of the Microsoft SQL Server revision
+    /// (ADR-0051 decision 4, ADR-0022 decision 4).
+    pub(crate) const NOTE_LABELS_2026_10: &str = "target_status.note_labels.2026_10";
     /// The `redis` value of `Engine` (ADR-0052 decision 12).
     pub(crate) const ENGINE_REDIS: &str = "engine.redis";
     /// The `valkey` value of `Engine` (ADR-0052 decision 12).

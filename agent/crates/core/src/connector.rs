@@ -112,6 +112,14 @@ pub trait Connector: Send + Sync {
     fn audit_source(&self, _target: &TargetConfig) -> Option<EventSource> {
         None
     }
+
+    /// The server version the last [`check`](Self::check) of `target`
+    /// read (heartbeat `TargetStatus.server_version`), as the server
+    /// reported it; the core sends it only when it matches the contract
+    /// pattern. `None` when unknown (the default).
+    fn server_version(&self, _target: &TargetConfig) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

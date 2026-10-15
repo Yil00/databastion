@@ -22,6 +22,7 @@ use crate::engine::Engine;
 
 pub mod cas;
 pub mod redis;
+pub mod sqlserver;
 
 /// Hard upper bound on the rows sampled per object (contract `sample_rows`
 /// range is `1..=10000`).
@@ -266,6 +267,8 @@ pub enum TargetEngine {
     Redis,
     /// Valkey (Redis / Valkey connector, ADR-0052).
     Valkey,
+    /// Microsoft SQL Server (ADR-0051).
+    Sqlserver,
 }
 
 impl TargetEngine {
@@ -279,6 +282,7 @@ impl TargetEngine {
             Self::Openldap => Engine::Openldap,
             Self::Cas => Engine::Cas,
             Self::Redis | Self::Valkey => Engine::Redis,
+            Self::Sqlserver => Engine::Sqlserver,
         }
     }
 }
@@ -332,6 +336,9 @@ pub struct TargetConfig {
     /// Redis / Valkey settings (`engine: redis` or `valkey` only).
     #[serde(default)]
     pub redis: Option<redis::RedisTargetConfig>,
+    /// Microsoft SQL Server settings (`engine: sqlserver` only).
+    #[serde(default)]
+    pub sqlserver: Option<sqlserver::SqlserverTargetConfig>,
     /// Apereo CAS settings (`engine: cas` only, required there): local
     /// paths only.
     #[serde(default)]
@@ -756,6 +763,7 @@ impl TargetConfig {
             TargetEngine::Mongodb => self.mongodb.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Redis | TargetEngine::Valkey => self.redis.as_ref()?.cas_stores.as_ref(),
+            TargetEngine::Sqlserver => self.sqlserver.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Cas => None,
         }
     }
@@ -773,6 +781,12 @@ impl TargetConfig {
     #[must_use]
     pub fn redis_settings(&self) -> redis::RedisTargetConfig {
         self.redis.clone().unwrap_or_default()
+    }
+
+    /// Microsoft SQL Server settings, defaults when absent.
+    #[must_use]
+    pub fn sqlserver_settings(&self) -> sqlserver::SqlserverTargetConfig {
+        self.sqlserver.clone().unwrap_or_default()
     }
 
     /// OpenLDAP settings, defaults when absent.
@@ -795,6 +809,7 @@ impl TargetConfig {
             TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
             TargetEngine::Mongodb => 27017,
             TargetEngine::Redis | TargetEngine::Valkey => redis::DEFAULT_PORT,
+            TargetEngine::Sqlserver => sqlserver::DEFAULT_PORT,
             TargetEngine::Openldap => {
                 if self.openldap_settings().tls == OpenldapTlsMode::VerifyFull {
                     636
@@ -1006,6 +1021,13 @@ const KNOWN_KEYS: &[&str] = &[
     "cas_stores",
     "ticket_registry",
     "audit_trail",
+    "sqlserver",
+    "auto",
+    "strict",
+    "mandatory",
+    "rls_visibility",
+    "view_definition",
+    "max_tables",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -1295,6 +1317,12 @@ impl TargetConfig {
         if matches!(self.engine, TargetEngine::Redis | TargetEngine::Valkey) {
             self.validate_redis(i)?;
         }
+        if self.sqlserver.is_some() && self.engine != TargetEngine::Sqlserver {
+            return Err(invalid(f("sqlserver"), "only for engine sqlserver"));
+        }
+        if self.engine == TargetEngine::Sqlserver {
+            self.validate_sqlserver(i)?;
+        }
         match (&self.host, &self.socket) {
             (Some(host), None) => {
                 if host.is_empty() || host.len() > 253 || host.chars().any(char::is_control) {
@@ -1444,6 +1472,21 @@ impl TargetConfig {
             return Err(invalid(f("cas"), "required for engine cas"));
         }
         Ok(())
+    }
+
+    /// A Microsoft SQL Server target (ADR-0051 decision 2): TCP only (a
+    /// declared host, no socket), and the `sqlserver` block's own rules.
+    fn validate_sqlserver(&self, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].{name}");
+        if self.socket.is_some() || self.host.is_none() {
+            return Err(invalid(
+                f("host"),
+                "a SQL Server target is reached over TCP with TLS: declare host (and port)",
+            ));
+        }
+        self.sqlserver_settings()
+            .validate()
+            .map_err(|(key, reason)| invalid(f(&format!("sqlserver.{key}")), reason))
     }
 
     /// A Redis / Valkey target (ADR-0052 decision 3): a named ACL user with
