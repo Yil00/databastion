@@ -118,6 +118,7 @@
   "HeartbeatRequest.remote-detected-target.json": "additionalProperties",
   "HeartbeatRequest.socket-outside-runtime-dirs.json": "pattern",
   "HeartbeatRequest.socket-path-traversal.json": "pattern",
+  "HeartbeatRequest.sqlserver-raw-database-permission-label.json": "enum",
   "HeartbeatRequest.sqlserver-raw-permission-label.json": "enum",
   "HeartbeatRequest.sqlserver-version-banner.json": "pattern",
   "HeartbeatRequest.target-without-audit-level.json": "required",

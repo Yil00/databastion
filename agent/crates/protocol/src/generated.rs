@@ -2086,7 +2086,13 @@ pub struct EventsBatch {
     pub events: ::std::vec::Vec<AccessEvent>,
 }
 /**Closed set of failure causes. Driver or engine messages are never sent (they can contain values
-or query text); `engine_code` may carry the engine's numeric / SQLSTATE code.
+or query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no
+TLS-specific code. The reliable sign of a TLS problem is the `stage_tls` label of the
+target's `check.stage_failed` note; the code depends on the cause and the engine: usually
+`target_unreachable` (a failed handshake or certificate verification) or `timeout`;
+`internal` for a TLS setup error on some engines and for an OpenLDAP StartTLS anomaly;
+`unsupported` for a SQL Server server that refuses encryption or sends a malformed
+PRELOGIN.
 */
 #[derive(
     ::serde::Deserialize,
@@ -4018,6 +4024,18 @@ Revisions:
   (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,
   `shutdown`…) use that value, with no token. A console that lists the token renders
   every value of the revision.
+- `target_status.note_labels.2026_10_b` (ADR-0051 refinement of 2026-10-14, items 5 to
+  7): the SQL Server labels below `password_hash_probe`, written by the same rule: the
+  database-scoped event-session permissions of the refusal list (`ALTER ANY DATABASE
+  EVENT SESSION` and its granular forms, `CREATE` / `DROP ANY DATABASE EVENT SESSION`),
+  the other database and server permissions the SQL Server connector judges by name
+  (`VIEW SECURITY DEFINITION`, `VIEW DATABASE SECURITY STATE`, `VIEW ANY PERFORMANCE
+  DEFINITION`…), and the `check()` reads named with `privilege.not_evaluated` when they
+  cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the
+  minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,
+  so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's
+  column read cut or failed). Each revision is negotiated on its own: a value is sent
+  only when the token of its own revision is listed.
 */
 #[derive(
     ::serde::Deserialize,
@@ -4380,6 +4398,46 @@ pub enum TargetNoteLabel {
     Showplan,
     #[serde(rename = "password_hash_probe")]
     PasswordHashProbe,
+    #[serde(rename = "alter_any_database_event_session")]
+    AlterAnyDatabaseEventSession,
+    #[serde(rename = "alter_any_database_event_session_enable")]
+    AlterAnyDatabaseEventSessionEnable,
+    #[serde(rename = "alter_any_database_event_session_disable")]
+    AlterAnyDatabaseEventSessionDisable,
+    #[serde(rename = "alter_any_database_event_session_add_event")]
+    AlterAnyDatabaseEventSessionAddEvent,
+    #[serde(rename = "alter_any_database_event_session_drop_event")]
+    AlterAnyDatabaseEventSessionDropEvent,
+    #[serde(rename = "alter_any_database_event_session_add_target")]
+    AlterAnyDatabaseEventSessionAddTarget,
+    #[serde(rename = "alter_any_database_event_session_drop_target")]
+    AlterAnyDatabaseEventSessionDropTarget,
+    #[serde(rename = "alter_any_database_event_session_option")]
+    AlterAnyDatabaseEventSessionOption,
+    #[serde(rename = "create_any_database_event_session")]
+    CreateAnyDatabaseEventSession,
+    #[serde(rename = "drop_any_database_event_session")]
+    DropAnyDatabaseEventSession,
+    #[serde(rename = "view_any_performance_definition")]
+    ViewAnyPerformanceDefinition,
+    #[serde(rename = "view_security_definition")]
+    ViewSecurityDefinition,
+    #[serde(rename = "view_performance_definition")]
+    ViewPerformanceDefinition,
+    #[serde(rename = "view_database_security_state")]
+    ViewDatabaseSecurityState,
+    #[serde(rename = "view_database_performance_state")]
+    ViewDatabasePerformanceState,
+    #[serde(rename = "view_any_column_encryption_key_definition")]
+    ViewAnyColumnEncryptionKeyDefinition,
+    #[serde(rename = "view_any_column_master_key_definition")]
+    ViewAnyColumnMasterKeyDefinition,
+    #[serde(rename = "logon_trigger_probe")]
+    LogonTriggerProbe,
+    #[serde(rename = "refusal_list_probe")]
+    RefusalListProbe,
+    #[serde(rename = "cas_store_guard_probe")]
+    CasStoreGuardProbe,
 }
 impl ::std::fmt::Display for TargetNoteLabel {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -4590,6 +4648,56 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::ViewDatabaseState => f.write_str("view_database_state"),
             Self::Showplan => f.write_str("showplan"),
             Self::PasswordHashProbe => f.write_str("password_hash_probe"),
+            Self::AlterAnyDatabaseEventSession => {
+                f.write_str("alter_any_database_event_session")
+            }
+            Self::AlterAnyDatabaseEventSessionEnable => {
+                f.write_str("alter_any_database_event_session_enable")
+            }
+            Self::AlterAnyDatabaseEventSessionDisable => {
+                f.write_str("alter_any_database_event_session_disable")
+            }
+            Self::AlterAnyDatabaseEventSessionAddEvent => {
+                f.write_str("alter_any_database_event_session_add_event")
+            }
+            Self::AlterAnyDatabaseEventSessionDropEvent => {
+                f.write_str("alter_any_database_event_session_drop_event")
+            }
+            Self::AlterAnyDatabaseEventSessionAddTarget => {
+                f.write_str("alter_any_database_event_session_add_target")
+            }
+            Self::AlterAnyDatabaseEventSessionDropTarget => {
+                f.write_str("alter_any_database_event_session_drop_target")
+            }
+            Self::AlterAnyDatabaseEventSessionOption => {
+                f.write_str("alter_any_database_event_session_option")
+            }
+            Self::CreateAnyDatabaseEventSession => {
+                f.write_str("create_any_database_event_session")
+            }
+            Self::DropAnyDatabaseEventSession => {
+                f.write_str("drop_any_database_event_session")
+            }
+            Self::ViewAnyPerformanceDefinition => {
+                f.write_str("view_any_performance_definition")
+            }
+            Self::ViewSecurityDefinition => f.write_str("view_security_definition"),
+            Self::ViewPerformanceDefinition => f.write_str("view_performance_definition"),
+            Self::ViewDatabaseSecurityState => {
+                f.write_str("view_database_security_state")
+            }
+            Self::ViewDatabasePerformanceState => {
+                f.write_str("view_database_performance_state")
+            }
+            Self::ViewAnyColumnEncryptionKeyDefinition => {
+                f.write_str("view_any_column_encryption_key_definition")
+            }
+            Self::ViewAnyColumnMasterKeyDefinition => {
+                f.write_str("view_any_column_master_key_definition")
+            }
+            Self::LogonTriggerProbe => f.write_str("logon_trigger_probe"),
+            Self::RefusalListProbe => f.write_str("refusal_list_probe"),
+            Self::CasStoreGuardProbe => f.write_str("cas_store_guard_probe"),
         }
     }
 }
@@ -4783,6 +4891,46 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "view_database_state" => Ok(Self::ViewDatabaseState),
             "showplan" => Ok(Self::Showplan),
             "password_hash_probe" => Ok(Self::PasswordHashProbe),
+            "alter_any_database_event_session" => Ok(Self::AlterAnyDatabaseEventSession),
+            "alter_any_database_event_session_enable" => {
+                Ok(Self::AlterAnyDatabaseEventSessionEnable)
+            }
+            "alter_any_database_event_session_disable" => {
+                Ok(Self::AlterAnyDatabaseEventSessionDisable)
+            }
+            "alter_any_database_event_session_add_event" => {
+                Ok(Self::AlterAnyDatabaseEventSessionAddEvent)
+            }
+            "alter_any_database_event_session_drop_event" => {
+                Ok(Self::AlterAnyDatabaseEventSessionDropEvent)
+            }
+            "alter_any_database_event_session_add_target" => {
+                Ok(Self::AlterAnyDatabaseEventSessionAddTarget)
+            }
+            "alter_any_database_event_session_drop_target" => {
+                Ok(Self::AlterAnyDatabaseEventSessionDropTarget)
+            }
+            "alter_any_database_event_session_option" => {
+                Ok(Self::AlterAnyDatabaseEventSessionOption)
+            }
+            "create_any_database_event_session" => {
+                Ok(Self::CreateAnyDatabaseEventSession)
+            }
+            "drop_any_database_event_session" => Ok(Self::DropAnyDatabaseEventSession),
+            "view_any_performance_definition" => Ok(Self::ViewAnyPerformanceDefinition),
+            "view_security_definition" => Ok(Self::ViewSecurityDefinition),
+            "view_performance_definition" => Ok(Self::ViewPerformanceDefinition),
+            "view_database_security_state" => Ok(Self::ViewDatabaseSecurityState),
+            "view_database_performance_state" => Ok(Self::ViewDatabasePerformanceState),
+            "view_any_column_encryption_key_definition" => {
+                Ok(Self::ViewAnyColumnEncryptionKeyDefinition)
+            }
+            "view_any_column_master_key_definition" => {
+                Ok(Self::ViewAnyColumnMasterKeyDefinition)
+            }
+            "logon_trigger_probe" => Ok(Self::LogonTriggerProbe),
+            "refusal_list_probe" => Ok(Self::RefusalListProbe),
+            "cas_store_guard_probe" => Ok(Self::CasStoreGuardProbe),
             _ => Err("invalid value".into()),
         }
     }

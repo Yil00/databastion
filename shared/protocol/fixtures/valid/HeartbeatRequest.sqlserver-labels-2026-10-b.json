@@ -1,0 +1,69 @@
+{
+  "ts": "2026-10-15T09:00:00Z",
+  "agent_version": "0.8.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-xe-admin",
+      "engine": "sqlserver",
+      "server_version": "16.0.4305.5",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "privilege.refused",
+          "labels": [
+            "alter_any_database_event_session",
+            "alter_any_database_event_session_enable",
+            "alter_any_database_event_session_disable",
+            "alter_any_database_event_session_add_event",
+            "alter_any_database_event_session_drop_event",
+            "alter_any_database_event_session_add_target",
+            "alter_any_database_event_session_drop_target",
+            "alter_any_database_event_session_option",
+            "create_any_database_event_session",
+            "drop_any_database_event_session"
+          ]
+        },
+        {
+          "code": "privilege.global_privileges",
+          "count": 1,
+          "labels": [
+            "view_any_performance_definition"
+          ]
+        },
+        {
+          "code": "privilege.beyond_select",
+          "count": 6,
+          "labels": [
+            "view_security_definition",
+            "view_performance_definition",
+            "view_database_security_state",
+            "view_database_performance_state",
+            "view_any_column_encryption_key_definition",
+            "view_any_column_master_key_definition"
+          ]
+        },
+        {
+          "code": "privilege.not_evaluated",
+          "labels": [
+            "password_hash_probe",
+            "logon_trigger_probe",
+            "refusal_list_probe",
+            "cas_store_guard_probe"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

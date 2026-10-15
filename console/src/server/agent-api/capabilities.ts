@@ -32,7 +32,10 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  *
  * `target_status.note_labels.2026_10` (ADR-0051 decision 4, ADR-0022 decision 4): the SQL Server
  * `TargetNoteLabel` values of that revision are accepted and rendered with their display names
- * (`src/lib/target-notes.ts`).
+ * (`src/lib/target-notes.ts`). `target_status.note_labels.2026_10_b` (ADR-0051 refinement of
+ * 2026-10-14, items 5 to 7): the second SQL Server revision (database-scoped event-session
+ * permissions, the other permissions the connector judges by name, and the `check()` reads named
+ * with `privilege.not_evaluated`), accepted and rendered the same way.
  */
 export const CONSOLE_ACCEPTS = [
   "access_event.bytes",
@@ -42,6 +45,7 @@ export const CONSOLE_ACCEPTS = [
   "engine.valkey",
   "job_progress.coverage",
   "target_status.note_labels.2026_10",
+  "target_status.note_labels.2026_10_b",
   "target_status.notes",
 ] as const;
 

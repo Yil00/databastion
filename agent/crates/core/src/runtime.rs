@@ -1170,8 +1170,14 @@ impl Runtime {
         {
             crate::notes::to_protocol(
                 &notes,
-                self.console_caps
-                    .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10),
+                crate::notes::LabelRevisions {
+                    r2026_10: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10),
+                    r2026_10_b: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_B),
+                },
             )
         } else {
             Vec::new()

@@ -72,3 +72,19 @@ pub fn coverage_of(sink: &crate::FindingSink) -> crate::ScanCoverage {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .unwrap_or_default()
 }
+
+/// The labels of `note` as the core sends them (negotiated, ranked by
+/// severity, cut to the contract's 16, in enum order), for a console that
+/// lists every label revision (`all_revisions`) or none.
+#[must_use]
+pub fn sent_labels(note: &crate::TargetNote, all_revisions: bool) -> Vec<String> {
+    let revisions = crate::notes::LabelRevisions {
+        r2026_10: all_revisions,
+        r2026_10_b: all_revisions,
+    };
+    crate::notes::to_protocol(std::slice::from_ref(note), revisions)
+        .first()
+        .and_then(|n| n.labels.as_ref())
+        .map(|l| l.iter().map(ToString::to_string).collect())
+        .unwrap_or_default()
+}

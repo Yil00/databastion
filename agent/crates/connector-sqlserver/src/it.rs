@@ -261,6 +261,13 @@ fn has(h: &TargetHealth, code: NoteCode) -> bool {
     h.notes.iter().any(|n| n.code() == code)
 }
 
+/// Whether the note `code` carries `label`.
+fn has_label(h: &TargetHealth, code: NoteCode, label: &str) -> bool {
+    h.notes
+        .iter()
+        .any(|n| n.code() == code && n.labels().iter().any(|l| l.as_str() == label))
+}
+
 fn key() -> Arc<HmacKey> {
     Arc::new(HmacKey::new(&[7u8; 32]).unwrap())
 }
@@ -351,7 +358,11 @@ async fn check_minimal_login() {
     assert!(has(&h, NoteCode::PrivilegeAuditGrantWithoutAudit));
     // Logon triggers invisible to the minimal variant: not evaluated,
     // never reported as absent.
-    assert!(has(&h, NoteCode::PrivilegeNotEvaluated));
+    assert!(
+        has_label(&h, NoteCode::PrivilegeNotEvaluated, "logon_trigger_probe"),
+        "{:?}",
+        codes(&h)
+    );
     assert!(!has(&h, NoteCode::SecurityLoginEventTrigger));
     // The TLS modes of the version: `tls_modes_by_version`.
     major().await;
@@ -817,7 +828,15 @@ async fn refused_accounts() {
         Err(e) => assert_eq!(e.number, Some(4631), "{e:?}"),
         Ok(_) => {
             let h = c.check(&throwaway_target("it_dbxe", "")).await;
-            assert!(has(&h, NoteCode::PrivilegeRefused), "{:?}", codes(&h));
+            assert!(
+                has_label(
+                    &h,
+                    NoteCode::PrivilegeRefused,
+                    "alter_any_database_event_session"
+                ),
+                "{:?}",
+                codes(&h)
+            );
         }
     }
     drop_login(&mut s, "it_dbxe").await;

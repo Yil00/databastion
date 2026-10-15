@@ -733,8 +733,9 @@ fn labels<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<NoteLabel> {
 pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
     if ev.is_refused() {
         // The probe's label ranks first in the core's label severity, then
-        // `sysadmin`, `control_server`, `db_owner`…: the 16-label cap
-        // never drops them (review L4).
+        // `sysadmin`, `control_server`, `db_owner`…: the 16-label cap,
+        // applied by the core when the note is sent and after label
+        // negotiation, never drops them (review L4; core `notes`).
         let mut l = labels(&ev.refused);
         if ev.hash_exposed {
             l.push(NoteLabel::sqlserver("password_hash_probe"));
@@ -786,8 +787,11 @@ pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
         );
     }
     if !ev.incomplete.is_empty() {
+        // Sent as `other` until the console lists the label revision
+        // `2026_10_b` (core `notes`).
         notes.merge(
-            TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([NoteLabel::OTHER]),
+            TargetNote::new(NoteCode::PrivilegeNotEvaluated)
+                .with_labels([NoteLabel::sqlserver("refusal_list_probe")]),
             databastion_core::CountMerge::Sum,
         );
     }
@@ -911,15 +915,20 @@ async fn checked(
                     );
                 }
             }
-            Err(e) if !e.fatal => notes.add(
-                TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([NoteLabel::OTHER]),
+            Err(e) if !e.fatal => notes.merge(
+                TargetNote::new(NoteCode::PrivilegeNotEvaluated)
+                    .with_labels([NoteLabel::sqlserver("logon_trigger_probe")]),
+                databastion_core::CountMerge::Sum,
             ),
             Err(e) => return Err(e),
         }
     } else {
-        // The logon-trigger label is a pending P9-C item: `other` until then.
+        // The catalog is hidden: never "no logon trigger" (refinement item
+        // 6). The label is sent as `other` until the console lists the
+        // label revision `2026_10_b` (core `notes`).
         notes.merge(
-            TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([NoteLabel::OTHER]),
+            TargetNote::new(NoteCode::PrivilegeNotEvaluated)
+                .with_labels([NoteLabel::sqlserver("logon_trigger_probe")]),
             databastion_core::CountMerge::Sum,
         );
     }
@@ -973,7 +982,8 @@ async fn checked(
             );
         } else if !cas.complete {
             notes.merge(
-                TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([NoteLabel::OTHER]),
+                TargetNote::new(NoteCode::PrivilegeNotEvaluated)
+                    .with_labels([NoteLabel::sqlserver("cas_store_guard_probe")]),
                 databastion_core::CountMerge::Sum,
             );
         }
@@ -1039,7 +1049,8 @@ mod tests {
     }
 
     /// Review M3 and L4: an incomplete evaluation blocks, and the hash
-    /// probe's label survives the 16-label cap.
+    /// probe's label survives the 16-label cap the core applies at send
+    /// time, after label negotiation.
     #[test]
     fn incomplete_evaluation_blocks_and_hash_label_survives() {
         let mut ev = Evaluation::default();
@@ -1061,11 +1072,9 @@ mod tests {
         ev.refused.insert("##MS_LoginManager##".into());
         let mut notes = Notes::default();
         evaluation_notes(&ev, &mut notes);
-        let l: Vec<String> = notes.as_slice()[0]
-            .labels()
-            .iter()
-            .map(|l| l.as_str())
-            .collect();
+        assert!(notes.as_slice()[0].labels().len() > 16);
+        let l = databastion_core::test_support::sent_labels(&notes.as_slice()[0], true);
+        assert_eq!(l.len(), 16);
         for want in [
             "password_hash_probe",
             "sysadmin",
@@ -1129,8 +1138,63 @@ mod tests {
         let n = &notes.as_slice()[0];
         assert_eq!(n.code(), NoteCode::PrivilegeRefused);
         let l: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
-        for want in ["control_server", "db_owner", "ms_login_manager", "other"] {
+        for want in [
+            "control_server",
+            "db_owner",
+            "ms_login_manager",
+            "alter_any_database_event_session",
+        ] {
             assert!(l.contains(&want.to_owned()), "{want} in {l:?}");
+        }
+        assert!(!l.contains(&"other".to_owned()), "{l:?}");
+    }
+
+    /// Every permission and role the connector judges by name has a
+    /// contract label (revisions `2026_10` and `2026_10_b`): none of them
+    /// reaches the console as `other` once the console lists both.
+    #[test]
+    fn every_name_the_connector_judges_has_a_label() {
+        let names = SERVER_REFUSED
+            .iter()
+            .chain(SERVER_AUDIT)
+            .chain(ROLES_REFUSED)
+            .chain(DATABASE_REFUSED)
+            .chain(PUBLIC_DEFAULTS)
+            .chain(DATABASE_RLS)
+            .chain(PRINCIPAL_REFUSED)
+            .chain(DATABASE_FROM_SERVER.iter().flat_map(|(d, s)| [d, s]));
+        for name in names {
+            assert!(!NoteLabel::sqlserver_name(name).is_other(), "{name}");
+        }
+        // The ten database-scoped event-session rights (refinement item 5).
+        assert_eq!(
+            DATABASE_REFUSED
+                .iter()
+                .filter(|p| p.contains("DATABASE EVENT SESSION"))
+                .count(),
+            10
+        );
+    }
+
+    /// The reads named with `privilege.not_evaluated` carry their own
+    /// label, never `other`.
+    #[test]
+    fn not_evaluated_reads_are_labelled() {
+        let mut ev = Evaluation::default();
+        ev.incomplete.insert("more than 64 database roles");
+        ev.not_evaluated.insert("password_hash_probe");
+        let mut notes = Notes::default();
+        evaluation_notes(&ev, &mut notes);
+        let n = &notes.as_slice()[0];
+        assert_eq!(n.code(), NoteCode::PrivilegeNotEvaluated);
+        let l: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        assert_eq!(l, ["password_hash_probe", "refusal_list_probe"]);
+        for probe in [
+            "logon_trigger_probe",
+            "refusal_list_probe",
+            "cas_store_guard_probe",
+        ] {
+            assert_eq!(NoteLabel::sqlserver(probe).as_str(), probe);
         }
     }
 }
