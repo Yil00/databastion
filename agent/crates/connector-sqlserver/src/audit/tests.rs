@@ -28,7 +28,7 @@ fn cursor_round_trips() {
         offset: 53_248,
         skip: 3,
         pattern: Some(P1.to_owned()),
-        after: Some(((0, 134_365_416_940_740_000), 4096)),
+        after: Some(((134_365_416_940_740_000, 0), 4096)),
         history_us: Some(17),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
@@ -47,11 +47,13 @@ fn cursor_round_trips() {
 fn file_keys_order_one_set() {
     assert_eq!(
         file_key(&f("/x/", 134_365_416_940_740_000)),
-        Some((0, 134_365_416_940_740_000))
+        Some((134_365_416_940_740_000, 0))
     );
     assert!(file_key("/x/a.sqlaudit").is_none());
     assert!(file_key("/x/a_0_12x.sqlaudit").is_none());
     assert!(file_key(&f("/z/", 1)) < file_key(&f("/a/", 2)));
+    // Timestamp first, then partition.
+    assert!(file_key("/x/a_9_1.sqlaudit") < file_key("/x/a_0_2.sqlaudit"));
 }
 
 #[test]
@@ -80,10 +82,40 @@ fn a_full_read_reads_its_last_buffer_again() {
         ..c.clone()
     };
     let n = advance(&c2, &pos(&[("f1", 8192); 8]), 8);
-    assert_eq!(
-        (n.file.as_deref(), n.offset, n.skip),
-        (Some("f1"), 4096, 12)
-    );
+    assert_eq!((n.file.as_deref(), n.offset, n.skip), (Some("f1"), 4096, 8));
+}
+
+/// Re-review N1: a buffer larger than a read is walked without losing or
+/// repeating a record (skip 16, batch 16, a buffer of 40 records).
+#[test]
+fn a_large_buffer_is_walked_record_by_record() {
+    let buffer: Vec<Record> = (0..40)
+        .map(|i| {
+            let mut r = at("f1", 8192);
+            r.time_us = i;
+            r
+        })
+        .collect();
+    let mut c = Cursor {
+        file: Some("f1".to_owned()),
+        offset: 4096,
+        skip: 16,
+        ..Cursor::default()
+    };
+    let mut seen: Vec<i64> = (0..16).collect();
+    for _ in 0..10 {
+        let top = 16 + c.skip as usize;
+        let read: Vec<Record> = buffer.iter().take(top).cloned().collect();
+        let returned = read.len();
+        let b = batch(&c, read, returned, top);
+        seen.extend(b.kept.iter().map(|r| r.time_us));
+        c = b.next;
+        if !b.full {
+            break;
+        }
+    }
+    assert_eq!(seen, (0..40).collect::<Vec<i64>>());
+    assert_eq!((c.file.as_deref(), c.offset, c.skip), (Some("f1"), 8192, 0));
 }
 
 /// Review H1: another folder (either sort direction) or another GUID is
@@ -97,7 +129,7 @@ fn a_new_file_set_is_read_whole() {
             file: Some(f(old, 900)),
             offset: 81_920,
             pattern: Some(pat(old)),
-            after: Some(((0, 900), 81_920)),
+            after: Some(((900, 0), 81_920)),
             ..Cursor::default()
         };
         assert!(on_pattern(&mut c, &pat(new)), "a gap");
@@ -132,7 +164,7 @@ fn a_refused_position_skips_what_was_read() {
     };
     on_bad_position(&mut c);
     assert_eq!(c.file, None);
-    assert_eq!(c.after, Some(((0, 500), 8192)));
+    assert_eq!(c.after, Some(((500, 0), 8192)));
     let recs = vec![
         at(&f(folder, 500), 4096),
         at(&f(folder, 500), 8192),
@@ -143,7 +175,7 @@ fn a_refused_position_skips_what_was_read() {
     let kept: Vec<(i64, i64)> = b
         .kept
         .iter()
-        .map(|r| (file_key(&r.file).unwrap().1, r.offset))
+        .map(|r| (file_key(&r.file).unwrap().0, r.offset))
         .collect();
     assert_eq!(kept, [(500, 12_288), (600, 4096)]);
     assert_eq!(

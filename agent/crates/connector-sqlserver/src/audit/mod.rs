@@ -343,10 +343,11 @@ pub(crate) fn advance(cursor: &Cursor, positions: &[(String, i64)], top: usize) 
     let in_last = positions.iter().rev().take_while(|p| *p == last).count();
     let before = positions.len() - in_last;
     if before == 0 {
-        // The whole read is one buffer (the first one after the position).
-        next.skip = cursor
-            .skip
-            .saturating_add(u32::try_from(in_last).unwrap_or(u32::MAX));
+        // The whole read is one buffer (the first one after the position):
+        // the read started at that buffer again, so its records handled are
+        // exactly those it returned (re-review N1: adding the previous skip
+        // counted the re-read records twice and lost as many).
+        next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
     } else {
         let prev = &positions[before - 1];
         next.file = Some(prev.0.clone());
@@ -356,9 +357,10 @@ pub(crate) fn advance(cursor: &Cursor, positions: &[(String, i64)], top: usize) 
     next
 }
 
-/// The order key of an audit file of one file set:
-/// `…_<partition>_<timestamp>.sqlaudit` (measured: the name of the audit
-/// and its GUID, then the partition and an 18-digit timestamp). Within one
+/// The order key of an audit file of one file set, (timestamp,
+/// partition), from `…_<partition>_<timestamp>.sqlaudit` (measured: the
+/// name of the audit and its GUID, then the partition and an 18-digit
+/// timestamp). Within one
 /// set, files are ordered by this key, never by their path string (review
 /// H1). `None` when the name has another form.
 pub(crate) fn file_key(name: &str) -> Option<(i64, i64)> {
@@ -370,7 +372,8 @@ pub(crate) fn file_key(name: &str) -> Option<(i64, i64)> {
             .then(|| s.parse::<i64>().ok())
             .flatten()
     };
-    Some((num(part)?, num(ts)?))
+    // Ordered by timestamp first, then partition (re-review Low).
+    Some((num(ts)?, num(part)?))
 }
 
 /// The catalog's file pattern seen by a reprobe. Another pattern (the
@@ -935,7 +938,8 @@ async fn read(
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
     let b = batch(&st.cursor, polled.records, polled.returned, top);
-    if !b.kept.is_empty() || polled.returned > 0 {
+    // Freshness from parsed records only (re-review Low).
+    if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
     let history = st.cursor.history_us;

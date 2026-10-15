@@ -365,7 +365,11 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
         && s.objects
             .iter()
             .any(|(_, _, o, _)| tsql::CREDENTIAL_PROCEDURES.contains(&o.to_lowercase().as_str()));
-    if analysis.as_ref().is_some_and(|a| a.credential) || procedure_record {
+    // The class applies to the call's own record (`EX`) only: on a read or
+    // write record of the same text (a batch that also calls one), the
+    // text is left unread instead (re-review N2).
+    let credential_exec = h.action == "EX" && analysis.as_ref().is_some_and(|a| a.credential);
+    if credential_exec || procedure_record {
         action = EventAction::Dcl;
     }
     let mut ev = MaskedEvent::new(EventSource::SqlserverAudit, action, principal, ts);
@@ -404,9 +408,9 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
         ev = ev.with_signal(Signal::Bcp);
     }
     if let Some(a) = &analysis {
-        if a.credential {
+        if a.credential && credential_exec {
             // Kind and the records' objects only (decision 6, M6).
-        } else if a.credential_function {
+        } else if a.credential || a.credential_function {
             // A password-taking function: no text-derived signal, and what
             // else the text names is not used: `*`, always reported.
             star = true;
