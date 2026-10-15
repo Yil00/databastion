@@ -43,6 +43,8 @@ pub(crate) const EDITIONS: &[i64] = &[2, 3, 4];
 pub(crate) struct CheckState {
     pub(crate) choice: TlsChoice,
     versions: Mutex<HashMap<String, String>>,
+    /// Audit facts shared with the stream.
+    pub(crate) audit: crate::audit::Shared,
 }
 
 impl CheckState {
@@ -144,7 +146,9 @@ const SERVER_REFUSED: &[&str] = &[
 const SERVER_EXPECTED: &[&str] = &["CONNECT SQL", "VIEW ANY DATABASE"];
 
 /// The Audit permissions (decision 4, refinement item 1): expected only
-/// while an Audit stream uses them; none runs in this lot.
+/// while an Audit stream uses them (`VIEW SERVER SECURITY AUDIT` and `VIEW
+/// ANY SECURITY DEFINITION`, option (a'), `audit::probe::SOURCE_GRANTS`);
+/// the others belong to sources this build does not read.
 const SERVER_AUDIT: &[&str] = &[
     "VIEW SERVER SECURITY AUDIT",
     "VIEW ANY SECURITY DEFINITION",
@@ -873,8 +877,41 @@ async fn checked(
             conn::Mode::Mandatory => "mandatory",
         }
     )];
-    let ev = evaluate(s, target).await?;
+    let mut ev = evaluate(s, target).await?;
+    // The Audit source (decision 6, option (a')): its two grants are
+    // expected while a stream uses them.
+    let settings = target.sqlserver_settings();
+    let audit_cfg = settings.audit.as_ref();
+    let facts = state.audit.facts(&target.id);
+    let audit_probe = match crate::audit::probe::audit_name(audit_cfg) {
+        Some(name)
+            if v.major >= crate::audit::probe::MIN_AUDIT_MAJOR
+                && !ev.blocks()
+                && ev.server_perms.contains(crate::audit::probe::CATALOG_GRANT) =>
+        {
+            let (dbs, _) = monitored_databases(s, target).await?;
+            // Boxed: keeps check()'s future small.
+            Some(Box::pin(crate::audit::probe::probe(s, name, &dbs, Stage::Check)).await?)
+        }
+        _ => None,
+    };
+    let audit = crate::audit::probe::level(&crate::audit::probe::Inputs {
+        cfg: audit_cfg,
+        major: v.major,
+        perms: &ev.server_perms,
+        blocks: ev.blocks(),
+        probe: audit_probe.as_ref(),
+        stream: facts,
+    });
+    state.audit.set_usable(&target.id, audit.source);
+    if audit.source && facts.running {
+        for g in crate::audit::probe::SOURCE_GRANTS {
+            ev.audit_grants.remove(*g);
+        }
+    }
     evaluation_notes(&ev, &mut notes);
+    notes.extend(audit.notes.iter().cloned());
+    detail.extend(audit.details.iter().map(|d| format!("Audit: {d}")));
     if ev.is_refused() {
         detail.push(
             "the account holds a right of the refusal list: Discovery and Audit do not run"
@@ -891,13 +928,11 @@ async fn checked(
     }
     // Logon triggers (decision 7, refinement item 6): evaluated only when
     // the catalog is visible; never "no logon trigger" otherwise.
-    let visible = [
-        "VIEW ANY DEFINITION",
-        "VIEW ANY SECURITY DEFINITION",
-        "CONTROL SERVER",
-    ]
-    .iter()
-    .any(|p| ev.server_perms.contains(*p));
+    // `VIEW ANY SECURITY DEFINITION` does not show them (measured on 2022
+    // with a disabled logon trigger: 0 rows), so it does not count.
+    let visible = ["VIEW ANY DEFINITION", "CONTROL SERVER"]
+        .iter()
+        .any(|p| ev.server_perms.contains(*p));
     if visible {
         match s
             .rows(sql::LOGON_TRIGGERS, Stage::Check, Shape::rows(1, 1))
@@ -991,8 +1026,7 @@ async fn checked(
     tracing::info!(target_id = %target.id, detail = %detail.join("; "), "SQL Server checked");
     Ok(TargetHealth {
         reachable: true,
-        // No Audit source in this lot (P9-A lot 3).
-        audit_level: AuditLevel::None,
+        audit_level: audit.level,
         failure: None,
         detail: Some(detail.join("; ")),
         notes: notes.into_vec(),

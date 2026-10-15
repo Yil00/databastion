@@ -253,6 +253,9 @@ this agent emits only the closed set below (`masking::Signal::ALL`):
 | `shape.bulk_search` | OpenLDAP: a search with scope one-level, subtree or children whose filter selects no entry by value (presence tests and `objectClass` equality assertions only, under `&` / `\|`): an LDIF export or a bulk `ldapsearch` (phase 6, ADR-0029) |
 | `volume.failed_logins_many_accounts` | CAS: one client address (before the `client_addr` reduction) with failed authentications for at least 16 distinct principals within 10 minutes; its further failures are aggregated per address and minute under the principal `*` (`EventPrincipal::many_accounts`, the only principal sent as `*`; phase 8, ADR-0041) |
 | `volume.failed_logins_one_account` | CAS: one principal with at least 20 failed authentications within 10 minutes, whatever the addresses (phase 8, ADR-0041) |
+| `signature.bcp` | SQL Server: a read by a client whose application name is an export tool's (`bcp`, measured; `sqlpackage…`, `…Import and Export Wizard`) (P9-A, ADR-0051) |
+| `signature.backup_database` | SQL Server: a `BACKUP DATABASE` / `BACKUP LOG` audit record, or the text of `BACKUP DATABASE` / `LOG`, `DBCC CLONEDATABASE` or `EXEC sp_detach_db` |
+| `signature.remote_data_access` | SQL Server: `OPENROWSET`, `OPENDATASOURCE`, `OPENQUERY`, `EXEC … AT`, `BULK INSERT`, a four-part name in a write target, `CREATE EXTERNAL TABLE … AS SELECT`, `xp_cmdshell`, `xp_dirtree` / `xp_fileexist` / `xp_subdirs`, `sp_send_dbmail` with a query, `sp_invoke_external_rest_endpoint`, `sp_OACreate` / `sp_OAMethod`, `sp_execute_external_script`; also when refused |
 
 The thresholds sit above the agent's own maximum sample (10 000 rows), so
 its Discovery never raises them. `shape.*` and `signature.*` are heuristics
@@ -294,6 +297,21 @@ MASTER` / `CHANGE REPLICATION SOURCE`, `CREATE SERVER` and every other
 utility statement keep no text. Property tests: `tests/query_mysql_props.rs`
 (every literal and comment form, both `sql_mode` readings, password-bearing
 statements as clients write them and as the servers log them, truncation).
+
+The T-SQL mode (`query::tsql::analyze_tsql`, P9-A, ADR-0051 decision 6)
+reduces a SQL Server Audit statement text to a kind and closed flags; it
+names objects only from closed lists (statement-text, credential-bearing
+and value-bearing objects), never from the text itself (SQL Server Audit
+names the objects of each permission check). Password-bearing statements
+(`CREATE` / `ALTER LOGIN`, `USER`, `APPLICATION ROLE`, credentials, keys and
+certificates, and `EXEC` of the procedures that take a password, wherever
+the call stands) are recognized from their first tokens and the lexer stops
+there. Comments nest; `'…'` and `N'…'` literals, numbers, `0x…` and money
+literals keep no content; `[…]` is an identifier; `"…"` stays opaque
+(`QUOTED_IDENTIFIER` unknown) and, where a name is read, makes the text
+ambiguous (kind only); every argument of `EXEC` is a value. A
+schema-qualified call outside the `sys` built-ins measured on 2019, 2022
+and 2025 (`SYS_FUNCTIONS`) is user code. Property tests in the module.
 
 ## Tests
 

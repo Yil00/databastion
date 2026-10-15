@@ -961,6 +961,9 @@ pub enum EventSource {
     RedisAclLog,
     /// Redis / Valkey full synchronizations (`INFO stats` `sync_full`).
     RedisSync,
+    /// SQL Server Audit, `FILE` target, read through
+    /// `sys.fn_get_audit_file` (ADR-0051 decision 6).
+    SqlserverAudit,
 }
 
 impl EventSource {
@@ -983,6 +986,7 @@ impl EventSource {
             Self::RedisCommandlog => "redis_commandlog",
             Self::RedisAclLog => "redis_acl_log",
             Self::RedisSync => "redis_sync",
+            Self::SqlserverAudit => "sqlserver_audit",
         }
     }
 
@@ -1061,11 +1065,22 @@ pub enum Signal {
     /// guarded by the CAS store guard by name, or with a strict ticket
     /// prefix (ADR-0052 decision 6, re-review N5).
     CasTicketRead,
+    /// `signature.bcp`: a SQL Server read by a client whose application
+    /// name is an export tool's (`bcp`; ADR-0051 decision 6).
+    Bcp,
+    /// `signature.backup_database`: a full copy of a SQL Server database
+    /// made by the server (`BACKUP DATABASE` / `LOG`, `DBCC
+    /// CLONEDATABASE`, `sp_detach_db`).
+    BackupDatabase,
+    /// `signature.remote_data_access`: data leaving through the SQL Server
+    /// server to another place (`OPENROWSET`, `OPENQUERY`, `EXEC … AT`,
+    /// `xp_cmdshell`…), even when refused.
+    RemoteDataAccess,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 20] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -1083,6 +1098,9 @@ impl Signal {
         Self::LargeReply,
         Self::KeyspaceEnumeration,
         Self::CasTicketRead,
+        Self::Bcp,
+        Self::BackupDatabase,
+        Self::RemoteDataAccess,
     ];
 
     /// Contract value.
@@ -1106,6 +1124,9 @@ impl Signal {
             Self::LargeReply => "volume.large_reply",
             Self::KeyspaceEnumeration => "shape.keyspace_enumeration",
             Self::CasTicketRead => "signature.cas_ticket_read",
+            Self::Bcp => "signature.bcp",
+            Self::BackupDatabase => "signature.backup_database",
+            Self::RemoteDataAccess => "signature.remote_data_access",
         }
     }
 }

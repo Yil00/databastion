@@ -47,6 +47,77 @@ pub enum RlsVisibility {
     ViewDefinition,
 }
 
+/// `sqlserver.audit.source` (ADR-0051 decision 6): which operator-created
+/// source the Audit stream reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlserverAuditSource {
+    /// The preference rule of decision 6: SQL Server Audit when usable,
+    /// then Extended Events.
+    #[default]
+    Auto,
+    /// SQL Server Audit, `FILE` target (`audit_name`).
+    SqlserverAudit,
+    /// An Extended Events session with an `event_file` target
+    /// (`xe_session`).
+    SqlserverXevents,
+}
+
+/// `sqlserver.audit`: the operator-created audit sources the agent reads
+/// (decision 6). The agent never creates, alters, starts or stops them;
+/// the audit file pattern is read from the server's catalog, never from
+/// here (a path from configuration would make the agent a file-read
+/// primitive).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SqlserverAuditConfig {
+    /// Which source. Default: `auto`.
+    #[serde(default)]
+    pub source: SqlserverAuditSource,
+    /// Name of the server audit (`sys.server_file_audits.name`).
+    #[serde(default)]
+    pub audit_name: Option<String>,
+    /// Name of the Extended Events session.
+    #[serde(default)]
+    pub xe_session: Option<String>,
+}
+
+impl SqlserverAuditConfig {
+    fn validate(&self) -> Result<(), (&'static str, &'static str)> {
+        for (key, name) in [
+            ("audit.audit_name", &self.audit_name),
+            ("audit.xe_session", &self.xe_session),
+        ] {
+            if let Some(n) = name
+                && (n.is_empty()
+                    || n.chars().count() > MAX_NAME_CHARS
+                    || n.chars().any(char::is_control))
+            {
+                return Err((
+                    key,
+                    "must be 1 to 128 characters without control characters",
+                ));
+            }
+        }
+        match self.source {
+            SqlserverAuditSource::SqlserverAudit if self.audit_name.is_none() => Err((
+                "audit.audit_name",
+                "is required with source: sqlserver_audit",
+            )),
+            SqlserverAuditSource::SqlserverXevents if self.xe_session.is_none() => Err((
+                "audit.xe_session",
+                "is required with source: sqlserver_xevents",
+            )),
+            SqlserverAuditSource::Auto
+                if self.audit_name.is_none() && self.xe_session.is_none() =>
+            {
+                Err(("audit", "names no source (audit_name or xe_session)"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// SQL Server settings of a target.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +146,9 @@ pub struct SqlserverTargetConfig {
     /// CAS stores under custom names (ADR-0041 decision 5).
     #[serde(default)]
     pub cas_stores: Option<crate::cas_guard::CasStores>,
+    /// The Audit sources (decision 6); absent: no Audit source.
+    #[serde(default)]
+    pub audit: Option<SqlserverAuditConfig>,
 }
 
 const fn default_max_tables() -> u32 {
@@ -91,6 +165,7 @@ impl Default for SqlserverTargetConfig {
             extended_grants: false,
             max_tables: default_max_tables(),
             cas_stores: None,
+            audit: None,
         }
     }
 }
@@ -125,6 +200,9 @@ impl SqlserverTargetConfig {
         }
         if !(MAX_TABLES_RANGE.0..=MAX_TABLES_RANGE.1).contains(&self.max_tables) {
             return Err(("max_tables", "must be in 1..=16384"));
+        }
+        if let Some(Err(e)) = self.audit.as_ref().map(SqlserverAuditConfig::validate) {
+            return Err(e);
         }
         if let Some(Err(e)) = self
             .cas_stores
@@ -165,5 +243,51 @@ mod tests {
             ..SqlserverTargetConfig::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn audit_block_rules() {
+        let with = |audit: SqlserverAuditConfig| SqlserverTargetConfig {
+            audit: Some(audit),
+            ..SqlserverTargetConfig::default()
+        };
+        let ok = SqlserverAuditConfig {
+            source: SqlserverAuditSource::SqlserverAudit,
+            audit_name: Some("databastion_audit".into()),
+            xe_session: None,
+        };
+        assert!(with(ok.clone()).validate().is_ok());
+        assert!(
+            with(SqlserverAuditConfig {
+                audit_name: None,
+                ..ok.clone()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            with(SqlserverAuditConfig {
+                audit_name: Some("a\nb".to_owned()),
+                ..ok.clone()
+            })
+            .validate()
+            .is_err()
+        );
+        assert!(
+            with(SqlserverAuditConfig {
+                source: SqlserverAuditSource::Auto,
+                audit_name: None,
+                xe_session: None,
+            })
+            .validate()
+            .is_err()
+        );
+        let yaml: SqlserverTargetConfig =
+            serde_yaml_ng::from_str("{audit: {audit_name: databastion_audit}}").unwrap();
+        assert_eq!(yaml.audit.unwrap().source, SqlserverAuditSource::Auto);
+        assert!(
+            serde_yaml_ng::from_str::<SqlserverTargetConfig>("{audit: {audit_name: a, path: /x}}")
+                .is_err()
+        );
     }
 }

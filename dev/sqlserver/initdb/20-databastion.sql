@@ -2,9 +2,12 @@
 -- dev/sqlserver/entrypoint.sh as the sqlcmd variable DATABASTION_PASSWORD (never logged).
 -- Schema-level SELECT on the two monitored schemas only; no VIEW DEFINITION, no db_datareader.
 -- The CAS store guard gets the three columns of the ticket table it counts (ADR-0041 decision 6).
--- Audit is enabled in dev, so the Audit grant of decision 4 is given for the server's version:
--- VIEW SERVER SECURITY AUDIT (2022+, SQL Server Audit source) and VIEW SERVER PERFORMANCE STATE
--- (2022+, Extended Events source); VIEW SERVER STATE on 2019 (Extended Events only).
+-- Audit is enabled in dev, so the Audit grants are given for the server's version: on 2022+, the
+-- SQL Server Audit source's set of ADR-0051 refinement item 1, option (a') (accepted on
+-- 2026-10-15): VIEW SERVER SECURITY AUDIT (reads the audit) and VIEW ANY SECURITY DEFINITION
+-- (shows the audit and specification catalogs; no password hash, measured), and no VIEW SERVER
+-- SECURITY STATE (the audit's own AUSC records prove its restarts). On 2019, VIEW SERVER STATE for
+-- the Extended Events source (not read by this agent build yet: reported as an unused Audit grant).
 -- Row-level security visibility (ADR-0051 refinement item 2, option (iv), open question 5): the
 -- dev and E2E account holds database VIEW DEFINITION in `retail` and its targets declare
 -- `sqlserver.rls_visibility: view_definition`, so Discovery is tested; the integration tests
@@ -16,7 +19,7 @@ GO
 DECLARE @major int = CONVERT(int, SERVERPROPERTY('ProductMajorVersion'));
 IF @major >= 16
 BEGIN
-  EXEC (N'GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW SERVER PERFORMANCE STATE TO databastion;');
+  EXEC (N'GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY DEFINITION TO databastion;');
 END
 ELSE
 BEGIN
