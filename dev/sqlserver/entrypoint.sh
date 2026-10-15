@@ -27,6 +27,8 @@ rm -f "$READY"
 if [ ! -s "$TLS/server.pem" ] || [ ! -s "$TLS/server.key" ]; then
   mkdir -p "$TLS"
   tmp="$(mktemp -d)"
+  # The CA key never outlives this block, even when a step fails.
+  trap 'rm -rf "$tmp"' EXIT
   printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' \
     'extendedKeyUsage=serverAuth' 'subjectAltName=DNS:localhost,DNS:sqlserver,IP:127.0.0.1,IP:::1' > "$tmp/ext"
   # The CA's extensions from a config file of their own, not -addext: OpenSSL 1.1.1 (the 2019
@@ -45,6 +47,7 @@ if [ ! -s "$TLS/server.pem" ] || [ ! -s "$TLS/server.key" ]; then
   install -m 0644 "$tmp/server.pem" "$TLS/server.pem"
   install -m 0600 "$tmp/server.key" "$TLS/server.key"
   rm -rf "$tmp"
+  trap - EXIT
 fi
 
 {
