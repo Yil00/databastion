@@ -55,8 +55,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, CATCH_UP, Cursor, HISTORY_READS, MIN_BATCH, OWN_FILE_BYTES, OWN_SESSIONS,
-    POLL_BYTES, REEVALUATE, REPROBE, batch, on_bad_position, on_pattern, target_error,
+    APP, BATCH, Batch, CATCH_UP, Cursor, HISTORY_READS, MIN_BATCH, OWN_FILE_BYTES, OWN_SESSIONS,
+    POLL_BYTES, Positioned, REEVALUATE, REPROBE, on_bad_position, on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -452,6 +452,99 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     Ok(())
 }
 
+/// Events of one buffer handled across reads at most; beyond, the rest of
+/// that buffer is dropped (a gap). A buffer holds at most a few thousand
+/// events (`MAX_MEMORY` 4 MB by default, three buffers).
+pub(crate) const XE_MAX_SKIP: u32 = 1_000_000;
+
+/// The records of an Extended Events read from `cursor` (the server
+/// skipped the first `cursor.skip` events after the position, all of the
+/// buffer `cursor.buffer`), `returned` rows asked with `asked`: those at
+/// or before a refused position left out, the next position, and the gap.
+///
+/// The position stays before the buffer whose events may not all have
+/// come (a full read); its handled events are counted in `skip` and
+/// skipped by the server next time, so a buffer of any size is walked
+/// with reads of at most `asked` events, none read twice, none lost.
+pub(crate) fn xe_batch(
+    cursor: &Cursor,
+    records: Vec<XeRecord>,
+    returned: usize,
+    asked: usize,
+) -> Batch<XeRecord> {
+    let positions: Vec<(String, i64)> = records
+        .iter()
+        .map(|r| (r.file().to_owned(), r.offset()))
+        .collect();
+    let mut kept = records;
+    if let Some((key, offset)) = cursor.after {
+        // A record of another form of name is kept (read again, loud).
+        kept.retain(|r| sql::xe_file_key(&r.file).is_none_or(|k| (k, r.offset) > (key, offset)));
+    }
+    let full = returned >= asked;
+    let mut next = cursor.clone();
+    if let Some(last) = positions.last() {
+        let in_last = positions.iter().rev().take_while(|p| *p == last).count();
+        let before = positions.len() - in_last;
+        let skipped_buffer = cursor.buffer.as_ref().filter(|_| cursor.skip > 0);
+        if !full {
+            next.file = Some(last.0.clone());
+            next.offset = last.1;
+            next.skip = 0;
+            next.buffer = None;
+        } else if skipped_buffer == Some(last) {
+            // Still the buffer whose first events were skipped.
+            next.skip = cursor
+                .skip
+                .saturating_add(u32::try_from(in_last).unwrap_or(u32::MAX));
+        } else {
+            // The last buffer may continue: the position goes to the
+            // buffer before it (a returned one, else the skipped one, now
+            // read whole, else the position stays).
+            let prev = if before > 0 {
+                positions.get(before - 1).cloned()
+            } else {
+                skipped_buffer.cloned()
+            };
+            if let Some((f, o)) = prev {
+                next.file = Some(f);
+                next.offset = o;
+            }
+            next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
+            next.buffer = Some(last.clone());
+        }
+    }
+    // Nothing returned: the position and the skipped events stay.
+    let passed = cursor.after.is_some_and(|(key, offset)| {
+        positions
+            .last()
+            .and_then(|(f, o)| sql::xe_file_key(f).map(|k| (k, *o)))
+            .is_some_and(|last| last > (key, offset))
+    });
+    if passed || !full {
+        next.after = None;
+    }
+    let mut gap = false;
+    if next.skip > XE_MAX_SKIP {
+        // One buffer larger than the bound: the rest of it is dropped.
+        if let Some(b) = next.buffer.take() {
+            next.file = Some(b.0);
+            next.offset = b.1;
+        }
+        next.skip = 0;
+        gap = true;
+    }
+    if !full {
+        next.history_us = None;
+    }
+    Batch {
+        kept,
+        next,
+        gap,
+        full,
+    }
+}
+
 /// What one poll returned.
 struct Polled {
     records: Vec<XeRecord>,
@@ -468,11 +561,13 @@ async fn poll_records(
     file: &str,
     offset: i64,
     top: usize,
+    skip: u32,
 ) -> Result<Polled, SsError> {
     let params = [
         Param::NVarChar(file.to_owned()),
         Param::BigInt(offset),
         Param::BigInt(i64::try_from(top).unwrap_or(i64::MAX)),
+        Param::BigInt(i64::from(skip)),
     ];
     s.credit_poll(text, kind);
     let mut out = Polled {
@@ -517,7 +612,10 @@ async fn read(
     sink: &EventSink,
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
-    let top = st.batch + st.cursor.skip as usize;
+    // The server skips the events of the next buffer already handled
+    // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
+    let top = st.batch;
+    let skip = st.cursor.skip;
     let polled = match st.cursor.file.clone() {
         None => {
             Box::pin(poll_records(
@@ -527,6 +625,7 @@ async fn read(
                 "",
                 0,
                 top,
+                skip,
             ))
             .await
         }
@@ -538,6 +637,7 @@ async fn read(
                 &f,
                 st.cursor.offset,
                 top,
+                skip,
             ))
             .await
         }
@@ -571,13 +671,7 @@ async fn read(
         Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
-    let b = batch(
-        &st.cursor,
-        polled.records,
-        polled.returned,
-        top,
-        sql::xe_file_key,
-    );
+    let b = xe_batch(&st.cursor, polled.records, polled.returned, top);
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }

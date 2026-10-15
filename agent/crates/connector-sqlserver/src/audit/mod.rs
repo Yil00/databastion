@@ -313,6 +313,9 @@ pub(crate) struct Cursor {
     /// Extended Events: the session's `create_time` (server µs) the
     /// position was read under; another one is a restart (a gap).
     pub(crate) session: Option<i64>,
+    /// Extended Events: the buffer (file, offset) whose first `skip`
+    /// events were handled (the server skips them, `sql::XE_POLL_FROM`).
+    pub(crate) buffer: Option<(String, i64)>,
 }
 
 fn hex(s: &str) -> String {
@@ -349,6 +352,9 @@ impl Cursor {
         if let Some(c) = self.session {
             out.push_str(&format!("session {c}\n"));
         }
+        if let Some((f, o)) = &self.buffer {
+            out.push_str(&format!("buffer {} {o}\n", hex(f)));
+        }
         out.into_bytes()
     }
 
@@ -376,6 +382,7 @@ impl Cursor {
                 }
                 ("history", h) => c.history_us = Some(h.parse().ok()?),
                 ("session", v) => c.session = Some(v.parse().ok()?),
+                ("buffer", f) => c.buffer = Some((unhex(f)?, p.next()?.parse().ok()?)),
                 _ => return None,
             }
         }
@@ -450,6 +457,7 @@ pub(crate) fn on_pattern(cursor: &mut Cursor, pattern: &str) -> bool {
         cursor.offset = 0;
         cursor.skip = 0;
         cursor.after = None;
+        cursor.buffer = None;
     }
     cursor.pattern = Some(pattern.to_owned());
     changed
@@ -468,6 +476,7 @@ pub(crate) fn on_bad_position(cursor: &mut Cursor, key: FileKey) {
     cursor.file = None;
     cursor.offset = 0;
     cursor.skip = 0;
+    cursor.buffer = None;
 }
 
 /// What one read gives: the records to handle, the next position, and

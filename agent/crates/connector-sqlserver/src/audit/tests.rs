@@ -31,6 +31,7 @@ fn cursor_round_trips() {
         after: Some(((134_365_416_940_740_000, 0), 4096)),
         history_us: Some(17),
         session: Some(1_800_000_000_000_000),
+        buffer: Some(("/var/opt/mssql/xe/x_0_1.xel".to_owned(), 8192)),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
     assert_eq!(
@@ -269,4 +270,75 @@ fn xe_positions_follow_the_file_key() {
     );
     assert_eq!(b.next.after, None);
     assert_eq!(b.next.session, Some(1), "the session's start is kept");
+}
+
+/// Extended Events buffers hold hundreds of events (measured on 2025): a
+/// buffer of any size is walked with reads of at most `asked` events, the
+/// server skipping those handled; none is read twice, none lost.
+#[test]
+fn xe_large_buffers_are_walked_without_loss() {
+    use crate::audit::xe::events::XeRecord;
+    use crate::audit::xe::xe_batch;
+    let ev = |file: &str, offset: i64, i: usize| XeRecord {
+        file: file.to_owned(),
+        offset,
+        time_us: i64::try_from(i).unwrap(),
+        name: "sql_statement_completed".to_owned(),
+        event: None,
+        procedure: None,
+        skip: false,
+    };
+    // The file: buffer 4096 (3 events), 8192 (1 200 events), 12288 (5).
+    let mut all = Vec::new();
+    for (off, n) in [(4096, 3), (8192, 1200), (12288, 5)] {
+        for _ in 0..n {
+            all.push((off, all.len()));
+        }
+    }
+    // The server: after the buffer at the position, skip, then `asked`.
+    let read = |c: &Cursor, asked: usize| -> Vec<XeRecord> {
+        let start = all
+            .iter()
+            .position(|(o, _)| c.file.is_none() || *o > c.offset)
+            .unwrap_or(all.len());
+        all.iter()
+            .skip(start + c.skip as usize)
+            .take(asked)
+            .map(|(o, i)| ev("f", *o, *i))
+            .collect()
+    };
+    let mut c = Cursor::default();
+    let mut seen = Vec::new();
+    for _ in 0..20 {
+        let got = read(&c, 500);
+        let n = got.len();
+        let b = xe_batch(&c, got, n, 500);
+        assert!(!b.gap);
+        seen.extend(b.kept.iter().map(|r| r.time_us));
+        c = b.next;
+        if !b.full {
+            break;
+        }
+    }
+    let want: Vec<i64> = (0..all.len()).map(|i| i64::try_from(i).unwrap()).collect();
+    assert_eq!(seen, want);
+    assert_eq!((c.file.as_deref(), c.offset, c.skip), (Some("f"), 12288, 0));
+    // A full read ending exactly at the end of the skipped buffer: the
+    // next read starts with another buffer, and the position moves.
+    let c = Cursor {
+        file: Some("f".to_owned()),
+        offset: 4096,
+        skip: 1000,
+        buffer: Some(("f".to_owned(), 8192)),
+        ..Cursor::default()
+    };
+    let b = xe_batch(&c, vec![ev("f", 12288, 0), ev("f", 12288, 1)], 2, 2);
+    assert_eq!(
+        (b.next.file.as_deref(), b.next.offset, b.next.skip),
+        (Some("f"), 8192, 2)
+    );
+    assert_eq!(b.next.buffer, Some(("f".to_owned(), 12288)));
+    // Nothing new: the position and the skip stay.
+    let b = xe_batch(&c, Vec::new(), 0, 500);
+    assert_eq!((b.next.offset, b.next.skip), (4096, 1000));
 }

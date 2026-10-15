@@ -64,9 +64,13 @@ pub(crate) const REQUIRED_EVENTS: &[&str] = &[
 pub(crate) const REQUIRED_ACTIONS: i64 = 5;
 
 /// Jitter of `sys.dm_xe_sessions.create_time` between two reads of the
-/// same running session (measured on 2019: 3.3 ms, one `datetime` tick,
-/// back and forth).
-pub(crate) const CREATE_TIME_JITTER_US: i64 = 20_000;
+/// same running session: measured up to 10 ms (three `datetime` ticks,
+/// back and forth) on 2019 and 2025; the tolerance keeps a wide margin. A
+/// restart moves the value by the time the session had run since its
+/// previous start, which the agent observed: a restart of a session that
+/// had run less than this long is not told from jitter (a residual; the
+/// first restart is a gap all the same).
+pub(crate) const CREATE_TIME_JITTER_US: i64 = 500_000;
 
 /// Whether two `create_time` reads are the same start of the session: a
 /// restart moves it by the time the session had run (at least the time
@@ -458,6 +462,7 @@ mod tests {
     #[test]
     fn create_time_jitter_is_not_a_restart() {
         assert!(same_start(1_792_091_423_743_333, 1_792_091_423_746_666));
+        assert!(same_start(1_792_094_790_483_333, 1_792_094_790_493_333));
         assert!(!same_start(1_792_091_423_743_333, 1_792_091_424_743_333));
     }
 

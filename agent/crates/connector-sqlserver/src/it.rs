@@ -1685,6 +1685,21 @@ async fn xe_scenario() {
         Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
     );
 
+    // Statistics the agent's own reads make the server build (on system
+    // base tables, measured on a fresh 2025 server) are server statements
+    // in the agent's sessions that no own rule covers (refinement item 4
+    // pairs a build with a statement naming the same table only): built
+    // before the stream starts, so the test checks the agent's routine
+    // statements on a server that has them (see the lot 3 implementation
+    // notes of ADR-0051).
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }
     let dir = std::env::temp_dir().join(format!("databastion-sqlserver-xe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

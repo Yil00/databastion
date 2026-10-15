@@ -127,17 +127,23 @@ CONVERT(bigint, DATALENGTH(f.event_data))";
 
 /// The first poll of an Extended Events session: from the start of its
 /// file set. `{pattern}` is built from the session's current file
-/// (`XE_SESSION`), a literal (decision 6, M1); `@p3` the row bound.
-pub(crate) const XE_POLL_START: &str = "SELECT TOP (@p3) {columns} FROM \
+/// (`XE_SESSION`), a literal (decision 6, M1); `@p3` the row bound, `@p4`
+/// the events skipped (as [`XE_POLL_FROM`]).
+pub(crate) const XE_POLL_START: &str = "SELECT {columns} FROM \
 sys.fn_xe_file_target_read_file({pattern}, NULL, NULL, NULL) f CROSS APPLY (SELECT CASE WHEN \
-DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d)";
+DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d) ORDER BY (SELECT NULL) \
+OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY";
 
 /// The following polls: after the buffer at `@p2` of the file `@p1`
 /// (measured on 2019: the read starts after that buffer; an offset that is
-/// not a buffer gives error 25722, a missing file 25717).
-pub(crate) const XE_POLL_FROM: &str = "SELECT TOP (@p3) {columns} FROM \
+/// not a buffer gives error 25722, a missing file 25717), the first `@p4`
+/// events skipped on the server (those of the next buffer already
+/// handled: a buffer holds hundreds of events, measured on 2025), at most
+/// `@p3` returned, in file order.
+pub(crate) const XE_POLL_FROM: &str = "SELECT {columns} FROM \
 sys.fn_xe_file_target_read_file({pattern}, NULL, @p1, @p2) f CROSS APPLY (SELECT CASE WHEN \
-DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d)";
+DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d) ORDER BY (SELECT NULL) \
+OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY";
 
 /// The number of columns of an Extended Events poll.
 pub(crate) const XE_POLL_COLUMNS: usize = 5 + XE_SLICES;
@@ -557,7 +563,11 @@ pub(crate) fn own_text(text: &str) -> OwnText {
         }
     }
     // Credit-only forms: decided by the credit (the exact text sent).
-    if text.starts_with("SELECT TOP (") {
+    if text.starts_with("SELECT TOP (")
+        || text
+            .strip_prefix("SELECT ")
+            .is_some_and(|r| r.starts_with(XE_COLUMNS))
+    {
         return OwnText::NeedsCredit;
     }
     OwnText::No

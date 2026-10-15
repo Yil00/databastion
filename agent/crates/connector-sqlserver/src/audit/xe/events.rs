@@ -66,9 +66,10 @@ const LOGIN_FAILURES: &[i64] = &[18_456, 18_452, 18_470, 18_486, 18_487, 18_488]
 
 /// Server builds (`ProductVersion`) where `StatMan` was checked not
 /// callable by users (refinement item 4: by a minimal login and a
-/// `sysadmin`, as a batch and inside `sp_executesql`; measured on
-/// 2026-10-15): the statistics exclusion is on there only.
-pub(crate) const STATMAN_BUILDS: &[&str] = &["15.0.4500.2"];
+/// `sysadmin`, as a batch and inside `sp_executesql`, error 195; measured
+/// on 2026-10-15 on 2019 and 2025 Express): the statistics exclusion is
+/// on there only.
+pub(crate) const STATMAN_BUILDS: &[&str] = &["15.0.4500.2", "17.0.5015.4"];
 
 /// RPCs of the driver protocol, not user procedures (open question 12).
 fn system_rpc(name: &str) -> bool {
