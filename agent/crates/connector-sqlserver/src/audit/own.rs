@@ -691,6 +691,38 @@ mod tests {
         assert!(session_at(t, 74, end + 1, last).is_none());
     }
 
+    /// Lot 2 review follow-up: a foreign session that reuses the SPID at
+    /// once and repeats the agent's **credited** last text inside the
+    /// 250 ms clock tolerance passes the session rule, but finds no credit
+    /// (the agent's own record consumed it): it is reported.
+    #[test]
+    fn a_foreign_repeat_of_a_credited_last_text_is_reported() {
+        let t = "own-test-foreign-repeat";
+        reset(t);
+        let _s = stream_started(t);
+        let now = agent_now_us();
+        let mut h = opened(t, 75, now, 0, None, Instant::now());
+        let sample = "SELECT TOP (5) CONVERT(nvarchar(4000), LEFT([c], 4000)) FROM [d].[s].[t] OPTION (MAXDOP 1)";
+        h.credit(sample, Duration::from_secs(30), None);
+        h.sent(sample);
+        h.end(false, Duration::ZERO);
+        let end = session_at(t, 75, now, "").unwrap().end_us.unwrap();
+        // The agent's own record of it, a few ms after the computed end.
+        assert!(session_at(t, 75, end + 2_500, sample).is_some());
+        assert!(take_credit(t, 75, sample, None, end + 2_500, 0));
+        // The foreign session on the same SPID, 100 ms later, same text:
+        // inside the tolerance, but no credit is left.
+        assert!(session_at(t, 75, end + 100_000, sample).is_some());
+        assert!(
+            !take_credit(t, 75, sample, None, end + 100_000, 0),
+            "a foreign repeat of a credited text must be reported"
+        );
+        // With a transaction id, another execution does not share it either.
+        h.credit(sample, Duration::from_secs(30), None);
+        assert!(take_credit(t, 75, sample, None, end + 1_000, 11));
+        assert!(!take_credit(t, 75, sample, None, end + 100_000, 12));
+    }
+
     #[test]
     fn lost_sessions_get_the_grace() {
         let t = "own-test-lost";

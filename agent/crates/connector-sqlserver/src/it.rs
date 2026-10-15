@@ -1593,3 +1593,498 @@ async fn sys_function_list_matches_the_server() {
         "sys functions not in SYS_FUNCTIONS: {missing:?}"
     );
 }
+
+/// The Extended Events settings of the dev session
+/// (dev/sqlserver/initdb/30-audit.sql).
+const XE: &str = "rls_visibility: view_definition, audit: {source: sqlserver_xevents, xe_session: databastion_xe}";
+
+/// ADR-0051 decision 6, P9-A lot 3: the Extended Events source end to end
+/// against the dev session (the only Audit source on SQL Server 2019). A
+/// dump-like read raises a read of the table with `shape.full_table_read`
+/// and its row count; a failed login is fingerprinted; credential DCL and
+/// password-taking calls never leak their marker; the agent's own
+/// `check()`, Discovery and polls are left out while the same login from
+/// another session is reported; no ground-truth value leaves in the
+/// events; the position survives a restart of the stream.
+#[tokio::test]
+async fn xe_reports_reads_and_leaves_the_agents_own_out() {
+    Box::pin(xe_scenario()).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn xe_scenario() {
+    use databastion_classifiers::masking::{EventAction, MaskedEvent, Signal};
+    use databastion_core::AuditLevel;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    // The Extended Events grant of decision 4 (the dev account holds it on
+    // 2019 already).
+    let grant = if major >= 16 {
+        "VIEW SERVER PERFORMANCE STATE"
+    } else {
+        "VIEW SERVER STATE"
+    };
+    Box::pin(exec(
+        &mut s,
+        &in_db("master", &format!("GRANT {grant} TO databastion")),
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_xdump", &[])).await;
+
+    // `source: auto` with both sources named: SQL Server Audit when usable
+    // (2022+ with its grants), else the session (2019: CONTROL SERVER).
+    {
+        let c2 = SqlserverConnector::new();
+        let both = agent(&format!(
+            "{}, rls_visibility: view_definition, audit: {{audit_name: databastion_audit, \
+             xe_session: databastion_xe}}",
+            own_tls()
+        ));
+        let h = Box::pin(c2.check(&both)).await;
+        eprintln!(
+            "[it] xe, auto: {:?} {:?}",
+            c2.audit_source(&both),
+            codes(&h)
+        );
+        if major < 16 {
+            assert_eq!(
+                c2.audit_source(&both),
+                Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
+            );
+            assert!(has(&h, NoteCode::AuditSqlserverAuditNeedsControlServer));
+        } else {
+            assert_eq!(
+                c2.audit_source(&both),
+                Some(databastion_classifiers::masking::EventSource::SqlserverAudit)
+            );
+        }
+    }
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!("\n[it] xe, no stream: {:?} {:?}", h.audit_level, codes(&h));
+    assert!(h.reachable, "{:?}", h.detail);
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
+    assert!(has(&h, NoteCode::AuditPartialPendingFirstRecord));
+    assert!(!has(&h, NoteCode::AuditXeEventsMissing), "{:?}", codes(&h));
+    assert!(!has(&h, NoteCode::AuditXeSessionFiltered));
+    assert!(!has(&h, NoteCode::AuditXeCausalityOff));
+    assert!(!has(&h, NoteCode::AuditLogWithoutRowCounts));
+    assert_eq!(
+        c.audit_source(&t),
+        Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
+    );
+
+    let dir = std::env::temp_dir().join(format!("databastion-sqlserver-xe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let start = |c: &Arc<SqlserverConnector>| {
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(c);
+        (
+            tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await }),
+            rx,
+        )
+    };
+    let (stream, mut rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+
+    // The agent's own activity while the stream reads.
+    let h = Box::pin(c.check(&t)).await;
+    assert!(!has(&h, NoteCode::PrivilegeRefused), "{:?}", codes(&h));
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }
+
+    // Someone else.
+    let truth = truth();
+    let email = truth["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["engine"] == "sqlserver")
+        .flat_map(|l| l["values"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .find(|v| v.contains('@'))
+        .expect("a ground-truth e-mail");
+    let marker = "XeCredMarker7Zq9";
+    {
+        let mut d = Box::pin(foreign_session(
+            "it_xdump",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT id, customer_id FROM retail.crm.customer_notes",
+            2,
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            &format!(
+                "SELECT id FROM retail.crm.customers WHERE email = N'{}'",
+                email.replace('\'', "''")
+            ),
+            1,
+        ))
+        .await;
+        // A parameterized read (an ORM's RPC): its inner statement keeps
+        // its table.
+        Box::pin(d.rpc(
+            "SELECT TOP (1) id FROM retail.crm.customers WHERE email = @p1",
+            &[crate::tds::Param::NVarChar(email.clone())],
+            Stage::Check,
+            Shape::rows(1, 10),
+            |_| conn::Flow::Continue,
+        ))
+        .await
+        .unwrap();
+        Box::pin(exec_ok(&mut d, "EXEC master.dbo.xp_cmdshell 'whoami'")).await;
+        Box::pin(try_rows(
+            &mut d,
+            &format!(
+                "SELECT TOP (1) id FROM retail.crm.customers WHERE \
+                 ENCRYPTBYPASSPHRASE('{marker}', N'x') IS NOT NULL"
+            ),
+            1,
+        ))
+        .await;
+        d.close().await;
+    }
+    // The agent's login from a session that is not the agent's own.
+    {
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut f,
+            "SELECT TOP (3) email FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        Box::pin(try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1)).await;
+        f.close().await;
+    }
+    // A failed login.
+    {
+        let mut bad = target(
+            "it_no_such_xlogin",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+            own_tls(),
+        );
+        bad.id = "it-foreign".to_owned();
+        let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
+        assert!(
+            Box::pin(conn::connect(
+                &bad,
+                &tls,
+                &TlsChoice::default(),
+                Duration::from_secs(10)
+            ))
+            .await
+            .is_err()
+        );
+    }
+    // Credential DCL in forms the server does not mask itself.
+    Box::pin(drop_login(&mut s, "it_xcred")).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("EXEC sp_addlogin it_xcred, {marker}"),
+    ))
+    .await;
+    Box::pin(exec_ok(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("CREATE CREDENTIAL it_xcred_c WITH IDENTITY = 'i', SECRET = '{marker}'"),
+    ))
+    .await;
+    Box::pin(exec(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
+    Box::pin(drop_login(&mut s, "it_xcred")).await;
+
+    // The session's dispatch latency is 5 s.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!("[it] xe, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+    // The source's grant is expected while the stream uses it.
+    let label = grant.to_lowercase().replace(' ', "_");
+    assert!(
+        !has_label(&h, NoteCode::PrivilegeAuditGrantWithoutAudit, &label),
+        "{:?}",
+        codes(&h)
+    );
+    stream.abort();
+    let _ = stream.await;
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    for e in &events {
+        eprintln!(
+            "[it] xe event {:?} {} {:?} {:?} rows={:?} always={}",
+            e.action(),
+            shown_account(e),
+            names_of(e),
+            e.signals(),
+            e.rows(),
+            e.always_report()
+        );
+    }
+    let by = |who: &str| -> Vec<&MaskedEvent> {
+        events
+            .iter()
+            .filter(|e| e.principal().account_name().eq_ignore_ascii_case(who))
+            .collect()
+    };
+    let dump = by("it_xdump");
+    assert!(
+        dump.iter().any(|e| e.action() == EventAction::Read
+            && names_of(e) == ["retail.crm.customer_notes"]
+            && e.signals().contains(&Signal::FullTableRead)
+            && e.rows().is_some()),
+        "no whole-table read reported"
+    );
+    assert!(
+        dump.iter()
+            .filter(|e| names_of(e) == ["retail.crm.customers"])
+            .count()
+            >= 2,
+        "the filtered read and the parameterized RPC must name their table"
+    );
+    // The ENCRYPTBYPASSPHRASE read: recorded by the server as `-- SELECT`
+    // (measured on 2019), a read of `*`, always reported. The refused
+    // xp_cmdshell leaves no statement event (measured on 2019).
+    assert!(
+        dump.iter().any(|e| e.action() == EventAction::Read
+            && e.always_report()
+            && names_of(e) == ["master.-.*"]),
+        "the password-taking read must be reported"
+    );
+    assert!(
+        events.iter().any(|e| e.action() == EventAction::AuthFailure
+            && !e.principal().send_name()
+            && e.principal().account_name() == "it_no_such_xlogin"),
+        "no failed login reported"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.action() == EventAction::AuthFailure
+                && e.principal().account_name() == "it_no_such_xlogin")
+            .count(),
+        1,
+        "a failed login is counted once"
+    );
+    assert!(
+        by("sa").iter().any(|e| e.action() == EventAction::Dcl),
+        "no DCL reported"
+    );
+    // The agent's login: only the foreign session's statements.
+    let agent_events = by("databastion");
+    assert!(
+        agent_events
+            .iter()
+            .any(|e| names_of(e) == ["retail.crm.customers"]),
+        "the agent's login from another session must be reported"
+    );
+    for e in &agent_events {
+        let ok = e.action() == EventAction::Read
+            && names_of(e).iter().all(|n| {
+                n == "retail.crm.customers"
+                    || n.ends_with(".sys.dm_exec_sessions")
+                    || n.ends_with(".sys.fn_my_permissions")
+                    || n.ends_with(".sys.fn_builtin_permissions")
+            });
+        assert!(
+            ok,
+            "an own statement reported: {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    assert!(agent_events.len() <= 6, "own statements reported");
+    let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe own left out: exact {exact}, sampling {sampling}, polls {polls}");
+    assert!(
+        exact > 10 && sampling >= 5 && polls >= 2,
+        "{exact} {sampling} {polls}"
+    );
+    // I2.
+    let json = databastion_core::test_support::contract_events_json(&events, &key());
+    assert!(json.contains("\"source\":\"sqlserver_xevents\""), "{json}");
+    assert!(!json.contains(marker), "credential DCL leaked");
+    assert!(
+        !json.contains("it_no_such_xlogin"),
+        "failed login name in clear"
+    );
+    for loc in truth["locations"].as_array().unwrap() {
+        for v in loc["values"].as_array().into_iter().flatten() {
+            if let Some(v) = v.as_str().filter(|v| v.len() >= 6) {
+                assert!(!json.contains(v), "a ground-truth value in the events");
+            }
+        }
+    }
+
+    // A restart of the stream: the position is kept.
+    let (stream, mut rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut again = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        again.push(e);
+    }
+    for e in &again {
+        eprintln!(
+            "[it] xe after restart {:?} {} {:?}",
+            e.action(),
+            shown_account(e),
+            names_of(e)
+        );
+    }
+    assert!(
+        !again.iter().any(|e| e
+            .principal()
+            .account_name()
+            .eq_ignore_ascii_case("it_xdump")),
+        "events reported twice after a restart"
+    );
+    assert!(
+        !again.iter().any(|e| e
+            .principal()
+            .account_name()
+            .eq_ignore_ascii_case("databastion")),
+        "the agent's own statements reported after a restart"
+    );
+    // The operator stops and starts the session (decision 6, "Position and
+    // gaps"): whatever happened in between was not recorded, a gap.
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+    let (stream, _rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!(
+        "[it] xe, after a session restart: {:?} {:?}",
+        h.audit_level,
+        codes(&h)
+    );
+    stream.abort();
+    let _ = stream.await;
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
+    assert!(has(&h, NoteCode::AuditRecordsDropped), "{:?}", codes(&h));
+    Box::pin(drop_login(&mut s, "it_xdump")).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`): the
+/// skew between the time a source stamps a statement with (SQL Server
+/// Audit `event_time`, Extended Events `timestamp_utc`) and the server's
+/// `SYSUTCDATETIME()` read just before and just after the statement on the
+/// same session (lot 2 follow-up: the own-session clean end is computed on
+/// `SYSUTCDATETIME()`). Prints the largest overshoot past the "after" time
+/// and the largest lead before the "before" time, in microseconds. Run as
+/// `sa` (2019: reading the audit needs `CONTROL SERVER`).
+#[tokio::test]
+async fn measure_event_time_skew() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let now = "SELECT CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', SYSUTCDATETIME()))";
+    let tag = std::process::id();
+    let mut spans = Vec::new();
+    for i in 0..200u32 {
+        let t0 = s.rows(now, Stage::Check, Shape::rows(1, 1)).await.unwrap()[0][0]
+            .as_int()
+            .unwrap();
+        let q = format!("SELECT TOP (1) id FROM retail.crm.customers WHERE id = -{tag}{i:03}");
+        s.rows(&q, Stage::Check, Shape::rows(1, 1)).await.unwrap();
+        let t1 = s.rows(now, Stage::Check, Shape::rows(1, 1)).await.unwrap()[0][0]
+            .as_int()
+            .unwrap();
+        spans.push((format!("-{tag}{i:03}"), t0, t1));
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let like = format!("%WHERE id = -{tag}%");
+    let sources = [
+        (
+            "sqlserver_audit",
+            format!(
+                "SELECT TOP (1000) CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', event_time)), \
+                 CONVERT(nvarchar(200), statement) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', \
+                 NULL, NULL) WHERE statement LIKE N'{like}'"
+            ),
+        ),
+        (
+            "sqlserver_xevents",
+            format!(
+                "SELECT TOP (1000) CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', timestamp_utc)), \
+                 CONVERT(nvarchar(200), SUBSTRING(event_data, CHARINDEX(N'WHERE id = -', event_data), 40)) \
+                 FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, \
+                 NULL) WHERE object_name = N'sql_statement_completed' AND event_data LIKE N'{like}'"
+            ),
+        ),
+    ];
+    for (name, sql) in sources {
+        let Some(rows) = try_rows(&mut s, &sql, 2).await else {
+            eprintln!("[it] skew {name}: not readable");
+            continue;
+        };
+        let (mut over, mut lead, mut n) = (i64::MIN, i64::MIN, 0);
+        for r in &rows {
+            let at = r[0].as_int().unwrap();
+            let text = r[1].as_text().unwrap_or_default();
+            if let Some((_, t0, t1)) = spans.iter().find(|(k, _, _)| {
+                text.contains(&format!("= {k}")) && !text.contains(&format!("= {k}0"))
+            }) {
+                over = over.max(at - t1);
+                lead = lead.max(t0 - at);
+                n += 1;
+            }
+        }
+        eprintln!(
+            "[it] skew {name}: {n} statements, largest overshoot past the next SYSUTCDATETIME() {over} us, largest lead before the previous one {lead} us"
+        );
+    }
+}

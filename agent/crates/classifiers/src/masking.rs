@@ -964,6 +964,9 @@ pub enum EventSource {
     /// SQL Server Audit, `FILE` target, read through
     /// `sys.fn_get_audit_file` (ADR-0051 decision 6).
     SqlserverAudit,
+    /// SQL Server Extended Events session, `event_file` target, read
+    /// through `sys.fn_xe_file_target_read_file` (ADR-0051 decision 6).
+    SqlserverXevents,
 }
 
 impl EventSource {
@@ -987,6 +990,7 @@ impl EventSource {
             Self::RedisAclLog => "redis_acl_log",
             Self::RedisSync => "redis_sync",
             Self::SqlserverAudit => "sqlserver_audit",
+            Self::SqlserverXevents => "sqlserver_xevents",
         }
     }
 

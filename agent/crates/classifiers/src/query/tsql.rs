@@ -1,13 +1,19 @@
-//! T-SQL statement analysis for the SQL Server Audit source (ADR-0051
-//! decision 6, "Statement text"; the T-SQL counterpart of the MySQL mode
-//! of ADR-0023 decision 4).
+//! T-SQL statement analysis for the SQL Server Audit and Extended Events
+//! sources (ADR-0051 decision 6, "Statement text"; the T-SQL counterpart
+//! of the MySQL mode of ADR-0023 decision 4).
 //!
 //! The `statement` of a SQL Server Audit record is the text of the
-//! statement a permission check belongs to. The agent never sends it (the
-//! contract has no field for it): [`analyze_tsql`] reduces it to a
-//! statement kind and a closed set of flags, and names only objects of
-//! closed lists ([`TsqlAnalysis::listed`]). The objects of an event come
-//! from the audit record itself, never from the text.
+//! statement a permission check belongs to; the `statement` of an
+//! Extended Events statement event is the text of one statement. The agent
+//! never sends either (the contract has no field for it): [`analyze_tsql`]
+//! reduces it to a statement kind, a closed set of flags, the objects of
+//! closed lists ([`TsqlAnalysis::listed`]) and the names of the tables it
+//! reads or writes ([`TsqlAnalysis::relations`], identifier tokens only).
+//! On SQL Server Audit the objects of an event come from the audit record
+//! itself, never from the text; on Extended Events, whose events carry no
+//! object list, from [`TsqlAnalysis::relations`] (decision 6: "its
+//! statements name objects only through their text"), with `*` when they
+//! are not complete.
 //!
 //! - **Password-bearing statements** (the #82 rule, decision 6, M6) are
 //!   recognized from their first tokens only ([`TsqlAnalysis::credential`]):
@@ -111,6 +117,53 @@ pub struct TsqlAnalysis {
     /// statement-text, credential-bearing and value-bearing objects of
     /// decision 6): canonical names from those lists, never text.
     pub listed: Vec<&'static str>,
+    /// The tables (and views, synonyms) a DML statement or an `EXEC`
+    /// names, as written (identifier tokens only, never a literal), for
+    /// the Extended Events source, whose events carry no object list
+    /// (decision 6: "its statements name objects only through their
+    /// text"). Common table expressions, aliases, table variables and
+    /// `#temp` tables are left out. Empty unless [`Self::usable`].
+    pub relations: Vec<TsqlRelation>,
+    /// [`Self::relations`] holds every table the statement reads or
+    /// writes, as far as the text tells: `false` when a table position
+    /// holds something else than a name (an unqualified call that is not a
+    /// rowset built-in, a table-valued function of a user schema, a text
+    /// pointer statement), at [`MAX_RELATIONS`], or when the text is not
+    /// usable. A caller that must name every object adds `*`.
+    pub relations_complete: bool,
+    /// The text holds comments only (no token), though not blank: what
+    /// SQL Server's Extended Events record in place of a password-bearing
+    /// statement (`-- CREATE LOGIN`, `-- sp_addlinkedsrvlogin`, measured
+    /// on 2019 and 2022).
+    pub comment_only: bool,
+    /// A write target of the statement (`INSERT`, `UPDATE`, `DELETE`,
+    /// `MERGE`, `INTO`) is a table, not a table variable or a `#temp`
+    /// table (`INSERT INTO @t SELECT …` only reads). Set with
+    /// [`Self::relations`].
+    pub writes_table: bool,
+}
+
+/// Most relations kept per statement.
+pub const MAX_RELATIONS: usize = 64;
+
+/// A relation named by a T-SQL statement: its parts as written, the
+/// database and schema when the name is qualified (three-part and
+/// two-part names). Names are metadata but may embed values: never
+/// printed as is, and normalized before they leave the agent.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TsqlRelation {
+    /// Database, from a three-part name.
+    pub database: Option<String>,
+    /// Schema, from a two- or three-part name.
+    pub schema: Option<String>,
+    /// Table, view, synonym or procedure name.
+    pub name: String,
+}
+
+impl std::fmt::Debug for TsqlRelation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TsqlRelation(<redacted>)")
+    }
 }
 
 impl TsqlAnalysis {
@@ -128,6 +181,10 @@ impl TsqlAnalysis {
             four_part: false,
             shape: None,
             listed: Vec::new(),
+            relations: Vec::new(),
+            relations_complete: false,
+            comment_only: false,
+            writes_table: false,
         }
     }
 
@@ -456,14 +513,37 @@ const AGGREGATES: &[&str] = &[
     "grouping",
 ];
 
+/// An identifier: lowercased for every comparison, and as written (the
+/// names of [`TsqlAnalysis::relations`]). Both bounded and zeroized on drop.
+#[derive(Clone, PartialEq, Eq)]
+struct Name {
+    lower: Zeroizing<String>,
+    raw: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.lower)
+    }
+}
+
+impl Name {
+    fn new(s: &str) -> Self {
+        Self {
+            lower: bounded_lower(s),
+            raw: Zeroizing::new(s.chars().take(MAX_WORD_CHARS).collect()),
+        }
+    }
+}
+
 /// A lexical token. Literal content is never kept; identifiers are
-/// lowercased and zeroized on drop.
+/// zeroized on drop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
-    /// Unquoted identifier or keyword (also `#temp`), lowercased.
-    Word(Zeroizing<String>),
-    /// `[…]`, unescaped and lowercased.
-    Bracket(Zeroizing<String>),
+    /// Unquoted identifier or keyword (also `#temp`).
+    Word(Name),
+    /// `[…]`, unescaped.
+    Bracket(Name),
     /// `"…"`: a string or an identifier (unknown `QUOTED_IDENTIFIER`).
     DQuoted,
     /// `'…'`, `N'…'`, `0x…`, a money or decimal literal.
@@ -479,15 +559,23 @@ enum Tok {
 impl Tok {
     fn word(&self) -> Option<&str> {
         match self {
-            Self::Word(w) => Some(w.as_str()),
+            Self::Word(w) => Some(w.lower.as_str()),
             _ => None,
         }
     }
 
-    /// An identifier, quoted or not.
+    /// An identifier, quoted or not (lowercased).
     fn ident(&self) -> Option<&str> {
         match self {
-            Self::Word(w) | Self::Bracket(w) => Some(w.as_str()),
+            Self::Word(w) | Self::Bracket(w) => Some(w.lower.as_str()),
+            _ => None,
+        }
+    }
+
+    /// An identifier as written.
+    fn raw(&self) -> Option<&str> {
+        match self {
+            Self::Word(w) | Self::Bracket(w) => Some(w.raw.as_str()),
             _ => None,
         }
     }
@@ -567,15 +655,14 @@ impl<'a> Lexer<'a> {
     }
 
     /// Reads a bracketed identifier (after `[`).
-    fn bracket(&mut self) -> Option<Zeroizing<String>> {
+    fn bracket(&mut self) -> Option<Name> {
         let mut out = Zeroizing::new(String::new());
         while let Some((_, c)) = self.chars.next() {
             if c == ']' {
                 if self.peek_char() == Some(']') {
                     self.chars.next();
                 } else {
-                    let lower = bounded_lower(&out);
-                    return Some(lower);
+                    return Some(Name::new(&out));
                 }
             }
             if out.chars().count() < MAX_WORD_CHARS {
@@ -700,7 +787,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let word = self.text.get(i..end).unwrap_or_default();
-                return Ok(Tok::Word(bounded_lower(word)));
+                return Ok(Tok::Word(Name::new(word)));
             }
             return Ok(Tok::Punct(c));
         }
@@ -852,7 +939,36 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
         a.lexed = false;
         return a;
     }
+    if toks.is_empty() && !text.trim().is_empty() {
+        let mut a = TsqlAnalysis::kind_only(placeholder_kind(text));
+        a.lexed = true;
+        a.comment_only = true;
+        return a;
+    }
     analyze_tokens(&toks, kind)
+}
+
+/// The kind a comment-only text names when it is exactly the server's
+/// placeholder for a statement it does not record (`-- SELECT`, `-- CREATE
+/// LOGIN`, `-- sp_addlinkedsrvlogin`: one or two words of letters and `_`
+/// after `--`, measured on 2019); [`TsqlKind::Other`] for any other
+/// comment. Only those words are read.
+fn placeholder_kind(text: &str) -> TsqlKind {
+    let Some(body) = text.trim().strip_prefix("--") else {
+        return TsqlKind::Other;
+    };
+    let words: Vec<&str> = body.split_ascii_whitespace().collect();
+    let plain = |w: &&str| {
+        !w.is_empty() && w.len() <= 64 && w.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
+    };
+    if words.is_empty() || words.len() > 2 || !words.iter().all(plain) || body.contains('\n') {
+        return TsqlKind::Other;
+    }
+    let lower: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    kind_of(
+        lower.first().map(String::as_str),
+        lower.get(1).map(String::as_str),
+    )
 }
 
 /// The lexer stopped at the name of a password-taking procedure (the last
@@ -1250,7 +1366,570 @@ fn analyze_tokens(toks: &[Tok], kind: TsqlKind) -> TsqlAnalysis {
     if kind == TsqlKind::Select {
         a.shape = Some(select_shape(toks));
     }
+    if matches!(
+        kind,
+        TsqlKind::Select | TsqlKind::Write | TsqlKind::Execute | TsqlKind::Other
+    ) {
+        let (relations, complete, writes) = relations(toks);
+        a.relations = relations;
+        a.relations_complete = complete;
+        a.writes_table = writes;
+    }
     a
+}
+
+/// Rowset functions of the server that read no table: an unqualified call
+/// of one in a table position is not a relation.
+const ROWSET_BUILTINS: &[&str] = &["openjson", "string_split", "generate_series", "openxml"];
+
+/// Words that end a `FROM` clause at their depth.
+const FROM_END: &[&str] = &[
+    "where",
+    "group",
+    "having",
+    "order",
+    "union",
+    "except",
+    "intersect",
+    "option",
+    "for",
+    "window",
+    "select",
+    "set",
+    "values",
+    "output",
+    "when",
+];
+
+/// Words that cannot be an alias after a table name.
+const NOT_ALIAS: &[&str] = &[
+    "where",
+    "group",
+    "having",
+    "order",
+    "union",
+    "except",
+    "intersect",
+    "option",
+    "for",
+    "window",
+    "select",
+    "set",
+    "values",
+    "output",
+    "join",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "outer",
+    "cross",
+    "on",
+    "with",
+    "using",
+    "when",
+    "tablesample",
+    "pivot",
+    "unpivot",
+    "as",
+    "into",
+    "from",
+    "exec",
+    "execute",
+    "default",
+    "top",
+];
+
+/// Statements whose `FROM` names no table (cursors), or that read through
+/// a text pointer (`READTEXT t.c …`: the table is a column qualifier).
+const NO_RELATION_HEADS: &[&str] = &["fetch", "close", "deallocate", "open"];
+const TEXT_POINTER_HEADS: &[&str] = &["readtext", "writetext", "updatetext"];
+
+/// The parts of a dotted name at `i`, as written: (parts, index after).
+fn dotted_raw(toks: &[Tok], i: usize) -> (Vec<Option<&str>>, usize) {
+    let mut parts = Vec::new();
+    let mut j = i;
+    loop {
+        match toks.get(j) {
+            Some(t) if t.name_like() => {
+                parts.push(t.raw());
+                j += 1;
+            }
+            _ => break,
+        }
+        while toks.get(j).is_some_and(|t| t.punct('.'))
+            && toks.get(j + 1).is_some_and(|t| t.punct('.'))
+        {
+            parts.push(None);
+            j += 1;
+        }
+        if toks.get(j).is_some_and(|t| t.punct('.')) && toks.get(j + 1).is_some_and(Tok::name_like)
+        {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    (parts, j)
+}
+
+/// Skips `TOP (n) [PERCENT]` / `TOP n` at `i`; the index after it.
+fn skip_top(toks: &[Tok], i: usize) -> usize {
+    if !toks.get(i).is_some_and(|t| t.is("top")) {
+        return i;
+    }
+    let mut j = i + 1;
+    if toks.get(j).is_some_and(|t| t.punct('(')) {
+        j = close_paren(toks, j) + 1;
+    } else {
+        j += 1;
+    }
+    if toks.get(j).is_some_and(|t| t.is("percent")) {
+        j += 1;
+    }
+    j
+}
+
+/// The index of the main statement's keyword: 0, or the first top-level
+/// DML keyword after a `WITH` list of common table expressions; and the
+/// names those expressions define (lowercased).
+fn main_statement(toks: &[Tok]) -> (usize, Vec<String>) {
+    let mut i = 0;
+    while toks.get(i).is_some_and(|t| t.punct(';')) {
+        i += 1;
+    }
+    if !toks.get(i).is_some_and(|t| t.is("with")) {
+        return (i, Vec::new());
+    }
+    let mut ctes = Vec::new();
+    let mut depth = 0usize;
+    let mut expect_name = true;
+    let mut j = i + 1;
+    while let Some(t) = toks.get(j) {
+        if t.punct('(') {
+            depth += 1;
+        } else if t.punct(')') {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 {
+            if t.punct(',') {
+                expect_name = true;
+            } else if expect_name {
+                if let Some(n) = t.ident() {
+                    ctes.push(n.to_owned());
+                }
+                expect_name = false;
+            } else if let Some(w) = t.word()
+                && matches!(w, "select" | "insert" | "update" | "delete" | "merge")
+            {
+                return (j, ctes);
+            }
+        }
+        j += 1;
+    }
+    (toks.len(), ctes)
+}
+
+/// The relations of a lexed statement ([`TsqlAnalysis::relations`]),
+/// whether they are complete, and whether a write target is a table.
+#[allow(clippy::too_many_lines)]
+fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
+    let mut out: Vec<(TsqlRelation, bool)> = Vec::new();
+    let mut complete = true;
+    let mut writes = false;
+    let head = toks.iter().find_map(Tok::word);
+    if head.is_some_and(|h| NO_RELATION_HEADS.contains(&h)) {
+        return (Vec::new(), true, false);
+    }
+    if head.is_some_and(|h| TEXT_POINTER_HEADS.contains(&h)) {
+        return (Vec::new(), false, true);
+    }
+    let (main, ctes) = main_statement(toks);
+    let mut aliases: Vec<String> = Vec::new();
+    // Per depth: a `SELECT` / `DELETE` / `UPDATE` seen (a `FROM` then
+    // names tables; `TRIM(x FROM y)` does not), and in its FROM clause.
+    let mut has_query: Vec<bool> = vec![false];
+    let mut in_from: Vec<bool> = vec![false];
+    // The next name is a table: (a write target that may be an alias, a
+    // target followed by a column list rather than a call, a write target).
+    let mut expect: Option<(bool, bool, bool)> = None;
+    // The write target of `UPDATE` / `DELETE` (it may be an alias).
+    let mut alias_target: Option<String> = None;
+    let mut i = 0usize;
+    while let Some(t) = toks.get(i) {
+        let depth = has_query.len() - 1;
+        if t.punct('(') {
+            // A derived table or a subquery in a table position: its own
+            // FROM names the tables.
+            expect = None;
+            has_query.push(false);
+            in_from.push(false);
+            i += 1;
+            continue;
+        }
+        if t.punct(')') {
+            if has_query.len() > 1 {
+                has_query.pop();
+                in_from.pop();
+            }
+            expect = None;
+            i += 1;
+            continue;
+        }
+        if t.punct(';') {
+            expect = None;
+            if let (Some(q), Some(f)) = (has_query.last_mut(), in_from.last_mut()) {
+                *q = false;
+                *f = false;
+            }
+            i += 1;
+            continue;
+        }
+        if t.is("exec") || t.is("execute") {
+            // The procedure (a relation of the statement); its arguments
+            // are values, skipped to the end of the statement.
+            let mut j = i + 1;
+            if matches!(toks.get(j), Some(Tok::Var(_)))
+                && toks.get(j + 1).is_some_and(|u| u.punct('='))
+            {
+                j += 2;
+            }
+            if toks.get(j).is_some_and(Tok::name_like) {
+                let (parts, after) = dotted_raw(toks, j);
+                let last = toks.get(after.saturating_sub(1)).and_then(Tok::ident);
+                if parts.len() <= 3 && last != Some("sp_executesql") {
+                    push_relation(&mut out, &parts, false, &mut complete);
+                }
+                j = after;
+            }
+            while let Some(u) = toks.get(j) {
+                if u.punct(';') || u.word().is_some_and(statement_start) {
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            expect = None;
+            continue;
+        }
+        if let Some(w) = t.word() {
+            let at_main = i == main;
+            match w {
+                "select" => {
+                    has_query[depth] = true;
+                    in_from[depth] = false;
+                    expect = None;
+                    i += 1;
+                    continue;
+                }
+                "receive" => {
+                    has_query[depth] = true;
+                    i += 1;
+                    continue;
+                }
+                "from" if has_query[depth] => {
+                    in_from[depth] = true;
+                    let carried = expect.is_some_and(|e| e.0);
+                    expect = Some((carried, false, carried));
+                    i += 1;
+                    continue;
+                }
+                "join" | "apply" | "using" => {
+                    expect = Some((false, false, false));
+                    i += 1;
+                    continue;
+                }
+                "into" => {
+                    expect = Some((false, true, true));
+                    i += 1;
+                    continue;
+                }
+                "update" | "delete" | "insert" | "merge" if at_main => {
+                    has_query[depth] = true;
+                    let mut j = skip_top(toks, i + 1);
+                    if w == "update" && toks.get(j).is_some_and(|u| u.is("statistics")) {
+                        j += 1;
+                    }
+                    // `DELETE FROM`, `INSERT INTO`, `MERGE INTO`: the
+                    // following word names the target.
+                    expect = Some((w != "insert", w != "delete", true));
+                    i = j;
+                    continue;
+                }
+                _ => {}
+            }
+            if FROM_END.contains(&w) {
+                in_from[depth] = false;
+                expect = None;
+                i += 1;
+                continue;
+            }
+            if expect.is_some() && w == "top" {
+                i = skip_top(toks, i);
+                continue;
+            }
+        }
+        if t.punct(',') && in_from[depth] && expect.is_none() {
+            expect = Some((false, false, false));
+            i += 1;
+            continue;
+        }
+        if let Some((write_target, column_list, write_pos)) = expect {
+            expect = None;
+            if matches!(t, Tok::Var(_)) {
+                // A table variable.
+                i += 1;
+                continue;
+            }
+            if t.name_like() {
+                let (parts, after) = dotted_raw(toks, i);
+                let lower: Vec<Option<&str>> = toks
+                    .get(i..after)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|u| u.name_like())
+                    .map(Tok::ident)
+                    .collect();
+                if !column_list && toks.get(after).is_some_and(|u| u.punct('(')) {
+                    // A call in a table position: a rowset built-in, a
+                    // `sys` function (listed or not), or user code.
+                    match lower.as_slice() {
+                        [Some(n)] if ROWSET_BUILTINS.contains(n) || REMOTE_WORDS.contains(n) => {}
+                        // A `sys` function read as a table
+                        // (`sys.fn_my_permissions(…)`): named.
+                        [.., Some("sys"), Some(n)] if SYS_FUNCTIONS.contains(n) => {
+                            push_relation(&mut out, &parts, false, &mut complete);
+                        }
+                        _ => complete = false,
+                    }
+                    i = after;
+                    continue;
+                }
+                let temp = parts
+                    .last()
+                    .copied()
+                    .flatten()
+                    .is_some_and(|n| n.starts_with('#'));
+                let single = lower.len() == 1;
+                let cte = single && lower[0].is_some_and(|n| ctes.iter().any(|c| c == n));
+                if !temp && !cte && parts.len() <= 3 {
+                    push_relation(&mut out, &parts, write_target && single, &mut complete);
+                    if write_pos {
+                        if write_target && single {
+                            alias_target = lower[0].map(str::to_owned);
+                        } else {
+                            writes = true;
+                        }
+                    }
+                }
+                // An alias after the name.
+                let mut k = after;
+                if toks.get(k).is_some_and(|u| u.is("as")) {
+                    k += 1;
+                }
+                if let Some(a) = toks.get(k).and_then(Tok::ident)
+                    && !(matches!(toks.get(k), Some(Tok::Word(_))) && NOT_ALIAS.contains(&a))
+                {
+                    aliases.push(a.to_owned());
+                    k += 1;
+                }
+                i = k.max(after);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // A write target that is an alias of a FROM item (`UPDATE c SET … FROM
+    // crm.customers c`) names that item, already kept.
+    let mut kept: Vec<TsqlRelation> = Vec::new();
+    let is_alias = |n: &str| aliases.iter().any(|a| *a == n.to_lowercase());
+    for (r, maybe_alias) in out {
+        if maybe_alias && r.schema.is_none() && is_alias(&r.name) {
+            continue;
+        }
+        if !kept.contains(&r) {
+            kept.push(r);
+        }
+    }
+    // An `UPDATE` / `DELETE` target that is not an alias is a table; an
+    // alias names a FROM item that is a table (variables and `#temp`
+    // tables are never aliased into the kept list).
+    if alias_target.is_some() {
+        writes = true;
+    }
+    (kept, complete, writes)
+}
+
+fn push_relation(
+    out: &mut Vec<(TsqlRelation, bool)>,
+    parts: &[Option<&str>],
+    maybe_alias: bool,
+    complete: &mut bool,
+) {
+    let Some(name) = parts.last().copied().flatten() else {
+        *complete = false;
+        return;
+    };
+    if out.len() >= MAX_RELATIONS {
+        *complete = false;
+        return;
+    }
+    let n = parts.len();
+    let part = |k: usize| {
+        n.checked_sub(k)
+            .and_then(|i| parts.get(i).copied().flatten())
+            .map(str::to_owned)
+    };
+    out.push((
+        TsqlRelation {
+            database: if n >= 3 { part(3) } else { None },
+            schema: if n >= 2 { part(2) } else { None },
+            name: name.to_owned(),
+        },
+        maybe_alias,
+    ));
+}
+
+/// Hints the server's statistics statements carry in `OPTION (…)`.
+const STATMAN_HINTS: &[&str] = &["maxdop"];
+
+/// The table of an automatic statistics statement (refinement item 4 of
+/// ADR-0051, condition 2): the text matches, token by token over the whole
+/// text, the server's grammar `SELECT StatMan([SC0], …) FROM (SELECT TOP
+/// 100 PERCENT <[column] AS [SCn], …> FROM [schema].[table] WITH
+/// (READUNCOMMITTED) [TABLESAMPLE SYSTEM (<number> PERCENT)] [ORDER BY
+/// [SCn], …]) AS _MS_UPDSTATS_TBL [OPTION (MAXDOP <n>)]` (captured on SQL
+/// Server 2019 15.0.4500.2 and 2022 16.0.4305.5). Returns (schema, table)
+/// as written; `None` for any other token, a cut text, or a text that does
+/// not lex. Filtered statistics (`WHERE`) are not in the captured forms.
+#[must_use]
+pub fn statman_table(text: &str) -> Option<(String, String)> {
+    if text.len() > 64 * 1024 {
+        return None;
+    }
+    let mut lexer = Lexer::new(text);
+    let mut toks = Vec::new();
+    loop {
+        match lexer.next_tok() {
+            Ok(t) => {
+                toks.push(t);
+                if toks.len() > 4096 {
+                    return None;
+                }
+            }
+            Err(LexEnd::Done) => break,
+            Err(LexEnd::Failed) => return None,
+        }
+    }
+    let mut p = 0usize;
+    let word = |p: &mut usize, w: &str| -> Option<()> {
+        toks.get(*p).filter(|t| t.is(w))?;
+        *p += 1;
+        Some(())
+    };
+    let punct = |p: &mut usize, c: char| -> Option<()> {
+        toks.get(*p).filter(|t| t.punct(c))?;
+        *p += 1;
+        Some(())
+    };
+    // `[SCn]`.
+    let alias = |p: &mut usize| -> Option<()> {
+        match toks.get(*p) {
+            Some(Tok::Bracket(n))
+                if n.lower.strip_prefix("sc").is_some_and(|d| {
+                    !d.is_empty() && d.len() <= 4 && d.bytes().all(|b| b.is_ascii_digit())
+                }) =>
+            {
+                *p += 1;
+                Some(())
+            }
+            _ => None,
+        }
+    };
+    let bracketed = |p: &mut usize| -> Option<String> {
+        match toks.get(*p) {
+            Some(Tok::Bracket(n)) => {
+                *p += 1;
+                Some(n.raw.to_string())
+            }
+            _ => None,
+        }
+    };
+    word(&mut p, "select")?;
+    word(&mut p, "statman")?;
+    punct(&mut p, '(')?;
+    loop {
+        alias(&mut p)?;
+        if punct(&mut p, ',').is_none() {
+            break;
+        }
+    }
+    punct(&mut p, ')')?;
+    word(&mut p, "from")?;
+    punct(&mut p, '(')?;
+    word(&mut p, "select")?;
+    word(&mut p, "top")?;
+    match toks.get(p) {
+        Some(Tok::Int(100)) => p += 1,
+        _ => return None,
+    }
+    word(&mut p, "percent")?;
+    loop {
+        bracketed(&mut p)?;
+        word(&mut p, "as")?;
+        alias(&mut p)?;
+        if punct(&mut p, ',').is_none() {
+            break;
+        }
+    }
+    word(&mut p, "from")?;
+    let schema = bracketed(&mut p)?;
+    punct(&mut p, '.')?;
+    let table = bracketed(&mut p)?;
+    word(&mut p, "with")?;
+    punct(&mut p, '(')?;
+    word(&mut p, "readuncommitted")?;
+    punct(&mut p, ')')?;
+    if word(&mut p, "tablesample").is_some() {
+        word(&mut p, "system")?;
+        punct(&mut p, '(')?;
+        match toks.get(p) {
+            Some(Tok::Int(_) | Tok::Literal) => p += 1,
+            _ => return None,
+        }
+        word(&mut p, "percent")?;
+        punct(&mut p, ')')?;
+    }
+    if word(&mut p, "order").is_some() {
+        word(&mut p, "by")?;
+        loop {
+            alias(&mut p)?;
+            if punct(&mut p, ',').is_none() {
+                break;
+            }
+        }
+    }
+    punct(&mut p, ')')?;
+    word(&mut p, "as")?;
+    word(&mut p, "_ms_updstats_tbl")?;
+    if word(&mut p, "option").is_some() {
+        punct(&mut p, '(')?;
+        loop {
+            let hint = toks.get(p).and_then(Tok::word)?;
+            if !STATMAN_HINTS.contains(&hint) {
+                return None;
+            }
+            p += 1;
+            match toks.get(p) {
+                Some(Tok::Int(_)) => p += 1,
+                _ => return None,
+            }
+            if punct(&mut p, ',').is_none() {
+                break;
+            }
+        }
+        punct(&mut p, ')')?;
+    }
+    (p == toks.len()).then_some((schema, table))
 }
 
 /// The shape of the main `SELECT` (top level): filter, aggregation, a
@@ -1644,6 +2323,218 @@ mod tests {
         assert_eq!(an("GRANT SELECT ON t TO u").kind, TsqlKind::Dcl);
         assert_eq!(an("DROP TABLE t").kind, TsqlKind::Ddl);
     }
+
+    /// `db.schema.name` of each relation (`-` for a missing part).
+    fn rel(t: &str) -> (Vec<String>, bool) {
+        let a = an(t);
+        (
+            a.relations
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}.{}.{}",
+                        r.database.as_deref().unwrap_or("-"),
+                        r.schema.as_deref().unwrap_or("-"),
+                        r.name
+                    )
+                })
+                .collect(),
+            a.relations_complete,
+        )
+    }
+
+    #[test]
+    fn relations_of_dml_and_exec() {
+        for (t, want) in [
+            (
+                "SELECT TOP (2) id FROM retail.crm.Customers WHERE id > 3",
+                vec!["retail.crm.Customers"],
+            ),
+            (
+                "SELECT c.id FROM crm.customers c JOIN [crm].[Customer Notes] AS n ON n.cid = c.id, crm.cards",
+                vec!["-.crm.customers", "-.crm.Customer Notes", "-.crm.cards"],
+            ),
+            (
+                "SELECT a FROM t1 WHERE b IN (SELECT b FROM t2) AND EXISTS (SELECT 1 FROM db..t3)",
+                vec!["-.-.t1", "-.-.t2", "db.-.t3"],
+            ),
+            (
+                "WITH c AS (SELECT id FROM crm.customers), d (x) AS (SELECT 1) SELECT * FROM c JOIN d ON 1 = 1",
+                vec!["-.crm.customers"],
+            ),
+            (
+                "UPDATE c SET name = N'x' FROM crm.customers c WHERE c.id = 1",
+                vec!["-.crm.customers"],
+            ),
+            (
+                "UPDATE TOP (5) crm.customers SET a = 1",
+                vec!["-.crm.customers"],
+            ),
+            (
+                "DELETE FROM crm.customers WHERE id = @p1",
+                vec!["-.crm.customers"],
+            ),
+            ("DELETE TOP (10) crm.customers", vec!["-.crm.customers"]),
+            (
+                "INSERT INTO crm.archive (a, b) SELECT a, b FROM crm.customers",
+                vec!["-.crm.archive", "-.crm.customers"],
+            ),
+            ("INSERT crm.archive VALUES (1, 'x')", vec!["-.crm.archive"]),
+            (
+                "MERGE INTO crm.t AS tgt USING crm.s AS src ON tgt.id = src.id WHEN MATCHED THEN UPDATE SET a = 1;",
+                vec!["-.crm.t", "-.crm.s"],
+            ),
+            (
+                "SELECT id INTO #tmp FROM crm.customers; SELECT * FROM #tmp",
+                vec!["-.crm.customers"],
+            ),
+            ("SELECT * FROM @tv", vec![]),
+            (
+                "SELECT TRIM(' ' FROM name) FROM crm.customers",
+                vec!["-.crm.customers"],
+            ),
+            (
+                "EXEC dbo.get_customers @id = 5",
+                vec!["-.dbo.get_customers"],
+            ),
+            (
+                "INSERT INTO crm.a EXEC crm.p 1, 'x'",
+                vec!["-.crm.a", "-.crm.p"],
+            ),
+            (
+                "SELECT * FROM crm.customers WITH (NOLOCK) WHERE 1 = 1",
+                vec!["-.crm.customers"],
+            ),
+            (
+                "IF EXISTS (SELECT 1 FROM crm.flags) PRINT 'x'",
+                vec!["-.crm.flags"],
+            ),
+            ("SET NOCOUNT ON", vec![]),
+            ("FETCH NEXT FROM cur INTO @a", vec![]),
+            (
+                "DECLARE c CURSOR FOR SELECT a FROM crm.t FOR UPDATE OF a",
+                vec!["-.crm.t"],
+            ),
+            ("SELECT * FROM OPENJSON(@j) WITH (a int)", vec![]),
+            (
+                "SELECT t.text FROM sys.dm_exec_query_stats s CROSS APPLY sys.dm_exec_sql_text(s.sql_handle) t",
+                vec!["-.sys.dm_exec_query_stats", "-.sys.dm_exec_sql_text"],
+            ),
+            (
+                "SELECT permission_name FROM sys.fn_my_permissions(NULL, 'SERVER')",
+                vec!["-.sys.fn_my_permissions"],
+            ),
+        ] {
+            let (got, complete) = rel(t);
+            assert_eq!(got, want, "{t}");
+            assert!(complete, "{t}");
+        }
+    }
+
+    #[test]
+    fn write_targets() {
+        for (t, writes) in [
+            ("INSERT INTO crm.archive SELECT * FROM crm.customers", true),
+            (
+                "INSERT INTO @t SELECT a FROM sys.fn_builtin_permissions(@c)",
+                false,
+            ),
+            ("INSERT #t VALUES (1)", false),
+            ("UPDATE crm.customers SET a = 1", true),
+            ("UPDATE c SET a = 1 FROM crm.customers c", true),
+            ("UPDATE @t SET a = 1", false),
+            ("DELETE FROM crm.customers", true),
+            ("DELETE FROM #t", false),
+            (
+                "MERGE crm.t USING crm.s ON 1 = 1 WHEN MATCHED THEN DELETE;",
+                true,
+            ),
+            ("SELECT a INTO crm.copy FROM crm.customers", true),
+            ("SELECT a INTO #copy FROM crm.customers", false),
+            ("SELECT a FROM crm.customers", false),
+        ] {
+            assert_eq!(an(t).writes_table, writes, "{t}");
+        }
+    }
+
+    #[test]
+    fn incomplete_relations() {
+        for t in [
+            "SELECT * FROM GetCustomers(1)",
+            "SELECT * FROM crm.customers c CROSS APPLY dbo.f(c.id) x",
+            "SELECT * FROM CONTAINSTABLE(crm.notes, body, 'x')",
+            "READTEXT crm.notes.body @ptr 0 100",
+            "SELECT 'abc",
+        ] {
+            assert!(!rel(t).1, "{t}");
+        }
+        let many: Vec<String> = (0..=MAX_RELATIONS).map(|i| format!("t{i}")).collect();
+        let (got, complete) = rel(&format!("SELECT 1 FROM {}", many.join(", ")));
+        assert_eq!(got.len(), MAX_RELATIONS);
+        assert!(!complete);
+        // Literals and comments never become relations.
+        let (got, _) = rel("SELECT 1 FROM t /* FROM secret_table */ WHERE x = 'FROM other'");
+        assert_eq!(got, ["-.-.t"]);
+        // DDL and DCL keep their kind only.
+        assert!(an("DROP TABLE crm.customers").relations.is_empty());
+        assert!(
+            an("CREATE LOGIN x WITH PASSWORD = 'p'")
+                .relations
+                .is_empty()
+        );
+        // A comment-only text: the server's placeholder for a password
+        // statement.
+        let a = an("-- CREATE LOGIN");
+        assert!(a.comment_only && a.relations.is_empty());
+        assert_eq!(a.kind, TsqlKind::Ddl);
+        assert_eq!(an("-- SELECT").kind, TsqlKind::Select);
+        assert_eq!(an("-- sp_addlinkedsrvlogin").kind, TsqlKind::Other);
+        assert_eq!(an("-- SELECT 'x' and more").kind, TsqlKind::Other);
+        assert_eq!(an("/* SELECT */").kind, TsqlKind::Other);
+        assert!(!an("   ").comment_only);
+        assert!(!an("SELECT 1 -- x").comment_only);
+    }
+
+    #[test]
+    fn statman_grammar_is_exact() {
+        // Captured on 2019 (15.0.4500.2) and 2022 (16.0.4305.5).
+        let captured = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM \
+            [crm].[customers] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+        assert_eq!(
+            statman_table(captured),
+            Some(("crm".to_owned(), "customers".to_owned()))
+        );
+        for ok in [
+            "SELECT StatMan([SC0], [SC1]) FROM (SELECT TOP 100 PERCENT [a] AS [SC0], [b] AS [SC1] \
+             FROM [s].[t] WITH (READUNCOMMITTED) ORDER BY [SC0], [SC1]) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [a] AS [SC0] FROM [s].[t] WITH \
+             (READUNCOMMITTED) TABLESAMPLE SYSTEM (2.5e+001 PERCENT) ORDER BY [SC0]) AS _MS_UPDSTATS_TBL \
+             OPTION (MAXDOP 1)",
+        ] {
+            assert!(statman_table(ok).is_some(), "{ok}");
+        }
+        for bad in [
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED) WHERE [id] > 1 ORDER BY [SC0]) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED) ORDER BY [SC0]) AS _MS_UPDSTATS_TBL; SELECT * FROM crm.cards",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             JOIN [crm].[cards] ON 1 = 1 WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT dbo.f([id]) AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL OPTION (RECOMPILE)",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 99 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM crm.customers \
+             WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL",
+            "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM [crm].[customers] \
+             WITH (READUNCOMMITTED)) AS _MS_UPDSTATS_TBL /* unterminated",
+            "",
+        ] {
+            assert!(statman_table(bad).is_none(), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1685,6 +2576,31 @@ mod proptests {
             let a = analyze_tsql(&format!("{head}{tail}"), false);
             prop_assert!(a.credential);
             prop_assert!(a.listed.is_empty() && a.shape.is_none() && !a.usable());
+        }
+
+        /// The statistics grammar (refinement item 4): no text with
+        /// anything after the server's statement but blanks, comments or
+        /// its `OPTION` clause is accepted.
+        #[test]
+        fn statman_needs_the_whole_grammar(tail in "\\PC{1,60}") {
+            // Anything after the captured statement (but whitespace and
+            // comments) fails the rule.
+            let base = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM \
+                [crm].[customers] WITH (READUNCOMMITTED) ORDER BY [SC0]) AS _MS_UPDSTATS_TBL";
+            let t = format!("{base} {tail}");
+            let mut lexer = Lexer::new(&tail);
+            let blank = matches!(lexer.next_tok(), Err(LexEnd::Done));
+            if statman_table(&t).is_some() {
+                prop_assert!(blank || tail.trim_start().to_lowercase().starts_with("option"));
+            }
+        }
+
+        /// Literal content never becomes a relation.
+        #[test]
+        fn relations_never_hold_literal_content(inner in "[a-z]{1,12}") {
+            let t = format!("SELECT a FROM t WHERE b = '{inner}' AND c = N'{inner}x'");
+            let a = analyze_tsql(&t, false);
+            prop_assert!(a.relations.iter().all(|r| r.name == "t"));
         }
 
         /// Arguments of `EXEC` are never names. The generator has no letter

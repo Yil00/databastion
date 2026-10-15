@@ -30,6 +30,7 @@ fn cursor_round_trips() {
         pattern: Some(P1.to_owned()),
         after: Some(((134_365_416_940_740_000, 0), 4096)),
         history_us: Some(17),
+        session: Some(1_800_000_000_000_000),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
     assert_eq!(
@@ -107,7 +108,7 @@ fn a_large_buffer_is_walked_record_by_record() {
         let top = 16 + c.skip as usize;
         let read: Vec<Record> = buffer.iter().take(top).cloned().collect();
         let returned = read.len();
-        let b = batch(&c, read, returned, top);
+        let b = batch(&c, read, returned, top, file_key);
         seen.extend(b.kept.iter().map(|r| r.time_us));
         c = b.next;
         if !b.full {
@@ -135,7 +136,13 @@ fn a_new_file_set_is_read_whole() {
         assert!(on_pattern(&mut c, &pat(new)), "a gap");
         assert_eq!(c.file, None);
         assert_eq!(c.after, None);
-        let b = batch(&c, vec![at(&f(new, 1), 4096), at(&f(new, 1), 8192)], 2, 10);
+        let b = batch(
+            &c,
+            vec![at(&f(new, 1), 4096), at(&f(new, 1), 8192)],
+            2,
+            10,
+            file_key,
+        );
         assert_eq!(
             b.kept.len(),
             2,
@@ -162,7 +169,7 @@ fn a_refused_position_skips_what_was_read() {
         pattern: Some(P1.to_owned()),
         ..Cursor::default()
     };
-    on_bad_position(&mut c);
+    on_bad_position(&mut c, file_key);
     assert_eq!(c.file, None);
     assert_eq!(c.after, Some(((500, 0), 8192)));
     let recs = vec![
@@ -171,7 +178,7 @@ fn a_refused_position_skips_what_was_read() {
         at(&f(folder, 500), 12_288),
         at(&f(folder, 600), 4096),
     ];
-    let b = batch(&c, recs, 4, 10);
+    let b = batch(&c, recs, 4, 10, file_key);
     let kept: Vec<(i64, i64)> = b
         .kept
         .iter()
@@ -183,7 +190,7 @@ fn a_refused_position_skips_what_was_read() {
         "the filter ends after a read that is not full"
     );
     // A full read that has not passed the position keeps the filter.
-    let b = batch(&c, vec![at(&f(folder, 400), 4096)], 1, 1);
+    let b = batch(&c, vec![at(&f(folder, 400), 4096)], 1, 1, file_key);
     assert!(b.kept.is_empty());
     assert_eq!(b.next.after, c.after);
 }
@@ -199,7 +206,7 @@ fn an_oversized_buffer_is_a_gap() {
     };
     let top = BATCH + MAX_SKIP as usize;
     let recs: Vec<Record> = (0..top).map(|_| at("f1", 8192)).collect();
-    let b = batch(&c, recs, top, top);
+    let b = batch(&c, recs, top, top, file_key);
     assert!(b.gap);
     assert_eq!(
         (b.next.file.as_deref(), b.next.offset, b.next.skip),
@@ -216,4 +223,50 @@ fn ausc_records_are_gaps() {
     assert_eq!(records::map("AUSF", "A"), records::Mapped::Restart);
     let s = records::group(vec![rec("AL", "A", "", "a", "ALTER SERVER AUDIT a")]);
     assert!(records::is_audit_change(&s[0]));
+}
+
+/// Extended Events positions: files ordered by their key (timestamp, then
+/// `<n>`), never by path; a refused position in the same set reads from
+/// the oldest file and leaves out what was read (lot 2 review H1).
+#[test]
+fn xe_positions_follow_the_file_key() {
+    let f = |ts: i64| format!("/var/opt/mssql/xe/databastion_xe_0_{ts}.xel");
+    let mut c = Cursor {
+        file: Some(f(134_365_650_237_540_000)),
+        offset: 8192,
+        pattern: Some("N'/var/opt/mssql/xe/databastion_xe_0_*.xel'".to_owned()),
+        session: Some(1),
+        ..Cursor::default()
+    };
+    on_bad_position(&mut c, crate::sql::xe_file_key);
+    assert_eq!(c.file, None);
+    assert_eq!(c.after, Some(((134_365_650_237_540_000, 0), 8192)));
+    let at = |file: &str, offset: i64| {
+        let mut r = rec("SL", "U", "crm", "customers", "x");
+        r.file = file.to_owned();
+        r.offset = offset;
+        r
+    };
+    let b = batch(
+        &c,
+        vec![
+            at(&f(134_365_650_237_540_000), 4096),
+            at(&f(134_365_650_237_540_000), 8192),
+            at(&f(134_365_650_237_540_000), 12288),
+            at(&f(134_365_660_000_000_000), 4096),
+        ],
+        4,
+        10,
+        crate::sql::xe_file_key,
+    );
+    let kept: Vec<(String, i64)> = b.kept.iter().map(|r| (r.file.clone(), r.offset)).collect();
+    assert_eq!(
+        kept,
+        vec![
+            (f(134_365_650_237_540_000), 12288),
+            (f(134_365_660_000_000_000), 4096)
+        ]
+    );
+    assert_eq!(b.next.after, None);
+    assert_eq!(b.next.session, Some(1), "the session's start is kept");
 }

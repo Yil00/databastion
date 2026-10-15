@@ -19,6 +19,48 @@ proptest! {
         crate::fuzz_entry::prelogin_wrap(&data);
         crate::fuzz_entry::tsql(&data);
         crate::fuzz_entry::audit_records(&data);
+        crate::fuzz_entry::xe_event_xml(&data);
+        crate::fuzz_entry::xe_records(&data);
+    }
+
+    /// The Extended Events XML reader on text (not bytes): never panics,
+    /// keeps a statement of any content exactly (entities and CDATA
+    /// decoded), and never keeps more than its bounds.
+    #[test]
+    fn xe_statement_round_trips(stmt in "\\PC{0,300}") {
+        let esc = stmt.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let x = format!(
+            "<event name=\"sql_statement_completed\"><data name=\"statement\"><value>{esc}</value></data></event>"
+        );
+        let e = crate::audit::xe::xml::parse(&x).unwrap();
+        prop_assert_eq!(e.statement.as_deref().map(String::as_str), Some(stmt.as_str()));
+        // CDATA keeps the text as is, split around `]]>`.
+        let cdata = stmt.replace("]]>", "]]]]><![CDATA[>");
+        let x = format!(
+            "<event name=\"sp_statement_completed\"><data name=\"statement\"><value><![CDATA[{cdata}]]></value></data></event>"
+        );
+        let e = crate::audit::xe::xml::parse(&x).unwrap();
+        prop_assert_eq!(e.statement.as_deref().map(String::as_str), Some(stmt.as_str()));
+    }
+
+    /// Whatever the statement text, the conversion never puts it in an
+    /// event: the JSON of the event holds no part of a literal.
+    #[test]
+    fn xe_events_never_carry_literals(secret in "[A-Za-z0-9]{12,24}", which in 0usize..6) {
+        let text = [
+            format!("SELECT id FROM crm.customers WHERE email = N'{secret}'"),
+            format!("UPDATE crm.customers SET note = '{secret}' WHERE id = 1"),
+            format!("EXEC sp_addlogin jane, {secret}"),
+            format!("CREATE LOGIN jane WITH PASSWORD = '{secret}'"),
+            format!("SELECT ENCRYPTBYPASSPHRASE('{secret}', a) FROM crm.customers"),
+            format!("EXEC crm.p @a = N'{secret}'"),
+        ][which].clone();
+        let r = crate::audit::xe::events::tests::stmt("sql_statement_completed", &text, 1, "51");
+        if let Some((ev, _)) = crate::audit::xe::events::convert(&r) {
+            let key = std::sync::Arc::new(databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap());
+            let json = databastion_core::test_support::contract_events_json(&[ev], &key);
+            prop_assert!(!json.contains(&secret));
+        }
     }
 
     /// The template matcher accepts a statement of the closed set filled
