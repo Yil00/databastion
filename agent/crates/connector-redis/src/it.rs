@@ -913,13 +913,20 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
         // at connect time (the engine-matrix flake: a paced Discovery that
         // fell between two polls).
         for _ in 0..3 {
-            let (mut s, _) = crate::node::open(
+            let (mut s, info) = crate::node::open(
                 &t,
                 crate::node::Which::Target,
                 std::time::Duration::from_secs(5),
             )
             .await
             .unwrap();
+            // Its address was recorded at connect time (not vacuous
+            // without NAT: the local address alone would not do before
+            // the server was seen to report it unchanged).
+            assert!(
+                crate::audit::own::is_seen(&t.id, s.hello.id.unwrap(), info.run),
+                "{name}: own address not recorded at connect time"
+            );
             let r = s
                 .call(
                     &crate::cmd::Cmd::Scan { cursor: 0 },

@@ -537,3 +537,69 @@ fn a_full_registry_forgets_closed_connections_first() {
     assert!(own::is_own_open_id(t, 1, run));
     drop(held);
 }
+
+/// Review L4(c), L4(d): an own session's address counts from its connect
+/// to 2 s after its close (entry times have a one-second granularity), not
+/// before nor later: an entry 3 s after the close, or 3 s before the
+/// connect, is reported (another client on the same address, or a reused
+/// port).
+#[test]
+fn an_own_address_counts_within_the_sessions_lifetime_only() {
+    let (cfg, target, state) = stream_parts();
+    let run = Some(55);
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new(
+            "databastion",
+            None,
+            None,
+            1000,
+            state.audit.own_usage("own-t"),
+        ),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run,
+    };
+    let db = NormalizedName::wildcard();
+    let secs = |t: SystemTime| {
+        i64::try_from(t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()).unwrap()
+    };
+    // Connected 30 s ago, closed now.
+    let connected = SystemTime::now() - Duration::from_secs(30);
+    let r = own::register("own-t", 41, None, run, connected);
+    own::seen("own-t", 41, run, "172.18.0.1:40141".parse().unwrap());
+    let before_close = SystemTime::now();
+    drop(r);
+    let after_close = SystemTime::now();
+    let mut ev = |ts: i64| {
+        st.log_event(
+            &entry(
+                1,
+                ts,
+                &[b"SCAN", b"0", b"COUNT", b"500"],
+                "172.18.0.1:40141",
+            ),
+            EventSource::RedisSlowlog,
+            &db,
+            &[],
+            secs(after_close),
+            0,
+        )
+    };
+    // Close + 2 s (the entry's second is at or before the close's): own.
+    assert!(ev(secs(before_close) + 2).is_none());
+    // Close + 3 s (rounded up): reported.
+    let late = ev(secs(after_close) + 4).expect("after the close's margin");
+    assert!(principal(&late).1);
+    assert!(ev(secs(after_close) + 3).is_some());
+    // During the session: own.
+    assert!(ev(secs(connected) + 1).is_none());
+    // 3 s before the connect: reported.
+    assert!(ev(secs(connected) - 3).is_some());
+}

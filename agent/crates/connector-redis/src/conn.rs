@@ -70,8 +70,9 @@ impl Session {
         password: &str,
         timeout: Duration,
     ) -> Result<Self, RdError> {
-        let started = std::time::SystemTime::now();
         let io = endpoint.open(tls).await?;
+        // Connected, before the first command (review L1).
+        let started = std::time::SystemTime::now();
         let mut s = Self {
             io,
             pending: Vec::new(),
@@ -125,13 +126,19 @@ impl Session {
     /// Records the address the server reports for this registered
     /// connection (`CLIENT LIST ID <own id>`), so its slow-log entries are
     /// recognized as the agent's even once it is closed and no `CLIENT
-    /// LIST` of the Audit stream saw it open. Sent only when the account is
-    /// known to hold `+client|list` on the target's node and the address
-    /// is not recorded yet; a refusal clears that knowledge (no second
-    /// try). A transport failure is returned (the session is unusable).
+    /// LIST` of the Audit stream saw it open. Sent at most once per
+    /// session, only while an Audit stream reads the target's logs and the
+    /// account is known to hold `+client|list` ([`own::should_learn`]).
+    /// An error reply is recorded (a `NOPERM` is sticky for the server run,
+    /// any other error stops the command for the run); a transport failure
+    /// or a timeout too, and is returned: the session's stream may be out
+    /// of step, so the caller must not reuse it.
+    ///
+    /// [`own::should_learn`]: crate::audit::own::should_learn
     pub(crate) async fn learn_own_address(
         &mut self,
         target_id: &str,
+        account: &str,
         timeout: Duration,
     ) -> Result<(), RdError> {
         use crate::audit::own;
@@ -139,25 +146,22 @@ impl Session {
         let Some(id) = self.hello.id else {
             return Ok(());
         };
-        if self.own.is_none()
-            || !own::learns_addresses(target_id)
-            || own::is_seen(target_id, id, run)
-        {
+        if self.own.is_none() || !own::should_learn(target_id, id, run, account) {
             return Ok(());
         }
-        let reply = self
+        match self
             .call(&Cmd::ClientListId(id), timeout, Stage::SessionSetup)
-            .await?;
-        match reply.error() {
-            Some(ErrorWord::Noperm) => own::set_client_list(target_id, false),
-            Some(_) => {}
-            None => {
-                if let Some(addr) = crate::audit::entries::own_address(&reply, id) {
-                    own::seen(target_id, id, run, addr);
-                }
+            .await
+        {
+            Ok(reply) => {
+                own::record_own_line(target_id, id, run, account, &reply);
+                Ok(())
+            }
+            Err(e) => {
+                own::note_client_list(target_id, run, account, own::ClientList::Unsupported);
+                Err(e)
             }
         }
-        Ok(())
     }
 
     /// Sends one command and reads its reply. Error replies are returned

@@ -692,6 +692,9 @@ pub(crate) async fn audit_stream(
         .target()
         .ok_or_else(|| target_error(FailureCode::Internal))?;
     let _running = state.audit.started(&target.id);
+    // Sessions to the target's node learn their address only while this
+    // stream reads its logs (ADR-0052 decision 4).
+    let _reading = own::audit_started(&target.id);
     let settings = target.redis_settings();
     let (mut session, info) = node::open(target, Which::Target, POLL_TIMEOUT)
         .await
@@ -915,11 +918,21 @@ async fn poll(
             match list.error() {
                 Some(ErrorWord::Noperm) => {
                     refused.2 = true;
-                    own::set_client_list(&target_id, false);
+                    own::note_client_list(
+                        &target_id,
+                        st.run,
+                        &st.target.account,
+                        own::ClientList::Refused,
+                    );
                 }
                 // The agent's other sessions may ask for their own line
                 // (`own`).
-                None => own::set_client_list(&target_id, true),
+                None => own::note_client_list(
+                    &target_id,
+                    st.run,
+                    &st.target.account,
+                    own::ClientList::Granted,
+                ),
                 Some(_) => {}
             }
             match text(server)
