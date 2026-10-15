@@ -15,7 +15,7 @@ Planned for the next minor release (0.8.0). Phase 9 is in progress: the entries 
 - **Upgrade the console before the agents**, as for every release. An agent of this release keeps Redis / Valkey items spooled until its console lists `engine.redis` and `engine.valkey` ([ADR-0042](docs/adr/0042-hold-items-of-unlisted-engines.md)).
 
 ### ✨ Features
-- **Redis / Valkey connector (phase 9, P9-B, [ADR-0052](docs/adr/0052-redis-valkey-connector.md); #237, #239).** Discovery and a Limited Audit for Redis 6.2.7+ and Valkey 7.2+. 6.2.7 is a provisional floor, pending the maintainer's decision on the ADR-0052 refinement. Redis 6.2 runs only with the local opt-in `redis.unevaluated_acl: accept`.
+- **Redis / Valkey connector (phase 9, P9-B, [ADR-0052](docs/adr/0052-redis-valkey-connector.md); #237, #239).** Discovery and a Limited Audit for Redis 6.2.7+ and Valkey 7.2+. The 6.2.7 floor comes from the ADR-0052 refinement of 2026-10-14, accepted on 2026-10-15. Redis 6.2 runs only with the local opt-in `redis.unevaluated_acl: accept`.
   - **Client and transport**: the agent's own bounded RESP3 client. `AUTH`, then `HELLO 3` without credentials. TLS `verify_full` by default; cleartext only on a Unix socket (server uid checked) or a loopback address.
   - **Account checks**: the ACL user's rights are evaluated with `ACL DRYRUN`, never `ACL GETUSER`. Accounts that can run a refusal-list command (`CONFIG SET`, `MODULE LOAD`, scripting, `ACL SETUSER`, `REPLICAOF`, `MIGRATE`…) are refused.
   - **Discovery**: a bounded `SCAN` walk with local filtering against the declared `redis.key_patterns`, and bounded sampling per type. Key names leave the agent only as normalized key patterns (`user:*:email`); values found in names are reported under `#key` / `#field`.

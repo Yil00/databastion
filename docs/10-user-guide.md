@@ -163,7 +163,7 @@ A console older than the `cas` engine (it does not list `engine.cas`) shows no C
 ### Redis / Valkey targets
 **In development, not released yet**: the connector is merged on `dev` (phase 9) and is not in 0.7.0. It needs a console that lists the `engine.redis` and `engine.valkey` capabilities; until then the agent keeps the items spooled. Redis and Valkey are mainly Discovery engines: Audit is Limited at best ([08-engine-capabilities.md](08-engine-capabilities.md#redis--valkey-audit)).
 
-Supported: Redis 6.2.7 and later (6.2.7 is a provisional floor, pending the maintainer's decision) and Valkey 7.2 and later. Declare one node per target, with `engine: redis` or `engine: valkey`, a named ACL user as `account` (never `default`) and its password as `secret`:
+Supported: Redis 6.2.7 and later and Valkey 7.2 and later. Declare one node per target, with `engine: redis` or `engine: valkey`, a named ACL user as `account` (never `default`) and its password as `secret`:
 
 ```yaml
 targets:
