@@ -134,6 +134,26 @@ pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Reads a private file of at most `max` bytes (see [`open_private`]):
+/// at most `max + 1` bytes are ever read, so a large file planted in the
+/// state directory costs no more than that. A larger file is refused.
+pub(crate) fn read_private_bounded(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let file = open_private(path)?;
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    if len > max {
+        return Err(denied("state file is too large"));
+    }
+    // One more byte than allowed, to detect a file that grew meanwhile.
+    let mut out = Vec::with_capacity(len.min(max).saturating_add(1));
+    let n = file
+        .take(u64::try_from(max.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut out)?;
+    if n > max {
+        return Err(denied("state file is too large"));
+    }
+    Ok(out)
+}
+
 /// Reads a private file of at most `max` bytes into a zeroizing buffer
 /// allocated once (no reallocation leaves unzeroized copies of a secret).
 /// A larger file is refused.

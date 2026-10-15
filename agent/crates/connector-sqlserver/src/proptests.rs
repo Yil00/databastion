@@ -16,6 +16,7 @@ proptest! {
         crate::fuzz_entry::token_stream(&data);
         crate::fuzz_entry::packets(&data);
         crate::fuzz_entry::plp(&data);
+        crate::fuzz_entry::prelogin_wrap(&data);
     }
 
     #[test]
@@ -109,4 +110,27 @@ proptest! {
             }
         }
     }
+}
+
+/// Re-review R5: the `PreloginWrap` fuzz entry over a well-formed exchange
+/// (both oracles see data), then a refused header.
+#[test]
+fn prelogin_wrap_fuzz_entry_runs_a_handshake() {
+    use crate::tds;
+    let hello = tds::frame(tds::ptype::PRELOGIN, b"server-hello", 512);
+    let mut input = vec![4u8];
+    input.extend([2, u8::try_from(hello.len()).unwrap()]);
+    input.extend(&hello);
+    input.extend([3, 5, 3, 20]);
+    input.extend([0, 12]);
+    input.extend(b"client-hello");
+    input.extend([1, 0, 4, 2]);
+    input.extend([5, 0, 0, 3]);
+    input.extend(b"raw");
+    input.extend([1, 0, 4, 1]);
+    crate::fuzz_entry::prelogin_wrap(&input);
+    // A packet of another type: the read fails and the run ends.
+    let mut input = vec![4u8, 2, 8, 0x17, 3, 3, 0, 20, 0, 0, 0, 3, 7];
+    input.extend([0, 1, b'x']);
+    crate::fuzz_entry::prelogin_wrap(&input);
 }

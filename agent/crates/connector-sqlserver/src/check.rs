@@ -257,18 +257,19 @@ fn texts(rows: &[Vec<Value>], col: usize) -> Vec<String> {
         .collect()
 }
 
-/// Evaluates the account (decision 4) in every accessible database.
-pub(crate) async fn evaluate(
-    s: &mut Session,
-    target: &TargetConfig,
-) -> Result<Evaluation, SsError> {
-    let settings = target.sqlserver_settings();
-    let mut ev = Evaluation::default();
-    // Effective server permissions.
-    let perms = s
-        .rows(sql::SERVER_PERMISSIONS, Stage::Check, Shape::rows(1, 513))
-        .await?;
-    let perms: BTreeSet<String> = texts(&perms, 0).into_iter().collect();
+/// Most server permission and server grant rows evaluated: the reads ask
+/// for one more (`TOP (513)`), and a 513th row means the list was cut
+/// (re-review R2).
+pub(crate) const MAX_SERVER_ROWS: usize = 512;
+
+/// The effective server permissions (`sql::SERVER_PERMISSIONS`) against
+/// the refusal, Audit and expected lists. A cut list marks the evaluation
+/// incomplete (fail closed), as the database-level reads do.
+fn server_permissions(rows: &[Vec<Value>], ev: &mut Evaluation) {
+    if rows.len() > MAX_SERVER_ROWS {
+        ev.incomplete.insert("more than 512 server permissions");
+    }
+    let perms: BTreeSet<String> = texts(rows, 0).into_iter().collect();
     for p in &perms {
         if SERVER_REFUSED.contains(&p.as_str()) {
             ev.refused.insert(p.clone());
@@ -279,6 +280,44 @@ pub(crate) async fn evaluate(
         }
     }
     ev.server_perms = perms;
+}
+
+/// The securable-level server grants (`sql::SERVER_GRANTS`): refused
+/// principal-class grants and grant options. A cut list marks the
+/// evaluation incomplete (fail closed).
+fn server_grants(rows: &[Vec<Value>], ev: &mut Evaluation) {
+    if rows.len() > MAX_SERVER_ROWS {
+        ev.incomplete.insert("more than 512 server grants");
+    }
+    for row in rows {
+        let name = row.first().and_then(Value::as_text).unwrap_or_default();
+        let state = row.get(1).and_then(Value::as_text).unwrap_or_default();
+        let class = row.get(2).and_then(Value::as_int).unwrap_or(-1);
+        let to_public = row.get(3).and_then(Value::as_int) == Some(1);
+        if class == CLASS_SERVER_PRINCIPAL && PRINCIPAL_REFUSED.contains(&name) {
+            ev.refused.insert(name.to_owned());
+        } else if state == "W" && !to_public {
+            ev.grant_option = true;
+        }
+    }
+}
+
+/// Evaluates the account (decision 4) in every accessible database.
+pub(crate) async fn evaluate(
+    s: &mut Session,
+    target: &TargetConfig,
+) -> Result<Evaluation, SsError> {
+    let settings = target.sqlserver_settings();
+    let mut ev = Evaluation::default();
+    // Effective server permissions.
+    let perms = s
+        .rows(
+            sql::SERVER_PERMISSIONS,
+            Stage::Check,
+            Shape::rows(1, MAX_SERVER_ROWS + 1),
+        )
+        .await?;
+    server_permissions(&perms, &mut ev);
     // Server roles.
     let roles = s
         .rows(
@@ -299,19 +338,13 @@ pub(crate) async fn evaluate(
     }
     // Securable-level server grants.
     let grants = s
-        .rows(sql::SERVER_GRANTS, Stage::Check, Shape::rows(4, 513))
+        .rows(
+            sql::SERVER_GRANTS,
+            Stage::Check,
+            Shape::rows(4, MAX_SERVER_ROWS + 1),
+        )
         .await?;
-    for row in &grants {
-        let name = row.first().and_then(Value::as_text).unwrap_or_default();
-        let state = row.get(1).and_then(Value::as_text).unwrap_or_default();
-        let class = row.get(2).and_then(Value::as_int).unwrap_or(-1);
-        let to_public = row.get(3).and_then(Value::as_int) == Some(1);
-        if class == CLASS_SERVER_PRINCIPAL && PRINCIPAL_REFUSED.contains(&name) {
-            ev.refused.insert(name.to_owned());
-        } else if state == "W" && !to_public {
-            ev.grant_option = true;
-        }
-    }
+    server_grants(&grants, &mut ev);
     // The merged password_hash probe (refinement item 1).
     match s
         .rows(sql::PASSWORD_HASH_PROBE, Stage::Check, Shape::rows(1, 1))
@@ -1041,6 +1074,47 @@ mod tests {
         ] {
             assert!(l.contains(&want.to_owned()), "{want}: {l:?}");
         }
+    }
+
+    /// Re-review R2: a cut server permission or grant list (513 rows for
+    /// `TOP (513)`) blocks, as the database-level reads do; 512 rows do
+    /// not.
+    #[test]
+    fn cut_server_lists_are_incomplete() {
+        let perm = |i: usize| vec![Value::Text(format!("PERM {i}"))];
+        let grant = |i: usize| {
+            vec![
+                Value::Text(format!("PERM {i}")),
+                Value::Text("G".into()),
+                Value::Int(100),
+                Value::Int(0),
+            ]
+        };
+        let full: Vec<Vec<Value>> = (0..MAX_SERVER_ROWS).map(perm).collect();
+        let mut ev = Evaluation::default();
+        server_permissions(&full, &mut ev);
+        assert!(ev.incomplete.is_empty() && !ev.blocks());
+        assert_eq!(ev.server_perms.len(), MAX_SERVER_ROWS);
+        let cut: Vec<Vec<Value>> = (0..=MAX_SERVER_ROWS).map(perm).collect();
+        let mut ev = Evaluation::default();
+        server_permissions(&cut, &mut ev);
+        assert!(ev.incomplete.contains("more than 512 server permissions"));
+        assert!(ev.blocks());
+        let full: Vec<Vec<Value>> = (0..MAX_SERVER_ROWS).map(grant).collect();
+        let mut ev = Evaluation::default();
+        server_grants(&full, &mut ev);
+        assert!(!ev.blocks());
+        let cut: Vec<Vec<Value>> = (0..=MAX_SERVER_ROWS).map(grant).collect();
+        let mut ev = Evaluation::default();
+        server_grants(&cut, &mut ev);
+        assert!(ev.incomplete.contains("more than 512 server grants"));
+        assert!(ev.blocks() && !ev.is_refused());
+        // A refused right in a cut list is still refused.
+        let mut cut = cut;
+        cut.push(vec![Value::Text("CONTROL SERVER".into())]);
+        let mut ev = Evaluation::default();
+        server_permissions(&cut, &mut ev);
+        assert!(ev.is_refused() && !ev.incomplete.is_empty());
     }
 
     #[test]

@@ -73,6 +73,149 @@ pub fn prelogin_tls_framing(data: &[u8]) {
     }
 }
 
+/// The TDS 7.x TLS handshake adapter ([`crate::tls::PreloginWrap`]),
+/// driven over an in-memory duplex stream by the input (re-review R5):
+/// a capacity byte, then operations of two bytes (operation, length), the
+/// writes followed by their data:
+///
+/// - 0: the client writes `length` bytes through the adapter;
+/// - 1: the client flushes;
+/// - 2: the server sends `length` raw bytes (well-formed `PRELOGIN`
+///   packets or not);
+/// - 3: the client reads at most `length + 1` bytes through the adapter;
+/// - 4: the server reads at most `16 * length + 1` bytes;
+/// - 5: the handshake ends (`pass_through`).
+///
+/// Polled once per operation with a no-op waker (no runtime): `Pending`
+/// is a valid outcome. It must never panic nor hang, and while the framing
+/// is on, what the client reads is a prefix of the payloads of the
+/// server's valid packets, and what the server receives is `PRELOGIN`
+/// packets whose payloads are a prefix of what the client wrote.
+pub fn prelogin_wrap(data: &[u8]) {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    let Some((&first, mut ops)) = data.split_first() else {
+        return;
+    };
+    let (client, mut server) = tokio::io::duplex(16 + usize::from(first) * 64);
+    let mut wrap = crate::tls::PreloginWrap::new(client);
+    let mut cx = Context::from_waker(Waker::noop());
+    // What the server sent, what the client read through the adapter,
+    // what the client wrote into it and what reached the server.
+    let mut fed = Vec::new();
+    let mut read = Vec::new();
+    let mut written = Vec::new();
+    let mut on_wire = Vec::new();
+    let mut framing = true;
+    while let [op, len, rest @ ..] = ops {
+        let len = usize::from(*len);
+        ops = rest;
+        match op % 6 {
+            0 | 2 => {
+                let (chunk, tail) = ops.split_at(len.min(ops.len()));
+                ops = tail;
+                let polled = if op % 6 == 0 {
+                    Pin::new(&mut wrap).poll_write(&mut cx, chunk)
+                } else {
+                    Pin::new(&mut server).poll_write(&mut cx, chunk)
+                };
+                match polled {
+                    Poll::Ready(Ok(n)) => {
+                        assert!(n <= chunk.len());
+                        let done = chunk.get(..n).unwrap_or_default();
+                        if op % 6 == 2 {
+                            fed.extend_from_slice(done);
+                        } else if framing {
+                            written.extend_from_slice(done);
+                        }
+                    }
+                    Poll::Ready(Err(_)) => return,
+                    Poll::Pending => {}
+                }
+            }
+            1 => {
+                if let Poll::Ready(Err(_)) = Pin::new(&mut wrap).poll_flush(&mut cx) {
+                    return;
+                }
+            }
+            3 | 4 => {
+                let mut space = vec![0u8; if op % 6 == 3 { len + 1 } else { 16 * len + 1 }];
+                let mut buf = ReadBuf::new(&mut space);
+                let polled = if op % 6 == 3 {
+                    Pin::new(&mut wrap).poll_read(&mut cx, &mut buf)
+                } else {
+                    Pin::new(&mut server).poll_read(&mut cx, &mut buf)
+                };
+                match polled {
+                    // A refused packet header: the session is dropped.
+                    Poll::Ready(Err(_)) => return,
+                    Poll::Ready(Ok(())) if op % 6 == 3 => {
+                        if framing {
+                            read.extend_from_slice(buf.filled());
+                        }
+                    }
+                    Poll::Ready(Ok(())) => on_wire.extend_from_slice(buf.filled()),
+                    Poll::Pending => {}
+                }
+            }
+            _ => {
+                wrap.pass_through();
+                framing = false;
+            }
+        }
+        if framing {
+            assert!(
+                unwrapped(&fed).starts_with(&read),
+                "read bytes that are not packet payloads"
+            );
+            assert!(
+                written.starts_with(&sent_payloads(&on_wire)),
+                "sent bytes that were not written"
+            );
+        }
+    }
+}
+
+/// The payloads of the valid handshake packets at the start of `wire` (a
+/// last packet may be partial), up to the first invalid header.
+fn unwrapped(wire: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = wire;
+    while let Some(h) = rest.get(..tds::HEADER) {
+        let mut header = [0u8; tds::HEADER];
+        header.copy_from_slice(h);
+        let Ok(n) = crate::tls::handshake_header(&header) else {
+            break;
+        };
+        let body = rest.get(tds::HEADER..).unwrap_or_default();
+        out.extend_from_slice(body.get(..n.min(body.len())).unwrap_or_default());
+        rest = body.get(n..).unwrap_or_default();
+    }
+    out
+}
+
+/// The payloads of the packets the adapter sent: every packet must be a
+/// `PRELOGIN` packet of at most the default packet size, with a payload.
+fn sent_payloads(wire: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = wire;
+    while let Some(h) = rest.get(..tds::HEADER) {
+        let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
+        assert_eq!(h[0], ptype::PRELOGIN, "a handshake packet of another type");
+        assert!(
+            len > tds::HEADER && len <= tds::DEFAULT_PACKET,
+            "a handshake packet of {len} bytes"
+        );
+        let body = rest.get(tds::HEADER..).unwrap_or_default();
+        let n = len - tds::HEADER;
+        out.extend_from_slice(body.get(..n.min(body.len())).unwrap_or_default());
+        rest = body.get(n..).unwrap_or_default();
+    }
+    out
+}
+
 /// PLP reassembly: one `nvarchar(max)` column, the input as its PLP body.
 pub fn plp(data: &[u8]) {
     let mut stream = vec![

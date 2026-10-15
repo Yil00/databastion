@@ -9,7 +9,18 @@
 //! - `SQLSERVER_DATABASTION_PASSWORD`, `SQLSERVER_SA_PASSWORD` (dev/.env);
 //! - `SQLSERVER_PORT` (default 1433);
 //! - `DATABASTION_IT_SQLSERVER_THROWAWAY`: the fake password of the
-//!   throwaway logins the tests create ([`PW`]).
+//!   throwaway logins the tests create ([`PW`]);
+//! - `DATABASTION_DEV_SQLSERVER_FORCE_STRICT=1` when the server forces
+//!   strict encryption (dev service on 2025): the tests then expect
+//!   `strict` and use it for their own sessions;
+//! - `DATABASTION_IT_SQLSERVER_MAJOR` (optional, set by CI): the major
+//!   version the server must report (15, 16 or 17), so an entry of the
+//!   engine matrix cannot silently test another image.
+//!
+//! The TLS mode reached is asserted per version (ADR-0051 refinement item
+//! 3): `mandatory` and the `auto` fallback on 2019 and 2022 (and 2025
+//! without forced strict), `strict` and `auto` reaching strict on 2025
+//! with forced strict.
 //!
 //! `sa` is used by the tests only, to create throwaway logins and grants
 //! (the refusal tests, the RLS tiers); the connector never uses it (P9-A
@@ -61,10 +72,70 @@ fn ca() -> String {
     std::env::var("DATABASTION_IT_SQLSERVER_CA").expect("DATABASTION_IT_SQLSERVER_CA")
 }
 
+/// Whether the dev server forces strict encryption (TDS 8.0).
+fn strict_forced() -> bool {
+    std::env::var("DATABASTION_DEV_SQLSERVER_FORCE_STRICT").as_deref() == Ok("1")
+}
+
+/// The TLS setting the tests' own sessions use: the mode the server
+/// accepts (`mandatory` is refused by a server forcing strict).
+fn own_tls() -> &'static str {
+    if strict_forced() {
+        "tls: strict"
+    } else {
+        "tls: mandatory"
+    }
+}
+
+/// The server's major version (15: 2019, 16: 2022, 17: 2025), checked
+/// against `DATABASTION_IT_SQLSERVER_MAJOR` when set.
+async fn major() -> u32 {
+    let c = SqlserverConnector::new();
+    let t = agent("");
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    let v = c.server_version(&t).unwrap();
+    let major: u32 = v.split('.').next().unwrap().parse().unwrap();
+    assert!((15..=17).contains(&major), "{v}");
+    if let Ok(want) = std::env::var("DATABASTION_IT_SQLSERVER_MAJOR").map(|v| v.trim().to_owned())
+        && !want.is_empty()
+    {
+        assert_eq!(major.to_string(), want, "server version {v}");
+    }
+    if strict_forced() {
+        assert!(major >= 17, "forced strict needs 2025 on Linux: {v}");
+    }
+    major
+}
+
 /// A target of the dev profile.
+/// A private per-run `state_dir`, so that the "strict seen" marks of
+/// `auto` targets never land outside the temporary directory (the tests
+/// may run as root).
+fn state_dir() -> &'static str {
+    static STATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-it-sqlserver-state-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir.to_str().unwrap().to_owned()
+    });
+    &STATE
+}
+
 fn target(account: &str, secret_env: &str, sqlserver: &str) -> TargetConfig {
+    target_in(state_dir(), account, secret_env, sqlserver)
+}
+
+/// A target of the dev profile with its own `state_dir`.
+fn target_in(state_dir: &str, account: &str, secret_env: &str, sqlserver: &str) -> TargetConfig {
     let yaml = format!(
-        "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: it, \
+        "{{console: {{url: \"https://c.example\"}}, state_dir: {state_dir}, targets: [{{id: it, \
          engine: sqlserver, host: 127.0.0.1, port: {port}, account: {account}, \
          secret: {{env: {secret_env}}}, \
          sqlserver: {{ca_file: \"{ca}\"{sep}{sqlserver}}}}}]}}",
@@ -93,7 +164,7 @@ fn throwaway_target(name: &str, sqlserver: &str) -> TargetConfig {
 
 /// A raw `sa` session (tests only).
 async fn sa() -> Session {
-    let t = target("sa", "SQLSERVER_SA_PASSWORD", "tls: mandatory");
+    let t = target("sa", "SQLSERVER_SA_PASSWORD", own_tls());
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
     conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
@@ -283,18 +354,9 @@ async fn check_minimal_login() {
     // never reported as absent.
     assert!(has(&h, NoteCode::PrivilegeNotEvaluated));
     assert!(!has(&h, NoteCode::SecurityLoginEventTrigger));
-    let v = c.server_version(&t).unwrap();
-    assert!(v.starts_with("16."), "{v}");
-    // No strict encryption on 2022 for Linux: `strict` fails, `auto`
-    // fell back to `mandatory` above.
-    let h = c.check(&agent("tls: strict")).await;
-    assert!(!h.reachable);
-    assert!(
-        h.detail
-            .unwrap()
-            .contains("strict encryption not available")
-    );
-    let h = c.check(&agent("tls: mandatory")).await;
+    // The TLS modes of the version: `tls_modes_by_version`.
+    major().await;
+    let h = c.check(&agent(own_tls())).await;
     assert!(h.reachable);
     // Without the opt-in, Discovery samples nothing: every table skipped
     // as row-level security not verifiable.
@@ -310,6 +372,126 @@ async fn check_minimal_login() {
         &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
     )
     .await;
+}
+
+/// ADR-0051 decision 2 and refinement item 3, per version (lot 1 review
+/// M2): which TLS mode each setting reaches, the `auto` fallback and its
+/// in-memory retry, and the persisted "strict seen" mark (set only after
+/// a strict session; cleared when `tls` is not `auto`, re-review R4).
+#[tokio::test]
+async fn tls_modes_by_version() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = major().await;
+    let state =
+        std::env::temp_dir().join(format!("databastion-it-sqlserver-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let dir = state.to_str().unwrap();
+    let with = |tls: &str| {
+        target_in(
+            dir,
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+            &format!("tls: {tls}"),
+        )
+    };
+    let mark = state.join(conn::STRICT_SEEN_DIR).join("it");
+    let configs = tls::configs(with("auto").sqlserver_settings().ca_file.as_deref()).unwrap();
+    let c = SqlserverConnector::new();
+    eprintln!("major {major}, forced strict {}", strict_forced());
+    if strict_forced() {
+        // Strict on 2025: `strict` works, `mandatory` is refused (the
+        // server disconnects a TDS 7.x PRELOGIN), `auto` reaches strict
+        // and marks the target "strict seen".
+        let s = conn::connect(
+            &with("strict"),
+            &configs,
+            &TlsChoice::default(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.mode, conn::Mode::Strict);
+        s.close().await;
+        let h = c.check(&with("mandatory")).await;
+        assert!(
+            !h.reachable,
+            "mandatory against forced strict: {:?}",
+            h.detail
+        );
+        let choice = TlsChoice::default();
+        let s = conn::connect(&with("auto"), &configs, &choice, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(s.mode, conn::Mode::Strict, "auto on forced strict");
+        s.close().await;
+        assert!(mark.is_file(), "strict seen not persisted");
+        assert!(conn::persisted_strict_seen(&with("auto")));
+        // A fresh process (new in-memory state) keeps strict.
+        let s = conn::connect(
+            &with("auto"),
+            &configs,
+            &TlsChoice::default(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.mode, conn::Mode::Strict);
+        s.close().await;
+        // `tls: strict` (not `auto`) clears the mark.
+        let s = conn::connect(
+            &with("strict"),
+            &configs,
+            &TlsChoice::default(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        s.close().await;
+        assert!(!mark.exists(), "strict seen not cleared by tls: strict");
+    } else {
+        // 2019, 2022 (and 2025 without forced strict) on Linux: no strict
+        // encryption. `strict` fails with the local detail, `mandatory`
+        // works, `auto` falls back once to `mandatory`, never marks the
+        // target, and connects in `mandatory` directly within the hour.
+        let h = c.check(&with("strict")).await;
+        assert!(!h.reachable, "strict on {major}");
+        let detail = h.detail.unwrap();
+        assert!(
+            detail.contains("strict encryption not available"),
+            "{detail}"
+        );
+        let s = conn::connect(
+            &with("mandatory"),
+            &configs,
+            &TlsChoice::default(),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.mode, conn::Mode::Mandatory);
+        s.close().await;
+        let choice = TlsChoice::default();
+        for attempt in ["fallback", "in-memory retry"] {
+            let s = conn::connect(&with("auto"), &configs, &choice, Duration::from_secs(10))
+                .await
+                .unwrap();
+            assert_eq!(s.mode, conn::Mode::Mandatory, "auto, {attempt}");
+            s.close().await;
+        }
+        assert!(!mark.exists(), "strict seen set without a strict session");
+        let h = c.check(&with("auto")).await;
+        assert!(h.reachable, "{:?}", h.detail);
+        assert!(!mark.exists());
+    }
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 #[tokio::test]
@@ -424,6 +606,14 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
         ),
     )
     .await;
+    exec_ok(
+        &mut s,
+        &in_db("master", "REVOKE VIEW ANY DEFINITION TO public"),
+    )
+    .await;
+    // ... and its server role, with its DENY.
+    drop_login(&mut s, name).await;
+    exec_ok(&mut s, "DROP SERVER ROLE it_rls_srvrole").await;
     throwaway(
         &mut s,
         name,
@@ -475,42 +665,71 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
         )
         .await;
     }
-    // Server scope (review M4): a DENY of VIEW ANY DEFINITION to the login.
-    // Through `sp_executesql` in a literal: the session's own run-time
-    // deny-list refuses a bare text naming DEFINITION, test or not.
+    // Server scope (review M4, re-review R1): a DENY of VIEW ANY
+    // DEFINITION to the login, to `public` and to a server role the login
+    // is a member of. Through `sp_executesql` in a literal: the session's
+    // own run-time deny-list refuses a bare text naming DEFINITION, test
+    // or not.
     exec(
         &mut s,
-        &in_db("master", &format!("DENY VIEW ANY DEFINITION TO [{name}]")),
+        "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'it_rls_srvrole') \
+         CREATE SERVER ROLE it_rls_srvrole",
     )
     .await;
-    // The tier proof itself fails; with the definitions hidden, parts of
-    // the refusal list are unreadable too, which blocks Discovery anyway
-    // (review M3).
-    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    let mut ts = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
-        .await
-        .unwrap();
-    let tier = crate::check::rls_tier(&mut ts, "retail", &t).await.unwrap();
-    assert!(
-        matches!(tier, crate::check::RlsTier::NotVerifiable(_)),
-        "server DENY: {tier:?}"
-    );
-    ts.close().await;
-    let h = c.check(&t).await;
-    assert!(
-        has(&h, NoteCode::CoverageRlsNotVerifiable) || has(&h, NoteCode::PrivilegeNotEvaluated),
-        "server DENY: {:?}",
-        codes(&h)
-    );
-    let scan = scan(&t).await;
-    assert!(scan.findings.is_empty(), "server DENY");
     exec(
         &mut s,
-        &in_db("master", &format!("REVOKE VIEW ANY DEFINITION TO [{name}]")),
+        &format!("ALTER SERVER ROLE it_rls_srvrole ADD MEMBER [{name}]"),
     )
     .await;
+    for grantee in [name, "public", "it_rls_srvrole"] {
+        exec(
+            &mut s,
+            &in_db(
+                "master",
+                &format!("DENY VIEW ANY DEFINITION TO [{grantee}]"),
+            ),
+        )
+        .await;
+        // The tier proof itself fails; with the definitions hidden, parts
+        // of the refusal list are unreadable too, which blocks Discovery
+        // anyway (review M3).
+        let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+        let mut ts = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let tier = crate::check::rls_tier(&mut ts, "retail", &t).await.unwrap();
+        assert!(
+            matches!(tier, crate::check::RlsTier::NotVerifiable(_)),
+            "server DENY to {grantee}: {tier:?}"
+        );
+        ts.close().await;
+        let h = c.check(&t).await;
+        assert!(
+            has(&h, NoteCode::CoverageRlsNotVerifiable) || has(&h, NoteCode::PrivilegeNotEvaluated),
+            "server DENY to {grantee}: {:?}",
+            codes(&h)
+        );
+        let scan = scan(&t).await;
+        assert!(scan.findings.is_empty(), "server DENY to {grantee}");
+        exec(
+            &mut s,
+            &in_db(
+                "master",
+                &format!("REVOKE VIEW ANY DEFINITION TO [{grantee}]"),
+            ),
+        )
+        .await;
+        // The DENY lifted: the tier is proven again.
+        let h = c.check(&t).await;
+        assert!(
+            !has(&h, NoteCode::CoverageRlsNotVerifiable),
+            "after the server DENY to {grantee}: {:?}",
+            codes(&h)
+        );
+    }
     drop_login(&mut s, name).await;
     exec_ok(&mut s, &in_db("retail", "DROP ROLE it_rls_role")).await;
+    exec_ok(&mut s, "DROP SERVER ROLE it_rls_srvrole").await;
 }
 
 /// P9-A obligation L13 and refinement item 5: refused accounts.
@@ -613,18 +832,27 @@ async fn untrusted_certificate_is_refused() {
         return;
     }
     let _g = serial().await;
-    let other_ca = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/other-ca.pem");
+    let other_ca_path = crate::fake::other_ca_file();
+    let other_ca = other_ca_path.to_str().unwrap();
     let yaml = format!(
-        "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: it, \
+        "{{console: {{url: \"https://c.example\"}}, state_dir: {}, targets: [{{id: it, \
          engine: sqlserver, host: 127.0.0.1, port: {}, account: databastion, \
          secret: {{env: SQLSERVER_DATABASTION_PASSWORD}}, sqlserver: {{ca_file: \"{other_ca}\", \
-         tls: mandatory}}}}]}}",
-        port()
+         {}}}}}]}}",
+        state_dir(),
+        port(),
+        own_tls()
     );
     let t = databastion_core::AgentConfig::parse(&yaml).unwrap().targets[0].clone();
     let h = SqlserverConnector::new().check(&t).await;
+    let _ = std::fs::remove_file(&other_ca_path);
     assert!(!h.reachable);
-    assert!(h.detail.unwrap().contains("stage tls"));
+    let detail = h.detail.unwrap();
+    assert!(detail.contains("stage tls"), "{detail}");
+    assert!(
+        detail.contains("did not verify"),
+        "a certificate error, not a missing CA file: {detail}"
+    );
     // Wrong host name: the dev certificate names localhost and 127.0.0.1
     // only.
     let _ = Detail::FallbackCertificate;

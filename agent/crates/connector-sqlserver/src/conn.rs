@@ -134,7 +134,36 @@ fn persist_strict_seen(target: &TargetConfig) {
     }
 }
 
+/// Clears the target's "strict seen" mark, in memory and on disk, when its
+/// `tls` setting is not `auto` (decision 2: the mark is cleared by
+/// changing the target's host, port or `tls` setting; re-review R4). A
+/// later return to `auto` tries strict first again, with the one
+/// fallback.
+fn clear_strict_seen(target: &TargetConfig, choice: &TlsChoice, key: &str) {
+    choice.remove(key);
+    let Some(dir) = target.state_dir() else {
+        return;
+    };
+    match databastion_core::local_state::remove(&dir.join(STRICT_SEEN_DIR), &target.id) {
+        Ok(true) => tracing::info!(
+            target_id = %target.id,
+            "tls is not auto: strict-seen mark cleared"
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(target_id = %target.id, error = %e.kind(), "strict-seen mark not cleared");
+        }
+    }
+}
+
 impl TlsChoice {
+    fn remove(&self, key: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+
     fn get(&self, key: &str) -> Option<Remembered> {
         self.inner
             .lock()
@@ -244,11 +273,14 @@ pub(crate) async fn connect(
     statement_timeout: Duration,
 ) -> Result<Session, SsError> {
     let settings = target.sqlserver_settings();
+    let key = choice_key(target);
+    if settings.tls != SqlserverTlsMode::Auto {
+        clear_strict_seen(target, choice, &key);
+    }
     let password = target
         .secret
         .read()
         .map_err(|_| SsError::new(FailureCode::AuthenticationFailed, Stage::Secret))?;
-    let key = choice_key(target);
     let open = |mode| open(target, tls, mode, &password, statement_timeout);
     match settings.tls {
         SqlserverTlsMode::Strict => open(Mode::Strict).await.map_err(|e| {
@@ -1157,6 +1189,56 @@ pub(crate) mod tests {
             std::fs::set_permissions(&mark, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         assert!(!persisted_strict_seen(&t));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-review R4: a target whose `tls` is not `auto` has its mark
+    /// cleared, on disk and in memory, at its next connection attempt.
+    #[::tokio::test]
+    async fn strict_seen_is_cleared_when_tls_is_not_auto() {
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-clear-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The secret is unset: every attempt fails before any connection,
+        // after the mark is handled.
+        let parse = |tls: &str| {
+            databastion_core::AgentConfig::parse(&format!(
+                "{{console: {{url: \"https://c.example\"}}, state_dir: {}, targets: [{{id: t1, \
+                 engine: sqlserver, host: 127.0.0.1, port: 9, account: a, \
+                 secret: {{env: DATABASTION_TEST_SQLSERVER_CLEAR}}, sqlserver: {{tls: {tls}}}}}]}}",
+                dir.display()
+            ))
+            .unwrap()
+            .targets[0]
+                .clone()
+        };
+        let ca = crate::fake::other_ca_file();
+        let configs = tls::configs(Some(&ca)).unwrap();
+        let _ = std::fs::remove_file(&ca);
+        let choice = TlsChoice::default();
+        for mode in ["mandatory", "strict"] {
+            let auto = parse("auto");
+            persist_strict_seen(&auto);
+            choice.set(choice_key(&auto), Remembered::StrictSeen);
+            assert!(persisted_strict_seen(&auto));
+            let t = parse(mode);
+            let _ = connect(&t, &configs, &choice, Duration::from_secs(1)).await;
+            assert!(!persisted_strict_seen(&auto), "{mode}");
+            assert!(!dir.join(STRICT_SEEN_DIR).join("t1").exists(), "{mode}");
+            assert!(choice.get(&choice_key(&auto)).is_none(), "{mode}");
+        }
+        // `auto` keeps it.
+        let auto = parse("auto");
+        persist_strict_seen(&auto);
+        let _ = connect(&auto, &configs, &choice, Duration::from_secs(1)).await;
+        assert!(persisted_strict_seen(&auto));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
