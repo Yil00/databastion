@@ -1471,3 +1471,34 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
     drop_login(&mut s, "it_dump").await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P9-A obligation L4: the closed list of `sys` built-in functions
+/// (`classifiers::query::tsql::SYS_FUNCTIONS`) holds every function of
+/// the server's `sys` schema, so a schema-qualified call of a built-in is
+/// never taken for user code (a missing name only reports more, but the
+/// list must follow the matrix images).
+#[tokio::test]
+async fn sys_function_list_matches_the_server() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = sa().await;
+    let rows = s
+        .rows(
+            "SELECT CONVERT(nvarchar(128), LOWER(name)) FROM sys.all_objects WHERE schema_id = \
+             SCHEMA_ID('sys') AND type IN ('FN', 'IF', 'TF', 'FS', 'FT', 'AF')",
+            Stage::Check,
+            Shape::rows(1, 4096),
+        )
+        .await
+        .unwrap();
+    let list = databastion_classifiers::query::tsql::SYS_FUNCTIONS;
+    let missing: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.first().and_then(Value::as_text).map(str::to_owned))
+        .filter(|n| !list.contains(&n.as_str()))
+        .collect();
+    assert!(rows.len() > 100, "{}", rows.len());
+    assert!(missing.is_empty(), "sys functions not in SYS_FUNCTIONS: {missing:?}");
+}
