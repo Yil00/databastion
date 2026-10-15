@@ -68,6 +68,28 @@ pub fn statement_allow_list() -> &'static [(&'static str, &'static str)] {
     sql::STATEMENTS
 }
 
+/// The statement deny-list, for the agent's architecture test.
+#[doc(hidden)]
+#[must_use]
+pub fn statement_deny_list() -> &'static [&'static str] {
+    sql::DENIED
+}
+
+/// A statement text without the content of its quoted identifiers and
+/// literals, lower-cased (what the deny-list is checked on).
+#[doc(hidden)]
+#[must_use]
+pub fn statement_skeleton(text: &str) -> String {
+    sql::unquoted(text)
+}
+
+/// Whether the session would send `text` (the run-time deny-list check).
+#[doc(hidden)]
+#[must_use]
+pub fn statement_checked(text: &str) -> bool {
+    sql::checked(text)
+}
+
 /// Microsoft SQL Server connector. One instance serves every declared SQL
 /// Server target.
 #[derive(Default)]

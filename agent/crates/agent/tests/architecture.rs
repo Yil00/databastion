@@ -456,10 +456,11 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
 
 /// ADR-0051 refinement item 7 (M4): the SQL Server connector never reads
 /// module bodies or definition-bearing columns. Its statements are a
-/// reviewed allow-list (`connector-sqlserver/src/sql.rs`, `STATEMENTS`,
-/// checked by the crate's own tests); this test checks the deny-list again
-/// on the crate's statement-bearing sources, outside comments, tests and
-/// the deny-list constant itself, and on every allow-listed text.
+/// reviewed allow-list (`connector-sqlserver/src/sql.rs`, `STATEMENTS`);
+/// every text is checked on its skeleton (quoted identifiers and literals
+/// emptied, as the session checks each text it sends at run time) against
+/// this list **and** the crate's own `DENIED`, which must contain it.
+#[cfg(feature = "sqlserver")]
 #[test]
 fn sqlserver_statements_never_read_definitions() {
     const DENIED: [&str; 14] = [
@@ -478,34 +479,32 @@ fn sqlserver_statements_never_read_definitions() {
         "data_source",
         "server_audits",
     ];
-    let src = workspace_root().join("crates/connector-sqlserver/src");
-    for file in ["sql.rs", "conn.rs", "check.rs", "discover.rs"] {
-        let text = fs::read_to_string(src.join(file)).unwrap();
-        let text = text.split("#[cfg(test)]").next().unwrap_or_default();
-        // The deny-list constant of sql.rs names the tokens on purpose.
-        let text = match (
-            text.find("pub(crate) const DENIED"),
-            text.find("pub(crate) fn unquoted"),
-        ) {
-            (Some(a), Some(b)) if a < b => format!("{}{}", &text[..a], &text[b..]),
-            _ => text.to_owned(),
-        };
-        for (n, line) in code_lines(&text).enumerate() {
-            let lower = line.to_lowercase();
-            for d in DENIED {
-                assert!(
-                    !lower.contains(d),
-                    "{file}:{}: a statement names {d} (ADR-0051 refinement item 7)",
-                    n + 1
-                );
+    let shared = databastion_connector_sqlserver::statement_deny_list();
+    for d in DENIED {
+        assert!(shared.contains(&d), "sql::DENIED lacks {d}");
+    }
+    let list = databastion_connector_sqlserver::statement_allow_list();
+    assert!(list.len() >= 20, "allow-list looks empty");
+    for (name, text) in list {
+        let skeleton = databastion_connector_sqlserver::statement_skeleton(text);
+        for d in shared.iter().chain(DENIED.iter()) {
+            // The one exempt text: the exact one-bit password_hash probe.
+            if *name == "password_hash_probe" && (*d == "password_hash") {
+                continue;
             }
+            assert!(!skeleton.contains(d), "{name} names {d}");
         }
+        assert!(
+            databastion_connector_sqlserver::statement_checked(text),
+            "{name}"
+        );
     }
-    #[cfg(feature = "sqlserver")]
-    for (name, text) in databastion_connector_sqlserver::statement_allow_list() {
-        let lower = text.to_lowercase();
-        for d in DENIED {
-            assert!(!lower.contains(d), "{name} names {d}");
-        }
-    }
+    // The skeleton ignores names: a user's column called `definition` is
+    // sampled, a catalog read of it is not.
+    assert!(databastion_connector_sqlserver::statement_checked(
+        "SELECT TOP (1) CONVERT(nvarchar(4000), LEFT([definition], 4000)) FROM [d].[s].[t]"
+    ));
+    assert!(!databastion_connector_sqlserver::statement_checked(
+        "SELECT definition FROM sys.sql_modules"
+    ));
 }
