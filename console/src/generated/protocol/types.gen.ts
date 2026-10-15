@@ -539,10 +539,12 @@ export interface components {
         /**
          * @description Closed set of failure causes. Driver or engine messages are never sent (they can contain values
          *     or query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no
-         *     TLS-specific code: on every engine, a failed TLS handshake or certificate verification is
-         *     `target_unreachable` (`timeout` when the handshake times out; on SQL Server, `unsupported`
-         *     when the server offers no encryption mode the agent accepts), and the target's
-         *     `check.stage_failed` note names the stage (`stage_tls`).
+         *     TLS-specific code. The reliable sign of a TLS problem is the `stage_tls` label of the
+         *     target's `check.stage_failed` note; the code depends on the cause and the engine: usually
+         *     `target_unreachable` (a failed handshake or certificate verification) or `timeout`;
+         *     `internal` for a TLS setup error on some engines and for an OpenLDAP StartTLS anomaly;
+         *     `unsupported` for a SQL Server server that refuses encryption or sends a malformed
+         *     PRELOGIN.
          * @enum {string}
          */
         FailureCode: "target_unreachable" | "authentication_failed" | "permission_denied" | "timeout" | "cancelled" | "expired" | "unknown_target" | "unsupported" | "invalid_params" | "resource_limit" | "internal";
