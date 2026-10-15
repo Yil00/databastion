@@ -139,7 +139,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis` and `valkey` are in development, not released yet ([below](#redis--valkey-targets));
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` are in development, not released yet ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets));
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -197,6 +197,85 @@ targets:
 
 Create the ACL user on each node the agent reads, as in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only): `-@all` plus the listed read commands on `%R~*` (or the declared patterns), `resetchannels`, and the Audit commands (`slowlog|get`, `acl|log`, `client|list`, Valkey 8.1+ `commandlog|get`) only where Audit runs. An account that can run `CONFIG SET`, `MODULE LOAD`, `ACL SETUSER`, scripts, `REPLICAOF`, `MIGRATE` or another refusal-list command is refused for Discovery and Audit. For Audit, set the server's `slowlog-log-slower-than` (Valkey 8.1+: `commandlog-execution-slower-than`) low enough for the commands you want to see: only commands slower than it are logged.
 
+### Microsoft SQL Server targets
+**In development, not released yet**: the connector's `check()` and Discovery are merged on `dev` (phase 9) and are not in 0.7.0. **Audit is not implemented yet** (in progress): SQL Server targets report the audit level None. The agent needs a console that lists the `engine.sqlserver` capability; until then it keeps the items spooled. Limits and measurements: [08-engine-capabilities.md](08-engine-capabilities.md#microsoft-sql-server-discovery); decisions: [ADR-0051](adr/0051-sqlserver-connector.md) and its refinement of 2026-10-14.
+
+Supported: SQL Server 2019, 2022 and 2025, Standard, Enterprise, Developer and Express editions; Azure SQL is refused. Tested: 2022 Express on every change (CI job `agent-sqlserver`), and 2019, 2022 and 2025 Express in the engine matrix. Declare one `host` and `port` per target (default 1433; no Unix socket): the agent does not use the SQL Server Browser, so a named instance is reached by its port. The `account` is a **SQL login**: Windows integrated authentication, Microsoft Entra ID and contained database users are not supported. Local detection reports a SQL Server listening on port 1433 or running as a `sqlservr` process; it is monitored only once declared.
+
+```yaml
+targets:
+  - id: erp-eu-1
+    engine: sqlserver
+    host: erp-db-1.internal              # a name (or IP literal) in the server certificate
+    port: 1433
+    account: databastion_agent
+    secret: { file: /etc/databastion/secrets/erp-eu-1 }
+    sqlserver:
+      tls: auto                          # default; or strict, or mandatory
+      ca_file: /etc/databastion/tls/sqlserver-ca.pem   # absolute path; otherwise the system store
+      databases: [app]                   # default: every user database the login can access
+      rls_visibility: view_definition    # opt-in, see below: without it, nothing is sampled
+      # extended_grants: true            # db_datareader instead of per-schema SELECT
+      # max_tables: 16384                # tables per database and scan (1 to 16384, the default)
+```
+
+The block also takes `cas_stores`, as the other engines do ([section 6](#6-declare-targets)). Unknown keys are refused.
+
+**TLS.** Every connection is encrypted, loopback included, because the SQL Server login packet carries the password in a reversible form: there is no `disable` mode. Every mode verifies the server certificate against `ca_file` (then the only trusted root) or the system store, and the declared host. Install on the server a certificate issued by a CA the agent trusts, whose subject alternative name holds the declared host or IP literal (`127.0.0.1` as an IP SAN for a loopback target). Without one, SQL Server uses a self-signed fallback certificate with no subject alternative name, regenerated at each service start: the agent refuses it, and there is no mode that trusts a server certificate without verifying it.
+- **`auto`** (default): TDS 8.0 strict encryption first (TLS from the first byte). If the strict handshake fails before any TDS byte, the agent falls back once to `mandatory`, fully verified, then connects in `mandatory` for an hour before trying strict again (in memory only; every agent start tries strict first). A certificate error never causes a fallback.
+- **`strict`**: TDS 8.0 only. On Linux, strict encryption exists from SQL Server 2025 (`network.forcestrict`); against 2019 or 2022 on Linux the connection fails, and the agent's log says "strict encryption not available on this server".
+- **`mandatory`**: TDS 7.x, encryption required for the whole session; a server that offers login-only encryption or none is refused. Use `tls: mandatory` for SQL Server 2019, and for 2022 on Linux, to avoid a failed strict handshake every hour.
+- **"Strict seen" mark**: once `auto` has completed one authenticated strict session with a target, the agent writes `<state_dir>/sqlserver-strict-seen/<target_id>` (mode `0600`, holding the declared host and port) and from then on never falls back to `mandatory` for that target: a strict failure fails the connection, so that someone on the network path cannot downgrade a known strict server. Setting the target's `tls` to `strict` or `mandatory` removes the mark at its next connection attempt, and a mark for another host or port is ignored. If you move the server to a version or configuration without strict encryption and keep `tls: auto`, the target shows as unreachable with a TLS-stage error: stop the agent, delete the file and start the agent again (the agent also keeps the mark in memory while it runs). Details: [08-engine-capabilities.md](08-engine-capabilities.md#tls-modes-and-the-strict-seen-mark).
+- **What the console shows**: a TLS failure has no failure code of its own. The target is unreachable with `target_unreachable` (the fallback certificate, a certificate that does not verify, strict encryption not available), `timeout`, or `unsupported` (the server does not encrypt the whole session), with the note `check.stage_failed` labelled `stage_tls`; the exact reason is in the agent's log.
+
+**The account (minimal grant).** As the login's administrator, with a client that does not log the statement text (it holds the password):
+
+```sql
+-- Once per server. Type the password at a prompt.
+CREATE LOGIN databastion_agent WITH PASSWORD = '<from a prompt>',
+  CHECK_POLICY = ON, DEFAULT_DATABASE = [app];
+-- In each monitored database
+USE [app];
+CREATE USER databastion_agent FOR LOGIN databastion_agent;   -- grants CONNECT
+GRANT SELECT ON SCHEMA::[crm] TO databastion_agent;          -- present and future tables of the schema
+-- Row-level security opt-in (sqlserver.rls_visibility: view_definition), in each monitored database:
+GRANT VIEW DEFINITION TO databastion_agent;
+```
+
+- Grant `SELECT` per schema to cover; a schema without it is not sampled. With `extended_grants: true`, membership of `db_datareader` replaces the per-schema grants and is reported as `privilege.extended_variant`; without the flag it is reported as over-privilege.
+- `CHECK_POLICY = ON` applies the server's account lockout policy to the login: repeated failures (a wrong password in `agent.yaml`, or someone guessing it) lock the agent out, reported as `authentication_failed` with "login locked out" in the agent's log.
+- No Audit grant is needed yet. An Audit permission the account holds today (`VIEW SERVER SECURITY AUDIT`, `VIEW SERVER STATE`…) is reported as `privilege.audit_grant_without_audit`.
+
+**With the minimal grant, Discovery samples nothing.** SQL Server has no table-level flag that tells a table with a row-level security policy from one without (measured negative on SQL Server 2022), and the minimal account cannot see the policy catalog. Sampling such a table would run the policy's predicate function, user code, in the agent's session, and would silently miss the rows it hides. So, unless you opt in, **every table of every monitored database is skipped** (`skipped_row_level_security`), and `check()` reports `coverage.rls_not_verifiable` with the number of databases from the first heartbeat; the agent's log gives the reason. To sample:
+1. declare `rls_visibility: view_definition` in the target's `sqlserver` block;
+2. grant database `VIEW DEFINITION` to the agent's user in each monitored database (above).
+
+`check()` then proves, per database, that `VIEW DEFINITION` is effective and that no `DENY` hides a policy again: no `DENY` of `VIEW DEFINITION`, `VIEW SECURITY DEFINITION` or `CONTROL` at database, schema or object scope, and no server-level `DENY` of `VIEW ANY DEFINITION`, `VIEW ANY SECURITY DEFINITION`, `VIEW SERVER SECURITY STATE` or `CONTROL SERVER`, to the agent, one of its roles or `public`. Any such `DENY`, or a proof that cannot be read, keeps the whole database skipped. With the proof, only the tables that have an enabled policy are skipped (`coverage.relations_rls_skipped`). Granting `VIEW DEFINITION` on single policies or schemas does not lift the skip: a policy created later would stay invisible. There is no setting that asserts "this database has no policy" in place of the proof.
+
+**The cost of the opt-in**: database `VIEW DEFINITION` makes the definitions of the database readable by whoever holds the agent's credentials: the bodies of procedures, views, functions and triggers (which can hold literals, sometimes credentials or values), and, per ADR-0051, check and default constraint definitions, computed-column definitions and partition boundary values. The agent itself never reads them: its statements are a reviewed allow-list, and a test forbids every definition-bearing catalog, function and column in them. Decide per server whether Discovery is worth that exposure.
+
+Not sampled in any case: views, synonyms, external and Stretch tables, computed columns, Always Encrypted columns (the server holds ciphertext only), and columns of types other than character types, `text` / `ntext`, `int`, `bigint`, `decimal`, `numeric` and the date types; at most 512 columns per table. Columns under dynamic data masking are sampled as the agent's account sees them, masked. Masked, encrypted and computed columns and views are counted in target notes.
+
+**What a stolen agent credential reads.** Measured with the minimal account on SQL Server 2022, beyond the tables it is granted ([08-engine-capabilities.md](08-engine-capabilities.md#what-a-stolen-agent-credential-reads)):
+- **Always Encrypted key metadata**, through `public`'s default `VIEW ANY COLUMN ENCRYPTION KEY DEFINITION` and `VIEW ANY COLUMN MASTER KEY DEFINITION`: the encrypted column encryption key values and the column master key paths. The keys stay encrypted by the column master key, which is outside the server. `check()` accepts these two permissions only when they come from `public`; granted to the agent's login, user or roles they are reported as `privilege.beyond_select`.
+- **`sys.servers.data_source`**: the host names of linked servers. Their `provider_string` was empty in the measurement; the agent never reads either column. A provider string can hold connection options and, when badly configured, a password: keep credentials out of it.
+- **With the row-level security opt-in**: the module bodies and the security policies of the monitored databases (above).
+- Also visible: the names and types of the objects the account can read, and `sys.masked_columns.masking_function` (a partial mask can hold a literal).
+- Not readable with the minimal account (measured): other logins' password hashes, credentials, linked logins, keys and certificates, logon triggers, the `msdb` mail and proxy tables, other sessions and their statement texts.
+- Not measured yet: whether `xp_dirtree` / `xp_fileexist` are executable by `public` on your server (they would let the account make the server open an outbound SMB connection). The agent never sends them.
+
+**Refused accounts and what `check()` reports.** At every heartbeat, `check()` reads the login's effective permissions and its securable-level grants, in **every** database it can access, not only the monitored ones, following its server and database roles (up to 64). An account that holds any right of the refusal list is **refused**: `check()` reports `privilege.refused` with the rights as labels, and Discovery does not run (Audit will not either). The refusal list:
+- membership of `sysadmin`, `securityadmin` or `##MS_LoginManager##`, and of `db_owner` in any accessible database;
+- `CONTROL SERVER`, `CONTROL` on any accessible database, `ALTER ANY SERVER AUDIT`, `ALTER ANY DATABASE AUDIT`;
+- the event-session rights, server and database scope: `ALTER ANY EVENT SESSION` and its granular forms (`… ENABLE`, `… DISABLE`, `… ADD EVENT`, `… DROP EVENT`, `… ADD TARGET`, `… DROP TARGET`, `… OPTION`), `CREATE ANY EVENT SESSION`, `DROP ANY EVENT SESSION`, and their `DATABASE EVENT SESSION` counterparts;
+- `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`, `IMPERSONATE ANY LOGIN`, and `IMPERSONATE`, `CONTROL`, `ALTER` or `TAKE OWNERSHIP` on any login or database user;
+- `VIEW ANY CRYPTOGRAPHICALLY SECURED DEFINITION`;
+- other logins' password hashes readable: a one-bit probe asks the server whether any other login's hash is visible, and no hash reaches the agent (label `password_hash_probe`).
+
+The check fails closed: when one of these reads fails or is cut, `check()` reports `privilege.not_evaluated` with the label `refusal_list_probe`, and Discovery does not run. Rights beyond the minimal grant that are not refused are reported as over-privilege, to remove: `privilege.global_privileges` (server permissions such as `VIEW ANY DEFINITION`, `ADMINISTER BULK OPERATIONS`, `ALTER ANY LINKED SERVER`, `ALTER TRACE`), `privilege.server_roles`, `privilege.database_roles`, `privilege.beyond_select` (database permissions beyond `CONNECT` and `SELECT`, such as `UNMASK`, `VIEW DATABASE STATE`, `SHOWPLAN`, `EXECUTE`), `privilege.grant_option` and `privilege.owner_of_objects`. Logon triggers are visible only with rights the minimal account does not hold, so a minimal account shows `privilege.not_evaluated` with the label `logon_trigger_probe` at every heartbeat: that is expected, and the agent never reports "no logon trigger" while it cannot see them. A CAS store guard read that fails gives the label `cas_store_guard_probe`.
+
+**Upgrade note.** The SQL Server labels above (`refusal_list_probe`, `logon_trigger_probe`, the database event-session permissions…) belong to the note-label revision `target_status.note_labels.2026_10_b`, and the agent sends `other` in their place until the console lists that token. Upgrade the console first, as usual. With several console replicas behind a load balancer, **upgrade every replica before any agent sees the `2026_10_b` token** (and `engine.sqlserver`): an agent uses a token as soon as one replica lists it, and a replica that does not know the values rejects them ([ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 8).
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 
@@ -207,6 +286,7 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256, `authenticationRestrictions` with `clientSource` = the agent's address(es) | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
 | OpenLDAP | service DN with `read` on the tree; rule `{0}` names **every** credential attribute of the loaded schemas (`userPassword`, `userPKCS12`, and the Samba, Kerberos, ppolicy… ones where loaded), never readable; a `peername.ip` restriction to the agent's address, since the accesslog records no client address | `read` on `cn=accesslog` only while Audit runs for the target (otherwise `privilege.accesslog_without_audit`) | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
 | Apereo CAS (`cas`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
+| Microsoft SQL Server (not released yet) | SQL login with `CHECK_POLICY = ON`, a database user and `SELECT` per schema in each monitored database; database `VIEW DEFINITION` too with the row-level security opt-in, or Discovery samples nothing; never `sysadmin`, `db_owner` or the other refused rights | not implemented yet | [ADR-0051](adr/0051-sqlserver-connector.md), [section 6](#microsoft-sql-server-targets) |
 | Redis / Valkey (not released yet) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
 
 Also:
