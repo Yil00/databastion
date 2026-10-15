@@ -101,6 +101,9 @@ pub(crate) struct XeRecord {
     /// Left out by [`context`] (a duplicate failed login, a statistics
     /// build).
     pub(crate) skip: bool,
+    /// A statement event whose data could not be read (malformed, cut,
+    /// or the reader panicked): reported as a read of `*`.
+    pub(crate) unreadable: bool,
 }
 
 impl std::fmt::Debug for XeRecord {
@@ -126,12 +129,41 @@ impl Positioned for XeRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Malformed;
 
+/// The event of the joined slices: UTF-16 units decoded once (a lone
+/// surrogate or an odd length is malformed), the length the server
+/// reported, the XML read by the bounded reader and naming the row's event.
+fn body(bytes: &[u8], size: Option<usize>, name: &str) -> Result<Option<XeEvent>, Malformed> {
+    if size != Some(bytes.len()) || !bytes.len().is_multiple_of(2) {
+        return Err(Malformed);
+    }
+    let units: Zeroizing<Vec<u16>> = Zeroizing::new(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect(),
+    );
+    let x = Zeroizing::new(String::from_utf16(&units).map_err(|_| Malformed)?);
+    let e = xml::parse(&x).map_err(|_| Malformed)?;
+    if e.name != name {
+        return Err(Malformed);
+    }
+    Ok(Some(e))
+}
+
 impl XeRecord {
     /// A record from one poll row (`sql::XE_POLL_COLUMNS` columns: the
-    /// name, the slices of the XML, the position, the time, the XML's
-    /// size). The position and time are required; the slices must add up
-    /// to the size; the XML is read here (`Err` when it is malformed: the
-    /// caller drops and counts it).
+    /// name, the slices of the XML as UTF-16 bytes, the position, the time,
+    /// the XML's size). The name, position and time are required (`Err`
+    /// otherwise: the caller drops and counts the row). The slices are
+    /// joined as bytes and decoded once, checked against the size, and the
+    /// XML read under panic isolation; when any of that fails for a
+    /// statement event, the record keeps no event data and is
+    /// [`Self::unreadable`]: a read of `*` by an unidentified principal,
+    /// always reported, as an oversized one (security review of lot 3, M1;
+    /// the ADR-0032 / #90 precedent), never dropped. Another event that
+    /// fails is `Err`.
     pub(crate) fn from_row(mut row: Vec<Value>) -> Result<Self, Malformed> {
         use crate::sql::XE_SLICES;
         if row.len() != crate::sql::XE_POLL_COLUMNS {
@@ -140,7 +172,7 @@ impl XeRecord {
         let int = |row: &[Value], i: usize| row.get(i).and_then(Value::as_int);
         let offset = int(&row, XE_SLICES + 2).ok_or(Malformed)?;
         let time_us = int(&row, XE_SLICES + 3).ok_or(Malformed)?;
-        let size = int(&row, XE_SLICES + 4);
+        let size = int(&row, XE_SLICES + 4).and_then(|n| usize::try_from(n).ok());
         let text = |row: &mut [Value], i: usize| match row.get_mut(i) {
             Some(Value::Text(t)) => std::mem::take(t),
             _ => String::new(),
@@ -150,33 +182,27 @@ impl XeRecord {
         if name.is_empty() || name.len() > 60 || file.is_empty() {
             return Err(Malformed);
         }
-        let present = row
-            .get(1..=XE_SLICES)
-            .is_some_and(|s| s.iter().any(|v| matches!(v, Value::Text(_))));
-        let event = if present {
-            let mut x = Zeroizing::new(String::new());
-            let mut units = 0usize;
-            for i in 1..=XE_SLICES {
-                let part = Zeroizing::new(text(&mut row, i));
-                units += part.encode_utf16().count();
-                x.push_str(&part);
+        let mut bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+        let mut present = false;
+        for v in row.iter_mut().take(XE_SLICES + 1).skip(1) {
+            if let Value::Binary(b) = v {
+                present = true;
+                bytes.extend_from_slice(b);
+                zeroize::Zeroize::zeroize(b);
             }
-            // The slices hold the whole XML (UTF-16 code units, 2 bytes).
-            if size.and_then(|n| usize::try_from(n).ok()) != Some(units * 2) {
-                return Err(Malformed);
-            }
-            let e = xml::parse(&x).map_err(|_| Malformed)?;
-            // The XML names its event: it must be the row's.
-            if e.name != name {
-                return Err(Malformed);
-            }
-            Some(e)
+        }
+        let body = if present {
+            databastion_core::isolate(|| body(&bytes, size, &name)).unwrap_or(Err(Malformed))
+        } else if size > Some(crate::sql::XE_EVENT_BYTES) {
+            // Above the poll's bound: no XML, by design.
+            Ok(None)
         } else {
-            // No XML: only for an event above the poll's bound.
-            if size.and_then(|n| usize::try_from(n).ok()) <= Some(crate::sql::XE_EVENT_BYTES) {
-                return Err(Malformed);
-            }
-            None
+            Err(Malformed)
+        };
+        let (event, unreadable) = match body {
+            Ok(e) => (e, false),
+            Err(Malformed) if Kind::of(&name).is_statement() => (None, true),
+            Err(e) => return Err(e),
         };
         Ok(Self {
             file,
@@ -186,6 +212,7 @@ impl XeRecord {
             event,
             procedure: None,
             skip: false,
+            unreadable,
         })
     }
 
@@ -241,23 +268,20 @@ const CONTEXT_WINDOW: usize = 256;
 
 /// The relations of a statement event, resolved to (database, schema,
 /// table) lowercased, for the statistics pairing.
-fn resolved(r: &XeRecord) -> Vec<(String, String, String)> {
+fn resolved(r: &XeRecord) -> Vec<(Zeroizing<String>, Zeroizing<String>, Zeroizing<String>)> {
     let Some(e) = &r.event else { return Vec::new() };
     let Some(text) = &e.statement else {
         return Vec::new();
     };
     let a = tsql::analyze_tsql(text, e.statement_cut);
-    let db = e.database.clone().unwrap_or_default();
+    let db = Zeroizing::new(e.database.clone().unwrap_or_default());
     a.relations
         .iter()
         .map(|rel| {
             (
-                rel.database
-                    .clone()
-                    .unwrap_or_else(|| db.clone())
-                    .to_lowercase(),
-                rel.schema.clone().unwrap_or_default().to_lowercase(),
-                rel.name.to_lowercase(),
+                Zeroizing::new(rel.database.as_deref().unwrap_or(&db).to_lowercase()),
+                Zeroizing::new(rel.schema.as_deref().unwrap_or_default().to_lowercase()),
+                Zeroizing::new(rel.name.to_lowercase()),
             )
         })
         .collect()
@@ -345,9 +369,9 @@ pub(crate) fn context(records: &mut [XeRecord], statman: bool) {
             continue;
         };
         let key = (
-            e.database.clone().unwrap_or_default().to_lowercase(),
-            schema.to_lowercase(),
-            table.to_lowercase(),
+            Zeroizing::new(e.database.clone().unwrap_or_default().to_lowercase()),
+            Zeroizing::new(schema.to_lowercase()),
+            Zeroizing::new(table.to_lowercase()),
         );
         let hi = (i + 1 + CONTEXT_WINDOW).min(records.len());
         let lo = i.saturating_sub(CONTEXT_WINDOW);
@@ -598,6 +622,7 @@ pub(crate) mod tests {
             event: Some(xml::parse(&x).unwrap()),
             procedure: None,
             skip: false,
+            unreadable: false,
         }
     }
 
@@ -905,10 +930,31 @@ pub(crate) mod tests {
             event: None,
             procedure: None,
             skip: false,
+            unreadable: false,
         };
         let ev = one(&r);
         assert!(ev.always_report() && !ev.principal().send_name());
         assert_eq!(names(&ev), ["*.-.*"]);
+    }
+
+    /// A poll row whose slices hold `units` as UTF-16LE bytes (8 000 bytes
+    /// each, as `sql::XE_COLUMNS`) and whose size is `size`.
+    pub(crate) fn row_of(name: &str, units: &[u16], size: usize) -> Vec<Value> {
+        use crate::sql::XE_SLICES;
+        let mut row = vec![Value::Null; crate::sql::XE_POLL_COLUMNS];
+        row[0] = Value::Text(name.to_owned());
+        let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        for i in 0..XE_SLICES {
+            let part = bytes
+                .get(i * 8000..((i + 1) * 8000).min(bytes.len()))
+                .unwrap_or_default();
+            row[1 + i] = Value::Binary(part.to_vec());
+        }
+        row[XE_SLICES + 1] = Value::Text("/x/s_0_1.xel".to_owned());
+        row[XE_SLICES + 2] = Value::Int(4096);
+        row[XE_SLICES + 3] = Value::Int(1);
+        row[XE_SLICES + 4] = Value::Int(i64::try_from(size).unwrap());
+        row
     }
 
     #[test]
@@ -923,36 +969,26 @@ pub(crate) mod tests {
         row[XE_SLICES + 3] = Value::Int(1);
         row[XE_SLICES + 4] = Value::Int(300_000);
         let r = XeRecord::from_row(row.clone()).unwrap();
-        assert!(r.event.is_none(), "above the bound: no XML");
-        let set = |row: &mut Vec<Value>, x: &str| {
-            let units: Vec<u16> = x.encode_utf16().collect();
-            for (i, chunk) in units.chunks(4000).enumerate() {
-                row[1 + i] = Value::Text(String::from_utf16_lossy(chunk));
-            }
-            for v in row
-                .iter_mut()
-                .take(XE_SLICES + 1)
-                .skip(1 + units.len().div_ceil(4000))
-            {
-                *v = Value::Text(String::new());
-            }
-            row[XE_SLICES + 4] = Value::Int(i64::try_from(units.len() * 2).unwrap());
-        };
+        assert!(
+            r.event.is_none() && !r.unreadable,
+            "above the bound: no XML"
+        );
+        let units = |x: &str| -> Vec<u16> { x.encode_utf16().collect() };
         // The XML must name the row's event.
-        set(&mut row, &event("login", &[], &[]));
-        assert!(XeRecord::from_row(row.clone()).is_err());
-        // Slices joined: a statement across the 4 000-character boundary.
-        let long = format!(
-            "SELECT a FROM crm.customers WHERE b = N'{}'",
-            "y".repeat(9000)
+        let x = units(&event("login", &[], &[]));
+        assert!(
+            XeRecord::from_row(row_of("sql_statement_completed", &x, x.len() * 2))
+                .unwrap()
+                .unreadable
         );
-        let x = event(
-            "sql_statement_completed",
-            &[("statement", &long)],
-            &[("session_id", "5")],
-        );
-        set(&mut row, &x);
-        let r = XeRecord::from_row(row.clone()).unwrap();
+        // A statement whose surrogate pair straddles the 8 000-byte slice
+        // boundary is joined exactly (M2).
+        let head = "<event name=\"sql_statement_completed\"><data name=\"statement\"><value>";
+        let pad = 4000 - head.encode_utf16().count() - 1;
+        let stmt = format!("{}\u{1F600} tail", "y".repeat(pad));
+        let x = units(&format!("{head}{stmt}</value></data></event>"));
+        assert_eq!(x[3999], 0xD83D, "the pair is split by the slices");
+        let r = XeRecord::from_row(row_of("sql_statement_completed", &x, x.len() * 2)).unwrap();
         assert_eq!(
             r.event
                 .as_ref()
@@ -960,10 +996,56 @@ pub(crate) mod tests {
                 .statement
                 .as_deref()
                 .map(String::as_str),
-            Some(long.as_str())
+            Some(stmt.as_str())
         );
-        // Slices that do not add up to the size (cut on the way): malformed.
-        row[XE_SLICES + 4] = Value::Int(10);
-        assert!(XeRecord::from_row(row).is_err());
+    }
+
+    /// Security review of lot 3, M1: a statement event that cannot be read
+    /// is a read of `*` by an unidentified principal, always reported;
+    /// another event is dropped and counted.
+    #[test]
+    fn unreadable_statement_events_are_reported() {
+        let units = |x: &str| -> Vec<u16> { x.encode_utf16().collect() };
+        let bad_xml = [
+            event(
+                "sql_statement_completed",
+                &[("statement", "SELECT &#0;")],
+                &[],
+            ),
+            event(
+                "sql_statement_completed",
+                &[("statement", "SELECT &#xD800;")],
+                &[],
+            ),
+            "<event name=\"sql_statement_completed\"><data".to_owned(),
+        ];
+        for x in &bad_xml {
+            let u = units(x);
+            let r = XeRecord::from_row(row_of("sql_statement_completed", &u, u.len() * 2)).unwrap();
+            assert!(r.unreadable && r.event.is_none());
+            let ev = one(&r);
+            assert!(ev.always_report() && !ev.principal().send_name());
+            assert_eq!(names(&ev), ["*.-.*"]);
+        }
+        // A lone surrogate in the bytes, an odd length, a size that does not
+        // match the slices, and no slice at all under the bound.
+        let mut lone = units(&event("sp_statement_completed", &[("statement", "x")], &[]));
+        lone[60] = 0xDC00;
+        let cases = [
+            row_of("sp_statement_completed", &lone, lone.len() * 2),
+            row_of("sp_statement_completed", &units("<event/>"), 5),
+            row_of("sp_statement_completed", &units("<event/>"), 10),
+        ];
+        for row in cases {
+            assert!(XeRecord::from_row(row).unwrap().unreadable);
+        }
+        let mut none = row_of("sql_statement_completed", &[], 100);
+        for v in none.iter_mut().take(crate::sql::XE_SLICES + 1).skip(1) {
+            *v = Value::Null;
+        }
+        assert!(XeRecord::from_row(none).unwrap().unreadable);
+        // Not a statement event: dropped (counted by the caller).
+        let u = units("<event name=\"login\"><data");
+        assert!(XeRecord::from_row(row_of("login", &u, u.len() * 2)).is_err());
     }
 }

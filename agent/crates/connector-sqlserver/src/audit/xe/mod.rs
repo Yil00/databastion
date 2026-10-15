@@ -39,7 +39,8 @@
 //!   DDL and DCL are always reported.
 //! - **Preference** (decision 6): with `source: auto` and a server audit
 //!   named, the stream ends at a re-probe that finds SQL Server Audit
-//!   usable, and the core restarts it on that source.
+//!   usable, and the core restarts it on that source; a switch between the
+//!   sources is a gap (`audit.records_dropped`).
 
 pub(crate) mod events;
 pub(crate) mod probe;
@@ -685,6 +686,10 @@ async fn read(
         records.drain(..n);
         st.state.audit.note_dropped(&target_id, n as u64);
         st.skip = 0;
+    }
+    let unreadable = records.iter().filter(|r| r.unreadable).count();
+    if unreadable > 0 {
+        tracing::warn!(target_id = %target_id, unreadable, "Extended Events: statement events whose data could not be read: reported as reads of *");
     }
     let statman = st.statman;
     if databastion_core::isolate(|| events::context(&mut records, statman)).is_none() {

@@ -457,6 +457,7 @@ pub fn xe_records(data: &[u8]) {
             event: (head & 0x80 == 0).then_some(event),
             procedure: None,
             skip: false,
+            unreadable: false,
         });
     }
     context(&mut records, data.first().is_some_and(|b| b & 1 == 1));

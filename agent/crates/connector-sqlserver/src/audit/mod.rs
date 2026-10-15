@@ -126,6 +126,8 @@ pub(crate) struct Shared {
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
+    /// The source the last stream of the target read.
+    streamed: Mutex<HashMap<String, Source>>,
     /// Extended Events session counters last seen per target (`check()`
     /// and the stream): (`create_time`, dropped events, dropped buffers).
     xe_seen: Mutex<HashMap<String, (i64, i64, i64)>>,
@@ -227,6 +229,20 @@ impl Shared {
 
     pub(crate) fn chosen(&self, target_id: &str) -> Option<Source> {
         lock(&self.chosen).get(target_id).copied()
+    }
+
+    /// Records the source a stream starts on; on a switch from the other
+    /// source, a gap (security review of lot 3, L3): what was written to
+    /// the old source after its last read, and to the new one before its
+    /// position or, on its first start, before now (no history replay), is
+    /// read by neither.
+    pub(crate) fn stream_source(&self, target_id: &str, source: Source) {
+        let before = lock(&self.streamed).insert(target_id.to_owned(), source);
+        if before.is_some_and(|b| b != source) {
+            tracing::warn!(target_id = %target_id, "SQL Server Audit: the stream switched between SQL Server Audit and Extended Events: events around the switch may be read by neither (a gap)");
+            self.note_gap(target_id);
+            self.note_dropped(target_id, 1);
+        }
     }
 
     /// Records the Extended Events session counters seen now; `true` (and a
@@ -766,11 +782,13 @@ pub(crate) async fn audit_stream(
     let name = match (use_audit, audit_name, xe_name) {
         (true, Some(name), _) => name,
         (_, _, Some(xe)) => {
+            state.audit.stream_source(&target.id, Source::Xevents);
             return Box::pin(xe::stream(cfg, sink, state, target, session, xe)).await;
         }
         (_, Some(name), None) => name,
         (_, None, None) => return Err(target_error(FailureCode::Unsupported)),
     };
+    state.audit.stream_source(&target.id, Source::Audit);
     let store = cfg.cursor(CURSOR);
     let loaded = match store.as_ref().map(CursorStore::load) {
         Some(Ok(Some(bytes))) => {

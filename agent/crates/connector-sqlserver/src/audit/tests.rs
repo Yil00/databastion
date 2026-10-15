@@ -287,6 +287,7 @@ fn xe_large_buffers_are_walked_without_loss() {
         event: None,
         procedure: None,
         skip: false,
+        unreadable: false,
     };
     // The file: buffer 4096 (3 events), 8192 (1 200 events), 12288 (5).
     let mut all = Vec::new();

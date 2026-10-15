@@ -90,38 +90,42 @@ WHERE s.name = {session}";
 /// position, time and size: a read of `*`, always reported.
 pub(crate) const XE_EVENT_BYTES: usize = 131_072;
 
-/// Slices of `event_data` per row: 17 of 4 000 characters cover
+/// Slices of `event_data` per row: 17 of 8 000 bytes cover
 /// [`XE_EVENT_BYTES`].
 pub(crate) const XE_SLICES: usize = 17;
 
 /// The columns of an Extended Events poll: the event's name, its XML (when
-/// at most [`XE_EVENT_BYTES`]) in [`XE_SLICES`] `nvarchar(4000)` slices,
-/// the position, the time (UTC, µs since 1970) and the XML's size.
+/// at most [`XE_EVENT_BYTES`]) as UTF-16LE bytes in [`XE_SLICES`]
+/// `varbinary(8000)` slices, the position, the time (UTC, µs since 1970)
+/// and the XML's size.
 ///
 /// Measured on 2019: the session setting `SET TEXTSIZE 8000` (decision 5,
 /// sent on every connection) cuts an `nvarchar(max)` value to 8 000 bytes,
 /// so `event_data` itself would arrive cut, without a sign, for any event
-/// above 4 000 characters. Slices of `nvarchar(4000)` are not `max` values
+/// above 4 000 characters. Slices of `varbinary(8000)` are not `max` values
 /// (`TEXTSIZE` does not apply) and keep the client's closed type set
-/// without a `max` column (decision 1).
+/// without a `max` column (decision 1). They are cut by byte, whatever the
+/// collation (a supplementary-character collation counts characters, not
+/// UTF-16 units, in `SUBSTRING` of `nvarchar`), and the client joins the
+/// bytes before decoding them once (security review of lot 3, M2).
 const XE_COLUMNS: &str = "CONVERT(nvarchar(60), f.object_name), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 1, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 4001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 8001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 12001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 16001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 20001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 24001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 28001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 32001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 36001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 40001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 44001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 48001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 52001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 56001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 60001, 4000)), \
-CONVERT(nvarchar(4000), SUBSTRING(x.d, 64001, 4000)), CONVERT(nvarchar(260), f.file_name), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 1, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 8001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 16001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 24001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 32001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 40001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 48001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 56001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 64001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 72001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 80001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 88001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 96001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 104001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 112001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 120001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 128001, 8000)), CONVERT(nvarchar(260), f.file_name), \
 CONVERT(bigint, f.file_offset), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', f.timestamp_utc)), \
 CONVERT(bigint, DATALENGTH(f.event_data))";
 
@@ -131,8 +135,8 @@ CONVERT(bigint, DATALENGTH(f.event_data))";
 /// the events skipped (as [`XE_POLL_FROM`]).
 pub(crate) const XE_POLL_START: &str = "SELECT {columns} FROM \
 sys.fn_xe_file_target_read_file({pattern}, NULL, NULL, NULL) f CROSS APPLY (SELECT CASE WHEN \
-DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d) ORDER BY (SELECT NULL) \
-OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY";
+DATALENGTH(f.event_data) <= 131072 THEN CONVERT(varbinary(max), f.event_data) END) x(b) \
+ORDER BY (SELECT NULL) OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
 
 /// The following polls: after the buffer at `@p2` of the file `@p1`
 /// (measured on 2019: the read starts after that buffer; an offset that is
@@ -142,8 +146,8 @@ OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY";
 /// `@p3` returned, in file order.
 pub(crate) const XE_POLL_FROM: &str = "SELECT {columns} FROM \
 sys.fn_xe_file_target_read_file({pattern}, NULL, @p1, @p2) f CROSS APPLY (SELECT CASE WHEN \
-DATALENGTH(f.event_data) <= 131072 THEN f.event_data END) x(d) ORDER BY (SELECT NULL) \
-OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY";
+DATALENGTH(f.event_data) <= 131072 THEN CONVERT(varbinary(max), f.event_data) END) x(b) \
+ORDER BY (SELECT NULL) OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
 
 /// The number of columns of an Extended Events poll.
 pub(crate) const XE_POLL_COLUMNS: usize = 5 + XE_SLICES;
@@ -1043,12 +1047,13 @@ mod tests {
         assert_eq!(p, "N'/var/opt/mssql/xe/databastion_xe_0_*.xel'");
         let poll = xe_poll(&p, true).unwrap();
         assert!(checked(&poll) && poll.contains("NULL, @p1, @p2) f"));
-        assert_eq!(poll.matches("SUBSTRING(x.d, ").count(), XE_SLICES);
+        assert_eq!(poll.matches("SUBSTRING(x.b, ").count(), XE_SLICES);
         assert!(poll.contains(&format!(
-            "SUBSTRING(x.d, {}, 4000)",
-            (XE_SLICES - 1) * 4000 + 1
+            "SUBSTRING(x.b, {}, 8000)",
+            (XE_SLICES - 1) * 8000 + 1
         )));
-        const { assert!(XE_SLICES * 4000 * 2 >= XE_EVENT_BYTES) };
+        assert!(poll.ends_with("OPTION (MAXDOP 1)"));
+        const { assert!(XE_SLICES * 8000 >= XE_EVENT_BYTES) };
         assert_eq!(own_text(&poll), OwnText::NeedsCredit);
         assert_eq!(
             xe_pattern("C:\\XE\\o'x_0_1.xel").unwrap(),

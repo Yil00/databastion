@@ -43,6 +43,25 @@ proptest! {
         prop_assert_eq!(e.statement.as_deref().map(String::as_str), Some(stmt.as_str()));
     }
 
+    /// The poll's byte slices joined and decoded once give back the event
+    /// exactly, wherever the 8 000-byte boundaries fall in it (security
+    /// review of lot 3, M2: surrogate pairs included).
+    #[test]
+    fn xe_slices_join_exactly(stmt in "\\PC{0,40}", pad in 3900usize..4100, reps in 1usize..3) {
+        let stmt = format!("{}{}", "\u{1F600}y".repeat(pad * reps / 3), stmt);
+        let esc = stmt.replace('&', "&amp;").replace('<', "&lt;");
+        let x = format!(
+            "<event name=\"sql_statement_completed\"><data name=\"statement\"><value>{esc}</value></data></event>"
+        );
+        let units: Vec<u16> = x.encode_utf16().collect();
+        let row = crate::audit::xe::events::tests::row_of("sql_statement_completed", &units, units.len() * 2);
+        let r = crate::audit::xe::events::XeRecord::from_row(row).unwrap();
+        let e = r.event.unwrap();
+        if !e.statement_cut {
+            prop_assert_eq!(e.statement.as_deref().map(String::as_str), Some(stmt.as_str()));
+        }
+    }
+
     /// Whatever the statement text, the conversion never puts it in an
     /// event: the JSON of the event holds no part of a literal.
     #[test]
