@@ -298,7 +298,7 @@ jobs:
         if: failure()
         run: |
           [ -f "$RUNNER_TEMP/it.log" ] || exit 0
-          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error|^\[it\] " "$RUNNER_TEMP/it.log" | head -n 120 || true
           grep -nA12 "panicked at" "$RUNNER_TEMP/it.log" | head -n 120 || true
       - name: Stop
         if: always()

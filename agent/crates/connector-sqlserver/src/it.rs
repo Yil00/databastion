@@ -1171,6 +1171,17 @@ fn names_of(ev: &databastion_classifiers::masking::MaskedEvent) -> Vec<String> {
         .collect()
 }
 
+/// The account of an event as the test diagnostics print it (`[it]`
+/// lines, shown in CI's failure summary): the login, except for failed
+/// logins, whose name tried is never printed.
+fn shown_account(e: &databastion_classifiers::masking::MaskedEvent) -> String {
+    if e.principal().send_name() {
+        e.principal().account_name().to_owned()
+    } else {
+        "<fingerprinted>".to_owned()
+    }
+}
+
 /// ADR-0051 decision 6 and refinement item 1 (a'), P9-A lot 2: the SQL
 /// Server Audit source end to end against the dev audit. A dump-like read
 /// raises a read with `shape.full_table_read`; a failed login, a denied
@@ -1228,7 +1239,11 @@ async fn audit_scenario() {
 
     // Before any stream: every proof but a fresh record.
     let h = Box::pin(c.check(&t)).await;
-    eprintln!("audit, no stream: {:?} {:?}", h.audit_level, codes(&h));
+    eprintln!(
+        "\n[it] audit, no stream: {:?} {:?}",
+        h.audit_level,
+        codes(&h)
+    );
     assert!(h.reachable, "{:?}", h.detail);
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
     assert!(has(&h, NoteCode::AuditPartialPendingFirstRecord));
@@ -1396,7 +1411,7 @@ async fn audit_scenario() {
 
     tokio::time::sleep(Duration::from_secs(6)).await;
     let h = Box::pin(c.check(&t)).await;
-    eprintln!("audit, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    eprintln!("[it] audit, streaming: {:?} {:?}", h.audit_level, codes(&h));
     assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
     // The source's grants are expected while the stream uses them.
     assert!(!has_label(
@@ -1412,9 +1427,9 @@ async fn audit_scenario() {
     }
     for e in &events {
         eprintln!(
-            "event {:?} {} {:?} {:?} always={}",
+            "[it] event {:?} {} {:?} {:?} always={}",
             e.action(),
-            e.principal().account_name(),
+            shown_account(e),
             names_of(e),
             e.signals(),
             e.always_report()
@@ -1489,7 +1504,7 @@ async fn audit_scenario() {
     // Not vacuous: the agent's own catalog reads, sampling and polls were
     // in the audit and were left out.
     let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
-    eprintln!("own left out: exact {exact}, sampling {sampling}, polls {polls}");
+    eprintln!("[it] own left out: exact {exact}, sampling {sampling}, polls {polls}");
     assert!(
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
@@ -1522,9 +1537,9 @@ async fn audit_scenario() {
     }
     for e in &again {
         eprintln!(
-            "after restart {:?} {} {:?}",
+            "[it] after restart {:?} {} {:?}",
             e.action(),
-            e.principal().account_name(),
+            shown_account(e),
             names_of(e)
         );
     }

@@ -60,6 +60,19 @@ const OPEN_AT_SAVE_GRACE: Duration = Duration::from_secs(35);
 /// `login_time` is a `datetime` (3.33 ms steps): the start is moved back
 /// this much.
 const START_SLACK_US: i64 = 10_000;
+/// Tolerance between the server clock the lifetime is measured on
+/// (`SYSUTCDATETIME()` of the read-back) and the clock SQL Server Audit
+/// stamps `event_time` with. Measured on 2022: the records of a session's
+/// last statement, sent and answered before its clean close, carried an
+/// `event_time` up to 2.5 ms after the session's end computed from
+/// `SYSUTCDATETIME()` (CI failure of PR #247, reproduced locally about
+/// once in five runs). 250 ms is a hundred times that, above the 15.6 ms
+/// tick of a Windows system clock. It applies **only to the records of the
+/// session's last statement** (the same text, by its keyed hash), never to
+/// another text: a time tolerance alone made a session of the agent's
+/// login opened right after on the reused SPID (the integration test's
+/// foreign session) pass as the agent's for its first statements.
+pub(crate) const CLOCK_TOLERANCE_US: i64 = 250_000;
 /// Shortest and longest lifetime of a credit.
 pub(crate) const MAX_CREDIT_TTL: Duration = Duration::from_secs(900);
 /// Slack after a credited statement's timeout (clock steps of the
@@ -78,11 +91,22 @@ pub(crate) struct OwnSession {
     pub(crate) end_us: Option<i64>,
     /// The client address the server saw (`None`: not an IP literal).
     pub(crate) addr: Option<IpAddr>,
+    /// Keyed hash of the last statement the session sent before its clean
+    /// close (in memory only: the key is per process).
+    pub(crate) last: Option<u64>,
 }
 
 impl OwnSession {
-    fn within(&self, at_us: i64) -> bool {
-        self.start_us <= at_us && self.end_us.is_none_or(|e| at_us <= e)
+    /// Whether a record's `event_time` falls in the session's lifetime;
+    /// after a clean end, within [`CLOCK_TOLERANCE_US`], only for the text
+    /// of the session's last statement (`text_hash`).
+    fn within(&self, at_us: i64, text_hash: u64) -> bool {
+        self.start_us <= at_us
+            && self.end_us.is_none_or(|e| {
+                at_us <= e
+                    || (self.last == Some(text_hash)
+                        && at_us <= e.saturating_add(CLOCK_TOLERANCE_US))
+            })
     }
 }
 
@@ -161,6 +185,8 @@ pub(crate) struct Handle {
     server_us: i64,
     at: Instant,
     ended: bool,
+    /// Keyed hash of the last statement sent.
+    last: Option<u64>,
 }
 
 impl Handle {
@@ -173,6 +199,12 @@ impl Handle {
         let elapsed = self.at.elapsed() + extra;
         self.server_us
             .saturating_add(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX / 4))
+    }
+
+    /// Records the statement the session sends (its keyed hash: the
+    /// tolerance of the clean end applies to the last one only).
+    pub(crate) fn sent(&mut self, text: &str) {
+        self.last = Some(text_hash(text));
     }
 
     /// Records the end of the session: `lost` adds `grace` (the statement
@@ -192,6 +224,8 @@ impl Handle {
                 .find(|s| s.spid == self.spid && s.start_us == self.start_us)
         {
             s.end_us = Some(end);
+            // A lost session's grace already covers its last statement.
+            s.last = if lost { None } else { self.last };
         }
     }
 
@@ -274,6 +308,7 @@ pub(crate) fn opened(
         start_us,
         end_us: None,
         addr,
+        last: None,
     });
     Handle {
         target: target_id.to_owned(),
@@ -282,19 +317,21 @@ pub(crate) fn opened(
         server_us,
         at,
         ended: false,
+        last: None,
     }
 }
 
 /// The agent's session `spid` of `target_id` whose lifetime holds
 /// `at_us`, if any.
-pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64) -> Option<OwnSession> {
+pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64, text: &str) -> Option<OwnSession> {
+    let h = text_hash(text);
     let reg = lock();
     reg.targets
         .get(target_id)?
         .sessions
         .iter()
         .rev()
-        .find(|s| s.spid == spid && s.within(at_us))
+        .find(|s| s.spid == spid && s.within(at_us, h))
         .copied()
 }
 
@@ -501,6 +538,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
             start_us,
             end_us,
             addr,
+            last: None,
         });
     }
     Some(Persisted {
@@ -580,19 +618,77 @@ mod tests {
             "10.0.0.1".parse().ok(),
             Instant::now(),
         );
-        let s = session_at(t, 61, 999_600_000).unwrap();
+        let s = session_at(t, 61, 999_600_000, "").unwrap();
         assert_eq!(s.addr, "10.0.0.1".parse().ok());
-        assert!(session_at(t, 61, 999_400_000).is_none(), "before the login");
-        assert!(session_at(t, 62, 999_600_000).is_none(), "another spid");
+        assert!(
+            session_at(t, 61, 999_400_000, "").is_none(),
+            "before the login"
+        );
+        assert!(session_at(t, 62, 999_600_000, "").is_none(), "another spid");
         h.end(false, Duration::from_secs(30));
-        let end = session_at(t, 61, 999_600_000).unwrap().end_us.unwrap();
+        let end = session_at(t, 61, 999_600_000, "").unwrap().end_us.unwrap();
         assert!((1_000_000_000..1_001_000_000).contains(&end), "{end}");
         assert!(
-            session_at(t, 61, end + 1).is_none(),
+            session_at(t, 61, end + 1, "").is_none(),
             "no grace after a clean close"
         );
         drop(h);
-        assert_eq!(session_at(t, 61, 999_600_000).unwrap().end_us, Some(end));
+        assert_eq!(
+            session_at(t, 61, 999_600_000, "").unwrap().end_us,
+            Some(end)
+        );
+    }
+
+    /// The clock tolerance (CI failure of PR #247): a record of the last
+    /// statement stamped a few milliseconds after the computed clean end
+    /// is the session's; any other text after the end is not (a session
+    /// reusing the SPID at once, the integration test's foreign session),
+    /// nor the last text well after it, nor another SPID, nor after a lost
+    /// end.
+    #[test]
+    fn only_the_last_statement_gets_the_clock_tolerance() {
+        let t = "own-test-tolerance";
+        reset(t);
+        let mut h = opened(t, 72, 5_000_000_000, 0, None, Instant::now());
+        h.sent("SELECT 1 FROM sys.objects");
+        h.sent("SELECT TOP (20001) last");
+        h.end(false, Duration::ZERO);
+        let last = "SELECT TOP (20001) last";
+        let end = session_at(t, 72, 5_000_000_000, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        assert!(
+            session_at(t, 72, end + 2_500, last).is_some(),
+            "2.5 ms after the end (measured)"
+        );
+        assert!(session_at(t, 72, end + CLOCK_TOLERANCE_US, last).is_some());
+        assert!(session_at(t, 72, end + CLOCK_TOLERANCE_US + 1, last).is_none());
+        assert!(
+            session_at(t, 72, end + 2_500, "SELECT 1 FROM sys.objects").is_none(),
+            "an earlier text"
+        );
+        assert!(
+            session_at(t, 72, end + 2_500, crate::conn::SESSION_READBACK).is_none(),
+            "a new session's read-back"
+        );
+        assert!(
+            session_at(t, 73, end + 2_500, last).is_none(),
+            "another SPID"
+        );
+        assert!(
+            session_at(t, 72, 5_000_000_000 - START_SLACK_US - 1, last).is_none(),
+            "before the start"
+        );
+        // A lost end has its grace, no tolerance on top of it.
+        let mut l = opened(t, 74, 6_000_000_000, 0, None, Instant::now());
+        l.sent(last);
+        l.end(true, Duration::ZERO);
+        let end = session_at(t, 74, 6_000_000_000, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        assert!(session_at(t, 74, end + 1, last).is_none());
     }
 
     #[test]
@@ -601,7 +697,10 @@ mod tests {
         reset(t);
         let h = opened(t, 70, 2_000_000_000, 0, None, Instant::now());
         drop(h);
-        let end = session_at(t, 70, 2_000_000_000).unwrap().end_us.unwrap();
+        let end = session_at(t, 70, 2_000_000_000, "")
+            .unwrap()
+            .end_us
+            .unwrap();
         assert!(end >= 2_000_000_000 + 35_000_000);
     }
 
@@ -736,6 +835,7 @@ mod tests {
                     start_us: 0,
                     end_us: Some(1),
                     addr: None,
+                    last: None,
                 }],
                 polls: Vec::new(),
             },

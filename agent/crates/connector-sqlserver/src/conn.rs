@@ -890,6 +890,9 @@ impl Session {
         }
         let payload =
             tds::sql_batch(sql).map_err(|_| SsError::new(FailureCode::Internal, stage))?;
+        if let Some(h) = self.own.as_mut() {
+            h.sent(sql);
+        }
         self.request(ptype::SQL_BATCH, &payload, stage, shape, on_cell)
             .await
     }
@@ -909,6 +912,9 @@ impl Session {
         }
         let payload = tds::rpc_executesql(text, params)
             .map_err(|_| SsError::new(FailureCode::Internal, stage))?;
+        if let Some(h) = self.own.as_mut() {
+            h.sent(text);
+        }
         self.request(ptype::RPC, &payload, stage, shape, on_cell)
             .await
     }

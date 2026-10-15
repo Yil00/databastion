@@ -549,7 +549,8 @@ impl Stream<'_> {
         if h.cut {
             return Err("cut text");
         }
-        let Some(session) = own::session_at(&self.target.id, h.session_id, h.time_us) else {
+        let Some(session) = own::session_at(&self.target.id, h.session_id, h.time_us, &h.statement)
+        else {
             return Err("not one of the agent's sessions at that time");
         };
         let account = &self.target.account;
