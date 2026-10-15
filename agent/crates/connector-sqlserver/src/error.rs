@@ -41,6 +41,11 @@ pub(crate) enum Detail {
     FallbackCertificate,
     /// `tls: strict` against a server that does not speak TDS 8.0.
     StrictUnavailable,
+    /// The TLS handshake failed before any TDS byte (I/O, alert, protocol):
+    /// the only failure after which `auto` falls back to `mandatory`.
+    HandshakeFailed,
+    /// The server certificate did not verify (never a reason to fall back).
+    CertificateRejected,
     /// The server answered `ENCRYPT_OFF` / `ENCRYPT_NOT_SUP`.
     EncryptionRefused,
     /// Error 18486 (decision 2, L7).
@@ -64,6 +69,10 @@ impl Detail {
                  install a certificate issued by a trusted CA that names the declared host"
             }
             Self::StrictUnavailable => "strict encryption not available on this server",
+            Self::HandshakeFailed => "the TLS handshake failed",
+            Self::CertificateRejected => {
+                "the server certificate did not verify against the trusted roots and the declared host"
+            }
             Self::EncryptionRefused => {
                 "the server does not encrypt the whole session (ENCRYPT_OFF or ENCRYPT_NOT_SUP)"
             }

@@ -347,6 +347,11 @@ pub struct TargetConfig {
     /// configuration was loaded ([`AgentConfig::parse`]).
     #[serde(skip)]
     cas_resolved: Option<cas::CasSettings>,
+    /// The agent's `state_dir`, set when the configuration was loaded
+    /// ([`AgentConfig::parse`]): where a connector keeps small per-target
+    /// marks ([`crate::local_state`]).
+    #[serde(skip)]
+    state_dir: Option<PathBuf>,
 }
 
 /// Maximum number of databases declared for one PostgreSQL target.
@@ -783,6 +788,13 @@ impl TargetConfig {
         self.redis.clone().unwrap_or_default()
     }
 
+    /// The agent's `state_dir` (`None` for a target that did not come from
+    /// [`AgentConfig::parse`]).
+    #[must_use]
+    pub fn state_dir(&self) -> Option<&std::path::Path> {
+        self.state_dir.as_deref()
+    }
+
     /// Microsoft SQL Server settings, defaults when absent.
     #[must_use]
     pub fn sqlserver_settings(&self) -> sqlserver::SqlserverTargetConfig {
@@ -1127,6 +1139,9 @@ impl AgentConfig {
         config.validate()?;
         let mut config = config;
         config.resolve_cas()?;
+        for target in &mut config.targets {
+            target.state_dir = Some(config.state_dir.clone());
+        }
         Ok(config)
     }
 

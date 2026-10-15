@@ -72,10 +72,12 @@ pub(crate) enum Mode {
     Mandatory,
 }
 
-/// `auto`'s memory per target (refinement item 3, decision 2): strict
-/// seen (no fallback from then on, in memory), and the time until which
-/// `mandatory` is used directly after a failed strict attempt. Nothing is
-/// persisted: every agent start tries strict first.
+/// `auto`'s memory per target (decision 2, refinement item 3): "strict
+/// seen" (no fallback from then on), kept in memory **and persisted** in
+/// the agent's `state_dir` with the declared host and port (security
+/// review M1); and the time until which `mandatory` is used directly after
+/// a failed strict attempt, in memory only, so every agent start tries
+/// strict first.
 #[derive(Default)]
 pub(crate) struct TlsChoice {
     inner: Mutex<HashMap<String, Remembered>>,
@@ -94,6 +96,42 @@ fn choice_key(target: &TargetConfig) -> String {
         target.host.as_deref().unwrap_or_default(),
         target.effective_port().unwrap_or_default()
     )
+}
+
+/// Directory of the persisted "strict seen" marks, under `state_dir`.
+pub(crate) const STRICT_SEEN_DIR: &str = "sqlserver-strict-seen";
+
+/// The persisted mark's content: the declared host and port; a mark for
+/// another host or port (the target was changed) is not "seen".
+fn strict_seen_mark(target: &TargetConfig) -> Vec<u8> {
+    format!(
+        "{}\n{}\n",
+        target.host.as_deref().unwrap_or_default(),
+        target.effective_port().unwrap_or_default()
+    )
+    .into_bytes()
+}
+
+/// Whether the target's persisted mark says "strict seen" (fail safe:
+/// absent, unreadable or for another endpoint is "not seen").
+pub(crate) fn persisted_strict_seen(target: &TargetConfig) -> bool {
+    target.state_dir().is_some_and(|dir| {
+        databastion_core::local_state::load(&dir.join(STRICT_SEEN_DIR), &target.id)
+            .is_some_and(|m| m == strict_seen_mark(target))
+    })
+}
+
+fn persist_strict_seen(target: &TargetConfig) {
+    let Some(dir) = target.state_dir() else {
+        return;
+    };
+    if let Err(e) = databastion_core::local_state::store(
+        &dir.join(STRICT_SEEN_DIR),
+        &target.id,
+        &strict_seen_mark(target),
+    ) {
+        tracing::warn!(target_id = %target.id, error = %e.kind(), "strict-seen mark not persisted");
+    }
 }
 
 impl TlsChoice {
@@ -214,26 +252,35 @@ pub(crate) async fn connect(
     let open = |mode| open(target, tls, mode, &password, statement_timeout);
     match settings.tls {
         SqlserverTlsMode::Strict => open(Mode::Strict).await.map_err(|e| {
-            if e.stage == Stage::Tls && e.detail.is_none() {
+            if e.detail == Some(Detail::HandshakeFailed) {
                 e.with_detail(Detail::StrictUnavailable)
             } else {
                 e
             }
         }),
         SqlserverTlsMode::Mandatory => open(Mode::Mandatory).await,
-        SqlserverTlsMode::Auto => match choice.get(&key) {
-            Some(Remembered::StrictSeen) => open(Mode::Strict).await,
+        SqlserverTlsMode::Auto => match choice
+            .get(&key)
+            .or_else(|| persisted_strict_seen(target).then_some(Remembered::StrictSeen))
+        {
+            Some(Remembered::StrictSeen) => {
+                choice.set(key, Remembered::StrictSeen);
+                open(Mode::Strict).await
+            }
             Some(Remembered::MandatoryUntil(t)) if Instant::now() < t => {
                 open(Mode::Mandatory).await
             }
             _ => match open(Mode::Strict).await {
                 Ok(s) => {
                     choice.set(key, Remembered::StrictSeen);
+                    persist_strict_seen(target);
                     Ok(s)
                 }
-                // The strict handshake failed before any TDS byte: one
-                // fallback, fully verified, and strict again in an hour.
-                Err(e) if e.stage == Stage::Tls => {
+                // The strict handshake failed before any TDS byte (I/O,
+                // alert, protocol; never a certificate error, never after
+                // a completed handshake): one fallback, fully verified,
+                // and strict again in an hour (security review M1).
+                Err(e) if e.detail == Some(Detail::HandshakeFailed) => {
                     choice.set(
                         key,
                         Remembered::MandatoryUntil(Instant::now() + STRICT_RETRY),
@@ -278,16 +325,39 @@ fn server_name(target: &TargetConfig) -> Result<ServerName<'static>, SsError> {
     ServerName::try_from(host).map_err(|_| SsError::new(FailureCode::Internal, Stage::Tls))
 }
 
-fn tls_error(tls: &tls::TlsConfigs) -> SsError {
+/// Classifies a TLS handshake failure: the fallback certificate, another
+/// certificate error, or a handshake failure (I/O, alert, protocol).
+fn tls_error(tls: &tls::TlsConfigs, err: &std::io::Error) -> SsError {
     let e = SsError::new(FailureCode::TargetUnreachable, Stage::Tls);
     if tls
         .fallback_seen
         .swap(false, std::sync::atomic::Ordering::Relaxed)
     {
-        e.with_detail(Detail::FallbackCertificate)
-    } else {
-        e
+        return e.with_detail(Detail::FallbackCertificate);
     }
+    if is_certificate_error(err) {
+        e.with_detail(Detail::CertificateRejected)
+    } else {
+        e.with_detail(Detail::HandshakeFailed)
+    }
+}
+
+/// Whether a handshake I/O error carries a rustls certificate error.
+pub(crate) fn is_certificate_error(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|r| {
+            matches!(
+                r,
+                rustls::Error::InvalidCertificate(_)
+                    | rustls::Error::NoCertificatesPresented
+                    | rustls::Error::InvalidCertRevocationList(_)
+            )
+        })
+}
+
+fn handshake_timeout() -> SsError {
+    SsError::new(FailureCode::Timeout, Stage::Tls).with_detail(Detail::HandshakeFailed)
 }
 
 async fn open(
@@ -307,8 +377,8 @@ async fn open(
                     .connect(name, stream),
             )
             .await
-            .map_err(|_| SsError::new(FailureCode::Timeout, Stage::Tls))?
-            .map_err(|_| tls_error(tls))?;
+            .map_err(|_| handshake_timeout())?
+            .map_err(|e| tls_error(tls, &e))?;
             let mut s = Session::new(Box::new(tls_stream), mode, statement_timeout);
             // PRELOGIN inside TLS; its answer is read and not relied on.
             s.prelogin().await?;
@@ -332,8 +402,8 @@ async fn open(
                     .connect(name, wrapped),
             )
             .await
-            .map_err(|_| SsError::new(FailureCode::Timeout, Stage::Tls))?
-            .map_err(|_| tls_error(tls))?;
+            .map_err(|_| handshake_timeout())?
+            .map_err(|e| tls_error(tls, &e))?;
             tls_stream.get_mut().0.pass_through();
             s.io = Box::new(tls_stream);
             s.reset_stream();
@@ -990,6 +1060,66 @@ pub(crate) mod tests {
         assert_eq!(s.reasm.pending(), 0);
         assert!(s.buf.is_empty());
         drop(srv.await.unwrap());
+    }
+
+    /// Security review M1: only handshake failures fall back; a
+    /// certificate error never does.
+    #[test]
+    fn certificate_errors_are_told_apart() {
+        let cert = std::io::Error::other(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ));
+        assert!(is_certificate_error(&cert));
+        let alert = std::io::Error::other(rustls::Error::AlertReceived(
+            rustls::AlertDescription::HandshakeFailure,
+        ));
+        assert!(!is_certificate_error(&alert));
+        assert!(!is_certificate_error(
+            &std::io::ErrorKind::UnexpectedEof.into()
+        ));
+    }
+
+    /// Decision 2 (M1): "strict seen" is persisted per target, private,
+    /// bound to the declared host and port, and read fail-safe.
+    #[test]
+    fn strict_seen_is_persisted_for_the_declared_endpoint() {
+        let dir =
+            std::env::temp_dir().join(format!("databastion-sqlserver-seen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let parse = |host: &str| {
+            databastion_core::AgentConfig::parse(&format!(
+                "{{console: {{url: \"https://c.example\"}}, state_dir: {}, targets: [{{id: t1, \
+                 engine: sqlserver, host: {host}, account: a, secret: {{env: X}}}}]}}",
+                dir.display()
+            ))
+            .unwrap()
+            .targets[0]
+                .clone()
+        };
+        let t = parse("db.example");
+        assert!(!persisted_strict_seen(&t));
+        persist_strict_seen(&t);
+        assert!(persisted_strict_seen(&t));
+        let mark = dir.join(STRICT_SEEN_DIR).join("t1");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&mark).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Another host: not seen.
+        assert!(!persisted_strict_seen(&parse("other.example")));
+        // Unreadable (not private): not seen.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mark, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(!persisted_strict_seen(&t));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[::tokio::test]
