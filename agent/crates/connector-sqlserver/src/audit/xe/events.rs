@@ -415,9 +415,10 @@ pub(crate) fn context(
                         && o.event.as_ref().is_some_and(|oe| {
                             !oe.statement_cut
                                 && oe.activity.as_ref().is_some_and(|(g, _)| g == guid)
-                                && oe.statement.as_deref().is_some_and(|t| {
-                                    crate::sql::own_text(t) == crate::sql::OwnText::Exact
-                                })
+                                && oe
+                                    .statement
+                                    .as_deref()
+                                    .is_some_and(|t| crate::sql::catalog_text(t))
                         })
                         && own(o)
                 })
@@ -1315,6 +1316,23 @@ mod statistics_tests {
         recs[2] = stmt_in("databastion", "SELECT name FROM sys.objects", Some(GUID), 3);
         context(&mut recs, true, &own);
         assert!(!recs[0].skip, "no exact catalog text");
+        // One of the agent's exact texts that is not a catalog read.
+        for text in [
+            crate::sql::VERSION.to_owned(),
+            crate::conn::SESSION_SETTINGS.to_owned(),
+            crate::sql::render(crate::sql::XE_SESSION, &[("session", "N'databastion_xe'")])
+                .unwrap(),
+        ] {
+            assert_eq!(
+                crate::sql::own_text(&text),
+                crate::sql::OwnText::Exact,
+                "{text}"
+            );
+            let mut recs = own_build(Some(GUID));
+            recs[2] = stmt_in("databastion", &text, Some(GUID), 3);
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "not a catalog read: {text}");
+        }
         let mut recs = own_build(Some(GUID));
         recs[2] = stmt_in(
             "databastion",

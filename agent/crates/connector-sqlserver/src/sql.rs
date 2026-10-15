@@ -557,6 +557,49 @@ const CREDIT_ONLY: &[&str] = &[
 
 /// Whether `text` is exactly one of the connector's statements: a
 /// constant, or a template whose slots hold quoted values of the forms
+/// The agent's catalog reads (`check()`, Discovery and the Audit proofs
+/// that read catalog views): the statements whose compilation can make a
+/// fresh server build statistics on the system base tables of ADR-0051's
+/// refinement of 2026-10-15, case 2 (re-review: "exact catalog texts").
+/// Never the session settings, the version, the samples and counts of
+/// user tables, the polls, or the session proofs over DMVs. Measured as
+/// build partners on 2022: `server_permissions`, `server_roles`,
+/// `server_grants`, `accessible_databases`, `database_grants`,
+/// `column_counts`, `tables`, `cas_credential_columns`.
+const CATALOG_READS: &[&str] = &[
+    "server_permissions",
+    "server_roles",
+    "server_grants",
+    "password_hash_probe",
+    "logon_triggers",
+    "accessible_databases",
+    "user_databases",
+    "database_permissions",
+    "database_roles",
+    "database_grants",
+    "rls_view_definition",
+    "rls_denies",
+    "rls_server_denies",
+    "rls_tables",
+    "unsampled_objects",
+    "column_counts",
+    "tables",
+    "columns",
+    "cas_credential_columns",
+    "audit_file",
+    "audit_specifications",
+    "audit_database_reads",
+];
+
+/// Whether `text` is exactly one of the agent's catalog reads
+/// ([`CATALOG_READS`]), as [`render`] produces it.
+pub(crate) fn catalog_text(text: &str) -> bool {
+    STATEMENTS.iter().any(|(name, template)| {
+        CATALOG_READS.contains(name)
+            && (*template == text || (template.contains('{') && matches_template(template, text)))
+    })
+}
+
 /// [`render`] produces. Never by prefix or shape.
 pub(crate) fn own_text(text: &str) -> OwnText {
     if SERVER_INTERNAL.contains(&text) {
@@ -941,6 +984,36 @@ pub(crate) fn checked(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalog reads of case 2 (re-review): named statements, never a
+    /// credit-only one, a sample, a poll or a session proof.
+    #[test]
+    fn catalog_reads_are_a_closed_list_of_statements() {
+        for name in CATALOG_READS {
+            assert!(STATEMENTS.iter().any(|(n, _)| n == name), "{name}");
+            assert!(!CREDIT_ONLY.contains(name), "{name}");
+        }
+        for name in [
+            "session_settings",
+            "session_readback",
+            "version",
+            "sample",
+            "ticket_type_counts",
+            "xe_session",
+            "xe_events",
+            "audit_poll_start",
+            "audit_poll_from",
+            "xe_poll_start",
+            "xe_poll_from",
+        ] {
+            assert!(!CATALOG_READS.contains(&name), "{name}");
+        }
+        assert!(catalog_text(SERVER_PERMISSIONS));
+        assert!(catalog_text(&tables("retail", 16_384).unwrap()));
+        assert!(!catalog_text(VERSION));
+        assert!(!catalog_text(SERVER_INTERNAL[0]));
+        assert!(!catalog_text("SELECT name FROM sys.objects"));
+    }
 
     #[test]
     fn every_statement_passes_the_deny_list() {
