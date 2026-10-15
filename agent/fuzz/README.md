@@ -25,6 +25,8 @@ tests of each connector (`src/proptests.rs`).
 | `sqlserver_packets` | `…::fuzz::packets` | TDS packet reassembly (headers checked before bodies) and the `PRELOGIN` response parser |
 | `sqlserver_prelogin_tls` | `…::fuzz::prelogin_tls_framing` | The packet header check of the TLS handshake wrapped in `PRELOGIN` packets |
 | `sqlserver_plp` | `…::fuzz::plp` | The body of an `nvarchar(max)` row: PLP chunks reassembled under their cap (obligation L1) |
+| `sqlserver_tsql` | `…::fuzz::tsql` | The T-SQL analysis of SQL Server Audit statement texts (password-bearing statements keep their class only) and the own-text matcher |
+| `sqlserver_audit_records` | `…::fuzz::audit_records` | SQL Server Audit records: statement parts reassembled, records grouped per statement, events converted |
 | `cas_registry` | `databastion_connector_cas::fuzz::registry` | One CAS service definition file (JSON); paths named, service indexed |
 | `cas_registry_yaml` | `…::fuzz::registry_yaml` | One CAS YAML service definition file: the pre-scan (anchors, aliases, tags, merge keys refused), then the crate's own YAML parser and the same visitor |
 | `cas_registry_yaml_diff` | `…::fuzz::registry_yaml_diff` | Differential ([ADR-0046](../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md)): on every file the pre-scan accepts, the crate's YAML parser and `serde_yaml_ng` (the oracle, a dependency of this harness only) must read the same values and the same definition, or both fail; a disagreement panics |

@@ -23,7 +23,15 @@ const REGISTRY: &str = include_str!("../../../../shared/protocol/signals.json");
 /// Add an engine here in the change that implements its Audit connector,
 /// together with its signals in `Signal` and in `signals.json`.
 const AUDIT_ENGINES: &[&str] = &[
-    "postgres", "mysql", "mariadb", "mongodb", "openldap", "cas", "redis", "valkey",
+    "postgres",
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "openldap",
+    "cas",
+    "redis",
+    "valkey",
+    "sqlserver",
 ];
 
 /// Registered engines of each signal id. The registry schema

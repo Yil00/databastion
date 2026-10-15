@@ -250,3 +250,93 @@ pub fn plp(data: &[u8]) {
     with_cap.extend(stream);
     token_stream(&with_cap);
 }
+
+/// The T-SQL statement analysis of the Audit records (ADR-0051 decision
+/// 1: "the T-SQL statement analysis"): never panics; a password-bearing
+/// prefix keeps the class only whatever follows; the own-text matcher
+/// never accepts a text that is not exactly a statement of the closed set.
+pub fn tsql(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let cut = data.first().is_some_and(|b| b & 1 == 1);
+    let a = databastion_classifiers::query::tsql::analyze_tsql(&text, cut);
+    if a.credential {
+        assert!(a.listed.is_empty() && a.shape.is_none());
+    }
+    let head = format!("CREATE LOGIN x WITH PASSWORD = {text}");
+    let c = databastion_classifiers::query::tsql::analyze_tsql(&head, false);
+    assert!(c.credential && c.listed.is_empty());
+    if crate::sql::own_text(&text) == crate::sql::OwnText::Exact {
+        assert!(
+            crate::sql::SERVER_INTERNAL.contains(&text.as_ref())
+                || crate::sql::STATEMENTS
+                    .iter()
+                    .any(|(_, t)| *t == text || crate::sql::matches_template(t, &text))
+        );
+    }
+}
+
+/// The Audit record pipeline (decision 1: "the Audit record conversion"):
+/// records built from the input (actions and classes from the closed
+/// tables and others, any text, any sequence numbers and groups) are
+/// reassembled, grouped and converted without panicking; a converted
+/// event never carries text beyond normalized names.
+pub fn audit_records(data: &[u8]) {
+    use crate::audit::records::{Record, convert, group, reassemble};
+    const ACTIONS: &[&str] = &[
+        "SL", "IN", "UP", "DL", "EX", "LGIF", "LGIS", "AUSC", "CR", "AL", "DR", "G", "BA", "DBCC",
+        "RC", "XX", "APRL", "TO",
+    ];
+    const CLASSES: &[&str] = &[
+        "U", "V", "X", "P", "DB", "SL", "LX", "A", "SA", "US", "IF", "",
+    ];
+    let mut records = Vec::new();
+    for chunk in data.split(|b| *b == 0xFF).take(256) {
+        let Some((&head, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let (meta, text) = rest.split_at(rest.len().min(3));
+        let pick = |list: &[&str], i: usize| list[i % list.len()].to_owned();
+        let m = |i: usize| usize::from(meta.get(i).copied().unwrap_or(0));
+        records.push(Record {
+            time_us: i64::from(head) * 1000,
+            action: pick(ACTIONS, usize::from(head)),
+            succeeded: head & 1 == 0,
+            class: pick(CLASSES, m(0)),
+            session_id: i64::from(head % 4),
+            principal: "p".to_owned(),
+            session_principal: if head & 2 == 0 {
+                "p".to_owned()
+            } else {
+                String::new()
+            },
+            database: "db".to_owned(),
+            schema: String::from_utf8_lossy(&text[..text.len().min(8)]).into_owned(),
+            object: "o".to_owned(),
+            statement: zeroize::Zeroizing::new(String::from_utf8_lossy(text).into_owned()),
+            client_ip: if m(1) % 2 == 0 {
+                "10.0.0.1".to_owned()
+            } else {
+                "x".to_owned()
+            },
+            application: if m(1) % 3 == 0 {
+                "bcp".to_owned()
+            } else {
+                String::new()
+            },
+            sequence: i64::try_from(m(2) % 4).unwrap_or(1),
+            transaction: i64::from(head % 3),
+            file: "f".to_owned(),
+            offset: 4096,
+            group: format!("{}", m(0) % 3),
+            error: (m(1) % 5 == 0).then_some(17_830),
+            cut: false,
+        });
+    }
+    for s in group(reassemble(records)) {
+        if let Some((ev, _)) = convert(&s) {
+            for o in ev.objects() {
+                assert!(o.object().as_str().len() <= 256);
+            }
+        }
+    }
+}

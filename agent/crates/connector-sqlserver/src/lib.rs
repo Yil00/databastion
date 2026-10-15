@@ -1,6 +1,7 @@
 //! Microsoft SQL Server connector for the DataBastion agent (phase 9,
 //! ADR-0051 and its accepted refinement of 2026-10-14). Lot 1: the TDS
-//! client, `check()` and Discovery; Audit comes in a later lot.
+//! client, `check()` and Discovery; lot 2: Audit from SQL Server Audit
+//! ([`audit`], Partial at best).
 //!
 //! - Own bounded TDS client (decision 1): `PRELOGIN`, TLS (TDS 8.0 strict,
 //!   or the handshake wrapped in `PRELOGIN` packets), `LOGIN7` with SQL
@@ -28,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod check;
 mod conn;
 mod discover;
@@ -56,6 +58,7 @@ mod it;
 mod proptests;
 
 use async_trait::async_trait;
+use databastion_classifiers::masking::EventSource;
 use databastion_core::config::TargetConfig;
 use databastion_core::{
     AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
@@ -128,14 +131,21 @@ impl Connector for SqlserverConnector {
 
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
-        _sink: &EventSink,
+        cfg: &AuditConfig,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        // Audit is the third P9-A lot (ADR-0051 decision 10).
-        Err(ConnectorError::NotImplemented {
-            engine: Engine::Sqlserver,
-            operation: "audit_stream",
-        })
+        audit::audit_stream(cfg, sink, &self.state).await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(&self, target: &TargetConfig) -> Option<EventSource> {
+        self.state
+            .audit
+            .usable(&target.id)
+            .then_some(EventSource::SqlserverAudit)
     }
 
     fn server_version(&self, target: &TargetConfig) -> Option<String> {
@@ -177,7 +187,7 @@ mod tests {
     async fn default_job_without_target_fails_closed() {
         let c = SqlserverConnector::new();
         assert_eq!(c.engine(), Engine::Sqlserver);
-        assert!(!c.supports_audit());
+        assert!(c.supports_audit());
         let (findings, _rx) = FindingSink::channel(1);
         assert!(c.discover(&ScanJob::default(), &findings).await.is_err());
     }

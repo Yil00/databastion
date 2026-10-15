@@ -1127,3 +1127,347 @@ async fn hostile_names_stay_quoted() {
     agent_s.close().await;
     exec(&mut s, &in_db("retail", &format!("DROP TABLE crm.{qt}"))).await;
 }
+
+/// A session of `account` that is **not** one of the agent's own for the
+/// target `it` (registered under another target id): what someone holding
+/// the agent's credentials, or another client, opens.
+async fn foreign_session(account: &str, secret_env: &str) -> Session {
+    let mut t = target(account, secret_env, own_tls());
+    t.id = "it-foreign".to_owned();
+    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+        .await
+        .unwrap()
+}
+
+/// Rows of `sql` (tests only), errors ignored.
+async fn try_rows(s: &mut Session, sql: &str, columns: usize) -> Option<Vec<Vec<Value>>> {
+    match s
+        .rows(sql, Stage::Check, Shape::rows(columns, 10_000))
+        .await
+    {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!("try_rows: {e:?}");
+            None
+        }
+    }
+}
+
+/// The audit settings of the dev audit (dev/sqlserver/initdb/30-audit.sql).
+const AUDIT: &str = "rls_visibility: view_definition, audit: {source: sqlserver_audit, audit_name: databastion_audit}";
+
+fn names_of(ev: &databastion_classifiers::masking::MaskedEvent) -> Vec<String> {
+    ev.objects()
+        .iter()
+        .map(|o| {
+            format!(
+                "{}.{}.{}",
+                o.database().as_str(),
+                o.schema().map_or("-", |s| s.as_str()),
+                o.object().as_str()
+            )
+        })
+        .collect()
+}
+
+/// ADR-0051 decision 6 and refinement item 1 (a'), P9-A lot 2: the SQL
+/// Server Audit source end to end against the dev audit. A dump-like read
+/// raises a read with `shape.full_table_read`; a failed login, a denied
+/// `xp_cmdshell` and credential DCL are reported (the DCL never leaks its
+/// password); the agent's own `check()`, Discovery and polls are left
+/// out while the same login from another session is reported; no
+/// ground-truth value leaves in the events; the position survives a
+/// restart of the stream. SQL Server 2019: no source (`CONTROL SERVER`).
+#[tokio::test]
+async fn audit_reports_reads_and_leaves_the_agents_own_out() {
+    use databastion_classifiers::masking::{EventAction, MaskedEvent, Signal};
+    use databastion_core::AuditLevel;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = major().await;
+    let mut s = sa().await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {AUDIT}", own_tls()));
+    if major < 16 {
+        let h = c.check(&t).await;
+        assert_eq!(h.audit_level, AuditLevel::None);
+        assert!(
+            has(&h, NoteCode::AuditSqlserverAuditNeedsControlServer),
+            "{:?}",
+            codes(&h)
+        );
+        return;
+    }
+    // Option (a'): the dev account's Audit grants (dev/sqlserver/initdb).
+    exec(
+        &mut s,
+        &in_db(
+            "master",
+            "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
+             DEFINITION TO databastion",
+        ),
+    )
+    .await;
+    exec(
+        &mut s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    )
+    .await;
+    throwaway(&mut s, "it_dump", &[]).await;
+    drop_login(&mut s, "it_cred").await;
+
+    // Before any stream: every proof but a fresh record.
+    let h = c.check(&t).await;
+    eprintln!("audit, no stream: {:?} {:?}", h.audit_level, codes(&h));
+    assert!(h.reachable, "{:?}", h.detail);
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
+    assert!(has(&h, NoteCode::AuditPartialPendingFirstRecord));
+    assert!(has(&h, NoteCode::AuditLogWithoutRowCounts));
+    assert!(has(&h, NoteCode::PrivilegeAuditGrantWithoutAudit));
+    // ON_FAILURE = CONTINUE in the dev audit: its counter is not read.
+    assert!(has(&h, NoteCode::PrivilegeNotEvaluated));
+    assert!(c.audit_source(&t).is_some());
+
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-audit-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let start = |c: &Arc<SqlserverConnector>| {
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(c);
+        (
+            tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await }),
+            rx,
+        )
+    };
+    let (stream, mut rx) = start(&c);
+    // The first start skips the audit's history.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+
+    // The agent's own activity while the stream reads: check() and a
+    // Discovery scan (sampling, CAS ticket counts, catalog reads).
+    let h = c.check(&t).await;
+    assert!(!has(&h, NoteCode::PrivilegeRefused), "{:?}", codes(&h));
+    let scan = {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        let r = c.discover(&job, &sink).await;
+        drop(sink);
+        drain.await.unwrap();
+        r
+    };
+    scan.unwrap();
+
+    // Someone else: a dump-like read, a read with a ground-truth value in
+    // its text, a denied xp_cmdshell.
+    let truth = truth();
+    let email = truth["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["engine"] == "sqlserver")
+        .flat_map(|l| l["values"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .find(|v| v.contains('@'))
+        .expect("a ground-truth e-mail");
+    {
+        let mut d = foreign_session("it_dump", "DATABASTION_IT_SQLSERVER_THROWAWAY").await;
+        try_rows(
+            &mut d,
+            "SELECT id, customer_id FROM retail.crm.customer_notes",
+            2,
+        )
+        .await;
+        try_rows(
+            &mut d,
+            &format!(
+                "SELECT id FROM retail.crm.customers WHERE email = N'{}'",
+                email.replace('\'', "''")
+            ),
+            1,
+        )
+        .await;
+        exec_ok(&mut d, "EXEC master.dbo.xp_cmdshell 'whoami'").await;
+        d.close().await;
+    }
+    // The agent's login from a session that is not the agent's own.
+    {
+        let mut f = foreign_session("databastion", "SQLSERVER_DATABASTION_PASSWORD").await;
+        try_rows(&mut f, "SELECT TOP (3) email FROM retail.crm.customers", 1).await;
+        f.close().await;
+    }
+    // A failed login (the name tried is fingerprinted).
+    {
+        let mut bad = target(
+            "it_no_such_login",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+            own_tls(),
+        );
+        bad.id = "it-foreign".to_owned();
+        let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
+        assert!(
+            conn::connect(&bad, &tls, &TlsChoice::default(), Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+    }
+    // Credential DCL: its password never leaves the agent.
+    let marker = "Cred-Marker-7Zq9-only-in-dcl";
+    exec(
+        &mut s,
+        &format!("CREATE LOGIN [it_cred] WITH PASSWORD = N'{marker}', CHECK_POLICY = OFF"),
+    )
+    .await;
+    drop_login(&mut s, "it_cred").await;
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let h = c.check(&t).await;
+    eprintln!("audit, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+    // The source's grants are expected while the stream uses them.
+    assert!(!has_label(
+        &h,
+        NoteCode::PrivilegeAuditGrantWithoutAudit,
+        "view_any_security_definition"
+    ));
+    stream.abort();
+    let _ = stream.await;
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    for e in &events {
+        eprintln!(
+            "event {:?} {} {:?} {:?} always={}",
+            e.action(),
+            e.principal().account_name(),
+            names_of(e),
+            e.signals(),
+            e.always_report()
+        );
+    }
+    let by = |who: &str| -> Vec<&MaskedEvent> {
+        events
+            .iter()
+            .filter(|e| e.principal().account_name().eq_ignore_ascii_case(who))
+            .collect()
+    };
+    // The dump-like read.
+    let dump = by("it_dump");
+    assert!(
+        dump.iter().any(|e| e.action() == EventAction::Read
+            && names_of(e).contains(&"retail.crm.customer_notes".to_owned())
+            && e.signals().contains(&Signal::FullTableRead)),
+        "no whole-table read reported"
+    );
+    // The denied xp_cmdshell.
+    assert!(
+        dump.iter()
+            .any(|e| e.signals().contains(&Signal::RemoteDataAccess) && e.always_report()),
+        "no remote data access reported"
+    );
+    // The failed login, fingerprinted.
+    assert!(
+        events.iter().any(|e| e.action() == EventAction::AuthFailure
+            && !e.principal().send_name()
+            && e.principal().account_name() == "it_no_such_login"),
+        "no failed login reported"
+    );
+    // The credential DCL, by `sa`.
+    assert!(
+        by("sa").iter().any(|e| e.action() == EventAction::Dcl),
+        "no DCL reported"
+    );
+    // The agent's login: only the foreign session's statements (its
+    // session read-back and its read, which are the agent's constant and
+    // a plain read, but from a session that is not the agent's), nothing
+    // of the agent's own check(), Discovery or polls.
+    let agent_events = by("databastion");
+    assert!(
+        agent_events
+            .iter()
+            .any(|e| names_of(e) == ["retail.crm.customers"]),
+        "the agent's login from another session must be reported"
+    );
+    for e in &agent_events {
+        assert!(
+            (names_of(e) == ["retail.crm.customers"]
+                || names_of(e) == ["master.sys.dm_exec_sessions"])
+                && e.action() == EventAction::Read,
+            "an own statement reported: {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    assert_eq!(agent_events.len(), 2, "own statements reported");
+    // Not vacuous: the agent's own catalog reads, sampling and polls were
+    // in the audit and were left out.
+    let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
+    eprintln!("own left out: exact {exact}, sampling {sampling}, polls {polls}");
+    assert!(
+        exact > 10 && sampling >= 5 && polls >= 2,
+        "{exact} {sampling} {polls}"
+    );
+    // I2: no ground-truth value, nor the DCL password, in what is sent.
+    let json = databastion_core::test_support::contract_events_json(&events, &key());
+    assert!(json.contains("\"source\":\"sqlserver_audit\""), "{json}");
+    assert!(!json.contains(marker), "credential DCL leaked");
+    assert!(
+        !json.contains("it_no_such_login"),
+        "failed login name in clear"
+    );
+    for loc in truth["locations"].as_array().unwrap() {
+        for v in loc["values"].as_array().into_iter().flatten() {
+            if let Some(v) = v.as_str().filter(|v| v.len() >= 6) {
+                assert!(!json.contains(v), "a ground-truth value in the events");
+            }
+        }
+    }
+
+    // A restart of the stream: the position is kept, nothing already
+    // read is reported again.
+    let (stream, mut rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut again = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        again.push(e);
+    }
+    for e in &again {
+        eprintln!(
+            "after restart {:?} {} {:?}",
+            e.action(),
+            e.principal().account_name(),
+            names_of(e)
+        );
+    }
+    assert!(
+        !again
+            .iter()
+            .any(|e| e.principal().account_name().eq_ignore_ascii_case("it_dump")),
+        "events reported twice after a restart"
+    );
+    assert!(
+        !again.iter().any(|e| e
+            .principal()
+            .account_name()
+            .eq_ignore_ascii_case("databastion")),
+        "the agent's own statements reported after a restart"
+    );
+    drop_login(&mut s, "it_dump").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

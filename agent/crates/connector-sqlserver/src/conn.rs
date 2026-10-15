@@ -47,10 +47,18 @@ SET DEADLOCK_PRIORITY LOW; SET NOCOUNT OFF; SET QUOTED_IDENTIFIER ON; SET ANSI_N
 SET ROWCOUNT 0; SET TEXTSIZE 8000; SET LANGUAGE us_english; SET DATEFORMAT ymd";
 
 /// The settings read back (decision 5): `@@OPTIONS`, `@@LOCK_TIMEOUT`,
-/// `@@SPID` and the session's isolation level.
+/// `@@SPID` and the session's isolation level; and the session's own
+/// identity for the Audit own-session rule (decision 6, H1): the server's
+/// UTC time, the time since its `login_time` (both in µs; `login_time` is
+/// local time, so the difference is taken on the server's local clock),
+/// and the client address the server sees. A session sees its own
+/// `sys.dm_exec_sessions` row without `VIEW SERVER STATE` (measured).
 pub(crate) const SESSION_READBACK: &str = "SELECT CONVERT(int, @@OPTIONS), \
 CONVERT(int, @@LOCK_TIMEOUT), CONVERT(int, @@SPID), CONVERT(int, (SELECT \
-transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID))";
+transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID)), \
+CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', SYSUTCDATETIME())), CONVERT(bigint, (SELECT \
+DATEDIFF_BIG(microsecond, login_time, SYSDATETIME()) FROM sys.dm_exec_sessions WHERE session_id = \
+@@SPID)), CONVERT(nvarchar(48), CONNECTIONPROPERTY('client_net_address'))";
 
 /// `@@OPTIONS` bits checked.
 mod opt {
@@ -294,11 +302,19 @@ pub(crate) struct Session {
     pub(crate) spid: Option<i64>,
     /// Statement timeout of this session.
     pub(crate) statement_timeout: Duration,
+    /// The session's registration as one of the agent's own (decision 6).
+    pub(crate) own: Option<crate::audit::own::Handle>,
+    /// A request is in flight (a drop then loses the session).
+    in_flight: bool,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         self.buf.zeroize();
+        if let Some(h) = self.own.as_mut() {
+            // Not closed through `close()`: lost (decision 6).
+            h.end(true, self.statement_timeout + crate::audit::own::LOST_GRACE);
+        }
     }
 }
 
@@ -479,8 +495,26 @@ async fn open(
         }
     };
     session.login(&target.account, password).await?;
-    session.setup().await?;
+    let identity = session.setup().await?;
+    session.own = Some(crate::audit::own::opened(
+        &target.id,
+        identity.spid,
+        identity.server_us,
+        identity.since_login_us,
+        identity.addr,
+        identity.at,
+    ));
     Ok(session)
+}
+
+/// What the read-back tells of the session itself (decision 6).
+struct Identity {
+    spid: i64,
+    server_us: i64,
+    since_login_us: i64,
+    addr: Option<std::net::IpAddr>,
+    /// The agent's instant before the read-back was sent.
+    at: Instant,
 }
 
 impl Session {
@@ -500,6 +534,8 @@ impl Session {
             info: ServerInfo::default(),
             spid: None,
             statement_timeout,
+            own: None,
+            in_flight: false,
         }
     }
 
@@ -511,9 +547,32 @@ impl Session {
         self.last_used.elapsed() >= STALE_AFTER
     }
 
-    /// Closes the connection (the server ends whatever ran on it).
+    /// Closes the connection (the server ends whatever ran on it). A
+    /// session with nothing in flight and not poisoned ends cleanly (no
+    /// grace, decision 6, re-review N4); otherwise it is lost.
     pub(crate) async fn close(mut self) {
+        let lost = self.poisoned || self.in_flight;
+        let grace = self.statement_timeout + crate::audit::own::LOST_GRACE;
         let _ = ::tokio::time::timeout(Duration::from_secs(1), self.io.shutdown()).await;
+        if let Some(h) = self.own.as_mut() {
+            h.end(lost, grace);
+        }
+    }
+
+    /// Grants an Audit credit for `text` on this session (decision 6, L5):
+    /// called right before a sampling statement, a CAS ticket count or an
+    /// Audit poll is sent.
+    pub(crate) fn credit(&self, text: &str) {
+        if let Some(h) = &self.own {
+            h.credit(text, self.statement_timeout, None);
+        }
+    }
+
+    /// Grants the credit of an Audit poll (decision 6).
+    pub(crate) fn credit_poll(&self, text: &str, kind: crate::audit::own::PollKind) {
+        if let Some(h) = &self.own {
+            h.credit(text, self.statement_timeout, Some(kind));
+        }
     }
 
     async fn send(&mut self, ptype: u8, payload: &[u8], stage: Stage) -> Result<(), SsError> {
@@ -748,7 +807,7 @@ impl Session {
     }
 
     /// The constant session settings, read back and checked.
-    async fn setup(&mut self) -> Result<(), SsError> {
+    async fn setup(&mut self) -> Result<Identity, SsError> {
         self.run(
             SESSION_SETTINGS,
             Stage::SessionSetup,
@@ -756,8 +815,9 @@ impl Session {
             |_| Flow::Continue,
         )
         .await?;
+        let at = Instant::now();
         let rows = self
-            .rows(SESSION_READBACK, Stage::SessionSetup, Shape::rows(4, 1))
+            .rows(SESSION_READBACK, Stage::SessionSetup, Shape::rows(7, 1))
             .await?;
         let row = rows.first().ok_or(SsError::protocol(Stage::SessionSetup))?;
         let int = |i: usize| row.get(i).and_then(Value::as_int);
@@ -775,7 +835,22 @@ impl Session {
             return Err(SsError::new(FailureCode::Internal, Stage::SessionSetup));
         }
         self.spid = int(2);
-        Ok(())
+        let (Some(spid), Some(server_us), Some(since_login_us)) = (int(2), int(4), int(5)) else {
+            self.poisoned = true;
+            return Err(SsError::protocol(Stage::SessionSetup));
+        };
+        // Only an IP literal counts (decision 6).
+        let addr = row
+            .get(6)
+            .and_then(Value::as_text)
+            .and_then(|a| a.parse::<std::net::IpAddr>().ok());
+        Ok(Identity {
+            spid,
+            server_us,
+            since_login_us,
+            addr,
+            at,
+        })
     }
 
     /// Runs a statement and returns its rows (at most `shape.max_rows`).
@@ -820,7 +895,6 @@ impl Session {
     }
 
     /// Runs `sp_executesql` with a constant text and typed parameters.
-    #[allow(dead_code)]
     pub(crate) async fn rpc(
         &mut self,
         text: &str,
@@ -829,6 +903,10 @@ impl Session {
         shape: Shape,
         on_cell: impl FnMut(Cell) -> Flow,
     ) -> Result<Ended, SsError> {
+        if !crate::sql::checked(text) {
+            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
+            return Err(SsError::new(FailureCode::Internal, stage));
+        }
         let payload = tds::rpc_executesql(text, params)
             .map_err(|_| SsError::new(FailureCode::Internal, stage))?;
         self.request(ptype::RPC, &payload, stage, shape, on_cell)
@@ -855,6 +933,7 @@ impl Session {
         self.dec.discard = false;
         self.msg_bytes = 0;
         self.msg_cap = shape.max_bytes;
+        self.in_flight = true;
         self.send(ptype, payload, stage).await?;
         let deadline = Instant::now() + self.statement_timeout;
         let mut results = 0usize;
@@ -927,8 +1006,10 @@ impl Session {
         }
         if let Some(outcome) = stop {
             self.cancel(stage).await;
+            self.in_flight = self.poisoned;
             return outcome;
         }
+        self.in_flight = false;
         self.last_used = Instant::now();
         match error {
             Some(e) => Err(e),

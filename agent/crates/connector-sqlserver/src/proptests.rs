@@ -17,6 +17,22 @@ proptest! {
         crate::fuzz_entry::packets(&data);
         crate::fuzz_entry::plp(&data);
         crate::fuzz_entry::prelogin_wrap(&data);
+        crate::fuzz_entry::tsql(&data);
+        crate::fuzz_entry::audit_records(&data);
+    }
+
+    /// The template matcher accepts a statement of the closed set filled
+    /// with any database name, and nothing else in its slots.
+    #[test]
+    fn own_templates_hold_any_quoted_name(db in "\\PC{1,40}", junk in "\\PC{1,20}") {
+        prop_assume!(!db.chars().any(char::is_control));
+        for t in [crate::sql::DATABASE_GRANTS, crate::sql::DATABASE_ROLES, crate::sql::COLUMN_COUNTS] {
+            let text = crate::sql::in_database(t, &db).unwrap();
+            prop_assert!(crate::sql::matches_template(t, &text));
+            prop_assert_eq!(crate::sql::own_text(&text), crate::sql::OwnText::Exact);
+            let changed = text.replacen(&crate::sql::quote_ident(&db).unwrap(), &format!("[x]{junk}"), 1);
+            prop_assert!(!crate::sql::matches_template(t, &changed) || changed == text);
+        }
     }
 
     #[test]

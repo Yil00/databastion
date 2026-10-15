@@ -195,3 +195,17 @@ path = "fuzz_targets/sqlserver_plp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sqlserver_tsql"
+path = "fuzz_targets/sqlserver_tsql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_audit_records"
+path = "fuzz_targets/sqlserver_audit_records.rs"
+test = false
+doc = false
+bench = false

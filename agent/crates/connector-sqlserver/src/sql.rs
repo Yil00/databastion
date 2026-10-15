@@ -38,7 +38,77 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
     ("cas_credential_columns", CAS_COLUMNS),
     ("ticket_type_counts", TICKET_TYPE_COUNTS),
     ("sample", SAMPLE),
+    ("audit_file", AUDIT_FILE),
+    ("audit_specifications", AUDIT_SPECIFICATIONS),
+    ("audit_database_reads", AUDIT_DATABASE_READS),
+    ("audit_poll_start", AUDIT_POLL_START),
+    ("audit_poll_from", AUDIT_POLL_FROM),
 ];
+
+/// The Audit source's server audit (ADR-0051 decision 6, refinement item 1
+/// (a'), M4), read from `sys.server_file_audits` (a `FILE` target only;
+/// never `sys.server_audits`): enabled, **whether** it has a predicate
+/// (never the predicate's text), `ON_FAILURE`, its GUID and folder (used
+/// only to build the poll's file pattern) and `QUEUE_DELAY`. Visible with
+/// `VIEW ANY SECURITY DEFINITION` (measured on 2022).
+pub(crate) const AUDIT_FILE: &str = "SELECT TOP (2) CONVERT(int, is_state_enabled), \
+CONVERT(int, CASE WHEN predicate IS NULL THEN 1 ELSE 0 END), CONVERT(int, on_failure), \
+CONVERT(nvarchar(36), audit_guid), CONVERT(nvarchar(260), log_file_path), CONVERT(int, queue_delay) \
+FROM sys.server_file_audits WHERE name = {audit}";
+
+/// The action groups of the enabled server audit specifications of the
+/// audit (decision 6 proofs 3 and 4): group names and audited results, a
+/// closed vocabulary of the server, never an object or principal name.
+pub(crate) const AUDIT_SPECIFICATIONS: &str = "SELECT TOP (513) \
+CONVERT(nvarchar(64), d.audit_action_name), CONVERT(nvarchar(32), d.audited_result) \
+FROM sys.server_audit_specifications s JOIN sys.server_audit_specification_details d ON \
+d.server_specification_id = s.server_specification_id WHERE s.audit_guid = \
+CONVERT(uniqueidentifier, {guid}) AND s.is_state_enabled = 1";
+
+/// Read coverage of one monitored database by an enabled database audit
+/// specification of the audit (decision 6 proof 3): `SCHEMA_OBJECT_ACCESS_GROUP`
+/// or `SELECT` on the database by `public`, counted on the server (no
+/// object or principal name is read; refinement item 1, I2).
+pub(crate) const AUDIT_DATABASE_READS: &str = "SELECT CONVERT(int, COUNT(*)) FROM \
+{db}.sys.database_audit_specifications s JOIN {db}.sys.database_audit_specification_details d \
+ON d.database_specification_id = s.database_specification_id WHERE s.audit_guid = \
+CONVERT(uniqueidentifier, {guid}) AND s.is_state_enabled = 1 AND d.audited_result LIKE N'SUCCESS%' \
+AND (d.audit_action_name = N'SCHEMA_OBJECT_ACCESS_GROUP' OR (d.audit_action_name = N'SELECT' AND \
+d.class = 0 AND d.audited_principal_id = 0))";
+
+/// The columns of an Audit poll (decision 6, "What is kept"): times as
+/// microseconds since 1970 (UTC), the closed fields, the statement (its
+/// text never leaves the agent), the position, and for a failed login the
+/// error number only, cut from `additional_information` on the server
+/// (the rest of that XML is never read). Dropped: `host_name`,
+/// `additional_information`, `data_sensitivity_information`,
+/// `user_defined_information`, `permission_bitmask`, `affected_rows` and
+/// `response_rows` (always 0 on boxed SQL Server, measured on 2022).
+const AUDIT_COLUMNS: &str = "CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', event_time)), \
+CONVERT(nvarchar(4), action_id), CONVERT(int, succeeded), CONVERT(nvarchar(2), class_type), \
+CONVERT(int, session_id), CONVERT(nvarchar(128), server_principal_name), \
+CONVERT(nvarchar(128), session_server_principal_name), CONVERT(nvarchar(128), database_name), \
+CONVERT(nvarchar(128), schema_name), CONVERT(nvarchar(128), object_name), statement, \
+CONVERT(nvarchar(128), client_ip), CONVERT(nvarchar(128), application_name), \
+CONVERT(int, sequence_number), CONVERT(bigint, transaction_id), CONVERT(nvarchar(260), file_name), \
+CONVERT(bigint, audit_file_offset), CONVERT(nvarchar(34), sequence_group_id, 1), \
+CONVERT(int, CASE WHEN action_id = 'LGIF' THEN CONVERT(int, TRY_CONVERT(varbinary(4), \
+SUBSTRING(additional_information, CHARINDEX(N'<error>', additional_information) + 7, 10), 1)) END)";
+
+/// The first poll of an audit: from the start of its file set. `{pattern}`
+/// is the file pattern built from the catalog, a literal (decision 6,
+/// M1: never a parameter); `@p3` the row bound.
+pub(crate) const AUDIT_POLL_START: &str =
+    "SELECT TOP (@p3) {columns} FROM sys.fn_get_audit_file({pattern}, NULL, NULL)";
+
+/// The following polls: after the buffer at `@p2` of the file `@p1`
+/// (measured: the read starts after that buffer; a file outside the
+/// pattern's set is refused with error 33225).
+pub(crate) const AUDIT_POLL_FROM: &str =
+    "SELECT TOP (@p3) {columns} FROM sys.fn_get_audit_file({pattern}, @p1, @p2)";
+
+/// The number of columns of an Audit poll.
+pub(crate) const AUDIT_POLL_COLUMNS: usize = 19;
 
 /// Version and edition (decision 3).
 pub(crate) const VERSION: &str = "SELECT CONVERT(int, SERVERPROPERTY('EngineEdition')), \
@@ -217,6 +287,226 @@ pub(crate) fn quote_ident(name: &str) -> Option<String> {
         return None;
     }
     Some(format!("[{}]", name.replace(']', "]]")))
+}
+
+/// Quotes an audit file pattern as an `N'…'` literal: the folder read from
+/// `sys.server_file_audits.log_file_path`, the audit's name and GUID
+/// (`<folder><name>_<guid>_*.sqlaudit`). `None` for a folder longer than
+/// 260 characters or holding a control character or a wildcard, a name
+/// that is not a plain identifier of the catalog, or a GUID that is not
+/// one.
+pub(crate) fn audit_pattern(folder: &str, name: &str, guid: &str) -> Option<String> {
+    let guid_ok = guid.len() == 36
+        && guid.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        });
+    let plain = |s: &str| !s.chars().any(|c| c.is_control() || matches!(c, '*' | '?'));
+    if !guid_ok
+        || folder.is_empty()
+        || folder.chars().count() > 260
+        || !plain(folder)
+        || name.is_empty()
+        || name.chars().count() > 128
+        || !plain(name)
+    {
+        return None;
+    }
+    let sep = if folder.ends_with('/') || folder.ends_with('\\') {
+        ""
+    } else if folder.contains('\\') {
+        "\\"
+    } else {
+        "/"
+    };
+    let pattern = format!("{folder}{sep}{name}_{guid}_*.sqlaudit");
+    if pattern.chars().count() > 400 {
+        return None;
+    }
+    Some(format!("N'{}'", pattern.replace('\'', "''")))
+}
+
+/// An Audit poll text for a quoted pattern ([`audit_pattern`]).
+pub(crate) fn audit_poll(pattern: &str, from: bool) -> Option<String> {
+    render(
+        if from {
+            AUDIT_POLL_FROM
+        } else {
+            AUDIT_POLL_START
+        },
+        &[("columns", AUDIT_COLUMNS), ("pattern", pattern)],
+    )
+}
+
+/// A GUID as an `N'…'` literal, checked.
+pub(crate) fn quote_guid(guid: &str) -> Option<String> {
+    (guid.len() == 36 && guid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .then(|| format!("N'{guid}'"))
+}
+
+/// How an Audit record's statement text stands to the connector's own
+/// statement set ([`own_text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnText {
+    /// A constant of [`STATEMENTS`] or a catalog template filled with
+    /// quoted names: matched by exact text, no credit needed.
+    Exact,
+    /// A sampling, ticket-count or Audit poll text: the agent's own only
+    /// with an unexpired credit of the same session.
+    NeedsCredit,
+    /// Not one of the connector's statements.
+    No,
+}
+
+/// Statements the server runs inside a built-in the agent calls, recorded
+/// by SQL Server Audit with the caller's session and the built-in's own
+/// text (measured on 2022: `sys.fn_my_permissions` checks
+/// `sys.fn_builtin_permissions` with this statement). Exact texts of the
+/// server's code, matched like the agent's own constants (from its own
+/// sessions only); another build's text is reported, fail closed.
+pub(crate) const SERVER_INTERNAL: &[&str] = &[
+    "INSERT INTO @myperms\r\n\t    SELECT @entityname, '', fbp.permission_name\r\n\t    FROM \
+     sys.fn_builtin_permissions(@class) AS fbp\r\n\t    WHERE has_perms_by_name(@entity, \
+     @pseudoclass, fbp.permission_name) <> 0",
+];
+
+/// Templates matched only with a credit (security review L5; decision 6
+/// "per-poll credit").
+const CREDIT_ONLY: &[&str] = &[
+    "sample",
+    "ticket_type_counts",
+    "audit_poll_start",
+    "audit_poll_from",
+];
+
+/// Whether `text` is exactly one of the connector's statements: a
+/// constant, or a template whose slots hold quoted values of the forms
+/// [`render`] produces. Never by prefix or shape.
+pub(crate) fn own_text(text: &str) -> OwnText {
+    if SERVER_INTERNAL.contains(&text) {
+        return OwnText::Exact;
+    }
+    for (name, template) in STATEMENTS {
+        if CREDIT_ONLY.contains(name) {
+            continue;
+        }
+        if *template == text || (template.contains('{') && matches_template(template, text)) {
+            return OwnText::Exact;
+        }
+    }
+    // Credit-only forms: decided by the credit (the exact text sent).
+    if text.starts_with("SELECT TOP (") {
+        return OwnText::NeedsCredit;
+    }
+    OwnText::No
+}
+
+/// Reads a bracketed identifier at the start of `s`: (unescaped, rest).
+fn take_bracketed(s: &str) -> Option<(String, &str)> {
+    let mut chars = s.strip_prefix('[')?.char_indices().peekable();
+    let mut out = String::new();
+    let body = s.get(1..)?;
+    while let Some((i, c)) = chars.next() {
+        if c == ']' {
+            if chars.peek().map(|(_, d)| *d) == Some(']') {
+                chars.next();
+                out.push(']');
+                continue;
+            }
+            return Some((out, body.get(i + 1..)?));
+        }
+        out.push(c);
+    }
+    None
+}
+
+/// Reads an `N'…'` literal at the start of `s`: (unescaped, rest).
+fn take_literal(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix("N'")?;
+    let mut chars = body.char_indices().peekable();
+    let mut out = String::new();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if chars.peek().map(|(_, d)| *d) == Some('\'') {
+                chars.next();
+                out.push('\'');
+                continue;
+            }
+            return Some((out, body.get(i + 1..)?));
+        }
+        out.push(c);
+    }
+    None
+}
+
+/// Whether `text` is `template` with each slot filled the way [`render`]
+/// and the quoting functions fill it: `{db}` a bracketed identifier,
+/// `{dbname}`, `{audit}`, `{guid}` an `N'…'` literal (`{dbname}` equal to
+/// `{db}`), `{n}` / `{obj}` an integer. Rendered again from the values
+/// read and compared exactly, so nothing else can hide in a slot.
+pub(crate) fn matches_template(template: &str, text: &str) -> bool {
+    let mut rest_t = template;
+    let mut rest = text;
+    let mut slots: Vec<(String, String)> = Vec::new();
+    while let Some(open) = rest_t.find('{') {
+        let Some(lit) = rest_t.get(..open) else {
+            return false;
+        };
+        let Some(r) = rest.strip_prefix(lit) else {
+            return false;
+        };
+        rest = r;
+        let Some(close) = rest_t.get(open..).and_then(|s| s.find('}')) else {
+            return false;
+        };
+        let Some(name) = rest_t.get(open + 1..open + close) else {
+            return false;
+        };
+        rest_t = rest_t.get(open + close + 1..).unwrap_or("");
+        let value = match name {
+            "db" => take_bracketed(rest).and_then(|(v, r)| quote_ident(&v).map(|q| (q, r))),
+            "dbname" | "audit" => {
+                take_literal(rest).and_then(|(v, r)| quote_literal(&v).map(|q| (q, r)))
+            }
+            "guid" => take_literal(rest).and_then(|(v, r)| quote_guid(&v).map(|q| (q, r))),
+            "n" | "obj" => {
+                let len = rest
+                    .char_indices()
+                    .take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && *c == '-'))
+                    .count();
+                (len > 0 && len <= 20).then(|| (rest[..len].to_owned(), &rest[len..]))
+            }
+            _ => None,
+        };
+        let Some((quoted, r)) = value else {
+            return false;
+        };
+        rest = r;
+        if let Some((_, prev)) = slots.iter().find(|(n, _)| n == name)
+            && *prev != quoted
+        {
+            return false;
+        }
+        slots.push((name.to_owned(), quoted));
+    }
+    if rest != rest_t {
+        return false;
+    }
+    // `{dbname}` names the same database as `{db}`.
+    let get = |n: &str| slots.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+    if let (Some(db), Some(name)) = (get("db"), get("dbname"))
+        && take_bracketed(db).map(|(v, _)| v) != take_literal(name).map(|(v, _)| v)
+    {
+        return false;
+    }
+    let pairs: Vec<(&str, &str)> = slots
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    render(template, &pairs).as_deref() == Some(text)
 }
 
 /// Quotes a catalog name as an `N'…'` literal (`'` doubled), for the
@@ -441,10 +731,31 @@ pub(crate) fn denied_token(text: &str) -> Option<&'static str> {
     DENIED.iter().copied().find(|d| bare.contains(d))
 }
 
+/// Whether a text names `predicate` (an audit's `WHERE` filter, which can
+/// hold literals) other than as `predicate IS NULL` (M4).
+pub(crate) fn raw_predicate(text: &str) -> bool {
+    let bare = unquoted(text);
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    let mut from = 0;
+    while let Some(i) = bare.get(from..).and_then(|r| r.find("predicate")) {
+        let at = from + i;
+        let end = at + "predicate".len();
+        let before = bare.get(..at).and_then(|b| b.chars().next_back());
+        let after = bare.get(end..).unwrap_or_default();
+        // A whole identifier (`sys.security_predicates` is another name).
+        if !word(before) && !word(after.chars().next()) && !after.starts_with(" is null") {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Whether the session may send `text`: the exact `password_hash` probe
-/// (one bit, decision 4), or a text that names no denied token.
+/// (one bit, decision 4), or a text that names no denied token and no
+/// raw audit predicate.
 pub(crate) fn checked(text: &str) -> bool {
-    text == PASSWORD_HASH_PROBE || denied_token(text).is_none()
+    text == PASSWORD_HASH_PROBE || (denied_token(text).is_none() && !raw_predicate(text))
 }
 
 #[cfg(test)]
@@ -470,6 +781,14 @@ mod tests {
         // The exempt probe is the refinement's exact constant.
         assert!(PASSWORD_HASH_PROBE.contains("sid <> SUSER_SID() AND password_hash IS NOT NULL"));
         // A raw predicate or a module body is refused.
+        assert!(raw_predicate(
+            "SELECT predicate FROM sys.server_file_audits"
+        ));
+        assert!(!raw_predicate(AUDIT_FILE));
+        assert!(!raw_predicate(RLS_TABLES));
+        assert!(raw_predicate(
+            "SELECT a.predicate FROM sys.server_file_audits a"
+        ));
         for bad in [
             "SELECT predicate FROM sys.server_audits",
             "SELECT definition FROM sys.sql_modules",
@@ -485,6 +804,54 @@ mod tests {
         dedup.sort_unstable();
         dedup.dedup();
         assert_eq!(names.len(), dedup.len());
+    }
+
+    #[test]
+    fn own_texts_are_exact() {
+        assert_eq!(own_text(VERSION), OwnText::Exact);
+        assert_eq!(own_text(PASSWORD_HASH_PROBE), OwnText::Exact);
+        assert_eq!(own_text(SERVER_INTERNAL[0]), OwnText::Exact);
+        let db = in_database(DATABASE_GRANTS, "re]tail").unwrap();
+        assert_eq!(own_text(&db), OwnText::Exact);
+        // A slot holding anything else, a changed or longer text: not own.
+        assert_ne!(
+            own_text(&db.replace("TOP (1025)", "TOP (1026)")),
+            OwnText::Exact
+        );
+        assert_ne!(own_text(&format!("{VERSION} ")), OwnText::Exact);
+        assert_ne!(own_text(&format!("{VERSION}; SELECT 1")), OwnText::Exact);
+        let other = in_database(DATABASE_PERMISSIONS, "a").unwrap().replace(
+            "HAS_PERMS_BY_NAME(N'a'",
+            "HAS_PERMS_BY_NAME(N'a' + (SELECT TOP 1 name FROM sys.sql_logins)",
+        );
+        assert_ne!(own_text(&other), OwnText::Exact);
+        // `{dbname}` and `{db}` must name the same database.
+        let t = tables("a", 10).unwrap().replacen("N'a'", "N'b'", 1);
+        assert!(!matches_template(TABLES, &t));
+        assert!(matches_template(TABLES, &tables("a]]b'c", 10).unwrap()));
+        // Sampling texts need a credit.
+        let sample = sample_statement("d", "s", "t", &[("c", Sampled::Text)], 5, None).unwrap();
+        assert_eq!(own_text(&sample), OwnText::NeedsCredit);
+        let p = audit_pattern(
+            "/var/opt/mssql/audit/",
+            "a'b",
+            "B5BEF79B-88AC-4A47-91AE-0081BBD71D51",
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            "N'/var/opt/mssql/audit/a''b_B5BEF79B-88AC-4A47-91AE-0081BBD71D51_*.sqlaudit'"
+        );
+        assert!(audit_pattern("/x/*", "a", "B5BEF79B-88AC-4A47-91AE-0081BBD71D51").is_none());
+        assert!(audit_pattern("/x/", "a", "not-a-guid").is_none());
+        assert!(
+            audit_pattern("C:\\Audit", "a", "B5BEF79B-88AC-4A47-91AE-0081BBD71D51")
+                .unwrap()
+                .starts_with("N'C:\\Audit\\a_")
+        );
+        let poll = audit_poll(&p, true).unwrap();
+        assert!(checked(&poll) && poll.contains("@p1, @p2)") && poll.contains("TOP (@p3)"));
+        assert_eq!(own_text(&poll), OwnText::NeedsCredit);
     }
 
     #[test]

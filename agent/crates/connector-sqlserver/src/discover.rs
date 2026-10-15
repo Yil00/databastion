@@ -190,6 +190,9 @@ pub(crate) async fn sample_table(
         {
             let stmt = sql::ticket_type_counts(db, &table.schema, &table.name, &col.name)
                 .ok_or(SsError::new(FailureCode::Internal, Stage::Sample))?;
+            // Its Audit record is the agent's own only with this credit
+            // (ADR-0051 decision 6, L5).
+            s.credit(&stmt);
             let rows = s.rows(&stmt, Stage::Sample, Shape::rows(2, 256)).await?;
             let mut counts = TicketCounts::default();
             for r in &rows {
@@ -227,6 +230,9 @@ pub(crate) async fn sample_table(
         .ok_or(SsError::new(FailureCode::Internal, Stage::Sample))?;
     let mut values: Vec<Vec<RawValue>> = selected.iter().map(|_| Vec::new()).collect();
     let mut bytes = 0usize;
+    // Its Audit record is the agent's own only with this credit (ADR-0051
+    // decision 6, L5).
+    s.credit(&stmt);
     let ended = s
         .run(
             &stmt,
