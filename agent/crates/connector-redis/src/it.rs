@@ -207,6 +207,18 @@ async fn tgt(engine: &str, server: TargetEngine, account: &str, redis: &str) -> 
     }
 }
 
+/// Whether the server reached for `engine` has Valkey's command log (8.1+):
+/// the large-reply source exists only there.
+async fn has_commandlog(engine: TargetEngine) -> bool {
+    let t = target("valkey", engine, "databastion", "");
+    let r = admin(&t, &[vec![b"INFO", b"server"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    crate::info::server(&text).is_some_and(crate::info::Server::has_commandlog)
+}
+
 /// `ACL LOG` entries of `user` (their `count` summed).
 async fn acl_log_count(t: &TargetConfig, user: &str) -> i64 {
     let Value::Array(entries) = raw(t, &[b"ACL", b"LOG", b"128"]).await else {
@@ -852,6 +864,9 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
         ("redis", TargetEngine::Redis),
     ] {
         let t = tgt(name, engine, "databastion", "").await;
+        // Valkey 8.1+ only: the large-reply log (`COMMANDLOG`); Valkey 7.2
+        // and 8.0 have the slow log alone.
+        let large_reply_log = has_commandlog(engine).await;
         let connector = Arc::new(RedisConnector::new());
         // The patterns the stream maps keys to.
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
@@ -893,7 +908,7 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
 
         // Valkey 8.1+: a large-reply threshold the `KEYS` reply reaches
         // (default 1 MiB), restored below.
-        if name == "valkey" {
+        if large_reply_log {
             admin(
                 &t,
                 &[vec![
@@ -936,7 +951,7 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
         .await;
         let synced = sync_full(&t).await > syncs;
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        if name == "valkey" {
+        if large_reply_log {
             admin(
                 &t,
                 &[vec![
@@ -1021,7 +1036,7 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
                 && e["principal"]["db_user_fingerprint"].is_string()),
             "{name}: {json:#?}"
         );
-        if name == "valkey" {
+        if large_reply_log {
             assert!(
                 json.iter().any(|e| e["source"] == "redis_commandlog"
                     && has_signal(e, "volume.large_reply")
