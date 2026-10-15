@@ -19,13 +19,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 6] = [
+const CONNECTORS: [&str; 7] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
     "connector-openldap",
     "connector-cas",
     "connector-redis",
+    "connector-sqlserver",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
@@ -191,9 +192,16 @@ fn regex_keeps_unicode_case() {
 }
 
 #[test]
-fn lockfile_has_no_openssl_or_native_tls() {
+fn lockfile_has_no_openssl_native_tls_or_aws_lc() {
     let lock = fs::read_to_string(workspace_root().join("Cargo.lock")).unwrap();
-    for banned in ["openssl", "openssl-sys", "openssl-src", "native-tls"] {
+    for banned in [
+        "openssl",
+        "openssl-sys",
+        "openssl-src",
+        "native-tls",
+        "aws-lc-rs",
+        "aws-lc-sys",
+    ] {
         let entry = format!("name = \"{banned}\"");
         assert!(!lock.contains(&entry), "Cargo.lock contains {banned}");
     }
@@ -444,4 +452,60 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
         !code_lines(normal).any(|l| l.contains("test-support")),
         "the agent binary enables a test-support feature"
     );
+}
+
+/// ADR-0051 refinement item 7 (M4): the SQL Server connector never reads
+/// module bodies or definition-bearing columns. Its statements are a
+/// reviewed allow-list (`connector-sqlserver/src/sql.rs`, `STATEMENTS`,
+/// checked by the crate's own tests); this test checks the deny-list again
+/// on the crate's statement-bearing sources, outside comments, tests and
+/// the deny-list constant itself, and on every allow-listed text.
+#[test]
+fn sqlserver_statements_never_read_definitions() {
+    const DENIED: [&str; 14] = [
+        "sql_modules",
+        "syscomments",
+        "numbered_procedures",
+        "object_definition",
+        "sp_helptext",
+        "computed_columns",
+        "check_constraints",
+        "default_constraints",
+        "partition_range_values",
+        "predicate_definition",
+        "filter_definition",
+        "provider_string",
+        "data_source",
+        "server_audits",
+    ];
+    let src = workspace_root().join("crates/connector-sqlserver/src");
+    for file in ["sql.rs", "conn.rs", "check.rs", "discover.rs"] {
+        let text = fs::read_to_string(src.join(file)).unwrap();
+        let text = text.split("#[cfg(test)]").next().unwrap_or_default();
+        // The deny-list constant of sql.rs names the tokens on purpose.
+        let text = match (
+            text.find("pub(crate) const DENIED"),
+            text.find("pub(crate) fn unquoted"),
+        ) {
+            (Some(a), Some(b)) if a < b => format!("{}{}", &text[..a], &text[b..]),
+            _ => text.to_owned(),
+        };
+        for (n, line) in code_lines(&text).enumerate() {
+            let lower = line.to_lowercase();
+            for d in DENIED {
+                assert!(
+                    !lower.contains(d),
+                    "{file}:{}: a statement names {d} (ADR-0051 refinement item 7)",
+                    n + 1
+                );
+            }
+        }
+    }
+    #[cfg(feature = "sqlserver")]
+    for (name, text) in databastion_connector_sqlserver::statement_allow_list() {
+        let lower = text.to_lowercase();
+        for d in DENIED {
+            assert!(!lower.contains(d), "{name} names {d}");
+        }
+    }
 }

@@ -9,13 +9,14 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis"]
+default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis", "sqlserver"]
 postgres = ["dep:databastion-connector-postgres"]
 mysql = ["dep:databastion-connector-mysql"]
 mongodb = ["dep:databastion-connector-mongodb"]
 openldap = ["dep:databastion-connector-openldap"]
 cas = ["dep:databastion-connector-cas"]
 redis = ["dep:databastion-connector-redis"]
+sqlserver = ["dep:databastion-connector-sqlserver"]
 
 [dependencies]
 databastion-core.workspace = true
@@ -25,6 +26,7 @@ databastion-connector-mongodb = { workspace = true, optional = true }
 databastion-connector-openldap = { workspace = true, optional = true }
 databastion-connector-cas = { workspace = true, optional = true }
 databastion-connector-redis = { workspace = true, optional = true }
+databastion-connector-sqlserver = { workspace = true, optional = true }
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing.workspace = true

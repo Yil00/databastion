@@ -24,6 +24,7 @@ databastion-connector-mongodb = { path = "../crates/connector-mongodb", features
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
 databastion-connector-redis = { path = "../crates/connector-redis", features = ["fuzzing"] }
+databastion-connector-sqlserver = { path = "../crates/connector-sqlserver", features = ["fuzzing"] }
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
@@ -163,6 +164,34 @@ bench = false
 [[bin]]
 name = "redis_learned_patterns"
 path = "fuzz_targets/redis_learned_patterns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_token_stream"
+path = "fuzz_targets/sqlserver_token_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_packets"
+path = "fuzz_targets/sqlserver_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_prelogin_tls"
+path = "fuzz_targets/sqlserver_prelogin_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_plp"
+path = "fuzz_targets/sqlserver_plp.rs"
 test = false
 doc = false
 bench = false
