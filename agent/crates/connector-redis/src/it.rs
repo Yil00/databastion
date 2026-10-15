@@ -2,11 +2,20 @@
 //! dev/README.md "Valkey and Redis"): Valkey 9.0 and Redis 8.10 over TLS
 //! with the dev CA, the ACL users `databastion` and `databastion_scoped`.
 //!
+//! On Redis 6.2 (no `ACL DRYRUN`, engine matrix with
+//! `DATABASTION_DEV_REDIS_IMAGE`), the Redis targets carry the local opt-in
+//! `unevaluated_acl: accept` (ADR-0052 decision 4) and the checks expect
+//! `privilege.not_evaluated` in place of the evaluated notes.
+//!
 //! Skipped unless `DATABASTION_IT_REDIS=1`. Variables:
 //! - `DATABASTION_IT_REDIS_CA`: the dev CA (`docker compose … exec -T
 //!   valkey cat /tls/ca.pem`);
 //! - `DATABASTION_DB_PASSWORD`: the agent users' password (dev/.env);
-//! - `VALKEY_PORT` / `REDIS_PORT`: default 6379 / 6389.
+//! - `VALKEY_PORT` / `REDIS_PORT`: default 6379 / 6389;
+//! - `DATABASTION_IT_REDIS_EXEC_VALKEY` (optional): a command prefix that
+//!   runs a command in the Valkey container (e.g. `docker compose -f
+//!   dev/docker-compose.yml exec -T valkey`), for the test with clients on
+//!   the server's Unix socket; skipped without it.
 //!
 //! The tests read the server's `ACL LOG` through a test-only raw client
 //! with the agent's own user (`+acl|log` is part of the dev ACL); the
@@ -27,6 +36,16 @@ use crate::resp::{Decoder, Limits as RespLimits, Value};
 
 fn enabled() -> bool {
     std::env::var("DATABASTION_IT_REDIS").as_deref() == Ok("1")
+}
+
+/// The tests share two servers whose slow log, `ACL LOG` and connection
+/// list every test changes: they run one at a time, so an Audit test
+/// never sees another test's agent connections (short-lived ones, closed
+/// before any poll, are reported as not the agent's: review M1).
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    LOCK.lock().await
 }
 
 fn port(engine: TargetEngine) -> u16 {
@@ -154,6 +173,52 @@ async fn admin(t: &TargetConfig, cmds: &[Vec<&[u8]>]) -> Vec<Value> {
     raw_as(t, "admin", &password, cmds).await
 }
 
+/// Whether the server reached for `engine` is Redis before 7.0 (no
+/// `ACL DRYRUN`: the 6.2 path of decision 4).
+async fn legacy(engine: TargetEngine) -> bool {
+    if engine != TargetEngine::Redis {
+        return false;
+    }
+    let t = target("redis", engine, "databastion", "");
+    let r = admin(&t, &[vec![b"INFO", b"server"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    matches!(
+        crate::info::server(&text),
+        Some(crate::info::Server::Redis(v)) if v < crate::info::Version(7, 0, 0)
+    )
+}
+
+/// [`target`], with `unevaluated_acl: accept` on Redis 6.2 (the opt-in an
+/// operator sets after reviewing the account by hand).
+async fn tgt(engine: &str, server: TargetEngine, account: &str, redis: &str) -> TargetConfig {
+    if legacy(server).await {
+        let sep = if redis.is_empty() { "" } else { ", " };
+        target(
+            engine,
+            server,
+            account,
+            &format!("{redis}{sep}unevaluated_acl: accept"),
+        )
+    } else {
+        target(engine, server, account, redis)
+    }
+}
+
+/// Whether the server reached for `engine` has Valkey's command log (8.1+):
+/// the large-reply source exists only there.
+async fn has_commandlog(engine: TargetEngine) -> bool {
+    let t = target("valkey", engine, "databastion", "");
+    let r = admin(&t, &[vec![b"INFO", b"server"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    crate::info::server(&text).is_some_and(crate::info::Server::has_commandlog)
+}
+
 /// `ACL LOG` entries of `user` (their `count` summed).
 async fn acl_log_count(t: &TargetConfig, user: &str) -> i64 {
     let Value::Array(entries) = raw(t, &[b"ACL", b"LOG", b"128"]).await else {
@@ -187,11 +252,13 @@ async fn check_reports_a_healthy_account_on_both_engines() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (declared, server) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
     ] {
-        let t = target(declared, server, "databastion", "");
+        let old = legacy(server).await;
+        let t = tgt(declared, server, "databastion", "").await;
         let h = RedisConnector::new().check(&t).await;
         let codes = codes(&h);
         assert!(h.reachable, "{declared}: {h:?}");
@@ -202,7 +269,6 @@ async fn check_reports_a_healthy_account_on_both_engines() {
             NoteCode::PrivilegeAdminCommands,
             NoteCode::PrivilegeScripting,
             NoteCode::PrivilegePubsubChannels,
-            NoteCode::PrivilegeNotEvaluated,
             NoteCode::PrivilegeDeclaredKeysNotReadable,
             NoteCode::SecurityDefaultUserNopass,
             NoteCode::CheckServerIsRedis,
@@ -210,8 +276,27 @@ async fn check_reports_a_healthy_account_on_both_engines() {
         ] {
             assert!(!codes.contains(&over), "{declared}: {over:?} in {codes:?}");
         }
-        // `%R~*` lets the account read any key, the CAS guard probes too.
-        assert!(codes.contains(&NoteCode::PrivilegeTicketCredentialsReadable));
+        if old {
+            // Redis 6.2: nothing evaluated, shown permanently; the CAS
+            // key privilege and the declarations are not evaluated either
+            // (never reported as passed nor as failed).
+            assert!(
+                codes.contains(&NoteCode::PrivilegeNotEvaluated),
+                "{codes:?}"
+            );
+            assert!(
+                !codes.contains(&NoteCode::PrivilegeTicketCredentialsReadable),
+                "{codes:?}"
+            );
+        } else {
+            assert!(
+                !codes.contains(&NoteCode::PrivilegeNotEvaluated),
+                "{codes:?}"
+            );
+            // `%R~*` lets the account read any key, the CAS guard probes
+            // too.
+            assert!(codes.contains(&NoteCode::PrivilegeTicketCredentialsReadable));
+        }
     }
     // The declared engine differs from the server's.
     let t = target("redis", TargetEngine::Valkey, "databastion", "");
@@ -224,6 +309,7 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     let ok = target(
         "valkey",
         TargetEngine::Valkey,
@@ -254,7 +340,18 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
         "unevaluated_acl: accept",
     );
     let h = RedisConnector::new().check(&opt_in).await;
-    assert_eq!(h.failure, Some(FailureCode::Unsupported));
+    if legacy(TargetEngine::Redis).await {
+        // Redis 6.2: the opt-in is what lets the target run, with
+        // `privilege.not_evaluated` shown permanently.
+        assert_eq!(h.failure, None, "{:?}", codes(&h));
+        assert!(codes(&h).contains(&NoteCode::PrivilegeNotEvaluated));
+        // Without it, refused.
+        let plain = target("redis", TargetEngine::Redis, "databastion", "");
+        let h = RedisConnector::new().check(&plain).await;
+        assert_eq!(h.failure, Some(FailureCode::Unsupported));
+    } else {
+        assert_eq!(h.failure, Some(FailureCode::Unsupported));
+    }
 }
 
 /// The contract findings, as the core would send them.
@@ -271,7 +368,7 @@ fn findings_json(findings: &[MaskedFinding], engine: TargetEngine) -> Vec<serde_
 }
 
 async fn discovery_matches_the_ground_truth(engine: TargetEngine, name: &str) {
-    let t = target(name, engine, "databastion", "");
+    let t = tgt(name, engine, "databastion", "").await;
     let s = scan(&t).await;
     assert!(s.result.is_ok(), "{name}: {:?}", s.result);
     assert!(s.coverage.sampled > 0, "{:?}", s.coverage);
@@ -372,6 +469,7 @@ async fn discovery_on_valkey() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     discovery_matches_the_ground_truth(TargetEngine::Valkey, "valkey").await;
 }
 
@@ -380,6 +478,7 @@ async fn discovery_on_redis() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     discovery_matches_the_ground_truth(TargetEngine::Redis, "redis").await;
 }
 
@@ -388,16 +487,18 @@ async fn narrowed_patterns_write_no_acl_log_entry() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
     ] {
-        let t = target(
+        let t = tgt(
             name,
             engine,
             "databastion_scoped",
             "key_patterns: ['customer:*', 'user:*']",
-        );
+        )
+        .await;
         let before = acl_log_count(&t, "databastion_scoped").await;
         let h = RedisConnector::new().check(&t).await;
         assert_eq!(h.failure, None, "{name}");
@@ -435,6 +536,7 @@ async fn the_password_never_reaches_the_slow_log() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     // The dev servers log every command (`slowlog-log-slower-than 0`).
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
@@ -487,6 +589,7 @@ async fn local_glob_matcher_agrees_with_scan_match() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -546,6 +649,7 @@ async fn a_large_data_keyed_hash_reports_no_field_name() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     let names = [
         "jdupont", "amartin", "lucas", "bernard", "dubois", "thomas", "robert", "richard", "petit",
         "durand", "leroy", "moreau", "simon", "laurent", "lefebvre", "michel", "garcia", "david",
@@ -555,7 +659,7 @@ async fn a_large_data_keyed_hash_reports_no_field_name() {
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
     ] {
-        let t = target(name, engine, "databastion", "databases: [14]");
+        let t = tgt(name, engine, "databastion", "databases: [14]").await;
         let values: Vec<String> = (0..names.len())
             .map(|i| format!("support.desk{i}@example.org"))
             .collect();
@@ -585,5 +689,785 @@ async fn a_large_data_keyed_hash_reports_no_field_name() {
         for n in names {
             assert!(!text.contains(n), "{name}: a field name left in clear");
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Audit (ADR-0052 decision 8).
+// ---------------------------------------------------------------------
+
+/// A raw TLS connection as `user` (test only): `AUTH`, `HELLO 3`, then,
+/// after `before`, `cmds`; their replies are read, the connection is held
+/// for `after`. `AUTH` must succeed.
+async fn raw_held(
+    t: &TargetConfig,
+    user: &str,
+    password: &str,
+    before: std::time::Duration,
+    cmds: &[Vec<&[u8]>],
+    after: std::time::Duration,
+) -> Vec<Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
+    let ep = Endpoint::Tcp {
+        host: "127.0.0.1".to_owned(),
+        port: t.port.unwrap(),
+    };
+    let mut io = ep.open(tls).await.unwrap();
+    let mut req = Vec::new();
+    crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
+    crate::resp::encode(&[b"HELLO", b"3"], &mut req);
+    io.write_all(&req).await.unwrap();
+    let limits = RespLimits {
+        bulk: 1 << 20,
+        items: 1 << 16,
+        skip_oversized: false,
+        reply: 64 << 20,
+    };
+    let mut d = Decoder::new(limits);
+    let mut buf = vec![0u8; 65536];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut replies = Vec::new();
+    let mut want = 2;
+    let mut sent = false;
+    loop {
+        while replies.len() < want {
+            let (used, v) = d.feed(&pending).unwrap();
+            pending.drain(..used);
+            match v {
+                Some(v) => replies.push(v),
+                None => {
+                    let n = io.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "connection closed");
+                    pending.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+        if sent {
+            break;
+        }
+        assert!(replies[0].error().is_none(), "AUTH as {user}");
+        tokio::time::sleep(before).await;
+        let mut req = Vec::new();
+        for c in cmds {
+            crate::resp::encode(c, &mut req);
+        }
+        io.write_all(&req).await.unwrap();
+        want += cmds.len();
+        sent = true;
+    }
+    tokio::time::sleep(after).await;
+    replies.split_off(2)
+}
+
+/// Raw bytes received for `secs` after sending `cmds` on a raw TLS
+/// connection (test only; `MONITOR`, `SYNC`, a failed `AUTH`).
+async fn raw_bytes(t: &TargetConfig, cmds: &[Vec<&[u8]>], secs: u64) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
+    let ep = Endpoint::Tcp {
+        host: "127.0.0.1".to_owned(),
+        port: t.port.unwrap(),
+    };
+    let mut io = ep.open(tls).await.unwrap();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    // One command at a time, each reply read first (`SYNC` is refused
+    // with pending output).
+    let (last, first) = cmds.split_last().unwrap();
+    for c in first {
+        let mut req = Vec::new();
+        crate::resp::encode(c, &mut req);
+        io.write_all(&req).await.unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), io.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        out.extend_from_slice(&buf[..n]);
+    }
+    let mut req = Vec::new();
+    crate::resp::encode(last, &mut req);
+    io.write_all(&req).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, io.read(&mut buf)).await {
+        if n == 0 {
+            break;
+        }
+        if out.len() < (1 << 20) {
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    out
+}
+
+fn admin_password() -> String {
+    std::env::var("REDIS_ADMIN_PASSWORD").unwrap_or_else(|_| "dev-only-redis-admin".to_owned())
+}
+
+/// `INFO stats` `sync_full` (as `admin`).
+async fn sync_full(t: &TargetConfig) -> u64 {
+    let r = admin(t, &[vec![b"INFO", b"stats"]]).await;
+    let text = String::from_utf8_lossy(r[0].as_bytes().unwrap()).into_owned();
+    crate::info::field(&text, "sync_full")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Every string of the ground truth's values and names (I2 markers).
+fn ground_truth_values(engine: &str) -> Vec<String> {
+    let gt: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../dev/ground-truth.json")).unwrap();
+    let mut out = Vec::new();
+    for l in gt["locations"].as_array().unwrap() {
+        if l["engine"] != engine {
+            continue;
+        }
+        for k in ["values", "name_values"] {
+            for v in l[k].as_array().into_iter().flatten() {
+                if let Some(v) = v.as_str().filter(|v| v.chars().count() >= 4) {
+                    out.push(v.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn events_json(events: &[databastion_classifiers::masking::MaskedEvent]) -> Vec<serde_json::Value> {
+    databastion_core::test_support::contract_events_json(events, &key())
+        .lines()
+        .flat_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Slow commands on sensitive keys become events under learned patterns
+/// (H1), with no value in the contract JSON (I2); the agent's own reads,
+/// from a Discovery scan run while the stream polls, are never reported
+/// (H3); failed authentications are reported; `KEYS` and a large `SCAN`
+/// set `shape.keyspace_enumeration`; on Valkey 8.1+ the large-reply log
+/// gives `volume.large_reply` with `bytes`; a `SYNC` gives
+/// `signature.full_sync` where `sync_full` grows; `check()` then reports
+/// Limited.
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_reports_slow_reads_and_never_the_agents_own() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        // Valkey 8.1+ only: the large-reply log (`COMMANDLOG`); Valkey 7.2
+        // and 8.0 have the slow log alone.
+        let large_reply_log = has_commandlog(engine).await;
+        let connector = Arc::new(RedisConnector::new());
+        // The patterns the stream maps keys to.
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-audit-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&connector);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+
+        // The agent's own Discovery while the stream polls (paced, so it
+        // lasts several polls).
+        let paced = Limits {
+            discovery_duty_cycle_percent: 30,
+            ..Limits::default()
+        };
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // Valkey 8.1+: a large-reply threshold the `KEYS` reply reaches
+        // (default 1 MiB), restored below.
+        if large_reply_log {
+            admin(
+                &t,
+                &[vec![
+                    b"CONFIG",
+                    b"SET",
+                    b"commandlog-reply-larger-than",
+                    b"1024",
+                ]],
+            )
+            .await;
+        }
+        // Another client, connected well before its commands (L2).
+        let pw = admin_password();
+        let replies = raw_held(
+            &t,
+            "admin",
+            &pw,
+            std::time::Duration::from_secs(3),
+            &[
+                vec![b"HGETALL", b"session:jdupont"],
+                vec![b"GET", b"customer:1000:email"],
+                vec![b"KEYS", b"customer:*"],
+                vec![b"SCAN", b"0", b"MATCH", b"user:jdupont*", b"COUNT", b"5000"],
+            ],
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(replies.len(), 4);
+        // A failed authentication.
+        raw_bytes(&t, &[vec![b"AUTH", b"intruder", b"wrong-password-0052"]], 1).await;
+        // A full synchronization (`redis-cli --rdb` does the same).
+        let syncs = sync_full(&t).await;
+        raw_bytes(
+            &t,
+            &[vec![b"AUTH", b"admin", pw.as_bytes()], vec![b"SYNC"]],
+            // Diskless sync waits `repl-diskless-sync-delay` (5 s) for
+            // other replicas before the transfer starts.
+            9,
+        )
+        .await;
+        let synced = sync_full(&t).await > syncs;
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        if large_reply_log {
+            admin(
+                &t,
+                &[vec![
+                    b"CONFIG",
+                    b"SET",
+                    b"commandlog-reply-larger-than",
+                    b"1048576",
+                ]],
+            )
+            .await;
+        }
+        let h = connector.check(&t).await;
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let json = events_json(&events);
+        let text = serde_json::to_string(&json).unwrap();
+        // I2: no ground-truth value, no raw key name, no argument.
+        for v in ground_truth_values(name) {
+            assert!(
+                !text.contains(&v),
+                "{name}: a ground-truth value in an event"
+            );
+        }
+        for raw in [
+            "jdupont",
+            "customer:1000",
+            "wrong-password-0052",
+            "intruder",
+        ] {
+            assert!(!text.contains(raw), "{name}: {raw} in an event");
+        }
+        for e in &json {
+            for o in e["objects"].as_array().into_iter().flatten() {
+                let o = o["object"].as_str().unwrap();
+                assert!(
+                    o == "*" || crate::audit::entries::tests_support::is_learned_shape(o),
+                    "{name}: {o}"
+                );
+            }
+        }
+        // The agent's own reads: never reported (H3).
+        for e in &json {
+            assert_ne!(e["principal"]["db_user"], "databastion", "{name}: {e}");
+            assert_ne!(
+                e["principal"]["application"], "databastion-agent",
+                "{name}: {e}"
+            );
+        }
+        // The other client's reads, attributed to its user.
+        let admin_reads: Vec<&serde_json::Value> = json
+            .iter()
+            .filter(|e| {
+                e["principal"]["db_user"] == "admin"
+                    && e["action"] == "read"
+                    && e["source"] == "redis_slowlog"
+            })
+            .collect();
+        assert!(admin_reads.len() >= 2, "{name}: {json:#?}");
+        let has_signal = |e: &serde_json::Value, s: &str| {
+            e["signals"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x == s))
+        };
+        assert!(
+            admin_reads
+                .iter()
+                .filter(|e| has_signal(e, "shape.keyspace_enumeration"))
+                .count()
+                >= 1,
+            "{name}: {json:#?}"
+        );
+        // A failed authentication, the name tried fingerprinted.
+        assert!(
+            json.iter().any(|e| e["action"] == "auth_failure"
+                && e["source"] == "redis_acl_log"
+                && e["principal"]["db_user_fingerprint"].is_string()),
+            "{name}: {json:#?}"
+        );
+        if large_reply_log {
+            assert!(
+                json.iter().any(|e| e["source"] == "redis_commandlog"
+                    && has_signal(e, "volume.large_reply")
+                    && e["bytes"].as_i64().is_some_and(|b| b > 0)),
+                "{name}: {json:#?}"
+            );
+        }
+        if synced {
+            assert!(
+                json.iter().any(|e| e["source"] == "redis_sync"
+                    && has_signal(e, "signature.full_sync")
+                    && e["principal"]["account_not_recorded"] == true),
+                "{name}: {json:#?}"
+            );
+        } else {
+            panic!("{name}: SYNC did not grow sync_full");
+        }
+        // Limited at best, once a slow-log entry was read.
+        assert_eq!(
+            h.audit_level,
+            databastion_core::AuditLevel::Limited,
+            "{name}: {:?}",
+            codes(&h)
+        );
+        assert!(codes(&h).contains(&NoteCode::AuditSlowOperationsOnly));
+    }
+}
+
+/// ADR-0052 decision 1 (H2, L5), widened: with every command logged, and a
+/// `MONITOR` session open, the agent's password never appears in the
+/// `MONITOR` stream, `SLOWLOG GET` or (Valkey 8.1+) any `COMMANDLOG` type,
+/// over a `check()`, a scan and Audit polls.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_password_never_reaches_monitor_or_the_command_log() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let pw = admin_password();
+        let tm = t.clone();
+        let monitor = tokio::spawn(async move {
+            raw_bytes(
+                &tm,
+                &[vec![b"AUTH", b"admin", pw.as_bytes()], vec![b"MONITOR"]],
+                6,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let connector = Arc::new(RedisConnector::new());
+        assert!(connector.check(&t).await.reachable);
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits);
+        let (sink, _rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&connector);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        stream.abort();
+        let seen = monitor.await.unwrap();
+        let password = t.secret.read().unwrap();
+        let has = |bytes: &[u8]| {
+            bytes
+                .windows(password.len())
+                .any(|w| w == password.as_bytes())
+        };
+        assert!(seen.len() > 100, "{name}: MONITOR saw nothing");
+        assert!(!has(&seen), "{name}: the password is in the MONITOR stream");
+        let mut logs: Vec<Vec<&[u8]>> = vec![vec![b"SLOWLOG", b"GET", b"128"]];
+        let commandlog = matches!(
+            connector.state.reports.of_target(&t, std::time::Duration::from_secs(3)).await,
+            Ok((_, s)) if s.has_commandlog()
+        );
+        if commandlog {
+            for kind in [&b"slow"[..], b"large-request", b"large-reply"] {
+                logs.push(vec![b"COMMANDLOG", b"GET", b"128", kind]);
+            }
+        }
+        for r in admin(&t, &logs).await {
+            let mut text = Vec::new();
+            strings(&r, &mut text);
+            assert!(!has(&text), "{name}: the password is in a server log");
+        }
+    }
+}
+
+/// Review M4 (ADR-0052 obligation): the key positions of the closed
+/// command table agree with the server's own `COMMAND GETKEYS`, row by row,
+/// on this server version (the engine matrix runs it per version). The
+/// agent never reads as a key an argument the server does not take for
+/// one; commands the server does not know (older versions) are skipped.
+#[tokio::test]
+async fn key_positions_match_command_getkeys() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // One example per keyed row: keys `k1`, `k2`, `k3`; nothing else
+    // looks like them.
+    const EXAMPLES: &[(&str, Option<&str>, &str)] = &[
+        ("get", None, "get k1"),
+        ("getrange", None, "getrange k1 0 1"),
+        ("substr", None, "substr k1 0 1"),
+        ("strlen", None, "strlen k1"),
+        ("mget", None, "mget k1 k2"),
+        ("getbit", None, "getbit k1 0"),
+        ("bitcount", None, "bitcount k1"),
+        ("bitpos", None, "bitpos k1 1"),
+        ("bitfield_ro", None, "bitfield_ro k1 GET u8 0"),
+        ("lcs", None, "lcs k1 k2"),
+        ("set", None, "set k1 v"),
+        ("setnx", None, "setnx k1 v"),
+        ("setex", None, "setex k1 10 v"),
+        ("psetex", None, "psetex k1 10 v"),
+        ("getset", None, "getset k1 v"),
+        ("getdel", None, "getdel k1"),
+        ("getex", None, "getex k1"),
+        ("append", None, "append k1 v"),
+        ("incr", None, "incr k1"),
+        ("incrby", None, "incrby k1 1"),
+        ("incrbyfloat", None, "incrbyfloat k1 1"),
+        ("decr", None, "decr k1"),
+        ("decrby", None, "decrby k1 1"),
+        ("setrange", None, "setrange k1 0 v"),
+        ("setbit", None, "setbit k1 0 1"),
+        ("bitfield", None, "bitfield k1 GET u8 0"),
+        ("mset", None, "mset k1 v k2 w"),
+        ("msetnx", None, "msetnx k1 v k2 w"),
+        ("bitop", None, "bitop AND k1 k2 k3"),
+        ("exists", None, "exists k1 k2"),
+        ("type", None, "type k1"),
+        ("ttl", None, "ttl k1"),
+        ("pttl", None, "pttl k1"),
+        ("expiretime", None, "expiretime k1"),
+        ("pexpiretime", None, "pexpiretime k1"),
+        ("dump", None, "dump k1"),
+        ("touch", None, "touch k1 k2"),
+        ("sort_ro", None, "sort_ro k1 BY w_* GET o_*"),
+        ("sort", None, "sort k1 BY w_* GET o_*"),
+        ("del", None, "del k1 k2"),
+        ("unlink", None, "unlink k1 k2"),
+        ("expire", None, "expire k1 10"),
+        ("pexpire", None, "pexpire k1 10"),
+        ("expireat", None, "expireat k1 10"),
+        ("pexpireat", None, "pexpireat k1 10"),
+        ("persist", None, "persist k1"),
+        ("rename", None, "rename k1 k2"),
+        ("renamenx", None, "renamenx k1 k2"),
+        ("copy", None, "copy k1 k2"),
+        ("move", None, "move k1 1"),
+        ("restore", None, "restore k1 0 x"),
+        ("hget", None, "hget k1 f"),
+        ("hmget", None, "hmget k1 f g"),
+        ("hgetall", None, "hgetall k1"),
+        ("hkeys", None, "hkeys k1"),
+        ("hvals", None, "hvals k1"),
+        ("hlen", None, "hlen k1"),
+        ("hexists", None, "hexists k1 f"),
+        ("hstrlen", None, "hstrlen k1 f"),
+        ("hrandfield", None, "hrandfield k1"),
+        ("hscan", None, "hscan k1 0"),
+        ("hset", None, "hset k1 f v"),
+        ("hsetnx", None, "hsetnx k1 f v"),
+        ("hmset", None, "hmset k1 f v"),
+        ("hdel", None, "hdel k1 f"),
+        ("hincrby", None, "hincrby k1 f 1"),
+        ("hincrbyfloat", None, "hincrbyfloat k1 f 1"),
+        ("lrange", None, "lrange k1 0 1"),
+        ("lindex", None, "lindex k1 0"),
+        ("llen", None, "llen k1"),
+        ("lpos", None, "lpos k1 e"),
+        ("lpush", None, "lpush k1 v"),
+        ("rpush", None, "rpush k1 v"),
+        ("lpushx", None, "lpushx k1 v"),
+        ("rpushx", None, "rpushx k1 v"),
+        ("lpop", None, "lpop k1"),
+        ("rpop", None, "rpop k1"),
+        ("linsert", None, "linsert k1 BEFORE p v"),
+        ("lset", None, "lset k1 0 v"),
+        ("lrem", None, "lrem k1 0 v"),
+        ("ltrim", None, "ltrim k1 0 1"),
+        ("lmove", None, "lmove k1 k2 LEFT RIGHT"),
+        ("blmove", None, "blmove k1 k2 LEFT RIGHT 0"),
+        ("rpoplpush", None, "rpoplpush k1 k2"),
+        ("brpoplpush", None, "brpoplpush k1 k2 0"),
+        ("blpop", None, "blpop k1 k2 0"),
+        ("brpop", None, "brpop k1 k2 0"),
+        ("lmpop", None, "lmpop 2 k1 k2 LEFT"),
+        ("blmpop", None, "blmpop 0 2 k1 k2 LEFT"),
+        ("smembers", None, "smembers k1"),
+        ("sismember", None, "sismember k1 m"),
+        ("smismember", None, "smismember k1 m"),
+        ("scard", None, "scard k1"),
+        ("srandmember", None, "srandmember k1"),
+        ("sscan", None, "sscan k1 0"),
+        ("sunion", None, "sunion k1 k2"),
+        ("sinter", None, "sinter k1 k2"),
+        ("sdiff", None, "sdiff k1 k2"),
+        ("sintercard", None, "sintercard 2 k1 k2"),
+        ("sadd", None, "sadd k1 m"),
+        ("srem", None, "srem k1 m"),
+        ("spop", None, "spop k1"),
+        ("smove", None, "smove k1 k2 m"),
+        ("sunionstore", None, "sunionstore k1 k2 k3"),
+        ("sinterstore", None, "sinterstore k1 k2 k3"),
+        ("sdiffstore", None, "sdiffstore k1 k2 k3"),
+        ("zrange", None, "zrange k1 0 1"),
+        ("zrangebyscore", None, "zrangebyscore k1 0 1"),
+        ("zrangebylex", None, "zrangebylex k1 - +"),
+        ("zrevrange", None, "zrevrange k1 0 1"),
+        ("zrevrangebyscore", None, "zrevrangebyscore k1 1 0"),
+        ("zrevrangebylex", None, "zrevrangebylex k1 + -"),
+        ("zscore", None, "zscore k1 m"),
+        ("zmscore", None, "zmscore k1 m"),
+        ("zcard", None, "zcard k1"),
+        ("zcount", None, "zcount k1 0 1"),
+        ("zlexcount", None, "zlexcount k1 - +"),
+        ("zrank", None, "zrank k1 m"),
+        ("zrevrank", None, "zrevrank k1 m"),
+        ("zrandmember", None, "zrandmember k1"),
+        ("zscan", None, "zscan k1 0"),
+        ("zunion", None, "zunion 2 k1 k2"),
+        ("zinter", None, "zinter 2 k1 k2"),
+        ("zdiff", None, "zdiff 2 k1 k2"),
+        ("zintercard", None, "zintercard 2 k1 k2"),
+        ("zadd", None, "zadd k1 1 m"),
+        ("zrem", None, "zrem k1 m"),
+        ("zincrby", None, "zincrby k1 1 m"),
+        ("zpopmin", None, "zpopmin k1"),
+        ("zpopmax", None, "zpopmax k1"),
+        ("bzpopmin", None, "bzpopmin k1 k2 0"),
+        ("bzpopmax", None, "bzpopmax k1 k2 0"),
+        ("zmpop", None, "zmpop 2 k1 k2 MIN"),
+        ("bzmpop", None, "bzmpop 0 2 k1 k2 MIN"),
+        ("zremrangebyrank", None, "zremrangebyrank k1 0 1"),
+        ("zremrangebyscore", None, "zremrangebyscore k1 0 1"),
+        ("zremrangebylex", None, "zremrangebylex k1 - +"),
+        ("zunionstore", None, "zunionstore k1 2 k2 k3"),
+        ("zinterstore", None, "zinterstore k1 2 k2 k3"),
+        ("zdiffstore", None, "zdiffstore k1 2 k2 k3"),
+        ("zrangestore", None, "zrangestore k1 k2 0 1"),
+        ("xrange", None, "xrange k1 - +"),
+        ("xrevrange", None, "xrevrange k1 + -"),
+        ("xlen", None, "xlen k1"),
+        ("xread", None, "xread COUNT 1 STREAMS k1 k2 0 0"),
+        ("xreadgroup", None, "xreadgroup GROUP g c STREAMS k1 >"),
+        ("xadd", None, "xadd k1 * f v"),
+        ("xdel", None, "xdel k1 0-1"),
+        ("xtrim", None, "xtrim k1 MAXLEN 1"),
+        ("xack", None, "xack k1 g 0-1"),
+        ("xclaim", None, "xclaim k1 g c 0 0-1"),
+        ("xautoclaim", None, "xautoclaim k1 g c 0 0"),
+        ("xsetid", None, "xsetid k1 0-1"),
+        ("pfcount", None, "pfcount k1 k2"),
+        ("pfadd", None, "pfadd k1 a"),
+        ("pfmerge", None, "pfmerge k1 k2"),
+        ("geopos", None, "geopos k1 m"),
+        ("geodist", None, "geodist k1 a b"),
+        ("geohash", None, "geohash k1 m"),
+        ("geosearch", None, "geosearch k1 FROMMEMBER m BYRADIUS 1 km"),
+        ("georadius_ro", None, "georadius_ro k1 0 0 1 km"),
+        (
+            "georadiusbymember_ro",
+            None,
+            "georadiusbymember_ro k1 m 1 km",
+        ),
+        ("georadius", None, "georadius k1 0 0 1 km"),
+        ("georadiusbymember", None, "georadiusbymember k1 m 1 km"),
+        (
+            "geosearchstore",
+            None,
+            "geosearchstore k1 k2 FROMMEMBER m BYRADIUS 1 km",
+        ),
+        ("geoadd", None, "geoadd k1 0 0 m"),
+        ("object", Some("encoding"), "object encoding k1"),
+        ("object", Some("freq"), "object freq k1"),
+        ("object", Some("idletime"), "object idletime k1"),
+        ("object", Some("refcount"), "object refcount k1"),
+        ("memory", Some("usage"), "memory usage k1"),
+        ("xinfo", Some("stream"), "xinfo stream k1"),
+        ("xinfo", Some("groups"), "xinfo groups k1"),
+        ("xinfo", Some("consumers"), "xinfo consumers k1 g"),
+        ("xgroup", Some("*"), "xgroup create k1 g $"),
+        ("xgroup", Some("*"), "xgroup destroy k1 g"),
+        ("xgroup", Some("*"), "xgroup createconsumer k1 g c"),
+        ("xgroup", Some("*"), "xgroup delconsumer k1 g c"),
+        ("xgroup", Some("*"), "xgroup setid k1 g $"),
+    ];
+    // Every keyed row has an example.
+    for (name, sub) in crate::audit::commands::keyed_rows() {
+        assert!(
+            EXAMPLES.iter().any(|(n, s, _)| *n == name && *s == sub),
+            "no GETKEYS example for {name} {sub:?}"
+        );
+    }
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = target(name, engine, "databastion", "");
+        let cmds: Vec<Vec<Vec<u8>>> = EXAMPLES
+            .iter()
+            .map(|(_, _, ex)| {
+                let mut c: Vec<Vec<u8>> = vec![b"COMMAND".to_vec(), b"GETKEYS".to_vec()];
+                c.extend(ex.split(' ').map(|a| a.as_bytes().to_vec()));
+                c
+            })
+            .collect();
+        let refs: Vec<Vec<&[u8]>> = cmds
+            .iter()
+            .map(|c| c.iter().map(Vec::as_slice).collect())
+            .collect();
+        let replies = admin(&t, &refs).await;
+        let mut checked = 0;
+        let mut differ = Vec::new();
+        for ((_, _, ex), r) in EXAMPLES.iter().zip(&replies) {
+            let Value::Array(keys) = r else {
+                // A command this version does not have.
+                continue;
+            };
+            let args: Vec<&[u8]> = ex.split(' ').map(str::as_bytes).collect();
+            let mut server: Vec<usize> = keys
+                .iter()
+                .filter_map(Value::as_bytes)
+                .filter_map(|k| args.iter().position(|a| *a == k))
+                .collect();
+            server.sort_unstable();
+            server.dedup();
+            let (spec, _) = crate::audit::commands::lookup(args[0], args.get(1).copied());
+            let mut ours = crate::audit::commands::key_indices(spec.keys, &args, args.len())
+                .unwrap_or_default();
+            ours.sort_unstable();
+            ours.dedup();
+            if ours != server {
+                differ.push(format!("{ex}: ours {ours:?}, server {server:?}"));
+            }
+            checked += 1;
+        }
+        assert!(checked > 150, "{name}: {checked} rows checked");
+        assert!(differ.is_empty(), "{name}: {differ:#?}");
+    }
+}
+
+/// Review H1: clients on the server's Unix socket all share one address,
+/// so a socket entry is never attributed through `CLIENT LIST` nor taken
+/// for the agent's: two socket clients (the dev `admin` and the agent's
+/// own user, connected well before their commands) give events without a
+/// recorded account and with the client address `local`. Needs
+/// `DATABASTION_IT_REDIS_EXEC_VALKEY` (the dev socket is inside the
+/// container).
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_clients_are_never_attributed() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    let Ok(exec) = std::env::var("DATABASTION_IT_REDIS_EXEC_VALKEY") else {
+        tracing::warn!("DATABASTION_IT_REDIS_EXEC_VALKEY unset: socket attribution not tested");
+        return;
+    };
+    let t = target("valkey", TargetEngine::Valkey, "databastion", "");
+    let connector = Arc::new(RedisConnector::new());
+    // Learned patterns for the objects.
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+    let (fs, mut frx) = FindingSink::channel(4096);
+    let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+    connector.discover(&job, &fs).await.unwrap();
+    drop(fs);
+    drain.await.unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits);
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&connector);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // The CLI reads its whole input, then runs it: the connection opens at
+    // once and its commands run after the sleep. The `admin` client then
+    // stays connected (`BLPOP` with a timeout) while the agent's user runs
+    // its command from another socket connection.
+    let socket_client = |user: &str, password: String, commands: &str| {
+        let script = format!(
+            "C=$(command -v valkey-cli || command -v redis-cli); \
+             (printf 'AUTH {user} {password}\\n'; sleep 3; printf '{commands}') \
+             | $C -s /tmp/databastion-dev.sock >/dev/null 2>&1"
+        );
+        let mut parts = exec.split_whitespace();
+        let mut cmd = std::process::Command::new(parts.next().unwrap());
+        cmd.args(parts).args(["bash", "-c", &script]);
+        tokio::task::spawn_blocking(move || cmd.status().map(|s| s.success()))
+    };
+    let a = socket_client(
+        "admin",
+        admin_password(),
+        "HGETALL session:sockettest\\nGETRANGE session:sockettest 0 4095\\nBLPOP session:none 6\\n",
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let b = socket_client(
+        "databastion",
+        t.secret.read().unwrap().to_string(),
+        "GETRANGE session:sockettest 0 4095\\n",
+    );
+    assert!(b.await.unwrap().unwrap(), "socket client (agent's user)");
+    assert!(a.await.unwrap().unwrap(), "socket client (admin)");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let json = events_json(&events);
+    let local: Vec<&serde_json::Value> = json
+        .iter()
+        .filter(|e| e["principal"]["client_addr"] == "local")
+        .collect();
+    // Both clients' reads (the agent's user from another connection is
+    // never the agent's): at least the 3 `HGETALL` / `GETRANGE`.
+    assert!(local.len() >= 3, "{json:#?}");
+    for e in local {
+        assert_eq!(e["principal"]["account_not_recorded"], true, "{e}");
+        assert!(e["principal"].get("db_user").is_none(), "{e}");
+        assert_eq!(e["source"], "redis_slowlog", "{e}");
     }
 }

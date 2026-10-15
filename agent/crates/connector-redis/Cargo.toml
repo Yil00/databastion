@@ -18,6 +18,9 @@ async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
 tracing.workspace = true
 zeroize.workspace = true
+# Truncated SHA-256 of the server's `run_id` (Audit positions and the
+# agent's own connections, never sent).
+sha2.workspace = true
 # Own client for a closed subset of RESP3 (`resp`, `cmd`, `conn`), no Redis
 # client crate (ADR-0052 decision 1): bounded replies, no write command, no
 # server text kept, no topology following.

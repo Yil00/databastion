@@ -311,10 +311,16 @@ pub(crate) async fn discover(
             continue;
         }
         let walked = walk(&mut conn, job, sink, &patterns, &settings, &info).await?;
-        let Some(emitted) = walked else {
+        let Some((emitted, complete)) = walked else {
             facts.declared_not_readable += 1;
             continue;
         };
+        // The patterns Audit maps log keys to (decision 8, H1).
+        let learned: Vec<String> = emitted
+            .iter()
+            .map(|p| p.pattern.as_str().to_owned())
+            .collect();
+        state.audit.learn(&target.id, *db, &learned, complete);
         sample_database(&mut conn, job, sink, &name, emitted, &mut facts).await?;
     }
     state.record_scan(&target.id, facts);
@@ -324,8 +330,9 @@ pub(crate) async fn discover(
     Ok(())
 }
 
-/// Walks one database (decision 6). `None` when the walk ended on an
-/// unexpected `NOPERM` (the database counts in `skipped_not_readable`).
+/// Walks one database (decision 6): its patterns, and whether the walk
+/// was complete. `None` when the walk ended on an unexpected `NOPERM`
+/// (the database counts in `skipped_not_readable`).
 async fn walk(
     conn: &mut Conn<'_>,
     job: &ScanJob,
@@ -333,7 +340,7 @@ async fn walk(
     patterns: &[Vec<u8>],
     settings: &databastion_core::config::redis::RedisTargetConfig,
     info: &NodeInfo,
-) -> Result<Option<Vec<EmittedPattern>>, ConnectorError> {
+) -> Result<Option<(Vec<EmittedPattern>, bool)>, ConnectorError> {
     let max_keys = u64::from(settings.max_keys);
     let max_calls = (4 * max_keys / u64::from(SCAN_COUNT)).max(1);
     let stores = job.cas_stores();
@@ -403,7 +410,8 @@ async fn walk(
     cov.limit += builder.overflow().min(1);
     let _ = info;
     sink.add_coverage(cov);
-    Ok(Some(builder.finish()))
+    let complete = !limited && builder.overflow() == 0;
+    Ok(Some((builder.finish(), complete)))
 }
 
 enum Walk {

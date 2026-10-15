@@ -134,6 +134,8 @@ it_redis() {
   compose exec -T valkey cat /tls/ca.pem > dev/.state/tls/redis-ca.pem
   export DATABASTION_IT_REDIS=1
   export DATABASTION_IT_REDIS_CA="$ROOT/dev/.state/tls/redis-ca.pem"
+  # Clients on the Valkey server's Unix socket (inside the container): the socket attribution test.
+  export DATABASTION_IT_REDIS_EXEC_VALKEY="timeout 120 docker compose -f $COMPOSE_FILE exec -T valkey"
   cargo_it databastion-connector-redis --test-threads 1
 }
 

@@ -1,6 +1,7 @@
 //! Fuzz entry points (`agent/fuzz`, cargo-fuzz): the reply decoder fed in
 //! arbitrary chunks under every request's limits, the `INFO` parser and
-//! the key-name normalizer. Never panic, never allocate past the limits.
+//! the key-name normalizer, the Audit log-entry parsers and the learned-
+//! pattern matcher. Never panic, never allocate past the limits.
 
 use crate::cmd::{Cmd, InfoSection};
 use crate::resp::Decoder;
@@ -70,4 +71,102 @@ pub fn key_pattern(data: &[u8]) {
     let _ = crate::glob::matches(pat, name);
     let _ = crate::glob::example(pat);
     let _ = crate::guard::key_guarded(data, None);
+}
+
+fn decode_reply(cmd: &Cmd<'_>, data: &[u8]) -> Option<crate::resp::Value> {
+    let mut d = Decoder::new(cmd.limits());
+    match d.feed(data) {
+        Ok((_, v)) => v,
+        Err(_) => None,
+    }
+}
+
+fn learned() -> databastion_classifiers::keys::LearnedPatterns {
+    databastion_classifiers::keys::LearnedPatterns::new([
+        "user:*:email",
+        "session:*",
+        "cache:page:about",
+        "order_*_*",
+        "*:*",
+    ])
+}
+
+/// Every object is `*` or a contract `KeyPattern` made of the learned
+/// set's literals only (the H1 oracle, review L8).
+fn assert_objects(objects: &[databastion_classifiers::names::NormalizedName]) {
+    use databastion_classifiers::keys::pattern_tokens;
+    let set = learned();
+    let learned_tokens: std::collections::HashSet<&str> = set
+        .patterns()
+        .iter()
+        .flat_map(|p| pattern_tokens(p))
+        .collect();
+    for o in objects {
+        let o = o.as_str();
+        assert!(
+            o == "*" || databastion_classifiers::keys::is_key_pattern(o),
+            "{o:?}"
+        );
+        for t in pattern_tokens(o) {
+            assert!(
+                t == "*" || learned_tokens.contains(t),
+                "{t:?} not learned in {o:?}"
+            );
+        }
+    }
+}
+
+/// A `SLOWLOG GET` / `COMMANDLOG GET` reply, decoded under its limits, each
+/// entry reduced (ADR-0052 decision 8): every object is `*` or a contract
+/// `KeyPattern`.
+pub fn slowlog_entry(data: &[u8]) {
+    let Some(v) = decode_reply(&Cmd::SlowlogGet, data) else {
+        return;
+    };
+    let set = learned();
+    let ctx = crate::audit::entries::Context {
+        learned: &set,
+        stores: None,
+    };
+    let items = match &v {
+        crate::resp::Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    for item in items {
+        if let Ok(e) = crate::audit::entries::parse_log_entry(item, &ctx) {
+            assert_objects(&e.objects);
+        }
+    }
+}
+
+/// An `ACL LOG` reply (each entry, with its `client-info`), then the input
+/// as a `CLIENT LIST` line.
+pub fn acl_log_entry(data: &[u8]) {
+    let _ = crate::audit::entries::parse_client(data);
+    let Some(v) = decode_reply(&Cmd::AclLog, data) else {
+        return;
+    };
+    let set = learned();
+    let get = |_: Option<u16>| &set;
+    let key = std::collections::hash_map::RandomState::new();
+    let items = match &v {
+        crate::resp::Value::Array(items) => items.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    for item in items {
+        if let Ok(e) = crate::audit::entries::parse_acl_entry(item, &get, None, &key) {
+            assert_objects(std::slice::from_ref(&e.object));
+        }
+    }
+    let _ = crate::audit::entries::parse_client_list(&v);
+}
+
+/// The learned-pattern matcher (`classifiers::keys::LearnedPatterns`): the
+/// object always passes the contract gate.
+pub fn learned_patterns(data: &[u8]) {
+    let o = databastion_classifiers::keys::fuzz_learned(data);
+    assert!(
+        o == "*" || databastion_classifiers::keys::is_key_pattern(&o),
+        "{o:?}"
+    );
 }

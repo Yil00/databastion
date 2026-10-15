@@ -54,6 +54,8 @@ pub(crate) fn endpoint(target: &TargetConfig, which: Which) -> Option<Endpoint> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NodeInfo {
     pub(crate) server: Server,
+    /// The server run ([`info::run_hash`]).
+    pub(crate) run: Option<u64>,
     pub(crate) cluster: bool,
     pub(crate) replica: bool,
 }
@@ -87,6 +89,7 @@ pub(crate) async fn open(
     let mut session = Session::open(&endpoint, tls, &target.account, &password, timeout).await?;
     drop(password);
     let info = identify(&mut session, timeout).await?;
+    session.register_own(&target.id, info.run);
     Ok((session, info))
 }
 
@@ -158,6 +161,7 @@ pub(crate) async fn identify(
     }
     Ok(NodeInfo {
         server: engine,
+        run: info::run_hash(&server_text),
         cluster: text(cluster).is_some_and(|t| info::cluster_enabled(&t)),
         replica: text(replication).is_some_and(|t| info::is_replica(&t)),
     })
@@ -178,6 +182,8 @@ pub(crate) struct Report {
     pub(crate) ticket_keys_readable: Option<u64>,
     /// The account may run `ACL DRYRUN` (the first probe was answered).
     pub(crate) dryrun_granted: bool,
+    /// The Audit reads the account may run (decision 8).
+    pub(crate) audit: acl::AuditGrants,
 }
 
 /// The union of two optional index lists (`None` when either is).
@@ -212,6 +218,8 @@ impl Report {
                 _ => None,
             },
             dryrun_granted: self.dryrun_granted && other.dryrun_granted,
+            // Audit reads the target's node only.
+            audit: self.audit,
         }
     }
 
@@ -357,12 +365,41 @@ pub(crate) async fn evaluate(
         .filter(|r| acl::readable(r) != Some(false))
         .count() as u64;
 
+    // The Audit reads (decision 8): each sent only when allowed (H3).
+    let reads: Vec<acl::AuditRead> = acl::AuditRead::ALL
+        .into_iter()
+        .filter(|r| *r != acl::AuditRead::Commandlog || server.has_commandlog())
+        .collect();
+    let cmds: Vec<Cmd<'_>> = reads
+        .iter()
+        .map(|r| Cmd::DryRun {
+            user,
+            probe: r.probe(),
+        })
+        .collect();
+    let replies = session.pipeline(&cmds, timeout, Stage::Check).await?;
+    let mut audit = acl::AuditGrants::default();
+    for (r, reply) in reads.iter().zip(&replies) {
+        audit.set(
+            *r,
+            match acl::verdict(reply) {
+                Verdict::Allowed => Some(true),
+                Verdict::Denied => Some(false),
+                Verdict::NotEvaluated => None,
+            },
+        );
+    }
+    if !server.has_commandlog() {
+        audit.commandlog = Some(false);
+    }
+
     Ok(Report {
         eval: Some(eval),
         patterns_not_readable: Some(not_readable),
         databases_not_readable,
         ticket_keys_readable: Some(readable),
         dryrun_granted: true,
+        audit,
     })
 }
 
@@ -494,6 +531,7 @@ mod tests {
             databases_not_readable: Some(Vec::new()),
             ticket_keys_readable: Some(0),
             dryrun_granted: true,
+            audit: acl::AuditGrants::default(),
         }
     }
 

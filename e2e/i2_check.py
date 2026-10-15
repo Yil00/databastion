@@ -29,8 +29,13 @@ Subcommands
             fingerprint): OpenLDAP principals are entry DNs, sent as fingerprints (ADR-0029
             decision 7); `@fingerprint!SIGNAL` stands for a fingerprinted principal none of whose
             events carries SIGNAL (the OpenLDAP analyst: the exporter's bulk search carries
-            shape.bulk_search). --fingerprinted-only then requires every principal to be one (a
-            principal in clear is counted, never printed: it may be a DN holding a value),
+            shape.bulk_search). `@not_recorded` stands for an event without a recorded account
+            (`account_not_recorded`, Redis / Valkey only, ADR-0052 decision 8: neither `db_user`
+            nor `db_user_fingerprint`) and an incident without a principal whose events all
+            have no recorded account (`events_account_not_recorded`, run.sh). --fingerprinted-only
+            then requires every principal to be one (a
+            principal in clear is counted, never printed: it may be a DN holding a value; events
+            without a recorded account have no principal and are not counted),
             --min-fingerprints the number of distinct fingerprinted principals that read, and
             --max-fingerprints the most distinct fingerprints over every event and incident, any
             action (with both at N: exactly the N test clients, the agent's own reads never
@@ -811,6 +816,23 @@ FINGERPRINTED = "@fingerprint"
 _FINGERPRINT = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 
 
+# An event the source records no account for (contract `Principal.account_not_recorded`, Redis /
+# Valkey only); its incidents carry an empty principal (console `principalLabel`) and are told
+# apart by their events (`events_account_not_recorded`, exported by run.sh).
+NOT_RECORDED = "@not_recorded"
+
+
+def _not_recorded_event(e: dict) -> bool:
+    return e.get("account_not_recorded") is True and not e.get("db_user") \
+        and not e.get("db_user_fingerprint")
+
+
+def _not_recorded_incident(i: dict) -> bool:
+    # An empty principal is also the console's label of other incidents without a principal: only
+    # those whose events all have no recorded account (exported as events_account_not_recorded).
+    return not i.get("principal") and i.get("events_account_not_recorded") is True
+
+
 def _fingerprinted_event(e: dict) -> bool:
     return not e.get("db_user") and bool(_FINGERPRINT.match(str(e.get("db_user_fingerprint") or "")))
 
@@ -829,8 +851,10 @@ def _fingerprints_without(events: list[dict], signal: str) -> set[str]:
 
 def _matcher(events: list[dict], principal: str):
     """(event predicate, incident predicate) of a principal given on the command line: a name,
-    `@fingerprint` (any fingerprinted principal) or `@fingerprint!SIGNAL` (a fingerprinted
-    principal none of whose events carries SIGNAL)."""
+    `@fingerprint` (any fingerprinted principal), `@fingerprint!SIGNAL` (a fingerprinted
+    principal none of whose events carries SIGNAL) or `@not_recorded` (no recorded account)."""
+    if principal == NOT_RECORDED:
+        return _not_recorded_event, _not_recorded_incident
     if principal == FINGERPRINTED:
         return _fingerprinted_event, _fingerprinted_incident
     if principal.startswith(FINGERPRINTED + "!"):
@@ -909,7 +933,8 @@ def check_audit(events: list[dict], incidents: list[dict], ground_truth: dict, e
         else:
             errors.append(f"no access event of {what}")
     if fingerprinted_only:
-        clear_events = sum(1 for e in events if not _fingerprinted_event(e))
+        clear_events = sum(1 for e in events
+                           if not _fingerprinted_event(e) and not _not_recorded_event(e))
         clear_incidents = sum(1 for i in incidents if _principal(i) and not _fingerprinted_incident(i))
         if clear_events:
             errors.append(f"{clear_events} access event(s) carry a principal that is not a "

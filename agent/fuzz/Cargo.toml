@@ -145,3 +145,24 @@ path = "fuzz_targets/redis_key_pattern.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "redis_slowlog_entry"
+path = "fuzz_targets/redis_slowlog_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_acl_log_entry"
+path = "fuzz_targets/redis_acl_log_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_learned_patterns"
+path = "fuzz_targets/redis_learned_patterns.rs"
+test = false
+doc = false
+bench = false

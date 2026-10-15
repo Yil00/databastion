@@ -36,6 +36,9 @@ pub(crate) struct Session {
     pub(crate) hello: Hello,
     /// Unusable after a fatal error.
     broken: bool,
+    /// The agent's own connection, registered for Audit's own-entry rule
+    /// (decision 8, H3); marked closed on drop.
+    own: Option<crate::audit::own::Registration>,
 }
 
 impl Drop for Session {
@@ -68,6 +71,7 @@ impl Session {
             pending: Vec::new(),
             hello: Hello::default(),
             broken: false,
+            own: None,
         };
         let auth = s
             .call(&Cmd::Auth { user, password }, timeout, Stage::Auth)
@@ -92,6 +96,20 @@ impl Session {
         let hello = s.call(&Cmd::Hello, timeout, Stage::SessionSetup).await?;
         s.hello = parse_hello(&hello)?;
         Ok(s)
+    }
+
+    /// Registers this connection as one of the agent's own for `target_id`
+    /// (its connection id from `HELLO`, its local address and the server
+    /// run).
+    pub(crate) fn register_own(&mut self, target_id: &str, run: Option<u64>) {
+        if let Some(id) = self.hello.id {
+            self.own = Some(crate::audit::own::register(
+                target_id,
+                id,
+                self.io.local_addr(),
+                run,
+            ));
+        }
     }
 
     /// Sends one command and reads its reply. Error replies are returned

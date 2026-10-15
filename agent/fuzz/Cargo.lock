@@ -255,6 +255,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tracing",

@@ -46,6 +46,19 @@ pub(crate) enum Transport {
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
+impl Transport {
+    /// The local TCP address of the connection (`None` on a Unix socket):
+    /// the agent's own `addr:port` as a server without NAT reports it
+    /// (ADR-0052 decision 8, own entries).
+    pub(crate) fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.local_addr().ok(),
+            Self::Tls(s) => s.get_ref().0.local_addr().ok(),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
 fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "connect timed out")
 }

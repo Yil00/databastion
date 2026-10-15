@@ -23,6 +23,8 @@ pub const MAX_DATABASES: usize = 64;
 pub const MAX_KEYS_RANGE: (u32, u32) = (1_000, 10_000_000);
 /// Default `redis.max_keys`.
 pub const DEFAULT_MAX_KEYS: u32 = 100_000;
+/// Most declared replica addresses (`redis.replicas`).
+pub const MAX_REPLICAS: usize = 64;
 /// Default TCP port of Redis and Valkey.
 pub const DEFAULT_PORT: u16 = 6379;
 
@@ -115,6 +117,13 @@ pub struct RedisTargetConfig {
     /// (`ticket_registry`) the CAS store guard never reads.
     #[serde(default)]
     pub cas_stores: Option<crate::cas_guard::CasStores>,
+    /// The replicas' addresses, as the server lists them in `INFO
+    /// replication` (IP literals, at most 64): Audit compares them with
+    /// the replica of a full synchronization, which is reported anyway;
+    /// an address not listed here is sent as the event's client address
+    /// (ADR-0052 decision 8). Compared only, never connected to (I5).
+    #[serde(default)]
+    pub replicas: Vec<std::net::IpAddr>,
 }
 
 const fn default_max_keys() -> u32 {
@@ -139,6 +148,7 @@ impl Default for RedisTargetConfig {
             server_uid: None,
             unevaluated_acl: None,
             cas_stores: None,
+            replicas: Vec::new(),
         }
     }
 }
@@ -240,6 +250,9 @@ impl RedisTargetConfig {
         }
         if let Some(stores) = &self.cas_stores {
             stores.validate()?;
+        }
+        if self.replicas.len() > MAX_REPLICAS {
+            return Err(("replicas", "must list at most 64 addresses"));
         }
         if let Some(node) = &self.discovery_node {
             validate_endpoint(

@@ -952,6 +952,15 @@ pub enum EventSource {
     OpenldapAccesslog,
     /// Apereo CAS JSON audit log (ADR-0041).
     CasAuditLog,
+    /// Redis / Valkey slow log (`SLOWLOG GET`, or `COMMANDLOG GET … slow`
+    /// on Valkey 8.1+; ADR-0052 decision 8).
+    RedisSlowlog,
+    /// Valkey command log, `large-reply` type (Valkey 8.1+).
+    RedisCommandlog,
+    /// Redis / Valkey `ACL LOG` (failed authentications, denials).
+    RedisAclLog,
+    /// Redis / Valkey full synchronizations (`INFO stats` `sync_full`).
+    RedisSync,
 }
 
 impl EventSource {
@@ -970,7 +979,22 @@ impl EventSource {
             Self::MongodbLog => "mongodb_log",
             Self::OpenldapAccesslog => "openldap_accesslog",
             Self::CasAuditLog => "cas_audit_log",
+            Self::RedisSlowlog => "redis_slowlog",
+            Self::RedisCommandlog => "redis_commandlog",
+            Self::RedisAclLog => "redis_acl_log",
+            Self::RedisSync => "redis_sync",
         }
+    }
+
+    /// Whether events of this source name their objects with a contract
+    /// `KeyPattern` (the Redis / Valkey sources, contract `ObjectRef`) and
+    /// may carry the `account_not_recorded` principal.
+    #[must_use]
+    pub const fn is_redis(self) -> bool {
+        matches!(
+            self,
+            Self::RedisSlowlog | Self::RedisCommandlog | Self::RedisAclLog | Self::RedisSync
+        )
     }
 }
 
@@ -1023,11 +1047,25 @@ pub enum Signal {
     /// `volume.failed_logins_one_account`: one principal with at least 20
     /// failed authentications within 10 minutes (CAS, ADR-0041 decision 8).
     FailedLoginsOneAccount,
+    /// `signature.full_sync`: a full synchronization of a Redis / Valkey
+    /// server (a replica's first sync, `redis-cli --rdb`, a rogue replica;
+    /// ADR-0052 decision 8).
+    FullSync,
+    /// `volume.large_reply`: a command whose reply exceeded the server's
+    /// large-reply threshold (Valkey 8.1+ command log).
+    LargeReply,
+    /// `shape.keyspace_enumeration`: `KEYS`, or a `SCAN` with a `COUNT`
+    /// above 1 000, seen in a Redis / Valkey log entry.
+    KeyspaceEnumeration,
+    /// `signature.cas_ticket_read`: a Redis / Valkey log entry naming a key
+    /// guarded by the CAS store guard by name, or with a strict ticket
+    /// prefix (ADR-0052 decision 6, re-review N5).
+    CasTicketRead,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -1041,6 +1079,10 @@ impl Signal {
         Self::BulkSearch,
         Self::FailedLoginsManyAccounts,
         Self::FailedLoginsOneAccount,
+        Self::FullSync,
+        Self::LargeReply,
+        Self::KeyspaceEnumeration,
+        Self::CasTicketRead,
     ];
 
     /// Contract value.
@@ -1060,6 +1102,10 @@ impl Signal {
             Self::BulkSearch => "shape.bulk_search",
             Self::FailedLoginsManyAccounts => "volume.failed_logins_many_accounts",
             Self::FailedLoginsOneAccount => "volume.failed_logins_one_account",
+            Self::FullSync => "signature.full_sync",
+            Self::LargeReply => "volume.large_reply",
+            Self::KeyspaceEnumeration => "shape.keyspace_enumeration",
+            Self::CasTicketRead => "signature.cas_ticket_read",
         }
     }
 }
@@ -1104,6 +1150,9 @@ pub struct EventPrincipal {
     send_name: bool,
     /// The `*` aggregate of several accounts (CAS failed-login floods).
     many_accounts: bool,
+    /// The source records no account (Redis / Valkey, contract
+    /// `account_not_recorded`).
+    not_recorded: bool,
     client: Option<ClientAddr>,
     application: Option<String>,
 }
@@ -1113,6 +1162,7 @@ impl fmt::Debug for EventPrincipal {
         f.debug_struct("EventPrincipal")
             .field("send_name", &self.send_name)
             .field("many_accounts", &self.many_accounts)
+            .field("not_recorded", &self.not_recorded)
             .field("client", &self.client)
             .finish_non_exhaustive()
     }
@@ -1134,6 +1184,7 @@ impl EventPrincipal {
             account: bounded(raw, MAX_ACCOUNT_BYTES),
             send_name: true,
             many_accounts: false,
+            not_recorded: false,
             client: None,
             application: None,
         }
@@ -1152,9 +1203,33 @@ impl EventPrincipal {
             account: MANY_ACCOUNTS.to_owned(),
             send_name: true,
             many_accounts: true,
+            not_recorded: false,
             client: None,
             application: None,
         }
+    }
+
+    /// No recorded account (contract `account_not_recorded`): a Redis /
+    /// Valkey slow-log or command-log entry whose connection could not be
+    /// attributed, or a full synchronization (ADR-0052 decision 8). The
+    /// core sends it only on events of a Redis / Valkey source that are
+    /// not `auth_failure`, and drops any other event built with it.
+    #[must_use]
+    pub fn not_recorded() -> Self {
+        Self {
+            account: String::new(),
+            send_name: false,
+            many_accounts: false,
+            not_recorded: true,
+            client: None,
+            application: None,
+        }
+    }
+
+    /// Whether this is the [`Self::not_recorded`] principal.
+    #[must_use]
+    pub fn is_not_recorded(&self) -> bool {
+        self.not_recorded
     }
 
     /// Whether this is the [`Self::many_accounts`] aggregate.
@@ -1322,6 +1397,9 @@ pub struct MaskedEvent {
     /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`].
     objects: Vec<EventObject>,
     rows: Option<u64>,
+    /// Bytes returned, when the source records it (contract
+    /// `AccessEvent.bytes`).
+    bytes: Option<u64>,
     /// Sorted, without duplicates.
     signals: Vec<Signal>,
     source: EventSource,
@@ -1357,6 +1435,7 @@ impl MaskedEvent {
             action,
             objects: Vec::new(),
             rows: None,
+            bytes: None,
             signals: Vec::new(),
             source,
             aggregated_count: 1,
@@ -1401,6 +1480,13 @@ impl MaskedEvent {
     #[must_use]
     pub fn with_rows(mut self, rows: Option<u64>) -> Self {
         self.rows = rows.map(|r| r.min(MAX_COUNT));
+        self
+    }
+
+    /// Sets the bytes returned (saturated at [`MAX_COUNT`]).
+    #[must_use]
+    pub fn with_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.bytes = bytes.map(|b| b.min(MAX_COUNT));
         self
     }
 
@@ -1455,6 +1541,10 @@ impl MaskedEvent {
             (Some(a), Some(b)) => Some(a.saturating_add(b).min(MAX_COUNT)),
             (a, b) => a.or(b),
         };
+        self.bytes = match (self.bytes, other.bytes) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b).min(MAX_COUNT)),
+            (a, b) => a.or(b),
+        };
         for s in other.signals {
             self.add_signal(s);
         }
@@ -1495,6 +1585,12 @@ impl MaskedEvent {
     #[must_use]
     pub fn rows(&self) -> Option<u64> {
         self.rows
+    }
+
+    /// Bytes returned, when known.
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64> {
+        self.bytes
     }
 
     /// Signals (sorted, unique).

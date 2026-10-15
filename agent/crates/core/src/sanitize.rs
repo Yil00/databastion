@@ -10,14 +10,14 @@
 //! |---------|-------|------|
 //! | `not` (Identifier) | location / object names | name replaced by `*` |
 //! | `if` / `then` / `else` on `Location.engine` (`KeyPattern` for `redis` / `valkey`, `Identifier` otherwise) | location objects | name replaced by `*` (the `KeyPattern` pattern and every `not` rule, `keys::is_key_pattern`) |
-//! | `ObjectName` other than an `Identifier` on an event object | event objects | name replaced by `*` (no connector builds Redis / Valkey events yet, ADR-0052) |
+//! | `ObjectName` by source (`KeyPattern` for the `redis_*` sources, `Identifier` otherwise) | event objects | name replaced by `*` (the `KeyPattern` pattern and every `not` rule) |
 //! | `minimum` / `maximum` on numbers | `confidence` | item dropped (NaN, < 0, > 1) |
 //! | `minimum` / `maximum` on integers | `sampled`, `matched`, `aggregated_count`, `Count` | item dropped, or optional field omitted |
 //! | `maxItems` | `masked_samples` (5), `fingerprints` (50), `objects` (16), `signals` (16) | truncated |
 //! | `uniqueItems` | `fingerprints`, `signals` | deduplicated |
 //! | `if` / `then` | `read` / `write` events need an object | item dropped |
 //! | cross-field | `matched <= sampled` | item dropped |
-//! | `if` / `then` | `account_not_recorded` principal (Redis / Valkey sources only, never `auth_failure`) | item dropped (no connector builds it yet, ADR-0052) |
+//! | `if` / `then` | `account_not_recorded` principal (Redis / Valkey sources only, never `auth_failure`) | item dropped |
 //! | `minItems` / `maxItems` of the batch, 1 MiB | envelope | enforced by the batch builder in `uplink` |
 //!
 //! Raw strings that are not names (`db_user`, `application`) go through
@@ -33,9 +33,9 @@ use databastion_classifiers::keys::is_key_pattern;
 use databastion_classifiers::masking::{HmacKey, RawSample};
 use databastion_classifiers::names::{is_forbidden_char, violates_numeric_rule};
 use databastion_protocol::{
-    AccessEvent, AccessEventAction, ClientAddress, Count, Engine, Finding, Fingerprint, Identifier,
-    ObjectName, Principal, PrincipalVariant0Application, PrincipalVariant0DbUser,
-    PrincipalVariant1Application,
+    AccessEvent, AccessEventAction, AuditSource, ClientAddress, Count, Engine, Finding,
+    Fingerprint, Identifier, ObjectName, Principal, PrincipalVariant0Application,
+    PrincipalVariant0DbUser, PrincipalVariant1Application, PrincipalVariant2Application,
 };
 
 /// Contract `Count` maximum (JavaScript safe integer).
@@ -160,6 +160,44 @@ pub(crate) fn principal(
     }
 }
 
+/// The `account_not_recorded` principal (contract `Principal`, Redis /
+/// Valkey only): a non-conforming `client_addr` or `application` is
+/// omitted.
+pub(crate) fn principal_not_recorded(
+    client_addr: Option<&str>,
+    application: Option<&str>,
+) -> Principal {
+    let client_addr = client_addr.and_then(|a| {
+        if a == "local" {
+            serde_json::from_value::<ClientAddress>(serde_json::Value::from(a)).ok()
+        } else {
+            a.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => ClientAddress::from(v4),
+                std::net::IpAddr::V6(v6) => ClientAddress::from(v6),
+            })
+        }
+    });
+    Principal::Variant2 {
+        account_not_recorded: true,
+        application: application
+            .map(clean_application)
+            .and_then(|a| PrincipalVariant2Application::try_from(a).ok()),
+        client_addr,
+    }
+}
+
+/// Whether events of `source` name their objects with a `KeyPattern` and
+/// may carry `account_not_recorded` (the `redis_*` sources).
+pub(crate) fn is_redis_source(source: AuditSource) -> bool {
+    matches!(
+        source,
+        AuditSource::RedisSlowlog
+            | AuditSource::RedisCommandlog
+            | AuditSource::RedisAclLog
+            | AuditSource::RedisSync
+    )
+}
+
 fn wildcard() -> Option<Identifier> {
     Identifier::try_from("*").ok()
 }
@@ -187,11 +225,9 @@ pub(crate) fn clamped_count(n: u64) -> Count {
     Count(i64::try_from(n).map_or(MAX_COUNT, |v| v.min(MAX_COUNT)))
 }
 
-/// Sanitizes an object name in place outside a Redis / Valkey location.
-/// An `Identifier` goes through [`fix_identifier`]. A name that is only a
-/// `KeyPattern` becomes `*`: on an event object (no Redis / Valkey Audit
-/// yet, ADR-0052 decision 8) or on another engine's location (fail
-/// closed).
+/// Sanitizes an object name in place outside a Redis / Valkey location or
+/// event. An `Identifier` goes through [`fix_identifier`]. A name that is
+/// only a `KeyPattern` becomes `*` (fail closed).
 fn fix_object_name(name: &mut ObjectName) -> bool {
     match name {
         ObjectName::Variant0(id) => fix_identifier(id),
@@ -269,16 +305,28 @@ pub(crate) fn check_finding(f: &mut Finding) -> bool {
 
 /// Validates and sanitizes an access event in place. `false`: drop it.
 pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
+    let redis = is_redis_source(e.source);
     // `account_not_recorded` is valid only on Redis / Valkey sources and
-    // never on `auth_failure` (contract `Principal`); no connector builds it
-    // yet (ADR-0052 decision 8), so it is refused here (fail closed).
-    if matches!(e.principal, Principal::Variant2 { .. }) {
+    // never on `auth_failure` (contract `Principal`, ADR-0052 decision 8).
+    if let Principal::Variant2 {
+        account_not_recorded,
+        ..
+    } = &e.principal
+        && (!redis || !*account_not_recorded || e.action == AccessEventAction::AuthFailure)
+    {
         return false;
     }
     e.objects.truncate(MAX_OBJECTS);
     for o in &mut e.objects {
+        // A Redis / Valkey source names objects with a `KeyPattern`
+        // (contract `ObjectRef`), any other source with an `Identifier`.
+        let object_ok = if redis {
+            fix_location_object(&mut o.object, Engine::Redis)
+        } else {
+            fix_object_name(&mut o.object)
+        };
         let ok = fix_identifier(&mut o.database)
-            && fix_object_name(&mut o.object)
+            && object_ok
             && o.schema.as_mut().is_none_or(fix_identifier);
         if !ok {
             return false;
@@ -458,21 +506,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn key_patterns_and_unrecorded_accounts_are_not_sent_yet() {
-        // No Redis / Valkey Audit yet (ADR-0052 decision 8): a key pattern
-        // event object becomes `*`, an `account_not_recorded` principal
-        // drops the event.
+    fn key_patterns_and_unrecorded_accounts_by_source() {
+        let unrecorded = || -> Principal {
+            serde_json::from_value(serde_json::json!({
+                "account_not_recorded": true, "client_addr": "198.51.100.7"
+            }))
+            .unwrap()
+        };
+        // Another source: a key pattern object becomes `*`, an
+        // `account_not_recorded` principal drops the event.
         let mut e = event("read", 1);
         e.objects[0].object = "session:*".parse().unwrap();
         assert!(check_event(&mut e));
         assert_eq!(e.objects[0].object.to_string(), "*");
         let mut e = event("read", 1);
-        e.principal = serde_json::from_value(serde_json::json!({
-            "account_not_recorded": true, "client_addr": "198.51.100.7"
-        }))
-        .unwrap();
+        e.principal = unrecorded();
         assert!(matches!(e.principal, Principal::Variant2 { .. }));
         assert!(!check_event(&mut e));
+        // A Redis / Valkey source: key patterns kept when they pass every
+        // `not` rule, `*` otherwise; `account_not_recorded` kept, except
+        // on `auth_failure`.
+        for source in [
+            AuditSource::RedisSlowlog,
+            AuditSource::RedisCommandlog,
+            AuditSource::RedisAclLog,
+            AuditSource::RedisSync,
+        ] {
+            let mut e = event("read", 2);
+            e.source = source;
+            e.principal = unrecorded();
+            e.objects[0].object = "session:*".parse().unwrap();
+            e.objects[1].object = "user:123456789".parse().unwrap();
+            assert!(check_event(&mut e));
+            assert_eq!(e.objects[0].object.to_string(), "session:*");
+            assert_eq!(e.objects[1].object.to_string(), "*");
+            let mut e = event("auth_failure", 0);
+            e.source = source;
+            e.principal = unrecorded();
+            assert!(!check_event(&mut e));
+        }
     }
 
     #[test]

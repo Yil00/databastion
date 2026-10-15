@@ -13,8 +13,10 @@
 //!   after the walk, then bounded sampling per type. Values are classified
 //!   through `ScanJob::classify`; only masked findings reach the sink (I2).
 //!   Locations: `db<index>`, the Redis type, the key pattern, the field.
-//! - Audit: not in this version (a later lot of P9-B); `check()` reports
-//!   `audit.stream_not_available`.
+//! - Audit ([`audit_stream`](Connector::audit_stream)), Limited at best:
+//!   the slow log (or Valkey's command log), Valkey's large-reply log,
+//!   `ACL LOG` and full synchronizations, polled and reduced at parse
+//!   time to learned key patterns; no argument value is kept (decision 8).
 //!
 //! The connector only reads (I4): its own RESP3 client can encode no
 //! write command. It connects only to the declared node and Discovery node
@@ -27,6 +29,7 @@
 #![cfg_attr(not(test), deny(clippy::string_slice, clippy::indexing_slicing))]
 
 mod acl;
+pub(crate) mod audit;
 mod check;
 mod cmd;
 mod conn;
@@ -50,9 +53,11 @@ mod it;
 mod proptests;
 
 use async_trait::async_trait;
+use databastion_classifiers::masking::EventSource;
 use databastion_core::config::TargetConfig;
 use databastion_core::{
-    AuditConfig, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob, TargetHealth,
+    AuditConfig, AuditLevel, Connector, ConnectorError, Engine, EventSink, FindingSink, ScanJob,
+    TargetHealth,
 };
 
 /// Redis / Valkey connector. One instance serves every declared Redis and
@@ -93,20 +98,25 @@ impl Connector for RedisConnector {
 
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
-        _sink: &EventSink,
+        cfg: &AuditConfig,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
-        Err(ConnectorError::NotImplemented {
-            engine: Engine::Redis,
-            operation: "audit_stream",
-        })
+        audit::audit_stream(cfg, sink, &self.state).await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(&self, target: &TargetConfig) -> Option<EventSource> {
+        (self.state.level(&target.id) == AuditLevel::Limited).then_some(EventSource::RedisSlowlog)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databastion_core::{AuditLevel, FailureCode};
+    use databastion_core::FailureCode;
 
     fn target(yaml: &str) -> TargetConfig {
         let config = databastion_core::AgentConfig::parse(&format!(
@@ -137,7 +147,7 @@ mod tests {
     async fn default_job_without_target_fails_closed() {
         let connector = RedisConnector::new();
         assert_eq!(connector.engine(), Engine::Redis);
-        assert!(!connector.supports_audit());
+        assert!(connector.supports_audit());
         let (findings, _rx) = FindingSink::channel(1);
         let r = connector.discover(&ScanJob::default(), &findings).await;
         assert!(matches!(

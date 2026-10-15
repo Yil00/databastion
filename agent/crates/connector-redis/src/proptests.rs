@@ -135,5 +135,31 @@ proptest! {
         crate::fuzz::resp_decoder(&data);
         crate::fuzz::info(&data);
         crate::fuzz::key_pattern(&data);
+        crate::fuzz::slowlog_entry(&data);
+        crate::fuzz::acl_log_entry(&data);
+        crate::fuzz::learned_patterns(&data);
+    }
+
+    /// Well-formed slow-log replies with arbitrary arguments: every object
+    /// holds learned literals only (the fuzz oracle, review L8).
+    #[test]
+    fn slow_log_objects_hold_learned_literals_only(
+        cmd in prop::sample::select(vec![
+            "GET", "MGET", "HGETALL", "MSET", "ZUNIONSTORE", "XREAD", "SORT", "OBJECT", "LMPOP",
+            "BITOP", "DEL", "SCAN", "KEYS", "EVAL",
+        ]),
+        rest in prop::collection::vec(
+            prop_oneof!["[a-zA-Z0-9:_.@/|{}#*-]{1,24}", Just("2".to_owned()), Just("STREAMS".to_owned())],
+            0..8,
+        ),
+    ) {
+        let mut args = vec![cmd.to_owned()];
+        args.extend(rest);
+        let mut out = format!("*1\r\n*6\r\n:1\r\n:1\r\n:1\r\n*{}\r\n", args.len()).into_bytes();
+        for a in &args {
+            out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+        }
+        out.extend_from_slice(b"$11\r\n10.0.0.1:12\r\n$0\r\n\r\n");
+        crate::fuzz::slowlog_entry(&out);
     }
 }
