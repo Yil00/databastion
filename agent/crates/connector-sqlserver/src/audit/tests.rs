@@ -32,6 +32,7 @@ fn cursor_round_trips() {
         history_us: Some(17),
         session: Some(1_800_000_000_000_000),
         floor: Some(17),
+        floor_set_ms: 1_800_000_000_000,
         buffer: Some(("/var/opt/mssql/xe/x_0_1.xel".to_owned(), 8192)),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
@@ -44,6 +45,57 @@ fn cursor_round_trips() {
     assert!(Cursor::decode(b"v1\nguid x\n").is_none());
     let big = Cursor::decode(b"v1\nskip 999999\n").unwrap();
     assert_eq!(big.skip, MAX_SKIP);
+    // A floor saved without its first start ends once caught up.
+    let old = Cursor::decode(b"v1\nfloor 17\n").unwrap();
+    assert_eq!((old.floor, old.floor_set_ms), (Some(17), 0));
+}
+
+/// Re-review N1, on both sources (SQL Server Audit: no skew; Extended
+/// Events: the floor 20 ms past the first start).
+#[test]
+fn the_floor_is_counted_after_the_history_phase_and_ends() {
+    for skew in [0, xe::XE_CLOCK_SKEW_US] {
+        let mut c = Cursor::default();
+        c.first_start(Some(1_000_000), skew);
+        let set = c.floor_set_ms;
+        let floor = 1_000_000 + skew;
+        // History phase: below the start, or below the floor, not counted.
+        assert_eq!(c.below(999_999), Some(Below::History));
+        assert_eq!(c.below(floor - 1), Some(Below::History));
+        assert_eq!(c.below(floor), None);
+        // The floor stays during the history phase whatever the time.
+        c.expire_floor(set + 3_600_000, Duration::from_secs(1));
+        assert_eq!(c.floor, Some(floor));
+        // After the first caught-up read: a record stamped below the floor
+        // (late history, or the server's clock stepped back) is counted.
+        c.history_us = None;
+        assert_eq!(c.below(1), Some(Below::Dropped));
+        assert_eq!(c.below(floor - 1), Some(Below::Dropped));
+        assert_eq!(c.below(floor), None);
+        // A read started before the delivery delay passed keeps it.
+        c.expire_floor(set + 999, Duration::from_secs(1));
+        assert_eq!(c.floor, Some(floor));
+        // One started after it ends it: nothing below it is left out.
+        c.expire_floor(set + 1_000, Duration::from_secs(1));
+        assert_eq!(c.floor, None);
+        assert_eq!(c.below(1), None);
+        // Bounded at 5 minutes, whatever the delay (INFINITE latency).
+        let mut c = Cursor::default();
+        c.first_start(Some(1_000_000), skew);
+        c.history_us = None;
+        let set = c.floor_set_ms;
+        c.expire_floor(set + 299_999, Duration::from_secs(86_400));
+        assert!(c.floor.is_some());
+        c.expire_floor(set + 300_000, Duration::from_secs(86_400));
+        assert_eq!(c.floor, None);
+        // The agent's clock went back past the first start: ended.
+        let mut c = Cursor::default();
+        c.first_start(Some(1_000_000), skew);
+        c.history_us = None;
+        let set = c.floor_set_ms;
+        c.expire_floor(set - 1, Duration::from_secs(1));
+        assert_eq!(c.floor, None);
+    }
 }
 
 #[test]

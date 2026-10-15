@@ -57,7 +57,10 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
 /// `do_not_drop_event`/`block`), whether it tracks causality, and the
 /// current file of its `event_file` target, cut from the target's status
 /// XML on the server (only that file name is read, never other target
-/// data: a `ring_buffer` target holds events). Visible with `VIEW SERVER
+/// data: a `ring_buffer` target holds events), and the session's
+/// `MAX_DISPATCH_LATENCY` (ms, 0 for `INFINITE`, from
+/// `sys.server_event_sessions`: the bound of the first start's floor,
+/// re-review N1). Visible with `VIEW SERVER
 /// STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+). An exact own
 /// text (refinement P9-A obligation L8).
 pub(crate) const XE_SESSION: &str = "SELECT TOP (2) \
@@ -67,7 +70,8 @@ CONVERT(nvarchar(60), s.buffer_policy_desc), \
 CONVERT(int, CASE WHEN s.flag_desc LIKE N'%track_causality%' THEN 1 ELSE 0 END), \
 CONVERT(nvarchar(260), (SELECT TOP (1) CONVERT(xml, t.target_data).value('(EventFileTarget/File/@name)[1]', \
 'nvarchar(260)') FROM sys.dm_xe_session_targets t WHERE t.event_session_address = s.address AND \
-t.target_name = N'event_file')) FROM sys.dm_xe_sessions s WHERE s.name = {session}";
+t.target_name = N'event_file')), CONVERT(bigint, (SELECT TOP (1) d.max_dispatch_latency FROM \
+sys.server_event_sessions d WHERE d.name = s.name)) FROM sys.dm_xe_sessions s WHERE s.name = {session}";
 
 /// The events of the session (decision 6 proofs 2 and 3): each event's
 /// name, **whether** it has a predicate (never the predicate, which can

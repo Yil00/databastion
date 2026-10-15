@@ -56,8 +56,9 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, Batch, CATCH_UP, Cursor, HISTORY_READS, MIN_BATCH, OWN_FILE_BYTES, OWN_SESSIONS,
-    POLL_BYTES, Positioned, REEVALUATE, REPROBE, on_bad_position, on_pattern, target_error,
+    APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, MIN_BATCH,
+    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, Positioned, REEVALUATE, REPROBE, on_bad_position,
+    on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -314,14 +315,13 @@ pub(crate) async fn stream(
     let first_start = loaded.is_none();
     let mut cursor = loaded.unwrap_or_default();
     if first_start {
-        // No history replay.
-        cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
-        // The event clock runs ahead of the server time the first start is
-        // read on by up to the skew: what ran just before the start can be
-        // stamped just after it (measured: 2 ms).
-        cursor.floor = cursor
-            .history_us
-            .map(|h| h.saturating_add(XE_CLOCK_SKEW_US));
+        // No history replay. The event clock runs ahead of the server time
+        // the first start is read on by up to the skew: what ran just
+        // before the start can be stamped just after it (measured: 2 ms).
+        cursor.first_start(
+            session.own.as_ref().map(own::Handle::server_now),
+            XE_CLOCK_SKEW_US,
+        );
     }
     let mut st = Stream {
         name,
@@ -654,6 +654,7 @@ async fn read(
     sink: &EventSink,
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
+    let read_started_ms = super::agent_now_ms();
     // The server skips the events of the next buffer already handled
     // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
     let top = st.batch;
@@ -719,10 +720,22 @@ async fn read(
     }
     // Events stamped before the first start are history, whenever they
     // reach the file (the dispatch latency delays them past the first,
-    // caught-up read).
+    // caught-up read); after that read, until the floor ends, they are
+    // counted as dropped (re-review N1: the server's clock may have
+    // stepped back).
     let mut records = b.kept;
-    if let Some(h) = st.cursor.floor {
-        records.retain(|r| r.time_us >= h);
+    let mut below_floor = 0u64;
+    records.retain(|r| match st.cursor.below(r.time_us) {
+        Some(Below::History) => false,
+        Some(Below::Dropped) => {
+            below_floor += 1;
+            false
+        }
+        None => true,
+    });
+    if below_floor > 0 {
+        tracing::warn!(target_id = %target_id, below_floor, "Extended Events: events stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
+        st.state.audit.note_dropped(&target_id, below_floor);
     }
     if st.skip > 0 {
         let n = (st.skip as usize).min(records.len());
@@ -764,6 +777,21 @@ async fn read(
         }
     }
     st.cursor = b.next;
+    if !b.full {
+        // An event stamped below the floor reaches the file at most the
+        // dispatch latency after its stamp (`INFINITE` or not visible: the
+        // bound).
+        let delay = st
+            .probe
+            .as_ref()
+            .and_then(|p| p.dispatch_latency)
+            .map_or(FLOOR_MAX, |d| {
+                d.saturating_add(std::time::Duration::from_micros(
+                    XE_CLOCK_SKEW_US.unsigned_abs(),
+                ))
+            });
+        st.cursor.expire_floor(read_started_ms, delay);
+    }
     if b.gap {
         tracing::warn!(target_id = %target_id, "Extended Events: one buffer holds more events than the bound: the rest of it is dropped");
         st.state.audit.note_gap(&target_id);

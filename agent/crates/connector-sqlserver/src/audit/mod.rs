@@ -341,13 +341,43 @@ pub(crate) struct Cursor {
     /// Extended Events: the session's `create_time` (server µs) the
     /// position was read under; another one is a restart (a gap).
     pub(crate) session: Option<i64>,
-    /// First start: records stamped before this (server µs) are never
+    /// First start: records stamped before this (server µs) are not
     /// reported, even when they reach the source after it was read to its
-    /// end (`QUEUE_DELAY`, `MAX_DISPATCH_LATENCY`). Kept for good.
+    /// end (`QUEUE_DELAY`, `MAX_DISPATCH_LATENCY`). Bounded (re-review N1):
+    /// dropped once the stream caught up and the source's delivery delay
+    /// passed since the first start ([`Cursor::expire_floor`]); a record it
+    /// leaves out after the first caught-up read is counted as dropped.
     pub(crate) floor: Option<i64>,
+    /// The agent's wall clock (Unix ms) at the first start the floor was
+    /// set at.
+    pub(crate) floor_set_ms: i64,
     /// Extended Events: the buffer (file, offset) whose first `skip`
     /// events were handled (the server skips them, `sql::XE_POLL_FROM`).
     pub(crate) buffer: Option<(String, i64)>,
+}
+
+/// The longest the floor is kept after the first start (re-review N1),
+/// whatever delivery delay the source states.
+pub(crate) const FLOOR_MAX: Duration = Duration::from_secs(300);
+
+/// The agent's wall clock, Unix ms (the floor's bound, never the server's
+/// clock, which is what may step).
+pub(crate) fn agent_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// What the first start's history and floor say of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Below {
+    /// Stamped before the first start, read in the history phase: not
+    /// reported, not counted.
+    History,
+    /// Stamped below the floor after the first caught-up read (late
+    /// history, or the server's clock stepped back): not reported,
+    /// counted as dropped.
+    Dropped,
 }
 
 fn hex(s: &str) -> String {
@@ -366,6 +396,41 @@ fn unhex(s: &str) -> Option<String> {
 }
 
 impl Cursor {
+    /// Sets the history and the floor of a first start: `server_now`
+    /// (server µs) plus `skew_us`, the source's clock lead.
+    pub(crate) fn first_start(&mut self, server_now: Option<i64>, skew_us: i64) {
+        self.history_us = server_now;
+        self.floor = server_now.map(|h| h.saturating_add(skew_us));
+        self.floor_set_ms = agent_now_ms();
+    }
+
+    /// After a read that reached the end of the source (`self` its next
+    /// position, so no history phase any more) and started at
+    /// `read_started_ms` on the agent's clock: the floor ends when `delay`
+    /// (the source's delivery delay, at most [`FLOOR_MAX`]) had passed
+    /// since the first start when the read started, since every record
+    /// stamped before the first start had then reached the source and was
+    /// read; at once if the agent's clock went back past the first start.
+    pub(crate) fn expire_floor(&mut self, read_started_ms: i64, delay: Duration) {
+        if self.floor.is_none() || self.history_us.is_some() {
+            return;
+        }
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if since >= delay_ms || since < 0 {
+            self.floor = None;
+        }
+    }
+
+    /// Whether a record stamped `time_us` (server µs) is left out, and how.
+    pub(crate) fn below(&self, time_us: i64) -> Option<Below> {
+        match (self.history_us, self.floor) {
+            (Some(h), f) => (time_us < f.map_or(h, |f| f.max(h))).then_some(Below::History),
+            (None, Some(f)) => (time_us < f).then_some(Below::Dropped),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = String::from("v1\n");
         out.push_str(&format!(
@@ -385,7 +450,7 @@ impl Cursor {
             out.push_str(&format!("session {c}\n"));
         }
         if let Some(f) = self.floor {
-            out.push_str(&format!("floor {f}\n"));
+            out.push_str(&format!("floor {f} {}\n", self.floor_set_ms));
         }
         if let Some((f, o)) = &self.buffer {
             out.push_str(&format!("buffer {} {o}\n", hex(f)));
@@ -417,7 +482,15 @@ impl Cursor {
                 }
                 ("history", h) => c.history_us = Some(h.parse().ok()?),
                 ("session", v) => c.session = Some(v.parse().ok()?),
-                ("floor", v) => c.floor = Some(v.parse().ok()?),
+                ("floor", v) => {
+                    c.floor = Some(v.parse().ok()?);
+                    // Without its first start (an older cursor): ends once
+                    // caught up.
+                    c.floor_set_ms = match p.next() {
+                        Some(t) => t.parse().ok()?,
+                        None => 0,
+                    };
+                }
                 ("buffer", f) => c.buffer = Some((unhex(f)?, p.next()?.parse().ok()?)),
                 _ => return None,
             }
@@ -835,8 +908,7 @@ pub(crate) async fn audit_stream(
     let mut cursor = loaded.unwrap_or_default();
     if first_start {
         // No history replay: what the audit holds from before now.
-        cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
-        cursor.floor = cursor.history_us;
+        cursor.first_start(session.own.as_ref().map(own::Handle::server_now), 0);
     }
     let mut st = Stream {
         name,
@@ -1038,6 +1110,7 @@ async fn read(
     sink: &EventSink,
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
+    let read_started_ms = agent_now_ms();
     let top = st.batch + st.cursor.skip as usize;
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
@@ -1098,7 +1171,6 @@ async fn read(
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
-    let history = st.cursor.history_us;
     let mut statements = records::group(records::reassemble(b.kept));
     if st.skip > 0 {
         let n = (st.skip as usize).min(statements.len());
@@ -1107,12 +1179,15 @@ async fn read(
         st.skip = 0;
     }
     let mut reprobe = false;
+    let mut below_floor = 0u64;
     for stmt in &statements {
-        if history
-            .or(st.cursor.floor)
-            .is_some_and(|h| stmt.head.time_us < h)
-        {
-            continue;
+        match st.cursor.below(stmt.head.time_us) {
+            Some(Below::History) => continue,
+            Some(Below::Dropped) => {
+                below_floor += 1;
+                continue;
+            }
+            None => {}
         }
         match records::map(&stmt.head.action, &stmt.head.class) {
             Mapped::Restart => {
@@ -1140,7 +1215,15 @@ async fn read(
             None => st.state.audit.note_dropped(&target_id, 1),
         }
     }
+    if below_floor > 0 {
+        tracing::warn!(target_id = %target_id, below_floor, "SQL Server Audit: records stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
+        st.state.audit.note_dropped(&target_id, below_floor);
+    }
     st.cursor = b.next;
+    if !b.full {
+        let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
+        st.cursor.expire_floor(read_started_ms, delay);
+    }
     if b.gap {
         tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
         st.state.audit.note_gap(&target_id);

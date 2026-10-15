@@ -2401,3 +2401,113 @@ async fn xe_fresh_scenario() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Re-review N1: the first start's floor is bounded. A saved position
+/// whose floor is far ahead of the server's clock (what a server clock
+/// stepped back gives) and that has left its history phase: what the
+/// stream reads below it is counted as dropped, never reported nor
+/// silent, and the floor ends once a caught-up read started the source's
+/// delivery delay after the first start, so a later read is reported.
+#[tokio::test]
+async fn floor_ahead_of_the_server_clock_is_counted_then_ends() {
+    Box::pin(floor_scenario()).await;
+}
+
+async fn floor_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let login = "it_floor";
+    Box::pin(throwaway(&mut s, login, &[])).await;
+    let mut sources = vec![(XE, "sqlserver_xevents")];
+    if major >= 16 {
+        sources.push((AUDIT, "sqlserver_audit"));
+    }
+    for (settings, cursor) in sources {
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {settings}", own_tls()));
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-floor-{}-{cursor}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        // From the start of the file set, out of the history phase, under
+        // a floor an hour ahead.
+        let seeded = crate::audit::Cursor {
+            floor: Some(
+                i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros(),
+                )
+                .unwrap()
+                    + 3_600_000_000,
+            ),
+            floor_set_ms: crate::audit::agent_now_ms(),
+            ..crate::audit::Cursor::default()
+        };
+        cfg.cursor(cursor).unwrap().save(&seeded.encode()).unwrap();
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        // Past the delivery delay (5 s session latency, 1 s queue delay).
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(!stream.is_finished(), "{:?}", stream.await);
+        let dropped = c.state.audit.facts(&t.id).dropped;
+        let mut d = Box::pin(foreign_session(login, "DATABASTION_IT_SQLSERVER_THROWAWAY")).await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT TOP (1) id FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        d.close().await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        eprintln!(
+            "[it] floor ({cursor}): {} events, dropped below the floor {dropped}",
+            events.len()
+        );
+        assert!(dropped > 0, "{cursor}: what the floor left out is counted");
+        // Nothing of the file set before the floor ended is reported: only
+        // the read made after it.
+        for e in &events {
+            assert!(
+                e.principal().account_name().eq_ignore_ascii_case(login),
+                "{cursor}: an event below the floor was reported: {:?}",
+                names_of(e)
+            );
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| names_of(e).iter().any(|n| n == "retail.crm.customers")),
+            "{cursor}: the read after the floor ended is reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(drop_login(&mut s, login)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+}

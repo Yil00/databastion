@@ -33,6 +33,7 @@
 //! not sent for this source).
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use databastion_core::config::sqlserver::{SqlserverAuditConfig, SqlserverAuditSource};
 use databastion_core::{AuditLevel, NoteCode, TargetNote};
@@ -105,6 +106,8 @@ pub(crate) struct Probe {
     pub(crate) causality: bool,
     /// The current file of the `event_file` target.
     pub(crate) current_file: String,
+    /// `MAX_DISPATCH_LATENCY`, when stated and finite.
+    pub(crate) dispatch_latency: Option<Duration>,
     /// Required events or actions missing, statement collection off.
     pub(crate) missing: u64,
     /// A predicate on a required event.
@@ -145,7 +148,7 @@ pub(crate) async fn probe(s: &mut Session, name: &str, stage: Stage) -> Result<P
         .ok_or(SsError::new(databastion_core::FailureCode::Internal, stage))?;
     let text = sql::render(sql::XE_SESSION, &[("session", &session)])
         .ok_or(SsError::new(databastion_core::FailureCode::Internal, stage))?;
-    let rows = match s.rows(&text, stage, Shape::rows(6, 2)).await {
+    let rows = match s.rows(&text, stage, Shape::rows(7, 2)).await {
         Ok(r) => r,
         Err(e) if !e.fatal => {
             p.incomplete = true;
@@ -164,6 +167,10 @@ pub(crate) async fn probe(s: &mut Session, name: &str, stage: Stage) -> Result<P
     p.retention = text(3).trim().to_owned();
     p.causality = int(4) == Some(1);
     p.current_file = text(5).trim().to_owned();
+    p.dispatch_latency = int(6)
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| u64::try_from(ms).ok())
+        .map(Duration::from_millis);
     p.running = !p.current_file.is_empty() && int(0).is_some();
     let events = sql::render(sql::XE_EVENTS, &[("session", &session)])
         .ok_or(SsError::new(databastion_core::FailureCode::Internal, stage))?;
@@ -346,6 +353,7 @@ mod tests {
             retention: "drop_event".into(),
             causality: true,
             current_file: "/var/opt/mssql/xe/databastion_xe_0_134365650237540000.xel".into(),
+            dispatch_latency: Some(Duration::from_secs(5)),
             missing: 0,
             filtered: false,
             failed_logins: true,
