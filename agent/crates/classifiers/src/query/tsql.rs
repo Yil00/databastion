@@ -160,6 +160,20 @@ pub struct TsqlRelation {
     pub name: String,
 }
 
+impl Drop for TsqlRelation {
+    // Names come from statement text: zeroized as the text is.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.name.zeroize();
+        if let Some(d) = self.database.as_mut() {
+            d.zeroize();
+        }
+        if let Some(s) = self.schema.as_mut() {
+            s.zeroize();
+        }
+    }
+}
+
 impl std::fmt::Debug for TsqlRelation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("TsqlRelation(<redacted>)")
@@ -1551,7 +1565,9 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
         return (Vec::new(), false, true);
     }
     let (main, ctes) = main_statement(toks);
-    let mut aliases: Vec<String> = Vec::new();
+    // Aliases of FROM items with their depth: only those of the main
+    // statement's own FROM (depth 0) can stand for its write target.
+    let mut aliases: Vec<(String, usize)> = Vec::new();
     // Per depth: a `SELECT` / `DELETE` / `UPDATE` seen (a `FROM` then
     // names tables; `TRIM(x FROM y)` does not), and in its FROM clause.
     let mut has_query: Vec<bool> = vec![false];
@@ -1565,11 +1581,27 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
     while let Some(t) = toks.get(i) {
         let depth = has_query.len() - 1;
         if t.punct('(') {
-            // A derived table or a subquery in a table position: its own
-            // FROM names the tables.
+            let table_position = expect.is_some_and(|e| !e.1);
             expect = None;
-            has_query.push(false);
-            in_from.push(false);
+            if has_query.len() > MAX_DEPTH {
+                // Deeper than followed: the rest is not read.
+                return (Vec::new(), false, true);
+            }
+            let query = toks
+                .get(i + 1)
+                .is_some_and(|u| u.is("select") || u.is("with") || u.is("values"));
+            if table_position && !query {
+                // A parenthesized joined-table group (`FROM (a JOIN b ON …)`):
+                // its items are table positions at the new depth.
+                has_query.push(true);
+                in_from.push(true);
+                expect = Some((false, false, false));
+            } else {
+                // A derived table, a subquery or an expression: its own FROM
+                // names the tables.
+                has_query.push(false);
+                in_from.push(false);
+            }
             i += 1;
             continue;
         }
@@ -1664,6 +1696,33 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
                 }
                 _ => {}
             }
+            if w == "for" && toks.get(i + 1).is_some_and(|u| u.is("system_time")) {
+                // A temporal clause after a table: skipped, the FROM clause
+                // goes on, an alias may follow. A form not understood ends
+                // the completeness.
+                match skip_system_time(toks, i + 2) {
+                    Some(j) => {
+                        let mut k = j;
+                        if toks.get(k).is_some_and(|u| u.is("as")) {
+                            k += 1;
+                        }
+                        if let Some(a) = toks.get(k).and_then(Tok::ident)
+                            && !(matches!(toks.get(k), Some(Tok::Word(_)))
+                                && NOT_ALIAS.contains(&a))
+                        {
+                            aliases.push((a.to_owned(), depth));
+                            k += 1;
+                        }
+                        i = k;
+                    }
+                    None => {
+                        complete = false;
+                        i += 2;
+                    }
+                }
+                expect = None;
+                continue;
+            }
             if FROM_END.contains(&w) {
                 in_from[depth] = false;
                 expect = None;
@@ -1736,19 +1795,26 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
                 if let Some(a) = toks.get(k).and_then(Tok::ident)
                     && !(matches!(toks.get(k), Some(Tok::Word(_))) && NOT_ALIAS.contains(&a))
                 {
-                    aliases.push(a.to_owned());
+                    aliases.push((a.to_owned(), depth));
                     k += 1;
                 }
                 i = k.max(after);
                 continue;
             }
+            // Anything else in a table position (`.cards`, an operator, a
+            // literal): what it names is not known.
+            complete = false;
         }
         i += 1;
     }
     // A write target that is an alias of a FROM item (`UPDATE c SET … FROM
     // crm.customers c`) names that item, already kept.
     let mut kept: Vec<TsqlRelation> = Vec::new();
-    let is_alias = |n: &str| aliases.iter().any(|a| *a == n.to_lowercase());
+    let is_alias = |n: &str| {
+        aliases
+            .iter()
+            .any(|(a, d)| *d == 0 && *a == n.to_lowercase())
+    };
     for (r, maybe_alias) in out {
         if maybe_alias && r.schema.is_none() && is_alias(&r.name) {
             continue;
@@ -1764,6 +1830,50 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
         writes = true;
     }
     (kept, complete, writes)
+}
+
+/// One expression of a temporal clause at `i`: a literal, a variable, a
+/// name, a call or a parenthesized expression; the index after it.
+fn skip_operand(toks: &[Tok], i: usize) -> Option<usize> {
+    match toks.get(i)? {
+        Tok::Punct('(') => Some(close_paren(toks, i) + 1),
+        Tok::Literal | Tok::Int(_) | Tok::Var(_) => Some(i + 1),
+        t if t.name_like() => {
+            let (_, _, after) = dotted(toks, i);
+            if toks.get(after).is_some_and(|u| u.punct('(')) {
+                Some(close_paren(toks, after) + 1)
+            } else {
+                Some(after)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The index after `FOR SYSTEM_TIME`'s specification at `i`: `ALL`, `AS OF
+/// x`, `FROM x TO y`, `BETWEEN x AND y`, `CONTAINED IN (x, y)`; `None` for
+/// another form.
+fn skip_system_time(toks: &[Tok], i: usize) -> Option<usize> {
+    let w = toks.get(i)?.word()?;
+    match w {
+        "all" => Some(i + 1),
+        "as" if toks.get(i + 1)?.is("of") => skip_operand(toks, i + 2),
+        "from" => {
+            let j = skip_operand(toks, i + 1)?;
+            toks.get(j)?.is("to").then_some(())?;
+            skip_operand(toks, j + 1)
+        }
+        "between" => {
+            let j = skip_operand(toks, i + 1)?;
+            toks.get(j)?.is("and").then_some(())?;
+            skip_operand(toks, j + 1)
+        }
+        "contained" if toks.get(i + 1)?.is("in") => {
+            toks.get(i + 2)?.punct('(').then_some(())?;
+            Some(close_paren(toks, i + 2) + 1)
+        }
+        _ => None,
+    }
 }
 
 fn push_relation(
@@ -2438,6 +2548,88 @@ mod tests {
         }
     }
 
+    /// Security review of lot 3, H1 and L1: a table inside a parenthesized
+    /// joined-table group, after a temporal clause, or a table position
+    /// holding something else is named, or the list is not complete.
+    #[test]
+    fn nested_groups_and_temporal_clauses() {
+        for (t, want) in [
+            (
+                "SELECT c.* FROM (crm.cards c CROSS JOIN (SELECT 1 a) d)",
+                vec!["-.crm.cards"],
+            ),
+            (
+                "SELECT c.* FROM (crm.cards c CROSS APPLY OPENJSON(N'[1]') j)",
+                vec!["-.crm.cards"],
+            ),
+            (
+                "SELECT c.* FROM (crm.cards AS c INNER JOIN crm.dummy AS d ON 1 = 1)",
+                vec!["-.crm.cards", "-.crm.dummy"],
+            ),
+            (
+                "SELECT * FROM crm.dummy d, (crm.cards c JOIN crm.x y ON 1=1)",
+                vec!["-.crm.dummy", "-.crm.cards", "-.crm.x"],
+            ),
+            (
+                "SELECT * FROM crm.dummy d LEFT JOIN (crm.cards c JOIN crm.x y ON 1=1) ON 1 = 1",
+                vec!["-.crm.dummy", "-.crm.cards", "-.crm.x"],
+            ),
+            (
+                "SELECT * FROM ((crm.a JOIN crm.b ON 1 = 1) JOIN crm.c ON 1 = 1)",
+                vec!["-.crm.a", "-.crm.b", "-.crm.c"],
+            ),
+            (
+                "SELECT * FROM crm.dummy FOR SYSTEM_TIME ALL AS d, crm.cards AS c",
+                vec!["-.crm.dummy", "-.crm.cards"],
+            ),
+            (
+                "SELECT * FROM crm.c1 FOR SYSTEM_TIME AS OF '2020-01-01' AS c, crm.c2",
+                vec!["-.crm.c1", "-.crm.c2"],
+            ),
+            (
+                "SELECT * FROM crm.c1 FOR SYSTEM_TIME BETWEEN @a AND SYSUTCDATETIME() c JOIN crm.c2 ON 1 = 1",
+                vec!["-.crm.c1", "-.crm.c2"],
+            ),
+            (
+                "SELECT * FROM crm.c1 FOR SYSTEM_TIME CONTAINED IN ('a', 'b'), crm.c2",
+                vec!["-.crm.c1", "-.crm.c2"],
+            ),
+            ("SELECT a FROM crm.t FOR XML PATH('x')", vec!["-.crm.t"]),
+        ] {
+            let (got, complete) = rel(t);
+            assert!(
+                !complete || want.iter().all(|w| got.contains(&(*w).to_owned())),
+                "{t}: {got:?}"
+            );
+            assert!(complete, "{t}");
+            assert_eq!(got, want, "{t}");
+        }
+        for t in [
+            "SELECT * FROM ..cards",
+            "SELECT * FROM .cards",
+            "SELECT * FROM crm.c FOR SYSTEM_TIME SOMEDAY, crm.d",
+            "SELECT * FROM 'x'",
+        ] {
+            assert!(!rel(t).1, "{t}");
+        }
+    }
+
+    /// Security review of lot 3, L2 and L6.
+    #[test]
+    fn write_target_aliases_and_column_lists() {
+        for t in [
+            "UPDATE cards SET a = (SELECT TOP 1 1 FROM crm.d cards)",
+            "DELETE cards OUTPUT deleted.* WHERE EXISTS (SELECT 1 FROM crm.d cards)",
+        ] {
+            let a = an(t);
+            assert!(a.writes_table, "{t}");
+            assert!(a.relations.iter().any(|r| r.name == "cards"), "{t}");
+        }
+        let (got, complete) = rel("INSERT crm.copy (a, b) SELECT a, b FROM crm.src");
+        assert_eq!(got, ["-.crm.copy", "-.crm.src"]);
+        assert!(complete);
+    }
+
     #[test]
     fn write_targets() {
         for (t, writes) in [
@@ -2557,6 +2749,73 @@ mod proptests {
 
     use super::*;
 
+    /// A table source of the FROM grammar (see
+    /// `every_generated_table_is_named_or_incomplete`).
+    fn gen_source(
+        it: &mut impl Iterator<Item = u8>,
+        depth: u32,
+        names: &mut Vec<String>,
+    ) -> String {
+        let c = it.next().unwrap_or(0);
+        match c % 8 {
+            5 if depth < 3 => format!("({})", gen_joined(it, depth + 1, names)),
+            6 if depth < 3 => format!(
+                "(SELECT a FROM {}) AS d{}",
+                gen_joined(it, depth + 1, names),
+                names.len()
+            ),
+            7 => format!("OPENJSON(N'[{c}]') j{c}"),
+            _ => {
+                let name = format!("t{}", names.len());
+                names.push(name.clone());
+                let mut s = match c % 3 {
+                    0 => format!("crm.{name}"),
+                    1 => format!("[db].[crm].[{name}]"),
+                    _ => name,
+                };
+                let d = it.next().unwrap_or(0);
+                s.push_str(match d % 6 {
+                    0 => " FOR SYSTEM_TIME ALL",
+                    1 => " FOR SYSTEM_TIME AS OF '2020-01-01'",
+                    2 => " FOR SYSTEM_TIME BETWEEN @a AND @b",
+                    _ => "",
+                });
+                s.push_str(match (d / 6) % 4 {
+                    0 => " AS a",
+                    1 => " b",
+                    _ => "",
+                });
+                if d >= 128 {
+                    s.push_str(" WITH (NOLOCK)");
+                }
+                s
+            }
+        }
+    }
+
+    /// A joined table: sources joined by `,`, `JOIN … ON`, `LEFT JOIN … ON`,
+    /// `CROSS JOIN`, `CROSS APPLY`.
+    fn gen_joined(
+        it: &mut impl Iterator<Item = u8>,
+        depth: u32,
+        names: &mut Vec<String>,
+    ) -> String {
+        let mut s = gen_source(it, depth, names);
+        let more = it.next().unwrap_or(0) % 4;
+        for _ in 0..more {
+            let j = it.next().unwrap_or(0);
+            let src = gen_source(it, depth, names);
+            match j % 5 {
+                0 => s.push_str(&format!(", {src}")),
+                1 => s.push_str(&format!(" JOIN {src} ON 1 = 1")),
+                2 => s.push_str(&format!(" LEFT OUTER JOIN {src} ON a.x = b.y")),
+                3 => s.push_str(&format!(" CROSS JOIN {src}")),
+                _ => s.push_str(&format!(" CROSS APPLY {src}")),
+            }
+        }
+        s
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -2609,12 +2868,32 @@ mod proptests {
             }
         }
 
-        /// Literal content never becomes a relation.
+        /// Security review of lot 3, H1: FROM clauses built from a grammar
+        /// (parenthesized groups, nested joins, derived tables, temporal
+        /// clauses, hints, aliases, `APPLY`, comma joins) over generated
+        /// table names: every table is in the relations, or the list is
+        /// marked incomplete.
         #[test]
-        fn relations_never_hold_literal_content(inner in "[a-z]{1,12}") {
-            let t = format!("SELECT a FROM t WHERE b = '{inner}' AND c = N'{inner}x'");
+        fn every_generated_table_is_named_or_incomplete(
+            choices in proptest::collection::vec(any::<u8>(), 1..64),
+            filter in any::<bool>(),
+        ) {
+            let mut it = choices.into_iter().cycle().take(400);
+            let mut names = Vec::new();
+            let from = gen_joined(&mut it, 0, &mut names);
+            let t = format!(
+                "SELECT * FROM {from}{}",
+                if filter { " WHERE x = 'FROM hidden' AND y IN (SELECT 1)" } else { "" }
+            );
             let a = analyze_tsql(&t, false);
-            prop_assert!(a.relations.iter().all(|r| r.name == "t"));
+            prop_assert!(a.lexed, "{}", t);
+            for n in &names {
+                prop_assert!(
+                    !a.relations_complete || a.relations.iter().any(|r| r.name == *n),
+                    "{} misses {}", t, n
+                );
+            }
+            prop_assert!(a.relations.iter().all(|r| r.name != "hidden"));
         }
 
         /// Arguments of `EXEC` are never names. The generator has no letter
