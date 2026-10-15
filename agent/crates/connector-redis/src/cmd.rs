@@ -33,6 +33,8 @@ const SCAN_SLACK: usize = 500;
 const INFO_BYTES: usize = 1024 * 1024;
 /// Most elements of a `HELLO` reply aggregate (the `modules` array cap).
 const HELLO_ITEMS: usize = 64;
+/// Longest `CLIENT LIST ID` reply read (the session's own line).
+const CLIENT_LINE_BYTES: usize = 64 * 1024;
 /// Entries asked of `SLOWLOG GET` / `COMMANDLOG GET` per poll (security
 /// review M5: 512 entries of at most 32 arguments of 128 bytes stay under
 /// the 4 MiB reply cap).
@@ -156,6 +158,9 @@ pub(crate) enum Cmd<'a> {
     AclLog,
     /// `CLIENT LIST` (Audit attribution).
     ClientList,
+    /// `CLIENT LIST ID <id>`: a session's own line, for its server-side
+    /// address (Audit's own-entry rule, decision 8).
+    ClientListId(i64),
 }
 
 impl std::fmt::Debug for Cmd<'_> {
@@ -191,7 +196,7 @@ impl Cmd<'_> {
             Self::SlowlogGet => "SLOWLOG GET",
             Self::CommandlogGet(_) => "COMMANDLOG GET",
             Self::AclLog => "ACL LOG",
-            Self::ClientList => "CLIENT LIST",
+            Self::ClientList | Self::ClientListId(_) => "CLIENT LIST",
         }
     }
 
@@ -266,6 +271,13 @@ impl Cmd<'_> {
                 items: LOG_ITEMS,
                 skip_oversized: true,
                 reply: MAX_REPLY_BYTES,
+            },
+            // One line.
+            Self::ClientListId(_) => Limits {
+                bulk: CLIENT_LINE_BYTES,
+                items: 0,
+                skip_oversized: true,
+                reply: CLIENT_LINE_BYTES + 64,
             },
             // Over 4 MiB: discarded, entries not attributed.
             Self::ClientList => Limits {
@@ -371,6 +383,9 @@ impl Cmd<'_> {
                 out,
             ),
             Self::ClientList => resp::encode(&[b"CLIENT", b"LIST"], out),
+            Self::ClientListId(id) => {
+                resp::encode(&[b"CLIENT", b"LIST", b"ID", id.to_string().as_bytes()], out)
+            }
         }
     }
 }

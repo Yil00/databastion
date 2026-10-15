@@ -23,7 +23,9 @@
 //! - **The agent's own entries** ([`own`], H3): by connection id or by the
 //!   `addr:port` of one of its connections within its lifetime, never by
 //!   user or client name; left out only for its own command shapes and
-//!   within the own-read budget.
+//!   within the own-read budget. Each session records the address the
+//!   server reports for it at connect time (`CLIENT LIST ID`), so a session
+//!   closed before the stream's next `CLIENT LIST` is still recognized.
 //! - Per-record panic isolation: each entry is parsed and converted under
 //!   `databastion_core::isolate`; a failing entry is dropped and counted.
 
@@ -910,8 +912,15 @@ async fn poll(
             .await
             .map_err(RdError::into_connector_error)?;
         if let [server, list] = r.as_slice() {
-            if list.error() == Some(ErrorWord::Noperm) {
-                refused.2 = true;
+            match list.error() {
+                Some(ErrorWord::Noperm) => {
+                    refused.2 = true;
+                    own::set_client_list(&target_id, false);
+                }
+                // The agent's other sessions may ask for their own line
+                // (`own`).
+                None => own::set_client_list(&target_id, true),
+                Some(_) => {}
             }
             match text(server)
                 .and_then(|t| info::field(t, "server_time_usec"))

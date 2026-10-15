@@ -906,6 +906,34 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
         drain.await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+        // Sessions of the agent that read and close within a few
+        // milliseconds, between two of the stream's `CLIENT LIST`: their
+        // entries carry only the address the server reports for them
+        // (behind Docker's port publishing, not their local one), recorded
+        // at connect time (the engine-matrix flake: a paced Discovery that
+        // fell between two polls).
+        for _ in 0..3 {
+            let (mut s, _) = crate::node::open(
+                &t,
+                crate::node::Which::Target,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let r = s
+                .call(
+                    &crate::cmd::Cmd::Scan { cursor: 0 },
+                    std::time::Duration::from_secs(5),
+                    crate::error::Stage::Introspection,
+                )
+                .await
+                .unwrap();
+            assert!(r.error().is_none(), "{name}: SCAN refused");
+            s.close().await;
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
         // Valkey 8.1+: a large-reply threshold the `KEYS` reply reaches
         // (default 1 MiB), restored below.
         if large_reply_log {

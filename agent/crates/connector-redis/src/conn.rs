@@ -39,6 +39,11 @@ pub(crate) struct Session {
     /// The agent's own connection, registered for Audit's own-entry rule
     /// (decision 8, H3); marked closed on drop.
     own: Option<crate::audit::own::Registration>,
+    /// The server run the connection was registered on.
+    own_run: Option<u64>,
+    /// When the connection was opened (before its first command): the
+    /// start of its lifetime for the own-entry rule.
+    started: std::time::SystemTime,
 }
 
 impl Drop for Session {
@@ -65,6 +70,7 @@ impl Session {
         password: &str,
         timeout: Duration,
     ) -> Result<Self, RdError> {
+        let started = std::time::SystemTime::now();
         let io = endpoint.open(tls).await?;
         let mut s = Self {
             io,
@@ -72,6 +78,8 @@ impl Session {
             hello: Hello::default(),
             broken: false,
             own: None,
+            own_run: None,
+            started,
         };
         let auth = s
             .call(&Cmd::Auth { user, password }, timeout, Stage::Auth)
@@ -99,17 +107,57 @@ impl Session {
     }
 
     /// Registers this connection as one of the agent's own for `target_id`
-    /// (its connection id from `HELLO`, its local address and the server
-    /// run).
+    /// (its connection id from `HELLO`, its local address, the server run
+    /// and the time it was opened).
     pub(crate) fn register_own(&mut self, target_id: &str, run: Option<u64>) {
         if let Some(id) = self.hello.id {
+            self.own_run = run;
             self.own = Some(crate::audit::own::register(
                 target_id,
                 id,
                 self.io.local_addr(),
                 run,
+                self.started,
             ));
         }
+    }
+
+    /// Records the address the server reports for this registered
+    /// connection (`CLIENT LIST ID <own id>`), so its slow-log entries are
+    /// recognized as the agent's even once it is closed and no `CLIENT
+    /// LIST` of the Audit stream saw it open. Sent only when the account is
+    /// known to hold `+client|list` on the target's node and the address
+    /// is not recorded yet; a refusal clears that knowledge (no second
+    /// try). A transport failure is returned (the session is unusable).
+    pub(crate) async fn learn_own_address(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> Result<(), RdError> {
+        use crate::audit::own;
+        let run = self.own_run;
+        let Some(id) = self.hello.id else {
+            return Ok(());
+        };
+        if self.own.is_none()
+            || !own::learns_addresses(target_id)
+            || own::is_seen(target_id, id, run)
+        {
+            return Ok(());
+        }
+        let reply = self
+            .call(&Cmd::ClientListId(id), timeout, Stage::SessionSetup)
+            .await?;
+        match reply.error() {
+            Some(ErrorWord::Noperm) => own::set_client_list(target_id, false),
+            Some(_) => {}
+            None => {
+                if let Some(addr) = crate::audit::entries::own_address(&reply, id) {
+                    own::seen(target_id, id, run, addr);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sends one command and reads its reply. Error replies are returned

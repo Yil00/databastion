@@ -17,6 +17,17 @@
 //! report the agent's local addresses unchanged (no NAT or proxy between
 //! them; review M1). The registry is per target, bounded, and forgets
 //! connections closed more than a day ago.
+//!
+//! Slow-log and command-log entries carry no connection id, only the
+//! address: a connection that runs commands and closes between two of the
+//! stream's `CLIENT LIST` snapshots (a `check()` session, a report probe,
+//! a short Discovery session) would never have its reported address
+//! recorded, and its entries would come out as another client's
+//! (`account_not_recorded`). So every session asks the server for its own
+//! line (`CLIENT LIST ID <own id>`) right after its handshake, when the
+//! account is known to hold `+client|list` ([`set_client_list`]), and
+//! records the address from it ([`seen`]); a closed connection keeps that
+//! address for its whole lifetime (plus [`MARGIN`]) and [`KEEP`] after.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -58,6 +69,9 @@ struct Target {
     /// address (no NAT nor proxy): local addresses can stand for the
     /// reported ones.
     local_is_seen: bool,
+    /// The account holds `+client|list` on the target's node: the latest
+    /// `ACL DRYRUN` evaluation, or the stream's last `CLIENT LIST` answer.
+    client_list: bool,
 }
 
 type Registry = Mutex<HashMap<String, Target>>;
@@ -94,12 +108,13 @@ impl Drop for Registration {
 }
 
 /// Registers a connection of the agent's own account to `target_id`,
-/// opened on the server run `run`.
+/// opened at `opened` (before its first command) on the server run `run`.
 pub(crate) fn register(
     target_id: &str,
     id: i64,
     local: Option<SocketAddr>,
     run: Option<u64>,
+    opened: SystemTime,
 ) -> Registration {
     let now = SystemTime::now();
     let mut map = lock();
@@ -108,15 +123,25 @@ pub(crate) fn register(
         c.closed
             .is_none_or(|x| now.duration_since(x).unwrap_or_default() < KEEP)
     });
+    // Full: the oldest closed connection goes first; an open one (the Audit
+    // stream's own, held for days) only when every remembered connection
+    // is open.
     while t.conns.len() >= MAX_CONNS {
-        t.conns.pop_front();
+        match t.conns.iter().position(|c| c.closed.is_some()) {
+            Some(i) => {
+                t.conns.remove(i);
+            }
+            None => {
+                t.conns.pop_front();
+            }
+        }
     }
     t.conns.push_back(Conn {
         id,
         run,
         local,
         seen: None,
-        opened: now,
+        opened: opened.min(now),
         closed: None,
     });
     Registration {
@@ -150,8 +175,29 @@ pub(crate) fn is_own_id_at(target_id: &str, id: i64, run: Option<u64>, at: Syste
     })
 }
 
+/// Records whether the account may run `CLIENT LIST` on the node of
+/// `target_id` (the target's node, the one Audit reads).
+pub(crate) fn set_client_list(target_id: &str, granted: bool) {
+    lock().entry(target_id.to_owned()).or_default().client_list = granted;
+}
+
+/// Whether the agent's sessions to `target_id` ask the server for their
+/// own address at connect time ([`set_client_list`]).
+pub(crate) fn learns_addresses(target_id: &str) -> bool {
+    lock().get(target_id).is_some_and(|t| t.client_list)
+}
+
+/// Whether the address of the open connection `id` is recorded already.
+pub(crate) fn is_seen(target_id: &str, id: i64, run: Option<u64>) -> bool {
+    lock().get(target_id).is_some_and(|t| {
+        t.conns
+            .iter()
+            .any(|c| c.id == id && same_run(c, run) && c.closed.is_none() && c.seen.is_some())
+    })
+}
+
 /// Records the address the server reports for one of the agent's open
-/// connections (`CLIENT LIST`).
+/// connections (`CLIENT LIST`, or its own `CLIENT LIST ID` line).
 pub(crate) fn seen(target_id: &str, id: i64, run: Option<u64>, addr: SocketAddr) {
     if let Some(t) = lock().get_mut(target_id) {
         let mut local_seen = false;
@@ -201,7 +247,7 @@ mod tests {
         let a: SocketAddr = "10.0.0.5:51000".parse().unwrap();
         let nat: SocketAddr = "172.17.0.1:40000".parse().unwrap();
         let before = SystemTime::now() - Duration::from_secs(60);
-        let r = register(t, 42, Some(a), run);
+        let r = register(t, 42, Some(a), run, SystemTime::now());
         assert!(is_own_open_id(t, 42, run));
         assert!(!is_own_open_id(t, 43, run));
         assert!(!is_own_open_id("other", 42, run));
@@ -234,8 +280,8 @@ mod tests {
         let run = Some(1);
         let a: SocketAddr = "127.0.0.1:50001".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:50002".parse().unwrap();
-        let _r1 = register(t, 1, Some(a), run);
-        let _r2 = register(t, 2, Some(b), run);
+        let _r1 = register(t, 1, Some(a), run, SystemTime::now());
+        let _r2 = register(t, 2, Some(b), run, SystemTime::now());
         assert!(!is_own_addr(t, b, SystemTime::now(), run));
         // The server reports connection 1 at its local address: no NAT.
         seen(t, 1, run, a);

@@ -90,7 +90,31 @@ pub(crate) async fn open(
     drop(password);
     let info = identify(&mut session, timeout).await?;
     session.register_own(&target.id, info.run);
+    // The address the target's node reports for it, before any other
+    // command (the Audit stream reads that node's logs only).
+    if node_of(target, which) == Which::Target {
+        session.learn_own_address(&target.id, timeout).await?;
+    }
     Ok((session, info))
+}
+
+/// After an evaluation on the target's node: whether the account holds
+/// `+client|list` there (when evaluated), and this session's address if it
+/// is not recorded yet ([`Session::learn_own_address`]).
+async fn after_evaluation(
+    session: &mut Session,
+    target: &TargetConfig,
+    which: Which,
+    report: &Report,
+    timeout: Duration,
+) -> Result<(), RdError> {
+    if which != Which::Target {
+        return Ok(());
+    }
+    if let Some(granted) = report.audit.client_list {
+        crate::audit::own::set_client_list(&target.id, granted);
+    }
+    session.learn_own_address(&target.id, timeout).await
 }
 
 /// The TLS configuration of a target (`None`: `disable`).
@@ -471,6 +495,7 @@ impl Reports {
         }
         let r = evaluate(session, target, server, timeout).await?;
         self.store(&target.id, which, r.clone(), server);
+        after_evaluation(session, target, which, &r, timeout).await?;
         Ok(r)
     }
 
@@ -486,6 +511,10 @@ impl Reports {
         }
         let (mut s, info) = open(target, Which::Target, timeout).await?;
         let r = evaluate(&mut s, target, info.server, timeout).await;
+        if let Ok(r) = &r {
+            // Best effort: the report stands whatever the outcome.
+            let _ = after_evaluation(&mut s, target, Which::Target, r, timeout).await;
+        }
         s.close().await;
         let r = r?;
         self.store(&target.id, Which::Target, r.clone(), info.server);
