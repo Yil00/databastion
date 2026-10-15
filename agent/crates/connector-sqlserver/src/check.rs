@@ -173,11 +173,9 @@ const DATABASE_REFUSED: &[&str] = &[
     "DROP ANY DATABASE EVENT SESSION",
 ];
 
-/// Database permissions expected: `CONNECT`, database-wide `SELECT`
-/// (`db_datareader`), and what `public` holds by default.
-const DATABASE_EXPECTED: &[&str] = &[
-    "CONNECT",
-    "SELECT",
+/// What `public` holds in every database by default: accepted only when
+/// it comes from `public` (security review M5; measured on 2022).
+const PUBLIC_DEFAULTS: &[&str] = &[
     "VIEW ANY COLUMN ENCRYPTION KEY DEFINITION",
     "VIEW ANY COLUMN MASTER KEY DEFINITION",
 ];
@@ -234,11 +232,22 @@ pub(crate) struct Evaluation {
     pub(crate) not_evaluated: BTreeSet<&'static str>,
     pub(crate) hash_exposed: bool,
     pub(crate) server_perms: BTreeSet<String>,
+    /// Refusal-list reads that failed or were cut (security review M3):
+    /// closed local reasons. Any one blocks Discovery (and Audit), as a
+    /// refusal does: the refusal list fails closed.
+    pub(crate) incomplete: BTreeSet<&'static str>,
 }
 
 impl Evaluation {
+    /// A right of the refusal list is held (`privilege.refused`).
     pub(crate) fn is_refused(&self) -> bool {
         !self.refused.is_empty() || self.hash_exposed
+    }
+
+    /// Discovery and Audit must not run: refused, or the refusal list
+    /// could not be evaluated completely.
+    pub(crate) fn blocks(&self) -> bool {
+        self.is_refused() || !self.incomplete.is_empty()
     }
 }
 
@@ -279,7 +288,7 @@ pub(crate) async fn evaluate(
         )
         .await?;
     if roles.len() > MAX_ROLES {
-        ev.not_evaluated.insert("other");
+        ev.incomplete.insert("more than 64 server roles");
     }
     for r in texts(&roles, 0) {
         if ROLES_REFUSED.contains(&r.as_str()) {
@@ -339,7 +348,7 @@ pub(crate) async fn evaluate(
         )
         .await?;
     if dbs.len() > 1024 {
-        ev.not_evaluated.insert("other");
+        ev.incomplete.insert("more than 1024 accessible databases");
     }
     for db in texts(&dbs, 0).iter().take(1024) {
         database(s, db, &settings, &mut ev).await?;
@@ -353,96 +362,150 @@ async fn database(
     settings: &databastion_core::config::sqlserver::SqlserverTargetConfig,
     ev: &mut Evaluation,
 ) -> Result<(), SsError> {
-    let Some(stmt) = sql::in_database(sql::DATABASE_PERMISSIONS, db) else {
-        ev.not_evaluated.insert("other");
+    let rls = settings.rls_visibility == Some(RlsVisibility::ViewDefinition);
+    let stmts = (
+        sql::in_database(sql::DATABASE_GRANTS, db),
+        sql::in_database(sql::DATABASE_PERMISSIONS, db),
+        sql::in_database(sql::DATABASE_ROLES, db),
+    );
+    let (Some(grants), Some(perms), Some(roles)) = stmts else {
+        ev.incomplete
+            .insert("a database name the connector cannot quote");
         return Ok(());
     };
-    let rls = settings.rls_visibility == Some(RlsVisibility::ViewDefinition);
-    match s.rows(&stmt, Stage::Check, Shape::rows(1, 513)).await {
+    // Securable-level grants first: what `public` holds by default is
+    // known before the effective permissions are judged (review M5).
+    let mut public = BTreeSet::new();
+    match s.rows(&grants, Stage::Check, Shape::rows(4, 1025)).await {
         Ok(rows) => {
-            for p in texts(&rows, 0) {
-                let implied = DATABASE_FROM_SERVER
-                    .iter()
-                    .any(|(d, srv)| *d == p && ev.server_perms.contains(*srv));
-                if DATABASE_REFUSED.contains(&p.as_str()) {
-                    ev.refused.insert(p);
-                } else if DATABASE_EXPECTED.contains(&p.as_str())
-                    || implied
-                    || (rls && DATABASE_RLS.contains(&p.as_str()))
+            if rows.len() > 1024 {
+                ev.incomplete.insert("more than 1024 database grants");
+            }
+            for row in &rows {
+                let name = row.first().and_then(Value::as_text).unwrap_or_default();
+                let state = row.get(1).and_then(Value::as_text).unwrap_or_default();
+                let class = row.get(2).and_then(Value::as_int).unwrap_or(-1);
+                let to_public = row.get(3).and_then(Value::as_int) == Some(1);
+                if (class == CLASS_DATABASE_PRINCIPAL && PRINCIPAL_REFUSED.contains(&name))
+                    || DATABASE_REFUSED.contains(&name)
                 {
-                } else {
-                    ev.beyond_select.insert(p);
+                    ev.refused.insert(name.to_owned());
+                    continue;
+                }
+                if to_public {
+                    if class == 0 {
+                        public.insert(name.to_owned());
+                    }
+                    continue;
+                }
+                if state == "W" {
+                    ev.grant_option = true;
+                }
+                if !grant_allowed(name, class, rls) {
+                    ev.beyond_select.insert(name.to_owned());
                 }
             }
         }
         Err(e) if !e.fatal => {
-            ev.not_evaluated.insert("other");
+            ev.incomplete
+                .insert("a database grant list could not be read");
         }
         Err(e) => return Err(e),
     }
-    if let Some(stmt) = sql::in_database(sql::DATABASE_ROLES, db) {
-        match s
-            .rows(&stmt, Stage::Check, Shape::rows(1, MAX_ROLES + 1))
-            .await
-        {
-            Ok(rows) => {
-                if rows.len() > MAX_ROLES {
-                    ev.not_evaluated.insert("other");
-                }
-                for r in texts(&rows, 0) {
-                    match r.as_str() {
-                        "db_owner" => {
-                            ev.refused.insert(r);
-                        }
-                        "db_datareader" if settings.extended_grants => ev.extended_variant = true,
-                        _ => {
-                            ev.database_roles.insert(r);
-                        }
+    match s.rows(&perms, Stage::Check, Shape::rows(1, 513)).await {
+        Ok(rows) => {
+            if rows.len() > 512 {
+                ev.incomplete.insert("more than 512 database permissions");
+            }
+            for p in texts(&rows, 0) {
+                match effective_db_permission(&p, &ev.server_perms, &public, rls) {
+                    DbPerm::Refused => {
+                        ev.refused.insert(p);
+                    }
+                    DbPerm::Expected => {}
+                    DbPerm::Beyond => {
+                        ev.beyond_select.insert(p);
                     }
                 }
             }
-            Err(e) if !e.fatal => {
-                ev.not_evaluated.insert("other");
-            }
-            Err(e) => return Err(e),
         }
+        Err(e) if !e.fatal => {
+            ev.incomplete
+                .insert("database permissions could not be read");
+        }
+        Err(e) => return Err(e),
     }
-    if let Some(stmt) = sql::in_database(sql::DATABASE_GRANTS, db) {
-        match s.rows(&stmt, Stage::Check, Shape::rows(4, 1025)).await {
-            Ok(rows) => {
-                for row in &rows {
-                    let name = row.first().and_then(Value::as_text).unwrap_or_default();
-                    let state = row.get(1).and_then(Value::as_text).unwrap_or_default();
-                    let class = row.get(2).and_then(Value::as_int).unwrap_or(-1);
-                    let to_public = row.get(3).and_then(Value::as_int) == Some(1);
-                    if class == CLASS_DATABASE_PRINCIPAL && PRINCIPAL_REFUSED.contains(&name) {
-                        ev.refused.insert(name.to_owned());
-                        continue;
+    match s
+        .rows(&roles, Stage::Check, Shape::rows(1, MAX_ROLES + 1))
+        .await
+    {
+        Ok(rows) => {
+            if rows.len() > MAX_ROLES {
+                ev.incomplete.insert("more than 64 database roles");
+            }
+            for r in texts(&rows, 0) {
+                match r.as_str() {
+                    "db_owner" => {
+                        ev.refused.insert(r);
                     }
-                    if DATABASE_REFUSED.contains(&name) {
-                        ev.refused.insert(name.to_owned());
-                        continue;
-                    }
-                    if to_public {
-                        continue;
-                    }
-                    if state == "W" {
-                        ev.grant_option = true;
-                    }
-                    let allowed = matches!(name, "SELECT" | "CONNECT")
-                        || (rls && class == 0 && name == "VIEW DEFINITION");
-                    if !allowed {
-                        ev.beyond_select.insert(name.to_owned());
+                    "db_datareader" if settings.extended_grants => ev.extended_variant = true,
+                    _ => {
+                        ev.database_roles.insert(r);
                     }
                 }
             }
-            Err(e) if !e.fatal => {
-                ev.not_evaluated.insert("other");
-            }
-            Err(e) => return Err(e),
         }
+        Err(e) if !e.fatal => {
+            ev.incomplete.insert("database roles could not be read");
+        }
+        Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// A securable-level grant to the user or its roles that is expected:
+/// `SELECT`, `CONNECT`, and database `VIEW DEFINITION` with the RLS
+/// opt-in. Anything else (the Always Encrypted key-definition
+/// permissions included, review M5) is beyond `SELECT`.
+pub(crate) fn grant_allowed(name: &str, class: i64, rls: bool) -> bool {
+    matches!(name, "SELECT" | "CONNECT") || (rls && class == 0 && name == "VIEW DEFINITION")
+}
+
+/// How an effective database permission is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbPerm {
+    Refused,
+    Expected,
+    Beyond,
+}
+
+/// Judges an effective database permission: the refusal list; expected
+/// (`CONNECT`, database `SELECT`, the RLS opt-in's `VIEW DEFINITION` and
+/// what it implies, what a held server Audit permission implies, and the
+/// Always Encrypted key-definition permissions **only when `public` holds
+/// them**, review M5); otherwise beyond `SELECT`.
+pub(crate) fn effective_db_permission(
+    p: &str,
+    server: &BTreeSet<String>,
+    public: &BTreeSet<String>,
+    rls: bool,
+) -> DbPerm {
+    if DATABASE_REFUSED.contains(&p) {
+        return DbPerm::Refused;
+    }
+    let implied = DATABASE_FROM_SERVER
+        .iter()
+        .any(|(d, srv)| *d == p && server.contains(*srv));
+    let public_default = PUBLIC_DEFAULTS.contains(&p) && public.contains(p);
+    if matches!(p, "CONNECT" | "SELECT")
+        || implied
+        || public_default
+        || (rls && DATABASE_RLS.contains(&p))
+    {
+        DbPerm::Expected
+    } else {
+        DbPerm::Beyond
+    }
 }
 
 /// RLS tier of one monitored database (refinement item 2).
@@ -610,10 +673,13 @@ fn labels<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<NoteLabel> {
 /// The notes of an evaluation.
 pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
     if ev.is_refused() {
-        let mut l = labels(&ev.refused);
+        // The probe's label first, then at most 15 others: the 16-label
+        // cap can never drop it (review L4).
+        let mut l = Vec::new();
         if ev.hash_exposed {
             l.push(NoteLabel::sqlserver("password_hash_probe"));
         }
+        l.extend(labels(&ev.refused).into_iter().take(16 - l.len()));
         notes.add(TargetNote::new(NoteCode::PrivilegeRefused).with_labels(l));
     }
     if !ev.global.is_empty() {
@@ -660,10 +726,17 @@ pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
             TargetNote::new(NoteCode::PrivilegeOwnerOfObjects).with_count(ev.owner_of_objects),
         );
     }
+    if !ev.incomplete.is_empty() {
+        notes.merge(
+            TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([NoteLabel::OTHER]),
+            databastion_core::CountMerge::Sum,
+        );
+    }
     if !ev.not_evaluated.is_empty() {
-        notes.add(
+        notes.merge(
             TargetNote::new(NoteCode::PrivilegeNotEvaluated)
                 .with_labels(ev.not_evaluated.iter().map(|l| NoteLabel::sqlserver(l))),
+            databastion_core::CountMerge::Sum,
         );
     }
 }
@@ -745,6 +818,14 @@ async fn checked(
                 .to_owned(),
         );
     }
+    if !ev.incomplete.is_empty() {
+        let why: Vec<&str> = ev.incomplete.iter().copied().collect();
+        detail.push(format!(
+            "the refusal list could not be evaluated completely ({}): Discovery and Audit do \
+             not run",
+            why.join(", ")
+        ));
+    }
     // Logon triggers (decision 7, refinement item 6): evaluated only when
     // the catalog is visible; never "no logon trigger" otherwise.
     let visible = [
@@ -784,7 +865,7 @@ async fn checked(
         );
     }
     // RLS tiers, from the first heartbeat (refinement item 2).
-    if !ev.is_refused() {
+    if !ev.blocks() {
         let (dbs, _) = monitored_databases(s, target).await?;
         let mut not_verifiable = 0u64;
         let mut counts = [0u64; 4];
@@ -861,6 +942,71 @@ mod tests {
         );
         assert_eq!(contract_version("16.0 (RTM)"), None);
         assert_eq!(contract_version(""), None);
+    }
+
+    /// Review M5: the Always Encrypted key-definition permissions are
+    /// expected only from `public`.
+    #[test]
+    fn public_defaults_only_from_public() {
+        let none = BTreeSet::new();
+        let public: BTreeSet<String> =
+            ["VIEW ANY COLUMN ENCRYPTION KEY DEFINITION".to_owned()].into();
+        let p = "VIEW ANY COLUMN ENCRYPTION KEY DEFINITION";
+        assert_eq!(
+            effective_db_permission(p, &none, &public, false),
+            DbPerm::Expected
+        );
+        assert_eq!(
+            effective_db_permission(p, &none, &none, false),
+            DbPerm::Beyond
+        );
+        assert!(!grant_allowed(p, 0, false));
+        assert_eq!(
+            effective_db_permission("CONTROL", &none, &public, false),
+            DbPerm::Refused
+        );
+        assert_eq!(
+            effective_db_permission("CONNECT", &none, &none, false),
+            DbPerm::Expected
+        );
+        assert_eq!(
+            effective_db_permission("VIEW DEFINITION", &none, &none, false),
+            DbPerm::Beyond
+        );
+        assert_eq!(
+            effective_db_permission("VIEW DEFINITION", &none, &none, true),
+            DbPerm::Expected
+        );
+    }
+
+    /// Review M3 and L4: an incomplete evaluation blocks, and the hash
+    /// probe's label survives the 16-label cap.
+    #[test]
+    fn incomplete_evaluation_blocks_and_hash_label_survives() {
+        let mut ev = Evaluation::default();
+        assert!(!ev.blocks());
+        ev.incomplete.insert("more than 64 database roles");
+        assert!(ev.blocks() && !ev.is_refused());
+        let mut notes = Notes::default();
+        evaluation_notes(&ev, &mut notes);
+        assert_eq!(notes.as_slice()[0].code(), NoteCode::PrivilegeNotEvaluated);
+        let mut ev = Evaluation {
+            hash_exposed: true,
+            ..Evaluation::default()
+        };
+        for p in SERVER_REFUSED {
+            ev.refused.insert((*p).to_owned());
+        }
+        ev.refused.insert("sysadmin".into());
+        ev.refused.insert("db_owner".into());
+        let mut notes = Notes::default();
+        evaluation_notes(&ev, &mut notes);
+        let l: Vec<String> = notes.as_slice()[0]
+            .labels()
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        assert!(l.contains(&"password_hash_probe".to_owned()), "{l:?}");
     }
 
     #[test]

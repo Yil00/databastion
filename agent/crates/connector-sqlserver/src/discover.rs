@@ -317,7 +317,7 @@ pub(crate) async fn discover(
         }
     };
     let (ev, (mut dbs, cut)) = start;
-    if ev.is_refused() {
+    if ev.blocks() {
         first.close().await;
         tracing::warn!(
             target_id = %target.id,
