@@ -175,7 +175,14 @@ pub(crate) fn reassemble(records: Vec<Record>) -> Vec<Record> {
                     if h.statement.len() + r.statement.len() > MAX_STATEMENT_BYTES {
                         h.cut = true;
                     } else {
-                        h.statement.push_str(&r.statement);
+                        // A new buffer of the full size: the old one is
+                        // zeroized when dropped (a reallocation by
+                        // `push_str` would leave it unzeroized).
+                        let mut joined =
+                            String::with_capacity(h.statement.len() + r.statement.len());
+                        joined.push_str(&h.statement);
+                        joined.push_str(&r.statement);
+                        h.statement = Zeroizing::new(joined);
                     }
                     h.sequence = r.sequence;
                 }

@@ -759,8 +759,8 @@ fn kind_of(first: Option<&str>, second: Option<&str>) -> TsqlKind {
 }
 
 /// Whether the first words name a password-bearing statement.
-fn credential_prefix(words: &[Option<String>]) -> bool {
-    let w = |i: usize| words.get(i).and_then(Option::as_deref);
+fn credential_prefix(words: &[&str]) -> bool {
+    let w = |i: usize| words.get(i).copied();
     match (w(0), w(1)) {
         (Some("create" | "alter"), Some("login" | "user" | "credential" | "certificate")) => true,
         (Some("create" | "alter"), Some("application")) => w(2) == Some("role"),
@@ -796,36 +796,31 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
     let mut lexer = Lexer::new(text);
     let mut toks: Vec<Tok> = Vec::new();
     let mut end = LexEnd::Done;
-    // The prefix: the first words, then the password-bearing rule before
-    // anything else is read.
-    let mut prefix: Vec<Option<String>> = Vec::with_capacity(PREFIX_TOKENS);
+    // The prefix: token by token, the password-bearing rules checked after
+    // each one, so the lexer stops at the class (`CREATE LOGIN`) or at the
+    // name of a password-taking procedure, before any argument is read.
     while toks.len() < PREFIX_TOKENS {
         match lexer.next_tok() {
             Ok(t) => {
-                prefix.push(t.word().map(str::to_owned));
+                let procedure = t.ident().is_some_and(credential_procedure);
                 toks.push(t);
+                if procedure {
+                    let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
+                    a.credential = true;
+                    return a;
+                }
+                let words: Vec<&str> = toks.iter().filter_map(Tok::word).collect();
+                if credential_prefix(&words) {
+                    let mut a = TsqlAnalysis::kind_only(TsqlKind::Dcl);
+                    a.credential = true;
+                    return a;
+                }
             }
             Err(e) => {
                 end = e;
                 break;
             }
         }
-    }
-    // Skip a leading `(`, `;` or `WITH` CTE for the kind: the kind of the
-    // main statement is decided below, after the CTE list.
-    let first_words: Vec<Option<String>> = prefix.iter().filter(|w| w.is_some()).cloned().collect();
-    if credential_prefix(&first_words) {
-        let mut a = TsqlAnalysis::kind_only(TsqlKind::Dcl);
-        a.credential = true;
-        return a;
-    }
-    // A password-taking procedure called at the start, before its
-    // arguments are read.
-    let fw = |i: usize| first_words.get(i).and_then(Option::as_deref);
-    if exec_names_credential(&toks) {
-        let mut a = TsqlAnalysis::kind_only(TsqlKind::Execute);
-        a.credential = true;
-        return a;
     }
     let mut lexed = end == LexEnd::Done;
     if lexed && toks.len() == PREFIX_TOKENS {
@@ -858,7 +853,10 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
         a.credential = true;
         return a;
     }
-    let kind = main_kind(&toks).unwrap_or_else(|| kind_of(fw(0), fw(1)));
+    let kind = main_kind(&toks).unwrap_or_else(|| {
+        let mut words = toks.iter().filter_map(Tok::word);
+        kind_of(words.next(), words.next())
+    });
     if !lexed || truncated {
         let mut a = TsqlAnalysis::kind_only(kind);
         // A cut or unlexable text still says what it is when its first
@@ -867,32 +865,6 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
         return a;
     }
     analyze_tokens(&toks, kind)
-}
-
-/// Whether the text starts with `EXEC [@rc =] [db.][schema.]proc` naming
-/// a password-taking procedure, or with the procedure name alone.
-fn exec_names_credential(toks: &[Tok]) -> bool {
-    let mut i = 0;
-    if toks
-        .first()
-        .is_some_and(|t| t.is("exec") || t.is("execute"))
-    {
-        i = 1;
-        if matches!(toks.get(1), Some(Tok::Var(_))) && toks.get(2).is_some_and(|t| t.punct('=')) {
-            i = 3;
-        }
-    }
-    // The last part of a dotted name.
-    let mut last = None;
-    while let Some(t) = toks.get(i) {
-        match t.ident() {
-            Some(n) => last = Some(n),
-            None if t.punct('.') => {}
-            None => break,
-        }
-        i += 1;
-    }
-    last.is_some_and(credential_procedure)
 }
 
 /// The kind of the main statement, after a `WITH` CTE list.
