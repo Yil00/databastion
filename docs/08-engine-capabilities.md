@@ -972,6 +972,16 @@ Slow-log and command-log entries carry an address, not a connection id, so the a
 
 No table-level flag tells a table with a row-level security policy from one without, and the minimal account cannot see the policy catalog. **Without the local opt-in `sqlserver.rls_visibility: view_definition` (database `VIEW DEFINITION` in each monitored database, proven effective and not hidden by a `DENY` at database or server scope), Discovery samples nothing**: every table of the database is skipped (`skipped_row_level_security`) and `check()` reports `coverage.rls_not_verifiable` from the first heartbeat. The opt-in makes the module bodies of the database (procedures, views, functions, triggers) readable by whoever holds the agent's credentials; the connector itself never reads them.
 
+### TLS modes and the "strict seen" mark
+
+`sqlserver.tls` is `auto` (default), `strict` (TDS 8.0, TLS from the first byte) or `mandatory` (TDS 7.x, the TLS handshake inside `PRELOGIN` packets, then the whole session encrypted); there is no unencrypted mode ([ADR-0051](adr/0051-sqlserver-connector.md) decision 2 and refinement item 3). On Linux, strict encryption exists from SQL Server 2025 only (`network.forcestrict`): against 2019 and 2022, `auto` falls back once to `mandatory`, then connects in `mandatory` directly for an hour before trying strict again (in memory only), and `strict` fails with the local detail "strict encryption not available on this server". Use `tls: mandatory` for SQL Server 2022 on Linux. Tested in CI on each version (`agent-sqlserver` on 2022, the engine matrix on 2019, 2022 and 2025 with strict forced).
+
+Once `auto` has completed one authenticated strict session with a target, the agent persists a **"strict seen" mark** and from then on never falls back to `mandatory` for that target (a strict failure fails the connection):
+
+- File: `<state_dir>/sqlserver-strict-seen/<target_id>`, mode `0600` in a `0700` directory, holding the target's declared host and port. A mark for another host or port, a file that is not private or not owned by the agent's user, or one larger than 4 KiB counts as "not seen".
+- Cleared automatically when the target's `tls` is set to `strict` or `mandatory` (at its next connection attempt), or made void by changing its `host` or `port`.
+- To clear it by hand (for example after moving the server to a version or configuration without strict encryption while keeping `tls: auto`): delete the file; the next connection tries strict first again, with the one fallback. Until then, the target is reported unreachable with a TLS-stage detail.
+
 ### What a stolen agent credential reads
 
 Measured with the minimal account, beyond the tables it is granted:

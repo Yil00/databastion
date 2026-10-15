@@ -2,7 +2,7 @@
 # Connector integration tests against the running dev environment (`make dev`), one engine at a
 # time, with the same variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the
 # matching CI job (.github/workflows/ci.yml: agent-pg, agent-mysql, agent-mongodb, agent-openldap,
-# agent-redis).
+# agent-redis, agent-sqlserver).
 #
 #   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|sqlserver|all   (or: make agent-it [ENGINE=...])
 #
@@ -149,6 +149,9 @@ it_sqlserver() {
   export DATABASTION_IT_SQLSERVER_CA="$ROOT/dev/.state/tls/sqlserver-ca.pem"
   # The fake password of the throwaway logins the tests create as `sa` (refusal list, RLS tiers).
   export DATABASTION_IT_SQLSERVER_THROWAWAY=Fake-IT-Passw0rd-marker
+  # Read by the tests from the environment as given (the engine matrix sets them):
+  # DATABASTION_DEV_SQLSERVER_FORCE_STRICT=1 (the service forces strict: the tests expect `strict`)
+  # and DATABASTION_IT_SQLSERVER_MAJOR (the major version the server must report).
   cargo_it databastion-connector-sqlserver --test-threads 1
 }
 

@@ -17,15 +17,27 @@ TLS="$DATA/databastion-tls"
 READY="$DATA/.databastion-ready"
 SEEDED="$DATA/.databastion-seeded"
 SQLCMD=(/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -C -b -I)
+# A server forcing strict encryption disconnects a TDS 7.x client (error 17819): the seeding
+# sessions then use strict encryption too, with the dev server certificate pinned (-J).
+if [ "${DATABASTION_DEV_SQLSERVER_FORCE_STRICT:-0}" = 1 ]; then
+  SQLCMD=(/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -N s -J "$TLS/server.pem" -b -I)
+fi
 rm -f "$READY"
 
 if [ ! -s "$TLS/server.pem" ] || [ ! -s "$TLS/server.key" ]; then
   mkdir -p "$TLS"
   tmp="$(mktemp -d)"
+  # The CA key never outlives this block, even when a step fails.
+  trap 'rm -rf "$tmp"' EXIT
   printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature,keyEncipherment' \
     'extendedKeyUsage=serverAuth' 'subjectAltName=DNS:localhost,DNS:sqlserver,IP:127.0.0.1,IP:::1' > "$tmp/ext"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=DataBastion dev CA (sqlserver)" \
-    -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  # The CA's extensions from a config file of their own, not -addext: OpenSSL 1.1.1 (the 2019
+  # image) adds the default config's v3_ca extensions as well, and a certificate with a duplicate
+  # basicConstraints is refused by the agent's verifier.
+  printf '%s\n' '[req]' 'distinguished_name = dn' 'x509_extensions = v3_ca' 'prompt = no' \
+    '[dn]' 'CN = DataBastion dev CA (sqlserver)' '[v3_ca]' 'basicConstraints = critical,CA:TRUE' \
+    'keyUsage = critical,keyCertSign,cRLSign' 'subjectKeyIdentifier = hash' > "$tmp/ca.cnf"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$tmp/ca.cnf" \
     -keyout "$tmp/ca-key.pem" -out "$tmp/ca.pem" 2>/dev/null
   openssl req -newkey rsa:2048 -nodes -subj "/CN=sqlserver" -keyout "$tmp/server.key" \
     -out "$tmp/server.csr" 2>/dev/null
@@ -35,6 +47,7 @@ if [ ! -s "$TLS/server.pem" ] || [ ! -s "$TLS/server.key" ]; then
   install -m 0644 "$tmp/server.pem" "$TLS/server.pem"
   install -m 0600 "$tmp/server.key" "$TLS/server.key"
   rm -rf "$tmp"
+  trap - EXIT
 fi
 
 {
@@ -48,7 +61,13 @@ fi
 } > "$DATA/mssql.conf"
 mkdir -p "$DATA/audit" "$DATA/xe"
 
-/opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr &
+# 2022 and 2025 start sqlservr through launch_sqlservr.sh; the 2019 image has no such wrapper (its
+# own entrypoint, permissions_check.sh, only prints a message before running sqlservr).
+if [ -x /opt/mssql/bin/launch_sqlservr.sh ]; then
+  /opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr &
+else
+  /opt/mssql/bin/sqlservr &
+fi
 pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"' TERM INT
 

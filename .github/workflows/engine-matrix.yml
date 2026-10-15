@@ -1,13 +1,17 @@
 name: Engine matrix
 
 # Connector integration tests (the "dev image" step of the ci.yml agent-pg / agent-mysql /
-# agent-mongodb / agent-redis jobs, through dev/agent-it.sh) against several versions of each
-# engine: the dev services of dev/docker-compose.yml with their image overridden by the
-# DATABASTION_DEV_*_IMAGE variables (ROADMAP v0.1.x follow-up (h)). Entries without an override run
+# agent-mongodb / agent-redis / agent-sqlserver jobs, through dev/agent-it.sh) against several
+# versions of each engine: the dev services of dev/docker-compose.yml with their image overridden
+# by the DATABASTION_DEV_*_IMAGE variables (ROADMAP v0.1.x follow-up (h)). Entries without an override run
 # the pinned default images, as ci.yml does. Percona Server (MySQL, MongoDB) and OpenLDAP stay
 # single-version (ci.yml).
 # Redis and Valkey (ADR-0052 decision 13 and open question 7): every maintained line here, one
 # version of each in ci.yml (agent-redis); the services are in the opt-in Compose profile `redis`.
+# SQL Server (ADR-0051 decision 9 and refinement item 3): 2019, 2022 and 2025 Express here, 2022 in
+# ci.yml (agent-sqlserver); the service is in the opt-in Compose profile `sqlserver`. The TLS mode
+# each version reaches is asserted by the tests (tls_modes_by_version): `mandatory` and the `auto`
+# fallback on 2019 and 2022, `strict` on 2025 with DATABASTION_DEV_SQLSERVER_FORCE_STRICT=1.
 # Not a required check: not part of the "CI result" gate of ci.yml.
 # Every image is pinned by tag AND index digest (multi-arch), like the rest of the repository.
 on:
@@ -25,10 +29,13 @@ on:
       - "dev/mariadb/**"
       - "dev/mongo/**"
       - "dev/redis/**"
+      - "dev/sqlserver/**"
+      - "agent/crates/core/**"
       - "agent/crates/connector-postgres/**"
       - "agent/crates/connector-mysql/**"
       - "agent/crates/connector-mongodb/**"
       - "agent/crates/connector-redis/**"
+      - "agent/crates/connector-sqlserver/**"
 
 permissions:
   contents: read
@@ -208,6 +215,36 @@ jobs:
             profile: redis
             services: valkey redis
             valkey_image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+          # Microsoft SQL Server, Express (MSSQL_PID=Express in docker-compose.yml: the maintainer's
+          # choice until the Developer license terms are confirmed for CI, ADR-0051 open question
+          # 13). amd64-only images, pinned by digest (ADR-0051 decision 9). sqlserver_major is the
+          # major version the tests require the server to report.
+          # 2019: no strict encryption (TDS 8.0 is 2022+): `mandatory`, and `auto` falling back.
+          - engine: SQL Server
+            version: "2019 (15.0.4500.2)"
+            it: sqlserver
+            profile: sqlserver
+            services: sqlserver
+            sqlserver_image: mcr.microsoft.com/mssql/server:2019-latest@sha256:07d7dedecdbfcf6776035dc5eefb5bfd9aa1804b2f6b99f7dedb397d8a599069
+            sqlserver_major: "15"
+          # 2022 on Linux: no strict setting in mssql-conf (refinement item 3): `auto` falls back
+          # to `mandatory`, `strict` fails with its local detail.
+          - engine: SQL Server
+            version: "2022 (16.0.4305.5, default)"
+            it: sqlserver
+            profile: sqlserver
+            services: sqlserver
+            sqlserver_major: "16"
+          # 2025 with network.forcestrict: `strict` and `auto` reaching strict (persisted "strict
+          # seen" mark), `mandatory` refused by the server.
+          - engine: SQL Server
+            version: "2025 (17.0.5015.4, strict)"
+            it: sqlserver
+            profile: sqlserver
+            services: sqlserver
+            sqlserver_image: mcr.microsoft.com/mssql/server:2025-latest@sha256:742481d1b1186cccc81220a1eaacef244ca8d0f7d19c8e5c70df8ae541ffbab2
+            sqlserver_major: "17"
+            sqlserver_force_strict: "1"
     # Unset matrix fields are empty strings: docker-compose.yml and dev/agent-it.sh treat an empty
     # variable as unset (`${VAR:-default}`), so the entry runs the pinned default.
     env:
@@ -219,7 +256,11 @@ jobs:
       DATABASTION_DEV_MONGO_IMAGE: ${{ matrix.mongo_image }}
       DATABASTION_DEV_REDIS_IMAGE: ${{ matrix.redis_image }}
       DATABASTION_DEV_VALKEY_IMAGE: ${{ matrix.valkey_image }}
-      # Opt-in Compose profiles of the entry (Redis / Valkey: `redis`); empty for the others.
+      DATABASTION_DEV_SQLSERVER_IMAGE: ${{ matrix.sqlserver_image }}
+      DATABASTION_DEV_SQLSERVER_FORCE_STRICT: ${{ matrix.sqlserver_force_strict }}
+      DATABASTION_IT_SQLSERVER_MAJOR: ${{ matrix.sqlserver_major }}
+      # Opt-in Compose profiles of the entry (Redis / Valkey: `redis`, SQL Server: `sqlserver`);
+      # empty for the others.
       COMPOSE_PROFILES: ${{ matrix.profile }}
       IT_ENGINE: ${{ matrix.it }}
       SERVICES: ${{ matrix.services }}
