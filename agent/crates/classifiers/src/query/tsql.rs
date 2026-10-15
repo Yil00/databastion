@@ -940,9 +940,11 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
         return a;
     }
     if toks.is_empty() && !text.trim().is_empty() {
-        let mut a = TsqlAnalysis::kind_only(placeholder_kind(text));
+        let (kind, credential) = placeholder(text);
+        let mut a = TsqlAnalysis::kind_only(kind);
         a.lexed = true;
         a.comment_only = true;
+        a.credential = credential;
         return a;
     }
     analyze_tokens(&toks, kind)
@@ -950,24 +952,29 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
 
 /// The kind a comment-only text names when it is exactly the server's
 /// placeholder for a statement it does not record (`-- SELECT`, `-- CREATE
-/// LOGIN`, `-- sp_addlinkedsrvlogin`: one or two words of letters and `_`
-/// after `--`, measured on 2019); [`TsqlKind::Other`] for any other
-/// comment. Only those words are read.
-fn placeholder_kind(text: &str) -> TsqlKind {
+/// LOGIN`, `-- CREATE CREDENTIAL`, `-- sp_addlogin`, `-- Encrypted text`
+/// for a statement of an encrypted module: one or two words of letters
+/// and `_` after `--`, measured on 2019), and whether it is a
+/// password-bearing statement; [`TsqlKind::Other`] for any other comment.
+/// Only those words are read.
+fn placeholder(text: &str) -> (TsqlKind, bool) {
     let Some(body) = text.trim().strip_prefix("--") else {
-        return TsqlKind::Other;
+        return (TsqlKind::Other, false);
     };
     let words: Vec<&str> = body.split_ascii_whitespace().collect();
     let plain = |w: &&str| {
         !w.is_empty() && w.len() <= 64 && w.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
     };
     if words.is_empty() || words.len() > 2 || !words.iter().all(plain) || body.contains('\n') {
-        return TsqlKind::Other;
+        return (TsqlKind::Other, false);
     }
     let lower: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
-    kind_of(
-        lower.first().map(String::as_str),
-        lower.get(1).map(String::as_str),
+    let refs: Vec<&str> = lower.iter().map(String::as_str).collect();
+    let credential =
+        credential_prefix(&refs) || refs.first().is_some_and(|w| credential_procedure(w));
+    (
+        kind_of(refs.first().copied(), refs.get(1).copied()),
+        credential,
     )
 }
 
@@ -2487,8 +2494,15 @@ mod tests {
         let a = an("-- CREATE LOGIN");
         assert!(a.comment_only && a.relations.is_empty());
         assert_eq!(a.kind, TsqlKind::Ddl);
-        assert_eq!(an("-- SELECT").kind, TsqlKind::Select);
-        assert_eq!(an("-- sp_addlinkedsrvlogin").kind, TsqlKind::Other);
+        assert!(a.credential);
+        assert!(an("-- CREATE CREDENTIAL").credential);
+        assert!(an("-- sp_addlogin").credential);
+        let s = an("-- SELECT");
+        assert_eq!(s.kind, TsqlKind::Select);
+        assert!(!s.credential);
+        let e = an("-- Encrypted text");
+        assert_eq!(e.kind, TsqlKind::Other);
+        assert!(!e.credential && e.comment_only);
         assert_eq!(an("-- SELECT 'x' and more").kind, TsqlKind::Other);
         assert_eq!(an("/* SELECT */").kind, TsqlKind::Other);
         assert!(!an("   ").comment_only);

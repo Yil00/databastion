@@ -482,12 +482,19 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
     let a = tsql::analyze_tsql(text, e.statement_cut);
     if a.comment_only {
         // The server's placeholder for a statement it does not record
-        // (`-- SELECT` for a read calling ENCRYPTBYPASSPHRASE, `-- CREATE
-        // LOGIN`, measured on 2019): the kind its words name, never more.
-        let action = match a.kind {
-            TsqlKind::Select => EventAction::Read,
-            TsqlKind::Write => EventAction::Write,
-            _ => EventAction::Dcl,
+        // (measured on 2019): `-- CREATE LOGIN`, `-- CREATE CREDENTIAL`,
+        // `-- sp_addlogin` (password-bearing: DCL), `-- SELECT` (a read
+        // calling ENCRYPTBYPASSPHRASE), `-- Encrypted text` (a statement of
+        // an encrypted module: code that runs out of sight). The kind its
+        // words name, never more; `*`, always reported.
+        let action = if a.credential {
+            EventAction::Dcl
+        } else if a.kind == TsqlKind::Write {
+            EventAction::Write
+        } else if matches!(a.kind, TsqlKind::Ddl | TsqlKind::Dcl) {
+            EventAction::Dcl
+        } else {
+            EventAction::Read
         };
         return Some((star(new(action)), Some(a)));
     }
@@ -724,11 +731,15 @@ pub(crate) mod tests {
 
     #[test]
     fn password_statements_keep_their_class_only() {
-        let ev = one(&stmt("sql_statement_completed", "-- SELECT", 1, "51"));
-        assert_eq!(ev.action(), EventAction::Read);
-        assert!(ev.always_report() && names(&ev) == ["retail.-.*"]);
+        for t in ["-- SELECT", "-- Encrypted text"] {
+            let ev = one(&stmt("sp_statement_completed", t, 1, "51"));
+            assert_eq!(ev.action(), EventAction::Read, "{t}");
+            assert!(ev.always_report() && names(&ev) == ["retail.-.*"], "{t}");
+        }
         for t in [
             "-- CREATE LOGIN",
+            "-- CREATE CREDENTIAL",
+            "-- sp_addlogin",
             "-- sp_addlinkedsrvlogin",
             "CREATE LOGIN jane WITH PASSWORD = 'Marker-123'",
             "EXEC sp_addlogin jane, Pa55wordMarker",
