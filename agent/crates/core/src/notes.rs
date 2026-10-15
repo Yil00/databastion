@@ -28,6 +28,25 @@ const MAX_LABELS: usize = 16;
 const SEVERITY: &[TargetNoteLabel] = {
     use TargetNoteLabel as L;
     &[
+        // Microsoft SQL Server refusal list (ADR-0051 decision 4): the
+        // password_hash probe and the rights that own the server or a
+        // database first, so a long refusal never loses them.
+        L::PasswordHashProbe,
+        L::Sysadmin,
+        L::ControlServer,
+        L::DbOwner,
+        L::Control,
+        L::Securityadmin,
+        L::MsLoginManager,
+        L::ImpersonateAnyLogin,
+        L::Impersonate,
+        L::AlterAnyLogin,
+        L::AlterAnyServerRole,
+        L::AlterAnyServerAudit,
+        L::AlterAnyDatabaseAudit,
+        L::ViewAnyCryptographicallySecuredDefinition,
+        L::AlterAnyEventSession,
+        L::TakeOwnership,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,

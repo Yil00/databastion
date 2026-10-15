@@ -699,13 +699,13 @@ fn labels<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<NoteLabel> {
 /// The notes of an evaluation.
 pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
     if ev.is_refused() {
-        // The probe's label first, then at most 15 others: the 16-label
-        // cap can never drop it (review L4).
-        let mut l = Vec::new();
+        // The probe's label ranks first in the core's label severity, then
+        // `sysadmin`, `control_server`, `db_owner`…: the 16-label cap
+        // never drops them (review L4).
+        let mut l = labels(&ev.refused);
         if ev.hash_exposed {
             l.push(NoteLabel::sqlserver("password_hash_probe"));
         }
-        l.extend(labels(&ev.refused).into_iter().take(16 - l.len()));
         notes.add(TargetNote::new(NoteCode::PrivilegeRefused).with_labels(l));
     }
     if !ev.global.is_empty() {
@@ -1025,6 +1025,7 @@ mod tests {
         }
         ev.refused.insert("sysadmin".into());
         ev.refused.insert("db_owner".into());
+        ev.refused.insert("##MS_LoginManager##".into());
         let mut notes = Notes::default();
         evaluation_notes(&ev, &mut notes);
         let l: Vec<String> = notes.as_slice()[0]
@@ -1032,7 +1033,14 @@ mod tests {
             .iter()
             .map(|l| l.as_str())
             .collect();
-        assert!(l.contains(&"password_hash_probe".to_owned()), "{l:?}");
+        for want in [
+            "password_hash_probe",
+            "sysadmin",
+            "control_server",
+            "db_owner",
+        ] {
+            assert!(l.contains(&want.to_owned()), "{want}: {l:?}");
+        }
     }
 
     #[test]

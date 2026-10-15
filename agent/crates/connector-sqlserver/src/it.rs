@@ -415,6 +415,15 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
     let _g = serial().await;
     let mut s = sa().await;
     let name = "it_rls_deny";
+    // A run stopped half-way leaves its DENY to `public` behind.
+    exec_ok(
+        &mut s,
+        &in_db(
+            "retail",
+            "REVOKE VIEW DEFINITION ON SCHEMA::security TO public",
+        ),
+    )
+    .await;
     throwaway(
         &mut s,
         name,
@@ -467,14 +476,39 @@ async fn rls_opt_in_fails_closed_on_a_deny() {
         .await;
     }
     // Server scope (review M4): a DENY of VIEW ANY DEFINITION to the login.
-    exec(&mut s, &format!("DENY VIEW ANY DEFINITION TO [{name}]")).await;
+    // Through `sp_executesql` in a literal: the session's own run-time
+    // deny-list refuses a bare text naming DEFINITION, test or not.
+    exec(
+        &mut s,
+        &in_db("master", &format!("DENY VIEW ANY DEFINITION TO [{name}]")),
+    )
+    .await;
+    // The tier proof itself fails; with the definitions hidden, parts of
+    // the refusal list are unreadable too, which blocks Discovery anyway
+    // (review M3).
+    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+    let mut ts = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
+        .await
+        .unwrap();
+    let tier = crate::check::rls_tier(&mut ts, "retail", &t).await.unwrap();
+    assert!(
+        matches!(tier, crate::check::RlsTier::NotVerifiable(_)),
+        "server DENY: {tier:?}"
+    );
+    ts.close().await;
     let h = c.check(&t).await;
     assert!(
-        has(&h, NoteCode::CoverageRlsNotVerifiable),
+        has(&h, NoteCode::CoverageRlsNotVerifiable) || has(&h, NoteCode::PrivilegeNotEvaluated),
         "server DENY: {:?}",
         codes(&h)
     );
-    exec(&mut s, &format!("REVOKE VIEW ANY DEFINITION TO [{name}]")).await;
+    let scan = scan(&t).await;
+    assert!(scan.findings.is_empty(), "server DENY");
+    exec(
+        &mut s,
+        &in_db("master", &format!("REVOKE VIEW ANY DEFINITION TO [{name}]")),
+    )
+    .await;
     drop_login(&mut s, name).await;
     exec_ok(&mut s, &in_db("retail", "DROP ROLE it_rls_role")).await;
 }
@@ -773,4 +807,71 @@ async fn measure_credential_bearing_reads() {
     drop_login(&mut sa, "it_min").await;
     drop_login(&mut sa, "it_vd").await;
     let _ = Value::Null;
+}
+
+/// Security review C1: a table and a column named after the template
+/// placeholders, with brackets, quotes and comment openers, are sampled
+/// with a statement that differs from the template only by the quoted
+/// names.
+#[tokio::test]
+async fn hostile_names_stay_quoted() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = sa().await;
+    let table = "t{from}]x'--/*";
+    let column = "c{dbname}{select}]y'";
+    let qt = crate::sql::quote_ident(table).unwrap();
+    let qc = crate::sql::quote_ident(column).unwrap();
+    exec(
+        &mut s,
+        &in_db(
+            "retail",
+            &format!(
+                "IF OBJECT_ID(N'crm.{}') IS NOT NULL DROP TABLE crm.{qt}; CREATE TABLE crm.{qt} ({qc} nvarchar(100)); \
+                 INSERT INTO crm.{qt} VALUES (N'fake.one@example.com'), (N'fake.two@example.com')",
+                qt.replace('\'', "''")
+            ),
+        ),
+    )
+    .await;
+    let built = crate::sql::sample_statement(
+        "retail",
+        "crm",
+        table,
+        &[(column, crate::sql::Sampled::Text)],
+        10,
+        None,
+    )
+    .unwrap();
+    let benign = crate::sql::sample_statement(
+        "retail",
+        "crm",
+        "x",
+        &[("x", crate::sql::Sampled::Text)],
+        10,
+        None,
+    )
+    .unwrap();
+    assert_eq!(crate::sql::unquoted(&built), crate::sql::unquoted(&benign));
+    assert_eq!(
+        built,
+        benign
+            .replace("[x], 4000", &format!("{qc}, 4000"))
+            .replace("[crm].[x]", &format!("[crm].{qt}"))
+    );
+    // The agent samples it: the server parsed the text as one statement.
+    let t = agent("rls_visibility: view_definition");
+    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+    let mut agent_s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
+        .await
+        .unwrap();
+    let rows = agent_s
+        .rows(&built, Stage::Sample, Shape::rows(1, 10))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    agent_s.close().await;
+    exec(&mut s, &in_db("retail", &format!("DROP TABLE crm.{qt}"))).await;
 }

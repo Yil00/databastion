@@ -107,7 +107,10 @@ p.principal_id IN (SELECT id FROM roles) UNION SELECT N'db_owner' FROM me WHERE 
 OPTION (MAXRECURSION 64)";
 
 /// Securable-level grants in `{db}` to the user, its roles and `public`
-/// (decision 4, M3): permission, state, class, to `public`.
+/// (decision 4, M3): permission, state, class, to `public`. `public`'s
+/// rows are read at database and principal class only: its default
+/// object grants in `master` and `msdb` run to thousands and hold no
+/// right of the refusal list.
 pub(crate) const DATABASE_GRANTS: &str = "WITH me AS (SELECT principal_id FROM \
 {db}.sys.database_principals WHERE sid = SUSER_SID()), roles (id, depth) AS (SELECT \
 rm.role_principal_id, 1 FROM {db}.sys.database_role_members rm JOIN me ON \
@@ -115,9 +118,9 @@ rm.member_principal_id = me.principal_id UNION ALL SELECT rm.role_principal_id, 
 {db}.sys.database_role_members rm JOIN roles r ON rm.member_principal_id = r.id WHERE r.depth < 64) \
 SELECT TOP (1025) CONVERT(nvarchar(128), p.permission_name), CONVERT(nvarchar(1), p.state), \
 CONVERT(int, p.class), CONVERT(int, CASE WHEN p.grantee_principal_id = 0 THEN 1 ELSE 0 END) \
-FROM {db}.sys.database_permissions p WHERE p.state IN ('G', 'W') AND (p.grantee_principal_id = 0 \
-OR p.grantee_principal_id IN (SELECT principal_id FROM me) OR p.grantee_principal_id IN \
-(SELECT id FROM roles)) OPTION (MAXRECURSION 64)";
+FROM {db}.sys.database_permissions p WHERE p.state IN ('G', 'W') AND ((p.grantee_principal_id = 0 \
+AND p.class IN (0, 4)) OR p.grantee_principal_id IN (SELECT principal_id FROM me) OR \
+p.grantee_principal_id IN (SELECT id FROM roles)) OPTION (MAXRECURSION 64)";
 
 /// RLS tier (ii), first proof: database `VIEW DEFINITION` effective.
 pub(crate) const RLS_VIEW_DEFINITION: &str =
