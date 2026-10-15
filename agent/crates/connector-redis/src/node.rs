@@ -73,7 +73,7 @@ pub(crate) enum Refusal {
 }
 
 /// Opens an authenticated session to a node and identifies it.
-pub(crate) async fn open(
+async fn open_plain(
     target: &TargetConfig,
     which: Which,
     timeout: Duration,
@@ -91,6 +91,47 @@ pub(crate) async fn open(
     let info = identify(&mut session, timeout).await?;
     session.register_own(&target.id, info.run);
     Ok((session, info))
+}
+
+/// Opens a session to a declared node; on the target's node, it records
+/// the address the server reports for it before any other command
+/// ([`Session::learn_own_address`], the Audit stream reads that node's
+/// logs only). Best effort (review L3): when that fails, the session is
+/// replaced by a new one, which does not ask again (the failure is
+/// recorded for the server run).
+pub(crate) async fn open(
+    target: &TargetConfig,
+    which: Which,
+    timeout: Duration,
+) -> Result<(Session, NodeInfo), RdError> {
+    let (mut session, info) = open_plain(target, which, timeout).await?;
+    if node_of(target, which) == Which::Target
+        && session
+            .learn_own_address(&target.id, &target.account, timeout)
+            .await
+            .is_err()
+    {
+        session.close().await;
+        return open_plain(target, which, timeout).await;
+    }
+    Ok((session, info))
+}
+
+/// After an evaluation of the account on the node `which` (mapped by
+/// [`node_of`]): on the target's node, records whether `ACL DRYRUN` allows
+/// `CLIENT LIST` there (a refusal of a real call still wins, review L2).
+/// Whether the evaluated session should then record its own address.
+fn note_evaluation(target: &TargetConfig, which: Which, report: &Report) -> bool {
+    if which != Which::Target {
+        return false;
+    }
+    use crate::audit::own::{ClientList, note_client_list};
+    match report.audit.client_list {
+        Some(true) => note_client_list(&target.id, None, &target.account, ClientList::Granted),
+        Some(false) => note_client_list(&target.id, None, &target.account, ClientList::Denied),
+        None => {}
+    }
+    true
 }
 
 /// The TLS configuration of a target (`None`: `disable`).
@@ -471,6 +512,18 @@ impl Reports {
         }
         let r = evaluate(session, target, server, timeout).await?;
         self.store(&target.id, which, r.clone(), server);
+        // Best effort (review L3): a failed `CLIENT LIST ID` replaces the
+        // session, whose stream may be out of step.
+        if note_evaluation(target, which, &r)
+            && session
+                .learn_own_address(&target.id, &target.account, timeout)
+                .await
+                .is_err()
+        {
+            let (fresh, _) = open_plain(target, Which::Target, timeout).await?;
+            let old = std::mem::replace(session, fresh);
+            old.close().await;
+        }
         Ok(r)
     }
 
@@ -486,6 +539,14 @@ impl Reports {
         }
         let (mut s, info) = open(target, Which::Target, timeout).await?;
         let r = evaluate(&mut s, target, info.server, timeout).await;
+        if let Ok(r) = &r
+            && note_evaluation(target, Which::Target, r)
+        {
+            // Best effort: the session is closed whatever the outcome.
+            let _ = s
+                .learn_own_address(&target.id, &target.account, timeout)
+                .await;
+        }
         s.close().await;
         let r = r?;
         self.store(&target.id, Which::Target, r.clone(), info.server);
@@ -562,5 +623,70 @@ mod tests {
         // A node not evaluated leaves the merge not evaluated.
         assert_eq!(target.worst(&Report::default()).eval, None);
         assert!(!target.worst(&Report::default()).dryrun_granted);
+    }
+
+    /// Review M1(b), L4(a): an evaluation of the Discovery node (another
+    /// server, its own ACLs) says nothing about `CLIENT LIST` on the
+    /// target's node, and its sessions never ask for their own line; one
+    /// of the target's node does.
+    #[test]
+    fn only_the_target_nodes_evaluation_sets_the_grant() {
+        let parse = |id: &str, extra: &str| {
+            databastion_core::AgentConfig::parse(&format!(
+                "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: {id}, \
+                 engine: valkey, host: 127.0.0.1, account: databastion, secret: {{env: X}}, \
+                 redis: {{tls: disable{extra}}}}}]}}"
+            ))
+            .unwrap()
+            .targets[0]
+                .clone()
+        };
+        let mut granted = Report::default();
+        granted.audit.client_list = Some(true);
+        let run = Some(1);
+        let _stream_a = crate::audit::own::audit_started("eval-replica-t");
+        let _stream_b = crate::audit::own::audit_started("eval-target-t");
+        // A declared Discovery node: its evaluation is not the target's.
+        let replica = parse("eval-replica-t", ", discovery_node: {host: 127.0.0.2}");
+        let which = node_of(&replica, Which::Discovery);
+        assert_eq!(which, Which::Discovery);
+        assert!(!note_evaluation(&replica, which, &granted));
+        assert!(!crate::audit::own::learns_addresses(
+            "eval-replica-t",
+            run,
+            "databastion"
+        ));
+        let which = node_of(&replica, Which::Target);
+        assert!(note_evaluation(&replica, which, &granted));
+        assert!(crate::audit::own::learns_addresses(
+            "eval-replica-t",
+            run,
+            "databastion"
+        ));
+        // Without a Discovery node, Discovery reads the target's node.
+        let single = parse("eval-target-t", "");
+        let which = node_of(&single, Which::Discovery);
+        assert_eq!(which, Which::Target);
+        assert!(note_evaluation(&single, which, &granted));
+        assert!(crate::audit::own::learns_addresses(
+            "eval-target-t",
+            run,
+            "databastion"
+        ));
+        // Not evaluated (Redis 6.2): the grant stays as it was.
+        assert!(note_evaluation(&single, which, &Report::default()));
+        assert!(crate::audit::own::learns_addresses(
+            "eval-target-t",
+            run,
+            "databastion"
+        ));
+        let mut denied = Report::default();
+        denied.audit.client_list = Some(false);
+        assert!(note_evaluation(&single, which, &denied));
+        assert!(!crate::audit::own::learns_addresses(
+            "eval-target-t",
+            run,
+            "databastion"
+        ));
     }
 }

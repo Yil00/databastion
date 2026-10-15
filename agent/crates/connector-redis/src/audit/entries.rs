@@ -269,6 +269,17 @@ fn own_shape(args: &[Option<&[u8]>]) -> OwnShape {
     if eq(name, b"client") && n == 2 && eq(a(1), b"list") {
         return unkeyed(Cmd::ClientList);
     }
+    // A session's own line, at connect time (`own`).
+    if eq(name, b"client")
+        && n == 4
+        && eq(a(1), b"list")
+        && eq(a(2), b"id")
+        && a(3)
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .is_some_and(|v| v.parse::<i64>().is_ok())
+    {
+        return unkeyed(Cmd::ClientListId(0));
+    }
     let small = (eq(name, b"select") && n == 2)
         || (eq(name, b"acl") && eq(a(1), b"dryrun"))
         || (eq(name, b"client") && n == 3 && eq(a(1), b"no-touch") && eq(a(2), b"on"))
@@ -512,6 +523,17 @@ pub(crate) fn parse_client_list(v: &Value) -> Vec<Client> {
         .take(MAX_CLIENTS)
         .map(parse_client)
         .collect()
+}
+
+/// The TCP address the server reports for the connection `id`, from its
+/// `CLIENT LIST ID <id>` reply (a Unix-socket peer has none: socket peers
+/// are never attributed).
+pub(crate) fn own_address(v: &Value, id: i64) -> Option<SocketAddr> {
+    parse_client_list(v)
+        .into_iter()
+        .find(|c| c.id == Some(id))
+        .and_then(|c| c.peer)
+        .and_then(Peer::socket)
 }
 
 /// Why an `ACL LOG` entry was written.
@@ -777,6 +799,13 @@ mod tests {
         );
         assert!(unkeyed(&[b"SCAN", b"7", b"COUNT", b"500"]));
         assert!(unkeyed(&[b"SLOWLOG", b"GET", b"512"]));
+        // A session's own line, asked at connect time.
+        assert!(unkeyed(&[b"CLIENT", b"LIST", b"ID", b"1234"]));
+        assert_eq!(
+            entry(&[b"CLIENT", b"LIST", b"ID", b"1234", b"1235"]).own,
+            OwnShape::No
+        );
+        assert_eq!(entry(&[b"CLIENT", b"LIST", b"ID", b"x"]).own, OwnShape::No);
         assert_eq!(entry(&[b"HGETALL", b"k"]).own, OwnShape::No);
         assert_eq!(entry(&[b"GET", b"k"]).own, OwnShape::No);
     }
@@ -825,6 +854,20 @@ mod tests {
         assert_eq!(c.user.as_deref().map(String::as_str), Some("alice"));
         assert_eq!(c.app.as_deref(), Some("my"));
         assert_eq!(application(b"a\x07b<x>").as_deref(), Some("a_b_x_"));
+        // A session's own `CLIENT LIST ID` line: its server-side address,
+        // only for its own id and a TCP peer.
+        let bulk = |line: &str| decode(format!("${}\r\n{line}\r\n", line.len()).as_bytes());
+        let v = bulk(
+            "id=7 addr=172.18.0.1:40112 laddr=172.18.0.2:6379 fd=9 name=databastion-agent age=0 db=0 user=databastion\n",
+        );
+        assert_eq!(
+            own_address(&v, 7),
+            Some("172.18.0.1:40112".parse().unwrap())
+        );
+        assert_eq!(own_address(&v, 8), None);
+        let sock = bulk("id=7 addr=/run/valkey.sock:0 user=databastion\n");
+        assert_eq!(own_address(&sock, 7), None);
+        assert_eq!(own_address(&Value::Null, 7), None);
     }
 
     #[test]

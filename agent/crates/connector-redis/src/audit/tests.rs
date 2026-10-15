@@ -323,7 +323,7 @@ fn attribution_and_own_entries() {
     let db = NormalizedName::wildcard();
     // The agent's own session (id 1) and a local user (id 2), both on the
     // socket.
-    let _own = own::register("own-t", 1, None, Some(99));
+    let _own = own::register("own-t", 1, None, Some(99), SystemTime::now());
     let socket = clients_of(
         "id=1 addr=/run/valkey.sock:0 age=100 user=databastion\nid=2 addr=/run/valkey.sock:0 age=100 user=alice",
     );
@@ -342,7 +342,7 @@ fn attribution_and_own_entries() {
     );
 
     // TCP: the agent's own connection (id 1), its own shape: left out.
-    let _own3 = own::register("own-t", 3, None, Some(99));
+    let _own3 = own::register("own-t", 3, None, Some(99), SystemTime::now());
     let tcp = clients_of(
         "id=3 addr=10.0.0.1:4000 age=100 user=databastion\nid=4 addr=10.0.0.2:5000 age=100 user=alice",
     );
@@ -383,4 +383,223 @@ fn attribution_and_own_entries() {
         .log_event(&big, EventSource::RedisCommandlog, &db, &tcp, now, 0)
         .expect("a reply above the agent's bound is reported");
     assert_eq!(ev.bytes(), Some(1 << 30));
+}
+
+/// The engine-matrix flake of `audit_reports_slow_reads_and_never_the_agents_own`
+/// (ADR-0052 decision 8, #237 review H3): a session of the agent behind NAT
+/// (the server reports another address than its local one) runs commands
+/// and closes before the stream's next `CLIENT LIST`. Its slow-log entries
+/// carry no connection id, only that address, and `CLIENT LIST` no longer
+/// lists it: unless the session recorded its reported address at connect
+/// time (`CLIENT LIST ID`), they came out as another client's, with the
+/// agent's client name.
+#[test]
+fn an_own_session_closed_before_the_next_poll_stays_the_agents() {
+    let (cfg, target, state) = stream_parts();
+    let run = Some(77);
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new(
+            "databastion",
+            None,
+            None,
+            1000,
+            state.audit.own_usage("own-t"),
+        ),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run,
+    };
+    let db = NormalizedName::wildcard();
+    let now_s = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let opened = SystemTime::now() - Duration::from_secs(20);
+    let named = |id: i64, ts: i64, peer: &str| {
+        let mut e = entry(id, ts, &[b"SCAN", b"0", b"COUNT", b"500"], peer);
+        e.app = entries::application(b"databastion-agent");
+        e
+    };
+    // The poll's `CLIENT LIST`: both sessions are gone, another client is
+    // connected.
+    let clients = clients_of("id=90 addr=10.0.0.2:5000 age=100 user=alice");
+
+    // A session that did not record its address (`+client|list` not
+    // known to be granted) and that no `CLIENT LIST` saw open.
+    let unseen = own::register(
+        "own-t",
+        22,
+        Some("127.0.0.1:50501".parse().unwrap()),
+        run,
+        opened,
+    );
+    drop(unseen);
+    let ev = st
+        .log_event(
+            &named(1, now_s - 5, "172.18.0.1:40113"),
+            EventSource::RedisSlowlog,
+            &db,
+            &clients,
+            now_s,
+            0,
+        )
+        .expect("an address the agent never recorded is not the agent's");
+    assert_eq!(
+        principal(&ev),
+        (
+            String::new(),
+            true,
+            Some(ClientAddr::Ip("172.18.0.1".parse().unwrap()))
+        )
+    );
+
+    // The fix: the session records the address the server reports for it
+    // (its own `CLIENT LIST ID` line) before its first command, then
+    // closes before the poll.
+    let own_line = "id=21 addr=172.18.0.1:40112 laddr=172.18.0.2:6379 fd=9 name=databastion-agent age=0 db=0 user=databastion\n";
+    let reply = decode(format!("${}\r\n{own_line}\r\n", own_line.len()).as_bytes());
+    let session = own::register(
+        "own-t",
+        21,
+        Some("127.0.0.1:50500".parse().unwrap()),
+        run,
+        opened,
+    );
+    let addr = entries::own_address(&reply, 21).expect("its own line");
+    own::seen("own-t", 21, run, addr);
+    drop(session);
+    // Its entries, polled after it closed: the agent's routine, left out.
+    for (id, ts) in [(2, now_s - 19), (3, now_s - 1), (4, now_s)] {
+        assert!(
+            st.log_event(
+                &named(id, ts, "172.18.0.1:40112"),
+                EventSource::RedisSlowlog,
+                &db,
+                &clients,
+                now_s,
+                0,
+            )
+            .is_none(),
+            "entry {id}"
+        );
+    }
+    // The same address before the session opened, or long after it closed
+    // (a port reused by another client), is not the agent's, whatever its
+    // client name.
+    for ts in [now_s - 60, now_s + 60] {
+        assert!(
+            st.log_event(
+                &named(5, ts, "172.18.0.1:40112"),
+                EventSource::RedisSlowlog,
+                &db,
+                &clients,
+                now_s,
+                0,
+            )
+            .is_some()
+        );
+    }
+    // Another server run: the recorded address means nothing.
+    st.run = Some(78);
+    assert!(
+        st.log_event(
+            &named(6, now_s - 1, "172.18.0.1:40112"),
+            EventSource::RedisSlowlog,
+            &db,
+            &clients,
+            now_s,
+            0,
+        )
+        .is_some()
+    );
+}
+
+/// The registry keeps the agent's open connections (the Audit stream's,
+/// held for days) when it is full of closed ones.
+#[test]
+fn a_full_registry_forgets_closed_connections_first() {
+    let t = "own-full-t";
+    let run = Some(5);
+    let held = own::register(t, 1, None, run, SystemTime::now());
+    for id in 2..3000 {
+        drop(own::register(t, id, None, run, SystemTime::now()));
+    }
+    assert!(own::is_own_open_id(t, 1, run));
+    drop(held);
+}
+
+/// Review L4(c), L4(d): an own session's address counts from its connect
+/// to 2 s after its close (entry times have a one-second granularity), not
+/// before nor later: an entry 3 s after the close, or 3 s before the
+/// connect, is reported (another client on the same address, or a reused
+/// port).
+#[test]
+fn an_own_address_counts_within_the_sessions_lifetime_only() {
+    let (cfg, target, state) = stream_parts();
+    let run = Some(55);
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new(
+            "databastion",
+            None,
+            None,
+            1000,
+            state.audit.own_usage("own-t"),
+        ),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run,
+    };
+    let db = NormalizedName::wildcard();
+    let secs = |t: SystemTime| {
+        i64::try_from(t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()).unwrap()
+    };
+    // Connected 30 s ago, closed now.
+    let connected = SystemTime::now() - Duration::from_secs(30);
+    let r = own::register("own-t", 41, None, run, connected);
+    own::seen("own-t", 41, run, "172.18.0.1:40141".parse().unwrap());
+    let before_close = SystemTime::now();
+    drop(r);
+    let after_close = SystemTime::now();
+    let mut ev = |ts: i64| {
+        st.log_event(
+            &entry(
+                1,
+                ts,
+                &[b"SCAN", b"0", b"COUNT", b"500"],
+                "172.18.0.1:40141",
+            ),
+            EventSource::RedisSlowlog,
+            &db,
+            &[],
+            secs(after_close),
+            0,
+        )
+    };
+    // Close + 2 s (the entry's second is at or before the close's): own.
+    assert!(ev(secs(before_close) + 2).is_none());
+    // Close + 3 s (rounded up): reported.
+    let late = ev(secs(after_close) + 4).expect("after the close's margin");
+    assert!(principal(&late).1);
+    assert!(ev(secs(after_close) + 3).is_some());
+    // During the session: own.
+    assert!(ev(secs(connected) + 1).is_none());
+    // 3 s before the connect: reported.
+    assert!(ev(secs(connected) - 3).is_some());
 }
