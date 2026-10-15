@@ -1183,6 +1183,17 @@ impl LearnedPatterns {
     }
 }
 
+/// The tokens of a key pattern or name (split on the segment and token
+/// separators; `*` is a token): the oracle of the fuzz targets and tests
+/// that an Audit object holds learned literals only.
+#[doc(hidden)]
+#[must_use]
+pub fn pattern_tokens(s: &str) -> Vec<&str> {
+    s.split(|c: char| is_segment_sep(c) || is_token_sep(c))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// Fuzz entry point: a learned set from `patterns` (one per line of the
 /// first half of `data`), then the object of a key (the second half);
 /// the result must always pass the contract gate.
@@ -1194,7 +1205,20 @@ pub fn fuzz_learned(data: &[u8]) -> String {
     let text = String::from_utf8_lossy(pats);
     let learned = LearnedPatterns::new(text.lines());
     let cut = key.first().is_some_and(|b| b & 1 == 1);
-    learned.object(key, cut).as_str().to_owned()
+    let out = learned.object(key, cut).as_str().to_owned();
+    // The oracle: learned literals only (H1).
+    let tokens: HashSet<&str> = learned
+        .patterns()
+        .iter()
+        .flat_map(|p| pattern_tokens(p))
+        .collect();
+    for t in pattern_tokens(&out) {
+        assert!(
+            t == "*" || tokens.contains(t),
+            "{t:?} not learned in {out:?}"
+        );
+    }
+    out
 }
 
 /// Fuzz entry point: the per-key rules then a walk of one key; the
@@ -1528,16 +1552,24 @@ mod tests {
         /// made of learned literals only.
         #[test]
         fn audit_objects_hold_learned_literals_only(
-            key in "[a-z0-9:_.@-]{0,40}",
+            // Every separator, digits, `@`, and non-ASCII letters, some of
+            // which NFKC folds into learned literals (review L8).
+            key in "[a-zA-Z0-9:_.@/|{}#ｕｓｅｒéÅ-]{0,40}",
             cut in proptest::bool::ANY,
         ) {
-            let l = learned(&["user:*:email", "session:*", "cache:page:about", "a_b_*"]);
+            let l = learned(&[
+                "user:*:email", "session:*", "cache:page:about", "a_b_*", "user:{*}:x",
+                "q|r#*", "p/*",
+            ]);
             let o = l.object(key.as_bytes(), cut);
             let o = o.as_str();
             proptest::prop_assert!(o == "*" || is_key_pattern(o));
-            let allowed = ["user", "email", "session", "cache", "page", "about", "a", "b", "*"];
-            for tok in o.split(|c: char| is_segment_sep(c) || is_token_sep(c)) {
-                proptest::prop_assert!(tok.is_empty() || allowed.contains(&tok), "{} in {}", tok, o);
+            let allowed = [
+                "user", "email", "session", "cache", "page", "about", "a", "b", "x", "q", "r",
+                "p", "*",
+            ];
+            for tok in pattern_tokens(o) {
+                proptest::prop_assert!(allowed.contains(&tok), "{} in {}", tok, o);
             }
         }
     }

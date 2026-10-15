@@ -99,13 +99,15 @@ impl Session {
     }
 
     /// Registers this connection as one of the agent's own for `target_id`
-    /// (its connection id from `HELLO` and its local address).
-    pub(crate) fn register_own(&mut self, target_id: &str) {
+    /// (its connection id from `HELLO`, its local address and the server
+    /// run).
+    pub(crate) fn register_own(&mut self, target_id: &str, run: Option<u64>) {
         if let Some(id) = self.hello.id {
             self.own = Some(crate::audit::own::register(
                 target_id,
                 id,
                 self.io.local_addr(),
+                run,
             ));
         }
     }

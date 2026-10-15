@@ -402,7 +402,11 @@ const SUBCOMMANDS: &[(&str, &str, Spec)] = &[
 
 /// The default of a container command's other subcommands. `CLIENT` with
 /// another subcommand (`SETNAME`, `NO-TOUCH`, `ID`, `TRACKING`…) carries no
-/// data; every other unlisted subcommand fails closed.
+/// data and gives no event; that includes `CLIENT TRACKING ON BCAST
+/// PREFIX …`, whose invalidation messages name keys of the prefixes as
+/// they change (a documented gap, review L5: the prefixes are client
+/// input, never read, and the keys travel as pushes, not as replies the
+/// logs record). Every other unlisted subcommand fails closed.
 const DEFAULTS: &[(&str, Spec)] = &[
     ("object", s(Read, NONE)),
     ("memory", s(Read, NONE)),
@@ -419,6 +423,31 @@ const DEFAULTS: &[(&str, Spec)] = &[
     ("cluster", s(Ddl, NONE)),
     ("latency", s(Ddl, NONE)),
 ];
+
+/// Every row of the table whose key positions are read: (command,
+/// subcommand), for the per-version check against the server's own
+/// `COMMAND GETKEYS` (`crate::it`, review M4). The container defaults are
+/// listed with the subcommands they serve.
+#[cfg(test)]
+pub(crate) fn keyed_rows() -> Vec<(&'static str, Option<&'static str>)> {
+    let mut out: Vec<(&'static str, Option<&'static str>)> = COMMANDS
+        .iter()
+        .filter(|(_, s)| s.keys != Keys::None)
+        .map(|(n, _)| (*n, None))
+        .collect();
+    out.extend(
+        SUBCOMMANDS
+            .iter()
+            .filter(|(_, _, s)| s.keys != Keys::None)
+            .map(|(n, sub, _)| (*n, Some(*sub))),
+    );
+    for (n, d) in DEFAULTS {
+        if d.keys != Keys::None {
+            out.push((n, Some("*")));
+        }
+    }
+    out
+}
 
 /// An unknown command: a read of `*`, never dropped (fail closed).
 pub(crate) const UNKNOWN: Spec = s(Read, NONE);

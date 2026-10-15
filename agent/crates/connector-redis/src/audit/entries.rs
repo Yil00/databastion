@@ -52,10 +52,11 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
-    /// `ip:port`, `[ipv6]:port`, or a Unix socket path (`/…:0`).
+    /// `ip:port`, `[ipv6]:port`, or a Unix socket path: `/…:0` in `CLIENT
+    /// LIST`, `[/…:0]:0` in the slow log (measured on Valkey 9.0.6).
     pub(crate) fn parse(raw: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(raw).ok()?;
-        if text.starts_with('/') {
+        if text.starts_with('/') || text.starts_with("[/") {
             return Some(Self {
                 addr: ClientAddr::Local,
                 port: 0,
@@ -102,17 +103,37 @@ pub(crate) fn application(raw: &[u8]) -> Option<String> {
 }
 
 /// Whether one of the agent's own command shapes (decision 6): the exact
-/// commands and constant arguments the connector sends.
+/// commands and constant arguments the connector sends, with the largest
+/// reply the agent's client accepts for it (`max_reply`, bytes: a
+/// `large-reply` entry above it is not the agent's routine; review L1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnShape {
     No,
     /// A command without a key (a walk's `SCAN`, `INFO`, the Audit reads,
     /// the handshake): left out without a budget when it is the agent's.
-    Unkeyed,
+    Unkeyed {
+        max_reply: u64,
+    },
     /// A sampling command, reading at most `rows` members.
     Keyed {
         rows: u64,
+        max_reply: u64,
     },
+}
+
+impl OwnShape {
+    /// The largest reply of the shape (`0` for [`Self::No`]).
+    pub(crate) fn max_reply(self) -> u64 {
+        match self {
+            Self::No => 0,
+            Self::Unkeyed { max_reply } | Self::Keyed { max_reply, .. } => max_reply,
+        }
+    }
+}
+
+/// The reply bound of a command the connector sends (`Cmd::limits`).
+fn bound(cmd: &crate::cmd::Cmd<'_>) -> u64 {
+    cmd.limits().reply as u64
 }
 
 /// What a slow-log or command-log entry is reduced to.
@@ -175,33 +196,43 @@ fn num(a: Option<&[u8]>, n: impl ToString) -> bool {
     a == Some(n.to_string().as_bytes())
 }
 
-/// The own shape of `args` (decision 6; constants from `cmd`).
+/// The own shape of `args` (decision 6; constants and reply bounds from
+/// `cmd`).
 fn own_shape(args: &[Option<&[u8]>]) -> OwnShape {
+    use crate::cmd::{Cmd, CommandLog, InfoSection};
+    const K: &[u8] = b"k";
     let a = |i: usize| args.get(i).copied().flatten();
     let n = args.len();
     let name = a(0);
-    let keyed = |rows: u64| OwnShape::Keyed { rows };
+    let keyed = |rows: u64, cmd: Cmd<'_>| OwnShape::Keyed {
+        rows,
+        max_reply: bound(&cmd),
+    };
     if eq(name, b"type") && n == 2 {
-        return keyed(0);
+        return keyed(0, Cmd::Type(K));
     }
     if eq(name, b"getrange") && n == 4 && num(a(2), 0) && num(a(3), VALUE_BYTES - 1) {
-        return keyed(1);
-    }
-    if eq(name, b"hrandfield") && n == 3 && num(a(2), HASH_FIELDS_ASKED) {
-        return keyed(0);
-    }
-    if eq(name, b"hstrlen") && n == 3 {
-        return keyed(0);
-    }
-    if eq(name, b"hmget") && (3..=3 + MEMBERS_PER_KEY as usize).contains(&n) {
-        return keyed(n as u64 - 2);
+        return keyed(1, Cmd::GetRange(K));
     }
     let m = u64::from(MEMBERS_PER_KEY);
-    if (eq(name, b"srandmember") || eq(name, b"zrandmember")) && n == 3 && num(a(2), m) {
-        return keyed(m);
+    // Field names, of which 16 are read (review L1: charged 16 rows).
+    if eq(name, b"hrandfield") && n == 3 && num(a(2), HASH_FIELDS_ASKED) {
+        return keyed(m, Cmd::HRandField(K));
+    }
+    if eq(name, b"hstrlen") && n == 3 {
+        return keyed(0, Cmd::HStrLen(K, K));
+    }
+    if eq(name, b"hmget") && (3..=2 + MEMBERS_PER_KEY as usize).contains(&n) {
+        return keyed(n as u64 - 2, Cmd::HMGet(K, &[]));
+    }
+    if eq(name, b"srandmember") && n == 3 && num(a(2), m) {
+        return keyed(m, Cmd::SRandMember(K));
+    }
+    if eq(name, b"zrandmember") && n == 3 && num(a(2), m) {
+        return keyed(m, Cmd::ZRandMember(K));
     }
     if eq(name, b"lrange") && n == 4 && num(a(2), 0) && num(a(3), m - 1) {
-        return keyed(m);
+        return keyed(m, Cmd::LRange(K));
     }
     if eq(name, b"xrevrange")
         && n == 6
@@ -210,20 +241,36 @@ fn own_shape(args: &[Option<&[u8]>]) -> OwnShape {
         && eq(a(4), b"count")
         && num(a(5), m)
     {
-        return keyed(m);
+        return keyed(m, Cmd::XRevRange(K));
     }
-    let unkeyed = (eq(name, b"scan") && n == 4 && eq(a(2), b"count") && num(a(3), SCAN_COUNT))
-        || (eq(name, b"select") && n == 2)
-        || (eq(name, b"info") && n == 2)
-        || (eq(name, b"slowlog") && n == 3 && eq(a(1), b"get") && num(a(2), LOG_ENTRIES))
-        || (eq(name, b"commandlog")
-            && n == 4
-            && eq(a(1), b"get")
-            && num(a(2), LOG_ENTRIES)
-            && (eq(a(3), b"slow") || eq(a(3), b"large-reply")))
-        || (eq(name, b"acl") && n == 3 && eq(a(1), b"log") && num(a(2), ACL_LOG_ENTRIES))
+    let unkeyed = |cmd: Cmd<'_>| OwnShape::Unkeyed {
+        max_reply: bound(&cmd),
+    };
+    if eq(name, b"scan") && n == 4 && eq(a(2), b"count") && num(a(3), SCAN_COUNT) {
+        return unkeyed(Cmd::Scan { cursor: 0 });
+    }
+    if eq(name, b"info") && n == 2 {
+        return unkeyed(Cmd::Info(InfoSection::Server));
+    }
+    if eq(name, b"slowlog") && n == 3 && eq(a(1), b"get") && num(a(2), LOG_ENTRIES) {
+        return unkeyed(Cmd::SlowlogGet);
+    }
+    if eq(name, b"commandlog")
+        && n == 4
+        && eq(a(1), b"get")
+        && num(a(2), LOG_ENTRIES)
+        && (eq(a(3), b"slow") || eq(a(3), b"large-reply"))
+    {
+        return unkeyed(Cmd::CommandlogGet(CommandLog::Slow));
+    }
+    if eq(name, b"acl") && n == 3 && eq(a(1), b"log") && num(a(2), ACL_LOG_ENTRIES) {
+        return unkeyed(Cmd::AclLog);
+    }
+    if eq(name, b"client") && n == 2 && eq(a(1), b"list") {
+        return unkeyed(Cmd::ClientList);
+    }
+    let small = (eq(name, b"select") && n == 2)
         || (eq(name, b"acl") && eq(a(1), b"dryrun"))
-        || (eq(name, b"client") && n == 2 && eq(a(1), b"list"))
         || (eq(name, b"client") && n == 3 && eq(a(1), b"no-touch") && eq(a(2), b"on"))
         || (eq(name, b"readonly") && n == 1)
         || (eq(name, b"auth") && n == 3)
@@ -233,8 +280,8 @@ fn own_shape(args: &[Option<&[u8]>]) -> OwnShape {
                     && num(a(1), 3)
                     && eq(a(2), b"setname")
                     && a(3) == Some(CLIENT_NAME.as_bytes()))));
-    if unkeyed {
-        OwnShape::Unkeyed
+    if small {
+        unkeyed(Cmd::Hello)
     } else {
         OwnShape::No
     }
@@ -287,6 +334,10 @@ fn reduce(
         Some(last) if args.len() > 1 && is_more_arguments(last) => args.len() - 1,
         _ => args.len(),
     };
+    // The list as logged, the server's marker included: a cut list fits
+    // no range of keys (review M4).
+    let logged: Vec<&[u8]> = args.iter().map(|a| a.unwrap_or(b"")).collect();
+    let cut = complete < args.len();
     let args = args.get(..complete).unwrap_or_default();
     let Some(name) = args.first().copied().flatten() else {
         // An oversized command name: unknown, a read of `*`.
@@ -297,11 +348,33 @@ fn reduce(
             OwnShape::No,
         );
     };
-    let (spec, _) = commands::lookup(name, args.get(1).copied().flatten());
+    // The agent never sends a list long enough to be cut.
+    let own = if cut { OwnShape::No } else { own_shape(args) };
+    let (mut spec, _) = commands::lookup(name, args.get(1).copied().flatten());
+    // `ACL LOG RESET` clears the log Audit reads (review L5).
+    if eq(Some(name), b"acl")
+        && eq(args.get(1).copied().flatten(), b"log")
+        && eq(args.get(2).copied().flatten(), b"reset")
+    {
+        spec.action = Action::Ddl;
+    }
     if spec.action == Action::Ignore {
-        return (Action::Ignore, Vec::new(), Vec::new(), own_shape(args));
+        return (Action::Ignore, Vec::new(), Vec::new(), own);
     }
     let mut signals = Vec::new();
+    // `SORT … BY / GET <pattern>` reads keys the patterns name (never
+    // read here: `*`); `STORE` writes (review L5).
+    let mut sort_patterns = false;
+    if eq(Some(name), b"sort") || eq(Some(name), b"sort_ro") {
+        for a in args.iter().skip(2) {
+            if eq(*a, b"by") || eq(*a, b"get") {
+                sort_patterns = true;
+            }
+            if eq(*a, b"store") {
+                spec.action = Action::Write;
+            }
+        }
+    }
     if eq(Some(name), b"keys") {
         signals.push(Signal::KeyspaceEnumeration);
     }
@@ -328,13 +401,17 @@ fn reduce(
     } else {
         // The positions are computed on the arguments as logged; an
         // oversized argument counts as present (its key becomes `*`).
-        let shapes: Vec<&[u8]> = args.iter().map(|a| a.unwrap_or(b"")).collect();
-        match commands::key_indices(spec.keys, &shapes, shapes.len()) {
+        let mut objects = match commands::key_indices(spec.keys, &logged, complete) {
             Some(idx) => objects_of(args, &idx, ctx, &mut signals),
             None => vec![NormalizedName::wildcard()],
+        };
+        let star = NormalizedName::wildcard();
+        if sort_patterns && !objects.contains(&star) && objects.len() < MAX_OBJECTS {
+            objects.push(star);
         }
+        objects
     };
-    (spec.action, objects, signals, own_shape(args))
+    (spec.action, objects, signals, own)
 }
 
 /// Parses one `SLOWLOG GET` / `COMMANDLOG GET` entry: `[id, timestamp,
@@ -680,34 +757,47 @@ mod tests {
 
     #[test]
     fn the_agents_own_command_shapes() {
-        assert_eq!(
+        let rows = |args: &[&[u8]]| match entry(args).own {
+            OwnShape::Keyed { rows, .. } => Some(rows),
+            _ => None,
+        };
+        let unkeyed = |args: &[&[u8]]| matches!(entry(args).own, OwnShape::Unkeyed { .. });
+        assert!(matches!(
             entry(&[b"GETRANGE", b"k", b"0", b"4095"]).own,
-            OwnShape::Keyed { rows: 1 }
-        );
+            OwnShape::Keyed { rows: 1, max_reply } if max_reply == 4096 + 64
+        ));
         assert_eq!(entry(&[b"GETRANGE", b"k", b"0", b"-1"]).own, OwnShape::No);
+        assert_eq!(rows(&[b"LRANGE", b"k", b"0", b"15"]), Some(16));
+        // Review L1: 16 field names are read.
+        assert_eq!(rows(&[b"HRANDFIELD", b"k", b"17"]), Some(16));
+        assert_eq!(rows(&[b"HMGET", b"k", b"a", b"b"]), Some(2));
         assert_eq!(
-            entry(&[b"LRANGE", b"k", b"0", b"15"]).own,
-            OwnShape::Keyed { rows: 16 }
+            rows(&[b"XREVRANGE", b"k", b"+", b"-", b"COUNT", b"16"]),
+            Some(16)
         );
-        assert_eq!(
-            entry(&[b"HRANDFIELD", b"k", b"17"]).own,
-            OwnShape::Keyed { rows: 0 }
-        );
-        assert_eq!(
-            entry(&[b"HMGET", b"k", b"a", b"b"]).own,
-            OwnShape::Keyed { rows: 2 }
-        );
-        assert_eq!(
-            entry(&[b"XREVRANGE", b"k", b"+", b"-", b"COUNT", b"16"]).own,
-            OwnShape::Keyed { rows: 16 }
-        );
-        assert_eq!(
-            entry(&[b"SCAN", b"7", b"COUNT", b"500"]).own,
-            OwnShape::Unkeyed
-        );
-        assert_eq!(entry(&[b"SLOWLOG", b"GET", b"512"]).own, OwnShape::Unkeyed);
+        assert!(unkeyed(&[b"SCAN", b"7", b"COUNT", b"500"]));
+        assert!(unkeyed(&[b"SLOWLOG", b"GET", b"512"]));
         assert_eq!(entry(&[b"HGETALL", b"k"]).own, OwnShape::No);
         assert_eq!(entry(&[b"GET", b"k"]).own, OwnShape::No);
+    }
+
+    #[test]
+    fn cut_lists_sort_and_acl_log_reset() {
+        // Review M4: a list the server cut past 32 arguments fits no range.
+        let mut args: Vec<&[u8]> = vec![b"MGET"];
+        args.extend(std::iter::repeat_n(&b"session:x"[..], 31));
+        args.push(b"... (5 more arguments)");
+        assert_eq!(objs(&entry(&args)), ["*"]);
+        let mut args: Vec<&[u8]> = vec![b"GET", b"session:x"];
+        args.push(b"... (5 more arguments)");
+        assert_eq!(objs(&entry(&args)), ["session:*"]);
+        // Review L5: SORT patterns give `*`, STORE a write.
+        let e = entry(&[b"SORT", b"session:a", b"BY", b"w_*", b"GET", b"user:*"]);
+        assert_eq!((e.action, objs(&e)), (Action::Read, vec!["session:*", "*"]));
+        let e = entry(&[b"SORT", b"session:a", b"STORE", b"dest"]);
+        assert_eq!((e.action, objs(&e)), (Action::Write, vec!["session:*"]));
+        assert_eq!(entry(&[b"ACL", b"LOG", b"RESET"]).action, Action::Ddl);
+        assert_eq!(entry(&[b"ACL", b"LOG", b"10"]).action, Action::Read);
     }
 
     #[test]
@@ -723,6 +813,10 @@ mod tests {
         );
         assert_eq!(
             Peer::parse(b"/tmp/redis.sock:0").unwrap().addr,
+            ClientAddr::Local
+        );
+        assert_eq!(
+            Peer::parse(b"[/tmp/redis.sock:0]:0").unwrap().addr,
             ClientAddr::Local
         );
         assert!(Peer::parse(b"host.example:1").is_none());

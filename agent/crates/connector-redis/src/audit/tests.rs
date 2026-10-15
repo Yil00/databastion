@@ -119,12 +119,10 @@ fn attribution_needs_an_older_connection() {
 #[test]
 fn replicas_and_databases() {
     let repl = "role:master\r\nconnected_slaves:2\r\nslave0:ip=10.0.0.7,port=6379,state=online\r\nslave1:ip=10.0.0.8,port=6380,state=wait_bgsave\r\nmaster_replid:x\r\n";
+    // Review L7: only replicas in a sync state.
     assert_eq!(
-        replica_ips(repl),
-        vec![
-            "10.0.0.7".parse::<IpAddr>().unwrap(),
-            "10.0.0.8".parse().unwrap()
-        ]
+        syncing_replica_ips(repl),
+        vec!["10.0.0.8".parse::<IpAddr>().unwrap()]
     );
     let mut l = state::Learned::default();
     l.dbs
@@ -202,9 +200,11 @@ fn levels() {
             NoteCode::AuditRecordsDropped
         ]
     );
-    drop(running);
     // Never Partial or Full.
     assert_eq!(level(&state, "t", None, false).0, AuditLevel::Limited);
+    // Review L6: no stream running, no level, whatever was read before.
+    drop(running);
+    assert_eq!(level(&state, "t", Some(all), false).0, AuditLevel::None);
 }
 
 fn acl(id: Option<i64>, count: u64, ident: u64) -> AclEntry {
@@ -224,7 +224,7 @@ fn acl(id: Option<i64>, count: u64, ident: u64) -> AclEntry {
 
 #[test]
 fn acl_log_deltas() {
-    let deltas = |c: &mut Cursor, i: &mut Option<HashMap<u64, u64>>, e: &[AclEntry]| {
+    let deltas = |c: &mut Cursor, i: &mut Option<HashMap<(u64, u32), u64>>, e: &[AclEntry]| {
         let (d, lost) = acl_deltas(c, i, e);
         (d.iter().map(|(n, _)| *n).collect::<Vec<_>>(), lost)
     };
@@ -250,4 +250,137 @@ fn acl_log_deltas() {
         deltas(&mut c, &mut i, &[acl(None, 5, 7), acl(None, 1, 8)]),
         (vec![3, 1], 0)
     );
+    // Review M3: a second entry of the same identity (Redis groups for
+    // 60 s only) is new, with its whole count; the older one keeps its
+    // own count. The log lists the newest first.
+    assert_eq!(
+        deltas(
+            &mut c,
+            &mut i,
+            &[acl(None, 4, 7), acl(None, 5, 7), acl(None, 1, 8)]
+        ),
+        (vec![4, 0, 0], 0)
+    );
+    assert_eq!(
+        deltas(
+            &mut c,
+            &mut i,
+            &[acl(None, 6, 7), acl(None, 5, 7), acl(None, 1, 8)]
+        ),
+        (vec![2, 0, 0], 0)
+    );
+}
+
+fn stream_parts() -> (AuditConfig, TargetConfig, CheckState) {
+    let target = databastion_core::AgentConfig::parse(
+        "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: own-t, \
+         engine: valkey, host: 127.0.0.1, account: databastion, secret: {env: X}, \
+         redis: {tls: disable}}]}",
+    )
+    .unwrap()
+    .targets[0]
+        .clone();
+    let cfg = AuditConfig::local(&target, 10, &databastion_core::config::Limits::default());
+    (cfg, target, CheckState::default())
+}
+
+fn clients_of(list: &str) -> Vec<Client> {
+    entries::parse_client_list(&decode(format!("${}\r\n{list}\r\n", list.len()).as_bytes()))
+}
+
+fn principal(ev: &MaskedEvent) -> (String, bool, Option<ClientAddr>) {
+    let p = ev.principal();
+    (p.account_name().to_owned(), p.is_not_recorded(), p.client())
+}
+
+/// Review H1, M1, L1: socket peers are never attributed nor taken for the
+/// agent's; an attributed connection that is not the agent's is never
+/// the agent's whatever its address; a large reply above the shape's
+/// bound is reported.
+#[test]
+fn attribution_and_own_entries() {
+    let (cfg, target, state) = stream_parts();
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new(
+            "databastion",
+            None,
+            None,
+            1000,
+            state.audit.own_usage("own-t"),
+        ),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run: Some(99),
+    };
+    let now = 2_000_000_000;
+    let db = NormalizedName::wildcard();
+    // The agent's own session (id 1) and a local user (id 2), both on the
+    // socket.
+    let _own = own::register("own-t", 1, None, Some(99));
+    let socket = clients_of(
+        "id=1 addr=/run/valkey.sock:0 age=100 user=databastion\nid=2 addr=/run/valkey.sock:0 age=100 user=alice",
+    );
+    let e = entry(
+        5,
+        now - 10,
+        &[b"GETRANGE", b"session:x", b"0", b"4095"],
+        "/run/valkey.sock:0",
+    );
+    let ev = st
+        .log_event(&e, EventSource::RedisSlowlog, &db, &socket, now, 0)
+        .expect("a socket entry is reported");
+    assert_eq!(
+        principal(&ev),
+        (String::new(), true, Some(ClientAddr::Local))
+    );
+
+    // TCP: the agent's own connection (id 1), its own shape: left out.
+    let _own3 = own::register("own-t", 3, None, Some(99));
+    let tcp = clients_of(
+        "id=3 addr=10.0.0.1:4000 age=100 user=databastion\nid=4 addr=10.0.0.2:5000 age=100 user=alice",
+    );
+    own::seen("own-t", 3, Some(99), "10.0.0.1:4000".parse().unwrap());
+    let mine = entry(
+        6,
+        now - 10,
+        &[b"GETRANGE", b"session:x", b"0", b"4095"],
+        "10.0.0.1:4000",
+    );
+    assert!(
+        st.log_event(&mine, EventSource::RedisSlowlog, &db, &tcp, now, 0)
+            .is_none()
+    );
+    // The same address marked as the agent's (a spoofed or stale seen
+    // address), but `CLIENT LIST` attributes it to another connection:
+    // reported with that user (M1).
+    own::seen("own-t", 3, Some(99), "10.0.0.2:5000".parse().unwrap());
+    let theirs = entry(
+        7,
+        now - 10,
+        &[b"GETRANGE", b"session:x", b"0", b"4095"],
+        "10.0.0.2:5000",
+    );
+    let ev = st
+        .log_event(&theirs, EventSource::RedisSlowlog, &db, &tcp, now, 0)
+        .expect("another connection's entry is reported");
+    assert_eq!(principal(&ev).0, "alice");
+    // Another server run: the agent's id means nothing.
+    st.run = Some(100);
+    let ev = st.log_event(&mine, EventSource::RedisSlowlog, &db, &tcp, now, 0);
+    assert_eq!(ev.map(|e| principal(&e).0), Some("databastion".to_owned()));
+    st.run = Some(99);
+    // L1: a large reply above the shape's bound is reported.
+    let mut big = mine.clone();
+    big.size = 1 << 30;
+    let ev = st
+        .log_event(&big, EventSource::RedisCommandlog, &db, &tcp, now, 0)
+        .expect("a reply above the agent's bound is reported");
+    assert_eq!(ev.bytes(), Some(1 << 30));
 }

@@ -54,6 +54,8 @@ pub(crate) fn endpoint(target: &TargetConfig, which: Which) -> Option<Endpoint> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NodeInfo {
     pub(crate) server: Server,
+    /// The server run ([`info::run_hash`]).
+    pub(crate) run: Option<u64>,
     pub(crate) cluster: bool,
     pub(crate) replica: bool,
 }
@@ -86,8 +88,8 @@ pub(crate) async fn open(
     let tls = tls_of(&settings)?;
     let mut session = Session::open(&endpoint, tls, &target.account, &password, timeout).await?;
     drop(password);
-    session.register_own(&target.id);
     let info = identify(&mut session, timeout).await?;
+    session.register_own(&target.id, info.run);
     Ok((session, info))
 }
 
@@ -159,6 +161,7 @@ pub(crate) async fn identify(
     }
     Ok(NodeInfo {
         server: engine,
+        run: info::run_hash(&server_text),
         cluster: text(cluster).is_some_and(|t| info::cluster_enabled(&t)),
         replica: text(replication).is_some_and(|t| info::is_replica(&t)),
     })

@@ -11,7 +11,11 @@
 //! - `DATABASTION_IT_REDIS_CA`: the dev CA (`docker compose … exec -T
 //!   valkey cat /tls/ca.pem`);
 //! - `DATABASTION_DB_PASSWORD`: the agent users' password (dev/.env);
-//! - `VALKEY_PORT` / `REDIS_PORT`: default 6379 / 6389.
+//! - `VALKEY_PORT` / `REDIS_PORT`: default 6379 / 6389;
+//! - `DATABASTION_IT_REDIS_EXEC_VALKEY` (optional): a command prefix that
+//!   runs a command in the Valkey container (e.g. `docker compose -f
+//!   dev/docker-compose.yml exec -T valkey`), for the test with clients on
+//!   the server's Unix socket; skipped without it.
 //!
 //! The tests read the server's `ACL LOG` through a test-only raw client
 //! with the agent's own user (`+acl|log` is part of the dev ACL); the
@@ -32,6 +36,16 @@ use crate::resp::{Decoder, Limits as RespLimits, Value};
 
 fn enabled() -> bool {
     std::env::var("DATABASTION_IT_REDIS").as_deref() == Ok("1")
+}
+
+/// The tests share two servers whose slow log, `ACL LOG` and connection
+/// list every test changes: they run one at a time, so an Audit test
+/// never sees another test's agent connections (short-lived ones, closed
+/// before any poll, are reported as not the agent's: review M1).
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    LOCK.lock().await
 }
 
 fn port(engine: TargetEngine) -> u16 {
@@ -226,6 +240,7 @@ async fn check_reports_a_healthy_account_on_both_engines() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (declared, server) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -282,6 +297,7 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     let ok = target(
         "valkey",
         TargetEngine::Valkey,
@@ -441,6 +457,7 @@ async fn discovery_on_valkey() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     discovery_matches_the_ground_truth(TargetEngine::Valkey, "valkey").await;
 }
 
@@ -449,6 +466,7 @@ async fn discovery_on_redis() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     discovery_matches_the_ground_truth(TargetEngine::Redis, "redis").await;
 }
 
@@ -457,6 +475,7 @@ async fn narrowed_patterns_write_no_acl_log_entry() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -505,6 +524,7 @@ async fn the_password_never_reaches_the_slow_log() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     // The dev servers log every command (`slowlog-log-slower-than 0`).
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
@@ -557,6 +577,7 @@ async fn local_glob_matcher_agrees_with_scan_match() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -616,6 +637,7 @@ async fn a_large_data_keyed_hash_reports_no_field_name() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     let names = [
         "jdupont", "amartin", "lucas", "bernard", "dubois", "thomas", "robert", "richard", "petit",
         "durand", "leroy", "moreau", "simon", "laurent", "lefebvre", "michel", "garcia", "david",
@@ -824,6 +846,7 @@ async fn audit_reports_slow_reads_and_never_the_agents_own() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -1036,6 +1059,7 @@ async fn the_password_never_reaches_monitor_or_the_command_log() {
     if !enabled() {
         return;
     }
+    let _serial = serial().await;
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
         ("redis", TargetEngine::Redis),
@@ -1088,5 +1112,347 @@ async fn the_password_never_reaches_monitor_or_the_command_log() {
             strings(&r, &mut text);
             assert!(!has(&text), "{name}: the password is in a server log");
         }
+    }
+}
+
+/// Review M4 (ADR-0052 obligation): the key positions of the closed
+/// command table agree with the server's own `COMMAND GETKEYS`, row by row,
+/// on this server version (the engine matrix runs it per version). The
+/// agent never reads as a key an argument the server does not take for
+/// one; commands the server does not know (older versions) are skipped.
+#[tokio::test]
+async fn key_positions_match_command_getkeys() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // One example per keyed row: keys `k1`, `k2`, `k3`; nothing else
+    // looks like them.
+    const EXAMPLES: &[(&str, Option<&str>, &str)] = &[
+        ("get", None, "get k1"),
+        ("getrange", None, "getrange k1 0 1"),
+        ("substr", None, "substr k1 0 1"),
+        ("strlen", None, "strlen k1"),
+        ("mget", None, "mget k1 k2"),
+        ("getbit", None, "getbit k1 0"),
+        ("bitcount", None, "bitcount k1"),
+        ("bitpos", None, "bitpos k1 1"),
+        ("bitfield_ro", None, "bitfield_ro k1 GET u8 0"),
+        ("lcs", None, "lcs k1 k2"),
+        ("set", None, "set k1 v"),
+        ("setnx", None, "setnx k1 v"),
+        ("setex", None, "setex k1 10 v"),
+        ("psetex", None, "psetex k1 10 v"),
+        ("getset", None, "getset k1 v"),
+        ("getdel", None, "getdel k1"),
+        ("getex", None, "getex k1"),
+        ("append", None, "append k1 v"),
+        ("incr", None, "incr k1"),
+        ("incrby", None, "incrby k1 1"),
+        ("incrbyfloat", None, "incrbyfloat k1 1"),
+        ("decr", None, "decr k1"),
+        ("decrby", None, "decrby k1 1"),
+        ("setrange", None, "setrange k1 0 v"),
+        ("setbit", None, "setbit k1 0 1"),
+        ("bitfield", None, "bitfield k1 GET u8 0"),
+        ("mset", None, "mset k1 v k2 w"),
+        ("msetnx", None, "msetnx k1 v k2 w"),
+        ("bitop", None, "bitop AND k1 k2 k3"),
+        ("exists", None, "exists k1 k2"),
+        ("type", None, "type k1"),
+        ("ttl", None, "ttl k1"),
+        ("pttl", None, "pttl k1"),
+        ("expiretime", None, "expiretime k1"),
+        ("pexpiretime", None, "pexpiretime k1"),
+        ("dump", None, "dump k1"),
+        ("touch", None, "touch k1 k2"),
+        ("sort_ro", None, "sort_ro k1 BY w_* GET o_*"),
+        ("sort", None, "sort k1 BY w_* GET o_*"),
+        ("del", None, "del k1 k2"),
+        ("unlink", None, "unlink k1 k2"),
+        ("expire", None, "expire k1 10"),
+        ("pexpire", None, "pexpire k1 10"),
+        ("expireat", None, "expireat k1 10"),
+        ("pexpireat", None, "pexpireat k1 10"),
+        ("persist", None, "persist k1"),
+        ("rename", None, "rename k1 k2"),
+        ("renamenx", None, "renamenx k1 k2"),
+        ("copy", None, "copy k1 k2"),
+        ("move", None, "move k1 1"),
+        ("restore", None, "restore k1 0 x"),
+        ("hget", None, "hget k1 f"),
+        ("hmget", None, "hmget k1 f g"),
+        ("hgetall", None, "hgetall k1"),
+        ("hkeys", None, "hkeys k1"),
+        ("hvals", None, "hvals k1"),
+        ("hlen", None, "hlen k1"),
+        ("hexists", None, "hexists k1 f"),
+        ("hstrlen", None, "hstrlen k1 f"),
+        ("hrandfield", None, "hrandfield k1"),
+        ("hscan", None, "hscan k1 0"),
+        ("hset", None, "hset k1 f v"),
+        ("hsetnx", None, "hsetnx k1 f v"),
+        ("hmset", None, "hmset k1 f v"),
+        ("hdel", None, "hdel k1 f"),
+        ("hincrby", None, "hincrby k1 f 1"),
+        ("hincrbyfloat", None, "hincrbyfloat k1 f 1"),
+        ("lrange", None, "lrange k1 0 1"),
+        ("lindex", None, "lindex k1 0"),
+        ("llen", None, "llen k1"),
+        ("lpos", None, "lpos k1 e"),
+        ("lpush", None, "lpush k1 v"),
+        ("rpush", None, "rpush k1 v"),
+        ("lpushx", None, "lpushx k1 v"),
+        ("rpushx", None, "rpushx k1 v"),
+        ("lpop", None, "lpop k1"),
+        ("rpop", None, "rpop k1"),
+        ("linsert", None, "linsert k1 BEFORE p v"),
+        ("lset", None, "lset k1 0 v"),
+        ("lrem", None, "lrem k1 0 v"),
+        ("ltrim", None, "ltrim k1 0 1"),
+        ("lmove", None, "lmove k1 k2 LEFT RIGHT"),
+        ("blmove", None, "blmove k1 k2 LEFT RIGHT 0"),
+        ("rpoplpush", None, "rpoplpush k1 k2"),
+        ("brpoplpush", None, "brpoplpush k1 k2 0"),
+        ("blpop", None, "blpop k1 k2 0"),
+        ("brpop", None, "brpop k1 k2 0"),
+        ("lmpop", None, "lmpop 2 k1 k2 LEFT"),
+        ("blmpop", None, "blmpop 0 2 k1 k2 LEFT"),
+        ("smembers", None, "smembers k1"),
+        ("sismember", None, "sismember k1 m"),
+        ("smismember", None, "smismember k1 m"),
+        ("scard", None, "scard k1"),
+        ("srandmember", None, "srandmember k1"),
+        ("sscan", None, "sscan k1 0"),
+        ("sunion", None, "sunion k1 k2"),
+        ("sinter", None, "sinter k1 k2"),
+        ("sdiff", None, "sdiff k1 k2"),
+        ("sintercard", None, "sintercard 2 k1 k2"),
+        ("sadd", None, "sadd k1 m"),
+        ("srem", None, "srem k1 m"),
+        ("spop", None, "spop k1"),
+        ("smove", None, "smove k1 k2 m"),
+        ("sunionstore", None, "sunionstore k1 k2 k3"),
+        ("sinterstore", None, "sinterstore k1 k2 k3"),
+        ("sdiffstore", None, "sdiffstore k1 k2 k3"),
+        ("zrange", None, "zrange k1 0 1"),
+        ("zrangebyscore", None, "zrangebyscore k1 0 1"),
+        ("zrangebylex", None, "zrangebylex k1 - +"),
+        ("zrevrange", None, "zrevrange k1 0 1"),
+        ("zrevrangebyscore", None, "zrevrangebyscore k1 1 0"),
+        ("zrevrangebylex", None, "zrevrangebylex k1 + -"),
+        ("zscore", None, "zscore k1 m"),
+        ("zmscore", None, "zmscore k1 m"),
+        ("zcard", None, "zcard k1"),
+        ("zcount", None, "zcount k1 0 1"),
+        ("zlexcount", None, "zlexcount k1 - +"),
+        ("zrank", None, "zrank k1 m"),
+        ("zrevrank", None, "zrevrank k1 m"),
+        ("zrandmember", None, "zrandmember k1"),
+        ("zscan", None, "zscan k1 0"),
+        ("zunion", None, "zunion 2 k1 k2"),
+        ("zinter", None, "zinter 2 k1 k2"),
+        ("zdiff", None, "zdiff 2 k1 k2"),
+        ("zintercard", None, "zintercard 2 k1 k2"),
+        ("zadd", None, "zadd k1 1 m"),
+        ("zrem", None, "zrem k1 m"),
+        ("zincrby", None, "zincrby k1 1 m"),
+        ("zpopmin", None, "zpopmin k1"),
+        ("zpopmax", None, "zpopmax k1"),
+        ("bzpopmin", None, "bzpopmin k1 k2 0"),
+        ("bzpopmax", None, "bzpopmax k1 k2 0"),
+        ("zmpop", None, "zmpop 2 k1 k2 MIN"),
+        ("bzmpop", None, "bzmpop 0 2 k1 k2 MIN"),
+        ("zremrangebyrank", None, "zremrangebyrank k1 0 1"),
+        ("zremrangebyscore", None, "zremrangebyscore k1 0 1"),
+        ("zremrangebylex", None, "zremrangebylex k1 - +"),
+        ("zunionstore", None, "zunionstore k1 2 k2 k3"),
+        ("zinterstore", None, "zinterstore k1 2 k2 k3"),
+        ("zdiffstore", None, "zdiffstore k1 2 k2 k3"),
+        ("zrangestore", None, "zrangestore k1 k2 0 1"),
+        ("xrange", None, "xrange k1 - +"),
+        ("xrevrange", None, "xrevrange k1 + -"),
+        ("xlen", None, "xlen k1"),
+        ("xread", None, "xread COUNT 1 STREAMS k1 k2 0 0"),
+        ("xreadgroup", None, "xreadgroup GROUP g c STREAMS k1 >"),
+        ("xadd", None, "xadd k1 * f v"),
+        ("xdel", None, "xdel k1 0-1"),
+        ("xtrim", None, "xtrim k1 MAXLEN 1"),
+        ("xack", None, "xack k1 g 0-1"),
+        ("xclaim", None, "xclaim k1 g c 0 0-1"),
+        ("xautoclaim", None, "xautoclaim k1 g c 0 0"),
+        ("xsetid", None, "xsetid k1 0-1"),
+        ("pfcount", None, "pfcount k1 k2"),
+        ("pfadd", None, "pfadd k1 a"),
+        ("pfmerge", None, "pfmerge k1 k2"),
+        ("geopos", None, "geopos k1 m"),
+        ("geodist", None, "geodist k1 a b"),
+        ("geohash", None, "geohash k1 m"),
+        ("geosearch", None, "geosearch k1 FROMMEMBER m BYRADIUS 1 km"),
+        ("georadius_ro", None, "georadius_ro k1 0 0 1 km"),
+        (
+            "georadiusbymember_ro",
+            None,
+            "georadiusbymember_ro k1 m 1 km",
+        ),
+        ("georadius", None, "georadius k1 0 0 1 km"),
+        ("georadiusbymember", None, "georadiusbymember k1 m 1 km"),
+        (
+            "geosearchstore",
+            None,
+            "geosearchstore k1 k2 FROMMEMBER m BYRADIUS 1 km",
+        ),
+        ("geoadd", None, "geoadd k1 0 0 m"),
+        ("object", Some("encoding"), "object encoding k1"),
+        ("object", Some("freq"), "object freq k1"),
+        ("object", Some("idletime"), "object idletime k1"),
+        ("object", Some("refcount"), "object refcount k1"),
+        ("memory", Some("usage"), "memory usage k1"),
+        ("xinfo", Some("stream"), "xinfo stream k1"),
+        ("xinfo", Some("groups"), "xinfo groups k1"),
+        ("xinfo", Some("consumers"), "xinfo consumers k1 g"),
+        ("xgroup", Some("*"), "xgroup create k1 g $"),
+        ("xgroup", Some("*"), "xgroup destroy k1 g"),
+        ("xgroup", Some("*"), "xgroup createconsumer k1 g c"),
+        ("xgroup", Some("*"), "xgroup delconsumer k1 g c"),
+        ("xgroup", Some("*"), "xgroup setid k1 g $"),
+    ];
+    // Every keyed row has an example.
+    for (name, sub) in crate::audit::commands::keyed_rows() {
+        assert!(
+            EXAMPLES.iter().any(|(n, s, _)| *n == name && *s == sub),
+            "no GETKEYS example for {name} {sub:?}"
+        );
+    }
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = target(name, engine, "databastion", "");
+        let cmds: Vec<Vec<Vec<u8>>> = EXAMPLES
+            .iter()
+            .map(|(_, _, ex)| {
+                let mut c: Vec<Vec<u8>> = vec![b"COMMAND".to_vec(), b"GETKEYS".to_vec()];
+                c.extend(ex.split(' ').map(|a| a.as_bytes().to_vec()));
+                c
+            })
+            .collect();
+        let refs: Vec<Vec<&[u8]>> = cmds
+            .iter()
+            .map(|c| c.iter().map(Vec::as_slice).collect())
+            .collect();
+        let replies = admin(&t, &refs).await;
+        let mut checked = 0;
+        let mut differ = Vec::new();
+        for ((_, _, ex), r) in EXAMPLES.iter().zip(&replies) {
+            let Value::Array(keys) = r else {
+                // A command this version does not have.
+                continue;
+            };
+            let args: Vec<&[u8]> = ex.split(' ').map(str::as_bytes).collect();
+            let mut server: Vec<usize> = keys
+                .iter()
+                .filter_map(Value::as_bytes)
+                .filter_map(|k| args.iter().position(|a| *a == k))
+                .collect();
+            server.sort_unstable();
+            server.dedup();
+            let (spec, _) = crate::audit::commands::lookup(args[0], args.get(1).copied());
+            let mut ours = crate::audit::commands::key_indices(spec.keys, &args, args.len())
+                .unwrap_or_default();
+            ours.sort_unstable();
+            ours.dedup();
+            if ours != server {
+                differ.push(format!("{ex}: ours {ours:?}, server {server:?}"));
+            }
+            checked += 1;
+        }
+        assert!(checked > 150, "{name}: {checked} rows checked");
+        assert!(differ.is_empty(), "{name}: {differ:#?}");
+    }
+}
+
+/// Review H1: clients on the server's Unix socket all share one address,
+/// so a socket entry is never attributed through `CLIENT LIST` nor taken
+/// for the agent's: two socket clients (the dev `admin` and the agent's
+/// own user, connected well before their commands) give events without a
+/// recorded account and with the client address `local`. Needs
+/// `DATABASTION_IT_REDIS_EXEC_VALKEY` (the dev socket is inside the
+/// container).
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_clients_are_never_attributed() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    let Ok(exec) = std::env::var("DATABASTION_IT_REDIS_EXEC_VALKEY") else {
+        tracing::warn!("DATABASTION_IT_REDIS_EXEC_VALKEY unset: socket attribution not tested");
+        return;
+    };
+    let t = target("valkey", TargetEngine::Valkey, "databastion", "");
+    let connector = Arc::new(RedisConnector::new());
+    // Learned patterns for the objects.
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+    let (fs, mut frx) = FindingSink::channel(4096);
+    let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+    connector.discover(&job, &fs).await.unwrap();
+    drop(fs);
+    drain.await.unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits);
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&connector);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // The CLI reads its whole input, then runs it: the connection opens at
+    // once and its commands run after the sleep. The `admin` client then
+    // stays connected (`BLPOP` with a timeout) while the agent's user runs
+    // its command from another socket connection.
+    let socket_client = |user: &str, password: String, commands: &str| {
+        let script = format!(
+            "C=$(command -v valkey-cli || command -v redis-cli); \
+             (printf 'AUTH {user} {password}\\n'; sleep 3; printf '{commands}') \
+             | $C -s /tmp/databastion-dev.sock >/dev/null 2>&1"
+        );
+        let mut parts = exec.split_whitespace();
+        let mut cmd = std::process::Command::new(parts.next().unwrap());
+        cmd.args(parts).args(["bash", "-c", &script]);
+        tokio::task::spawn_blocking(move || cmd.status().map(|s| s.success()))
+    };
+    let a = socket_client(
+        "admin",
+        admin_password(),
+        "HGETALL session:sockettest\\nGETRANGE session:sockettest 0 4095\\nBLPOP session:none 6\\n",
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let b = socket_client(
+        "databastion",
+        t.secret.read().unwrap().to_string(),
+        "GETRANGE session:sockettest 0 4095\\n",
+    );
+    assert!(b.await.unwrap().unwrap(), "socket client (agent's user)");
+    assert!(a.await.unwrap().unwrap(), "socket client (admin)");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let json = events_json(&events);
+    let local: Vec<&serde_json::Value> = json
+        .iter()
+        .filter(|e| e["principal"]["client_addr"] == "local")
+        .collect();
+    // Both clients' reads (the agent's user from another connection is
+    // never the agent's): at least the 3 `HGETALL` / `GETRANGE`.
+    assert!(local.len() >= 3, "{json:#?}");
+    for e in local {
+        assert_eq!(e["principal"]["account_not_recorded"], true, "{e}");
+        assert!(e["principal"].get("db_user").is_none(), "{e}");
+        assert_eq!(e["source"], "redis_slowlog", "{e}");
     }
 }

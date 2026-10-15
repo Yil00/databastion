@@ -1,16 +1,22 @@
 //! The agent's own connections (ADR-0052 decision 8, security review H3
 //! and L2): an Audit log entry is the agent's only when its connection is
 //! one of the agent's own, recognized by the connection id (`HELLO`'s
-//! `id`, valid until the server restarts) or by the `addr:port` the server
-//! reports for it, within the connection's lifetime; **never** by user or
-//! client name (any client can name itself `databastion-agent`, and anyone
-//! holding the agent's credentials uses its user).
+//! `id`) or by the `addr:port` the server reports for it, within the
+//! connection's lifetime; **never** by user or client name (any client can
+//! name itself `databastion-agent`, and anyone holding the agent's
+//! credentials uses its user).
 //!
 //! Every session the connector opens with the agent's account registers
-//! here ([`register`]) with its id and local TCP address; the Audit stream
-//! adds the address the server reports for the connections it sees open
-//! in `CLIENT LIST` (behind NAT the two differ). The registry is per
-//! target, bounded, and forgets connections closed more than a day ago.
+//! here ([`register`]) with its id, its local TCP address and the server
+//! run it was opened on (a truncated SHA-256 of `run_id`: ids start over
+//! when the server restarts, so a registration only ever matches entries
+//! of its own run; review M2, L3). The Audit stream records the address
+//! the server reports for the agent's open connections (`CLIENT LIST`).
+//! Address matches use that reported address only; the local address is
+//! used for a connection not seen yet only once the server was seen to
+//! report the agent's local addresses unchanged (no NAT or proxy between
+//! them; review M1). The registry is per target, bounded, and forgets
+//! connections closed more than a day ago.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -29,19 +35,36 @@ const MARGIN: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 struct Conn {
     id: i64,
-    /// Local address, and the address the server reported (`CLIENT
-    /// LIST`), when known.
+    /// The server run it was opened on (`None`: unknown, never matches).
+    run: Option<u64>,
     local: Option<SocketAddr>,
+    /// The address the server reported for it (`CLIENT LIST`).
     seen: Option<SocketAddr>,
     opened: SystemTime,
     closed: Option<SystemTime>,
 }
 
-type Registry = Mutex<HashMap<String, VecDeque<Conn>>>;
+impl Conn {
+    fn within(&self, at: SystemTime) -> bool {
+        self.opened.checked_sub(MARGIN).is_none_or(|o| o <= at)
+            && self.closed.is_none_or(|t| at <= t + MARGIN)
+    }
+}
+
+#[derive(Debug, Default)]
+struct Target {
+    conns: VecDeque<Conn>,
+    /// The server reported one of the agent's connections at its local
+    /// address (no NAT nor proxy): local addresses can stand for the
+    /// reported ones.
+    local_is_seen: bool,
+}
+
+type Registry = Mutex<HashMap<String, Target>>;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn lock() -> std::sync::MutexGuard<'static, HashMap<String, VecDeque<Conn>>> {
+fn lock() -> std::sync::MutexGuard<'static, HashMap<String, Target>> {
     REGISTRY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -52,33 +75,45 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, VecDeque<Conn>>> {
 pub(crate) struct Registration {
     target: String,
     id: i64,
+    run: Option<u64>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         let now = SystemTime::now();
-        if let Some(conns) = lock().get_mut(&self.target) {
-            for c in conns.iter_mut().filter(|c| c.id == self.id) {
+        if let Some(t) = lock().get_mut(&self.target) {
+            for c in t
+                .conns
+                .iter_mut()
+                .filter(|c| c.id == self.id && c.run == self.run)
+            {
                 c.closed.get_or_insert(now);
             }
         }
     }
 }
 
-/// Registers a connection of the agent's own account to `target_id`.
-pub(crate) fn register(target_id: &str, id: i64, local: Option<SocketAddr>) -> Registration {
+/// Registers a connection of the agent's own account to `target_id`,
+/// opened on the server run `run`.
+pub(crate) fn register(
+    target_id: &str,
+    id: i64,
+    local: Option<SocketAddr>,
+    run: Option<u64>,
+) -> Registration {
     let now = SystemTime::now();
     let mut map = lock();
-    let conns = map.entry(target_id.to_owned()).or_default();
-    conns.retain(|c| {
+    let t = map.entry(target_id.to_owned()).or_default();
+    t.conns.retain(|c| {
         c.closed
-            .is_none_or(|t| now.duration_since(t).unwrap_or_default() < KEEP)
+            .is_none_or(|x| now.duration_since(x).unwrap_or_default() < KEEP)
     });
-    while conns.len() >= MAX_CONNS {
-        conns.pop_front();
+    while t.conns.len() >= MAX_CONNS {
+        t.conns.pop_front();
     }
-    conns.push_back(Conn {
+    t.conns.push_back(Conn {
         id,
+        run,
         local,
         seen: None,
         opened: now,
@@ -87,50 +122,70 @@ pub(crate) fn register(target_id: &str, id: i64, local: Option<SocketAddr>) -> R
     Registration {
         target: target_id.to_owned(),
         id,
+        run,
     }
 }
 
-/// Whether `id` is one of the agent's connections to `target_id`.
-pub(crate) fn is_own_id(target_id: &str, id: i64) -> bool {
-    lock()
-        .get(target_id)
-        .is_some_and(|c| c.iter().any(|c| c.id == id))
+fn same_run(c: &Conn, run: Option<u64>) -> bool {
+    run.is_some() && c.run == run
+}
+
+/// Whether `id`, seen open in `CLIENT LIST` on the server run `run`, is one
+/// of the agent's connections still open (review M2).
+pub(crate) fn is_own_open_id(target_id: &str, id: i64, run: Option<u64>) -> bool {
+    lock().get(target_id).is_some_and(|t| {
+        t.conns
+            .iter()
+            .any(|c| c.id == id && same_run(c, run) && c.closed.is_none())
+    })
+}
+
+/// Whether `id`, logged at `at` (agent clock) on the server run `run`, was
+/// one of the agent's connections then (`ACL LOG`; review M2).
+pub(crate) fn is_own_id_at(target_id: &str, id: i64, run: Option<u64>, at: SystemTime) -> bool {
+    lock().get(target_id).is_some_and(|t| {
+        t.conns
+            .iter()
+            .any(|c| c.id == id && same_run(c, run) && c.within(at))
+    })
 }
 
 /// Records the address the server reports for one of the agent's open
 /// connections (`CLIENT LIST`).
-pub(crate) fn seen(target_id: &str, id: i64, addr: SocketAddr) {
-    if let Some(conns) = lock().get_mut(target_id) {
-        for c in conns.iter_mut().filter(|c| c.id == id) {
+pub(crate) fn seen(target_id: &str, id: i64, run: Option<u64>, addr: SocketAddr) {
+    if let Some(t) = lock().get_mut(target_id) {
+        let mut local_seen = false;
+        for c in t
+            .conns
+            .iter_mut()
+            .filter(|c| c.id == id && same_run(c, run) && c.closed.is_none())
+        {
             c.seen = Some(addr);
+            local_seen |= c.local == Some(addr);
         }
+        t.local_is_seen |= local_seen;
     }
 }
 
-/// Forgets every connection id of `target_id` (the server restarted: ids
-/// start over).
-pub(crate) fn server_restarted(target_id: &str) {
-    if let Some(conns) = lock().get_mut(target_id) {
-        conns.retain(|c| c.closed.is_none());
-        for c in conns.iter_mut() {
-            // Ids of connections opened before the restart mean nothing
-            // now; open ones were closed by the restart anyway.
-            c.closed.get_or_insert(SystemTime::now());
-            c.id = i64::MIN;
-        }
-    }
-}
-
-/// Whether an entry from `addr` at `at` (agent clock) comes from one of
-/// the agent's connections: same address (as the server reported it, or
-/// the local one), and `at` within the connection's lifetime (a port
-/// reused by another connection is not taken for the agent's).
-pub(crate) fn is_own_addr(target_id: &str, addr: SocketAddr, at: SystemTime) -> bool {
-    lock().get(target_id).is_some_and(|conns| {
-        conns.iter().any(|c| {
-            (c.seen == Some(addr) || c.local == Some(addr))
-                && c.opened.checked_sub(MARGIN).is_none_or(|o| o <= at)
-                && c.closed.is_none_or(|t| at <= t + MARGIN)
+/// Whether an entry from `addr` at `at` (agent clock), on the server run
+/// `run`, comes from one of the agent's connections: the address the
+/// server reported for it (or, once the server was seen to report local
+/// addresses unchanged, its local address when it was not seen yet), and
+/// `at` within its lifetime (a port reused by another connection is not
+/// taken for the agent's).
+pub(crate) fn is_own_addr(
+    target_id: &str,
+    addr: SocketAddr,
+    at: SystemTime,
+    run: Option<u64>,
+) -> bool {
+    lock().get(target_id).is_some_and(|t| {
+        t.conns.iter().any(|c| {
+            let address = match c.seen {
+                Some(seen) => seen == addr,
+                None => t.local_is_seen && c.local == Some(addr),
+            };
+            address && same_run(c, run) && c.within(at)
         })
     })
 }
@@ -142,28 +197,48 @@ mod tests {
     #[test]
     fn own_connections_by_id_and_address_within_their_lifetime() {
         let t = "own-test-target";
+        let run = Some(7);
         let a: SocketAddr = "10.0.0.5:51000".parse().unwrap();
-        let seen: SocketAddr = "172.17.0.1:40000".parse().unwrap();
+        let nat: SocketAddr = "172.17.0.1:40000".parse().unwrap();
         let before = SystemTime::now() - Duration::from_secs(60);
-        let r = register(t, 42, Some(a));
-        assert!(is_own_id(t, 42));
-        assert!(!is_own_id(t, 43));
-        assert!(!is_own_id("other", 42));
-        assert!(is_own_addr(t, a, SystemTime::now()));
+        let r = register(t, 42, Some(a), run);
+        assert!(is_own_open_id(t, 42, run));
+        assert!(!is_own_open_id(t, 43, run));
+        assert!(!is_own_open_id("other", 42, run));
+        // Another server run (a restart): the id means nothing (M2, L3).
+        assert!(!is_own_open_id(t, 42, Some(8)));
+        assert!(!is_own_open_id(t, 42, None));
+        // Not seen yet: the local address is not trusted (M1).
+        assert!(!is_own_addr(t, a, SystemTime::now(), run));
+        seen(t, 42, run, nat);
+        assert!(is_own_addr(t, nat, SystemTime::now(), run));
+        assert!(!is_own_addr(t, a, SystemTime::now(), run));
+        assert!(!is_own_addr(t, nat, SystemTime::now(), Some(8)));
         // Before the connection opened: another client on the same port.
-        assert!(!is_own_addr(t, a, before));
-        assert!(!is_own_addr(t, seen, SystemTime::now()));
-        self::seen(t, 42, seen);
-        assert!(is_own_addr(t, seen, SystemTime::now()));
+        assert!(!is_own_addr(t, nat, before, run));
+        assert!(is_own_id_at(t, 42, run, SystemTime::now()));
+        assert!(!is_own_id_at(t, 42, run, before));
         drop(r);
-        // Closed: entries right after still match, later ones do not.
-        assert!(is_own_addr(t, seen, SystemTime::now()));
-        assert!(!is_own_addr(
-            t,
-            seen,
-            SystemTime::now() + Duration::from_secs(60)
-        ));
-        server_restarted(t);
-        assert!(!is_own_id(t, 42));
+        // Closed: no longer open for `CLIENT LIST`; entries right after
+        // still match by time, later ones do not.
+        assert!(!is_own_open_id(t, 42, run));
+        assert!(is_own_addr(t, nat, SystemTime::now(), run));
+        let later = SystemTime::now() + Duration::from_secs(60);
+        assert!(!is_own_addr(t, nat, later, run));
+        assert!(!is_own_id_at(t, 42, run, later));
+    }
+
+    #[test]
+    fn local_addresses_count_once_the_server_reports_them_unchanged() {
+        let t = "own-test-target-local";
+        let run = Some(1);
+        let a: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let _r1 = register(t, 1, Some(a), run);
+        let _r2 = register(t, 2, Some(b), run);
+        assert!(!is_own_addr(t, b, SystemTime::now(), run));
+        // The server reports connection 1 at its local address: no NAT.
+        seen(t, 1, run, a);
+        assert!(is_own_addr(t, b, SystemTime::now(), run));
     }
 }

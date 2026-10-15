@@ -33,7 +33,6 @@ pub(crate) mod own;
 pub(crate) mod state;
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash as _, Hasher as _};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -180,12 +179,14 @@ pub(crate) fn level(
         // `None` grants (Redis 6.2): not evaluated, tried by the stream.
         let slow = grants.is_none_or(|g| g.slowlog != Some(false) || g.commandlog == Some(true));
         let acl = grants.is_none_or(|g| g.acl_log != Some(false));
-        if slow && state.audit.recent_slow_record(target_id) {
-            notes.push(TargetNote::new(NoteCode::AuditSlowOperationsOnly));
-            AuditLevel::Limited
-        } else if !state.audit.is_running(target_id) {
+        // A stream must run (Audit configured) and have read, in the last
+        // 24 h, a new entry of another client (review L6).
+        if !state.audit.is_running(target_id) {
             notes.push(TargetNote::new(NoteCode::AuditStreamNotAvailable));
             AuditLevel::None
+        } else if slow && state.audit.recent_slow_record(target_id) {
+            notes.push(TargetNote::new(NoteCode::AuditSlowOperationsOnly));
+            AuditLevel::Limited
         } else if slow {
             notes.push(TargetNote::new(NoteCode::AuditLimitedPendingFirstRecord));
             notes.push(TargetNote::new(NoteCode::AuditSlowOperationsOnly));
@@ -251,12 +252,6 @@ struct Infos {
     keyspace: Vec<u16>,
 }
 
-fn hash_of(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
 fn text(v: &Value) -> Option<&str> {
     v.as_bytes().and_then(|b| std::str::from_utf8(b).ok())
 }
@@ -279,7 +274,7 @@ async fn infos(s: &mut Session) -> Result<Infos, RdError> {
     let server = text(server).unwrap_or_default();
     let stats = text(stats).unwrap_or_default();
     Ok(Infos {
-        run: info::field(server, "run_id").map(hash_of),
+        run: info::run_hash(server),
         now_us: info::field(server, "server_time_usec").and_then(|v| v.parse().ok()),
         sync_full: info::field(stats, "sync_full").and_then(|v| v.parse().ok()),
         keyspace: info::keyspace(text(keyspace).unwrap_or_default())
@@ -289,8 +284,10 @@ async fn infos(s: &mut Session) -> Result<Infos, RdError> {
     })
 }
 
-/// The replicas' addresses in `INFO replication` (`slaveN:ip=…,port=…`).
-fn replica_ips(text: &str) -> Vec<IpAddr> {
+/// The addresses of the replicas `INFO replication` lists in a sync state
+/// (`slaveN:ip=…,port=…,state=wait_bgsave|send_bulk`): an online replica
+/// is not the one being fully synchronized (review L7).
+fn syncing_replica_ips(text: &str) -> Vec<IpAddr> {
     text.lines()
         .filter(|l| {
             l.strip_prefix("slave")
@@ -298,11 +295,14 @@ fn replica_ips(text: &str) -> Vec<IpAddr> {
                 .is_some_and(|(n, _)| n.bytes().all(|b| b.is_ascii_digit()) && !n.is_empty())
         })
         .filter_map(|l| {
-            l.split_once(':')?
-                .1
+            let fields = l.split_once(':')?.1.trim_end_matches('\r');
+            let state = fields.split(',').find_map(|kv| kv.strip_prefix("state="))?;
+            if !matches!(state, "wait_bgsave" | "send_bulk") {
+                return None;
+            }
+            fields
                 .split(',')
                 .find_map(|kv| kv.strip_prefix("ip="))?
-                .trim_end_matches('\r')
                 .parse()
                 .ok()
         })
@@ -410,8 +410,11 @@ struct Stream<'a> {
     /// Records the core asks to skip (isolation after panics).
     skip: u32,
     acl_ident_key: std::collections::hash_map::RandomState,
-    /// `ACL LOG` counts by identity, for servers without entry ids.
-    acl_idents: Option<HashMap<u64, u64>>,
+    /// `ACL LOG` counts by identity and position, for servers without
+    /// entry ids.
+    acl_idents: Option<HashMap<(u64, u32), u64>>,
+    /// The server run of the current poll ([`info::run_hash`]).
+    run: Option<u64>,
 }
 
 impl Stream<'_> {
@@ -453,17 +456,29 @@ impl Stream<'_> {
         now_s: i64,
         offset_s: i64,
     ) -> Option<MaskedEvent> {
-        let action = e.action.event_action()?;
         let ts = system_time(e.ts);
-        let attributed = e.peer.and_then(|p| attribute(clients, p, e.ts, now_s));
-        // The agent's own connection (H3): its id, or its address within
-        // its lifetime; never its user or client name.
-        let own_conn = attributed
-            .and_then(|c| c.id)
-            .is_some_and(|id| own::is_own_id(&self.target.id, id))
-            || e.peer.and_then(Peer::socket).is_some_and(|a| {
-                own::is_own_addr(&self.target.id, a, system_time(e.ts - offset_s))
-            });
+        // A Unix-socket peer is never attributed: every socket client has
+        // the same address (review H1). A TCP peer is attributed through
+        // `CLIENT LIST` (L2); the agent's own connection (H3) is the
+        // attributed connection when there is one (its id, review M1),
+        // else its address within its lifetime; never its user or client
+        // name.
+        let tcp = e.peer.filter(|p| p.socket().is_some());
+        let attributed = tcp.and_then(|p| attribute(clients, p, e.ts, now_s));
+        let own_conn = match attributed {
+            Some(c) => {
+                c.id.is_some_and(|id| own::is_own_open_id(&self.target.id, id, self.run))
+            }
+            None => tcp.and_then(Peer::socket).is_some_and(|a| {
+                own::is_own_addr(&self.target.id, a, system_time(e.ts - offset_s), self.run)
+            }),
+        };
+        // A new entry of another client proves the log is read (review
+        // L6).
+        if source == EventSource::RedisSlowlog && !own_conn {
+            self.state.audit.note_slow_record(&self.target.id);
+        }
+        let action = e.action.event_action()?;
         let client = e.peer.map(|p| p.addr);
         let principal = match attributed.and_then(|c| c.user.as_ref()) {
             Some(user) => EventPrincipal::account(user),
@@ -486,18 +501,25 @@ impl Stream<'_> {
         // signal of its source: the agent's own Audit reads (`SLOWLOG GET`,
         // `CLIENT LIST`…) have large replies by nature; its sampling
         // commands are bounded (decision 6).
-        if own_conn {
-            let account = self.target.account.clone();
+        // A large reply above what the agent's client accepts for the
+        // shape is never its routine (review L1).
+        let over = source == EventSource::RedisCommandlog && e.size > e.own.max_reply();
+        if own_conn && !over {
+            // The attributed user, so the core's own-account rule applies
+            // to it (review M1).
+            let user = attributed
+                .and_then(|c| c.user.as_ref())
+                .map_or_else(|| self.target.account.clone(), |u| u.to_string());
             let routine = match e.own {
                 OwnShape::No => false,
-                OwnShape::Unkeyed => {
+                OwnShape::Unkeyed { .. } => {
                     self.own
-                        .routine_unbudgeted(&account, None, ClientSeen::NotRecorded, &ev)
+                        .routine_unbudgeted(&user, None, ClientSeen::NotRecorded, &ev)
                 }
-                OwnShape::Keyed { rows } => {
+                OwnShape::Keyed { rows, .. } => {
                     let charged = ev.clone().with_rows(Some(rows));
                     self.own.routine(
-                        &account,
+                        &user,
                         None,
                         ClientSeen::NotRecorded,
                         &charged,
@@ -516,16 +538,21 @@ impl Stream<'_> {
     }
 
     /// The events of an `ACL LOG` entry (its count delta), if any.
-    fn acl_event(&mut self, e: &AclEntry, delta: u64) -> Option<MaskedEvent> {
+    fn acl_event(&mut self, e: &AclEntry, delta: u64, offset_s: i64) -> Option<MaskedEvent> {
         if delta == 0 {
             return None;
         }
         let client = e.client.as_ref();
         // Entries of the agent's own connections (H3): a declaration that
-        // does not match the ACL, reported by `check()`.
+        // does not match the ACL, reported by `check()`. The id must be of
+        // the current server run and the entry within the connection's
+        // lifetime (review M2).
+        let at = e
+            .updated_ms
+            .map_or_else(SystemTime::now, |ms| system_time(ms / 1000 - offset_s));
         if client
             .and_then(|c| c.id)
-            .is_some_and(|id| own::is_own_id(&self.target.id, id))
+            .is_some_and(|id| own::is_own_id_at(&self.target.id, id, self.run, at))
         {
             if e.reason != Reason::Auth {
                 self.state.audit.note_own_denial(&self.target.id, delta);
@@ -585,7 +612,7 @@ impl Stream<'_> {
 /// empty log included) is the baseline: no history replay.
 fn acl_deltas<'e>(
     cursor: &mut Cursor,
-    idents: &mut Option<HashMap<u64, u64>>,
+    idents: &mut Option<HashMap<(u64, u32), u64>>,
     acl: &'e [AclEntry],
 ) -> (Vec<(u64, &'e AclEntry)>, u64) {
     let mut events = Vec::new();
@@ -623,19 +650,31 @@ fn acl_deltas<'e>(
         if acl.is_empty() && cursor.acl.is_none() {
             cursor.acl = Some(-1);
         }
+        // Redis groups identical denials for 60 s only: later ones are new
+        // entries of the same identity. Each entry is keyed by its identity
+        // and its position among the entries of that identity, counted from
+        // the oldest (the log lists the newest first); a new position is a
+        // new entry, reported with its whole count (review M3).
         let first = idents.is_none();
         let known = idents.get_or_insert_with(HashMap::new);
         let mut next = HashMap::new();
-        for e in acl {
+        let mut seen: HashMap<u64, u32> = HashMap::new();
+        let mut keyed: Vec<(u64, &'e AclEntry)> = Vec::with_capacity(acl.len());
+        for e in acl.iter().rev() {
+            let pos = seen.entry(e.ident).or_insert(0);
+            let key = (e.ident, *pos);
+            *pos += 1;
             let delta = if first {
                 0
             } else {
                 e.count
-                    .saturating_sub(known.get(&e.ident).copied().unwrap_or(0))
+                    .saturating_sub(known.get(&key).copied().unwrap_or(0))
             };
-            next.insert(e.ident, e.count);
-            events.push((delta, e));
+            next.insert(key, e.count);
+            keyed.push((delta, e));
         }
+        keyed.reverse();
+        events.extend(keyed);
         *idents = Some(next);
     }
     (events, lost)
@@ -685,6 +724,7 @@ pub(crate) async fn audit_stream(
         skip,
         acl_ident_key: std::collections::hash_map::RandomState::new(),
         acl_idents: None,
+        run: None,
     };
     let mut refused_reads: (bool, bool, bool) = (false, false, false);
     loop {
@@ -754,7 +794,6 @@ async fn poll(
     if inf.run.is_some() && st.cursor.run.is_some() && inf.run != st.cursor.run {
         // A server restart: ids start over; entries since are new.
         tracing::info!(target_id = %target_id, "Redis / Valkey server restarted: Audit positions reset");
-        own::server_restarted(&target_id);
         st.cursor = Cursor {
             run: inf.run,
             slow: st.cursor.slow.map(|_| -1),
@@ -766,6 +805,7 @@ async fn poll(
         st.acl_idents = None;
     }
     st.cursor.run = inf.run.or(st.cursor.run);
+    st.run = inf.run;
     let agent_now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
@@ -807,9 +847,6 @@ async fn poll(
         };
         let (parsed, malformed) = parse_logs(&items, &ctx);
         drop(items);
-        if !parsed.is_empty() && source == EventSource::RedisSlowlog {
-            st.state.audit.note_slow_record(&target_id);
-        }
         let cursor = if source == EventSource::RedisSlowlog {
             &mut st.cursor.slow
         } else {
@@ -858,21 +895,41 @@ async fn poll(
     // Attribution: one `CLIENT LIST` when there is something to
     // attribute; the agent's own connections learn their server-side
     // address from it.
+    // The server's time is read in the same pipeline (`INFO server`, as
+    // `TIME` is not granted), so the connections' ages and the time they
+    // are compared with are of one instant (review L4).
     let mut clients: Vec<Client> = Vec::new();
+    let mut clients_now_s = now_s;
     if reads.client_list && logs.iter().any(|(_, l)| !l.is_empty()) {
-        let v = s
-            .call(&Cmd::ClientList, POLL_TIMEOUT, Stage::Introspection)
+        let r = s
+            .pipeline(
+                &[Cmd::Info(InfoSection::Server), Cmd::ClientList],
+                POLL_TIMEOUT,
+                Stage::Introspection,
+            )
             .await
             .map_err(RdError::into_connector_error)?;
-        if v.error() == Some(ErrorWord::Noperm) {
-            refused.2 = true;
+        if let [server, list] = r.as_slice() {
+            if list.error() == Some(ErrorWord::Noperm) {
+                refused.2 = true;
+            }
+            match text(server)
+                .and_then(|t| info::field(t, "server_time_usec"))
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                Some(us) => {
+                    clients_now_s = us / 1_000_000;
+                    clients = entries::parse_client_list(list);
+                }
+                // Without the server's time, no attribution.
+                None => clients.clear(),
+            }
         }
-        clients = entries::parse_client_list(&v);
         for c in &clients {
             if let (Some(id), Some(addr)) = (c.id, c.peer.and_then(Peer::socket))
-                && own::is_own_id(&target_id, id)
+                && own::is_own_open_id(&target_id, id, st.run)
             {
-                own::seen(&target_id, id, addr);
+                own::seen(&target_id, id, st.run, addr);
             }
         }
     }
@@ -883,7 +940,7 @@ async fn poll(
                 continue;
             }
             let ev = databastion_core::isolate(|| {
-                st.log_event(&e, source, &database, &clients, now_s, offset_s)
+                st.log_event(&e, source, &database, &clients, clients_now_s, offset_s)
             });
             match ev {
                 Some(Some(ev)) => sink.submit(ev).await?,
@@ -904,7 +961,7 @@ async fn poll(
             if delta > 0 && st.take_skip() {
                 continue;
             }
-            match databastion_core::isolate(|| st.acl_event(e, delta)) {
+            match databastion_core::isolate(|| st.acl_event(e, delta, offset_s)) {
                 Some(Some(ev)) => sink.submit(ev).await?,
                 Some(None) => {}
                 None => st.state.audit.note_dropped(&target_id, 1),
@@ -926,7 +983,10 @@ async fn poll(
                 .await
                 .map_err(RdError::into_connector_error)?;
             let declared = &st.target.redis_settings().replicas;
-            let unknown: Vec<IpAddr> = replica_ips(text(&repl).unwrap_or_default())
+            // A guess (review L7): the one undeclared replica in a sync
+            // state when the poll sees it; else no address. The transfer
+            // may have ended before the poll (`redis-cli --rdb`).
+            let unknown: Vec<IpAddr> = syncing_replica_ips(text(&repl).unwrap_or_default())
                 .into_iter()
                 .filter(|ip| !declared.contains(ip))
                 .collect();

@@ -119,6 +119,18 @@ pub(crate) fn server(text: &str) -> Option<Server> {
         .map(Server::Redis)
 }
 
+/// The server run of `INFO server` (`run_id`, which changes at every
+/// restart) as the first 8 bytes of its SHA-256: compared, persisted in
+/// the Audit cursor, never sent nor logged (review L2).
+pub(crate) fn run_hash(text: &str) -> Option<u64> {
+    use sha2::Digest as _;
+    let run = field(text, "run_id")?;
+    let d = sha2::Sha256::digest(run.as_bytes());
+    let mut b = [0u8; 8];
+    b.copy_from_slice(d.get(..8)?);
+    Some(u64::from_be_bytes(b))
+}
+
 /// Whether `INFO server` reports Sentinel mode.
 pub(crate) fn is_sentinel(text: &str) -> bool {
     field(text, "redis_mode") == Some("sentinel")
@@ -190,5 +202,8 @@ mod tests {
         assert!(is_replica("role:slave\r\n"));
         assert!(!is_replica("role:master\r\n"));
         assert!(cluster_enabled("cluster_enabled:1\r\n"));
+        let a = run_hash("run_id:aa\r\n").unwrap();
+        assert_ne!(Some(a), run_hash("run_id:ab\r\n"));
+        assert_eq!(run_hash("redis_version:7\r\n"), None);
     }
 }

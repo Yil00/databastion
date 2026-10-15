@@ -91,13 +91,28 @@ fn learned() -> databastion_classifiers::keys::LearnedPatterns {
     ])
 }
 
+/// Every object is `*` or a contract `KeyPattern` made of the learned
+/// set's literals only (the H1 oracle, review L8).
 fn assert_objects(objects: &[databastion_classifiers::names::NormalizedName]) {
+    use databastion_classifiers::keys::pattern_tokens;
+    let set = learned();
+    let learned_tokens: std::collections::HashSet<&str> = set
+        .patterns()
+        .iter()
+        .flat_map(|p| pattern_tokens(p))
+        .collect();
     for o in objects {
+        let o = o.as_str();
         assert!(
-            o.as_str() == "*" || databastion_classifiers::keys::is_key_pattern(o.as_str()),
-            "{:?}",
-            o.as_str()
+            o == "*" || databastion_classifiers::keys::is_key_pattern(o),
+            "{o:?}"
         );
+        for t in pattern_tokens(o) {
+            assert!(
+                t == "*" || learned_tokens.contains(t),
+                "{t:?} not learned in {o:?}"
+            );
+        }
     }
 }
 
