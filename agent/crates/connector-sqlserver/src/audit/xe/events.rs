@@ -466,8 +466,9 @@ pub(crate) fn context(
 const MAX_BUILD_INTERNALS: u64 = 3;
 
 /// Measured system base tables whose statistics the agent's own catalog
-/// reads make a fresh server build (2022 16.0.4305.5 and 2025 17.0.5015.4,
-/// measured on 2026-10-15; none on 2019): the closed list of case 2, never
+/// reads make a fresh server build (2019 15.0.4500.2, 2022 16.0.4305.5 and
+/// 2025 17.0.5015.4, each on a new data volume, measured on 2026-10-15; the
+/// same tables on all three): the closed list of case 2, never
 /// any `sys` table. `sysowners` and `sysxlgns` were measured too (builds on
 /// their `password` and `type` columns) and are left off on purpose: they
 /// hold credentials, so a build on them stays reported (fail closed, for
@@ -1398,39 +1399,75 @@ mod statistics_tests {
     }
 
     /// The drift fixtures (captured on 2026-10-15 from each matrix image):
-    /// what the accepted rule leaves out there, and what it reports. On
-    /// 2022 a build at `nest_level` 2 has its internal statement at
-    /// `nest_level` 1, outside case 1 as accepted (nest level 2): reported
-    /// (the ADR's lot 3 notes propose the revision).
+    /// what the accepted rule leaves out there, and what it reports. An
+    /// internal statement is at the build's `nest_level` minus one
+    /// (measured on 2019, 2022 and 2025): left out
+    /// (case 1) under a build at nest level 3, reported under one at nest
+    /// level 2 (the ADR's lot 3 notes propose the revision).
     #[test]
     fn fixtures_of_the_matrix_images() {
-        let mut recs = fixture("statistics-16.0.4305.5.xml");
-        context(&mut recs, true, &own);
-        let shown: Vec<(String, bool, Option<i64>, bool)> = recs
-            .iter()
-            .map(|r| {
+        for (file, internals_left_out) in [
+            ("statistics-15.0.4500.2.xml", 4),
+            ("statistics-16.0.4305.5.xml", 0),
+            ("statistics-17.0.5015.4.xml", 4),
+        ] {
+            let mut recs = fixture(file);
+            let builds = recs
+                .iter()
+                .filter(|r| {
+                    r.event
+                        .as_ref()
+                        .and_then(|e| e.statement.as_deref())
+                        .is_some_and(|t| t.contains("StatMan"))
+                })
+                .count();
+            assert_eq!(
+                context(&mut recs, true, &own),
+                builds + internals_left_out,
+                "{file}"
+            );
+            let mut internal_reported = 0;
+            for (i, r) in recs.iter().enumerate() {
                 let e = r.event.as_ref().unwrap();
-                (
-                    r.login().to_owned(),
-                    e.statement
-                        .as_deref()
-                        .is_some_and(|t| t.contains("StatMan")),
-                    e.nest_level,
-                    r.skip,
-                )
-            })
-            .collect();
-        for (login, build, nest, skip) in &shown {
-            if *build {
-                assert!(*skip, "{login}: a build is left out (item 4 or case 2)");
-            } else if *nest == Some(1) {
-                assert!(
-                    !*skip,
-                    "{login}: an internal statement at nest level 1 stays reported"
-                );
+                let build = e
+                    .statement
+                    .as_deref()
+                    .is_some_and(|t| t.contains("StatMan"));
+                let login = r.login();
+                if build {
+                    assert!(
+                        r.skip,
+                        "{file} {i} {login}: a build is left out (item 4 or case 2)"
+                    );
+                } else if e.statement.as_deref().is_some_and(|t| t.is_empty()) {
+                    let under = recs.iter().find(|b| {
+                        b.event.as_ref().is_some_and(|be| {
+                            matches!((&be.activity, &e.activity),
+                                (Some((g, s)), Some((h, t))) if g == h && s + 1 == *t)
+                        })
+                    });
+                    let nest = under
+                        .and_then(|b| b.event.as_ref())
+                        .and_then(|b| b.nest_level);
+                    assert_eq!(e.nest_level.zip(nest).map(|(a, b)| a + 1 == b), Some(true));
+                    assert_eq!(r.skip, e.nest_level == Some(2), "{file} {i} {login}");
+                    if !r.skip {
+                        internal_reported += 1;
+                        assert!(convert(r).is_some(), "{file} {i}: reported");
+                    }
+                } else {
+                    assert!(!r.skip, "{file} {i} {login}: a client's statement stays");
+                }
             }
+            assert!(internal_reported >= 1, "{file}");
+            assert!(
+                recs.iter().any(|r| r.login() == "databastion" && r.skip),
+                "{file}"
+            );
+            assert!(
+                recs.iter().any(|r| r.login() == "it_xstats" && r.skip),
+                "{file}"
+            );
         }
-        assert!(shown.iter().any(|(l, b, ..)| l == "databastion" && *b));
-        assert!(shown.iter().any(|(l, b, ..)| l == "it_xstats" && *b));
     }
 }

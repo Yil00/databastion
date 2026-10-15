@@ -2261,7 +2261,7 @@ async fn xe_statistics_scenario() {
         "the build is left out: the client's read alone names the table"
     );
     // The build's internal statements: left out when of the accepted shape
-    // (case 1: nest level 2); on 2022 they are at nest level 1 (measured)
+    // (case 1: nest level 2); under a build at nest level 2 they are at nest level 1 (measured on 2019, 2022, 2025)
     // and stay reported as reads of `*`, always reported.
     let others: Vec<_> = mine
         .iter()
@@ -2307,7 +2307,7 @@ async fn xe_statistics_scenario() {
 /// new data volume), the agent's own `check()` and Discovery make the server
 /// build statistics on system base tables in its sessions; they are left
 /// out with their internal statements of the accepted shape. The two
-/// measured residuals (internal statements at nest level 1 on 2022, and a
+/// measured residuals (internal statements at nest level 1 under builds at nest level 2, and a
 /// build whose catalog statement comes in a later read) are tolerated and
 /// counted; nothing else of the agent's is reported.
 #[tokio::test]
@@ -2365,12 +2365,13 @@ async fn xe_fresh_scenario() {
     }
     let [exact, _, _, statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] xe fresh: exact {exact}, statistics statements left out {statistics}");
-    // What can remain, both measured on 2022 and listed in the ADR's notes
-    // with the revision they need: the builds' internal statements at nest
-    // level 1, outside case 1 as accepted (reads of `*`, always reported),
-    // and a build whose catalog statement reached the file only after the
-    // read that held the build (case 2 pairs within one read). Nothing
-    // else: no other own statement, no other table.
+    // What can remain, both measured (on 2019, 2022 and 2025) and listed in
+    // the ADR's notes with the revision they need: the builds' internal
+    // statements at nest level 1, outside case 1 as accepted (reads of
+    // `*`, always reported), and a build whose catalog statement reached
+    // the file only after the read that held the build (case 2 pairs
+    // within one read). Nothing else: no other own statement, no other
+    // table.
     let mut internal = 0;
     let mut unpaired = 0;
     for e in &own {
@@ -2387,12 +2388,10 @@ async fn xe_fresh_scenario() {
         }
     }
     eprintln!("[it] xe fresh: internal statements reported {internal}, builds unpaired {unpaired}");
-    if major >= 16 {
-        assert!(
-            statistics > 0,
-            "not a fresh server: no statistics build was seen"
-        );
-    }
+    assert!(
+        statistics > 0,
+        "not a fresh server: no statistics build was seen"
+    );
     if major >= 16 {
         Box::pin(exec(
             &mut s,
