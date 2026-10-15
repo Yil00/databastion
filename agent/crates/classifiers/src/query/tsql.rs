@@ -1360,7 +1360,10 @@ fn analyze_tokens(toks: &[Tok], kind: TsqlKind) -> TsqlAnalysis {
                     a.remote_access = true;
                 }
             }
-            if call && parts.len() >= 2 {
+            // `INSERT [INTO] crm.copy (a, b)`: a column list, not a call
+            // (re-review L6).
+            let column_list = matches!(prev_kw, Some("insert" | "into"));
+            if call && parts.len() >= 2 && !column_list {
                 let schema = parts.get(parts.len() - 2).copied().flatten();
                 let builtin =
                     schema == Some("sys") && last.is_some_and(|n| SYS_FUNCTIONS.contains(&n));
@@ -2628,6 +2631,25 @@ mod tests {
         let (got, complete) = rel("INSERT crm.copy (a, b) SELECT a, b FROM crm.src");
         assert_eq!(got, ["-.crm.copy", "-.crm.src"]);
         assert!(complete);
+        // A column list is not a call (re-review L6); the connectors'
+        // `convert()` outcome is tested with them.
+        for t in [
+            "INSERT crm.copy (a, b) SELECT a, b FROM crm.src",
+            "INSERT INTO crm.copy (a, b) SELECT a, b FROM crm.src",
+            "INSERT crm.copy (a) VALUES (1)",
+            "INSERT INTO retail.crm.copy(a) VALUES (1)",
+        ] {
+            let a = an(t);
+            assert!(
+                !a.user_function && a.usable() && a.relations_complete,
+                "{t}"
+            );
+            assert!(a.writes_table, "{t}");
+        }
+        // A call stays one elsewhere, and a function in the inserted rows.
+        assert!(an("SELECT crm.f(a) FROM crm.src").user_function);
+        assert!(an("INSERT crm.copy (a) SELECT crm.f(a) FROM crm.src").user_function);
+        assert!(an("INSERT crm.copy (a) VALUES (crm.f(1))").user_function);
     }
 
     #[test]

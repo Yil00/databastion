@@ -870,6 +870,41 @@ pub(crate) mod tests {
         assert!(names(&ev).contains(&"retail.sys.dm_exec_sql_text".to_owned()));
     }
 
+    /// Re-review L6: an `INSERT` column list is not a function call; the
+    /// event names the target and the sources and is not always reported.
+    #[test]
+    fn write_target_aliases_and_column_lists() {
+        for (t, want) in [
+            (
+                "INSERT crm.copy (a, b) SELECT a, b FROM crm.src",
+                vec!["retail.crm.copy", "retail.crm.src"],
+            ),
+            (
+                "INSERT INTO crm.copy (a, b) SELECT a, b FROM crm.src",
+                vec!["retail.crm.copy", "retail.crm.src"],
+            ),
+            ("INSERT crm.copy (a) VALUES (1)", vec!["retail.crm.copy"]),
+            (
+                "INSERT INTO retail.crm.copy(a) VALUES (1)",
+                vec!["retail.crm.copy"],
+            ),
+        ] {
+            let ev = one(&stmt("sql_statement_completed", t, 1, "51"));
+            assert_eq!(ev.action(), EventAction::Write, "{t}");
+            assert_eq!(names(&ev), want, "{t}");
+            assert!(!ev.always_report(), "{t}");
+        }
+        // A user function in the inserted rows still names `*`.
+        for t in [
+            "INSERT crm.copy (a) SELECT crm.f(a) FROM crm.src",
+            "INSERT crm.copy (a) VALUES (crm.f(1))",
+        ] {
+            let ev = one(&stmt("sql_statement_completed", t, 1, "51"));
+            assert!(ev.always_report(), "{t}");
+            assert!(names(&ev).contains(&"retail.-.*".to_owned()), "{t}");
+        }
+    }
+
     #[test]
     fn password_statements_keep_their_class_only() {
         for t in ["-- SELECT", "-- Encrypted text"] {
