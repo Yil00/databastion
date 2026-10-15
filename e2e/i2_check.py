@@ -31,7 +31,8 @@ Subcommands
             events carries SIGNAL (the OpenLDAP analyst: the exporter's bulk search carries
             shape.bulk_search). `@not_recorded` stands for an event without a recorded account
             (`account_not_recorded`, Redis / Valkey only, ADR-0052 decision 8: neither `db_user`
-            nor `db_user_fingerprint`) and an incident without a principal. --fingerprinted-only
+            nor `db_user_fingerprint`) and an incident without a principal whose events all
+            have no recorded account (`events_account_not_recorded`, run.sh). --fingerprinted-only
             then requires every principal to be one (a
             principal in clear is counted, never printed: it may be a DN holding a value; events
             without a recorded account have no principal and are not counted),
@@ -816,7 +817,8 @@ _FINGERPRINT = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 
 
 # An event the source records no account for (contract `Principal.account_not_recorded`, Redis /
-# Valkey only); its incidents carry an empty principal (console `principalLabel`).
+# Valkey only); its incidents carry an empty principal (console `principalLabel`) and are told
+# apart by their events (`events_account_not_recorded`, exported by run.sh).
 NOT_RECORDED = "@not_recorded"
 
 
@@ -826,7 +828,9 @@ def _not_recorded_event(e: dict) -> bool:
 
 
 def _not_recorded_incident(i: dict) -> bool:
-    return not i.get("principal")
+    # An empty principal is also the console's label of other incidents without a principal: only
+    # those whose events all have no recorded account (exported as events_account_not_recorded).
+    return not i.get("principal") and i.get("events_account_not_recorded") is True
 
 
 def _fingerprinted_event(e: dict) -> bool:
