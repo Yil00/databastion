@@ -30,6 +30,7 @@ on:
       - "dev/mongo/**"
       - "dev/redis/**"
       - "dev/sqlserver/**"
+      - "agent/crates/core/**"
       - "agent/crates/connector-postgres/**"
       - "agent/crates/connector-mysql/**"
       - "agent/crates/connector-mongodb/**"

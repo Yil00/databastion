@@ -88,8 +88,9 @@ jobs:
           fi
           echo "cas=$cas" | tee -a "$GITHUB_OUTPUT"
           # SQL Server connector (agent-sqlserver, a 2.3 GB image): the agent, the SQL Server dev
-          # service and its seed, the compose file (image pin), the test script and this workflow.
-          if [ -z "$changed" ] || grep -qE '^(agent/|dev/sqlserver/|dev/seed/out/sqlserver\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|dev/agent-it\.sh$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+          # service and its seed, the compose file (image pin), the dev passwords and ports
+          # (dev/.env.example), `make dev-dirs`, the test script and this workflow.
+          if [ -z "$changed" ] || grep -qE '^(agent/|dev/sqlserver/|dev/seed/out/sqlserver\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|dev/\.env\.example$|dev/agent-it\.sh$|Makefile$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
             sqlserver=true
           else
             sqlserver=false
