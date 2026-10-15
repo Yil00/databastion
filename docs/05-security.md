@@ -355,6 +355,18 @@ Requirements for every connector (acceptance criteria of P2-B and P2-C, in addit
 
 The opposite effect, over-masking, is accepted (ADR-0052 decision 7). Many two-segment names become `*:*`, and the families merged into one pattern share its sampling budget ([08-engine-capabilities.md](08-engine-capabilities.md#keyspace-walk-and-sampling)).
 
+## Microsoft SQL Server connector
+*In development, not released yet: merged on `dev` in phase 9 (P9-A, #242 and #243 Discovery and `check()`, #247 Audit), `agent/crates/connector-sqlserver`; decisions in [ADR-0051](adr/0051-sqlserver-connector.md) and its refinement of 2026-10-14; setup in the [user guide](10-user-guide.md#microsoft-sql-server-targets); levels and limits in [08-engine-capabilities.md](08-engine-capabilities.md#microsoft-sql-server-discovery).*
+
+- **Own client** (ADR-0051 decision 1): a bounded TDS client, no driver crate. SQL logins only, no NTLM; the password is held in a zeroized buffer. Fuzz targets cover the packet, token-stream, PLP and `PRELOGIN` / TLS parsers and, for Audit, the T-SQL analysis and the audit records.
+- **TLS on every connection**, loopback included (`LOGIN7` carries the password in a reversible form): `auto`, `strict` (TDS 8.0) or `mandatory`, certificate and host always verified (rustls, WebPKI; `aws-lc-rs` banned), no unencrypted mode. `auto` falls back to `mandatory` only when the strict handshake fails before any TDS byte, never on a certificate error, and never for a target where a strict session was seen (the persisted "strict seen" mark, [08-engine-capabilities.md](08-engine-capabilities.md#tls-modes-and-the-strict-seen-mark)).
+- **Read-only and bounded** (I4): every statement is on a reviewed allow-list, rendered in a single pass with quoted names, checked again at run time and by an architecture test. Sampling runs in autocommit at `READ UNCOMMITTED` with `LOCK_TIMEOUT 2000`, `MAXDOP 1`, a 30 s per-table deadline and 32 MiB per table; its schema-stability lock can delay DDL by up to that deadline ([08-engine-capabilities.md](08-engine-capabilities.md#schema-stability-locks-adr-0051-obligation-l9)).
+- **Account evaluation**: at every heartbeat, `check()` reads the login's effective and securable-level permissions in every database it can access, through its roles, and refuses the account (no Discovery, no Audit) when it holds a right of the **refusal list**: `sysadmin`, `securityadmin`, `##MS_LoginManager##`, `db_owner`, `CONTROL SERVER`, `CONTROL` on a database, `ALTER ANY SERVER AUDIT`, `ALTER ANY DATABASE AUDIT`, the server and database event-session rights, the login and impersonation rights, `VIEW ANY CRYPTOGRAPHICALLY SECURED DEFINITION`, or other logins' password hashes readable (a one-bit probe; no hash reaches the agent). A read that fails or is cut fails closed (`privilege.not_evaluated`). Full list: [user guide](10-user-guide.md#microsoft-sql-server-targets).
+- **Minimal grant**: a SQL login with `CHECK_POLICY = ON`, a user and `SELECT` per schema in each monitored database. **With it alone, Discovery samples nothing**: row-level security policies are invisible to it, so every database is skipped (`coverage.rls_not_verifiable`). The opt-in `sqlserver.rls_visibility: view_definition` with database `VIEW DEFINITION` lets Discovery prove which tables have a policy; it also makes the database's module bodies, constraint and computed-column definitions readable with the agent's credentials (the agent never reads them).
+- **Audit grants** (SQL Server 2022+, only where Audit runs): `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION`. Never `VIEW SERVER SECURITY STATE` (not needed) nor `CONTROL SERVER` (refused; it is what reading the audit needs on 2019, which therefore has no Audit yet). The audit and its specifications are created by the operator; the agent never alters them.
+- **What a stolen agent credential reads**, measured: with the minimal grant, beyond the granted tables, Always Encrypted key metadata (still encrypted by the column master key) and linked servers' host names ([08-engine-capabilities.md](08-engine-capabilities.md#what-a-stolen-agent-credential-reads)); with the Audit grants, also **any `.sqlaudit` file the server's service account can read** (other users' statement texts with their literals), every login's name and role memberships, and certificate and key metadata of `master`, but no password hash, statement-text view or other session ([08-engine-capabilities.md](08-engine-capabilities.md#what-the-audit-grants-expose-measured)). Grant the Audit permissions only where Audit runs, and protect the password like the data.
+- **I2 on statement text**: audit statement texts never leave the agent. Objects come from the audit records; the text only feeds the T-SQL analysis (flags and signals), and password-bearing statements keep their class only. DDL, DCL and failed-login texts are never analysed; failed-login names are fingerprinted.
+
 ## Recommended database accounts (read-only)
 **PostgreSQL** ([ADR-0012](adr/0012-postgresql-agent-grants.md), minimal variant, recommended default). Discovery through explicit per-schema grants; Audit through `pg_read_all_stats` only.
 ```sql
@@ -537,6 +549,21 @@ ACL SETUSER databastion +readonly
 - **Narrower key patterns** (`%R~app:*` instead of `%R~*`) must be listed in `redis.key_patterns` in `agent.yaml`, or the agent's commands on other keys would be refused and logged in `ACL LOG`. Redis ACLs have no negative key patterns: on a server shared with a CAS ticket registry, use positive patterns for the application prefixes (otherwise `privilege.ticket_credentials_readable`).
 - **Never**: any write command, `GET`, `MGET`, `HGETALL`, `SMEMBERS`, `DUMP`, `KEYS`, `SORT`, `MONITOR`, `SYNC`, `PSYNC`, `CONFIG`, `DEBUG`, `MODULE`, `EVAL*`, `FCALL*`, `FUNCTION`, `SCRIPT`, `ACL GETUSER` / `ACL LIST` (password hashes), `SLOWLOG RESET`, `COMMANDLOG RESET`, `CLIENT KILL`, pub/sub. The refusal-list commands ([above](#redis--valkey-connector)) stop the target; the others are reported as over-privilege notes.
 - Keep the server's `default` user `off`, or give it a password (`security.default_user_nopass` otherwise).
+
+**Microsoft SQL Server** ([ADR-0051](adr/0051-sqlserver-connector.md) decision 4 and refinement items 1 and 2; in development, not released yet). A SQL login, a database user per monitored database, and the Audit permissions only where Audit runs ([above](#microsoft-sql-server-connector); the full setup, with the audit itself, in the [user guide](10-user-guide.md#microsoft-sql-server-targets)):
+```sql
+-- Once per server, from a client that does not log the statement (it holds the password).
+CREATE LOGIN databastion_agent WITH PASSWORD = '<from a prompt>', CHECK_POLICY = ON;
+-- In each monitored database
+CREATE USER databastion_agent FOR LOGIN databastion_agent;
+GRANT SELECT ON SCHEMA::[crm] TO databastion_agent;   -- per schema to cover
+GRANT VIEW DEFINITION TO databastion_agent;           -- opt-in (rls_visibility: view_definition); without it nothing is sampled
+-- Audit, SQL Server 2022+, in master, only where Audit runs
+GRANT VIEW SERVER SECURITY AUDIT TO databastion_agent;
+GRANT VIEW ANY SECURITY DEFINITION TO databastion_agent;
+```
+- **Never**: `sysadmin`, `securityadmin`, `db_owner`, `CONTROL SERVER`, `CONTROL` on a database, `ALTER ANY SERVER AUDIT`, `ALTER ANY DATABASE AUDIT`, event-session rights, login and impersonation rights (refused); `VIEW SERVER SECURITY STATE`, `VIEW SERVER STATE`, `db_datareader` without `extended_grants`, `UNMASK` and other rights beyond `SELECT` (reported as over-privilege).
+- `CHECK_POLICY = ON` applies the server's lockout policy to the login: repeated failures lock the agent out (`authentication_failed`).
 
 **Apereo CAS** ([ADR-0041](adr/0041-cas-connector.md) decision 6). The `cas` target needs no account at all (no CAS credential, no actuator); its files are read through the file system. The CAS stores held in a database or directory are read by that engine's target, under the CAS store guard, with the grants below.
 
