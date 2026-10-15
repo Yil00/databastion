@@ -258,7 +258,8 @@ pub const VALUE_OBJECTS: &[&str] = &[
 /// The `sys` functions of SQL Server 2019, 2022 and 2025 (P9-A obligation
 /// L4): a schema-qualified `sys.f(` is a built-in only when `f` is listed.
 /// Measured from `sys.all_objects` (types `FN`, `IF`, `TF`, `FS`, `FT`,
-/// `AF`) on 2022 (16.0.4305.5) and 2025 (17.0.5015.4: four more, marked);
+/// `AF`) on 2022 (16.0.4305.5), 2025 (17.0.5015.4: four more, marked) and
+/// 2019 (15.0.4500.2: one more, marked);
 /// the integration drift test compares it with each matrix image.
 pub const SYS_FUNCTIONS: &[&str] = &[
     "dm_cryptographic_provider_algorithms",
@@ -279,6 +280,7 @@ pub const SYS_FUNCTIONS: &[&str] = &[
     "dm_db_stats_properties",
     "dm_db_stats_properties_internal",
     "dm_db_xtp_hash_index_approx_stats",
+    "dm_enumerate_blobdirectory", // 2019
     "dm_exec_cached_plan_dependent_objects",
     "dm_exec_cursors",
     "dm_exec_describe_first_result_set",
