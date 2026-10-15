@@ -139,7 +139,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0);
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis` and `valkey` are in development, not released yet ([below](#redis--valkey-targets));
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -160,6 +160,43 @@ The example file documents each key with its range. After changing `agent.yaml`,
 
 A console older than the `cas` engine (it does not list `engine.cas`) shows no CAS target: the agent keeps its findings and events spooled until the console is upgraded. CAS stores held in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP (JPA ticket and service tables, MongoDB collections) are read by those engines' targets, under the **CAS store guard**, on by default: ticket registries are never sampled (ticket counts only), ticket ids are dropped before classification wherever they appear, and the agent reports an account that can read ticket or audit-trail credential columns (`privilege.ticket_credentials_readable`) at every heartbeat ([08-engine-capabilities.md](08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap)). List stores kept under custom names in that target's `cas_stores`. Levels and limits: [08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas).
 
+### Redis / Valkey targets
+**In development, not released yet**: the connector is merged on `dev` (phase 9) and is not in 0.7.0. It needs a console that lists the `engine.redis` and `engine.valkey` capabilities; until then the agent keeps the items spooled. Redis and Valkey are mainly Discovery engines: Audit is Limited at best ([08-engine-capabilities.md](08-engine-capabilities.md#redis--valkey-audit)).
+
+Supported: Redis 6.2.7 and later (6.2.7 is a provisional floor, pending the maintainer's decision) and Valkey 7.2 and later. Declare one node per target, with `engine: redis` or `engine: valkey`, a named ACL user as `account` (never `default`) and its password as `secret`:
+
+```yaml
+targets:
+  - id: cache-eu-1
+    engine: valkey
+    host: cache-eu-1.internal
+    port: 6379
+    account: databastion
+    secret: { file: /etc/databastion/secrets/cache-eu-1 }
+    redis:
+      tls: verify_full                     # default; TLS from the first byte
+      ca_file: /etc/databastion/tls/cache-ca.pem
+      # client_cert: /etc/databastion/tls/agent.pem   # with tls-auth-clients yes
+      # client_key: /etc/databastion/tls/agent.key    # 0600, owned by the agent's user
+      key_patterns: ["app:*", "session:*"] # the ACL's read patterns; default ["*"]
+      databases: [0, 1]                    # default: every database
+      max_keys: 100000                     # keys examined per database and scan (1000 to 10000000)
+      discovery_node: { host: cache-eu-1-replica.internal, port: 6379 }  # a replica, for Discovery
+      replicas: [10.0.4.12]                # known replica addresses, compared for full syncs only
+      # cas_stores: { ticket_registry: ["CAS_TICKET:*"] }
+```
+
+- **`tls`**: `verify_full` (default) or `disable`. `disable` is accepted only with `socket` (a Unix socket) or a loopback IP literal such as `127.0.0.1`, never `localhost`. There is no `disable_insecure`, because `AUTH` sends the password itself. `ca_file`, `client_cert` and `client_key` need `verify_full`.
+- **Unix socket**: `socket: /run/valkey/valkey.sock` instead of `host` / `port`, with `tls: disable`. The agent checks the server process's uid on the socket before sending the password. Set **`server_uid`** to the server's uid; without it, the socket file's owner is trusted only when no other user can write to the socket's directory (as with `/run/valkey`). On a socket, Audit cannot attribute any entry to an account, the agent's own included ([08-engine-capabilities.md](08-engine-capabilities.md#redis--valkey-audit)).
+- **`key_patterns`**: if the ACL user's key patterns are narrower than `%R~*`, list them here with the server's glob syntax (at most 64). The agent never sends a command the ACL would refuse, because each refusal writes an `ACL LOG` entry. A pattern the account cannot read is reported as `privilege.declared_keys_not_readable`.
+- **`databases`**: the logical databases to scan (indexes). On Valkey 9.1+ with `db=` ACL permissions, list the same databases.
+- **`discovery_node`**: a replica that Discovery reads instead of the target's node (`host` / `port` or `socket`, with the target's account and TLS settings). Declaring one is recommended, so the scan load and lazy expirations stay off the primary. `check()` and Audit still read the target's node, since the logs are per node. If the Discovery node is down, the whole target shows as unreachable.
+- **`replicas`**: the replicas' IP addresses as the server lists them. A full synchronization is always reported (`signature.full_sync`); a syncing replica not listed here becomes the event's client address.
+- **`unevaluated_acl: accept`**: Redis 6.2 only. Redis 6.2 cannot evaluate the account (no `ACL DRYRUN`), so it is refused unless you set this after reviewing the ACL by hand; the target then shows `privilege.not_evaluated` permanently. On Redis 7.0+ or Valkey it is a configuration error.
+- **Cluster**: each node is a separate target; the agent never follows `MOVED` / `ASK` or the cluster topology. Sentinel is refused.
+
+Create the ACL user on each node the agent reads, as in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only): `-@all` plus the listed read commands on `%R~*` (or the declared patterns), `resetchannels`, and the Audit commands (`slowlog|get`, `acl|log`, `client|list`, Valkey 8.1+ `commandlog|get`) only where Audit runs. An account that can run `CONFIG SET`, `MODULE LOAD`, `ACL SETUSER`, scripts, `REPLICAOF`, `MIGRATE` or another refusal-list command is refused for Discovery and Audit. For Audit, set the server's `slowlog-log-slower-than` (Valkey 8.1+: `commandlog-execution-slower-than`) low enough for the commands you want to see: only commands slower than it are logged.
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 
@@ -170,6 +207,7 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256, `authenticationRestrictions` with `clientSource` = the agent's address(es) | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
 | OpenLDAP | service DN with `read` on the tree; rule `{0}` names **every** credential attribute of the loaded schemas (`userPassword`, `userPKCS12`, and the Samba, Kerberos, ppolicy… ones where loaded), never readable; a `peername.ip` restriction to the agent's address, since the accesslog records no client address | `read` on `cn=accesslog` only while Audit runs for the target (otherwise `privilege.accesslog_without_audit`) | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
 | Apereo CAS (`cas`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
+| Redis / Valkey (not released yet) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.

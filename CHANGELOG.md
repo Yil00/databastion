@@ -7,6 +7,39 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+Planned for the next minor release (0.8.0). Phase 9 is in progress: the entries below are merged on `dev`, and the Redis / Valkey end-to-end and load tests are still to come.
+
+### ⚠️ Upgrade notes
+- **Console migration `0040`** adds the `account_not_recorded` principal to stored access events. The `access_events_principal` check is re-added `NOT VALID` and validated after the migration ([ADR-0028](docs/adr/0028-online-constraint-validation.md)), so it holds no long lock.
+- **Policies with `exclude_principals: ["*"]`** do not hide Redis / Valkey events whose account is not recorded (`account_not_recorded`), by design (#235 review).
+- **Upgrade the console before the agents**, as for every release. An agent of this release keeps Redis / Valkey items spooled until its console lists `engine.redis` and `engine.valkey` ([ADR-0042](docs/adr/0042-hold-items-of-unlisted-engines.md)).
+
+### ✨ Features
+- **Redis / Valkey connector (phase 9, P9-B, [ADR-0052](docs/adr/0052-redis-valkey-connector.md); #237, #239).** Discovery and a Limited Audit for Redis 6.2.7+ and Valkey 7.2+. 6.2.7 is a provisional floor, pending the maintainer's decision on the ADR-0052 refinement. Redis 6.2 runs only with the local opt-in `redis.unevaluated_acl: accept`.
+  - **Client and transport**: the agent's own bounded RESP3 client. `AUTH`, then `HELLO 3` without credentials. TLS `verify_full` by default; cleartext only on a Unix socket (server uid checked) or a loopback address.
+  - **Account checks**: the ACL user's rights are evaluated with `ACL DRYRUN`, never `ACL GETUSER`. Accounts that can run a refusal-list command (`CONFIG SET`, `MODULE LOAD`, scripting, `ACL SETUSER`, `REPLICAOF`, `MIGRATE`…) are refused.
+  - **Discovery**: a bounded `SCAN` walk with local filtering against the declared `redis.key_patterns`, and bounded sampling per type. Key names leave the agent only as normalized key patterns (`user:*:email`); values found in names are reported under `#key` / `#field`.
+  - **Audit**, Limited at best: `SLOWLOG` (Valkey 8.1+: `COMMANDLOG`), Valkey's large-reply log, `ACL LOG` and `sync_full`. Every log entry is reduced at parse time to the command, learned key patterns and counts. Accounts come from `CLIENT LIST`, best effort, and `account_not_recorded` is used otherwise.
+  - **Signals and guard**: `signature.full_sync`, `volume.large_reply`, `shape.keyspace_enumeration`, `signature.cas_ticket_read`. The CAS store guard applies to key names and values.
+  - See [docs/08](docs/08-engine-capabilities.md#redis--valkey-discovery) and [docs/05](docs/05-security.md#redis--valkey-connector).
+- **Protocol (P9-C, #234)**, a compatible change. New engines `sqlserver`, `redis` and `valkey`, each behind an `engine.*` capability token. The Redis / Valkey connector and sources need both tokens. Also new: Redis / Valkey and SQL Server `AuditSource` values; the `KeyPattern` object name for Redis / Valkey; the `account_not_recorded` principal (Redis / Valkey sources only, never on `auth_failure`); SQL Server note labels (revision `target_status.note_labels.2026_10`); 7 signals and 25 target notes. Existing note texts are now engine-neutral.
+- **Console support for SQL Server, Redis and Valkey (P9-E, #235).** The console lists the new engine tokens and stores `account_not_recorded` events (dedup per client network, no per-principal baseline, webhook field `principal_not_recorded`). It renders key patterns as escaped code, never as links, with a CSV formula guard. A heartbeat target whose `audit_source` does not serve its engine is stored without the source, and an agent-integrity event is recorded. The UI gains per-engine location labels, an engine filter on findings and setup hints for detected targets. Redis / Valkey key patterns cannot be listed as Audit sensitive objects yet: they are skipped with a counter and a UI note.
+
+### 🔒 Security
+- `rustls` 0.23.46 (RUSTSEC-2026-0346 to 0349, #236).
+
+### 👷 CI
+- New required jobs `agent-redis` (connector integration tests against Valkey 9.0.6 and Redis 8.10.2 over TLS) and `agent-keys-sweep` (the release-mode key-pattern contract sweep). The weekly engine matrix gains 13 Redis and Valkey lines: Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10, 8.4.7, 8.6.7, 8.8.3, 8.10.2; Valkey 7.2.14, 8.0.11, 8.1.10, 9.0.6, 9.1.2 (#238).
+- Opt-in dev services: SQL Server (Express, `make dev-sqlserver`), and Valkey 9.0.6 and Redis 8.10.2 (`make dev-redis`), TLS only, with seeded fake data and ground truth. The phase 9 engine facts are measured in [docs/measurements/phase9-engine-facts.md](docs/measurements/phase9-engine-facts.md) (#233).
+- Fuzz targets `redis_resp_decoder`, `redis_info`, `redis_key_pattern`, `redis_slowlog_entry`, `redis_acl_log_entry` and `redis_learned_patterns`, in the nightly run.
+
+### 📝 Documentation
+- [ADR-0051](docs/adr/0051-sqlserver-connector.md) (SQL Server connector) and [ADR-0052](docs/adr/0052-redis-valkey-connector.md) (Redis / Valkey connector), accepted by the maintainer on 2026-10-14 (#231, #232). ADR-0052 gains implementation notes (2026-10-15).
+
+### ⚠️ Known limitations
+- Redis / Valkey: Audit sees only slow commands (and, on Valkey 8.1+, large replies), with no row count. Accounts are best effort, and Unix-socket clients are never attributed: on a socket target, the agent's own slow entries come back as `account_not_recorded`. Many two-segment key names are over-masked to `*:*`. The CAS Redis ticket registry prefix is not confirmed. No end-to-end or load test yet. Details: [docs/08](docs/08-engine-capabilities.md#redis--valkey-audit).
+- SQL Server is not implemented yet (the protocol and the console accept it).
+
 ## [0.7.0](https://github.com/Yil00/databastion/compare/0.6.0...0.7.0) (2026-10-13)
 
 ### ⚠️ Upgrade notes

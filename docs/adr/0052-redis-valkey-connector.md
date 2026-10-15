@@ -261,6 +261,15 @@ Security review Lows and test obligations the implementation must meet; the P9-F
 - **M6**: the CAS prefix confirmed before the connector samples anything (open question 9); the unanchored value tripwire tested on values that embed a ticket id after other text.
 
 
+## Implementation notes (2026-10-15)
+Facts of the implementation (P9-B lot 1 #237, lot 2 #239), recorded by the docs-keeper. They change no decision above; where the code differs from the text, the difference is stated for the maintainer.
+- **`HRANDFIELD key 17`** (decision 6 writes `HRANDFIELD key 16`): the connector asks for one more field than the collapse threshold of decision 7 and reads at most 16 of them. A hash with more than 16 fields reports every field name as `*`, even when it is its pattern's only key, so the field names of a hash keyed by data never reach the cardinality rule alone (#237 review H2).
+- **`TIME` is not used.** The attribution rule of decision 8 compares a connection's `age` with the entry's timestamp on the server's clock. `TIME` is not in the allow-list of decision 4, so `server_time_usec` is read from `INFO server`, in the same pipeline as `CLIENT LIST` (#239 review L4). No grant was added.
+- **Provisional Redis floor: 6.2.7.** The N1 gate is applied as one constant at 6.2.7, pending the maintainer's decision on the proposed refinement of 2026-10-14 (branch `docs/p9-adr-refinements`, not merged). It rests on the [measurements](../measurements/phase9-engine-facts.md#redis-and-valkey-adr-0052): 6.2.0 never slow-logs `AUTH` but logs other clients' `CONFIG SET masterauth` and `MIGRATE … AUTH2` passwords in clear; 6.2.7 and 6.2.24 redact them; 6.2.1 to 6.2.6 were not measured. Until the decision, decision 2's floor reads as 6.2.7 in the agent.
+- **Over-masking cascade, accepted under decision 7.** The record-id rule applies at every position, the first included. So two-segment names with different first segments and a value-like second segment collapse to `*:*` (`phone:1` and `addressbook:2` give `*:*`), and many unrelated families merge into one pattern. Decision 7 accepts this: a lost name is a smaller harm than a leaked value. The families merged into one pattern share its sampling budget of decision 6 (the first keys met by the walk). Round-robin sampling across them is a [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups).
+- **Start cursor.** The walk starts at cursor 0, which is the fallback of decision 6, not a cursor derived from the scan's seed. A walk cut by its bounds therefore sees the same first keys at each scan.
+- **Poll interval.** No `redis.audit_poll_interval_s` key exists (Consequences). The Audit stream polls at the Audit settings' `poll_interval_s` (default 10 s), with `limits.min_audit_poll_interval_s` as the floor, as the other polled sources do.
+
 ## To verify (facts this ADR could not confirm)
 - That `SCAN` returns key names outside the account's key patterns on every supported version (decision 4, residual risk).
 - That `redis-cli --rdb` increases `sync_full` and shows in `INFO replication` on Redis 7.0+ and Valkey (`REPLCONF rdb-only`).
