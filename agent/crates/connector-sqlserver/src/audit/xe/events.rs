@@ -290,7 +290,14 @@ fn resolved(r: &XeRecord) -> Vec<(Zeroizing<String>, Zeroizing<String>, Zeroizin
 /// The context pass over one poll's records, in file order (see the
 /// module documentation): procedure names of RPCs, duplicate failed
 /// logins, statistics builds on the allow-listed builds (`statman`).
-pub(crate) fn context(records: &mut [XeRecord], statman: bool) {
+/// Returns how many statistics statements it left out. `own` tells
+/// whether a record is from one of the agent's own sessions within its
+/// lifetime with both principals the agent's (case 2).
+pub(crate) fn context(
+    records: &mut [XeRecord],
+    statman: bool,
+    own: &dyn Fn(&XeRecord) -> bool,
+) -> usize {
     // RPCs of user procedures: their statements, back to the previous
     // boundary of the session.
     for i in 0..records.len() {
@@ -351,10 +358,11 @@ pub(crate) fn context(records: &mut [XeRecord], statman: bool) {
         }
     }
     if !statman {
-        return;
+        return 0;
     }
-    // Statistics builds, paired with a reported statement of the same
-    // request naming the same table in the same database.
+    // Statistics builds (refinement item 4 and the refinement of
+    // 2026-10-15, case 2).
+    let mut builds: Vec<usize> = Vec::new();
     for i in 0..records.len() {
         let r = &records[i];
         if r.kind() != Kind::SpStatementCompleted {
@@ -375,6 +383,8 @@ pub(crate) fn context(records: &mut [XeRecord], statman: bool) {
         );
         let hi = (i + 1 + CONTEXT_WINDOW).min(records.len());
         let lo = i.saturating_sub(CONTEXT_WINDOW);
+        // Item 4: paired with a reported statement of the same request
+        // naming the same table in the same database.
         let paired = (lo..hi).filter(|j| *j != i).any(|j| {
             let o = &records[j];
             o.kind().is_statement()
@@ -386,10 +396,114 @@ pub(crate) fn context(records: &mut [XeRecord], statman: bool) {
                 && no_boundary_between(records, i, j)
                 && resolved(o).contains(&key)
         });
-        if paired {
-            records[i].skip = true;
+        // Case 2: a build on a measured system base table, in one of the
+        // agent's own sessions (`own`: SPID, lifetime, both principals),
+        // in the same causality activity as one of the agent's exact
+        // catalog texts from its own session.
+        let own_catalog = || {
+            let Some((guid, _)) = e.activity.as_ref() else {
+                return false;
+            };
+            schema.eq_ignore_ascii_case("sys")
+                && SYS_BASE_TABLES
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(&table))
+                && own(r)
+                && (lo..hi).filter(|j| *j != i).any(|j| {
+                    let o = &records[j];
+                    o.kind().is_statement()
+                        && o.event.as_ref().is_some_and(|oe| {
+                            !oe.statement_cut
+                                && oe.activity.as_ref().is_some_and(|(g, _)| g == guid)
+                                && oe.statement.as_deref().is_some_and(|t| {
+                                    crate::sql::own_text(t) == crate::sql::OwnText::Exact
+                                })
+                        })
+                        && own(o)
+                })
+        };
+        if paired || own_catalog() {
+            builds.push(i);
         }
     }
+    let mut left_out = 0;
+    for &i in &builds {
+        records[i].skip = true;
+        left_out += 1;
+        // Case 1: the build's internal statements that follow it in its
+        // causality activity (never by session order), at contiguous
+        // sequence numbers, at most 3, each of the measured shape.
+        let Some((guid, seq)) = records[i].event.as_ref().and_then(|e| e.activity.clone()) else {
+            continue;
+        };
+        // In file order, an internal statement can come before its build
+        // (measured on 2022): looked for on both sides, by sequence.
+        let lo = i.saturating_sub(CONTEXT_WINDOW);
+        let hi = (i + 1 + CONTEXT_WINDOW).min(records.len());
+        for next in seq + 1..=seq + MAX_BUILD_INTERNALS {
+            let found = (lo..hi).find(|&j| {
+                records[j]
+                    .event
+                    .as_ref()
+                    .and_then(|e| e.activity.as_ref())
+                    .is_some_and(|(g, s)| *g == guid && *s == next)
+            });
+            match found {
+                Some(j) if build_internal(&records[j]) && !records[j].skip => {
+                    records[j].skip = true;
+                    left_out += 1;
+                }
+                // Not contiguous, or not of the shape: the run ends.
+                _ => break,
+            }
+        }
+    }
+    left_out
+}
+
+/// Internal statements of one statistics build left out at most (case 1:
+/// one to three measured).
+const MAX_BUILD_INTERNALS: u64 = 3;
+
+/// Measured system base tables whose statistics the agent's own catalog
+/// reads make a fresh server build (2022 16.0.4305.5 and 2025 17.0.5015.4,
+/// measured on 2026-10-15; none on 2019): the closed list of case 2, never
+/// any `sys` table. `sysowners` and `sysxlgns` were measured too (builds on
+/// their `password` and `type` columns) and are left off on purpose: they
+/// hold credentials, so a build on them stays reported (fail closed, for
+/// the maintainer).
+pub(crate) const SYS_BASE_TABLES: &[&str] = &[
+    "sysschobjs",
+    "sysrowsets",
+    "syscolpars",
+    "sysobjvalues",
+    "sysidxstats",
+    "sysclsobjs",
+    "sysmultiobjrefs",
+    "syssingleobjrefs",
+    "sysprivs",
+    "sysdbreg",
+];
+
+/// The `object_type` map value of `ADHOC`.
+const ADHOC: i64 = 20_801;
+
+/// The measured shape of a statistics build's internal statement (case 1):
+/// `sp_statement_completed`, an empty complete text, `object_type` ADHOC,
+/// `nest_level` 2, both offsets 0.
+pub(crate) fn build_internal(r: &XeRecord) -> bool {
+    r.kind() == Kind::SpStatementCompleted
+        && r.event.as_ref().is_some_and(|e| {
+            !e.statement_cut
+                && e.statement.as_deref().is_some_and(|t| t.is_empty())
+                && e.object_type == Some(ADHOC)
+                && e.object_type_name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("adhoc"))
+                && e.nest_level == Some(2)
+                && e.offset == Some(0)
+                && e.offset_end == Some(0)
+        })
 }
 
 /// No `rpc_completed` / `sql_batch_completed` of the session between `a`
@@ -804,7 +918,7 @@ pub(crate) mod tests {
             )
         };
         let mut recs = vec![fail(), fail()];
-        context(&mut recs, false);
+        context(&mut recs, false, &|_| false);
         let evs: Vec<MaskedEvent> = recs.iter().filter_map(convert).map(|(e, _)| e).collect();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].action(), EventAction::AuthFailure);
@@ -840,7 +954,7 @@ pub(crate) mod tests {
                 &actions,
             ),
         ];
-        context(&mut recs, false);
+        context(&mut recs, false, &|_| false);
         let ev = one(&recs[0]);
         assert_eq!(
             names(&ev),
@@ -861,7 +975,7 @@ pub(crate) mod tests {
                 &actions,
             ),
         ];
-        context(&mut recs, false);
+        context(&mut recs, false, &|_| false);
         assert_eq!(names(&one(&recs[0])), ["retail.crm.customers"]);
     }
 
@@ -881,10 +995,10 @@ pub(crate) mod tests {
             ]
         };
         let mut recs = build();
-        context(&mut recs, true);
+        context(&mut recs, true, &|_| false);
         assert!(recs[0].skip, "paired: left out");
         let mut recs = build();
-        context(&mut recs, false);
+        context(&mut recs, false, &|_| false);
         assert!(!recs[0].skip, "not an allow-listed build: counted");
         let ev = one(&recs[0]);
         assert_eq!(names(&ev), ["retail.crm.customers"]);
@@ -904,7 +1018,7 @@ pub(crate) mod tests {
                 "52",
             ),
         ];
-        context(&mut recs, true);
+        context(&mut recs, true, &|_| false);
         assert!(!recs[0].skip);
         // A pair alone in another database: counted.
         let mut recs = vec![
@@ -916,7 +1030,7 @@ pub(crate) mod tests {
                 "51",
             ),
         ];
-        context(&mut recs, true);
+        context(&mut recs, true, &|_| false);
         assert!(!recs[0].skip);
     }
 
@@ -1047,5 +1161,276 @@ pub(crate) mod tests {
         // Not a statement event: dropped (counted by the caller).
         let u = units("<event name=\"login\"><data");
         assert!(XeRecord::from_row(row_of("login", &u, u.len() * 2)).is_err());
+    }
+}
+
+/// The refinement of 2026-10-15 (statistics builds, cases 1 and 2): each
+/// condition on its excluded and its reported side, and the measured
+/// fixtures of each matrix image.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod statistics_tests {
+    use super::tests::{rec, who};
+    use super::*;
+
+    const BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [nsid] AS [SC0] FROM \
+        [sys].[sysschobjs] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+    const USER_BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [v] AS [SC0] FROM \
+        [crm].[t] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+    const GUID: &str = "B84042D7-4A61-4898-A945-0C2CF29E7FDA";
+
+    /// An `sp_statement_completed` of `login` in activity (`guid`, `seq`).
+    fn sp(
+        login: &str,
+        text: &str,
+        guid: Option<&str>,
+        seq: u64,
+        shape: (i64, &str, i64, i64),
+    ) -> XeRecord {
+        let (nest, otype, off, end) = shape;
+        let mut a: Vec<(&str, String)> = who(login, "56");
+        if let Some(g) = guid {
+            a.push(("attach_activity_id", format!("{g}-{seq}")));
+        }
+        let actions: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let nest = nest.to_string();
+        let off = off.to_string();
+        let end = end.to_string();
+        let x = format!(
+            "<event name=\"sp_statement_completed\"><data name=\"object_type\"><value>{}</value><text>{otype}</text></data>\
+             <data name=\"nest_level\"><value>{nest}</value></data><data name=\"offset\"><value>{off}</value></data>\
+             <data name=\"offset_end\"><value>{end}</value></data><data name=\"statement\"><value>{}</value></data>{}</event>",
+            if otype == "ADHOC" { 20_801 } else { 8272 },
+            text.replace('&', "&amp;").replace('<', "&lt;"),
+            actions
+                .iter()
+                .map(|(k, v)| format!("<action name=\"{k}\"><value>{v}</value></action>"))
+                .collect::<String>()
+        );
+        let mut r = rec("sp_statement_completed", &[], &[]);
+        r.event = Some(xml::parse(&x).unwrap());
+        r
+    }
+
+    const INTERNAL: (i64, &str, i64, i64) = (2, "ADHOC", 0, 0);
+    const BUILD_SHAPE: (i64, &str, i64, i64) = (3, "ADHOC", 0, 342);
+
+    /// A statement of `login` in activity (`guid`, `seq`).
+    fn stmt_in(login: &str, text: &str, guid: Option<&str>, seq: u64) -> XeRecord {
+        let mut a: Vec<(&str, String)> = who(login, "56");
+        if let Some(g) = guid {
+            a.push(("attach_activity_id", format!("{g}-{seq}")));
+        }
+        let actions: Vec<(&str, &str)> = a.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let t = text.replace('&', "&amp;").replace('<', "&lt;");
+        rec(
+            "sql_statement_completed",
+            &[("row_count", "1"), ("statement", &t)],
+            &actions,
+        )
+    }
+
+    fn own(r: &XeRecord) -> bool {
+        r.login() == "databastion"
+    }
+
+    fn catalog() -> String {
+        crate::sql::tables("retail", 16_384).unwrap()
+    }
+
+    fn reported(recs: &[XeRecord]) -> Vec<usize> {
+        recs.iter()
+            .enumerate()
+            .filter(|(_, r)| convert(r).is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Case 2: a build on a measured base table in the agent's own session,
+    /// in the activity of one of its exact catalog texts.
+    fn own_build(guid: Option<&str>) -> Vec<XeRecord> {
+        vec![
+            sp("databastion", BUILD, guid, 1, BUILD_SHAPE),
+            sp("databastion", "", guid, 2, INTERNAL),
+            stmt_in("databastion", &catalog(), guid, 3),
+        ]
+    }
+
+    #[test]
+    fn case_2_needs_every_condition() {
+        // Excluded: the build and its internal statement; the catalog read
+        // is the agent's own by its exact text (the stream's own rule).
+        let mut recs = own_build(Some(GUID));
+        assert_eq!(context(&mut recs, true, &own), 2);
+        assert!(recs[0].skip && recs[1].skip && !recs[2].skip);
+        // Reported: no causality, a build not allow-listed, not the
+        // agent's session, no exact catalog text in the activity, another
+        // activity, a table off the list, a credential table.
+        let mut recs = own_build(None);
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip && !recs[1].skip, "no causality");
+        let mut recs = own_build(Some(GUID));
+        context(&mut recs, false, &own);
+        assert!(!recs[0].skip, "not an allow-listed build");
+        let mut recs = own_build(Some(GUID));
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip, "not the agent's session");
+        let mut recs = own_build(Some(GUID));
+        recs[2] = stmt_in("databastion", "SELECT name FROM sys.objects", Some(GUID), 3);
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip, "no exact catalog text");
+        let mut recs = own_build(Some(GUID));
+        recs[2] = stmt_in(
+            "databastion",
+            &catalog(),
+            Some("AAAAAAAA-0000-0000-0000-000000000000"),
+            3,
+        );
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip, "the catalog text in another activity");
+        for table in [
+            "[sys].[sysowners]",
+            "[sys].[sysxlgns]",
+            "[sys].[sysfiles1]",
+            "[dbo].[sysschobjs]",
+        ] {
+            let mut recs = own_build(Some(GUID));
+            recs[0] = sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", table),
+                Some(GUID),
+                1,
+                BUILD_SHAPE,
+            );
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "{table}");
+            assert_eq!(reported(&recs), [0, 1, 2], "{table}");
+        }
+    }
+
+    #[test]
+    fn case_1_needs_every_condition() {
+        // A user's build, paired by item 4 with the user's read.
+        let build = |shape: (i64, &str, i64, i64), guid: Option<&str>, seq_internal: u64| {
+            vec![
+                sp("app", "", guid, seq_internal, shape),
+                sp("app", USER_BUILD, guid, 1, BUILD_SHAPE),
+                stmt_in("app", "SELECT TOP (5) id FROM crm.t WHERE v = 3", guid, 9),
+            ]
+        };
+        // Excluded (before the build in file order, as measured).
+        let mut recs = build(INTERNAL, Some(GUID), 2);
+        assert_eq!(context(&mut recs, true, &|_| false), 2);
+        assert_eq!(reported(&recs), [2]);
+        // Reported: no causality (no session-order fallback), another
+        // activity, not contiguous, another shape, not allow-listed.
+        let mut recs = build(INTERNAL, None, 2);
+        context(&mut recs, true, &|_| false);
+        assert_eq!(reported(&recs), [0, 2], "no causality");
+        let mut recs = build(INTERNAL, Some(GUID), 3);
+        context(&mut recs, true, &|_| false);
+        assert_eq!(reported(&recs), [0, 2], "not contiguous");
+        for shape in [
+            (1, "ADHOC", 0, 0),
+            (2, "PROC", 0, 0),
+            (2, "ADHOC", 4, 0),
+            (2, "ADHOC", 0, -1),
+        ] {
+            let mut recs = build(shape, Some(GUID), 2);
+            context(&mut recs, true, &|_| false);
+            assert_eq!(reported(&recs), [0, 2], "{shape:?}");
+        }
+        let mut recs = build(INTERNAL, Some(GUID), 2);
+        recs[0] = sp("app", "SELECT 1 FROM crm.t", Some(GUID), 2, INTERNAL);
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip, "a text: not an internal statement");
+        let mut recs = build(INTERNAL, Some(GUID), 2);
+        context(&mut recs, false, &|_| false);
+        assert_eq!(reported(&recs), [0, 1, 2], "not an allow-listed build");
+        // Another activity's internal statement with the next sequence.
+        let mut recs = build(INTERNAL, Some(GUID), 2);
+        recs[0] = sp(
+            "app",
+            "",
+            Some("AAAAAAAA-0000-0000-0000-000000000000"),
+            2,
+            INTERNAL,
+        );
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip);
+        // At most 3.
+        let mut recs: Vec<XeRecord> = (2..=5)
+            .map(|s| sp("app", "", Some(GUID), s, INTERNAL))
+            .collect();
+        recs.push(sp("app", USER_BUILD, Some(GUID), 1, BUILD_SHAPE));
+        recs.push(stmt_in(
+            "app",
+            "SELECT TOP (5) id FROM crm.t WHERE v = 3",
+            Some(GUID),
+            9,
+        ));
+        assert_eq!(context(&mut recs, true, &|_| false), 4);
+        assert!(recs[0].skip && recs[1].skip && recs[2].skip && !recs[3].skip);
+    }
+
+    /// Reads a fixture: one event per line, captured on the image.
+    fn fixture(name: &str) -> Vec<XeRecord> {
+        let text =
+            std::fs::read_to_string(format!("{}/fixtures/xe/{name}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        text.lines()
+            .filter(|l| l.trim_start().starts_with("<event"))
+            .enumerate()
+            .map(|(i, l)| {
+                let e = xml::parse(l.trim()).unwrap();
+                XeRecord {
+                    file: "/x/s_0_1.xel".to_owned(),
+                    offset: 4096,
+                    time_us: i64::try_from(i).unwrap(),
+                    name: e.name.clone(),
+                    event: Some(e),
+                    procedure: None,
+                    skip: false,
+                    unreadable: false,
+                }
+            })
+            .collect()
+    }
+
+    /// The drift fixtures (captured on 2026-10-15 from each matrix image):
+    /// what the accepted rule leaves out there, and what it reports. On
+    /// 2022 a build at `nest_level` 2 has its internal statement at
+    /// `nest_level` 1, outside case 1 as accepted (nest level 2): reported
+    /// (the ADR's lot 3 notes propose the revision).
+    #[test]
+    fn fixtures_of_the_matrix_images() {
+        let mut recs = fixture("statistics-16.0.4305.5.xml");
+        context(&mut recs, true, &own);
+        let shown: Vec<(String, bool, Option<i64>, bool)> = recs
+            .iter()
+            .map(|r| {
+                let e = r.event.as_ref().unwrap();
+                (
+                    r.login().to_owned(),
+                    e.statement
+                        .as_deref()
+                        .is_some_and(|t| t.contains("StatMan")),
+                    e.nest_level,
+                    r.skip,
+                )
+            })
+            .collect();
+        for (login, build, nest, skip) in &shown {
+            if *build {
+                assert!(*skip, "{login}: a build is left out (item 4 or case 2)");
+            } else if *nest == Some(1) {
+                assert!(
+                    !*skip,
+                    "{login}: an internal statement at nest level 1 stays reported"
+                );
+            }
+        }
+        assert!(shown.iter().any(|(l, b, ..)| l == "databastion" && *b));
+        assert!(shown.iter().any(|(l, b, ..)| l == "it_xstats" && *b));
     }
 }

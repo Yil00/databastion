@@ -69,6 +69,13 @@ use events::XeRecord;
 
 /// Cursor file name.
 const CURSOR: &str = "sqlserver_xevents";
+/// How far Extended Events' `timestamp_utc` can run ahead of the
+/// `SYSUTCDATETIME()` an own session's end is computed on: measured up to
+/// 0.9 ms (2019), 3.5 ms (2022) and 2.8 ms (2025); every statement of an
+/// own session is matched up to this long after its clean end (a session
+/// that reuses the SPID within it, with the agent's login and one of its
+/// exact texts or credits, is the residual of decision 6).
+pub(crate) const XE_CLOCK_SKEW_US: i64 = 20_000;
 /// The server's errors for a position outside the session's file set: an
 /// offset that is not a buffer, a file that is gone (measured on 2019).
 const ERR_BAD_OFFSET: i32 = 25_722;
@@ -152,7 +159,9 @@ impl Stream<'_> {
         let Some(spid) = e.session_id else {
             return Err("no session");
         };
-        if own::session_at(&self.target.id, spid, r.time_us, text).is_none() {
+        if own::session_at_skewed(&self.target.id, spid, r.time_us, text, XE_CLOCK_SKEW_US)
+            .is_none()
+        {
             return Err("not one of the agent's sessions at that time");
         }
         let account = &self.target.account;
@@ -220,6 +229,32 @@ impl Stream<'_> {
     }
 }
 
+/// Whether a record comes from one of the agent's own sessions within its
+/// lifetime, with both principals the agent's login and, when present, its
+/// application name (decision 6; the source records no client address):
+/// the own-session part of the rule, without the text and credit part.
+fn own_session(target: &TargetConfig, r: &XeRecord) -> bool {
+    let Some(e) = &r.event else { return false };
+    if e.statement_cut {
+        return false;
+    }
+    let Some(spid) = e.session_id else {
+        return false;
+    };
+    let text = e.statement.as_deref().map_or("", |s| s.as_str());
+    let account = &target.account;
+    let both = |p: &Option<String>| {
+        p.as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(account))
+    };
+    own::session_at_skewed(&target.id, spid, r.time_us, text, XE_CLOCK_SKEW_US).is_some()
+        && both(&e.server_principal)
+        && both(&e.session_principal)
+        && e.client_app
+            .as_deref()
+            .is_none_or(|a| a.is_empty() || a == APP)
+}
+
 /// Whether the SQL Server Audit source is usable on `s` now (the
 /// preference rule of decision 6): an audit named, SQL Server 2022 or
 /// later, its grants held and the audit found.
@@ -281,6 +316,12 @@ pub(crate) async fn stream(
     if first_start {
         // No history replay.
         cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
+        // The event clock runs ahead of the server time the first start is
+        // read on by up to the skew: what ran just before the start can be
+        // stamped just after it (measured: 2 ms).
+        cursor.floor = cursor
+            .history_us
+            .map(|h| h.saturating_add(XE_CLOCK_SKEW_US));
     }
     let mut st = Stream {
         name,
@@ -676,9 +717,11 @@ async fn read(
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
-    let history = st.cursor.history_us;
+    // Events stamped before the first start are history, whenever they
+    // reach the file (the dispatch latency delays them past the first,
+    // caught-up read).
     let mut records = b.kept;
-    if let Some(h) = history {
+    if let Some(h) = st.cursor.floor {
         records.retain(|r| r.time_us >= h);
     }
     if st.skip > 0 {
@@ -692,7 +735,12 @@ async fn read(
         tracing::warn!(target_id = %target_id, unreadable, "Extended Events: statement events whose data could not be read: reported as reads of *");
     }
     let statman = st.statman;
-    if databastion_core::isolate(|| events::context(&mut records, statman)).is_none() {
+    let target = st.target;
+    let own = |r: &XeRecord| own_session(target, r);
+    let context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
+    if let Some(n) = context {
+        st.state.audit.note_statistics(&target_id, n);
+    } else {
         // The context pass panicked: every record of the read is converted
         // without it (counted twice at worst, never dropped).
         for r in &mut records {

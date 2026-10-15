@@ -120,6 +120,15 @@ enum Field {
     ClientApp,
     Database,
     Activity,
+    /// `sp_statement_completed`: `nest_level`, `offset`, `offset_end` and
+    /// `object_type` (its map value and its text): the shape of a
+    /// statistics build's internal statements (ADR-0051 refinement of
+    /// 2026-10-15, case 1).
+    NestLevel,
+    Offset,
+    OffsetEnd,
+    ObjectType,
+    ObjectTypeName,
 }
 
 /// The kept field of a `data` element of an event of `kind`.
@@ -139,6 +148,10 @@ fn data_field(kind: Kind, name: &str) -> Option<Field> {
         // values, is never kept).
         (Kind::RpcCompleted, "object_name") => Some(Field::ObjectName),
         (Kind::ErrorReported, "error_number") => Some(Field::ErrorNumber),
+        (Kind::SpStatementCompleted, "nest_level") => Some(Field::NestLevel),
+        (Kind::SpStatementCompleted, "offset") => Some(Field::Offset),
+        (Kind::SpStatementCompleted, "offset_end") => Some(Field::OffsetEnd),
+        (Kind::SpStatementCompleted, "object_type") => Some(Field::ObjectType),
         _ => None,
     }
 }
@@ -178,6 +191,13 @@ pub(crate) struct XeEvent {
     /// `attach_activity_id`: the activity GUID and the event's sequence in
     /// it (`TRACK_CAUSALITY = ON`).
     pub(crate) activity: Option<(String, u64)>,
+    /// `sp_statement_completed` only.
+    pub(crate) nest_level: Option<i64>,
+    pub(crate) offset: Option<i64>,
+    pub(crate) offset_end: Option<i64>,
+    /// The `object_type` map value and its text (`20801`, `ADHOC`).
+    pub(crate) object_type: Option<i64>,
+    pub(crate) object_type_name: Option<String>,
 }
 
 impl std::fmt::Debug for XeEvent {
@@ -252,6 +272,26 @@ impl XeEvent {
             Field::Database => {
                 dup(self.database.is_some())?;
                 self.database = Some(short(text)?);
+            }
+            Field::NestLevel => {
+                dup(self.nest_level.is_some())?;
+                self.nest_level = Some(number(&short(text)?)?);
+            }
+            Field::Offset => {
+                dup(self.offset.is_some())?;
+                self.offset = Some(number(&short(text)?)?);
+            }
+            Field::OffsetEnd => {
+                dup(self.offset_end.is_some())?;
+                self.offset_end = Some(number(&short(text)?)?);
+            }
+            Field::ObjectType => {
+                dup(self.object_type.is_some())?;
+                self.object_type = Some(number(&short(text)?)?);
+            }
+            Field::ObjectTypeName => {
+                dup(self.object_type_name.is_some())?;
+                self.object_type_name = Some(short(text)?);
             }
             Field::Activity => {
                 dup(self.activity.is_some())?;
@@ -696,6 +736,7 @@ fn child_content(
     ev: &mut XeEvent,
 ) -> Result<(), XmlError> {
     let mut kept = false;
+    let mut kept_text = false;
     loop {
         p.text(&mut Sink::Drop)?;
         if p.peek().is_none() {
@@ -710,7 +751,12 @@ fn child_content(
         }
         p.pos += 1;
         let s = p.start()?;
-        let keep = field.filter(|_| s.name == "value" && !kept);
+        let keep = match (field, s.name) {
+            (Some(f), "value") if !kept => Some(f),
+            // A map's text (`object_type`: `ADHOC`).
+            (Some(Field::ObjectType), "text") if !kept_text => Some(Field::ObjectTypeName),
+            _ => None,
+        };
         let mut sink = match keep {
             Some(f) => Sink::Keep {
                 buf: Zeroizing::new(String::new()),
@@ -727,7 +773,11 @@ fn child_content(
             p.skip_content(s.name, 3, &mut sink)?;
         }
         if let (Some(f), Sink::Keep { buf, cut, .. }) = (keep, sink) {
-            kept = true;
+            if f == Field::ObjectTypeName {
+                kept_text = true;
+            } else {
+                kept = true;
+            }
             ev.set(f, Capture { text: buf, cut })?;
         }
     }

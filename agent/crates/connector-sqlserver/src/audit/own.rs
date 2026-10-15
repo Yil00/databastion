@@ -100,10 +100,10 @@ impl OwnSession {
     /// Whether a record's `event_time` falls in the session's lifetime;
     /// after a clean end, within [`CLOCK_TOLERANCE_US`], only for the text
     /// of the session's last statement (`text_hash`).
-    fn within(&self, at_us: i64, text_hash: u64) -> bool {
+    fn within(&self, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
         self.start_us <= at_us
             && self.end_us.is_none_or(|e| {
-                at_us <= e
+                at_us <= e.saturating_add(skew_us)
                     || (self.last == Some(text_hash)
                         && at_us <= e.saturating_add(CLOCK_TOLERANCE_US))
             })
@@ -324,6 +324,21 @@ pub(crate) fn opened(
 /// The agent's session `spid` of `target_id` whose lifetime holds
 /// `at_us`, if any.
 pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64, text: &str) -> Option<OwnSession> {
+    session_at_skewed(target_id, spid, at_us, text, 0)
+}
+
+/// [`session_at`] for a source whose clock runs ahead of
+/// `SYSUTCDATETIME()` by up to `skew_us`: every statement of a session is
+/// matched up to `skew_us` after its clean end (Extended Events: measured
+/// up to 3.5 ms on 2022, `xe::XE_CLOCK_SKEW_US`), its last statement up to
+/// [`CLOCK_TOLERANCE_US`].
+pub(crate) fn session_at_skewed(
+    target_id: &str,
+    spid: i64,
+    at_us: i64,
+    text: &str,
+    skew_us: i64,
+) -> Option<OwnSession> {
     let h = text_hash(text);
     let reg = lock();
     reg.targets
@@ -331,7 +346,7 @@ pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64, text: &str) -> 
         .sessions
         .iter()
         .rev()
-        .find(|s| s.spid == spid && s.within(at_us, h))
+        .find(|s| s.spid == spid && s.within(at_us, h, skew_us))
         .copied()
 }
 
@@ -721,6 +736,30 @@ mod tests {
         h.credit(sample, Duration::from_secs(30), None);
         assert!(take_credit(t, 75, sample, None, end + 1_000, 11));
         assert!(!take_credit(t, 75, sample, None, end + 100_000, 12));
+    }
+
+    /// Extended Events stamps statements up to a few ms after the
+    /// `SYSUTCDATETIME()` the end is computed on (measured): every text is
+    /// matched within the skew, none beyond it.
+    #[test]
+    fn a_skewed_source_matches_every_text_within_the_skew() {
+        let t = "own-test-skew";
+        reset(t);
+        let mut h = opened(t, 77, 7_000_000_000, 0, None, Instant::now());
+        h.sent("SELECT 2");
+        h.end(false, Duration::ZERO);
+        let end = session_at(t, 77, 7_000_000_000, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        let cols = "SELECT TOP (4097) CONVERT(nvarchar(128), c.name)";
+        assert!(
+            session_at(t, 77, end + 3_000, cols).is_none(),
+            "no skew: not matched"
+        );
+        assert!(session_at_skewed(t, 77, end + 3_000, cols, 20_000).is_some());
+        assert!(session_at_skewed(t, 77, end + 20_001, cols, 20_000).is_none());
+        assert!(session_at_skewed(t, 77, end + 100_000, "SELECT 2", 20_000).is_some());
     }
 
     #[test]

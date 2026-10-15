@@ -460,7 +460,11 @@ pub fn xe_records(data: &[u8]) {
             unreadable: false,
         });
     }
-    context(&mut records, data.first().is_some_and(|b| b & 1 == 1));
+    context(
+        &mut records,
+        data.first().is_some_and(|b| b & 1 == 1),
+        &|r| r.time_us % 2 == 0,
+    );
     for r in &records {
         if let Some((ev, _)) = convert(r) {
             for o in ev.objects() {

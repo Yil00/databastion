@@ -1503,7 +1503,7 @@ async fn audit_scenario() {
     assert!(agent_events.len() <= 6, "own statements reported");
     // Not vacuous: the agent's own catalog reads, sampling and polls were
     // in the audit and were left out.
-    let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
+    let [exact, sampling, polls, _statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] own left out: exact {exact}, sampling {sampling}, polls {polls}");
     assert!(
         exact > 10 && sampling >= 5 && polls >= 2,
@@ -1942,7 +1942,7 @@ async fn xe_scenario() {
         );
     }
     assert!(agent_events.len() <= 6, "own statements reported");
-    let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
+    let [exact, sampling, polls, _statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] xe own left out: exact {exact}, sampling {sampling}, polls {polls}");
     assert!(
         exact > 10 && sampling >= 5 && polls >= 2,
@@ -2102,4 +2102,303 @@ async fn measure_event_time_skew() {
             "[it] skew {name}: {n} statements, largest overshoot past the next SYSUTCDATETIME() {over} us, largest lead before the previous one {lead} us"
         );
     }
+}
+
+/// Runs an Extended Events stream of `t` (state in `dir`) while `work`
+/// runs, then 12 s more (the dev session's dispatch latency is 5 s), and
+/// returns its events.
+async fn xe_stream_around<F: std::future::Future<Output = ()>>(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    work: F,
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    work.await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    events
+}
+
+/// The Extended Events grant of the server's version, granted to the dev
+/// account for a test (2019: held already).
+async fn xe_grant(s: &mut Session, major: u32) -> &'static str {
+    let grant = if major >= 16 {
+        "VIEW SERVER PERFORMANCE STATE"
+    } else {
+        "VIEW SERVER STATE"
+    };
+    Box::pin(exec(
+        s,
+        &in_db("master", &format!("GRANT {grant} TO databastion")),
+    ))
+    .await;
+    Box::pin(exec(
+        s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    grant
+}
+
+/// ADR-0051 refinement of 2026-10-15, case 1 and the drift test of item 4:
+/// a first read of a column by a client makes the server build statistics
+/// (`StatMan`) followed by its internal statements; on the allow-listed
+/// image, with causality, the build and its internal statements are left
+/// out, and the client's read alone is reported. With
+/// `DATABASTION_IT_SQLSERVER_CAPTURE=<file>`, the session's events of that
+/// activity are written to `<file>` (the unit fixtures, fake data only).
+#[tokio::test]
+async fn xe_statistics_builds_match_the_fixture() {
+    Box::pin(xe_statistics_scenario()).await;
+}
+
+async fn xe_statistics_scenario() {
+    use databastion_classifiers::masking::EventAction;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let table = format!("it_stats_{}", std::process::id());
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "retail",
+            &format!(
+                "CREATE TABLE crm.{table} (id int, v int); INSERT INTO crm.{table} \
+                 SELECT TOP (500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 7 FROM sys.all_objects"
+            ),
+        ),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_xstats", &[])).await;
+    // Statistics of the agent's own reads first (pre-warm).
+    let _ = Box::pin(c.check(&t)).await;
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xestats-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let q = format!("SELECT TOP (5) id FROM retail.crm.{table} WHERE v = 3");
+    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
+        let mut d = Box::pin(foreign_session(
+            "it_xstats",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(&mut d, &q, 1)).await;
+        d.close().await;
+    }))
+    .await;
+    let mine: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("it_xstats")
+        })
+        .collect();
+    for e in &mine {
+        eprintln!(
+            "[it] xe statistics event {:?} {:?} always={}",
+            e.action(),
+            names_of(e),
+            e.always_report()
+        );
+    }
+    let [_, _, _, statistics] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe statistics statements left out: {statistics}");
+    if let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") {
+        let rows = try_rows(
+            &mut s,
+            "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM \
+             sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, NULL) \
+             WHERE event_data LIKE N'%it[_]xstats%' AND object_name = N'sp_statement_completed' \
+             OR (event_data LIKE N'%it[_]stats[_]%' AND event_data LIKE N'%it[_]xstats%')",
+            1,
+        )
+        .await
+        .unwrap_or_default();
+        let lines: Vec<String> = rows
+            .iter()
+            .filter_map(|r| {
+                r.first()
+                    .and_then(Value::as_text)
+                    .map(|x| x.replace('\n', " "))
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+    let reads = mine
+        .iter()
+        .filter(|e| {
+            e.action() == EventAction::Read && names_of(e) == [format!("retail.crm.{table}")]
+        })
+        .count();
+    assert_eq!(
+        reads, 1,
+        "the build is left out: the client's read alone names the table"
+    );
+    // The build's internal statements: left out when of the accepted shape
+    // (case 1: nest level 2); on 2022 they are at nest level 1 (measured)
+    // and stay reported as reads of `*`, always reported.
+    let others: Vec<_> = mine
+        .iter()
+        .filter(|e| {
+            names_of(e) != [format!("retail.crm.{table}")]
+                && !names_of(e)
+                    .iter()
+                    .all(|n| n.ends_with(".sys.dm_exec_sessions"))
+        })
+        .collect();
+    assert!(others.len() <= 3, "{} other events", others.len());
+    for e in &others {
+        assert!(
+            e.action() == EventAction::Read && e.always_report() && names_of(e) == ["retail.-.*"],
+            "an unexpected event: {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    eprintln!(
+        "[it] xe statistics: internal statements reported {} (major {major})",
+        others.len()
+    );
+    assert!(statistics >= 1, "the build is left out: {statistics}");
+    Box::pin(drop_login(&mut s, "it_xstats")).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", &format!("DROP TABLE crm.{table}")),
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0051 refinement of 2026-10-15, case 2: on a **fresh** server (no
+/// statistics built yet; `DATABASTION_IT_SQLSERVER_FRESH=1`, run first on a
+/// new data volume), the agent's own `check()` and Discovery make the server
+/// build statistics on system base tables in its sessions; they are left
+/// out with their internal statements of the accepted shape. The two
+/// measured residuals (internal statements at nest level 1 on 2022, and a
+/// build whose catalog statement comes in a later read) are tolerated and
+/// counted; nothing else of the agent's is reported.
+#[tokio::test]
+async fn xe_fresh_server_own_reads_raise_no_event() {
+    Box::pin(xe_fresh_scenario()).await;
+}
+
+async fn xe_fresh_scenario() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_FRESH").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let major = {
+        let c = SqlserverConnector::new();
+        let t = agent("");
+        let _ = Box::pin(c.check(&t)).await;
+        c.server_version(&t)
+            .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
+            .unwrap()
+    };
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xefresh-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
+        let _ = Box::pin(c.check(&t)).await;
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }))
+    .await;
+    let own: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("databastion")
+        })
+        .collect();
+    for e in &own {
+        eprintln!(
+            "[it] xe fresh: own event reported {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    let [exact, _, _, statistics] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe fresh: exact {exact}, statistics statements left out {statistics}");
+    // What can remain, both measured on 2022 and listed in the ADR's notes
+    // with the revision they need: the builds' internal statements at nest
+    // level 1, outside case 1 as accepted (reads of `*`, always reported),
+    // and a build whose catalog statement reached the file only after the
+    // read that held the build (case 2 pairs within one read). Nothing
+    // else: no other own statement, no other table.
+    let mut internal = 0;
+    let mut unpaired = 0;
+    for e in &own {
+        let names = names_of(e);
+        if e.always_report() && names.iter().all(|n| n.ends_with(".-.*")) {
+            internal += 1;
+        } else if names.iter().all(|n| {
+            n.strip_prefix("retail.sys.")
+                .is_some_and(|t| crate::audit::xe::events::SYS_BASE_TABLES.contains(&t))
+        }) {
+            unpaired += 1;
+        } else {
+            panic!("the agent's own reads raised an event on a fresh server: {names:?}");
+        }
+    }
+    eprintln!("[it] xe fresh: internal statements reported {internal}, builds unpaired {unpaired}");
+    if major >= 16 {
+        assert!(
+            statistics > 0,
+            "not a fresh server: no statistics build was seen"
+        );
+    }
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

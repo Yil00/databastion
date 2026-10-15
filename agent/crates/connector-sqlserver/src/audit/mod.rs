@@ -132,8 +132,9 @@ pub(crate) struct Shared {
     /// and the stream): (`create_time`, dropped events, dropped buffers).
     xe_seen: Mutex<HashMap<String, (i64, i64, i64)>>,
     /// Statements left out as the agent's own: (exact texts, credited
-    /// sampling, credited polls), for the logs and the tests.
-    own_left_out: Mutex<HashMap<String, [u64; 3]>>,
+    /// sampling, credited polls, statistics builds and their internal
+    /// statements), for the logs and the tests.
+    own_left_out: Mutex<HashMap<String, [u64; 4]>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -270,10 +271,21 @@ impl Shared {
         }
     }
 
-    /// Statements left out as the agent's own: exact texts, credited
-    /// sampling, credited polls.
+    /// Statistics statements left out (item 4, refinement of 2026-10-15).
+    pub(crate) fn note_statistics(&self, target_id: &str, n: usize) {
+        if let Some(c) = lock(&self.own_left_out)
+            .entry(target_id.to_owned())
+            .or_default()
+            .get_mut(3)
+        {
+            *c = c.saturating_add(n as u64);
+        }
+    }
+
+    /// Statements left out: exact texts, credited sampling, credited
+    /// polls, statistics statements.
     #[cfg(test)]
-    pub(crate) fn own_left_out(&self, target_id: &str) -> [u64; 3] {
+    pub(crate) fn own_left_out(&self, target_id: &str) -> [u64; 4] {
         lock(&self.own_left_out)
             .get(target_id)
             .copied()
@@ -329,6 +341,10 @@ pub(crate) struct Cursor {
     /// Extended Events: the session's `create_time` (server µs) the
     /// position was read under; another one is a restart (a gap).
     pub(crate) session: Option<i64>,
+    /// First start: records stamped before this (server µs) are never
+    /// reported, even when they reach the source after it was read to its
+    /// end (`QUEUE_DELAY`, `MAX_DISPATCH_LATENCY`). Kept for good.
+    pub(crate) floor: Option<i64>,
     /// Extended Events: the buffer (file, offset) whose first `skip`
     /// events were handled (the server skips them, `sql::XE_POLL_FROM`).
     pub(crate) buffer: Option<(String, i64)>,
@@ -368,6 +384,9 @@ impl Cursor {
         if let Some(c) = self.session {
             out.push_str(&format!("session {c}\n"));
         }
+        if let Some(f) = self.floor {
+            out.push_str(&format!("floor {f}\n"));
+        }
         if let Some((f, o)) = &self.buffer {
             out.push_str(&format!("buffer {} {o}\n", hex(f)));
         }
@@ -398,6 +417,7 @@ impl Cursor {
                 }
                 ("history", h) => c.history_us = Some(h.parse().ok()?),
                 ("session", v) => c.session = Some(v.parse().ok()?),
+                ("floor", v) => c.floor = Some(v.parse().ok()?),
                 ("buffer", f) => c.buffer = Some((unhex(f)?, p.next()?.parse().ok()?)),
                 _ => return None,
             }
@@ -816,6 +836,7 @@ pub(crate) async fn audit_stream(
     if first_start {
         // No history replay: what the audit holds from before now.
         cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
+        cursor.floor = cursor.history_us;
     }
     let mut st = Stream {
         name,
@@ -1087,7 +1108,10 @@ async fn read(
     }
     let mut reprobe = false;
     for stmt in &statements {
-        if history.is_some_and(|h| stmt.head.time_us < h) {
+        if history
+            .or(st.cursor.floor)
+            .is_some_and(|h| stmt.head.time_us < h)
+        {
             continue;
         }
         match records::map(&stmt.head.action, &stmt.head.class) {

@@ -31,6 +31,7 @@ fn cursor_round_trips() {
         after: Some(((134_365_416_940_740_000, 0), 4096)),
         history_us: Some(17),
         session: Some(1_800_000_000_000_000),
+        floor: Some(17),
         buffer: Some(("/var/opt/mssql/xe/x_0_1.xel".to_owned(), 8192)),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
