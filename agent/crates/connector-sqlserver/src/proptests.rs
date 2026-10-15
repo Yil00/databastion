@@ -53,3 +53,60 @@ proptest! {
         prop_assert!(s.chars().count() <= bytes.len() / 2 + 1);
     }
 }
+
+/// Hostile catalog names (security review C1): placeholders, brackets,
+/// quotes and comment openers.
+fn hostile_name() -> impl Strategy<Value = String> {
+    let parts = prop_oneof![
+        Just("{from}".to_owned()),
+        Just("{dbname}".to_owned()),
+        Just("{select}".to_owned()),
+        Just("{sample}".to_owned()),
+        Just("{col}".to_owned()),
+        Just("{db}".to_owned()),
+        Just("{n}".to_owned()),
+        Just("]".to_owned()),
+        Just("[".to_owned()),
+        Just("'".to_owned()),
+        Just("--".to_owned()),
+        Just("/*".to_owned()),
+        Just("*/".to_owned()),
+        Just(";".to_owned()),
+        "[a-zA-Z0-9 _.@é]{1,8}",
+    ];
+    proptest::collection::vec(parts, 1..8).prop_map(|v| v.concat())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Whatever the names, a statement differs from the one built with
+    /// benign names only inside quoted identifiers and literals.
+    #[test]
+    fn names_never_change_the_statement_skeleton(
+        db in hostile_name(),
+        schema in hostile_name(),
+        table in hostile_name(),
+        col in hostile_name(),
+        col2 in hostile_name(),
+    ) {
+        use crate::sql::{self, Sampled, unquoted};
+        let benign = "x";
+        let cols = [(col.as_str(), Sampled::Text), (col2.as_str(), Sampled::LargeText)];
+        let plain = [(benign, Sampled::Text), (benign, Sampled::LargeText)];
+        let a = sql::sample_statement(&db, &schema, &table, &cols, 10, Some(1.5)).unwrap();
+        let b = sql::sample_statement(benign, benign, benign, &plain, 10, Some(1.5)).unwrap();
+        prop_assert_eq!(unquoted(&a), unquoted(&b));
+        let a = sql::ticket_type_counts(&db, &schema, &table, &col).unwrap();
+        let b = sql::ticket_type_counts(benign, benign, benign, benign).unwrap();
+        prop_assert_eq!(unquoted(&a), unquoted(&b));
+        prop_assert_eq!(unquoted(&sql::tables(&db, 5).unwrap()), unquoted(&sql::tables(benign, 5).unwrap()));
+        prop_assert_eq!(unquoted(&sql::columns(&db, 7).unwrap()), unquoted(&sql::columns(benign, 7).unwrap()));
+        for (name, template) in sql::STATEMENTS {
+            if let Some(a) = sql::in_database(template, &db) {
+                let b = sql::in_database(template, benign).unwrap();
+                prop_assert_eq!(unquoted(&a), unquoted(&b), "{}", name);
+            }
+        }
+    }
+}

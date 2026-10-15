@@ -207,7 +207,9 @@ pub(crate) fn quote_ident(name: &str) -> Option<String> {
 }
 
 /// Quotes a catalog name as an `N'…'` literal (`'` doubled), for the
-/// built-ins that take a name.
+/// built-ins that take a name. Its output is only ever placed outside
+/// brackets (a `]` in a string literal is plain text); the skeleton test
+/// checks it on every template.
 pub(crate) fn quote_literal(name: &str) -> Option<String> {
     if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
         return None;
@@ -215,24 +217,46 @@ pub(crate) fn quote_literal(name: &str) -> Option<String> {
     Some(format!("N'{}'", name.replace('\'', "''")))
 }
 
-/// A database statement: `{db}` and `{dbname}` replaced.
+/// Renders a template **in one pass** (security review C1): the template
+/// is scanned for `{slot}` placeholders and each is replaced by its
+/// already-quoted value; inserted text is never scanned again, so a name
+/// holding `{from}` or `]` cannot reach another slot. `None` for an
+/// unknown or unterminated placeholder.
+pub(crate) fn render(template: &str, slots: &[(&str, &str)]) -> Option<String> {
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(rest.get(..open)?);
+        let after = rest.get(open + 1..)?;
+        let close = after.find('}')?;
+        let name = after.get(..close)?;
+        let value = slots.iter().find(|(k, _)| *k == name)?.1;
+        out.push_str(value);
+        rest = after.get(close + 1..)?;
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// A database statement: `{db}` and `{dbname}` filled.
 pub(crate) fn in_database(template: &str, db: &str) -> Option<String> {
-    Some(
-        template
-            .replace("{db}", &quote_ident(db)?)
-            .replace("{dbname}", &quote_literal(db)?),
-    )
+    let (q, l) = (quote_ident(db)?, quote_literal(db)?);
+    render(template, &[("db", &q), ("dbname", &l)])
 }
 
 /// The table list of `{db}`, at most `limit` tables (one more read to
 /// detect the cut).
 pub(crate) fn tables(db: &str, limit: u32) -> Option<String> {
-    in_database(TABLES, db).map(|s| s.replace("{n}", &(u64::from(limit) + 1).to_string()))
+    let (q, l) = (quote_ident(db)?, quote_literal(db)?);
+    let n = (u64::from(limit) + 1).to_string();
+    render(TABLES, &[("db", &q), ("dbname", &l), ("n", &n)])
 }
 
 /// The columns of one table.
 pub(crate) fn columns(db: &str, object_id: i64) -> Option<String> {
-    in_database(COLUMNS, db).map(|s| s.replace("{obj}", &object_id.to_string()))
+    let (q, l) = (quote_ident(db)?, quote_literal(db)?);
+    let obj = object_id.to_string();
+    render(COLUMNS, &[("db", &q), ("dbname", &l), ("obj", &obj)])
 }
 
 fn from(db: &str, schema: &str, table: &str) -> Option<String> {
@@ -251,11 +275,8 @@ pub(crate) fn ticket_type_counts(
     table: &str,
     column: &str,
 ) -> Option<String> {
-    Some(
-        TICKET_TYPE_COUNTS
-            .replace("{col}", &quote_ident(column)?)
-            .replace("{from}", &from(db, schema, table)?),
-    )
+    let (col, from) = (quote_ident(column)?, from(db, schema, table)?);
+    render(TICKET_TYPE_COUNTS, &[("col", &col), ("from", &from)])
 }
 
 /// How a column is sampled (decision 5, L3), by `system_type_id`.
@@ -329,12 +350,10 @@ pub(crate) fn sample_statement(
         Some(p) => format!(" TABLESAMPLE SYSTEM ({p:.2} PERCENT)"),
         None => String::new(),
     };
-    Some(
-        SAMPLE
-            .replace("{n}", &n.to_string())
-            .replace("{select}", &select.join(", "))
-            .replace("{from}", &from(db, schema, table)?)
-            .replace("{sample}", &sample),
+    let (n, select, from) = (n.to_string(), select.join(", "), from(db, schema, table)?);
+    render(
+        SAMPLE,
+        &[("n", &n), ("select", &select), ("from", &from), ("sample", &sample)],
     )
 }
 
