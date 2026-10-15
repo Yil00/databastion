@@ -18,8 +18,11 @@ pub fn load(dir: &Path, name: &str) -> Option<Vec<u8>> {
     if !valid_name(name) {
         return None;
     }
-    // Bounded read (re-review R3): a larger file is never read whole.
-    fsutil::read_private_bounded(&dir.join(name), MAX_MARK).ok()
+    // Through a checked directory handle (review L1), then a bounded read
+    // (re-review R3): a larger file is never read whole.
+    let handle = fsutil::open_private_dir(dir).ok()??;
+    let file = fsutil::open_private_at(&handle, name).ok()?;
+    fsutil::read_bounded(file, MAX_MARK).ok()
 }
 
 /// Writes the mark at `dir/name` atomically, `0600`, creating `dir`
@@ -46,17 +49,13 @@ pub fn remove(dir: &Path, name: &str) -> io::Result<bool> {
     if !valid_name(name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid mark"));
     }
-    match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-        Ok(_) => {}
-    }
-    fsutil::check_private_dir(dir)?;
-    match std::fs::remove_file(dir.join(name)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+    // The directory is opened once and checked on its handle; the mark is
+    // unlinked relative to that handle (review L1: no check-then-use on a
+    // path).
+    let Some(handle) = fsutil::open_private_dir(dir)? else {
+        return Ok(false);
+    };
+    fsutil::unlink_at(&handle, name)
 }
 
 /// A file name of `[a-z0-9_.-]`, 1 to 128 bytes, not starting with a dot.
@@ -126,6 +125,18 @@ mod tests {
         std::os::unix::fs::symlink(&sub, &link).unwrap();
         store(&sub, "t4", b"x").unwrap();
         assert!(remove(&link, "t4").is_err());
+        assert_eq!(load(&link, "t4"), None, "symlinked directory: not set");
         assert_eq!(load(&sub, "t4").as_deref(), Some(&b"x"[..]));
+        // A directory writable by others is refused for both.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(remove(&sub, "t4").is_err());
+        assert_eq!(load(&sub, "t4"), None);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(remove(&sub, "t4").unwrap());
+        // A file where the directory should be.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(remove(&file, "t1").is_err());
     }
 }
