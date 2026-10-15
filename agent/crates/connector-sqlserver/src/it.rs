@@ -1181,6 +1181,12 @@ fn names_of(ev: &databastion_classifiers::masking::MaskedEvent) -> Vec<String> {
 /// restart of the stream. SQL Server 2019: no source (`CONTROL SERVER`).
 #[tokio::test]
 async fn audit_reports_reads_and_leaves_the_agents_own_out() {
+    // The test's future is large in a debug build: on the heap, not on the
+    // test thread's 2 MiB stack.
+    Box::pin(audit_scenario()).await;
+}
+
+async fn audit_scenario() {
     use databastion_classifiers::masking::{EventAction, MaskedEvent, Signal};
     use databastion_core::AuditLevel;
 
@@ -1188,12 +1194,12 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
         return;
     }
     let _g = serial().await;
-    let major = major().await;
-    let mut s = sa().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
     let c = Arc::new(SqlserverConnector::new());
     let t = agent(&format!("{}, {AUDIT}", own_tls()));
     if major < 16 {
-        let h = c.check(&t).await;
+        let h = Box::pin(c.check(&t)).await;
         assert_eq!(h.audit_level, AuditLevel::None);
         assert!(
             has(&h, NoteCode::AuditSqlserverAuditNeedsControlServer),
@@ -1203,25 +1209,25 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
         return;
     }
     // Option (a'): the dev account's Audit grants (dev/sqlserver/initdb).
-    exec(
+    Box::pin(exec(
         &mut s,
         &in_db(
             "master",
             "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
              DEFINITION TO databastion",
         ),
-    )
+    ))
     .await;
-    exec(
+    Box::pin(exec(
         &mut s,
         &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
-    )
+    ))
     .await;
-    throwaway(&mut s, "it_dump", &[]).await;
-    drop_login(&mut s, "it_cred").await;
+    Box::pin(throwaway(&mut s, "it_dump", &[])).await;
+    Box::pin(drop_login(&mut s, "it_cred")).await;
 
     // Before any stream: every proof but a fresh record.
-    let h = c.check(&t).await;
+    let h = Box::pin(c.check(&t)).await;
     eprintln!("audit, no stream: {:?} {:?}", h.audit_level, codes(&h));
     assert!(h.reachable, "{:?}", h.detail);
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
@@ -1258,13 +1264,13 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
 
     // The agent's own activity while the stream reads: check() and a
     // Discovery scan (sampling, CAS ticket counts, catalog reads).
-    let h = c.check(&t).await;
+    let h = Box::pin(c.check(&t)).await;
     assert!(!has(&h, NoteCode::PrivilegeRefused), "{:?}", codes(&h));
     let scan = {
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         let (sink, mut frx) = FindingSink::channel(10_000);
         let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
-        let r = c.discover(&job, &sink).await;
+        let r = Box::pin(c.discover(&job, &sink)).await;
         drop(sink);
         drain.await.unwrap();
         r
@@ -1284,29 +1290,42 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
         .find(|v| v.contains('@'))
         .expect("a ground-truth e-mail");
     {
-        let mut d = foreign_session("it_dump", "DATABASTION_IT_SQLSERVER_THROWAWAY").await;
-        try_rows(
+        let mut d = Box::pin(foreign_session(
+            "it_dump",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
             &mut d,
             "SELECT id, customer_id FROM retail.crm.customer_notes",
             2,
-        )
+        ))
         .await;
-        try_rows(
+        Box::pin(try_rows(
             &mut d,
             &format!(
                 "SELECT id FROM retail.crm.customers WHERE email = N'{}'",
                 email.replace('\'', "''")
             ),
             1,
-        )
+        ))
         .await;
-        exec_ok(&mut d, "EXEC master.dbo.xp_cmdshell 'whoami'").await;
+        Box::pin(exec_ok(&mut d, "EXEC master.dbo.xp_cmdshell 'whoami'")).await;
         d.close().await;
     }
     // The agent's login from a session that is not the agent's own.
     {
-        let mut f = foreign_session("databastion", "SQLSERVER_DATABASTION_PASSWORD").await;
-        try_rows(&mut f, "SELECT TOP (3) email FROM retail.crm.customers", 1).await;
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut f,
+            "SELECT TOP (3) email FROM retail.crm.customers",
+            1,
+        ))
+        .await;
         f.close().await;
     }
     // A failed login (the name tried is fingerprinted).
@@ -1319,47 +1338,64 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
         bad.id = "it-foreign".to_owned();
         let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
         assert!(
-            conn::connect(&bad, &tls, &TlsChoice::default(), Duration::from_secs(10))
-                .await
-                .is_err()
+            Box::pin(conn::connect(
+                &bad,
+                &tls,
+                &TlsChoice::default(),
+                Duration::from_secs(10)
+            ))
+            .await
+            .is_err()
         );
     }
     // Credential DCL and password-taking calls in forms the server does
     // not mask itself: the marker never leaves the agent.
     let marker = "CredMarker7Zq9xYz";
-    drop_login(&mut s, "it_cred2").await;
-    exec(&mut s, &format!("EXEC sp_addlogin it_cred2, {marker}")).await;
-    exec_ok(&mut s, "DROP CREDENTIAL it_cred_c").await;
-    exec(
+    Box::pin(drop_login(&mut s, "it_cred2")).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("EXEC sp_addlogin it_cred2, {marker}"),
+    ))
+    .await;
+    Box::pin(exec_ok(&mut s, "DROP CREDENTIAL it_cred_c")).await;
+    Box::pin(exec(
         &mut s,
         &format!("CREATE CREDENTIAL it_cred_c WITH IDENTITY = 'i', SECRET = '{marker}'"),
-    )
+    ))
     .await;
-    exec(&mut s, "DROP CREDENTIAL it_cred_c").await;
-    drop_login(&mut s, "it_cred2").await;
+    Box::pin(exec(&mut s, "DROP CREDENTIAL it_cred_c")).await;
+    Box::pin(drop_login(&mut s, "it_cred2")).await;
     {
-        let mut d = foreign_session("it_dump", "DATABASTION_IT_SQLSERVER_THROWAWAY").await;
-        try_rows(
+        let mut d = Box::pin(foreign_session(
+            "it_dump",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
             &mut d,
             &format!(
                 "SELECT TOP (1) id FROM retail.crm.customers WHERE \
                  ENCRYPTBYPASSPHRASE('{marker}', N'x') IS NOT NULL"
             ),
             1,
-        )
+        ))
         .await;
         d.close().await;
     }
     // The server's internal statement of fn_my_permissions, which the
     // agent's own sessions produce, from a session that is not its own.
     {
-        let mut f = foreign_session("databastion", "SQLSERVER_DATABASTION_PASSWORD").await;
-        try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1).await;
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        Box::pin(try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1)).await;
         f.close().await;
     }
 
     tokio::time::sleep(Duration::from_secs(6)).await;
-    let h = c.check(&t).await;
+    let h = Box::pin(c.check(&t)).await;
     eprintln!("audit, streaming: {:?} {:?}", h.audit_level, codes(&h));
     assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
     // The source's grants are expected while the stream uses them.
@@ -1505,7 +1541,7 @@ async fn audit_reports_reads_and_leaves_the_agents_own_out() {
             .eq_ignore_ascii_case("databastion")),
         "the agent's own statements reported after a restart"
     );
-    drop_login(&mut s, "it_dump").await;
+    Box::pin(drop_login(&mut s, "it_dump")).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

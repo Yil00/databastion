@@ -713,7 +713,7 @@ pub(crate) async fn audit_stream(
             );
             old.close().await;
         }
-        let r = cycle(&mut st, &mut session, sink).await;
+        let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
         if let Err(e) = r {
             st.save();
             session.close().await;
@@ -739,7 +739,7 @@ async fn cycle(
             tracing::warn!(target_id = %target.id, "SQL Server Audit needs SQL Server 2022 or later (CONTROL SERVER before): no Audit source");
             return Err(target_error(FailureCode::Unsupported));
         }
-        let ev = check::evaluate(s, target)
+        let ev = Box::pin(check::evaluate(s, target))
             .await
             .map_err(SsError::into_connector_error)?;
         if ev.blocks() {
@@ -757,20 +757,20 @@ async fn cycle(
         st.probe = None;
     }
     if st.probe.is_none() || st.reprobe_at.elapsed() >= REPROBE {
-        reprobe(st, s).await?;
+        Box::pin(reprobe(st, s)).await?;
     }
     let started = Instant::now();
     let mut history_reads = 0usize;
     loop {
         let in_history = st.cursor.history_us.is_some();
-        let full = read(st, s, sink).await?;
+        let full = Box::pin(read(st, s, sink)).await?;
         st.save();
         history_reads += usize::from(in_history);
         if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
             break;
         }
         if st.probe.is_none() {
-            reprobe(st, s).await?;
+            Box::pin(reprobe(st, s)).await?;
         }
     }
     Ok(())
@@ -782,7 +782,7 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     let (dbs, _) = check::monitored_databases(s, target)
         .await
         .map_err(SsError::into_connector_error)?;
-    let p = probe::probe(s, &st.name, &dbs, Stage::Introspection)
+    let p = Box::pin(probe::probe(s, &st.name, &dbs, Stage::Introspection))
         .await
         .map_err(SsError::into_connector_error)?;
     if !p.found {
@@ -881,16 +881,27 @@ async fn read(
     let target_id = st.target.id.clone();
     let top = st.batch + st.cursor.skip as usize;
     let polled = match st.cursor.file.clone() {
-        None => poll_records(s, &st.poll_start.clone(), own::PollKind::Start, "", 0, top).await,
+        // Boxed: the poll's future is large (a debug build's stack).
+        None => {
+            Box::pin(poll_records(
+                s,
+                &st.poll_start.clone(),
+                own::PollKind::Start,
+                "",
+                0,
+                top,
+            ))
+            .await
+        }
         Some(f) => {
-            poll_records(
+            Box::pin(poll_records(
                 s,
                 &st.poll_from.clone(),
                 own::PollKind::From,
                 &f,
                 st.cursor.offset,
                 top,
-            )
+            ))
             .await
         }
     };
@@ -905,7 +916,8 @@ async fn read(
             // (rolled over), read from the oldest file, leaving out what
             // was read; whatever was between is lost (M4, review H1).
             let before = st.cursor.pattern.clone();
-            reprobe(st, s).await?;
+            // Boxed: the proofs' future is large (a debug build's stack).
+            Box::pin(reprobe(st, s)).await?;
             if st.cursor.pattern == before && st.cursor.file.is_some() {
                 tracing::warn!(target_id = %target_id, "SQL Server Audit: the saved position is no longer in the audit's file set (rollover): reading from the oldest file");
                 on_bad_position(&mut st.cursor);

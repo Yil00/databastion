@@ -890,7 +890,8 @@ async fn checked(
                 && ev.server_perms.contains(crate::audit::probe::CATALOG_GRANT) =>
         {
             let (dbs, _) = monitored_databases(s, target).await?;
-            Some(crate::audit::probe::probe(s, name, &dbs, Stage::Check).await?)
+            // Boxed: keeps check()'s future small.
+            Some(Box::pin(crate::audit::probe::probe(s, name, &dbs, Stage::Check)).await?)
         }
         _ => None,
     };
