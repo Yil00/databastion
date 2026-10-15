@@ -22,9 +22,12 @@ pub(crate) const MAX_NOTES: usize = 16;
 const MAX_LABELS: usize = 16;
 
 /// Labels that matter most, in decreasing severity: kept first when a note
-/// has more than [`MAX_LABELS`] labels, so that e.g. `super` or `file` is
-/// never cut from a long privilege list. Any label not listed ranks after
-/// them (in enum order), and `other` last.
+/// has more than [`MAX_LABELS`] labels to send, so that e.g. `super` or
+/// `file` is never cut from a long privilege list. Any label not listed
+/// ranks after them (in enum order), and `other` last. The ranking applies
+/// to the labels **as sent**, after negotiation ([`to_protocol`]): a label
+/// the console has not negotiated is `other` by then, so it never takes the
+/// place of one it can receive.
 const SEVERITY: &[TargetNoteLabel] = {
     use TargetNoteLabel as L;
     &[
@@ -723,9 +726,12 @@ fn in_a_revision(value: &str) -> bool {
 /// text from the engine.
 ///
 /// New label values are a contract enum change, negotiated with a
-/// `target_status.note_labels.<revision>` token (ADR-0022 decision 4): the
-/// values of this build are the base enum of protocol 0.1.0, sent without
-/// a token.
+/// `target_status.note_labels.<revision>` token (ADR-0022 decision 4). The
+/// values of this build are those of protocol 0.1.0, sent without a token,
+/// and those of the SQL Server revisions `2026_10`
+/// ([`LABELS_REVISION_2026_10`]) and `2026_10_b`
+/// ([`LABELS_REVISION_2026_10_B`]), each sent only once the console lists
+/// its own token, `other` before ([`to_protocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLabel(TargetNoteLabel);
 
@@ -904,7 +910,9 @@ impl TargetNote {
         self
     }
 
-    /// Adds labels (sorted, deduplicated; past 16, the most severe kept).
+    /// Adds labels (sorted, deduplicated). Nothing is cut here: the cut to
+    /// the contract's 16 happens when the note is sent, after negotiation
+    /// ([`to_protocol`]).
     #[must_use]
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = NoteLabel>) -> Self {
         self.labels.extend(labels);
@@ -912,14 +920,12 @@ impl TargetNote {
         self
     }
 
-    /// Deduplicates the labels, keeps the [`MAX_LABELS`] most severe
-    /// ([`SEVERITY`], `other` last) and sorts them in enum order.
+    /// Sorts the labels in enum order and deduplicates them. Bounded
+    /// without a cut: the labels are values of the closed contract enum, so
+    /// a note holds at most one of each.
     fn normalize_labels(&mut self) {
-        self.labels
-            .sort_unstable_by_key(|l| (severity_rank(l.0), *l));
-        self.labels.dedup();
-        self.labels.truncate(MAX_LABELS);
         self.labels.sort_unstable();
+        self.labels.dedup();
     }
 
     /// The code.
@@ -934,7 +940,8 @@ impl TargetNote {
         self.count
     }
 
-    /// The labels.
+    /// The labels, in enum order: all of them, before negotiation and the
+    /// cut to the contract's 16 ([`to_protocol`]).
     #[must_use]
     pub fn labels(&self) -> &[NoteLabel] {
         &self.labels
@@ -1016,6 +1023,17 @@ impl IntoIterator for Notes {
     }
 }
 
+/// The labels of one note as sent: negotiated, deduplicated, the
+/// [`MAX_LABELS`] most severe kept, in enum order.
+fn sent_labels(labels: &[NoteLabel], revisions: LabelRevisions) -> Vec<TargetNoteLabel> {
+    let mut out: Vec<TargetNoteLabel> = labels.iter().map(|l| l.negotiated(revisions).0).collect();
+    out.sort_unstable_by_key(|l| (severity_rank(*l), *l));
+    out.dedup();
+    out.truncate(MAX_LABELS);
+    out.sort_unstable();
+    out
+}
+
 /// The contract `TargetStatus.notes` of a target: one note per code (the
 /// first one kept), at most [`MAX_NOTES`], insecure settings, check
 /// failures and privileges kept first; counts saturated at the contract
@@ -1024,7 +1042,9 @@ impl IntoIterator for Notes {
 /// The labels of a revision after protocol 0.1.0
 /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`]) are sent
 /// only when `revisions` holds its token (the console listed it), `other`
-/// otherwise (ADR-0022 decision 4).
+/// otherwise (ADR-0022 decision 4). Negotiation comes first, then the
+/// ranking by [`SEVERITY`] (`other` last), then the cut to [`MAX_LABELS`]:
+/// labels the console cannot receive never push out labels it can.
 pub(crate) fn to_protocol(
     notes: &[TargetNote],
     revisions: LabelRevisions,
@@ -1042,17 +1062,7 @@ pub(crate) fn to_protocol(
             Some(databastion_protocol::TargetNote {
                 code: databastion_protocol::TargetNoteCode::try_from(n.code.as_str()).ok()?,
                 count: n.count.map(crate::sanitize::clamped_count),
-                labels: (!n.labels.is_empty()).then(|| {
-                    let mut labels: Vec<TargetNoteLabel> = n
-                        .labels
-                        .iter()
-                        .take(MAX_LABELS)
-                        .map(|l| l.negotiated(revisions).0)
-                        .collect();
-                    labels.sort_unstable();
-                    labels.dedup();
-                    labels
-                }),
+                labels: (!n.labels.is_empty()).then(|| sent_labels(&n.labels, revisions)),
             })
         })
         .collect()
@@ -1294,11 +1304,19 @@ mod tests {
         let n = TargetNote::new(NoteCode::PrivilegeBeyondSelect)
             .with_labels(many.iter().map(|p| NoteLabel::parse(p)))
             .with_labels([NoteLabel::OTHER, NoteLabel::OTHER]);
-        assert_eq!(n.labels().len(), MAX_LABELS);
+        // Kept whole (deduplicated, sorted) until sent.
+        assert_eq!(n.labels().len(), many.len() + 1);
         let mut sorted = n.labels().to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, n.labels());
+        // Cut to the contract's 16 when sent.
+        let out = sent(&n, LabelRevisions::default());
+        assert_eq!(out.len(), MAX_LABELS);
+        let mut sorted = out.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), MAX_LABELS);
     }
 
     #[test]
@@ -1329,7 +1347,7 @@ mod tests {
             .with_labels([NoteLabel::OTHER])
             .with_labels(lesser.iter().map(|p| NoteLabel::parse(p)))
             .with_labels(["super", "file", "process"].map(NoteLabel::parse));
-        let kept: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        let kept = sent(&n, LabelRevisions::default());
         assert_eq!(kept.len(), MAX_LABELS);
         for must in ["super", "file", "process", "execute"] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
@@ -1337,9 +1355,13 @@ mod tests {
         for gone in ["other", "show_view", "create_view", "flush_tables"] {
             assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
         }
-        let mut sorted = n.labels().to_vec();
+        let as_sent = super::to_protocol(std::slice::from_ref(&n), LabelRevisions::default())[0]
+            .labels
+            .clone()
+            .unwrap();
+        let mut sorted = as_sent.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, n.labels(), "sent in enum order");
+        assert_eq!(sorted, as_sent, "sent in enum order");
         // PostgreSQL attributes rank first, and survive a merge too.
         let mut notes = Notes::default();
         notes.add(
@@ -1350,14 +1372,85 @@ mod tests {
             TargetNote::new(NoteCode::PrivilegeRoleAttributes)
                 .with_labels(["superuser", "bypassrls", "createrole"].map(NoteLabel::parse)),
         );
-        let kept: Vec<String> = notes.as_slice()[0]
-            .labels()
-            .iter()
-            .map(|l| l.as_str())
-            .collect();
+        let kept = sent(&notes.as_slice()[0], LabelRevisions::default());
+        assert_eq!(kept.len(), MAX_LABELS);
         for must in ["superuser", "bypassrls", "createrole"] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
         }
+    }
+
+    /// Security review L1: labels of a revision the console has not
+    /// negotiated become `other` before the cut, so they never push out
+    /// labels it can receive; the hash probe always survives.
+    #[test]
+    fn the_cut_to_sixteen_keeps_the_labels_the_console_can_receive() {
+        // A console that lists `2026_10` only.
+        let a = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: false,
+        };
+        // 14 labels of 2026_10 outside the severity list, the hash probe,
+        // and the 20 labels of 2026_10_b (three of them in the severity
+        // list): 35 labels, 15 of them sendable.
+        let sendable = [
+            "serveradmin",
+            "setupadmin",
+            "processadmin",
+            "diskadmin",
+            "dbcreator",
+            "bulkadmin",
+            "ms_database_connector",
+            "ms_database_manager",
+            "ms_definition_reader",
+            "db_securityadmin",
+            "db_accessadmin",
+            "db_backupoperator",
+            "db_ddladmin",
+            "db_datawriter",
+        ];
+        let note = TargetNote::new(NoteCode::PrivilegeRefused).with_labels(
+            sendable
+                .iter()
+                .chain(super::LABELS_REVISION_2026_10_B)
+                .chain(&["password_hash_probe"])
+                .map(|v| NoteLabel::sqlserver(v)),
+        );
+        assert_eq!(note.labels().len(), 35);
+        let out = sent(&note, a);
+        assert_eq!(out.len(), 16, "{out:?}");
+        for must in sendable.iter().chain(&["password_hash_probe", "other"]) {
+            assert!(out.iter().any(|l| l == must), "{must} cut: {out:?}");
+        }
+        for v in super::LABELS_REVISION_2026_10_B {
+            assert!(!out.iter().any(|l| l == v), "{v} sent unnegotiated");
+        }
+        // With more sendable labels than slots, the hash probe still
+        // survives, and `other` is the first to go.
+        let crowded = note.clone().with_labels(
+            [
+                "select",
+                "insert",
+                "update",
+                "delete",
+                "alter",
+                "execute",
+                "control",
+                "impersonate",
+            ]
+            .map(NoteLabel::sqlserver),
+        );
+        let out = sent(&crowded, a);
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().any(|l| l == "password_hash_probe"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "other"), "{out:?}");
+        // Both revisions: the 16 most severe, the hash probe first.
+        let out = sent(&crowded, LabelRevisions::ALL);
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().any(|l| l == "password_hash_probe"), "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "alter_any_database_event_session"),
+            "{out:?}"
+        );
     }
 
     #[test]

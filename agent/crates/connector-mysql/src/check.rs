@@ -1921,7 +1921,9 @@ mod tests {
             .find(|n| n.code() == NoteCode::PrivilegeGlobalPrivileges)
             .unwrap();
         assert_eq!(n.count(), Some(names.len() as u64));
-        let labels: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        // Every label is kept until sent; the core cuts to 16 at send time.
+        assert_eq!(n.labels().len(), names.len());
+        let labels = databastion_core::test_support::sent_labels(n, false);
         assert_eq!(labels.len(), 16);
         for must in ["super", "file", "execute"] {
             assert!(labels.iter().any(|l| l == must), "{must} cut: {labels:?}");

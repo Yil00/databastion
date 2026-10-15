@@ -733,8 +733,9 @@ fn labels<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<NoteLabel> {
 pub(crate) fn evaluation_notes(ev: &Evaluation, notes: &mut Notes) {
     if ev.is_refused() {
         // The probe's label ranks first in the core's label severity, then
-        // `sysadmin`, `control_server`, `db_owner`…: the 16-label cap
-        // never drops them (review L4).
+        // `sysadmin`, `control_server`, `db_owner`…: the 16-label cap,
+        // applied by the core when the note is sent and after label
+        // negotiation, never drops them (review L4; core `notes`).
         let mut l = labels(&ev.refused);
         if ev.hash_exposed {
             l.push(NoteLabel::sqlserver("password_hash_probe"));
@@ -1048,7 +1049,8 @@ mod tests {
     }
 
     /// Review M3 and L4: an incomplete evaluation blocks, and the hash
-    /// probe's label survives the 16-label cap.
+    /// probe's label survives the 16-label cap the core applies at send
+    /// time, after label negotiation.
     #[test]
     fn incomplete_evaluation_blocks_and_hash_label_survives() {
         let mut ev = Evaluation::default();
@@ -1070,11 +1072,9 @@ mod tests {
         ev.refused.insert("##MS_LoginManager##".into());
         let mut notes = Notes::default();
         evaluation_notes(&ev, &mut notes);
-        let l: Vec<String> = notes.as_slice()[0]
-            .labels()
-            .iter()
-            .map(|l| l.as_str())
-            .collect();
+        assert!(notes.as_slice()[0].labels().len() > 16);
+        let l = databastion_core::test_support::sent_labels(&notes.as_slice()[0], true);
+        assert_eq!(l.len(), 16);
         for want in [
             "password_hash_probe",
             "sysadmin",
