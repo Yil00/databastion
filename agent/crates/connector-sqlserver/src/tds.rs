@@ -217,7 +217,24 @@ pub(crate) fn login7(user: &str, password: &str) -> Result<Zeroizing<Vec<u8>>, F
         return Err(FrameError::Encode);
     }
     const FIXED: usize = 94;
-    let mut buf = Zeroizing::new(vec![0u8; FIXED]);
+    // Variable part (no secret): offsets from the start of the message.
+    let fields: [(usize, Vec<u8>, bool); 9] = [
+        (36, Vec::new(), true), // HostName: empty
+        (40, utf16(user), true),
+        // Password: obfuscated below, in the message buffer only.
+        (44, Vec::new(), true),
+        (48, utf16(APP_NAME), true),
+        (52, Vec::new(), true),           // ServerName
+        (56, Vec::new(), false),          // Extension: none
+        (60, utf16("databastion"), true), // CltIntName
+        (64, Vec::new(), true),           // Language
+        (68, Vec::new(), true),           // Database: the login's default
+    ];
+    // The exact length is reserved before anything is written, so the
+    // buffer never reallocates while it holds the password (review L1).
+    let total = FIXED + fields.iter().map(|(_, v, _)| v.len()).sum::<usize>() + n(password) * 2;
+    let mut buf = Zeroizing::new(Vec::with_capacity(total));
+    buf.resize(FIXED, 0u8);
     let put_u32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
     put_u32(&mut buf, 4, TDS_74);
     put_u32(&mut buf, 8, DEFAULT_PACKET as u32);
@@ -227,19 +244,6 @@ pub(crate) fn login7(user: &str, password: &str) -> Result<Zeroizing<Vec<u8>>, F
     buf[26] = 0x00; // TypeFlags: fReadOnlyIntent never set
     buf[27] = 0x00; // OptionFlags3: no fExtension (no FEATUREEXT)
     put_u32(&mut buf, 32, 0x0409); // ClientLCID
-    // Variable part: offsets from the start of the message.
-    let mut fields: Vec<(usize, Vec<u8>, bool)> = Vec::new();
-    let mut add = |at: usize, value: Vec<u8>, chars: bool| fields.push((at, value, chars));
-    add(36, Vec::new(), true); // HostName: empty
-    add(40, utf16(user), true);
-    // Password: obfuscated below, in the message buffer only.
-    add(44, Vec::new(), true);
-    add(48, utf16(APP_NAME), true);
-    add(52, Vec::new(), true); // ServerName
-    add(56, Vec::new(), false); // Extension: none
-    add(60, utf16("databastion"), true); // CltIntName
-    add(64, Vec::new(), true); // Language
-    add(68, Vec::new(), true); // Database: the login's default
     let mut offset = FIXED;
     for (at, value, chars) in &fields {
         let len = if *chars { value.len() / 2 } else { value.len() };
@@ -435,6 +439,8 @@ mod tests {
         assert_eq!(msg[27] & 0x10, 0, "fExtension");
         assert_eq!(&msg[72..78], &[0; 6], "ClientID");
         assert_eq!(&msg[38..40], &[0, 0], "HostName empty");
+        // Reserved exactly: never reallocated while holding the password.
+        assert_eq!(msg.capacity(), msg.len());
         // The clear password appears nowhere, in UTF-16 or UTF-8.
         let clear = utf16(pw);
         assert!(!msg.windows(clear.len()).any(|w| w == clear.as_slice()));

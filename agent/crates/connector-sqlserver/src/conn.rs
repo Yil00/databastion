@@ -778,10 +778,12 @@ impl Session {
         if self.poisoned {
             return Err(SsError::new(FailureCode::Internal, stage));
         }
-        self.dec.limits = Limits {
+        // A fresh decoder per request: no column metadata of an earlier
+        // statement can describe this one's rows (review L3).
+        self.dec = Decoder::new(Limits {
             max_columns: shape.columns.max(1),
             plp_cap: shape.plp_cap,
-        };
+        });
         self.dec.discard = false;
         self.msg_bytes = 0;
         self.msg_cap = shape.max_bytes;
@@ -811,6 +813,11 @@ impl Session {
                     }
                 }
                 Event::RowStart => {
+                    // A row before this statement's COLMETADATA (L3).
+                    if results == 0 {
+                        stop = Some(Err(SsError::protocol(stage)));
+                        break;
+                    }
                     rows += 1;
                     if rows > shape.max_rows {
                         stop = Some(Err(SsError::new(FailureCode::ResourceLimit, stage)));
@@ -897,7 +904,18 @@ impl Session {
         self.dec.discard = false;
         // The rest of the acknowledging message, if any.
         if !self.poisoned && !(self.reasm.eom && self.pos >= self.buf.len()) {
-            while let Ok(Some(_)) = self.next_event(deadline, stage).await {}
+            // Any error here leaves the stream out of step: poisoned
+            // (review L2).
+            loop {
+                match self.next_event(deadline, stage).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.poisoned = true;
+                        break;
+                    }
+                }
+            }
         } else if !self.poisoned {
             self.reasm.next_message();
             self.buf.clear();
@@ -950,6 +968,26 @@ pub(crate) mod tests {
         assert_eq!(e.number, Some(229));
         assert_eq!(e.code, FailureCode::PermissionDenied);
         assert!(!s.is_poisoned());
+    }
+
+    /// Review L3: the column metadata of a previous statement never
+    /// describes the next statement's rows.
+    #[::tokio::test]
+    async fn rows_need_this_statements_metadata() {
+        let mut ok = build::colmeta_int(&["a"]);
+        ok.extend(build::row_int(&[Some(7)]));
+        ok.extend(build::done(tok::DONE, done::COUNT, 1));
+        let mut bare = build::row_int(&[Some(8)]);
+        bare.extend(build::done(tok::DONE, done::COUNT, 1));
+        let (mut s, _h) = scripted(vec![ok, bare]);
+        s.rows("SELECT 7", Stage::Check, Shape::rows(1, 1))
+            .await
+            .unwrap();
+        assert!(
+            s.rows("SELECT 8", Stage::Check, Shape::rows(1, 1))
+                .await
+                .is_err()
+        );
     }
 
     #[::tokio::test]
