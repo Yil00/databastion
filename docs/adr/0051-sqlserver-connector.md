@@ -519,9 +519,9 @@ For the maintainer; each with this refinement's recommendation, none decided unt
 9. **Logon triggers with the minimal variant** (item 6): report `privilege.not_evaluated` with the logon-trigger label instead of `security.login_event_trigger`?
    **Recommended**: yes; never report "no logon trigger" when the catalog is invisible.
 
-## Refinement proposal (2026-10-15, pending the maintainer)
+## Refinement (2026-10-15, accepted)
 
-**Status: proposed on 2026-10-15 with the P9-A Audit lot (the security review of that lot, M3); not accepted.** The text above, including refinement item 1, is unchanged until the maintainer accepts it.
+**Status: proposed on 2026-10-15 with the P9-A Audit lot (the security review of that lot, M3); accepted by the maintainer on 2026-10-15.** It completes refinement item 1: option (a') is verified for 2022 and 2025, and `VIEW SERVER SECURITY STATE` is not part of the Audit grant set.
 
 - **Context.** Refinement item 1 chose option (a') "if the `AUSC` records are verified", the check it named being a record at `ALTER SERVER AUDIT … WITH (STATE = OFF)` then `ON`, at a service restart and after an unclean stop. Measured on 2026-10-15 (SQL Server 2022 16.0.4305.5 and 2025 17.0.5015.4, Express, the dev audit):
   - `STATE = OFF` writes `AUSC` records (`destroyed`, `event disabled`) on both versions;
@@ -531,9 +531,9 @@ For the maintainer; each with this refinement's recommendation, none decided unt
 
 ## Implementation notes, Audit lot (2026-10-15)
 
-Recorded with the P9-A Audit lot (lot 2) and its security review; they describe the implementation, change no accepted decision, and those marked pending need the maintainer's confirmation.
+Recorded with the P9-A Audit lot (lot 2) and its security review; they describe the implementation, change no accepted decision, and the scope split below was confirmed by the maintainer on 2026-10-15.
 
-- **Scope split (pending maintainer confirmation of the scope split).** Only the SQL Server Audit source is implemented. The Extended Events source (`sqlserver_xevents`) and the plan cache statistics source (`sqlserver_query_stats`, open question 11) are deferred to a later lot, so a SQL Server 2019 target, and one naming only `sqlserver.audit.xe_session`, reports the level None (`audit.sqlserver_audit_needs_control_server` or `audit.source_not_configured`).
+- **Scope split (confirmed by the maintainer on 2026-10-15).** Only the SQL Server Audit source is implemented. The Extended Events source (`sqlserver_xevents`) and the plan cache statistics source (`sqlserver_query_stats`, open question 11) are deferred to a later lot, so a SQL Server 2019 target, and one naming only `sqlserver.audit.xe_session`, reports the level None (`audit.sqlserver_audit_needs_control_server` or `audit.source_not_configured`).
 - **Proof 7 gives None, not Limited.** Without `VIEW ANY SECURITY DEFINITION` the audit's folder (`sys.server_file_audits.log_file_path`) is not visible, and decision 6 forbids taking the poll's file pattern from anywhere else: there is no source at all, so the level is None, with `privilege.not_evaluated` (label `view_any_security_definition`).
 - **Server-internal statements.** `sys.fn_my_permissions` checks `sys.fn_builtin_permissions` with a statement of its own (`INSERT INTO @myperms … WHERE has_perms_by_name(@entity, @pseudoclass, fbp.permission_name) <> 0`, measured on 2022 and 2025), recorded with the caller's session. That exact text (`sql::SERVER_INTERNAL`) is matched like one of the agent's constants, only from the agent's own sessions; the same text from any other session is reported (integration test).
 - **Credits.** A credit's window is on the server's clock and is checked against the record's `event_time`: from 1 s before the grant to the statement timeout plus 5 s after it. One credit covers the records of one execution (its transaction id), because one statement can produce several records at slightly different times (measured on 2025: a poll's records name `fn_get_audit_file` and `fn_get_audit_file_v2`); a record without a transaction id consumes it once. Poll credits are persisted with the own sessions; sampling credits are not (a sample whose record is read only after an agent restart is reported).
