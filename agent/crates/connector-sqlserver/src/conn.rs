@@ -10,7 +10,7 @@
 //! and closed. Reads go through cancel-safe `read` calls into
 //! [`tds::Reassembly`], so a deadline never desynchronizes the framing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,10 @@ pub(crate) enum Mode {
 #[derive(Default)]
 pub(crate) struct TlsChoice {
     inner: Mutex<HashMap<String, Remembered>>,
+    /// Targets whose mark was already cleared by this process (review L2:
+    /// once per process and target, not at every connection attempt;
+    /// reset when `auto` records a new strict session).
+    cleared: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -140,6 +144,9 @@ fn persist_strict_seen(target: &TargetConfig) {
 /// later return to `auto` tries strict first again, with the one
 /// fallback.
 fn clear_strict_seen(target: &TargetConfig, choice: &TlsChoice, key: &str) {
+    if !choice.first_clear(key) {
+        return;
+    }
     choice.remove(key);
     let Some(dir) = target.state_dir() else {
         return;
@@ -156,7 +163,37 @@ fn clear_strict_seen(target: &TargetConfig, choice: &TlsChoice, key: &str) {
     }
 }
 
+/// Records a completed strict session of an `auto` target: in memory, on
+/// disk, and so that a later non-`auto` setting clears the new mark again.
+fn remember_strict_seen(target: &TargetConfig, choice: &TlsChoice, key: String) {
+    choice
+        .cleared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    choice.set(key, Remembered::StrictSeen);
+    persist_strict_seen(target);
+}
+
 impl TlsChoice {
+    /// Whether this is the first clear of `key` in this process (then
+    /// recorded).
+    fn first_clear(&self, key: &str) -> bool {
+        let mut cleared = self
+            .cleared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cleared.contains(key) {
+            return false;
+        }
+        // Bounded by the declared targets in practice; capped anyway.
+        if cleared.len() >= 4096 {
+            cleared.clear();
+        }
+        cleared.insert(key.to_owned());
+        true
+    }
+
     fn remove(&self, key: &str) {
         self.inner
             .lock()
@@ -304,8 +341,7 @@ pub(crate) async fn connect(
             }
             _ => match open(Mode::Strict).await {
                 Ok(s) => {
-                    choice.set(key, Remembered::StrictSeen);
-                    persist_strict_seen(target);
+                    remember_strict_seen(target, choice, key);
                     Ok(s)
                 }
                 // The strict handshake failed before any TDS byte (I/O,
@@ -1193,7 +1229,9 @@ pub(crate) mod tests {
     }
 
     /// Re-review R4: a target whose `tls` is not `auto` has its mark
-    /// cleared, on disk and in memory, at its next connection attempt.
+    /// cleared, on disk and in memory, at its next connection attempt;
+    /// once per process (review L2) until `auto` records a new strict
+    /// session.
     #[::tokio::test]
     async fn strict_seen_is_cleared_when_tls_is_not_auto() {
         let dir = std::env::temp_dir().join(format!(
@@ -1225,8 +1263,7 @@ pub(crate) mod tests {
         let choice = TlsChoice::default();
         for mode in ["mandatory", "strict"] {
             let auto = parse("auto");
-            persist_strict_seen(&auto);
-            choice.set(choice_key(&auto), Remembered::StrictSeen);
+            remember_strict_seen(&auto, &choice, choice_key(&auto));
             assert!(persisted_strict_seen(&auto));
             let t = parse(mode);
             let _ = connect(&t, &configs, &choice, Duration::from_secs(1)).await;
@@ -1234,9 +1271,19 @@ pub(crate) mod tests {
             assert!(!dir.join(STRICT_SEEN_DIR).join("t1").exists(), "{mode}");
             assert!(choice.get(&choice_key(&auto)).is_none(), "{mode}");
         }
-        // `auto` keeps it.
+        // Once per process: a mark that appears afterwards without a strict
+        // session of this process is not looked for again.
         let auto = parse("auto");
         persist_strict_seen(&auto);
+        let _ = connect(
+            &parse("mandatory"),
+            &configs,
+            &choice,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(persisted_strict_seen(&auto));
+        // `auto` keeps it.
         let _ = connect(&auto, &configs, &choice, Duration::from_secs(1)).await;
         assert!(persisted_strict_seen(&auto));
         let _ = std::fs::remove_dir_all(&dir);
