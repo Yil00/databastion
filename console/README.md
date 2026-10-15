@@ -715,8 +715,10 @@ notes clears them. The agent page renders each note from the phrase catalog gene
 integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQL role attributes
 and MySQL / MariaDB privileges in upper case, SQL Server permissions in upper case with spaces,
 SQL Server fixed roles as SQL Server names them, `##MS_…##` for the SQL Server 2022 roles, the
-other labels as sent; the SQL Server labels are those of revision
-`target_status.note_labels.2026_10`, which the console lists in `accepts`), in one non-recursive pass;
+other labels, the `check()` probes such as `logon_trigger_probe` included, as sent; the SQL Server
+labels are those of revisions `target_status.note_labels.2026_10` and
+`target_status.note_labels.2026_10_b`, both listed by the console in `accepts`), in one
+non-recursive pass;
 a code this console does not know is shown raw with its count and labels. Everything is rendered as
 text (escaped). The console never derives a decision from notes.
 
