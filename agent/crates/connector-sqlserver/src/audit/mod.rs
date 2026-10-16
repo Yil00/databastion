@@ -444,12 +444,34 @@ impl Cursor {
         self.expire_floor(read_started_ms, delay);
     }
 
-    /// Whether a record stamped `time_us` (server µs) is left out, and how.
-    pub(crate) fn below(&self, time_us: i64) -> Option<Below> {
-        match (self.history_us, self.floor) {
-            (Some(h), f) => (time_us < f.map_or(h, |f| f.max(h))).then_some(Below::History),
-            (None, Some(f)) => (time_us < f).then_some(Below::Dropped),
-            (None, None) => None,
+    /// Whether a record stamped `time_us` (server µs), read by a read that
+    /// started at `read_started_ms` on the agent's clock, is left out, and
+    /// how. History only while the source's delivery `delay` (at most
+    /// [`FLOOR_MAX`]) has not passed since the first start (final review
+    /// L1): after it, a record below the start or the floor is counted as
+    /// dropped, also during a first catch-up that lasts longer (a large
+    /// backlog's old records included, which is the price of telling a
+    /// server clock stepped back from history).
+    pub(crate) fn below(
+        &self,
+        time_us: i64,
+        read_started_ms: i64,
+        delay: Duration,
+    ) -> Option<Below> {
+        let threshold = match (self.history_us, self.floor) {
+            (Some(h), f) => f.map_or(h, |f| f.max(h)),
+            (None, Some(f)) => f,
+            (None, None) => return None,
+        };
+        if time_us >= threshold {
+            return None;
+        }
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if self.history_us.is_some() && (0..delay_ms).contains(&since) {
+            Some(Below::History)
+        } else {
+            Some(Below::Dropped)
         }
     }
 
@@ -1133,6 +1155,9 @@ async fn read(
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
     let read_started_ms = agent_now_ms();
+    // The audit's delivery delay (`QUEUE_DELAY`): the history and floor
+    // bound.
+    let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
     let top = st.batch + st.cursor.skip as usize;
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
@@ -1203,7 +1228,7 @@ async fn read(
     let mut reprobe = false;
     let mut below_floor = 0u64;
     for stmt in &statements {
-        match st.cursor.below(stmt.head.time_us) {
+        match st.cursor.below(stmt.head.time_us, read_started_ms, delay) {
             Some(Below::History) => continue,
             Some(Below::Dropped) => {
                 below_floor += 1;
@@ -1244,7 +1269,6 @@ async fn read(
     let prev_history = st.cursor.history_us;
     st.cursor = b.next;
     if !b.full {
-        let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
     if b.gap {

@@ -544,6 +544,13 @@ pub(crate) fn xe_batch(
 /// buffer went over [`XE_MAX_SKIP`] (a gap). A read cut before one of its
 /// events (the deferral of a build) is a full read of the events before
 /// it.
+///
+/// The skip counts the events read, while the server skips rows: a row of
+/// the last buffer that could not be read (dropped and counted as such)
+/// makes the next read start one row early. That row is then met again
+/// (counted again), or, when it came before the buffer's first event read,
+/// that event is read twice (reported twice, never lost): at most one per
+/// such row (final review L2; the same holds for any full read).
 pub(crate) fn xe_next(cursor: &Cursor, positions: &[(String, i64)], full: bool) -> (Cursor, bool) {
     let mut next = cursor.clone();
     if let Some(last) = positions.last() {
@@ -674,6 +681,18 @@ async fn read(
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
     let read_started_ms = super::agent_now_ms();
+    // An event stamped below the floor reaches the file at most the
+    // dispatch latency after its stamp (`INFINITE` or not visible: the
+    // bound): the history and floor bound.
+    let delay = st
+        .probe
+        .as_ref()
+        .and_then(|p| p.dispatch_latency)
+        .map_or(FLOOR_MAX, |d| {
+            d.saturating_add(std::time::Duration::from_micros(
+                XE_CLOCK_SKEW_US.unsigned_abs(),
+            ))
+        });
     // The server skips the events of the next buffer already handled
     // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
     let top = st.batch;
@@ -749,14 +768,16 @@ async fn read(
     // stepped back).
     let mut records = b.kept;
     let mut below_floor: Vec<usize> = Vec::new();
-    records.retain(|r| match st.cursor.below(r.time_us) {
-        Some(Below::History) => false,
-        Some(Below::Dropped) => {
-            below_floor.push(r.index);
-            false
-        }
-        None => true,
-    });
+    records.retain(
+        |r| match st.cursor.below(r.time_us, read_started_ms, delay) {
+            Some(Below::History) => false,
+            Some(Below::Dropped) => {
+                below_floor.push(r.index);
+                false
+            }
+            None => true,
+        },
+    );
     if st.skip > 0 {
         let n = (st.skip as usize).min(records.len());
         records.drain(..n);
@@ -834,18 +855,6 @@ async fn read(
     let prev_history = st.cursor.history_us;
     st.cursor = next;
     if !b.full && cut.is_none() {
-        // An event stamped below the floor reaches the file at most the
-        // dispatch latency after its stamp (`INFINITE` or not visible: the
-        // bound).
-        let delay = st
-            .probe
-            .as_ref()
-            .and_then(|p| p.dispatch_latency)
-            .map_or(FLOOR_MAX, |d| {
-                d.saturating_add(std::time::Duration::from_micros(
-                    XE_CLOCK_SKEW_US.unsigned_abs(),
-                ))
-            });
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
     if gap {
