@@ -43,10 +43,16 @@
 //!   is not followed: the position is a buffer of the audit file, not a
 //!   record, so it cannot be saved between two records of one buffer; a
 //!   skip the core asks for drops the first statement of the next read.
+//! - **Extended Events** ([`xe`]): the other source of decision 6, the
+//!   only one on SQL Server 2019. With `source: auto`, SQL Server Audit is
+//!   read when usable, else the Extended Events session (the preference
+//!   rule shared by `check()` and the stream, re-evaluated every 5
+//!   minutes: a stream whose choice changes ends and is restarted).
 
 pub(crate) mod own;
 pub(crate) mod probe;
 pub(crate) mod records;
+pub(crate) mod xe;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -119,10 +125,16 @@ pub(crate) struct Shared {
     gap: Mutex<HashMap<String, Instant>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
-    usable: Mutex<HashMap<String, bool>>,
+    chosen: Mutex<HashMap<String, Source>>,
+    /// The source the last stream of the target read.
+    streamed: Mutex<HashMap<String, Source>>,
+    /// Extended Events session counters last seen per target (`check()`
+    /// and the stream): (`create_time`, dropped events, dropped buffers).
+    xe_seen: Mutex<HashMap<String, (i64, i64, i64)>>,
     /// Statements left out as the agent's own: (exact texts, credited
-    /// sampling, credited polls), for the logs and the tests.
-    own_left_out: Mutex<HashMap<String, [u64; 3]>>,
+    /// sampling, credited polls, statistics builds and their internal
+    /// statements), for the logs and the tests.
+    own_left_out: Mutex<HashMap<String, [u64; 4]>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -207,13 +219,46 @@ impl Shared {
             .clone()
     }
 
-    /// The last `check()` found the SQL Server Audit source usable.
-    pub(crate) fn set_usable(&self, target_id: &str, usable: bool) {
-        lock(&self.usable).insert(target_id.to_owned(), usable);
+    /// The source the last `check()` chose (`None`: no usable source).
+    pub(crate) fn set_chosen(&self, target_id: &str, source: Option<Source>) {
+        let mut map = lock(&self.chosen);
+        match source {
+            Some(s) => map.insert(target_id.to_owned(), s),
+            None => map.remove(target_id),
+        };
     }
 
-    pub(crate) fn usable(&self, target_id: &str) -> bool {
-        lock(&self.usable).get(target_id).copied().unwrap_or(false)
+    pub(crate) fn chosen(&self, target_id: &str) -> Option<Source> {
+        lock(&self.chosen).get(target_id).copied()
+    }
+
+    /// Records the source a stream starts on; on a switch from the other
+    /// source, a gap (security review of lot 3, L3): what was written to
+    /// the old source after its last read, and to the new one before its
+    /// position or, on its first start, before now (no history replay), is
+    /// read by neither.
+    pub(crate) fn stream_source(&self, target_id: &str, source: Source) {
+        let before = lock(&self.streamed).insert(target_id.to_owned(), source);
+        if before.is_some_and(|b| b != source) {
+            tracing::warn!(target_id = %target_id, "SQL Server Audit: the stream switched between SQL Server Audit and Extended Events: events around the switch may be read by neither (a gap)");
+            self.note_gap(target_id);
+            self.note_dropped(target_id, 1);
+        }
+    }
+
+    /// Records the Extended Events session counters seen now; `true` (and a
+    /// gap noted, decision 6 proof 4) when the session was restarted
+    /// (another `create_time`) or its drop counters grew since last seen.
+    pub(crate) fn observe_xe(&self, target_id: &str, seen: (i64, i64, i64)) -> bool {
+        let before = lock(&self.xe_seen).insert(target_id.to_owned(), seen);
+        let gap = before.is_some_and(|(create, events, buffers)| {
+            !xe::probe::same_start(create, seen.0) || seen.1 > events || seen.2 > buffers
+        });
+        if gap {
+            self.note_gap(target_id);
+            self.note_dropped(target_id, 1);
+        }
+        gap
     }
 
     fn note_own(&self, target_id: &str, which: usize) {
@@ -226,16 +271,54 @@ impl Shared {
         }
     }
 
-    /// Statements left out as the agent's own: exact texts, credited
-    /// sampling, credited polls.
+    /// Statistics statements left out (item 4, refinement of 2026-10-15).
+    pub(crate) fn note_statistics(&self, target_id: &str, n: usize) {
+        if let Some(c) = lock(&self.own_left_out)
+            .entry(target_id.to_owned())
+            .or_default()
+            .get_mut(3)
+        {
+            *c = c.saturating_add(n as u64);
+        }
+    }
+
+    /// Statements left out: exact texts, credited sampling, credited
+    /// polls, statistics statements.
     #[cfg(test)]
-    pub(crate) fn own_left_out(&self, target_id: &str) -> [u64; 3] {
+    pub(crate) fn own_left_out(&self, target_id: &str) -> [u64; 4] {
         lock(&self.own_left_out)
             .get(target_id)
             .copied()
             .unwrap_or_default()
     }
 }
+
+/// An Audit source of SQL Server (contract `AuditSource`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// SQL Server Audit (`sqlserver_audit`).
+    Audit,
+    /// An Extended Events session (`sqlserver_xevents`).
+    Xevents,
+}
+
+/// A record with a position in an audit or event file set.
+pub(crate) trait Positioned {
+    fn file(&self) -> &str;
+    fn offset(&self) -> i64;
+}
+
+impl Positioned for Record {
+    fn file(&self) -> &str {
+        &self.file
+    }
+    fn offset(&self) -> i64 {
+        self.offset
+    }
+}
+
+/// The order key of a file of a file set (`file_key`, `sql::xe_file_key`).
+pub(crate) type FileKey = fn(&str) -> Option<(i64, i64)>;
 
 /// The persisted position (file names hex-encoded, numbers).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -255,6 +338,46 @@ pub(crate) struct Cursor {
     /// First start: records older than this (server µs) are history, not
     /// reported.
     pub(crate) history_us: Option<i64>,
+    /// Extended Events: the session's `create_time` (server µs) the
+    /// position was read under; another one is a restart (a gap).
+    pub(crate) session: Option<i64>,
+    /// First start: records stamped before this (server µs) are not
+    /// reported, even when they reach the source after it was read to its
+    /// end (`QUEUE_DELAY`, `MAX_DISPATCH_LATENCY`). Bounded (re-review N1):
+    /// dropped once the stream caught up and the source's delivery delay
+    /// passed since the first start ([`Cursor::settle`]); a record it
+    /// leaves out after the first caught-up read is counted as dropped.
+    pub(crate) floor: Option<i64>,
+    /// The agent's wall clock (Unix ms) at the first start the floor was
+    /// set at.
+    pub(crate) floor_set_ms: i64,
+    /// Extended Events: the buffer (file, offset) whose first `skip`
+    /// events were handled (the server skips them, `sql::XE_POLL_FROM`).
+    pub(crate) buffer: Option<(String, i64)>,
+}
+
+/// The longest the floor is kept after the first start (re-review N1),
+/// whatever delivery delay the source states.
+pub(crate) const FLOOR_MAX: Duration = Duration::from_secs(300);
+
+/// The agent's wall clock, Unix ms (the floor's bound, never the server's
+/// clock, which is what may step).
+pub(crate) fn agent_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// What the first start's history and floor say of a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Below {
+    /// Stamped before the first start, read in the history phase: not
+    /// reported, not counted.
+    History,
+    /// Stamped below the floor after the first caught-up read (late
+    /// history, or the server's clock stepped back): not reported,
+    /// counted as dropped.
+    Dropped,
 }
 
 fn hex(s: &str) -> String {
@@ -273,6 +396,85 @@ fn unhex(s: &str) -> Option<String> {
 }
 
 impl Cursor {
+    /// Sets the history and the floor of a first start: `server_now`
+    /// (server µs) plus `skew_us`, the source's clock lead.
+    pub(crate) fn first_start(&mut self, server_now: Option<i64>, skew_us: i64) {
+        self.history_us = server_now;
+        self.floor = server_now.map(|h| h.saturating_add(skew_us));
+        self.floor_set_ms = agent_now_ms();
+    }
+
+    /// After a read that reached the end of the source (`self` its next
+    /// position, so no history phase any more) and started at
+    /// `read_started_ms` on the agent's clock: the floor ends when `delay`
+    /// (the source's delivery delay, at most [`FLOOR_MAX`]) had passed
+    /// since the first start when the read started, since every record
+    /// stamped before the first start had then reached the source and was
+    /// read; at once if the agent's clock went back past the first start.
+    pub(crate) fn expire_floor(&mut self, read_started_ms: i64, delay: Duration) {
+        if self.floor.is_none() || self.history_us.is_some() {
+            return;
+        }
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if since >= delay_ms || since < 0 {
+            self.floor = None;
+        }
+    }
+
+    /// After a read that reached the end of the source, `self` its next
+    /// position (the history phase cleared) and `prev_history` the history
+    /// before it: while the source's delivery `delay` has not passed since
+    /// the first start, records stamped before it may still come, so the
+    /// history phase goes on (they are history, not counted); once it has,
+    /// the history phase and the floor end together
+    /// ([`Self::expire_floor`]).
+    pub(crate) fn settle(
+        &mut self,
+        prev_history: Option<i64>,
+        read_started_ms: i64,
+        delay: Duration,
+    ) {
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if prev_history.is_some() && (0..delay_ms).contains(&since) {
+            self.history_us = prev_history;
+            return;
+        }
+        self.expire_floor(read_started_ms, delay);
+    }
+
+    /// Whether a record stamped `time_us` (server µs), read by a read that
+    /// started at `read_started_ms` on the agent's clock, is left out, and
+    /// how. History only while the source's delivery `delay` (at most
+    /// [`FLOOR_MAX`]) has not passed since the first start (final review
+    /// L1): after it, a record below the start or the floor is counted as
+    /// dropped, also during a first catch-up that lasts longer (a large
+    /// backlog's old records included, which is the price of telling a
+    /// server clock stepped back from history).
+    pub(crate) fn below(
+        &self,
+        time_us: i64,
+        read_started_ms: i64,
+        delay: Duration,
+    ) -> Option<Below> {
+        let threshold = match (self.history_us, self.floor) {
+            (Some(h), f) => f.map_or(h, |f| f.max(h)),
+            (None, Some(f)) => f,
+            (None, None) => return None,
+        };
+        if time_us >= threshold {
+            return None;
+        }
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if self.history_us.is_some() && (0..delay_ms).contains(&since) {
+            Some(Below::History)
+        } else {
+            Some(Below::Dropped)
+        }
+    }
+
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = String::from("v1\n");
         out.push_str(&format!(
@@ -287,6 +489,15 @@ impl Cursor {
         }
         if let Some(h) = self.history_us {
             out.push_str(&format!("history {h}\n"));
+        }
+        if let Some(c) = self.session {
+            out.push_str(&format!("session {c}\n"));
+        }
+        if let Some(f) = self.floor {
+            out.push_str(&format!("floor {f} {}\n", self.floor_set_ms));
+        }
+        if let Some((f, o)) = &self.buffer {
+            out.push_str(&format!("buffer {} {o}\n", hex(f)));
         }
         out.into_bytes()
     }
@@ -314,6 +525,17 @@ impl Cursor {
                     ));
                 }
                 ("history", h) => c.history_us = Some(h.parse().ok()?),
+                ("session", v) => c.session = Some(v.parse().ok()?),
+                ("floor", v) => {
+                    c.floor = Some(v.parse().ok()?);
+                    // Without its first start (an older cursor): ends once
+                    // caught up.
+                    c.floor_set_ms = match p.next() {
+                        Some(t) => t.parse().ok()?,
+                        None => 0,
+                    };
+                }
+                ("buffer", f) => c.buffer = Some((unhex(f)?, p.next()?.parse().ok()?)),
                 _ => return None,
             }
         }
@@ -388,6 +610,7 @@ pub(crate) fn on_pattern(cursor: &mut Cursor, pattern: &str) -> bool {
         cursor.offset = 0;
         cursor.skip = 0;
         cursor.after = None;
+        cursor.buffer = None;
     }
     cursor.pattern = Some(pattern.to_owned());
     changed
@@ -397,22 +620,23 @@ pub(crate) fn on_pattern(cursor: &mut Cursor, pattern: &str) -> bool {
 /// from the oldest file again, leaving out what was read up to the
 /// position, by file key and offset. A file name of another form keeps no
 /// filter (what was read is read again: loud, never lost).
-pub(crate) fn on_bad_position(cursor: &mut Cursor) {
+pub(crate) fn on_bad_position(cursor: &mut Cursor, key: FileKey) {
     cursor.after = cursor
         .file
         .as_deref()
-        .and_then(file_key)
+        .and_then(key)
         .map(|k| (k, cursor.offset));
     cursor.file = None;
     cursor.offset = 0;
     cursor.skip = 0;
+    cursor.buffer = None;
 }
 
 /// What one read gives: the records to handle, the next position, and
 /// the gap (records lost) it reveals.
 #[derive(Debug)]
-pub(crate) struct Batch {
-    pub(crate) kept: Vec<Record>,
+pub(crate) struct Batch<T> {
+    pub(crate) kept: Vec<T>,
     pub(crate) next: Cursor,
     /// A buffer above [`MAX_SKIP`] records: the rest of it is lost.
     pub(crate) gap: bool,
@@ -422,18 +646,26 @@ pub(crate) struct Batch {
 /// The records of a read (`returned` rows asked with `top`) from `cursor`:
 /// the records of the first buffer already handled skipped, those at or
 /// before a refused position left out, the next position, and the gaps.
-pub(crate) fn batch(cursor: &Cursor, records: Vec<Record>, returned: usize, top: usize) -> Batch {
-    let positions: Vec<(String, i64)> =
-        records.iter().map(|r| (r.file.clone(), r.offset)).collect();
+pub(crate) fn batch<T: Positioned>(
+    cursor: &Cursor,
+    records: Vec<T>,
+    returned: usize,
+    top: usize,
+    file_key: FileKey,
+) -> Batch<T> {
+    let positions: Vec<(String, i64)> = records
+        .iter()
+        .map(|r| (r.file().to_owned(), r.offset()))
+        .collect();
     let mut skip_first = cursor.skip as usize;
     let first = positions.first().cloned();
-    let mut kept: Vec<Record> = records
+    let mut kept: Vec<T> = records
         .into_iter()
         .filter(|r| {
             if skip_first > 0
                 && first
                     .as_ref()
-                    .is_some_and(|(f, o)| *f == r.file && *o == r.offset)
+                    .is_some_and(|(f, o)| f == r.file() && *o == r.offset())
             {
                 skip_first -= 1;
                 return false;
@@ -443,7 +675,7 @@ pub(crate) fn batch(cursor: &Cursor, records: Vec<Record>, returned: usize, top:
         .collect();
     if let Some((key, offset)) = cursor.after {
         // A record of another form of name is kept (read again, loud).
-        kept.retain(|r| file_key(&r.file).is_none_or(|k| (k, r.offset) > (key, offset)));
+        kept.retain(|r| file_key(r.file()).is_none_or(|k| (k, r.offset()) > (key, offset)));
     }
     let full = returned >= top;
     let mut next = advance(cursor, &positions, top);
@@ -582,8 +814,9 @@ impl Stream<'_> {
         match sql::own_text(&h.statement) {
             OwnText::Exact => {
                 // A listed (always-reported) object is the agent's only
-                // through its one-bit password_hash probe.
-                if ev.always_report() && *h.statement != *sql::PASSWORD_HASH_PROBE {
+                // through its one-bit password_hash probe or its Extended
+                // Events status read.
+                if ev.always_report() && !sql::own_listed_read(&h.statement) {
                     return Err("always-reported object");
                 }
                 unbudgeted(&self.own, 0)
@@ -638,10 +871,12 @@ pub(crate) async fn audit_stream(
         .target()
         .ok_or_else(|| target_error(FailureCode::Internal))?;
     let settings = target.sqlserver_settings();
-    let Some(name) = probe::audit_name(settings.audit.as_ref()).map(str::to_owned) else {
-        tracing::warn!(target_id = %target.id, "SQL Server Audit: no server audit named in agent.yaml (sqlserver.audit.audit_name)");
+    let audit_name = probe::audit_name(settings.audit.as_ref()).map(str::to_owned);
+    let xe_name = xe::probe::session_name(settings.audit.as_ref()).map(str::to_owned);
+    if audit_name.is_none() && xe_name.is_none() {
+        tracing::warn!(target_id = %target.id, "SQL Server Audit: no server audit nor Extended Events session named in agent.yaml (sqlserver.audit)");
         return Err(target_error(FailureCode::Unsupported));
-    };
+    }
     let _running = state.audit.started(&target.id);
     let _streaming = own::stream_started(&target.id);
     let own_store = cfg.counters(OWN_SESSIONS);
@@ -650,6 +885,47 @@ pub(crate) async fn audit_stream(
     {
         own::restore(&target.id, persisted);
     }
+    let tls = tls::configs(settings.ca_file.as_deref())
+        .ok_or_else(|| target_error(FailureCode::Internal))?;
+    let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
+        .await
+        .map_err(SsError::into_connector_error)?;
+    // The preference rule (decision 6): SQL Server Audit when usable, then
+    // the Extended Events session.
+    let use_audit = match (&audit_name, &xe_name) {
+        (Some(_), None) => true,
+        (None, _) => false,
+        (Some(_), Some(_)) => {
+            let chosen = async {
+                let v = check::version(&mut session).await?;
+                let ev = Box::pin(check::evaluate(&mut session, target)).await?;
+                Box::pin(xe::audit_usable(
+                    &mut session,
+                    target,
+                    v.major,
+                    &ev.server_perms,
+                ))
+                .await
+            };
+            match Box::pin(chosen).await {
+                Ok(usable) => usable,
+                Err(e) => {
+                    session.close().await;
+                    return Err(e.into_connector_error());
+                }
+            }
+        }
+    };
+    let name = match (use_audit, audit_name, xe_name) {
+        (true, Some(name), _) => name,
+        (_, _, Some(xe)) => {
+            state.audit.stream_source(&target.id, Source::Xevents);
+            return Box::pin(xe::stream(cfg, sink, state, target, session, xe)).await;
+        }
+        (_, Some(name), None) => name,
+        (_, None, None) => return Err(target_error(FailureCode::Unsupported)),
+    };
+    state.audit.stream_source(&target.id, Source::Audit);
     let store = cfg.cursor(CURSOR);
     let loaded = match store.as_ref().map(CursorStore::load) {
         Some(Ok(Some(bytes))) => {
@@ -672,16 +948,11 @@ pub(crate) async fn audit_stream(
         _ => None,
     };
     let skip = store.as_ref().map_or(0, CursorStore::skip_records);
-    let tls = tls::configs(settings.ca_file.as_deref())
-        .ok_or_else(|| target_error(FailureCode::Internal))?;
-    let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
-        .await
-        .map_err(SsError::into_connector_error)?;
     let first_start = loaded.is_none();
     let mut cursor = loaded.unwrap_or_default();
     if first_start {
         // No history replay: what the audit holds from before now.
-        cursor.history_us = session.own.as_ref().map(own::Handle::server_now);
+        cursor.first_start(session.own.as_ref().map(own::Handle::server_now), 0);
     }
     let mut st = Stream {
         name,
@@ -883,6 +1154,10 @@ async fn read(
     sink: &EventSink,
 ) -> Result<bool, ConnectorError> {
     let target_id = st.target.id.clone();
+    let read_started_ms = agent_now_ms();
+    // The audit's delivery delay (`QUEUE_DELAY`): the history and floor
+    // bound.
+    let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
     let top = st.batch + st.cursor.skip as usize;
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
@@ -924,7 +1199,7 @@ async fn read(
             Box::pin(reprobe(st, s)).await?;
             if st.cursor.pattern == before && st.cursor.file.is_some() {
                 tracing::warn!(target_id = %target_id, "SQL Server Audit: the saved position is no longer in the audit's file set (rollover): reading from the oldest file");
-                on_bad_position(&mut st.cursor);
+                on_bad_position(&mut st.cursor, file_key);
                 st.state.audit.note_gap(&target_id);
                 st.state.audit.note_dropped(&target_id, 1);
             }
@@ -938,12 +1213,11 @@ async fn read(
         Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
-    let b = batch(&st.cursor, polled.records, polled.returned, top);
+    let b = batch(&st.cursor, polled.records, polled.returned, top, file_key);
     // Freshness from parsed records only (re-review Low).
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
-    let history = st.cursor.history_us;
     let mut statements = records::group(records::reassemble(b.kept));
     if st.skip > 0 {
         let n = (st.skip as usize).min(statements.len());
@@ -952,9 +1226,15 @@ async fn read(
         st.skip = 0;
     }
     let mut reprobe = false;
+    let mut below_floor = 0u64;
     for stmt in &statements {
-        if history.is_some_and(|h| stmt.head.time_us < h) {
-            continue;
+        match st.cursor.below(stmt.head.time_us, read_started_ms, delay) {
+            Some(Below::History) => continue,
+            Some(Below::Dropped) => {
+                below_floor += 1;
+                continue;
+            }
+            None => {}
         }
         match records::map(&stmt.head.action, &stmt.head.class) {
             Mapped::Restart => {
@@ -982,7 +1262,15 @@ async fn read(
             None => st.state.audit.note_dropped(&target_id, 1),
         }
     }
+    if below_floor > 0 {
+        tracing::warn!(target_id = %target_id, below_floor, "SQL Server Audit: records stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
+        st.state.audit.note_dropped(&target_id, below_floor);
+    }
+    let prev_history = st.cursor.history_us;
     st.cursor = b.next;
+    if !b.full {
+        st.cursor.settle(prev_history, read_started_ms, delay);
+    }
     if b.gap {
         tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
         st.state.audit.note_gap(&target_id);

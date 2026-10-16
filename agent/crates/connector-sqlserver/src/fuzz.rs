@@ -264,7 +264,15 @@ pub fn tsql(data: &[u8]) {
     }
     let head = format!("CREATE LOGIN x WITH PASSWORD = {text}");
     let c = databastion_classifiers::query::tsql::analyze_tsql(&head, false);
-    assert!(c.credential && c.listed.is_empty());
+    assert!(c.credential && c.listed.is_empty() && c.relations.is_empty());
+    // Relations come from identifiers only; the statistics grammar is
+    // whole-text (refinement item 4): an accepted text starts with the
+    // server's statement and names its derived table.
+    assert!(a.relations.len() <= databastion_classifiers::query::tsql::MAX_RELATIONS);
+    if databastion_classifiers::query::tsql::statman_table(&text).is_some() {
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.trim_start().starts_with("select") && lower.contains("_ms_updstats_tbl"));
+    }
     if crate::sql::own_text(&text) == crate::sql::OwnText::Exact {
         assert!(
             crate::sql::SERVER_INTERNAL.contains(&text.as_ref())
@@ -336,6 +344,135 @@ pub fn audit_records(data: &[u8]) {
         if let Some((ev, _)) = convert(&s) {
             for o in ev.objects() {
                 assert!(o.object().as_str().len() <= 256);
+            }
+        }
+    }
+}
+
+/// The bounded Extended Events XML reader (ADR-0051 decision 6, "the event
+/// XML is parsed by a bounded reader … fuzzed"): never panics on any
+/// input, raw or wrapped in the event shape; what it keeps stays within its
+/// bounds; a `rpc_completed` never keeps a statement (its text holds
+/// parameter values) and nothing ever keeps a message.
+pub fn xe_event_xml(data: &[u8]) {
+    use crate::audit::xe::xml::{MAX_FIELD_BYTES, MAX_STATEMENT_BYTES, parse};
+    let text = String::from_utf8_lossy(data);
+    let check = |x: &str| {
+        if let Ok(e) = parse(x) {
+            assert!(
+                e.statement
+                    .as_ref()
+                    .is_none_or(|s| s.len() <= MAX_STATEMENT_BYTES)
+            );
+            for f in [
+                &e.server_principal,
+                &e.session_principal,
+                &e.client_app,
+                &e.database,
+                &e.object_name,
+            ] {
+                assert!(f.as_ref().is_none_or(|v| v.len() <= MAX_FIELD_BYTES));
+            }
+            if e.name == "rpc_completed" || e.name == "sql_batch_completed" {
+                assert!(e.statement.is_none());
+            }
+        }
+    };
+    check(&text);
+    // Inside the measured shape, as a statement, a name and a raw child.
+    let kind = match data.first().map(|b| b % 4) {
+        Some(0) => "sql_statement_completed",
+        Some(1) => "sp_statement_completed",
+        Some(2) => "rpc_completed",
+        _ => "error_reported",
+    };
+    check(&format!(
+        "<event name=\"{kind}\" package=\"sqlserver\"><data name=\"statement\"><value>{text}</value></data>\
+         <action name=\"session_id\" package=\"sqlserver\"><value>51</value></action></event>"
+    ));
+    check(&format!(
+        "<event name=\"{kind}\"><data name=\"statement\"><value><![CDATA[{text}]]></value></data></event>"
+    ));
+    check(&format!("<event name=\"{kind}\">{text}</event>"));
+}
+
+/// The Extended Events record pipeline (decision 1, "the Audit record
+/// conversion"; decision 6): records built from the input (event kinds,
+/// sessions, activities, procedures and texts drawn from it) go through
+/// the context pass (procedure names, duplicate failed logins, statistics
+/// builds) and the conversion without panicking; an event never names
+/// more than normalized names, and a statement that names `*` is always
+/// reported.
+pub fn xe_records(data: &[u8]) {
+    use crate::audit::xe::events::{XeRecord, context, convert};
+    use crate::audit::xe::xml::parse;
+    const KINDS: &[&str] = &[
+        "sql_statement_completed",
+        "sp_statement_completed",
+        "rpc_completed",
+        "sql_batch_completed",
+        "error_reported",
+        "login",
+        "other_event",
+    ];
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
+    let mut records = Vec::new();
+    for (i, chunk) in data.split(|b| *b == 0xFF).take(128).enumerate() {
+        let Some((&head, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let kind = KINDS[usize::from(head) % KINDS.len()];
+        let text = esc(&String::from_utf8_lossy(rest));
+        let session = head % 3;
+        let activity = if head & 0x40 == 0 {
+            format!(
+                "<action name=\"attach_activity_id\"><value>AAAAAAAA-0000-0000-0000-00000000000{}-{i}</value></action>",
+                head % 2
+            )
+        } else {
+            String::new()
+        };
+        let x = format!(
+            "<event name=\"{kind}\"><data name=\"statement\"><value>{text}</value></data>\
+             <data name=\"object_name\"><value>{proc}</value></data>\
+             <data name=\"error_number\"><value>{err}</value></data>\
+             <data name=\"row_count\"><value>{rows}</value></data>\
+             <action name=\"session_id\"><value>{session}</value></action>\
+             <action name=\"server_principal_name\"><value>p</value></action>\
+             <action name=\"database_name\"><value>db</value></action>{activity}</event>",
+            proc = if head & 0x10 == 0 {
+                "sp_executesql"
+            } else {
+                "get_x"
+            },
+            err = if head & 0x20 == 0 { 18_456 } else { 208 },
+            rows = u64::from(head) * 1000,
+        );
+        let Ok(event) = parse(&x) else { continue };
+        records.push(XeRecord {
+            file: "/x/s_0_1.xel".to_owned(),
+            offset: 4096,
+            time_us: i64::from(head),
+            name: kind.to_owned(),
+            event: (head & 0x80 == 0).then_some(event),
+            procedure: None,
+            skip: false,
+            unreadable: false,
+            index: 0,
+        });
+    }
+    context(
+        &mut records,
+        data.first().is_some_and(|b| b & 1 == 1),
+        &|r| r.time_us % 2 == 0,
+    );
+    for r in &records {
+        if let Some((ev, _)) = convert(r) {
+            for o in ev.objects() {
+                assert!(o.object().as_str().len() <= 256);
+                if o.object().as_str() == "*" && r.kind().is_statement() {
+                    assert!(ev.always_report());
+                }
             }
         }
     }

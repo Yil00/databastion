@@ -1,7 +1,9 @@
 //! Microsoft SQL Server connector for the DataBastion agent (phase 9,
 //! ADR-0051 and its accepted refinement of 2026-10-14). Lot 1: the TDS
 //! client, `check()` and Discovery; lot 2: Audit from SQL Server Audit
-//! ([`audit`], Partial at best).
+//! ([`audit`], Partial at best); lot 3: Audit from an Extended Events
+//! session (`audit::xe`, Partial at best, the only source on SQL Server
+//! 2019).
 //!
 //! - Own bounded TDS client (decision 1): `PRELOGIN`, TLS (TDS 8.0 strict,
 //!   or the handshake wrapped in `PRELOGIN` packets), `LOGIN7` with SQL
@@ -142,10 +144,10 @@ impl Connector for SqlserverConnector {
     }
 
     fn audit_source(&self, target: &TargetConfig) -> Option<EventSource> {
-        self.state
-            .audit
-            .usable(&target.id)
-            .then_some(EventSource::SqlserverAudit)
+        self.state.audit.chosen(&target.id).map(|s| match s {
+            audit::Source::Audit => EventSource::SqlserverAudit,
+            audit::Source::Xevents => EventSource::SqlserverXevents,
+        })
     }
 
     fn server_version(&self, target: &TargetConfig) -> Option<String> {

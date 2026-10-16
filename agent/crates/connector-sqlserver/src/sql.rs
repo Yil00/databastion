@@ -43,7 +43,175 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
     ("audit_database_reads", AUDIT_DATABASE_READS),
     ("audit_poll_start", AUDIT_POLL_START),
     ("audit_poll_from", AUDIT_POLL_FROM),
+    ("xe_session", XE_SESSION),
+    ("xe_events", XE_EVENTS),
+    ("xe_poll_start", XE_POLL_START),
+    ("xe_poll_from", XE_POLL_FROM),
 ];
+
+/// The Extended Events session named in `agent.yaml` (ADR-0051 decision 6,
+/// proofs 1 and 4, "Position and gaps"), from `sys.dm_xe_sessions` (a
+/// running session only): its `create_time` (a restart of the session
+/// changes it), its drop counters, its retention mode
+/// (`buffer_policy_desc`: `drop_event`, `drop_full_buffer` or
+/// `do_not_drop_event`/`block`), whether it tracks causality, and the
+/// current file of its `event_file` target, cut from the target's status
+/// XML on the server (only that file name is read, never other target
+/// data: a `ring_buffer` target holds events), and the session's
+/// `MAX_DISPATCH_LATENCY` (ms, 0 for `INFINITE`, from
+/// `sys.server_event_sessions`: the bound of the first start's floor,
+/// re-review N1). Visible with `VIEW SERVER
+/// STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+). An exact own
+/// text (refinement P9-A obligation L8).
+pub(crate) const XE_SESSION: &str = "SELECT TOP (2) \
+CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', s.create_time)), \
+CONVERT(bigint, s.dropped_event_count), CONVERT(bigint, s.dropped_buffer_count), \
+CONVERT(nvarchar(60), s.buffer_policy_desc), \
+CONVERT(int, CASE WHEN s.flag_desc LIKE N'%track_causality%' THEN 1 ELSE 0 END), \
+CONVERT(nvarchar(260), (SELECT TOP (1) CONVERT(xml, t.target_data).value('(EventFileTarget/File/@name)[1]', \
+'nvarchar(260)') FROM sys.dm_xe_session_targets t WHERE t.event_session_address = s.address AND \
+t.target_name = N'event_file')), CONVERT(bigint, (SELECT TOP (1) d.max_dispatch_latency FROM \
+sys.server_event_sessions d WHERE d.name = s.name)) FROM sys.dm_xe_sessions s WHERE s.name = {session}";
+
+/// The events of the session (decision 6 proofs 2 and 3): each event's
+/// name, **whether** it has a predicate (never the predicate, which can
+/// hold literals), how many of the five required actions it carries, and
+/// whether its statement collection is off (`collect_statement = 0`).
+pub(crate) const XE_EVENTS: &str = "SELECT TOP (257) CONVERT(nvarchar(60), e.event_name), \
+CONVERT(int, CASE WHEN e.event_predicate IS NULL THEN 1 ELSE 0 END), CONVERT(int, (SELECT COUNT(*) \
+FROM sys.dm_xe_session_event_actions a WHERE a.event_session_address = e.event_session_address AND \
+a.event_name = e.event_name AND a.action_name IN (N'server_principal_name', \
+N'session_server_principal_name', N'client_app_name', N'database_name', N'session_id'))), \
+CONVERT(int, (SELECT COUNT(*) FROM sys.dm_xe_session_object_columns c WHERE \
+c.event_session_address = e.event_session_address AND c.object_name = e.event_name AND \
+c.object_type = N'event' AND c.column_name = N'collect_statement' AND c.column_value = N'0')) \
+FROM sys.dm_xe_session_events e JOIN sys.dm_xe_sessions s ON s.address = e.event_session_address \
+WHERE s.name = {session}";
+
+/// The largest event the Extended Events poll returns (UTF-16 bytes of
+/// `event_data`): 64 Ki characters (decision 6: "bounded at 64 KiB per
+/// event"). A larger event comes back without its XML, with its name,
+/// position, time and size: a read of `*`, always reported.
+pub(crate) const XE_EVENT_BYTES: usize = 131_072;
+
+/// Slices of `event_data` per row: 17 of 8 000 bytes cover
+/// [`XE_EVENT_BYTES`].
+pub(crate) const XE_SLICES: usize = 17;
+
+/// The columns of an Extended Events poll: the event's name, its XML (when
+/// at most [`XE_EVENT_BYTES`]) as UTF-16LE bytes in [`XE_SLICES`]
+/// `varbinary(8000)` slices, the position, the time (UTC, µs since 1970)
+/// and the XML's size.
+///
+/// Measured on 2019: the session setting `SET TEXTSIZE 8000` (decision 5,
+/// sent on every connection) cuts an `nvarchar(max)` value to 8 000 bytes,
+/// so `event_data` itself would arrive cut, without a sign, for any event
+/// above 4 000 characters. Slices of `varbinary(8000)` are not `max` values
+/// (`TEXTSIZE` does not apply) and keep the client's closed type set
+/// without a `max` column (decision 1). They are cut by byte, whatever the
+/// collation (a supplementary-character collation counts characters, not
+/// UTF-16 units, in `SUBSTRING` of `nvarchar`), and the client joins the
+/// bytes before decoding them once (security review of lot 3, M2).
+const XE_COLUMNS: &str = "CONVERT(nvarchar(60), f.object_name), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 1, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 8001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 16001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 24001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 32001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 40001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 48001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 56001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 64001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 72001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 80001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 88001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 96001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 104001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 112001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 120001, 8000)), \
+CONVERT(varbinary(8000), SUBSTRING(x.b, 128001, 8000)), CONVERT(nvarchar(260), f.file_name), \
+CONVERT(bigint, f.file_offset), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', f.timestamp_utc)), \
+CONVERT(bigint, DATALENGTH(f.event_data))";
+
+/// The first poll of an Extended Events session: from the start of its
+/// file set. `{pattern}` is built from the session's current file
+/// (`XE_SESSION`), a literal (decision 6, M1); `@p3` the row bound, `@p4`
+/// the events skipped (as [`XE_POLL_FROM`]).
+pub(crate) const XE_POLL_START: &str = "SELECT {columns} FROM \
+sys.fn_xe_file_target_read_file({pattern}, NULL, NULL, NULL) f CROSS APPLY (SELECT CASE WHEN \
+DATALENGTH(f.event_data) <= 131072 THEN CONVERT(varbinary(max), f.event_data) END) x(b) \
+ORDER BY (SELECT NULL) OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
+
+/// The following polls: after the buffer at `@p2` of the file `@p1`
+/// (measured on 2019: the read starts after that buffer; an offset that is
+/// not a buffer gives error 25722, a missing file 25717), the first `@p4`
+/// events skipped on the server (those of the next buffer already
+/// handled: a buffer holds hundreds of events, measured on 2025), at most
+/// `@p3` returned, in file order.
+pub(crate) const XE_POLL_FROM: &str = "SELECT {columns} FROM \
+sys.fn_xe_file_target_read_file({pattern}, NULL, @p1, @p2) f CROSS APPLY (SELECT CASE WHEN \
+DATALENGTH(f.event_data) <= 131072 THEN CONVERT(varbinary(max), f.event_data) END) x(b) \
+ORDER BY (SELECT NULL) OFFSET @p4 ROWS FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
+
+/// The number of columns of an Extended Events poll.
+pub(crate) const XE_POLL_COLUMNS: usize = 5 + XE_SLICES;
+
+/// An Extended Events poll text for a quoted pattern ([`xe_pattern`]).
+pub(crate) fn xe_poll(pattern: &str, from: bool) -> Option<String> {
+    render(
+        if from { XE_POLL_FROM } else { XE_POLL_START },
+        &[("columns", XE_COLUMNS), ("pattern", pattern)],
+    )
+}
+
+/// The file pattern of an Extended Events session, from its current file
+/// as the server names it (`<folder>/<stem>_<n>_<timestamp>.xel`): the
+/// same folder, stem and `<n>`, any timestamp, as an `N'…'` literal.
+/// `None` for a name of another form, a folder or stem holding a control
+/// character or a wildcard, or a path longer than 260 characters.
+pub(crate) fn xe_pattern(current: &str) -> Option<String> {
+    if current.chars().count() > 260
+        || current
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '*' | '?'))
+    {
+        return None;
+    }
+    let cut = current.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let (folder, file) = current.split_at(cut);
+    let stem = file.strip_suffix(".xel")?;
+    let (rest, ts) = stem.rsplit_once('_')?;
+    let (base, part) = rest.rsplit_once('_')?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    if folder.is_empty() || base.is_empty() || !digits(ts) || !digits(part) {
+        return None;
+    }
+    let pattern = format!("{folder}{base}_{part}_*.xel");
+    Some(format!("N'{}'", pattern.replace('\'', "''")))
+}
+
+/// The order key of an Extended Events file of one file set, (timestamp,
+/// `<n>`), from `…_<n>_<timestamp>.xel`; `None` for another form. Files
+/// are ordered by this key, never by their path string (lot 2 review H1).
+pub(crate) fn xe_file_key(name: &str) -> Option<(i64, i64)> {
+    let stem = name.strip_suffix(".xel")?;
+    let (rest, ts) = stem.rsplit_once('_')?;
+    let (_, part) = rest.rsplit_once('_')?;
+    let num = |s: &str| {
+        (!s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
+    Some((num(ts)?, num(part)?))
+}
+
+/// Own texts that read an always-reported object (decision 6): the agent's
+/// own only by their exact text from one of its own sessions. The one-bit
+/// `password_hash` probe (decision 4) and the Extended Events status read
+/// (`sys.dm_xe_session_targets`, P9-A obligation L8).
+pub(crate) fn own_listed_read(text: &str) -> bool {
+    text == PASSWORD_HASH_PROBE || matches_template(XE_SESSION, text)
+}
 
 /// The Audit source's server audit (ADR-0051 decision 6, refinement item 1
 /// (a'), M4), read from `sys.server_file_audits` (a `FILE` target only;
@@ -383,7 +551,55 @@ const CREDIT_ONLY: &[&str] = &[
     "ticket_type_counts",
     "audit_poll_start",
     "audit_poll_from",
+    "xe_poll_start",
+    "xe_poll_from",
 ];
+
+/// The agent's catalog reads (`check()`, Discovery and the Audit proofs
+/// that read catalog views): the statements whose compilation can make a
+/// fresh server build statistics on the system base tables of ADR-0051's
+/// refinement of 2026-10-15, case 2 (re-review: "exact catalog texts").
+/// Never the session settings, the version, the samples and counts of
+/// user tables, the polls, or the proof over DMVs only (`xe_events`).
+/// Measured as build partners on 2022: `server_permissions`,
+/// `server_roles`, `server_grants`, `accessible_databases`,
+/// `database_grants`, `column_counts`, `tables`, `cas_credential_columns`,
+/// `audit_file`, and `xe_session` (since it reads
+/// `sys.server_event_sessions`, re-review N1).
+const CATALOG_READS: &[&str] = &[
+    "server_permissions",
+    "server_roles",
+    "server_grants",
+    "password_hash_probe",
+    "logon_triggers",
+    "accessible_databases",
+    "user_databases",
+    "database_permissions",
+    "database_roles",
+    "database_grants",
+    "rls_view_definition",
+    "rls_denies",
+    "rls_server_denies",
+    "rls_tables",
+    "unsampled_objects",
+    "column_counts",
+    "tables",
+    "columns",
+    "cas_credential_columns",
+    "audit_file",
+    "audit_specifications",
+    "audit_database_reads",
+    "xe_session",
+];
+
+/// Whether `text` is exactly one of the agent's catalog reads
+/// ([`CATALOG_READS`]), as [`render`] produces it.
+pub(crate) fn catalog_text(text: &str) -> bool {
+    STATEMENTS.iter().any(|(name, template)| {
+        CATALOG_READS.contains(name)
+            && (*template == text || (template.contains('{') && matches_template(template, text)))
+    })
+}
 
 /// Whether `text` is exactly one of the connector's statements: a
 /// constant, or a template whose slots hold quoted values of the forms
@@ -401,7 +617,11 @@ pub(crate) fn own_text(text: &str) -> OwnText {
         }
     }
     // Credit-only forms: decided by the credit (the exact text sent).
-    if text.starts_with("SELECT TOP (") {
+    if text.starts_with("SELECT TOP (")
+        || text
+            .strip_prefix("SELECT ")
+            .is_some_and(|r| r.starts_with(XE_COLUMNS))
+    {
         return OwnText::NeedsCredit;
     }
     OwnText::No
@@ -471,7 +691,7 @@ pub(crate) fn matches_template(template: &str, text: &str) -> bool {
         rest_t = rest_t.get(open + close + 1..).unwrap_or("");
         let value = match name {
             "db" => take_bracketed(rest).and_then(|(v, r)| quote_ident(&v).map(|q| (q, r))),
-            "dbname" | "audit" => {
+            "dbname" | "audit" | "session" => {
                 take_literal(rest).and_then(|(v, r)| quote_literal(&v).map(|q| (q, r)))
             }
             "guid" => take_literal(rest).and_then(|(v, r)| quote_guid(&v).map(|q| (q, r))),
@@ -734,22 +954,25 @@ pub(crate) fn denied_token(text: &str) -> Option<&'static str> {
     DENIED.iter().copied().find(|d| bare.contains(d))
 }
 
-/// Whether a text names `predicate` (an audit's `WHERE` filter, which can
-/// hold literals) other than as `predicate IS NULL` (M4).
+/// Whether a text names `predicate` (an audit's `WHERE` filter) or
+/// `event_predicate` (an Extended Events session's), which can hold
+/// literals, other than as `… IS NULL` (M4).
 pub(crate) fn raw_predicate(text: &str) -> bool {
     let bare = unquoted(text);
     let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
-    let mut from = 0;
-    while let Some(i) = bare.get(from..).and_then(|r| r.find("predicate")) {
-        let at = from + i;
-        let end = at + "predicate".len();
-        let before = bare.get(..at).and_then(|b| b.chars().next_back());
-        let after = bare.get(end..).unwrap_or_default();
-        // A whole identifier (`sys.security_predicates` is another name).
-        if !word(before) && !word(after.chars().next()) && !after.starts_with(" is null") {
-            return true;
+    for name in ["predicate", "event_predicate"] {
+        let mut from = 0;
+        while let Some(i) = bare.get(from..).and_then(|r| r.find(name)) {
+            let at = from + i;
+            let end = at + name.len();
+            let before = bare.get(..at).and_then(|b| b.chars().next_back());
+            let after = bare.get(end..).unwrap_or_default();
+            // A whole identifier (`sys.security_predicates` is another name).
+            if !word(before) && !word(after.chars().next()) && !after.starts_with(" is null") {
+                return true;
+            }
+            from = end;
         }
-        from = end;
     }
     false
 }
@@ -764,6 +987,35 @@ pub(crate) fn checked(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalog reads of case 2 (re-review): named statements, never a
+    /// credit-only one, a sample, a poll or a session proof.
+    #[test]
+    fn catalog_reads_are_a_closed_list_of_statements() {
+        for name in CATALOG_READS {
+            assert!(STATEMENTS.iter().any(|(n, _)| n == name), "{name}");
+            assert!(!CREDIT_ONLY.contains(name), "{name}");
+        }
+        for name in [
+            "session_settings",
+            "session_readback",
+            "version",
+            "sample",
+            "ticket_type_counts",
+            "xe_events",
+            "audit_poll_start",
+            "audit_poll_from",
+            "xe_poll_start",
+            "xe_poll_from",
+        ] {
+            assert!(!CATALOG_READS.contains(&name), "{name}");
+        }
+        assert!(catalog_text(SERVER_PERMISSIONS));
+        assert!(catalog_text(&tables("retail", 16_384).unwrap()));
+        assert!(!catalog_text(VERSION));
+        assert!(!catalog_text(SERVER_INTERNAL[0]));
+        assert!(!catalog_text("SELECT name FROM sys.objects"));
+    }
 
     #[test]
     fn every_statement_passes_the_deny_list() {
@@ -788,6 +1040,10 @@ mod tests {
             "SELECT predicate FROM sys.server_file_audits"
         ));
         assert!(!raw_predicate(AUDIT_FILE));
+        assert!(!raw_predicate(XE_EVENTS));
+        assert!(raw_predicate(
+            "SELECT e.event_predicate FROM sys.dm_xe_session_events e"
+        ));
         assert!(!raw_predicate(RLS_TABLES));
         assert!(raw_predicate(
             "SELECT a.predicate FROM sys.server_file_audits a"
@@ -858,6 +1114,45 @@ mod tests {
         let poll = audit_poll(&p, true).unwrap();
         assert!(checked(&poll) && poll.contains("@p1, @p2)") && poll.contains("TOP (@p3)"));
         assert_eq!(own_text(&poll), OwnText::NeedsCredit);
+        // Extended Events: the session reads are exact own texts, the
+        // status read an exempt listed read; polls need a credit.
+        let session = render(XE_SESSION, &[("session", &quote_literal("x'e").unwrap())]).unwrap();
+        assert_eq!(own_text(&session), OwnText::Exact);
+        assert!(own_listed_read(&session) && own_listed_read(PASSWORD_HASH_PROBE));
+        assert!(!own_listed_read(&session.replace("TOP (2)", "TOP (3)")));
+        let events = render(XE_EVENTS, &[("session", "N'x'")]).unwrap();
+        assert_eq!(own_text(&events), OwnText::Exact);
+        let p = xe_pattern("/var/opt/mssql/xe/databastion_xe_0_134365650237540000.xel").unwrap();
+        assert_eq!(p, "N'/var/opt/mssql/xe/databastion_xe_0_*.xel'");
+        let poll = xe_poll(&p, true).unwrap();
+        assert!(checked(&poll) && poll.contains("NULL, @p1, @p2) f"));
+        assert_eq!(poll.matches("SUBSTRING(x.b, ").count(), XE_SLICES);
+        assert!(poll.contains(&format!(
+            "SUBSTRING(x.b, {}, 8000)",
+            (XE_SLICES - 1) * 8000 + 1
+        )));
+        assert!(poll.ends_with("OPTION (MAXDOP 1)"));
+        const { assert!(XE_SLICES * 8000 >= XE_EVENT_BYTES) };
+        assert_eq!(own_text(&poll), OwnText::NeedsCredit);
+        assert_eq!(
+            xe_pattern("C:\\XE\\o'x_0_1.xel").unwrap(),
+            "N'C:\\XE\\o''x_0_*.xel'"
+        );
+        for bad in [
+            "/x/a.xel",
+            "/x/a_0_1.txt",
+            "a_0_1.xel",
+            "/x/*_0_1.xel",
+            "/x/a_b_1.xel",
+            "/x/_0_1.xel",
+        ] {
+            assert!(xe_pattern(bad).is_none(), "{bad}");
+        }
+        assert_eq!(
+            xe_file_key("/x/databastion_xe_0_134365650237540000.xel"),
+            Some((134_365_650_237_540_000, 0))
+        );
+        assert!(xe_file_key("/x/a.xel").is_none());
     }
 
     #[test]

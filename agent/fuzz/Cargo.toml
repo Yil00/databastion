@@ -209,3 +209,17 @@ path = "fuzz_targets/sqlserver_audit_records.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sqlserver_xe_xml"
+path = "fuzz_targets/sqlserver_xe_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_xe_records"
+path = "fuzz_targets/sqlserver_xe_records.rs"
+test = false
+doc = false
+bench = false

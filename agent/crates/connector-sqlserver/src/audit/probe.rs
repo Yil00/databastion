@@ -26,6 +26,9 @@
 //! 7. the catalogs visible (`VIEW ANY SECURITY DEFINITION`); without them
 //!    the poll's file pattern cannot be built either, so there is no
 //!    source at all (`privilege.not_evaluated`, `view_any_security_definition`).
+//!
+//! The Extended Events source has its own rule (`xe::probe`); the
+//! preference between them is `check()`'s and the stream's.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -235,15 +238,11 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
             "no sqlserver.audit block in agent.yaml",
         );
     };
-    let Some(name) = audit_name(Some(cfg)) else {
-        return none(
-            out,
-            Some(TargetNote::new(NoteCode::AuditSourceNotConfigured)),
-            "the Extended Events source is not implemented in this agent build (ADR-0051 \
-             decision 6): name a server audit (sqlserver.audit.audit_name)",
-        );
-    };
-    let _ = name;
+    if audit_name(Some(cfg)).is_none() {
+        // No server audit named: this source does not apply (the Extended
+        // Events session's rule decides, `xe::probe`).
+        return out;
+    }
     if i.major < MIN_AUDIT_MAJOR {
         return none(
             out,

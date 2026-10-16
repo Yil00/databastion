@@ -147,8 +147,11 @@ const SERVER_EXPECTED: &[&str] = &["CONNECT SQL", "VIEW ANY DATABASE"];
 
 /// The Audit permissions (decision 4, refinement item 1): expected only
 /// while an Audit stream uses them (`VIEW SERVER SECURITY AUDIT` and `VIEW
-/// ANY SECURITY DEFINITION`, option (a'), `audit::probe::SOURCE_GRANTS`);
-/// the others belong to sources this build does not read.
+/// ANY SECURITY DEFINITION` for SQL Server Audit, option (a'),
+/// `audit::probe::SOURCE_GRANTS`; `VIEW SERVER STATE` on 2019 or `VIEW
+/// SERVER PERFORMANCE STATE` on 2022+ for Extended Events,
+/// `audit::xe::probe::grant`); `VIEW SERVER SECURITY STATE`, and `VIEW
+/// SERVER STATE` on 2022+, are used by no source.
 const SERVER_AUDIT: &[&str] = &[
     "VIEW SERVER SECURITY AUDIT",
     "VIEW ANY SECURITY DEFINITION",
@@ -895,7 +898,7 @@ async fn checked(
         }
         _ => None,
     };
-    let audit = crate::audit::probe::level(&crate::audit::probe::Inputs {
+    let sql_audit = crate::audit::probe::level(&crate::audit::probe::Inputs {
         cfg: audit_cfg,
         major: v.major,
         perms: &ev.server_perms,
@@ -903,10 +906,54 @@ async fn checked(
         probe: audit_probe.as_ref(),
         stream: facts,
     });
-    state.audit.set_usable(&target.id, audit.source);
-    if audit.source && facts.running {
-        for g in crate::audit::probe::SOURCE_GRANTS {
-            ev.audit_grants.remove(*g);
+    // The Extended Events source (decision 6), when a session is named and
+    // SQL Server Audit is not usable (the preference rule).
+    let xe_grant = crate::audit::xe::probe::grant(v.major);
+    let xe_probe = match crate::audit::xe::probe::session_name(audit_cfg) {
+        Some(name) if !sql_audit.source && !ev.blocks() && ev.server_perms.contains(xe_grant) => {
+            let p = Box::pin(crate::audit::xe::probe::probe(s, name, Stage::Check)).await?;
+            if p.running {
+                // A restart or a loss since last seen is a gap (proof 4).
+                state.audit.observe_xe(&target.id, p.counters());
+            }
+            Some(p)
+        }
+        _ => None,
+    };
+    let xe = crate::audit::xe::probe::level(&crate::audit::xe::probe::Inputs {
+        cfg: audit_cfg,
+        major: v.major,
+        perms: &ev.server_perms,
+        blocks: ev.blocks(),
+        probe: xe_probe.as_ref(),
+        stream: state.audit.facts(&target.id),
+    });
+    let (audit, chosen) = if sql_audit.source {
+        (sql_audit, Some(crate::audit::Source::Audit))
+    } else if xe.source {
+        // SQL Server Audit's reason (2019: CONTROL SERVER) stays visible.
+        let mut l = xe;
+        l.notes.extend(sql_audit.notes);
+        l.details.extend(sql_audit.details);
+        (l, Some(crate::audit::Source::Xevents))
+    } else {
+        let mut l = sql_audit;
+        l.notes.extend(xe.notes);
+        l.details.extend(xe.details);
+        (l, None)
+    };
+    state.audit.set_chosen(&target.id, chosen);
+    if facts.running {
+        match chosen {
+            Some(crate::audit::Source::Audit) => {
+                for g in crate::audit::probe::SOURCE_GRANTS {
+                    ev.audit_grants.remove(*g);
+                }
+            }
+            Some(crate::audit::Source::Xevents) => {
+                ev.audit_grants.remove(xe_grant);
+            }
+            None => {}
         }
     }
     evaluation_notes(&ev, &mut notes);

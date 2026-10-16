@@ -1503,7 +1503,7 @@ async fn audit_scenario() {
     assert!(agent_events.len() <= 6, "own statements reported");
     // Not vacuous: the agent's own catalog reads, sampling and polls were
     // in the audit and were left out.
-    let [exact, sampling, polls] = c.state.audit.own_left_out(&t.id);
+    let [exact, sampling, polls, _statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] own left out: exact {exact}, sampling {sampling}, polls {polls}");
     assert!(
         exact > 10 && sampling >= 5 && polls >= 2,
@@ -1592,4 +1592,965 @@ async fn sys_function_list_matches_the_server() {
         missing.is_empty(),
         "sys functions not in SYS_FUNCTIONS: {missing:?}"
     );
+}
+
+/// The Extended Events settings of the dev session
+/// (dev/sqlserver/initdb/30-audit.sql).
+const XE: &str = "rls_visibility: view_definition, audit: {source: sqlserver_xevents, xe_session: databastion_xe}";
+
+/// ADR-0051 decision 6, P9-A lot 3: the Extended Events source end to end
+/// against the dev session (the only Audit source on SQL Server 2019). A
+/// dump-like read raises a read of the table with `shape.full_table_read`
+/// and its row count; a failed login is fingerprinted; credential DCL and
+/// password-taking calls never leak their marker; the agent's own
+/// `check()`, Discovery and polls are left out while the same login from
+/// another session is reported; no ground-truth value leaves in the
+/// events; the position survives a restart of the stream.
+#[tokio::test]
+async fn xe_reports_reads_and_leaves_the_agents_own_out() {
+    Box::pin(xe_scenario()).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn xe_scenario() {
+    use databastion_classifiers::masking::{EventAction, MaskedEvent, Signal};
+    use databastion_core::AuditLevel;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    // The Extended Events grant of decision 4 (the dev account holds it on
+    // 2019 already).
+    let grant = if major >= 16 {
+        "VIEW SERVER PERFORMANCE STATE"
+    } else {
+        "VIEW SERVER STATE"
+    };
+    Box::pin(exec(
+        &mut s,
+        &in_db("master", &format!("GRANT {grant} TO databastion")),
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_xdump", &[])).await;
+
+    // `source: auto` with both sources named: SQL Server Audit when usable
+    // (2022+ with its grants), else the session (2019: CONTROL SERVER).
+    {
+        let c2 = SqlserverConnector::new();
+        let both = agent(&format!(
+            "{}, rls_visibility: view_definition, audit: {{audit_name: databastion_audit, \
+             xe_session: databastion_xe}}",
+            own_tls()
+        ));
+        let h = Box::pin(c2.check(&both)).await;
+        eprintln!(
+            "[it] xe, auto: {:?} {:?}",
+            c2.audit_source(&both),
+            codes(&h)
+        );
+        if major < 16 {
+            assert_eq!(
+                c2.audit_source(&both),
+                Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
+            );
+            assert!(has(&h, NoteCode::AuditSqlserverAuditNeedsControlServer));
+        } else {
+            assert_eq!(
+                c2.audit_source(&both),
+                Some(databastion_classifiers::masking::EventSource::SqlserverAudit)
+            );
+        }
+    }
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!("\n[it] xe, no stream: {:?} {:?}", h.audit_level, codes(&h));
+    assert!(h.reachable, "{:?}", h.detail);
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
+    assert!(has(&h, NoteCode::AuditPartialPendingFirstRecord));
+    assert!(!has(&h, NoteCode::AuditXeEventsMissing), "{:?}", codes(&h));
+    assert!(!has(&h, NoteCode::AuditXeSessionFiltered));
+    assert!(!has(&h, NoteCode::AuditXeCausalityOff));
+    assert!(!has(&h, NoteCode::AuditLogWithoutRowCounts));
+    assert_eq!(
+        c.audit_source(&t),
+        Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
+    );
+
+    // Statistics the agent's own reads make the server build (on system
+    // base tables, measured on a fresh 2025 server) are server statements
+    // in the agent's sessions that no own rule covers (refinement item 4
+    // pairs a build with a statement naming the same table only): built
+    // before the stream starts, so the test checks the agent's routine
+    // statements on a server that has them (see the lot 3 implementation
+    // notes of ADR-0051).
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("databastion-sqlserver-xe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let start = |c: &Arc<SqlserverConnector>| {
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(c);
+        (
+            tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await }),
+            rx,
+        )
+    };
+    let (stream, mut rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+
+    // The agent's own activity while the stream reads.
+    let h = Box::pin(c.check(&t)).await;
+    assert!(!has(&h, NoteCode::PrivilegeRefused), "{:?}", codes(&h));
+    {
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }
+
+    // Someone else.
+    let truth = truth();
+    let email = truth["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["engine"] == "sqlserver")
+        .flat_map(|l| l["values"].as_array().cloned().unwrap_or_default())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .find(|v| v.contains('@'))
+        .expect("a ground-truth e-mail");
+    let marker = "XeCredMarker7Zq9";
+    {
+        let mut d = Box::pin(foreign_session(
+            "it_xdump",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT id, customer_id FROM retail.crm.customer_notes",
+            2,
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            &format!(
+                "SELECT id FROM retail.crm.customers WHERE email = N'{}'",
+                email.replace('\'', "''")
+            ),
+            1,
+        ))
+        .await;
+        // A parameterized read (an ORM's RPC): its inner statement keeps
+        // its table.
+        Box::pin(d.rpc(
+            "SELECT TOP (1) id FROM retail.crm.customers WHERE email = @p1",
+            &[crate::tds::Param::NVarChar(email.clone())],
+            Stage::Check,
+            Shape::rows(1, 10),
+            |_| conn::Flow::Continue,
+        ))
+        .await
+        .unwrap();
+        Box::pin(exec_ok(&mut d, "EXEC master.dbo.xp_cmdshell 'whoami'")).await;
+        Box::pin(try_rows(
+            &mut d,
+            &format!(
+                "SELECT TOP (1) id FROM retail.crm.customers WHERE \
+                 ENCRYPTBYPASSPHRASE('{marker}', N'x') IS NOT NULL"
+            ),
+            1,
+        ))
+        .await;
+        d.close().await;
+    }
+    // The agent's login from a session that is not the agent's own.
+    {
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut f,
+            "SELECT TOP (3) email FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        Box::pin(try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1)).await;
+        f.close().await;
+    }
+    // A failed login.
+    {
+        let mut bad = target(
+            "it_no_such_xlogin",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+            own_tls(),
+        );
+        bad.id = "it-foreign".to_owned();
+        let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
+        assert!(
+            Box::pin(conn::connect(
+                &bad,
+                &tls,
+                &TlsChoice::default(),
+                Duration::from_secs(10)
+            ))
+            .await
+            .is_err()
+        );
+    }
+    // Credential DCL in forms the server does not mask itself.
+    Box::pin(drop_login(&mut s, "it_xcred")).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("EXEC sp_addlogin it_xcred, {marker}"),
+    ))
+    .await;
+    Box::pin(exec_ok(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("CREATE CREDENTIAL it_xcred_c WITH IDENTITY = 'i', SECRET = '{marker}'"),
+    ))
+    .await;
+    Box::pin(exec(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
+    Box::pin(drop_login(&mut s, "it_xcred")).await;
+
+    // The session's dispatch latency is 5 s.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!("[it] xe, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+    // The source's grant is expected while the stream uses it.
+    let label = grant.to_lowercase().replace(' ', "_");
+    assert!(
+        !has_label(&h, NoteCode::PrivilegeAuditGrantWithoutAudit, &label),
+        "{:?}",
+        codes(&h)
+    );
+    stream.abort();
+    let _ = stream.await;
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    for e in &events {
+        eprintln!(
+            "[it] xe event {:?} {} {:?} {:?} rows={:?} always={}",
+            e.action(),
+            shown_account(e),
+            names_of(e),
+            e.signals(),
+            e.rows(),
+            e.always_report()
+        );
+    }
+    let by = |who: &str| -> Vec<&MaskedEvent> {
+        events
+            .iter()
+            .filter(|e| e.principal().account_name().eq_ignore_ascii_case(who))
+            .collect()
+    };
+    let dump = by("it_xdump");
+    assert!(
+        dump.iter().any(|e| e.action() == EventAction::Read
+            && names_of(e) == ["retail.crm.customer_notes"]
+            && e.signals().contains(&Signal::FullTableRead)
+            && e.rows().is_some()),
+        "no whole-table read reported"
+    );
+    assert!(
+        dump.iter()
+            .filter(|e| names_of(e) == ["retail.crm.customers"])
+            .count()
+            >= 2,
+        "the filtered read and the parameterized RPC must name their table"
+    );
+    // The ENCRYPTBYPASSPHRASE read: recorded by the server as `-- SELECT`
+    // (measured on 2019), a read of `*`, always reported. The refused
+    // xp_cmdshell leaves no statement event (measured on 2019).
+    assert!(
+        dump.iter().any(|e| e.action() == EventAction::Read
+            && e.always_report()
+            && names_of(e) == ["master.-.*"]),
+        "the password-taking read must be reported"
+    );
+    assert!(
+        events.iter().any(|e| e.action() == EventAction::AuthFailure
+            && !e.principal().send_name()
+            && e.principal().account_name() == "it_no_such_xlogin"),
+        "no failed login reported"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.action() == EventAction::AuthFailure
+                && e.principal().account_name() == "it_no_such_xlogin")
+            .count(),
+        1,
+        "a failed login is counted once"
+    );
+    assert!(
+        by("sa").iter().any(|e| e.action() == EventAction::Dcl),
+        "no DCL reported"
+    );
+    // The agent's login: only the foreign session's statements.
+    let agent_events = by("databastion");
+    assert!(
+        agent_events
+            .iter()
+            .any(|e| names_of(e) == ["retail.crm.customers"]),
+        "the agent's login from another session must be reported"
+    );
+    for e in &agent_events {
+        let ok = e.action() == EventAction::Read
+            && names_of(e).iter().all(|n| {
+                n == "retail.crm.customers"
+                    || n.ends_with(".sys.dm_exec_sessions")
+                    || n.ends_with(".sys.fn_my_permissions")
+                    || n.ends_with(".sys.fn_builtin_permissions")
+            });
+        assert!(
+            ok,
+            "an own statement reported: {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    assert!(agent_events.len() <= 6, "own statements reported");
+    let [exact, sampling, polls, _statistics] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe own left out: exact {exact}, sampling {sampling}, polls {polls}");
+    assert!(
+        exact > 10 && sampling >= 5 && polls >= 2,
+        "{exact} {sampling} {polls}"
+    );
+    // I2.
+    let json = databastion_core::test_support::contract_events_json(&events, &key());
+    assert!(json.contains("\"source\":\"sqlserver_xevents\""), "{json}");
+    assert!(!json.contains(marker), "credential DCL leaked");
+    assert!(
+        !json.contains("it_no_such_xlogin"),
+        "failed login name in clear"
+    );
+    for loc in truth["locations"].as_array().unwrap() {
+        for v in loc["values"].as_array().into_iter().flatten() {
+            if let Some(v) = v.as_str().filter(|v| v.len() >= 6) {
+                assert!(!json.contains(v), "a ground-truth value in the events");
+            }
+        }
+    }
+
+    // A restart of the stream: the position is kept.
+    let (stream, mut rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut again = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        again.push(e);
+    }
+    for e in &again {
+        eprintln!(
+            "[it] xe after restart {:?} {} {:?}",
+            e.action(),
+            shown_account(e),
+            names_of(e)
+        );
+    }
+    assert!(
+        !again.iter().any(|e| e
+            .principal()
+            .account_name()
+            .eq_ignore_ascii_case("it_xdump")),
+        "events reported twice after a restart"
+    );
+    assert!(
+        !again.iter().any(|e| e
+            .principal()
+            .account_name()
+            .eq_ignore_ascii_case("databastion")),
+        "the agent's own statements reported after a restart"
+    );
+    // The operator stops and starts the session (decision 6, "Position and
+    // gaps"): whatever happened in between was not recorded, a gap.
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+    let (stream, _rx) = start(&c);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let h = Box::pin(c.check(&t)).await;
+    eprintln!(
+        "[it] xe, after a session restart: {:?} {:?}",
+        h.audit_level,
+        codes(&h)
+    );
+    stream.abort();
+    let _ = stream.await;
+    assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
+    assert!(has(&h, NoteCode::AuditRecordsDropped), "{:?}", codes(&h));
+    Box::pin(drop_login(&mut s, "it_xdump")).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`): the
+/// skew between the time a source stamps a statement with (SQL Server
+/// Audit `event_time`, Extended Events `timestamp_utc`) and the server's
+/// `SYSUTCDATETIME()` read just before and just after the statement on the
+/// same session (lot 2 follow-up: the own-session clean end is computed on
+/// `SYSUTCDATETIME()`). Prints the largest overshoot past the "after" time
+/// and the largest lead before the "before" time, in microseconds. Run as
+/// `sa` (2019: reading the audit needs `CONTROL SERVER`).
+#[tokio::test]
+async fn measure_event_time_skew() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let now = "SELECT CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', SYSUTCDATETIME()))";
+    let tag = std::process::id();
+    let mut spans = Vec::new();
+    for i in 0..200u32 {
+        let t0 = s.rows(now, Stage::Check, Shape::rows(1, 1)).await.unwrap()[0][0]
+            .as_int()
+            .unwrap();
+        let q = format!("SELECT TOP (1) id FROM retail.crm.customers WHERE id = -{tag}{i:03}");
+        s.rows(&q, Stage::Check, Shape::rows(1, 1)).await.unwrap();
+        let t1 = s.rows(now, Stage::Check, Shape::rows(1, 1)).await.unwrap()[0][0]
+            .as_int()
+            .unwrap();
+        spans.push((format!("-{tag}{i:03}"), t0, t1));
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let like = format!("%WHERE id = -{tag}%");
+    let sources = [
+        (
+            "sqlserver_audit",
+            format!(
+                "SELECT TOP (1000) CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', event_time)), \
+                 CONVERT(nvarchar(200), statement) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', \
+                 NULL, NULL) WHERE statement LIKE N'{like}'"
+            ),
+        ),
+        (
+            "sqlserver_xevents",
+            format!(
+                "SELECT TOP (1000) CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', timestamp_utc)), \
+                 CONVERT(nvarchar(200), SUBSTRING(event_data, CHARINDEX(N'WHERE id = -', event_data), 40)) \
+                 FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, \
+                 NULL) WHERE object_name = N'sql_statement_completed' AND event_data LIKE N'{like}'"
+            ),
+        ),
+    ];
+    for (name, sql) in sources {
+        let Some(rows) = try_rows(&mut s, &sql, 2).await else {
+            eprintln!("[it] skew {name}: not readable");
+            continue;
+        };
+        let (mut over, mut lead, mut n) = (i64::MIN, i64::MIN, 0);
+        for r in &rows {
+            let at = r[0].as_int().unwrap();
+            let text = r[1].as_text().unwrap_or_default();
+            if let Some((_, t0, t1)) = spans.iter().find(|(k, _, _)| {
+                text.contains(&format!("= {k}")) && !text.contains(&format!("= {k}0"))
+            }) {
+                over = over.max(at - t1);
+                lead = lead.max(t0 - at);
+                n += 1;
+            }
+        }
+        eprintln!(
+            "[it] skew {name}: {n} statements, largest overshoot past the next SYSUTCDATETIME() {over} us, largest lead before the previous one {lead} us"
+        );
+    }
+}
+
+/// Runs an Extended Events stream of `t` (state in `dir`) while `work`
+/// runs, then 12 s more (the dev session's dispatch latency is 5 s), and
+/// returns its events.
+async fn xe_stream_around<F: std::future::Future<Output = ()>>(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    work: F,
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    work.await;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    events
+}
+
+/// The Extended Events grant of the server's version, granted to the dev
+/// account for a test (2019: held already).
+async fn xe_grant(s: &mut Session, major: u32) -> &'static str {
+    let grant = if major >= 16 {
+        "VIEW SERVER PERFORMANCE STATE"
+    } else {
+        "VIEW SERVER STATE"
+    };
+    Box::pin(exec(
+        s,
+        &in_db("master", &format!("GRANT {grant} TO databastion")),
+    ))
+    .await;
+    Box::pin(exec(
+        s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    grant
+}
+
+/// ADR-0051 refinement of 2026-10-15, case 1 and the drift test of item 4:
+/// a first read of a column by a client makes the server build statistics
+/// (`StatMan`) followed by its internal statements; on the allow-listed
+/// image, with causality, the build and its internal statements are left
+/// out, and the client's read alone is reported. With
+/// `DATABASTION_IT_SQLSERVER_CAPTURE=<file>`, the session's events of that
+/// activity are written to `<file>` (the unit fixtures, fake data only).
+#[tokio::test]
+async fn xe_statistics_builds_match_the_fixture() {
+    Box::pin(xe_statistics_scenario()).await;
+}
+
+async fn xe_statistics_scenario() {
+    use databastion_classifiers::masking::EventAction;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let table = format!("it_stats_{}", std::process::id());
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "retail",
+            &format!(
+                "CREATE TABLE crm.{table} (id int, v int); INSERT INTO crm.{table} \
+                 SELECT TOP (500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 7 FROM sys.all_objects"
+            ),
+        ),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_xstats", &[])).await;
+    // Statistics of the agent's own reads first (pre-warm).
+    let _ = Box::pin(c.check(&t)).await;
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xestats-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A first read of a column in a batch (the build at nest level 2),
+    // then of another column inside `sp_executesql` (nest level 3).
+    let q = format!("SELECT TOP (5) id FROM retail.crm.{table} WHERE v = 3");
+    let q3 = format!("EXEC sp_executesql N'SELECT TOP (5) v FROM retail.crm.{table} WHERE id = 3'");
+    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
+        let mut d = Box::pin(foreign_session(
+            "it_xstats",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(&mut d, &q, 1)).await;
+        Box::pin(try_rows(&mut d, &q3, 1)).await;
+        d.close().await;
+    }))
+    .await;
+    let mine: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("it_xstats")
+        })
+        .collect();
+    for e in &mine {
+        eprintln!(
+            "[it] xe statistics event {:?} {:?} always={}",
+            e.action(),
+            names_of(e),
+            e.always_report()
+        );
+    }
+    let [_, _, _, statistics] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe statistics statements left out: {statistics}");
+    if let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") {
+        let rows = try_rows(
+            &mut s,
+            "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM \
+             sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, NULL) \
+             WHERE event_data LIKE N'%it[_]xstats%' AND object_name = N'sp_statement_completed' \
+             OR (event_data LIKE N'%it[_]stats[_]%' AND event_data LIKE N'%it[_]xstats%')",
+            1,
+        )
+        .await
+        .unwrap_or_default();
+        let lines: Vec<String> = rows
+            .iter()
+            .filter_map(|r| {
+                r.first()
+                    .and_then(Value::as_text)
+                    .map(|x| x.replace('\n', " "))
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+    let reads = mine
+        .iter()
+        .filter(|e| {
+            e.action() == EventAction::Read && names_of(e) == [format!("retail.crm.{table}")]
+        })
+        .count();
+    assert_eq!(
+        reads, 2,
+        "the builds are left out: the client's two reads alone name the table"
+    );
+    // The builds' internal statements, at the build's nest level minus one
+    // (case 1 as revised on 2026-10-16): left out at both depths.
+    let others: Vec<_> = mine
+        .iter()
+        .filter(|e| {
+            names_of(e) != [format!("retail.crm.{table}")]
+                && !names_of(e)
+                    .iter()
+                    .all(|n| n.ends_with(".sys.dm_exec_sessions"))
+        })
+        .collect();
+    // One: the batch `EXEC sp_executesql N'…'` itself, in the session's
+    // database `master` (dynamic SQL in text: `*`, always reported); no
+    // internal statement.
+    assert_eq!(others.len(), 1, "{} other events", others.len());
+    for e in &others {
+        assert!(
+            e.action() == EventAction::Read && e.always_report() && names_of(e) == ["master.-.*"],
+            "an unexpected event: {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    eprintln!(
+        "[it] xe statistics: other events {} (major {major})",
+        others.len()
+    );
+    assert!(
+        statistics >= 4,
+        "the builds and their internal statements are left out: {statistics}"
+    );
+    Box::pin(drop_login(&mut s, "it_xstats")).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", &format!("DROP TABLE crm.{table}")),
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0051 refinement of 2026-10-15, case 2: on a **fresh** server (no
+/// statistics built yet; `DATABASTION_IT_SQLSERVER_FRESH=1`, run first on a
+/// new data volume), the agent's own `check()` and Discovery make the server
+/// build statistics on system base tables in its sessions; they are left
+/// out with their internal statements of the accepted shape. The two
+/// measured residuals (internal statements at nest level 1 under builds at nest level 2, and a
+/// build whose catalog statement comes in a later read) are tolerated and
+/// counted; nothing else of the agent's is reported.
+#[tokio::test]
+async fn xe_fresh_server_own_reads_raise_no_event() {
+    Box::pin(xe_fresh_scenario()).await;
+}
+
+async fn xe_fresh_scenario() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_FRESH").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let major = {
+        let c = SqlserverConnector::new();
+        let t = agent("");
+        let _ = Box::pin(c.check(&t)).await;
+        c.server_version(&t)
+            .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
+            .unwrap()
+    };
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xefresh-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
+        let _ = Box::pin(c.check(&t)).await;
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (sink, mut frx) = FindingSink::channel(10_000);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        Box::pin(c.discover(&job, &sink)).await.unwrap();
+        drop(sink);
+        drain.await.unwrap();
+    }))
+    .await;
+    let own: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("databastion")
+        })
+        .collect();
+    for e in &own {
+        eprintln!(
+            "[it] xe fresh: own event reported {:?} {:?}",
+            e.action(),
+            names_of(e)
+        );
+    }
+    let [exact, _, _, statistics] = c.state.audit.own_left_out(&t.id);
+    eprintln!("[it] xe fresh: exact {exact}, statistics statements left out {statistics}");
+    // What can remain (ADR-0051 refinement of 2026-10-16): a build on a
+    // credential-bearing base table (`sysowners`, `sysxlgns`: reported by
+    // decision, item 3), and a build whose catalog statement reached the
+    // file only after the bounded deferral (item 4). No internal statement
+    // (item 2), no other own statement, no other table.
+    let mut internal = 0;
+    let mut unpaired = 0;
+    let mut credential = 0;
+    for e in &own {
+        let names = names_of(e);
+        if e.always_report() && names.iter().all(|n| n.ends_with(".-.*")) {
+            internal += 1;
+        } else if names
+            .iter()
+            .all(|n| matches!(n.as_str(), "retail.sys.sysowners" | "retail.sys.sysxlgns"))
+        {
+            credential += 1;
+        } else if names.iter().all(|n| {
+            n.strip_prefix("retail.sys.")
+                .is_some_and(|t| crate::audit::xe::events::SYS_BASE_TABLES.contains(&t))
+        }) {
+            unpaired += 1;
+        } else {
+            panic!("the agent's own reads raised an event on a fresh server: {names:?}");
+        }
+    }
+    eprintln!(
+        "[it] xe fresh: internal statements reported {internal}, builds unpaired {unpaired}, \
+         credential tables {credential}"
+    );
+    assert_eq!(
+        internal, 0,
+        "internal statements of the builds are left out"
+    );
+    assert!(
+        statistics > 0,
+        "not a fresh server: no statistics build was seen"
+    );
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Re-review N1: the first start's floor is bounded. A saved position
+/// whose floor is far ahead of the server's clock (what a server clock
+/// stepped back gives) and that has left its history phase: what the
+/// stream reads below it is counted as dropped, never reported nor
+/// silent, and the floor ends once a caught-up read started the source's
+/// delivery delay after the first start, so a later read is reported.
+#[tokio::test]
+async fn floor_ahead_of_the_server_clock_is_counted_then_ends() {
+    Box::pin(floor_scenario()).await;
+}
+
+async fn floor_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let login = "it_floor";
+    let before = "it_floor_old";
+    Box::pin(throwaway(&mut s, login, &[])).await;
+    Box::pin(throwaway(&mut s, before, &[])).await;
+    let mut sources = vec![(XE, "sqlserver_xevents")];
+    if major >= 16 {
+        sources.push((AUDIT, "sqlserver_audit"));
+    }
+    for (settings, cursor) in sources {
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {settings}", own_tls()));
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-floor-{}-{cursor}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        // A read written to the source before the first start the floor is set at: below
+        // the floor.
+        let mut d = Box::pin(foreign_session(
+            before,
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT TOP (1) id FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        d.close().await;
+        // From the start of the file set, out of the history phase, under
+        // a floor an hour ahead.
+        let seeded = crate::audit::Cursor {
+            floor: Some(
+                i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros(),
+                )
+                .unwrap()
+                    + 3_600_000_000,
+            ),
+            floor_set_ms: crate::audit::agent_now_ms(),
+            ..crate::audit::Cursor::default()
+        };
+        cfg.cursor(cursor).unwrap().save(&seeded.encode()).unwrap();
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        // Past the delivery delay (5 s session latency, 1 s queue delay).
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert!(!stream.is_finished(), "{:?}", stream.await);
+        let dropped = c.state.audit.facts(&t.id).dropped;
+        let mut d = Box::pin(foreign_session(login, "DATABASTION_IT_SQLSERVER_THROWAWAY")).await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT TOP (1) id FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        d.close().await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        eprintln!(
+            "[it] floor ({cursor}): {} events, dropped below the floor {dropped}",
+            events.len()
+        );
+        assert!(dropped > 0, "{cursor}: what the floor left out is counted");
+        // Nothing of the file set before the floor ended is reported (the
+        // read made before the stream started), the read made after it is.
+        for e in &events {
+            eprintln!(
+                "[it] floor ({cursor}): event {} {:?} {:?}",
+                e.principal().account_name(),
+                e.action(),
+                names_of(e)
+            );
+            assert!(
+                !e.principal().account_name().eq_ignore_ascii_case(before),
+                "{cursor}: an event below the floor was reported"
+            );
+        }
+        assert!(
+            events.iter().any(|e| {
+                e.principal().account_name().eq_ignore_ascii_case(login)
+                    && names_of(e).iter().any(|n| n == "retail.crm.customers")
+            }),
+            "{cursor}: the read after the floor ended is reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(drop_login(&mut s, login)).await;
+    Box::pin(drop_login(&mut s, before)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
 }
