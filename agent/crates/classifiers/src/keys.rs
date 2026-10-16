@@ -1098,7 +1098,7 @@ impl LearnedPatterns {
         match found {
             // The second gate: the per-key rules again, then the contract
             // gate; they only ever turn literals into `*`.
-            Some(mut p) => {
+            Some((mut p, _)) => {
                 let gated = split_key(p.as_bytes()).pattern();
                 p.zeroize();
                 gated
@@ -1107,7 +1107,37 @@ impl LearnedPatterns {
         }
     }
 
-    fn find(&self, folded: &str, cut: bool) -> Option<String> {
+    /// The learned pattern a complete key name `raw` matches as a whole,
+    /// if any (the one [`Self::object`] gives when it gives a learned
+    /// pattern rather than a literal prefix followed by `*`), after the
+    /// same second gate. For the agent's own-read budget, which is kept
+    /// per pattern (ADR-0052 decision 8): never an event object by itself.
+    #[must_use]
+    pub fn pattern_of(&self, raw: &[u8]) -> Option<NormalizedName> {
+        if raw.is_empty() || raw.len() > MAX_KEY_BYTES {
+            return None;
+        }
+        let text = std::str::from_utf8(raw).ok()?;
+        let mut folded: String = text.nfkc().collect();
+        let found = self.find(&folded, false);
+        folded.zeroize();
+        match found {
+            Some((mut p, true)) => {
+                let gated = split_key(p.as_bytes()).pattern();
+                p.zeroize();
+                Some(gated)
+            }
+            Some((mut p, false)) => {
+                p.zeroize();
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// The object text of `folded` and whether it is a learned pattern
+    /// matched as a whole (`false`: a literal prefix followed by `*`).
+    fn find(&self, folded: &str, cut: bool) -> Option<(String, bool)> {
         let (units, tail) = units_of(folded, MAX_MATCH_UNITS, false)?;
         // The best full match: (literal tokens, index).
         let mut full: Option<(usize, usize)> = None;
@@ -1175,9 +1205,11 @@ impl LearnedPatterns {
         }
         // The one naming more learned literals; a full match on a tie.
         match (full, prefixed) {
-            (Some((lits, i)), Some((k, _))) if lits >= k => self.texts.get(i).cloned(),
-            (_, Some((_, p))) => Some(p),
-            (Some((_, i)), None) => self.texts.get(i).cloned(),
+            (Some((lits, i)), Some((k, _))) if lits >= k => {
+                self.texts.get(i).cloned().map(|t| (t, true))
+            }
+            (_, Some((_, p))) => Some((p, false)),
+            (Some((_, i)), None) => self.texts.get(i).cloned().map(|t| (t, true)),
             (None, None) => None,
         }
     }
@@ -1545,6 +1577,29 @@ mod tests {
         let i = LearnedPatterns::intersection(&[&a, &b]);
         assert_eq!(i.patterns(), ["session:*"]);
         assert!(LearnedPatterns::intersection(&[]).is_empty());
+    }
+
+    /// `pattern_of` gives a learned pattern matched as a whole, never a
+    /// literal prefix followed by `*`, nor `*` (the own-read budget's key).
+    #[test]
+    fn pattern_of_is_a_whole_learned_match_only() {
+        let l = learned(&["session:*", "cache:page:about", "user:*:profile"]);
+        let p = |k: &str| l.pattern_of(k.as_bytes()).map(|n| n.as_str().to_owned());
+        assert_eq!(p("session:0d72ab48").as_deref(), Some("session:*"));
+        assert_eq!(p("user:jdupont:profile").as_deref(), Some("user:*:profile"));
+        assert_eq!(p("cache:page:about").as_deref(), Some("cache:page:about"));
+        // `object` falls back to the learned literal prefix; `pattern_of`
+        // gives nothing.
+        assert_eq!(
+            l.object(b"cache:page:jdupont", false).as_str(),
+            "cache:page:*"
+        );
+        assert_eq!(p("cache:page:jdupont"), None);
+        assert_eq!(p("user:jdupont:email"), None);
+        assert_eq!(p("jdupont"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(l.pattern_of(&[0xff, b':', b'x']), None);
+        assert_eq!(LearnedPatterns::default().pattern_of(b"session:x"), None);
     }
 
     proptest::proptest! {

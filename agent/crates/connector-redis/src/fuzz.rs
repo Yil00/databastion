@@ -127,6 +127,7 @@ pub fn slowlog_entry(data: &[u8]) {
     let ctx = crate::audit::entries::Context {
         learned: &set,
         stores: None,
+        dbs: &[],
     };
     let items = match &v {
         crate::resp::Value::Array(items) => items.as_slice(),

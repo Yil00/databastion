@@ -21,6 +21,25 @@ pub(crate) const MEMBERS_PER_KEY: u32 = 16;
 pub(crate) const HASH_FIELDS_ASKED: u32 = 17;
 const _: () =
     assert!(HASH_FIELDS_ASKED as usize == databastion_classifiers::keys::COLLAPSE_THRESHOLD + 1);
+/// The most rows the own-read budget charges for one sampled key (ADR-0052,
+/// refinement of 2026-10-16): [`MEMBERS_PER_KEY`] members read, plus the
+/// most statement and metadata calls one key can cost, each charged at
+/// least one row (`databastion_core::audit::own::charged_rows`). The
+/// largest sequence is a hash's: `TYPE` (the walk, 1), `HRANDFIELD`
+/// ([`MEMBERS_PER_KEY`] field names), one `HSTRLEN` per field
+/// ([`MEMBERS_PER_KEY`] statements of no row) and `HMGET` of at most
+/// [`MEMBERS_PER_KEY`] fields: 49 today. A unit test sums each type's
+/// sequence against it (`audit::tests`).
+pub(crate) const PER_KEY_MAX: u64 = per_key_max();
+
+const fn per_key_max() -> u64 {
+    let m = MEMBERS_PER_KEY as u64;
+    // Statements and metadata: `TYPE`, one `HSTRLEN` per field, and the
+    // `HMGET` of the fields read (charged its fields).
+    let calls = 1u64.saturating_add(m).saturating_add(m);
+    m.saturating_add(calls)
+}
+
 /// Bytes of a string read per key, and the largest hash value read.
 pub(crate) const VALUE_BYTES: usize = 4096;
 /// Longest key or field name kept; longer ones are read and discarded.

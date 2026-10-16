@@ -34,6 +34,7 @@ fn entry(id: i64, ts: i64, args: &[&[u8]], peer: &str) -> LogEntry {
     let ctx = Context {
         learned: &learned,
         stores: None,
+        dbs: &[],
     };
     entries::parse_log_entry(&decode(&resp_entry(id, ts, args, peer)), &ctx).unwrap()
 }
@@ -83,6 +84,7 @@ fn a_parser_panic_drops_one_entry_only() {
     let ctx = Context {
         learned: &learned,
         stores: None,
+        dbs: &[],
     };
     let items = vec![
         decode(&resp_entry(1, 1, &[b"GET", b"a"], "10.0.0.1:1")),
@@ -602,4 +604,309 @@ fn an_own_address_counts_within_the_sessions_lifetime_only() {
     assert!(ev(secs(connected) + 1).is_none());
     // 3 s before the connect: reported.
     assert!(ev(secs(connected) - 3).is_some());
+}
+
+/// The P9-D end-to-end finding: with keys in two databases whose learned
+/// patterns differ (`session:*` only in `db1`), slow-log entries, which
+/// carry no database, are matched against the patterns learned in every
+/// database: none, so every object is `*`. The own-read budget was then
+/// charged on that one object for the whole scan, and the agent's own
+/// sampling reads came back as one read of `*` once `max_sample_rows` rows
+/// of all patterns together had been read. The budget is kept per pattern
+/// (ADR-0052 decision 8): each own sampling read is charged on the pattern
+/// its key matches in the databases where it does; the event's object
+/// stays `*`, and a pattern's budget still runs out. The pattern budgets
+/// are scaled by `PER_KEY_MAX` (ADR-0052 refinement of 2026-10-16), the
+/// `*` fallback is not.
+#[test]
+fn own_reads_are_budgeted_per_pattern_when_the_database_is_unknown() {
+    let (cfg, target, state) = stream_parts();
+    let run = Some(4242);
+    // `max_sample_rows` 2: 98 rows per pattern, 2 for `*`.
+    let budget = 2;
+    assert_eq!(budget * PER_KEY_MAX, 98);
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new(
+            "databastion",
+            None,
+            None,
+            budget,
+            state.audit.own_usage("own-t"),
+        ),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run,
+    };
+    let mut learned = state::Learned::default();
+    learned.dbs.insert(
+        0,
+        Arc::new(LearnedPatterns::new([
+            "customer:*",
+            "events:*",
+            "user:*:profile",
+        ])),
+    );
+    learned.dbs.insert(
+        1,
+        Arc::new(LearnedPatterns::new(["session:*", "user:*:profile"])),
+    );
+    let (database, log_set) = log_database(&learned, &[0, 1]);
+    assert_eq!(database.as_str(), "*");
+    assert_eq!(log_set.patterns(), ["user:*:profile".to_owned()]);
+    let sets: Vec<(u16, &LearnedPatterns)> =
+        learned.dbs.iter().map(|(d, s)| (*d, s.as_ref())).collect();
+    let parse = |id: i64, args: &[&[u8]], peer: &str, dbs: &[(u16, &LearnedPatterns)]| {
+        let ctx = Context {
+            learned: &log_set,
+            stores: None,
+            dbs,
+        };
+        entries::parse_log_entry(&decode(&resp_entry(id, 1, args, peer)), &ctx).unwrap()
+    };
+    let now_s = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    // The agent's Discovery session, its address recorded.
+    let _own = own::register("own-t", 4201, None, run, SystemTime::now());
+    own::seen("own-t", 4201, run, "10.0.42.1:4000".parse().unwrap());
+    let mine = "10.0.42.1:4000";
+    let left_out = |e: &mut LogEntry, st: &mut Stream<'_>| {
+        e.ts = now_s;
+        st.log_event(e, EventSource::RedisSlowlog, &database, &[], now_s, 0)
+            .is_none()
+    };
+    // One scan's sampling: 5 hashes of `session:*` (16 rows each, and its
+    // `TYPE`), 5 streams of `events:*` (16 rows each), 60 strings of
+    // `customer:*`: 225 rows in all, at most 85 per pattern (within 98,
+    // far over 2). Every entry's object is `*`; every entry is left out.
+    let mut id = 0;
+    let mut next = || {
+        id += 1;
+        id
+    };
+    for k in 0..5 {
+        let key = format!("session:{k:032x}");
+        let mut t = parse(next(), &[b"TYPE", key.as_bytes()], mine, &sets);
+        assert!(left_out(&mut t, &mut st), "TYPE {k}");
+        let mut e = parse(next(), &[b"HRANDFIELD", key.as_bytes(), b"17"], mine, &sets);
+        assert_eq!(e.objects, [NormalizedName::wildcard()]);
+        assert_eq!(e.budget.len(), 1);
+        assert!(left_out(&mut e, &mut st), "HRANDFIELD {k}");
+        let key = format!("events:{k}");
+        let mut e = parse(
+            next(),
+            &[b"XREVRANGE", key.as_bytes(), b"+", b"-", b"COUNT", b"16"],
+            mine,
+            &sets,
+        );
+        assert!(left_out(&mut e, &mut st), "XREVRANGE {k}");
+    }
+    for k in 0..60 {
+        let key = format!("customer:{}", 1000 + k);
+        let mut e = parse(
+            next(),
+            &[b"GETRANGE", key.as_bytes(), b"0", b"4095"],
+            mine,
+            &sets,
+        );
+        assert!(left_out(&mut e, &mut st), "GETRANGE {k}");
+    }
+    let mut keys = state
+        .audit
+        .own_usage("own-t")
+        .lock()
+        .unwrap()
+        .budgeted_objects();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "db0\u{0}\u{0}customer:*",
+            "db0\u{0}\u{0}events:*",
+            "db1\u{0}\u{0}session:*"
+        ]
+    );
+    // A key whose pattern was learned in both databases is charged in
+    // both (fail closed).
+    let mut e = parse(
+        next(),
+        &[b"HRANDFIELD", b"user:jdupont:profile", b"17"],
+        mine,
+        &sets,
+    );
+    assert_eq!(e.budget.len(), 2);
+    assert!(left_out(&mut e, &mut st));
+    // A pattern's budget still runs out: the reads beyond it are
+    // reported, under the event's object (`*`), never the pattern.
+    let key = format!("session:{:032x}", 99);
+    let mut e = parse(next(), &[b"HRANDFIELD", key.as_bytes(), b"17"], mine, &sets);
+    assert!(!left_out(&mut e, &mut st));
+    e.ts = now_s;
+    let ev = st
+        .log_event(&e, EventSource::RedisSlowlog, &database, &[], now_s, 0)
+        .expect("over the pattern's budget");
+    assert_eq!(principal(&ev).0, "databastion");
+    assert_eq!(ev.objects().len(), 1);
+    assert_eq!(ev.objects()[0].object().as_str(), "*");
+    assert_eq!(ev.objects()[0].database().as_str(), "*");
+    // A key no database's patterns match keeps the event's object as its
+    // budget: `*`, shared by every such key, with the plain budget (not
+    // scaled): two one-row reads, then reported.
+    for k in 0..2 {
+        let key = format!("unlearned:{k}");
+        let mut e = parse(
+            next(),
+            &[b"GETRANGE", key.as_bytes(), b"0", b"4095"],
+            mine,
+            &sets,
+        );
+        assert!(e.budget.is_empty());
+        assert!(left_out(&mut e, &mut st), "unlearned {k}");
+    }
+    let mut e = parse(
+        next(),
+        &[b"GETRANGE", b"unlearned:2", b"0", b"4095"],
+        mine,
+        &sets,
+    );
+    assert!(!left_out(&mut e, &mut st));
+    // A 16-row read of an unlearned key is over the plain budget at once.
+    let mut e = parse(next(), &[b"LRANGE", b"other:x", b"0", b"15"], mine, &sets);
+    assert!(!left_out(&mut e, &mut st));
+    // Another client's read of a learned key: reported as before, `*`.
+    let theirs = parse(
+        next(),
+        &[b"HRANDFIELD", key.as_bytes(), b"17"],
+        "10.0.42.9:5000",
+        &sets,
+    );
+    let ev = st
+        .log_event(&theirs, EventSource::RedisSlowlog, &database, &[], now_s, 0)
+        .expect("another client's read");
+    assert!(principal(&ev).1);
+    assert_eq!(ev.objects()[0].object().as_str(), "*");
+    // No database with learned patterns: the event's object.
+    let one = parse(next(), &[b"HRANDFIELD", key.as_bytes(), b"17"], mine, &[]);
+    assert!(one.budget.is_empty());
+}
+
+/// ADR-0052 refinement of 2026-10-16, condition 2: the rows the own-read
+/// budget charges for one key's whole sampling sequence (its `TYPE` in the
+/// walk, then the sampling commands as `discover` sends them, encoded by
+/// the same `Cmd`), summed with the core's `charged_rows`, stay within
+/// `PER_KEY_MAX` for every type, and the hash's is exactly it. A source
+/// check of `discover.rs` fails when a command is added to the walk or the
+/// sampling without updating this sequence, and so the factor.
+#[test]
+fn one_keys_sampling_sequence_fits_per_key_max() {
+    use crate::cmd::{Cmd, MEMBERS_PER_KEY};
+    use databastion_core::audit::own::charged_rows;
+
+    // The commands `discover` sends (the source check below).
+    let src = include_str!("../discover.rs");
+    let mut used: Vec<&str> = src
+        .match_indices("Cmd::")
+        .map(|(i, _)| {
+            let rest = &src[i + 5..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    assert_eq!(
+        used,
+        [
+            "ClientNoTouchOn",
+            "GetRange",
+            "HMGet",
+            "HRandField",
+            "HStrLen",
+            "Info",
+            "LRange",
+            "ReadOnly",
+            "SRandMember",
+            "Scan",
+            "Select",
+            "Type",
+            "XRevRange",
+            "ZRandMember"
+        ],
+        "discover sends another command: add it to the sequences below and to PER_KEY_MAX"
+    );
+    let start = src.find("async fn sample_pattern(").unwrap();
+    let body = &src[start..];
+    let body = &body[..body.find("\nfn ").unwrap()];
+    assert_eq!(
+        (
+            body.matches(".call(").count(),
+            body.matches(".pipeline(").count()
+        ),
+        (5, 1),
+        "the sampling sends another statement per key: update the sequences below and PER_KEY_MAX"
+    );
+
+    let learned = LearnedPatterns::new(["k:*"]);
+    let ctx = Context {
+        learned: &learned,
+        stores: None,
+        dbs: &[],
+    };
+    let rows_of = |cmd: &Cmd<'_>| -> u64 {
+        let mut req = Vec::new();
+        cmd.encode(&mut req);
+        let Value::Array(args) = decode(&req) else {
+            panic!("a request is an array")
+        };
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes().unwrap()).collect();
+        let e = entries::parse_log_entry(&decode(&resp_entry(1, 1, &args, "10.0.0.1:1")), &ctx)
+            .unwrap();
+        let OwnShape::Keyed { rows, .. } = e.own else {
+            panic!("{cmd:?}: not one of the agent's sampling shapes")
+        };
+        let ev = MaskedEvent::new(
+            EventSource::RedisSlowlog,
+            EventAction::Read,
+            EventPrincipal::account("databastion"),
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_rows(Some(rows));
+        charged_rows(&ev, u64::MAX)
+    };
+    let key: &[u8] = b"k:1";
+    let m = MEMBERS_PER_KEY as usize;
+    let fields: Vec<Vec<u8>> = (0..m).map(|i| format!("f{i}").into_bytes()).collect();
+    let names: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    let mut hash = vec![Cmd::Type(key), Cmd::HRandField(key)];
+    hash.extend(names.iter().map(|f| Cmd::HStrLen(key, f)));
+    hash.push(Cmd::HMGet(key, &names));
+    let sequences: [(&str, Vec<Cmd<'_>>); 6] = [
+        ("string", vec![Cmd::Type(key), Cmd::GetRange(key)]),
+        ("hash", hash),
+        ("list", vec![Cmd::Type(key), Cmd::LRange(key)]),
+        ("set", vec![Cmd::Type(key), Cmd::SRandMember(key)]),
+        ("zset", vec![Cmd::Type(key), Cmd::ZRandMember(key)]),
+        ("stream", vec![Cmd::Type(key), Cmd::XRevRange(key)]),
+    ];
+    for (kind, seq) in &sequences {
+        let total = seq.iter().map(&rows_of).fold(0u64, u64::saturating_add);
+        assert!(total <= PER_KEY_MAX, "{kind}: {total} > {PER_KEY_MAX}");
+        if *kind == "hash" {
+            assert_eq!(total, PER_KEY_MAX, "the factor is the hash's sequence");
+        }
+    }
+    assert_eq!(PER_KEY_MAX, 49);
 }
