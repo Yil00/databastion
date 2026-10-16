@@ -151,7 +151,7 @@ How the servers resolve an unqualified name followed by `(` (MySQL 8.4 reference
 
 ## Refinement (2026-10-16, accepted): cut digests of interrupted own polls
 
-**Status: accepted by the maintainer on 2026-10-16** (option (a) of the root-cause report of the intermittent `own_sessions_it` failure, relayed by the coordinator). It refines refinement (ii) of 2026-10-11 ("its text is not cut") for one case: the agent's own poll statement interrupted while it ran. Nothing else of decision 4 or of the 2026-10-11 refinement changes.
+**Status: accepted by the maintainer on 2026-10-16** (option (a) of the root-cause report of the intermittent `own_sessions_it` failure). It refines refinement (ii) of 2026-10-11 ("its text is not cut") for one case: the agent's own poll statement interrupted while it ran. Nothing else of decision 4 or of the 2026-10-11 refinement changes.
 
 - **Context.** When the core stops an Audit stream (shutdown, reconfiguration, a stream restarted) while its poll statement runs, the statement's cancel guard sends `KILL QUERY` from a separate connection ([ADR-0018](0018-mysql-mariadb-grants-and-connector.md)); the statement timeout can stop a poll too. Measured on 2026-10-16 against the dev images:
   - MySQL 8.4.11: a poll stopped by `KILL QUERY` ends in `events_statements_history_long` with errno 1317, and one stopped by `max_execution_time` with errno 3024, both with **`SQL_TEXT` NULL** and their digest only, and no current schema;
