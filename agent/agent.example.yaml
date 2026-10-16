@@ -253,12 +253,22 @@ targets:
   #     # max_tables: 16384        # 1..=16384; tables read per database and scan
   #     # cas_stores:
   #     #   ticket_registry: [sso_tickets]
-  #     # Audit (SQL Server 2022+): an operator-created server audit with a FILE
-  #     # target; the agent never creates or alters it. Needs VIEW SERVER
-  #     # SECURITY AUDIT and VIEW ANY SECURITY DEFINITION (docs/10-user-guide.md).
-  #     # source: auto (default) | sqlserver_audit | sqlserver_xevents (not
-  #     #   implemented yet: the target reports None)
+  #     # Audit: an operator-created source; the agent never creates, alters,
+  #     # starts or stops it (docs/10-user-guide.md). Partial at best.
+  #     # source: auto (default: SQL Server Audit when usable, else the
+  #     #   Extended Events session) | sqlserver_audit | sqlserver_xevents
+  #     # sqlserver_audit (SQL Server 2022 and later): a server audit with a
+  #     #   FILE target; needs VIEW SERVER SECURITY AUDIT and VIEW ANY
+  #     #   SECURITY DEFINITION.
   #     # audit: {source: sqlserver_audit, audit_name: databastion_audit}
+  #     # sqlserver_xevents (2019, 2022, 2025; the only source on 2019): an
+  #     #   Extended Events session with an event_file target; needs VIEW
+  #     #   SERVER STATE (2019) or VIEW SERVER PERFORMANCE STATE (2022 and
+  #     #   later), which exposes every statement text on the server,
+  #     #   with its literal values.
+  #     # audit: {source: sqlserver_xevents, xe_session: databastion_xe}
+  #     # auto naming both: the server audit when usable, else the session.
+  #     # audit: {source: auto, audit_name: databastion_audit, xe_session: databastion_xe}
 
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting

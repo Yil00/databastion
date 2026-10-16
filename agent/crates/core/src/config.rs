@@ -1040,6 +1040,16 @@ const KNOWN_KEYS: &[&str] = &[
     "rls_visibility",
     "view_definition",
     "max_tables",
+    "audit",
+    "source",
+    "audit_name",
+    "xe_session",
+    "sqlserver_audit",
+    "sqlserver_xevents",
+    "replicas",
+    "spool",
+    "max_batches",
+    "max_bytes",
 ];
 
 /// Renders a YAML / serde error without deriving any text from it: a
@@ -1850,6 +1860,52 @@ targets:
         assert!(!cfg.targets.is_empty());
     }
 
+    /// The commented SQL Server target of the example file is valid once
+    /// uncommented, with each of its `audit` examples uncommented in turn.
+    #[test]
+    fn example_sqlserver_target_is_valid_uncommented() {
+        let text = include_str!("../../../agent.example.yaml");
+        let start = text.find("  # - id: erp-eu-1\n").unwrap();
+        let end = start + text[start..].find("\n\n").unwrap() + 1;
+        let block: String = text[start..end]
+            .lines()
+            .map(|l| {
+                l.strip_prefix("  # ")
+                    .map_or_else(|| l.to_owned(), |r| format!("  {r}"))
+            })
+            .map(|l| l + "\n")
+            .collect();
+        let audits: Vec<&str> = block
+            .lines()
+            .filter(|l| l.starts_with("      # audit: {"))
+            .collect();
+        assert_eq!(audits.len(), 3, "{block}");
+        let base = BASE.split("targets:\n").next().unwrap();
+        let mut variants = vec![block.clone()];
+        variants.extend(
+            audits
+                .iter()
+                .map(|a| block.replace(a, &a.replacen("# audit:", "audit:", 1))),
+        );
+        let mut sources = Vec::new();
+        for v in &variants {
+            let cfg = parse(&format!("{base}targets:\n{v}")).unwrap_or_else(|e| panic!("{e}\n{v}"));
+            let t = &cfg.targets[0];
+            assert_eq!(t.engine, TargetEngine::Sqlserver);
+            sources.push(t.sqlserver_settings().audit.as_ref().map(|a| a.source));
+        }
+        use sqlserver::SqlserverAuditSource as S;
+        assert_eq!(
+            sources,
+            [
+                None,
+                Some(S::SqlserverAudit),
+                Some(S::SqlserverXevents),
+                Some(S::Auto)
+            ]
+        );
+    }
+
     #[test]
     fn base_config_parses_with_defaults() {
         let cfg = parse(BASE).unwrap();
@@ -2591,6 +2647,107 @@ targets:
                 let message = parse(&text).unwrap_err().to_string();
                 assert!(!message.contains(&marker), "{value:?} -> {message}");
             }
+        }
+    }
+
+    /// The names serde lists after "expected" when `yaml` is refused as a
+    /// `T`: every field of a `deny_unknown_fields` struct (fed an unknown
+    /// key), or every variant of a closed enum (fed an unknown value).
+    fn expected_names<T: serde::de::DeserializeOwned>(yaml: &str) -> Vec<String> {
+        let Err(e) = serde_yaml_ng::from_str::<T>(yaml) else {
+            panic!("{yaml} was accepted");
+        };
+        let message = e.to_string();
+        let (_, expected) = message
+            .split_once("expected")
+            .unwrap_or_else(|| panic!("{message}"));
+        let names: Vec<String> = expected
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        assert!(!names.is_empty(), "{message}");
+        names
+    }
+
+    /// Every key of every `deny_unknown_fields` struct of the schema, and
+    /// every value of its closed enums, is in `KNOWN_KEYS`, so that a parse
+    /// error can name it (the SQL Server and Redis / Valkey blocks
+    /// included).
+    #[test]
+    fn known_keys_cover_every_key_of_the_schema() {
+        const KEY: &str = "databastion_unknown_key: 1";
+        const VALUE: &str = "databastion_unknown_value";
+        let mut names = Vec::new();
+        names.extend(expected_names::<AgentConfig>(KEY));
+        names.extend(expected_names::<SpoolConfig>(KEY));
+        names.extend(expected_names::<ConsoleConfig>(KEY));
+        names.extend(expected_names::<Limits>(KEY));
+        names.extend(expected_names::<TargetConfig>(KEY));
+        names.extend(expected_names::<PostgresTargetConfig>(KEY));
+        names.extend(expected_names::<PgAuditLogConfig>(KEY));
+        names.extend(expected_names::<MysqlTargetConfig>(KEY));
+        names.extend(expected_names::<MysqlAuditLogConfig>(KEY));
+        names.extend(expected_names::<MongodbTargetConfig>(KEY));
+        names.extend(expected_names::<MongodbAuditLogConfig>(KEY));
+        names.extend(expected_names::<OpenldapTargetConfig>(KEY));
+        names.extend(expected_names::<SecretRef>(KEY));
+        names.extend(expected_names::<MetricsConfig>(KEY));
+        // `PhoneRegionConfig` (unit variants only) cannot be probed this way;
+        // its variant `fr` is covered by the explicit list.
+        names.extend(expected_names::<cas::RawServiceRegistry>(KEY));
+        names.extend(expected_names::<cas::RawAuditLog>(KEY));
+        names.extend(expected_names::<cas::RawCasSettings>(KEY));
+        names.extend(expected_names::<crate::cas_guard::CasStores>(KEY));
+        names.extend(expected_names::<sqlserver::SqlserverTargetConfig>(KEY));
+        names.extend(expected_names::<sqlserver::SqlserverAuditConfig>(KEY));
+        names.extend(expected_names::<redis::RedisTargetConfig>(KEY));
+        names.extend(expected_names::<redis::RedisNode>(KEY));
+        names.extend(expected_names::<TargetEngine>(VALUE));
+        names.extend(expected_names::<PgLogFormat>(VALUE));
+        names.extend(expected_names::<PgTlsMode>(VALUE));
+        names.extend(expected_names::<MysqlLogFormat>(VALUE));
+        names.extend(expected_names::<MysqlTlsMode>(VALUE));
+        names.extend(expected_names::<MongodbLogFormat>(VALUE));
+        names.extend(expected_names::<MongodbTlsMode>(VALUE));
+        names.extend(expected_names::<OpenldapTlsMode>(VALUE));
+        names.extend(expected_names::<OpenldapBind>(VALUE));
+        names.extend(expected_names::<cas::ClientAddrMode>(VALUE));
+        names.extend(expected_names::<sqlserver::SqlserverTlsMode>(VALUE));
+        names.extend(expected_names::<sqlserver::RlsVisibility>(VALUE));
+        names.extend(expected_names::<sqlserver::SqlserverAuditSource>(VALUE));
+        names.extend(expected_names::<redis::RedisTlsMode>(VALUE));
+        names.extend(expected_names::<redis::UnevaluatedAcl>(VALUE));
+        let mut missing: Vec<&String> = names
+            .iter()
+            .filter(|n| !KNOWN_KEYS.contains(&n.as_str()))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "not in KNOWN_KEYS: {missing:?}");
+        // And the SQL Server and Redis / Valkey keys reach the rendered
+        // error's path.
+        for (engine, block, path) in [
+            (
+                "sqlserver",
+                "sqlserver: {audit: {source: sqlserver_xevents, xe_session: s, nope: 1}}",
+                "targets[0].sqlserver.audit",
+            ),
+            (
+                "redis",
+                "redis: {replicas: [nope]}",
+                "targets[0].redis.replicas",
+            ),
+        ] {
+            let yaml = format!(
+                "console: {{url: \"https://c.example\"}}\nstate_dir: /var/lib/databastion\n\
+                 targets: [{{id: t, engine: {engine}, host: 127.0.0.1, account: a, \
+                 secret: {{env: X}}, {block}}}]"
+            );
+            let message = AgentConfig::parse(&yaml).unwrap_err().to_string();
+            assert!(message.contains(path), "{block}: {message}");
+            assert!(!message.contains("nope"), "{block}: {message}");
         }
     }
 }
