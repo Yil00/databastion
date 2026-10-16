@@ -1534,47 +1534,63 @@ async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
             _ => None,
         }
         .expect("slowlog-max-len");
-        admin(&t, &[vec![b"CONFIG", b"SET", b"slowlog-max-len", b"1024"]]).await;
-        let connector = Arc::new(RedisConnector::new());
-        // The patterns the stream maps keys to, in both databases.
-        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
-        let (fs, mut frx) = FindingSink::channel(4096);
-        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
-        connector.discover(&job, &fs).await.unwrap();
-        drop(fs);
-        drain.await.unwrap();
-
         let dir = std::env::temp_dir().join(format!(
             "databastion-redis-own-budget-{}-{name}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let limits = Limits {
-            min_audit_poll_interval_s: 1,
-            ..Limits::default()
-        };
-        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
-        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
-        let c2 = Arc::clone(&connector);
-        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+        admin(&t, &[vec![b"CONFIG", b"SET", b"slowlog-max-len", b"1024"]]).await;
+        // The scans and the stream in a task of their own, so a failure
+        // there still restores the slow log's length and removes the state
+        // directory before it is raised (review L3).
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            // The patterns the stream maps keys to, in both databases.
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
 
-        // The agent's own Discovery while the stream polls (paced, so no
-        // poll finds more than the 512 entries it reads).
-        let paced = Limits {
-            discovery_duty_cycle_percent: 30,
-            ..Limits::default()
-        };
-        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
-        let (fs, mut frx) = FindingSink::channel(4096);
-        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
-        connector.discover(&job, &fs).await.unwrap();
-        drop(fs);
-        drain.await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        stream.abort();
-        let _ = stream.await;
+            std::fs::create_dir_all(&dir).unwrap();
+            let limits = Limits {
+                min_audit_poll_interval_s: 1,
+                ..Limits::default()
+            };
+            let cfg =
+                databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            // Stopped whatever happens below.
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+
+            // The agent's own Discovery while the stream polls (paced, so
+            // no poll finds more than the 512 entries it reads).
+            let paced = Limits {
+                discovery_duty_cycle_percent: 30,
+                ..Limits::default()
+            };
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            (connector, events)
+        })
+        .await;
         admin(
             &t,
             &[vec![
@@ -1586,10 +1602,10 @@ async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
         )
         .await;
         let _ = std::fs::remove_dir_all(&dir);
-        let mut events = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            events.push(e);
-        }
+        let (connector, events) = match run {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
         let json = events_json(&events);
         // Nobody else used the server: no event at all.
         assert!(json.is_empty(), "{name}: {json:#?}");
@@ -1610,5 +1626,14 @@ async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
             budgets.iter().any(|k| k.starts_with("db0\u{0}")),
             "{name}: {budgets:?}"
         );
+    }
+}
+
+/// Aborts a task when dropped (a test that fails leaves no stream polling).
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
