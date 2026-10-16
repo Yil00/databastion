@@ -1,0 +1,110 @@
+# SQL Server target end to end (ROADMAP P9-D, ADR-0051 "End-to-end and load"): merged over
+# docker-compose.yml by e2e/sqlserver.sh only (`-f docker-compose.yml -f docker-compose.sqlserver.yml`,
+# project databastion-e2e-sqlserver), and by e2e/load/sqlserver.sh with its own overlay. The main e2e
+# run (run.sh) never reads this file. Only db, migrate, web, worker, proxy, bootstrap-admin,
+# target-mssql, mssql-client, agent and agent-files are started: none of the other targets of
+# docker-compose.yml.
+#
+#   target-mssql  the dev service's image and setup (dev/sqlserver: SQL Server 2022 Express, the dev
+#                 CA and a server certificate naming `sqlserver`, forced encryption, the committed
+#                 seed dev/seed/out/sqlserver.sql, the agent login of the minimal variant with the
+#                 2022 SQL Server Audit grants and the RLS opt-in, the server audit `databastion_audit`
+#                 and the Extended Events session `databastion_xe`). Express (MSSQL_PID=Express):
+#                 ADR-0051 open question 13, CI on Express until the Developer license terms are
+#                 confirmed. The passwords come from Docker secrets, exported by the wrapper below for
+#                 the SQL Server process and the dev entrypoint only (never in the container's
+#                 environment, so never in `docker inspect`). On agent-net only (alias `sqlserver`,
+#                 the name in the certificate); nothing published.
+#   mssql-client  one-shot clients of the Audit test (`tools` profile): the same image's sqlcmd and
+#                 bcp (mssql-tools18, ODBC Driver 18: encryption mandatory, the server certificate
+#                 verified against the dev CA through SSL_CERT_FILE, host name `sqlserver`), as the
+#                 test logins e2e_exporter / e2e_analyst / e2e_admin (never the agent's login); rows go
+#                 to /dev/null inside the container.
+
+x-mssql-image: &mssql-image ${E2E_MSSQL_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718}
+
+services:
+  target-mssql:
+    image: *mssql-image
+    # Not read-only (as dev's): sqlservr writes its data, logs, audit and Extended Events files
+    # under /var/opt/mssql (a volume) and its own state under /.system.
+    cap_drop: [ALL]
+    # sqlservr carries the file capability cap_net_bind_service: its exec fails (EPERM) when the
+    # capability is outside the bounding set.
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        MSSQL_SA_PASSWORD="$$(cat /run/secrets/target_mssql_password)"
+        DATABASTION_SQLSERVER_PASSWORD="$$(cat /run/secrets/target_agent_password)"
+        export MSSQL_SA_PASSWORD DATABASTION_SQLSERVER_PASSWORD
+        exec /bin/bash /databastion/entrypoint.sh
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Express
+      MSSQL_MEMORY_LIMIT_MB: "2048"
+      DATABASTION_DEV_SQLSERVER_FORCE_STRICT: "0"
+    secrets: [target_mssql_password, target_agent_password, target_client_password]
+    volumes:
+      - mssql-data:/var/opt/mssql
+      - ../dev/sqlserver/entrypoint.sh:/databastion/entrypoint.sh:ro
+      - ../dev/sqlserver/initdb:/databastion/initdb:ro
+      - ../dev/seed/out/sqlserver.sql:/databastion/seed/10-seed.sql:ro
+    networks:
+      agent-net:
+        aliases: [sqlserver]
+    healthcheck:
+      # As dev's: a marker written once the seed is applied and the server answers, then a bare TCP
+      # connect: no login, so no audit record and no Extended Events event.
+      test: ["CMD", "bash", "-c", "test -f /var/opt/mssql/.databastion-ready && exec 3<>/dev/tcp/127.0.0.1/1433"]
+      interval: 3s
+      timeout: 5s
+      start_period: 180s
+      retries: 100
+
+  mssql-client:
+    image: *mssql-image
+    profiles: [tools]
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/bin/bash", "-euc"]
+    environment:
+      HOME: /tmp
+      # ODBC Driver 18 (OpenSSL) verifies the server certificate against this file only.
+      SSL_CERT_FILE: /etc/e2e/sqlserver-ca.pem
+    secrets: [target_client_password]
+    volumes:
+      - ${E2E_WORK_DIR:?set by sqlserver.sh}/tls/sqlserver-ca.pem:/etc/e2e/sqlserver-ca.pem:ro
+    tmpfs: [/tmp]
+    networks: [agent-net]
+
+  agent:
+    # Only the mounts of this run: agent.yaml, the console CA, the secrets volume and the dev CA of
+    # the SQL Server target (copied out of the target by sqlserver.sh).
+    group_add: !reset []
+    volumes: !override
+      - agent-state:/var/lib/databastion
+      - agent-secrets:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by sqlserver.sh}/agent/agent.yaml:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by sqlserver.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      - ${E2E_WORK_DIR:?set by sqlserver.sh}/tls/sqlserver-ca.pem:/etc/databastion/sqlserver-ca.pem:ro
+    depends_on: !override
+      proxy:
+        condition: service_started
+      target-mssql:
+        condition: service_healthy
+
+  agent-files:
+    volumes: !override
+      - agent-state:/state
+      - agent-secrets:/secrets
+
+volumes:
+  mssql-data: {}
+
+secrets:
+  target_mssql_password:
+    file: ${E2E_WORK_DIR:?set by sqlserver.sh}/secrets/target_mssql_password

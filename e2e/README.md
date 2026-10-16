@@ -14,7 +14,8 @@ gates** of phase 7; and a password-bearing DCL statement on the Audit path (Post
 / `ALTER ROLE … PASSWORD`, MariaDB `CREATE USER` / `ALTER USER … IDENTIFIED BY`, phase 7); see also
 [Adding an Audit target](#adding-an-audit-target). The console's OIDC login against Keycloak (P8-D)
 is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario), and so
-is the Apereo CAS target (P8-D): [CAS target](#cas-target). The same `run.sh` also runs with the
+are the Apereo CAS target (P8-D): [CAS target](#cas-target), and the phase 9 engines (P9-D):
+[SQL Server target](#sql-server-target) and [Valkey and Redis targets](#valkey-and-redis-targets). The same `run.sh` also runs with the
 previous release's agent: [Compatibility with the previous agent](#compatibility-with-the-previous-agent).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
@@ -571,8 +572,166 @@ overlay cannot be built as is (Gradle must trust the proxy's CA): build it befor
 Gradle base image that trusts it (`docker build --build-arg GRADLE_IMAGE=<that image> -t
 databastion-dev/cas:8.0.2-overlay dev/cas`, never committed), then run with `E2E_SKIP_BUILD=1`.
 
+## SQL Server target
+ROADMAP P9-D, [ADR-0051](../docs/adr/0051-sqlserver-connector.md) "End-to-end and load": a
+`sqlserver` target with Discovery, Audit from SQL Server Audit and the I2 check, the statement
+text of the Audit scenario and a password-bearing `CREATE LOGIN` included.
+[`sqlserver.sh`](sqlserver.sh) merges [`docker-compose.sqlserver.yml`](docker-compose.sqlserver.yml)
+over this stack (Compose project `databastion-e2e-sqlserver`) and starts only `db`, `migrate`,
+`web`, `worker`, `proxy`, `target-mssql` and `agent`. The CI job is `e2e-sqlserver` in
+[`ci.yml`](../.github/workflows/ci.yml) (45 min budget, `sqlserver.sh` at most 2280 s), required
+through `CI result`; it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`,
+`dev/sqlserver/`, `dev/seed/out/sqlserver.sql`, `dev/ground-truth.json`, `dev/docker-compose.yml`
+or `ci.yml` change. A job of its own: the SQL Server image is 2.3 GB (amd64 only). The shared
+helpers of the phase 9 scenarios are in [`lib.sh`](lib.sh). In both phase 9 scenarios (and their
+load runs), `docker inspect` of every container of the project (environment, command, entrypoint,
+labels, mounts) is dumped to a private file and searched for every registered secret, after the
+start and again with the agent running; event objects reach the job log only as counts of mapped
+forms (`*`, a ground-truth location's name, `<other>`), never as stored; the test logins' password
+reaches `sqlcmd` through the environment (`PW`, a scripting variable), never its command line.
+
+| Service | Image | Role |
+|---------|-------|------|
+| `target-mssql` | SQL Server 2022 (the dev pin, `MSSQL_PID=Express`) | The dev service's setup ([`dev/sqlserver`](../dev/sqlserver/entrypoint.sh)): a dev CA and a server certificate naming `sqlserver` (the network alias on `agent-net`), forced encryption, the committed seed [`dev/seed/out/sqlserver.sql`](../dev/seed/out/sqlserver.sql) (`retail`, the value-bearing table name included), the agent login `databastion` of the minimal variant ([`20-databastion.sql`](../dev/sqlserver/initdb/20-databastion.sql): the two SQL Server Audit grants of 2022 and the RLS opt-in) and the server audit `databastion_audit` ([`30-audit.sql`](../dev/sqlserver/initdb/30-audit.sql)). Express, not Developer: [ADR-0051](../docs/adr/0051-sqlserver-connector.md) open question 13 (CI on Express until the maintainer confirms the Developer license terms). The `sa` and agent passwords are Docker secrets that a wrapper exports for the server and the dev entrypoint only (`sqlserver.sh` checks that no password is in the container's environment). Nothing published |
+| `mssql-client` | the same image | One-shot clients (`tools` profile): its `sqlcmd` and `bcp` (ODBC Driver 18: encryption mandatory, the server certificate verified against the dev CA through `SSL_CERT_FILE`, host name `sqlserver`), as the test logins `e2e_exporter`, `e2e_analyst` and `e2e_admin` (never the agent's login); passwords read from the secret file inside the container (`bcp` reads it on stdin), table lists and statements on stdin, rows to `/dev/null` |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Target `mssql-e2e` (`engine: sqlserver`, host `sqlserver`, `tls: auto` with the dev CA as `ca_file`, `databases: [retail]`, `rls_visibility: view_definition`, `audit: {source: sqlserver_audit, audit_name: databastion_audit}`) |
+
+**Scenario.**
+1. The image is the dev service's pin; the server reports 2022 (16.x) and `EngineEdition` 4
+   (Express). The agent login holds exactly `CONNECT SQL`, `VIEW ANY SECURITY DEFINITION` and
+   `VIEW SERVER SECURITY AUDIT` on the server, no server role, and in `retail` exactly `CONNECT`,
+   `VIEW DEFINITION`, `SELECT` on the schemas `crm` and `finance` and on the three columns of
+   `cas.cas_tickets`, no database role (I4). The test logins are created as `sa` before the agent
+   starts (the stream skips the audit's history at its first start): `e2e_exporter` and
+   `e2e_analyst` with `SELECT` on `crm` and `finance`, `e2e_admin` with `ALTER ANY LOGIN` only.
+2. The agent is online; the console lists `engine.sqlserver`, so the target is reported, reachable,
+   checked over **mandatory** encryption (SQL Server 2022 on Linux has no TDS 8.0 strict mode: the
+   `auto` fallback, certificate verified; the agent's `SQL Server checked` line), audit level
+   **Limited** from `sqlserver_audit` before any stream runs. Negative TLS control: a second target
+   entry, `mssql-e2e-wrong-ca`, declares the same server with the console's test CA as `ca_file`
+   (a CA that did not sign the server certificate); it must be reported unreachable with
+   `check.stage_failed` labelled `stage_tls` (the contract has no TLS failure code). The connector's
+   integration test `untrusted_certificate_is_refused` covers the same refusal against the dev
+   server.
+3. Three `access_event` policies (`signature.bcp` or `shape.full_table_read`, critical; every
+   `read`; every `dcl`), Audit enabled. Discovery while the stream runs:
+   [`i2_check.py findings`](i2_check.py) with every expected classifier and no negative control,
+   the value-bearing table stored under its normalized name.
+4. The heartbeat level becomes **Partial** (`sqlserver_audit`) with `audit.log_without_row_counts`
+   and none of the pending, dropped, not-logged, filtered, not-configured, refused, unused-grant,
+   stopped or failed-check notes. 25 s after the scan, **no event at all** on the target: the
+   agent's `check()`, Discovery and audit polls are left out (positive control at the end: the
+   audit file holds `SL` records of the agent's login).
+5. Traffic: `bcp out` of the seven readable tables of `crm` and `finance` and a whole-table
+   `SELECT` as `e2e_exporter` (the time from its start to the critical incident on the console is
+   printed, limit 120 s); two filtered `SELECT`s whose literals are a ground-truth e-mail and IBAN as
+   `e2e_analyst`; `CREATE LOGIN`, `ALTER LOGIN … WITH PASSWORD` (random marker passwords) and
+   `DROP LOGIN` as `e2e_admin`.
+6. Events and incidents: the exporter's events carry `signature.bcp` and `shape.full_table_read`;
+   the analyst's are exactly 2 reads naming `crm.customers` and `finance.payment_cards`; the
+   admin's exactly 3 `dcl`; every event's source is `sqlserver_audit`; an incident of each policy
+   for its principal; [`i2_check.py audit`](i2_check.py) (no event or incident of the agent's
+   login, no raw value-bearing name in an object). Positive controls in SQL Server's own audit file
+   (read as `sa`): the analyst's literals are there, and the `CREATE LOGIN` statement (the server
+   masks its password itself; the run logs whether a marker is there).
+7. I2: the console database dump, the Audit tables, the pages (findings, events, incidents and each
+   incident, the agent, the target's Audit settings, `GET /api/agents`), the agent's state and every
+   log but the target's: no ground-truth value of `sqlserver`; the literals alone; the marker
+   passwords (whole, 16-character windows, base64 / hex; `scan --secret-file`). No generated secret
+   in any log (the target's included), the console database, the pages or the agent's state.
+
+Not covered: the Extended Events source (`sqlserver_xevents`; a second target on the same server
+would see the first target's sessions as another login's), SQL Server 2019 and 2025 (the
+connector's integration tests and the engine matrix cover them).
+
+```sh
+e2e/sqlserver.sh                     # about 7 minutes once the images exist
+E2E_SKIP_BUILD=1 e2e/sqlserver.sh    # reuse databastion-console:e2e and databastion-agent:e2e
+```
+
+## Valkey and Redis targets
+ROADMAP P9-D, [ADR-0052](../docs/adr/0052-redis-valkey-connector.md) decision 13 ("End to end"):
+a Valkey target and a Redis one with Discovery, Audit from the slow log and the I2 check on values
+**and key names**. [`redis.sh`](redis.sh) merges [`docker-compose.redis.yml`](docker-compose.redis.yml)
+over this stack (Compose project `databastion-e2e-redis`) and starts only `db`, `migrate`, `web`,
+`worker`, `proxy`, `redis-tls-init`, `target-valkey`, `target-redis` and `agent`; the client traffic
+comes from [`redis_scenario.py`](redis_scenario.py) on the host (Python standard library, a
+minimal RESP2 client over TLS; unit tests in [`test_redis_scenario.py`](test_redis_scenario.py)).
+The CI job is `e2e-redis` in [`ci.yml`](../.github/workflows/ci.yml) (40 min budget, `redis.sh` at
+most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `shared/`, `e2e/`,
+`deploy/initdb/`, `dev/redis/`, `dev/seed/out/redis.txt`, `dev/ground-truth.json`,
+`dev/docker-compose.yml` or `ci.yml` change.
+
+| Service | Image | Role |
+|---------|-------|------|
+| `redis-tls-init` | PostgreSQL 17 (pinned, for its `openssl`) | One-shot, no network: [`dev/redis/tls-init.sh`](../dev/redis/tls-init.sh), a dev CA (key deleted at once) and a server certificate naming `valkey`, `redis`, `localhost` and `127.0.0.1` |
+| `target-valkey`, `target-redis` | Valkey 9.0.6, Redis 8.10.2 (the dev pins) | The dev services' setup ([`dev/redis/entrypoint.sh`](../dev/redis/entrypoint.sh)): the committed keyspace [`dev/seed/out/redis.txt`](../dev/seed/out/redis.txt) (keys in `db0` and `db1`, names that embed e-mail addresses and phone numbers), the agent's ACL user `databastion` with the ADR-0052 decision 4 allow-list, `default` off, TLS only on TCP, the slow log at every command (`slowlog-log-slower-than 0`, 1024 entries); the test clients' ACL users from a file of `user` lines written by `redis.sh` (`DATABASTION_DEV_REDIS_EXTRA_ACL`, passwords as SHA-256): `e2e_exporter` (`+@read`, `SYNC` / `PSYNC`), `e2e_analyst` (`+@read`). The agent and admin passwords are Docker secrets that a wrapper exports for the entrypoint only; the admin password reaches `redis-cli` / `valkey-cli` through `REDISCLI_AUTH`, never their command line. On `agent-net` (aliases `valkey`, `redis`) and `redis-net`, which publishes their TLS port on `127.0.0.1:${E2E_VALKEY_PORT:-16379}` / `${E2E_REDIS_PORT:-16389}` for the host-side client (certificate verified against the same CA); the agent is not on `redis-net` |
+| `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Targets `valkey-e2e` (`engine: valkey`, host `valkey`) and `redis-e2e` (`engine: redis`, host `redis`): `tls: verify_full` with the dev CA as `ca_file`, the agent's defaults otherwise (all key patterns, every database) |
+
+**Scenario**, for each target.
+1. The images are the dev services' pins. As `admin` on the server's socket: `default` is off, and
+   `ACL DRYRUN` refuses the agent's user writes, `CONFIG`, `FLUSHALL`, `KEYS`, `MONITOR`, `DEBUG`,
+   `EVAL` and `ACL LIST`, and allows `SCAN`, `TYPE`, `GETRANGE`, `SLOWLOG GET`, `INFO` and
+   `CLIENT LIST` (I4).
+2. The agent is online; the console lists `engine.redis` and `engine.valkey`, so both targets are
+   reported, reachable, as the engine they are (no `check.server_is_*` note), level **None** before
+   Audit. Negative TLS control: a third target entry, `valkey-e2e-wrong-ca`, declares the Valkey
+   server with the console's test CA as `ca_file`; it must be reported unreachable with
+   `check.stage_failed` labelled `stage_tls`. The Redis connector has no integration test of a
+   refused certificate; this step is its only end-to-end check.
+3. Discovery before Audit: [`i2_check.py findings`](i2_check.py) with every expected classifier, no
+   negative control, the value-bearing key names stored under their normalized patterns
+   (`user:*:profile`, `*:*`). Two `access_event` policies (`shape.keyspace_enumeration` or
+   `signature.full_sync`, critical; every `read`), Audit enabled (contract defaults: 10 s polls).
+4. A second Discovery scan while the streams run (`E2E_REDIS_SCAN_UNDER_AUDIT=0` skips it); 25 s
+   later, **no event at all** on either target: the agent's `check()`, Discovery and polls are left
+   out (positive control at the end: the slow log holds entries from the agent's address). The
+   diagnostic on failure prints the events' kind, objects and counts, and the command names (never
+   the arguments) of the agent's slow-log entries.
+5. Traffic from the host: a sweep as `e2e_exporter` (`KEYS *` on `db0` and `db1`, then every key's
+   `TYPE` and whole value), the connection opened 3 s before its first command and held 15 s after
+   its last one (the agent attributes an entry to a user through the connection still open at its
+   poll, and older than the entry); three reads as `e2e_analyst` of keys whose names embed a
+   ground-truth e-mail or phone number (from a private file, never a command line); a full
+   synchronization (`SYNC`, as `redis-cli --rdb` does: the RDB payload counted and discarded),
+   whose `INFO stats` `sync_full` must grow (measured: it does, on both).
+6. Events and incidents: the exporter's events carry `shape.keyspace_enumeration` (attributed to
+   `e2e_exporter`); one event with `signature.full_sync` and no recorded account
+   (`account_not_recorded`); at least 3 reads of `e2e_analyst`; a critical incident for the
+   exporter and one without a principal (the full sync), a read incident for the analyst;
+   [`i2_check.py audit`](i2_check.py) (no event of the agent's user, no raw key name in an object);
+   no event from the agent's address. The level becomes **Limited** (`redis_slowlog`,
+   `audit.slow_operations_only`). The analyst's objects are `*`: the keyspace spans `db0` and
+   `db1` and slow-log entries carry no database, so no database's learned patterns apply (docs/08).
+   Positive control: the server's slow log (read as `admin`) holds the analyst's key names.
+7. I2, for the `valkey` and `redis` ground-truth engines: the console database dump, the Audit
+   tables, the pages, the agent's state and every log but the targets': no ground-truth value or
+   value-bearing key or field name; the analyst's key names alone; no generated secret in any log
+   (the targets' included), the console database, the pages or the agent's state.
+
+**Residual: egress of the targets.** `redis-net` is an ordinary (not internal) bridge network: the
+host-side client needs a published port, and Docker publishes no port from an internal network.
+So `target-valkey` and `target-redis` can open outbound connections to the internet for the run's
+length (nothing in them does: the pinned dev images, the server only). The agent is not on
+`redis-net`, and nothing listens outside `127.0.0.1`. Running the client from a container on
+`agent-net` instead (an image with Python, pinned by digest) would remove it; not done yet.
+
+**Known issue (agent, found by this scenario).** On Valkey 9.0.6, the agent's own Discovery
+sampling commands read by the stream while it runs come back as one aggregated `read` of `*` by the
+agent's own user (about 200 entries at the agent's default `max_sample_rows`, about 550 at 100);
+Redis 8.10.2 leaves them out in the same run. Step 4 fails on it until the agent is fixed.
+
+```sh
+e2e/redis.sh                                  # about 8 minutes once the images exist
+E2E_SKIP_BUILD=1 e2e/redis.sh                 # reuse databastion-console:e2e and databastion-agent:e2e
+E2E_REDIS_SCAN_UNDER_AUDIT=0 e2e/redis.sh     # without the Discovery scan under Audit (step 4)
+```
+
 ## Load / database impact
 The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to
 measure the database CPU impact of Discovery, the Audit path under a sustained workload and the
 agent's resource use, and, with [`load/cas.sh`](load/README.md#cas-target), the CAS target under a
-login workload. It runs in its own workflow, outside the required `CI result` check.
+login workload, with [`load/sqlserver.sh`](load/README.md#sql-server-target) the SQL Server target and
+with [`load/redis.sh`](load/README.md#valkey-and-redis-targets) a Valkey (or Redis) target, on the
+compose files of the scenarios above. It runs in its own workflow, outside the required `CI result`
+check.

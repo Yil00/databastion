@@ -1,0 +1,24 @@
+# Valkey / Redis load run (e2e/load/redis.sh, e2e/load/README.md "Valkey and Redis targets"): merged
+# over e2e/docker-compose.yml and e2e/docker-compose.redis.yml (project databastion-load-redis).
+# Only the measurement settings change: the targets get a fixed CPU limit (their "capacity"), their
+# healthchecks run every 2 s while starting, then every 60 s (each check is a process in the
+# measured cgroup), and the agent waits for the proxy only (the run starts one target:
+# LOAD_REDIS_ENGINE).
+
+services:
+  target-valkey:
+    cpus: ${LOAD_DB_CPUS:-2}
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 300s
+  target-redis:
+    cpus: ${LOAD_DB_CPUS:-2}
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 300s
+  agent:
+    depends_on: !override
+      proxy:
+        condition: service_started

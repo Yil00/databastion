@@ -29,6 +29,8 @@ jobs:
       oidc: ${{ steps.e2e.outputs.oidc }}
       cas: ${{ steps.e2e.outputs.cas }}
       sqlserver: ${{ steps.e2e.outputs.sqlserver }}
+      e2e_sqlserver: ${{ steps.e2e.outputs.e2e_sqlserver }}
+      e2e_redis: ${{ steps.e2e.outputs.e2e_redis }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,6 +98,23 @@ jobs:
             sqlserver=false
           fi
           echo "sqlserver=$sqlserver" | tee -a "$GITHUB_OUTPUT"
+          # SQL Server target end to end (e2e/sqlserver.sh, the 2.3 GB image): the agent, the console,
+          # the e2e harness, the SQL Server dev service and its seed, the ground truth, the compose
+          # file (image pin) and this workflow.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/sqlserver/|dev/seed/out/sqlserver\.sql$|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e_sqlserver=true
+          else
+            e2e_sqlserver=false
+          fi
+          echo "e2e_sqlserver=$e2e_sqlserver" | tee -a "$GITHUB_OUTPUT"
+          # Valkey and Redis targets end to end (e2e/redis.sh): the same, with the Redis / Valkey dev
+          # services and their keyspace.
+          if [ -z "$changed" ] || grep -qE '^(agent/|console/|shared/|e2e/|deploy/initdb/|dev/redis/|dev/seed/out/redis\.txt$|dev/ground-truth\.json$|dev/docker-compose\.yml$|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            e2e_redis=true
+          else
+            e2e_redis=false
+          fi
+          echo "e2e_redis=$e2e_redis" | tee -a "$GITHUB_OUTPUT"
           if [ -z "$changed" ] || { [ "$EVENT" = pull_request ] && [ "$BASE_REF" = main ]; } \
               || grep -qE '^(agent/|console/|deploy/|\.github/workflows/(ci|packaging|publish|release)\.yml$|\.github/scripts/)' <<<"$changed"; then
             packaging=true
@@ -880,6 +899,101 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # End-to-end SQL Server target (e2e/README.md "SQL Server target", ROADMAP P9-D, ADR-0051
+  # "End-to-end and load"): the console and agent images with the dev SQL Server 2022 Express
+  # service (Express: ADR-0051 open question 13; dev CA, forced encryption, the seed, the agent
+  # login of the minimal variant, the server audit): the login's grants, the target's TLS mode and
+  # honest audit level (Limited, then Partial from SQL Server Audit), Discovery against
+  # dev/ground-truth.json, the agent's own statements never reported, Audit (bcp out and a
+  # whole-table SELECT raising a critical incident, filtered SELECTs with ground-truth literals,
+  # CREATE / ALTER LOGIN with marker passwords) and I2 (no ground-truth value, literal or marker in
+  # the console database, the logs, the pages or the agent's state; no secret in any log). A job of
+  # its own, with its own path filter: the image is 2.3 GB (amd64 only). Required through ci-result.
+  e2e-sqlserver:
+    name: E2E SQL Server target
+    needs: detect
+    if: needs.detect.outputs.e2e_sqlserver == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-sqlserver-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/sqlserver.sh e2e/lib.sh
+      - name: Unit tests of the I2 leak scanner
+        run: timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
+      - name: Run e2e/sqlserver.sh
+        # Within the job budget (45 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 2280 e2e/sqlserver.sh
+      # sqlserver.sh redacts every generated secret and the DCL marker passwords from the logs on
+      # exit, whatever the result (and masks them in the job log).
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-logs
+          path: e2e-sqlserver-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # End-to-end Valkey and Redis targets (e2e/README.md "Valkey and Redis targets", ROADMAP P9-D,
+  # ADR-0052 decision 13): the console and agent images with the dev Valkey 9.0 and Redis 8.10
+  # services (dev CA, TLS only, the keyspace, the agent's ACL user): the ACL allow-list, the
+  # targets' honest audit level (None, then Limited from the slow log), Discovery against
+  # dev/ground-truth.json (key names that embed values stored normalized), the agent's own commands
+  # never reported (a Discovery scan with Audit on included), Audit (a KEYS * sweep and a SYNC full
+  # synchronization raising critical incidents, reads of value-bearing key names) and I2 (no
+  # ground-truth value or key name in the console database, the logs, the pages or the agent's
+  # state; no secret in any log). Required through ci-result.
+  e2e-redis:
+    name: E2E Valkey and Redis targets
+    needs: detect
+    if: needs.detect.outputs.e2e_redis == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-redis-logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+          shellcheck --version | head -n 2
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/redis.sh e2e/lib.sh dev/redis/entrypoint.sh
+      - name: Unit tests of the scenario driver and the I2 leak scanner
+        run: |
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_redis*.py' -v
+          timeout 120 python3 -m unittest discover -s e2e -p 'test_i2*.py' -v
+      - name: Run e2e/redis.sh
+        # Within the job budget (40 min, checkout and unit tests included): cleanup always completes.
+        run: timeout 1980 e2e/redis.sh
+      # redis.sh redacts every generated secret from the logs on exit, whatever the result (and
+      # masks them in the job log).
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-redis-logs
+          path: e2e-redis-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # RELEASE.md section 7 "Compatibility": e2e/run.sh with the console from this PR and the agent of
   # the previous release (its signed image, verified with the exact tag identity and pulled by
   # digest; .github/workflows/e2e-compat.yml, e2e/README.md "Compatibility with the previous agent").
@@ -910,7 +1024,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

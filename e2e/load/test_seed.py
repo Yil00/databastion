@@ -182,5 +182,88 @@ const print = (x) => console.error(String(x));
                         self.assertEqual(d[k], ref[k], (t.mongo_name, k))
 
 
+
+class SqlServerTest(unittest.TestCase):
+    """The T-SQL generators (run against SQL Server 2022 Express by e2e/load/sqlserver.sh)."""
+
+    def test_seed_shape(self) -> None:
+        p = seed.plan(45, 9000)
+        sql = seed.sqlserver_sql(p, batch=20)
+        self.assertEqual(sql.count("CREATE TABLE load.t"), 45)
+        self.assertEqual(sql.count("INSERT INTO load.t"), 45)
+        self.assertIn("USE retail;", sql)
+        # One batch per 20 tables, then the grants in a batch of their own.
+        self.assertEqual(sql.count("\nGO\n"), 1 + 2 + 2)
+        self.assertIn("GRANT SELECT ON SCHEMA::load TO databastion;", sql)
+        self.assertIn("GRANT SELECT ON SCHEMA::load TO load_app;", sql)
+        for t in p:
+            self.assertIn(f"GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))", sql)
+        # No value literal of a row: the server generates them.
+        self.assertNotIn("@inbox.example.com", sql)
+
+    def test_iban_expression_matches_the_reference(self) -> None:
+        # The T-SQL builds the same BBAN as bban(): bank code, table index on 5 digits, row id on
+        # 11 digits, row id mod 97 on 2 digits; the check digits are 98 - (BBAN || "152700") mod 97.
+        for table, row in ((1, 1), (7, 12345), (400, 99999999)):
+            b = seed.bban(table, row)
+            self.assertEqual(len(b), 23)
+            check = 98 - int(b + "152700") % 97
+            self.assertEqual(f"FR{check:02d}{b}", seed.fr_iban(b))
+            self.assertTrue(iban_valid(seed.fr_iban(b)))
+
+    def test_workload_script(self) -> None:
+        p = seed.plan(50, 100000)
+        hot = seed.workload_tables(p, 40)
+        sql = seed.tsql_workload(hot)
+        self.assertEqual(sql.count("SELECT @v = note FROM load.t"), 40)
+        for k, t in enumerate(hot):
+            self.assertIn(f"@k = {k} SELECT @v = note FROM load.t{t.tag} WHERE id = 1 + @r % {t.rows};", sql)
+        # The only sqlcmd variable is in the first batch: the loop's text is the same everywhere.
+        first, loop = sql.split("\nGO\n")
+        self.assertIn("SET CONTEXT_INFO $(CTX);", first)
+        self.assertNotIn("$(", loop)
+        self.assertIn("% 40;", loop)
+        self.assertIn("SELECT CONCAT('RESULT '", loop)
+
+    def test_context(self) -> None:
+        ctx = seed.tsql_context(13500, 13333, 4)
+        self.assertEqual(ctx, "0x" + "00000000000034bc" + "0000000000003415" + "0000000000000004")
+        raw = bytes.fromhex(ctx[2:])
+        self.assertEqual([int.from_bytes(raw[i:i + 8], "big") for i in (0, 8, 16)], [13500, 13333, 4])
+        with self.assertRaises(ValueError):
+            seed.tsql_context(-1, 1, 1)
+
+    def test_cli(self) -> None:
+        out = subprocess.run([sys.executable, os.path.join(os.path.dirname(seed.__file__), "seed.py"),
+                              "tsql", "--tables", "10", "--rows", "2000", "--workload-tables", "4"],
+                             capture_output=True, text=True, timeout=60, check=True).stdout
+        self.assertEqual(out.count("SELECT @v = note FROM load.t"), 4)
+
+
+class RedisTest(unittest.TestCase):
+    def test_lua_shape(self) -> None:
+        lua = seed.redis_lua()
+        self.assertIn('redis.call("SET", "load:s:" .. g, email)', lua)
+        self.assertIn('redis.call("HSET", "load:h:" .. g', lua)
+        self.assertIn("tonumber(ARGV[1]), tonumber(ARGV[2])", lua)
+        for name in seed.FIRST_NAMES + seed.LAST_NAMES + seed.MAIL_DOMAINS:
+            self.assertIn(f'"{name}"', lua)
+
+    def test_lua_values_match_the_reference(self) -> None:
+        # The Lua e-mail and phone formulas, evaluated in Python for a few ids, equal email() and
+        # phone() of table 1 (Lua tables are 1-based; floor division as math.floor).
+        nf, nl, nd = len(seed.FIRST_NAMES), len(seed.LAST_NAMES), len(seed.MAIL_DOMAINS)
+        for g in (1, 19, 20, 399, 400, 123456, 1000000):
+            lua_email = (seed.FIRST_NAMES[g % nf] + "." + seed.LAST_NAMES[(g // nf) % nl] + str(g // (nf * nl))
+                         + "@" + seed.MAIL_DOMAINS[(g + 1) % nd])
+            self.assertEqual(lua_email, seed.email(1, g))
+            self.assertEqual("+33 6 39 98 01 %02d" % (g % 100), seed.phone(1, g))
+        self.assertIn('"+33 6 39 98 01 %02d"', seed.redis_lua())
+
+    def test_cli(self) -> None:
+        out = subprocess.run([sys.executable, os.path.join(os.path.dirname(seed.__file__), "seed.py"),
+                              "redis", "--rows", "1000"], capture_output=True, text=True, timeout=60, check=True).stdout
+        self.assertTrue(out.startswith("local F = {"))
+
 if __name__ == "__main__":
     unittest.main()

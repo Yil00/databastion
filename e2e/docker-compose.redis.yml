@@ -1,0 +1,137 @@
+# Valkey and Redis targets end to end (ROADMAP P9-D, ADR-0052 decision 13): merged over
+# docker-compose.yml by e2e/redis.sh only (`-f docker-compose.yml -f docker-compose.redis.yml`,
+# project databastion-e2e-redis), and by e2e/load/redis.sh with its own overlay. The main e2e run
+# (run.sh) never reads this file. Only db, migrate, web, worker, proxy, bootstrap-admin,
+# redis-tls-init, target-valkey, target-redis, agent and agent-files are started: none of the other
+# targets of docker-compose.yml.
+#
+#   redis-tls-init  one-shot (dev/redis/tls-init.sh, as dev): a throwaway CA and a server certificate
+#                   naming valkey, redis, localhost and 127.0.0.1, on the redis-tls volume (the CA
+#                   key is deleted at once).
+#   target-valkey,  the dev services' images and setup (dev/redis/entrypoint.sh: the committed
+#   target-redis    keyspace dev/seed/out/redis.txt, the agent's ACL user `databastion` with the
+#                   ADR-0052 decision 4 allow-list, `default` off, TLS only on TCP, the slow log at
+#                   every command). Valkey is the default dev service (BSD-3); Redis 8 is licensed
+#                   RSALv2 / SSPLv1 / AGPLv3 (dev/README.md). The passwords come from Docker
+#                   secrets, exported by the wrapper below for the server's entrypoint only (never
+#                   in the container's environment, so never in `docker inspect`). The test clients'
+#                   ACL users (e2e_exporter, e2e_analyst, load_app) come from a file of `user` lines
+#                   (passwords as SHA-256 hashes) written by redis.sh. On agent-net (aliases `valkey`
+#                   and `redis`, the names in the certificate) for the agent; their TLS port is
+#                   published on 127.0.0.1 only, through redis-net, for the host-side client
+#                   (e2e/redis_scenario.py, certificate verified against the same CA).
+
+x-valkey-image: &valkey-image ${E2E_VALKEY_IMAGE:-valkey/valkey:9.0.6@sha256:63346cb24a61221e76bdf41acce99b3968a9fa83d8122144deab45394b27b4f2}
+x-redis-image: &redis-image ${E2E_REDIS_IMAGE:-redis:8.10.2@sha256:2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6}
+
+x-redis-target: &redis-target
+  user: "999:999"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  entrypoint: ["/bin/bash", "-euc"]
+  command:
+    - |
+      DATABASTION_DB_PASSWORD="$$(cat /run/secrets/target_agent_password)"
+      REDIS_ADMIN_PASSWORD="$$(cat /run/secrets/target_redis_admin_password)"
+      export DATABASTION_DB_PASSWORD REDIS_ADMIN_PASSWORD
+      exec /bin/bash /usr/local/bin/databastion-entrypoint.sh
+  environment:
+    DATABASTION_DEV_REDIS_SLOWLOG_US: "0"
+    DATABASTION_DEV_REDIS_SLOWLOG_MAX_LEN: "${E2E_REDIS_SLOWLOG_MAX_LEN:-1024}"
+    DATABASTION_DEV_REDIS_EXTRA_ACL: /etc/e2e/redis-clients.acl
+  secrets: [target_agent_password, target_redis_admin_password]
+  tmpfs: [/tmp]
+  depends_on:
+    redis-tls-init: {condition: service_completed_successfully}
+  healthcheck:
+    # As dev's: a marker, so the check never sends a command (no slow-log or ACL LOG noise).
+    test: ["CMD", "bash", "-c", "test -f /tmp/databastion-ready && exec 3<>/dev/tcp/127.0.0.1/6379"]
+    interval: 2s
+    timeout: 5s
+    retries: 90
+
+services:
+  redis-tls-init:
+    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    entrypoint: ["sh", "/usr/local/bin/tls-init.sh"]
+    volumes:
+      - ../dev/redis/tls-init.sh:/usr/local/bin/tls-init.sh:ro
+      - redis-tls:/tls
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  target-valkey:
+    <<: *redis-target
+    image: *valkey-image
+    volumes:
+      - valkey-data:/data
+      - redis-tls:/tls:ro
+      - ../dev/redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
+      - ../dev/seed/out/redis.txt:/seed/redis.txt:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/redis/clients.acl:/etc/e2e/redis-clients.acl:ro
+    ports:
+      - "127.0.0.1:${E2E_VALKEY_PORT:-16379}:6379"
+    networks:
+      agent-net:
+        aliases: [valkey]
+      redis-net: {}
+
+  target-redis:
+    <<: *redis-target
+    image: *redis-image
+    volumes:
+      - redis-data:/data
+      - redis-tls:/tls:ro
+      - ../dev/redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
+      - ../dev/seed/out/redis.txt:/seed/redis.txt:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/redis/clients.acl:/etc/e2e/redis-clients.acl:ro
+    ports:
+      - "127.0.0.1:${E2E_REDIS_PORT:-16389}:6379"
+    networks:
+      agent-net:
+        aliases: [redis]
+      redis-net: {}
+
+  agent:
+    # Only the mounts of this run: agent.yaml, the console CA, the secrets volume and the dev CA of
+    # the Valkey and Redis targets (copied out of target-valkey by redis.sh; never the server key).
+    group_add: !reset []
+    volumes: !override
+      - agent-state:/var/lib/databastion
+      - agent-secrets:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/agent/agent.yaml:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/tls/redis-ca.pem:/etc/databastion/redis-ca.pem:ro
+    depends_on: !override
+      proxy:
+        condition: service_started
+      target-valkey:
+        condition: service_healthy
+      target-redis:
+        condition: service_healthy
+
+  agent-files:
+    volumes: !override
+      - agent-state:/state
+      - agent-secrets:/secrets
+
+networks:
+  # The published TLS ports of the targets (an internal network cannot publish one); the agent is
+  # not on it.
+  redis-net: {}
+
+volumes:
+  redis-tls: {}
+  valkey-data: {}
+  redis-data: {}
+
+secrets:
+  target_redis_admin_password:
+    file: ${E2E_WORK_DIR:?set by redis.sh}/secrets/target_redis_admin_password
