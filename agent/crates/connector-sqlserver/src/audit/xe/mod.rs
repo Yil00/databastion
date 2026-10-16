@@ -716,16 +716,22 @@ async fn read(
     // calibrates its session (own::calibrate), before any own rule.
     own::calibrate(&target_id, &readbacks(&records, &st.target.account));
     let mut below_floor: Vec<usize> = Vec::new();
-    records.retain(
-        |r| match st.cursor.below(r.time_us, read_started_ms, delay) {
+    // The records handled, by order (`max_seen_us`): those of this read
+    // before a cut only, set below.
+    let handled: Vec<(usize, i64)> = records.iter().map(|r| (r.index, r.time_us)).collect();
+    let mut seen = st.cursor.max_seen_us;
+    records.retain(|r| {
+        let class = st.cursor.below(r.time_us, seen, delay);
+        seen = Cursor::seen(seen, r.time_us);
+        match class {
             Some(Below::History) => false,
             Some(Below::Dropped) => {
                 below_floor.push(r.index);
                 false
             }
             None => true,
-        },
-    );
+        }
+    });
     if st.skip > 0 {
         let n = (st.skip as usize).min(records.len());
         records.drain(..n);
@@ -801,7 +807,12 @@ async fn read(
         }
     }
     let prev_history = st.cursor.history_us;
+    let seen = handled
+        .iter()
+        .filter(|(i, _)| cut.is_none_or(|at| *i < at))
+        .fold(st.cursor.max_seen_us, |m, (_, t)| Cursor::seen(m, *t));
     st.cursor = next;
+    st.cursor.max_seen_us = seen;
     if !b.full && cut.is_none() {
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
