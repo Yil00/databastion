@@ -150,12 +150,13 @@ pub(crate) struct LogEntry {
     pub(crate) peer: Option<Peer>,
     pub(crate) app: Option<String>,
     pub(crate) own: OwnShape,
-    /// For one of the agent's sampling shapes ([`OwnShape::Keyed`]) when
-    /// the log's database is not known: the learned pattern the key
-    /// matches as a whole in each database where it does, by database
-    /// index. The own-read budget is kept per pattern (decision 8), while
-    /// the event's object is matched against the patterns learned in
-    /// every database and is mostly `*`. Empty: the event's objects.
+    /// For one of the agent's sampling shapes ([`OwnShape::Keyed`]): the
+    /// learned pattern the key matches as a whole in each database where
+    /// it does, by database index. The own-read budget is kept per
+    /// pattern (decision 8) and scaled (refinement of 2026-10-16), while
+    /// the event's object, when several databases hold keys, is matched
+    /// against the patterns learned in every database and is mostly `*`.
+    /// Empty: the event's objects, within the plain budget.
     pub(crate) budget: Vec<(u16, NormalizedName)>,
 }
 
@@ -163,9 +164,8 @@ pub(crate) struct LogEntry {
 pub(crate) struct Context<'a> {
     pub(crate) learned: &'a LearnedPatterns,
     pub(crate) stores: Option<&'a CasStores>,
-    /// When the log's database is not known (several databases hold
-    /// keys): each such database's learned patterns, for the own-read
-    /// budget only ([`LogEntry::budget`]); empty otherwise.
+    /// Each database holding keys with its learned patterns, for the
+    /// own-read budget only ([`LogEntry::budget`]).
     pub(crate) dbs: &'a [(u16, &'a LearnedPatterns)],
 }
 
@@ -376,7 +376,10 @@ fn budget_of(
             continue;
         }
         for (db, set) in ctx.dbs {
-            if let Some(p) = set.pattern_of(key) {
+            // A pattern the second gate turned into `*` is no pattern: the
+            // `*` key keeps the plain budget (ADR-0052 refinement of
+            // 2026-10-16, condition 3).
+            if let Some(p) = set.pattern_of(key).filter(|p| p.as_str() != "*") {
                 let entry = (*db, p);
                 if out.len() < MAX_OBJECTS && !out.contains(&entry) {
                     out.push(entry);

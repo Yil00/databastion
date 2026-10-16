@@ -23,9 +23,12 @@
 //! - **The agent's own entries** ([`own`], H3): by connection id or by the
 //!   `addr:port` of one of its connections within its lifetime, never by
 //!   user or client name; left out only for its own command shapes and
-//!   within the own-read budget, kept per learned pattern (when several
-//!   databases hold keys, the pattern the key matches in each database
-//!   where it does, since the event's object is then mostly `*`). Each
+//!   within the own-read budget, kept per learned pattern (the pattern the
+//!   key matches whole in each database where it does, since the event's
+//!   object is mostly `*` when several databases hold keys), scaled by the
+//!   most one sampled key costs (`max_sample_rows × PER_KEY_MAX`); a key
+//!   no pattern matches whole is charged to the event's object within the
+//!   plain `max_sample_rows`. Each
 //!   session records the address the server reports for it at connect
 //!   time (`CLIENT LIST ID`), so a session closed before the stream's next
 //!   `CLIENT LIST` is still recognized.
@@ -54,7 +57,7 @@ use databastion_core::{AuditConfig, ConnectorError, Engine, EventSink, FailureCo
 
 use crate::acl::AuditGrants;
 use crate::check::CheckState;
-use crate::cmd::{Cmd, CommandLog, InfoSection};
+use crate::cmd::{Cmd, CommandLog, InfoSection, PER_KEY_MAX};
 use crate::conn::Session;
 use crate::error::{RdError, Stage};
 use crate::info::{self, Server};
@@ -521,13 +524,27 @@ impl Stream<'_> {
                     self.own
                         .routine_unbudgeted(&user, None, ClientSeen::NotRecorded, &ev)
                 }
+                OwnShape::Keyed { rows, .. } if e.budget.is_empty() => {
+                    // No learned pattern matches the key whole: the
+                    // event's object (`*`, or a learned prefix and `*`)
+                    // with the plain budget, never scaled.
+                    let charged = ev.clone().with_rows(Some(rows));
+                    self.own.routine(
+                        &user,
+                        None,
+                        ClientSeen::NotRecorded,
+                        &charged,
+                        Instant::now(),
+                    )
+                }
                 OwnShape::Keyed { rows, .. } => {
-                    let charged = if e.budget.is_empty() {
-                        ev.clone()
-                    } else {
-                        // The patterns the key matches in the databases
-                        // where it does, rather than the event's object
-                        // (`*` when the patterns differ between them).
+                    // The patterns the key matches whole, in each database
+                    // where it does (`db<n>` / pattern), rather than the
+                    // event's object (`*` when the patterns differ between
+                    // databases), each within the scaled budget
+                    // (`max_sample_rows × PER_KEY_MAX`, ADR-0052
+                    // refinement of 2026-10-16).
+                    let charged = {
                         let mut c = MaskedEvent::new(source, action, ev.principal().clone(), ts);
                         for (db, p) in &e.budget {
                             c = c.with_object(EventObject::new(
@@ -539,15 +556,16 @@ impl Stream<'_> {
                         for s in &e.signals {
                             c = c.with_signal(*s);
                         }
-                        c
-                    }
-                    .with_rows(Some(rows));
-                    self.own.routine(
+                        c.with_rows(Some(rows))
+                    };
+                    let scaled = self.own.budget().saturating_mul(PER_KEY_MAX);
+                    self.own.routine_within(
                         &user,
                         None,
                         ClientSeen::NotRecorded,
                         &charged,
                         Instant::now(),
+                        scaled,
                     )
                 }
             };
@@ -840,17 +858,15 @@ async fn poll(
     let offset_s = now_s - agent_now;
     let learned = st.state.audit.learned(&target_id);
     let (database, log_set) = log_database(&learned, &inf.keyspace);
-    // The own-read budget is kept per pattern (decision 8): when the log's
-    // database is not known, each database's patterns name the agent's
-    // own sampling reads for the budget (never for the event).
-    let budget_sets: Vec<(u16, &LearnedPatterns)> = if inf.keyspace.len() > 1 {
-        inf.keyspace
-            .iter()
-            .filter_map(|d| learned.dbs.get(d).map(|s| (*d, s.as_ref())))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // The own-read budget is kept per pattern (decision 8): each
+    // database's patterns name the agent's own sampling reads for the
+    // budget (never for the event, whose database is not known when
+    // several hold keys).
+    let budget_sets: Vec<(u16, &LearnedPatterns)> = inf
+        .keyspace
+        .iter()
+        .filter_map(|d| learned.dbs.get(d).map(|s| (*d, s.as_ref())))
+        .collect();
     let stores = st.target.cas_stores();
 
     // Logs.
