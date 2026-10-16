@@ -13,7 +13,8 @@
 //!   a given catalog state: the file pattern (from the catalog's folder,
 //!   the audit's name and GUID) is a literal of the text, never a
 //!   parameter (M1); the file name, the buffer offset and the row bound
-//!   are parameters. At most [`BATCH`] records per read (halved after a
+//!   and the records of the next buffer already handled (skipped on the
+//!   server) are parameters. At most [`BATCH`] records per read (halved after a
 //!   response over [`POLL_BYTES`]), each turned into a record as its row
 //!   ends; a full read is followed by another, within [`CATCH_UP`] (and
 //!   [`HISTORY_READS`] reads while the first start skips the history). Each poll gets a credit
@@ -21,7 +22,9 @@
 //! - **Position** (M4), persisted through the core: the file and the
 //!   offset of the last buffer read whole (a read starts after it,
 //!   measured), and how many records of the next buffer were already
-//!   handled, and the file pattern it belongs to. Another pattern (the
+//!   handled (skipped on the server by the next read, so a buffer of any
+//!   size is walked by reads of at most [`BATCH`]), and the file pattern
+//!   it belongs to. Another pattern (the
 //!   folder moved, the audit renamed or recreated) is another file set:
 //!   read from its start, a gap. A position the server refuses (error
 //!   33225) in the same set (rolled over) restarts at the oldest file,
@@ -77,12 +80,18 @@ use records::{Mapped, Record, Statement};
 /// Records read per poll (decision 6: at most 1 000). A record is at most
 /// about 9.3 KiB on the wire (an `nvarchar(4000)` statement, five
 /// `nvarchar(128)` names, a 260-character file name and the numbers), so a
-/// read of `BATCH + MAX_SKIP` rows stays under [`POLL_BYTES`] (security
-/// review of P9-A lot 2, L5: the agent's measured peak RSS is 42 MiB).
+/// read of `BATCH` rows stays under [`POLL_BYTES`] (security review of
+/// P9-A lot 2, L5: the agent's measured peak RSS is 42 MiB).
 pub(crate) const BATCH: usize = 500;
-/// Records of one buffer handled across polls at most; beyond, the rest
-/// of that buffer is dropped (a gap).
-pub(crate) const MAX_SKIP: u32 = 500;
+/// Records of one buffer handled across reads at most; beyond, the rest
+/// of that buffer is dropped (a gap). The handled records are skipped on
+/// the server (`sql::AUDIT_POLL_FROM`), so a read returns at most
+/// [`BATCH`] records whatever the buffer's size. A buffer holds about
+/// 500 KiB of records, often more than a read (measured on 2022 at 300
+/// statements/s: about 300 records, 789 after the stall of a rollover, up
+/// to 1 047 with other sessions' records; the P9-D load run lost the rest
+/// of such buffers while the bound was 500).
+pub(crate) const MAX_SKIP: u32 = 1_000_000;
 /// Smallest read after responses over [`POLL_BYTES`] (the read halves).
 const MIN_BATCH: usize = 16;
 /// Time spent catching up (full reads one after the other) per cycle.
@@ -328,7 +337,8 @@ pub(crate) struct Cursor {
     /// start of the file set).
     pub(crate) file: Option<String>,
     pub(crate) offset: i64,
-    /// Records of the buffer after it already handled.
+    /// Records of the buffer after it already handled (skipped on the
+    /// server by the next read).
     pub(crate) skip: u32,
     /// The file pattern (folder, audit name and GUID) the position belongs
     /// to: positions are never compared across file sets.
@@ -352,8 +362,9 @@ pub(crate) struct Cursor {
     /// The agent's wall clock (Unix ms) at the first start the floor was
     /// set at.
     pub(crate) floor_set_ms: i64,
-    /// Extended Events: the buffer (file, offset) whose first `skip`
-    /// events were handled (the server skips them, `sql::XE_POLL_FROM`).
+    /// The buffer (file, offset) whose first `skip` records were handled
+    /// (the server skips them, `sql::AUDIT_POLL_FROM`,
+    /// `sql::XE_POLL_FROM`).
     pub(crate) buffer: Option<(String, i64)>,
 }
 
@@ -544,40 +555,100 @@ impl Cursor {
     }
 }
 
-/// Where the next read starts, from what a read returned (`(file,
-/// offset)` of each record in order) and how many it asked for.
+/// The position after a read from `cursor` that returned records at
+/// `positions` (in order), `full` when more may follow; and whether one
+/// buffer went over [`MAX_SKIP`] (a gap). Both sources: the server skipped
+/// the first `cursor.skip` records after the position, all of the buffer
+/// `cursor.buffer`, and `key` orders the files of the set.
 ///
-/// A read starts after the buffer at the position (measured), so a
-/// buffer whose records may not all have come (the read was full) is
-/// read again next time, its records already handled skipped.
-pub(crate) fn advance(cursor: &Cursor, positions: &[(String, i64)], top: usize) -> Cursor {
+/// A read starts after the buffer at the position (measured), so the
+/// position stays before a buffer whose records may not all have come (a
+/// full read); its handled records are counted in `skip` and skipped by
+/// the server next time, so a buffer of any size is walked with reads of
+/// at most a batch, none read twice, none lost.
+///
+/// The skip counts the records read, while the server skips rows: a row
+/// of the last buffer that could not be parsed (dropped and counted as
+/// such) makes the next read start one row early. That row is then met
+/// again (counted again), or, when it came before the buffer's first
+/// record read, that record is read twice (reported twice, never lost):
+/// at most one per such row (lot 3 final review L2; the same holds for
+/// any full read).
+pub(crate) fn next_position(
+    cursor: &Cursor,
+    positions: &[(String, i64)],
+    full: bool,
+    key: FileKey,
+) -> (Cursor, bool) {
     let mut next = cursor.clone();
-    let Some(last) = positions.last() else {
-        return next;
-    };
-    let full = positions.len() >= top;
-    if !full {
-        next.file = Some(last.0.clone());
-        next.offset = last.1;
+    if let Some(last) = positions.last() {
+        let in_last = positions.iter().rev().take_while(|p| *p == last).count();
+        let before = positions.len() - in_last;
+        let skipped_buffer = cursor.buffer.as_ref().filter(|_| cursor.skip > 0);
+        if !full {
+            next.file = Some(last.0.clone());
+            next.offset = last.1;
+            next.skip = 0;
+            next.buffer = None;
+        } else if skipped_buffer == Some(last) {
+            // Still the buffer whose first records were skipped.
+            next.skip = cursor
+                .skip
+                .saturating_add(u32::try_from(in_last).unwrap_or(u32::MAX));
+        } else {
+            // The last buffer may continue: the position goes to the
+            // buffer before it (a returned one, else the skipped one, now
+            // read whole, else the position stays).
+            let prev = if before > 0 {
+                positions.get(before - 1).cloned()
+            } else {
+                skipped_buffer.cloned()
+            };
+            if let Some((f, o)) = prev {
+                next.file = Some(f);
+                next.offset = o;
+            }
+            next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
+            next.buffer = Some(last.clone());
+        }
+    }
+    // Nothing returned: the position and the skipped records stay. The
+    // filter of a refused position ends once the read passed it, and after
+    // any read that is not full (the set was read to its end).
+    let passed = cursor.after.is_some_and(|(k, offset)| {
+        positions
+            .last()
+            .and_then(|(f, o)| key(f).map(|lk| (lk, *o)))
+            .is_some_and(|last| last > (k, offset))
+    });
+    if passed || !full {
+        next.after = None;
+    }
+    let mut gap = false;
+    if next.skip > MAX_SKIP {
+        // One buffer larger than the bound: the rest of it is dropped.
+        if let Some(b) = next.buffer.take() {
+            next.file = Some(b.0);
+            next.offset = b.1;
+        }
         next.skip = 0;
-        return next;
+        gap = true;
     }
-    // The last buffer may continue: keep the position before it.
-    let in_last = positions.iter().rev().take_while(|p| *p == last).count();
-    let before = positions.len() - in_last;
-    if before == 0 {
-        // The whole read is one buffer (the first one after the position):
-        // the read started at that buffer again, so its records handled are
-        // exactly those it returned (re-review N1: adding the previous skip
-        // counted the re-read records twice and lost as many).
-        next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
-    } else {
-        let prev = &positions[before - 1];
-        next.file = Some(prev.0.clone());
-        next.offset = prev.1;
-        next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
+    if !full {
+        // Caught up: no history any more.
+        next.history_us = None;
     }
-    next
+    (next, gap)
+}
+
+/// What a read from `cursor` asks the server for: (rows, rows of the
+/// next buffer skipped on the server). The records of that buffer already
+/// handled are skipped on the server, so a read returns at most `batch`
+/// records however large the buffer (P9-D load run: a buffer of more than
+/// a read's records, read again from its start with a client-side skip
+/// over a bound, lost the rest of it).
+pub(crate) fn request(cursor: &Cursor, batch: usize) -> (usize, u32) {
+    (batch, cursor.skip)
 }
 
 /// The order key of an audit file of one file set, (timestamp,
@@ -644,67 +715,28 @@ pub(crate) struct Batch<T> {
     pub(crate) full: bool,
 }
 
-/// The records of a read (`returned` rows asked with `top`) from `cursor`:
-/// the records of the first buffer already handled skipped, those at or
-/// before a refused position left out, the next position, and the gaps.
+/// The records of a read from `cursor` (the server skipped the first
+/// `cursor.skip` records after the position, [`request`]), `returned`
+/// rows asked with `asked`: those at or before a refused position left
+/// out, the next position, and the gap ([`next_position`]).
 pub(crate) fn batch<T: Positioned>(
     cursor: &Cursor,
     records: Vec<T>,
     returned: usize,
-    top: usize,
-    file_key: FileKey,
+    asked: usize,
+    key: FileKey,
 ) -> Batch<T> {
     let positions: Vec<(String, i64)> = records
         .iter()
         .map(|r| (r.file().to_owned(), r.offset()))
         .collect();
-    let mut skip_first = cursor.skip as usize;
-    let first = positions.first().cloned();
-    let mut kept: Vec<T> = records
-        .into_iter()
-        .filter(|r| {
-            if skip_first > 0
-                && first
-                    .as_ref()
-                    .is_some_and(|(f, o)| f == r.file() && *o == r.offset())
-            {
-                skip_first -= 1;
-                return false;
-            }
-            true
-        })
-        .collect();
-    if let Some((key, offset)) = cursor.after {
+    let mut kept = records;
+    if let Some((k, offset)) = cursor.after {
         // A record of another form of name is kept (read again, loud).
-        kept.retain(|r| file_key(r.file()).is_none_or(|k| (k, r.offset()) > (key, offset)));
+        kept.retain(|r| key(r.file()).is_none_or(|rk| (rk, r.offset()) > (k, offset)));
     }
-    let full = returned >= top;
-    let mut next = advance(cursor, &positions, top);
-    // The filter ends once the read passed it, and after any read that is
-    // not full (the set was read to its end).
-    let passed = cursor.after.is_some_and(|(key, offset)| {
-        positions
-            .last()
-            .and_then(|(f, o)| file_key(f).map(|k| (k, *o)))
-            .is_some_and(|last| last > (key, offset))
-    });
-    if passed || !full {
-        next.after = None;
-    }
-    let mut gap = false;
-    if next.skip > MAX_SKIP {
-        // One buffer larger than the bound: the rest of it is dropped.
-        if let Some((f, o)) = positions.last() {
-            next.file = Some(f.clone());
-            next.offset = *o;
-        }
-        next.skip = 0;
-        gap = true;
-    }
-    if !full {
-        // Caught up: no history any more.
-        next.history_us = None;
-    }
+    let full = returned >= asked;
+    let (next, gap) = next_position(cursor, &positions, full, key);
     Batch {
         kept,
         next,
@@ -951,6 +983,12 @@ pub(crate) async fn audit_stream(
     let skip = store.as_ref().map_or(0, CursorStore::skip_records);
     let first_start = loaded.is_none();
     let mut cursor = loaded.unwrap_or_default();
+    if cursor.skip > 0 && cursor.buffer.is_none() {
+        // A position saved before the server-side skip, without its
+        // buffer: that buffer is read again from its start (read twice,
+        // loud, never lost).
+        cursor.skip = 0;
+    }
     if first_start {
         // No history replay: what the audit holds from before now.
         cursor.first_start(session.own.as_ref().map(own::Handle::server_now), 0);
@@ -1097,8 +1135,10 @@ struct Polled {
     malformed: u64,
 }
 
-/// Sends one poll; each row becomes a record as it ends (review L5: no
-/// copy of the rows is held), alone under panic isolation.
+/// Sends one poll (the first `skip` records after the position skipped on
+/// the server, at most `top` returned); each row becomes a record as it
+/// ends (review L5: no copy of the rows is held), alone under panic
+/// isolation.
 async fn poll_records(
     s: &mut Session,
     text: &str,
@@ -1106,11 +1146,13 @@ async fn poll_records(
     file: &str,
     offset: i64,
     top: usize,
+    skip: u32,
 ) -> Result<Polled, SsError> {
     let params = [
         Param::NVarChar(file.to_owned()),
         Param::BigInt(offset),
         Param::BigInt(i64::try_from(top).unwrap_or(i64::MAX)),
+        Param::BigInt(i64::from(skip)),
     ];
     s.credit_poll(text, kind);
     let mut out = Polled {
@@ -1159,7 +1201,8 @@ async fn read(
     // The audit's delivery delay (`QUEUE_DELAY`): the history and floor
     // bound.
     let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
-    let top = st.batch + st.cursor.skip as usize;
+    // The server skips the records of the next buffer already handled.
+    let (top, skip) = request(&st.cursor, st.batch);
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
         None => {
@@ -1170,6 +1213,7 @@ async fn read(
                 "",
                 0,
                 top,
+                skip,
             ))
             .await
         }
@@ -1181,6 +1225,7 @@ async fn read(
                 &f,
                 st.cursor.offset,
                 top,
+                skip,
             ))
             .await
         }
