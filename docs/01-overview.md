@@ -9,7 +9,7 @@ It detects, audits and (eventually) prevents leaks of sensitive data **as close 
 - MongoDB
 - OpenLDAP
 - Apereo CAS (Central Authentication Service) — *since 0.4.0 (ROADMAP phase 8)*
-- Microsoft SQL Server, Redis and Valkey — *in development (ROADMAP phase 9): merged on `dev`, not released yet; SQL Server Audit reads SQL Server Audit files on 2022 and 2025, and SQL Server 2019 has no Audit until the Extended Events source is implemented*
+- Microsoft SQL Server, Redis and Valkey — *in development (ROADMAP phase 9): merged on `dev`, not released yet; SQL Server Audit reads SQL Server Audit files on 2022 and 2025, or an Extended Events session on every supported version (the only source on 2019)*
 - SQLite and Firebird — *planned, ROADMAP phase 10 ([ADR-0039](adr/0039-engine-scope-expansion.md)); not supported yet*
 
 ## Problem addressed
