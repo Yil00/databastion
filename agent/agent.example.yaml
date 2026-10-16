@@ -264,7 +264,8 @@ targets:
   #     # sqlserver_xevents (2019, 2022, 2025; the only source on 2019): an
   #     #   Extended Events session with an event_file target; needs VIEW
   #     #   SERVER STATE (2019) or VIEW SERVER PERFORMANCE STATE (2022 and
-  #     #   later), which exposes every statement text on the server.
+  #     #   later), which exposes every statement text on the server,
+  #     #   with its literal values.
   #     # audit: {source: sqlserver_xevents, xe_session: databastion_xe}
   #     # auto naming both: the server audit when usable, else the session.
   #     # audit: {source: auto, audit_name: databastion_audit, xe_session: databastion_xe}

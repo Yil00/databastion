@@ -2694,6 +2694,8 @@ targets:
         names.extend(expected_names::<OpenldapTargetConfig>(KEY));
         names.extend(expected_names::<SecretRef>(KEY));
         names.extend(expected_names::<MetricsConfig>(KEY));
+        // `PhoneRegionConfig` (unit variants only) cannot be probed this way;
+        // its variant `fr` is covered by the explicit list.
         names.extend(expected_names::<cas::RawServiceRegistry>(KEY));
         names.extend(expected_names::<cas::RawAuditLog>(KEY));
         names.extend(expected_names::<cas::RawCasSettings>(KEY));
