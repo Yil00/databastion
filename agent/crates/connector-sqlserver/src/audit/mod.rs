@@ -366,7 +366,16 @@ pub(crate) struct Cursor {
     /// (the server skips them, `sql::AUDIT_POLL_FROM`,
     /// `sql::XE_POLL_FROM`).
     pub(crate) buffer: Option<(String, i64)>,
+    /// The latest time (server µs) of the records the stream handled,
+    /// those a refused position left out (`after`) excepted: the history
+    /// boundary by order of a first catch-up ([`Cursor::below`]).
+    pub(crate) max_seen_us: Option<i64>,
 }
+
+/// How far below the latest record handled a record of the history phase
+/// may be stamped and still be history (disorder of the source's writers),
+/// at least: the delivery delay when larger, at most [`FLOOR_MAX`].
+pub(crate) const HISTORY_DISORDER: Duration = Duration::from_secs(5);
 
 /// The longest the floor is kept after the first start (re-review N1),
 /// whatever delivery delay the source states.
@@ -456,18 +465,19 @@ impl Cursor {
         self.expire_floor(read_started_ms, delay);
     }
 
-    /// Whether a record stamped `time_us` (server µs), read by a read that
-    /// started at `read_started_ms` on the agent's clock, is left out, and
-    /// how. History only while the source's delivery `delay` (at most
-    /// [`FLOOR_MAX`]) has not passed since the first start (final review
-    /// L1): after it, a record below the start or the floor is counted as
-    /// dropped, also during a first catch-up that lasts longer (a large
-    /// backlog's old records included, which is the price of telling a
-    /// server clock stepped back from history).
+    /// Whether a record stamped `time_us` (server µs) is left out, and how,
+    /// `seen_us` being the latest time of the records handled before it
+    /// ([`Self::max_seen_us`], updated through the read). In the history
+    /// phase (it ends with the first caught-up read once the delivery
+    /// delay has passed, [`Self::settle`]), a record below the start or the
+    /// floor is history unless it is stamped more than the tolerance
+    /// (`delay`, at least [`HISTORY_DISORDER`], at most [`FLOOR_MAX`])
+    /// below `seen_us`: a step back of the server's clock, counted as
+    /// dropped. After it, a record below the floor is counted as dropped.
     pub(crate) fn below(
         &self,
         time_us: i64,
-        read_started_ms: i64,
+        seen_us: Option<i64>,
         delay: Duration,
     ) -> Option<Below> {
         let threshold = match (self.history_us, self.floor) {
@@ -478,13 +488,25 @@ impl Cursor {
         if time_us >= threshold {
             return None;
         }
-        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
-        let since = read_started_ms.saturating_sub(self.floor_set_ms);
-        if self.history_us.is_some() && (0..delay_ms).contains(&since) {
-            Some(Below::History)
-        } else {
-            Some(Below::Dropped)
+        if self.history_us.is_none() {
+            return Some(Below::Dropped);
         }
+        // The history phase, however long the catch-up: by order (security
+        // review of lot 3, follow-up of L1). A record stamped within the
+        // tolerance below the latest one handled is history (the backlog
+        // read in order, or the writers' disorder); one further below is a
+        // step back of the server's clock: counted.
+        let tolerance = delay.max(HISTORY_DISORDER).min(FLOOR_MAX);
+        let tolerance_us = i64::try_from(tolerance.as_micros()).unwrap_or(i64::MAX);
+        match seen_us {
+            Some(m) if time_us < m.saturating_sub(tolerance_us) => Some(Below::Dropped),
+            _ => Some(Below::History),
+        }
+    }
+
+    /// `seen` with a record handled at `time_us`.
+    pub(crate) fn seen(seen: Option<i64>, time_us: i64) -> Option<i64> {
+        Some(seen.map_or(time_us, |m| m.max(time_us)))
     }
 
     pub(crate) fn encode(&self) -> Vec<u8> {
@@ -510,6 +532,9 @@ impl Cursor {
         }
         if let Some((f, o)) = &self.buffer {
             out.push_str(&format!("buffer {} {o}\n", hex(f)));
+        }
+        if let Some(m) = self.max_seen_us {
+            out.push_str(&format!("seen {m}\n"));
         }
         out.into_bytes()
     }
@@ -548,6 +573,7 @@ impl Cursor {
                     };
                 }
                 ("buffer", f) => c.buffer = Some((unhex(f)?, p.next()?.parse().ok()?)),
+                ("seen", v) => c.max_seen_us = Some(v.parse().ok()?),
                 _ => return None,
             }
         }
@@ -1273,8 +1299,11 @@ async fn read(
     }
     let mut reprobe = false;
     let mut below_floor = 0u64;
+    let mut seen = st.cursor.max_seen_us;
     for stmt in &statements {
-        match st.cursor.below(stmt.head.time_us, read_started_ms, delay) {
+        let class = st.cursor.below(stmt.head.time_us, seen, delay);
+        seen = Cursor::seen(seen, stmt.head.time_us);
+        match class {
             Some(Below::History) => continue,
             Some(Below::Dropped) => {
                 below_floor += 1;
@@ -1314,6 +1343,7 @@ async fn read(
     }
     let prev_history = st.cursor.history_us;
     st.cursor = b.next;
+    st.cursor.max_seen_us = seen;
     if !b.full {
         st.cursor.settle(prev_history, read_started_ms, delay);
     }

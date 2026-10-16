@@ -34,6 +34,7 @@ fn cursor_round_trips() {
         floor: Some(17),
         floor_set_ms: 1_800_000_000_000,
         buffer: Some(("/var/opt/mssql/xe/x_0_1.xel".to_owned(), 8192)),
+        max_seen_us: Some(1_800_000_000_000_001),
     };
     assert_eq!(Cursor::decode(&c.encode()), Some(c));
     assert_eq!(
@@ -68,7 +69,7 @@ fn the_history_phase_covers_the_delivery_delay_then_ends_with_the_floor() {
         next.settle(prev, set + 500, Duration::from_secs(1));
         assert_eq!(next.history_us, prev);
         assert_eq!(
-            next.below(999_999, set, Duration::from_secs(1)),
+            next.below(999_999, None, Duration::from_secs(1)),
             Some(Below::History)
         );
         assert!(next.floor.is_some());
@@ -77,7 +78,7 @@ fn the_history_phase_covers_the_delivery_delay_then_ends_with_the_floor() {
         next.history_us = None;
         next.settle(prev, set + 1_000, Duration::from_secs(1));
         assert_eq!((next.history_us, next.floor), (None, None));
-        assert_eq!(next.below(1, set, Duration::from_secs(1)), None);
+        assert_eq!(next.below(1, None, Duration::from_secs(1)), None);
         // The agent's clock went back past the first start: both end.
         let mut back = c.clone();
         back.history_us = None;
@@ -91,49 +92,89 @@ fn the_history_phase_covers_the_delivery_delay_then_ends_with_the_floor() {
     }
 }
 
-/// Final review L1: a first catch-up through a large backlog that goes on
-/// past the delivery delay; what it reads below the start or the floor
-/// after the delay is counted as dropped, not history.
+/// The history boundary by order (follow-up of the lot 3 final review,
+/// L1): in the history phase, however long the first catch-up takes, a
+/// record below the start or the floor is history unless it is stamped
+/// more than the tolerance below the latest record handled (a step back of
+/// the server's clock), counted then. A long backlog read in order gives
+/// no drop.
 #[test]
-fn a_long_first_catch_up_counts_what_is_below_the_floor_after_the_delay() {
+fn the_history_boundary_goes_by_order() {
     for skew in [0, xe::XE_CLOCK_SKEW_US] {
         let mut c = Cursor::default();
-        c.first_start(Some(1_000_000), skew);
-        let c = c;
-        let set = c.floor_set_ms;
+        c.first_start(Some(10_000_000_000), skew);
         let delay = Duration::from_secs(1);
-        let floor = 1_000_000 + skew;
-        // Full reads of the backlog, one after the other: still in the
-        // history phase (no read reached the end of the source, so the
-        // cursor's history stays).
+        let floor = 10_000_000_000 + skew;
+        // A long backlog with increasing times, read over many reads and
+        // whatever time: all history, no drop.
+        let mut seen = c.max_seen_us;
         let mut counted = 0;
-        let mut history = 0;
-        for (read, started) in [
-            (0, set),
-            (1, set + 400),
-            (2, set + 999),
-            (3, set + 1_000),
-            (4, set + 5_000),
-        ] {
-            assert!(c.history_us.is_some(), "read {read}: catching up");
-            for t in [1, 999_999, floor - 1] {
-                match c.below(t, started, delay) {
-                    Some(Below::History) => history += 1,
-                    Some(Below::Dropped) => counted += 1,
-                    None => panic!("below the floor"),
-                }
+        for t in (0..10_000).map(|i| 1_000_000 + i * 900_000) {
+            match c.below(t, seen, delay) {
+                Some(Below::History) => {}
+                Some(Below::Dropped) => counted += 1,
+                None => panic!("below the start"),
             }
-            assert_eq!(c.below(floor, started, delay), None);
+            seen = Cursor::seen(seen, t);
         }
-        assert_eq!((history, counted), (9, 6), "counted after the delay");
-        // Bounded at 5 minutes whatever the delay.
+        assert_eq!(counted, 0, "a long backlog in order");
+        // Disorder within the tolerance (5 s, the delay being shorter):
+        // history.
+        let m = seen.unwrap();
+        assert_eq!(c.below(m - 5_000_000, seen, delay), Some(Below::History));
+        // A step back beyond it, in the middle of the catch-up: counted.
+        assert_eq!(c.below(m - 5_000_001, seen, delay), Some(Below::Dropped));
+        // A longer delivery delay widens the tolerance, bounded by
+        // FLOOR_MAX.
         assert_eq!(
-            c.below(1, set + 300_000, Duration::from_secs(86_400)),
+            c.below(m - 30_000_000, seen, Duration::from_secs(60)),
+            Some(Below::History)
+        );
+        assert_eq!(
+            c.below(m - 300_000_001, seen, Duration::from_secs(86_400)),
             Some(Below::Dropped)
         );
-        // The agent's clock went back past the first start: counted.
-        assert_eq!(c.below(1, set - 1, delay), Some(Below::Dropped));
+        // At or above the start: not left out.
+        assert_eq!(c.below(floor, seen, delay), None);
+        // After the history phase: below the floor is counted.
+        c.history_us = None;
+        assert_eq!(c.below(floor - 1, seen, delay), Some(Below::Dropped));
     }
+}
+
+/// `max_seen_us` is kept across a restart (the cursor), and records a
+/// refused position left out (`after`) do not move it.
+#[test]
+fn the_latest_record_seen_survives_a_restart() {
+    let mut c = Cursor::default();
+    c.first_start(Some(10_000_000_000), 0);
+    c.max_seen_us = Some(9_000_000_000);
+    let back = Cursor::decode(&c.encode()).unwrap();
+    assert_eq!(back.max_seen_us, Some(9_000_000_000));
+    assert_eq!(back.history_us, c.history_us);
+    // After a refused position: the records at or before it are left out
+    // by the batch, and only the kept ones move the latest time.
+    let file = f("/x/", 134_365_416_940_740_000);
+    let mut c = Cursor {
+        after: Some(((134_365_416_940_740_000, 0), 8192)),
+        ..Cursor::default()
+    };
+    c.first_start(Some(10_000_000_000), 0);
+    let mut old = at(&file, 4096);
+    old.time_us = 9_999_000_000;
+    let mut new = at(&file, 12_288);
+    new.time_us = 5_000_000;
+    let b = batch(&c, vec![old, new], 2, 500, file_key);
+    assert_eq!(
+        b.kept.len(),
+        1,
+        "the record before the position is left out"
+    );
+    let seen = b
+        .kept
+        .iter()
+        .fold(c.max_seen_us, |m, r| Cursor::seen(m, r.time_us));
+    assert_eq!(seen, Some(5_000_000));
 }
 
 /// Re-review N1, on both sources (SQL Server Audit: no skew; Extended
@@ -147,14 +188,14 @@ fn the_floor_is_counted_after_the_history_phase_and_ends() {
         let floor = 1_000_000 + skew;
         // History phase: below the start, or below the floor, not counted.
         assert_eq!(
-            c.below(999_999, set, Duration::from_secs(1)),
+            c.below(999_999, None, Duration::from_secs(1)),
             Some(Below::History)
         );
         assert_eq!(
-            c.below(floor - 1, set, Duration::from_secs(1)),
+            c.below(floor - 1, None, Duration::from_secs(1)),
             Some(Below::History)
         );
-        assert_eq!(c.below(floor, set, Duration::from_secs(1)), None);
+        assert_eq!(c.below(floor, None, Duration::from_secs(1)), None);
         // The floor stays during the history phase whatever the time.
         c.expire_floor(set + 3_600_000, Duration::from_secs(1));
         assert_eq!(c.floor, Some(floor));
@@ -162,21 +203,21 @@ fn the_floor_is_counted_after_the_history_phase_and_ends() {
         // (late history, or the server's clock stepped back) is counted.
         c.history_us = None;
         assert_eq!(
-            c.below(1, set, Duration::from_secs(1)),
+            c.below(1, None, Duration::from_secs(1)),
             Some(Below::Dropped)
         );
         assert_eq!(
-            c.below(floor - 1, set, Duration::from_secs(1)),
+            c.below(floor - 1, None, Duration::from_secs(1)),
             Some(Below::Dropped)
         );
-        assert_eq!(c.below(floor, set, Duration::from_secs(1)), None);
+        assert_eq!(c.below(floor, None, Duration::from_secs(1)), None);
         // A read started before the delivery delay passed keeps it.
         c.expire_floor(set + 999, Duration::from_secs(1));
         assert_eq!(c.floor, Some(floor));
         // One started after it ends it: nothing below it is left out.
         c.expire_floor(set + 1_000, Duration::from_secs(1));
         assert_eq!(c.floor, None);
-        assert_eq!(c.below(1, set, Duration::from_secs(1)), None);
+        assert_eq!(c.below(1, None, Duration::from_secs(1)), None);
         // Bounded at 5 minutes, whatever the delay (INFINITE latency).
         let mut c = Cursor::default();
         c.first_start(Some(1_000_000), skew);

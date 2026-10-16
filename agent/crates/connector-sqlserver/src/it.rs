@@ -2651,3 +2651,58 @@ async fn floor_scenario() {
         .await;
     }
 }
+
+/// Follow-up of the lot 3 final review (L1), the `e2e-sqlserver` CI job: a
+/// first start (a long backlog to skip) followed by a Discovery scan with
+/// Audit on reports no `audit.records_dropped`, on both sources: the
+/// history boundary goes by order, not by the time the catch-up takes.
+#[tokio::test]
+async fn a_first_start_and_a_scan_drop_nothing() {
+    Box::pin(first_start_scenario()).await;
+}
+
+async fn first_start_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let mut sources = vec![(XE, "xevents")];
+    if major >= 16 {
+        sources.push((AUDIT, "audit"));
+    }
+    for (settings, label) in sources {
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {settings}", own_tls()));
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-first-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c2 = Arc::clone(&c);
+        let t2 = t.clone();
+        let _events = Box::pin(xe_stream_around(&c, &t, &dir, async move {
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t2, &unpaced(), key());
+            let (sink, mut frx) = FindingSink::channel(10_000);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            Box::pin(c2.discover(&job, &sink)).await.unwrap();
+            drop(sink);
+            drain.await.unwrap();
+        }))
+        .await;
+        let dropped = c.state.audit.facts(&t.id).dropped;
+        eprintln!("[it] first start ({label}): records dropped {dropped}");
+        assert_eq!(dropped, 0, "{label}: a first start and a scan drop nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+}
