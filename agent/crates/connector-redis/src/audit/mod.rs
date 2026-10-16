@@ -23,9 +23,12 @@
 //! - **The agent's own entries** ([`own`], H3): by connection id or by the
 //!   `addr:port` of one of its connections within its lifetime, never by
 //!   user or client name; left out only for its own command shapes and
-//!   within the own-read budget. Each session records the address the
-//!   server reports for it at connect time (`CLIENT LIST ID`), so a session
-//!   closed before the stream's next `CLIENT LIST` is still recognized.
+//!   within the own-read budget, kept per learned pattern (when several
+//!   databases hold keys, the pattern the key matches in each database
+//!   where it does, since the event's object is then mostly `*`). Each
+//!   session records the address the server reports for it at connect
+//!   time (`CLIENT LIST ID`), so a session closed before the stream's next
+//!   `CLIENT LIST` is still recognized.
 //! - Per-record panic isolation: each entry is parsed and converted under
 //!   `databastion_core::isolate`; a failing entry is dropped and counted.
 
@@ -519,7 +522,26 @@ impl Stream<'_> {
                         .routine_unbudgeted(&user, None, ClientSeen::NotRecorded, &ev)
                 }
                 OwnShape::Keyed { rows, .. } => {
-                    let charged = ev.clone().with_rows(Some(rows));
+                    let charged = if e.budget.is_empty() {
+                        ev.clone()
+                    } else {
+                        // The patterns the key matches in the databases
+                        // where it does, rather than the event's object
+                        // (`*` when the patterns differ between them).
+                        let mut c = MaskedEvent::new(source, action, ev.principal().clone(), ts);
+                        for (db, p) in &e.budget {
+                            c = c.with_object(EventObject::new(
+                                names::normalize_path(&format!("db{db}")),
+                                None,
+                                p.clone(),
+                            ));
+                        }
+                        for s in &e.signals {
+                            c = c.with_signal(*s);
+                        }
+                        c
+                    }
+                    .with_rows(Some(rows));
                     self.own.routine(
                         &user,
                         None,
@@ -818,6 +840,17 @@ async fn poll(
     let offset_s = now_s - agent_now;
     let learned = st.state.audit.learned(&target_id);
     let (database, log_set) = log_database(&learned, &inf.keyspace);
+    // The own-read budget is kept per pattern (decision 8): when the log's
+    // database is not known, each database's patterns name the agent's
+    // own sampling reads for the budget (never for the event).
+    let budget_sets: Vec<(u16, &LearnedPatterns)> = if inf.keyspace.len() > 1 {
+        inf.keyspace
+            .iter()
+            .filter_map(|d| learned.dbs.get(d).map(|s| (*d, s.as_ref())))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let stores = st.target.cas_stores();
 
     // Logs.
@@ -849,6 +882,7 @@ async fn poll(
         let ctx = Context {
             learned: &log_set,
             stores,
+            dbs: &budget_sets,
         };
         let (parsed, malformed) = parse_logs(&items, &ctx);
         drop(items);
