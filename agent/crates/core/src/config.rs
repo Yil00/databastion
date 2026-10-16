@@ -1860,6 +1860,52 @@ targets:
         assert!(!cfg.targets.is_empty());
     }
 
+    /// The commented SQL Server target of the example file is valid once
+    /// uncommented, with each of its `audit` examples uncommented in turn.
+    #[test]
+    fn example_sqlserver_target_is_valid_uncommented() {
+        let text = include_str!("../../../agent.example.yaml");
+        let start = text.find("  # - id: erp-eu-1\n").unwrap();
+        let end = start + text[start..].find("\n\n").unwrap() + 1;
+        let block: String = text[start..end]
+            .lines()
+            .map(|l| {
+                l.strip_prefix("  # ")
+                    .map_or_else(|| l.to_owned(), |r| format!("  {r}"))
+            })
+            .map(|l| l + "\n")
+            .collect();
+        let audits: Vec<&str> = block
+            .lines()
+            .filter(|l| l.starts_with("      # audit: {"))
+            .collect();
+        assert_eq!(audits.len(), 3, "{block}");
+        let base = BASE.split("targets:\n").next().unwrap();
+        let mut variants = vec![block.clone()];
+        variants.extend(
+            audits
+                .iter()
+                .map(|a| block.replace(a, &a.replacen("# audit:", "audit:", 1))),
+        );
+        let mut sources = Vec::new();
+        for v in &variants {
+            let cfg = parse(&format!("{base}targets:\n{v}")).unwrap_or_else(|e| panic!("{e}\n{v}"));
+            let t = &cfg.targets[0];
+            assert_eq!(t.engine, TargetEngine::Sqlserver);
+            sources.push(t.sqlserver_settings().audit.as_ref().map(|a| a.source));
+        }
+        use sqlserver::SqlserverAuditSource as S;
+        assert_eq!(
+            sources,
+            [
+                None,
+                Some(S::SqlserverAudit),
+                Some(S::SqlserverXevents),
+                Some(S::Auto)
+            ]
+        );
+    }
+
     #[test]
     fn base_config_parses_with_defaults() {
         let cfg = parse(BASE).unwrap();
