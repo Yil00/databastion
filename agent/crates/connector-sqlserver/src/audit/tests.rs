@@ -50,6 +50,44 @@ fn cursor_round_trips() {
     assert_eq!((old.floor, old.floor_set_ms), (Some(17), 0));
 }
 
+/// The history phase lasts until a read that reached the end of the
+/// source started once the delivery delay passed since the first start:
+/// records of before the start that come late within it are history (not
+/// counted as dropped, which would make every start Limited); then the
+/// history phase and the floor end together.
+#[test]
+fn the_history_phase_covers_the_delivery_delay_then_ends_with_the_floor() {
+    for skew in [0, xe::XE_CLOCK_SKEW_US] {
+        let mut c = Cursor::default();
+        c.first_start(Some(1_000_000), skew);
+        let set = c.floor_set_ms;
+        let prev = c.history_us;
+        // A caught-up read within the delay: still history.
+        let mut next = c.clone();
+        next.history_us = None;
+        next.settle(prev, set + 500, Duration::from_secs(1));
+        assert_eq!(next.history_us, prev);
+        assert_eq!(next.below(999_999), Some(Below::History));
+        assert!(next.floor.is_some());
+        // One started after it: both end.
+        let mut next = next.clone();
+        next.history_us = None;
+        next.settle(prev, set + 1_000, Duration::from_secs(1));
+        assert_eq!((next.history_us, next.floor), (None, None));
+        assert_eq!(next.below(1), None);
+        // The agent's clock went back past the first start: both end.
+        let mut back = c.clone();
+        back.history_us = None;
+        back.settle(prev, set - 1, Duration::from_secs(1));
+        assert_eq!((back.history_us, back.floor), (None, None));
+        // Bounded at 5 minutes whatever the delay.
+        let mut long = c.clone();
+        long.history_us = None;
+        long.settle(prev, set + 300_000, Duration::from_secs(86_400));
+        assert_eq!((long.history_us, long.floor), (None, None));
+    }
+}
+
 /// Re-review N1, on both sources (SQL Server Audit: no skew; Extended
 /// Events: the floor 20 ms past the first start).
 #[test]
@@ -341,6 +379,7 @@ fn xe_large_buffers_are_walked_without_loss() {
         procedure: None,
         skip: false,
         unreadable: false,
+        index: 0,
     };
     // The file: buffer 4096 (3 events), 8192 (1 200 events), 12288 (5).
     let mut all = Vec::new();

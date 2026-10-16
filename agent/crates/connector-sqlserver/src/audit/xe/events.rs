@@ -42,7 +42,7 @@
 //!   statement event is a read of `*` by an unidentified principal, always
 //!   reported.
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::masking::{
     EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
@@ -104,6 +104,9 @@ pub(crate) struct XeRecord {
     /// A statement event whose data could not be read (malformed, cut,
     /// or the reader panicked): reported as a read of `*`.
     pub(crate) unreadable: bool,
+    /// Its place among the records of its read (the deferral of a build,
+    /// refinement of 2026-10-16, item 4).
+    pub(crate) index: usize,
 }
 
 impl std::fmt::Debug for XeRecord {
@@ -213,6 +216,7 @@ impl XeRecord {
             procedure: None,
             skip: false,
             unreadable,
+            index: 0,
         })
     }
 
@@ -437,6 +441,7 @@ pub(crate) fn context(
         let Some((guid, seq)) = records[i].event.as_ref().and_then(|e| e.activity.clone()) else {
             continue;
         };
+        let build_nest = records[i].event.as_ref().and_then(|e| e.nest_level);
         // In file order, an internal statement can come before its build
         // (measured on 2022): looked for on both sides, by sequence.
         let lo = i.saturating_sub(CONTEXT_WINDOW);
@@ -450,7 +455,7 @@ pub(crate) fn context(
                     .is_some_and(|(g, s)| *g == guid && *s == next)
             });
             match found {
-                Some(j) if build_internal(&records[j]) && !records[j].skip => {
+                Some(j) if build_internal(&records[j], build_nest) && !records[j].skip => {
                     records[j].skip = true;
                     left_out += 1;
                 }
@@ -462,6 +467,88 @@ pub(crate) fn context(
     left_out
 }
 
+/// A build that case 2 could leave out but that its read left unpaired
+/// (refinement of 2026-10-16, item 4): an `sp_statement_completed`
+/// statistics build, not left out, with causality, on a listed system base
+/// table, from one of the agent's own sessions (`own`), on an allow-listed
+/// build (`statman`). Never a record of another session.
+pub(crate) fn unpaired_case_2(
+    r: &XeRecord,
+    statman: bool,
+    own: &dyn Fn(&XeRecord) -> bool,
+) -> bool {
+    if !statman || r.skip || r.kind() != Kind::SpStatementCompleted {
+        return false;
+    }
+    let Some(e) = &r.event else { return false };
+    if e.statement_cut || e.activity.is_none() {
+        return false;
+    }
+    let Some((schema, table)) = e.statement.as_deref().and_then(|t| tsql::statman_table(t)) else {
+        return false;
+    };
+    schema.eq_ignore_ascii_case("sys")
+        && SYS_BASE_TABLES
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&table))
+        && own(r)
+}
+
+/// The longest a build is deferred (refinement of 2026-10-16, item 4).
+pub(crate) const MAX_DEFERRAL: Duration = Duration::from_secs(60);
+/// Builds remembered at most; beyond, no new deferral (reported).
+const MAX_DEFERRED: usize = 4096;
+/// A deferral is forgotten this long after its bound.
+const DEFERRAL_KEEP: Duration = Duration::from_secs(600);
+
+/// The deferrals of unpaired case 2 builds across the reads of one stream
+/// (refinement of 2026-10-16, item 4), in memory only: a read that holds
+/// one ends just before it, so that the next read, which starts at it,
+/// can pair it. One deferral per build (by its causality activity and
+/// sequence number), for at most its bound from when it was first seen;
+/// after that, the build is handled as it stands (reported when still
+/// unpaired).
+#[derive(Debug, Default)]
+pub(crate) struct Deferrals {
+    until: std::collections::HashMap<(String, u64), Instant>,
+}
+
+impl Deferrals {
+    /// The index (in its read, [`XeRecord::index`]) before which the read
+    /// ends, if one of `records` (after [`context`]) is a build to defer.
+    pub(crate) fn cut(
+        &mut self,
+        records: &[XeRecord],
+        statman: bool,
+        own: &dyn Fn(&XeRecord) -> bool,
+        now: Instant,
+        bound: Duration,
+    ) -> Option<usize> {
+        let bound = bound.min(MAX_DEFERRAL);
+        self.until
+            .retain(|_, until| now.saturating_duration_since(*until) <= DEFERRAL_KEEP);
+        for r in records {
+            if !unpaired_case_2(r, statman, own) {
+                continue;
+            }
+            let Some(key) = r.event.as_ref().and_then(|e| e.activity.clone()) else {
+                continue;
+            };
+            match self.until.get(&key) {
+                Some(until) if now < *until => return Some(r.index),
+                // Its deferral is over: handled as it stands.
+                Some(_) => {}
+                None if self.until.len() < MAX_DEFERRED && !bound.is_zero() => {
+                    self.until.insert(key, now + bound);
+                    return Some(r.index);
+                }
+                None => {}
+            }
+        }
+        None
+    }
+}
+
 /// Internal statements of one statistics build left out at most (case 1:
 /// one to three measured).
 const MAX_BUILD_INTERNALS: u64 = 3;
@@ -471,9 +558,11 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// 2025 17.0.5015.4, each on a new data volume, measured on 2026-10-15; the
 /// same tables on all three): the closed list of case 2, never
 /// any `sys` table. `sysowners` and `sysxlgns` were measured too (builds on
-/// their `password` and `type` columns) and are left off on purpose: they
-/// hold credentials, so a build on them stays reported (fail closed, for
-/// the maintainer).
+/// their `password` and `type` columns) and are left off: they hold
+/// credentials, so a build on them stays reported (decided by the
+/// maintainer, ADR-0051 refinement of 2026-10-16, item 3). `sysguidrefs`
+/// (a build paired with the `audit_file` proof, measured on 2022 on
+/// 2026-10-16) is not on the list either until decided: reported.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysschobjs",
     "sysrowsets",
@@ -490,10 +579,15 @@ pub(crate) const SYS_BASE_TABLES: &[&str] = &[
 /// The `object_type` map value of `ADHOC`.
 const ADHOC: i64 = 20_801;
 
-/// The measured shape of a statistics build's internal statement (case 1):
-/// `sp_statement_completed`, an empty complete text, `object_type` ADHOC,
-/// `nest_level` 2, both offsets 0.
-pub(crate) fn build_internal(r: &XeRecord) -> bool {
+/// The measured shape of a statistics build's internal statement (case 1,
+/// condition 4 as revised on 2026-10-16): `sp_statement_completed`, an
+/// empty complete text, `object_type` ADHOC, both offsets 0, at the
+/// build's `nest_level` minus one, the build's `nest_level` being 2 or
+/// more (measured on 2019, 2022 and 2025).
+pub(crate) fn build_internal(r: &XeRecord, build_nest: Option<i64>) -> bool {
+    let Some(build_nest) = build_nest.filter(|n| *n >= 2) else {
+        return false;
+    };
     r.kind() == Kind::SpStatementCompleted
         && r.event.as_ref().is_some_and(|e| {
             !e.statement_cut
@@ -502,7 +596,7 @@ pub(crate) fn build_internal(r: &XeRecord) -> bool {
                 && e.object_type_name
                     .as_deref()
                     .is_some_and(|n| n.eq_ignore_ascii_case("adhoc"))
-                && e.nest_level == Some(2)
+                && e.nest_level == Some(build_nest - 1)
                 && e.offset == Some(0)
                 && e.offset_end == Some(0)
         })
@@ -739,6 +833,7 @@ pub(crate) mod tests {
             procedure: None,
             skip: false,
             unreadable: false,
+            index: 0,
         }
     }
 
@@ -760,7 +855,7 @@ pub(crate) mod tests {
         rec(kind, &[("row_count", &rows), ("statement", &t)], &actions)
     }
 
-    fn names(ev: &MaskedEvent) -> Vec<String> {
+    pub(super) fn names(ev: &MaskedEvent) -> Vec<String> {
         ev.objects()
             .iter()
             .map(|o| {
@@ -1082,6 +1177,7 @@ pub(crate) mod tests {
             procedure: None,
             skip: false,
             unreadable: false,
+            index: 0,
         };
         let ev = one(&r);
         assert!(ev.always_report() && !ev.principal().send_name());
@@ -1207,7 +1303,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod statistics_tests {
-    use super::tests::{rec, who};
+    use super::tests::{names, rec, who};
     use super::*;
 
     const BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [nsid] AS [SC0] FROM \
@@ -1320,8 +1416,7 @@ mod statistics_tests {
         for text in [
             crate::sql::VERSION.to_owned(),
             crate::conn::SESSION_SETTINGS.to_owned(),
-            crate::sql::render(crate::sql::XE_SESSION, &[("session", "N'databastion_xe'")])
-                .unwrap(),
+            crate::sql::render(crate::sql::XE_EVENTS, &[("session", "N'databastion_xe'")]).unwrap(),
         ] {
             assert_eq!(
                 crate::sql::own_text(&text),
@@ -1446,52 +1541,54 @@ mod statistics_tests {
                     procedure: None,
                     skip: false,
                     unreadable: false,
+                    index: 0,
                 }
             })
             .collect()
     }
 
-    /// The drift fixtures (captured on 2026-10-15 from each matrix image):
-    /// what the accepted rule leaves out there, and what it reports. An
-    /// internal statement is at the build's `nest_level` minus one
-    /// (measured on 2019, 2022 and 2025): left out
-    /// (case 1) under a build at nest level 3, reported under one at nest
-    /// level 2 (the ADR's lot 3 notes propose the revision).
+    /// The drift fixtures, one per matrix image (captured on 2026-10-16:
+    /// the agent's own builds on a fresh server, and a client's first reads
+    /// of two columns, in a batch, build at nest level 2, and inside
+    /// `sp_executesql` called by a batch, deeper: 4 on 2022): every build
+    /// is left out
+    /// (item 4 or case 2), and every internal statement with it, at the
+    /// build's nest level minus one (case 1 as revised on 2026-10-16).
     #[test]
     fn fixtures_of_the_matrix_images() {
-        for (file, internals_left_out) in [
-            ("statistics-15.0.4500.2.xml", 4),
-            ("statistics-16.0.4305.5.xml", 0),
-            ("statistics-17.0.5015.4.xml", 4),
+        for file in [
+            "statistics-15.0.4500.2.xml",
+            "statistics-16.0.4305.5.xml",
+            "statistics-17.0.5015.4.xml",
         ] {
             let mut recs = fixture(file);
-            let builds = recs
+            let is_build = |r: &XeRecord| {
+                r.event
+                    .as_ref()
+                    .and_then(|e| e.statement.as_deref())
+                    .is_some_and(|t| t.contains("StatMan"))
+            };
+            let builds = recs.iter().filter(|r| is_build(r)).count();
+            let internals = recs
                 .iter()
                 .filter(|r| {
-                    r.event
-                        .as_ref()
-                        .and_then(|e| e.statement.as_deref())
-                        .is_some_and(|t| t.contains("StatMan"))
+                    r.kind() == Kind::SpStatementCompleted
+                        && r.event
+                            .as_ref()
+                            .and_then(|e| e.statement.as_deref())
+                            .is_some_and(|t| t.is_empty())
                 })
                 .count();
-            assert_eq!(
-                context(&mut recs, true, &own),
-                builds + internals_left_out,
-                "{file}"
-            );
-            let mut internal_reported = 0;
+            assert_eq!(context(&mut recs, true, &own), builds + internals, "{file}");
+            let mut depths = std::collections::BTreeSet::new();
             for (i, r) in recs.iter().enumerate() {
                 let e = r.event.as_ref().unwrap();
-                let build = e
-                    .statement
-                    .as_deref()
-                    .is_some_and(|t| t.contains("StatMan"));
                 let login = r.login();
-                if build {
-                    assert!(
-                        r.skip,
-                        "{file} {i} {login}: a build is left out (item 4 or case 2)"
-                    );
+                if is_build(r) {
+                    assert!(r.skip, "{file} {i} {login}: a build is left out");
+                    if login == "it_xstats" {
+                        depths.extend(e.nest_level);
+                    }
                 } else if e.statement.as_deref().is_some_and(|t| t.is_empty()) {
                     let under = recs.iter().find(|b| {
                         b.event.as_ref().is_some_and(|be| {
@@ -1503,24 +1600,243 @@ mod statistics_tests {
                         .and_then(|b| b.event.as_ref())
                         .and_then(|b| b.nest_level);
                     assert_eq!(e.nest_level.zip(nest).map(|(a, b)| a + 1 == b), Some(true));
-                    assert_eq!(r.skip, e.nest_level == Some(2), "{file} {i} {login}");
-                    if !r.skip {
-                        internal_reported += 1;
-                        assert!(convert(r).is_some(), "{file} {i}: reported");
-                    }
+                    assert!(
+                        r.skip,
+                        "{file} {i} {login}: an internal statement is left out"
+                    );
                 } else {
                     assert!(!r.skip, "{file} {i} {login}: a client's statement stays");
                 }
             }
-            assert!(internal_reported >= 1, "{file}");
+            assert!(
+                depths.contains(&2) && depths.iter().any(|d| *d >= 3),
+                "{file}: a client's builds in a batch and inside sp_executesql: {depths:?}"
+            );
             assert!(
                 recs.iter().any(|r| r.login() == "databastion" && r.skip),
                 "{file}"
             );
-            assert!(
-                recs.iter().any(|r| r.login() == "it_xstats" && r.skip),
-                "{file}"
-            );
         }
+    }
+
+    /// Case 1, condition 4 as revised on 2026-10-16: the build's nest
+    /// level minus one, the build at nest level 2 or more.
+    #[test]
+    fn case_1_internal_at_the_build_nest_level_minus_one() {
+        let at = |build: i64, internal: i64| {
+            let mut recs = vec![
+                sp("app", USER_BUILD, Some(GUID), 1, (build, "ADHOC", 0, 342)),
+                sp("app", "", Some(GUID), 2, (internal, "ADHOC", 0, 0)),
+                stmt_in(
+                    "app",
+                    "SELECT TOP (5) id FROM crm.t WHERE v = 3",
+                    Some(GUID),
+                    9,
+                ),
+            ];
+            context(&mut recs, true, &|_| false);
+            recs[1].skip
+        };
+        // A client's first read in a batch (build at 2), inside
+        // `sp_executesql` or a procedure (3), deeper nesting.
+        assert!(at(2, 1));
+        assert!(at(3, 2));
+        assert!(at(4, 3));
+        // Any other depth is reported.
+        for (build, internal) in [(2, 2), (3, 1), (3, 3), (1, 0), (2, 0), (0, -1)] {
+            assert!(!at(build, internal), "build {build}, internal {internal}");
+        }
+    }
+
+    /// Refinement of 2026-10-16, item 3: the credential-bearing base tables
+    /// stay off the list, and their builds stay reported, even with every
+    /// other condition of case 2 met.
+    #[test]
+    fn credential_tables_stay_off_the_list() {
+        for table in ["sysowners", "sysxlgns"] {
+            assert!(!SYS_BASE_TABLES.contains(&table), "{table}");
+            let mut recs = own_build(Some(GUID));
+            recs[0] = sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", &format!("[sys].[{table}]")),
+                Some(GUID),
+                1,
+                BUILD_SHAPE,
+            );
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "{table}");
+            let ev = convert(&recs[0]).unwrap().0;
+            assert_eq!(names(&ev), [format!("retail.sys.{table}")], "{table}");
+        }
+    }
+
+    /// Refinement of 2026-10-16, item 4: a read whose own-session build on
+    /// a listed table is not paired yet ends just before it; the next read
+    /// starts at it and pairs it. Every event is handled once: none twice,
+    /// none lost.
+    #[test]
+    fn a_deferred_build_is_paired_by_the_next_read_without_duplicate_or_drop() {
+        use crate::audit::Cursor;
+        use crate::audit::xe::xe_next;
+        let at = |mut r: XeRecord, offset: i64, id: i64| {
+            r.file = "f".to_owned();
+            r.offset = offset;
+            r.time_us = id;
+            r
+        };
+        // Buffer 4096: a client's read, the agent's build and its internal
+        // statement; buffer 8192, written only after the first read: the
+        // agent's catalog read of the same activity (the build's pair).
+        let make = |i: usize| match i {
+            0 => at(
+                stmt_in("app", "SELECT TOP (1) id FROM crm.t", None, 0),
+                4096,
+                0,
+            ),
+            1 => at(
+                sp("databastion", BUILD, Some(GUID), 1, BUILD_SHAPE),
+                4096,
+                1,
+            ),
+            2 => at(sp("databastion", "", Some(GUID), 2, INTERNAL), 4096, 2),
+            _ => at(stmt_in("databastion", &catalog(), Some(GUID), 3), 8192, 3),
+        };
+        let offsets = [4096, 4096, 4096, 8192];
+        // The server: after the buffer at the position, skip, then all.
+        let serve = |c: &Cursor, written: usize| -> Vec<XeRecord> {
+            let start = offsets
+                .iter()
+                .take(written)
+                .position(|o| c.file.is_none() || *o > c.offset)
+                .unwrap_or(written);
+            (start + c.skip as usize..written)
+                .enumerate()
+                .map(|(i, k)| {
+                    let mut r = make(k);
+                    r.index = i;
+                    r
+                })
+                .collect()
+        };
+        let mut deferrals = Deferrals::default();
+        let mut cursor = Cursor::default();
+        let mut handled: Vec<(i64, bool)> = Vec::new();
+        let t0 = Instant::now();
+        for (read, written) in [(0u64, 3), (1, 4), (2, 4)] {
+            let mut recs = serve(&cursor, written);
+            let positions: Vec<(String, i64)> =
+                recs.iter().map(|r| (r.file.clone(), r.offset)).collect();
+            context(&mut recs, true, &own);
+            let now = t0 + Duration::from_secs(read);
+            let cut = deferrals.cut(&recs, true, &own, now, Duration::from_secs(5));
+            let (next, gap) = match cut {
+                Some(i) => {
+                    recs.retain(|r| r.index < i);
+                    for r in &mut recs {
+                        r.skip = false;
+                    }
+                    context(&mut recs, true, &own);
+                    xe_next(&cursor, &positions[..i], true)
+                }
+                None => xe_next(&cursor, &positions, false),
+            };
+            assert!(!gap);
+            handled.extend(recs.iter().map(|r| (r.time_us, r.skip)));
+            cursor = next;
+            if read == 0 {
+                assert_eq!(cut, Some(1), "the first read ends before the build");
+            }
+        }
+        // Each event once; the build and its internal statement left out by
+        // the next read, with their pair.
+        assert_eq!(
+            handled,
+            [(0, false), (1, true), (2, true), (3, false)],
+            "no duplicate, no drop"
+        );
+    }
+
+    /// A build still unpaired after its bound is handled as it stands
+    /// (reported); one deferral per build; never for another session's
+    /// record; nothing on a build off the allow-list.
+    #[test]
+    fn deferrals_are_bounded_and_for_the_agents_builds_only() {
+        let lone = || {
+            let mut r = sp("databastion", BUILD, Some(GUID), 1, BUILD_SHAPE);
+            r.index = 7;
+            vec![r]
+        };
+        let t0 = Instant::now();
+        let bound = Duration::from_secs(5);
+        let mut d = Deferrals::default();
+        let mut recs = lone();
+        context(&mut recs, true, &own);
+        assert_eq!(d.cut(&recs, true, &own, t0, bound), Some(7));
+        assert_eq!(
+            d.cut(&recs, true, &own, t0 + Duration::from_secs(4), bound),
+            Some(7),
+            "within its bound"
+        );
+        assert_eq!(
+            d.cut(&recs, true, &own, t0 + Duration::from_secs(5), bound),
+            None,
+            "after its bound: reported"
+        );
+        assert_eq!(reported(&recs), [0]);
+        assert_eq!(
+            d.cut(&recs, true, &own, t0 + Duration::from_secs(6), bound),
+            None,
+            "one deferral per build"
+        );
+        // Capped at 60 s whatever the bound.
+        let mut d = Deferrals::default();
+        assert!(
+            d.cut(&recs, true, &own, t0, Duration::from_secs(3600))
+                .is_some()
+        );
+        assert!(
+            d.cut(
+                &recs,
+                true,
+                &own,
+                t0 + Duration::from_secs(60),
+                Duration::from_secs(3600)
+            )
+            .is_none()
+        );
+        // Another session's build, a client's build, no causality, a table
+        // off the list, a credential table, not allow-listed: no deferral.
+        let mut d = Deferrals::default();
+        assert_eq!(
+            d.cut(&recs, true, &|_| false, t0, bound),
+            None,
+            "a foreign session"
+        );
+        let mut user = lone();
+        user[0] = sp("databastion", USER_BUILD, Some(GUID), 1, BUILD_SHAPE);
+        assert_eq!(d.cut(&user, true, &own, t0, bound), None, "a user table");
+        let mut nocause = lone();
+        nocause[0] = sp("databastion", BUILD, None, 1, BUILD_SHAPE);
+        assert_eq!(d.cut(&nocause, true, &own, t0, bound), None, "no causality");
+        for table in ["[sys].[sysowners]", "[sys].[sysfiles1]"] {
+            let mut off = lone();
+            off[0] = sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", table),
+                Some(GUID),
+                1,
+                BUILD_SHAPE,
+            );
+            assert_eq!(d.cut(&off, true, &own, t0, bound), None, "{table}");
+        }
+        assert_eq!(
+            d.cut(&recs, false, &own, t0, bound),
+            None,
+            "not allow-listed"
+        );
+        // A paired build is not deferred.
+        let mut paired = own_build(Some(GUID));
+        context(&mut paired, true, &own);
+        assert_eq!(d.cut(&paired, true, &own, t0, bound), None);
     }
 }

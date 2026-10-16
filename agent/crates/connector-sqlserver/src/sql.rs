@@ -562,10 +562,12 @@ const CREDIT_ONLY: &[&str] = &[
 /// fresh server build statistics on the system base tables of ADR-0051's
 /// refinement of 2026-10-15, case 2 (re-review: "exact catalog texts").
 /// Never the session settings, the version, the samples and counts of
-/// user tables, the polls, or the session proofs over DMVs. Measured as
-/// build partners on 2022: `server_permissions`, `server_roles`,
-/// `server_grants`, `accessible_databases`, `database_grants`,
-/// `column_counts`, `tables`, `cas_credential_columns`.
+/// user tables, the polls, or the proof over DMVs only (`xe_events`).
+/// Measured as build partners on 2022: `server_permissions`,
+/// `server_roles`, `server_grants`, `accessible_databases`,
+/// `database_grants`, `column_counts`, `tables`, `cas_credential_columns`,
+/// `audit_file`, and `xe_session` (since it reads
+/// `sys.server_event_sessions`, re-review N1).
 const CATALOG_READS: &[&str] = &[
     "server_permissions",
     "server_roles",
@@ -589,6 +591,7 @@ const CATALOG_READS: &[&str] = &[
     "audit_file",
     "audit_specifications",
     "audit_database_reads",
+    "xe_session",
 ];
 
 /// Whether `text` is exactly one of the agent's catalog reads
@@ -999,7 +1002,6 @@ mod tests {
             "version",
             "sample",
             "ticket_type_counts",
-            "xe_session",
             "xe_events",
             "audit_poll_start",
             "audit_poll_from",

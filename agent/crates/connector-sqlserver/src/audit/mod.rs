@@ -345,7 +345,7 @@ pub(crate) struct Cursor {
     /// reported, even when they reach the source after it was read to its
     /// end (`QUEUE_DELAY`, `MAX_DISPATCH_LATENCY`). Bounded (re-review N1):
     /// dropped once the stream caught up and the source's delivery delay
-    /// passed since the first start ([`Cursor::expire_floor`]); a record it
+    /// passed since the first start ([`Cursor::settle`]); a record it
     /// leaves out after the first caught-up read is counted as dropped.
     pub(crate) floor: Option<i64>,
     /// The agent's wall clock (Unix ms) at the first start the floor was
@@ -420,6 +420,28 @@ impl Cursor {
         if since >= delay_ms || since < 0 {
             self.floor = None;
         }
+    }
+
+    /// After a read that reached the end of the source, `self` its next
+    /// position (the history phase cleared) and `prev_history` the history
+    /// before it: while the source's delivery `delay` has not passed since
+    /// the first start, records stamped before it may still come, so the
+    /// history phase goes on (they are history, not counted); once it has,
+    /// the history phase and the floor end together
+    /// ([`Self::expire_floor`]).
+    pub(crate) fn settle(
+        &mut self,
+        prev_history: Option<i64>,
+        read_started_ms: i64,
+        delay: Duration,
+    ) {
+        let delay_ms = i64::try_from(delay.min(FLOOR_MAX).as_millis()).unwrap_or(i64::MAX);
+        let since = read_started_ms.saturating_sub(self.floor_set_ms);
+        if prev_history.is_some() && (0..delay_ms).contains(&since) {
+            self.history_us = prev_history;
+            return;
+        }
+        self.expire_floor(read_started_ms, delay);
     }
 
     /// Whether a record stamped `time_us` (server µs) is left out, and how.
@@ -1219,10 +1241,11 @@ async fn read(
         tracing::warn!(target_id = %target_id, below_floor, "SQL Server Audit: records stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
         st.state.audit.note_dropped(&target_id, below_floor);
     }
+    let prev_history = st.cursor.history_us;
     st.cursor = b.next;
     if !b.full {
         let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
-        st.cursor.expire_floor(read_started_ms, delay);
+        st.cursor.settle(prev_history, read_started_ms, delay);
     }
     if b.gap {
         tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");

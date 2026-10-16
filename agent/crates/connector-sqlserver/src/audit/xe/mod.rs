@@ -106,6 +106,10 @@ struct Stream<'a> {
     /// the last evaluation (the preference rule at each re-probe).
     major: i64,
     perms: std::collections::BTreeSet<String>,
+    /// The poll interval (the bound of a deferral).
+    poll: std::time::Duration,
+    /// Unpaired case 2 builds deferred (refinement of 2026-10-16, item 4).
+    deferrals: events::Deferrals,
 }
 
 impl Stream<'_> {
@@ -349,6 +353,8 @@ pub(crate) async fn stream(
         statman: false,
         major: 0,
         perms: std::collections::BTreeSet::new(),
+        poll: cfg.poll_interval(),
+        deferrals: events::Deferrals::default(),
     };
     let tls = crate::tls::configs(target.sqlserver_settings().ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
@@ -524,6 +530,21 @@ pub(crate) fn xe_batch(
         kept.retain(|r| sql::xe_file_key(&r.file).is_none_or(|k| (k, r.offset) > (key, offset)));
     }
     let full = returned >= asked;
+    let (next, gap) = xe_next(cursor, &positions, full);
+    Batch {
+        kept,
+        next,
+        gap,
+        full,
+    }
+}
+
+/// The position after a read from `cursor` that returned events at
+/// `positions` (in order), `full` when more may follow; and whether one
+/// buffer went over [`XE_MAX_SKIP`] (a gap). A read cut before one of its
+/// events (the deferral of a build) is a full read of the events before
+/// it.
+pub(crate) fn xe_next(cursor: &Cursor, positions: &[(String, i64)], full: bool) -> (Cursor, bool) {
     let mut next = cursor.clone();
     if let Some(last) = positions.last() {
         let in_last = positions.iter().rev().take_while(|p| *p == last).count();
@@ -579,12 +600,7 @@ pub(crate) fn xe_batch(
     if !full {
         next.history_us = None;
     }
-    Batch {
-        kept,
-        next,
-        gap,
-        full,
-    }
+    (next, gap)
 }
 
 /// What one poll returned.
@@ -635,7 +651,10 @@ async fn poll_records(
                     out.returned += 1;
                     let r = std::mem::take(&mut row);
                     match databastion_core::isolate(|| XeRecord::from_row(r)) {
-                        Some(Ok(rec)) => out.records.push(rec),
+                        Some(Ok(mut rec)) => {
+                            rec.index = out.records.len();
+                            out.records.push(rec);
+                        }
                         _ => out.malformed += 1,
                     }
                 }
@@ -714,6 +733,11 @@ async fn read(
         Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
+    let positions: Vec<(String, i64)> = polled
+        .records
+        .iter()
+        .map(|r| (r.file.clone(), r.offset))
+        .collect();
     let b = xe_batch(&st.cursor, polled.records, polled.returned, top);
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
@@ -724,19 +748,15 @@ async fn read(
     // counted as dropped (re-review N1: the server's clock may have
     // stepped back).
     let mut records = b.kept;
-    let mut below_floor = 0u64;
+    let mut below_floor: Vec<usize> = Vec::new();
     records.retain(|r| match st.cursor.below(r.time_us) {
         Some(Below::History) => false,
         Some(Below::Dropped) => {
-            below_floor += 1;
+            below_floor.push(r.index);
             false
         }
         None => true,
     });
-    if below_floor > 0 {
-        tracing::warn!(target_id = %target_id, below_floor, "Extended Events: events stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
-        st.state.audit.note_dropped(&target_id, below_floor);
-    }
     if st.skip > 0 {
         let n = (st.skip as usize).min(records.len());
         records.drain(..n);
@@ -750,7 +770,42 @@ async fn read(
     let statman = st.statman;
     let target = st.target;
     let own = |r: &XeRecord| own_session(target, r);
-    let context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
+    let mut context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
+    // An unpaired case 2 build: the read ends just before it, once and
+    // for a bounded time (refinement of 2026-10-16, item 4); what follows
+    // it is read again by the next read, from it.
+    let mut next = b.next;
+    let mut gap = b.gap;
+    let mut cut = None;
+    if context.is_some() {
+        let latency = st
+            .probe
+            .as_ref()
+            .and_then(|p| p.dispatch_latency)
+            .unwrap_or(events::MAX_DEFERRAL);
+        let bound = latency.min(st.poll.saturating_mul(2));
+        cut = st
+            .deferrals
+            .cut(&records, statman, &own, Instant::now(), bound);
+    }
+    if let Some(at) = cut {
+        records.retain(|r| r.index < at);
+        for r in &mut records {
+            r.skip = false;
+            r.procedure = None;
+        }
+        context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
+        (next, gap) = xe_next(&st.cursor, positions.get(..at).unwrap_or_default(), true);
+        tracing::debug!(target_id = %target_id, "Extended Events: a statistics build of the agent's not paired yet: the read ends before it");
+    }
+    let below_floor = below_floor
+        .iter()
+        .filter(|i| cut.is_none_or(|at| **i < at))
+        .count() as u64;
+    if below_floor > 0 {
+        tracing::warn!(target_id = %target_id, below_floor, "Extended Events: events stamped before the first start read after the stream caught up (late, or the server's clock stepped back): not reported, counted as dropped");
+        st.state.audit.note_dropped(&target_id, below_floor);
+    }
     if let Some(n) = context {
         st.state.audit.note_statistics(&target_id, n);
     } else {
@@ -776,8 +831,9 @@ async fn read(
             None => st.state.audit.note_dropped(&target_id, 1),
         }
     }
-    st.cursor = b.next;
-    if !b.full {
+    let prev_history = st.cursor.history_us;
+    st.cursor = next;
+    if !b.full && cut.is_none() {
         // An event stamped below the floor reaches the file at most the
         // dispatch latency after its stamp (`INFINITE` or not visible: the
         // bound).
@@ -790,12 +846,13 @@ async fn read(
                     XE_CLOCK_SKEW_US.unsigned_abs(),
                 ))
             });
-        st.cursor.expire_floor(read_started_ms, delay);
+        st.cursor.settle(prev_history, read_started_ms, delay);
     }
-    if b.gap {
+    if gap {
         tracing::warn!(target_id = %target_id, "Extended Events: one buffer holds more events than the bound: the rest of it is dropped");
         st.state.audit.note_gap(&target_id);
         st.state.audit.note_dropped(&target_id, 1);
     }
-    Ok(b.full)
+    // A cut read ends the cycle: the next read waits a poll interval.
+    Ok(b.full && cut.is_none())
 }

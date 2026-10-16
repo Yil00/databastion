@@ -2200,7 +2200,10 @@ async fn xe_statistics_scenario() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // A first read of a column in a batch (the build at nest level 2),
+    // then of another column inside `sp_executesql` (nest level 3).
     let q = format!("SELECT TOP (5) id FROM retail.crm.{table} WHERE v = 3");
+    let q3 = format!("EXEC sp_executesql N'SELECT TOP (5) v FROM retail.crm.{table} WHERE id = 3'");
     let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
         let mut d = Box::pin(foreign_session(
             "it_xstats",
@@ -2208,6 +2211,7 @@ async fn xe_statistics_scenario() {
         ))
         .await;
         Box::pin(try_rows(&mut d, &q, 1)).await;
+        Box::pin(try_rows(&mut d, &q3, 1)).await;
         d.close().await;
     }))
     .await;
@@ -2257,12 +2261,11 @@ async fn xe_statistics_scenario() {
         })
         .count();
     assert_eq!(
-        reads, 1,
-        "the build is left out: the client's read alone names the table"
+        reads, 2,
+        "the builds are left out: the client's two reads alone name the table"
     );
-    // The build's internal statements: left out when of the accepted shape
-    // (case 1: nest level 2); under a build at nest level 2 they are at nest level 1 (measured on 2019, 2022, 2025)
-    // and stay reported as reads of `*`, always reported.
+    // The builds' internal statements, at the build's nest level minus one
+    // (case 1 as revised on 2026-10-16): left out at both depths.
     let others: Vec<_> = mine
         .iter()
         .filter(|e| {
@@ -2272,20 +2275,26 @@ async fn xe_statistics_scenario() {
                     .all(|n| n.ends_with(".sys.dm_exec_sessions"))
         })
         .collect();
-    assert!(others.len() <= 3, "{} other events", others.len());
+    // One: the batch `EXEC sp_executesql N'…'` itself, in the session's
+    // database `master` (dynamic SQL in text: `*`, always reported); no
+    // internal statement.
+    assert_eq!(others.len(), 1, "{} other events", others.len());
     for e in &others {
         assert!(
-            e.action() == EventAction::Read && e.always_report() && names_of(e) == ["retail.-.*"],
+            e.action() == EventAction::Read && e.always_report() && names_of(e) == ["master.-.*"],
             "an unexpected event: {:?} {:?}",
             e.action(),
             names_of(e)
         );
     }
     eprintln!(
-        "[it] xe statistics: internal statements reported {} (major {major})",
+        "[it] xe statistics: other events {} (major {major})",
         others.len()
     );
-    assert!(statistics >= 1, "the build is left out: {statistics}");
+    assert!(
+        statistics >= 4,
+        "the builds and their internal statements are left out: {statistics}"
+    );
     Box::pin(drop_login(&mut s, "it_xstats")).await;
     Box::pin(exec(
         &mut s,
@@ -2365,19 +2374,23 @@ async fn xe_fresh_scenario() {
     }
     let [exact, _, _, statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] xe fresh: exact {exact}, statistics statements left out {statistics}");
-    // What can remain, both measured (on 2019, 2022 and 2025) and listed in
-    // the ADR's notes with the revision they need: the builds' internal
-    // statements at nest level 1, outside case 1 as accepted (reads of
-    // `*`, always reported), and a build whose catalog statement reached
-    // the file only after the read that held the build (case 2 pairs
-    // within one read). Nothing else: no other own statement, no other
-    // table.
+    // What can remain (ADR-0051 refinement of 2026-10-16): a build on a
+    // credential-bearing base table (`sysowners`, `sysxlgns`: reported by
+    // decision, item 3), and a build whose catalog statement reached the
+    // file only after the bounded deferral (item 4). No internal statement
+    // (item 2), no other own statement, no other table.
     let mut internal = 0;
     let mut unpaired = 0;
+    let mut credential = 0;
     for e in &own {
         let names = names_of(e);
         if e.always_report() && names.iter().all(|n| n.ends_with(".-.*")) {
             internal += 1;
+        } else if names
+            .iter()
+            .all(|n| matches!(n.as_str(), "retail.sys.sysowners" | "retail.sys.sysxlgns"))
+        {
+            credential += 1;
         } else if names.iter().all(|n| {
             n.strip_prefix("retail.sys.")
                 .is_some_and(|t| crate::audit::xe::events::SYS_BASE_TABLES.contains(&t))
@@ -2387,7 +2400,14 @@ async fn xe_fresh_scenario() {
             panic!("the agent's own reads raised an event on a fresh server: {names:?}");
         }
     }
-    eprintln!("[it] xe fresh: internal statements reported {internal}, builds unpaired {unpaired}");
+    eprintln!(
+        "[it] xe fresh: internal statements reported {internal}, builds unpaired {unpaired}, \
+         credential tables {credential}"
+    );
+    assert_eq!(
+        internal, 0,
+        "internal statements of the builds are left out"
+    );
     assert!(
         statistics > 0,
         "not a fresh server: no statistics build was seen"
@@ -2422,7 +2442,9 @@ async fn floor_scenario() {
     let mut s = Box::pin(sa()).await;
     let grant = Box::pin(xe_grant(&mut s, major)).await;
     let login = "it_floor";
+    let before = "it_floor_old";
     Box::pin(throwaway(&mut s, login, &[])).await;
+    Box::pin(throwaway(&mut s, before, &[])).await;
     let mut sources = vec![(XE, "sqlserver_xevents")];
     if major >= 16 {
         sources.push((AUDIT, "sqlserver_audit"));
@@ -2441,6 +2463,20 @@ async fn floor_scenario() {
             ..Limits::default()
         };
         let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        // A read written to the source before the first start the floor is set at: below
+        // the floor.
+        let mut d = Box::pin(foreign_session(
+            before,
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(try_rows(
+            &mut d,
+            "SELECT TOP (1) id FROM retail.crm.customers",
+            1,
+        ))
+        .await;
+        d.close().await;
         // From the start of the file set, out of the history phase, under
         // a floor an hour ahead.
         let seeded = crate::audit::Cursor {
@@ -2485,24 +2521,31 @@ async fn floor_scenario() {
             events.len()
         );
         assert!(dropped > 0, "{cursor}: what the floor left out is counted");
-        // Nothing of the file set before the floor ended is reported: only
-        // the read made after it.
+        // Nothing of the file set before the floor ended is reported (the
+        // read made before the stream started), the read made after it is.
         for e in &events {
-            assert!(
-                e.principal().account_name().eq_ignore_ascii_case(login),
-                "{cursor}: an event below the floor was reported: {:?}",
+            eprintln!(
+                "[it] floor ({cursor}): event {} {:?} {:?}",
+                e.principal().account_name(),
+                e.action(),
                 names_of(e)
+            );
+            assert!(
+                !e.principal().account_name().eq_ignore_ascii_case(before),
+                "{cursor}: an event below the floor was reported"
             );
         }
         assert!(
-            events
-                .iter()
-                .any(|e| names_of(e).iter().any(|n| n == "retail.crm.customers")),
+            events.iter().any(|e| {
+                e.principal().account_name().eq_ignore_ascii_case(login)
+                    && names_of(e).iter().any(|n| n == "retail.crm.customers")
+            }),
             "{cursor}: the read after the floor ended is reported"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
     Box::pin(drop_login(&mut s, login)).await;
+    Box::pin(drop_login(&mut s, before)).await;
     if major >= 16 {
         Box::pin(exec(
             &mut s,

@@ -458,6 +458,7 @@ pub fn xe_records(data: &[u8]) {
             procedure: None,
             skip: false,
             unreadable: false,
+            index: 0,
         });
     }
     context(
