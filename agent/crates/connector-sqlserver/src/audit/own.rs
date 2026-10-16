@@ -219,8 +219,9 @@ pub(crate) struct Handle {
     ended: bool,
     /// Keyed hash of the last statement sent.
     last: Option<u64>,
-    /// The last texts sent.
-    sent: SentTexts,
+    /// The last texts sent (boxed: a session is held across many
+    /// futures' states).
+    sent: Box<SentTexts>,
 }
 
 impl Handle {
@@ -266,7 +267,7 @@ impl Handle {
             s.sent = if lost {
                 SentTexts::default()
             } else {
-                self.sent
+                *self.sent
             };
         }
     }
@@ -361,7 +362,7 @@ pub(crate) fn opened(
         at,
         ended: false,
         last: None,
-        sent: SentTexts::default(),
+        sent: Box::default(),
     }
 }
 
