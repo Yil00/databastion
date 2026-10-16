@@ -150,12 +150,23 @@ pub(crate) struct LogEntry {
     pub(crate) peer: Option<Peer>,
     pub(crate) app: Option<String>,
     pub(crate) own: OwnShape,
+    /// For one of the agent's sampling shapes ([`OwnShape::Keyed`]): the
+    /// learned pattern the key matches as a whole in each database where
+    /// it does, by database index. The own-read budget is kept per
+    /// pattern (decision 8) and scaled (refinement of 2026-10-16), while
+    /// the event's object, when several databases hold keys, is matched
+    /// against the patterns learned in every database and is mostly `*`.
+    /// Empty: the event's objects, within the plain budget.
+    pub(crate) budget: Vec<(u16, NormalizedName)>,
 }
 
 /// What the parser needs to reduce key arguments.
 pub(crate) struct Context<'a> {
     pub(crate) learned: &'a LearnedPatterns,
     pub(crate) stores: Option<&'a CasStores>,
+    /// Each database holding keys with its learned patterns, for the
+    /// own-read budget only ([`LogEntry::budget`]).
+    pub(crate) dbs: &'a [(u16, &'a LearnedPatterns)],
 }
 
 fn int(v: Option<&Value>) -> Option<i64> {
@@ -336,11 +347,60 @@ fn objects_of(
     out
 }
 
-/// Reduces the arguments of a logged command.
-fn reduce(
+/// The budget objects of an own sampling command's keys at `indices`
+/// ([`LogEntry::budget`]): per database of `ctx.dbs`, the learned pattern
+/// a complete, unguarded key matches as a whole. A cut or guarded key, or
+/// one no database's patterns match, adds nothing.
+///
+/// Computed at parse time for every entry of an own sampling shape,
+/// whoever sent it (review L2 of e692192): whether the entry is the
+/// agent's is only known after the poll's `CLIENT LIST`, and computing it
+/// later would keep the raw key bytes alive past the parser (decision 8:
+/// arguments are dropped before any buffering beyond it). The work a
+/// foreign client can drive is bounded: only the agent's exact sampling
+/// shapes (a single key), at most 512 entries per log read, and at most
+/// 16 databases ([`crate::info::MAX_DATABASES`]), each one match of the
+/// kind [`objects_of`] already does for every entry.
+fn budget_of(
     args: &[Option<&[u8]>],
+    indices: &[usize],
     ctx: &Context<'_>,
-) -> (Action, Vec<NormalizedName>, Vec<Signal>, OwnShape) {
+) -> Vec<(u16, NormalizedName)> {
+    let mut out: Vec<(u16, NormalizedName)> = Vec::new();
+    for i in indices {
+        let Some(raw) = args.get(*i).copied().flatten() else {
+            continue;
+        };
+        let (key, cut) = uncut(raw);
+        if cut || guard::key_guarded(key, ctx.stores) {
+            continue;
+        }
+        for (db, set) in ctx.dbs {
+            // A pattern the second gate turned into `*` is no pattern: the
+            // `*` key keeps the plain budget (ADR-0052 refinement of
+            // 2026-10-16, condition 3).
+            if let Some(p) = set.pattern_of(key).filter(|p| p.as_str() != "*") {
+                let entry = (*db, p);
+                if out.len() < MAX_OBJECTS && !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What [`reduce`] keeps of a logged command.
+type Reduced = (
+    Action,
+    Vec<NormalizedName>,
+    Vec<Signal>,
+    OwnShape,
+    Vec<(u16, NormalizedName)>,
+);
+
+/// Reduces the arguments of a logged command.
+fn reduce(args: &[Option<&[u8]>], ctx: &Context<'_>) -> Reduced {
     let complete = match args.last().copied().flatten() {
         Some(last) if args.len() > 1 && is_more_arguments(last) => args.len() - 1,
         _ => args.len(),
@@ -357,6 +417,7 @@ fn reduce(
             vec![NormalizedName::wildcard()],
             Vec::new(),
             OwnShape::No,
+            Vec::new(),
         );
     };
     // The agent never sends a list long enough to be cut.
@@ -370,7 +431,7 @@ fn reduce(
         spec.action = Action::Ddl;
     }
     if spec.action == Action::Ignore {
-        return (Action::Ignore, Vec::new(), Vec::new(), own);
+        return (Action::Ignore, Vec::new(), Vec::new(), own, Vec::new());
     }
     let mut signals = Vec::new();
     // `SORT … BY / GET <pattern>` reads keys the patterns name (never
@@ -407,13 +468,19 @@ fn reduce(
             i += 2;
         }
     }
+    let mut budget = Vec::new();
     let objects = if spec.action == Action::Script {
         vec![NormalizedName::wildcard()]
     } else {
         // The positions are computed on the arguments as logged; an
         // oversized argument counts as present (its key becomes `*`).
         let mut objects = match commands::key_indices(spec.keys, &logged, complete) {
-            Some(idx) => objects_of(args, &idx, ctx, &mut signals),
+            Some(idx) => {
+                if matches!(own, OwnShape::Keyed { .. }) && !ctx.dbs.is_empty() {
+                    budget = budget_of(args, &idx, ctx);
+                }
+                objects_of(args, &idx, ctx, &mut signals)
+            }
             None => vec![NormalizedName::wildcard()],
         };
         let star = NormalizedName::wildcard();
@@ -422,7 +489,7 @@ fn reduce(
         }
         objects
     };
-    (spec.action, objects, signals, own)
+    (spec.action, objects, signals, own, budget)
 }
 
 /// Parses one `SLOWLOG GET` / `COMMANDLOG GET` entry: `[id, timestamp,
@@ -448,7 +515,7 @@ pub(crate) fn parse_log_entry(v: &Value, ctx: &Context<'_>) -> Result<LogEntry, 
             _ => return Err(Malformed),
         }
     }
-    let (action, objects, signals, own) = reduce(&args, ctx);
+    let (action, objects, signals, own, budget) = reduce(&args, ctx);
     let peer = items.get(4).and_then(Value::as_bytes).and_then(Peer::parse);
     let app = items.get(5).and_then(Value::as_bytes).and_then(application);
     Ok(LogEntry {
@@ -461,6 +528,7 @@ pub(crate) fn parse_log_entry(v: &Value, ctx: &Context<'_>) -> Result<LogEntry, 
         peer,
         app,
         own,
+        budget,
     })
 }
 
@@ -717,6 +785,7 @@ mod tests {
         let ctx = Context {
             learned: &learned,
             stores: None,
+            dbs: &[],
         };
         parse_log_entry(&decode(&resp_entry(7, args, "10.0.0.9:51000", "app")), &ctx).unwrap()
     }

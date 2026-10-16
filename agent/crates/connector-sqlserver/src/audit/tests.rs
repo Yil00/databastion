@@ -43,7 +43,7 @@ fn cursor_round_trips() {
     assert!(Cursor::decode(b"v2\n").is_none());
     assert!(Cursor::decode(b"v1\nfile zz\n").is_none());
     assert!(Cursor::decode(b"v1\nguid x\n").is_none());
-    let big = Cursor::decode(b"v1\nskip 999999\n").unwrap();
+    let big = Cursor::decode(b"v1\nskip 99999999\n").unwrap();
     assert_eq!(big.skip, MAX_SKIP);
     // A floor saved without its first start ends once caught up.
     let old = Cursor::decode(b"v1\nfloor 17\n").unwrap();
@@ -209,56 +209,71 @@ fn file_keys_order_one_set() {
     assert!(file_key("/x/a_9_1.sqlaudit") < file_key("/x/a_0_2.sqlaudit"));
 }
 
-#[test]
-fn a_read_that_is_not_full_moves_to_its_last_buffer() {
-    let c = Cursor::default();
-    let n = advance(&c, &pos(&[("f1", 4096), ("f1", 8192), ("f2", 4096)]), 10);
-    assert_eq!((n.file.as_deref(), n.offset, n.skip), (Some("f2"), 4096, 0));
-    assert_eq!(advance(&c, &[], 10), c);
+fn next(c: &Cursor, positions: &[(String, i64)], full: bool) -> Cursor {
+    let (n, gap) = next_position(c, positions, full, file_key);
+    assert!(!gap);
+    n
 }
 
 #[test]
-fn a_full_read_reads_its_last_buffer_again() {
+fn a_read_that_is_not_full_moves_to_its_last_buffer() {
+    let c = Cursor::default();
+    let n = next(&c, &pos(&[("f1", 4096), ("f1", 8192), ("f2", 4096)]), false);
+    assert_eq!((n.file.as_deref(), n.offset, n.skip), (Some("f2"), 4096, 0));
+    assert_eq!(n.buffer, None);
+    assert_eq!(next(&c, &[], false), c);
+}
+
+#[test]
+fn a_full_read_skips_its_last_buffer_on_the_server_next_time() {
     let c = Cursor {
         file: Some("f1".to_owned()),
         offset: 4096,
         ..Cursor::default()
     };
-    let n = advance(
+    let n = next(
         &c,
         &pos(&[("f1", 8192), ("f1", 8192), ("f1", 12288), ("f1", 12288)]),
-        4,
+        true,
     );
     assert_eq!((n.file.as_deref(), n.offset, n.skip), (Some("f1"), 8192, 2));
-    let c2 = Cursor {
-        skip: 4,
-        ..c.clone()
-    };
-    let n = advance(&c2, &pos(&[("f1", 8192); 8]), 8);
-    assert_eq!((n.file.as_deref(), n.offset, n.skip), (Some("f1"), 4096, 8));
+    assert_eq!(n.buffer, Some(("f1".to_owned(), 12288)));
+    // Still that buffer: the count grows, the position stays.
+    let n2 = next(&n, &pos(&[("f1", 12288); 8]), true);
+    assert_eq!(
+        (n2.file.as_deref(), n2.offset, n2.skip),
+        (Some("f1"), 8192, 10)
+    );
+    // The skipped buffer had no more records: the position moves to it.
+    let n3 = next(&n2, &pos(&[("f1", 16384); 3]), true);
+    assert_eq!(
+        (n3.file.as_deref(), n3.offset, n3.skip),
+        (Some("f1"), 12288, 3)
+    );
+    assert_eq!(n3.buffer, Some(("f1".to_owned(), 16384)));
+    // Nothing returned: everything stays.
+    assert_eq!(next(&n3, &[], true), n3);
 }
 
-/// Re-review N1: a buffer larger than a read is walked without losing or
-/// repeating a record (skip 16, batch 16, a buffer of 40 records).
+/// Re-review N1, with the skip on the server: a buffer larger than a read
+/// is walked without losing or repeating a record (batch 16, a buffer of
+/// 40 records).
 #[test]
 fn a_large_buffer_is_walked_record_by_record() {
-    let buffer: Vec<Record> = (0..40)
-        .map(|i| {
-            let mut r = at("f1", 8192);
-            r.time_us = i;
-            r
-        })
-        .collect();
+    let files = AuditFiles::new(
+        vec![("f1".to_owned(), 4096, 3), ("f1".to_owned(), 8192, 40)],
+        2,
+    );
     let mut c = Cursor {
         file: Some("f1".to_owned()),
         offset: 4096,
-        skip: 16,
         ..Cursor::default()
     };
-    let mut seen: Vec<i64> = (0..16).collect();
+    let mut seen: Vec<i64> = (0..3).collect();
     for _ in 0..10 {
-        let top = 16 + c.skip as usize;
-        let read: Vec<Record> = buffer.iter().take(top).cloned().collect();
+        let (top, skip) = request(&c, 16);
+        assert_eq!(top, 16, "a read asks for a batch whatever the skip");
+        let read = files.read(&c, top, skip);
         let returned = read.len();
         let b = batch(&c, read, returned, top, file_key);
         seen.extend(b.kept.iter().map(|r| r.time_us));
@@ -267,7 +282,7 @@ fn a_large_buffer_is_walked_record_by_record() {
             break;
         }
     }
-    assert_eq!(seen, (0..40).collect::<Vec<i64>>());
+    assert_eq!(seen, (0..43).collect::<Vec<i64>>());
     assert_eq!((c.file.as_deref(), c.offset, c.skip), (Some("f1"), 8192, 0));
 }
 
@@ -354,15 +369,22 @@ fn an_oversized_buffer_is_a_gap() {
         file: Some("f1".to_owned()),
         offset: 4096,
         skip: MAX_SKIP,
+        buffer: Some(("f1".to_owned(), 8192)),
         ..Cursor::default()
     };
-    let top = BATCH + MAX_SKIP as usize;
+    let (top, skip) = request(&c, BATCH);
+    assert_eq!((top, skip), (BATCH, MAX_SKIP));
     let recs: Vec<Record> = (0..top).map(|_| at("f1", 8192)).collect();
     let b = batch(&c, recs, top, top, file_key);
     assert!(b.gap);
     assert_eq!(
-        (b.next.file.as_deref(), b.next.offset, b.next.skip),
-        (Some("f1"), 8192, 0)
+        (
+            b.next.file.as_deref(),
+            b.next.offset,
+            b.next.skip,
+            b.next.buffer.as_ref()
+        ),
+        (Some("f1"), 8192, 0, None)
     );
     assert_eq!(b.kept.len(), BATCH);
 }
@@ -494,4 +516,152 @@ fn xe_large_buffers_are_walked_without_loss() {
     // Nothing new: the position and the skip stay.
     let b = xe_batch(&c, Vec::new(), 0, 500);
     assert_eq!((b.next.offset, b.next.skip), (4096, 1000));
+}
+
+/// An audit file set as `sys.fn_get_audit_file` reads it (measured on
+/// 2022): a read from (file, offset) starts at the buffer after that one,
+/// in the next file when it was the file's last; the first `skip` rows
+/// are skipped on the server, at most `top` returned, in file order. The
+/// first `visible` buffers are written. Each record's `time_us` is its
+/// index in the set.
+struct AuditFiles {
+    buffers: Vec<(String, i64, usize)>,
+    visible: usize,
+    all: Vec<Record>,
+}
+
+impl AuditFiles {
+    fn new(buffers: Vec<(String, i64, usize)>, visible: usize) -> Self {
+        let mut all = Vec::new();
+        for (file, offset, n) in &buffers {
+            for _ in 0..*n {
+                let mut r = at(file, *offset);
+                r.time_us = i64::try_from(all.len()).unwrap();
+                all.push(r);
+            }
+        }
+        Self {
+            buffers,
+            visible,
+            all,
+        }
+    }
+
+    fn read(&self, cursor: &Cursor, top: usize, skip: u32) -> Vec<Record> {
+        let end: usize = self.buffers.iter().take(self.visible).map(|b| b.2).sum();
+        let start: usize = match &cursor.file {
+            None => 0,
+            Some(f) => {
+                let i = self
+                    .buffers
+                    .iter()
+                    .position(|(bf, bo, _)| bf == f && *bo == cursor.offset)
+                    .expect("a buffer of the set");
+                self.buffers.iter().take(i + 1).map(|b| b.2).sum()
+            }
+        };
+        let from = (start + skip as usize).min(end);
+        self.all[from..end.min(from + top)].to_vec()
+    }
+
+    /// The stream's reads from the first start with reads of `batch`
+    /// records, `per_poll` more buffers written each time a read is not
+    /// full: the records handled, in order, and whether a gap was seen.
+    fn walk(
+        buffers: Vec<(String, i64, usize)>,
+        batch_size: usize,
+        per_poll: usize,
+    ) -> (Vec<i64>, bool) {
+        let mut files = Self::new(buffers, 0);
+        let mut c = Cursor::default();
+        let mut seen = Vec::new();
+        let mut gap = false;
+        loop {
+            let (top, skip) = request(&c, batch_size);
+            assert_eq!(top, batch_size, "a read asks for a batch whatever the skip");
+            let read = files.read(&c, top, skip);
+            let returned = read.len();
+            let got = batch(&c, read, returned, top, file_key);
+            gap |= got.gap;
+            seen.extend(got.kept.iter().map(|r| r.time_us));
+            c = got.next;
+            if !got.full {
+                if files.visible == files.buffers.len() {
+                    return (seen, gap);
+                }
+                // Caught up: the audit writes its next buffers.
+                files.visible = (files.visible + per_poll).min(files.buffers.len());
+            }
+        }
+    }
+}
+
+/// P9-D load run (300 statements/s): a rollover stalls the statements for
+/// about 2.4 s, and the buffers written right after it hold up to about
+/// 790 records (measured on 2022: 770 and 789, the buffer is about 500
+/// KiB), more than a read. Such a buffer is walked by full reads whatever
+/// its size, while the audit is written between reads: every record is
+/// handled once, none lost, no gap. (Before the server-side skip, a read
+/// asked for the batch plus the records already handled from the
+/// buffer's start, and a buffer over 500 handled records was a gap that
+/// lost its rest.)
+#[test]
+fn a_buffer_larger_than_a_read_loses_no_record() {
+    let folder = "/var/opt/mssql/audit/";
+    let (a, b) = (
+        f(folder, 134_366_529_617_000_000),
+        f(folder, 134_366_529_736_980_000),
+    );
+    let written: Vec<(String, i64, usize)> = vec![
+        (a.clone(), 16_384, 245),
+        (a.clone(), 176_128, 312),
+        (a.clone(), 380_928, 290),
+        (a.clone(), 1_753_088, 18),
+        (b.clone(), 12_288, 770),
+        (b.clone(), 512_000, 213),
+        (b.clone(), 651_264, 789),
+        (b.clone(), 1_163_264, 310),
+        (b.clone(), 1_363_968, 2_400),
+        (b.clone(), 4_000_000, 7),
+    ];
+    let total = i64::try_from(written.iter().map(|w| w.2).sum::<usize>()).unwrap();
+    for per_poll in 1..=3 {
+        let (seen, gap) = AuditFiles::walk(written.clone(), BATCH, per_poll);
+        assert!(!gap, "no buffer is above the bound");
+        assert_eq!(
+            seen,
+            (0..total).collect::<Vec<_>>(),
+            "{per_poll} buffer(s) written per poll: every record once"
+        );
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+    /// Any buffer sizes (up to several reads each), any read size, any
+    /// number of buffers written between reads, across two files: every
+    /// record is handled exactly once and in order.
+    #[test]
+    fn any_buffers_are_walked_without_loss_or_repeat(
+        sizes in proptest::collection::vec(1usize..2_500, 1..10),
+        split in 0usize..10,
+        batch_size in 16usize..=BATCH,
+        per_poll in 1usize..4,
+    ) {
+        let folder = "/var/opt/mssql/audit/";
+        let (a, b) = (f(folder, 1), f(folder, 2));
+        let buffers: Vec<(String, i64, usize)> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let file = if i < split { a.clone() } else { b.clone() };
+                (file, 4096 * (i64::try_from(i).unwrap() + 1), *n)
+            })
+            .collect();
+        let total = i64::try_from(sizes.iter().sum::<usize>()).unwrap();
+        let (seen, gap) = AuditFiles::walk(buffers, batch_size, per_poll);
+        proptest::prop_assert!(!gap);
+        proptest::prop_assert_eq!(seen, (0..total).collect::<Vec<_>>());
+    }
 }

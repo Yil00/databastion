@@ -306,7 +306,8 @@ fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration)
 /// statements can be (one statement may have sent every row, each other
 /// none), so one large call cannot hide many empty ones (security review
 /// of #197, L2a: one call of 500 rows and 500 empty calls cost 1000).
-fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
+#[must_use]
+pub fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
     let calls = e.aggregated_count().max(1);
     e.rows()
         .map_or(budget, |r| r.max(1).saturating_add(calls - 1))
@@ -397,9 +398,9 @@ impl OwnAccount {
         self.addr = addr;
     }
 
-    /// Charges `rows` to an object; `true` when its 24 h total exceeds the
-    /// budget (or it cannot be tracked).
-    fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
+    /// Charges `rows` to an object; `true` when its 24 h total exceeds
+    /// `budget` (or it cannot be tracked).
+    fn charge(&mut self, key: String, rows: u64, now: Instant, budget: u64) -> bool {
         let mut guard = self
             .usage
             .lock()
@@ -432,7 +433,7 @@ impl OwnAccount {
         let total = buckets
             .iter()
             .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
-        total > self.budget
+        total > budget
     }
 
     /// Whether an event may be left out: the agent's account, its
@@ -452,12 +453,38 @@ impl OwnAccount {
         e: &MaskedEvent,
         now: Instant,
     ) -> bool {
+        let budget = self.budget;
+        self.routine_within(user, application, client, e, now, budget)
+    }
+
+    /// The budget of [`OwnAccount::routine`] (`limits.max_sample_rows`).
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// [`OwnAccount::routine`] with another per-object budget, for a
+    /// connector whose own sampling of one object may read more rows than
+    /// `limits.max_sample_rows` in one scan by an accepted rule (the
+    /// Redis / Valkey scale of ADR-0052, refinement of 2026-10-16). Every
+    /// other rule is the same; the charges go to the same counters.
+    /// A new caller, or a larger budget, needs an accepted ADR: only
+    /// `connector-redis` calls it today.
+    pub fn routine_within(
+        &mut self,
+        user: &str,
+        application: Option<&str>,
+        client: ClientSeen,
+        e: &MaskedEvent,
+        now: Instant,
+        budget: u64,
+    ) -> bool {
         // The agent only reads (I4): a write, DDL or DCL with its identity
         // is someone else using it, and is always reported.
         if user != self.account || !matches!(e.action(), EventAction::Read | EventAction::Connect) {
             return false;
         }
-        let rows = charged_rows(e, self.budget);
+        let rows = charged_rows(e, budget);
         let identity = self.identity(application, client);
         let mut over = false;
         for o in e.objects() {
@@ -466,7 +493,7 @@ impl OwnAccount {
                 o.schema().map_or("", |s| s.as_str()),
                 o.object().as_str(),
             );
-            over |= self.charge(key, rows, now);
+            over |= self.charge(key, rows, now, budget);
         }
         if !e.objects().is_empty() {
             self.lock_usage().persist(now, false);
@@ -654,13 +681,39 @@ mod tests {
         let mut o = own(Some("192.0.2.14"));
         let t0 = Instant::now();
         let key = || "shop\u{0}crm\u{0}t".to_owned();
-        assert!(!o.charge(key(), 600, t0));
+        assert!(!o.charge(key(), 600, t0, 1000));
         // An hour later (past any aggregation window): still counted.
-        assert!(o.charge(key(), 600, t0 + Duration::from_secs(3600)));
+        assert!(o.charge(key(), 600, t0 + Duration::from_secs(3600), 1000));
         // A day later: the first charges have aged out.
         let mut o = own(Some("192.0.2.14"));
-        assert!(!o.charge(key(), 600, t0));
-        assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600)));
+        assert!(!o.charge(key(), 600, t0, 1000));
+        assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600), 1000));
+    }
+
+    /// `routine_within` checks the same counters against the budget it is
+    /// given; `routine` against `limits.max_sample_rows`.
+    #[test]
+    fn routine_within_uses_its_own_budget_on_the_same_counters() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("192.0.2.14"),
+            10,
+            std::sync::Arc::clone(&usage),
+        );
+        assert_eq!(o.budget(), 10);
+        let app = Some("databastion-agent");
+        assert!(o.routine_within("databastion", app, logged, &ev(Some(30)), now, 40));
+        // 30 charged: over the plain budget, within 40.
+        assert!(!o.routine("databastion", app, logged, &ev(Some(1)), now));
+        // 31 charged (the refused read is charged too), then 39, then 41.
+        assert!(o.routine_within("databastion", app, logged, &ev(Some(8)), now, 40));
+        assert!(!o.routine_within("databastion", app, logged, &ev(Some(2)), now, 40));
+        // The identity rules still apply.
+        assert!(!o.routine_within("cn=other", app, logged, &ev(Some(0)), now, u64::MAX));
     }
 
     /// A read that returns no row is charged one row (security review of

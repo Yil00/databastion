@@ -1506,3 +1506,145 @@ async fn socket_clients_are_never_attributed() {
         assert_eq!(e["source"], "redis_slowlog", "{e}");
     }
 }
+
+/// The P9-D end-to-end finding: keys in two databases whose learned
+/// patterns differ (the dev keyspace: `session:*` in `db1` only), a slow
+/// log long enough to hold a whole scan, and a Discovery scan while the
+/// stream polls. Slow-log entries carry no database, so their objects are
+/// matched against the patterns learned in every database (`*` here);
+/// the agent's own sampling reads must still be budgeted per pattern
+/// (ADR-0052 decision 8) and left out, never reported as one read of `*`,
+/// with `limits.max_sample_rows` 100 too (the scaled budget).
+#[tokio::test(flavor = "multi_thread")]
+async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // `limits.max_sample_rows` 100 (the P9-D variant): one scan samples up
+    // to 100 keys per pattern, within the scaled budget (`100 ×
+    // PER_KEY_MAX` per pattern, ADR-0052 refinement of 2026-10-16).
+    const MAX_ROWS: u32 = 100;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let len = admin(&t, &[vec![b"CONFIG", b"GET", b"slowlog-max-len"]]).await;
+        let old_len = match &len[0] {
+            Value::Map(kv) => kv
+                .first()
+                .and_then(|(_, v)| v.as_bytes().map(<[u8]>::to_vec)),
+            Value::Array(a) => a.get(1).and_then(|v| v.as_bytes().map(<[u8]>::to_vec)),
+            _ => None,
+        }
+        .expect("slowlog-max-len");
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-own-budget-{}-{name}",
+            std::process::id()
+        ));
+        admin(&t, &[vec![b"CONFIG", b"SET", b"slowlog-max-len", b"1024"]]).await;
+        // The scans and the stream in a task of their own, so a failure
+        // there still restores the slow log's length and removes the state
+        // directory before it is raised (review L3).
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            // The patterns the stream maps keys to, in both databases.
+            let first = Limits {
+                max_sample_rows: MAX_ROWS,
+                ..unpaced()
+            };
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &first, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+
+            std::fs::create_dir_all(&dir).unwrap();
+            let limits = Limits {
+                min_audit_poll_interval_s: 1,
+                max_sample_rows: MAX_ROWS,
+                ..Limits::default()
+            };
+            let cfg =
+                databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            // Stopped whatever happens below.
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+
+            // The agent's own Discovery while the stream polls (paced, so
+            // no poll finds more than the 512 entries it reads).
+            let paced = Limits {
+                discovery_duty_cycle_percent: 30,
+                max_sample_rows: MAX_ROWS,
+                ..Limits::default()
+            };
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            (connector, events)
+        })
+        .await;
+        admin(
+            &t,
+            &[vec![
+                b"CONFIG",
+                b"SET",
+                b"slowlog-max-len",
+                old_len.as_slice(),
+            ]],
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let (connector, events) = match run {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
+        let json = events_json(&events);
+        // Nobody else used the server: no event at all.
+        assert!(json.is_empty(), "{name}: {json:#?}");
+        // Not vacuous: the stream did charge the scan's reads, per
+        // pattern and database (`session:*` is learned in `db1` only).
+        let budgets = connector
+            .state
+            .audit
+            .own_usage(&t.id)
+            .lock()
+            .unwrap()
+            .budgeted_objects();
+        assert!(
+            budgets.iter().any(|k| k == "db1\u{0}\u{0}session:*"),
+            "{name}: {budgets:?}"
+        );
+        assert!(
+            budgets.iter().any(|k| k.starts_with("db0\u{0}")),
+            "{name}: {budgets:?}"
+        );
+    }
+}
+
+/// Aborts a task when dropped (a test that fails leaves no stream polling).
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
