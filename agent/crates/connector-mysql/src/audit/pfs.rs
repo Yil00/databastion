@@ -456,6 +456,17 @@ async fn own_session(session: &mut Session, stage: Stage) -> Result<Option<OwnSe
     Ok(rows.first().and_then(|r| own_row(r)))
 }
 
+/// Notes `own`, a poll session's thread, as one of the agent's poll
+/// sessions (`own_threads::PollThreads`), when its server run is known.
+fn note_poll_thread(poll_threads: &SharedPollThreads, own: &OwnSession) {
+    if let Some(run) = &own.run {
+        poll_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .note(run, own.uptime, own.thread);
+    }
+}
+
 /// Where polling resumes after a restart: `(last, seen, floor)`.
 type Resume = (Option<u64>, HashMap<(u64, u64), u64>, Option<u64>);
 
@@ -621,7 +632,11 @@ impl PsPoller {
         store: Option<CursorStore>,
         own: OwnSessions,
     ) -> Result<Self, MyError> {
+        // The thread is noted before any other statement: a stream dropped
+        // during the next ones (shutdown, reconfiguration) leaves its
+        // probes recognized by the other streams on the server.
         let attached = own_thread(session).await?;
+        note_poll_thread(&own.poll_threads, &attached);
         let limit = parse_limit;
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         if text_limit_low(text_limit) {
@@ -653,7 +668,7 @@ impl PsPoller {
             }
             saved = None;
         }
-        let mut poller = Self {
+        Ok(Self {
             table,
             text_limit,
             digest_limit,
@@ -670,25 +685,17 @@ impl PsPoller {
             floor,
             saved,
             own,
-            run: None,
+            run: attached.run,
             own_addr: None,
             own_dropped: 0,
             pinned: 0,
-        };
-        poller.note_own(attached);
-        Ok(poller)
+        })
     }
 
     /// The poll session's server run, and its thread noted as one of the
     /// agent's poll sessions (`own_threads::PollThreads`).
     fn note_own(&mut self, own: OwnSession) {
-        if let Some(run) = &own.run {
-            self.own
-                .poll_threads
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note(run, own.uptime, own.thread);
-        }
+        note_poll_thread(&self.own.poll_threads, &own);
         self.run = own.run;
     }
 
@@ -1827,6 +1834,82 @@ mod tests {
             }
             assert!(own_row(&cells(&["x", "h", "3306", "1", "1", "1"])).is_none());
             assert!(own_row(&[]).is_none());
+        }
+
+        /// The CI failure of the own-sessions integration test (lot E
+        /// follow-up): a stream dropped while it starts (shutdown,
+        /// reconfiguration, a stream restarted) has noted its poll thread as
+        /// soon as it read it, not after the text-limit reads that follow,
+        /// so that the other streams on the server drop its own probes.
+        #[tokio::test]
+        async fn the_poll_thread_is_noted_before_the_next_statement() {
+            use crate::conn::Flavor;
+            use crate::fake::{EOF, column_def};
+            use crate::proto::{PacketIo, put_lenenc};
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let target = databastion_core::AgentConfig::parse(
+                "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                 engine: mysql, host: 127.0.0.1, port: 9, account: databastion, \
+                 secret: {env: DATABASTION_TEST_UNSET_MY_SECRET}, mysql: {tls: disable}}]}",
+            )
+            .unwrap()
+            .targets[0]
+                .clone();
+            let mut session = Session::scripted(client, &target, Flavor::Mysql);
+            let (asked, asked_rx) = tokio::sync::oneshot::channel();
+            let srv = tokio::spawn(async move {
+                let mut io = PacketIo::new(server);
+                let q = io.read().await.unwrap();
+                assert_eq!(&q[1..], sql::ps_own_thread(Flavor::Mysql).as_bytes());
+                let cells = ["90", "db1", "3306", "1", "uuid-a", "1000000", "3600"];
+                io.write(&[7]).await.unwrap();
+                for i in 0..cells.len() {
+                    io.write(&column_def(format!("c{i}").as_bytes()))
+                        .await
+                        .unwrap();
+                }
+                io.write(&EOF).await.unwrap();
+                let mut row = Vec::new();
+                for c in cells {
+                    put_lenenc(&mut row, c.len() as u64);
+                    row.extend_from_slice(c.as_bytes());
+                }
+                io.write(&row).await.unwrap();
+                io.write(&EOF).await.unwrap();
+                io.reset_seq();
+                let q = io.read().await.unwrap();
+                assert_eq!(&q[1..], sql::PS_TEXT_LIMIT.as_bytes());
+                let _ = asked.send(());
+                // No answer: the stream is dropped while it waits.
+                let _ = io.read().await;
+            });
+            let polls: SharedPollThreads = Arc::new(Mutex::new(PollThreads::default()));
+            let own = OwnSessions {
+                account: AGENT.to_owned(),
+                poll_threads: Arc::clone(&polls),
+                pins: Arc::new(Mutex::new(DiscoveryPins::default())),
+            };
+            let builder = EventBuilder::new(OwnAccount::new(
+                AGENT,
+                Some(crate::audit::PROGRAM_NAME),
+                addr(),
+                BUDGET,
+                SharedOwnUsage::default(),
+            ));
+            let start = tokio::spawn(async move {
+                let _ =
+                    PsPoller::start(&mut session, PsTable::HistoryLong, builder, None, own).await;
+            });
+            asked_rx.await.unwrap();
+            start.abort();
+            assert!(start.await.unwrap_err().is_cancelled());
+            let run = ServerRun::new(
+                &["db1", "3306", "1", "uuid-a"].map(|c| Some(c.to_owned())),
+                1_000_000,
+            )
+            .unwrap();
+            assert!(polls.lock().unwrap().contains(&run, 90));
+            srv.await.unwrap();
         }
 
         /// A session seen while connected is remembered first: an ended

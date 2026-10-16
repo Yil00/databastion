@@ -196,6 +196,33 @@ async fn the_agents_own_sessions_are_never_unknown_principals() {
         let (task2, mut rx2) = stream(&connector, &t2, &s2.0, 1);
         // The first polls place the cursors at the newest statement.
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Both streams' sessions are noted as the agent's poll sessions.
+        {
+            let rows = a
+                .query(
+                    Stage::Audit,
+                    &format!(
+                        "SELECT THREAD_ID FROM performance_schema.threads \
+                         WHERE PROCESSLIST_USER = '{OS_USER}'"
+                    ),
+                )
+                .await
+                .unwrap();
+            let threads: Vec<u64> = rows
+                .iter()
+                .filter_map(|r| r.first().cloned().flatten()?.parse().ok())
+                .collect();
+            assert_eq!(threads.len(), 2, "{}: {threads:?}", server.name);
+            let polls = connector.check_state.poll_threads();
+            let polls = polls.lock().unwrap();
+            for thread in threads {
+                assert!(
+                    polls.contains_thread(thread),
+                    "{}: poll thread {thread} not noted",
+                    server.name
+                );
+            }
+        }
         // 1. A Discovery scan of the first target between two polls of its
         // stream: its sessions have ended when that stream reads them.
         let started = Instant::now();

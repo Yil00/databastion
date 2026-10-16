@@ -138,6 +138,15 @@ impl PollThreads {
         self.runs.push_back((run.clone(), VecDeque::from([thread])));
     }
 
+    /// Whether `thread` is one of the agent's poll sessions, on any run
+    /// (integration tests, which do not know the run).
+    #[cfg(test)]
+    pub(crate) fn contains_thread(&self, thread: u64) -> bool {
+        self.runs
+            .iter()
+            .any(|(_, threads)| threads.contains(&thread))
+    }
+
     /// Whether `thread` of `run` is one of the agent's poll sessions.
     pub(crate) fn contains(&self, run: &ServerRun, thread: u64) -> bool {
         self.runs
