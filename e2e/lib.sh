@@ -405,6 +405,41 @@ incidents_json() {
     FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '$1'"
 }
 
+# inspect_scan WHEN: `docker inspect` of every container of the project, running or exited
+# (environment, command, entrypoint, labels, mounts), into a private work file: no registered
+# secret may be in it (names logged, never values).
+inspect_scan() {
+  local f="$E2E_WORK_DIR/inspect.json" leaked l
+  local -a ids
+  mapfile -t ids < <(compose ps -aq)
+  [ "${#ids[@]}" -gt 0 ] || fail "no container to inspect ($1)"
+  timeout 60 docker inspect "${ids[@]}" >"$f" || fail "docker inspect failed ($1)"
+  if ! leaked="$(leak_scan "$f" "$P")"; then
+    while IFS= read -r l; do log "LEAK (docker inspect, $1): $l"; done <<<"$leaked"
+    rm -f -- "$f"
+    fail "a secret is in the containers' configuration ($1)"
+  fi
+  rm -f -- "$f"
+  log "docker inspect of ${#ids[@]} container(s) ($1): no secret"
+}
+
+# objects_summary TARGET ENGINE SQL_CONDITION: the event objects of a target's events matching the
+# condition, for the job log, never as stored: each object mapped to `*`, to the name of a
+# ground-truth location of ENGINE without a value in its name (its normalized pattern included), or
+# to `<other>`; "<mapped form> x<count>" per form. A raw object name (which may hold a value) is
+# never printed.
+objects_summary() {
+  local known
+  known="$(jq -r --arg e "$2" '[.locations[] | select(.engine == $e and (.name_contains_value | not)) | .object]
+      + [.locations[] | select(.engine == $e) | .expected_normalized_name // empty]
+    | unique | map("'"'"'" + gsub("'"'"'"; "'"''"'") + "'"'"'") | join(", ")' "$GROUND_TRUTH")"
+  console_sql "SELECT coalesce(string_agg(m || ' x' || n, ' ' ORDER BY m), 'none') FROM (
+      SELECT CASE WHEN o->>'object' = '*' THEN '*'
+                  WHEN o->>'object' IN (${known:-''}) THEN o->>'object' ELSE '<other>' END AS m, count(*) AS n
+      FROM access_events e, jsonb_array_elements(e.objects) o
+      WHERE e.agent_id = '${AGENT_ID}' AND e.target_id = '$1' AND ($3) GROUP BY 1) x"
+}
+
 # --------------------------------------------------------------------------- I2 collection
 # collect_console_side DIR TARGET...: the console database dump, the Audit tables as JSON, the
 # pages (findings, events, incidents, agent, each target's settings) and the agent's state.

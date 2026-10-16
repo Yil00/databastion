@@ -36,6 +36,7 @@ LOG_TAG="e2e-sqlserver"  # read by lib.sh
 I2_CHECK="$HERE/i2_check.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
 TARGET="mssql-e2e"
+BADCA="mssql-e2e-wrong-ca"   # the negative TLS control (the console test CA as ca_file)
 ENGINE="sqlserver"
 POLICY_DUMP="e2e sqlserver export"
 POLICY_READS="e2e sqlserver reads"
@@ -132,6 +133,17 @@ targets:
       databases: [retail]
       rls_visibility: view_definition
       audit: {source: sqlserver_audit, audit_name: databastion_audit}
+  - id: ${BADCA}
+    engine: sqlserver
+    host: sqlserver
+    port: 1433
+    account: databastion
+    secret:
+      file: /run/databastion-secrets/target_agent_password
+    sqlserver:
+      tls: auto
+      ca_file: /etc/databastion/console-ca.pem
+      databases: [retail]
 EOF
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -182,6 +194,7 @@ docker inspect "$(compose ps -q target-mssql)" --format '{{json .Config.Env}}' \
 compose exec -T target-mssql cat /var/opt/mssql/databastion-tls/ca.pem >"$T/sqlserver-ca.pem" \
   || fail "cannot copy the dev CA of target-mssql"
 grep -q 'BEGIN CERTIFICATE' "$T/sqlserver-ca.pem" || fail "no dev CA in target-mssql"
+inspect_scan "after the start"
 chmod 0644 "$T/sqlserver-ca.pem"
 version="$(mssql_sa_q "SELECT CONCAT(CONVERT(nvarchar(64), SERVERPROPERTY('ProductVersion')), ' ', CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), ' engine ', CONVERT(int, SERVERPROPERTY('EngineEdition')))")" \
   || fail "cannot read the server version"
@@ -221,7 +234,7 @@ expected+="+SELECT:OBJECT_OR_COLUMN:cas:col+SELECT:SCHEMA:crm+SELECT:SCHEMA:fina
 # first start) never sees these statements. e2e_exporter and e2e_analyst: SELECT on crm and finance;
 # e2e_admin: ALTER ANY LOGIN only (the DCL test), no table privilege.
 log "creating the test logins e2e_exporter, e2e_analyst, e2e_admin"
-# shellcheck disable=SC2016 # sqlcmd variables, not shell
+# shellcheck disable=SC2016 # sqlcmd variables (PW from the environment: never on a command line)
 printf '%s\n' 'SET NOCOUNT ON;' \
   "CREATE LOGIN e2e_exporter WITH PASSWORD = N'\$(PW)', CHECK_POLICY = OFF, DEFAULT_DATABASE = retail;" \
   "CREATE LOGIN e2e_analyst WITH PASSWORD = N'\$(PW)', CHECK_POLICY = OFF, DEFAULT_DATABASE = retail;" \
@@ -232,7 +245,7 @@ printf '%s\n' 'SET NOCOUNT ON;' \
   'GRANT SELECT ON SCHEMA::crm TO e2e_exporter, e2e_analyst;' \
   'GRANT SELECT ON SCHEMA::finance TO e2e_exporter, e2e_analyst;' 'GO' \
   | timeout 120 docker compose "${COMPOSE_ARGS[@]}" exec -T -e SSL_CERT_FILE=/var/opt/mssql/databastion-tls/ca.pem \
-    target-mssql bash -c 'SQLCMDPASSWORD="$(cat /run/secrets/target_mssql_password)" exec '"$SQLCMD"' -S localhost -U sa -b -I -v PW="$(cat /run/secrets/target_client_password)" -i /dev/stdin' \
+    target-mssql bash -c 'SQLCMDPASSWORD="$(cat /run/secrets/target_mssql_password)" PW="$(cat /run/secrets/target_client_password)" exec '"$SQLCMD"' -S localhost -U sa -b -I -i /dev/stdin' \
     >/dev/null 2>"$E2E_WORK_DIR/client.err" || fail "cannot create the test logins ($(client_error_code))"
 phase_done logins
 
@@ -256,6 +269,14 @@ line="$(compose logs --no-color agent 2>/dev/null | grep -F '"SQL Server checked
 [[ "$line" == *"(edition 4), mandatory encryption"* ]] \
   || fail "${TARGET}: no 'SQL Server checked' line with the Express edition and mandatory encryption in the agent log"
 log "${TARGET}: checked over mandatory encryption (TDS 7.x, certificate verified against the dev CA)"
+# Negative TLS control: the same server declared with a CA that did not sign its certificate (the
+# console's test CA): the target must be reported unreachable, failing at the TLS stage
+# (`check.stage_failed` with `stage_tls`; the contract has no TLS failure code), never connected.
+log "negative TLS control: ${BADCA} (the console test CA as ca_file) must fail at the TLS stage"
+wait_target_state "$BADCA" 120 '.present and .reachable == false
+    and any(.notes[]?; .code == "check.stage_failed" and ((.labels // []) | index("stage_tls")))' \
+  "unreachable with check.stage_failed stage_tls"
+log "${BADCA}: $(jq -c '{reachable, lastError, notes: [.notes[]? | {code, labels}]}' <<<"$TARGET_STATE")"
 phase_done enroll
 
 # --------------------------------------------------------------------------- Audit setup
@@ -410,10 +431,14 @@ log "Audit: exporter events with signature.bcp ${n_bcp}, shape.full_table_read $
 [ "$n_reads" = 2 ] || fail "Audit: the analyst ran 2 statements, ${n_reads} read(s) counted"
 [ "$n_dcl" = 3 ] || fail "Audit: the admin ran 3 DCL statements, ${n_dcl} counted"
 # The analyst's events name the two tables it read, nothing else.
-objs="$(console_sql "SELECT string_agg(DISTINCT o->>'schema' || '.' || (o->>'object'), ' ' ORDER BY o->>'schema' || '.' || (o->>'object'))
+# Compared in SQL: only the verdict and counts reach the job log, never an object name.
+objs="$(console_sql "SELECT concat_ws(',', count(DISTINCT o->>'schema' || '.' || (o->>'object')),
+    bool_or(o->>'schema' = 'crm' AND o->>'object' = 'customers'),
+    bool_or(o->>'schema' = 'finance' AND o->>'object' = 'payment_cards'))
   FROM access_events e, jsonb_array_elements(e.objects) o WHERE e.agent_id = '${AGENT_ID}'
   AND e.target_id = '${TARGET}' AND e.db_user = 'e2e_analyst'")"
-[ "$objs" = "crm.customers finance.payment_cards" ] || fail "Audit: the analyst's events name '$objs'"
+[ "$objs" = "2,t,t" ] \
+  || fail "Audit: the analyst's events should name exactly crm.customers and finance.payment_cards ($(objects_summary "$TARGET" "$ENGINE" "e.db_user = 'e2e_analyst'"))"
 # Every event is SQL Server Audit's.
 events_json "$TARGET" >"$E2E_WORK_DIR/events.json" || fail "cannot read the access events"
 incidents_json "$TARGET" >"$E2E_WORK_DIR/incidents.json" || fail "cannot read the incidents"
@@ -466,6 +491,7 @@ dump_logs "${SERVICES[@]}"
 for f in agent.log web.log worker.log; do
   [ -s "$E2E_LOG_DIR/$f" ] || fail "$f is empty: the scans would prove nothing"
 done
+inspect_scan "with the agent"
 D="$E2E_WORK_DIR/dump"
 collect_console_side "$D" "$TARGET"
 grep -qF 'e2e_exporter' "$D/pages/incidents.html" || fail "the incidents page does not list e2e_exporter (page scan control)"

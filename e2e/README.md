@@ -583,7 +583,12 @@ over this stack (Compose project `databastion-e2e-sqlserver`) and starts only `d
 through `CI result`; it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`,
 `dev/sqlserver/`, `dev/seed/out/sqlserver.sql`, `dev/ground-truth.json`, `dev/docker-compose.yml`
 or `ci.yml` change. A job of its own: the SQL Server image is 2.3 GB (amd64 only). The shared
-helpers of the phase 9 scenarios are in [`lib.sh`](lib.sh).
+helpers of the phase 9 scenarios are in [`lib.sh`](lib.sh). In both phase 9 scenarios (and their
+load runs), `docker inspect` of every container of the project (environment, command, entrypoint,
+labels, mounts) is dumped to a private file and searched for every registered secret, after the
+start and again with the agent running; event objects reach the job log only as counts of mapped
+forms (`*`, a ground-truth location's name, `<other>`), never as stored; the test logins' password
+reaches `sqlcmd` through the environment (`PW`, a scripting variable), never its command line.
 
 | Service | Image | Role |
 |---------|-------|------|
@@ -602,7 +607,12 @@ helpers of the phase 9 scenarios are in [`lib.sh`](lib.sh).
 2. The agent is online; the console lists `engine.sqlserver`, so the target is reported, reachable,
    checked over **mandatory** encryption (SQL Server 2022 on Linux has no TDS 8.0 strict mode: the
    `auto` fallback, certificate verified; the agent's `SQL Server checked` line), audit level
-   **Limited** from `sqlserver_audit` before any stream runs.
+   **Limited** from `sqlserver_audit` before any stream runs. Negative TLS control: a second target
+   entry, `mssql-e2e-wrong-ca`, declares the same server with the console's test CA as `ca_file`
+   (a CA that did not sign the server certificate); it must be reported unreachable with
+   `check.stage_failed` labelled `stage_tls` (the contract has no TLS failure code). The connector's
+   integration test `untrusted_certificate_is_refused` covers the same refusal against the dev
+   server.
 3. Three `access_event` policies (`signature.bcp` or `shape.full_table_read`, critical; every
    `read`; every `dcl`), Audit enabled. Discovery while the stream runs:
    [`i2_check.py findings`](i2_check.py) with every expected classifier and no negative control,
@@ -665,7 +675,10 @@ most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `
    `CLIENT LIST` (I4).
 2. The agent is online; the console lists `engine.redis` and `engine.valkey`, so both targets are
    reported, reachable, as the engine they are (no `check.server_is_*` note), level **None** before
-   Audit.
+   Audit. Negative TLS control: a third target entry, `valkey-e2e-wrong-ca`, declares the Valkey
+   server with the console's test CA as `ca_file`; it must be reported unreachable with
+   `check.stage_failed` labelled `stage_tls`. The Redis connector has no integration test of a
+   refused certificate; this step is its only end-to-end check.
 3. Discovery before Audit: [`i2_check.py findings`](i2_check.py) with every expected classifier, no
    negative control, the value-bearing key names stored under their normalized patterns
    (`user:*:profile`, `*:*`). Two `access_event` policies (`shape.keyspace_enumeration` or
@@ -695,6 +708,13 @@ most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `
    tables, the pages, the agent's state and every log but the targets': no ground-truth value or
    value-bearing key or field name; the analyst's key names alone; no generated secret in any log
    (the targets' included), the console database, the pages or the agent's state.
+
+**Residual: egress of the targets.** `redis-net` is an ordinary (not internal) bridge network: the
+host-side client needs a published port, and Docker publishes no port from an internal network.
+So `target-valkey` and `target-redis` can open outbound connections to the internet for the run's
+length (nothing in them does: the pinned dev images, the server only). The agent is not on
+`redis-net`, and nothing listens outside `127.0.0.1`. Running the client from a container on
+`agent-net` instead (an image with Python, pinned by digest) would remove it; not done yet.
 
 **Known issue (agent, found by this scenario).** On Valkey 9.0.6, the agent's own Discovery
 sampling commands read by the stream while it runs come back as one aggregated `read` of `*` by the

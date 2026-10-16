@@ -41,6 +41,7 @@ LOG_TAG="e2e-redis"  # read by lib.sh
 I2_CHECK="$HERE/i2_check.py"
 SCENARIO="$HERE/redis_scenario.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
+BADCA="valkey-e2e-wrong-ca"   # the negative TLS control (the console test CA as ca_file)
 POLICY_DUMP="e2e redis export"
 POLICY_READS="e2e redis reads"
 DUMP_INCIDENT_LIMIT_S=120
@@ -143,6 +144,18 @@ EOF
       ca_file: /etc/databastion/redis-ca.pem
 EOF
   done
+  cat <<EOF
+  - id: ${BADCA}
+    engine: valkey
+    host: valkey
+    port: 6379
+    account: databastion
+    secret:
+      file: /run/databastion-secrets/target_agent_password
+    redis:
+      tls: verify_full
+      ca_file: /etc/databastion/console-ca.pem
+EOF
 } >"$E2E_WORK_DIR/agent/agent.yaml"
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -193,6 +206,7 @@ for spec in "${TARGETS[@]}"; do
 done
 compose exec -T target-valkey cat /tls/ca.pem >"$T/redis-ca.pem" || fail "cannot copy the dev CA of the targets"
 grep -q 'BEGIN CERTIFICATE' "$T/redis-ca.pem" || fail "no dev CA in target-valkey"
+inspect_scan "after the start"
 chmod 0644 "$T/redis-ca.pem"
 phase_done start
 
@@ -236,6 +250,14 @@ done
 AGENT_IP="$(docker inspect "$(compose ps -q agent)" --format '{{json .NetworkSettings.Networks}}' \
   | jq -r --arg n "${PROJECT}_agent-net" '.[$n].IPAddress')"
 [[ "$AGENT_IP" =~ ^[0-9.]+$ ]] || fail "no address of the agent on agent-net"
+# Negative TLS control: the same server declared with a CA that did not sign its certificate (the
+# console's test CA): the target must be reported unreachable, failing at the TLS stage
+# (`check.stage_failed` with `stage_tls`; the contract has no TLS failure code), never connected.
+log "negative TLS control: ${BADCA} (the console test CA as ca_file) must fail at the TLS stage"
+wait_target_state "$BADCA" 120 '.present and .reachable == false
+    and any(.notes[]?; .code == "check.stage_failed" and ((.labels // []) | index("stage_tls")))' \
+  "unreachable with check.stage_failed stage_tls"
+log "${BADCA}: $(jq -c '{reachable, lastError, notes: [.notes[]? | {code, labels}]}' <<<"$TARGET_STATE")"
 phase_done enroll
 
 # --------------------------------------------------------------------------- Discovery
@@ -290,10 +312,11 @@ for spec in "${TARGETS[@]}"; do
     # (learned patterns or `*`), signals, count; and the command names of the agent's slow-log
     # entries (never their arguments).
     console_sql "SELECT string_agg(coalesce(db_user, CASE WHEN account_not_recorded THEN 'not_recorded' ELSE 'fp' END)
-        || ' ' || action || ' ' || source || ' ' || coalesce(client_addr, '-') || ' objects ' || objects::text
+        || ' ' || action || ' ' || source || ' ' || coalesce(client_addr, '-')
         || ' signals ' || signals::text || ' count ' || aggregated_count, '; ')
       FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${id}'" >&2 || true
-    read -r _ _ svc _ _ cli <<<"$spec"
+    read -r _ engine svc _ _ cli <<<"$spec"
+    log "${id}: objects of those events: $(objects_summary "$id" "$engine" "true")"
     admin_cli "$svc" "$cli" --json SLOWLOG GET 1024 2>/dev/null | jq -r --arg ip "$AGENT_IP" \
       '.[] | select((.[4] // "") | startswith($ip + ":")) | (.[3][0] | ascii_upcase) + (if (.[3][0] | ascii_downcase) == "client" or (.[3][0] | ascii_downcase) == "slowlog" or (.[3][0] | ascii_downcase) == "acl" or (.[3][0] | ascii_downcase) == "commandlog" then " " + (.[3][1] // "") else "" end)' \
       | sort | uniq -c | sort -rn >&2 || true
@@ -411,10 +434,7 @@ for spec in "${TARGETS[@]}"; do
   # below). The dev keyspace holds keys in db0 and db1, and slow-log entries carry no database, so
   # the stream cannot pick a database's patterns: every object is `*` here (docs/08, "Redis / Valkey
   # Audit", What is kept).
-  objs="$(console_sql "SELECT string_agg(DISTINCT coalesce(o->>'database', '-') || '/' || (o->>'object'), ' ')
-    FROM access_events e, jsonb_array_elements(e.objects) o
-    WHERE e.agent_id = '${AGENT_ID}' AND e.target_id = '${id}' AND e.db_user = 'e2e_analyst'")"
-  log "Audit ($id): the analyst's event objects: $objs"
+  log "Audit ($id): the analyst's event objects: $(objects_summary "$id" "$engine" "e.db_user = 'e2e_analyst'")"
   events_json "$id" >"$E2E_WORK_DIR/events.json" || fail "cannot read the access events of $id"
   incidents_json "$id" >"$E2E_WORK_DIR/incidents.json" || fail "cannot read the incidents of $id"
   log "Audit ($id): sources $(jq -c '[.[].source] | unique' "$E2E_WORK_DIR/events.json"), signals $(jq -c '[.[].signals[]?] | unique' "$E2E_WORK_DIR/events.json")"
@@ -456,6 +476,7 @@ dump_logs "${SERVICES[@]}"
 for f in agent.log web.log worker.log; do
   [ -s "$E2E_LOG_DIR/$f" ] || fail "$f is empty: the scans would prove nothing"
 done
+inspect_scan "with the agent"
 D="$E2E_WORK_DIR/dump"
 collect_console_side "$D" valkey-e2e redis-e2e
 grep -qF 'e2e_exporter' "$D/pages/incidents.html" || fail "the incidents page does not list e2e_exporter (page scan control)"

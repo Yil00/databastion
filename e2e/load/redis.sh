@@ -257,6 +257,7 @@ log "agent online: $(target_summary "$(target_json "$TARGET")")"
   done
 ) &
 BG_PIDS+=("$!")
+inspect_scan "with the agent"
 log "idle baseline with the agent running, no job (${LOAD_IDLE_S} s)"
 t0="$(now_s)"
 sleep "$LOAD_IDLE_S"

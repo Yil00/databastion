@@ -202,11 +202,11 @@ fact --argjson r "$LOAD_MSSQL_RATE" --argjson soak "$LOAD_SOAK_S" --argjson base
     tables: $tables, rows: $rows}'
 
 log "creating the workload login load_app; seeding ${LOAD_MSSQL_TABLES} tables, ${LOAD_MSSQL_ROWS} rows (schema load of retail)"
-# shellcheck disable=SC2016 # sqlcmd variable
+# shellcheck disable=SC2016 # sqlcmd variable (from the environment: never on a command line)
 printf '%s\n' 'SET NOCOUNT ON;' "CREATE LOGIN load_app WITH PASSWORD = N'\$(PW)', CHECK_POLICY = OFF, DEFAULT_DATABASE = retail;" \
   'GO' 'USE retail;' 'CREATE USER load_app FOR LOGIN load_app;' 'GO' \
   | timeout 120 docker compose "${COMPOSE_ARGS[@]}" exec -T -e SSL_CERT_FILE=/var/opt/mssql/databastion-tls/ca.pem \
-    target-mssql bash -c 'SQLCMDPASSWORD="$(cat /run/secrets/target_mssql_password)" exec '"$SQLCMD"' -S localhost -U sa -b -I -v PW="$(cat /run/secrets/target_client_password)" -i /dev/stdin' \
+    target-mssql bash -c 'SQLCMDPASSWORD="$(cat /run/secrets/target_mssql_password)" PW="$(cat /run/secrets/target_client_password)" exec '"$SQLCMD"' -S localhost -U sa -b -I -i /dev/stdin' \
     >/dev/null || fail "cannot create the workload login"
 t0="$(date +%s)"
 python3 "$SEED" sqlserver --tables "$LOAD_MSSQL_TABLES" --rows "$LOAD_MSSQL_ROWS" | mssql_sa >"$W/out/seed.out" 2>&1 \
@@ -252,6 +252,7 @@ log "agent online: $(target_summary "$(target_json "$TARGET")")"
   done
 ) &
 BG_PIDS+=("$!")
+inspect_scan "with the agent"
 log "idle baseline with the agent running, no job (${LOAD_IDLE_S} s)"
 t0="$(now_s)"
 sleep "$LOAD_IDLE_S"
