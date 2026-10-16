@@ -196,6 +196,33 @@ async fn the_agents_own_sessions_are_never_unknown_principals() {
         let (task2, mut rx2) = stream(&connector, &t2, &s2.0, 1);
         // The first polls place the cursors at the newest statement.
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Both streams' sessions are noted as the agent's poll sessions.
+        {
+            let rows = a
+                .query(
+                    Stage::Audit,
+                    &format!(
+                        "SELECT THREAD_ID FROM performance_schema.threads \
+                         WHERE PROCESSLIST_USER = '{OS_USER}'"
+                    ),
+                )
+                .await
+                .unwrap();
+            let threads: Vec<u64> = rows
+                .iter()
+                .filter_map(|r| r.first().cloned().flatten()?.parse().ok())
+                .collect();
+            assert_eq!(threads.len(), 2, "{}: {threads:?}", server.name);
+            let polls = connector.check_state.poll_threads();
+            let polls = polls.lock().unwrap();
+            for thread in threads {
+                assert!(
+                    polls.contains_thread(thread),
+                    "{}: poll thread {thread} not noted",
+                    server.name
+                );
+            }
+        }
         // 1. A Discovery scan of the first target between two polls of its
         // stream: its sessions have ended when that stream reads them.
         let started = Instant::now();
@@ -409,6 +436,218 @@ async fn a_copied_nonce_never_pins_another_session() {
             exec(&mut a, "SET @databastion_pin = NULL").await;
             s.close().await;
         }
+        exec(&mut a, &format!("DROP DATABASE IF EXISTS {OS_DB}")).await;
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OS_USER}'@'%'")).await;
+    }
+}
+
+/// A foreign account for the interrupted-poll test.
+const OS_FOREIGN: &str = "databastion_it_osess_foreign";
+
+/// The poll text of `events_statements_history_long` (with the
+/// `program_name` subquery), as the agent sends it.
+fn poll_text() -> String {
+    crate::sql::ps_statements("events_statements_history_long", true)
+}
+
+/// Runs the poll text on `s` and interrupts it: by `KILL QUERY` from `a`
+/// (retried until a kill lands while it runs), or, with `timeout`, by the
+/// session's statement timeout (`max_execution_time = 1` on MySQL). The
+/// server's error code, `None` when no attempt was interrupted.
+async fn interrupted_poll(s: &mut Session, a: &mut Session, timeout: bool) -> Option<u32> {
+    exec(s, "SET @databastion_from = 0").await;
+    if timeout {
+        exec(s, "SET SESSION max_execution_time = 1").await;
+        let r = s.query(Stage::Audit, &poll_text()).await;
+        exec(s, "SET SESSION max_execution_time = 10000").await;
+        return r.err().and_then(|e| e.errno).map(u32::from);
+    }
+    let kill = format!("KILL QUERY {}", s.connection_id());
+    let text = poll_text();
+    for attempt in 0..200u64 {
+        let delay = Duration::from_micros(200 + (attempt * 97) % 3000);
+        let (r, _) = tokio::join!(s.query(Stage::Audit, &text), async {
+            tokio::time::sleep(delay).await;
+            let _ = a.exec(Stage::Check, &kill).await;
+        });
+        if let Err(e) = r
+            && let Some(errno) = e.errno
+        {
+            return Some(u32::from(errno));
+        }
+    }
+    None
+}
+
+/// History rows of the poll text ended with an error: (`SQL_TEXT` is
+/// NULL, errno), seen by an administrator.
+async fn interrupted_rows(a: &mut Session) -> Vec<(bool, String)> {
+    a.query(
+        Stage::Check,
+        "SELECT SQL_TEXT IS NULL, MYSQL_ERRNO FROM \
+         performance_schema.events_statements_history_long \
+         WHERE DIGEST_TEXT LIKE 'SELECT `h` . `THREAD_ID` , `h` . `EVENT_ID`%' \
+         AND MYSQL_ERRNO <> 0",
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.first().cloned().flatten().as_deref() == Some("1"),
+            r.get(1).cloned().flatten().unwrap_or_default(),
+        )
+    })
+    .collect()
+}
+
+/// ADR-0045 refinement of 2026-10-16: the agent's own poll, interrupted by
+/// `KILL QUERY` (and on MySQL by its statement timeout), is kept by the
+/// server with a cut digest only; the stream drops it and reports
+/// nothing. The same poll text run by a foreign account on its own thread
+/// and interrupted the same way is still reported.
+#[tokio::test]
+async fn interrupted_own_polls_are_dropped_and_foreign_ones_reported() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let logs = Logs::default();
+        let _guard = logs.capture();
+        let mut a = admin_session(&server, &admin).await;
+        let version = scalar(&mut a, "SELECT VERSION()").await.unwrap_or_default();
+        let mysql = !version.contains("MariaDB");
+        fixture(&mut a).await;
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OS_FOREIGN}'@'%'")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER '{OS_FOREIGN}'@'%' IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON performance_schema.* TO '{OS_FOREIGN}'@'%'"),
+        )
+        .await;
+        // A history long enough for the poll to run a while.
+        for _ in 0..3000 {
+            exec(&mut a, "DO 1").await;
+        }
+        let (_d, t) = super::audit_it::audit_target(&server, OS_USER, IT_PASSWORD, None);
+        let (_df, tf) = super::audit_it::audit_target(&server, OS_FOREIGN, IT_PASSWORD, None);
+        let connector = Arc::new(MysqlConnector::new());
+        let health = connector.check(&t).await;
+        if health.audit_level != AuditLevel::Partial {
+            eprintln!("{} {version}: {health:?}: skipped", server.name);
+            continue;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let state = TempDir::new();
+        let (task, mut rx) = stream(&connector, &t, &state.0, 1);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // The agent's own poll session (noted as the streams note theirs),
+        // its poll interrupted.
+        let mut own = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let poller = crate::audit::pfs::PsPoller::start(
+            &mut own,
+            crate::audit::pfs::PsTable::HistoryLong,
+            crate::audit::events::EventBuilder::new(databastion_core::audit::own::OwnAccount::new(
+                OS_USER,
+                Some(crate::audit::PROGRAM_NAME),
+                None,
+                0,
+                databastion_core::audit::own::SharedOwnUsage::default(),
+            )),
+            None,
+            crate::audit::pfs::OwnSessions {
+                account: OS_USER.to_owned(),
+                poll_threads: connector.check_state.poll_threads(),
+                pins: connector.check_state.discovery_pins(),
+                statement_timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+        let before = interrupted_rows(&mut a).await.len();
+        let killed = interrupted_poll(&mut own, &mut a, false).await;
+        let timed_out = if mysql {
+            interrupted_poll(&mut own, &mut a, true).await
+        } else {
+            None
+        };
+        drop(poller);
+        own.close().await;
+        let rows = interrupted_rows(&mut a).await;
+        // Measured: the error each interruption leaves, and whether the
+        // server kept `SQL_TEXT`.
+        eprintln!(
+            "{} {version}: own poll killed {killed:?}, timed out {timed_out:?}; interrupted \
+             rows (SQL_TEXT NULL, errno): {:?}",
+            server.name,
+            &rows[before.min(rows.len())..]
+        );
+        assert_eq!(
+            killed,
+            Some(1317),
+            "{} {version}: the kill never landed",
+            server.name
+        );
+        if mysql {
+            assert_eq!(timed_out, Some(3024), "{}", server.name);
+        }
+        // Two polls: the rows are read and dropped.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut ev: Vec<MaskedEvent> = Vec::new();
+        collect_until(&mut rx, &mut ev, Duration::from_millis(500), |_| false).await;
+        let all: Vec<String> = ev.iter().map(describe).collect();
+        assert!(
+            !ev.iter().any(|e| e.principal().account_name() == OS_USER
+                || (!e.principal().send_name() && !healthcheck(e))),
+            "{} {version}: the agent's interrupted polls were reported: {all:#?}",
+            server.name
+        );
+        if mysql {
+            // MySQL keeps them with no SQL_TEXT: dropped by the new rule.
+            assert!(
+                logs.text().contains("interrupted_own_poll"),
+                "{} {version}: no interrupted own poll dropped",
+                server.name
+            );
+        }
+        // A foreign account runs the same poll text on its own thread,
+        // interrupted the same way: reported.
+        let mut foreign = Session::connect(&tf, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let fkilled = interrupted_poll(&mut foreign, &mut a, false).await;
+        assert_eq!(fkilled, Some(1317), "{} {version}", server.name);
+        foreign.close().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut ev: Vec<MaskedEvent> = Vec::new();
+        collect_until(&mut rx, &mut ev, Duration::from_millis(500), |_| false).await;
+        task.abort();
+        let _ = task.await;
+        let all: Vec<String> = ev.iter().map(describe).collect();
+        assert!(
+            ev.iter().any(|e| {
+                (e.principal().account_name() == OS_FOREIGN || !e.principal().send_name())
+                    && e.always_report()
+                    && e.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "events_statements_history_long")
+            }),
+            "{} {version}: the foreign interrupted poll was not reported: {all:#?}",
+            server.name
+        );
+        assert!(
+            !ev.iter().any(|e| e.principal().account_name() == OS_USER),
+            "{} {version}: {all:#?}",
+            server.name
+        );
+        exec(&mut a, &format!("DROP USER IF EXISTS '{OS_FOREIGN}'@'%'")).await;
         exec(&mut a, &format!("DROP DATABASE IF EXISTS {OS_DB}")).await;
         exec(&mut a, &format!("DROP USER IF EXISTS '{OS_USER}'@'%'")).await;
     }

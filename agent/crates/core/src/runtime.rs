@@ -1273,6 +1273,13 @@ impl Runtime {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::window_overflows() as f64);
         }
+        // Rows of the agent's own interrupted performance_schema polls
+        // dropped by the MySQL / MariaDB connector (ADR-0045 refinement of
+        // 2026-10-16).
+        if let Ok(key) = MetricsMapKey::try_from("audit_own_polls_interrupted_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::interrupted_own_polls() as f64);
+        }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
         if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {

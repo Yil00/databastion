@@ -1001,6 +1001,73 @@ pub(crate) fn own_ps_shape(text: &[u8]) -> bool {
     text_shape(text).is_some_and(|s| OWN_PS_SHAPES.contains(&s))
 }
 
+/// A token of a shape compared by [`own_poll_prefix`]: MySQL 8.4 and
+/// MariaDB 11.4 render `USER()` as `SYSTEM_USER ( )` in a digest (a
+/// synonym of the same function, measured on 8.4.11 and 11.4.13).
+fn poll_token(t: &str) -> &str {
+    if t == "system_user" { "user" } else { t }
+}
+
+/// Whether a digest token stands for the poll text's token: the same, or
+/// the `?` a digest puts for the poll text's `NULL` literal.
+fn poll_token_eq(digest: &str, own: &str) -> bool {
+    poll_token(digest) == own || (own == "null" && digest == "?")
+}
+
+/// The shapes of the poll and stats texts only (`sql::ps_statements`,
+/// `sql::ps_stats`; never the probes, the pin or the own-thread probe),
+/// each with the shortest prefix that may stand for it: past its outermost
+/// `FROM` and the table it names (ADR-0045 refinement of 2026-10-16,
+/// condition 4).
+static OWN_POLL_SHAPES: std::sync::LazyLock<Vec<(Vec<String>, usize)>> =
+    std::sync::LazyLock::new(|| {
+        let mut texts = Vec::new();
+        for table in crate::sql::PS_POLL_TABLES {
+            texts.push(crate::sql::ps_stats(table));
+            for with_program in [true, false] {
+                texts.push(crate::sql::ps_statements(table, with_program));
+            }
+        }
+        texts
+            .iter()
+            .filter_map(|t| {
+                let shape: Vec<String> = text_shape(t.as_bytes())?
+                    .iter()
+                    .map(|x| poll_token(x).to_owned())
+                    .collect();
+                let mut depth = 0i32;
+                let from = shape.iter().position(|x| {
+                    match x.as_str() {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0 && x == "from"
+                })?;
+                // `FROM performance_schema . table`.
+                (shape.get(from + 1).map(String::as_str) == Some("performance_schema")
+                    && shape.get(from + 2).map(String::as_str) == Some("."))
+                .then_some((shape, from + 4))
+            })
+            .collect()
+    });
+
+/// Whether `text`, a `performance_schema` digest the source marks as cut,
+/// is token for token a prefix of the shape of one of the poll or stats
+/// texts, reaching past its outermost `FROM` and the table it names
+/// (ADR-0045 refinement of 2026-10-16, condition 4). Never for a text
+/// that does not lex, nor for one longer than the text it matches.
+pub(crate) fn own_poll_prefix(text: &[u8]) -> bool {
+    let Some(shape) = text_shape(text) else {
+        return false;
+    };
+    OWN_POLL_SHAPES.iter().any(|(own, min)| {
+        shape.len() >= *min
+            && shape.len() <= own.len()
+            && shape.iter().zip(own).all(|(a, b)| poll_token_eq(a, b))
+    })
+}
+
 /// One statement to turn into an event.
 pub(crate) struct Access<'a> {
     /// Session key (`c<connection id>`, `t<thread id>`).
