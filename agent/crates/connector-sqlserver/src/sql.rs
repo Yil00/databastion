@@ -555,8 +555,6 @@ const CREDIT_ONLY: &[&str] = &[
     "xe_poll_from",
 ];
 
-/// Whether `text` is exactly one of the connector's statements: a
-/// constant, or a template whose slots hold quoted values of the forms
 /// The agent's catalog reads (`check()`, Discovery and the Audit proofs
 /// that read catalog views): the statements whose compilation can make a
 /// fresh server build statistics on the system base tables of ADR-0051's
@@ -603,6 +601,8 @@ pub(crate) fn catalog_text(text: &str) -> bool {
     })
 }
 
+/// Whether `text` is exactly one of the connector's statements: a
+/// constant, or a template whose slots hold quoted values of the forms
 /// [`render`] produces. Never by prefix or shape.
 pub(crate) fn own_text(text: &str) -> OwnText {
     if SERVER_INTERNAL.contains(&text) {
