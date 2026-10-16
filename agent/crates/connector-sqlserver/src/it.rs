@@ -2318,7 +2318,13 @@ async fn xe_statistics_scenario() {
 /// out with their internal statements of the accepted shape. The two
 /// measured residuals (internal statements at nest level 1 under builds at nest level 2, and a
 /// build whose catalog statement comes in a later read) are tolerated and
-/// counted; nothing else of the agent's is reported.
+/// counted; nothing else of the agent's is reported. On 2022 and later, a
+/// `check()` naming an audit as well (`source: auto`, as an operator may
+/// configure it while the stream reads the session) sends the
+/// `audit_file` proof, whose build on `sys.sysguidrefs` is left out too
+/// (the addendum of 2026-10-16). With
+/// `DATABASTION_IT_SQLSERVER_CAPTURE=<file>`, the events of that build's
+/// activity are written to `<file>` (the unit fixtures, fake data only).
 #[tokio::test]
 async fn xe_fresh_server_own_reads_raise_no_event() {
     Box::pin(xe_fresh_scenario()).await;
@@ -2347,8 +2353,20 @@ async fn xe_fresh_scenario() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // The same target naming an audit too: its `check()` sends the
+    // `audit_file` proof (2022 and later). The own-session registry is
+    // keyed by the target id, as for one agent's check and stream. The
+    // audit does not exist, so the proof stops there: the next proof
+    // (`audit_specifications`) builds statistics on `sys.sysaudacts`, which
+    // is not on case 2's list (measured on 2022 on 2026-10-16; reported).
+    let t_audit = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: it_no_such_audit, \
+         xe_session: databastion_xe}}",
+        own_tls()
+    ));
     let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
         let _ = Box::pin(c.check(&t)).await;
+        let _ = Box::pin(SqlserverConnector::new().check(&t_audit)).await;
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         let (sink, mut frx) = FindingSink::channel(10_000);
         let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
@@ -2393,6 +2411,7 @@ async fn xe_fresh_scenario() {
             credential += 1;
         } else if names.iter().all(|n| {
             n.strip_prefix("retail.sys.")
+                .or_else(|| n.strip_prefix("master.sys."))
                 .is_some_and(|t| crate::audit::xe::events::SYS_BASE_TABLES.contains(&t))
         }) {
             unpaired += 1;
@@ -2413,6 +2432,7 @@ async fn xe_fresh_scenario() {
         "not a fresh server: no statistics build was seen"
     );
     if major >= 16 {
+        Box::pin(xe_fresh_sysguidrefs(&mut s, &own)).await;
         Box::pin(exec(
             &mut s,
             &in_db("master", &format!("REVOKE {grant} FROM databastion")),
@@ -2420,6 +2440,78 @@ async fn xe_fresh_scenario() {
         .await;
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `audit_file` proof's build on `sys.sysguidrefs` in the fresh run: in
+/// the session's file, from the agent's login, and not reported (`own`:
+/// the agent's events the stream reported). Captures its activity's events
+/// with `DATABASTION_IT_SQLSERVER_CAPTURE`.
+async fn xe_fresh_sysguidrefs(
+    s: &mut Session,
+    own: &[&databastion_classifiers::masking::MaskedEvent],
+) {
+    const FILES: &str = "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', \
+                         NULL, NULL, NULL)";
+    let read = |rows: Option<Vec<Vec<Value>>>| -> Vec<String> {
+        rows.unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                r.first()
+                    .and_then(Value::as_text)
+                    .map(|x| x.replace('\n', " "))
+            })
+            .collect()
+    };
+    let builds = read(
+        Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
+                 WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+                 AND event_data LIKE N'%sysguidrefs%' AND event_data LIKE N'%databastion%'"
+            ),
+            1,
+        ))
+        .await,
+    );
+    eprintln!("[it] xe fresh: builds on sysguidrefs {}", builds.len());
+    assert!(
+        !builds.is_empty(),
+        "not a fresh server: the audit_file proof built no statistics on sysguidrefs"
+    );
+    assert!(
+        !own.iter()
+            .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysguidrefs"))),
+        "the build on sysguidrefs paired with the audit_file proof is left out"
+    );
+    let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
+        return;
+    };
+    let activity = |x: &str| -> Option<String> {
+        let at = x.find("name=\"attach_activity_id\"")?;
+        let rest = &x[at..];
+        let v = &rest[rest.find("<value>")? + 7..];
+        let v = &v[..v.find("</value>")?];
+        Some(v.rsplit_once('-')?.0.to_owned())
+    };
+    let mut lines = Vec::new();
+    let guids: std::collections::BTreeSet<String> =
+        builds.iter().filter_map(|b| activity(b)).collect();
+    for guid in guids {
+        assert!(guid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
+        lines.extend(read(
+            Box::pin(try_rows(
+                s,
+                &format!(
+                    "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
+                     WHERE event_data LIKE N'%{guid}-%'"
+                ),
+                1,
+            ))
+            .await,
+        ));
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 }
 
 /// Re-review N1: the first start's floor is bounded. A saved position

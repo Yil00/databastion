@@ -561,8 +561,9 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// their `password` and `type` columns) and are left off: they hold
 /// credentials, so a build on them stays reported (decided by the
 /// maintainer, ADR-0051 refinement of 2026-10-16, item 3). `sysguidrefs`
-/// (a build paired with the `audit_file` proof, measured on 2022 on
-/// 2026-10-16) is not on the list either until decided: reported.
+/// (in `master`, a build paired with the `audit_file` proof, measured on
+/// 2022 and 2025) joined the list on 2026-10-16 (ADR-0051, addendum to the
+/// refinement of 2026-10-16), under the same conditions as the others.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysschobjs",
     "sysrowsets",
@@ -574,6 +575,7 @@ pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "syssingleobjrefs",
     "sysprivs",
     "sysdbreg",
+    "sysguidrefs",
 ];
 
 /// The `object_type` map value of `ADHOC`.
@@ -1666,6 +1668,276 @@ mod statistics_tests {
             context(&mut recs, true, &own);
             assert!(!recs[0].skip, "{table}");
             let ev = convert(&recs[0]).unwrap().0;
+            assert_eq!(names(&ev), [format!("retail.sys.{table}")], "{table}");
+        }
+    }
+
+    /// A build on `sys.sysguidrefs` (in `master`), of the shape measured on
+    /// 2022 and 2025 after the `audit_file` proof.
+    const GUIDREFS_BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [class] AS [SC0] FROM \
+        [sys].[sysguidrefs] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+    const GUIDREFS_SHAPE: (i64, &str, i64, i64) = (2, "ADHOC", 0, 344);
+
+    /// The `audit_file` proof of decision 6 (one of case 2's catalog
+    /// reads), as the agent renders it.
+    fn audit_file() -> String {
+        let name = crate::sql::quote_literal("databastion_audit").unwrap();
+        crate::sql::render(crate::sql::AUDIT_FILE, &[("audit", &name)]).unwrap()
+    }
+
+    /// A build on `sysguidrefs` (`build_login`), its internal statement
+    /// (at the build's nest level minus one), and a partner statement
+    /// (`partner_login`, `partner`) in activity `guid`: build, internal,
+    /// partner in file order, or the partner first when `partner_first`.
+    fn guidrefs(
+        build_login: &str,
+        partner_login: &str,
+        partner: &str,
+        guid: Option<&str>,
+        partner_first: bool,
+    ) -> Vec<XeRecord> {
+        let mut recs = vec![
+            sp(build_login, GUIDREFS_BUILD, guid, 2, GUIDREFS_SHAPE),
+            sp(build_login, "", guid, 3, (1, "ADHOC", 0, 0)),
+        ];
+        let p = stmt_in(partner_login, partner, guid, 1);
+        if partner_first {
+            recs.insert(0, p);
+        } else {
+            recs.push(p);
+        }
+        recs
+    }
+
+    fn statement(r: &XeRecord) -> Option<&str> {
+        r.event
+            .as_ref()
+            .and_then(|e| e.statement.as_deref())
+            .map(|s| s.as_str())
+    }
+
+    /// ADR-0051, addendum of 2026-10-16 to the refinement of that day:
+    /// `sys.sysguidrefs` is on case 2's closed list, paired with the
+    /// `audit_file` proof, every other condition of case 2 unchanged.
+    #[test]
+    fn sysguidrefs_build_paired_with_the_audit_file_proof() {
+        assert!(SYS_BASE_TABLES.contains(&"sysguidrefs"));
+        assert!(crate::sql::catalog_text(&audit_file()));
+        // Left out with its internal statement, whichever comes first in
+        // the file; the proof itself is not touched by case 2.
+        for first in [false, true] {
+            let mut recs = guidrefs(
+                "databastion",
+                "databastion",
+                &audit_file(),
+                Some(GUID),
+                first,
+            );
+            assert_eq!(context(&mut recs, true, &own), 2, "partner first {first}");
+            for r in &recs {
+                let is_proof = statement(r) == Some(audit_file().as_str());
+                assert_eq!(r.skip, !is_proof, "partner first {first}");
+            }
+        }
+        // Another quoted audit name renders the same template.
+        let name = crate::sql::quote_literal("Audit 'x'").unwrap();
+        let other = crate::sql::render(crate::sql::AUDIT_FILE, &[("audit", &name)]).unwrap();
+        assert!(crate::sql::catalog_text(&other));
+        let mut recs = guidrefs("databastion", "databastion", &other, Some(GUID), false);
+        assert_eq!(context(&mut recs, true, &own), 2);
+
+        // Reported: no causality (no session-order fallback).
+        let mut recs = guidrefs("databastion", "databastion", &audit_file(), None, false);
+        assert_eq!(context(&mut recs, true, &own), 0);
+        assert_eq!(reported(&recs), [0, 1, 2], "no causality");
+        // Reported: a foreign session's build with the agent's proof in the
+        // same activity, and the agent's build with the proof's text sent
+        // by a foreign session.
+        for (build, partner) in [("app", "databastion"), ("databastion", "app")] {
+            let mut recs = guidrefs(build, partner, &audit_file(), Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(
+                !recs[0].skip && !recs[1].skip,
+                "build {build}, partner {partner}"
+            );
+            let ev = convert(&recs[0]).unwrap().0;
+            assert_eq!(names(&ev), ["retail.sys.sysguidrefs"], "build {build}");
+        }
+        let mut recs = guidrefs(
+            "databastion",
+            "databastion",
+            &audit_file(),
+            Some(GUID),
+            false,
+        );
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip, "no own session at all");
+        // Reported: a partner that is not one of the catalog reads: the
+        // agent's own exact texts that are not (the version, the session
+        // settings, the DMV proof, the SQL Server Audit poll), a near-copy
+        // of the proof, and a client's read of the same view.
+        for text in [
+            crate::sql::VERSION.to_owned(),
+            crate::conn::SESSION_SETTINGS.to_owned(),
+            crate::sql::render(crate::sql::XE_EVENTS, &[("session", "N'databastion_xe'")]).unwrap(),
+            crate::sql::AUDIT_POLL_START.to_owned(),
+            audit_file().replace("TOP (2)", "TOP (3)"),
+            "SELECT name FROM sys.server_file_audits".to_owned(),
+        ] {
+            assert!(!crate::sql::catalog_text(&text), "{text}");
+            let mut recs = guidrefs("databastion", "databastion", &text, Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip && !recs[1].skip, "not a catalog read: {text}");
+        }
+        // Reported: the proof in another activity.
+        let mut recs = guidrefs(
+            "databastion",
+            "databastion",
+            &audit_file(),
+            Some(GUID),
+            false,
+        );
+        recs[2] = stmt_in(
+            "databastion",
+            &audit_file(),
+            Some("AAAAAAAA-0000-0000-0000-000000000000"),
+            1,
+        );
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip, "the proof in another activity");
+        // Reported: a build that is not allow-listed.
+        let mut recs = guidrefs(
+            "databastion",
+            "databastion",
+            &audit_file(),
+            Some(GUID),
+            false,
+        );
+        assert_eq!(context(&mut recs, false, &own), 0);
+        assert_eq!(reported(&recs), [0, 1, 2], "not an allow-listed build");
+        assert!(!unpaired_case_2(&recs[0], false, &own));
+        // Unpaired in its read, the agent's build is a deferral candidate
+        // (item 4) like any listed table; a foreign session's is not.
+        let mut recs = guidrefs(
+            "databastion",
+            "databastion",
+            crate::sql::VERSION,
+            Some(GUID),
+            false,
+        );
+        context(&mut recs, true, &own);
+        assert!(unpaired_case_2(&recs[0], true, &own));
+        assert!(!unpaired_case_2(&recs[0], true, &|_| false));
+        // Only `sys.sysguidrefs` by its exact name.
+        for table in [
+            "[sys].[sysguidrefs2]",
+            "[sys].[sysguidref]",
+            "[dbo].[sysguidrefs]",
+        ] {
+            let mut recs = guidrefs(
+                "databastion",
+                "databastion",
+                &audit_file(),
+                Some(GUID),
+                false,
+            );
+            recs[0] = sp(
+                "databastion",
+                &GUIDREFS_BUILD.replace("[sys].[sysguidrefs]", table),
+                Some(GUID),
+                2,
+                GUIDREFS_SHAPE,
+            );
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "{table}");
+        }
+    }
+
+    /// The `audit_file` proof's builds on a fresh server, one fixture per
+    /// image with a SQL Server Audit source (captured on 2026-10-16 from a
+    /// new data volume by the fresh-server integration test; 2019 has no
+    /// such proof, so no build on `sysguidrefs`): builds on `sysguidrefs`
+    /// at nest level 1 (several columns, no internal statement) and 2 (one
+    /// column, an internal statement at 1), and on `sysobjvalues`, all in
+    /// the proof's activity, all left out with their internal statements;
+    /// the proof itself is not touched. Each is reported without
+    /// causality, from a foreign session, or off the allow-listed builds.
+    #[test]
+    fn sysguidrefs_fixtures_of_the_audit_images() {
+        for file in ["sysguidrefs-16.0.4305.5.xml", "sysguidrefs-17.0.5015.4.xml"] {
+            let recs = fixture(file);
+            let is_build = |r: &XeRecord| statement(r).is_some_and(|t| t.contains("StatMan"));
+            let guidrefs = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysguidrefs]")))
+                .count();
+            assert!(guidrefs >= 2, "{file}");
+            let depths: std::collections::BTreeSet<i64> = recs
+                .iter()
+                .filter(|r| is_build(r))
+                .filter_map(|r| r.event.as_ref().and_then(|e| e.nest_level))
+                .collect();
+            assert!(
+                depths.contains(&1) && depths.contains(&2),
+                "{file}: {depths:?}"
+            );
+            let proofs = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
+                .count();
+            assert_eq!(proofs, 1, "{file}: the audit_file proof");
+            let mut left = fixture(file);
+            assert_eq!(context(&mut left, true, &own), recs.len() - 1, "{file}");
+            for r in &left {
+                assert_eq!(
+                    r.skip,
+                    !statement(r).is_some_and(crate::sql::catalog_text),
+                    "{file}"
+                );
+            }
+            // Reported: not an allow-listed build, a foreign session, no
+            // causality.
+            let mut off = fixture(file);
+            assert_eq!(context(&mut off, false, &own), 0, "{file}");
+            let mut foreign = fixture(file);
+            assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
+            let mut no_causality = fixture(file);
+            for r in &mut no_causality {
+                if let Some(e) = r.event.as_mut() {
+                    e.activity = None;
+                }
+            }
+            assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
+            for r in off.iter().chain(&foreign).chain(&no_causality) {
+                assert!(!r.skip, "{file}");
+            }
+        }
+    }
+
+    /// The credential-bearing tables stay reported next to a `sysguidrefs`
+    /// build left out in the same activity (item 3, unchanged by the
+    /// addendum).
+    #[test]
+    fn credential_tables_stay_reported_next_to_sysguidrefs() {
+        for table in ["sysowners", "sysxlgns"] {
+            let mut recs = guidrefs(
+                "databastion",
+                "databastion",
+                &audit_file(),
+                Some(GUID),
+                false,
+            );
+            recs.push(sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", &format!("[sys].[{table}]")),
+                Some(GUID),
+                5,
+                BUILD_SHAPE,
+            ));
+            context(&mut recs, true, &own);
+            assert!(recs[0].skip && recs[1].skip && !recs[3].skip, "{table}");
+            assert_eq!(reported(&recs), [2, 3], "{table}");
+            let ev = convert(&recs[3]).unwrap().0;
             assert_eq!(names(&ev), [format!("retail.sys.{table}")], "{table}");
         }
     }
