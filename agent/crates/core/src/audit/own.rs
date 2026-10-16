@@ -468,6 +468,8 @@ impl OwnAccount {
     /// `limits.max_sample_rows` in one scan by an accepted rule (the
     /// Redis / Valkey scale of ADR-0052, refinement of 2026-10-16). Every
     /// other rule is the same; the charges go to the same counters.
+    /// A new caller, or a larger budget, needs an accepted ADR: only
+    /// `connector-redis` calls it today.
     pub fn routine_within(
         &mut self,
         user: &str,
