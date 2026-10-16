@@ -123,9 +123,9 @@ trap 'exit 130' INT TERM
 
 # ------------------------------------------------------------------------------ secrets, CA, agent.yaml
 console_secrets
-put_secret target_mssql_password "$(rand_password)"
-put_secret target_agent_password "$(rand_password)"
-put_secret target_client_password "$(rand_password)"   # login load_app
+put_secret target_mssql_password "$(rand_password 20)"
+put_secret target_agent_password "$(rand_password 20)"
+put_secret target_client_password "$(rand_password 20)"   # login load_app
 test_ca "SQL Server load"
 : >"$T/sqlserver-ca.pem"
 cat >"$W/agent/agent.yaml" <<EOF

@@ -98,9 +98,9 @@ timeout 60 python3 "$I2_CHECK" coverage --ground-truth "$GROUND_TRUTH" --engine 
 
 # --------------------------------------------------------------------------- secrets, CA, agent.yaml
 console_secrets
-put_secret target_mssql_password "$(rand_password)"   # sa: stays in the target container
-put_secret target_agent_password "$(rand_password)"   # login databastion (ADR-0051 decision 4)
-put_secret target_client_password "$(rand_password)"  # test logins e2e_exporter / e2e_analyst / e2e_admin
+put_secret target_mssql_password "$(rand_password 20)"   # sa: stays in the target container
+put_secret target_agent_password "$(rand_password 20)"   # login databastion (ADR-0051 decision 4)
+put_secret target_client_password "$(rand_password 20)"  # test logins e2e_exporter / e2e_analyst / e2e_admin
 # Marker passwords of the DCL test: they must reach no console-side artifact and no log.
 DCL_MARKER_1="Dcl1-$(rand_hex 12)"
 DCL_MARKER_2="Dcl2-$(rand_hex 12)"
@@ -369,7 +369,7 @@ gt_needle() {
 }
 IFS=$'\t' read -r email_id email < <(gt_needle crm customers email)
 IFS=$'\t' read -r iban_id iban < <(gt_needle finance payment_cards iban)
-[ -n "${email:-}" ] && [ -n "${iban:-}" ] || fail "no ground-truth e-mail / IBAN for the literal queries"
+if [ -z "${email:-}" ] || [ -z "${iban:-}" ]; then fail "no ground-truth e-mail / IBAN for the literal queries"; fi
 LITERAL_IDS="$email_id $iban_id"
 {
   printf 'SET NOCOUNT ON;\n'
