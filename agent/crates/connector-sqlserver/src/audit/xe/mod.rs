@@ -767,6 +767,20 @@ async fn read(
     // counted as dropped (re-review N1: the server's clock may have
     // stepped back).
     let mut records = b.kept;
+    // The agent's sessions on this source's clock: each read-back event
+    // calibrates its session (own::calibrate), before any own rule.
+    let readbacks: Vec<(i64, i64)> = records
+        .iter()
+        .filter(|r| r.kind() == xml::Kind::SqlStatementCompleted)
+        .filter_map(|r| {
+            let e = r.event.as_ref()?;
+            (!e.statement_cut
+                && e.statement.as_deref().map(|t| t.as_str())
+                    == Some(crate::conn::SESSION_READBACK))
+            .then_some((e.session_id?, r.time_us))
+        })
+        .collect();
+    own::calibrate(&target_id, &readbacks);
     let mut below_floor: Vec<usize> = Vec::new();
     records.retain(
         |r| match st.cursor.below(r.time_us, read_started_ms, delay) {

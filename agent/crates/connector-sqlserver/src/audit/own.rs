@@ -123,7 +123,34 @@ pub(crate) struct OwnSession {
     /// The texts the session sent last, after a clean close only (empty
     /// after a lost end and for a restored session).
     pub(crate) sent: SentTexts,
+    /// The server's `SYSUTCDATETIME()` its read-back returned (`None`
+    /// for a restored session).
+    pub(crate) readback_us: Option<i64>,
+    /// The Extended Events clock against the read-back's, from the
+    /// read-back's own event ([`calibrate`]).
+    pub(crate) clock: SourceClock,
 }
+
+/// How a session's lifetime maps onto the Extended Events clock, which can
+/// run apart from `SYSUTCDATETIME()` by tens of milliseconds for a while
+/// (measured on 2025: a session's read-back stamped 38 ms before the time
+/// it returned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SourceClock {
+    /// Not seen yet: the lifetime is compared as it is.
+    #[default]
+    Unknown,
+    /// `SYSUTCDATETIME()` minus the event clock (µs), from the session's
+    /// read-back event.
+    Offset(i64),
+    /// More than one read-back event of its SPID near its own: never
+    /// calibrated (fail closed).
+    Ambiguous,
+}
+
+/// The largest difference between the read-back's time and its event's
+/// stamp accepted as the clock difference; beyond, not the session's.
+pub(crate) const CALIBRATION_BOUND_US: i64 = 100_000;
 
 impl OwnSession {
     /// Whether a record's `event_time` falls in the session's lifetime;
@@ -139,6 +166,18 @@ impl OwnSession {
                     || (self.last == Some(text_hash)
                         && at_us <= e.saturating_add(CLOCK_TOLERANCE_US))
             })
+    }
+
+    /// [`Self::within`] for an event stamped `at_us` on the Extended
+    /// Events clock: moved onto the read-back's clock when the session was
+    /// calibrated (its lifetime is the same; only the clock it is read on
+    /// changes).
+    fn within_source(&self, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
+        let at_us = match self.clock {
+            SourceClock::Offset(o) => at_us.saturating_add(o),
+            SourceClock::Unknown | SourceClock::Ambiguous => at_us,
+        };
+        self.within(at_us, text_hash, skew_us)
     }
 }
 
@@ -353,6 +392,8 @@ pub(crate) fn opened(
         addr,
         last: None,
         sent: SentTexts::default(),
+        readback_us: Some(server_us),
+        clock: SourceClock::Unknown,
     });
     Handle {
         target: target_id.to_owned(),
@@ -369,11 +410,54 @@ pub(crate) fn opened(
 /// The agent's session `spid` of `target_id` whose lifetime holds
 /// `at_us`, if any.
 pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64, text: &str) -> Option<OwnSession> {
-    session_at_skewed(target_id, spid, at_us, text, 0)
+    let h = text_hash(text);
+    let reg = lock();
+    reg.targets
+        .get(target_id)?
+        .sessions
+        .iter()
+        .rev()
+        .find(|s| s.spid == spid && s.within(at_us, h, 0))
+        .copied()
 }
 
-/// [`session_at`] for a source whose clock runs ahead of
-/// `SYSUTCDATETIME()` by up to `skew_us`: a statement whose text is among
+/// Calibrates the agent's sessions of `target_id` on the Extended Events
+/// clock from the read-back events of a read (`(spid, stamp)` of each
+/// event whose text is exactly the read-back): a session takes the clock
+/// difference from the one read-back event of its SPID within
+/// [`CALIBRATION_BOUND_US`] of the time its read-back returned. Two such
+/// events (another session on the reused SPID sent the same text close
+/// by) make it ambiguous for good: compared as it is, never shifted.
+pub(crate) fn calibrate(target_id: &str, readbacks: &[(i64, i64)]) {
+    if readbacks.is_empty() {
+        return;
+    }
+    let mut reg = lock();
+    let Some(t) = reg.targets.get_mut(target_id) else {
+        return;
+    };
+    for s in &mut t.sessions {
+        let Some(r) = s.readback_us else { continue };
+        let near: Vec<i64> = readbacks
+            .iter()
+            .filter(|(spid, at)| *spid == s.spid && (r - *at).abs() <= CALIBRATION_BOUND_US)
+            .map(|(_, at)| r - *at)
+            .collect();
+        s.clock = match (s.clock, near.as_slice()) {
+            (c, []) => c,
+            (SourceClock::Unknown, [o]) => SourceClock::Offset(*o),
+            // The same event read again (a read after a deferral or a
+            // refused position).
+            (SourceClock::Offset(k), [o]) if *o == k => SourceClock::Offset(k),
+            _ => SourceClock::Ambiguous,
+        };
+    }
+}
+
+/// [`session_at`] for the Extended Events source, whose clock can run
+/// apart from `SYSUTCDATETIME()`: the event's stamp is read on the
+/// session's calibrated clock ([`calibrate`]), and ahead of it by up to
+/// `skew_us`: a statement whose text is among
 /// the last [`SENT_TEXTS`] the session sent is matched up to `skew_us`
 /// after its clean end (Extended Events: measured up to 3.5 ms on 2022,
 /// `xe::XE_CLOCK_SKEW_US`), its last statement up to
@@ -392,7 +476,7 @@ pub(crate) fn session_at_skewed(
         .sessions
         .iter()
         .rev()
-        .find(|s| s.spid == spid && s.within(at_us, h, skew_us))
+        .find(|s| s.spid == spid && s.within_source(at_us, h, skew_us))
         .copied()
 }
 
@@ -601,6 +685,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
             addr,
             last: None,
             sent: SentTexts::default(),
+            readback_us: None,
+            clock: SourceClock::Unknown,
         });
     }
     Some(Persisted {
@@ -657,6 +743,18 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
     restored.append(&mut t.sessions);
     t.sessions = restored;
     prune(t, restart_us);
+}
+
+/// How many of the target's sessions the Extended Events source
+/// calibrated (tests).
+#[cfg(test)]
+pub(crate) fn calibrated(target_id: &str) -> usize {
+    lock().targets.get(target_id).map_or(0, |t| {
+        t.sessions
+            .iter()
+            .filter(|s| matches!(s.clock, SourceClock::Offset(_)))
+            .count()
+    })
 }
 
 #[cfg(test)]
@@ -816,6 +914,90 @@ mod tests {
         let foreign = "SELECT TOP (1) id FROM retail.crm.customers";
         assert!(session_at_skewed(t, 77, end + 1, foreign, 20_000).is_none());
         assert!(session_at_skewed(t, 77, end, foreign, 20_000).is_some());
+    }
+
+    /// CI failure of PR #251 (SQL Server 2025, strict): the Extended
+    /// Events clock ran 38 ms behind `SYSUTCDATETIME()`, so a session's
+    /// first statements after its read-back were stamped before its
+    /// computed start and reported as another session's. The read-back's
+    /// own event calibrates the session; the lifetime is unchanged.
+    #[test]
+    fn a_session_is_read_on_the_event_clock_its_read_back_gives() {
+        let t = "own-test-clock";
+        reset(t);
+        let readback = 9_000_000_000;
+        let lag = 38_000;
+        let mut h = opened(t, 81, readback, 3_000, None, Instant::now());
+        h.sent("SELECT TOP (65) roles");
+        h.end(false, Duration::ZERO);
+        let s = session_at(t, 81, readback, "").unwrap();
+        let (start, end) = (s.start_us, s.end_us.unwrap());
+        // The session's statements right after its read-back, stamped on a
+        // clock 38 ms behind: before its computed start.
+        let first = readback + 5_000 - lag;
+        assert!(first < start);
+        assert!(
+            session_at_skewed(t, 81, first, "SELECT TOP (65) roles", 20_000).is_none(),
+            "the failure, before calibration"
+        );
+        // The read-back's own event, stamped on that clock.
+        calibrate(t, &[(81, readback - lag)]);
+        assert_eq!(
+            session_at(t, 81, readback, "").unwrap().clock,
+            SourceClock::Offset(lag)
+        );
+        assert!(session_at_skewed(t, 81, first, "SELECT TOP (65) roles", 20_000).is_some());
+        // The lifetime is the same on that clock: nothing before its start
+        // or after its end is the session's.
+        assert!(session_at_skewed(t, 81, start - lag - 1, "SELECT 1", 0).is_none());
+        assert!(session_at_skewed(t, 81, end - lag, "SELECT 1", 0).is_some());
+        assert!(
+            session_at_skewed(t, 81, end - lag + 1, "SELECT 1", 0).is_none(),
+            "a session reusing the SPID right after its end is not the agent's"
+        );
+        // SQL Server Audit's lookup never takes the offset.
+        assert!(session_at(t, 81, first, "SELECT TOP (65) roles").is_none());
+        // The same event read again keeps it.
+        calibrate(t, &[(81, readback - lag)]);
+        assert_eq!(
+            session_at(t, 81, readback, "").unwrap().clock,
+            SourceClock::Offset(lag)
+        );
+    }
+
+    /// Calibration fails closed: two read-back events of the SPID near the
+    /// session's (another session on the reused SPID sent the same text),
+    /// or one beyond the bound, never shift the session.
+    #[test]
+    fn calibration_is_never_ambiguous_nor_far() {
+        let t = "own-test-clock-ambiguous";
+        reset(t);
+        let readback = 9_000_000_000;
+        let _h = opened(t, 82, readback, 3_000, None, Instant::now());
+        let _g = opened(t, 83, readback, 3_000, None, Instant::now());
+        let _k = opened(t, 84, readback, 3_000, None, Instant::now());
+        calibrate(t, &[(82, readback - 38_000), (82, readback - 60_000)]);
+        calibrate(t, &[(83, readback - CALIBRATION_BOUND_US - 1)]);
+        calibrate(t, &[(84, readback - 38_000)]);
+        calibrate(t, &[(84, readback - 70_000)]);
+        let clock = |spid| session_at(t, spid, readback, "").unwrap().clock;
+        assert_eq!(clock(82), SourceClock::Ambiguous);
+        assert_eq!(clock(83), SourceClock::Unknown);
+        assert_eq!(
+            clock(84),
+            SourceClock::Ambiguous,
+            "a second one in a later read"
+        );
+        // Another SPID's read-back never calibrates it.
+        let _m = opened(t, 85, readback, 3_000, None, Instant::now());
+        calibrate(t, &[(86, readback - 38_000)]);
+        assert_eq!(clock(85), SourceClock::Unknown);
+        // A restored session has no read-back time: never calibrated.
+        let bytes = encode(t, 4096);
+        reset(t);
+        restore(t, decode(&bytes).unwrap());
+        calibrate(t, &[(85, readback - 38_000)]);
+        assert_eq!(clock(85), SourceClock::Unknown);
     }
 
     /// A foreign session on the reused SPID, its text outside the set.
@@ -1024,6 +1206,8 @@ mod tests {
                     addr: None,
                     last: None,
                     sent: SentTexts::default(),
+                    readback_us: None,
+                    clock: SourceClock::Unknown,
                 }],
                 polls: Vec::new(),
             },

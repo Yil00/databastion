@@ -1942,6 +1942,11 @@ async fn xe_scenario() {
         );
     }
     assert!(agent_events.len() <= 6, "own statements reported");
+    // The agent's sessions were read on the event clock (CI failure of
+    // PR #251).
+    let calibrated = crate::audit::own::calibrated(&t.id);
+    eprintln!("[it] xe: sessions calibrated on the event clock {calibrated}");
+    assert!(calibrated > 0);
     let [exact, sampling, polls, _statistics] = c.state.audit.own_left_out(&t.id);
     eprintln!("[it] xe own left out: exact {exact}, sampling {sampling}, polls {polls}");
     assert!(
