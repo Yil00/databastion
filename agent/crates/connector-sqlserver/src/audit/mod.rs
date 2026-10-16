@@ -6,8 +6,9 @@
 //! - **Source**: SQL Server 2022 and later, with `VIEW SERVER SECURITY
 //!   AUDIT` and `VIEW ANY SECURITY DEFINITION`. The audit and its
 //!   specifications are the operator's; the agent never creates, alters,
-//!   starts or stops them (I4). The Extended Events source (SQL Server
-//!   2019) is not implemented in this build: such a target reports None.
+//!   starts or stops them (I4). The other source, an Extended Events
+//!   session, is described below ([`xe`]); it is the only one on SQL
+//!   Server 2019.
 //! - **Polls**: one `sp_executesql` RPC each, whose text is constant for
 //!   a given catalog state: the file pattern (from the catalog's folder,
 //!   the audit's name and GUID) is a literal of the text, never a
