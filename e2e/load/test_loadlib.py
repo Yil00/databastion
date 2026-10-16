@@ -614,6 +614,23 @@ class ReportTest(unittest.TestCase):
         self.assertIsNotNone(rep["audit"]["cas-load"]["db_cores_audit_on"])
         self.assertIn("| casdb-load |", L.render_markdown(rep))
 
+    def test_latency_metric_named(self) -> None:
+        # The SQL Server and Redis runs report another latency figure in p95_ms and name it.
+        facts, samples, hbs = scenario()
+        for f in facts:
+            if f.get("kind") == "workload":
+                f["latency_metric"] = "mean elapsed time per workload statement"
+        rep, ck = L.build_report(facts, samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"])
+        c = [c for c in ck.items if c["name"] == "audit.pg-load.p95_latency_ms"][0]
+        self.assertIn("latency figure: mean elapsed time per workload statement", c["note"])
+        self.assertEqual(rep["audit"]["pg-load"]["latency_metric"], "mean elapsed time per workload statement")
+        # Without it, the note is unchanged.
+        facts, samples, hbs = scenario()
+        _, ck = L.build_report(facts, samples, hbs, L.Limits())
+        c = [c for c in ck.items if c["name"] == "audit.pg-load.p95_latency_ms"][0]
+        self.assertNotIn("latency figure", c["note"])
+
     def test_limits_from_env(self) -> None:
         lim = L.Limits.from_env({"LOAD_LIMIT_DISCOVERY_PCT": "1.5", "LOAD_LIMIT_SPOOL_MAX_BATCHES": "7",
                                  "LOAD_LIMIT_DRAIN_S": ""})

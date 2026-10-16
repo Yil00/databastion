@@ -1,0 +1,13 @@
+# SQL Server load run (e2e/load/sqlserver.sh, e2e/load/README.md "SQL Server target"): merged over
+# e2e/docker-compose.yml and e2e/docker-compose.sqlserver.yml (project databastion-load-sqlserver).
+# Only the measurement settings change: the target gets a fixed CPU limit (its "capacity"), and its
+# healthcheck runs every 2 s while starting, then every 60 s (each check is a process in the measured
+# cgroup).
+
+services:
+  target-mssql:
+    cpus: ${LOAD_DB_CPUS:-2}
+    healthcheck:
+      interval: 60s
+      start_interval: 2s
+      start_period: 300s

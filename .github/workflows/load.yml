@@ -4,6 +4,7 @@ name: Load / database impact
 # (PostgreSQL, MariaDB, MongoDB; MVP criterion < 2 %), the Audit path under a sustained workload
 # (pgbench, sysbench; nothing dropped, p95 latency with and without Audit) and the agent's CPU / RSS
 # over a 10-minute run. About 30 minutes: NOT part of the required "CI result" check (ci.yml).
+# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey targets the same way.
 # Runs weekly, on demand, and on pull requests labelled `load-test`; the harness unit tests run on
 # every pull request.
 on:
@@ -38,7 +39,7 @@ jobs:
       - name: Unit tests (seed generator, sampler, analysis)
         run: timeout 120 python3 -m unittest discover -s e2e/load -p 'test_*.py' -v
       - name: shellcheck
-        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
+        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/sqlserver.sh e2e/load/redis.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
 
   load:
     name: Load / database impact
@@ -127,5 +128,99 @@ jobs:
         with:
           name: load-cas-logs
           path: load-cas-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The SQL Server target (e2e/load/README.md "SQL Server target", ADR-0051 "End-to-end and load"):
+  # SQL Server 2022 Express (the dev service, 2 CPUs), a paced Discovery scan of a scaled seed
+  # against the < 2 % criterion, a fixed-rate point-select workload with and without SQL Server Audit
+  # read by the agent (every statement an event, the engine-measured time per statement), the agent's
+  # CPU / RSS. In parallel with the other runs, same triggers.
+  load-sqlserver:
+    name: Load / SQL Server target
+    needs: unit
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-sqlserver-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-sqlserver-results
+      LOAD_SOAK_S: ${{ inputs.soak_s || '600' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+      - name: Run e2e/load/sqlserver.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 4200 e2e/load/sqlserver.sh
+      # Counters, timings and latencies only (run.sh's format): no seeded value, no secret
+      # (sqlserver.sh redacts every generated secret from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlserver-results
+          path: load-sqlserver-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlserver-logs
+          path: load-sqlserver-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The Valkey target (e2e/load/README.md "Valkey and Redis targets", ADR-0052 decision 13 "Load"):
+  # Valkey 9.0 (the dev service, 2 CPUs) with a keyspace of 1 000 000 keys, a paced Discovery scan
+  # against the < 2 % criterion, a fixed-rate GET workload with and without the Audit stream reading
+  # the slow log at every command (the polls' cost on the server, every GET an event), the agent's
+  # CPU / RSS. In parallel with the other runs, same triggers.
+  load-redis:
+    name: Load / Valkey target
+    needs: unit
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-redis-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-redis-results
+      LOAD_SOAK_S: ${{ inputs.soak_s || '600' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+      - name: Run e2e/load/redis.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 3300 e2e/load/redis.sh
+      # Counters, timings and latencies only (run.sh's format): no key, no value, no secret
+      # (redis.sh redacts every generated secret from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-redis-results
+          path: load-redis-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-redis-logs
+          path: load-redis-logs/
           retention-days: 7
           if-no-files-found: ignore

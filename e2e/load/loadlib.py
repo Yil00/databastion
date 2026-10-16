@@ -692,8 +692,15 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
                ev.get("drain_s"), f"<= {lim.drain_s}", "workload end -> every statement stored")
         p_off, p_on = off.get("p95_ms"), wl.get("p95_ms")
         bound = None if p_off is None else _r(lim.p95_factor * p_off + lim.p95_slack_ms)
+        # A workload whose client cannot time single statements reports another latency figure in
+        # `p95_ms` and names it (`latency_metric`, e.g. SQL Server's engine-measured mean elapsed
+        # time per statement): the same bound applies, the note says what was compared.
+        metric = wl.get("latency_metric")
+        if metric:
+            a["latency_metric"] = metric
         ck.add(f"audit.{target}.p95_latency_ms", None if p_on is None or bound is None else p_on <= bound,
-               p_on, f"<= {bound}", f"{lim.p95_factor} x p95 without Audit ({p_off} ms) + {lim.p95_slack_ms} ms")
+               p_on, f"<= {bound}", f"{lim.p95_factor} x p95 without Audit ({p_off} ms) + {lim.p95_slack_ms} ms"
+               + (f"; latency figure: {metric}" if metric else ""))
     rep["audit"] = audit
 
     # ---- 2b. Side accounts of the Audit run (ADR-0045): a monitoring-like reader of statement-text

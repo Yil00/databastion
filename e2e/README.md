@@ -711,4 +711,7 @@ E2E_REDIS_SCAN_UNDER_AUDIT=0 e2e/redis.sh     # without the Discovery scan under
 The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to
 measure the database CPU impact of Discovery, the Audit path under a sustained workload and the
 agent's resource use, and, with [`load/cas.sh`](load/README.md#cas-target), the CAS target under a
-login workload. It runs in its own workflow, outside the required `CI result` check.
+login workload, with [`load/sqlserver.sh`](load/README.md#sql-server-target) the SQL Server target and
+with [`load/redis.sh`](load/README.md#valkey-and-redis-targets) a Valkey (or Redis) target, on the
+compose files of the scenarios above. It runs in its own workflow, outside the required `CI result`
+check.
