@@ -534,6 +534,13 @@ impl Session {
         }
     }
 
+    /// The server's connection id of this session (tests: `KILL QUERY`
+    /// from another session).
+    #[cfg(test)]
+    pub(crate) fn connection_id(&self) -> u32 {
+        self.connection_id
+    }
+
     pub(crate) fn flavor(&self) -> Flavor {
         self.flavor
     }
