@@ -479,6 +479,44 @@ fn note_poll_thread(poll_threads: &SharedPollThreads, own: &OwnSession, timeout:
     }
 }
 
+/// A poll thread noted by [`PsPoller::start`] before the poller exists:
+/// if `start` returns early or is dropped (its stream stopped) before it
+/// hands the thread to the poller, the thread's life ends then, so that an
+/// interrupted statement of it is matched only within that life
+/// (ADR-0045 refinement of 2026-10-16, condition 3; security review of
+/// the refinement, Low).
+struct NotedPollThread {
+    poll_threads: SharedPollThreads,
+    noted: Option<(ServerRun, u64)>,
+}
+
+impl NotedPollThread {
+    /// Notes `own` (see [`note_poll_thread`]) and guards it.
+    fn note(poll_threads: &SharedPollThreads, own: &OwnSession, timeout: Duration) -> Self {
+        note_poll_thread(poll_threads, own, timeout);
+        Self {
+            poll_threads: std::sync::Arc::clone(poll_threads),
+            noted: own.run.clone().map(|run| (run, own.thread)),
+        }
+    }
+
+    /// The poller takes the thread over (it ends its life when dropped).
+    fn into_attached(mut self) -> Option<(ServerRun, u64)> {
+        self.noted.take()
+    }
+}
+
+impl Drop for NotedPollThread {
+    fn drop(&mut self) {
+        if let Some((run, thread)) = self.noted.take() {
+            self.poll_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ended(&run, thread, SystemTime::now());
+        }
+    }
+}
+
 /// Errors of a statement interrupted by `KILL QUERY` (1317) or by MySQL's
 /// `max_execution_time` (3024): MySQL 8.4 keeps such a statement with no
 /// `SQL_TEXT`, its digest only (ADR-0045 refinement of 2026-10-16,
@@ -654,7 +692,7 @@ impl PsPoller {
         // during the next ones (shutdown, reconfiguration) leaves its
         // probes recognized by the other streams on the server.
         let attached = own_thread(session).await?;
-        note_poll_thread(&own.poll_threads, &attached, own.statement_timeout);
+        let noted = NotedPollThread::note(&own.poll_threads, &attached, own.statement_timeout);
         let limit = parse_limit;
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         if text_limit_low(text_limit) {
@@ -703,7 +741,7 @@ impl PsPoller {
             floor,
             saved,
             own,
-            attached: attached.run.clone().map(|run| (run, attached.thread)),
+            attached: noted.into_attached(),
             run: attached.run,
             own_addr: None,
             own_dropped: 0,
@@ -1956,8 +1994,12 @@ mod tests {
         /// reconfiguration, a stream restarted) has noted its poll thread as
         /// soon as it read it, not after the text-limit reads that follow,
         /// so that the other streams on the server drop its own probes.
-        #[tokio::test]
-        async fn the_poll_thread_is_noted_before_the_next_statement() {
+        /// Starts a poller on a scripted session that answers the
+        /// own-thread probe (thread 90), then, with `close`, closes the
+        /// connection at the text-limit read (`start` returns an error),
+        /// else leaves it unanswered and drops `start`. The poll threads
+        /// and the server run.
+        async fn scripted_start(close: bool) -> (SharedPollThreads, ServerRun) {
             use crate::conn::Flavor;
             use crate::fake::{EOF, column_def};
             use crate::proto::{PacketIo, put_lenenc};
@@ -1995,6 +2037,10 @@ mod tests {
                 let q = io.read().await.unwrap();
                 assert_eq!(&q[1..], sql::PS_TEXT_LIMIT.as_bytes());
                 let _ = asked.send(());
+                if close {
+                    drop(io);
+                    return;
+                }
                 // No answer: the stream is dropped while it waits.
                 let _ = io.read().await;
             });
@@ -2013,19 +2059,53 @@ mod tests {
                 SharedOwnUsage::default(),
             ));
             let start = tokio::spawn(async move {
-                let _ =
-                    PsPoller::start(&mut session, PsTable::HistoryLong, builder, None, own).await;
+                PsPoller::start(&mut session, PsTable::HistoryLong, builder, None, own)
+                    .await
+                    .is_ok()
             });
             asked_rx.await.unwrap();
-            start.abort();
-            assert!(start.await.unwrap_err().is_cancelled());
+            if close {
+                assert!(!start.await.unwrap(), "start succeeded");
+            } else {
+                // Still waiting for the text limit: noted already.
+                start.abort();
+                assert!(start.await.unwrap_err().is_cancelled());
+            }
+            srv.await.unwrap();
             let run = ServerRun::new(
                 &["db1", "3306", "1", "uuid-a"].map(|c| Some(c.to_owned())),
                 1_000_000,
             )
             .unwrap();
+            (polls, run)
+        }
+
+        #[tokio::test]
+        async fn the_poll_thread_is_noted_before_the_next_statement() {
+            let (polls, run) = scripted_start(false).await;
             assert!(polls.lock().unwrap().contains(&run, 90));
-            srv.await.unwrap();
+        }
+
+        /// Security review of the 2026-10-16 refinement, Low: a `start`
+        /// dropped, or returning early, after noting its poll thread ends
+        /// that thread's life (no poller exists to end it): an interrupted
+        /// statement of it is no longer matched past the statement
+        /// timeout and the slack.
+        #[tokio::test]
+        async fn a_start_dropped_or_failed_after_the_note_ends_the_life() {
+            let slack = crate::audit::own_threads::INTERRUPTED_SLACK;
+            for close in [false, true] {
+                let (polls, run) = scripted_start(close).await;
+                let p = polls.lock().unwrap();
+                assert!(p.contains(&run, 90), "{close}");
+                let now = SystemTime::now();
+                assert!(p.within_life(&run, 90, now), "{close}");
+                let past = now + Duration::from_secs(30) + slack + Duration::from_secs(2);
+                assert!(
+                    !p.within_life(&run, 90, past),
+                    "close {close}: life not ended"
+                );
+            }
         }
 
         /// The per-version digests of the poll and stats texts
