@@ -57,8 +57,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 use super::own;
 use super::{
     APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, MIN_BATCH,
-    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, Positioned, REEVALUATE, REPROBE, on_bad_position,
-    on_pattern, target_error,
+    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern,
+    target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -529,114 +529,30 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     Ok(())
 }
 
-/// Events of one buffer handled across reads at most; beyond, the rest of
-/// that buffer is dropped (a gap). A buffer holds at most a few thousand
-/// events (`MAX_MEMORY` 4 MB by default, three buffers).
-pub(crate) const XE_MAX_SKIP: u32 = 1_000_000;
-
 /// The records of an Extended Events read from `cursor` (the server
 /// skipped the first `cursor.skip` events after the position, all of the
 /// buffer `cursor.buffer`), `returned` rows asked with `asked`: those at
-/// or before a refused position left out, the next position, and the gap.
-///
-/// The position stays before the buffer whose events may not all have
-/// come (a full read); its handled events are counted in `skip` and
-/// skipped by the server next time, so a buffer of any size is walked
-/// with reads of at most `asked` events, none read twice, none lost.
+/// or before a refused position left out, the next position, and the gap
+/// ([`super::batch`]; a buffer of any size is walked with reads of at most
+/// `asked` events, none read twice, none lost).
 pub(crate) fn xe_batch(
     cursor: &Cursor,
     records: Vec<XeRecord>,
     returned: usize,
     asked: usize,
 ) -> Batch<XeRecord> {
-    let positions: Vec<(String, i64)> = records
-        .iter()
-        .map(|r| (r.file().to_owned(), r.offset()))
-        .collect();
-    let mut kept = records;
-    if let Some((key, offset)) = cursor.after {
-        // A record of another form of name is kept (read again, loud).
-        kept.retain(|r| sql::xe_file_key(&r.file).is_none_or(|k| (k, r.offset) > (key, offset)));
-    }
-    let full = returned >= asked;
-    let (next, gap) = xe_next(cursor, &positions, full);
-    Batch {
-        kept,
-        next,
-        gap,
-        full,
-    }
+    super::batch(cursor, records, returned, asked, sql::xe_file_key)
 }
 
 /// The position after a read from `cursor` that returned events at
 /// `positions` (in order), `full` when more may follow; and whether one
-/// buffer went over [`XE_MAX_SKIP`] (a gap). A read cut before one of its
-/// events (the deferral of a build) is a full read of the events before
-/// it.
-///
-/// The skip counts the events read, while the server skips rows: a row of
-/// the last buffer that could not be read (dropped and counted as such)
-/// makes the next read start one row early. That row is then met again
-/// (counted again), or, when it came before the buffer's first event read,
-/// that event is read twice (reported twice, never lost): at most one per
-/// such row (final review L2; the same holds for any full read).
+/// buffer went over [`super::MAX_SKIP`] (a gap; an event buffer holds
+/// at most a few thousand events, `MAX_MEMORY` 4 MB by default, three
+/// buffers) ([`super::next_position`]). A
+/// read cut before one of its events (the deferral of a build) is a full
+/// read of the events before it.
 pub(crate) fn xe_next(cursor: &Cursor, positions: &[(String, i64)], full: bool) -> (Cursor, bool) {
-    let mut next = cursor.clone();
-    if let Some(last) = positions.last() {
-        let in_last = positions.iter().rev().take_while(|p| *p == last).count();
-        let before = positions.len() - in_last;
-        let skipped_buffer = cursor.buffer.as_ref().filter(|_| cursor.skip > 0);
-        if !full {
-            next.file = Some(last.0.clone());
-            next.offset = last.1;
-            next.skip = 0;
-            next.buffer = None;
-        } else if skipped_buffer == Some(last) {
-            // Still the buffer whose first events were skipped.
-            next.skip = cursor
-                .skip
-                .saturating_add(u32::try_from(in_last).unwrap_or(u32::MAX));
-        } else {
-            // The last buffer may continue: the position goes to the
-            // buffer before it (a returned one, else the skipped one, now
-            // read whole, else the position stays).
-            let prev = if before > 0 {
-                positions.get(before - 1).cloned()
-            } else {
-                skipped_buffer.cloned()
-            };
-            if let Some((f, o)) = prev {
-                next.file = Some(f);
-                next.offset = o;
-            }
-            next.skip = u32::try_from(in_last).unwrap_or(u32::MAX);
-            next.buffer = Some(last.clone());
-        }
-    }
-    // Nothing returned: the position and the skipped events stay.
-    let passed = cursor.after.is_some_and(|(key, offset)| {
-        positions
-            .last()
-            .and_then(|(f, o)| sql::xe_file_key(f).map(|k| (k, *o)))
-            .is_some_and(|last| last > (key, offset))
-    });
-    if passed || !full {
-        next.after = None;
-    }
-    let mut gap = false;
-    if next.skip > XE_MAX_SKIP {
-        // One buffer larger than the bound: the rest of it is dropped.
-        if let Some(b) = next.buffer.take() {
-            next.file = Some(b.0);
-            next.offset = b.1;
-        }
-        next.skip = 0;
-        gap = true;
-    }
-    if !full {
-        next.history_us = None;
-    }
-    (next, gap)
+    super::next_position(cursor, positions, full, sql::xe_file_key)
 }
 
 /// What one poll returned.

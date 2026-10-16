@@ -267,15 +267,22 @@ SUBSTRING(additional_information, CHARINDEX(N'<error>', additional_information) 
 
 /// The first poll of an audit: from the start of its file set. `{pattern}`
 /// is the file pattern built from the catalog, a literal (decision 6,
-/// M1: never a parameter); `@p3` the row bound.
-pub(crate) const AUDIT_POLL_START: &str =
-    "SELECT TOP (@p3) {columns} FROM sys.fn_get_audit_file({pattern}, NULL, NULL)";
+/// M1: never a parameter); the first `@p4` records skipped on the server,
+/// at most `@p3` returned, in file order (as [`AUDIT_POLL_FROM`]).
+pub(crate) const AUDIT_POLL_START: &str = "SELECT {columns} FROM \
+sys.fn_get_audit_file({pattern}, NULL, NULL) ORDER BY (SELECT NULL) OFFSET @p4 ROWS \
+FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
 
 /// The following polls: after the buffer at `@p2` of the file `@p1`
-/// (measured: the read starts after that buffer; a file outside the
-/// pattern's set is refused with error 33225).
-pub(crate) const AUDIT_POLL_FROM: &str =
-    "SELECT TOP (@p3) {columns} FROM sys.fn_get_audit_file({pattern}, @p1, @p2)";
+/// (measured: the read starts after that buffer, in the next file when it
+/// was its file's last; a file outside the pattern's set is refused with
+/// error 33225), the first `@p4` records skipped on the server (those of
+/// the next buffer already handled: a buffer holds about 500 KiB of
+/// records, up to 1 047 measured on 2022, more than a read), at most `@p3`
+/// returned, in file order.
+pub(crate) const AUDIT_POLL_FROM: &str = "SELECT {columns} FROM \
+sys.fn_get_audit_file({pattern}, @p1, @p2) ORDER BY (SELECT NULL) OFFSET @p4 ROWS \
+FETCH NEXT @p3 ROWS ONLY OPTION (MAXDOP 1)";
 
 /// The number of columns of an Audit poll.
 pub(crate) const AUDIT_POLL_COLUMNS: usize = 19;
@@ -620,7 +627,7 @@ pub(crate) fn own_text(text: &str) -> OwnText {
     if text.starts_with("SELECT TOP (")
         || text
             .strip_prefix("SELECT ")
-            .is_some_and(|r| r.starts_with(XE_COLUMNS))
+            .is_some_and(|r| r.starts_with(XE_COLUMNS) || r.starts_with(AUDIT_COLUMNS))
     {
         return OwnText::NeedsCredit;
     }
@@ -1112,7 +1119,9 @@ mod tests {
                 .starts_with("N'C:\\Audit\\a_")
         );
         let poll = audit_poll(&p, true).unwrap();
-        assert!(checked(&poll) && poll.contains("@p1, @p2)") && poll.contains("TOP (@p3)"));
+        assert!(checked(&poll));
+        assert!(poll.contains("@p1, @p2) ORDER BY (SELECT NULL) OFFSET @p4 ROWS"));
+        assert!(poll.contains("FETCH NEXT @p3 ROWS ONLY"));
         assert_eq!(own_text(&poll), OwnText::NeedsCredit);
         // Extended Events: the session reads are exact own texts, the
         // status read an exempt listed read; polls need a credit.
