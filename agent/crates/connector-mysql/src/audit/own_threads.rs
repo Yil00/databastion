@@ -39,6 +39,15 @@
 //!   (`events::text_shape`), for its pin statement and its sampling
 //!   credits only.
 //!
+//! - **Interrupted polls** (ADR-0045 refinement of 2026-10-16): a poll
+//!   stopped by the agent's own `KILL QUERY` (its stream dropped while the
+//!   poll ran) or by the statement timeout is kept by MySQL 8.4 with no
+//!   `SQL_TEXT` and a cut digest. Each noted poll thread keeps when it was
+//!   noted and when the agent closed or dropped its session, so that such
+//!   a row is dropped only within that session's life plus the statement
+//!   timeout ([`PollThreads::within_life`]); the other conditions are in
+//!   `pfs`.
+//!
 //! **Fail closed.** A thread id is matched only together with the server
 //! run it was read on ([`ServerRun`]): the server's identity (`@@hostname`,
 //! `@@port`, `@@server_id`, and `@@server_uuid` on MySQL) and its start
@@ -56,7 +65,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Two start times (Unix seconds, each `now - Uptime` read at another
 /// time) this close are the same server run.
@@ -105,37 +114,93 @@ impl ServerRun {
     }
 }
 
+/// Slack around a poll session's lifetime when an interrupted row's end
+/// time (the agent's estimate from the server's timers) is compared with
+/// it (ADR-0045 refinement of 2026-10-16, condition 3).
+pub(crate) const INTERRUPTED_SLACK: Duration = Duration::from_secs(5);
+
+/// One poll session's thread: when it was noted and, once the agent closed
+/// or dropped the session, when; and the statement timeout of its stream.
+#[derive(Debug, Clone)]
+struct PollThread {
+    thread: u64,
+    noted: SystemTime,
+    ended: Option<SystemTime>,
+    timeout: Duration,
+}
+
 /// The agent's poll sessions' threads, per server run (see the module
 /// documentation). One per connector: every stream on a server shares it.
 #[derive(Default)]
 pub(crate) struct PollThreads {
-    runs: VecDeque<(ServerRun, VecDeque<u64>)>,
+    runs: VecDeque<(ServerRun, VecDeque<PollThread>)>,
 }
 
 pub(crate) type SharedPollThreads = Arc<Mutex<PollThreads>>;
 
 impl PollThreads {
-    /// Notes `thread` as a poll session of `run`, up `uptime` seconds.
-    pub(crate) fn note(&mut self, run: &ServerRun, uptime: u64, thread: u64) {
+    /// Notes `thread` as a poll session of `run`, up `uptime` seconds, at
+    /// `now`, whose stream bounds its statements by `timeout`. A thread
+    /// noted again (a stream moving to another statement table on the
+    /// same session) is live again.
+    pub(crate) fn note(
+        &mut self,
+        run: &ServerRun,
+        uptime: u64,
+        thread: u64,
+        timeout: Duration,
+        now: SystemTime,
+    ) {
         if uptime < MIN_UPTIME_S {
             return;
         }
         // Another run of the same server: its threads mean nothing now.
         self.runs
             .retain(|(r, _)| r.ident != run.ident || r.same(run));
+        let entry = PollThread {
+            thread,
+            noted: now,
+            ended: None,
+            timeout,
+        };
         if let Some((_, threads)) = self.runs.iter_mut().find(|(r, _)| r.same(run)) {
-            if !threads.contains(&thread) {
-                if threads.len() >= MAX_POLL_THREADS {
-                    threads.pop_front();
+            match threads.iter_mut().find(|t| t.thread == thread) {
+                Some(t) => {
+                    t.ended = None;
+                    t.timeout = timeout;
                 }
-                threads.push_back(thread);
+                None => {
+                    if threads.len() >= MAX_POLL_THREADS {
+                        threads.pop_front();
+                    }
+                    threads.push_back(entry);
+                }
             }
             return;
         }
         if self.runs.len() >= MAX_RUNS {
             self.runs.pop_front();
         }
-        self.runs.push_back((run.clone(), VecDeque::from([thread])));
+        self.runs.push_back((run.clone(), VecDeque::from([entry])));
+    }
+
+    /// The agent closed or dropped the poll session of `thread` of `run`
+    /// at `at` (its stream ended, failed or reconnected).
+    pub(crate) fn ended(&mut self, run: &ServerRun, thread: u64, at: SystemTime) {
+        for (_, threads) in self.runs.iter_mut().filter(|(r, _)| r.same(run)) {
+            for t in threads.iter_mut().filter(|t| t.thread == thread) {
+                if t.ended.is_none() {
+                    t.ended = Some(at);
+                }
+            }
+        }
+    }
+
+    fn find(&self, run: &ServerRun, thread: u64) -> Option<&PollThread> {
+        self.runs
+            .iter()
+            .filter(|(r, _)| r.same(run))
+            .find_map(|(_, threads)| threads.iter().find(|t| t.thread == thread))
     }
 
     /// Whether `thread` is one of the agent's poll sessions, on any run
@@ -144,14 +209,26 @@ impl PollThreads {
     pub(crate) fn contains_thread(&self, thread: u64) -> bool {
         self.runs
             .iter()
-            .any(|(_, threads)| threads.contains(&thread))
+            .any(|(_, threads)| threads.iter().any(|t| t.thread == thread))
     }
 
     /// Whether `thread` of `run` is one of the agent's poll sessions.
     pub(crate) fn contains(&self, run: &ServerRun, thread: u64) -> bool {
-        self.runs
-            .iter()
-            .any(|(r, threads)| r.same(run) && threads.contains(&thread))
+        self.find(run, thread).is_some()
+    }
+
+    /// Whether a statement of `thread` of `run` that ended at `ts` ended
+    /// within that poll session's life: from its note to its end (still
+    /// running: no end) plus its stream's statement timeout, each with
+    /// [`INTERRUPTED_SLACK`] (ADR-0045 refinement of 2026-10-16,
+    /// condition 3).
+    pub(crate) fn within_life(&self, run: &ServerRun, thread: u64, ts: SystemTime) -> bool {
+        self.find(run, thread).is_some_and(|t| {
+            let from = t.noted.checked_sub(INTERRUPTED_SLACK).unwrap_or(t.noted);
+            ts >= from
+                && t.ended
+                    .is_none_or(|end| ts <= end + t.timeout + INTERRUPTED_SLACK)
+        })
     }
 }
 
@@ -420,7 +497,7 @@ mod tests {
     fn poll_threads_are_per_server_run_and_bounded() {
         let mut p = PollThreads::default();
         let r = run("db1", 1_000_000);
-        p.note(&r, 3600, 42);
+        p.note(&r, 3600, 42, Duration::from_secs(30), SystemTime::now());
         assert!(p.contains(&r, 42));
         assert!(p.contains(&run("db1", 1_000_001), 42));
         assert!(!p.contains(&r, 43));
@@ -428,24 +505,73 @@ mod tests {
         assert!(!p.contains(&run("db2", 1_000_000), 42));
         assert!(!p.contains(&run("db1", 1_003_600), 42));
         // A server that just started: nothing noted.
-        p.note(&run("db3", 2_000_000), MIN_UPTIME_S - 1, 7);
+        p.note(
+            &run("db3", 2_000_000),
+            MIN_UPTIME_S - 1,
+            7,
+            Duration::from_secs(30),
+            SystemTime::now(),
+        );
         assert!(!p.contains(&run("db3", 2_000_000), 7));
         // A restart of db1 seen by a new note forgets the old run.
-        p.note(&run("db1", 1_003_600), 60, 5);
+        p.note(
+            &run("db1", 1_003_600),
+            60,
+            5,
+            Duration::from_secs(30),
+            SystemTime::now(),
+        );
         assert!(!p.contains(&r, 42));
         assert!(p.contains(&run("db1", 1_003_600), 5));
         // Bounded: the oldest threads, then the oldest runs, are dropped.
         let r = run("db4", 5_000_000);
         for t in 0..(MAX_POLL_THREADS as u64 + 5) {
-            p.note(&r, 3600, t);
+            p.note(&r, 3600, t, Duration::from_secs(30), SystemTime::now());
         }
         assert!(!p.contains(&r, 0));
         assert!(p.contains(&r, MAX_POLL_THREADS as u64 + 4));
         for i in 0..(MAX_RUNS as u64 + 1) {
-            p.note(&run(&format!("h{i}"), 9_000_000), 3600, 1);
+            p.note(
+                &run(&format!("h{i}"), 9_000_000),
+                3600,
+                1,
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
         }
         assert!(p.runs.len() <= MAX_RUNS);
         assert!(!p.contains(&r, MAX_POLL_THREADS as u64 + 4));
+    }
+
+    /// ADR-0045 refinement of 2026-10-16, condition 3: a poll session's
+    /// life runs from its note to its end plus the statement timeout, each
+    /// with the slack; a thread noted again is live again.
+    #[test]
+    fn poll_sessions_have_a_life() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let timeout = Duration::from_secs(30);
+        let mut p = PollThreads::default();
+        let r = run("db1", 1_000_000);
+        p.note(&r, 3600, 7, timeout, t0);
+        let s = INTERRUPTED_SLACK;
+        assert!(p.within_life(&r, 7, t0 - s));
+        assert!(!p.within_life(&r, 7, t0 - s - Duration::from_secs(1)));
+        // Not ended: open.
+        assert!(p.within_life(&r, 7, t0 + Duration::from_secs(86_400)));
+        let end = t0 + Duration::from_secs(60);
+        p.ended(&r, 7, end);
+        assert!(p.within_life(&r, 7, end + timeout + s));
+        assert!(!p.within_life(&r, 7, end + timeout + s + Duration::from_secs(1)));
+        // A later end does not move the first one.
+        p.ended(&r, 7, end + Duration::from_secs(600));
+        assert!(!p.within_life(&r, 7, end + timeout + s + Duration::from_secs(1)));
+        // Another thread, another run: never.
+        assert!(!p.within_life(&r, 8, t0));
+        assert!(!p.within_life(&run("db1", 1_000_100), 7, t0));
+        // Noted again: live again; still a poll thread once ended.
+        p.note(&r, 3600, 7, timeout, end + Duration::from_secs(5));
+        assert!(p.within_life(&r, 7, end + Duration::from_secs(3600)));
+        assert!(p.contains(&r, 7));
     }
 
     #[test]

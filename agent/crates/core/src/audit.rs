@@ -63,6 +63,24 @@ pub(crate) fn pending_evicted() -> u64 {
     PENDING_EVICTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Rows of the agent's own `performance_schema` polls that were
+/// interrupted (`KILL QUERY`, statement timeout) and kept by the server
+/// with a cut digest only, dropped by the MySQL / MariaDB connector
+/// (ADR-0045 refinement of 2026-10-16): heartbeat metric
+/// `audit_own_polls_interrupted_total`.
+static OWN_POLLS_INTERRUPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts `n` dropped rows of interrupted own polls (see
+/// [`OWN_POLLS_INTERRUPTED`]).
+pub fn count_interrupted_own_polls(n: u64) {
+    OWN_POLLS_INTERRUPTED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_interrupted_own_polls`].
+pub(crate) fn interrupted_own_polls() -> u64 {
+    OWN_POLLS_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Saved audit log cursors discarded at open because the file at their
 /// inode no longer holds what had been read (truncated, or rewritten in
 /// place while the agent was stopped): heartbeat metric
