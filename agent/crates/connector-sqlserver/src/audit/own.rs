@@ -11,7 +11,11 @@
 //! future), to the moment it was lost plus the statement timeout and 5 s.
 //! Times are the server's UTC clock: the session's server time at its
 //! read-back plus the agent's monotonic time since, so no clock offset
-//! between the agent and the server enters the rule.
+//! between the agent and the server enters the rule. On the Extended
+//! Events source, whose clock can run apart from `SYSUTCDATETIME()`, the
+//! difference measured once per session from its read-back's own event
+//! ([`calibrate`]) moves the start side only: the end side is never
+//! compared later than without it.
 //!
 //! The list is kept per target, bounded by time only (sessions ended more
 //! than 48 h ago are dropped, none earlier; a warning above 100 000),
@@ -159,7 +163,13 @@ impl OwnSession {
     /// source's skew only for a text among those the session sent last
     /// (refinement of 2026-10-16, item 1).
     fn within(&self, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
-        self.start_us <= at_us
+        self.within_sides(at_us, at_us, text_hash, skew_us)
+    }
+
+    /// [`Self::within`] with the time compared to the start (`at_start`)
+    /// and the one compared to the end (`at_end`) apart.
+    fn within_sides(&self, at_start: i64, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
+        self.start_us <= at_start
             && self.end_us.is_none_or(|e| {
                 at_us <= e
                     || (self.sent.contains(text_hash) && at_us <= e.saturating_add(skew_us))
@@ -169,15 +179,18 @@ impl OwnSession {
     }
 
     /// [`Self::within`] for an event stamped `at_us` on the Extended
-    /// Events clock: moved onto the read-back's clock when the session was
-    /// calibrated (its lifetime is the same; only the clock it is read on
-    /// changes).
+    /// Events clock: against the start, moved onto the read-back's clock
+    /// when the session was calibrated; against the end, at the later of
+    /// the stamp and the moved stamp, so a stale or negative difference
+    /// never makes the end side match later than without it (review M1).
     fn within_source(&self, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
-        let at_us = match self.clock {
-            SourceClock::Offset(o) => at_us.saturating_add(o),
-            SourceClock::Unknown | SourceClock::Ambiguous => at_us,
-        };
-        self.within(at_us, text_hash, skew_us)
+        match self.clock {
+            SourceClock::Offset(o) => {
+                let moved = at_us.saturating_add(o);
+                self.within_sides(moved, moved.max(at_us), text_hash, skew_us)
+            }
+            SourceClock::Unknown | SourceClock::Ambiguous => self.within(at_us, text_hash, skew_us),
+        }
     }
 }
 
@@ -963,6 +976,84 @@ mod tests {
             session_at(t, 81, readback, "").unwrap().clock,
             SourceClock::Offset(lag)
         );
+    }
+
+    /// Review M1: the difference moves the start side only; against the
+    /// end, the later of the stamp and the moved stamp is compared, so a
+    /// negative difference (the event clock ahead) or a stale one never
+    /// matches later than without it. Both bounds.
+    #[test]
+    fn the_difference_never_opens_the_end_side() {
+        let t = "own-test-clock-end";
+        reset(t);
+        // Sessions of about 1 s.
+        let readback = 9_000_000_000;
+        let mut h = opened(
+            t,
+            86,
+            readback,
+            3_000,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        );
+        h.sent("SELECT 1");
+        h.end(false, Duration::ZERO);
+        let s = session_at(t, 86, readback, "").unwrap();
+        let (start, end) = (s.start_us, s.end_us.unwrap());
+        let other = "SELECT name FROM sys.objects";
+        // The event clock 15 ms ahead: the read-back stamped 15 ms late.
+        let lead = 15_000;
+        calibrate(t, &[(86, readback + lead)]);
+        assert_eq!(
+            session_at(t, 86, readback, "").unwrap().clock,
+            SourceClock::Offset(-lead)
+        );
+        // Start: moved by the difference.
+        assert!(session_at_skewed(t, 86, start + lead, other, 0).is_some());
+        assert!(session_at_skewed(t, 86, start + lead - 1, other, 0).is_none());
+        // End: as without it (not moved earlier).
+        assert!(session_at_skewed(t, 86, end, other, 0).is_some());
+        assert!(
+            session_at_skewed(t, 86, end + 1, other, 0).is_none(),
+            "a negative difference does not move the end later"
+        );
+        assert!(session_at_skewed(t, 86, end + lead, other, 0).is_none());
+        // A stale difference (the clocks back together): a statement of a
+        // session reusing the SPID right after the end is not matched.
+        reset(t);
+        let mut h = opened(
+            t,
+            87,
+            readback,
+            3_000,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        );
+        h.end(false, Duration::ZERO);
+        let end = session_at(t, 87, readback, "").unwrap().end_us.unwrap();
+        calibrate(t, &[(87, readback + 40_000)]);
+        for after in [1, 10_000, 39_999] {
+            assert!(
+                session_at_skewed(t, 87, end + after, other, 0).is_none(),
+                "stale: {after} µs after the end"
+            );
+        }
+        // A positive difference (the event clock behind) keeps the end on
+        // the moved stamp, which is the later one.
+        reset(t);
+        let mut h = opened(
+            t,
+            88,
+            readback,
+            3_000,
+            None,
+            Instant::now() - Duration::from_secs(1),
+        );
+        h.end(false, Duration::ZERO);
+        let end = session_at(t, 88, readback, "").unwrap().end_us.unwrap();
+        calibrate(t, &[(88, readback - 38_000)]);
+        assert!(session_at_skewed(t, 88, end - 38_000, other, 0).is_some());
+        assert!(session_at_skewed(t, 88, end - 38_000 + 1, other, 0).is_none());
     }
 
     /// Calibration fails closed: two read-back events of the SPID near the

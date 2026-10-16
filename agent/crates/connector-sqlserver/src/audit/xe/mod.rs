@@ -260,6 +260,35 @@ fn own_session(target: &TargetConfig, r: &XeRecord) -> bool {
             .is_none_or(|a| a.is_empty() || a == APP)
 }
 
+/// The read-back events of a read, as `(spid, stamp)`, for
+/// [`own::calibrate`]: `sql_statement_completed` with exactly the
+/// read-back text (not cut), a session id, both principals the agent's
+/// login and the agent's application name (or none), the checks of
+/// [`own_session`] (review L1). Another login's read-back is ignored: it
+/// gives neither a difference nor an ambiguity.
+pub(crate) fn readbacks(records: &[XeRecord], account: &str) -> Vec<(i64, i64)> {
+    let agent = |p: &Option<String>| {
+        p.as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(account))
+    };
+    records
+        .iter()
+        .filter(|r| r.kind() == xml::Kind::SqlStatementCompleted)
+        .filter_map(|r| {
+            let e = r.event.as_ref()?;
+            let ok = !e.statement_cut
+                && e.statement.as_deref().map(|t| t.as_str())
+                    == Some(crate::conn::SESSION_READBACK)
+                && agent(&e.server_principal)
+                && agent(&e.session_principal)
+                && e.client_app
+                    .as_deref()
+                    .is_none_or(|a| a.is_empty() || a == APP);
+            ok.then_some((e.session_id?, r.time_us))
+        })
+        .collect()
+}
+
 /// Whether the SQL Server Audit source is usable on `s` now (the
 /// preference rule of decision 6): an audit named, SQL Server 2022 or
 /// later, its grants held and the audit found.
@@ -769,18 +798,7 @@ async fn read(
     let mut records = b.kept;
     // The agent's sessions on this source's clock: each read-back event
     // calibrates its session (own::calibrate), before any own rule.
-    let readbacks: Vec<(i64, i64)> = records
-        .iter()
-        .filter(|r| r.kind() == xml::Kind::SqlStatementCompleted)
-        .filter_map(|r| {
-            let e = r.event.as_ref()?;
-            (!e.statement_cut
-                && e.statement.as_deref().map(|t| t.as_str())
-                    == Some(crate::conn::SESSION_READBACK))
-            .then_some((e.session_id?, r.time_us))
-        })
-        .collect();
-    own::calibrate(&target_id, &readbacks);
+    own::calibrate(&target_id, &readbacks(&records, &st.target.account));
     let mut below_floor: Vec<usize> = Vec::new();
     records.retain(
         |r| match st.cursor.below(r.time_us, read_started_ms, delay) {
@@ -878,4 +896,89 @@ async fn read(
     }
     // A cut read ends the cycle: the next read waits a poll interval.
     Ok(b.full && cut.is_none())
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::events::tests::rec;
+    use super::*;
+
+    fn readback(name: &str, text: &str, login: &str, app: &str, cut: bool) -> XeRecord {
+        let t = text.replace('&', "&amp;").replace('<', "&lt;");
+        let mut r = rec(
+            name,
+            &[("statement", &t)],
+            &[
+                ("session_id", "81"),
+                ("server_principal_name", login),
+                ("session_server_principal_name", login),
+                ("client_app_name", app),
+            ],
+        );
+        r.time_us = 7;
+        if let Some(e) = r.event.as_mut() {
+            e.statement_cut = cut;
+        }
+        r
+    }
+
+    /// Review L1 and L2: only the agent's own read-back events calibrate.
+    #[test]
+    fn only_the_agents_read_back_events_calibrate() {
+        let rb = crate::conn::SESSION_READBACK;
+        let ok = readback("sql_statement_completed", rb, "databastion", APP, false);
+        assert_eq!(readbacks(&[ok], "databastion"), [(81, 7)]);
+        let none = readback("sql_statement_completed", rb, "databastion", "", false);
+        assert_eq!(
+            readbacks(&[none], "DataBastion"),
+            [(81, 7)],
+            "no application name"
+        );
+        let near = format!("{rb} ");
+        for (r, why) in [
+            (
+                readback("sql_statement_completed", rb, "databastion", APP, true),
+                "cut",
+            ),
+            (
+                readback("sql_statement_completed", &near, "databastion", APP, false),
+                "a near copy",
+            ),
+            (
+                readback("sp_statement_completed", rb, "databastion", APP, false),
+                "sp_statement_completed",
+            ),
+            (
+                readback("sql_statement_completed", rb, "mallory", APP, false),
+                "another login",
+            ),
+            (
+                readback(
+                    "sql_statement_completed",
+                    rb,
+                    "databastion",
+                    "SQLCMD",
+                    false,
+                ),
+                "another application",
+            ),
+        ] {
+            assert!(readbacks(&[r], "databastion").is_empty(), "{why}");
+        }
+        // Another login's read-back is ignored: no ambiguity with the
+        // agent's.
+        let t = "xe-readback-foreign";
+        own::reset(t);
+        let at = 9_000_000_000;
+        let _h = own::opened(t, 81, at, 3_000, None, Instant::now());
+        let mut mine = readback("sql_statement_completed", rb, "databastion", APP, false);
+        mine.time_us = at - 38_000;
+        let mut theirs = readback("sql_statement_completed", rb, "mallory", APP, false);
+        theirs.time_us = at - 20_000;
+        own::calibrate(t, &readbacks(&[mine, theirs], "databastion"));
+        assert_eq!(
+            own::session_at(t, 81, at, "").unwrap().clock,
+            own::SourceClock::Offset(38_000)
+        );
+    }
 }
