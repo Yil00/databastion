@@ -351,6 +351,16 @@ fn objects_of(
 /// ([`LogEntry::budget`]): per database of `ctx.dbs`, the learned pattern
 /// a complete, unguarded key matches as a whole. A cut or guarded key, or
 /// one no database's patterns match, adds nothing.
+///
+/// Computed at parse time for every entry of an own sampling shape,
+/// whoever sent it (review L2 of e692192): whether the entry is the
+/// agent's is only known after the poll's `CLIENT LIST`, and computing it
+/// later would keep the raw key bytes alive past the parser (decision 8:
+/// arguments are dropped before any buffering beyond it). The work a
+/// foreign client can drive is bounded: only the agent's exact sampling
+/// shapes (a single key), at most 512 entries per log read, and at most
+/// 16 databases ([`crate::info::MAX_DATABASES`]), each one match of the
+/// kind [`objects_of`] already does for every entry.
 fn budget_of(
     args: &[Option<&[u8]>],
     indices: &[usize],
