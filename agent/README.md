@@ -353,6 +353,12 @@ is not seen.
 MySQL / MariaDB audit log statements reported before their statement record
 because the bounded grouping state was full are counted in the heartbeat
 metric `audit_pending_evicted_total` (`databastion_core::audit::count_pending_evicted`).
+Rows of the agent's own MySQL `performance_schema` polls that were
+interrupted (`KILL QUERY`, statement timeout) and kept by the server with a
+cut digest only, dropped by the MySQL / MariaDB connector (ADR-0045
+refinement of 2026-10-16), are counted in the heartbeat metric
+`audit_own_polls_interrupted_total`
+(`databastion_core::audit::count_interrupted_own_polls`).
 
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's
