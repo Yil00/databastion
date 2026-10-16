@@ -1670,64 +1670,87 @@ mod statistics_tests {
         }
     }
 
-    /// Refinement of 2026-10-16, item 4: a read whose own-session build on
-    /// a listed table is not paired yet ends just before it; the next read
-    /// starts at it and pairs it. Every event is handled once: none twice,
-    /// none lost.
-    #[test]
-    fn a_deferred_build_is_paired_by_the_next_read_without_duplicate_or_drop() {
+    /// One row of a simulated event file: its buffer offset and what it is.
+    #[derive(Clone, Copy)]
+    enum Row {
+        /// A client's statement (its id).
+        Client(i64),
+        Build,
+        Internal,
+        /// The agent's catalog read of the build's activity (its pair).
+        Catalog,
+        /// A row the reader cannot read (dropped and counted).
+        Malformed,
+    }
+
+    /// Reads a simulated file through deferrals: `schedule` gives, per
+    /// read, the rows written so far and the rows asked. Returns the
+    /// events handled (time, left out) and the malformed rows met.
+    fn walk(rows: &[(i64, Row)], schedule: &[(usize, usize)]) -> (Vec<(i64, bool)>, usize) {
         use crate::audit::Cursor;
         use crate::audit::xe::xe_next;
-        let at = |mut r: XeRecord, offset: i64, id: i64| {
+        let make = |offset: i64, row: Row| {
+            let mut r = match row {
+                Row::Client(id) => {
+                    let mut r = stmt_in("app", "SELECT TOP (1) id FROM crm.t", None, 0);
+                    r.time_us = id;
+                    r
+                }
+                Row::Build => {
+                    let mut r = sp("databastion", BUILD, Some(GUID), 1, BUILD_SHAPE);
+                    r.time_us = 101;
+                    r
+                }
+                Row::Internal => {
+                    let mut r = sp("databastion", "", Some(GUID), 2, INTERNAL);
+                    r.time_us = 102;
+                    r
+                }
+                Row::Catalog | Row::Malformed => {
+                    let mut r = stmt_in("databastion", &catalog(), Some(GUID), 3);
+                    r.time_us = 103;
+                    r
+                }
+            };
             r.file = "f".to_owned();
             r.offset = offset;
-            r.time_us = id;
             r
-        };
-        // Buffer 4096: a client's read, the agent's build and its internal
-        // statement; buffer 8192, written only after the first read: the
-        // agent's catalog read of the same activity (the build's pair).
-        let make = |i: usize| match i {
-            0 => at(
-                stmt_in("app", "SELECT TOP (1) id FROM crm.t", None, 0),
-                4096,
-                0,
-            ),
-            1 => at(
-                sp("databastion", BUILD, Some(GUID), 1, BUILD_SHAPE),
-                4096,
-                1,
-            ),
-            2 => at(sp("databastion", "", Some(GUID), 2, INTERNAL), 4096, 2),
-            _ => at(stmt_in("databastion", &catalog(), Some(GUID), 3), 8192, 3),
-        };
-        let offsets = [4096, 4096, 4096, 8192];
-        // The server: after the buffer at the position, skip, then all.
-        let serve = |c: &Cursor, written: usize| -> Vec<XeRecord> {
-            let start = offsets
-                .iter()
-                .take(written)
-                .position(|o| c.file.is_none() || *o > c.offset)
-                .unwrap_or(written);
-            (start + c.skip as usize..written)
-                .enumerate()
-                .map(|(i, k)| {
-                    let mut r = make(k);
-                    r.index = i;
-                    r
-                })
-                .collect()
         };
         let mut deferrals = Deferrals::default();
         let mut cursor = Cursor::default();
-        let mut handled: Vec<(i64, bool)> = Vec::new();
+        let mut handled = Vec::new();
+        let mut malformed = 0;
         let t0 = Instant::now();
-        for (read, written) in [(0u64, 3), (1, 4), (2, 4)] {
-            let mut recs = serve(&cursor, written);
+        for (read, &(written, asked)) in schedule.iter().enumerate() {
+            // The server: after the buffer at the position, skip rows, then
+            // at most `asked` rows; the reader drops the malformed ones.
+            let start = rows
+                .iter()
+                .take(written)
+                .position(|(o, _)| cursor.file.is_none() || *o > cursor.offset)
+                .unwrap_or(written);
+            let served: Vec<(i64, Row)> = rows
+                .iter()
+                .take(written)
+                .skip(start + cursor.skip as usize)
+                .take(asked)
+                .copied()
+                .collect();
+            let returned = served.len();
+            let mut recs = Vec::new();
+            for (o, row) in served {
+                if matches!(row, Row::Malformed) {
+                    malformed += 1;
+                    continue;
+                }
+                let mut r = make(o, row);
+                r.index = recs.len();
+                recs.push(r);
+            }
             let positions: Vec<(String, i64)> =
                 recs.iter().map(|r| (r.file.clone(), r.offset)).collect();
             context(&mut recs, true, &own);
-            let now = t0 + Duration::from_secs(read);
+            let now = t0 + Duration::from_secs(u64::try_from(read).unwrap());
             let cut = deferrals.cut(&recs, true, &own, now, Duration::from_secs(5));
             let (next, gap) = match cut {
                 Some(i) => {
@@ -1738,22 +1761,83 @@ mod statistics_tests {
                     context(&mut recs, true, &own);
                     xe_next(&cursor, &positions[..i], true)
                 }
-                None => xe_next(&cursor, &positions, false),
+                None => xe_next(&cursor, &positions, returned >= asked),
             };
             assert!(!gap);
             handled.extend(recs.iter().map(|r| (r.time_us, r.skip)));
             cursor = next;
-            if read == 0 {
-                assert_eq!(cut, Some(1), "the first read ends before the build");
-            }
         }
-        // Each event once; the build and its internal statement left out by
-        // the next read, with their pair.
-        assert_eq!(
-            handled,
-            [(0, false), (1, true), (2, true), (3, false)],
-            "no duplicate, no drop"
-        );
+        (handled, malformed)
+    }
+
+    /// Refinement of 2026-10-16, item 4: a read whose own-session build on
+    /// a listed table is not paired yet ends just before it; the next read
+    /// starts at it and pairs it. Every event is handled once: none twice,
+    /// none lost.
+    #[test]
+    fn a_deferred_build_is_paired_by_the_next_read_without_duplicate_or_drop() {
+        use Row::{Build, Catalog, Client, Internal, Malformed};
+        let want = |clients: &[i64]| {
+            let mut v: Vec<(i64, bool)> = clients.iter().map(|c| (*c, false)).collect();
+            v.extend([(101, true), (102, true), (103, false)]);
+            v
+        };
+        // Buffer 4096: a client's read, the agent's build and its internal
+        // statement; buffer 8192, written only after the first read: the
+        // agent's catalog read of the same activity (the build's pair).
+        let rows = [
+            (4096, Client(0)),
+            (4096, Build),
+            (4096, Internal),
+            (8192, Catalog),
+        ];
+        let (handled, _) = walk(&rows, &[(3, 500), (4, 500), (4, 500)]);
+        assert_eq!(handled, want(&[0]), "no duplicate, no drop");
+
+        // The cut buffer's first events were handled by an earlier full
+        // read (`cursor.skip > 0`): the cut adds to the skip count.
+        let rows = [
+            (4096, Client(0)),
+            (4096, Client(1)),
+            (4096, Client(2)),
+            (4096, Build),
+            (4096, Internal),
+            (8192, Catalog),
+        ];
+        let (handled, _) = walk(&rows, &[(5, 2), (5, 500), (6, 500), (6, 500)]);
+        assert_eq!(handled, want(&[0, 1, 2]), "no duplicate, no drop");
+
+        // A malformed row in the cut buffer, after the client's event: the
+        // skip counts the events read, not the rows, so the next read
+        // meets the malformed row again (dropped and counted twice), and
+        // no event is lost or handled twice.
+        let rows = [
+            (4096, Client(0)),
+            (4096, Malformed),
+            (4096, Build),
+            (4096, Internal),
+            (8192, Catalog),
+        ];
+        let (handled, malformed) = walk(&rows, &[(4, 500), (5, 500), (5, 500)]);
+        assert_eq!(handled, want(&[0]), "no drop");
+        assert_eq!(malformed, 2, "the malformed row is met again (bounded)");
+
+        // Before the client's event: the next read starts one row early,
+        // so that event is handled twice (bounded: one per malformed row
+        // before the cut in the cut buffer, each counted as dropped);
+        // nothing is lost.
+        let rows = [
+            (4096, Malformed),
+            (4096, Client(0)),
+            (4096, Build),
+            (4096, Internal),
+            (8192, Catalog),
+        ];
+        let (handled, malformed) = walk(&rows, &[(4, 500), (5, 500), (5, 500)]);
+        let mut twice = want(&[0]);
+        twice.insert(1, (0, false));
+        assert_eq!(handled, twice, "a bounded duplicate, no drop");
+        assert_eq!(malformed, 1);
     }
 
     /// A build still unpaired after its bound is handled as it stands
