@@ -80,6 +80,32 @@ pub(crate) const MAX_CREDIT_TTL: Duration = Duration::from_secs(900);
 pub(crate) const CREDIT_SLACK: Duration = Duration::from_secs(5);
 /// Credits held per target at most.
 pub(crate) const MAX_CREDITS: usize = 4096;
+/// Texts a session remembers having sent, at most (ADR-0051 refinement of
+/// 2026-10-16, item 1): the last ones, by keyed hash.
+pub(crate) const SENT_TEXTS: usize = 16;
+
+/// Keyed hashes of the last [`SENT_TEXTS`] texts a session sent (in memory
+/// only: never logged nor persisted; the key is per process).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SentTexts {
+    hashes: [u64; SENT_TEXTS],
+    len: usize,
+    next: usize,
+}
+
+impl SentTexts {
+    fn push(&mut self, h: u64) {
+        if let Some(slot) = self.hashes.get_mut(self.next) {
+            *slot = h;
+        }
+        self.next = (self.next + 1) % SENT_TEXTS;
+        self.len = (self.len + 1).min(SENT_TEXTS);
+    }
+
+    fn contains(&self, h: u64) -> bool {
+        self.hashes.iter().take(self.len).any(|x| *x == h)
+    }
+}
 
 /// One of the agent's sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,16 +120,22 @@ pub(crate) struct OwnSession {
     /// Keyed hash of the last statement the session sent before its clean
     /// close (in memory only: the key is per process).
     pub(crate) last: Option<u64>,
+    /// The texts the session sent last, after a clean close only (empty
+    /// after a lost end and for a restored session).
+    pub(crate) sent: SentTexts,
 }
 
 impl OwnSession {
     /// Whether a record's `event_time` falls in the session's lifetime;
     /// after a clean end, within [`CLOCK_TOLERANCE_US`], only for the text
-    /// of the session's last statement (`text_hash`).
+    /// of the session's last statement (`text_hash`), and within the
+    /// source's skew only for a text among those the session sent last
+    /// (refinement of 2026-10-16, item 1).
     fn within(&self, at_us: i64, text_hash: u64, skew_us: i64) -> bool {
         self.start_us <= at_us
             && self.end_us.is_none_or(|e| {
-                at_us <= e.saturating_add(skew_us)
+                at_us <= e
+                    || (self.sent.contains(text_hash) && at_us <= e.saturating_add(skew_us))
                     || (self.last == Some(text_hash)
                         && at_us <= e.saturating_add(CLOCK_TOLERANCE_US))
             })
@@ -187,6 +219,8 @@ pub(crate) struct Handle {
     ended: bool,
     /// Keyed hash of the last statement sent.
     last: Option<u64>,
+    /// The last texts sent.
+    sent: SentTexts,
 }
 
 impl Handle {
@@ -204,7 +238,9 @@ impl Handle {
     /// Records the statement the session sends (its keyed hash: the
     /// tolerance of the clean end applies to the last one only).
     pub(crate) fn sent(&mut self, text: &str) {
-        self.last = Some(text_hash(text));
+        let h = text_hash(text);
+        self.last = Some(h);
+        self.sent.push(h);
     }
 
     /// Records the end of the session: `lost` adds `grace` (the statement
@@ -224,8 +260,14 @@ impl Handle {
                 .find(|s| s.spid == self.spid && s.start_us == self.start_us)
         {
             s.end_us = Some(end);
-            // A lost session's grace already covers its last statement.
+            // A lost session's grace already covers its last statement;
+            // it gets no tolerance.
             s.last = if lost { None } else { self.last };
+            s.sent = if lost {
+                SentTexts::default()
+            } else {
+                self.sent
+            };
         }
     }
 
@@ -309,6 +351,7 @@ pub(crate) fn opened(
         end_us: None,
         addr,
         last: None,
+        sent: SentTexts::default(),
     });
     Handle {
         target: target_id.to_owned(),
@@ -318,6 +361,7 @@ pub(crate) fn opened(
         at,
         ended: false,
         last: None,
+        sent: SentTexts::default(),
     }
 }
 
@@ -328,10 +372,11 @@ pub(crate) fn session_at(target_id: &str, spid: i64, at_us: i64, text: &str) -> 
 }
 
 /// [`session_at`] for a source whose clock runs ahead of
-/// `SYSUTCDATETIME()` by up to `skew_us`: every statement of a session is
-/// matched up to `skew_us` after its clean end (Extended Events: measured
-/// up to 3.5 ms on 2022, `xe::XE_CLOCK_SKEW_US`), its last statement up to
-/// [`CLOCK_TOLERANCE_US`].
+/// `SYSUTCDATETIME()` by up to `skew_us`: a statement whose text is among
+/// the last [`SENT_TEXTS`] the session sent is matched up to `skew_us`
+/// after its clean end (Extended Events: measured up to 3.5 ms on 2022,
+/// `xe::XE_CLOCK_SKEW_US`), its last statement up to
+/// [`CLOCK_TOLERANCE_US`]; nothing after a lost end's grace.
 pub(crate) fn session_at_skewed(
     target_id: &str,
     spid: i64,
@@ -554,6 +599,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
             end_us,
             addr,
             last: None,
+            sent: SentTexts::default(),
         });
     }
     Some(Persisted {
@@ -739,27 +785,96 @@ mod tests {
     }
 
     /// Extended Events stamps statements up to a few ms after the
-    /// `SYSUTCDATETIME()` the end is computed on (measured): every text is
-    /// matched within the skew, none beyond it.
+    /// `SYSUTCDATETIME()` the end is computed on (measured): after a clean
+    /// end, a text the session sent is matched within the skew, a text it
+    /// did not send is not (refinement of 2026-10-16, item 1).
     #[test]
-    fn a_skewed_source_matches_every_text_within_the_skew() {
+    fn a_skewed_source_matches_only_the_texts_sent_within_the_skew() {
         let t = "own-test-skew";
         reset(t);
+        let cols = "SELECT TOP (4097) CONVERT(nvarchar(128), c.name)";
         let mut h = opened(t, 77, 7_000_000_000, 0, None, Instant::now());
+        h.sent(cols);
         h.sent("SELECT 2");
         h.end(false, Duration::ZERO);
         let end = session_at(t, 77, 7_000_000_000, "")
             .unwrap()
             .end_us
             .unwrap();
-        let cols = "SELECT TOP (4097) CONVERT(nvarchar(128), c.name)";
+        // Sent: within the skew, not beyond it.
         assert!(
             session_at(t, 77, end + 3_000, cols).is_none(),
             "no skew: not matched"
         );
         assert!(session_at_skewed(t, 77, end + 3_000, cols, 20_000).is_some());
         assert!(session_at_skewed(t, 77, end + 20_001, cols, 20_000).is_none());
+        // The last statement keeps its 250 ms.
         assert!(session_at_skewed(t, 77, end + 100_000, "SELECT 2", 20_000).is_some());
+        // Not sent by the session (what a session reusing the SPID sends):
+        // no skew.
+        let foreign = "SELECT TOP (1) id FROM retail.crm.customers";
+        assert!(session_at_skewed(t, 77, end + 1, foreign, 20_000).is_none());
+        assert!(session_at_skewed(t, 77, end, foreign, 20_000).is_some());
+    }
+
+    /// A foreign session on the reused SPID, its text outside the set.
+    #[test]
+    fn a_foreign_session_on_the_reused_spid_gets_no_skew() {
+        let t = "own-test-skew-foreign";
+        reset(t);
+        let mut h = opened(t, 78, 7_000_000_000, 0, None, Instant::now());
+        h.sent("SELECT 1");
+        h.end(false, Duration::ZERO);
+        let end = session_at(t, 78, 7_000_000_000, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        for text in ["SELECT name FROM sys.objects", "SELECT 1 "] {
+            assert!(
+                session_at_skewed(t, 78, end + 5_000, text, 20_000).is_none(),
+                "{text}"
+            );
+        }
+    }
+
+    /// The set keeps the last [`SENT_TEXTS`] texts only; a lost end and a
+    /// restored session keep none.
+    #[test]
+    fn the_sent_set_is_bounded_and_kept_after_a_clean_end_only() {
+        let t = "own-test-skew-bound";
+        reset(t);
+        let mut h = opened(t, 79, 7_000_000_000, 0, None, Instant::now());
+        for i in 0..=SENT_TEXTS {
+            h.sent(&format!("SELECT {i}"));
+        }
+        h.end(false, Duration::ZERO);
+        let s = session_at(t, 79, 7_000_000_000, "").unwrap();
+        let end = s.end_us.unwrap();
+        assert_eq!(s.sent.len, SENT_TEXTS);
+        assert!(session_at_skewed(t, 79, end + 5_000, "SELECT 0", 20_000).is_none());
+        for i in 1..=SENT_TEXTS {
+            let text = format!("SELECT {i}");
+            assert!(
+                session_at_skewed(t, 79, end + 5_000, &text, 20_000).is_some(),
+                "{text}"
+            );
+        }
+        // Lost: the grace, then no tolerance at all.
+        let mut l = opened(t, 80, 7_000_000_000, 0, None, Instant::now());
+        l.sent("SELECT 9");
+        l.end(true, Duration::from_secs(1));
+        let s = session_at(t, 80, 7_000_000_000, "").unwrap();
+        assert_eq!(s.sent, SentTexts::default());
+        assert_eq!(s.last, None);
+        let end = s.end_us.unwrap();
+        assert!(session_at_skewed(t, 80, end + 1, "SELECT 9", 20_000).is_none());
+        // Restored: none.
+        let bytes = encode(t, 4096);
+        reset(t);
+        restore(t, decode(&bytes).unwrap());
+        let s = session_at(t, 79, 7_000_000_000, "").unwrap();
+        assert_eq!((s.sent, s.last), (SentTexts::default(), None));
+        assert!(session_at_skewed(t, 79, end + 5_000, "SELECT 5", 20_000).is_none());
     }
 
     #[test]
@@ -907,6 +1022,7 @@ mod tests {
                     end_us: Some(1),
                     addr: None,
                     last: None,
+                    sent: SentTexts::default(),
                 }],
                 polls: Vec::new(),
             },
