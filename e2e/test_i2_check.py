@@ -871,6 +871,47 @@ class AuditFingerprintTest(Base):
         self.assertIn("no access event of principal '@fingerprint' with shape.bulk_search", out)
         self.assertIn("no incident of policy 'e2e reads', principal '@fingerprint'", out)
 
+    def test_not_recorded_events(self) -> None:
+        # Redis / Valkey: an event without a recorded account (ADR-0052 decision 8) has no
+        # principal: `@not_recorded` selects it (and an incident without a principal), and
+        # --fingerprinted-only does not count it as a principal in clear.
+        unrec = {"db_user": None, "db_user_fingerprint": None, "account_not_recorded": True,
+                 "action": "read", "objects": [{"database": "*", "object": "*"}],
+                 "signals": ["signature.full_sync"], "source": "redis_sync"}
+        inc = self.INCIDENTS + [{"policy_name": "e2e full sync", "principal": "",
+                                 "event_signals": ["signature.full_sync"],
+                                 "events_account_not_recorded": True}]
+        ev = self.write("events.json", json.dumps(self.events() + [unrec]))
+        rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                       "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                       "--events", ev, "--incidents", self.write("incidents.json", json.dumps(inc)),
+                       *self.REQUIRED,
+                       "--require-event", "@not_recorded:signature.full_sync",
+                       "--require-incident", "e2e full sync:@not_recorded:signature.full_sync"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1 event(s) of principal '@not_recorded' with signature.full_sync", out)
+        self.assertIn("every principal is a fingerprint", out)
+        # A fingerprinted event is not `@not_recorded`, nor is a flag without the value true.
+        rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                       "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                       "--events", self.write("events.json", json.dumps(
+                           self.events() + [dict(unrec, account_not_recorded=False)])),
+                       "--incidents", self.write("incidents.json", json.dumps(self.INCIDENTS)),
+                       "--require-event", "@not_recorded"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no access event of principal '@not_recorded'", out)
+        # An incident without a principal whose events have a recorded account (or unknown
+        # events) is not `@not_recorded`.
+        for flag in (False, None):
+            other = [dict(inc[-1], events_account_not_recorded=flag)]
+            rc, out = run(["audit", "--ground-truth", self.gt, "--engine", "postgresql",
+                           "--agent-account", "cn=databastion,ou=services,dc=example,dc=org",
+                           "--events", ev, "--incidents",
+                           self.write("incidents.json", json.dumps(self.INCIDENTS + other)),
+                           "--require-incident", "e2e full sync:@not_recorded"])
+            self.assertEqual(rc, 1, out)
+            self.assertIn("no incident of policy 'e2e full sync', principal '@not_recorded'", out)
+
     def test_bare_hex_is_not_a_fingerprint(self) -> None:
         # The contract `Fingerprint` carries the "hmac-sha256:" prefix; 64 bare hex digits are not one.
         ev = [dict(e, db_user_fingerprint=e["db_user_fingerprint"].removeprefix("hmac-sha256:"))

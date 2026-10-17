@@ -42,16 +42,85 @@ export function isGlob(v: unknown): v is string {
 }
 
 /**
+ * Unicode lowercase with the final sigma unified (security review M1): `ς` (U+03C2) becomes `σ`
+ * (U+03C3), so `ΠΕΛΑΤΕΣ`, `πελατες` and `πελατεσ` fold alike whatever the position of the letter
+ * (`String.prototype.toLowerCase` maps a word-final `Σ` to `ς`, a per-code-point lowercase to `σ`).
+ * The agent's `same_name` applies the same mapping, and the sensitivity pre-filter in SQL too.
+ */
+export function foldCase(s: string): string {
+  return s.toLowerCase().replaceAll(FINAL_SIGMA, SIGMA);
+}
+
+/** Final sigma and sigma (security review M1), also bound as parameters in SQL. */
+export const FINAL_SIGMA = "\u03c2";
+export const SIGMA = "\u03c3";
+
+/** Drops trailing spaces (U+0020 only, as the agent and SQL `rtrim` do). Linear, no regex. */
+export function trimTrailingSpaces(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 0x20) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
+
+/**
+ * Identity of an object name for object-scoped matching (end-of-phase-9 review N1): trailing
+ * spaces dropped, then {@link foldCase}. The agent compares sensitive objects the same way
+ * (`same_name` in agent/crates/core/src/job.rs): names taken from statement text keep the client's
+ * spelling, and SQL Server (default collation), MySQL / MariaDB with `lower_case_table_names` other
+ * than 0 and LDAP compare identifiers without case, so `CRM.CUSTOMERS` in an event is the
+ * `crm.customers` that Discovery recorded.
+ */
+export function foldName(s: string): string {
+  return foldCase(trimTrailingSpaces(s));
+}
+
+/**
+ * Engines whose identifier comparisons ignore trailing spaces, so a location exception also
+ * covers a name that differs from its globs by trailing spaces only (N1): SQL Server (padded
+ * comparisons under every collation) and MySQL / MariaDB (identifiers cannot end with a space).
+ * Elsewhere a trailing space can be part of a distinct name (a quoted PostgreSQL identifier, a
+ * MongoDB collection, a Redis / Valkey key), and an exception never loosens there: looser
+ * exceptions suppress more. Policy conditions and scoring ignore trailing spaces on every engine
+ * (looser matching only reports more).
+ */
+export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb"];
+
+export function exceptionGlobOptions(engine: string | null): GlobOptions {
+  return { ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) };
+}
+
+export interface GlobOptions {
+  /**
+   * Also match once trailing spaces are dropped from the value and trailing literal spaces from
+   * the pattern (N1). Strictly looser: a match without it is still a match.
+   */
+  ignoreTrailingSpaces?: boolean;
+}
+
+/**
  * Case-insensitive glob match (`*` any run, `?` one character, `\` escapes the next character).
+ * Both sides are folded with {@link foldCase}.
  * Greedy two-pointer matcher with a single backtrack point and no regular expression: worst case
  * O(n x m) time for a name of n characters and a pattern of m tokens, O(n + m) space, with no
  * catastrophic (exponential) backtracking. Both sides are bounded (names 256 characters by the
  * contract, patterns `MAX_GLOB_LENGTH`), so a match costs at most ~65 000 steps. Tokenized
  * patterns are cached (policies reuse the same few patterns for every event or finding).
  */
-export function globMatch(pattern: string, value: string): boolean {
+export function globMatch(pattern: string, value: string, opts: GlobOptions = {}): boolean {
   const p = compiled(pattern);
-  const s = [...value.toLowerCase()];
+  const s = [...foldCase(value)];
+  if (matchTokens(p, s)) return true;
+  if (!opts.ignoreTrailingSpaces) return false;
+  let pe = p.length;
+  while (pe > 0 && isSpace(p[pe - 1])) pe--;
+  let se = s.length;
+  while (se > 0 && s[se - 1] === " ") se--;
+  return (pe < p.length || se < s.length) && matchTokens(pe < p.length ? p.slice(0, pe) : p, s.slice(0, se));
+}
+
+const isSpace = (t: GlobToken | undefined) => t !== undefined && t.kind === "char" && t.ch === " ";
+
+function matchTokens(p: readonly GlobToken[], s: readonly string[]): boolean {
   let pi = 0;
   let si = 0;
   let star = -1;
@@ -84,7 +153,7 @@ function compiled(pattern: string): GlobToken[] {
   let t = globCache.get(pattern);
   if (!t) {
     if (globCache.size >= GLOB_CACHE_MAX) globCache.clear();
-    t = tokens(pattern.toLowerCase());
+    t = tokens(foldCase(pattern));
     globCache.set(pattern, t);
   }
   return t;

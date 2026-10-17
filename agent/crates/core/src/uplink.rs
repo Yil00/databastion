@@ -535,14 +535,15 @@ pub(crate) fn held_back(
     !gates.iter().all(|t| caps.console_accepts(t))
 }
 
-/// The token gating a finding: that of its location's engine.
-fn finding_gate(f: &Finding) -> Option<&'static str> {
+/// The tokens gating a finding: those of its location's engine.
+fn finding_gate(f: &Finding) -> &'static [&'static str] {
     crate::capabilities::engine_token(f.location.engine)
 }
 
-/// The token gating an event: that of its source (an event names no
-/// engine; every source belongs to one).
-fn event_gate(e: &AccessEvent) -> Option<&'static str> {
+/// The tokens gating an event: those of its source (an event names no
+/// engine; every source belongs to one engine, or to both Redis and
+/// Valkey).
+fn event_gate(e: &AccessEvent) -> &'static [&'static str] {
     crate::capabilities::audit_source_token(e.source)
 }
 
@@ -601,8 +602,16 @@ impl Parsed {
 
     fn gates(&self) -> Vec<&'static str> {
         let mut gates: Vec<&'static str> = match self {
-            Self::Findings(b) => b.findings.iter().filter_map(finding_gate).collect(),
-            Self::Events(b) => b.events.iter().filter_map(event_gate).collect(),
+            Self::Findings(b) => b
+                .findings
+                .iter()
+                .flat_map(|f| finding_gate(f).iter().copied())
+                .collect(),
+            Self::Events(b) => b
+                .events
+                .iter()
+                .flat_map(|e| event_gate(e).iter().copied())
+                .collect(),
         };
         gates.sort_unstable();
         gates.dedup();
@@ -802,7 +811,7 @@ impl ResultBatch {
                         }
                         let keep = keep_values
                             && unknown_value.binary_search(i).is_ok()
-                            && finding_gate(f).is_some();
+                            && !finding_gate(f).is_empty();
                         kept_values |= keep;
                         keep
                     })
@@ -821,7 +830,7 @@ impl ResultBatch {
                     let field = unknown.binary_search(&i).is_ok() && event_carries_gated(&e);
                     let value = keep_values
                         && unknown_value.binary_search(&i).is_ok()
-                        && event_gate(&e).is_some();
+                        && !event_gate(&e).is_empty();
                     if rejected.binary_search(&i).is_ok() {
                         if !field && !value {
                             left_out += 1;
@@ -1016,6 +1025,12 @@ fn event_item(
     {
         return None;
     }
+    // `account_not_recorded` (contract `Principal`): only on a Redis /
+    // Valkey source and never on `auth_failure`; any other event built with
+    // it is dropped (counted).
+    if p.is_not_recorded() && (!e.source().is_redis() || e.action() == EventAction::AuthFailure) {
+        return None;
+    }
     let send_name = p.send_name()
         && (p.is_many_accounts()
             || p.account_name() != databastion_classifiers::masking::MANY_ACCOUNTS);
@@ -1023,18 +1038,29 @@ fn event_item(
         ClientAddr::Ip(ip) => ip.to_string(),
         ClientAddr::Local => "local".to_owned(),
     });
-    let principal = sanitize::principal(
-        p.account_name(),
-        send_name,
-        client.as_deref(),
-        p.application(),
-        fingerprints,
-    )?;
+    let principal = if p.is_not_recorded() {
+        sanitize::principal_not_recorded(client.as_deref(), p.application())
+    } else {
+        sanitize::principal(
+            p.account_name(),
+            send_name,
+            client.as_deref(),
+            p.application(),
+            fingerprints,
+        )?
+    };
     let mut objects = Vec::with_capacity(e.objects().len());
     for o in e.objects() {
         objects.push(ObjectRef {
             database: id(o.database())?,
-            object: id(o.object())?,
+            // A Redis / Valkey source names its objects with a
+            // `KeyPattern` (contract `ObjectRef`; checked with every `not`
+            // rule by the sanitizer), every other source an `Identifier`.
+            object: if e.source().is_redis() {
+                o.object().as_str().parse().ok()?
+            } else {
+                id(o.object())?.into()
+            },
             schema: match o.schema() {
                 Some(s) => Some(id(s)?),
                 None => None,
@@ -1058,10 +1084,11 @@ fn event_item(
             EventAction::Dcl => AccessEventAction::Dcl,
         },
         aggregated_count: std::num::NonZeroU64::new(e.aggregated_count())?,
-        // No connector reports a result size yet (the PostgreSQL sources
-        // have none). A gated field (ADR-0022): `pack_events` strips it
-        // unless the console listed `access_event.bytes`.
-        bytes: None,
+        // The reply size where the source records it (Valkey's
+        // `large-reply` command log). A gated field (ADR-0022):
+        // `pack_events` strips it unless the console listed
+        // `access_event.bytes`.
+        bytes: e.bytes().map(sanitize::clamped_count),
         objects,
         principal,
         rows: e.rows().map(sanitize::clamped_count),
@@ -1104,7 +1131,14 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             database: id(&loc.database)?,
             engine,
             field: id(&loc.field)?,
-            object: id(&loc.object)?,
+            // A Redis / Valkey key pattern (contract `KeyPattern`, checked
+            // with its `not` rules by the sanitizer); an `Identifier` on
+            // every other engine.
+            object: if crate::sanitize::uses_key_patterns(engine) {
+                loc.object.as_str().parse().ok()?
+            } else {
+                id(&loc.object)?.into()
+            },
             schema: match &loc.schema {
                 Some(s) => Some(id(s)?),
                 None => None,
@@ -1265,6 +1299,73 @@ mod tests {
             n.ts_last.map(|t| t.0),
             Some(at(past + Duration::from_secs(30)))
         );
+    }
+
+    #[test]
+    fn redis_events_carry_key_patterns_unrecorded_accounts_and_bytes() {
+        use databastion_classifiers::keys::LearnedPatterns;
+        use databastion_classifiers::masking::{
+            EventAction, EventObject, EventPrincipal, EventSource, Signal as S,
+        };
+        use databastion_classifiers::names::normalize_path;
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let target = TargetId::try_from("valkey-main").unwrap();
+        struct Fp;
+        impl sanitize::Fingerprinter for Fp {
+            fn fingerprint(&self, _: &str) -> Option<databastion_protocol::Fingerprint> {
+                databastion_protocol::Fingerprint::try_from(
+                    format!("hmac-sha256:{}", "0".repeat(64)).as_str(),
+                )
+                .ok()
+            }
+        }
+        let item = |e: &MaskedEvent| {
+            event_item(&target, e, &Fp, now).map(|i| serde_json::to_value(i).unwrap())
+        };
+        let object = LearnedPatterns::new(["session:*"]).object(b"session:jdupont", false);
+        let read = |source, principal| {
+            MaskedEvent::new(source, EventAction::Read, principal, now).with_object(
+                EventObject::new(normalize_path("db0"), None, object.clone()),
+            )
+        };
+        let e = read(
+            EventSource::RedisCommandlog,
+            EventPrincipal::not_recorded().with_client(
+                databastion_classifiers::masking::ClientAddr::parse("10.0.0.9"),
+            ),
+        )
+        .with_signal(S::LargeReply)
+        .with_bytes(Some(18_000));
+        let j = item(&e).unwrap();
+        assert_eq!(j["objects"][0]["object"], "session:*");
+        assert_eq!(j["principal"]["account_not_recorded"], true);
+        assert!(j["principal"].get("db_user").is_none());
+        assert_eq!(j["principal"]["client_addr"], "10.0.0.9");
+        assert_eq!(j["bytes"], 18_000);
+        assert_eq!(j["source"], "redis_commandlog");
+        // The same object on another source is an `Identifier` only: `:`
+        // refuses it (the event is dropped, counted).
+        assert!(item(&read(EventSource::Pgaudit, EventPrincipal::account("u"))).is_none());
+        // `account_not_recorded` never on another source nor on a failed
+        // authentication.
+        assert!(
+            item(&read(
+                EventSource::MongodbProfiler,
+                EventPrincipal::not_recorded()
+            ))
+            .is_none()
+        );
+        let auth = MaskedEvent::new(
+            EventSource::RedisAclLog,
+            EventAction::AuthFailure,
+            EventPrincipal::not_recorded(),
+            now,
+        );
+        assert!(item(&auth).is_none());
+        let star = read(EventSource::RedisSlowlog, EventPrincipal::account("admin"));
+        let j = item(&star).unwrap();
+        assert_eq!(j["principal"]["db_user"], "admin");
     }
 
     #[test]

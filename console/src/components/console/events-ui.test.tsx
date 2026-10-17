@@ -35,6 +35,7 @@ const event = (over: Partial<EventView> = {}): EventView => ({
   principalKey: KEY,
   principal: "backup",
   fingerprinted: false,
+  accountNotRecorded: false,
   clientAddr: "192.0.2.14",
   application: "pg_dump",
   action: "read",

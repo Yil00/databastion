@@ -1,0 +1,112 @@
+{
+  "batch_id": "01925a1c-3b40-7d2e-9a11-4c5d6e7f8092",
+  "job_id": "01925a1b-7f00-7a3c-8b22-1d2e3f4a5b6d",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "cache-redis",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "hash",
+        "object": "user:*:profile",
+        "field": "email"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 16,
+      "matched": 16,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "j*******@e******.com"
+      ],
+      "fingerprints": [
+        "hmac-sha256:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+      ]
+    },
+    {
+      "target_id": "cache-redis",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "string",
+        "object": "user:*",
+        "field": "#key"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.95,
+      "sampled": 16,
+      "matched": 16,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "a*****@e******.org"
+      ],
+      "fingerprints": [
+        "hmac-sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+      ]
+    },
+    {
+      "target_id": "cache-redis",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "string",
+        "object": "session:*",
+        "field": "value"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 16,
+      "matched": 16,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "j*******@e******.com"
+      ],
+      "fingerprints": [
+        "hmac-sha256:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+      ]
+    },
+    {
+      "target_id": "cache-redis",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "string",
+        "object": "cache:v2:page",
+        "field": "value"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 16,
+      "matched": 16,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "j*******@e******.com"
+      ],
+      "fingerprints": [
+        "hmac-sha256:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+      ]
+    },
+    {
+      "target_id": "cache-redis",
+      "location": {
+        "engine": "redis",
+        "database": "db0",
+        "schema": "string",
+        "object": "api:v1:item:42",
+        "field": "value"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 16,
+      "matched": 16,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "j*******@e******.com"
+      ],
+      "fingerprints": [
+        "hmac-sha256:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+      ]
+    }
+  ]
+}

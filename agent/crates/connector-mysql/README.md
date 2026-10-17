@@ -316,6 +316,21 @@ a reconnect no longer competes with a `KILL QUERY` for that slot.
   sessions' statements that the persisted cursor reads again are reported
   as before. Two agents sharing one account on one server each report the
   other's ended sessions as unidentified reads (noise).
+- **Interrupted own polls** (ADR-0045 refinement of 2026-10-16): a poll
+  stopped by the agent's own `KILL QUERY` (its stream dropped while the
+  poll ran) or by the statement timeout is kept by MySQL 8.4 with errno
+  1317 or 3024, no `SQL_TEXT` and a cut digest. Such a row is dropped only
+  when its thread is one of the agent's poll sessions on that server run,
+  it ended within that session's life (noted to closed or dropped, plus
+  the statement timeout, 5 s of slack; a `PsPoller::start` that fails or is
+  dropped after the note ends that life itself), its cut digest is a
+  token-for-token prefix of a poll or stats text past the outermost `FROM`
+  and its table (per-version fixtures in `src/audit/testdata/`), its
+  session ended or has the agent's account, and its event is a read with
+  no signal. Each drop is counted in the heartbeat metric
+  `audit_own_polls_interrupted_total`
+  (`databastion_core::audit::count_interrupted_own_polls`) and logged with
+  the reason `interrupted_own_poll`, without any text.
 - **Statement-text tables** (ADR-0045 part (a)): reads of the system
   tables that hold other sessions' statement texts
   (`audit::events::STATEMENT_TEXT_TABLES`: `performance_schema`

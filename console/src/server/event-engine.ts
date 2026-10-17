@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { accessEvents, agentTargets, findings, incidentEvents, incidents, policies, policyExceptions, principalBaselines } from "@/db/schema";
@@ -27,6 +27,7 @@ import {
   type EventObject,
 } from "@/lib/event-model";
 import { logger } from "@/lib/logger";
+import { FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 import {
@@ -133,6 +134,7 @@ const PENDING_COLUMNS = {
   principalKey: accessEvents.principalKey,
   dbUser: accessEvents.dbUser,
   dbUserFingerprint: accessEvents.dbUserFingerprint,
+  accountNotRecorded: accessEvents.accountNotRecorded,
   clientAddr: accessEvents.clientAddr,
   action: accessEvents.action,
   objects: accessEvents.objects,
@@ -149,6 +151,8 @@ type PendingEvent = {
   principalKey: string;
   dbUser: string | null;
   dbUserFingerprint: string | null;
+  /** No recorded account (Redis / Valkey): no baseline, `unknown:*` dedup principal. */
+  accountNotRecorded: boolean;
   clientAddr: string | null;
   action: string;
   objects: EventObject[];
@@ -158,18 +162,63 @@ type PendingEvent = {
 };
 
 const SEP = "\u0000";
+/**
+ * Object key of the sensitivity lookup: database, schema and object compared with `foldName`
+ * (trailing spaces dropped, Unicode lowercase) on every engine (end-of-phase-9 review N1), as the
+ * agent's sensitive-object match: a looser match only raises a sensitivity and a score.
+ */
 const objectKey = (agentId: string, targetId: string, o: EventObject) =>
-  [agentId, targetId, o.database, o.schema === undefined || o.schema === null ? "*" : `=${o.schema}`, o.object].join(SEP);
+  [agentId, targetId, foldName(o.database), o.schema === undefined || o.schema === null ? "*" : `=${foldName(o.schema)}`, foldName(o.object)].join(SEP);
 
 /**
- * Findings (false positives excluded) of the objects reached by `events`, by object key: the exact
+ * Whether the console database's default collation lowercases non-ASCII letters (security review
+ * L1): false under a `C` / `POSIX` character type, where PostgreSQL `lower` folds ASCII only.
+ */
+async function lowerFoldsUnicode(tx: Tx): Promise<boolean> {
+  const r = await tx.execute<{ folds: boolean }>(sql`select lower(${"\u00c9"}::text) = ${"\u00e9"}::text as folds`);
+  return r.rows[0]?.folds === true;
+}
+
+/** `foldName` in SQL: `replace(lower(rtrim(x)), 'ς', 'σ')`, both letters bound as parameters. */
+const sqlFold = (x: SQL) => sql`replace(lower(rtrim(${x})), ${FINAL_SIGMA}::text, ${SIGMA}::text)`;
+
+const nonAscii = (s: string) => [...s].some((c) => c.charCodeAt(0) > 0x7f);
+
+/**
+ * Names for the SQL pre-filter of `loadObjectHits`: every event name and its `foldName`, or `null`
+ * (no name pre-filter, `objectKey` alone decides) when the database's `lower` folds ASCII only and
+ * a name holds another character (security review L1).
+ */
+export function prefilterNames(objectNames: readonly string[], unicodeLower: boolean): string[] | null {
+  if (!unicodeLower && objectNames.some(nonAscii)) return null;
+  return [...new Set(objectNames.flatMap((n) => [n, foldName(n)]))];
+}
+
+/**
+ * Findings (false positives excluded) of the objects reached by `events`, by object key: the
  * schema (`=<schema>`), and `*` for any schema (events whose source logs no schema).
+ *
+ * The SQL pre-filter compares `sqlFold(object_name)` with `sqlFold(name)` for each event name and
+ * for its `foldName`, so both sides go through the same PostgreSQL `lower` and the pre-filter
+ * keeps every finding whose object name differs by case or trailing spaces; `objectKey` then
+ * decides. PostgreSQL folds non-ASCII letters only under a UTF-8 character type (deploy/README.md:
+ * the console database needs one, as the images' `en_US.utf8`); under `C` / `POSIX` the name
+ * pre-filter is dropped for a chunk with a non-ASCII name (all findings of its agents are read,
+ * L1). No index covers `object_name`, so the expression costs no index.
  */
 async function loadObjectHits(tx: Tx, events: readonly PendingEvent[]): Promise<Map<string, ClassifierHit[]>> {
   const agentIds = [...new Set(events.map((e) => e.agentId))];
-  const names = [...new Set(events.flatMap((e) => e.objects.map((o) => o.object)))];
+  const objectNames = [...new Set(events.flatMap((e) => e.objects.map((o) => o.object)))];
   const out = new Map<string, ClassifierHit[]>();
-  if (names.length === 0) return out;
+  if (objectNames.length === 0) return out;
+  const names = prefilterNames(objectNames, !objectNames.some(nonAscii) || (await lowerFoldsUnicode(tx)));
+  const sameName =
+    names === null
+      ? undefined
+      : sql`${sqlFold(sql`${findings.objectName}`)} in (${sql.join(
+          names.map((n) => sqlFold(sql`${n}::text`)),
+          sql`, `,
+        )})`;
   const rows = await tx
     .select({
       agentId: findings.agentId,
@@ -181,7 +230,7 @@ async function loadObjectHits(tx: Tx, events: readonly PendingEvent[]): Promise<
       confidence: sql<number>`max(${findings.confidence})`,
     })
     .from(findings)
-    .where(and(isNull(findings.falsePositiveAt), inArray(findings.agentId, agentIds), inArray(findings.objectName, names)))
+    .where(and(isNull(findings.falsePositiveAt), inArray(findings.agentId, agentIds), sameName))
     .groupBy(findings.agentId, findings.targetId, findings.databaseName, findings.schemaName, findings.objectName, findings.classifier);
   const push = (key: string, hit: ClassifierHit) => {
     const list = out.get(key);
@@ -468,6 +517,8 @@ async function applyEventPolicy(
       action: e.action,
       principalKey: e.principalKey,
       networkHash: sha256Hex(clientNetwork(e.clientAddr)),
+      accountNotRecorded: e.accountNotRecorded,
+      clientAddr: e.clientAddr,
     }),
     databaseKey: database === null ? "-" : sha256Hex(database),
     bucket,
@@ -573,7 +624,8 @@ async function applyEventPolicy(
     agent_id: e.agentId,
     target_id: e.targetId,
     principal: principal ?? "",
-    principal_fingerprinted: e.dbUser === null,
+    principal_fingerprinted: e.dbUserFingerprint !== null,
+    principal_not_recorded: !overflow && e.accountNotRecorded,
     database: overflow ? null : database,
     hour: (overflow ? state.hour : bucket).toISOString(),
     overflow: overflow ? { limit_per_hour: state.cap } : null,
@@ -682,6 +734,7 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         targetId: e.targetId,
         engine: engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
+        accountNotRecorded: e.accountNotRecorded,
         action: e.action,
         source: e.source,
         objects: e.objects,

@@ -17,6 +17,10 @@ pub enum Engine {
     Openldap,
     /// Apereo CAS (local files only, ADR-0041).
     Cas,
+    /// Redis and Valkey (one connector, ADR-0052).
+    Redis,
+    /// Microsoft SQL Server (ADR-0051).
+    Sqlserver,
 }
 
 impl Engine {
@@ -29,6 +33,8 @@ impl Engine {
             Self::Mongodb => "mongodb",
             Self::Openldap => "openldap",
             Self::Cas => "cas",
+            Self::Redis => "redis",
+            Self::Sqlserver => "sqlserver",
         }
     }
 }

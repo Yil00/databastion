@@ -22,12 +22,37 @@ pub(crate) const MAX_NOTES: usize = 16;
 const MAX_LABELS: usize = 16;
 
 /// Labels that matter most, in decreasing severity: kept first when a note
-/// has more than [`MAX_LABELS`] labels, so that e.g. `super` or `file` is
-/// never cut from a long privilege list. Any label not listed ranks after
-/// them (in enum order), and `other` last.
+/// has more than [`MAX_LABELS`] labels to send, so that e.g. `super` or
+/// `file` is never cut from a long privilege list. Any label not listed
+/// ranks after them (in enum order), and `other` last. The ranking applies
+/// to the labels **as sent**, after negotiation ([`to_protocol`]): a label
+/// the console has not negotiated is `other` by then, so it never takes the
+/// place of one it can receive.
 const SEVERITY: &[TargetNoteLabel] = {
     use TargetNoteLabel as L;
     &[
+        // Microsoft SQL Server refusal list (ADR-0051 decision 4): the
+        // password_hash probe and the rights that own the server or a
+        // database first, so a long refusal never loses them.
+        L::PasswordHashProbe,
+        L::Sysadmin,
+        L::ControlServer,
+        L::DbOwner,
+        L::Control,
+        L::Securityadmin,
+        L::MsLoginManager,
+        L::ImpersonateAnyLogin,
+        L::Impersonate,
+        L::AlterAnyLogin,
+        L::AlterAnyServerRole,
+        L::AlterAnyServerAudit,
+        L::AlterAnyDatabaseAudit,
+        L::ViewAnyCryptographicallySecuredDefinition,
+        L::AlterAnyEventSession,
+        L::AlterAnyDatabaseEventSession,
+        L::CreateAnyDatabaseEventSession,
+        L::DropAnyDatabaseEventSession,
+        L::TakeOwnership,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -268,6 +293,56 @@ pub enum NoteCode {
     SecurityTicketRegistryUnencrypted,
     /// `security.tls_disabled`.
     SecurityTlsDisabled,
+    /// `security.default_user_nopass`.
+    SecurityDefaultUserNopass,
+    /// `privilege.admin_commands`.
+    PrivilegeAdminCommands,
+    /// `privilege.scripting`.
+    PrivilegeScripting,
+    /// `privilege.pubsub_channels`.
+    PrivilegePubsubChannels,
+    /// `privilege.declared_keys_not_readable`.
+    PrivilegeDeclaredKeysNotReadable,
+    /// `coverage.cluster_node_only`.
+    CoverageClusterNodeOnly,
+    /// `coverage.module_types_not_sampled`.
+    CoverageModuleTypesNotSampled,
+    /// `audit.acl_log_only`.
+    AuditAclLogOnly,
+    /// `check.server_is_valkey`.
+    CheckServerIsValkey,
+    /// `check.server_is_redis`.
+    CheckServerIsRedis,
+    /// `audit.audit_changes_not_audited` (Microsoft SQL Server, ADR-0051).
+    AuditAuditChangesNotAudited,
+    /// `audit.failed_logins_not_audited` (Microsoft SQL Server, ADR-0051).
+    AuditFailedLoginsNotAudited,
+    /// `audit.server_audit_filtered` (Microsoft SQL Server, ADR-0051).
+    AuditServerAuditFiltered,
+    /// `audit.sqlserver_audit_needs_control_server` (Microsoft SQL Server, ADR-0051).
+    AuditSqlserverAuditNeedsControlServer,
+    /// `audit.xe_causality_off` (Microsoft SQL Server, ADR-0051).
+    AuditXeCausalityOff,
+    /// `audit.xe_events_missing` (Microsoft SQL Server, ADR-0051).
+    AuditXeEventsMissing,
+    /// `audit.xe_session_filtered` (Microsoft SQL Server, ADR-0051).
+    AuditXeSessionFiltered,
+    /// `coverage.computed_columns_not_sampled` (Microsoft SQL Server, ADR-0051).
+    CoverageComputedColumnsNotSampled,
+    /// `coverage.encrypted_columns` (Microsoft SQL Server, ADR-0051).
+    CoverageEncryptedColumns,
+    /// `coverage.masked_columns` (Microsoft SQL Server, ADR-0051).
+    CoverageMaskedColumns,
+    /// `coverage.rls_not_verifiable` (Microsoft SQL Server, ADR-0051).
+    CoverageRlsNotVerifiable,
+    /// `privilege.audit_grant_without_audit` (Microsoft SQL Server, ADR-0051).
+    PrivilegeAuditGrantWithoutAudit,
+    /// `privilege.database_roles` (Microsoft SQL Server, ADR-0051).
+    PrivilegeDatabaseRoles,
+    /// `privilege.refused` (Microsoft SQL Server, ADR-0051).
+    PrivilegeRefused,
+    /// `privilege.server_roles` (Microsoft SQL Server, ADR-0051).
+    PrivilegeServerRoles,
 }
 
 impl NoteCode {
@@ -352,6 +427,31 @@ impl NoteCode {
         Self::SecurityLoginEventTrigger,
         Self::SecurityTicketRegistryUnencrypted,
         Self::SecurityTlsDisabled,
+        Self::SecurityDefaultUserNopass,
+        Self::PrivilegeAdminCommands,
+        Self::PrivilegeScripting,
+        Self::PrivilegePubsubChannels,
+        Self::PrivilegeDeclaredKeysNotReadable,
+        Self::CoverageClusterNodeOnly,
+        Self::CoverageModuleTypesNotSampled,
+        Self::AuditAclLogOnly,
+        Self::CheckServerIsValkey,
+        Self::CheckServerIsRedis,
+        Self::AuditAuditChangesNotAudited,
+        Self::AuditFailedLoginsNotAudited,
+        Self::AuditServerAuditFiltered,
+        Self::AuditSqlserverAuditNeedsControlServer,
+        Self::AuditXeCausalityOff,
+        Self::AuditXeEventsMissing,
+        Self::AuditXeSessionFiltered,
+        Self::CoverageComputedColumnsNotSampled,
+        Self::CoverageEncryptedColumns,
+        Self::CoverageMaskedColumns,
+        Self::CoverageRlsNotVerifiable,
+        Self::PrivilegeAuditGrantWithoutAudit,
+        Self::PrivilegeDatabaseRoles,
+        Self::PrivilegeRefused,
+        Self::PrivilegeServerRoles,
     ];
 
     /// The registered code.
@@ -439,6 +539,33 @@ impl NoteCode {
             Self::SecurityLoginEventTrigger => "security.login_event_trigger",
             Self::SecurityTicketRegistryUnencrypted => "security.ticket_registry_unencrypted",
             Self::SecurityTlsDisabled => "security.tls_disabled",
+            Self::SecurityDefaultUserNopass => "security.default_user_nopass",
+            Self::PrivilegeAdminCommands => "privilege.admin_commands",
+            Self::PrivilegeScripting => "privilege.scripting",
+            Self::PrivilegePubsubChannels => "privilege.pubsub_channels",
+            Self::PrivilegeDeclaredKeysNotReadable => "privilege.declared_keys_not_readable",
+            Self::CoverageClusterNodeOnly => "coverage.cluster_node_only",
+            Self::CoverageModuleTypesNotSampled => "coverage.module_types_not_sampled",
+            Self::AuditAclLogOnly => "audit.acl_log_only",
+            Self::CheckServerIsValkey => "check.server_is_valkey",
+            Self::CheckServerIsRedis => "check.server_is_redis",
+            Self::AuditAuditChangesNotAudited => "audit.audit_changes_not_audited",
+            Self::AuditFailedLoginsNotAudited => "audit.failed_logins_not_audited",
+            Self::AuditServerAuditFiltered => "audit.server_audit_filtered",
+            Self::AuditSqlserverAuditNeedsControlServer => {
+                "audit.sqlserver_audit_needs_control_server"
+            }
+            Self::AuditXeCausalityOff => "audit.xe_causality_off",
+            Self::AuditXeEventsMissing => "audit.xe_events_missing",
+            Self::AuditXeSessionFiltered => "audit.xe_session_filtered",
+            Self::CoverageComputedColumnsNotSampled => "coverage.computed_columns_not_sampled",
+            Self::CoverageEncryptedColumns => "coverage.encrypted_columns",
+            Self::CoverageMaskedColumns => "coverage.masked_columns",
+            Self::CoverageRlsNotVerifiable => "coverage.rls_not_verifiable",
+            Self::PrivilegeAuditGrantWithoutAudit => "privilege.audit_grant_without_audit",
+            Self::PrivilegeDatabaseRoles => "privilege.database_roles",
+            Self::PrivilegeRefused => "privilege.refused",
+            Self::PrivilegeServerRoles => "privilege.server_roles",
         }
     }
 
@@ -461,14 +588,150 @@ impl NoteCode {
     }
 }
 
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10` (Microsoft SQL Server, ADR-0051
+/// decision 4). Until the agent negotiates that token (with the SQL Server
+/// connector), [`NoteLabel::parse`] maps them to `other`: a console built
+/// before the revision rejects them (ADR-0022 decision 4), and a MySQL /
+/// MariaDB server could name a dynamic privilege after one of them.
+pub(crate) const LABELS_REVISION_2026_10: &[&str] = &[
+    "sysadmin",
+    "securityadmin",
+    "serveradmin",
+    "setupadmin",
+    "processadmin",
+    "diskadmin",
+    "dbcreator",
+    "bulkadmin",
+    "ms_database_connector",
+    "ms_database_manager",
+    "ms_definition_reader",
+    "ms_login_manager",
+    "ms_performance_definition_reader",
+    "ms_security_definition_reader",
+    "ms_server_performance_state_reader",
+    "ms_server_security_state_reader",
+    "ms_server_state_manager",
+    "ms_server_state_reader",
+    "db_owner",
+    "db_securityadmin",
+    "db_accessadmin",
+    "db_backupoperator",
+    "db_ddladmin",
+    "db_datawriter",
+    "db_datareader",
+    "db_denydatareader",
+    "db_denydatawriter",
+    "control_server",
+    "alter_any_server_audit",
+    "alter_any_event_session",
+    "alter_any_event_session_enable",
+    "alter_any_event_session_disable",
+    "alter_any_event_session_add_event",
+    "alter_any_event_session_drop_event",
+    "alter_any_event_session_add_target",
+    "alter_any_event_session_drop_target",
+    "alter_any_event_session_option",
+    "create_any_event_session",
+    "drop_any_event_session",
+    "alter_any_login",
+    "alter_any_server_role",
+    "impersonate_any_login",
+    "view_any_cryptographically_secured_definition",
+    "view_any_definition",
+    "view_any_security_definition",
+    "administer_bulk_operations",
+    "alter_any_linked_server",
+    "alter_trace",
+    "view_server_state",
+    "view_server_performance_state",
+    "view_server_security_audit",
+    "view_server_security_state",
+    "control",
+    "impersonate",
+    "take_ownership",
+    "alter_any_database_audit",
+    "view_database_security_audit",
+    "unmask",
+    "view_definition",
+    "view_database_state",
+    "showplan",
+    "password_hash_probe",
+];
+
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10_b` (Microsoft SQL Server, ADR-0051
+/// refinement of 2026-10-14, items 5 to 7): the database-scoped
+/// event-session permissions of the refusal list, the other permissions
+/// the connector judges by name, and the `check()` reads it names with
+/// `privilege.not_evaluated`. Negotiated on their own token, like
+/// [`LABELS_REVISION_2026_10`]: `other` until the console lists it.
+pub(crate) const LABELS_REVISION_2026_10_B: &[&str] = &[
+    "alter_any_database_event_session",
+    "alter_any_database_event_session_enable",
+    "alter_any_database_event_session_disable",
+    "alter_any_database_event_session_add_event",
+    "alter_any_database_event_session_drop_event",
+    "alter_any_database_event_session_add_target",
+    "alter_any_database_event_session_drop_target",
+    "alter_any_database_event_session_option",
+    "create_any_database_event_session",
+    "drop_any_database_event_session",
+    "view_any_performance_definition",
+    "view_security_definition",
+    "view_performance_definition",
+    "view_database_security_state",
+    "view_database_performance_state",
+    "view_any_column_encryption_key_definition",
+    "view_any_column_master_key_definition",
+    "logon_trigger_probe",
+    "refusal_list_probe",
+    "cas_store_guard_probe",
+];
+
+/// The `target_status.note_labels.<revision>` tokens the console listed in
+/// its latest heartbeat response (ADR-0022 decision 4). Each revision is
+/// negotiated on its own: a label is sent only when the token of its own
+/// revision is listed, `other` otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LabelRevisions {
+    /// `target_status.note_labels.2026_10` ([`LABELS_REVISION_2026_10`]).
+    pub(crate) r2026_10: bool,
+    /// `target_status.note_labels.2026_10_b` ([`LABELS_REVISION_2026_10_B`]).
+    pub(crate) r2026_10_b: bool,
+}
+
+impl LabelRevisions {
+    /// Every revision this build knows (tests).
+    #[cfg(test)]
+    pub(crate) const ALL: Self = Self {
+        r2026_10: true,
+        r2026_10_b: true,
+    };
+
+    /// Whether `value` (a contract `TargetNoteLabel` value) may be sent.
+    fn allows(self, value: &str) -> bool {
+        (self.r2026_10 || !LABELS_REVISION_2026_10.contains(&value))
+            && (self.r2026_10_b || !LABELS_REVISION_2026_10_B.contains(&value))
+    }
+}
+
+/// Whether `value` belongs to a revision after protocol 0.1.0.
+fn in_a_revision(value: &str) -> bool {
+    LABELS_REVISION_2026_10.contains(&value) || LABELS_REVISION_2026_10_B.contains(&value)
+}
+
 /// Closed label of a note: a value of the contract `TargetNoteLabel` enum.
 /// Anything that does not map to it is `other`, so a label never carries
 /// text from the engine.
 ///
 /// New label values are a contract enum change, negotiated with a
-/// `target_status.note_labels.<revision>` token (ADR-0022 decision 4): the
-/// values of this build are the base enum of protocol 0.1.0, sent without
-/// a token.
+/// `target_status.note_labels.<revision>` token (ADR-0022 decision 4). The
+/// values of this build are those of protocol 0.1.0, sent without a token,
+/// and those of the SQL Server revisions `2026_10`
+/// ([`LABELS_REVISION_2026_10`]) and `2026_10_b`
+/// ([`LABELS_REVISION_2026_10_B`]), each sent only once the console lists
+/// its own token, `other` before ([`to_protocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLabel(TargetNoteLabel);
 
@@ -477,9 +740,16 @@ impl NoteLabel {
     pub const OTHER: Self = Self(TargetNoteLabel::Other);
 
     /// A label given as its exact contract value (lower snake case, e.g.
-    /// `bypassrls`, `pg_monitor`, `logging_on`); anything else is `other`.
+    /// `bypassrls`, `pg_monitor`, `logging_on`); anything else is `other`,
+    /// and so are the values of the SQL Server revisions
+    /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`]), which
+    /// only [`sqlserver`](Self::sqlserver) builds: a MySQL / MariaDB server
+    /// could name a dynamic privilege after one of them.
     #[must_use]
     pub fn parse(value: &str) -> Self {
+        if in_a_revision(value) {
+            return Self::OTHER;
+        }
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
@@ -532,6 +802,74 @@ impl NoteLabel {
         })
     }
 
+    /// A Microsoft SQL Server label (ADR-0051 decision 4): any contract
+    /// value, the revisions `target_status.note_labels.2026_10` and
+    /// `2026_10_b` included (each sent as `other` until the console lists
+    /// its token, see [`to_protocol`]); anything else is `other`.
+    #[must_use]
+    pub fn sqlserver(value: &str) -> Self {
+        value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
+    }
+
+    /// A SQL Server permission or role name as the server lists it
+    /// (`CONTROL SERVER`, `db_owner`, `##MS_LoginManager##`), mapped by the
+    /// contract rule: permissions lowercased with spaces replaced by `_`;
+    /// fixed roles in lower case; `##MS_Name##` as `ms_` and the name in
+    /// lower snake case. Anything else (longer than 64 bytes, characters
+    /// outside `[A-Za-z_ #]`, an unknown value) is `other`.
+    #[must_use]
+    pub fn sqlserver_name(name: &str) -> Self {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b' ' || b == b'#')
+        {
+            return Self::OTHER;
+        }
+        if let Some(inner) = name
+            .strip_prefix("##MS_")
+            .and_then(|n| n.strip_suffix("##"))
+        {
+            let mut out = String::from("ms");
+            for c in inner.chars() {
+                if c.is_ascii_uppercase() {
+                    out.push('_');
+                    out.push(c.to_ascii_lowercase());
+                } else if c.is_ascii_lowercase() {
+                    out.push(c);
+                } else {
+                    return Self::OTHER;
+                }
+            }
+            return Self::sqlserver(&out);
+        }
+        if name.contains('#') {
+            return Self::OTHER;
+        }
+        let normalized: String = name
+            .chars()
+            .map(|c| {
+                if c == ' ' {
+                    '_'
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        Self::sqlserver(&normalized)
+    }
+
+    /// This label as sent: a value of a revision the console did not
+    /// negotiate becomes `other`.
+    fn negotiated(self, revisions: LabelRevisions) -> Self {
+        if revisions.allows(self.0.to_string().as_str()) {
+            self
+        } else {
+            Self::OTHER
+        }
+    }
+
     /// Whether this is the fallback `other`.
     #[must_use]
     pub fn is_other(self) -> bool {
@@ -572,7 +910,9 @@ impl TargetNote {
         self
     }
 
-    /// Adds labels (sorted, deduplicated; past 16, the most severe kept).
+    /// Adds labels (sorted, deduplicated). Nothing is cut here: the cut to
+    /// the contract's 16 happens when the note is sent, after negotiation
+    /// ([`to_protocol`]).
     #[must_use]
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = NoteLabel>) -> Self {
         self.labels.extend(labels);
@@ -580,14 +920,12 @@ impl TargetNote {
         self
     }
 
-    /// Deduplicates the labels, keeps the [`MAX_LABELS`] most severe
-    /// ([`SEVERITY`], `other` last) and sorts them in enum order.
+    /// Sorts the labels in enum order and deduplicates them. Bounded
+    /// without a cut: the labels are values of the closed contract enum, so
+    /// a note holds at most one of each.
     fn normalize_labels(&mut self) {
-        self.labels
-            .sort_unstable_by_key(|l| (severity_rank(l.0), *l));
-        self.labels.dedup();
-        self.labels.truncate(MAX_LABELS);
         self.labels.sort_unstable();
+        self.labels.dedup();
     }
 
     /// The code.
@@ -602,7 +940,8 @@ impl TargetNote {
         self.count
     }
 
-    /// The labels.
+    /// The labels, in enum order: all of them, before negotiation and the
+    /// cut to the contract's 16 ([`to_protocol`]).
     #[must_use]
     pub fn labels(&self) -> &[NoteLabel] {
         &self.labels
@@ -684,11 +1023,32 @@ impl IntoIterator for Notes {
     }
 }
 
+/// The labels of one note as sent: negotiated, deduplicated, the
+/// [`MAX_LABELS`] most severe kept, in enum order.
+fn sent_labels(labels: &[NoteLabel], revisions: LabelRevisions) -> Vec<TargetNoteLabel> {
+    let mut out: Vec<TargetNoteLabel> = labels.iter().map(|l| l.negotiated(revisions).0).collect();
+    out.sort_unstable_by_key(|l| (severity_rank(*l), *l));
+    out.dedup();
+    out.truncate(MAX_LABELS);
+    out.sort_unstable();
+    out
+}
+
 /// The contract `TargetStatus.notes` of a target: one note per code (the
 /// first one kept), at most [`MAX_NOTES`], insecure settings, check
 /// failures and privileges kept first; counts saturated at the contract
 /// bound.
-pub(crate) fn to_protocol(notes: &[TargetNote]) -> Vec<databastion_protocol::TargetNote> {
+///
+/// The labels of a revision after protocol 0.1.0
+/// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`]) are sent
+/// only when `revisions` holds its token (the console listed it), `other`
+/// otherwise (ADR-0022 decision 4). Negotiation comes first, then the
+/// ranking by [`SEVERITY`] (`other` last), then the cut to [`MAX_LABELS`]:
+/// labels the console cannot receive never push out labels it can.
+pub(crate) fn to_protocol(
+    notes: &[TargetNote],
+    revisions: LabelRevisions,
+) -> Vec<databastion_protocol::TargetNote> {
     let mut kept: Vec<&TargetNote> = Vec::with_capacity(notes.len().min(MAX_NOTES));
     for n in notes {
         if !kept.iter().any(|k| k.code == n.code) {
@@ -702,8 +1062,7 @@ pub(crate) fn to_protocol(notes: &[TargetNote]) -> Vec<databastion_protocol::Tar
             Some(databastion_protocol::TargetNote {
                 code: databastion_protocol::TargetNoteCode::try_from(n.code.as_str()).ok()?,
                 count: n.count.map(crate::sanitize::clamped_count),
-                labels: (!n.labels.is_empty())
-                    .then(|| n.labels.iter().take(MAX_LABELS).map(|l| l.0).collect()),
+                labels: (!n.labels.is_empty()).then(|| sent_labels(&n.labels, revisions)),
             })
         })
         .collect()
@@ -721,6 +1080,178 @@ mod tests {
             assert!(seen.insert(c.as_str()), "{} listed twice", c.as_str());
             databastion_protocol::TargetNoteCode::try_from(c.as_str()).unwrap();
         }
+    }
+
+    /// The contract `TargetNoteLabel` values of one revision: the lines
+    /// after `from` and before `to` in `openapi.yaml`.
+    fn contract_revision(from: &str, to: &str) -> Vec<&'static str> {
+        let contract = include_str!("../../../../shared/protocol/openapi.yaml");
+        let start = contract.find(from).expect("revision start marker");
+        let after = &contract[start..];
+        let end = after.find(to).expect("revision end marker");
+        after[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.strip_prefix("        - "))
+            .collect()
+    }
+
+    const REVISION_B_MARKER: &str = "        # Revision target_status.note_labels.2026_10_b (ADR-0051 refinement of 2026-10-14):\n";
+
+    /// The labels sent for `note` with `revisions`.
+    fn sent(note: &TargetNote, revisions: LabelRevisions) -> Vec<String> {
+        super::to_protocol(std::slice::from_ref(note), revisions)[0]
+            .labels
+            .clone()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values after `stage_kill`, up
+        // to the next revision.
+        let revision = contract_revision("        - stage_kill\n", REVISION_B_MARKER);
+        assert_eq!(revision, super::LABELS_REVISION_2026_10);
+        for value in super::LABELS_REVISION_2026_10 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+        }
+        // A MySQL / MariaDB privilege named like one of them.
+        assert!(super::NoteLabel::privilege("CONTROL SERVER").is_other());
+        // SQL Server names keep their label in the agent, and are sent
+        // only once the console lists the revision token.
+        let l = super::NoteLabel::sqlserver_name("CONTROL SERVER");
+        assert_eq!(l.as_str(), "control_server");
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("##MS_LoginManager##").as_str(),
+            "ms_login_manager"
+        );
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("db_owner").as_str(),
+            "db_owner"
+        );
+        assert!(super::NoteLabel::sqlserver_name("##MS_Unknown##").is_other());
+        assert!(super::NoteLabel::sqlserver_name("ALTER ANY UNKNOWN THING").is_other());
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("SELECT").as_str(),
+            "select"
+        );
+        let note = super::TargetNote::new(super::NoteCode::PrivilegeRefused)
+            .with_labels([l, super::NoteLabel::sqlserver_name("SELECT")]);
+        let none = LabelRevisions::default();
+        let a = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: false,
+        };
+        let b = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: true,
+        };
+        assert_eq!(sent(&note, none), vec!["other", "select"]);
+        assert_eq!(sent(&note, b), vec!["other", "select"]);
+        assert_eq!(sent(&note, a), vec!["select", "control_server"]);
+        assert_eq!(
+            sent(&note, LabelRevisions::ALL),
+            vec!["select", "control_server"]
+        );
+        assert!(super::NoteLabel::privilege("SHOW VIEW").as_str() == "show_view");
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_b_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values of the revision, the
+        // last ones of the enum.
+        let revision = contract_revision(REVISION_B_MARKER, "    DetectedTarget:");
+        assert_eq!(revision, super::LABELS_REVISION_2026_10_B);
+        for value in super::LABELS_REVISION_2026_10_B {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            // Never built from a MySQL / MariaDB or PostgreSQL name.
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert_eq!(super::NoteLabel::sqlserver(value).as_str(), *value);
+        }
+        assert!(
+            super::LABELS_REVISION_2026_10_B
+                .iter()
+                .all(|v| !super::LABELS_REVISION_2026_10.contains(v)),
+            "a value belongs to one revision only"
+        );
+        assert!(super::NoteLabel::privilege("ALTER ANY DATABASE EVENT SESSION").is_other());
+        // The ten database-scoped event-session permissions (refinement
+        // item 5), as SQL Server names them.
+        let names = [
+            "ALTER ANY DATABASE EVENT SESSION",
+            "ALTER ANY DATABASE EVENT SESSION ENABLE",
+            "ALTER ANY DATABASE EVENT SESSION DISABLE",
+            "ALTER ANY DATABASE EVENT SESSION ADD EVENT",
+            "ALTER ANY DATABASE EVENT SESSION DROP EVENT",
+            "ALTER ANY DATABASE EVENT SESSION ADD TARGET",
+            "ALTER ANY DATABASE EVENT SESSION DROP TARGET",
+            "ALTER ANY DATABASE EVENT SESSION OPTION",
+            "CREATE ANY DATABASE EVENT SESSION",
+            "DROP ANY DATABASE EVENT SESSION",
+        ];
+        let labels: Vec<NoteLabel> = names
+            .iter()
+            .map(|n| super::NoteLabel::sqlserver_name(n))
+            .collect();
+        assert!(labels.iter().all(|l| !l.is_other()));
+        let refused = super::TargetNote::new(super::NoteCode::PrivilegeRefused).with_labels(
+            labels
+                .iter()
+                .copied()
+                .chain([super::NoteLabel::sqlserver_name("CONTROL SERVER")]),
+        );
+        let a = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: false,
+        };
+        let b = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: true,
+        };
+        // Not negotiated: every revision value is `other`, once.
+        assert_eq!(sent(&refused, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&refused, a), vec!["other", "control_server"]);
+        let only_b = sent(&refused, b);
+        assert_eq!(only_b.len(), 11);
+        assert_eq!(only_b[0], "other");
+        assert!(!only_b.contains(&"control_server".to_owned()));
+        // Negotiated: the real labels, in enum order.
+        let all = sent(&refused, LabelRevisions::ALL);
+        assert_eq!(all.len(), 11);
+        assert!(!all.contains(&"other".to_owned()));
+        let mut expected: Vec<String> = names
+            .iter()
+            .map(|n| n.to_lowercase().replace(' ', "_"))
+            .collect();
+        expected.insert(0, "control_server".to_owned());
+        assert_eq!(all, expected);
+        // The not-evaluated reads.
+        let probes = super::TargetNote::new(super::NoteCode::PrivilegeNotEvaluated).with_labels(
+            [
+                "password_hash_probe",
+                "logon_trigger_probe",
+                "refusal_list_probe",
+            ]
+            .map(super::NoteLabel::sqlserver),
+        );
+        assert_eq!(sent(&probes, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&probes, a), vec!["other", "password_hash_probe"]);
+        assert_eq!(
+            sent(&probes, b),
+            vec!["other", "logon_trigger_probe", "refusal_list_probe"]
+        );
+        assert_eq!(
+            sent(&probes, LabelRevisions::ALL),
+            vec![
+                "password_hash_probe",
+                "logon_trigger_probe",
+                "refusal_list_probe"
+            ]
+        );
     }
 
     #[test]
@@ -773,11 +1304,19 @@ mod tests {
         let n = TargetNote::new(NoteCode::PrivilegeBeyondSelect)
             .with_labels(many.iter().map(|p| NoteLabel::parse(p)))
             .with_labels([NoteLabel::OTHER, NoteLabel::OTHER]);
-        assert_eq!(n.labels().len(), MAX_LABELS);
+        // Kept whole (deduplicated, sorted) until sent.
+        assert_eq!(n.labels().len(), many.len() + 1);
         let mut sorted = n.labels().to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, n.labels());
+        // Cut to the contract's 16 when sent.
+        let out = sent(&n, LabelRevisions::default());
+        assert_eq!(out.len(), MAX_LABELS);
+        let mut sorted = out.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), MAX_LABELS);
     }
 
     #[test]
@@ -808,7 +1347,7 @@ mod tests {
             .with_labels([NoteLabel::OTHER])
             .with_labels(lesser.iter().map(|p| NoteLabel::parse(p)))
             .with_labels(["super", "file", "process"].map(NoteLabel::parse));
-        let kept: Vec<String> = n.labels().iter().map(|l| l.as_str()).collect();
+        let kept = sent(&n, LabelRevisions::default());
         assert_eq!(kept.len(), MAX_LABELS);
         for must in ["super", "file", "process", "execute"] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
@@ -816,9 +1355,13 @@ mod tests {
         for gone in ["other", "show_view", "create_view", "flush_tables"] {
             assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
         }
-        let mut sorted = n.labels().to_vec();
+        let as_sent = super::to_protocol(std::slice::from_ref(&n), LabelRevisions::default())[0]
+            .labels
+            .clone()
+            .unwrap();
+        let mut sorted = as_sent.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, n.labels(), "sent in enum order");
+        assert_eq!(sorted, as_sent, "sent in enum order");
         // PostgreSQL attributes rank first, and survive a merge too.
         let mut notes = Notes::default();
         notes.add(
@@ -829,14 +1372,85 @@ mod tests {
             TargetNote::new(NoteCode::PrivilegeRoleAttributes)
                 .with_labels(["superuser", "bypassrls", "createrole"].map(NoteLabel::parse)),
         );
-        let kept: Vec<String> = notes.as_slice()[0]
-            .labels()
-            .iter()
-            .map(|l| l.as_str())
-            .collect();
+        let kept = sent(&notes.as_slice()[0], LabelRevisions::default());
+        assert_eq!(kept.len(), MAX_LABELS);
         for must in ["superuser", "bypassrls", "createrole"] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
         }
+    }
+
+    /// Security review L1: labels of a revision the console has not
+    /// negotiated become `other` before the cut, so they never push out
+    /// labels it can receive; the hash probe always survives.
+    #[test]
+    fn the_cut_to_sixteen_keeps_the_labels_the_console_can_receive() {
+        // A console that lists `2026_10` only.
+        let a = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: false,
+        };
+        // 14 labels of 2026_10 outside the severity list, the hash probe,
+        // and the 20 labels of 2026_10_b (three of them in the severity
+        // list): 35 labels, 15 of them sendable.
+        let sendable = [
+            "serveradmin",
+            "setupadmin",
+            "processadmin",
+            "diskadmin",
+            "dbcreator",
+            "bulkadmin",
+            "ms_database_connector",
+            "ms_database_manager",
+            "ms_definition_reader",
+            "db_securityadmin",
+            "db_accessadmin",
+            "db_backupoperator",
+            "db_ddladmin",
+            "db_datawriter",
+        ];
+        let note = TargetNote::new(NoteCode::PrivilegeRefused).with_labels(
+            sendable
+                .iter()
+                .chain(super::LABELS_REVISION_2026_10_B)
+                .chain(&["password_hash_probe"])
+                .map(|v| NoteLabel::sqlserver(v)),
+        );
+        assert_eq!(note.labels().len(), 35);
+        let out = sent(&note, a);
+        assert_eq!(out.len(), 16, "{out:?}");
+        for must in sendable.iter().chain(&["password_hash_probe", "other"]) {
+            assert!(out.iter().any(|l| l == must), "{must} cut: {out:?}");
+        }
+        for v in super::LABELS_REVISION_2026_10_B {
+            assert!(!out.iter().any(|l| l == v), "{v} sent unnegotiated");
+        }
+        // With more sendable labels than slots, the hash probe still
+        // survives, and `other` is the first to go.
+        let crowded = note.clone().with_labels(
+            [
+                "select",
+                "insert",
+                "update",
+                "delete",
+                "alter",
+                "execute",
+                "control",
+                "impersonate",
+            ]
+            .map(NoteLabel::sqlserver),
+        );
+        let out = sent(&crowded, a);
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().any(|l| l == "password_hash_probe"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "other"), "{out:?}");
+        // Both revisions: the 16 most severe, the hash probe first.
+        let out = sent(&crowded, LabelRevisions::ALL);
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().any(|l| l == "password_hash_probe"), "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "alter_any_database_event_session"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -874,7 +1488,7 @@ mod tests {
             .map(|c| TargetNote::new(*c).with_count(u64::MAX))
             .collect();
         notes.push(TargetNote::new(NoteCode::SecurityTlsDisabled));
-        let out = to_protocol(&notes);
+        let out = to_protocol(&notes, LabelRevisions::default());
         assert_eq!(out.len(), MAX_NOTES);
         // Security and check notes are never the ones cut.
         for c in NoteCode::ALL {
@@ -895,7 +1509,10 @@ mod tests {
             );
         }
         // No labels: the field is omitted.
-        let one = to_protocol(&[TargetNote::new(NoteCode::CheckTimedOut)]);
+        let one = to_protocol(
+            &[TargetNote::new(NoteCode::CheckTimedOut)],
+            LabelRevisions::default(),
+        );
         assert_eq!(
             serde_json::to_value(&one).unwrap(),
             serde_json::json!([{"code": "check.timed_out"}])

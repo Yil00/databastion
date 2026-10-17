@@ -81,7 +81,9 @@ pub const MAX_TOTAL_DIGITS: usize = 8;
 const CONTAINER_TYPES: [&str; 6] = ["ou", "dc", "o", "c", "l", "st"];
 
 /// A name that went through this module. Always matches the contract
-/// `Identifier` schema. No public constructor from a string.
+/// `Identifier` schema, except a Redis / Valkey key pattern built by
+/// [`crate::keys`], which matches the contract `KeyPattern` schema
+/// instead. No public constructor from a string.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedName(String);
 
@@ -115,6 +117,51 @@ impl NormalizedName {
             Self::wildcard()
         }
     }
+}
+
+impl NormalizedName {
+    /// A Redis / Valkey key pattern ([`crate::keys`]), through the final
+    /// gate of the contract `KeyPattern` (pattern and `not` rules,
+    /// [`crate::keys::is_key_pattern`]); `*` otherwise. Only that module
+    /// builds key patterns; the core sends one only for a `redis` or
+    /// `valkey` location, and replaces it by `*` on any other engine.
+    pub(crate) fn key_pattern(candidate: String) -> Self {
+        if crate::keys::is_key_pattern(&candidate) {
+            Self(candidate)
+        } else {
+            Self::wildcard()
+        }
+    }
+}
+
+/// The case fold the agent compares object names with: Unicode lowercase
+/// (`char::to_lowercase`), then final sigma `ς` (U+03C2) read as `σ`
+/// (U+03C3), since `Σ` lowercases to `σ` while text often writes `ς`
+/// (`ΠΕΛΑΤΕΣ` and `πελατες`). Strictly looser than lowercase alone; the
+/// console folds the same way (`foldCase` in
+/// `console/src/lib/policy-common.ts`).
+#[must_use]
+pub fn fold_case(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == '\u{03C2}' { '\u{03C3}' } else { c })
+        .collect()
+}
+
+/// [`fold_case`] of one character's lowercase form, for streaming
+/// comparisons.
+pub fn fold_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase()
+        .map(|c| if c == '\u{03C2}' { '\u{03C3}' } else { c })
+}
+
+/// The value spans of a key name ([`crate::keys`]): `s` longer than the
+/// detectors' bound has none (the caller refuses such names first).
+pub(crate) fn key_value_spans(s: &str) -> Vec<Range<usize>> {
+    if s.len() > MAX_INPUT_BYTES {
+        return Vec::new();
+    }
+    value_spans(s)
 }
 
 impl fmt::Debug for NormalizedName {
@@ -1329,6 +1376,13 @@ mod tests {
             "clients"
         );
         assert_eq!(normalize_path("\u{202E}").as_str(), "*");
+    }
+
+    #[test]
+    fn fold_case_reads_final_sigma_as_sigma() {
+        assert_eq!(fold_case("ΠΕΛΑΤΕΣ"), fold_case("πελατες"));
+        assert_eq!(fold_case("Customers"), "customers");
+        assert_ne!(fold_case("πελατες"), fold_case("πελατεx"));
     }
 
     #[test]

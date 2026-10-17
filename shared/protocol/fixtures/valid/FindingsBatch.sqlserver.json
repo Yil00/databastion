@@ -1,0 +1,45 @@
+{
+  "batch_id": "01925a1c-3b40-7d2e-9a11-4c5d6e7f8091",
+  "job_id": "01925a1b-7f00-7a3c-8b22-1d2e3f4a5b6c",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "mssql-prod",
+      "location": {
+        "engine": "sqlserver",
+        "database": "crm",
+        "schema": "sales",
+        "object": "Customers",
+        "field": "Email"
+      },
+      "classifier": "pii.email",
+      "confidence": 0.97,
+      "sampled": 100,
+      "matched": 96,
+      "estimated_rows": 250000,
+      "masked_samples": [
+        "j*******@e******.com"
+      ],
+      "fingerprints": [
+        "hmac-sha256:5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d"
+      ]
+    },
+    {
+      "target_id": "mssql-prod",
+      "location": {
+        "engine": "sqlserver",
+        "database": "crm",
+        "schema": "dbo",
+        "object": "Customers_History",
+        "field": "Phone"
+      },
+      "classifier": "pii.phone",
+      "confidence": 0.9,
+      "sampled": 100,
+      "matched": 80,
+      "masked_samples": [
+        "+33 * ** ** ** 12"
+      ]
+    }
+  ]
+}

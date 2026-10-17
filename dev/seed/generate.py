@@ -10,6 +10,8 @@ byte-identical files. Outputs:
 - ``dev/seed/out/mongo.json``    MongoDB database ``app`` (loaded by ``dev/mongo/initdb/10-seed.js``)
 - ``dev/seed/out/openldap.ldif`` OpenLDAP suffix ``dc=example,dc=org``
 - ``dev/cas/services/*.json``    Apereo CAS JSON service registry (opt-in service ``cas``)
+- ``dev/seed/out/sqlserver.sql`` SQL Server database ``retail`` (opt-in service ``sqlserver``)
+- ``dev/seed/out/redis.txt``     Redis / Valkey keyspace, databases 0 and 1 (opt-in profile ``redis``)
 - ``dev/ground-truth.json``      every seeded location and the classifiers expected on it
 
 All values are fictitious by construction:
@@ -879,6 +881,386 @@ def gen_cas(f: Fake, t: Truth) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------------------------------
+# Microsoft SQL Server: database retail (opt-in service `sqlserver`, ADR-0051 decision 9)
+# --------------------------------------------------------------------------------------------------
+def mssql_lit(v) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "N'" + str(v).replace("'", "''") + "'"
+
+
+def gen_sqlserver(f: Fake, t: Truth) -> str:
+    """T-SQL run by sqlcmd as `sa` in the container (dev/sqlserver/entrypoint.sh), batches split by
+    GO. Schemas `crm` and `finance` hold the PII; the fixtures of ADR-0051 decision 9 (masked
+    column, Always Encrypted column with a fake key, temporal table, row-level security, computed
+    column calling a function, synonym to a linked server on an unresolvable `.invalid` host, CAS
+    JPA ticket table, value-bearing table name) are seeded next to them. The agent account and the
+    audit setup are in dev/sqlserver/initdb/."""
+    E, DB = "sqlserver", "retail"
+    people = [f.person() for _ in range(100)]
+    s = [HEADER.format(seed=SEED), "SET NOCOUNT ON;\nGO\nCREATE DATABASE retail;\nGO\nUSE retail;\nGO\n"]
+    for schema in ("crm", "finance", "cas", "security"):
+        s.append(f"CREATE SCHEMA {schema};\nGO\n")
+
+    s.append("""CREATE TABLE crm.customers (
+  id int PRIMARY KEY, first_name nvarchar(60) NOT NULL, last_name nvarchar(60) NOT NULL,
+  email nvarchar(160) NOT NULL, phone nvarchar(32) NULL, birth_date date NULL, street nvarchar(200) NULL,
+  postal_code nvarchar(16) NULL, city nvarchar(80) NULL, country_code char(2) NULL, nir varchar(32) NULL,
+  secondary_email nvarchar(160) MASKED WITH (FUNCTION = 'email()') NULL,
+  email_opt_in bit NOT NULL, created_at datetime2(0) NOT NULL
+);
+""")
+    rows = []
+    for i, p in enumerate(people):
+        rows.append((i + 1, p["first"], p["last"], p["email"], p["phone"], p["birth_date"], p["street"],
+                     p["postal_code"], p["city"], p["country"], p["nir"],
+                     f.email(p["first"], p["last"]), f.r.random() < 0.5, f.timestamp()[:19].replace("T", " ")))
+    s.append(inserts("crm.customers", ["id", "first_name", "last_name", "email", "phone", "birth_date",
+                                       "street", "postal_code", "city", "country_code", "nir",
+                                       "secondary_email", "email_opt_in", "created_at"], rows, mssql_lit, ""))
+    s.append("GO\n")
+    c = ("crm", "customers")
+    t.add(E, DB, *c, "first_name", ["pii.person_name"], [r[1] for r in rows])
+    t.add(E, DB, *c, "last_name", ["pii.person_name"], [r[2] for r in rows])
+    t.add(E, DB, *c, "email", ["pii.email"], [r[3] for r in rows])
+    t.add(E, DB, *c, "phone", ["pii.phone"], [r[4] for r in rows])
+    t.add(E, DB, *c, "birth_date", ["pii.birth_date"], [r[5] for r in rows])
+    t.add(E, DB, *c, "street", ["pii.postal_address"], [r[6] for r in rows])
+    t.add(E, DB, *c, "nir", ["pii.nir"], [r[10] for r in rows])
+    t.add(E, DB, *c, "secondary_email", [], note=(
+        "dynamic data masking (email()): the agent's account has no UNMASK and reads the masked form; "
+        "counted in coverage.masked_columns, a finding is not expected"))
+    t.add(E, DB, *c, "email_opt_in", [], negative_control=True, note="bit; name looks sensitive")
+    t.add(E, DB, *c, "created_at", [], negative_control=True, note="timestamp, not a birth date")
+
+    notes, note_emails, note_phones = [], [], []
+    for i in range(40):
+        p = f.r.choice(people)
+        ph, em = f.fr_phone(), f.email(p["first"], p["last"])
+        note_phones.append(ph)
+        note_emails.append(em)
+        notes.append((i + 1, people.index(p) + 1, f"Customer called from {ph} and asked to use {em} for invoices."))
+    s.append("CREATE TABLE crm.customer_notes (id int PRIMARY KEY, customer_id int NOT NULL, note nvarchar(max) NOT NULL);\n")
+    s.append(inserts("crm.customer_notes", ["id", "customer_id", "note"], notes, mssql_lit, ""))
+    s.append("GO\n")
+    t.add(E, DB, "crm", "customer_notes", "note", ["pii.email", "pii.phone"], note_emails + note_phones,
+          note="free text (nvarchar(max)); values are embedded tokens")
+
+    # A computed column calling a scalar function (user code on read): never sampled.
+    s.append("""CREATE FUNCTION finance.fn_iban_prefix (@iban nvarchar(42)) RETURNS nvarchar(8)
+WITH SCHEMABINDING AS BEGIN RETURN LEFT(@iban, 4) + N'****'; END;
+GO
+CREATE TABLE finance.payment_cards (
+  id int PRIMARY KEY, customer_id int NOT NULL, card_brand varchar(16) NOT NULL, card_number varchar(24) NOT NULL,
+  card_holder nvarchar(120) NOT NULL, iban varchar(42) NOT NULL, tracking_ref varchar(16) NOT NULL,
+  iban_prefix AS finance.fn_iban_prefix(iban)
+);
+""")
+    rows = []
+    for i, p in enumerate(people[:80]):
+        rows.append((i + 1, i + 1, p["card_brand"], p["card"], f"{p['first']} {p['last']}".upper(), p["iban"],
+                     f.not_luhn(16)))
+    s.append(inserts("finance.payment_cards", ["id", "customer_id", "card_brand", "card_number", "card_holder",
+                                               "iban", "tracking_ref"], rows, mssql_lit, ""))
+    s.append("GO\n")
+    c = ("finance", "payment_cards")
+    t.add(E, DB, *c, "card_number", ["pii.card_number"], [r[3] for r in rows])
+    t.add(E, DB, *c, "card_holder", ["pii.person_name"], [r[4] for r in rows])
+    t.add(E, DB, *c, "iban", ["pii.iban"], [r[5] for r in rows])
+    t.add(E, DB, *c, "card_brand", [], negative_control=True, note="brand name, not a card number")
+    t.add(E, DB, *c, "tracking_ref", [], negative_control=True, note="16-digit numbers that FAIL the Luhn check")
+    t.add(E, DB, *c, "iban_prefix", [], note=(
+        "computed column calling finance.fn_iban_prefix (user code on read): never sampled, "
+        "coverage.computed_columns_not_sampled"))
+
+    # A system-versioned temporal table: the history table holds the values before the update.
+    s.append("""CREATE TABLE finance.salaries (
+  employee_id int PRIMARY KEY, employee_email nvarchar(160) NOT NULL, salary_eur int NOT NULL,
+  valid_from datetime2 GENERATED ALWAYS AS ROW START NOT NULL,
+  valid_to datetime2 GENERATED ALWAYS AS ROW END NOT NULL,
+  PERIOD FOR SYSTEM_TIME (valid_from, valid_to)
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = finance.salaries_history));
+""")
+    staff = [f.person() for _ in range(30)]
+    rows = [(i + 1, p["email"], f.r.randint(28000, 95000)) for i, p in enumerate(staff)]
+    s.append(inserts("finance.salaries", ["employee_id", "employee_email", "salary_eur"], rows, mssql_lit, ""))
+    s.append("GO\nUPDATE finance.salaries SET salary_eur = salary_eur + 1000;\nGO\n")
+    t.add(E, DB, "finance", "salaries", "employee_email", ["pii.email"], [r[1] for r in rows])
+    t.add(E, DB, "finance", "salaries", "salary_eur", [], negative_control=True)
+    t.add(E, DB, "finance", "salaries_history", "employee_email", ["pii.email"], [r[1] for r in rows],
+          note="history table of the temporal table finance.salaries (rows from the seed's UPDATE)")
+
+    # Row-level security: the predicate is user code; the table is skipped.
+    s.append("""CREATE TABLE crm.regional_contacts (id int PRIMARY KEY, region char(2) NOT NULL, contact_email nvarchar(160) NOT NULL);
+""")
+    rows = [(i + 1, f.r.choice(("FR", "GB", "DE")), f.person()["email"]) for i in range(20)]
+    s.append(inserts("crm.regional_contacts", ["id", "region", "contact_email"], rows, mssql_lit, ""))
+    s.append("""GO
+CREATE FUNCTION security.fn_region_predicate (@region char(2)) RETURNS TABLE WITH SCHEMABINDING AS
+RETURN SELECT 1 AS allowed WHERE @region = 'FR' OR USER_NAME() = N'dbo';
+GO
+CREATE SECURITY POLICY security.regional_contacts_policy
+  ADD FILTER PREDICATE security.fn_region_predicate(region) ON crm.regional_contacts WITH (STATE = ON);
+GO
+""")
+    t.add(E, DB, "crm", "regional_contacts", "contact_email", [], note=(
+        "row-level security (security.regional_contacts_policy): skipped, skipped_row_level_security / "
+        "coverage.relations_rls_skipped"))
+
+    # Always Encrypted with a fake column master key (no key material: nothing can decrypt it).
+    s.append("""CREATE COLUMN MASTER KEY dev_only_cmk WITH (
+  KEY_STORE_PROVIDER_NAME = N'MSSQL_JAVA_KEYSTORE', KEY_PATH = N'dev-only-fake-keystore/dev-only-cmk');
+GO
+CREATE COLUMN ENCRYPTION KEY dev_only_cek WITH VALUES (
+  COLUMN_MASTER_KEY = dev_only_cmk, ALGORITHM = 'RSA_OAEP',
+  ENCRYPTED_VALUE = 0x01700000016400650076002D006F006E006C0079);
+GO
+CREATE TABLE crm.patients_ae (
+  id int PRIMARY KEY,
+  nir varchar(32) COLLATE Latin1_General_BIN2 ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = dev_only_cek,
+    ENCRYPTION_TYPE = DETERMINISTIC, ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256') NULL
+);
+GO
+""")
+    t.add(E, DB, "crm", "patients_ae", "nir", [], note=(
+        "Always Encrypted column with a fake key, no rows: never sampled, coverage.encrypted_columns"))
+
+    # A linked server on an unresolvable host and a synonym to it: never read (I5).
+    s.append("""EXEC master.dbo.sp_addlinkedserver @server = N'DEV_ARCHIVE', @srvproduct = N'',
+  @provider = N'MSOLEDBSQL', @datasrc = N'archive.invalid';
+GO
+CREATE SYNONYM crm.archived_customers FOR DEV_ARCHIVE.retail.crm.customers;
+GO
+""")
+    t.add(E, DB, "crm", "archived_customers", None, [], note=(
+        "synonym to the linked server DEV_ARCHIVE (archive.invalid): never read (I5), never sampled"))
+
+    # CAS JPA ticket registry shape (ADR-0041 decisions 5 and 6): counted per type, never sampled.
+    s.append("""CREATE TABLE cas.cas_tickets (
+  id nvarchar(768) PRIMARY KEY, type nvarchar(255) NOT NULL, body nvarchar(max) NULL, parent_id nvarchar(768) NULL,
+  principal_id nvarchar(768) NULL, service nvarchar(max) NULL, attributes nvarchar(max) NULL,
+  creation_time datetime2 NOT NULL, expiration_time datetime2 NULL, last_used_time datetime2 NULL
+);
+""")
+    tickets = []
+    for i in range(6):
+        kind = ("TGT", "org.apereo.cas.ticket.TicketGrantingTicketImpl") if i % 2 == 0 else \
+            ("ST", "org.apereo.cas.ticket.ServiceTicketImpl")
+        tid = f"{kind[0]}-{i + 1}-dev-only-{f.chars(B64_CHARSET, 24)}"
+        tickets.append((tid, kind[1], "{}", None, f.person()["email"], None, None,
+                        f"2026-09-{i + 1:02d} 10:00:00", None, None))
+    s.append(inserts("cas.cas_tickets", ["id", "type", "body", "parent_id", "principal_id", "service",
+                                         "attributes", "creation_time", "expiration_time", "last_used_time"],
+                     tickets, mssql_lit, ""))
+    s.append("GO\n")
+    t.add(E, DB, "cas", "cas_tickets", "id", [], [r[0] for r in tickets], never_sampled=True,
+          note="CAS ticket registry (ADR-0041): counted per type, never sampled; the agent holds SELECT "
+               "on type, creation_time and expiration_time only")
+    t.add(E, DB, "cas", "cas_tickets", "principal_id", [], [r[4] for r in tickets], never_sampled=True,
+          note="CAS ticket registry: not readable by the agent's account")
+
+    # Secrets.
+    s.append("""CREATE TABLE finance.app_credentials (
+  id int PRIMARY KEY, service varchar(32) NOT NULL, aws_access_key_id varchar(32) NOT NULL,
+  aws_secret_access_key varchar(64) NOT NULL, owner_email nvarchar(160) NOT NULL
+);
+""")
+    rows = []
+    for i, svc in enumerate(("erp-export", "warehouse-sync", "backup")):
+        a, k = f.aws_key_pair()
+        rows.append((i + 1, svc, a, k, f.r.choice(people)["email"]))
+    s.append(inserts("finance.app_credentials", ["id", "service", "aws_access_key_id", "aws_secret_access_key",
+                                                 "owner_email"], rows, mssql_lit, ""))
+    s.append("GO\n")
+    c = ("finance", "app_credentials")
+    t.add(E, DB, *c, "aws_access_key_id", ["secret.aws_key"], [r[2] for r in rows])
+    t.add(E, DB, *c, "aws_secret_access_key", ["secret.aws_key"], [r[3] for r in rows])
+    t.add(E, DB, *c, "owner_email", ["pii.email"], [r[4] for r in rows])
+    t.add(E, DB, *c, "service", [], negative_control=True)
+
+    # Invoices: only look-alikes.
+    s.append("CREATE TABLE finance.invoices (id int PRIMARY KEY, invoice_number varchar(20) NOT NULL, "
+             "amount_cents int NOT NULL, email_template_id int NOT NULL);\n")
+    rows = [(i + 1, f"INV-2026-{i + 1:06d}", f.r.randint(500, 250000), f.r.randint(1, 9)) for i in range(100)]
+    s.append(inserts("finance.invoices", ["id", "invoice_number", "amount_cents", "email_template_id"], rows,
+                     mssql_lit, ""))
+    s.append("GO\n")
+    for col in ("invoice_number", "amount_cents", "email_template_id"):
+        t.add(E, DB, "finance", "invoices", col, [], negative_control=True)
+
+    # Value-bearing table name: an e-mail address in a bracketed name.
+    p = people[2]
+    tname = f"export_{p['email']}"
+    s.append(f"CREATE TABLE crm.[{tname}] (id int PRIMARY KEY, phone nvarchar(32) NOT NULL);\n")
+    s.append(inserts(f"crm.[{tname}]", ["id", "phone"], [(1, p["phone"])], mssql_lit, ""))
+    s.append("GO\n")
+    t.add(E, DB, "crm", tname, "phone", ["pii.phone"], [p["phone"]], name_values=[p["email"]],
+          name_value_classifiers=["pii.email"], normalized="*", note="table name embeds an e-mail address")
+    return "".join(s)
+
+
+# --------------------------------------------------------------------------------------------------
+# Redis and Valkey: one keyspace (opt-in profile `redis`, ADR-0052 decision 13)
+# --------------------------------------------------------------------------------------------------
+REDIS_ENGINES = ("valkey", "redis")
+# Read patterns of the second ACL user `databastion_scoped` (dev/redis/entrypoint.sh), declared in
+# agent.yaml as `redis.key_patterns` (ADR-0052 decision 4: narrowed patterns, H3 tests).
+REDIS_SCOPED_PATTERNS = ("customer:*", "user:*")
+
+
+def redis_arg(v) -> str:
+    """One argument in the line syntax redis-cli / valkey-cli reads from stdin (sdssplitargs)."""
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def gen_redis(f: Fake, t: Truth) -> str:
+    """Commands loaded by the admin user with `valkey-cli` / `redis-cli` (dev/redis/entrypoint.sh),
+    one per line. Locations follow ADR-0052 decision 7: database `db<index>`, container the Redis
+    type, object the expected key pattern, field `value`, the hash or stream field, `*` for a hash
+    keyed by data, `#key` / `#field` for values found in names. Listed once per engine (both
+    services load the same file)."""
+    cmds: list[list] = []
+    locs: list[tuple] = []
+
+    def loc(db: str, typ: str, pattern: str, field: str | None, classifiers: list[str], values=None, **kw):
+        locs.append((db, typ, pattern, field, classifiers, values, kw))
+
+    cmds.append(["SELECT", "0"])
+    # Strings whose key holds a record id (user:42:email -> customer:*:email).
+    people = [f.person() for _ in range(40)]
+    for i, p in enumerate(people):
+        cmds.append(["SET", f"customer:{1000 + i}:email", p["email"]])
+    loc("db0", "string", "customer:*:email", "value", ["pii.email"], [p["email"] for p in people])
+
+    # Hashes whose key embeds an e-mail address (the I2 check on key names).
+    people = [f.person() for _ in range(30)]
+    for p in people:
+        cmds.append(["HSET", f"user:{p['email']}:profile", "first_name", p["first"], "last_name", p["last"],
+                     "phone", p["phone"], "iban", p["iban"], "plan", f.r.choice(("free", "pro"))])
+    emails = [p["email"] for p in people]
+    kw = dict(name_values=emails, name_value_classifiers=["pii.email"], normalized="user:*:profile",
+              note="key names embed e-mail addresses")
+    loc("db0", "hash", "user:*:profile", "first_name", ["pii.person_name"], [p["first"] for p in people], **kw)
+    loc("db0", "hash", "user:*:profile", "last_name", ["pii.person_name"], [p["last"] for p in people], **kw)
+    loc("db0", "hash", "user:*:profile", "phone", ["pii.phone"], [p["phone"] for p in people], **kw)
+    loc("db0", "hash", "user:*:profile", "iban", ["pii.iban"], [p["iban"] for p in people], **kw)
+    loc("db0", "hash", "user:*:profile", "#key", ["pii.email"], emails, **kw)
+    loc("db0", "hash", "user:*:profile", "plan", [], negative_control=True)
+
+    # Digit-only key segments that are phone numbers (E.164 without +).
+    phones, names = [], []
+    for _ in range(25):
+        p = f.person()
+        k = "33" + f.fr_phone().replace(" ", "")[1:]
+        phones.append(k)
+        names.append(f"{p['first']} {p['last']}")
+        cmds.append(["SET", f"phone:{k}", names[-1]])
+    loc("db0", "string", "phone:*", "value", ["pii.person_name"], names, name_values=phones,
+        name_value_classifiers=["pii.phone"], normalized="*:*",
+        note="key names are phone numbers; `phone` and `addressbook` precede the same suffix `*`, so the "
+             "record-id rule masks the first segment too (ADR-0052 decision 7)")
+
+    # Hashes keyed by data: field names are e-mail addresses, values phone numbers.
+    field_emails, field_phones = [], []
+    for i in range(10):
+        args = ["HSET", f"addressbook:{i + 1}"]
+        for _ in range(3):
+            p = f.person()
+            em, ph = f.email(p["first"], p["last"]), f.fr_phone()
+            args += [em, ph]
+            field_emails.append(em)
+            field_phones.append(ph)
+        cmds.append(args)
+    kw = dict(name_values=field_emails, name_value_classifiers=["pii.email"], normalized="*:*",
+              note="hash field names are e-mail addresses; first segment masked as for `phone:*`")
+    loc("db0", "hash", "addressbook:*", "*", ["pii.phone"], field_phones, **kw)
+    loc("db0", "hash", "addressbook:*", "#field", ["pii.email"], field_emails, **kw)
+
+    # A set, a sorted set, a list and a stream.
+    subs = [f.person()["email"] for _ in range(60)]
+    cmds.append(["SADD", "newsletter:subscribers", *subs])
+    # Two-segment names share the first position with `phone:<n>` and `addressbook:<n>`: once
+    # that position collapses (record-id rule), `*:subscribers`, `*:leaderboard` and
+    # `*:payments` are records too (ADR-0052 decision 7 as written; over-masking accepted).
+    two = dict(normalized="*:*")
+    loc("db0", "set", "newsletter:subscribers", "value", ["pii.email"], subs, **two)
+    board = [f"{p['first']} {p['last']}" for p in (f.person() for _ in range(40))]
+    args = ["ZADD", "loyalty:leaderboard"]
+    for name in board:
+        args += [str(f.r.randint(0, 5000)), name]
+    cmds.append(args)
+    loc("db0", "zset", "loyalty:leaderboard", "value", ["pii.person_name"], board,
+        note="members only; scores are not read", **two)
+    sms = []
+    for _ in range(30):
+        ph = f.fr_phone()
+        sms.append(ph)
+        cmds.append(["RPUSH", "queue:sms_outbox", json.dumps({"to": ph, "body": f"Your code is {f.digits(6)}"})])
+    loc("db0", "list", "queue:sms_outbox", "value", ["pii.phone"], sms, note="JSON strings; phones embedded")
+    cards, ibans = [], []
+    for _ in range(30):
+        p = f.person()
+        cards.append(p["card"])
+        ibans.append(p["iban"])
+        cmds.append(["XADD", "events:payments", "*", "card_number", p["card"], "iban", p["iban"],
+                     "amount_cents", str(f.r.randint(500, 90000))])
+    loc("db0", "stream", "events:payments", "card_number", ["pii.card_number"], cards, **two)
+    loc("db0", "stream", "events:payments", "iban", ["pii.iban"], ibans, **two)
+    loc("db0", "stream", "events:payments", "amount_cents", [], negative_control=True, **two)
+
+    # Secrets.
+    a, k = f.aws_key_pair()
+    cmds.append(["SET", "integration:s3:access_key_id", a])
+    cmds.append(["SET", "integration:s3:secret_access_key", k])
+    # `s3` holds a digit: a value by the per-key rules (ADR-0052 decision 7).
+    loc("db0", "string", "integration:s3:access_key_id", "value", ["secret.aws_key"], [a],
+        normalized="integration:*:access_key_id")
+    loc("db0", "string", "integration:s3:secret_access_key", "value", ["secret.aws_key"], [k],
+        normalized="integration:*:secret_access_key")
+
+    # Look-alikes: many fixed names under one prefix (cardinality collapse), counters, flags.
+    for slug in ("home", "about", "contact", "pricing", "faq", "careers", "press", "blog", "terms",
+                 "privacy", "cookies", "support", "status", "partners", "shipping", "returns", "gifts"):
+        cmds.append(["SET", f"cache:page:{slug}", f"<p>Rendered page {slug} (phone and e-mail support)</p>"])
+    loc("db0", "string", "cache:page:*", "value", [], negative_control=True,
+        note="17 fixed page names: collapsed by cardinality; text mentions e-mail and phone as words")
+    for d in range(1, 15):
+        cmds.append(["SET", f"stats:visits:2026-09-{d:02d}", str(f.r.randint(100, 9999))])
+    loc("db0", "string", "stats:visits:*", "value", [], negative_control=True, note="dates in names, counters")
+    cmds.append(["HSET", "feature:flags", "email_digest", "on", "phone_login", "off", "iban_check", "on"])
+    loc("db0", "hash", "feature:flags", "email_digest", [], negative_control=True, note="name looks sensitive")
+
+    # CAS ticket-id shapes in key names (ADR-0052 decision 6, CAS store guard): never read.
+    tickets = [f"TGT-{i + 1}-dev-only-{f.chars(B64_CHARSET, 20)}" for i in range(3)]
+    for tid in tickets:
+        cmds.append(["SET", f"sso:{tid}", f"dev-only-ticket-body-{f.chars(B64_CHARSET, 12)}"])
+    loc("db0", "string", "sso:*", "value", [], tickets, never_sampled=True,
+        note="key names hold CAS ticket ids: never read, never reported, counted in coverage.cas_guard_tripped")
+
+    # db1: session hashes under a high-entropy key segment.
+    cmds.append(["SELECT", "1"])
+    sess = []
+    for _ in range(20):
+        p = f.person()
+        sess.append(p["email"])
+        cmds.append(["HSET", f"session:{f.chars('0123456789abcdef', 32)}", "email", p["email"],
+                     "user_agent", "Mozilla/5.0 (X11; Linux x86_64)"])
+    loc("db1", "hash", "session:*", "email", ["pii.email"], sess)
+    loc("db1", "hash", "session:*", "user_agent", [], negative_control=True)
+
+    for engine in REDIS_ENGINES:
+        for db, typ, pattern, field, classifiers, values, kw in locs:
+            t.add(engine, db, typ, pattern, field, classifiers, values, **kw)
+    head = [f"# GENERATED by dev/seed/generate.py (seed {SEED}). FAKE data only. Do not edit by hand."]
+    # The CLI reads commands, not comments: the header is stripped by dev/redis/entrypoint.sh.
+    return "\n".join(head + [" ".join(redis_arg(a) for a in c) for c in cmds]) + "\n"
+
+
+# --------------------------------------------------------------------------------------------------
 def build(seed: int = SEED) -> dict[str, str]:
     f = Fake(seed)
     t = Truth()
@@ -891,6 +1273,8 @@ def build(seed: int = SEED) -> dict[str, str]:
     }
     # Own random stream: the outputs above stay byte-identical.
     files.update(gen_cas(Fake(seed + 41), t))
+    files["seed/out/sqlserver.sql"] = gen_sqlserver(Fake(seed + 51), t)
+    files["seed/out/redis.txt"] = gen_redis(Fake(seed + 52), t)
     truth = {
         "version": 1,
         "generator": "dev/seed/generate.py",
@@ -912,6 +1296,13 @@ def build(seed: int = SEED) -> dict[str, str]:
             "never reach the console, the agent logs or the spool (ADR-0041 decision 14).",
             "cas: locations as connector-cas reports them (ADR-0041 decision 4); the registry is "
             "dev/cas/services, the audit log dev/.state/logs/cas/cas_audit.log.",
+            "sqlserver: opt-in service `sqlserver` (ADR-0051); container is the schema. Locations "
+            "with a note and no classifier are fixtures Discovery must skip (masked, encrypted, "
+            "computed, row-level security, synonym).",
+            "redis / valkey: opt-in profile `redis` (ADR-0052 decision 7); both services load the same "
+            "keyspace (dev/seed/out/redis.txt). database is db<index>, container the Redis type, "
+            "object the expected key pattern, field `value`, a hash or stream field, `*` for fields "
+            "keyed by data, `#key` / `#field` for values found in key or field names.",
         ],
         "targets": {
             "postgresql": {"service": "postgres", "databases": ["shop"]},
@@ -920,6 +1311,11 @@ def build(seed: int = SEED) -> dict[str, str]:
             "mongodb": {"service": "mongo", "databases": ["app"]},
             "openldap": {"service": "openldap", "databases": ["dc=example,dc=org"]},
             "cas": {"service": "cas", "databases": ["service_registry", "audit_trail"]},
+            "sqlserver": {"service": "sqlserver", "databases": ["retail"]},
+            "valkey": {"service": "valkey", "databases": ["db0", "db1"],
+                       "key_patterns_scoped_user": list(REDIS_SCOPED_PATTERNS)},
+            "redis": {"service": "redis", "databases": ["db0", "db1"],
+                      "key_patterns_scoped_user": list(REDIS_SCOPED_PATTERNS)},
         },
         "locations": t.locations,
     }

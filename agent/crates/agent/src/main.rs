@@ -75,6 +75,10 @@ fn compiled_connectors() -> Vec<Box<dyn Connector>> {
         Box::new(databastion_connector_openldap::OpenldapConnector::new()),
         #[cfg(feature = "cas")]
         Box::new(databastion_connector_cas::CasConnector::new()),
+        #[cfg(feature = "redis")]
+        Box::new(databastion_connector_redis::RedisConnector::new()),
+        #[cfg(feature = "sqlserver")]
+        Box::new(databastion_connector_sqlserver::SqlserverConnector::new()),
     ]
 }
 
@@ -281,5 +285,10 @@ mod tests {
             cfg!(feature = "openldap")
         );
         assert_eq!(engines.contains(&Engine::Cas), cfg!(feature = "cas"));
+        assert_eq!(engines.contains(&Engine::Redis), cfg!(feature = "redis"));
+        assert_eq!(
+            engines.contains(&Engine::Sqlserver),
+            cfg!(feature = "sqlserver")
+        );
     }
 }

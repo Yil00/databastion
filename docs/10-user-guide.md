@@ -2,7 +2,9 @@
 
 How to install the console and an agent, enroll the agent, declare targets, give the agent least-privilege accounts, and read findings and incidents. This page only describes what the code on `dev` does; the component READMEs linked below hold the full reference.
 
-> **Status.** v0.1.0, the first release, was published on 2026-09-30, v0.2.0, a maintenance release, and v0.3.0 (PostgreSQL audit levels: Full requires `pgaudit.log_rows`, [ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)), both on 2026-10-03, then v0.3.1 on 2026-10-04 (MSRV Rust 1.88, masking of typographic separators, automated release notes), v0.4.0 on 2026-10-07 (OpenID Connect login, Users page, Apereo CAS targets), v0.5.0 on 2026-10-08 (maintenance: MySQL / MariaDB Audit fails closed, Apereo CAS YAML service registries) and v0.6.0 on 2026-10-10 (maintenance: MySQL / MariaDB Audit reports reads of statement-text tables and calls of functions that are not built in, Apereo CAS YAML registries read by the agent's own parser) ([latest release](https://github.com/Yil00/databastion/releases/latest)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+> **Status.** v0.1.0, the first release, was published on 2026-09-30, v0.2.0, a maintenance release, and v0.3.0 (PostgreSQL audit levels: Full requires `pgaudit.log_rows`, [ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)), both on 2026-10-03, then v0.3.1 on 2026-10-04 (MSRV Rust 1.88, masking of typographic separators, automated release notes), v0.4.0 on 2026-10-07 (OpenID Connect login, Users page, Apereo CAS targets), v0.5.0 on 2026-10-08 (maintenance: MySQL / MariaDB Audit fails closed, Apereo CAS YAML service registries), v0.6.0 on 2026-10-10 (maintenance: MySQL / MariaDB Audit reports reads of statement-text tables and calls of functions that are not built in, Apereo CAS YAML registries read by the agent's own parser) and v0.7.0 on 2026-10-14 (maintenance: PostgreSQL Audit reports failed and cancelled reads and reads of the statistics, statement-text and credential-bearing catalogs, MySQL / MariaDB Audit reports `EXPLAIN` of a statement, MongoDB Audit reports failed operations and server-side JavaScript) ([latest release](https://github.com/Yil00/databastion/releases/latest)); it is early-stage software, and its known limitations are listed in the [CHANGELOG](../CHANGELOG.md) and [SECURITY.md](../SECURITY.md#known-limitations-and-residual-risks). The installation test passes in CI in under 15 minutes and the load tests are done; the 72 h stability test is deferred to v0.1.x ([ROADMAP](ROADMAP.md#v01x-follow-ups)). Read [08-engine-capabilities.md](08-engine-capabilities.md) before relying on Audit for an engine.
+
+> **New in 0.8.0** (phase 9, [ROADMAP](ROADMAP.md#phase-9--engine-scope-wave-1-microsoft-sql-server-redis-valkey)): Microsoft SQL Server targets, with Audit from SQL Server Audit or an Extended Events session ([section 6](#microsoft-sql-server-targets)), and Redis and Valkey targets, mainly for Discovery ([section 6](#redis--valkey-targets)). They need a 0.8.0 console. Upgrading from 0.7.x: read [section 12](#12-upgrading) first.
 
 > **New in 0.4.0** (phase 8, [ROADMAP](ROADMAP.md#phase-8--oidc-login--cas-connector)): console login with OpenID Connect and the Users page ([section 3](#single-sign-on-with-openid-connect)), and Apereo CAS targets with the CAS store guard in the other connectors ([section 6](#6-declare-targets)). Upgrading from 0.3.x: read [section 12](#12-upgrading) first.
 
@@ -51,6 +53,7 @@ Notes:
 - Without a usable `DATABASTION_ENCRYPTION_KEY`, the web and worker processes refuse to start in production. Changing it later makes the stored masked samples and notification channel secrets unusable ([console/README.md](../console/README.md#configuration)).
 - Prometheus metrics: `/metrics` on the dedicated port `9464`, with the `metrics_token` as bearer token ([console/README.md](../console/README.md#metrics)). Never publish that port: it must be reachable only by Prometheus, on the internal network.
 - Plan the internal database's `max_connections` from the sizing in [console/README.md](../console/README.md#docker-image).
+- With your own PostgreSQL for the console, create its database with a UTF-8 character type (`LC_CTYPE` such as `en_US.UTF-8` or `C.UTF-8`, not `C` or `POSIX`); the bundled image already does. Under `C` / `POSIX`, object matching stays correct but the worker reads every finding of an agent for each batch of events that names a non-ASCII object, which is slower on large installations ([deploy/README.md](../deploy/README.md#1-console)).
 
 ### Single sign-on with OpenID Connect
 *Since 0.4.0 (ROADMAP P8-A, [ADR-0038](adr/0038-console-oidc-login.md)).* The console can sign users in through one OpenID Connect provider (Keycloak, Microsoft Entra ID, Okta, Authentik…). Every setting is in [console/README.md, "Single sign-on (OIDC)"](../console/README.md#single-sign-on-oidc); the security model and residual risks in [05-security.md](05-security.md#console-login-with-openid-connect). OIDC needs `DATABASTION_PUBLIC_URL` and a usable `DATABASTION_ENCRYPTION_KEY`: without them the console refuses to start.
@@ -139,7 +142,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0);
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` since 0.8.0 ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets));
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -160,6 +163,256 @@ The example file documents each key with its range. After changing `agent.yaml`,
 
 A console older than the `cas` engine (it does not list `engine.cas`) shows no CAS target: the agent keeps its findings and events spooled until the console is upgraded. CAS stores held in PostgreSQL, MySQL / MariaDB, MongoDB or OpenLDAP (JPA ticket and service tables, MongoDB collections) are read by those engines' targets, under the **CAS store guard**, on by default: ticket registries are never sampled (ticket counts only), ticket ids are dropped before classification wherever they appear, and the agent reports an account that can read ticket or audit-trail credential columns (`privilege.ticket_credentials_readable`) at every heartbeat ([08-engine-capabilities.md](08-engine-capabilities.md#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap)). List stores kept under custom names in that target's `cas_stores`. Levels and limits: [08-engine-capabilities.md](08-engine-capabilities.md#apereo-cas).
 
+### Redis / Valkey targets
+*Since 0.8.0 (phase 9, P9-B, [ADR-0052](adr/0052-redis-valkey-connector.md)).* The connector needs a console that lists the `engine.redis` and `engine.valkey` capabilities; until then the agent keeps the items spooled. Redis and Valkey are mainly Discovery engines: Audit is Limited at best ([08-engine-capabilities.md](08-engine-capabilities.md#redis--valkey-audit)).
+
+Supported: Redis 6.2.7 and later and Valkey 7.2 and later. Declare one node per target, with `engine: redis` or `engine: valkey`, a named ACL user as `account` (never `default`) and its password as `secret`:
+
+```yaml
+targets:
+  - id: cache-eu-1
+    engine: valkey
+    host: cache-eu-1.internal
+    port: 6379
+    account: databastion
+    secret: { file: /etc/databastion/secrets/cache-eu-1 }
+    redis:
+      tls: verify_full                     # default; TLS from the first byte
+      ca_file: /etc/databastion/tls/cache-ca.pem
+      # client_cert: /etc/databastion/tls/agent.pem   # with tls-auth-clients yes
+      # client_key: /etc/databastion/tls/agent.key    # 0600, owned by the agent's user
+      key_patterns: ["app:*", "session:*"] # the ACL's read patterns; default ["*"]
+      databases: [0, 1]                    # default: every database
+      max_keys: 100000                     # keys examined per database and scan (1000 to 10000000)
+      discovery_node: { host: cache-eu-1-replica.internal, port: 6379 }  # a replica, for Discovery
+      replicas: [10.0.4.12]                # known replica addresses, compared for full syncs only
+      # cas_stores: { ticket_registry: ["CAS_TICKET:*"] }
+```
+
+- **`tls`**: `verify_full` (default) or `disable`. `disable` is accepted only with `socket` (a Unix socket) or a loopback IP literal such as `127.0.0.1`, never `localhost`. There is no `disable_insecure`, because `AUTH` sends the password itself. `ca_file`, `client_cert` and `client_key` need `verify_full`.
+- **Unix socket**: `socket: /run/valkey/valkey.sock` instead of `host` / `port`, with `tls: disable`. The agent checks the server process's uid on the socket before sending the password. Set **`server_uid`** to the server's uid; without it, the socket file's owner is trusted only when no other user can write to the socket's directory (as with `/run/valkey`). On a socket, Audit cannot attribute any entry to an account, the agent's own included ([08-engine-capabilities.md](08-engine-capabilities.md#redis--valkey-audit)).
+- **`key_patterns`**: if the ACL user's key patterns are narrower than `%R~*`, list them here with the server's glob syntax (at most 64). The agent never sends a command the ACL would refuse, because each refusal writes an `ACL LOG` entry. A pattern the account cannot read is reported as `privilege.declared_keys_not_readable`.
+- **`databases`**: the logical databases to scan (indexes). On Valkey 9.1+ with `db=` ACL permissions, list the same databases.
+- **`discovery_node`**: a replica that Discovery reads instead of the target's node (`host` / `port` or `socket`, with the target's account and TLS settings). Declaring one is recommended, so the scan load and lazy expirations stay off the primary. `check()` and Audit still read the target's node, since the logs are per node. If the Discovery node is down, the whole target shows as unreachable.
+- **`replicas`**: the replicas' IP addresses as the server lists them. A full synchronization is always reported (`signature.full_sync`); a syncing replica not listed here becomes the event's client address.
+- **`unevaluated_acl: accept`**: Redis 6.2 only. Redis 6.2 cannot evaluate the account (no `ACL DRYRUN`), so it is refused unless you set this after reviewing the ACL by hand; the target then shows `privilege.not_evaluated` permanently. On Redis 7.0+ or Valkey it is a configuration error.
+- **Cluster**: each node is a separate target; the agent never follows `MOVED` / `ASK` or the cluster topology. Sentinel is refused.
+
+Create the ACL user on each node the agent reads, as in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only): `-@all` plus the listed read commands on `%R~*` (or the declared patterns), `resetchannels`, and the Audit commands (`slowlog|get`, `acl|log`, `client|list`, Valkey 8.1+ `commandlog|get`) only where Audit runs. An account that can run `CONFIG SET`, `MODULE LOAD`, `ACL SETUSER`, scripts, `REPLICAOF`, `MIGRATE` or another refusal-list command is refused for Discovery and Audit. For Audit, set the server's `slowlog-log-slower-than` (Valkey 8.1+: `commandlog-execution-slower-than`) low enough for the commands you want to see: only commands slower than it are logged.
+
+**What a stolen agent credential reads.** The server enforces the ACL, not the agent's sampling bounds. Whoever holds the agent's password can run every command of the recommended ACL with any arguments ([05-security.md](05-security.md#redis--valkey-connector)):
+- **Every string in full**: with `%R~*` (or the declared patterns) and `+getrange`, `GETRANGE key 0 -1` reads a whole string, as `GET` would. The 4 KiB bound (`GETRANGE key 0 4095`) is the agent's, not the server's, and so are its member counts for `HRANDFIELD`, `SRANDMEMBER`, `ZRANDMEMBER`, `LRANGE`, `XREVRANGE` and `HMGET`. Leaving out `GET` does not protect the values.
+- **Other clients' commands and the connection map** (Audit commands only): `+slowlog|get`, `+commandlog|get` (Valkey 8.1+) and `+client|list` return other clients' logged command arguments, values included (at most 32 arguments of 128 bytes per entry), and every connection's address, user and client name.
+- **`ACL LOG RESET`**: `+acl|log` also allows the reset, so a stolen credential can clear the log of failed authentications and refused commands. A reset shows only as a gap, and only if entries were lost.
+- **An oracle on users**: `+acl|dryrun` lets the credential ask which commands any user may run, and whether a user name exists. It returns no password hash.
+
+The agent itself never sends `ACL LOG RESET`, a `GETRANGE` beyond 4 KiB, or `ACL DRYRUN` for a user other than its own and `default`: its client has a closed command set. Grant the Audit commands only on nodes where Audit runs, prefer narrower `key_patterns` where you can, and protect the password like the data.
+
+### Microsoft SQL Server targets
+*Since 0.8.0 (phase 9, P9-A: `check()` and Discovery in #242 and #243, Audit from SQL Server Audit in #247 and from Extended Events in #249).* Audit reads an operator-created SQL Server Audit on SQL Server 2022 and 2025 ([below](#sql-server-audit)), or an operator-created Extended Events session, the only Audit source on **SQL Server 2019** ([below](#sql-server-audit-through-extended-events)). The agent needs a console that lists the `engine.sqlserver` capability; until then it keeps the items spooled. Limits and measurements: [08-engine-capabilities.md](08-engine-capabilities.md#microsoft-sql-server-discovery); decisions: [ADR-0051](adr/0051-sqlserver-connector.md) and its refinement of 2026-10-14.
+
+Supported: SQL Server 2019, 2022 and 2025, Standard, Enterprise, Developer and Express editions; Azure SQL is refused. Tested: 2022 Express in CI (the integration job `agent-sqlserver`, and the end-to-end job `e2e-sqlserver` with SQL Server Audit), and 2019, 2022 and 2025 Express in the engine matrix. Declare one `host` and `port` per target (default 1433; no Unix socket): the agent does not use the SQL Server Browser, so a named instance is reached by its port. The `account` is a **SQL login**: Windows integrated authentication, Microsoft Entra ID and contained database users are not supported. Local detection reports a SQL Server listening on port 1433 or running as a `sqlservr` process; it is monitored only once declared.
+
+```yaml
+targets:
+  - id: erp-eu-1
+    engine: sqlserver
+    host: erp-db-1.internal              # a name (or IP literal) in the server certificate
+    port: 1433
+    account: databastion_agent
+    secret: { file: /etc/databastion/secrets/erp-eu-1 }
+    sqlserver:
+      tls: auto                          # default; or strict, or mandatory
+      ca_file: /etc/databastion/tls/sqlserver-ca.pem   # absolute path; otherwise the system store
+      databases: [app]                   # default: every user database the login can access
+      rls_visibility: view_definition    # opt-in, see below: without it, nothing is sampled
+      # extended_grants: true            # db_datareader instead of per-schema SELECT
+      # max_tables: 16384                # tables per database and scan (1 to 16384, the default)
+      # audit:                           # Audit source (see below)
+      #   source: sqlserver_audit        # or sqlserver_xevents; default auto
+      #   audit_name: databastion_audit  # the server audit (2022+), created by the operator
+      #   xe_session: databastion_xe     # the Extended Events session (2019+), created by the operator
+```
+
+The block also takes `cas_stores`, as the other engines do ([section 6](#6-declare-targets)). Unknown keys are refused.
+
+**TLS.** Every connection is encrypted, loopback included, because the SQL Server login packet carries the password in a reversible form: there is no `disable` mode. Every mode verifies the server certificate against `ca_file` (then the only trusted root) or the system store, and the declared host. Install on the server a certificate issued by a CA the agent trusts, whose subject alternative name holds the declared host or IP literal (`127.0.0.1` as an IP SAN for a loopback target). Without one, SQL Server uses a self-signed fallback certificate with no subject alternative name, regenerated at each service start: the agent refuses it, and there is no mode that trusts a server certificate without verifying it.
+- **`auto`** (default): TDS 8.0 strict encryption first (TLS from the first byte). If the strict handshake fails before any TDS byte, the agent falls back once to `mandatory`, fully verified, then connects in `mandatory` for an hour before trying strict again (in memory only; every agent start tries strict first). A certificate error never causes a fallback.
+- **`strict`**: TDS 8.0 only. On Linux, strict encryption exists from SQL Server 2025 (`network.forcestrict`); against 2019 or 2022 on Linux the connection fails, and the agent's log says "strict encryption not available on this server".
+- **`mandatory`**: TDS 7.x, encryption required for the whole session; a server that offers login-only encryption or none is refused. Use `tls: mandatory` for SQL Server 2019, and for 2022 on Linux, to avoid a failed strict handshake every hour.
+- **"Strict seen" mark**: once `auto` has completed one authenticated strict session with a target, the agent writes `<state_dir>/sqlserver-strict-seen/<target_id>` (mode `0600`, holding the declared host and port) and from then on never falls back to `mandatory` for that target: a strict failure fails the connection, so that someone on the network path cannot downgrade a known strict server. Setting the target's `tls` to `strict` or `mandatory` removes the mark at its next connection attempt, and a mark for another host or port is ignored. If you move the server to a version or configuration without strict encryption and keep `tls: auto`, the target shows as unreachable with a TLS-stage error: stop the agent, delete the file and start the agent again (the agent also keeps the mark in memory while it runs, so deleting the file alone has no effect until a restart), or set `tls: mandatory`, let the target attempt a connection, then set `tls: auto` again. Details: [08-engine-capabilities.md](08-engine-capabilities.md#tls-modes-and-the-strict-seen-mark).
+- **What the console shows**: a TLS failure has no failure code of its own. The target is unreachable with `target_unreachable` (the fallback certificate, a certificate that does not verify, strict encryption not available), `timeout`, or `unsupported` (the server does not encrypt the whole session), with the note `check.stage_failed` labelled `stage_tls`; the exact reason is in the agent's log.
+
+**The account (minimal grant).** As the login's administrator, with a client that does not log the statement text (it holds the password):
+
+```sql
+-- Once per server. Type the password at a prompt.
+CREATE LOGIN databastion_agent WITH PASSWORD = '<from a prompt>',
+  CHECK_POLICY = ON, DEFAULT_DATABASE = [app];
+-- In each monitored database
+USE [app];
+CREATE USER databastion_agent FOR LOGIN databastion_agent;   -- grants CONNECT
+GRANT SELECT ON SCHEMA::[crm] TO databastion_agent;          -- present and future tables of the schema
+-- Row-level security opt-in (sqlserver.rls_visibility: view_definition), in each monitored database:
+GRANT VIEW DEFINITION TO databastion_agent;
+```
+
+- Grant `SELECT` per schema to cover; a schema without it is not sampled. With `extended_grants: true`, membership of `db_datareader` replaces the per-schema grants and is reported as `privilege.extended_variant`; without the flag it is reported as over-privilege.
+- `CHECK_POLICY = ON` applies the server's account lockout policy to the login: repeated failures (a wrong password in `agent.yaml`, or someone guessing it) lock the agent out, reported as `authentication_failed` with "login locked out" in the agent's log.
+- The Audit grants are needed only where Audit runs: `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION` for SQL Server Audit ([below](#sql-server-audit)), or `VIEW SERVER STATE` (2019) / `VIEW SERVER PERFORMANCE STATE` (2022+) for Extended Events ([below](#sql-server-audit-through-extended-events)), which **exposes every statement text on the server**. Held while no Audit stream uses them, they are reported as `privilege.audit_grant_without_audit`, like any Audit permission the agent does not use (`VIEW SERVER SECURITY STATE`, and `VIEW SERVER STATE` on 2022+).
+
+**With the minimal grant, Discovery samples nothing.** SQL Server has no table-level flag that tells a table with a row-level security policy from one without (measured negative on SQL Server 2022), and the minimal account cannot see the policy catalog. Sampling such a table would run the policy's predicate function, user code, in the agent's session, and would silently miss the rows it hides. So, unless you opt in, **every table of every monitored database is skipped** (`skipped_row_level_security`), and `check()` reports `coverage.rls_not_verifiable` with the number of databases from the first heartbeat; the agent's log gives the reason. To sample:
+1. declare `rls_visibility: view_definition` in the target's `sqlserver` block;
+2. grant database `VIEW DEFINITION` to the agent's user in each monitored database (above).
+
+`check()` then proves, per database, that `VIEW DEFINITION` is effective and that no `DENY` hides a policy again: no `DENY` of `VIEW DEFINITION`, `VIEW SECURITY DEFINITION` or `CONTROL` at database, schema or object scope, and no server-level `DENY` of `VIEW ANY DEFINITION`, `VIEW ANY SECURITY DEFINITION`, `VIEW SERVER SECURITY STATE` or `CONTROL SERVER`, to the agent, one of its roles or `public`. Any such `DENY`, or a proof that cannot be read, keeps the whole database skipped. With the proof, only the tables that have an enabled policy are skipped (`coverage.relations_rls_skipped`). Granting `VIEW DEFINITION` on single policies or schemas does not lift the skip: a policy created later would stay invisible. There is no setting that asserts "this database has no policy" in place of the proof.
+
+**The cost of the opt-in**: database `VIEW DEFINITION` makes the definitions of the database readable by whoever holds the agent's credentials: the bodies of procedures, views, functions and triggers (which can hold literals, sometimes credentials or values), and, per ADR-0051, check and default constraint definitions, computed-column definitions and partition boundary values. The agent itself never reads them: its statements are a reviewed allow-list, and a test forbids every definition-bearing catalog, function and column in them. Decide per server whether Discovery is worth that exposure.
+
+Not sampled in any case: views, synonyms, external and Stretch tables, computed columns, Always Encrypted columns (the server holds ciphertext only), and columns of types other than character types, `text` / `ntext`, `int`, `bigint`, `decimal`, `numeric`, `date`, `datetime`, `datetime2` and `smalldatetime` (so not binary types, `money`, `float` / `real`, `uniqueidentifier`, `time`, `datetimeoffset`…); at most 512 columns per table ([08-engine-capabilities.md](08-engine-capabilities.md#scope-and-sampling)). Columns under dynamic data masking are sampled as the agent's account sees them, masked. Masked, encrypted and computed columns and views are counted in target notes.
+
+**What a stolen agent credential reads.** Measured with the minimal account on SQL Server 2022, beyond the tables it is granted ([08-engine-capabilities.md](08-engine-capabilities.md#what-a-stolen-agent-credential-reads)):
+- **Always Encrypted key metadata**, through `public`'s default `VIEW ANY COLUMN ENCRYPTION KEY DEFINITION` and `VIEW ANY COLUMN MASTER KEY DEFINITION`: the encrypted column encryption key values and the column master key paths. The keys stay encrypted by the column master key, which is outside the server. `check()` accepts these two permissions only when they come from `public`; granted to the agent's login, user or roles they are reported as `privilege.beyond_select`.
+- **`sys.servers.data_source`**: the host names of linked servers. Their `provider_string` was empty in the measurement; the agent never reads either column. A provider string can hold connection options and, when badly configured, a password: keep credentials out of it.
+- **With the row-level security opt-in**: the module bodies and the security policies of the monitored databases (above).
+- Also visible: the names and types of the objects the account can read, and `sys.masked_columns.masking_function` (a partial mask can hold a literal).
+- Not readable with the minimal account (measured): other logins' password hashes, credentials, linked logins, keys and certificates, logon triggers, the `msdb` mail and proxy tables, other sessions and their statement texts.
+- Not measured yet: whether `xp_dirtree` / `xp_fileexist` are executable by `public` on your server (they would let the account make the server open an outbound SMB connection). The agent never sends them.
+
+**Refused accounts and what `check()` reports.** At every heartbeat, `check()` reads the login's effective permissions and its securable-level grants, in **every** database it can access, not only the monitored ones, following its server and database roles (up to 64). An account that holds any right of the refusal list is **refused**: `check()` reports `privilege.refused` with the rights as labels, and neither Discovery nor Audit runs. The refusal list:
+- membership of `sysadmin`, `securityadmin` or `##MS_LoginManager##`, and of `db_owner` in any accessible database;
+- `CONTROL SERVER`, `CONTROL` on any accessible database, `ALTER ANY SERVER AUDIT`, `ALTER ANY DATABASE AUDIT`;
+- the event-session rights, server and database scope: `ALTER ANY EVENT SESSION` and its granular forms (`… ENABLE`, `… DISABLE`, `… ADD EVENT`, `… DROP EVENT`, `… ADD TARGET`, `… DROP TARGET`, `… OPTION`), `CREATE ANY EVENT SESSION`, `DROP ANY EVENT SESSION`, and their `DATABASE EVENT SESSION` counterparts;
+- `ALTER ANY LOGIN`, `ALTER ANY SERVER ROLE`, `IMPERSONATE ANY LOGIN`, and `IMPERSONATE`, `CONTROL`, `ALTER` or `TAKE OWNERSHIP` on any login or database user;
+- `VIEW ANY CRYPTOGRAPHICALLY SECURED DEFINITION`;
+- other logins' password hashes readable: a one-bit probe asks the server whether any other login's hash is visible, and no hash reaches the agent (label `password_hash_probe`).
+
+The check fails closed: when one of these reads fails or is cut, `check()` reports `privilege.not_evaluated` with the label `refusal_list_probe`, and Discovery does not run. Rights beyond the minimal grant that are not refused are reported as over-privilege, to remove: `privilege.global_privileges` (server permissions such as `VIEW ANY DEFINITION`, `ADMINISTER BULK OPERATIONS`, `ALTER ANY LINKED SERVER`, `ALTER TRACE`), `privilege.server_roles`, `privilege.database_roles`, `privilege.beyond_select` (database permissions beyond `CONNECT` and `SELECT`, such as `UNMASK`, `VIEW DATABASE STATE`, `SHOWPLAN`, `EXECUTE`), `privilege.grant_option` and `privilege.owner_of_objects`. Logon triggers are visible only with rights the minimal account does not hold, so a minimal account shows `privilege.not_evaluated` with the label `logon_trigger_probe` at every heartbeat: that is expected, and the agent never reports "no logon trigger" while it cannot see them. A CAS store guard read that fails gives the label `cas_store_guard_probe`.
+
+#### SQL Server Audit
+Audit reads an operator-created **SQL Server Audit** with a `FILE` target, through `sys.fn_get_audit_file` over the agent's own connection. The agent never creates, alters, starts or stops the audit or its specifications. It works on **SQL Server 2022 and 2025** only: on 2019, reading the audit needs `CONTROL SERVER`, which is refused (`audit.sqlserver_audit_needs_control_server`); use the [Extended Events source](#sql-server-audit-through-extended-events) there. With both an audit and a session named, the agent uses SQL Server Audit when it is usable (2022 or later, its two grants held, the named audit found), otherwise the session. Levels, proofs and limits: [08-engine-capabilities.md](08-engine-capabilities.md#microsoft-sql-server-audit).
+
+**1. Create the audit** (as an administrator, in `master`). A minimal example, adapted from the dev service (`dev/sqlserver/initdb/30-audit.sql`); choose the folder, sizes and `ON_FAILURE` for your server:
+
+```sql
+USE master;
+CREATE SERVER AUDIT databastion_audit
+  TO FILE (FILEPATH = N'/var/opt/mssql/audit/', MAXSIZE = 64 MB, MAX_ROLLOVER_FILES = 8)
+  WITH (QUEUE_DELAY = 1000, ON_FAILURE = CONTINUE);   -- no WHERE predicate
+CREATE SERVER AUDIT SPECIFICATION databastion_audit_spec FOR SERVER AUDIT databastion_audit
+  ADD (SCHEMA_OBJECT_ACCESS_GROUP),       -- reads and writes, in every database
+  ADD (AUDIT_CHANGE_GROUP),               -- changes of the audit itself
+  ADD (FAILED_LOGIN_GROUP),               -- recommended: failed logins
+  ADD (SERVER_PRINCIPAL_CHANGE_GROUP),    -- recommended: logins, users, roles and passwords (DCL)
+  ADD (DATABASE_PRINCIPAL_CHANGE_GROUP),
+  ADD (APPLICATION_ROLE_CHANGE_PASSWORD_GROUP),
+  ADD (LOGIN_CHANGE_PASSWORD_GROUP),
+  ADD (BACKUP_RESTORE_GROUP)              -- recommended: BACKUP DATABASE (signature.backup_database)
+  WITH (STATE = ON);
+ALTER SERVER AUDIT databastion_audit WITH (STATE = ON);
+```
+
+- **Required for Partial**: the audit enabled, with a `FILE` target and **no `WHERE` predicate** (`audit.server_audit_filtered` otherwise); `SCHEMA_OBJECT_ACCESS_GROUP` in an enabled server audit specification, or, per monitored database, an enabled database audit specification with `SCHEMA_OBJECT_ACCESS_GROUP` or `SELECT ON DATABASE::<db> BY public` (`audit.reads_not_logged` with the number of databases otherwise); `AUDIT_CHANGE_GROUP` in an enabled server audit specification (`audit.audit_changes_not_audited` otherwise).
+- **Recommended**: `FAILED_LOGIN_GROUP` (`audit.failed_logins_not_audited` otherwise, not required for Partial), the principal and password change groups (password-bearing DCL, reported by class only) and `BACKUP_RESTORE_GROUP`.
+- **Name**: an audit name with `/` or `\` is refused. The agent builds the file pattern from the catalog (folder, name, GUID), never from `agent.yaml`.
+- **File sizes**: size `MAXSIZE` and `MAX_ROLLOVER_FILES` so that a file outlives a few poll intervals. A file lost to rollover before the agent read it is a gap.
+- **`ON_FAILURE = CONTINUE`**: records lost when the audit cannot write are counted in `sys.dm_server_audit_status`, which the agent's grants do not read, so `check()` reports `privilege.not_evaluated` (label `other` until the contract has one). `SHUTDOWN` and `FAIL_OPERATION` lose no record but stop the server or fail statements when the audit cannot write: your choice.
+
+**2. Grant the two Audit permissions** to the agent's login, in `master`, only on servers where Audit runs:
+
+```sql
+USE master;
+GRANT VIEW SERVER SECURITY AUDIT TO databastion_agent;     -- reads the audit
+GRANT VIEW ANY SECURITY DEFINITION TO databastion_agent;   -- the audit and specification catalogs
+```
+
+Never grant `VIEW SERVER SECURITY STATE` (not needed: the audit's own start and stop records prove its restarts) nor `CONTROL SERVER`, `ALTER ANY SERVER AUDIT` or `ALTER ANY DATABASE AUDIT` (refused: the account then gets no Discovery and no Audit). Without `VIEW ANY SECURITY DEFINITION` the level is None with `privilege.not_evaluated`. What these two permissions let a stolen credential read (the audit files, every login's name, certificate and key metadata of `master`; not password hashes, statement-text views or other sessions) is measured in [08-engine-capabilities.md](08-engine-capabilities.md#what-the-audit-grants-expose-measured).
+
+**3. Name the audit in `agent.yaml`**, in the target's `sqlserver` block, then enable Audit for the target in the console ([section 10](#10-audit-enabling-it-and-reading-events)):
+
+```yaml
+    sqlserver:
+      audit:
+        source: sqlserver_audit          # or auto (default), which also takes xe_session (below)
+        audit_name: databastion_audit    # sys.server_file_audits.name, 1 to 128 characters
+```
+
+`source: sqlserver_audit` requires `audit_name`.
+
+**Levels.** Every SQL Server Audit target notes `audit.log_without_row_counts`: boxed SQL Server writes no row counts, so events carry no `rows`, raise no `volume.*` signal and score 0; incidents come from signals (`shape.full_table_read`, `signature.bcp`, `signature.backup_database`, `signature.remote_data_access`), objects and principals. With every proof held, the target is **Limited** (`audit.partial_pending_first_record`) until the stream reads its first record, then **Partial** while the stream runs; **never Full**. After a gap (a file lost to rollover, the audit stopped, restarted, recreated or moved, an unreadable position), the target notes `audit.records_dropped` and stays Limited for 24 h. The first start skips what the audit already holds.
+
+**Not covered**: SQL Server 2019 (use Extended Events); reads through a view or procedure under ownership chaining are recorded on the view or procedure only; reads refused by a missing server permission leave no record; Windows servers and the Developer edition are not measured. The end-to-end and load tests (#254) run SQL Server Audit on 2022 Express only. The server's own telemetry process reads audited objects under the principal `<host name>$` (observed on Linux): those reads are reported, and match policies on every read; exclude that principal in those policies, scoped to the target, if they are noise ([08-engine-capabilities.md](08-engine-capabilities.md#known-limits-6)). The agent's own statements are left out only from its own sessions, by exact text or per-execution credit; the records of a session's last statement are matched up to 250 ms after the session's clean end, for that statement's exact text only, because they were stamped up to 2.5 ms after the computed end on 2022 (re-measured on 2019, 2022 and 2025 in #249: the audit's `event_time` stayed within two `SYSUTCDATETIME()` reads around a statement; not measured on Windows) ([08-engine-capabilities.md](08-engine-capabilities.md#microsoft-sql-server-audit)).
+
+**Upgrade note.** The SQL Server labels above (`refusal_list_probe`, `logon_trigger_probe`, the database event-session permissions…) belong to the note-label revision `target_status.note_labels.2026_10_b`, and the agent sends `other` in their place until the console lists that token. Upgrade the console first, as usual. With several console replicas behind a load balancer, **upgrade every replica before any agent sees the `2026_10_b` token** (and `engine.sqlserver`): an agent uses a token as soon as one replica lists it, and a replica that does not know the values rejects them ([ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 8).
+
+#### SQL Server Audit through Extended Events
+Audit can read an operator-created **Extended Events session** with an `event_file` target, through `sys.fn_xe_file_target_read_file` over the agent's own connection (#249). It is the only Audit source on **SQL Server 2019**, and it also works on 2022 and 2025. The agent never creates, alters, starts or stops the session. Partial at best, with row counts; levels, proofs and limits: [08-engine-capabilities.md](08-engine-capabilities.md#extended-events-source-and-grants).
+
+**1. Create the session** (as an administrator). A minimal example, adapted from the dev service (`dev/sqlserver/initdb/30-audit.sql`); choose the folder and sizes for your server:
+
+```sql
+CREATE EVENT SESSION databastion_xe ON SERVER
+  ADD EVENT sqlserver.sql_statement_completed (ACTION (sqlserver.server_principal_name,
+    sqlserver.session_server_principal_name, sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)),
+  ADD EVENT sqlserver.sp_statement_completed (ACTION (sqlserver.server_principal_name,
+    sqlserver.session_server_principal_name, sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)),
+  ADD EVENT sqlserver.rpc_completed (ACTION (sqlserver.server_principal_name,
+    sqlserver.session_server_principal_name, sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)),
+  -- recommended: failed logins (error 18456)
+  ADD EVENT sqlserver.error_reported (ACTION (sqlserver.server_principal_name,
+    sqlserver.session_server_principal_name, sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)
+    WHERE ([error_number] = (18456)))
+  ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/databastion_xe.xel',
+    max_file_size = 64, max_rollover_files = 8)
+  WITH (TRACK_CAUSALITY = ON, STARTUP_STATE = ON, MAX_DISPATCH_LATENCY = 5 SECONDS);
+ALTER EVENT SESSION databastion_xe ON SERVER STATE = START;
+```
+
+- **Required for Partial**: the session running with an `event_file` target; `sql_statement_completed`, `sp_statement_completed` and `rpc_completed`, each with the five actions above (`audit.xe_events_missing` otherwise); statement collection left on for the first two (do not set `collect_statement = 0`); **no `WHERE` predicate on these three events** (`audit.xe_session_filtered` otherwise). A predicate on `error_reported`, as above, is fine.
+- **`error_reported` for failed logins**: without it, failed logins are not seen (the agent's log says so; no target note yet). The agent reads the error number and the name tried (fingerprinted), never the message. The predicate on 18456 keeps out error 17830, which every bare TCP connection such as a health check produces.
+- **`TRACK_CAUSALITY = ON`** is recommended, not required: without it the target notes `audit.xe_causality_off`, statements are grouped by session and event order, and the statistics exclusions that need causality do not apply: the empty internal statements of each statistics build are reported as always-reported reads of `*`, and, on a new server, the agent's own statistics builds as reads of system tables by its login.
+- **`MAX_DISPATCH_LATENCY`**: how long events can wait in memory before reaching the file. Keep it finite and short (the dev service uses 5 seconds): it bounds the first-start floor and the deferral of statistics builds; with `INFINITE`, the floor lasts up to 5 minutes.
+- **Retention**: the default `EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS` can drop events under load; drops are counted by the server, and the target then notes `audit.records_dropped` and stays Limited for 24 h. `NO_EVENT_LOSS` can slow the server under load: your choice. The mode only appears in the agent's log.
+- **File**: give the session a folder of its own (the agent reads every file named `<stem>_<n>_*.xel` in it, so another session with a matching name in the same folder would be read too), with a name of at most 260 characters without `*` or `?`. Size `max_file_size` and `max_rollover_files` so that a file outlives a few poll intervals: a file lost to rollover before the agent read it is a gap. The agent takes the path from the server, never from `agent.yaml`.
+- A stop and start of the session (a new `create_time`) is a gap, and so is a change of the file name or folder.
+
+**2. Grant the Extended Events permission** to the agent's login, in `master`, only on servers where Audit runs:
+
+```sql
+USE master;
+GRANT VIEW SERVER STATE TO databastion_agent;               -- SQL Server 2019
+GRANT VIEW SERVER PERFORMANCE STATE TO databastion_agent;   -- SQL Server 2022 and later, instead
+```
+
+**What it exposes**: with this permission, the agent's credentials read **every statement text on the server, with its literals**, through the statement-text views (`sys.dm_exec_sql_text`, `sys.dm_exec_query_stats`, cached plans, Query Store texts, `DBCC INPUTBUFFER`), every Extended Events file the server lets `sys.fn_xe_file_target_read_file` read, with the parameter values of every RPC that `rpc_completed` records, and the other sessions (measured on 2022: [08-engine-capabilities.md](08-engine-capabilities.md#extended-events-source-and-grants)). Grant it only where Audit runs, and protect the agent's password like the data. On 2022 and later, grant `VIEW SERVER PERFORMANCE STATE`, not `VIEW SERVER STATE`: the agent does not use the latter there and reports it as `privilege.audit_grant_without_audit`. Never grant `ALTER ANY EVENT SESSION` or the other event-session rights: they are refused, and the account then gets no Discovery and no Audit.
+
+**3. Name the session in `agent.yaml`**, in the target's `sqlserver` block, then enable Audit for the target in the console ([section 10](#10-audit-enabling-it-and-reading-events)):
+
+```yaml
+    sqlserver:
+      audit:
+        source: sqlserver_xevents        # or auto (default)
+        xe_session: databastion_xe       # the session's name, 1 to 128 characters
+        # audit_name: databastion_audit  # with auto: SQL Server Audit when usable, else the session
+```
+
+`source: sqlserver_xevents` requires `xe_session`. With `source: auto` naming both, the agent uses SQL Server Audit when it is usable (2022 or later, its two grants held, the named audit found), otherwise the session, and checks again every 5 minutes; a switch between the two sources is a gap.
+
+**Levels.** With every proof held, the target is **Limited** (`audit.partial_pending_first_record`) until the stream reads its first event, then **Partial** while the stream runs; **never Full**. Events carry row counts (`volume.large_result` above 10 000 rows). Objects are taken from the statement text: whenever the text may not name every object (dynamic SQL, a user function, an ambiguous or cut text…), and for every DDL and DCL statement, the event names `*` and is always reported. The first start skips what the session's files already hold, however large the backlog (since #255 the history boundary goes by the order of the events read; a step back of the server's clock beyond the delivery delay, at least 5 s, is counted as `audit.records_dropped`).
+
+**Statistics builds: noise outside three server builds.** When a statement needs statistics that are missing or stale, SQL Server builds them inside the caller's request: an internal `SELECT StatMan(…) FROM [schema].[table] …`, followed by one to three internal statements with an empty text. The agent leaves these out **only on three exact builds** (`SERVERPROPERTY('ProductVersion')`), where users were shown unable to call `StatMan` themselves: **15.0.4500.2** (2019), **16.0.4305.5** (2022) and **17.0.5015.4** (2025), the builds of the engine matrix. On any other build, a newer cumulative update included, every automatic statistics build is reported:
+- as a read of the table it builds statistics on, by whichever client's statement triggered it;
+- with each of its empty internal statements as a read of `*`, always reported;
+- on a new server, as reads of system base tables (`sys.sysschobjs`, `sys.syscolpars`…) by the agent's own login, triggered by the agent's catalog reads.
+
+What to do:
+- On another build, expect this noise: from every client, on new tables and after large data changes, whenever statistics are missing or stale.
+- **Do not exclude the agent's account** in your policies: the exclusion would also hide reads made with a stolen copy of its credential.
+- If an exclusion is needed, keep it narrow: a location exception on the table concerned, scoped to the target and the policy. Never an exception whose object glob matches the name `*` (the glob `*` itself, or `\*`): it would hide every read the agent could not name ([09-agent-protocol.md](09-agent-protocol.md#the-object-)).
+- The list of builds changes only with an agent release, once a new build has been measured; it is refreshed per release, and a [phase 9 follow-up](ROADMAP.md#phase-9-follow-ups) makes the engine matrix's drift test check it for each cumulative update. After a SQL Server update, the exclusions come back with the first agent release that lists the new build. Details: [08-engine-capabilities.md](08-engine-capabilities.md#extended-events-statistics-builds).
+
+**Not covered**: a refused `xp_cmdshell` leaves no event on this source; the plan cache (`sys.dm_exec_query_stats`) is not a source, so a server where neither SQL Server Audit nor a session is usable reports None; RPC calls of user procedures, `event_file` rollover while the agent reads, Windows servers and the Developer edition are not measured; this source is not in the end-to-end or load tests (integration tests and the engine matrix only).
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 
@@ -170,6 +423,8 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | MongoDB | custom role with `find` + `listCollections` per database, SCRAM-SHA-256, `authenticationRestrictions` with `clientSource` = the agent's address(es) | no grant with a file source; `find` on `system.profile` only for the profiler source | [ADR-0026](adr/0026-mongodb-connector.md), [ADR-0027](adr/0027-mongodb-audit.md), [connector README](../agent/crates/connector-mongodb/README.md) |
 | OpenLDAP | service DN with `read` on the tree; rule `{0}` names **every** credential attribute of the loaded schemas (`userPassword`, `userPKCS12`, and the Samba, Kerberos, ppolicy… ones where loaded), never readable; a `peername.ip` restriction to the agent's address, since the accesslog records no client address | `read` on `cn=accesslog` only while Audit runs for the target (otherwise `privilege.accesslog_without_audit`) | [ADR-0029](adr/0029-openldap-connector.md), [ADR-0032](adr/0032-audit-stream-panic-isolation-and-openldap-probe-refresh.md), [connector README](../agent/crates/connector-openldap/README.md) |
 | Apereo CAS (`cas`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
+| Microsoft SQL Server (since 0.8.0) | SQL login with `CHECK_POLICY = ON`, a database user and `SELECT` per schema in each monitored database; database `VIEW DEFINITION` too with the row-level security opt-in, or Discovery samples nothing; never `sysadmin`, `db_owner` or the other refused rights | Only where Audit runs. SQL Server Audit (2022+): `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION`. Extended Events: `VIEW SERVER STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+), which expose every statement text on the server. Never `VIEW SERVER SECURITY STATE` or `CONTROL SERVER` | [ADR-0051](adr/0051-sqlserver-connector.md), [section 6](#microsoft-sql-server-targets), [05-security.md](05-security.md#microsoft-sql-server-connector) |
+| Redis / Valkey (since 0.8.0) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.
@@ -177,7 +432,7 @@ Also:
 - At every heartbeat the agent checks each account and reports over-privilege and coverage problems as **target notes** on the agent page. A note about over-privilege means the account has more rights than recommended: remove them.
 
 ## 8. Audit prerequisites and levels
-What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. CAS never reaches Full either: Partial means authentications and ticket issuance are logged. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)). Since 0.7.0, Full also needs `log_min_messages` and `log_min_error_statement` at `error` or lower (the PostgreSQL defaults), so that failed and cancelled statements are logged with their text, for every role: no `ALTER ROLE … SET`, `ALTER ROLE … IN DATABASE … SET`, `ALTER DATABASE … SET` or function `SET` clause raising them above `error`, and, on PostgreSQL 15+, no `SET` or `ALTER SYSTEM` grant on them (`GRANT SET ON PARAMETER …`) to a role other than superusers (a grant to the agent's role is reported as an over-privilege). The agent reads these two settings only, filtered by the server ([05-security.md](05-security.md#recommended-database-accounts-read-only)). It reads them from `pg_db_role_setting` and `pg_proc` (and, on PostgreSQL 15+, the grants from `pg_parameter_acl`), which every role can read by default: no grant is needed. If `SELECT` on `pg_db_role_setting` was revoked from `PUBLIC`, grant it to the agent's role, or the target stays at Partial; check with `SELECT pg_catalog.has_table_privilege('databastion_agent', 'pg_catalog.pg_db_role_setting', 'SELECT')` (your agent role's name). An override or grant shows the target at Partial, and the agent's log names the database, the setting and the roles or functions. To get Full back, reset them (`ALTER ROLE app RESET log_min_error_statement`, `ALTER DATABASE shop RESET log_min_messages`, `ALTER FUNCTION f() RESET log_min_messages`) and revoke the grants (`REVOKE SET ON PARAMETER log_min_messages FROM app`); the level follows at the next heartbeat. Some operators raise `log_min_error_statement` for an application role to keep its statement texts out of the server log: that role's failed reads then leave no text, so the target is Partial.
+What Audit can see depends on the engine, its edition and its logging settings. The console shows the level reached for each target: **Full**, **Partial**, **Limited** or **None** (Discovery only). The prerequisites per engine (pgaudit, `server_audit`, `performance_schema`, `auditLog`, `slowms`, `slapo-accesslog`…) and the known limits are in [08-engine-capabilities.md](08-engine-capabilities.md). In 0.1, MySQL / MariaDB and MongoDB never reach Full, and MongoDB Community only sees slow operations. CAS never reaches Full either: Partial means authentications and ticket issuance are logged. SQL Server (since 0.8.0) reaches Partial at best, through SQL Server Audit on 2022 and 2025 or through Extended Events (the only source on 2019), and Redis / Valkey (since 0.8.0) Limited at best. PostgreSQL reaches Full only with pgaudit and `pgaudit.log_rows = on` (row counts in the log); without `log_rows` it is Partial ([ADR-0037](adr/0037-postgresql-full-requires-pgaudit-log-rows.md)). Since 0.7.0, Full also needs `log_min_messages` and `log_min_error_statement` at `error` or lower (the PostgreSQL defaults), so that failed and cancelled statements are logged with their text, for every role: no `ALTER ROLE … SET`, `ALTER ROLE … IN DATABASE … SET`, `ALTER DATABASE … SET` or function `SET` clause raising them above `error`, and, on PostgreSQL 15+, no `SET` or `ALTER SYSTEM` grant on them (`GRANT SET ON PARAMETER …`) to a role other than superusers (a grant to the agent's role is reported as an over-privilege). The agent reads these two settings only, filtered by the server ([05-security.md](05-security.md#recommended-database-accounts-read-only)). It reads them from `pg_db_role_setting` and `pg_proc` (and, on PostgreSQL 15+, the grants from `pg_parameter_acl`), which every role can read by default: no grant is needed. If `SELECT` on `pg_db_role_setting` was revoked from `PUBLIC`, grant it to the agent's role, or the target stays at Partial; check with `SELECT pg_catalog.has_table_privilege('databastion_agent', 'pg_catalog.pg_db_role_setting', 'SELECT')` (your agent role's name). An override or grant shows the target at Partial, and the agent's log names the database, the setting and the roles or functions. To get Full back, reset them (`ALTER ROLE app RESET log_min_error_statement`, `ALTER DATABASE shop RESET log_min_messages`, `ALTER FUNCTION f() RESET log_min_messages`) and revoke the grants (`REVOKE SET ON PARAMETER log_min_messages FROM app`); the level follows at the next heartbeat. Some operators raise `log_min_error_statement` for an application role to keep its statement texts out of the server log: that role's failed reads then leave no text, so the target is Partial.
 
 **PostgreSQL failed and cancelled reads.** With `pgaudit.log_rows = on`, which Full requires, pgaudit writes its record only when a statement completes, so a read that ends in an error or a cancel, including one that already sent rows to the client, has no pgaudit record. Since 0.7.0, the agent reports such reads from the server's `ERROR` lines in the same log file, by SQLSTATE only (it never reads their message, which can quote the value read): a read of the statement's relations with no row count, always reported ([08-engine-capabilities.md](08-engine-capabilities.md#failed-and-cancelled-statements)). Keep `log_min_messages` and `log_min_error_statement` at `error` or lower (the defaults); otherwise the target shows Partial and the agent's log says which setting. Expect events from applications whose queries fail (a missing table, a constraint violation on an `UPDATE`). **Up to 0.6.x**, such reads are not reported at Full: if that matters more than row counts there, set `pgaudit.log_rows = off` for the monitored databases (such reads are then reported, with no row count, and the target shows Partial).
 
@@ -252,11 +507,22 @@ The export signatures recognized per engine are listed in [08-engine-capabilitie
 
 ## 11. Policies, incidents and notifications
 - **Policies** (administrator): a policy applies to findings or to access events (fixed at creation). Conditions on findings: classifiers or families (`pii.*`), agents, targets, engines, location globs, confidence and match thresholds. Conditions on access events: signals or families, actions, principals, objects, minimum rows, score or sensitivity, baseline anomaly ([console/README.md](../console/README.md#audit-correlation)). Action: create an incident with a severity, and notify up to 5 channels. **Exceptions** (with a mandatory reason and an optional expiry) silence a scope. Model: [ADR-0014](adr/0014-policy-and-incident-model.md), [console/README.md](../console/README.md#policies-and-incidents).
+- **How object patterns match**: location and object globs (`*`, `?`, `\` escapes) ignore case on every engine, so `crm.customers` also matches an event on `CRM.CUSTOMERS`. Since 0.8.0 the comparison is a Unicode lowercase with the final sigma `ς` read as `σ`, an event object gets the sensitivity of its findings whatever its case, and trailing spaces in names are ignored in policy conditions and in sensitivity scores on every engine, but in exceptions only on SQL Server, MySQL and MariaDB targets, where identifiers compare that way; on PostgreSQL, MongoDB, Redis and Valkey a name with a trailing space is a distinct object and an exception for `customers` does not cover `customers `. Exceptions are case-insensitive on case-sensitive engines too: an exception for `customers` also silences `Customers`. The agent's Audit sensitive-object filter compares names as policy conditions do ([ADR-0014](adr/0014-policy-and-incident-model.md#implementation-note-2026-10-17-object-names-matched-without-case-or-trailing-spaces)).
 - **Incidents**: active incidents by default, most severe first. An incident shows its finding (with masked samples) or its events, its lifecycle and its notifications. Lifecycle: `open` → `acknowledged` → `resolved`, or `false_positive` (administrator). `resolved` means remediated: if a later scan still sees the data, a new incident opens.
 - **Notifications** (administrator): e-mail (SMTP with STARTTLS or TLS) and HMAC-signed webhook (`https://` only) channels, with a test button. Webhook receivers must escape the names they render, because a database account name is chosen by the client ([console/README.md](../console/README.md#alerting)). Channels flagged for system alerts also receive the console's own alerts: silent agent, agent integrity, dropped batches, stopped Audit stream and, with OIDC on (since 0.4.0), break-glass local administrator logins (`user.local_login`) and role sync guards (`user.role_sync`), within an hourly budget per channel.
 
 ## 12. Upgrading
 Upgrade the **console first**, then the agents; a console `X.Y` accepts agents `X.Y` and `X.(Y-1)` ([RELEASE.md](../RELEASE.md#compatibility)). For **0.1.0**, upgrade the console and every agent together: agent builds from before the protocol capability negotiation (#60) cannot decode the console's heartbeat response ([ADR-0022](adr/0022-protocol-capability-negotiation.md)). The console's default scan budget of 3600 s also assumes agents that pace Discovery (every released agent does). `migrate` applies the console migrations on start; deployments created before the database role split need the one-time steps in [console/README.md](../console/README.md#upgrading-an-existing-deployment). Upgrade commands for the Compose console and the `.deb` agent: [deploy/README.md](../deploy/README.md#agent-package-reference) ("Upgrade").
+
+From 0.7.x to **0.8.0** (new engines: Microsoft SQL Server, Redis and Valkey; one console migration; two Audit behaviour changes on every engine; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)):
+- **Events with more than 15 objects are always reported.** Up to 0.7.x, an event kept at most 16 objects and silently dropped the others (PostgreSQL, MySQL / MariaDB, OpenLDAP containers), so a sensitive table named after 16 others could be missed. From 0.8.0 such an event names 15 objects and `*`, and is always reported, whatever the minimum rows. Expect more events for statements that touch many tables ([08-engine-capabilities.md](08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine)).
+- **Object names match without case or trailing spaces**, in the agent's sensitive-object filter and in the console's policies, exceptions and sensitivity ([section 11](#11-policies-incidents-and-notifications)). On MySQL / MariaDB with `lower_case_table_names` other than 0, events on `CRM.CUSTOMERS` now count as events on the sensitive `crm.customers`. Check that the console database has a UTF-8 character type (`SELECT datctype FROM pg_database WHERE datname = current_database();`; the bundled image uses `en_US.utf8`): under `C` or `POSIX` matching stays correct but is slower ([deploy/README.md](../deploy/README.md#1-console)).
+- **Upgrade the console first.** A 0.8.0 agent keeps its SQL Server items spooled until the console lists `engine.sqlserver`, and its Redis / Valkey items until it lists `engine.redis` and `engine.valkey` ([ADR-0042](adr/0042-hold-items-of-unlisted-engines.md)). The console migration `0040` adds the `account_not_recorded` principal; its check is validated after the migration, without a long lock.
+- **Several console replicas**: upgrade every replica before any agent sees the note-label token `target_status.note_labels.2026_10_b`. An agent uses the token as soon as one replica lists it, and a replica that does not know its labels rejects them ([ADR-0022](adr/0022-protocol-capability-negotiation.md) decision 8).
+- **Policies with `exclude_principals: ["*"]`** do not hide Redis / Valkey events whose account is not recorded (`account_not_recorded`): such an event has no account name to match, by design.
+- **Minimum rows on Redis / Valkey targets**: their events carry no row count, and key patterns cannot be listed as sensitive objects yet. A minimum rows value in a Redis / Valkey target's Audit settings therefore drops the target's read and write events that carry no signal (always-reported events, such as scripts, still pass), and a policy's minimum rows condition never matches them. Leave minimum rows unset on these targets.
+- **SQL Server**: Discovery samples nothing without the row-level security opt-in ([section 6](#microsoft-sql-server-targets)); Audit needs an audit or an Extended Events session created by the operator, and the Extended Events grant exposes every statement text on the server. Outside the three listed server builds, expect statistics-build noise on Extended Events, and do not exclude the agent's account ([above](#sql-server-audit-through-extended-events)).
+- **MySQL / MariaDB** (recommended): raise `performance_schema_max_digest_length` and `max_digest_length` to 2048, so that the agent's poll digests are not cut at the default 1024 bytes and its exact-text rule applies to them.
 
 From 0.6.x to **0.7.0** (mainly agent changes: the console gains two target-note codes and dependency updates, no console migration; the full list is in the upgrade notes of the [CHANGELOG](../CHANGELOG.md)):
 - **No grant is added on any engine.** Upgrade the console first: a 0.6.x console shows the new MySQL / MariaDB target notes `audit.digest_consumer_disabled` and `audit.statement_text_limit_low` as raw codes.

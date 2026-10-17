@@ -24,6 +24,12 @@ Usage:
   seed.py mongo    --tables N --rows N              JavaScript for mongosh (`c`: a root connection)
   seed.py pgbench  --tables N --rows N --out DIR    one pgbench script per workload table (pg_tNNN.sql)
   seed.py sysbench --tables N --rows N              sysbench Lua script (MariaDB point selects)
+  seed.py sqlserver --tables N --rows N             T-SQL for target-mssql (sqlcmd, sa, db retail)
+  seed.py tsql     --tables N --rows N              T-SQL fixed-rate point-select loop of one
+                                                    workload session (sqlcmd variable CTX, see
+                                                    tsql_context; prints one RESULT line)
+  seed.py redis    --rows N                         Lua script for EVAL (Valkey / Redis): the keys
+                                                    ARGV[1]..ARGV[2] of the scaled keyspace
   (--workload-tables N, default 40: the workload reads the first N tables of the plan)
 """
 
@@ -304,6 +310,164 @@ print(total + " documents");
 """
 
 
+# ------------------------------------------------------------------------------------ SQL Server
+# The load tables go to their own schema of `retail` (the dev database of the agent login), granted
+# to the agent login and the workload login `load_app` as a whole (schema SELECT, the minimal
+# variant's unit, ADR-0051 decision 4).
+MSSQL_DATABASE = "retail"
+MSSQL_SCHEMA = "load"
+
+
+def mssql_name(t: Table) -> str:
+    return f"{MSSQL_SCHEMA}.t{t.tag}"
+
+
+def _choose(n_expr: str, values: tuple[str, ...]) -> str:
+    """T-SQL CHOOSE over string literals, 0-based on `n_expr` (an int expression)."""
+    return f"CHOOSE(1 + CAST({n_expr} AS int), {_sql_list(values)})"
+
+
+def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
+    """Schema, tables, rows (GENERATE_SERIES, SQL Server 2022, compatibility level 160) and grants,
+    in sqlcmd batches (GO) of `batch` tables."""
+    nf, nl, nd = len(FIRST_NAMES), len(LAST_NAMES), len(MAIL_DOMAINS)
+    types = {"email": "nvarchar(128)", "phone": "nvarchar(32)", "iban": "nvarchar(34)",
+             "amount": "decimal(12,2)", "quantity": "int"}
+    out = ["SET NOCOUNT ON;", f"USE {MSSQL_DATABASE};",
+           f"IF SCHEMA_ID(N'{MSSQL_SCHEMA}') IS NULL EXEC (N'CREATE SCHEMA {MSSQL_SCHEMA}');", "GO"]
+    for i, t in enumerate(tables):
+        exprs = {
+            "email": (f"CONCAT({_choose(f's.g % {nf}', FIRST_NAMES)}, '.', "
+                      f"{_choose(f'(s.g / {nf}) % {nl}', LAST_NAMES)}, s.g / {nf * nl}, '@', "
+                      f"{_choose(f'(s.g + {t.index}) % {nd}', MAIL_DOMAINS)})"),
+            "phone": f"CONCAT('+33 6 39 98 {t.index % 100:02d} ', RIGHT(CONCAT('0', s.g % 100), 2))",
+            "iban": ("CONCAT('FR', RIGHT(CONCAT('0', 98 - CAST(CONCAT(s.bban, '152700') AS decimal(38,0)) % 97), 2), "
+                     "s.bban)"),
+            "amount": "CAST((s.g % 100000) / 100.0 AS decimal(12,2))",
+            "quantity": "CAST(s.g % 50 + 1 AS int)",
+        }
+        cols = ", ".join(f"{c} {types[c]}" for c in t.columns)
+        out.append(
+            f"CREATE TABLE {mssql_name(t)} (id bigint NOT NULL PRIMARY KEY, created_at datetime2(0) NOT NULL, "
+            f"status nvarchar(16) NOT NULL, note nvarchar(80) NULL, {cols});"
+        )
+        sel = ", ".join(exprs[c] for c in t.columns)
+        out.append(
+            f"INSERT INTO {mssql_name(t)} SELECT s.g, DATEADD(minute, CAST(s.g AS int), CAST('2024-01-01' AS datetime2(0))), "
+            f"{_choose(f's.g % {len(STATUSES)}', STATUSES)}, CONCAT('order ', s.g, ' batch ', s.g % 97), {sel} "
+            f"FROM (SELECT value AS g, CONCAT('{BANK_CODE}', RIGHT(CONCAT('0000', {t.index}), 5), "
+            f"RIGHT(CONCAT('0000000000', value), 11), RIGHT(CONCAT('0', value % 97), 2)) AS bban "
+            f"FROM GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))) AS s;"
+        )
+        if (i + 1) % batch == 0:
+            out.append("GO")
+    out += [
+        "GO",
+        f"GRANT SELECT ON SCHEMA::{MSSQL_SCHEMA} TO databastion;",
+        f"GRANT SELECT ON SCHEMA::{MSSQL_SCHEMA} TO load_app;",
+        # The log flushed now rather than inside a measurement window.
+        "CHECKPOINT;",
+        f"SELECT CONCAT(COUNT(*), ' tables') FROM sys.tables WHERE schema_id = SCHEMA_ID(N'{MSSQL_SCHEMA}');",
+        "GO",
+    ]
+    return "\n".join(out) + "\n"
+
+
+def tsql_workload(tables: list[Table]) -> str:
+    """One workload session: two batches. The first sets CONTEXT_INFO from the sqlcmd variable `CTX`
+    (`0x` then three 16-digit hex numbers: statements, interval in microseconds, session number; a
+    SET statement, not audited); the second, whose text is the same for every session and phase (one
+    cached plan, whose statistics the harness reads), runs the point selects on the workload tables,
+    one every interval from the session's start (an absolute schedule: a late statement does not
+    shift the next ones), each on a table and id picked from the iteration and the session. Each
+    executed SELECT is one statement (one SQL Server Audit record). Prints `RESULT <issued> <late>
+    <p50_us> <p95_us> <p99_us> <schedule_p95_us> <mean_us>`: in-loop times of the SELECTs and the
+    delay from the scheduled start; late = started more than 1 s after its schedule. The server's
+    clock advances in steps of about 4.1 ms on Linux: each in-loop time is 0 or a step, so the
+    percentiles are not meaningful, but the mean over many statements is an unbiased estimate of
+    the mean duration (a step falls inside a statement with probability duration / step)."""
+    branches = []
+    for k, t in enumerate(tables):
+        kw = "IF" if k == 0 else "ELSE IF"
+        branches.append(f"  {kw} @k = {k} SELECT @v = note FROM {mssql_name(t)} WHERE id = 1 + @r % {t.rows};")
+    return f"""SET NOCOUNT ON;
+USE {MSSQL_DATABASE};
+SET CONTEXT_INFO $(CTX);
+GO
+DECLARE @lat TABLE (us bigint NOT NULL, sched_us bigint NOT NULL);
+DECLARE @n bigint = CAST(SUBSTRING(CONTEXT_INFO(), 1, 8) AS bigint),
+  @iv bigint = CAST(SUBSTRING(CONTEXT_INFO(), 9, 8) AS bigint),
+  @session bigint = CAST(SUBSTRING(CONTEXT_INFO(), 17, 8) AS bigint);
+DECLARE @i int = 0, @k int, @r bigint, @v nvarchar(80), @late int = 0, @w int, @d varchar(12);
+DECLARE @t0 datetime2(7) = SYSUTCDATETIME(), @due datetime2(7), @s datetime2(7);
+WHILE @i < @n
+BEGIN
+  SET @due = DATEADD(microsecond, CAST(@i * @iv AS int), @t0);
+  SET @w = DATEDIFF(millisecond, SYSUTCDATETIME(), @due);
+  IF @w > 0
+  BEGIN
+    SET @d = CONVERT(varchar(12), DATEADD(millisecond, @w, CAST('00:00:00' AS time(3))), 114);
+    WAITFOR DELAY @d;
+  END
+  ELSE IF @w < -1000 SET @late += 1;
+  SET @k = (@i * 7 + @session) % {len(tables)};
+  SET @r = ABS(CAST(CHECKSUM(NEWID()) AS bigint));
+  SET @s = SYSUTCDATETIME();
+{chr(10).join(branches)}
+  INSERT @lat VALUES (DATEDIFF_BIG(microsecond, @s, SYSUTCDATETIME()), DATEDIFF_BIG(microsecond, @due, @s));
+  SET @i += 1;
+END
+SELECT CONCAT('RESULT ', (SELECT COUNT(*) FROM @lat), ' ', @late, ' ',
+  (SELECT TOP 1 CAST(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY us) OVER () AS bigint) FROM @lat), ' ',
+  (SELECT TOP 1 CAST(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY us) OVER () AS bigint) FROM @lat), ' ',
+  (SELECT TOP 1 CAST(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY us) OVER () AS bigint) FROM @lat), ' ',
+  (SELECT TOP 1 CAST(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY sched_us) OVER () AS bigint) FROM @lat), ' ',
+  (SELECT CAST(AVG(CAST(us AS float)) AS decimal(18,3)) FROM @lat));
+"""
+
+
+def tsql_context(statements: int, interval_us: int, session: int) -> str:
+    """The CONTEXT_INFO value of tsql_workload: `0x` and three 16-digit hex numbers."""
+    for v in (statements, interval_us, session):
+        if not 0 <= v < 2**63:
+            raise ValueError("out of range")
+    return f"0x{statements:016x}{interval_us:016x}{session:016x}"
+
+
+# ------------------------------------------------------------------------------------ Redis / Valkey
+REDIS_LOAD_PREFIX = "load"
+
+
+def redis_lua(table: int = 1) -> str:
+    """EVAL script (Lua 5.1, numeric ARGV[1]..ARGV[2]): the scaled keyspace's keys of that range, in
+    database 0. Every tenth key is a hash `load:h:<n>` (email, phone, status); the others are
+    strings `load:s:<n>` (an e-mail address). The same values as the SQL generators (`email`,
+    `phone` of table `table`). Returns the number of keys written."""
+    first = ", ".join(f'"{v}"' for v in FIRST_NAMES)
+    last = ", ".join(f'"{v}"' for v in LAST_NAMES)
+    doms = ", ".join(f'"{v}"' for v in MAIL_DOMAINS)
+    stats = ", ".join(f'"{v}"' for v in STATUSES)
+    nf, nl, nd = len(FIRST_NAMES), len(LAST_NAMES), len(MAIL_DOMAINS)
+    return f"""local F = {{{first}}}
+local L = {{{last}}}
+local D = {{{doms}}}
+local S = {{{stats}}}
+local n = 0
+for g = tonumber(ARGV[1]), tonumber(ARGV[2]) do
+  local email = F[g % {nf} + 1] .. "." .. L[math.floor(g / {nf}) % {nl} + 1] .. math.floor(g / {nf * nl})
+    .. "@" .. D[(g + {table}) % {nd} + 1]
+  if g % 10 == 0 then
+    local phone = string.format("+33 6 39 98 {table % 100:02d} %02d", g % 100)
+    redis.call("HSET", "{REDIS_LOAD_PREFIX}:h:" .. g, "email", email, "phone", phone, "status", S[g % {len(STATUSES)} + 1])
+  else
+    redis.call("SET", "{REDIS_LOAD_PREFIX}:s:" .. g, email)
+  end
+  n = n + 1
+end
+return n
+"""
+
+
 # ------------------------------------------------------------------------------------ workloads
 def workload_tables(tables: list[Table], n: int) -> list[Table]:
     if not 1 <= n <= MAX_WORKLOAD_TABLES:
@@ -344,13 +508,20 @@ end
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("what", choices=["plan", "pg", "mariadb", "mongo", "pgbench", "sysbench"])
-    p.add_argument("--tables", type=int, required=True)
+    p.add_argument("what", choices=["plan", "pg", "mariadb", "mongo", "pgbench", "sysbench", "sqlserver",
+                                    "tsql", "redis"])
+    p.add_argument("--tables", type=int, default=None)
     p.add_argument("--rows", type=int, required=True)
     p.add_argument("--out", help="output directory (pgbench)")
     p.add_argument("--workload-tables", type=int, default=40,
                    help="tables the pgbench / sysbench workload reads (the first ones of the plan)")
     a = p.parse_args(argv)
+    if a.what == "redis":
+        sys.stdout.write(redis_lua())
+        return 0
+    if a.tables is None:
+        print("seed.py: --tables is required", file=sys.stderr)
+        return 2
     try:
         tables = plan(a.tables, a.rows)
         hot = workload_tables(tables, min(a.workload_tables, len(tables)))
@@ -368,6 +539,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(mongo_js(tables))
     elif a.what == "sysbench":
         sys.stdout.write(sysbench_lua(hot))
+    elif a.what == "sqlserver":
+        sys.stdout.write(sqlserver_sql(tables))
+    elif a.what == "tsql":
+        sys.stdout.write(tsql_workload(hot))
     else:
         if not a.out:
             print("seed.py: --out is required for pgbench", file=sys.stderr)

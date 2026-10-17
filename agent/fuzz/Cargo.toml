@@ -1,7 +1,7 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
 # server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
-# cn=accesslog entries; CAS service definitions (JSON and YAML, the YAML parser also against
+# cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
 # serde_yaml_ng as a differential oracle) and JSON audit log lines. See
 # README.md.
 #
@@ -23,6 +23,8 @@ libfuzzer-sys = "0.4"
 databastion-connector-mongodb = { path = "../crates/connector-mongodb", features = ["fuzzing"] }
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
+databastion-connector-redis = { path = "../crates/connector-redis", features = ["fuzzing"] }
+databastion-connector-sqlserver = { path = "../crates/connector-sqlserver", features = ["fuzzing"] }
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
@@ -120,6 +122,104 @@ bench = false
 [[bin]]
 name = "cas_audit_log"
 path = "fuzz_targets/cas_audit_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_resp_decoder"
+path = "fuzz_targets/redis_resp_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_info"
+path = "fuzz_targets/redis_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_key_pattern"
+path = "fuzz_targets/redis_key_pattern.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_slowlog_entry"
+path = "fuzz_targets/redis_slowlog_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_acl_log_entry"
+path = "fuzz_targets/redis_acl_log_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redis_learned_patterns"
+path = "fuzz_targets/redis_learned_patterns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_token_stream"
+path = "fuzz_targets/sqlserver_token_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_packets"
+path = "fuzz_targets/sqlserver_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_prelogin_tls"
+path = "fuzz_targets/sqlserver_prelogin_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_plp"
+path = "fuzz_targets/sqlserver_plp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_tsql"
+path = "fuzz_targets/sqlserver_tsql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_audit_records"
+path = "fuzz_targets/sqlserver_audit_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_xe_xml"
+path = "fuzz_targets/sqlserver_xe_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlserver_xe_records"
+path = "fuzz_targets/sqlserver_xe_records.rs"
 test = false
 doc = false
 bench = false

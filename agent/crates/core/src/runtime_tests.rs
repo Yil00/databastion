@@ -1985,6 +1985,96 @@ async fn target_notes_are_sent_only_while_the_console_accepts_them() {
 }
 
 #[tokio::test]
+async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
+    use crate::capabilities::token;
+    use crate::notes::{NoteLabel, TargetNote};
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::None,
+        failure: None,
+        detail: None,
+        notes: vec![
+            TargetNote::new(NoteCode::PrivilegeRefused).with_labels([
+                NoteLabel::sqlserver_name("CONTROL SERVER"),
+                NoteLabel::sqlserver_name("ALTER ANY DATABASE EVENT SESSION"),
+            ]),
+            TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([
+                NoteLabel::sqlserver("password_hash_probe"),
+                NoteLabel::sqlserver("logon_trigger_probe"),
+            ]),
+        ],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(health))],
+    )
+    .unwrap();
+    let labels = |statuses: &[databastion_protocol::TargetStatus]| -> Vec<Vec<String>> {
+        statuses[0]
+            .notes
+            .iter()
+            .map(|n| n.labels.iter().flatten().map(ToString::to_string).collect())
+            .collect()
+    };
+    // Neither revision: `other` only (an older console rejects the rest).
+    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+    assert_eq!(
+        labels(&rt.target_statuses(&env.config).await),
+        vec![vec!["other"], vec!["other"]]
+    );
+    // The first SQL Server revision only.
+    accept_tokens(
+        &rt,
+        &[token::TARGET_STATUS_NOTES, token::NOTE_LABELS_2026_10],
+    );
+    assert_eq!(
+        labels(&rt.target_statuses(&env.config).await),
+        vec![
+            vec!["other", "control_server"],
+            vec!["other", "password_hash_probe"]
+        ]
+    );
+    // The second revision only.
+    accept_tokens(
+        &rt,
+        &[token::TARGET_STATUS_NOTES, token::NOTE_LABELS_2026_10_B],
+    );
+    assert_eq!(
+        labels(&rt.target_statuses(&env.config).await),
+        vec![
+            vec!["other", "alter_any_database_event_session"],
+            vec!["other", "logon_trigger_probe"]
+        ]
+    );
+    // Both: every label as the connector built it.
+    accept_tokens(
+        &rt,
+        &[
+            token::TARGET_STATUS_NOTES,
+            token::NOTE_LABELS_2026_10,
+            token::NOTE_LABELS_2026_10_B,
+        ],
+    );
+    let statuses = rt.target_statuses(&env.config).await;
+    assert_eq!(
+        labels(&statuses),
+        vec![
+            vec!["control_server", "alter_any_database_event_session"],
+            vec!["password_hash_probe", "logon_trigger_probe"]
+        ]
+    );
+    for s in &statuses {
+        serde_json::from_value::<databastion_protocol::TargetStatus>(
+            serde_json::to_value(s).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_check_timed_out_by_the_core_is_noted() {
     struct Slow;
     #[async_trait::async_trait]

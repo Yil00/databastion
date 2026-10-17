@@ -21,7 +21,34 @@ export const SIGNAL_REGISTRY = {
       "postgres",
       "mysql",
       "mariadb",
-      "mongodb"
+      "mongodb",
+      "sqlserver"
+    ]
+  },
+  "shape.keyspace_enumeration": {
+    "description": "A Redis / Valkey keyspace enumeration seen in a slow-log or command-log entry: KEYS, or a SCAN with a COUNT above 1000 (redis-cli --scan uses COUNT 10, is usually fast and never sets it). Heuristic: only slow or logged commands are seen, so evadable by design.",
+    "engines": [
+      "redis",
+      "valkey"
+    ]
+  },
+  "signature.backup_database": {
+    "description": "A full copy of a SQL Server database made by the server: BACKUP DATABASE or BACKUP LOG (to a file or URL), DBCC CLONEDATABASE, or sp_detach_db (the data files become copyable).",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "signature.bcp": {
+    "description": "A SQL Server bulk export: a read by a client whose application name is one of a closed list of export tools (bcp, sqlpackage export, the SQL Server Import and Export Wizard / DTS), or a session that probed the table's metadata (SET FMTONLY ON, sp_describe_first_result_set) before reading it whole. Heuristic: the application name is declared by the client, so evadable by design.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
+  "signature.cas_ticket_read": {
+    "description": "A read of a Redis / Valkey key guarded by the CAS store guard: a key of the CAS ticket registry's prefix or of the declared CAS stores, or whose name holds a ticket id of a strict CAS prefix (TGT, ST, PT, PGT, OC, AT, RT). Reported as a read of *; the ticket id is never kept. A match on the generic ticket-id shape alone gives the read of * without this signal.",
+    "engines": [
+      "redis",
+      "valkey"
     ]
   },
   "signature.copy_to_file": {
@@ -34,6 +61,13 @@ export const SIGNAL_REGISTRY = {
     "description": "A server-side export to a program (COPY ... TO PROGRAM).",
     "engines": [
       "postgres"
+    ]
+  },
+  "signature.full_sync": {
+    "description": "A full synchronization of a Redis / Valkey server (INFO stats sync_full grew): a copy of the whole dataset over the replication protocol, as a replica's first sync, redis-cli --rdb or a rogue replica make. Reported as a read of * with the replica's address when a replica entry not declared in the agent's configuration shows it.",
+    "engines": [
+      "redis",
+      "valkey"
     ]
   },
   "signature.into_outfile": {
@@ -68,6 +102,12 @@ export const SIGNAL_REGISTRY = {
       "postgres"
     ]
   },
+  "signature.remote_data_access": {
+    "description": "Data leaving through the SQL Server server to another place, flagged even when the server refused it: OPENROWSET (including BULK), OPENDATASOURCE, OPENQUERY, EXEC ... AT, a four-part name in a write target, BULK INSERT, CREATE EXTERNAL TABLE AS SELECT, xp_cmdshell, xp_dirtree / xp_fileexist / xp_subdirs (an outbound connection to a named host), sp_send_dbmail with @query, sp_invoke_external_rest_endpoint, sp_OACreate / sp_OAMethod, or sp_execute_external_script.",
+    "engines": [
+      "sqlserver"
+    ]
+  },
   "volume.failed_logins_many_accounts": {
     "description": "One client address with failed authentications for at least 16 distinct principals within 10 minutes (credential stuffing or password spraying, indistinguishable without the passwords, which are never seen). On CAS, the further failures of that address are aggregated per minute under the principal * (several accounts). Heuristic: the address comes from X-Forwarded-For by default, so evadable by design.",
     "engines": [
@@ -80,6 +120,12 @@ export const SIGNAL_REGISTRY = {
       "cas"
     ]
   },
+  "volume.large_reply": {
+    "description": "A Valkey command whose reply exceeded the server's large-reply threshold (an entry of the command log's large-reply type, Valkey 8.1 and later), with the reply size as the event's bytes.",
+    "engines": [
+      "valkey"
+    ]
+  },
   "volume.large_result": {
     "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it).",
     "engines": [
@@ -87,7 +133,8 @@ export const SIGNAL_REGISTRY = {
       "mysql",
       "mariadb",
       "mongodb",
-      "openldap"
+      "openldap",
+      "sqlserver"
     ]
   }
 } as const;

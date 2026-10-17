@@ -15,6 +15,15 @@ import type { AuditSource, Engine } from "@/lib/protocol/enums";
  * store `audit_trail`, the log `audit_log` and the record field `who`. Principals are end users,
  * fingerprinted except `cas.clear_principals`, and `*` on an `auth_failure` event is the
  * several-accounts aggregate of a credential-stuffing burst (contract `Principal` text).
+ *
+ * SQL Server (ADR-0051 decision 5): database, schema, table, column.
+ *
+ * Redis / Valkey (ADR-0052 decision 7, contract `Location` text): `database` is `db<index>`,
+ * `schema` the Redis type (`string`, `hash`, `list`, `set`, `zset`, `stream`), `object` the
+ * normalized key pattern (`KeyPattern`, e.g. `user:*:email`) and `field` the hash or stream field,
+ * `value` for strings and members, or `#key` / `#field` for values found in names. Key patterns
+ * follow the contract's rendering rule (`KeyPattern`): escaped text only, never a link or `href`,
+ * inline code in plain-text messages (`src/lib/key-pattern.ts`).
  */
 
 export interface LocationPartLabels {
@@ -28,6 +37,29 @@ const GENERIC: LocationPartLabels = { database: "database", schema: "schema", ob
 const LDAP: LocationPartLabels = { database: "naming context", schema: "container", object: "object class", field: "attribute" };
 const CAS_REGISTRY: LocationPartLabels = { database: "store", schema: "service type", object: "service", field: "path" };
 const CAS_AUDIT: LocationPartLabels = { database: "store", schema: "schema", object: "log", field: "field" };
+const SQL_SERVER: LocationPartLabels = { database: "database", schema: "schema", object: "table", field: "column" };
+const KEY_VALUE: LocationPartLabels = { database: "database", schema: "type", object: "key pattern", field: "field" };
+
+/**
+ * Display names of the contract engines. Exhaustive: a new contract engine fails `tsc` until it is
+ * named here.
+ */
+const ENGINE_NAMES: Record<Engine, string> = {
+  postgres: "PostgreSQL",
+  mysql: "MySQL",
+  mariadb: "MariaDB",
+  mongodb: "MongoDB",
+  openldap: "OpenLDAP",
+  cas: "Apereo CAS",
+  sqlserver: "Microsoft SQL Server",
+  redis: "Redis",
+  valkey: "Valkey",
+};
+
+/** Display name of an engine; a string that is not a contract engine is returned as is. */
+export function engineDisplayName(engine: string): string {
+  return Object.hasOwn(ENGINE_NAMES, engine) ? ENGINE_NAMES[engine as Engine] : engine;
+}
 
 /** The `Location.database` of the CAS audit log (ADR-0041 decision 4). */
 export const CAS_AUDIT_STORE = "audit_trail";
@@ -40,38 +72,70 @@ export function isCasEngine(engine: string | null | undefined): boolean {
   return engine === "cas";
 }
 
-/** Engines whose location parts are shown with their own names rather than database / schema / table. */
+/**
+ * Engines whose location parts are shown with their own names rather than on one line: OpenLDAP,
+ * CAS, and Redis / Valkey (the key pattern is shown apart, as inline code).
+ */
 export function hasNamedLocationParts(engine: string | null | undefined): boolean {
-  return isLdapEngine(engine) || isCasEngine(engine);
+  return isLdapEngine(engine) || isCasEngine(engine) || isKeyPatternEngine(engine);
 }
 
 /** Names of the location parts; `database` tells the CAS service registry from its audit log. */
 export function locationPartLabels(engine: string | null | undefined, database: string | null = null): LocationPartLabels {
   if (isLdapEngine(engine)) return LDAP;
   if (isCasEngine(engine)) return database === CAS_AUDIT_STORE ? CAS_AUDIT : CAS_REGISTRY;
+  if (engine === "sqlserver") return SQL_SERVER;
+  if (isKeyPatternEngine(engine)) return KEY_VALUE;
   return GENERIC;
 }
 
 /**
- * Engine of a contract `AuditSource`, when the source alone tells it (`null` for the sources that
- * MySQL and MariaDB share). Exhaustive: a new contract source fails `tsc` until it is listed.
+ * Engines a contract `AuditSource` can serve: one engine, except the sources that MySQL and
+ * MariaDB share and those that Redis and Valkey share (ADR-0052 decision 8). Exhaustive: a new
+ * contract source fails `tsc` until it is listed. The agent API refuses an event whose source does
+ * not serve its target's engine (P9-C review H1), and the engine-token gate of a source is the
+ * union of its engines' tokens (`agent-api/capabilities.ts`).
  */
-const SOURCE_ENGINE: Record<AuditSource, Engine | null> = {
-  pgaudit: "postgres",
-  pg_stat_statements: "postgres",
-  pg_stat_activity: "postgres",
-  mariadb_server_audit: null,
-  mysql_audit_log: null,
-  performance_schema: null,
-  mongodb_audit_log: "mongodb",
-  mongodb_profiler: "mongodb",
-  mongodb_log: "mongodb",
-  openldap_accesslog: "openldap",
-  cas_audit_log: "cas",
+const SOURCE_ENGINES: Record<AuditSource, readonly Engine[]> = {
+  pgaudit: ["postgres"],
+  pg_stat_statements: ["postgres"],
+  pg_stat_activity: ["postgres"],
+  mariadb_server_audit: ["mysql", "mariadb"],
+  mysql_audit_log: ["mysql", "mariadb"],
+  performance_schema: ["mysql", "mariadb"],
+  mongodb_audit_log: ["mongodb"],
+  mongodb_profiler: ["mongodb"],
+  mongodb_log: ["mongodb"],
+  openldap_accesslog: ["openldap"],
+  cas_audit_log: ["cas"],
+  sqlserver_audit: ["sqlserver"],
+  sqlserver_xevents: ["sqlserver"],
+  sqlserver_query_stats: ["sqlserver"],
+  redis_slowlog: ["redis", "valkey"],
+  redis_commandlog: ["redis", "valkey"],
+  redis_acl_log: ["redis", "valkey"],
+  redis_sync: ["redis", "valkey"],
 };
 
+/** Engines served by a contract `AuditSource` (empty for a string that is not one). */
+export function auditSourceEngines(source: string): readonly Engine[] {
+  return Object.hasOwn(SOURCE_ENGINES, source) ? SOURCE_ENGINES[source as AuditSource] : [];
+}
+
+/**
+ * Engine of a contract `AuditSource`, when the source alone tells it (`null` for the sources that
+ * MySQL and MariaDB share, and for those Redis and Valkey share).
+ */
 export function auditSourceEngine(source: string): Engine | null {
-  return Object.hasOwn(SOURCE_ENGINE, source) ? SOURCE_ENGINE[source as AuditSource] : null;
+  const engines = auditSourceEngines(source);
+  return engines.length === 1 ? (engines[0] ?? null) : null;
+}
+
+/** Engines whose object names are `KeyPattern`s (contract `ObjectName`, ADR-0052 decision 7). */
+export const KEY_PATTERN_ENGINES: readonly Engine[] = ["redis", "valkey"];
+
+export function isKeyPatternEngine(engine: string | null | undefined): boolean {
+  return (KEY_PATTERN_ENGINES as readonly string[]).includes(engine ?? "");
 }
 
 /** Contract `db_user_fingerprint` prefix (`^hmac-sha256:[0-9a-f]{64}$`). */
@@ -117,3 +181,10 @@ export function fingerprintTitle(fingerprint: string, engine: string | null | un
       : "The agent sent a keyed fingerprint (HMAC) instead of the account name (unknown or non-conforming name, e.g. a failed login whose user name may be a mistyped password). It is not a name; the same name always gives the same fingerprint on one agent.";
   return `${why}\n${fingerprint}`;
 }
+
+/**
+ * An event without a recorded account (contract `Principal.account_not_recorded`, Redis / Valkey
+ * only, ADR-0052 decision 8): never a name nor a wildcard.
+ */
+export const UNRECORDED_PRINCIPAL_TITLE =
+  "The source records no account for this access: a slow-log or command-log entry whose connection had closed before the agent could attribute it, or a full synchronization. It is not an account name nor a wildcard. Such events are grouped by client network for incidents, and no per-principal baseline is built for them.";

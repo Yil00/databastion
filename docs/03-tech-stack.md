@@ -30,6 +30,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 | MySQL/MariaDB | Own client for the MySQL protocol + rustls, no driver crate | P2-C ([ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md) decision 3) |
 | MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A, #74 ([ADR-0026](adr/0026-mongodb-connector.md) decision 1); see below |
 | OpenLDAP | Own bounded LDAPv3 client (bind, search, StartTLS and Who am I? only; bounded BER reader) + rustls, no LDAP crate | Phase 6, #79 ([ADR-0029](adr/0029-openldap-connector.md) decision 1); see below |
+| Redis / Valkey | Own bounded RESP3 client (closed read-only command set, replies bounded before allocation) + rustls, no client crate | Phase 9, #237 ([ADR-0052](adr/0052-redis-valkey-connector.md) decision 1: the `redis` crate pulls `xxhash-rust`, BSL-1.0, outside the `deny.toml` allow-list, and has no reply bounds; `fred` had no release for 19 months); since 0.8.0 |
 | HTTP client (uplink) | reqwest + rustls (`ring` provider, system trust store) | No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
 | Packaging | Distroless Docker image + `.deb` | |
 | Architectures | x86_64 + arm64 | |
@@ -38,7 +39,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 
 **OpenLDAP client.** The `ldap3` crate was planned and rejected ([ADR-0029](adr/0029-openldap-connector.md)). Version 0.12.1 builds without OpenSSL and its license is allowed, but its codec has no frame bound (it buffers whatever length a server announces), its decoder panics on a malformed `LDAPMessage`, its errors carry the server's `diagnosticMessage` and `matchedDN` (text that can quote values and entry DNs) and the library logs connection errors itself, the write operations are compiled in, and its TLS support pulls `x509-parser` and `url`. The connector instead implements a closed subset of LDAPv3: encoders for `BindRequest` (simple, SASL `EXTERNAL`), `SearchRequest`, the StartTLS and Who am I? extended operations and `UnbindRequest` only (no write operation can be encoded, I4); a bounded BER reader (definite lengths, messages capped at 16 MiB before the body is read, fixed nesting, fail closed); only numeric result codes kept; referrals never followed (I5). It uses the workspace rustls crates and `zeroize`: no new license, no MSRV change.
 
-A single binary, `databastion-agent`, with connectors enabled through Cargo *features* (`postgres`, `mysql`, `mongodb`, `openldap`, all on by default) ([ADR-0002](adr/0002-single-agent-connectors.md)). Every crate is named with the `databastion-` prefix.
+A single binary, `databastion-agent`, with connectors enabled through Cargo *features* (`postgres`, `mysql`, `mongodb`, `openldap`, `cas`, `redis`, all on by default) ([ADR-0002](adr/0002-single-agent-connectors.md)). Every crate is named with the `databastion-` prefix.
 
 ## Protocol & shared contract
 - **Source of truth**: `shared/protocol/openapi.yaml` (OpenAPI 3.1 + JSON Schema)
@@ -77,7 +78,9 @@ databastion/
 │   ├── crates/connector-postgres/
 │   ├── crates/connector-mysql/
 │   ├── crates/connector-mongodb/
-│   └── crates/connector-openldap/
+│   ├── crates/connector-openldap/
+│   ├── crates/connector-cas/
+│   └── crates/connector-redis/
 ├── shared/protocol/    # openapi.yaml + JSON Schemas + fixtures
 ├── deploy/             # docker-compose, later helm/
 ├── dev/                # dev environment: databases seeded with fake PII + ground truth

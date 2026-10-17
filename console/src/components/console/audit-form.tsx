@@ -11,8 +11,11 @@ import { userApi } from "./client-api";
 /**
  * Audit settings form of one target (admin, P4-C). Manual sensitive objects are typed one per line
  * as `database/schema/object: classifier, classifier` (or `database/object: ...` without schema):
- * `/` and `:` cannot appear in a normalized name, so the format is unambiguous. The server
- * validates everything again against the contract.
+ * `/` and `:` cannot appear in a normalized name, so the format is unambiguous. On Redis / Valkey
+ * targets (P9-E review M3) object names are key patterns, where `/` and `:` are separators: the
+ * line is `database; object; classifier, classifier`, split on `;` only (a character neither an
+ * `Identifier` nor a `KeyPattern` may hold), never on `/` or `:`. The server validates everything
+ * again against the contract.
  *
  * A change that disables Audit, empties the sensitive objects or removes many of them is refused
  * with `409 confirmation_required`: the form then shows what the change does and sends it again
@@ -28,13 +31,32 @@ export interface ManualObject {
 
 const LINE = /^([^/:]+)\/(?:([^/:]+)\/)?([^/:]+):(.+)$/;
 
-/** Parses the manual objects text; returns the 1-based number of the first malformed line. */
-export function parseManualObjects(text: string): { ok: true; objects: ManualObject[] } | { ok: false; line: number } {
+/** Manual object line of the key-pattern engines: `database; object; classifier, classifier`. */
+function parseKeyPatternLine(raw: string): ManualObject | null {
+  const parts = raw.split(";").map((p) => p.trim());
+  if (parts.length !== 3) return null;
+  const [database, object, list] = parts as [string, string, string];
+  const classifiers = [...new Set(list.split(",").map((c) => c.trim()).filter((c) => c !== ""))];
+  if (database === "" || object === "" || classifiers.length === 0) return null;
+  return { database, object, classifiers };
+}
+
+/**
+ * Parses the manual objects text; returns the 1-based number of the first malformed line.
+ * `keyPatterns`: the target's engine names objects with key patterns (Redis / Valkey).
+ */
+export function parseManualObjects(text: string, keyPatterns = false): { ok: true; objects: ManualObject[] } | { ok: false; line: number } {
   const objects: ManualObject[] = [];
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const raw = (lines[i] ?? "").trim();
     if (raw === "") continue;
+    if (keyPatterns) {
+      const o = parseKeyPatternLine(raw);
+      if (!o) return { ok: false, line: i + 1 };
+      objects.push(o);
+      continue;
+    }
     const m = LINE.exec(raw);
     const classifiers = [...new Set((m?.[4] ?? "").split(",").map((c) => c.trim()).filter((c) => c !== ""))];
     if (!m || classifiers.length === 0) return { ok: false, line: i + 1 };
@@ -45,7 +67,8 @@ export function parseManualObjects(text: string): { ok: true; objects: ManualObj
   return { ok: true, objects };
 }
 
-export function formatManualObjects(objects: readonly ManualObject[]): string {
+export function formatManualObjects(objects: readonly ManualObject[], keyPatterns = false): string {
+  if (keyPatterns) return objects.map((o) => `${o.database}; ${o.object}; ${o.classifiers.join(", ")}`).join("\n");
   return objects
     .map((o) => `${[o.database, o.schema, o.object].filter((x) => x !== undefined).join("/")}: ${o.classifiers.join(", ")}`)
     .join("\n");
@@ -80,6 +103,9 @@ export function confirmationText(r: Pick<Refusal, "warning" | "previous_objects"
   }
 }
 
+const MANUAL_FORMAT = "database/schema/object: classifier, classifier";
+const MANUAL_FORMAT_KEY_PATTERNS = "database; object; classifier, classifier";
+
 const ERRORS: Record<string, string> = {
   aggregation_window_s: "Aggregation window: 1 to 300 seconds.",
   poll_interval_s: "Polling interval: 1 to 3600 seconds.",
@@ -92,11 +118,14 @@ export function AuditForm({
   targetId,
   csrfToken,
   initial,
+  keyPatterns = false,
 }: {
   agentId: string;
   targetId: string;
   csrfToken: string;
   initial: AuditFormValues;
+  /** Redis / Valkey target: manual objects use the `;` format (see above). */
+  keyPatterns?: boolean;
 }) {
   const router = useRouter();
   const [message, setMessage] = useState<string | null>(null);
@@ -126,16 +155,20 @@ export function AuditForm({
       return;
     }
     const truncated = typeof json?.truncated_objects === "number" && json.truncated_objects > 0 ? ` ${json.truncated_objects} objects over the limit of 1000 were left out.` : "";
-    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}`);
+    const skipped =
+      typeof json?.skipped_key_patterns === "number" && json.skipped_key_patterns > 0
+        ? ` ${json.skipped_key_patterns} key-pattern objects with findings cannot be listed as sensitive objects yet and were left out.`
+        : "";
+    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}${skipped}`);
     router.refresh();
   }
 
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = new FormData(e.currentTarget);
-    const manual = parseManualObjects(String(form.get("manual_objects") ?? ""));
+    const manual = parseManualObjects(String(form.get("manual_objects") ?? ""), keyPatterns);
     if (!manual.ok) {
-      setMessage(`Sensitive objects, line ${manual.line}: expected database/schema/object: classifier, classifier`);
+      setMessage(`Sensitive objects, line ${manual.line}: expected ${keyPatterns ? MANUAL_FORMAT_KEY_PATTERNS : MANUAL_FORMAT}`);
       return;
     }
     const minRows = String(form.get("min_rows") ?? "").trim();
@@ -174,13 +207,13 @@ export function AuditForm({
         <Label htmlFor={id("derive")}>Sensitive objects from the Discovery findings (false positives excluded)</Label>
       </div>
       <div className="flex flex-col gap-1">
-        <Label htmlFor={id("manual")}>Other sensitive objects, one per line: database/schema/object: classifier, classifier</Label>
+        <Label htmlFor={id("manual")}>Other sensitive objects, one per line: {keyPatterns ? MANUAL_FORMAT_KEY_PATTERNS : MANUAL_FORMAT}</Label>
         <textarea
           id={id("manual")}
           name="manual_objects"
           rows={5}
           maxLength={200_000}
-          defaultValue={formatManualObjects(initial.manualObjects)}
+          defaultValue={formatManualObjects(initial.manualObjects, keyPatterns)}
           className="rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm"
         />
       </div>

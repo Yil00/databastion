@@ -45,12 +45,16 @@
 //! of its poll sessions on the same server run (another stream's, or this
 //! stream's before it reconnected) are dropped, as the poll text drops its
 //! own session's; the rows of its pinned Discovery sessions are
-//! attributed to the agent's identity.
+//! attributed to the agent's identity. A poll of its own poll sessions
+//! interrupted by `KILL QUERY` or the statement timeout (errno 1317 or
+//! 3024), kept by the server with a cut digest only, is dropped under the
+//! conditions of the ADR-0045 refinement of 2026-10-16
+//! ([`PsPoller::row_event`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use databastion_classifiers::masking::{ClientAddr, EventPrincipal, EventSource};
+use databastion_classifiers::masking::{ClientAddr, EventAction, EventPrincipal, EventSource};
 use databastion_core::audit::CursorStore;
 use databastion_core::audit::own::ClientSeen;
 use databastion_core::{EventSink, FailureCode};
@@ -323,6 +327,11 @@ pub(crate) struct PsPoller {
     own_addr: Option<ClientAddr>,
     /// Rows of the agent's ended poll sessions dropped.
     pub(crate) own_dropped: u64,
+    /// Rows of the agent's interrupted polls dropped (cut digests).
+    pub(crate) interrupted_dropped: u64,
+    /// This poller's session thread, as noted (marked ended when the
+    /// poller moves to another session or is dropped).
+    attached: Option<(ServerRun, u64)>,
     /// Rows attributed to the agent through a Discovery pin.
     pub(crate) pinned: u64,
 }
@@ -335,6 +344,9 @@ pub(crate) struct OwnSessions {
     pub(crate) poll_threads: SharedPollThreads,
     /// The Discovery pins of every target of the connector.
     pub(crate) pins: SharedPins,
+    /// The stream's statement timeout (an interrupted poll ends within it
+    /// after its session ended: ADR-0045 refinement of 2026-10-16).
+    pub(crate) statement_timeout: Duration,
 }
 
 /// How a statement row's session is seen (see [`PsPoller::identify`]).
@@ -455,6 +467,61 @@ async fn own_session(session: &mut Session, stage: Stage) -> Result<Option<OwnSe
     };
     Ok(rows.first().and_then(|r| own_row(r)))
 }
+
+/// Notes `own`, a poll session's thread, as one of the agent's poll
+/// sessions (`own_threads::PollThreads`), when its server run is known.
+fn note_poll_thread(poll_threads: &SharedPollThreads, own: &OwnSession, timeout: Duration) {
+    if let Some(run) = &own.run {
+        poll_threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .note(run, own.uptime, own.thread, timeout, SystemTime::now());
+    }
+}
+
+/// A poll thread noted by [`PsPoller::start`] before the poller exists:
+/// if `start` returns early or is dropped (its stream stopped) before it
+/// hands the thread to the poller, the thread's life ends then, so that an
+/// interrupted statement of it is matched only within that life
+/// (ADR-0045 refinement of 2026-10-16, condition 3; security review of
+/// the refinement, Low).
+struct NotedPollThread {
+    poll_threads: SharedPollThreads,
+    noted: Option<(ServerRun, u64)>,
+}
+
+impl NotedPollThread {
+    /// Notes `own` (see [`note_poll_thread`]) and guards it.
+    fn note(poll_threads: &SharedPollThreads, own: &OwnSession, timeout: Duration) -> Self {
+        note_poll_thread(poll_threads, own, timeout);
+        Self {
+            poll_threads: std::sync::Arc::clone(poll_threads),
+            noted: own.run.clone().map(|run| (run, own.thread)),
+        }
+    }
+
+    /// The poller takes the thread over (it ends its life when dropped).
+    fn into_attached(mut self) -> Option<(ServerRun, u64)> {
+        self.noted.take()
+    }
+}
+
+impl Drop for NotedPollThread {
+    fn drop(&mut self) {
+        if let Some((run, thread)) = self.noted.take() {
+            self.poll_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ended(&run, thread, SystemTime::now());
+        }
+    }
+}
+
+/// Errors of a statement interrupted by `KILL QUERY` (1317) or by MySQL's
+/// `max_execution_time` (3024): MySQL 8.4 keeps such a statement with no
+/// `SQL_TEXT`, its digest only (ADR-0045 refinement of 2026-10-16,
+/// condition 2).
+const INTERRUPTED_ERRNOS: [u32; 2] = [1317, 3024];
 
 /// Where polling resumes after a restart: `(last, seen, floor)`.
 type Resume = (Option<u64>, HashMap<(u64, u64), u64>, Option<u64>);
@@ -621,7 +688,11 @@ impl PsPoller {
         store: Option<CursorStore>,
         own: OwnSessions,
     ) -> Result<Self, MyError> {
+        // The thread is noted before any other statement: a stream dropped
+        // during the next ones (shutdown, reconfiguration) leaves its
+        // probes recognized by the other streams on the server.
         let attached = own_thread(session).await?;
+        let noted = NotedPollThread::note(&own.poll_threads, &attached, own.statement_timeout);
         let limit = parse_limit;
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         if text_limit_low(text_limit) {
@@ -653,7 +724,7 @@ impl PsPoller {
             }
             saved = None;
         }
-        let mut poller = Self {
+        Ok(Self {
             table,
             text_limit,
             digest_limit,
@@ -670,26 +741,37 @@ impl PsPoller {
             floor,
             saved,
             own,
-            run: None,
+            attached: noted.into_attached(),
+            run: attached.run,
             own_addr: None,
             own_dropped: 0,
+            interrupted_dropped: 0,
             pinned: 0,
-        };
-        poller.note_own(attached);
-        Ok(poller)
+        })
     }
 
     /// The poll session's server run, and its thread noted as one of the
     /// agent's poll sessions (`own_threads::PollThreads`).
     fn note_own(&mut self, own: OwnSession) {
-        if let Some(run) = &own.run {
+        let next = own.run.clone().map(|run| (run, own.thread));
+        if self.attached != next {
+            self.end_attached();
+        }
+        note_poll_thread(&self.own.poll_threads, &own, self.own.statement_timeout);
+        self.attached = next;
+        self.run = own.run;
+    }
+
+    /// The poll session noted last is no longer this poller's (closed,
+    /// replaced or dropped): its life ends now.
+    fn end_attached(&mut self) {
+        if let Some((run, thread)) = self.attached.take() {
             self.own
                 .poll_threads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note(run, own.uptime, own.thread);
+                .ended(&run, thread, SystemTime::now());
         }
-        self.run = own.run;
     }
 
     /// Saves the cursor when it moved (after the poll's events were handed
@@ -1033,6 +1115,7 @@ impl PsPoller {
                     .as_deref()
                     .is_some_and(|t| super::events::own_ps_shape(t))
         };
+        let interrupted = self.interrupted_own_poll(r, ts);
         let (info, client, own_session) =
             match self.identify(r.thread, r.thread_info.as_ref(), own_poll, mono) {
                 Seen::Drop => {
@@ -1070,7 +1153,63 @@ impl PsPoller {
             source: EventSource::PerformanceSchema,
             own_session,
         };
-        convert(&mut self.builder, access, now)
+        let event = convert(&mut self.builder, access, now)?;
+        // Condition 6: a read with no signal (anything else on that thread
+        // takes the usual path).
+        if interrupted && event.as_ref().is_some_and(interrupted_droppable) {
+            self.interrupted_dropped = self.interrupted_dropped.saturating_add(1);
+            databastion_core::audit::count_interrupted_own_polls(1);
+            tracing::info!(
+                reason = "interrupted_own_poll",
+                "performance_schema row of an interrupted own poll dropped"
+            );
+            return Ok(None);
+        }
+        Ok(event)
+    }
+
+    /// Conditions 1 to 5 of the ADR-0045 refinement of 2026-10-16 for a
+    /// row whose only text is a cut digest: the agent's own poll, stopped
+    /// by `KILL QUERY` or the statement timeout. The row's thread is one
+    /// of the agent's poll sessions noted on this server run (never a pin,
+    /// never by the user name), its error says it was interrupted, it
+    /// ended within that session's life, its digest is a prefix of a poll
+    /// or stats text, and its session has ended or has the agent's
+    /// account.
+    fn interrupted_own_poll(&self, r: &Row, ts: SystemTime) -> bool {
+        let Some(run) = &self.run else {
+            return false;
+        };
+        r.truncated
+            && r.digest
+            && INTERRUPTED_ERRNOS.contains(&r.errno)
+            && r.thread_info
+                .as_ref()
+                .is_none_or(|i| i.user == self.own.account)
+            && r.text
+                .as_deref()
+                .is_some_and(|t| super::events::own_poll_prefix(t))
+            && self
+                .own
+                .poll_threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .within_life(run, r.thread, ts)
+    }
+}
+
+/// Condition 6 of the ADR-0045 refinement of 2026-10-16: only a read with
+/// no signal is dropped; a write, DDL or DCL, or a read with a signal, on
+/// that thread takes the usual path.
+fn interrupted_droppable(e: &databastion_classifiers::masking::MaskedEvent) -> bool {
+    e.action() == EventAction::Read && e.signals().is_empty()
+}
+
+impl Drop for PsPoller {
+    /// The stream ended (stopped, failed, moved to another source or
+    /// table): its poll session's life ends now.
+    fn drop(&mut self) {
+        self.end_attached();
     }
 }
 
@@ -1436,10 +1575,13 @@ mod tests {
                     account: AGENT.to_owned(),
                     poll_threads: Arc::clone(&polls),
                     pins: Arc::clone(&pins),
+                    statement_timeout: Duration::from_secs(30),
                 },
+                attached: None,
                 run: poller_run,
                 own_addr,
                 own_dropped: 0,
+                interrupted_dropped: 0,
                 pinned: 0,
             };
             Fixture {
@@ -1520,7 +1662,13 @@ mod tests {
             let poll_text = crate::sql::ps_statements("events_statements_history_long", true);
             let mono = Instant::now();
             let mut f = fixture(Some(run(1_000_000)), addr());
-            f.polls.lock().unwrap().note(&run(1_000_001), 3600, 7);
+            f.polls.lock().unwrap().note(
+                &run(1_000_001),
+                3600,
+                7,
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
             // Ended, and still connected under the agent's account.
             assert!(event(&mut f, &row(7, &poll_text, 3, None), mono).is_none());
             assert!(event(&mut f, &row(7, &poll_text, 3, Some(info(AGENT))), mono).is_none());
@@ -1566,12 +1714,24 @@ mod tests {
             assert!(unidentified(&e) && e.always_report());
             // Another server run (restarted, or another server).
             let mut g = fixture(Some(run(1_000_100)), addr());
-            g.polls.lock().unwrap().note(&run(1_000_000), 3600, 7);
+            g.polls.lock().unwrap().note(
+                &run(1_000_000),
+                3600,
+                7,
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
             let e = event(&mut g, &row(7, &poll_text, 3, None), mono).unwrap();
             assert!(unidentified(&e));
             // The poll session's server run unknown: nothing dropped.
             let mut h = fixture(None, addr());
-            h.polls.lock().unwrap().note(&run(1_000_000), 3600, 7);
+            h.polls.lock().unwrap().note(
+                &run(1_000_000),
+                3600,
+                7,
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
             assert!(event(&mut h, &row(7, &poll_text, 3, None), mono).is_some());
             assert_eq!(h.poller.own_dropped, 0);
         }
@@ -1827,6 +1987,391 @@ mod tests {
             }
             assert!(own_row(&cells(&["x", "h", "3306", "1", "1", "1"])).is_none());
             assert!(own_row(&[]).is_none());
+        }
+
+        /// The CI failure of the own-sessions integration test (lot E
+        /// follow-up): a stream dropped while it starts (shutdown,
+        /// reconfiguration, a stream restarted) has noted its poll thread as
+        /// soon as it read it, not after the text-limit reads that follow,
+        /// so that the other streams on the server drop its own probes.
+        /// Starts a poller on a scripted session that answers the
+        /// own-thread probe (thread 90), then, with `close`, closes the
+        /// connection at the text-limit read (`start` returns an error),
+        /// else leaves it unanswered and drops `start`. The poll threads
+        /// and the server run.
+        async fn scripted_start(close: bool) -> (SharedPollThreads, ServerRun) {
+            use crate::conn::Flavor;
+            use crate::fake::{EOF, column_def};
+            use crate::proto::{PacketIo, put_lenenc};
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let target = databastion_core::AgentConfig::parse(
+                "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                 engine: mysql, host: 127.0.0.1, port: 9, account: databastion, \
+                 secret: {env: DATABASTION_TEST_UNSET_MY_SECRET}, mysql: {tls: disable}}]}",
+            )
+            .unwrap()
+            .targets[0]
+                .clone();
+            let mut session = Session::scripted(client, &target, Flavor::Mysql);
+            let (asked, asked_rx) = tokio::sync::oneshot::channel();
+            let srv = tokio::spawn(async move {
+                let mut io = PacketIo::new(server);
+                let q = io.read().await.unwrap();
+                assert_eq!(&q[1..], sql::ps_own_thread(Flavor::Mysql).as_bytes());
+                let cells = ["90", "db1", "3306", "1", "uuid-a", "1000000", "3600"];
+                io.write(&[7]).await.unwrap();
+                for i in 0..cells.len() {
+                    io.write(&column_def(format!("c{i}").as_bytes()))
+                        .await
+                        .unwrap();
+                }
+                io.write(&EOF).await.unwrap();
+                let mut row = Vec::new();
+                for c in cells {
+                    put_lenenc(&mut row, c.len() as u64);
+                    row.extend_from_slice(c.as_bytes());
+                }
+                io.write(&row).await.unwrap();
+                io.write(&EOF).await.unwrap();
+                io.reset_seq();
+                let q = io.read().await.unwrap();
+                assert_eq!(&q[1..], sql::PS_TEXT_LIMIT.as_bytes());
+                let _ = asked.send(());
+                if close {
+                    drop(io);
+                    return;
+                }
+                // No answer: the stream is dropped while it waits.
+                let _ = io.read().await;
+            });
+            let polls: SharedPollThreads = Arc::new(Mutex::new(PollThreads::default()));
+            let own = OwnSessions {
+                account: AGENT.to_owned(),
+                poll_threads: Arc::clone(&polls),
+                pins: Arc::new(Mutex::new(DiscoveryPins::default())),
+                statement_timeout: Duration::from_secs(30),
+            };
+            let builder = EventBuilder::new(OwnAccount::new(
+                AGENT,
+                Some(crate::audit::PROGRAM_NAME),
+                addr(),
+                BUDGET,
+                SharedOwnUsage::default(),
+            ));
+            let start = tokio::spawn(async move {
+                PsPoller::start(&mut session, PsTable::HistoryLong, builder, None, own)
+                    .await
+                    .is_ok()
+            });
+            asked_rx.await.unwrap();
+            if close {
+                assert!(!start.await.unwrap(), "start succeeded");
+            } else {
+                // Still waiting for the text limit: noted already.
+                start.abort();
+                assert!(start.await.unwrap_err().is_cancelled());
+            }
+            srv.await.unwrap();
+            let run = ServerRun::new(
+                &["db1", "3306", "1", "uuid-a"].map(|c| Some(c.to_owned())),
+                1_000_000,
+            )
+            .unwrap();
+            (polls, run)
+        }
+
+        #[tokio::test]
+        async fn the_poll_thread_is_noted_before_the_next_statement() {
+            let (polls, run) = scripted_start(false).await;
+            assert!(polls.lock().unwrap().contains(&run, 90));
+        }
+
+        /// Security review of the 2026-10-16 refinement, Low: a `start`
+        /// dropped, or returning early, after noting its poll thread ends
+        /// that thread's life (no poller exists to end it): an interrupted
+        /// statement of it is no longer matched past the statement
+        /// timeout and the slack.
+        #[tokio::test]
+        async fn a_start_dropped_or_failed_after_the_note_ends_the_life() {
+            let slack = crate::audit::own_threads::INTERRUPTED_SLACK;
+            for close in [false, true] {
+                let (polls, run) = scripted_start(close).await;
+                let p = polls.lock().unwrap();
+                assert!(p.contains(&run, 90), "{close}");
+                let now = SystemTime::now();
+                assert!(p.within_life(&run, 90, now), "{close}");
+                let past = now + Duration::from_secs(30) + slack + Duration::from_secs(2);
+                assert!(
+                    !p.within_life(&run, 90, past),
+                    "close {close}: life not ended"
+                );
+            }
+        }
+
+        /// The per-version digests of the poll and stats texts
+        /// (`testdata/poll_digests.tsv`): (server, table, digest).
+        fn poll_digests() -> Vec<(String, String, String)> {
+            include_str!("testdata/poll_digests.tsv")
+                .lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .map(|l| {
+                    let c: Vec<&str> = l.split('\t').collect();
+                    (c[0].to_owned(), c[2].to_owned(), c[4].to_owned())
+                })
+                .collect()
+        }
+
+        /// ADR-0045 refinement of 2026-10-16, condition 4: a cut digest
+        /// is a prefix of a poll or stats text, token for token, past its
+        /// outermost `FROM` and the table it names, on every measured
+        /// server; never the probes, the pin or the own-thread probe, nor
+        /// a text that goes on past the poll text or names another table.
+        #[test]
+        fn interrupted_poll_digests_are_prefixes_of_the_poll_texts() {
+            use crate::audit::events::own_poll_prefix;
+            let all = poll_digests();
+            assert_eq!(all.len(), 18);
+            for (server, table, digest) in &all {
+                assert!(own_poll_prefix(digest.as_bytes()), "{server} {table}");
+                let main = format!("FROM `performance_schema` . `{table}`");
+                let at = digest.rfind(&main).unwrap_or_else(|| panic!("{server}"));
+                // Cut right after the table: matched.
+                let after = &digest[..at + main.len()];
+                assert!(own_poll_prefix(after.as_bytes()), "{server} {table}");
+                // Cut before the table, or before `FROM`: not matched.
+                let before = digest[..at + main.len() - table.len() - 2].trim_end();
+                assert!(!own_poll_prefix(before.as_bytes()), "{server} {table}");
+                assert!(!own_poll_prefix(digest[..at].trim_end().as_bytes()));
+                // Another table in its place: not matched.
+                let other = format!(
+                    "{}FROM `hr` . `customers`{}",
+                    &digest[..at],
+                    &digest[at + main.len()..]
+                );
+                assert!(!own_poll_prefix(other.as_bytes()), "{server} {table}");
+                // A text that goes on past the poll text: not matched.
+                if !digest.contains("LIMIT ?") || digest.trim_end().ends_with("LIMIT ?") {
+                    let longer = format!(
+                        "{} UNION SELECT `email` FROM `hr` . `customers`",
+                        digest.trim_end()
+                    );
+                    assert!(!own_poll_prefix(longer.as_bytes()), "{server} {table}");
+                }
+                // A token changed in the middle: not matched.
+                let changed = digest.replacen("`TIMER_END`", "`SQL_TEXT`", 1);
+                assert!(!own_poll_prefix(changed.as_bytes()), "{server} {table}");
+            }
+            // Never the probes, the pin or the own-thread probe.
+            for flavor in [crate::conn::Flavor::Mysql, crate::conn::Flavor::Mariadb] {
+                assert!(!own_poll_prefix(sql::ps_own_pin(flavor).as_bytes()));
+                assert!(!own_poll_prefix(sql::ps_own_thread(flavor).as_bytes()));
+            }
+            for probe in [
+                sql::PS_HISTORY_LONG,
+                sql::PS_HISTORY,
+                sql::PS_CURRENT,
+                sql::PS_CONSUMERS,
+                sql::PS_OWN_THREAD_ID,
+            ] {
+                assert!(!own_poll_prefix(probe.as_bytes()), "{probe}");
+            }
+            // A text that does not lex.
+            assert!(!own_poll_prefix(b"SELECT `h"));
+        }
+
+        /// The killed poll of the CI failure (MySQL 8.4.11): its digest
+        /// cut at the server's limit, `SQL_TEXT` gone, errno 1317, no
+        /// current schema.
+        fn interrupted_row(thread: u64, errno: u32) -> Row {
+            let digest = poll_digests()
+                .into_iter()
+                .find(|(s, t, d)| {
+                    s == "mysql-8.4.11"
+                        && t == "events_statements_history_long"
+                        && d.contains("session_connect_attrs")
+                })
+                .unwrap()
+                .2;
+            let mut r = digest_row(thread, &digest, 0);
+            r.truncated = true;
+            r.errno = errno;
+            r.schema = String::new();
+            r
+        }
+
+        fn noted(f: &Fixture, thread: u64) {
+            f.polls.lock().unwrap().note(
+                &run(1_000_000),
+                3600,
+                thread,
+                Duration::from_secs(30),
+                SystemTime::now(),
+            );
+        }
+
+        /// ADR-0045 refinement of 2026-10-16: the cut digest of an
+        /// interrupted poll of the agent's own poll session is dropped,
+        /// counted; each condition missing takes the usual path.
+        #[test]
+        fn interrupted_own_polls_are_dropped_on_every_condition_only() {
+            let mono = Instant::now();
+            let now = SystemTime::now();
+            #[track_caller]
+            fn reported_at(f: &mut Fixture, r: &Row, ts: SystemTime, mono: Instant) -> MaskedEvent {
+                let now = ts.max(SystemTime::now());
+                f.poller.row_event(r, ts, mono, now).unwrap().unwrap()
+            }
+            macro_rules! reported {
+                ($f:expr, $r:expr, $ts:expr) => {
+                    reported_at($f, $r, $ts, mono)
+                };
+            }
+            // Dropped: 1317 and 3024, ended or under the agent's account.
+            let mut f = fixture(Some(run(1_000_000)), addr());
+            noted(&f, 7);
+            for errno in [1317, 3024] {
+                assert!(event(&mut f, &interrupted_row(7, errno), mono).is_none());
+            }
+            assert_eq!(f.poller.interrupted_dropped, 2);
+            assert_eq!(f.poller.own_dropped, 0);
+            // 2. Not interrupted (a cut digest alone, or MariaDB's
+            // max_statement_time error): reported.
+            for errno in [0, 1969] {
+                let e = reported!(&mut f, &interrupted_row(7, errno), now);
+                assert!(unidentified(&e) && e.always_report(), "{errno}");
+            }
+            // 1. Not one of the agent's poll threads: another thread, a
+            // pinned Discovery thread, another server run, no run known.
+            let e = reported!(&mut f, &interrupted_row(8, 1317), now);
+            assert!(unidentified(&e) && e.always_report());
+            pinned(&f, AGENT, mono);
+            let e = reported!(&mut f, &interrupted_row(9, 1317), now);
+            assert_eq!(e.principal().account_name(), AGENT);
+            assert!(e.always_report());
+            let mut h = fixture(Some(run(1_000_100)), addr());
+            h.polls
+                .lock()
+                .unwrap()
+                .note(&run(1_000_000), 3600, 7, Duration::from_secs(30), now);
+            assert!(unidentified(&reported!(
+                &mut h,
+                &interrupted_row(7, 1317),
+                now
+            )));
+            let mut k = fixture(None, addr());
+            noted(&k, 7);
+            assert!(unidentified(&reported!(
+                &mut k,
+                &interrupted_row(7, 1317),
+                now
+            )));
+            // 5. Still connected under the agent's account (a sibling's
+            // session): dropped; under another account: that account's.
+            let mut l = fixture(Some(run(1_000_000)), addr());
+            noted(&l, 7);
+            let mut live = interrupted_row(7, 1317);
+            live.thread_info = Some(info(AGENT));
+            assert!(event(&mut l, &live, mono).is_none());
+            assert_eq!(l.poller.interrupted_dropped, 1);
+            let mut o = fixture(Some(run(1_000_000)), addr());
+            noted(&o, 7);
+            let mut other = interrupted_row(7, 1317);
+            other.thread_info = Some(info("app"));
+            let e = reported!(&mut o, &other, now);
+            assert_eq!(e.principal().account_name(), "app");
+            assert_eq!(o.poller.interrupted_dropped, 0);
+            // 4. Not a prefix of a poll text past its table: the pin, the
+            // own-thread probe, a cut before the table.
+            for text in [
+                sql::ps_own_pin(crate::conn::Flavor::Mysql),
+                sql::ps_own_thread(crate::conn::Flavor::Mysql),
+                "SELECT `h` . `THREAD_ID` , `h` . `EVENT_ID` FROM".to_owned(),
+            ] {
+                let mut r = interrupted_row(7, 1317);
+                r.text = Some(Zeroizing::new(text.into_bytes()));
+                assert!(unidentified(&reported!(&mut f, &r, now)));
+            }
+            // Not cut, or not a digest: the usual rules.
+            let mut whole = interrupted_row(7, 1317);
+            whole.truncated = false;
+            assert!(unidentified(&reported!(&mut f, &whole, now)));
+            let mut sql_text = interrupted_row(7, 1317);
+            sql_text.digest = false;
+            assert!(unidentified(&reported!(&mut f, &sql_text, now)));
+            // 3. Outside the session's life: ended, then past the
+            // statement timeout and the slack; or before its note.
+            let mut t = fixture(Some(run(1_000_000)), addr());
+            noted(&t, 7);
+            t.polls.lock().unwrap().ended(&run(1_000_000), 7, now);
+            let edge = now + Duration::from_secs(30) + crate::audit::own_threads::INTERRUPTED_SLACK;
+            assert!(
+                t.poller
+                    .row_event(&interrupted_row(7, 1317), edge, mono, edge)
+                    .unwrap()
+                    .is_none()
+            );
+            let late = edge + Duration::from_secs(1);
+            assert!(unidentified(&reported!(
+                &mut t,
+                &interrupted_row(7, 1317),
+                late
+            )));
+            let early = now - Duration::from_secs(6);
+            assert!(unidentified(&reported!(
+                &mut t,
+                &interrupted_row(7, 1317),
+                early
+            )));
+            assert_eq!(f.poller.interrupted_dropped, 2);
+            assert_eq!(t.poller.interrupted_dropped, 1);
+        }
+
+        /// Condition 6: only a read with no signal is dropped.
+        #[test]
+        fn only_a_read_with_no_signal_is_an_interrupted_poll() {
+            use databastion_classifiers::masking::Signal;
+            let e = |action| {
+                MaskedEvent::new(
+                    EventSource::PerformanceSchema,
+                    action,
+                    EventPrincipal::unidentified(),
+                    SystemTime::now(),
+                )
+            };
+            assert!(interrupted_droppable(&e(EventAction::Read)));
+            assert!(!interrupted_droppable(
+                &e(EventAction::Read).with_signal(Signal::FullTableRead)
+            ));
+            for action in [EventAction::Write, EventAction::Ddl, EventAction::Dcl] {
+                assert!(!interrupted_droppable(&e(action)), "{action:?}");
+            }
+        }
+
+        /// A poller that moves to another session, or is dropped, ends
+        /// its poll session's life.
+        #[test]
+        fn a_dropped_poller_ends_its_poll_session() {
+            let f = fixture(Some(run(1_000_000)), addr());
+            let Fixture {
+                mut poller, polls, ..
+            } = f;
+            poller.note_own(OwnSession {
+                thread: 7,
+                run: Some(run(1_000_000)),
+                uptime: 3600,
+            });
+            let later = SystemTime::now() + Duration::from_secs(600);
+            assert!(polls.lock().unwrap().within_life(&run(1_000_000), 7, later));
+            poller.note_own(OwnSession {
+                thread: 8,
+                run: Some(run(1_000_000)),
+                uptime: 3600,
+            });
+            assert!(!polls.lock().unwrap().within_life(&run(1_000_000), 7, later));
+            assert!(polls.lock().unwrap().within_life(&run(1_000_000), 8, later));
+            drop(poller);
+            assert!(!polls.lock().unwrap().within_life(&run(1_000_000), 8, later));
+            assert!(polls.lock().unwrap().contains(&run(1_000_000), 8));
         }
 
         /// A session seen while connected is remembered first: an ended

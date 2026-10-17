@@ -1,0 +1,102 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1c",
+  "events": [
+    {
+      "target_id": "mssql-prod",
+      "ts": "2026-10-14T09:01:00Z",
+      "principal": {
+        "db_user": "etl_reader",
+        "client_addr": "198.51.100.20",
+        "application": "bcp"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "sales",
+          "object": "Customers"
+        }
+      ],
+      "rows": 250000,
+      "signals": [
+        "shape.full_table_read",
+        "signature.bcp",
+        "volume.large_result"
+      ],
+      "source": "sqlserver_xevents",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "mssql-prod",
+      "ts": "2026-10-14T09:05:00Z",
+      "principal": {
+        "db_user": "dba_ops",
+        "client_addr": "198.51.100.21"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.backup_database"
+      ],
+      "source": "sqlserver_audit",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "mssql-prod",
+      "ts": "2026-10-14T09:06:00Z",
+      "principal": {
+        "db_user": "app_rw",
+        "client_addr": "198.51.100.22",
+        "application": "SQLCMD"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.remote_data_access"
+      ],
+      "source": "sqlserver_audit",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "mssql-prod",
+      "ts": "2026-10-14T09:07:00Z",
+      "ts_last": "2026-10-14T09:08:00Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        "client_addr": "203.0.113.9"
+      },
+      "action": "auth_failure",
+      "objects": [],
+      "source": "sqlserver_audit",
+      "aggregated_count": 7
+    },
+    {
+      "target_id": "mssql-2019",
+      "ts": "2026-10-14T09:09:00Z",
+      "principal": {
+        "db_user": "report"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "sales",
+          "object": "Orders"
+        }
+      ],
+      "rows": 120,
+      "source": "sqlserver_query_stats",
+      "aggregated_count": 3
+    }
+  ]
+}

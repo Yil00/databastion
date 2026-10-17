@@ -93,19 +93,44 @@ export function parseStoredNotes(v: unknown): StoredTargetNote[] {
 
 /** PostgreSQL role attributes, shown in upper case as in `CREATE ROLE`. */
 const ROLE_ATTRIBUTES = new Set(["superuser", "bypassrls", "replication", "createrole", "createdb"]);
-/** Labels shown as sent: predefined roles, audit collection states, check stages, `other`. */
-const VERBATIM = /^(pg_|stage_)|^(logging_on|logging_off|file_output|non_file_output|other)$/;
+/**
+ * Labels shown as sent: predefined roles, audit collection states, check stages, `other`; SQL
+ * Server fixed database roles (`db_owner`…) and check probes (revisions
+ * `target_status.note_labels.2026_10` and `2026_10_b`).
+ */
+const VERBATIM =
+  /^(pg_|stage_|db_)|^(logging_on|logging_off|file_output|non_file_output|other|password_hash_probe|logon_trigger_probe|refusal_list_probe|cas_store_guard_probe)$/;
+/** SQL Server fixed server roles, shown in lower case as SQL Server names them. */
+const SQL_SERVER_FIXED_SERVER_ROLES = new Set([
+  "sysadmin",
+  "securityadmin",
+  "serveradmin",
+  "setupadmin",
+  "processadmin",
+  "diskadmin",
+  "dbcreator",
+  "bulkadmin",
+]);
 
 /**
  * Display name of a note label. A contract `TargetNoteLabel`: PostgreSQL role attributes in upper
  * case (`BYPASSRLS`); MySQL / MariaDB privileges in upper case with spaces (`ALTER ROUTINE`,
- * `BINLOG ADMIN`); predefined roles, audit states, check stages and `other` as sent. A label that is
- * not a contract value (e.g. stored by a newer console build) is shown raw.
+ * `BINLOG ADMIN`); predefined roles, audit states, check stages and `other` as sent. SQL Server
+ * (revision `target_status.note_labels.2026_10`, ADR-0051 decision 4): fixed server and database
+ * roles as SQL Server names them (`sysadmin`, `db_owner`), the SQL Server 2022 roles in their
+ * `##MS_…##` form (`ms_login_manager` -> `##MS_LoginManager##`), permissions in upper case with
+ * spaces (`CONTROL SERVER`, `ALTER ANY EVENT SESSION`; revision `2026_10_b`: `ALTER ANY DATABASE
+ * EVENT SESSION`), check probes as sent (`logon_trigger_probe`). A label that is not a contract value (e.g.
+ * stored by a newer console build) is shown raw.
  */
 export function labelDisplayName(label: string): string {
   if (!validateSchema("TargetNoteLabel", label).ok) return label;
   if (ROLE_ATTRIBUTES.has(label)) return label.toUpperCase();
-  if (VERBATIM.test(label)) return label;
+  if (VERBATIM.test(label) || SQL_SERVER_FIXED_SERVER_ROLES.has(label)) return label;
+  if (label.startsWith("ms_")) {
+    const words = label.slice("ms_".length).split("_");
+    return `##MS_${words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("")}##`;
+  }
   return label.replace(/_/g, " ").toUpperCase();
 }
 

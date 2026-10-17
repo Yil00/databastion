@@ -10,12 +10,16 @@ import {
   fingerprintTitle,
   isAggregatePrincipal,
   isCasEngine,
+  isKeyPatternEngine,
   isLdapEngine,
   locationPartLabels,
   shortFingerprint,
+  UNRECORDED_PRINCIPAL_TITLE,
 } from "@/lib/location-labels";
 import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
+
+import { KeyPatternText } from "./key-pattern";
 
 /**
  * Access events view parts (server components). Every agent-provided string (principal,
@@ -29,6 +33,8 @@ import type { EventView, PrincipalView } from "@/server/events";
  * commas; `*` is an object class the log does not tell (no sensitive object reachable).
  * CAS (ADR-0041 decision 7): `service <name> (<type>)` for a ticket issued to an application (`*`:
  * no registry entry recognized), `service registry` for a change of the registry itself.
+ * Redis / Valkey (ADR-0052 decision 7): `key pattern <pattern> in <db>`, never joined with `.`
+ * (a key-pattern separator). Plain text, rendered as a text node: never a link.
  */
 export function objectsLabel(objects: EventView["objects"], max = 3, engine: string | null = null): string {
   const ldap = isLdapEngine(engine);
@@ -38,10 +44,32 @@ export function objectsLabel(objects: EventView["objects"], max = 3, engine: str
       ? `${l.object} ${o.object} in ${o.schema !== undefined ? `${l.schema} ${o.schema}` : `${l.database} ${o.database}`}`
       : isCasEngine(engine)
         ? casObjectLabel(o)
-        : [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."),
+        : isKeyPatternEngine(engine)
+          ? `${l.object} ${o.object} in ${o.database}`
+          : [o.database, o.schema, o.object].filter((x) => x !== undefined).join("."),
   );
   const sep = ldap ? "; " : ", ";
   return names.length > max ? `${names.slice(0, max).join(sep)} and ${names.length - max} more` : names.join(sep);
+}
+
+/**
+ * The objects cell of an event: Redis / Valkey key patterns as inline code with their database
+ * (contract `KeyPattern` rendering rule: escaped text, never a link); other engines as
+ * {@link objectsLabel}.
+ */
+export function ObjectsCell({ objects, engine, max = 3 }: { objects: EventView["objects"]; engine: string | null; max?: number }) {
+  if (!isKeyPatternEngine(engine)) return <>{objectsLabel(objects, max, engine)}</>;
+  const shown = objects.slice(0, max);
+  return (
+    <ul className="flex flex-col gap-0.5">
+      {shown.map((o, i) => (
+        <li key={i}>
+          <KeyPatternText value={o.object} /> <span className="text-muted-foreground">in {o.database}</span>
+        </li>
+      ))}
+      {objects.length > max && <li className="text-muted-foreground">and {objects.length - max} more</li>}
+    </ul>
+  );
 }
 
 function casObjectLabel(o: EventView["objects"][number]): string {
@@ -95,9 +123,27 @@ export function SignalBadge({ signal }: { signal: string }) {
  * A principal: the account name (or, OpenLDAP, the DN sent in clear), or a fingerprint. A
  * fingerprint is never shown as if it were a name: labelled, shortened in a monospace font, with
  * what it is and its full value in the tooltip. The CAS `*` aggregate is shown as "several
- * accounts", never as an account named `*`.
+ * accounts", never as an account named `*`. An event without a recorded account (Redis / Valkey,
+ * contract `Principal.account_not_recorded`) is shown as "account not recorded".
  */
-export function PrincipalLabel({ principal, fingerprinted, engine = null }: { principal: string; fingerprinted: boolean; engine?: string | null }) {
+export function PrincipalLabel({
+  principal,
+  fingerprinted,
+  engine = null,
+  notRecorded = false,
+}: {
+  principal: string;
+  fingerprinted: boolean;
+  engine?: string | null;
+  notRecorded?: boolean;
+}) {
+  if (notRecorded) {
+    return (
+      <span title={UNRECORDED_PRINCIPAL_TITLE} data-unrecorded-principal="" className="text-muted-foreground">
+        account not recorded
+      </span>
+    );
+  }
   if (!fingerprinted && isAggregatePrincipal(principal, engine)) {
     return (
       <span title={AGGREGATE_PRINCIPAL_TITLE} data-aggregate-principal="">
@@ -145,16 +191,26 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
               <div className="text-xs text-muted-foreground">{e.source}</div>
             </TableCell>
             <TableCell className="max-w-48 whitespace-normal">
-              <Link className="hover:underline" prefetch={false} href={principalHref(e.agentId, e.targetId, e.principalKey)}>
-                <PrincipalLabel principal={e.principal} fingerprinted={e.fingerprinted} engine={e.engine} />
-              </Link>
+              {e.accountNotRecorded ? (
+                // No baseline is built for these events (ADR-0052 decision 8): the link lists the
+                // events of the same client network instead of a principal page.
+                <Link className="hover:underline" prefetch={false} href={eventsHref({ agent: e.agentId, target: e.targetId, principal: e.principalKey })}>
+                  <PrincipalLabel principal={e.principal} fingerprinted={false} engine={e.engine} notRecorded />
+                </Link>
+              ) : (
+                <Link className="hover:underline" prefetch={false} href={principalHref(e.agentId, e.targetId, e.principalKey)}>
+                  <PrincipalLabel principal={e.principal} fingerprinted={e.fingerprinted} engine={e.engine} />
+                </Link>
+              )}
             </TableCell>
             <TableCell className="max-w-40 break-all whitespace-normal text-xs">
               {e.clientAddr ?? ""}
               {e.application ? <div className="text-muted-foreground">{e.application}</div> : null}
             </TableCell>
             <TableCell>{e.action}</TableCell>
-            <TableCell className="max-w-64 break-all whitespace-normal text-xs">{objectsLabel(e.objects, 3, e.engine)}</TableCell>
+            <TableCell className="max-w-64 break-all whitespace-normal text-xs">
+              <ObjectsCell objects={e.objects} engine={e.engine} />
+            </TableCell>
             <TableCell>
               {formatCount(e.rows)}
               {e.bytes !== null && (

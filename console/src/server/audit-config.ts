@@ -98,7 +98,13 @@ export function parseAuditConfigInput(v: unknown): { ok: true; value: AuditConfi
   };
 }
 
-/** Identity of a sensitive object (database, schema, object). */
+/**
+ * Identity of a sensitive object (database, schema, object), exact on purpose (end-of-phase-9
+ * review N1): the agent matches `sensitive_objects` without case or trailing spaces, so the
+ * spelling sent never narrows its filter, and keeping every catalog spelling (`Customers` next to
+ * `customers`, distinct tables on PostgreSQL) keeps both for an agent that still compares
+ * exactly. Merging spellings would only save list slots.
+ */
 export function objectIdentity(o: Pick<SensitiveObject, "database" | "schema" | "object">): string {
   return JSON.stringify([o.database, o.schema ?? null, o.object]);
 }
@@ -133,6 +139,18 @@ export async function deriveSensitiveObjects(db: Database | Tx, agentId: string,
     classifiers: [...new Set(hits.map((h) => h.classifier))].sort().slice(0, MAX_OBJECT_CLASSIFIERS),
     sensitivity: objectSensitivity(hits),
   }));
+}
+
+/**
+ * Derived objects the contract can carry as `SensitiveObject`s (P9-E review M3): `object` must be
+ * an `Identifier`. A Redis / Valkey finding names a key pattern (`user:*:email`), which is not
+ * one: such objects are left out (counted in `skipped`), so the save never fails and Audit can
+ * always be turned off. Follow-up: a contract change making `SensitiveObject.object` an
+ * `ObjectName` checked against the target's engine (as `ObjectRef`).
+ */
+export function sendableDerivedObjects<T extends SensitiveObject>(derived: readonly T[]): { objects: T[]; skipped: number } {
+  const objects = derived.filter((o) => validateSchema("Identifier", o.object).ok);
+  return { objects, skipped: derived.length - objects.length };
 }
 
 /**
@@ -286,9 +304,9 @@ export async function auditSummaries(db: Database, agentId: string): Promise<Map
 }
 
 export type AuditConfigureOutcome =
-  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number }
+  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number }
   /** A narrowing change without (or with an outdated) confirmation: nothing is queued. */
-  | { outcome: "confirmation_required"; change: AuditChange; digest: string; truncated: number }
+  | { outcome: "confirmation_required"; change: AuditChange; digest: string; truncated: number; skippedKeyPatterns: number }
   | { outcome: "not_found" }
   | { outcome: "invalid" };
 
@@ -320,9 +338,13 @@ export async function configureAudit(
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
-    const derived = input.deriveFromFindings ? await deriveSensitiveObjects(tx, agentId, targetId) : [];
+    // Key-pattern objects (Redis / Valkey findings) are not `SensitiveObject`s yet: left out (M3).
+    const { objects: derived, skipped: skippedKeyPatterns } = sendableDerivedObjects(
+      input.deriveFromFindings ? await deriveSensitiveObjects(tx, agentId, targetId) : [],
+    );
     const { objects, truncated } = mergeSensitiveObjects(derived, input.manualObjects);
-    const params = buildAuditParams(input, objects);
+    // Turning Audit off always works (M3): the objects are only a hint while it is off.
+    const params = buildAuditParams(input, objects) ?? (input.enabled ? null : buildAuditParams(input, []));
     if (!params) return { outcome: "invalid" };
     const [previous] = await tx
       .select({ enabled: auditConfigs.enabled, sentObjects: auditConfigs.sentObjects })
@@ -335,7 +357,7 @@ export async function configureAudit(
     );
     const digest = settingsDigest(params);
     if (change.warning !== null && input.confirm !== digest) {
-      return { outcome: "confirmation_required", change, digest, truncated };
+      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
     await tx
@@ -372,10 +394,10 @@ export async function configureAudit(
       targetType: "job",
       targetId: job.id,
       sourceIp: actor.ip,
-      details: auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
+      details: { ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true), skipped_key_patterns: skippedKeyPatterns },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
-    return { outcome: "queued", jobId: job.id, change, truncated };
+    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns };
   });
   if (result.outcome !== "queued") {
     await writeAudit(db, {

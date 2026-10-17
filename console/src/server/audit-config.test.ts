@@ -87,6 +87,17 @@ describe("audit settings model", () => {
     expect(many.objects[0]?.object).toBe(`t${MAX_SENSITIVE_OBJECTS + 4}`);
   });
 
+  it("keeps every spelling of an object as Discovery or the administrator wrote it (N1: the agent matches without case)", () => {
+    const derived = [
+      { ...obj("Customers", ["pii.email"]), sensitivity: 3 },
+      { ...obj("customers", ["pii.iban"]), sensitivity: 7 },
+    ];
+    const { objects } = mergeSensitiveObjects(derived, [obj("customers", ["pii.phone"]), obj("CUSTOMERS", ["pii.phone"])]);
+    expect(objects.map((o) => o.object)).toEqual(["CUSTOMERS", "customers", "Customers"]);
+    expect(objects[1]?.classifiers).toEqual(["pii.iban", "pii.phone"]);
+    expect(objects[2]?.classifiers).toEqual(["pii.email"]);
+  });
+
   it("flags a change that disables Audit, empties the list or removes many objects", () => {
     const on = (objects: SensitiveObject[]) => ({ enabled: true, objects });
     // First configuration: never a warning.
@@ -285,6 +296,51 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect((await configure(auth, { enabled: false, manual_objects: manual.slice(0, 10), confirm: d.digest })).status).toBe(202);
     const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
     expect(row).toMatchObject({ enabled: false, warning: "disabled" });
+  });
+
+  it("P9-E review M3: on a Redis target, key-pattern findings are left out of the settings, never failing the save; turning Audit off works", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "redis"],
+      targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    await enqueueJob(getDb(), {
+      agentId: auth.agentId,
+      type: "discovery.scan",
+      targetId: "cache-redis",
+      classifiersVersion: "2026.09.1",
+      params: { sample_rows: 200, max_duration_s: 900 },
+    });
+    const { jobs: list } = (await (await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).json()) as { jobs: { job_id: string }[] };
+    const redisFinding = (object: string) => ({
+      target_id: "cache-redis",
+      location: { engine: "redis", database: "db0", schema: "hash", object, field: "email" },
+      classifier: "pii.email",
+      confidence: 0.9,
+      sampled: 100,
+      matched: 50,
+    });
+    const body = { batch_id: uuidv7(), job_id: list[0]?.job_id, classifiers_version: "2026.09.1", findings: [redisFinding("user:*:profile"), redisFinding("profiles")] };
+    expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+    const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
+    expect(on.status).toBe(202);
+    expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
+    const [job] = await auditJobs(auth.agentId);
+    expect(job?.params).toMatchObject({ enabled: true, sensitive_objects: [{ database: "db0", schema: "hash", object: "profiles", classifiers: ["pii.email"] }] });
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ derived_objects: 1, skipped_key_patterns: 1 });
+    // Turning Audit off: confirmation, then queued.
+    const off = await configure(auth, { enabled: false }, { target: "cache-redis" });
+    expect(off.status).toBe(409);
+    const d = (await off.json()) as { digest: string };
+    expect((await configure(auth, { enabled: false, confirm: d.digest }, { target: "cache-redis" })).status).toBe(202);
+    const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
+    expect(row).toMatchObject({ enabled: false });
+    // A key pattern typed by hand is still refused (not a SensitiveObject yet).
+    const manual = await configure(auth, { enabled: true, manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }] }, { target: "cache-redis" });
+    expect(manual.status).toBe(400);
   });
 
   it("supersedes the settings jobs not delivered yet", async () => {

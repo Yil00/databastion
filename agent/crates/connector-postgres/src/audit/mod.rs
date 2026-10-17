@@ -132,6 +132,8 @@ struct PgauditState {
     format: Format,
     builder: events::PgauditEvents,
     reported_oversized: u64,
+    /// csvlog records with inconsistent quotes already reported.
+    reported_malformed: u64,
 }
 
 /// `Connector::audit_stream` for PostgreSQL.
@@ -186,6 +188,7 @@ pub(crate) async fn audit_stream(
                                 cfg, target, &pre, state,
                             )),
                             reported_oversized: 0,
+                            reported_malformed: 0,
                         })
                     }
                 };
@@ -350,6 +353,15 @@ async fn pgaudit_run(
                 "oversized log records skipped"
             );
             st.reported_oversized = t.oversized;
+        }
+        if t.malformed() > st.reported_malformed {
+            state.note_dropped(&target.id, t.malformed() - st.reported_malformed);
+            tracing::warn!(
+                target_id = %target.id,
+                dropped = t.malformed() - st.reported_malformed,
+                "csvlog records with inconsistent quotes dropped (damaged log)"
+            );
+            st.reported_malformed = t.malformed();
         }
         let panicked_before = st.builder.panicked;
         let events = st.builder.convert_entries(entries, SystemTime::now());

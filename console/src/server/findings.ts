@@ -388,6 +388,7 @@ function filterWhere(filter: FindingFilter): SQL | undefined {
   if (filter.agentId) conds.push(eq(findings.agentId, filter.agentId));
   if (filter.targetId) conds.push(eq(findings.targetId, filter.targetId));
   if (filter.classifier) conds.push(eq(findings.classifier, filter.classifier));
+  if (filter.engine) conds.push(eq(findings.engine, filter.engine));
   if (!filter.includeFalsePositives) conds.push(isNull(findings.falsePositiveAt));
   return conds.length > 0 ? and(...conds) : undefined;
 }

@@ -140,9 +140,10 @@ impl OwnUsage {
     /// objects are taken.
     fn merge(&mut self, file: OwnFile, current: u64) {
         for (key, hours) in file.o {
-            // Files written before keys were lowercased: folded the same
-            // way, so a restart after the upgrade keeps the charges.
-            let key = key.to_lowercase();
+            // Files written before keys were folded (lowercased, or with a
+            // final sigma): folded the same way as `budget_key`, so a
+            // restart after the upgrade keeps the charges.
+            let key = databastion_classifiers::names::fold_case(&key);
             if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
                 break;
             }
@@ -306,7 +307,8 @@ fn attach_and_flush(usage: &SharedOwnUsage, store: CursorStore, every: Duration)
 /// statements can be (one statement may have sent every row, each other
 /// none), so one large call cannot hide many empty ones (security review
 /// of #197, L2a: one call of 500 rows and 500 empty calls cost 1000).
-fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
+#[must_use]
+pub fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
     let calls = e.aggregated_count().max(1);
     e.rows()
         .map_or(budget, |r| r.max(1).saturating_add(calls - 1))
@@ -320,11 +322,12 @@ fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
 /// one budget. Two objects that really differ by case then share it too,
 /// which only reports sooner (fails closed).
 fn budget_key(database: &str, schema: &str, object: &str) -> String {
+    use databastion_classifiers::names::fold_case;
     format!(
         "{}\u{0}{}\u{0}{}",
-        database.to_lowercase(),
-        schema.to_lowercase(),
-        object.to_lowercase()
+        fold_case(database),
+        fold_case(schema),
+        fold_case(object)
     )
 }
 
@@ -397,9 +400,9 @@ impl OwnAccount {
         self.addr = addr;
     }
 
-    /// Charges `rows` to an object; `true` when its 24 h total exceeds the
-    /// budget (or it cannot be tracked).
-    fn charge(&mut self, key: String, rows: u64, now: Instant) -> bool {
+    /// Charges `rows` to an object; `true` when its 24 h total exceeds
+    /// `budget` (or it cannot be tracked).
+    fn charge(&mut self, key: String, rows: u64, now: Instant, budget: u64) -> bool {
         let mut guard = self
             .usage
             .lock()
@@ -432,7 +435,7 @@ impl OwnAccount {
         let total = buckets
             .iter()
             .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
-        total > self.budget
+        total > budget
     }
 
     /// Whether an event may be left out: the agent's account, its
@@ -443,7 +446,9 @@ impl OwnAccount {
     /// charged the whole budget, and every statement at least one row:
     /// [`charged_rows`]). The rows are charged whenever the account is the
     /// agent's. When the agent's own address is unknown, nothing is left
-    /// out.
+    /// out. An event whose objects overflowed the event's bound
+    /// (`MaskedEvent::objects_overflowed`) is never left out: the objects
+    /// it could not name were not charged.
     pub fn routine(
         &mut self,
         user: &str,
@@ -452,12 +457,38 @@ impl OwnAccount {
         e: &MaskedEvent,
         now: Instant,
     ) -> bool {
+        let budget = self.budget;
+        self.routine_within(user, application, client, e, now, budget)
+    }
+
+    /// The budget of [`OwnAccount::routine`] (`limits.max_sample_rows`).
+    #[must_use]
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// [`OwnAccount::routine`] with another per-object budget, for a
+    /// connector whose own sampling of one object may read more rows than
+    /// `limits.max_sample_rows` in one scan by an accepted rule (the
+    /// Redis / Valkey scale of ADR-0052, refinement of 2026-10-16). Every
+    /// other rule is the same; the charges go to the same counters.
+    /// A new caller, or a larger budget, needs an accepted ADR: only
+    /// `connector-redis` calls it today.
+    pub fn routine_within(
+        &mut self,
+        user: &str,
+        application: Option<&str>,
+        client: ClientSeen,
+        e: &MaskedEvent,
+        now: Instant,
+        budget: u64,
+    ) -> bool {
         // The agent only reads (I4): a write, DDL or DCL with its identity
         // is someone else using it, and is always reported.
         if user != self.account || !matches!(e.action(), EventAction::Read | EventAction::Connect) {
             return false;
         }
-        let rows = charged_rows(e, self.budget);
+        let rows = charged_rows(e, budget);
         let identity = self.identity(application, client);
         let mut over = false;
         for o in e.objects() {
@@ -466,12 +497,16 @@ impl OwnAccount {
                 o.schema().map_or("", |s| s.as_str()),
                 o.object().as_str(),
             );
-            over |= self.charge(key, rows, now);
+            over |= self.charge(key, rows, now, budget);
         }
         if !e.objects().is_empty() {
             self.lock_usage().persist(now, false);
         }
-        identity && e.signals().is_empty() && !over
+        // An event with more objects than it can name
+        // (`MaskedEvent::objects_overflowed`) has objects that were not
+        // charged: never left out under a budget (end-of-phase-9 review
+        // G7). The agent's own sampling statements name one object.
+        identity && e.signals().is_empty() && !over && !e.objects_overflowed()
     }
 
     /// Like [`OwnAccount::routine`] (account, application, address, no
@@ -654,13 +689,39 @@ mod tests {
         let mut o = own(Some("192.0.2.14"));
         let t0 = Instant::now();
         let key = || "shop\u{0}crm\u{0}t".to_owned();
-        assert!(!o.charge(key(), 600, t0));
+        assert!(!o.charge(key(), 600, t0, 1000));
         // An hour later (past any aggregation window): still counted.
-        assert!(o.charge(key(), 600, t0 + Duration::from_secs(3600)));
+        assert!(o.charge(key(), 600, t0 + Duration::from_secs(3600), 1000));
         // A day later: the first charges have aged out.
         let mut o = own(Some("192.0.2.14"));
-        assert!(!o.charge(key(), 600, t0));
-        assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600)));
+        assert!(!o.charge(key(), 600, t0, 1000));
+        assert!(!o.charge(key(), 600, t0 + Duration::from_secs(25 * 3600), 1000));
+    }
+
+    /// `routine_within` checks the same counters against the budget it is
+    /// given; `routine` against `limits.max_sample_rows`.
+    #[test]
+    fn routine_within_uses_its_own_budget_on_the_same_counters() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let usage = SharedOwnUsage::default();
+        let mut o = OwnAccount::new(
+            "databastion",
+            Some("databastion-agent"),
+            ClientAddr::parse("192.0.2.14"),
+            10,
+            std::sync::Arc::clone(&usage),
+        );
+        assert_eq!(o.budget(), 10);
+        let app = Some("databastion-agent");
+        assert!(o.routine_within("databastion", app, logged, &ev(Some(30)), now, 40));
+        // 30 charged: over the plain budget, within 40.
+        assert!(!o.routine("databastion", app, logged, &ev(Some(1)), now));
+        // 31 charged (the refused read is charged too), then 39, then 41.
+        assert!(o.routine_within("databastion", app, logged, &ev(Some(8)), now, 40));
+        assert!(!o.routine_within("databastion", app, logged, &ev(Some(2)), now, 40));
+        // The identity rules still apply.
+        assert!(!o.routine_within("cn=other", app, logged, &ev(Some(0)), now, u64::MAX));
     }
 
     /// A read that returns no row is charged one row (security review of
@@ -781,6 +842,14 @@ mod tests {
     /// Names that differ only in case share one budget (security review
     /// of #197, M2), and persisted keys are folded the same way.
     #[test]
+    fn budget_keys_read_final_sigma_as_sigma() {
+        assert_eq!(
+            budget_key("shop", "crm", "ΠΕΛΑΤΕΣ"),
+            budget_key("shop", "crm", "πελατες")
+        );
+    }
+
+    #[test]
     fn budget_keys_ignore_case() {
         let now = Instant::now();
         let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
@@ -832,6 +901,25 @@ mod tests {
                 .sum::<u64>(),
             7
         );
+        // A key saved with a final sigma: found again under the new fold.
+        u.merge(
+            OwnFile {
+                v: OWN_FILE_VERSION,
+                o: vec![(
+                    "db\u{0}\u{0}\u{03C0}\u{03B5}\u{03BB}\u{03B1}\u{03C4}\u{03B5}\u{03C2}"
+                        .to_owned(),
+                    vec![(current, 5)],
+                )],
+            },
+            current,
+        );
+        assert_eq!(
+            u.usage[&budget_key("db", "", "ΠΕΛΑΤΕΣ")]
+                .iter()
+                .map(|(_, n)| n)
+                .sum::<u64>(),
+            5
+        );
     }
 
     #[test]
@@ -874,6 +962,35 @@ mod tests {
             None,
             ClientSeen::NotVisible,
             &ev(None)
+        ));
+    }
+
+    /// G7: an own-identity event past the object bound is charged for the
+    /// objects it names but never left out under the budget; the
+    /// unbudgeted exact-text rule is unchanged (it charges nothing).
+    #[test]
+    fn overflowed_events_are_never_left_out_under_a_budget() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let mut e = ev(Some(1));
+        for i in 0..16u8 {
+            e = e.with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path(&format!("t_{}", char::from(b'a' + i))),
+            ));
+        }
+        assert!(e.objects_overflowed());
+        let mut o = own(Some("192.0.2.14"));
+        assert!(!o.routine("databastion", Some("databastion-agent"), logged, &e, now));
+        assert!(o.routine_unbudgeted("databastion", Some("databastion-agent"), logged, &e));
+        // A plain own read still is.
+        assert!(o.routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &ev(Some(1)),
+            now
         ));
     }
 

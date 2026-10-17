@@ -283,6 +283,14 @@ fn load_truth() -> Truth {
     let mut expected = BTreeMap::new();
     for loc in doc["locations"].as_array().unwrap() {
         let s = |k: &str| loc[k].as_str().map(str::to_owned);
+        // Phase 9 engines (P9-D seeds): their locations are scored by the
+        // connector tests of P9-A / P9-B, not by this seed-file test yet.
+        if matches!(
+            s("engine").as_deref(),
+            Some("sqlserver" | "redis" | "valkey")
+        ) {
+            continue;
+        }
         let field = s("field").unwrap();
         // Mongo dynamic keys: `contacts.<email>.phone` is seen as `contacts.*.phone`.
         let field = if field.contains('<') {

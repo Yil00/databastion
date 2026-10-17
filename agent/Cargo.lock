@@ -242,6 +242,8 @@ dependencies = [
  "databastion-connector-mysql",
  "databastion-connector-openldap",
  "databastion-connector-postgres",
+ "databastion-connector-redis",
+ "databastion-connector-sqlserver",
  "databastion-core",
  "serde_json",
  "tokio",
@@ -255,10 +257,12 @@ name = "databastion-classifiers"
 version = "0.7.0"
 dependencies = [
  "databastion-protocol",
+ "databastion-protocol-codegen",
  "getrandom 0.4.3",
  "hmac",
  "proptest",
  "regex",
+ "regress",
  "serde_json",
  "sha2",
  "unicode-normalization",
@@ -377,6 +381,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "databastion-connector-redis"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "databastion-classifiers",
+ "databastion-core",
+ "proptest",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "databastion-connector-sqlserver"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "databastion-classifiers",
+ "databastion-core",
+ "proptest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "databastion-core"
 version = "0.7.0"
 dependencies = [
@@ -385,9 +427,11 @@ dependencies = [
  "chrono",
  "databastion-classifiers",
  "databastion-protocol",
+ "databastion-protocol-codegen",
  "futures-util",
  "getrandom 0.4.3",
  "proptest",
+ "regress",
  "reqwest",
  "rustix",
  "serde",
@@ -1478,9 +1522,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",

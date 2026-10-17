@@ -1,0 +1,66 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1e",
+  "events": [
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:02:00Z",
+      "principal": {
+        "account_not_recorded": true,
+        "client_addr": "198.51.100.31"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "db0",
+          "object": "user:*:profile"
+        },
+        {
+          "database": "db0",
+          "object": "session:*"
+        }
+      ],
+      "source": "redis_slowlog",
+      "aggregated_count": 2,
+      "ts_last": "2026-10-14T09:02:30Z"
+    },
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:03:00Z",
+      "principal": {
+        "account_not_recorded": true,
+        "client_addr": "203.0.113.40"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "*",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.full_sync"
+      ],
+      "source": "redis_sync",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:03:30Z",
+      "principal": {
+        "account_not_recorded": true
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "*",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.full_sync"
+      ],
+      "source": "redis_sync",
+      "aggregated_count": 1
+    }
+  ]
+}

@@ -2118,10 +2118,11 @@ impl PgauditEvents {
             }
             let mut e = MaskedEvent::new(EventSource::Pgaudit, action, principal.clone(), ts)
                 .with_rows(part.rows);
-            // Statistics relations first (an event names 16 objects at
-            // most), always reported (ADR-0048 decision 3).
             // Statement-text objects (ADR-0049) first, then statistics
-            // relations: an event names 16 objects at most.
+            // relations (always reported, ADR-0048 decision 3): an event
+            // names 15 objects and `*` at most; past that, the core adds
+            // `*` and always reports the event (`MaskedEvent::with_object`,
+            // end-of-phase-9 review G7).
             let mut objects: Vec<&RelationName> = part.objects.iter().collect();
             objects.sort_by_key(|o| (!part.text_objects.contains(o), !is_statistics(o)));
             let statistics = part.objects.iter().any(is_statistics) || part.bound;
@@ -2139,7 +2140,7 @@ impl PgauditEvents {
             if statistics || unknown || text_read || part.rows_unknown {
                 e = e.with_always_report();
             }
-            for o in objects.into_iter().take(if unknown { 15 } else { 16 }) {
+            for o in objects {
                 e = e.with_object(object(&first.database, o));
             }
             if unknown {
@@ -2490,7 +2491,7 @@ impl PgauditEvents {
         if !under_filters {
             e = e.with_always_report();
         }
-        for o in named.into_iter().take(if star { 15 } else { 16 }) {
+        for o in named {
             e = e.with_object(object(database, o));
         }
         if star {
@@ -2781,9 +2782,9 @@ fn pss_event(
     )
     .with_rows(rows)
     .with_aggregate(d.calls, to);
-    // Statement-text objects (ADR-0049), then statistics relations (16
-    // objects at most), always reported (ADR-0048 decision 3, ADR-0049
-    // decision 4).
+    // Statement-text objects (ADR-0049), then statistics relations,
+    // always reported (ADR-0048 decision 3, ADR-0049 decision 4); past 15
+    // objects the core adds `*` and always reports the event (G7).
     let mut named: Vec<&RelationName> = objects.iter().collect();
     named.sort_by_key(|o| (!text_objects.contains(o), !is_statistics(o)));
     let statistics = objects.iter().any(is_statistics) || bound;
@@ -2795,7 +2796,7 @@ fn pss_event(
     if statistics || star || text_read || wrapping.rows_unknown {
         e = e.with_always_report();
     }
-    for o in named.into_iter().take(if star { 15 } else { 16 }) {
+    for o in named {
         e = e.with_object(object(d.database, o));
     }
     if star {
@@ -3016,6 +3017,55 @@ mod tests {
         );
         assert_eq!(events[0].rows(), None, "utility COPY rows are unknown");
         assert_eq!(events[0].principal().application(), Some("pg_dump"));
+    }
+
+    /// End-of-phase-9 review G7: pgaudit relation records of one
+    /// statement (a view over 16 harmless tables and a sensitive one) do
+    /// not hide the last relation: the event names `*` and is always
+    /// reported, below any `min_rows`.
+    #[test]
+    fn relation_records_past_the_object_bound_name_star() {
+        let mut b = PgauditEvents::new(own());
+        let text = "select * from public.v_all";
+        let mut recs = vec![rec(
+            "s9",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "public.v_all",
+            text,
+            Some(1),
+            "psql",
+        )];
+        for i in 0..16u8 {
+            let t = format!("public.harmless_{}", char::from(b'a' + i));
+            recs.push(rec("s9", 1, 1, "READ", "SELECT", &t, text, Some(1), "psql"));
+        }
+        recs.push(rec(
+            "s9",
+            1,
+            1,
+            "READ",
+            "SELECT",
+            "crm.customers",
+            text,
+            Some(1),
+            "psql",
+        ));
+        let events = b.convert(recs, SystemTime::now());
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert!(e.objects_overflowed(), "{}", json(e));
+        assert!(e.always_report());
+        assert_eq!(e.objects().len(), 16);
+        assert!(
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "*" && o.database().as_str() == "shop"),
+            "{}",
+            json(e)
+        );
     }
 
     #[test]

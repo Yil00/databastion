@@ -4,9 +4,9 @@ import type { Database } from "@/db/client";
 import { accessEvents, agents, agentTargets, auditConfigs, eventsBatches, incidentEvents, incidents, principalBaselines } from "@/db/schema";
 import type { EventFilter } from "@/lib/events-filter";
 import { baselineVerdict, isWarm, type BaselineState } from "@/lib/event-model";
-import { auditSourceEngine } from "@/lib/location-labels";
+import { auditSourceEngine, auditSourceEngines, isKeyPatternEngine } from "@/lib/location-labels";
 import { unregisteredSignals } from "@/lib/protocol/signals";
-import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
+import { MAX_VALIDATION_DETAILS, validateSchema, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import { MAX_FUTURE_SKEW_MS } from "./agent-api/pipeline";
 import { ipv6Groups, mappedIPv4 } from "./net-guard";
@@ -37,7 +37,11 @@ export type EventsIngestOutcome =
   | { kind: "batch_conflict" }
   /** `target_id` not reported by this agent: pointers `/events/<i>/target_id`. */
   | { kind: "foreign_target"; details: ValidationDetail[] }
-  /** Console-side checks (timestamps more than 5 min in the future). */
+  /**
+   * Console-side checks: a source that does not serve the target's engine, an
+   * `account_not_recorded` principal or a key-pattern object on a target that is not Redis /
+   * Valkey, timestamps more than 5 min in the future.
+   */
   | { kind: "invalid"; details: ValidationDetail[] }
   /**
    * Events older than the retention period (L1): `400`, `/events/<i>/ts`, `formatMinimum`. A
@@ -66,11 +70,35 @@ export function eventsBatchSha256(batch: EventsBatch): string {
 }
 
 /**
- * Grouping key of a principal (baselines, dedup): SHA-256 of `u\0<db_user>` or
+ * Grouping key of a principal (events view, baselines, dedup): SHA-256 of `u\0<db_user>` or
  * `f\0<fingerprint>`, so that a name and a fingerprint never collide and no key holds agent text.
+ * An event without a recorded account (`account_not_recorded`, Redis / Valkey only, ADR-0052
+ * decision 8) is keyed by its client network instead: SHA-256 of `n\0<network>`, where the
+ * network is {@link unrecordedNetwork} (`local`, `none`, or the /24 or /64): never the hash of an
+ * empty fingerprint, so such events are not merged with a principal of another kind. The schema
+ * guarantees exactly one of the three (`Principal.oneOf`); anything else is a programming error.
  */
-export function principalKey(p: { db_user?: string; db_user_fingerprint?: string }): string {
-  return p.db_user !== undefined ? sha256Hex(`u\u0000${p.db_user}`) : sha256Hex(`f\u0000${p.db_user_fingerprint ?? ""}`);
+export function principalKey(p: {
+  db_user?: string;
+  db_user_fingerprint?: string;
+  account_not_recorded?: boolean;
+  client_addr?: string;
+}): string {
+  if (p.db_user !== undefined) return sha256Hex(`u\u0000${p.db_user}`);
+  if (p.db_user_fingerprint !== undefined) return sha256Hex(`f\u0000${p.db_user_fingerprint}`);
+  if (p.account_not_recorded === true) return sha256Hex(`n\u0000${unrecordedNetwork(p.client_addr ?? null)}`);
+  throw new Error("principal without db_user, db_user_fingerprint or account_not_recorded");
+}
+
+/**
+ * Network of an event without a recorded account (ADR-0052 decision 8, ADR-0021 decision 6):
+ * `none` without a client address (e.g. a full synchronization without a replica entry), `local`
+ * for a local client, else the client network of {@link clientNetwork}.
+ */
+export function unrecordedNetwork(addr: string | null): string {
+  if (addr === null) return "none";
+  if (addr === "local") return "local";
+  return clientNetwork(addr);
 }
 
 /**
@@ -88,7 +116,12 @@ export function clientNetwork(addr: string | null): string {
   return addr;
 }
 
-/** Principal as displayed and matched by policies: `db_user`, or its fingerprint. */
+/**
+ * Principal as displayed and matched by policies: `db_user`, or its fingerprint; the empty string
+ * for an event without a recorded account (`account_not_recorded`: never a name, so a policy's
+ * `principals` globs other than `*` never match it). `db_user` and fingerprints are never empty
+ * (contract `minLength`), so an empty label on a non-overflow access incident means "not recorded".
+ */
 export function principalLabel(p: { dbUser: string | null; dbUserFingerprint: string | null }): string {
   return p.dbUser ?? p.dbUserFingerprint ?? "";
 }
@@ -103,6 +136,41 @@ function futureDetails(batch: EventsBatch, now: number): ValidationDetail[] {
     }
     if (details.length < MAX_VALIDATION_DETAILS && e.ts_last !== undefined && Date.parse(e.ts_last) > limit) {
       details.push({ pointer: `/events/${i}/ts_last`, keyword: "formatMaximum" });
+    }
+  });
+  return details;
+}
+
+/**
+ * Checks of each event against its **target's** engine as last reported by the agent (P9-C review
+ * H1, ADR-0052 decision 7), kept whatever capability tokens the console lists:
+ * - the event's `source` serves the target's engine (`/events/<i>/source`, `const`): the schema
+ *   chooses the object-name schema from the source (`KeyPattern` for the `redis_*` sources), so a
+ *   `redis_*` source on a PostgreSQL target would otherwise carry names with `:` and `/`;
+ * - `account_not_recorded` only on a `redis` or `valkey` target (`/events/<i>/principal`, `not`,
+ *   the keyword of the schema's own refusal on the other sources); it never reaches storage;
+ * - on any other target, every object name is an `Identifier` (`/events/<i>/objects/<j>/object`,
+ *   `pattern`): the contract's "enforced twice" rule for `ObjectRef`, which names no engine.
+ * `const` and `not` are not `enum`, so a conforming agent drops such items (ADR-0042 decision 3).
+ */
+export function targetEngineDetails(batch: EventsBatch, engines: ReadonlyMap<string, string>): ValidationDetail[] {
+  const details: ValidationDetail[] = [];
+  const push = (d: ValidationDetail) => {
+    if (details.length < MAX_VALIDATION_DETAILS) details.push(d);
+  };
+  batch.events.forEach((e, i) => {
+    const engine = engines.get(e.target_id) ?? null;
+    const keyPatterns = isKeyPatternEngine(engine);
+    if (engine === null || !(auditSourceEngines(e.source) as readonly string[]).includes(engine)) {
+      push({ pointer: `/events/${i}/source`, keyword: "const" });
+    }
+    if (e.principal.account_not_recorded !== undefined && !keyPatterns) {
+      push({ pointer: `/events/${i}/principal`, keyword: "not" });
+    }
+    if (!keyPatterns) {
+      e.objects.forEach((o, j) => {
+        if (!validateSchema("Identifier", o.object).ok) push({ pointer: `/events/${i}/objects/${j}/object`, keyword: "pattern" });
+      });
     }
   });
   return details;
@@ -131,6 +199,7 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
     principalKey: principalKey(e.principal),
     dbUser: e.principal.db_user ?? null,
     dbUserFingerprint: e.principal.db_user_fingerprint ?? null,
+    accountNotRecorded: e.principal.account_not_recorded === true,
     clientAddr: e.principal.client_addr ?? null,
     application: e.principal.application ?? null,
     action: e.action,
@@ -153,8 +222,10 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
  * 1. idempotency on `(agent_id, batch_id)`: same content -> duplicate, other content -> conflict
  *    (before every check below, so a replay reaching this step is always acknowledged);
  * 2. every `target_id` was reported by the agent (`404`, item pointers `/events/<i>/target_id`);
- * 3. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
- * 4. storage of the events (pending evaluation by the worker) + the batch record.
+ * 3. every event's source, principal and object names fit its target's engine (`400`, item
+ *    pointers, see `targetEngineDetails`);
+ * 4. no timestamp more than 5 min in the future (`400`, `formatMaximum`, item pointers);
+ * 5. storage of the events (pending evaluation by the worker) + the batch record.
  * Batches of one agent are serialized (transaction-scoped advisory lock).
  */
 export async function ingestEvents(
@@ -180,7 +251,12 @@ export async function ingestEvents(
 
     const targetIds = [...new Set(batch.events.map((e) => e.target_id))];
     const owned = await tx
-      .select({ targetId: agentTargets.targetId, present: agentTargets.present, auditEnabled: auditConfigs.enabled })
+      .select({
+        targetId: agentTargets.targetId,
+        engine: agentTargets.engine,
+        present: agentTargets.present,
+        auditEnabled: auditConfigs.enabled,
+      })
       .from(agentTargets)
       .leftJoin(auditConfigs, and(eq(auditConfigs.agentId, agentTargets.agentId), eq(auditConfigs.targetId, agentTargets.targetId)))
       .where(and(eq(agentTargets.agentId, agentId), inArray(agentTargets.targetId, targetIds)));
@@ -195,6 +271,8 @@ export async function ingestEvents(
     });
     if (foreign.length > 0) return { kind: "foreign_target" as const, details: foreign };
 
+    const mismatched = targetEngineDetails(batch, new Map(owned.map((t) => [t.targetId, t.engine])));
+    if (mismatched.length > 0) return { kind: "invalid" as const, details: mismatched };
     const future = futureDetails(batch, now);
     if (future.length > 0) return { kind: "invalid" as const, details: future };
     const expired = expiredDetails(batch, now, retentionDays);
@@ -306,6 +384,8 @@ export interface EventView {
   principalKey: string;
   principal: string;
   fingerprinted: boolean;
+  /** The source records no account for this access (Redis / Valkey, ADR-0052 decision 8). */
+  accountNotRecorded: boolean;
   clientAddr: string | null;
   application: string | null;
   action: string;
@@ -361,6 +441,7 @@ const EVENT_COLUMNS = {
   principalKey: accessEvents.principalKey,
   dbUser: accessEvents.dbUser,
   dbUserFingerprint: accessEvents.dbUserFingerprint,
+  accountNotRecorded: accessEvents.accountNotRecorded,
   clientAddr: accessEvents.clientAddr,
   application: accessEvents.application,
   action: accessEvents.action,
@@ -400,7 +481,7 @@ function toEventView({ dbUser, dbUserFingerprint, evaluatedAt, targetEngine, ...
     ...r,
     engine: auditSourceEngine(r.source) ?? targetEngine ?? null,
     principal: principalLabel({ dbUser, dbUserFingerprint }),
-    fingerprinted: dbUser === null,
+    fingerprinted: dbUser === null && dbUserFingerprint !== null,
     evaluated: evaluatedAt !== null,
     incidentIds: r.incidentIds ?? [],
   };

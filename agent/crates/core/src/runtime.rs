@@ -105,6 +105,8 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Mongodb => ProtoConnector::Mongodb,
         Engine::Openldap => ProtoConnector::Openldap,
         Engine::Cas => ProtoConnector::Cas,
+        Engine::Redis => ProtoConnector::Redis,
+        Engine::Sqlserver => ProtoConnector::Sqlserver,
     }
 }
 
@@ -1166,7 +1168,17 @@ impl Runtime {
             .console_caps
             .console_accepts(crate::capabilities::token::TARGET_STATUS_NOTES)
         {
-            crate::notes::to_protocol(&notes)
+            crate::notes::to_protocol(
+                &notes,
+                crate::notes::LabelRevisions {
+                    r2026_10: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10),
+                    r2026_10_b: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_B),
+                },
+            )
         } else {
             Vec::new()
         };
@@ -1179,7 +1191,9 @@ impl Runtime {
             metrics: None,
             notes,
             reachable,
-            server_version: None,
+            server_version: connector
+                .and_then(|c| c.server_version(target))
+                .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
             target_id,
         };
         (status, outcome)
@@ -1258,6 +1272,13 @@ impl Runtime {
         if let Ok(key) = MetricsMapKey::try_from("audit_window_overflow_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::window_overflows() as f64);
+        }
+        // Rows of the agent's own interrupted performance_schema polls
+        // dropped by the MySQL / MariaDB connector (ADR-0045 refinement of
+        // 2026-10-16).
+        if let Ok(key) = MetricsMapKey::try_from("audit_own_polls_interrupted_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::audit::interrupted_own_polls() as f64);
         }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
@@ -3320,6 +3341,9 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Mongodb => databastion_protocol::Engine::Mongodb,
         TargetEngine::Openldap => databastion_protocol::Engine::Openldap,
         TargetEngine::Cas => databastion_protocol::Engine::Cas,
+        TargetEngine::Redis => databastion_protocol::Engine::Redis,
+        TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
+        TargetEngine::Sqlserver => databastion_protocol::Engine::Sqlserver,
     }
 }
 

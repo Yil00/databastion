@@ -93,24 +93,39 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> 
     result
 }
 
+/// Flags of every state-file open: read-only, no symlink followed (last
+/// component), and `NONBLOCK`, so that a FIFO planted in the state
+/// directory cannot block the open; the handle is then checked to be a
+/// regular file.
+fn private_file_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK
+}
+
+fn symlink_refused(e: rustix::io::Errno) -> io::Error {
+    if e == rustix::io::Errno::LOOP {
+        denied("state file is a symlink")
+    } else {
+        io::Error::from(e)
+    }
+}
+
 /// Opens a private file without following symlinks and checks the handle:
 /// regular file, owned by the effective uid, no group / other access.
 pub(crate) fn open_private(path: &Path) -> io::Result<File> {
-    let fd = rustix::fs::open(
-        path,
-        // NONBLOCK: a FIFO planted in the state directory cannot block
-        // the open; the handle is then checked to be a regular file.
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|e| {
-        if e == rustix::io::Errno::LOOP {
-            denied("state file is a symlink")
-        } else {
-            io::Error::from(e)
-        }
-    })?;
-    let file = File::from(fd);
+    let fd =
+        rustix::fs::open(path, private_file_flags(), Mode::empty()).map_err(symlink_refused)?;
+    checked_private_file(File::from(fd))
+}
+
+/// Opens the private file `name` inside the directory handle `dir`
+/// (`openat`, no symlink followed), checked as [`open_private`] does.
+pub(crate) fn open_private_at(dir: &File, name: &str) -> io::Result<File> {
+    let fd = rustix::fs::openat(dir, name, private_file_flags(), Mode::empty())
+        .map_err(symlink_refused)?;
+    checked_private_file(File::from(fd))
+}
+
+fn checked_private_file(file: File) -> io::Result<File> {
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(denied("state file is not a regular file"));
@@ -126,11 +141,73 @@ pub(crate) fn open_private(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Opens `dir` as a directory handle without following a final symlink
+/// and checks the handle (`fstat`) as [`check_private_dir`] checks the
+/// path: owned by the effective uid, not writable by group or others.
+/// `Ok(None)` when it does not exist. Operations on its entries then go
+/// through the handle (`openat`, `unlinkat`), so the directory cannot be
+/// swapped between the check and the use.
+pub(crate) fn open_private_dir(dir: &Path) -> io::Result<Option<File>> {
+    let fd = match rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            return Err(denied("state_dir must be a directory, not a symlink"));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.file_type().is_dir() {
+        return Err(denied("state_dir must be a directory, not a symlink"));
+    }
+    if meta.uid() != euid() {
+        return Err(denied("state_dir must be owned by the agent user"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(denied("state_dir must not be writable by group or others"));
+    }
+    Ok(Some(file))
+}
+
+/// Unlinks the entry `name` of the directory handle `dir` (`unlinkat`:
+/// a symlink is removed, never followed). `Ok(false)` when there was none.
+pub(crate) fn unlink_at(dir: &File, name: &str) -> io::Result<bool> {
+    match rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Reads a private file (see [`open_private`]).
 pub(crate) fn read_private(path: &Path) -> io::Result<Vec<u8>> {
     let mut file = open_private(path)?;
     let mut out = Vec::new();
     file.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Reads at most `max` bytes of an opened private file: at most `max + 1`
+/// bytes are ever read, so a large file planted in the state directory
+/// costs no more than that. A larger file is refused.
+pub(crate) fn read_bounded(file: File, max: usize) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    if len > max {
+        return Err(denied("state file is too large"));
+    }
+    // One more byte than allowed, to detect a file that grew meanwhile.
+    let mut out = Vec::with_capacity(len.min(max).saturating_add(1));
+    let n = file
+        .take(u64::try_from(max.saturating_add(1)).unwrap_or(u64::MAX))
+        .read_to_end(&mut out)?;
+    if n > max {
+        return Err(denied("state file is too large"));
+    }
     Ok(out)
 }
 

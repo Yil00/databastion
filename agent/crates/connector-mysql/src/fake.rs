@@ -217,7 +217,8 @@ async fn server_errors_during_login_keep_no_text() {
     }
 }
 
-fn column_def(name: &[u8]) -> Vec<u8> {
+/// A column definition packet (scripted result sets).
+pub(crate) fn column_def(name: &[u8]) -> Vec<u8> {
     let mut p = Vec::new();
     for part in [&b"def"[..], b"s", b"t", b"t", name, name] {
         proto::put_lenenc(&mut p, part.len() as u64);
@@ -233,7 +234,8 @@ fn column_def(name: &[u8]) -> Vec<u8> {
     p
 }
 
-const EOF: [u8; 5] = [0xFE, 0, 0, 2, 0];
+/// An EOF packet (scripted result sets).
+pub(crate) const EOF: [u8; 5] = [0xFE, 0, 0, 2, 0];
 
 #[tokio::test]
 async fn result_sets_are_streamed_and_local_infile_is_refused() {

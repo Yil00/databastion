@@ -259,6 +259,31 @@ impl Session {
         Self::open(Arc::new(target.clone()), timeouts, true, true).await
     }
 
+    /// A session already logged in and set up, over one end of an
+    /// in-memory socket pair whose other end a test scripts (no listening
+    /// socket, I1). Unguarded: no `KILL QUERY` is attempted.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        stream: tokio::net::UnixStream,
+        target: &TargetConfig,
+        flavor: Flavor,
+    ) -> Self {
+        Self {
+            io: PacketIo::new(Transport::Unix(stream)),
+            target: Arc::new(target.clone()),
+            flavor,
+            version: match flavor {
+                Flavor::Mysql => (8, 4, 11),
+                Flavor::Mariadb => (11, 4, 13),
+            },
+            connection_id: 7,
+            timeouts: Timeouts::new(Duration::from_secs(10)),
+            poisoned: false,
+            last_used: Instant::now(),
+            kill_on_drop: false,
+        }
+    }
+
     /// `killer`: a session opened to send `KILL QUERY` (its own statements
     /// are not guarded).
     async fn open(
@@ -507,6 +532,13 @@ impl Session {
             Flavor::Mariadb if self.version < (11, 1, 0) => "tx_read_only",
             _ => "transaction_read_only",
         }
+    }
+
+    /// The server's connection id of this session (tests: `KILL QUERY`
+    /// from another session).
+    #[cfg(test)]
+    pub(crate) fn connection_id(&self) -> u32 {
+        self.connection_id
     }
 
     pub(crate) fn flavor(&self) -> Flavor {

@@ -12,7 +12,7 @@ WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb percona psmdb
 # Opt-in dev services (Compose profiles), stopped by dev-down / dev-reset too.
-DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas
+DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas --profile sqlserver --profile redis
 # pnpm at the version pinned by console/package.json (`packageManager`), through corepack.
 PNPM ?= corepack pnpm
 export COREPACK_ENABLE_DOWNLOAD_PROMPT ?= 0
@@ -31,7 +31,7 @@ AGENT_CONFIG ?=
 
 .PHONY: help \
 	install doctor \
-	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-down \
+	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-sqlserver dev-redis dev-down \
 	dev-reset dev-logs dev-ps seed seed-check test-dev \
 	console-dev console-worker console-migrate console-lint console-typecheck console-test console-build \
 	console-licenses \
@@ -135,6 +135,12 @@ dev-cas: dev/.env dev-dirs ## Start the opt-in Apereo CAS service (ADR-0041 targ
 dev-cas-smoke: dev/.env ## Smoke-test the running CAS service (registry, login, service ticket, audit log, permissions)
 	timeout 300 dev/cas/smoke.sh
 
+dev-sqlserver: dev/.env ## Start the opt-in SQL Server service (ADR-0051 target, Express, 2 GiB) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile sqlserver up -d --wait --wait-timeout $(WAIT_TIMEOUT) sqlserver
+
+dev-redis: dev/.env ## Start the opt-in Valkey and Redis services (ADR-0052 targets) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile redis up -d --wait --wait-timeout $(WAIT_TIMEOUT) valkey redis
+
 dev-down: ## Stop the dev environment (keeps data volumes)
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down --remove-orphans
 
@@ -220,7 +226,7 @@ agent-deny: ## cargo-deny bans / licenses / sources, dev-dependencies too (CI; n
 	cd agent && timeout 600 cargo deny --locked check bans licenses sources
 	cd agent && timeout 600 cargo deny --config deny-dev.toml --locked check licenses sources
 
-agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|all
+agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|redis|all (redis: after `make dev-redis`)
 	timeout $(CARGO_TIMEOUT) dev/agent-it.sh $(ENGINE)
 
 agent-fuzz: ## Fuzz smoke run of the parser targets, FUZZ_SECONDS each (CI: 10)
@@ -258,7 +264,8 @@ docs-check: ## Internal Markdown links (CI)
 
 shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and the Keycloak and CAS dev scripts
 	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
-	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh
+	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh dev/sqlserver/entrypoint.sh dev/redis/entrypoint.sh \
+	  dev/redis/tls-init.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'

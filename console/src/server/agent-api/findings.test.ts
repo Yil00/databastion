@@ -23,6 +23,7 @@ import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, endInFlightScans, enroll, expectConformingError, fixtures, uuidv7 } from "@/test/helpers";
 
 import { failuresPerAgent } from "./auth";
+import { unlistedEngineDetails } from "./capabilities";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
 
 // The real registry plus a second, test-only classifier set sharing `pii.email` with 2026.09.1.
@@ -40,7 +41,7 @@ const HEARTBEAT = {
   agent_version: "0.1.0",
   uptime_s: 12,
   classifiers_version: "2026.09.1",
-  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas"],
+  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis"],
   targets: [
     { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited" },
     { target_id: "pg-other", engine: "postgres", reachable: true, audit_level: "limited" },
@@ -48,6 +49,10 @@ const HEARTBEAT = {
     { target_id: "mongo-app", engine: "mongodb", reachable: true, audit_level: "limited" },
     { target_id: "ldap-main", engine: "openldap", reachable: true, audit_level: "full" },
     { target_id: "cas-prod", engine: "cas", reachable: true, audit_level: "partial", audit_source: "cas_audit_log" },
+    // P9-E: CONSOLE_ACCEPTS lists engine.sqlserver, engine.redis and engine.valkey.
+    { target_id: "mssql-prod", engine: "sqlserver", reachable: true, audit_level: "partial", audit_source: "sqlserver_audit" },
+    { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
+    { target_id: "sessions-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
@@ -141,6 +146,44 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
   });
 
   describe("contract fixtures", () => {
+    it("stores the sqlserver, redis and valkey fixtures with their locations as sent (P9-E)", async () => {
+      for (const name of ["FindingsBatch.sqlserver.json", "FindingsBatch.redis.json", "FindingsBatch.valkey.json"]) {
+        const [, fixture] = fixtures("valid", "FindingsBatch").find(([f]) => f === name) ?? [];
+        expect(fixture, name).toBeDefined();
+        expect(unlistedEngineDetails("FindingsBatch", fixture), name).toEqual([]);
+        const auth = await agentWithTargets();
+        const body = structuredClone(fixture) as Body;
+        body.job_id = await deliveredScan(auth, String(body.findings[0]?.target_id));
+        body.batch_id = uuidv7();
+        expect((await post(auth, body)).status, name).toBe(202);
+        const rows = await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId));
+        const loc = (f: Record<string, unknown>) => f.location as { engine: string; database: string; schema?: string; object: string; field: string };
+        expect(rows.map((r) => [r.engine, r.databaseName, r.schemaName, r.objectName, r.fieldName]).sort()).toEqual(
+          body.findings.map((f) => loc(f)).map((l) => [l.engine, l.database, l.schema ?? null, l.object, l.field]).sort(),
+        );
+      }
+    });
+
+    it("refuses a redis location with a key pattern on a postgres target: 400 const on its engine, nothing stored", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const body = batch(jobId, [PG_FINDING, { ...PG_FINDING, location: { engine: "redis", database: "db0", object: "a:b/c", field: "email" } }]);
+      expect(validateSchema("FindingsBatch", body).ok).toBe(true);
+      const res = await post(auth, body);
+      expect(res.status).toBe(400);
+      expect((await expectConformingError(res, body)).details).toEqual([{ pointer: "/findings/1/location/engine", keyword: "const" }]);
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
+    });
+
+    it("refuses a postgres location whose object is a key pattern (schema: Identifier on other engines)", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      const body = batch(jobId, [{ ...PG_FINDING, location: { ...PG_FINDING.location, object: "user:*:email" } }]);
+      expect(validateSchema("FindingsBatch", body).ok).toBe(false);
+      expect((await post(auth, body)).status).toBe(400);
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
+    });
+
     it.each(fixtures("valid", "FindingsBatch"))("valid fixture %s -> 202 and stored", async (_f, fixture) => {
       const auth = await agentWithTargets();
       const body = structuredClone(fixture) as Body;

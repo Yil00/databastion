@@ -13,6 +13,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { getDb } from "@/db/client";
 import { displayStatus, formatAge } from "@/lib/agent-status";
 import { auditWarningText } from "@/lib/audit-warning";
+import { detectedHow, setupHint } from "@/lib/detected-targets";
+import { engineDisplayName } from "@/lib/location-labels";
 import { eventsHref } from "@/lib/events-filter";
 import { getAgentDetail } from "@/server/agents";
 import { auditSummaries } from "@/server/audit-config";
@@ -218,7 +220,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                       {t.targetId}
                       {!t.present && " (removed)"}
                     </TableCell>
-                    <TableCell>{[t.engine, t.edition].filter(Boolean).join(" ")}</TableCell>
+                    <TableCell title={t.engine}>{[engineDisplayName(t.engine), t.edition].filter(Boolean).join(" ")}</TableCell>
                     <TableCell>{t.serverVersion ?? ""}</TableCell>
                     <TableCell>{t.reachable ? "yes" : "no"}</TableCell>
                     <TableCell>
@@ -290,6 +292,38 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
           )}
         </CardContent>
       </Card>
+      {agent.detectedTargets.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Detected on the host, not configured</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm">
+            <p className="text-muted-foreground">
+              Engines the agent found on its own host (local sockets, listening ports and process names only, no
+              network scan) that its agent.yaml does not declare. The agent never connects to them. Targets, accounts
+              and secrets are configured on the agent host only: the console never holds database credentials.
+            </p>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Engine</TableHead>
+                  <TableHead>Found by</TableHead>
+                  <TableHead>Setup</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {agent.detectedTargets.map((d, i) => (
+                  <TableRow key={i}>
+                    <TableCell title={d.engine}>{engineDisplayName(d.engine)}</TableCell>
+                    <TableCell className="break-all">{detectedHow(d)}</TableCell>
+                    <TableCell className="max-w-xl whitespace-normal text-xs">{setupHint(d.engine)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

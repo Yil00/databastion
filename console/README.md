@@ -179,7 +179,10 @@ lower-case identifiers only.
 
 The final schema is the one of `0027`. Rule for new migrations: a constraint added to a table
 that may be large is written `NOT VALID` in a custom migration and listed in
-`DEFERRED_VALIDATIONS`, never validated in the migration itself.
+`DEFERRED_VALIDATIONS`, never validated in the migration itself. Migration `0040` (P9-E) follows
+it: it adds `access_events.account_not_recorded` (constant default, catalog only) and replaces the
+`access_events_principal` CHECK (exactly one of `db_user`, `db_user_fingerprint` and
+`account_not_recorded`) `NOT VALID`; the runner validates it afterwards.
 
 ### Upgrading an existing deployment
 Deployments created before the role split (single `POSTGRES_USER` role used by everything; the
@@ -200,6 +203,13 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 Then drop any schema the old role created other than `public`, `pgboss` and `drizzle`, point
 `db_owner_url` at `databastion_owner` and `db_url` at `databastion_runtime`, run `migrate`, and
 restart the web and worker processes (check that they log no database role warning).
+
+Upgrading to the P9-E console (SQL Server, Redis and Valkey): `migrate` applies `0040`
+(`access_events.account_not_recorded`, the principal CHECK validated afterwards, see "Constraints
+on large tables"). Webhook receivers of `incident.opened` get a new field,
+`principal_not_recorded`; an access incident's `principal` is now also empty when the source
+recorded no account, so receivers must read `overflow` to recognize the overflow incident, never
+infer it from an empty `principal`.
 
 ## First administrator
 There is no default account and no default password. After `pnpm db:migrate`:
@@ -435,7 +445,7 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
 | `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 3600, `statement_timeout_ms` 30000; 3600 rather than the contract's 900 because Discovery is paced by the agent, a scan lasting about 100 times its query time at the default 1 % duty cycle; the agent clamps the budget to its `limits.max_scan_duration_s`, 3600 s by default. This default assumes agents that pace Discovery: every released agent does, since 0.1.0, the first release, ships console and agents together and no unpaced agent was ever released; upgrade consoles and agents together. A pre-release agent without pacing would hold a target for up to that budget); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (the agent's latest heartbeat carries no `classifiers_version`), `409 classifiers_version_unregistered` (that version is not in the contract classifier registry `classifiers.json`: no job is issued), `422 unknown_classifiers` (`classifiers` holds ids that are not classifiers of that version); each refusal is audited (`discovery.scan_request`, `failure`, with the reason and the version). The job carries the version of the agent's latest heartbeat. `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. **One scan per agent at a time** (security review M1): `GET /jobs` delivers a pending `discovery.scan` only when the agent has no other `discovery.scan` delivered or running and no older pending one, so the next scan of the agent goes out after the previous one ends (`succeeded`, `failed`, `cancelled`, or given up / timed out by the console; a scan ending wakes the agent's held poll). The agent counts a scan's window from its reception, so queue time no longer eats the budget of a scan requested together with others. Other job types are never held. Claims of one agent are serialized (transaction-scoped advisory lock `jobs.claim:<agent id>`, `src/server/job-lock.ts`), so concurrent polls never deliver two scans; revocation, the rotation-conflict lock, scan requests and Audit settings take the same lock after the agent row and before the agent's jobs (one lock order, so a revocation concurrent with polls never deadlocks). `GET /jobs` is limited to 20 requests per agent per 20 s (`429` + `Retry-After`). A held scan is shown as "pending (waiting for the previous scan of this agent)" on the agent page. While it is held and the agent is online (and neither revoked nor locked), its `expires_at` is kept at least 30 min ahead (refreshed to now + 1 h), so waiting behind long scans never expires it, but never past 24 h after the request (about 20 scans of the default 3600 s budget queued on one agent; an older order is stale: request it again); a held scan of an offline agent, one past that bound, or one whose `expires_at` already passed, expires as before. When a pending scan is delivered, its `expires_at` is raised, if lower, to now + 1 h (same 24 h bound), so a scan that waited does not reach the agent with only minutes left. Before the busy check and before each job claim, the agent's dead scans are swept: delivered / running past `first_delivered_at + max_duration_s + 1 h` (the first delivery: neither a redelivery nor a late `running` acknowledgement extends it; the `/findings` window of the scan uses the same deadline) → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline), then pending past `expires_at` → `expired`. The agent acknowledges a scan (`running`) only when it starts it: a delivered job without a status is delivered again every 120 s and given up (`failed`, `timeout`) after 5 deliveries, except a `discovery.scan` of an online agent (heartbeat within the last 90 s) before `first_delivered_at + max_duration_s + 600 s` (a malformed stored `max_duration_s` counts as the contract's 900 s): a delivered scan that still waits in the agent's queue (scans delivered by an older console before an upgrade) stays delivered (and redelivered, which the agent ignores while it holds the job) until it starts or its window is over. A scan job that fails the contract check when served is marked `failed` (`internal`) and the next pending scan is served in the same response |
-| `POST /api/agents/{id}/targets/{target_id}/audit` | Audit settings of a target, queued as an `audit.configure` job (admin, CSRF; P4-C). Body `{enabled, aggregation_window_s?, poll_interval_s?, min_rows?, derive_from_findings?, manual_objects?, confirm?}` (defaults 60, 10, none, `true`, `[]`; `manual_objects`: contract `SensitiveObject[]`); unknown keys and non-conforming objects: `400 {"error": "invalid_audit_settings", "field"}`; `404` unknown / inactive agent or target not currently reported. `202 {job_id, warning, previous_objects, next_objects, added_objects, removed_objects, truncated_objects}`. A change that disables Audit, empties `sensitive_objects` or removes many objects answers `409 {"error": "confirmation_required", warning, ...counts, digest}` and queues nothing: post the same settings again with `confirm: digest`. Audited `audit.configure` (counts, flags, warning, `confirmed`; refusals as failures). See "Audit correlation" |
+| `POST /api/agents/{id}/targets/{target_id}/audit` | Audit settings of a target, queued as an `audit.configure` job (admin, CSRF; P4-C). Body `{enabled, aggregation_window_s?, poll_interval_s?, min_rows?, derive_from_findings?, manual_objects?, confirm?}` (defaults 60, 10, none, `true`, `[]`; `manual_objects`: contract `SensitiveObject[]`); unknown keys and non-conforming objects: `400 {"error": "invalid_audit_settings", "field"}`; `404` unknown / inactive agent or target not currently reported. `202 {job_id, warning, previous_objects, next_objects, added_objects, removed_objects, truncated_objects, skipped_key_patterns}`. A change that disables Audit, empties `sensitive_objects` or removes many objects answers `409 {"error": "confirmation_required", warning, ...counts, digest}` and queues nothing: post the same settings again with `confirm: digest`. Audited `audit.configure` (counts, flags, warning, `confirmed`; refusals as failures). See "Audit correlation" |
 | `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor). Marking closes the finding's open / acknowledged incidents as `false_positive` (audited `incident.transition`); unmarking makes the policies apply to it again |
 | `POST /api/policies` | Create a policy (admin, CSRF): `{name, description?, enabled?, source?, conditions, actions}`, strictly validated (see "Policies and incidents"); `201 {id}`, `400 {"error": "invalid_policy", "field"}`, `409 name_taken` (case-insensitive). Audited `policy.create` (identifiers, flags and counts only: never the name or description) |
 | `PATCH` / `DELETE /api/policies/{id}` | Update any subset of the create keys (`source` is fixed) / delete (admin, CSRF); `204`, `404`. A deleted policy's exceptions go with it, its incidents are kept. Audited `policy.update` (with the changed keys) / `policy.delete` |
@@ -450,13 +460,15 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 UI pages (server components; data read server-side, only the user and the CSRF token reach the
 browser): `/login`, `/agents` (name, hostname, version, status online / silent (no heartbeat for
 90 s) / revoked / locked, last seen, targets with audit level and their number of notes),
-`/agents/{id}` (targets with their notes, see "Target notes"; admin:
+`/agents/{id}` (targets with their engine names and notes, see "Target notes"; the engines the agent
+detected on its host but does not declare (ADR-0006), each with a setup hint: what to declare in
+`agent.yaml` on the agent host, never anything the console configures; admin:
 "Rotate secret" and "Revoke" with confirmation dialogs), `/enrollment-tokens` (admin: create, the
 `dbe_…` token is shown once with a copy button; list; revoke), `/users` (admin: local users,
 roles, disable / enable, pending single sign-on logins), `/account` (own account, linked single
 sign-on identities, "Link single sign-on"), `/findings` (counts per target and
 classifier, then one row per location with its masked samples decrypted server side; filters
-`?agent=&target=&classifier=`, false positives hidden unless `fp=1`; "False positive" toggle per
+`?agent=&target=&classifier=&engine=`, false positives hidden unless `fp=1`; "False positive" toggle per
 row, admins only; analysts see a hint). The view fetches at most 500 rows round-robin over targets
 (most recently seen first within each), so one noisy agent or target cannot hide the others; the
 counts show at most 1000 (target, classifier) groups, fetched round-robin over agents then over
@@ -630,7 +642,10 @@ longer the current one is closed with `401`.
 table only holds what policies raise; merging both views is left to a later task):
 `agent.rotation_conflict` (`critical`), and since P2-D `agent.batch_rejected` (a `400` on
 `/findings`), `agent.batch_conflict` and `agent.foreign_target` (a finding for a target the agent
-never reported), all `high`, each with an audit-log entry of the same name; since P3-C also
+never reported), all `high`, each with an audit-log entry of the same name; since P9-E also
+`agent.target_mismatch` (endpoint `heartbeat`, status `200`: a heartbeat target whose
+`audit_source` does not serve its `engine` is stored without `audit_source` and the rest of the
+heartbeat is processed, contract "Heartbeat target checks"); since P3-C also
 `agent.silent` (`medium`, see "Alerting"). Each one is notified to the system-alert channels. Their details are the
 endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
 per 10 minutes; beyond, they are counted, logged once per window, and the next recorded event of the
@@ -698,7 +713,12 @@ notes clears them. The agent page renders each note from the phrase catalog gene
 `shared/protocol/target-notes.json` (`src/generated/protocol/target-notes.gen.ts`, renderer
 `src/lib/target-notes.ts`): templates looked up with `Object.hasOwn`, `{count}` replaced by the
 integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQL role attributes
-and MySQL / MariaDB privileges in upper case, the other labels as sent), in one non-recursive pass;
+and MySQL / MariaDB privileges in upper case, SQL Server permissions in upper case with spaces,
+SQL Server fixed roles as SQL Server names them, `##MS_…##` for the SQL Server 2022 roles, the
+other labels, the `check()` probes such as `logon_trigger_probe` included, as sent; the SQL Server
+labels are those of revisions `target_status.note_labels.2026_10` and
+`target_status.note_labels.2026_10_b`, both listed by the console in `accepts`), in one
+non-recursive pass;
 a code this console does not know is shown raw with its count and labels. Everything is rendered as
 text (escaped). The console never derives a decision from notes.
 
@@ -933,6 +953,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   spreadsheet formula context; a future CSV export must neutralize cells starting with `=`, `+`,
   `-`, `@`, tab or carriage return (the contract allows `+` and `-` at the start of `application`
   and any printable character in `db_user`).
+- **Redis / Valkey key patterns** (P9-E, contract `KeyPattern` rendering rule, ADR-0052 decision
+  7): object names of `redis` / `valkey` findings and of `redis_*` events are shown as escaped text
+  in `<code>` (`KeyPatternText`), never as a link, an `href` or a URL parameter; in the plain-text
+  e-mail they are wrapped in inline code (`src/lib/key-pattern.ts`) so that mail clients do not
+  auto-link `x:javascript:…` or `www.example/…`; in the webhook body they are JSON strings. The
+  console sends no chat-format webhook and has no HTML e-mail and no CSV export.
 - **OpenLDAP labels and principal fingerprints** (P7, ADR-0029 decision 6): for an OpenLDAP
   target (from the event's audit source `openldap_accesslog`, else the target's engine) the
   findings, events and incident views name the location parts as LDAP does: `database` is the
@@ -959,7 +985,8 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
 - **Score** = sensitivity x log10(1 + rows), 0 when the source reports no `rows` or no object is
   sensitive. For an event pre-aggregated by the agent, `rows` is the total of the merged events.
 - **Baselines** per (agent, target, principal), over the events that report `rows` (never
-  `connect` nor `auth_failure`, so failed logins with random account names create none): exponentially
+  `connect` nor `auth_failure`, so failed logins with random account names create none, and never
+  an event without a recorded account, `account_not_recorded`, Redis / Valkey only): exponentially
   weighted mean and variance of `ln(1 + rows)`, weight `max(0.05, 1/n)` (the plain mean for the first
   20 events, then about the last 20). Warm after 20 events. A warm baseline flags an event as an
   **anomaly** when `rows >= 1000` and `ln(1 + rows) > mean + max(ln 10, 3 sd)` (ten times the
@@ -983,7 +1010,10 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   `min_score`, `min_sensitivity`, `anomaly`): `signals` (contract ids or families `signature.*`,
   `shape.*`, `volume.*`; the event carries one of them), `event_actions`, `sources`, `agent_ids`,
   `target_ids`, `engines` (of the target), `principals` and `exclude_principals` (globs on the
-  account name, or on the fingerprint sent in its place), `objects` (`database`, `schema`,
+  account name, or on the fingerprint sent in its place; an event whose account the source did
+  not record, Redis / Valkey `account_not_recorded`, has no name: `principals` globs other than
+  `*` never match it, and `exclude_principals` never hides it, so it cannot be excluded by a
+  principal glob), `objects` (`database`, `schema`,
   `object` globs; one object of the event matches), `min_rows`, `min_score`, `min_sensitivity`,
   `anomaly: true`. Exceptions apply by agent, target and location (`database` / `schema` /
   `object` globs covering every retained object); a classifier-scoped exception never covers an
@@ -1006,7 +1036,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot
-  open one incident each. Every other event is keyed by its principal key (the name, or the
+  open one incident each. An event without a recorded account (`account_not_recorded`, Redis /
+  Valkey, ADR-0052 decision 8) is keyed `unrecorded:<sha256 of the client network>`,
+  `unrecorded:local` or `unrecorded:none` (no address), whatever its action: a prefix of its own,
+  so a failed login of the same network never opens the incident such an event is added to (P9-E
+  review M1); residual: every unrecorded event without a client address (`unrecorded:none`, e.g. full
+  synchronizations without a replica entry) shares one incident per policy, target, database and
+  hour, so several such sources of one hour show as one incident; its `principal_key` (events view filter) is
+  the SHA-256 of `n\0` and that network. Every other event is keyed by its principal key (the name, or the
   fingerprint sent in its place: a non-conforming account name, an OpenLDAP DN not listed in
   `clear_principals`, an unidentified account), ADR-0031
   decision 1, end-of-phase-6 review M1: two fingerprinted principals never share an incident,
@@ -1055,6 +1092,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   of those sent last time needs a confirmation of the exact settings (a digest: if the findings
   change in between, confirm again), is audited, and leaves a warning on the target until a later
   change that does not narrow Audit. The first configuration of a target never warns.
+  Redis / Valkey targets (P9-E review M3): the contract's `SensitiveObject.object` is an
+  `Identifier`, so derived objects named by a key pattern are left out of the settings sent
+  (counted in `skipped_key_patterns` of the answer and in the audit entry; the save never fails
+  because of them, and turning Audit off always works), the Audit page says so, and manual
+  objects are typed `database; object; classifier, …` (split on `;` only, never on `/` or `:`).
+  Key patterns typed by hand are refused until the contract carries them.
 
 ## Alerting
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
@@ -1086,7 +1129,11 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   location (engine, database, schema, object, field), counts (sampled, matched, confidence), and
   `source: "finding"` (absent in rows written before P4-C). An incident raised from access events
   has `source: "access_event"` and, instead of the classifier, location and counts: `principal`,
-  `principal_fingerprinted`, `database`, `hour` and `access` (the first event's `ts`, action,
+  `principal_fingerprinted`, `principal_not_recorded` (P9-E: the source recorded no account, Redis
+  / Valkey only; `principal` is then empty; absent in rows written before P9-E; upgrade note:
+  the field is new in P9-E, and an empty `principal` no longer means the overflow incident only:
+  receivers must read `overflow`, never infer it from an empty `principal`), `database`,
+  `hour` and `access` (the first event's `ts`, action,
   source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
   missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
@@ -1202,7 +1249,7 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   (`connect_failed`).
 - **Agent-integrity alerts**: every `security_events` row written by the console
   (`agent.rotation_conflict`, `agent.batch_rejected`, `agent.batch_conflict`,
-  `agent.foreign_target`) is notified to the system-alert channels, at most once per agent, kind
+  `agent.foreign_target`, `agent.target_mismatch`) is notified to the system-alert channels, at most once per agent, kind
   and hour per channel (the events themselves are all recorded, within their own budget), and within
   the system-alert budget above.
 - **Dropped batches** (P7, end-of-phase-4 review M2): each heartbeat reports `spool.dropped_batches`,

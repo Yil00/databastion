@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
-import { enrollAgent, recordHeartbeat } from "@/server/agents";
+import { enrollAgent, recordHeartbeat, targetSourceDetails, withoutMismatchedSources } from "@/server/agents";
 import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
@@ -21,7 +21,7 @@ import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
 import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
 import { authenticateAgent, authPrecheck, countTimedOutBody, type AuthOptions, type AuthResult } from "./auth";
-import { CONSOLE_ACCEPTS } from "./capabilities";
+import { CONSOLE_ACCEPTS, unlistedEngineDetails } from "./capabilities";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -62,6 +62,9 @@ export function handleEnroll(req: Request): Promise<Response> {
     }
     const body = await readValidBody(req, "EnrollRequest");
     if (!body.ok) return body.response;
+    // ADR-0042 decision 1: no connector of an engine whose token this console does not list.
+    const unlisted = unlistedEngineDetails("EnrollRequest", body.value);
+    if (unlisted.length > 0) return invalidRequest(unlisted);
     const enrolled = await enrollAgent(getDb(), body.value, ip);
     // L4: the enroll argon2id pool is full; the token was not consumed, the agent retries.
     if (enrolled === "busy") return unavailable();
@@ -96,7 +99,26 @@ export function handleHeartbeat(req: Request): Promise<Response> {
     if (!auth.ok) return auth.response;
     const body = await readValidBody(req, "HeartbeatRequest");
     if (!body.ok) return body.response;
-    await recordHeartbeat(getDb(), auth.agent.id, body.value);
+    // ADR-0042 decision 1 (P9-C review H1): connectors, targets, audit sources and detected
+    // targets of an engine whose token this console does not list are refused (`400` `enum`, the
+    // whole heartbeat, as a console built before the value would), never stored.
+    const unlisted = unlistedEngineDetails("HeartbeatRequest", body.value);
+    if (unlisted.length > 0) return invalidRequest(unlisted);
+    // P9-E (review M2, contract "Heartbeat target checks"): a target whose audit source does not
+    // serve its engine is stored without `audit_source`, as an agent-integrity event; the rest of
+    // the heartbeat is processed (no `400`).
+    const mismatched = targetSourceDetails(body.value);
+    if (mismatched.length > 0) {
+      await recordIntegrityEvent(getDb(), {
+        agentId: auth.agent.id,
+        kind: "target_mismatch",
+        endpoint: "heartbeat",
+        status: 200,
+        details: mismatched,
+        ip: clientIp(req),
+      });
+    }
+    await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched));
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,
@@ -339,7 +361,9 @@ export const findingsRequestsPerAgent = RateLimiter.shared("findings.requests_pe
 
 /**
  * `POST /findings` (P2-D). Pipeline: headers, authentication, body (4 MiB cap: `413`),
- * `validateSchema` then `checkSemantics` (`400`), then `ingestFindings`: idempotency on
+ * `validateSchema` then `checkSemantics` (`400`), the engine-token gate (`400` `enum` on
+ * `/findings/<i>/location/engine` for an engine this console does not list, ADR-0042), then
+ * `ingestFindings`: idempotency on
  * (`agent_id`, `batch_id`), job and target ownership (`404`), cross-field checks (`400`), storage.
  * A rejected batch (`400`), a `batch_conflict` and a finding for a target the agent does not own
  * are agent-integrity events (audit log + `security_events`). The body is never logged.
@@ -361,6 +385,13 @@ export function handleFindings(req: Request): Promise<Response> {
         await integrity("batch_rejected", 400, (await errorDetails(body.response)) as ValidationDetail[]);
       }
       return body.response;
+    }
+    // ADR-0042 decision 3 (P9-C review H1): `enum` on `/findings/<i>/location/engine` for an
+    // engine whose token this console does not list; the agent holds those items.
+    const unlisted = unlistedEngineDetails("FindingsBatch", body.value);
+    if (unlisted.length > 0) {
+      await integrity("batch_rejected", 400, unlisted);
+      return invalidRequest(unlisted);
     }
     const stored = await findingsPerAgent.reserveShared(agentId);
     if (!stored.ok) return rateLimited(stored.retryAfterS);
@@ -412,10 +443,11 @@ export const eventsRequestsPerAgent = RateLimiter.shared("events.requests_per_ag
  * headers and authentication; the request rate (`429`, 300 per minute, before the body is read);
  * body (4 MiB cap: `413`), `validateSchema` then `checkSemantics` (`400`: unknown fields such as
  * query text, names and account names that fail the contract patterns, `ts_last < ts`, batch over
- * 1 MiB); back-pressure (`429` + `Retry-After: 30` while the agent has more than 20 000 events not
+ * 1 MiB); the engine-token gate (`400` `enum` on `/events/<i>/source` for a source whose engine
+ * tokens this console does not all list, ADR-0042); back-pressure (`429` + `Retry-After: 30` while the agent has more than 20 000 events not
  * evaluated yet); the stored-batch rate (`429`, 60 per minute); then `ingestEvents`: idempotency on
- * (`agent_id`, `batch_id`), target ownership (`404`, item pointers), future timestamps and
- * retention (`400`), storage. The three `429` answers come **before** the idempotency check: a
+ * (`agent_id`, `batch_id`), target ownership (`404`, item pointers), source, principal and object
+ * names against the target's engine (`400`), future timestamps and retention (`400`), storage. The three `429` answers come **before** the idempotency check: a
  * throttled batch is never recorded, and even the replay of an accepted batch gets `429` until the
  * throttle ends, then `202` with `duplicate: true`. A back-pressure `429` does not consume the
  * stored-batch rate. A rejected batch, a `batch_conflict` and an event for a target the agent does
@@ -438,6 +470,13 @@ export function handleEvents(req: Request): Promise<Response> {
         await integrity("batch_rejected", 400, (await errorDetails(body.response)) as ValidationDetail[]);
       }
       return body.response;
+    }
+    // ADR-0042 decision 3 (P9-C review H1): `enum` on `/events/<i>/source` for a source whose
+    // engine tokens this console does not all list (both Redis and Valkey for `redis_*`).
+    const unlisted = unlistedEngineDetails("EventsBatch", body.value);
+    if (unlisted.length > 0) {
+      await integrity("batch_rejected", 400, unlisted);
+      return invalidRequest(unlisted);
     }
     // M2 back-pressure: the worker has not evaluated this agent's backlog yet.
     if (await pendingEventsOver(getDb(), agentId)) {

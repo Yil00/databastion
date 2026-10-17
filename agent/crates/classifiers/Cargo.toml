@@ -21,6 +21,11 @@ unicode-normalization.workspace = true
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+# tests/keys_contract.rs: the KeyPattern gate against the contract's own
+# patterns, read from openapi.yaml and compiled with `regress` (the engine of
+# the generated types and, in ECMAScript form, of the console's Ajv).
+databastion-protocol-codegen.workspace = true
+regress = "0.12"
 # Property tests check normalized names against the generated contract
 # `Identifier` type (test only; the library does not depend on it).
 databastion-protocol.workspace = true

@@ -3,21 +3,24 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
-import { hasNamedLocationParts, locationPartLabels } from "@/lib/location-labels";
+import { engineDisplayName, hasNamedLocationParts, isKeyPatternEngine, locationPartLabels } from "@/lib/location-labels";
+import type { Engine } from "@/lib/protocol/enums";
 import type { FindingSummaryRow, FindingView } from "@/server/findings";
 
 import { FalsePositiveButton } from "./false-positive-button";
+import { KeyPatternText } from "./key-pattern";
 
 /**
  * Findings view parts (server components). Every agent-provided string (target ids, names,
  * classifiers, masked samples) is rendered as a React text node: escaped, never HTML.
  */
 
-export function findingsHref(q: { agent?: string; target?: string; classifier?: string; fp?: boolean }): string {
+export function findingsHref(q: { agent?: string; target?: string; classifier?: string; engine?: Engine; fp?: boolean }): string {
   const params = new URLSearchParams();
   if (q.agent) params.set("agent", q.agent);
   if (q.target) params.set("target", q.target);
   if (q.classifier) params.set("classifier", q.classifier);
+  if (q.engine) params.set("engine", q.engine);
   if (q.fp) params.set("fp", "1");
   const s = params.toString();
   return s ? `/findings?${s}` : "/findings";
@@ -26,9 +29,11 @@ export function findingsHref(q: { agent?: string; target?: string; classifier?: 
 type LocationParts = Pick<FindingView, "databaseName" | "schemaName" | "objectName" | "fieldName">;
 
 /**
- * A finding location on one line. OpenLDAP (ADR-0029 decision 6) and CAS (ADR-0041 decision 4):
- * each part is named (naming context, container, object class, attribute; store, service type,
- * service, path), since `schema` and `object` do not mean a schema and a table there.
+ * A finding location on one line. OpenLDAP (ADR-0029 decision 6), CAS (ADR-0041 decision 4) and
+ * Redis / Valkey (ADR-0052 decision 7): each part is named (naming context, container, object
+ * class, attribute; store, service type, service, path; database, type, key pattern, field), since
+ * `schema` and `object` do not mean a schema and a table there. Plain text: callers render it as
+ * a text node (escaped), never as a link.
  */
 export function locationLabel(f: LocationParts, engine: string | null = null): string {
   if (!hasNamedLocationParts(engine)) return [f.databaseName, f.schemaName, f.objectName, f.fieldName].filter((p) => p !== null).join(" / ");
@@ -48,15 +53,21 @@ function namedParts(f: LocationParts, engine: string | null): [string, string][]
   return parts.filter((p): p is [string, string] => p[1] !== null);
 }
 
-/** The location cell: OpenLDAP and CAS parts one per line with their names; other engines on one line. */
+/**
+ * The location cell: OpenLDAP, CAS and Redis / Valkey parts one per line with their names (a key
+ * pattern as inline code, never a link: contract `KeyPattern` rendering rule); other engines on
+ * one line.
+ */
 export function LocationCell({ location, engine }: { location: LocationParts; engine: string | null }) {
   if (!hasNamedLocationParts(engine)) return <>{locationLabel(location)}</>;
+  const l = locationPartLabels(engine, location.databaseName);
+  const keyPatterns = isKeyPatternEngine(engine);
   return (
     <dl className="grid grid-cols-[max-content_1fr] gap-x-2 text-xs">
       {namedParts(location, engine).map(([label, value]) => (
         <div key={label} className="contents">
           <dt className="text-muted-foreground">{label}</dt>
-          <dd className="break-all">{value}</dd>
+          <dd className="break-all">{keyPatterns && label === l.object ? <KeyPatternText value={value} /> : value}</dd>
         </div>
       ))}
     </dl>
@@ -155,7 +166,7 @@ export function FindingsTable({
           <TableRow key={f.id} className={f.falsePositiveAt ? "text-muted-foreground" : undefined}>
             <TableCell>
               {f.agentName} / {f.targetId}
-              <div className="text-xs text-muted-foreground">{f.engine}</div>
+              <div className="text-xs text-muted-foreground">{engineDisplayName(f.engine)}</div>
             </TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal">
               <LocationCell location={f} engine={f.engine} />

@@ -14,13 +14,18 @@
 //! without a fallback value, so a console built before `cas` rejects any
 //! body naming it. Until the console lists `engine.cas`, the agent sends no
 //! `cas` connector, target, detected target, finding or event
-//! ([`engine_token`], [`ConsoleCapabilities::accepts_engine`]).
+//! ([`engine_token`], [`ConsoleCapabilities::accepts_engine`]). The same
+//! holds for `sqlserver` (`engine.sqlserver`, ADR-0051 decision 8) and for
+//! `redis` / `valkey` (`engine.redis`, `engine.valkey`, ADR-0052 decision
+//! 12); the `redis` connector and the `redis_*` audit sources serve both
+//! engines, so they wait for **both** tokens.
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 
 use databastion_protocol::{
-    AuditSource, CapabilityList, Connector, ConnectorList, Engine, HeartbeatRequest, TargetId,
+    AuditSource, CapabilityList, Connector, ConnectorList, DetectedTargetProcess, Engine,
+    HeartbeatRequest, TargetId,
 };
 
 /// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
@@ -39,31 +44,86 @@ pub(crate) mod token {
     /// The `cas` values of `Engine` and `Connector`, and `cas_audit_log` of
     /// `AuditSource` (ADR-0041 decision 12).
     pub(crate) const ENGINE_CAS: &str = "engine.cas";
+    /// The `sqlserver` values of `Engine` and `Connector`, and the
+    /// `sqlserver_*` values of `AuditSource` (ADR-0051 decision 8).
+    pub(crate) const ENGINE_SQLSERVER: &str = "engine.sqlserver";
+    /// The `TargetNoteLabel` values of the Microsoft SQL Server revision
+    /// (ADR-0051 decision 4, ADR-0022 decision 4).
+    pub(crate) const NOTE_LABELS_2026_10: &str = "target_status.note_labels.2026_10";
+    /// The `TargetNoteLabel` values of the second Microsoft SQL Server
+    /// revision (ADR-0051 refinement of 2026-10-14, items 5 to 7; ADR-0022
+    /// decision 4): database-scoped event-session permissions, the other
+    /// permissions the connector judges by name, and the `check()` reads
+    /// named with `privilege.not_evaluated`.
+    pub(crate) const NOTE_LABELS_2026_10_B: &str = "target_status.note_labels.2026_10_b";
+    /// The `redis` value of `Engine` (ADR-0052 decision 12).
+    pub(crate) const ENGINE_REDIS: &str = "engine.redis";
+    /// The `valkey` value of `Engine` (ADR-0052 decision 12).
+    pub(crate) const ENGINE_VALKEY: &str = "engine.valkey";
 }
 
-/// The token gating an `Engine` value (ADR-0039 decision 8): `None` for the
-/// engines of protocol 0.1.0, always sendable. Exhaustive on purpose: a new
+/// No token: a value of protocol 0.1.0.
+const UNGATED: &[&str] = &[];
+/// `engine.cas`.
+const CAS: &[&str] = &[token::ENGINE_CAS];
+/// `engine.sqlserver`.
+const SQLSERVER: &[&str] = &[token::ENGINE_SQLSERVER];
+/// The values shared by Redis and Valkey (the `redis` connector, the
+/// `redis_*` audit sources): both tokens (ADR-0052 decision 12).
+const REDIS_AND_VALKEY: &[&str] = &[token::ENGINE_REDIS, token::ENGINE_VALKEY];
+
+/// The tokens gating an `Engine` value (ADR-0039 decision 8): none for the
+/// engines of protocol 0.1.0, always sendable; otherwise the value is sent
+/// only once the console lists every one. Exhaustive on purpose: a new
 /// contract engine does not compile until it is given its token.
-pub(crate) fn engine_token(engine: Engine) -> Option<&'static str> {
+pub(crate) fn engine_token(engine: Engine) -> &'static [&'static str] {
     match engine {
         Engine::Postgres | Engine::Mysql | Engine::Mariadb | Engine::Mongodb | Engine::Openldap => {
-            None
+            UNGATED
         }
-        Engine::Cas => Some(token::ENGINE_CAS),
+        Engine::Cas => CAS,
+        Engine::Sqlserver => SQLSERVER,
+        Engine::Redis => &[token::ENGINE_REDIS],
+        Engine::Valkey => &[token::ENGINE_VALKEY],
     }
 }
 
-/// The token gating a `Connector` value (see [`engine_token`]).
-pub(crate) fn connector_token(connector: Connector) -> Option<&'static str> {
+/// The tokens gating a `DetectedTarget.process` value: those of the
+/// engines the process can belong to, as the console checks them (contract
+/// "Engine-token gate"). A detected target is sent only when both its
+/// engine's and its process's tokens are listed (P9-C L1: a Valkey server
+/// running as `redis-server` is a `valkey` target with a `redis` process,
+/// which a console listing only `engine.valkey` refuses, with the whole
+/// heartbeat).
+pub(crate) fn process_token(process: DetectedTargetProcess) -> &'static [&'static str] {
+    match process {
+        DetectedTargetProcess::Postgres
+        | DetectedTargetProcess::Mysqld
+        | DetectedTargetProcess::Mariadbd
+        | DetectedTargetProcess::Mongod
+        | DetectedTargetProcess::Slapd => UNGATED,
+        DetectedTargetProcess::Sqlservr => SQLSERVER,
+        DetectedTargetProcess::RedisServer => &[token::ENGINE_REDIS],
+        DetectedTargetProcess::ValkeyServer => &[token::ENGINE_VALKEY],
+    }
+}
+
+/// The tokens gating a `Connector` value (see [`engine_token`]).
+pub(crate) fn connector_token(connector: Connector) -> &'static [&'static str] {
     match connector {
-        Connector::Postgres | Connector::Mysql | Connector::Mongodb | Connector::Openldap => None,
-        Connector::Cas => Some(token::ENGINE_CAS),
+        Connector::Postgres | Connector::Mysql | Connector::Mongodb | Connector::Openldap => {
+            UNGATED
+        }
+        Connector::Cas => CAS,
+        Connector::Sqlserver => SQLSERVER,
+        Connector::Redis => REDIS_AND_VALKEY,
     }
 }
 
-/// The token gating an `AuditSource` value: the token of its engine (see
+/// The tokens gating an `AuditSource` value: those of its engine, or of
+/// both engines for the sources Redis and Valkey share (see
 /// [`engine_token`]).
-pub(crate) fn audit_source_token(source: AuditSource) -> Option<&'static str> {
+pub(crate) fn audit_source_token(source: AuditSource) -> &'static [&'static str] {
     match source {
         AuditSource::Pgaudit
         | AuditSource::PgStatStatements
@@ -74,8 +134,15 @@ pub(crate) fn audit_source_token(source: AuditSource) -> Option<&'static str> {
         | AuditSource::MongodbAuditLog
         | AuditSource::MongodbProfiler
         | AuditSource::MongodbLog
-        | AuditSource::OpenldapAccesslog => None,
-        AuditSource::CasAuditLog => Some(token::ENGINE_CAS),
+        | AuditSource::OpenldapAccesslog => UNGATED,
+        AuditSource::CasAuditLog => CAS,
+        AuditSource::SqlserverAudit
+        | AuditSource::SqlserverXevents
+        | AuditSource::SqlserverQueryStats => SQLSERVER,
+        AuditSource::RedisSlowlog
+        | AuditSource::RedisCommandlog
+        | AuditSource::RedisAclLog
+        | AuditSource::RedisSync => REDIS_AND_VALKEY,
     }
 }
 
@@ -113,10 +180,10 @@ impl ConsoleCapabilities {
         self.record(None);
     }
 
-    /// Whether the console accepts `token`, or nothing needs accepting
-    /// (`None`: a value of protocol 0.1.0).
-    pub(crate) fn accepts_gate(&self, token: Option<&str>) -> bool {
-        token.is_none_or(|t| self.console_accepts(t))
+    /// Whether the console accepts every one of `tokens` (none: a value of
+    /// protocol 0.1.0).
+    pub(crate) fn accepts_gate(&self, tokens: &[&str]) -> bool {
+        tokens.iter().all(|t| self.console_accepts(t))
     }
 
     /// Whether an `Engine` value may be sent (ADR-0039 decision 8).
@@ -171,9 +238,11 @@ pub(crate) fn withhold_unaccepted_engines(
             t.audit_source = None;
         }
     }
-    heartbeat
-        .detected_targets
-        .retain(|d| caps.accepts_engine(d.engine));
+    heartbeat.detected_targets.retain(|d| {
+        caps.accepts_engine(d.engine)
+            && d.process
+                .is_none_or(|p| caps.accepts_gate(process_token(p)))
+    });
     withheld
 }
 
@@ -182,7 +251,7 @@ pub(crate) fn withhold_unaccepted_engines(
 /// known yet. The others are reported by the first heartbeat whose
 /// predecessor's response listed their token.
 pub(crate) fn enroll_connectors(mut connectors: ConnectorList) -> ConnectorList {
-    connectors.0.retain(|c| connector_token(*c).is_none());
+    connectors.0.retain(|c| connector_token(*c).is_empty());
     connectors
 }
 
@@ -254,7 +323,7 @@ mod tests {
             Engine::Mongodb,
             Engine::Openldap,
         ] {
-            assert_eq!(engine_token(e), None);
+            assert!(engine_token(e).is_empty());
             assert!(caps.accepts_engine(e));
         }
         for c in [
@@ -288,19 +357,78 @@ mod tests {
 
     #[test]
     fn engine_tokens_are_contract_capabilities_named_after_the_value() {
-        let gated = [(
-            engine_token(Engine::Cas),
-            connector_token(Connector::Cas),
-            audit_source_token(AuditSource::CasAuditLog),
-            "cas",
-        )];
-        for (engine, connector, source, value) in gated {
-            let token = engine.unwrap();
-            assert_eq!(token, format!("engine.{value}"));
-            assert_eq!(connector, Some(token));
-            assert_eq!(source, Some(token));
-            assert!(databastion_protocol::Capability::try_from(token).is_ok());
+        for (engine, value) in [
+            (Engine::Cas, "cas"),
+            (Engine::Sqlserver, "sqlserver"),
+            (Engine::Redis, "redis"),
+            (Engine::Valkey, "valkey"),
+        ] {
+            assert_eq!(engine_token(engine), [format!("engine.{value}").as_str()]);
+            assert_eq!(engine.to_string(), value);
+            assert!(databastion_protocol::Capability::try_from(engine_token(engine)[0]).is_ok());
         }
+        assert_eq!(connector_token(Connector::Cas), engine_token(Engine::Cas));
+        assert_eq!(
+            audit_source_token(AuditSource::CasAuditLog),
+            engine_token(Engine::Cas)
+        );
+        assert_eq!(
+            connector_token(Connector::Sqlserver),
+            engine_token(Engine::Sqlserver)
+        );
+        for s in [
+            AuditSource::SqlserverAudit,
+            AuditSource::SqlserverXevents,
+            AuditSource::SqlserverQueryStats,
+        ] {
+            assert_eq!(audit_source_token(s), engine_token(Engine::Sqlserver));
+        }
+        // One connector and four sources serve Redis and Valkey: both tokens.
+        let both = [token::ENGINE_REDIS, token::ENGINE_VALKEY];
+        assert_eq!(connector_token(Connector::Redis), both);
+        for s in [
+            AuditSource::RedisSlowlog,
+            AuditSource::RedisCommandlog,
+            AuditSource::RedisAclLog,
+            AuditSource::RedisSync,
+        ] {
+            assert_eq!(audit_source_token(s), both);
+        }
+    }
+
+    #[test]
+    fn sqlserver_redis_and_valkey_values_wait_for_their_tokens() {
+        let caps = ConsoleCapabilities::default();
+        for e in [Engine::Sqlserver, Engine::Redis, Engine::Valkey] {
+            assert!(!caps.accepts_engine(e));
+        }
+        assert!(!caps.accepts_connector(Connector::Sqlserver));
+        assert!(!caps.accepts_connector(Connector::Redis));
+        assert!(!caps.accepts_audit_source(AuditSource::SqlserverXevents));
+        assert!(!caps.accepts_audit_source(AuditSource::RedisSlowlog));
+
+        caps.record(Some(&list(&[token::ENGINE_SQLSERVER])));
+        assert!(caps.accepts_engine(Engine::Sqlserver));
+        assert!(caps.accepts_connector(Connector::Sqlserver));
+        assert!(caps.accepts_audit_source(AuditSource::SqlserverAudit));
+        assert!(!caps.accepts_engine(Engine::Redis));
+
+        // One of the two tokens: that engine's targets, but not the shared
+        // connector nor the shared sources.
+        caps.record(Some(&list(&[token::ENGINE_REDIS])));
+        assert!(caps.accepts_engine(Engine::Redis));
+        assert!(!caps.accepts_engine(Engine::Valkey));
+        assert!(!caps.accepts_connector(Connector::Redis));
+        assert!(!caps.accepts_audit_source(AuditSource::RedisAclLog));
+        caps.record(Some(&list(&[token::ENGINE_VALKEY])));
+        assert!(caps.accepts_engine(Engine::Valkey));
+        assert!(!caps.accepts_connector(Connector::Redis));
+        assert!(!caps.accepts_audit_source(AuditSource::RedisSync));
+
+        caps.record(Some(&list(&[token::ENGINE_REDIS, token::ENGINE_VALKEY])));
+        assert!(caps.accepts_connector(Connector::Redis));
+        assert!(caps.accepts_audit_source(AuditSource::RedisCommandlog));
+        assert!(!caps.accepts_engine(Engine::Sqlserver));
     }
 
     /// The contract fixture of a heartbeat reporting `cas` targets.
@@ -336,7 +464,7 @@ mod tests {
         // What is left is what a console built before `cas` accepts: the
         // generated types of that console are the 0.1.0 enums.
         for t in &hb.targets {
-            assert!(engine_token(t.engine).is_none());
+            assert!(engine_token(t.engine).is_empty());
         }
 
         // Listed: everything is reported.
@@ -348,9 +476,57 @@ mod tests {
     }
 
     #[test]
+    fn detected_targets_wait_for_their_process_token_too() {
+        // A Valkey server started as `redis-server`: a `valkey` detected
+        // target with a `redis-server` process (P9-C L1).
+        let mut hb: HeartbeatRequest = serde_json::from_value(serde_json::json!({
+            "agent_version": "0.7.0",
+            "connectors": ["redis"],
+            "targets": [],
+            "detected_targets": [
+                {"engine": "valkey", "process": "redis-server"},
+                {"engine": "valkey", "process": "valkey-server"},
+                {"engine": "redis", "port": 6379},
+                {"engine": "postgres", "process": "postgres"}
+            ],
+            "ts": "2026-10-14T00:00:00Z",
+            "uptime_s": 1,
+            "spool": {"bytes": 0, "max_bytes": 1, "batches": 0}
+        }))
+        .unwrap();
+        let caps = ConsoleCapabilities::default();
+        caps.record(Some(&list(&[token::ENGINE_VALKEY])));
+        let mut only_valkey = hb.clone();
+        withhold_unaccepted_engines(&mut only_valkey, &caps);
+        let json = serde_json::to_string(&only_valkey.detected_targets).unwrap();
+        assert!(!json.contains("redis-server"), "{json}");
+        assert!(json.contains("valkey-server"), "{json}");
+        assert!(!json.contains(r#""engine":"redis""#), "{json}");
+        assert!(json.contains("postgres"), "{json}");
+        // The shared connector needs both tokens.
+        assert!(only_valkey.connectors.0.is_empty());
+
+        caps.record(Some(&list(&[token::ENGINE_VALKEY, token::ENGINE_REDIS])));
+        withhold_unaccepted_engines(&mut hb, &caps);
+        assert_eq!(hb.detected_targets.len(), 4);
+        assert_eq!(hb.connectors.0, vec![Connector::Redis]);
+        assert_eq!(
+            process_token(DetectedTargetProcess::RedisServer),
+            [token::ENGINE_REDIS]
+        );
+        assert!(process_token(DetectedTargetProcess::Slapd).is_empty());
+    }
+
+    #[test]
     fn enrollment_lists_only_the_connectors_of_protocol_0_1_0() {
         let all: ConnectorList = serde_json::from_value(serde_json::json!([
-            "postgres", "mysql", "mongodb", "openldap", "cas"
+            "postgres",
+            "mysql",
+            "mongodb",
+            "openldap",
+            "cas",
+            "sqlserver",
+            "redis"
         ]))
         .unwrap();
         let sent = enroll_connectors(all);

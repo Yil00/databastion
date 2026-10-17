@@ -46,7 +46,7 @@ exact certificate identity is known for each version: check it exactly, not with
 bundles use the Sigstore bundle format), then:
 
 ```bash
-VERSION=0.6.0
+VERSION=0.7.0
 ID=(--certificate-identity "https://github.com/Yil00/databastion/.github/workflows/publish.yml@refs/tags/$VERSION"
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
     --certificate-github-workflow-trigger push)
@@ -74,7 +74,7 @@ docker buildx imagetools inspect "$agent_ref" --format '{{json .Provenance}}'
 
 A tag can be moved in a registry; a digest cannot. **Pinning the digest is required**: `.env` takes
 the console line of the verified `image-digests.txt`
-(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.6.0@sha256:<digest>`), and Compose
+(`DATABASTION_CONSOLE_IMAGE=ghcr.io/yil00/databastion-console:0.7.0@sha256:<digest>`), and Compose
 then pulls exactly that image.
 
 ## Install
@@ -91,7 +91,7 @@ On the console host, in an empty directory (as a user allowed to run `docker`), 
 `SHA256SUMS` verified [above](#verify-the-artifacts):
 
 ```bash
-VERSION=0.6.0
+VERSION=0.7.0
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-deploy-$VERSION.tar.gz"
 sha256sum --check --ignore-missing SHA256SUMS            # must print "databastion-deploy-...: OK"
 tar -xzf "databastion-deploy-$VERSION.tar.gz" --strip-components=2 "databastion-deploy-$VERSION/deploy"
@@ -117,6 +117,15 @@ docker compose --profile proxy up -d     # pulls the images, runs the migrations
 
 `secrets/encryption_key` protects the secrets the console stores (notification channels, masked
 samples): keep a copy offline.
+
+**Console database locale.** The console matches the object names of Audit events against its
+findings without case (an event on `CRM.CUSTOMERS` gets the sensitivity of `crm.customers`), in
+part with PostgreSQL `lower`, which folds letters beyond ASCII only under a UTF-8 character type.
+The bundled PostgreSQL image creates its database with `en_US.utf8`. With your own PostgreSQL,
+create the console database with a UTF-8 `LC_CTYPE` (for example `en_US.UTF-8` or `C.UTF-8`), not
+`C` or `POSIX`. Check it with `SELECT datctype FROM pg_database WHERE datname = current_database();`.
+Under `C` / `POSIX` the matching still works, but the worker then reads every finding of the agent
+for each batch of events that names a non-ASCII object, which is slower on large installations.
 
 **Your own reverse proxy instead of Caddy**: `cp docker-compose.own-proxy.example.yml
 compose.own-proxy.yaml`, add `COMPOSE_FILE=compose.yaml:compose.own-proxy.yaml` to `.env`, start
@@ -149,7 +158,7 @@ for one agent.
 On the database host. Verify the download first ([above](#verify-the-artifacts)).
 
 ```bash
-VERSION=0.6.0
+VERSION=0.7.0
 ARCH="$(dpkg --print-architecture)"      # amd64 or arm64
 curl -fsSLO "https://github.com/Yil00/databastion/releases/download/$VERSION/databastion-agent_${VERSION}_${ARCH}.deb"
 sha256sum --check --ignore-missing SHA256SUMS          # the list verified with cosign

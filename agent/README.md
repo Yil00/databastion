@@ -3,11 +3,12 @@
 Rust Cargo workspace for `databastion-agent`, the single agent binary with
 per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 
-> **Status: released (v0.1.0; latest v0.6.0).** `agent.yaml`
+> **Status: released (v0.1.0; latest v0.7.0).** `agent.yaml`
 > configuration, enrollment, `0600` identity storage, HTTPS uplink,
 > heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
 > detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
-> MariaDB, MongoDB, OpenLDAP and, since 0.4.0, Apereo CAS (local files).
+> MariaDB, MongoDB, OpenLDAP, since 0.4.0 Apereo CAS (local files), and
+> since 0.8.0 Redis / Valkey and Microsoft SQL Server (phase 9).
 > `check()` reports the audit level each
 > target actually reaches
 > ([08-engine-capabilities.md](../docs/08-engine-capabilities.md)).
@@ -24,6 +25,8 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 | `databastion-connector-mongodb` | `crates/connector-mongodb` | MongoDB connector: Discovery and `check()` (P5-A, [ADR-0026](../docs/adr/0026-mongodb-connector.md), [README](crates/connector-mongodb/README.md)); Audit from the `auditLog`, the server log or the profiler (P5-B, P5-C, [ADR-0027](../docs/adr/0027-mongodb-audit.md)) |
 | `databastion-connector-openldap` | `crates/connector-openldap` | OpenLDAP connector: Discovery, `check()` and Audit through `cn=accesslog` (phase 6, [ADR-0029](../docs/adr/0029-openldap-connector.md), [README](crates/connector-openldap/README.md)) |
 | `databastion-connector-cas` | `crates/connector-cas` | Apereo CAS connector, local files only: JSON service registry Discovery, JSON audit log Audit, `check()` (phase 8, [ADR-0041](../docs/adr/0041-cas-connector.md), [README](crates/connector-cas/README.md)); its targets, findings and events are sent once the console lists `engine.cas` ([ADR-0042](../docs/adr/0042-hold-items-of-unlisted-engines.md)) |
+| `databastion-connector-redis` | `crates/connector-redis` | Redis / Valkey connector: own RESP3 client, Discovery, `check()` and a Limited Audit (phase 9, [ADR-0052](../docs/adr/0052-redis-valkey-connector.md); in development, not released yet); sent once the console lists `engine.redis` and `engine.valkey` |
+| `databastion-connector-sqlserver` | `crates/connector-sqlserver` | Microsoft SQL Server connector: own TDS client, Discovery, `check()` and Audit from SQL Server Audit (phase 9, [ADR-0051](../docs/adr/0051-sqlserver-connector.md); in development, not released yet); sent once the console lists `engine.sqlserver` |
 | `databastion-protocol` | `crates/protocol` | Protocol types generated from `shared/protocol/openapi.yaml` (used by the uplink only) |
 | `databastion-protocol-codegen` | `crates/protocol-codegen` | Developer tool: regenerates `crates/protocol/src/generated.rs` (not linked into the binary) |
 
@@ -31,7 +34,8 @@ Dependency direction: `classifiers` ← `core` ← `connector-*` ← `agent`;
 `protocol` ← `core` (uplink only, not re-exported).
 
 ### Cargo features (binary)
-`postgres`, `mysql`, `mongodb`, `openldap`, `cas`: all enabled by default. A
+`postgres`, `mysql`, `mongodb`, `openldap`, `cas`, `redis`, `sqlserver`: all
+enabled by default. A
 minimal binary: `cargo build --no-default-features --features postgres`.
 
 ## Security boundaries
@@ -202,9 +206,10 @@ minimal binary: `cargo build --no-default-features --features postgres`.
 `detect` looks at the agent host only, read-only, with no network I/O: a
 fixed list of Unix socket paths under `/run`, `/var/run`, `/tmp`,
 `/var/lib/mysql` (`lstat`, never connect); `LISTEN` entries of
-`/proc/net/tcp{,6}` for ports 5432 / 3306 / 27017 / 389 / 636 (the address is
-never reported); `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`,
-`mongod`, `slapd` (never the command line). Declared targets are excluded
+`/proc/net/tcp{,6}` for ports 5432 / 3306 / 27017 / 389 / 636 / 6379 / 1433
+(the address is never reported); `/proc/<pid>/comm` for `postgres`, `mysqld`,
+`mariadbd`, `mongod`, `slapd`, `redis-server`, `valkey-server`, `sqlservr`
+(never the command line). Declared targets are excluded
 (same socket; loopback host with the same port; a local target of the same
 engine family hides the process entry). At most 16 entries, reported as
 `detected_targets` in the heartbeat. Detection runs in `spawn_blocking` and
@@ -347,6 +352,12 @@ is not seen.
 MySQL / MariaDB audit log statements reported before their statement record
 because the bounded grouping state was full are counted in the heartbeat
 metric `audit_pending_evicted_total` (`databastion_core::audit::count_pending_evicted`).
+Rows of the agent's own MySQL `performance_schema` polls that were
+interrupted (`KILL QUERY`, statement timeout) and kept by the server with a
+cut digest only, dropped by the MySQL / MariaDB connector (ADR-0045
+refinement of 2026-10-16), are counted in the heartbeat metric
+`audit_own_polls_interrupted_total`
+(`databastion_core::audit::count_interrupted_own_polls`).
 
 Connectors parse every audit record in isolation (`databastion_core::isolate`),
 and the file sources also convert each record (PostgreSQL: each statement's

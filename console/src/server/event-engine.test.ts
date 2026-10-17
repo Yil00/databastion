@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { PgBoss } from "pg-boss";
@@ -29,6 +29,7 @@ import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
 import { configureAudit } from "./audit-config";
+import { sha256Hex } from "./crypto";
 import * as engine from "./event-engine";
 import { EVENT_CHUNK, EVENT_CHUNK_PER_AGENT, evaluateChunk } from "./event-engine";
 import { BASELINES_CAP_VAR, EVENT_INCIDENTS_CAP_VAR, getPrincipal, ingestEvents, incidentEventCount, incidentEventViews, listEvents, listPrincipals, principalIncidents, principalKey } from "./events";
@@ -205,6 +206,29 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(last?.sensitivity).toBe(objectSensitivity([{ classifier: "pii.email", confidence: 0.97 }]));
     });
 
+    it("matches the findings of an object without case or trailing spaces, on database, schema and object (N1)", async () => {
+      const auth = await agentWithTargets();
+      await scanWith(auth, [finding("email", "pii.email", 1), finding("name", "pii.person_name", 1, "clientèle"), finding("phone", "pii.phone", 1, "πελατες")]);
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "Crm", object: "Clients" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "Public", object: "CLIENTÈLE" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "CRM", schema: "PUBLIC", object: "CLIENT" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "CRM", schema: "PRIVATE", object: "CLIENTS" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "SHOP", schema: "PUBLIC", object: "CLIENTS" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: " clients" }], rows: 99 }),
+        // Review M1: final sigma.
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "ΠΕΛΑΤΕΣ" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "ΠΕΛΑΤΗΣ" }], rows: 99 }),
+      ]);
+      await drainPolicyWork(getDb());
+      const rows = await eventsOf(auth.agentId);
+      expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0, 0, 0, 3, 0]);
+      expect(rows.map((r) => r.score)).toEqual([6, 6, 4, 0, 0, 0, 0, 6, 0]);
+      // The event keeps the names as the agent sent them.
+      expect(rows[0]?.objects).toEqual([{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }]);
+    });
+
     it("an event without schema matches the findings of any schema (MySQL-like sources)", async () => {
       const auth = await agentWithTargets();
       await scanWith(auth, [finding("email", "pii.email", 1)]);
@@ -318,6 +342,41 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const list = await incidentsOf(auth.agentId);
       expect(list.map((i) => i.policyId)).toEqual([kept]);
       expect(list.every((i) => i.policyId !== disabled)).toBe(true);
+    });
+
+    it("`objects` conditions ignore case and trailing spaces; exceptions ignore trailing spaces on MySQL only (N1)", async () => {
+      const auth = await agentWithTargets();
+      const pid = await policy({ objects: { database: "crm", object: "clients" } });
+      // Exception of a second policy, scoped to the location only: case-insensitive on every
+      // engine (ADR-0014), blind to trailing spaces on SQL Server and MySQL / MariaDB only.
+      const xp = await policy({ objects: { object: "clients" } });
+      await createException(
+        getDb(),
+        { policyId: xp, agentId: null, targetId: null, classifier: null, location: { database: "crm", object: "clients" }, reason: "x", expiresAt: null },
+        actor(),
+      );
+      const mysql = (object: string, ts: string) =>
+        dumpEvent({ ts, target_id: "mysql-crm", objects: [{ database: "CRM", object }], signals: [], source: "performance_schema" });
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "CRM", schema: "public", object: "CLIENTS " }], principal: { db_user: "a" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "Clients" }], principal: { db_user: "b" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients " }], principal: { db_user: "c" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "client" }], principal: { db_user: "d" } }),
+        mysql("Clients ", at(1000)),
+        mysql("CLIENT", at(2000)),
+      ]);
+      await drainPolicyWork(getDb());
+      const evs = await eventsOf(auth.agentId);
+      const linked = async (policyId: string) => {
+        const incs = (await incidentsOf(auth.agentId)).filter((i) => i.policyId === policyId).map((i) => i.id);
+        const links = incs.length === 0 ? [] : await getDb().select().from(incidentEvents).where(inArray(incidentEvents.incidentId, incs));
+        return evs.flatMap((e, i) => (links.some((l) => l.eventId === e.id) ? [i] : []));
+      };
+      // Policy: every spelling of crm.clients, never `client`.
+      expect(await linked(pid)).toEqual([0, 1, 2, 4]);
+      // Exception: `Clients` excepted on PostgreSQL, `CLIENTS ` / `clients ` not (a distinct quoted
+      // name there), `Clients ` excepted on MySQL.
+      expect(await linked(xp)).toEqual([0, 2]);
     });
 
     it("a policy change applies to the events evaluated after it, never to past ones", async () => {
@@ -660,6 +719,113 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       } finally {
         spy.mockRestore();
       }
+    });
+  });
+
+  describe("P9-E: events without a recorded account (Redis / Valkey, ADR-0052 decision 8)", () => {
+    const REDIS_HEARTBEAT = {
+      ...HEARTBEAT,
+      connectors: [...HEARTBEAT.connectors, "redis"],
+      targets: [
+        ...HEARTBEAT.targets,
+        { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
+      ],
+    };
+    const slowRead = (i: number, principal: Record<string, unknown>, over: Record<string, unknown> = {}) => ({
+      target_id: "cache-redis",
+      ts: at(i * 1000),
+      principal,
+      action: "read",
+      objects: [{ database: "db0", object: "user:*:profile" }],
+      rows: 50_000,
+      source: "redis_slowlog",
+      aggregated_count: 1,
+      ...over,
+    });
+
+    it("dedup principal unrecorded:<network> / unrecorded:local / unrecorded:none, no baseline, principal shown as not recorded", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HEARTBEAT }))).status).toBe(200);
+      await policy({ event_actions: ["read"], sources: ["redis_slowlog", "redis_sync"] });
+      const none = { account_not_recorded: true };
+      await send(auth, [
+        slowRead(0, { account_not_recorded: true, client_addr: "198.51.100.31" }),
+        slowRead(1, { account_not_recorded: true, client_addr: "198.51.100.77", application: "redis-cli" }),
+        slowRead(2, { account_not_recorded: true, client_addr: "203.0.113.40" }),
+        slowRead(3, { account_not_recorded: true, client_addr: "local" }),
+        slowRead(4, none, { source: "redis_sync", objects: [{ database: "*", object: "*" }], signals: ["signature.full_sync"] }),
+        slowRead(5, none, { source: "redis_sync", objects: [{ database: "*", object: "*" }], signals: ["signature.full_sync"] }),
+        // A named account of the same network is never merged with the unrecorded ones.
+        slowRead(6, { db_user: "app", client_addr: "198.51.100.31" }),
+      ]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      const principalPart = (k: string) => /\|principal:([^|]+)\|/.exec(k)?.[1];
+      const byPrincipal = new Map(list.map((i) => [principalPart(i.dedupKey), i]));
+      const net = (n: string) => `unrecorded:${sha256Hex(n)}`;
+      expect([...byPrincipal.keys()].sort()).toEqual(
+        [net("198.51.100.0/24"), net("203.0.113.0/24"), "unrecorded:local", "unrecorded:none", principalKey({ db_user: "app" })].sort(),
+      );
+      expect(byPrincipal.get(net("198.51.100.0/24"))?.matchCount).toBe(2);
+      expect(byPrincipal.get("unrecorded:none")?.matchCount).toBe(2);
+      expect(byPrincipal.get("unrecorded:local")?.matchCount).toBe(1);
+      // Never the hash of an empty fingerprint, never agent text in a key.
+      for (const i of list) {
+        expect(i.dedupKey).not.toContain(principalKey({ db_user_fingerprint: "" } as never));
+        expect(i.dedupKey).not.toContain("198.51.100");
+      }
+      const unrecorded = list.filter((i) => i.principal === "");
+      expect(unrecorded).toHaveLength(4);
+      expect(byPrincipal.get(principalKey({ db_user: "app" }))?.principal).toBe("app");
+      // No per-principal baseline for the unrecorded events: only `app` has one.
+      const baselines = await getDb().select().from(principalBaselines).where(eq(principalBaselines.agentId, auth.agentId));
+      expect(baselines.map((b) => b.dbUser)).toEqual(["app"]);
+      const events = await eventsOf(auth.agentId);
+      expect(events.filter((e) => e.accountNotRecorded).every((e) => e.anomaly === false && e.baselineRows === null)).toBe(true);
+      // Notifications: no principal, flagged as not recorded, never fingerprinted.
+      const [delivery] = await getDb()
+        .select()
+        .from(notificationDeliveries)
+        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get("unrecorded:none")?.id)));
+      expect(delivery?.payload).toMatchObject({ principal: "", principal_fingerprinted: false, principal_not_recorded: true });
+      const [named] = await getDb()
+        .select()
+        .from(notificationDeliveries)
+        .where(eq(notificationDeliveries.incidentId, String(byPrincipal.get(principalKey({ db_user: "app" }))?.id)));
+      expect(named?.payload).toMatchObject({ principal: "app", principal_fingerprinted: false, principal_not_recorded: false });
+      // Views: the events carry the flag; filtering on the network key lists that network only.
+      const views = await listEvents(getDb(), { agentId: auth.agentId, targetId: "cache-redis" });
+      expect(views.filter((v) => v.accountNotRecorded).every((v) => v.principal === "" && !v.fingerprinted)).toBe(true);
+      const key = principalKey({ account_not_recorded: true, client_addr: "198.51.100.31" });
+      expect(await listEvents(getDb(), { agentId: auth.agentId, principalKey: key })).toHaveLength(2);
+    });
+
+    it("review M1: a failed login and an unrecorded event of the same /24 never share an incident", async () => {
+      const auth = await enroll();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HEARTBEAT }))).status).toBe(200);
+      await policy({ event_actions: ["read", "auth_failure"] });
+      await send(auth, [
+        // The attacker fails an AUTH on purpose first (ACL LOG, fingerprinted name tried)...
+        slowRead(0, { db_user_fingerprint: `hmac-sha256:${randomBytes(32).toString("hex")}`, client_addr: "198.51.100.9" }, {
+          action: "auth_failure",
+          source: "redis_acl_log",
+          objects: [],
+          rows: undefined,
+        }),
+        // ...then a full synchronization from the same network.
+        slowRead(1, { account_not_recorded: true, client_addr: "198.51.100.10" }, {
+          source: "redis_sync",
+          objects: [{ database: "*", object: "*" }],
+          rows: undefined,
+          signals: ["signature.full_sync"],
+        }),
+      ]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      const keys = list.map((i) => /\|principal:([^|]+)\|/.exec(i.dedupKey)?.[1]).sort();
+      expect(keys).toEqual([`unknown:${sha256Hex("198.51.100.0/24")}`, `unrecorded:${sha256Hex("198.51.100.0/24")}`].sort());
+      expect(list.every((i) => i.matchCount === 1)).toBe(true);
     });
   });
 

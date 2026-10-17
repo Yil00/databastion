@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { AuditForm } from "@/components/console/audit-form";
+import { KeyPatternText } from "@/components/console/key-pattern";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { getDb } from "@/db/client";
@@ -9,7 +10,8 @@ import { formatAge } from "@/lib/agent-status";
 import { validateSchema } from "@/lib/protocol/validate";
 import { getAgentDetail } from "@/server/agents";
 import { auditWarningText } from "@/lib/audit-warning";
-import { deriveSensitiveObjects, getAuditConfig, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
+import { engineDisplayName, isKeyPatternEngine } from "@/lib/location-labels";
+import { deriveSensitiveObjects, getAuditConfig, sendableDerivedObjects, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
 export const dynamic = "force-dynamic";
@@ -27,11 +29,14 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   if (!agent || !config) notFound();
   const derived = await deriveSensitiveObjects(db, id, targetId);
   derived.sort((a, b) => b.sensitivity - a.sensitivity);
+  const keyPatterns = isKeyPatternEngine(config.engine);
+  // Key-pattern objects (Redis / Valkey) are not `SensitiveObject`s yet (P9-E review M3).
+  const notSendable = sendableDerivedObjects(derived).skipped;
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const active = agent.revokedAt === null && agent.lockedAt === null && config.present;
   const facts: [string, string][] = [
-    ["Engine", config.engine],
+    ["Engine", engineDisplayName(config.engine)],
     ["Audit level reported", config.auditLevel],
     ["Settings", config.configured ? (config.enabled ? "enabled" : "disabled") : "never sent"],
     ["Sensitive objects sent", String(config.sentObjects.length)],
@@ -52,6 +57,14 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
       {config.warning && (
         <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
           {auditWarningText(config.warning, config.warningRemoved)}
+        </p>
+      )}
+      {keyPatterns && (
+        <p role="note" className="rounded-md border p-3 text-sm text-muted-foreground">
+          Key-pattern objects cannot be listed as sensitive objects yet: the Audit settings sent to the agent only carry plain names, so
+          the {engineDisplayName(config.engine)} findings named by a key pattern
+          {notSendable > 0 ? ` (${notSendable} here)` : ""} are left out of the settings sent. Accesses are still reported
+          when they carry a signal or reach the row threshold, and turning Audit off always works.
         </p>
       )}
       <Card>
@@ -81,6 +94,7 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
               agentId={id}
               targetId={targetId}
               csrfToken={session.csrfToken}
+              keyPatterns={keyPatterns}
               initial={{
                 enabled: config.configured ? config.enabled : true,
                 aggregationWindowS: config.aggregationWindowS,
@@ -112,7 +126,15 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
               <TableBody>
                 {derived.slice(0, SHOWN).map((o) => (
                   <TableRow key={`${o.database}/${o.schema ?? ""}/${o.object}`}>
-                    <TableCell className="break-all">{[o.database, o.schema, o.object].filter((x) => x !== undefined).join(" / ")}</TableCell>
+                    <TableCell className="break-all">
+                      {keyPatterns ? (
+                        <>
+                          {[o.database, o.schema].filter((x) => x !== undefined).join(" / ")} / <KeyPatternText value={o.object} />
+                        </>
+                      ) : (
+                        [o.database, o.schema, o.object].filter((x) => x !== undefined).join(" / ")
+                      )}
+                    </TableCell>
                     <TableCell>{o.classifiers.join(", ")}</TableCell>
                     <TableCell>{o.sensitivity}</TableCell>
                   </TableRow>

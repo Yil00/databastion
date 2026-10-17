@@ -54,6 +54,20 @@ jobs:
           - { target: openldap_message, seconds: 180 }
           - { target: openldap_filter, seconds: 180 }
           - { target: openldap_accesslog, seconds: 180 }
+          - { target: redis_resp_decoder, seconds: 300 }
+          - { target: redis_info, seconds: 120 }
+          - { target: redis_key_pattern, seconds: 300 }
+          - { target: redis_slowlog_entry, seconds: 300 }
+          - { target: redis_acl_log_entry, seconds: 180 }
+          - { target: redis_learned_patterns, seconds: 300 }
+          - { target: sqlserver_token_stream, seconds: 300 }
+          - { target: sqlserver_packets, seconds: 120 }
+          - { target: sqlserver_prelogin_tls, seconds: 60 }
+          - { target: sqlserver_plp, seconds: 180 }
+          - { target: sqlserver_tsql, seconds: 300 }
+          - { target: sqlserver_audit_records, seconds: 180 }
+          - { target: sqlserver_xe_xml, seconds: 300 }
+          - { target: sqlserver_xe_records, seconds: 180 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

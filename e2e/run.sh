@@ -1890,13 +1890,20 @@ audit_verify() {
 
   # Events and incidents of the target against the ground truth and the agent's own account.
   console_sql "SELECT coalesce(json_agg(json_build_object('db_user', db_user,
-      'db_user_fingerprint', db_user_fingerprint, 'action', action, 'objects', objects,
-      'signals', signals, 'rows', rows, 'source', source, 'aggregated_count', aggregated_count)
+      'db_user_fingerprint', db_user_fingerprint, 'account_not_recorded', account_not_recorded,
+      'action', action, 'objects', objects, 'signals', signals, 'rows', rows, 'bytes', bytes,
+      'source', source, 'aggregated_count', aggregated_count)
       ORDER BY ts), '[]')
     FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
     >"$E2E_WORK_DIR/audit-events.json" || fail "cannot read the access events of $target"
+  # events_account_not_recorded: every event of the incident has no recorded account (Redis /
+  # Valkey, ADR-0052 decision 8; `@not_recorded` of i2_check.py), null without events.
   console_sql "SELECT coalesce(json_agg(json_build_object('policy_name', policy_name,
-      'principal', principal, 'event_signals', event_signals, 'severity', severity) ORDER BY created_at), '[]')
+      'principal', principal, 'event_signals', event_signals, 'severity', severity,
+      'events_account_not_recorded', (SELECT bool_and(e.account_not_recorded) FROM access_events e
+        WHERE e.id = incidents.access_event_id
+           OR e.id IN (SELECT ie.event_id FROM incident_events ie WHERE ie.incident_id = incidents.id)))
+      ORDER BY created_at), '[]')
     FROM incidents WHERE agent_id = '${AGENT_ID}' AND target_id = '${target}'" \
     >"$E2E_WORK_DIR/audit-incidents.json" || fail "cannot read the incidents of $target"
   read -r -a extra <<<"$(client_fn "$client" i2_args)"

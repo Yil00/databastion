@@ -77,6 +77,8 @@ use crate::names::NormalizedName;
 
 /// Fully redacted placeholder, used when no format applies.
 const FULLY_REDACTED: &str = "***";
+/// The object name `*` (docs/09, "The object `*`").
+const WILDCARD_NAME: &str = "*";
 /// Longest run of letters or digits a masked sample may keep (contract
 /// `MaskedSample`: no run of more than 4). Also the bound of the property
 /// tests: no run of more than 4 consecutive digits of the raw value can
@@ -952,6 +954,21 @@ pub enum EventSource {
     OpenldapAccesslog,
     /// Apereo CAS JSON audit log (ADR-0041).
     CasAuditLog,
+    /// Redis / Valkey slow log (`SLOWLOG GET`, or `COMMANDLOG GET … slow`
+    /// on Valkey 8.1+; ADR-0052 decision 8).
+    RedisSlowlog,
+    /// Valkey command log, `large-reply` type (Valkey 8.1+).
+    RedisCommandlog,
+    /// Redis / Valkey `ACL LOG` (failed authentications, denials).
+    RedisAclLog,
+    /// Redis / Valkey full synchronizations (`INFO stats` `sync_full`).
+    RedisSync,
+    /// SQL Server Audit, `FILE` target, read through
+    /// `sys.fn_get_audit_file` (ADR-0051 decision 6).
+    SqlserverAudit,
+    /// SQL Server Extended Events session, `event_file` target, read
+    /// through `sys.fn_xe_file_target_read_file` (ADR-0051 decision 6).
+    SqlserverXevents,
 }
 
 impl EventSource {
@@ -970,7 +987,24 @@ impl EventSource {
             Self::MongodbLog => "mongodb_log",
             Self::OpenldapAccesslog => "openldap_accesslog",
             Self::CasAuditLog => "cas_audit_log",
+            Self::RedisSlowlog => "redis_slowlog",
+            Self::RedisCommandlog => "redis_commandlog",
+            Self::RedisAclLog => "redis_acl_log",
+            Self::RedisSync => "redis_sync",
+            Self::SqlserverAudit => "sqlserver_audit",
+            Self::SqlserverXevents => "sqlserver_xevents",
         }
+    }
+
+    /// Whether events of this source name their objects with a contract
+    /// `KeyPattern` (the Redis / Valkey sources, contract `ObjectRef`) and
+    /// may carry the `account_not_recorded` principal.
+    #[must_use]
+    pub const fn is_redis(self) -> bool {
+        matches!(
+            self,
+            Self::RedisSlowlog | Self::RedisCommandlog | Self::RedisAclLog | Self::RedisSync
+        )
     }
 }
 
@@ -1023,11 +1057,36 @@ pub enum Signal {
     /// `volume.failed_logins_one_account`: one principal with at least 20
     /// failed authentications within 10 minutes (CAS, ADR-0041 decision 8).
     FailedLoginsOneAccount,
+    /// `signature.full_sync`: a full synchronization of a Redis / Valkey
+    /// server (a replica's first sync, `redis-cli --rdb`, a rogue replica;
+    /// ADR-0052 decision 8).
+    FullSync,
+    /// `volume.large_reply`: a command whose reply exceeded the server's
+    /// large-reply threshold (Valkey 8.1+ command log).
+    LargeReply,
+    /// `shape.keyspace_enumeration`: `KEYS`, or a `SCAN` with a `COUNT`
+    /// above 1 000, seen in a Redis / Valkey log entry.
+    KeyspaceEnumeration,
+    /// `signature.cas_ticket_read`: a Redis / Valkey log entry naming a key
+    /// guarded by the CAS store guard by name, or with a strict ticket
+    /// prefix (ADR-0052 decision 6, re-review N5).
+    CasTicketRead,
+    /// `signature.bcp`: a SQL Server read by a client whose application
+    /// name is an export tool's (`bcp`; ADR-0051 decision 6).
+    Bcp,
+    /// `signature.backup_database`: a full copy of a SQL Server database
+    /// made by the server (`BACKUP DATABASE` / `LOG`, `DBCC
+    /// CLONEDATABASE`, `sp_detach_db`).
+    BackupDatabase,
+    /// `signature.remote_data_access`: data leaving through the SQL Server
+    /// server to another place (`OPENROWSET`, `OPENQUERY`, `EXEC … AT`,
+    /// `xp_cmdshell`…), even when refused.
+    RemoteDataAccess,
 }
 
 impl Signal {
     /// Every signal.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 20] = [
         Self::PgDump,
         Self::CopyToFile,
         Self::CopyToProgram,
@@ -1041,6 +1100,13 @@ impl Signal {
         Self::BulkSearch,
         Self::FailedLoginsManyAccounts,
         Self::FailedLoginsOneAccount,
+        Self::FullSync,
+        Self::LargeReply,
+        Self::KeyspaceEnumeration,
+        Self::CasTicketRead,
+        Self::Bcp,
+        Self::BackupDatabase,
+        Self::RemoteDataAccess,
     ];
 
     /// Contract value.
@@ -1060,6 +1126,13 @@ impl Signal {
             Self::BulkSearch => "shape.bulk_search",
             Self::FailedLoginsManyAccounts => "volume.failed_logins_many_accounts",
             Self::FailedLoginsOneAccount => "volume.failed_logins_one_account",
+            Self::FullSync => "signature.full_sync",
+            Self::LargeReply => "volume.large_reply",
+            Self::KeyspaceEnumeration => "shape.keyspace_enumeration",
+            Self::CasTicketRead => "signature.cas_ticket_read",
+            Self::Bcp => "signature.bcp",
+            Self::BackupDatabase => "signature.backup_database",
+            Self::RemoteDataAccess => "signature.remote_data_access",
         }
     }
 }
@@ -1104,6 +1177,9 @@ pub struct EventPrincipal {
     send_name: bool,
     /// The `*` aggregate of several accounts (CAS failed-login floods).
     many_accounts: bool,
+    /// The source records no account (Redis / Valkey, contract
+    /// `account_not_recorded`).
+    not_recorded: bool,
     client: Option<ClientAddr>,
     application: Option<String>,
 }
@@ -1113,6 +1189,7 @@ impl fmt::Debug for EventPrincipal {
         f.debug_struct("EventPrincipal")
             .field("send_name", &self.send_name)
             .field("many_accounts", &self.many_accounts)
+            .field("not_recorded", &self.not_recorded)
             .field("client", &self.client)
             .finish_non_exhaustive()
     }
@@ -1134,6 +1211,7 @@ impl EventPrincipal {
             account: bounded(raw, MAX_ACCOUNT_BYTES),
             send_name: true,
             many_accounts: false,
+            not_recorded: false,
             client: None,
             application: None,
         }
@@ -1152,9 +1230,33 @@ impl EventPrincipal {
             account: MANY_ACCOUNTS.to_owned(),
             send_name: true,
             many_accounts: true,
+            not_recorded: false,
             client: None,
             application: None,
         }
+    }
+
+    /// No recorded account (contract `account_not_recorded`): a Redis /
+    /// Valkey slow-log or command-log entry whose connection could not be
+    /// attributed, or a full synchronization (ADR-0052 decision 8). The
+    /// core sends it only on events of a Redis / Valkey source that are
+    /// not `auth_failure`, and drops any other event built with it.
+    #[must_use]
+    pub fn not_recorded() -> Self {
+        Self {
+            account: String::new(),
+            send_name: false,
+            many_accounts: false,
+            not_recorded: true,
+            client: None,
+            application: None,
+        }
+    }
+
+    /// Whether this is the [`Self::not_recorded`] principal.
+    #[must_use]
+    pub fn is_not_recorded(&self) -> bool {
+        self.not_recorded
     }
 
     /// Whether this is the [`Self::many_accounts`] aggregate.
@@ -1286,7 +1388,9 @@ impl EventObject {
     }
 }
 
-/// Contract `AccessEvent.objects.maxItems`.
+/// Contract `AccessEvent.objects.maxItems`. An event keeps at most
+/// `MAX_EVENT_OBJECTS - 1` objects that are not `*` and reserves the last
+/// slot for `*` (see [`MaskedEvent::with_object`]).
 pub const MAX_EVENT_OBJECTS: usize = 16;
 /// Contract `AccessEvent.aggregated_count.maximum`.
 pub const MAX_AGGREGATED_COUNT: u64 = 1_000_000;
@@ -1319,9 +1423,17 @@ pub struct MaskedEvent {
     ts_last: Option<std::time::SystemTime>,
     principal: EventPrincipal,
     action: EventAction,
-    /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`].
+    /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`], of which
+    /// at most `MAX_EVENT_OBJECTS - 1` are not `*`.
     objects: Vec<EventObject>,
+    /// Agent-internal, never sent: an object was not listed because the
+    /// event was full; a `*` object stands for it and the event is always
+    /// reported (see [`Self::with_object`]).
+    objects_overflowed: bool,
     rows: Option<u64>,
+    /// Bytes returned, when the source records it (contract
+    /// `AccessEvent.bytes`).
+    bytes: Option<u64>,
     /// Sorted, without duplicates.
     signals: Vec<Signal>,
     source: EventSource,
@@ -1357,10 +1469,12 @@ impl MaskedEvent {
             action,
             objects: Vec::new(),
             rows: None,
+            bytes: None,
             signals: Vec::new(),
             source,
             aggregated_count: 1,
             always_report: false,
+            objects_overflowed: false,
         }
     }
 
@@ -1382,8 +1496,18 @@ impl MaskedEvent {
         self.always_report
     }
 
-    /// Adds an object (duplicates and objects past [`MAX_EVENT_OBJECTS`]
-    /// are ignored).
+    /// Adds an object (duplicates are ignored). Fails closed at the
+    /// contract bound ([`MAX_EVENT_OBJECTS`]): the event keeps at most
+    /// `MAX_EVENT_OBJECTS - 1` objects that are not `*` and reserves the
+    /// last slot for a `*` object. An object that does not fit is never
+    /// dropped silently: the event gets `(<its database>, -, *)` once (or
+    /// `(*, -, *)` once overflowed objects of several databases, or the
+    /// reserved slot already taken, call for it), unless a `*` object
+    /// already covers it, and is marked always reported
+    /// ([`Self::always_report`]) and overflowed
+    /// ([`Self::objects_overflowed`]). A sensitive object past the bound
+    /// therefore still gets the event reported, whatever its row count
+    /// (end-of-phase-9 security review, G7).
     #[must_use]
     pub fn with_object(mut self, object: EventObject) -> Self {
         self.add_object(object);
@@ -1391,16 +1515,101 @@ impl MaskedEvent {
     }
 
     fn add_object(&mut self, object: EventObject) {
-        if self.objects.len() < MAX_EVENT_OBJECTS && !self.objects.contains(&object) {
-            self.objects.push(object);
-            self.objects.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        if self.objects.contains(&object) {
+            return;
         }
+        let fits = self.objects.len() < MAX_EVENT_OBJECTS
+            && (object.object.as_str() == WILDCARD_NAME
+                || self
+                    .objects
+                    .iter()
+                    .filter(|o| o.object.as_str() != WILDCARD_NAME)
+                    .count()
+                    < MAX_EVENT_OBJECTS - 1);
+        if fits {
+            self.insert_object(object);
+            return;
+        }
+        self.overflow(&object);
+    }
+
+    fn insert_object(&mut self, object: EventObject) {
+        let (Ok(pos) | Err(pos)) = self
+            .objects
+            .binary_search_by(|o| o.sort_key().cmp(&object.sort_key()));
+        self.objects.insert(pos, object);
+    }
+
+    /// `object` does not fit (see [`Self::with_object`]).
+    fn overflow(&mut self, object: &EventObject) {
+        self.always_report = true;
+        self.objects_overflowed = true;
+        let covers = |o: &EventObject| {
+            o.object.as_str() == WILDCARD_NAME
+                && (o.database.as_str() == WILDCARD_NAME || o.database == object.database)
+                && o.schema
+                    .as_ref()
+                    .is_none_or(|s| object.schema.as_ref() == Some(s))
+        };
+        if self.objects.iter().any(covers) {
+            return;
+        }
+        let wildcard = NormalizedName::wildcard;
+        if self.objects.len() < MAX_EVENT_OBJECTS {
+            self.insert_object(EventObject::new(object.database.clone(), None, wildcard()));
+            return;
+        }
+        // Full: the reserved slot holds a `*` object (only `*` objects
+        // reach it) that does not cover `object`. Widen one `*` object to
+        // `(*, -, *)`, which covers both.
+        if let Some(pos) = self
+            .objects
+            .iter()
+            .rposition(|o| o.object.as_str() == WILDCARD_NAME)
+        {
+            self.objects.remove(pos);
+        } else {
+            // Unreachable by construction; keep the bound anyway.
+            self.objects.pop();
+        }
+        self.insert_object(EventObject::new(wildcard(), None, wildcard()));
+    }
+
+    /// Records that objects of `database` (`*`: of several or unknown
+    /// databases) reached by the access were lost before reaching the
+    /// event (a bound in a connector): the same rule as an object past the
+    /// event's bound ([`Self::with_object`]): `(database, -, *)` unless a
+    /// `*` object already covers it, widened to `(*, -, *)` when the event
+    /// is full, always reported and overflowed.
+    #[must_use]
+    pub fn with_unlisted_objects(mut self, database: NormalizedName) -> Self {
+        self.overflow(&EventObject::new(
+            database,
+            None,
+            NormalizedName::wildcard(),
+        ));
+        self
+    }
+
+    /// Whether an object was not listed because the event was full (see
+    /// [`Self::with_object`]): the event then names `*` and is always
+    /// reported.
+    #[must_use]
+    pub fn objects_overflowed(&self) -> bool {
+        self.objects_overflowed
     }
 
     /// Sets the rows returned or affected (saturated at [`MAX_COUNT`]).
     #[must_use]
     pub fn with_rows(mut self, rows: Option<u64>) -> Self {
         self.rows = rows.map(|r| r.min(MAX_COUNT));
+        self
+    }
+
+    /// Sets the bytes returned (saturated at [`MAX_COUNT`]).
+    #[must_use]
+    pub fn with_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.bytes = bytes.map(|b| b.min(MAX_COUNT));
         self
     }
 
@@ -1455,10 +1664,15 @@ impl MaskedEvent {
             (Some(a), Some(b)) => Some(a.saturating_add(b).min(MAX_COUNT)),
             (a, b) => a.or(b),
         };
+        self.bytes = match (self.bytes, other.bytes) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b).min(MAX_COUNT)),
+            (a, b) => a.or(b),
+        };
         for s in other.signals {
             self.add_signal(s);
         }
         self.always_report |= other.always_report;
+        self.objects_overflowed |= other.objects_overflowed;
     }
 
     /// First occurrence.
@@ -1495,6 +1709,12 @@ impl MaskedEvent {
     #[must_use]
     pub fn rows(&self) -> Option<u64> {
         self.rows
+    }
+
+    /// Bytes returned, when known.
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64> {
+        self.bytes
     }
 
     /// Signals (sorted, unique).
@@ -1964,5 +2184,184 @@ mod tests {
         let mut c = ev(2);
         c.merge(ev(3));
         assert_eq!(c.rows(), Some(5));
+    }
+
+    fn read_event() -> MaskedEvent {
+        MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("report"),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    fn obj(db: &str, schema: Option<&str>, name: &str) -> EventObject {
+        use crate::names::normalize_path;
+        EventObject::new(
+            normalize_path(db),
+            schema.map(normalize_path),
+            if name == "*" {
+                NormalizedName::wildcard()
+            } else {
+                normalize_path(name)
+            },
+        )
+    }
+
+    fn star_of(e: &MaskedEvent) -> Vec<(String, Option<String>)> {
+        e.objects()
+            .iter()
+            .filter(|o| o.object().as_str() == "*")
+            .map(|o| {
+                (
+                    o.database().as_str().to_owned(),
+                    o.schema().map(|s| s.as_str().to_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sixteen_named_objects_keep_fifteen_and_name_star() {
+        // G7: 16 harmless tables, then the sensitive one.
+        let mut e = read_event();
+        for i in 0..16u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", Some("public"), &name));
+        }
+        e = e.with_object(obj("shop", Some("crm"), "customers"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        // Fifteen named objects, never more.
+        let named = e.objects().iter().filter(|o| o.object().as_str() != "*");
+        assert_eq!(named.count(), MAX_EVENT_OBJECTS - 1);
+    }
+
+    #[test]
+    fn fifteen_named_objects_do_not_overflow() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // A duplicate is not an overflow.
+        e = e.with_object(obj("shop", None, "t_a"));
+        assert!(!e.objects_overflowed());
+        assert!(!e.always_report());
+        assert_eq!(e.objects().len(), 15);
+        // The reserved slot takes a `*` object without overflowing.
+        e = e.with_object(obj("shop", None, "*"));
+        assert!(!e.objects_overflowed());
+        assert!(!e.always_report());
+        assert_eq!(e.objects().len(), 16);
+        // A further named object is covered by the `*` already present:
+        // no second `*`.
+        e = e.with_object(obj("shop", None, "customers"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(e.objects().len(), 16);
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+    }
+
+    #[test]
+    fn overflow_of_another_database_widens_star() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        e = e.with_object(obj("shop", None, "u"));
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        e = e.with_object(obj("crm", None, "customers"));
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+        // Then everything is covered, and a further `*` adds nothing.
+        e = e.with_object(obj("hr", None, "salaries"));
+        e = e.with_object(obj("hr", None, "*"));
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+    }
+
+    #[test]
+    fn a_schema_scoped_star_does_not_cover_other_schemas() {
+        let mut e = read_event();
+        for i in 0..13u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // `*` objects do not count against the 15 named ones.
+        e = e.with_object(obj("shop", Some("s_a"), "*"));
+        e = e.with_object(obj("shop", Some("s_b"), "x"));
+        e = e.with_object(obj("shop", Some("s_b"), "y"));
+        assert!(!e.objects_overflowed());
+        assert_eq!(e.objects().len(), 16);
+        // `(shop, s_a, *)` does not cover `s_b`, and the event is full:
+        // the `*` object is widened to `(*, -, *)`.
+        e = e.with_object(obj("shop", Some("s_b"), "z"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), 16);
+    }
+
+    #[test]
+    fn the_overflow_star_names_no_schema() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // The 16th slot is free: the overflow adds `(shop, -, *)`.
+        e = e.with_object(obj("shop", Some("s_b"), "z"));
+        assert!(e.objects_overflowed());
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+    }
+
+    #[test]
+    fn unlisted_objects_follow_the_overflow_rule() {
+        let e = read_event()
+            .with_object(obj("shop", None, "t"))
+            .with_unlisted_objects(normalize_name("shop"));
+        assert!(e.objects_overflowed() && e.always_report());
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        // Covered: nothing added; another database: a second `*` while
+        // there is room.
+        let e = e
+            .with_unlisted_objects(normalize_name("shop"))
+            .with_unlisted_objects(NormalizedName::wildcard());
+        assert_eq!(
+            star_of(&e),
+            [("*".to_owned(), None), ("shop".to_owned(), None)]
+        );
+        // A full event widens its `*`.
+        let mut f = read_event();
+        for i in 0..15u8 {
+            f = f.with_object(obj("shop", None, &format!("t_{}", char::from(b'a' + i))));
+        }
+        f = f.with_object(obj("shop", None, "*"));
+        assert!(!f.objects_overflowed());
+        let f = f.with_unlisted_objects(normalize_name("crm"));
+        assert_eq!(star_of(&f), [("*".to_owned(), None)]);
+        assert_eq!(f.objects().len(), MAX_EVENT_OBJECTS);
+    }
+
+    fn normalize_name(n: &str) -> NormalizedName {
+        crate::names::normalize_path(n)
+    }
+
+    #[test]
+    fn merged_events_keep_the_overflow() {
+        let mut a = read_event();
+        let mut b = read_event();
+        for i in 0..17u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            b = b.with_object(obj("shop", None, &name));
+        }
+        assert!(b.objects_overflowed());
+        a.merge(b);
+        assert!(a.objects_overflowed());
+        assert!(a.always_report());
     }
 }

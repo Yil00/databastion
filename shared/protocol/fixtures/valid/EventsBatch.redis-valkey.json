@@ -1,0 +1,97 @@
+{
+  "batch_id": "01925a1d-0c11-7e4f-8a33-5d6e7f809a1d",
+  "events": [
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:01:00Z",
+      "principal": {
+        "db_user": "app",
+        "client_addr": "198.51.100.30",
+        "application": "redis-cli"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "*",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "shape.keyspace_enumeration"
+      ],
+      "source": "redis_slowlog",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "sessions-valkey",
+      "ts": "2026-10-14T09:04:00Z",
+      "principal": {
+        "db_user": "app",
+        "client_addr": "198.51.100.32"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "db1",
+          "object": "cache/*"
+        }
+      ],
+      "bytes": 52428800,
+      "signals": [
+        "volume.large_reply"
+      ],
+      "source": "redis_commandlog",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:05:00Z",
+      "principal": {
+        "db_user": "app",
+        "client_addr": "198.51.100.30"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "db0",
+          "object": "*"
+        }
+      ],
+      "signals": [
+        "signature.cas_ticket_read"
+      ],
+      "source": "redis_slowlog",
+      "aggregated_count": 1
+    },
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:06:00Z",
+      "ts_last": "2026-10-14T09:07:00Z",
+      "principal": {
+        "db_user_fingerprint": "hmac-sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        "client_addr": "203.0.113.41"
+      },
+      "action": "auth_failure",
+      "objects": [],
+      "source": "redis_acl_log",
+      "aggregated_count": 12
+    },
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-14T09:08:00Z",
+      "principal": {
+        "db_user": "databastion",
+        "client_addr": "203.0.113.42"
+      },
+      "action": "write",
+      "objects": [
+        {
+          "database": "db0",
+          "object": "*"
+        }
+      ],
+      "source": "redis_acl_log",
+      "aggregated_count": 1
+    }
+  ]
+}

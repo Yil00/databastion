@@ -4,10 +4,10 @@
 //! - a fixed list of Unix socket paths (contract `UnixSocketPath`
 //!   directories: `/run`, `/var/run`, `/tmp`, `/var/lib/mysql`);
 //! - `LISTEN` entries of `/proc/net/tcp` and `/proc/net/tcp6` for the ports
-//!   5432, 3306, 27017, 389, 636 (only the port is kept; the listening
+//!   5432, 3306, 27017, 389, 636, 6379, 1433 (only the port is kept; the listening
 //!   address is never reported);
 //! - `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`, `mongod`,
-//!   `slapd` (the process name only: the command line may contain secrets
+//!   `slapd`, `redis-server`, `valkey-server`, `sqlservr` (the process name only: the command line may contain secrets
 //!   and is never read).
 //!
 //! The agent never connects to a detected engine. Engines already declared
@@ -47,6 +47,14 @@ const SOCKETS: &[(&str, Engine)] = &[
     ("/var/run/slapd/ldapi", Engine::Openldap),
     ("/run/openldap/ldapi", Engine::Openldap),
     ("/var/run/ldapi", Engine::Openldap),
+    // ADR-0052 decision 11: the distributions' default paths. A Redis path
+    // is reported as `redis` unless only `valkey-server` runs.
+    ("/run/redis/redis-server.sock", Engine::Redis),
+    ("/var/run/redis/redis-server.sock", Engine::Redis),
+    ("/run/redis/redis.sock", Engine::Redis),
+    ("/tmp/redis.sock", Engine::Redis),
+    ("/run/valkey/valkey.sock", Engine::Valkey),
+    ("/var/run/valkey/valkey.sock", Engine::Valkey),
 ];
 
 const PORTS: &[(u16, Engine)] = &[
@@ -55,6 +63,12 @@ const PORTS: &[(u16, Engine)] = &[
     (27017, Engine::Mongodb),
     (389, Engine::Openldap),
     (636, Engine::Openldap),
+    // Port 6379 cannot tell Redis from Valkey: `redis` unless only
+    // `valkey-server` runs. The Sentinel port 26379 is never reported.
+    (6379, Engine::Redis),
+    // ADR-0051 decision 7: the default instance port only (no SQL Server
+    // Browser, UDP 1434, is ever looked at).
+    (1433, Engine::Sqlserver),
 ];
 
 const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
@@ -67,6 +81,25 @@ const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
     ("mariadbd", DetectedTargetProcess::Mariadbd, Engine::Mariadb),
     ("mongod", DetectedTargetProcess::Mongod, Engine::Mongodb),
     ("slapd", DetectedTargetProcess::Slapd, Engine::Openldap),
+    // Process names only: `redis-sentinel` and `valkey-sentinel` are never
+    // reported (ADR-0052 decision 11). A Valkey server started as
+    // `redis-server` (compatibility name) is reported as `redis`.
+    (
+        "redis-server",
+        DetectedTargetProcess::RedisServer,
+        Engine::Redis,
+    ),
+    (
+        "valkey-server",
+        DetectedTargetProcess::ValkeyServer,
+        Engine::Valkey,
+    ),
+    // SQL Server on Linux (ADR-0051 decision 7).
+    (
+        "sqlservr",
+        DetectedTargetProcess::Sqlservr,
+        Engine::Sqlserver,
+    ),
 ];
 
 /// Where to look. Production: `/` and `std::os::unix::fs::FileTypeExt`.
@@ -93,6 +126,10 @@ fn family(engine: Engine) -> u8 {
         // Never detected (ADR-0041 decision 3: no local detection of CAS,
         // whose `java` command line carries secrets); its own family.
         Engine::Cas => 4,
+        // ADR-0051 decision 7: port 1433 and the `sqlservr` process.
+        Engine::Sqlserver => 5,
+        // ADR-0052 decision 11: one family, as MySQL and MariaDB.
+        Engine::Redis | Engine::Valkey => 6,
     }
 }
 
@@ -103,6 +140,8 @@ fn target_family(engine: TargetEngine) -> u8 {
         TargetEngine::Mongodb => 2,
         TargetEngine::Openldap => 3,
         TargetEngine::Cas => 4,
+        TargetEngine::Sqlserver => 5,
+        TargetEngine::Redis | TargetEngine::Valkey => 6,
     }
 }
 
@@ -123,6 +162,8 @@ fn default_port(engine: TargetEngine) -> u16 {
         TargetEngine::Openldap => 389,
         // Never detected (no port of its own here; ADR-0041 decision 3).
         TargetEngine::Cas => 0,
+        TargetEngine::Redis | TargetEngine::Valkey => crate::config::redis::DEFAULT_PORT,
+        TargetEngine::Sqlserver => crate::config::sqlserver::DEFAULT_PORT,
     }
 }
 
@@ -180,9 +221,13 @@ pub(crate) fn detect(view: &HostView<'_>, targets: &[TargetConfig]) -> Vec<Detec
     let procs = processes(view.root);
     let mariadb_only = procs.iter().any(|(_, e)| *e == Engine::Mariadb)
         && !procs.iter().any(|(_, e)| *e == Engine::Mysql);
+    let valkey_only = procs.iter().any(|(_, e)| *e == Engine::Valkey)
+        && !procs.iter().any(|(_, e)| *e == Engine::Redis);
     let refine = |e: Engine| {
         if e == Engine::Mysql && mariadb_only {
             Engine::Mariadb
+        } else if e == Engine::Redis && valkey_only {
+            Engine::Valkey
         } else {
             e
         }
@@ -378,6 +423,99 @@ mod tests {
             json.contains("PGSQL"),
             "a socket not declared is still reported"
         );
+    }
+
+    #[test]
+    fn redis_and_valkey_are_detected_without_sentinels() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proc/net")).unwrap();
+        // 6379 and the Sentinel port 26379 (0x66AB) listening.
+        fs::write(
+            root.join("proc/net/tcp"),
+            "  sl  local_address rem_address   st\n\
+   0: 0100007F:18EB 00000000:0000 0A 0\n\
+   1: 0100007F:66AB 00000000:0000 0A 0\n",
+        )
+        .unwrap();
+        for (pid, comm) in [
+            ("10", "valkey-server"),
+            ("11", "valkey-sentinel"),
+            ("12", "redis-sentinel"),
+        ] {
+            fs::create_dir_all(root.join("proc").join(pid)).unwrap();
+            fs::write(
+                root.join("proc").join(pid).join("comm"),
+                format!("{comm}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(root.join("run/valkey")).unwrap();
+        fs::write(root.join("run/valkey/valkey.sock"), "").unwrap();
+        let view = HostView {
+            root,
+            is_socket: exists,
+        };
+        let json = serde_json::to_string(&detect(&view, &[])).unwrap();
+        // Only valkey-server runs: the port is reported as valkey.
+        assert!(
+            json.contains(r#"{"engine":"valkey","port":6379}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"engine":"valkey","process":"valkey-server"}"#),
+            "{json}"
+        );
+        assert!(json.contains("/run/valkey/valkey.sock"), "{json}");
+        assert!(
+            !json.contains("26379") && !json.contains("sentinel"),
+            "{json}"
+        );
+        // A declared local Valkey target excludes its family's process.
+        let t = target(
+            "{id: v, engine: valkey, host: 127.0.0.1, account: a, secret: {env: X}, redis: {tls: disable}}",
+        );
+        let json = serde_json::to_string(&detect(&view, &[t])).unwrap();
+        assert!(
+            !json.contains(r#""port":6379"#) && !json.contains("valkey-server"),
+            "{json}"
+        );
+    }
+
+    /// ADR-0051 decision 7: port 1433 and the `sqlservr` process; never
+    /// the Browser port (UDP, not read) nor another port.
+    #[test]
+    fn sqlserver_is_detected_by_port_and_process() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proc/net")).unwrap();
+        // 1433 (0x0599) and 1434 (0x059A) listening.
+        fs::write(
+            root.join("proc/net/tcp"),
+            "  sl  local_address rem_address   st\n\
+   0: 00000000:0599 00000000:0000 0A 0\n\
+   1: 00000000:059A 00000000:0000 0A 0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("proc/20")).unwrap();
+        fs::write(root.join("proc/20/comm"), "sqlservr\n").unwrap();
+        let view = HostView {
+            root,
+            is_socket: exists,
+        };
+        let json = serde_json::to_string(&detect(&view, &[])).unwrap();
+        assert!(
+            json.contains(r#"{"engine":"sqlserver","port":1433}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"engine":"sqlserver","process":"sqlservr"}"#),
+            "{json}"
+        );
+        assert!(!json.contains("1434"), "{json}");
+        let t = target("{id: s, engine: sqlserver, host: 127.0.0.1, account: a, secret: {env: X}}");
+        let json = serde_json::to_string(&detect(&view, &[t])).unwrap();
+        assert!(!json.contains("sqlserver"), "{json}");
     }
 
     #[test]

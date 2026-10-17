@@ -1,0 +1,30 @@
+{
+  "ts": "2026-10-15T09:00:00Z",
+  "agent_version": "0.8.0",
+  "uptime_s": 60,
+  "connectors": [
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-prod",
+      "engine": "sqlserver",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "privilege.refused",
+          "labels": [
+            "ALTER ANY DATABASE EVENT SESSION"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}
