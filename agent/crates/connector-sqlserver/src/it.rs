@@ -2706,3 +2706,34 @@ async fn first_start_scenario() {
         .await;
     }
 }
+
+/// End-of-phase-9 review of G7 / N1, H1: SQL Server ignores trailing
+/// spaces in identifiers, so `[sys].[sql_logins ]` and `[sys ].[...]`
+/// resolve to the catalog views (an unknown name fails with error 208),
+/// and the analyzer names them as the listed objects.
+#[tokio::test]
+async fn trailing_spaces_in_bracketed_names_resolve_to_the_listed_views() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut sa = sa().await;
+    for (text, listed) in [
+        (
+            "IF EXISTS (SELECT 1 FROM [sys].[sql_logins ]) PRINT ''",
+            "sql_logins",
+        ),
+        (
+            "IF EXISTS (SELECT 1 FROM [sys  ].[sql_logins]) PRINT ''",
+            "sql_logins",
+        ),
+        (
+            "IF EXISTS (SELECT 1 FROM sys.dm_exec_requests r CROSS APPLY [sys].[dm_exec_sql_text ](r.sql_handle) t) PRINT ''",
+            "dm_exec_sql_text",
+        ),
+    ] {
+        exec(&mut sa, text).await;
+        let a = databastion_classifiers::query::tsql::analyze_tsql(text, false);
+        assert!(a.listed.contains(&listed), "{text}: {:?}", a.listed);
+    }
+}

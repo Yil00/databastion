@@ -668,7 +668,11 @@ impl<'a> Lexer<'a> {
         false
     }
 
-    /// Reads a bracketed identifier (after `[`).
+    /// Reads a bracketed identifier (after `[`). Trailing spaces (U+0020)
+    /// are dropped: SQL Server ignores them when it compares identifiers
+    /// (`[sys].[sql_logins ]` is `sys.sql_logins`), so every list
+    /// comparison sees the name the server resolves (end-of-phase-9
+    /// review of G7 / N1, H1).
     fn bracket(&mut self) -> Option<Name> {
         let mut out = Zeroizing::new(String::new());
         while let Some((_, c)) = self.chars.next() {
@@ -676,7 +680,7 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some(']') {
                     self.chars.next();
                 } else {
-                    return Some(Name::new(&out));
+                    return Some(Name::new(out.trim_end_matches(' ')));
                 }
             }
             if out.chars().count() < MAX_WORD_CHARS {
@@ -2412,6 +2416,28 @@ mod tests {
             vec!["syslogins"]
         );
         assert_eq!(an("EXEC sp_readerrorlog").listed, vec!["sp_readerrorlog"]);
+        // H1: SQL Server ignores trailing spaces in identifiers, so a
+        // bracketed name with them is the listed object.
+        assert_eq!(
+            an("SELECT name FROM [sys].[sql_logins ]").listed,
+            vec!["sql_logins"]
+        );
+        assert_eq!(
+            an("SELECT * FROM [sys ].[query_store_query_text]").listed,
+            vec!["query_store_query_text"]
+        );
+        assert_eq!(
+            an("SELECT t.text FROM x s CROSS APPLY [sys].[dm_exec_sql_text  ](s.h) t").listed,
+            vec!["dm_exec_sql_text"]
+        );
+        let a = an("SELECT * FROM [crm].[customers ]");
+        assert_eq!(a.relations.len(), 1);
+        assert_eq!(a.relations[0].name, "customers");
+        assert_eq!(a.relations[0].schema.as_deref(), Some("crm"));
+        // A double-quoted name is not read as a name: the analysis is not
+        // usable, so the event is `*` and always reported.
+        let a = an("SELECT name FROM sys.\"sql_logins \"");
+        assert!(a.ambiguous && !a.usable());
         // A column of a listed name is not the object.
         assert!(an("SELECT servers FROM crm.t").listed.is_empty());
         assert_eq!(
