@@ -18,7 +18,9 @@
 //!   the records or named in the text), dynamic SQL, calls of user
 //!   functions, four-part names, remote data access, server-side copies,
 //!   password-taking functions, cut or unreadable texts (which name `*`),
-//!   and the audit's own changes (`AUDIT_CHANGE_GROUP`).
+//!   statements with more objects than an event holds (which name `*`,
+//!   [`crate::audit::objects`]), and the audit's own changes
+//!   (`AUDIT_CHANGE_GROUP`).
 
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
@@ -30,6 +32,7 @@ use databastion_classifiers::names::NormalizedName;
 use databastion_classifiers::query::tsql::{self, TsqlAnalysis, TsqlKind};
 use zeroize::Zeroizing;
 
+use crate::audit::objects::Objects;
 use crate::discover::normalize;
 use crate::token::Value;
 
@@ -209,9 +212,16 @@ pub(crate) fn reassemble(records: Vec<Record>) -> Vec<Record> {
 #[derive(Debug)]
 pub(crate) struct Statement {
     pub(crate) head: Record,
-    /// (database, schema, object, class) of each record.
+    /// (database, schema, object, class) of each record, at most
+    /// [`MAX_GROUP_OBJECTS`].
     pub(crate) objects: Vec<(String, String, String, String)>,
+    /// Records of the statement whose objects did not fit: the event names
+    /// `*` and is always reported.
+    pub(crate) objects_dropped: bool,
 }
+
+/// Distinct record objects kept per statement.
+const MAX_GROUP_OBJECTS: usize = 64;
 
 fn same_statement(a: &Record, b: &Record) -> bool {
     a.session_id == b.session_id
@@ -245,14 +255,19 @@ pub(crate) fn group(records: Vec<Record>) -> Vec<Statement> {
                 .take(64)
                 .find(|s| same_statement(&s.head, &r))
         {
-            if !s.objects.contains(&obj) && s.objects.len() < 64 {
-                s.objects.push(obj);
+            if !s.objects.contains(&obj) {
+                if s.objects.len() < MAX_GROUP_OBJECTS {
+                    s.objects.push(obj);
+                } else {
+                    s.objects_dropped = true;
+                }
             }
             continue;
         }
         out.push(Statement {
             head: r,
             objects: vec![obj],
+            objects_dropped: false,
         });
     }
     out
@@ -376,6 +391,13 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
     let mut always = false;
     let mut star = false;
     let wildcard = NormalizedName::wildcard;
+    // More objects than an event holds (or than a statement keeps): `*`,
+    // always reported, rather than objects lost without a sign
+    // (end-of-phase-9 review, gate G1).
+    let mut objects = Objects::default();
+    if s.objects_dropped {
+        objects.mark_overflow();
+    }
     // Objects of the records.
     for (db, schema, object, class) in &s.objects {
         if schema.eq_ignore_ascii_case("sys") && HELPER_OBJECTS.contains(&object.as_str()) {
@@ -395,7 +417,7 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
         if listed_object(schema, object) {
             always = true;
         }
-        ev = ev.with_object(o);
+        objects.push(o);
     }
     if matches!(h.action.as_str(), "BA" | "BAL") {
         ev = ev.with_signal(Signal::BackupDatabase);
@@ -443,7 +465,7 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
                 } else {
                     normalize(&h.database)
                 };
-                ev = ev.with_object(EventObject::new(db, Some(normalize("sys")), normalize(n)));
+                objects.push(EventObject::new(db, Some(normalize("sys")), normalize(n)));
                 always = true;
             }
         }
@@ -451,14 +473,20 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
             star = true;
         }
     }
-    if star || ev.objects().is_empty() {
+    if objects.overflow() {
+        star = true;
+        always = true;
+    }
+    if star || objects.is_empty() {
         let db = if h.database.is_empty() {
             wildcard()
         } else {
             normalize(&h.database)
         };
+        // `*` first, so that it always fits.
         ev = ev.with_object(EventObject::new(db, None, wildcard()));
     }
+    ev = objects.apply(ev);
     if always {
         ev = ev.with_always_report();
     }
@@ -555,6 +583,47 @@ pub(crate) mod tests {
             rec("SL", "V", "sys", "objects$", q),
         ]);
         assert_eq!(names(&ev), ["retail.sys.tables"]);
+    }
+
+    /// End-of-phase-9 review, gate G1: a statement with more objects than
+    /// an event holds names `*` and is always reported, whether the bound
+    /// is the event's or the statement's; objects are never lost without a
+    /// sign.
+    #[test]
+    fn objects_past_the_bounds_name_star_and_are_always_reported() {
+        let text = "SELECT * FROM crm.v";
+        let many = |n: usize| -> Vec<Record> {
+            (0..n)
+                .map(|i| {
+                    rec(
+                        "SL",
+                        "U",
+                        "crm",
+                        &format!("t_{}", char::from(b'a' + u8::try_from(i % 26).unwrap()))
+                            .repeat(1 + i / 26),
+                        text,
+                    )
+                })
+                .collect()
+        };
+        let kept = databastion_classifiers::masking::MAX_EVENT_OBJECTS - 1;
+        let (ev, _) = one(many(kept));
+        assert!(!ev.always_report() && !names(&ev).contains(&"retail.-.*".to_owned()));
+        assert_eq!(ev.objects().len(), kept);
+        let (ev, _) = one(many(kept + 1));
+        assert!(ev.always_report());
+        assert!(names(&ev).contains(&"retail.-.*".to_owned()));
+        // Past the statement's own bound.
+        let g = group(reassemble(many(MAX_GROUP_OBJECTS + 1)));
+        assert_eq!(g.len(), 1);
+        assert!(g[0].objects_dropped && g[0].objects.len() == MAX_GROUP_OBJECTS);
+        let (ev, _) = convert(&g[0]).unwrap();
+        assert!(ev.always_report() && names(&ev).contains(&"retail.-.*".to_owned()));
+        // Duplicates do not count.
+        let mut dup = many(3);
+        dup.extend(many(3));
+        let (ev, _) = one(dup);
+        assert!(!ev.always_report() && ev.objects().len() == 3);
     }
 
     #[test]

@@ -287,7 +287,8 @@ pub fn tsql(data: &[u8]) {
 /// records built from the input (actions and classes from the closed
 /// tables and others, any text, any sequence numbers and groups) are
 /// reassembled, grouped and converted without panicking; a converted
-/// event never carries text beyond normalized names.
+/// event never carries text beyond normalized names, and one at the object
+/// bound names `*` and is always reported.
 pub fn audit_records(data: &[u8]) {
     use crate::audit::records::{Record, convert, group, reassemble};
     const ACTIONS: &[&str] = &[
@@ -344,6 +345,16 @@ pub fn audit_records(data: &[u8]) {
         if let Some((ev, _)) = convert(&s) {
             for o in ev.objects() {
                 assert!(o.object().as_str().len() <= 256);
+            }
+            // At the bound, `*` and always reported: no object lost without
+            // a sign (end-of-phase-9 review, gate G1).
+            if ev.objects().len() == databastion_classifiers::masking::MAX_EVENT_OBJECTS {
+                assert!(ev.always_report());
+                assert!(
+                    ev.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "*" && o.schema().is_none())
+                );
             }
         }
     }
@@ -402,7 +413,11 @@ pub fn xe_event_xml(data: &[u8]) {
 /// the context pass (procedure names, duplicate failed logins, statistics
 /// builds) and the conversion without panicking; an event never names
 /// more than normalized names, and a statement that names `*` is always
-/// reported.
+/// reported, unless that `*` is a masked name (a name of the text, or the
+/// procedure, that normalization replaced: protocol "The object `*`",
+/// which stays under the filters as on SQL Server Audit; end-of-phase-9
+/// review, gate G1); and an event at the object bound names `*` and is
+/// always reported (no object lost without a sign).
 pub fn xe_records(data: &[u8]) {
     use crate::audit::xe::events::{XeRecord, context, convert};
     use crate::audit::xe::xml::parse;
@@ -467,12 +482,39 @@ pub fn xe_records(data: &[u8]) {
         &|r| r.time_us % 2 == 0,
     );
     for r in &records {
-        if let Some((ev, _)) = convert(r) {
+        if let Some((ev, a)) = convert(r) {
+            let masked = |schema: Option<&str>| {
+                let star = |n: &str| crate::discover::normalize(n).as_str() == "*";
+                let same = |s: Option<&String>| {
+                    s.map(|s| crate::discover::normalize(s))
+                        .as_ref()
+                        .map(|n| n.as_str())
+                        == schema
+                };
+                a.as_ref().is_some_and(|a| {
+                    a.relations
+                        .iter()
+                        .any(|rel| star(&rel.name) && same(rel.schema.as_ref()))
+                }) || (schema.is_none() && r.procedure.as_deref().is_some_and(star))
+            };
             for o in ev.objects() {
                 assert!(o.object().as_str().len() <= 256);
-                if o.object().as_str() == "*" && r.kind().is_statement() {
+                if o.object().as_str() == "*"
+                    && r.kind().is_statement()
+                    && !masked(o.schema().map(|s| s.as_str()))
+                {
                     assert!(ev.always_report());
                 }
+            }
+            // At the bound, the event names `*` and is always reported: a
+            // statement with more objects never loses one without a sign.
+            if ev.objects().len() == databastion_classifiers::masking::MAX_EVENT_OBJECTS {
+                assert!(ev.always_report());
+                assert!(
+                    ev.objects()
+                        .iter()
+                        .any(|o| o.object().as_str() == "*" && o.schema().is_none())
+                );
             }
         }
     }
