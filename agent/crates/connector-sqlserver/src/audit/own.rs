@@ -57,6 +57,25 @@ pub(crate) const KEEP_US: i64 = 48 * 3600 * 1_000_000;
 const WARN_SESSIONS: usize = 100_000;
 /// Grace after a lost connection, on top of the statement timeout.
 pub(crate) const LOST_GRACE: Duration = Duration::from_secs(5);
+/// A session about to end cleanly stays open, idle, until this long after
+/// the answer of its last statement (`conn::Session::close`), so that its
+/// recorded end is at least this far after the records of every statement
+/// it sent. The audit clocks run ahead of the `SYSUTCDATETIME()` the end
+/// is computed on by a few milliseconds (measured: SQL Server Audit 2.5 ms,
+/// Extended Events 3.5 ms on 2022), and on SQL Server Audit only the last
+/// statement has a tolerance after a clean end ([`CLOCK_TOLERANCE_US`]):
+/// without the wait, the records of the statement before it could be
+/// stamped after the computed end and reported (CI failure of PR #262:
+/// the Discovery `columns` read of the scan's last table, whose 1-row
+/// sample answered at once before the close; measured on 2022 16.0.4305.5,
+/// the two statements' records carried the same `event_time`, 4.5 ms
+/// before the computed end, and a last statement's records came up to
+/// 0.07 ms after it; with the wait, every record of an own session was at
+/// least 22 ms before its end). Nothing is widened: the end
+/// is still the moment of the close, and the SPID stays held meanwhile, so
+/// no other session can reuse it. A lead above this is reported (fail
+/// closed).
+pub(crate) const CLEAN_CLOSE_SETTLE: Duration = Duration::from_millis(20);
 /// A persisted session still open at its last save ends this long after
 /// that save: the longest statement timeout of the connector (30 s, a
 /// Discovery sample) plus [`LOST_GRACE`].
