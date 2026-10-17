@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.8.0](https://github.com/Yil00/databastion/compare/0.7.0...0.8.0) (2026-10-17)
+
 Planned for the next minor release (0.8.0), with phase 9: Microsoft SQL Server, Redis and Valkey. The entries below are merged on `dev`. The end-of-phase-9 security review is done (no Critical or High finding); every release gate is met ([RELEASE.md](RELEASE.md#open-release-gates)).
 
 ### ⚠️ Upgrade notes
