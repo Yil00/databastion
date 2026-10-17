@@ -217,3 +217,15 @@ fn prelogin_wrap_fuzz_entry_runs_a_handshake() {
     let run = crate::fuzz_entry::prelogin_wrap(&input);
     assert!(run.read.is_empty() && run.sent.is_empty());
 }
+
+/// Release gate G1 (end-of-phase-9 review): the input of the nightly ASan
+/// fuzz run 39014225515 (`sqlserver_xe_records`, exit 77) on dev 2d969a4.
+#[test]
+fn xe_records_fuzz_crash_g1() {
+    let input: [u8; 61] = [
+        1, 0, 1, 97, 112, 112, 108, 121, 91, 115, 74, 155, 0, 155, 0, 155, 155, 1, 182, 105, 110,
+        115, 101, 114, 116, 47, 34, 91, 93, 255, 255, 248, 164, 93, 0, 1, 91, 1, 93, 61, 0, 1, 91,
+        227, 227, 227, 1, 0, 4, 91, 93, 0, 1, 91, 1, 93, 61, 91, 93, 91, 249,
+    ];
+    crate::fuzz_entry::xe_records(&input);
+}
