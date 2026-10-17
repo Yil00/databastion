@@ -7,9 +7,8 @@ per-engine connectors ([ADR-0002](../docs/adr/0002-single-agent-connectors.md)).
 > configuration, enrollment, `0600` identity storage, HTTPS uplink,
 > heartbeat and jobs loops, secret rotation (ADR-0008), spool, local engine
 > detection, and Discovery, `check()` and Audit for PostgreSQL, MySQL /
-> MariaDB, MongoDB, OpenLDAP and, since 0.4.0, Apereo CAS (local files).
-> In development on `dev`, not released yet: Redis / Valkey and Microsoft
-> SQL Server (phase 9).
+> MariaDB, MongoDB, OpenLDAP, since 0.4.0 Apereo CAS (local files), and
+> since 0.8.0 Redis / Valkey and Microsoft SQL Server (phase 9).
 > `check()` reports the audit level each
 > target actually reaches
 > ([08-engine-capabilities.md](../docs/08-engine-capabilities.md)).
