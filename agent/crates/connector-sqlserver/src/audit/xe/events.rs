@@ -50,6 +50,7 @@ use databastion_classifiers::masking::{
     EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
 };
 use databastion_classifiers::names::NormalizedName;
+use databastion_classifiers::names::fold_case;
 use databastion_classifiers::query::tsql::{self, TsqlAnalysis, TsqlKind};
 use zeroize::Zeroizing;
 
@@ -286,9 +287,9 @@ fn resolved(r: &XeRecord) -> Vec<(Zeroizing<String>, Zeroizing<String>, Zeroizin
         .iter()
         .map(|rel| {
             (
-                Zeroizing::new(rel.database.as_deref().unwrap_or(&db).to_lowercase()),
-                Zeroizing::new(rel.schema.as_deref().unwrap_or_default().to_lowercase()),
-                Zeroizing::new(rel.name.to_lowercase()),
+                Zeroizing::new(fold_case(rel.database.as_deref().unwrap_or(&db))),
+                Zeroizing::new(fold_case(rel.schema.as_deref().unwrap_or_default())),
+                Zeroizing::new(fold_case(&rel.name)),
             )
         })
         .collect()
@@ -384,9 +385,9 @@ pub(crate) fn context(
             continue;
         };
         let key = (
-            Zeroizing::new(e.database.clone().unwrap_or_default().to_lowercase()),
-            Zeroizing::new(schema.to_lowercase()),
-            Zeroizing::new(table.to_lowercase()),
+            Zeroizing::new(fold_case(e.database.as_deref().unwrap_or_default())),
+            Zeroizing::new(fold_case(&schema)),
+            Zeroizing::new(fold_case(&table)),
         );
         let hi = (i + 1 + CONTEXT_WINDOW).min(records.len());
         let lo = i.saturating_sub(CONTEXT_WINDOW);

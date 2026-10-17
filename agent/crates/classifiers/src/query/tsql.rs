@@ -628,7 +628,7 @@ fn bounded_lower(s: &str) -> Zeroizing<String> {
     Zeroizing::new(
         s.chars()
             .take(MAX_WORD_CHARS)
-            .flat_map(char::to_lowercase)
+            .flat_map(crate::names::fold_char)
             .collect(),
     )
 }

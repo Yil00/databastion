@@ -823,6 +823,14 @@ mod tests {
                                    "classifiers": ["pii.email"]}]
         }));
         assert!(reportable(&c, &at("shop", None, "ÉLÈVES")));
+        // Final sigma: `Σ` lowercases to `σ`, text often writes `ς`.
+        let c2 = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "object": "πελατες",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        assert!(reportable(&c2, &at("shop", None, "ΠΕΛΑΤΕΣ")));
+        assert!(reportable(&c2, &at("shop", None, "πελατεσ")));
         // Still exact otherwise: a different name or a schema the listed
         // object does not have does not match.
         assert!(!reportable(&c, &at("shop", None, "eleves")));

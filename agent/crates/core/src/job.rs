@@ -1003,7 +1003,9 @@ impl AuditConfig {
 
 /// Whether two normalized names designate the same object for the
 /// `audit.configure` sensitive-object match: equal once trailing spaces
-/// are dropped and letters are lowercased (Unicode, `char::to_lowercase`).
+/// are dropped and letters are folded
+/// ([`databastion_classifiers::names::fold_case`]: Unicode lowercase,
+/// final sigma read as sigma).
 ///
 /// Names in events come from the source (a log record or the statement
 /// text) as written, and several sources compare identifiers without case
@@ -1021,8 +1023,10 @@ fn same_name(a: &str, b: &str) -> bool {
     let b = b.trim_end_matches(' ');
     a == b
         || a.chars()
-            .flat_map(char::to_lowercase)
-            .eq(b.chars().flat_map(char::to_lowercase))
+            .flat_map(databastion_classifiers::names::fold_char)
+            .eq(b
+                .chars()
+                .flat_map(databastion_classifiers::names::fold_char))
 }
 
 #[cfg(test)]

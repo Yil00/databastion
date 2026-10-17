@@ -321,11 +321,12 @@ pub fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
 /// one budget. Two objects that really differ by case then share it too,
 /// which only reports sooner (fails closed).
 fn budget_key(database: &str, schema: &str, object: &str) -> String {
+    use databastion_classifiers::names::fold_case;
     format!(
         "{}\u{0}{}\u{0}{}",
-        database.to_lowercase(),
-        schema.to_lowercase(),
-        object.to_lowercase()
+        fold_case(database),
+        fold_case(schema),
+        fold_case(object)
     )
 }
 
@@ -839,6 +840,14 @@ mod tests {
 
     /// Names that differ only in case share one budget (security review
     /// of #197, M2), and persisted keys are folded the same way.
+    #[test]
+    fn budget_keys_read_final_sigma_as_sigma() {
+        assert_eq!(
+            budget_key("shop", "crm", "ΠΕΛΑΤΕΣ"),
+            budget_key("shop", "crm", "πελατες")
+        );
+    }
+
     #[test]
     fn budget_keys_ignore_case() {
         let now = Instant::now();
