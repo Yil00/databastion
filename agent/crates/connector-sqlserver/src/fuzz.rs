@@ -344,7 +344,12 @@ pub fn audit_records(data: &[u8]) {
     for s in group(reassemble(records)) {
         if let Some((ev, _)) = convert(&s) {
             for o in ev.objects() {
-                assert!(o.object().as_str().len() <= 256);
+                // Contract `Identifier.maxLength` counts characters, not
+                // bytes (a lossy U+FFFD is 3 bytes; run 39021675369).
+                assert!(
+                    o.object().as_str().chars().count()
+                        <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
+                );
             }
             // Past the bound, `*` and always reported: no object lost
             // without a sign (end-of-phase-9 review, gates G1 and G7).
@@ -483,7 +488,12 @@ pub fn xe_records(data: &[u8]) {
     for r in &records {
         if let Some((ev, a)) = convert(r) {
             for o in ev.objects() {
-                assert!(o.object().as_str().len() <= 256);
+                // Contract `Identifier.maxLength` counts characters, not
+                // bytes (a lossy U+FFFD is 3 bytes; run 39021675369).
+                assert!(
+                    o.object().as_str().chars().count()
+                        <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
+                );
             }
             // The exemption of masked names (a name normalization replaced
             // by `*`, protocol "The object `*`", under the filters as on
@@ -508,9 +518,41 @@ pub fn xe_records(data: &[u8]) {
                         .any(|o| o.object().as_str() == "*" && o.schema().is_none())
                 );
             }
-            // At the bound, either every object fits (15 named and a
-            // masked or unknown `*`) or the event overflowed: never more
-            // than 15 named objects.
+            // No relation of a usable text is lost without a sign: each is
+            // named, or the event overflowed and names a `*` (without
+            // schema) that covers it (end-of-phase-9 review, G7; security
+            // review of the G7 branch, L2).
+            if let (Some(a), Some(e)) = (a.as_ref(), r.event.as_ref())
+                && a.usable()
+                && !a.comment_only
+                && !matches!(
+                    a.kind,
+                    databastion_classifiers::query::tsql::TsqlKind::Ddl
+                        | databastion_classifiers::query::tsql::TsqlKind::Dcl
+                )
+            {
+                use databastion_classifiers::masking::EventObject;
+                use databastion_classifiers::names::NormalizedName;
+                let n = crate::discover::normalize;
+                let db = |d: Option<&str>| match d {
+                    Some(d) if !d.is_empty() => n(d),
+                    _ => NormalizedName::wildcard(),
+                };
+                for rel in &a.relations {
+                    let rdb = db(rel.database.as_deref().or(e.database.as_deref()));
+                    let o =
+                        EventObject::new(rdb.clone(), rel.schema.as_deref().map(n), n(&rel.name));
+                    let covered = ev.objects().contains(&o)
+                        || (ev.objects_overflowed()
+                            && ev.objects().iter().any(|s| {
+                                s.object().as_str() == "*"
+                                    && s.schema().is_none()
+                                    && (s.database().as_str() == "*" || *s.database() == rdb)
+                            }));
+                    assert!(covered, "a relation lost without a sign");
+                }
+            }
+            // Never more than 15 named objects.
             let named = ev
                 .objects()
                 .iter()
