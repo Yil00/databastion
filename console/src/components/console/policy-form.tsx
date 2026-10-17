@@ -321,7 +321,7 @@ export function PolicyForm({
         </div>
         <p className="text-xs text-muted-foreground">
           Location patterns apply to normalized names: <code>*</code> matches any run of characters, <code>?</code> one
-          character, <code>\</code> escapes the next one; case-insensitive.
+          character, <code>\</code> escapes the next one; case-insensitive, trailing spaces ignored.
         </p>
         <div className="grid gap-3 md:grid-cols-4">
           {LOCATION_FIELDS.map((f) => (

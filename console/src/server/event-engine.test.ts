@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { PgBoss } from "pg-boss";
@@ -206,6 +206,26 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(last?.sensitivity).toBe(objectSensitivity([{ classifier: "pii.email", confidence: 0.97 }]));
     });
 
+    it("matches the findings of an object without case or trailing spaces, on database, schema and object (N1)", async () => {
+      const auth = await agentWithTargets();
+      await scanWith(auth, [finding("email", "pii.email", 1), finding("name", "pii.person_name", 1, "clientèle")]);
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "Crm", object: "Clients" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "Public", object: "CLIENTÈLE" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "CRM", schema: "PUBLIC", object: "CLIENT" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "CRM", schema: "PRIVATE", object: "CLIENTS" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "SHOP", schema: "PUBLIC", object: "CLIENTS" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: " clients" }], rows: 99 }),
+      ]);
+      await drainPolicyWork(getDb());
+      const rows = await eventsOf(auth.agentId);
+      expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0, 0, 0]);
+      expect(rows.map((r) => r.score)).toEqual([6, 6, 4, 0, 0, 0, 0]);
+      // The event keeps the names as the agent sent them.
+      expect(rows[0]?.objects).toEqual([{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }]);
+    });
+
     it("an event without schema matches the findings of any schema (MySQL-like sources)", async () => {
       const auth = await agentWithTargets();
       await scanWith(auth, [finding("email", "pii.email", 1)]);
@@ -319,6 +339,41 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       const list = await incidentsOf(auth.agentId);
       expect(list.map((i) => i.policyId)).toEqual([kept]);
       expect(list.every((i) => i.policyId !== disabled)).toBe(true);
+    });
+
+    it("`objects` conditions ignore case and trailing spaces; exceptions ignore trailing spaces on MySQL only (N1)", async () => {
+      const auth = await agentWithTargets();
+      const pid = await policy({ objects: { database: "crm", object: "clients" } });
+      // Exception of a second policy, scoped to the location only: case-insensitive on every
+      // engine (ADR-0014), blind to trailing spaces on SQL Server and MySQL / MariaDB only.
+      const xp = await policy({ objects: { object: "clients" } });
+      await createException(
+        getDb(),
+        { policyId: xp, agentId: null, targetId: null, classifier: null, location: { database: "crm", object: "clients" }, reason: "x", expiresAt: null },
+        actor(),
+      );
+      const mysql = (object: string, ts: string) =>
+        dumpEvent({ ts, target_id: "mysql-crm", objects: [{ database: "CRM", object }], signals: [], source: "performance_schema" });
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "CRM", schema: "public", object: "CLIENTS " }], principal: { db_user: "a" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "Clients" }], principal: { db_user: "b" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients " }], principal: { db_user: "c" } }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "client" }], principal: { db_user: "d" } }),
+        mysql("Clients ", at(1000)),
+        mysql("CLIENT", at(2000)),
+      ]);
+      await drainPolicyWork(getDb());
+      const evs = await eventsOf(auth.agentId);
+      const linked = async (policyId: string) => {
+        const incs = (await incidentsOf(auth.agentId)).filter((i) => i.policyId === policyId).map((i) => i.id);
+        const links = incs.length === 0 ? [] : await getDb().select().from(incidentEvents).where(inArray(incidentEvents.incidentId, incs));
+        return evs.flatMap((e, i) => (links.some((l) => l.eventId === e.id) ? [i] : []));
+      };
+      // Policy: every spelling of crm.clients, never `client`.
+      expect(await linked(pid)).toEqual([0, 1, 2, 4]);
+      // Exception: `Clients` excepted on PostgreSQL, `CLIENTS ` / `clients ` not (a distinct quoted
+      // name there), `Clients ` excepted on MySQL.
+      expect(await linked(xp)).toEqual([0, 2]);
     });
 
     it("a policy change applies to the events evaluated after it, never to past ones", async () => {

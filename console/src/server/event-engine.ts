@@ -27,6 +27,7 @@ import {
   type EventObject,
 } from "@/lib/event-model";
 import { logger } from "@/lib/logger";
+import { foldName } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 import {
@@ -161,18 +162,36 @@ type PendingEvent = {
 };
 
 const SEP = "\u0000";
+/**
+ * Object key of the sensitivity lookup: database, schema and object compared with `foldName`
+ * (trailing spaces dropped, Unicode lowercase) on every engine (end-of-phase-9 review N1), as the
+ * agent's sensitive-object match: a looser match only raises a sensitivity and a score.
+ */
 const objectKey = (agentId: string, targetId: string, o: EventObject) =>
-  [agentId, targetId, o.database, o.schema === undefined || o.schema === null ? "*" : `=${o.schema}`, o.object].join(SEP);
+  [agentId, targetId, foldName(o.database), o.schema === undefined || o.schema === null ? "*" : `=${foldName(o.schema)}`, foldName(o.object)].join(SEP);
 
 /**
- * Findings (false positives excluded) of the objects reached by `events`, by object key: the exact
+ * Findings (false positives excluded) of the objects reached by `events`, by object key: the
  * schema (`=<schema>`), and `*` for any schema (events whose source logs no schema).
+ *
+ * The SQL pre-filter compares `lower(rtrim(object_name))` with `lower(rtrim(name))` for each event
+ * name and for its `foldName`, so both sides go through the same PostgreSQL `lower` and the
+ * pre-filter keeps every finding whose object name differs by case or trailing spaces; `objectKey`
+ * then decides. Residual: PostgreSQL folds ASCII letters under every locale but other letters
+ * only under a non-`C` character type (a UTF-8 locale such as the images' `en_US.utf8`); under
+ * `C`, a finding name with an upper-case non-ASCII letter only matches an event that spells that
+ * letter the same way.
+ * No index covers `object_name`, so the expression costs no index.
  */
 async function loadObjectHits(tx: Tx, events: readonly PendingEvent[]): Promise<Map<string, ClassifierHit[]>> {
   const agentIds = [...new Set(events.map((e) => e.agentId))];
-  const names = [...new Set(events.flatMap((e) => e.objects.map((o) => o.object)))];
+  const names = [...new Set(events.flatMap((e) => e.objects.flatMap((o) => [o.object, foldName(o.object)])))];
   const out = new Map<string, ClassifierHit[]>();
   if (names.length === 0) return out;
+  const sameName = sql`lower(rtrim(${findings.objectName})) in (${sql.join(
+    names.map((n) => sql`lower(rtrim(${n}::text))`),
+    sql`, `,
+  )})`;
   const rows = await tx
     .select({
       agentId: findings.agentId,
@@ -184,7 +203,7 @@ async function loadObjectHits(tx: Tx, events: readonly PendingEvent[]): Promise<
       confidence: sql<number>`max(${findings.confidence})`,
     })
     .from(findings)
-    .where(and(isNull(findings.falsePositiveAt), inArray(findings.agentId, agentIds), inArray(findings.objectName, names)))
+    .where(and(isNull(findings.falsePositiveAt), inArray(findings.agentId, agentIds), sameName))
     .groupBy(findings.agentId, findings.targetId, findings.databaseName, findings.schemaName, findings.objectName, findings.classifier);
   const push = (key: string, hit: ClassifierHit) => {
     const list = out.get(key);

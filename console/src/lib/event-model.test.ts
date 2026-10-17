@@ -247,6 +247,42 @@ describe("access_event conditions", () => {
     expect(eventMatches({ objects: { schema: "p*" } }, mysql)).toBeNull();
   });
 
+  it("`objects` globs ignore case and trailing spaces on every engine (N1)", () => {
+    const upper = { ...FACTS, objects: [{ database: "CRM", schema: "Public", object: "CLIENTS " }, { database: "crm", schema: "public", object: "orders" }] };
+    expect(eventMatches({ objects: { database: "crm", schema: "public", object: "clients" } }, upper)).toEqual([0]);
+    expect(eventMatches({ objects: { object: "clients " } }, FACTS)).toEqual([0]);
+    for (const engine of ["postgres", "mongodb", "redis", "sqlserver", "mysql"]) {
+      expect(eventMatches({ objects: { object: "Clients" } }, { ...upper, engine })).toEqual([0]);
+    }
+    expect(eventMatches({ objects: { object: "client" } }, upper)).toBeNull();
+    expect(eventMatches({ objects: { schema: "private", object: "clients" } }, upper)).toBeNull();
+    // A schema-less object still only matches a schema glob of `*`.
+    expect(eventMatches({ objects: { schema: "public" } }, { ...FACTS, objects: [{ database: "CRM", object: "CLIENTS" }] })).toBeNull();
+  });
+
+  it("exceptions: case-insensitive on every engine (ADR-0014), trailing spaces ignored only on SQL Server and MySQL / MariaDB (N1)", () => {
+    const now = new Date("2026-09-28T12:00:00Z");
+    const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null };
+    const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
+    const upper = { ...FACTS, objects: [{ database: "CRM", schema: "PUBLIC", object: "Clients" }] };
+    const padded = { ...FACTS, objects: [{ database: "CRM ", schema: "PUBLIC", object: "Clients " }] };
+    for (const engine of ["postgres", "mongodb", "redis", "sqlserver", "mysql", "mariadb"]) {
+      expect(exceptionCoversEvent(x, "p", { ...upper, engine }, [0], now)).toBe(true);
+      expect(exceptionCoversEvent(x, "p", { ...upper, engine, objects: [{ database: "CRM", schema: "PUBLIC", object: "orders" }] }, [0], now)).toBe(false);
+    }
+    for (const engine of ["sqlserver", "mysql", "mariadb"]) {
+      expect(exceptionCoversEvent(x, "p", { ...padded, engine }, [0], now)).toBe(true);
+      expect(exceptionCoversEvent({ ...base, location: { object: "clients " } }, "p", { ...upper, engine }, [0], now)).toBe(true);
+      expect(exceptionCoversEvent(x, "p", { ...padded, engine, objects: [{ database: "crm", schema: "public", object: "client " }] }, [0], now)).toBe(false);
+    }
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap"]) {
+      expect(exceptionCoversEvent(x, "p", { ...padded, engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent({ ...base, location: { object: "clients " } }, "p", { ...upper, engine }, [0], now)).toBe(false);
+    }
+    // Unknown engine (the target never reported one): never loosened.
+    expect(exceptionCoversEvent(x, "p", { ...padded, engine: null }, [0], now)).toBe(false);
+  });
+
   it("exceptions: agent, target and database / schema / object location only; never classifier-scoped", () => {
     const now = new Date("2026-09-28T12:00:00Z");
     const base = { policyId: null, agentId: null, targetId: null, classifier: null, location: null, expiresAt: null };

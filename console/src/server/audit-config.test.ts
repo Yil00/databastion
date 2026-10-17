@@ -87,6 +87,17 @@ describe("audit settings model", () => {
     expect(many.objects[0]?.object).toBe(`t${MAX_SENSITIVE_OBJECTS + 4}`);
   });
 
+  it("keeps every spelling of an object as Discovery or the administrator wrote it (N1: the agent matches without case)", () => {
+    const derived = [
+      { ...obj("Customers", ["pii.email"]), sensitivity: 3 },
+      { ...obj("customers", ["pii.iban"]), sensitivity: 7 },
+    ];
+    const { objects } = mergeSensitiveObjects(derived, [obj("customers", ["pii.phone"]), obj("CUSTOMERS", ["pii.phone"])]);
+    expect(objects.map((o) => o.object)).toEqual(["CUSTOMERS", "customers", "Customers"]);
+    expect(objects[1]?.classifiers).toEqual(["pii.iban", "pii.phone"]);
+    expect(objects[2]?.classifiers).toEqual(["pii.email"]);
+  });
+
   it("flags a change that disables Audit, empties the list or removes many objects", () => {
     const on = (objects: SensitiveObject[]) => ({ enabled: true, objects });
     // First configuration: never a warning.
