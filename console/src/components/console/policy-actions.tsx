@@ -183,6 +183,9 @@ export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; poli
           <Input id={id("expires_at")} name="expires_at" type="datetime-local" />
         </div>
       </div>
+      <p className="text-xs text-muted-foreground">
+        Patterns are case-insensitive; trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only.
+      </p>
       <div className="flex flex-col gap-1">
         <Label htmlFor={id("reason")}>Reason</Label>
         <Input id={id("reason")} name="reason" required maxLength={500} autoComplete="off" />

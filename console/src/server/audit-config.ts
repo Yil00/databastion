@@ -98,7 +98,13 @@ export function parseAuditConfigInput(v: unknown): { ok: true; value: AuditConfi
   };
 }
 
-/** Identity of a sensitive object (database, schema, object). */
+/**
+ * Identity of a sensitive object (database, schema, object), exact on purpose (end-of-phase-9
+ * review N1): the agent matches `sensitive_objects` without case or trailing spaces, so the
+ * spelling sent never narrows its filter, and keeping every catalog spelling (`Customers` next to
+ * `customers`, distinct tables on PostgreSQL) keeps both for an agent that still compares
+ * exactly. Merging spellings would only save list slots.
+ */
 export function objectIdentity(o: Pick<SensitiveObject, "database" | "schema" | "object">): string {
   return JSON.stringify([o.database, o.schema ?? null, o.object]);
 }

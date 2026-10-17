@@ -15,6 +15,7 @@ import {
   type FindingFacts,
   type IncidentStatus,
 } from "./policy-model";
+import { foldName } from "./policy-common";
 
 const FACTS: FindingFacts = {
   agentId: "01890a5d-ac96-774b-bcce-b302099a8058",
@@ -54,7 +55,44 @@ describe("globMatch", () => {
   it("runs in bounded O(n x m) time on hostile inputs (no exponential backtracking)", () => {
     const start = performance.now();
     expect(globMatch(`${"*a".repeat(100)}b`, "a".repeat(256))).toBe(false);
+    expect(globMatch(`${"*a".repeat(100)}b${" ".repeat(100)}`, `${"a".repeat(156)}${" ".repeat(100)}`, { ignoreTrailingSpaces: true })).toBe(false);
     expect(performance.now() - start).toBeLessThan(200);
+  });
+
+  it("folds non-ASCII letters, with the final sigma unified (N1, review M1)", () => {
+    expect(globMatch("ΚΑΤΆΛΟΓΟΣ", "κατάλογοσ")).toBe(true);
+    expect(globMatch("κατάλογοσ", "ΚΑΤΆΛΟΓΟΣ")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤΕΣ", "πελατες")).toBe(true);
+    expect(globMatch("πελατες", "ΠΕΛΑΤΕΣ")).toBe(true);
+    expect(globMatch("πελατες", "πελατεσ")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤ*Σ", "πελατες")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤΕΣ", "πελατε")).toBe(false);
+    expect(globMatch("CLIENTÈLE", "clientèle")).toBe(true);
+    expect(globMatch("clientèle", "clientele")).toBe(false);
+  });
+
+  it("ignores trailing spaces only when asked (N1), on both sides, never inner ones", () => {
+    expect(globMatch("clients", "clients  ")).toBe(false);
+    expect(globMatch("clients", "clients  ", { ignoreTrailingSpaces: true })).toBe(true);
+    expect(globMatch("clients ", "clients", { ignoreTrailingSpaces: true })).toBe(true);
+    expect(globMatch("clients\\ ", "CLIENTS", { ignoreTrailingSpaces: true })).toBe(true);
+    expect(globMatch("cli*", "CLIENTS ", { ignoreTrailingSpaces: true })).toBe(true);
+    expect(globMatch("clients?", "clients ", { ignoreTrailingSpaces: true })).toBe(true);
+    expect(globMatch("clients", " clients", { ignoreTrailingSpaces: true })).toBe(false);
+    expect(globMatch("cli ents", "clients", { ignoreTrailingSpaces: true })).toBe(false);
+    expect(globMatch("orders", "clients ", { ignoreTrailingSpaces: true })).toBe(false);
+  });
+});
+
+describe("foldName (N1)", () => {
+  it("drops trailing spaces only and lowercases every code point", () => {
+    expect(foldName("CRM ")).toBe("crm");
+    expect(foldName("  Customers  ")).toBe("  customers");
+    expect(foldName("CUSTOMERS\t")).toBe("customers\t");
+    expect(foldName("ΟΔΟΣ")).toBe("οδοσ");
+    expect(foldName("πελατες ")).toBe("πελατεσ");
+    expect(foldName("*")).toBe("*");
+    expect(foldName("")).toBe("");
   });
 });
 
@@ -157,6 +195,14 @@ describe("findingMatches", () => {
     expect(findingMatches({ min_match_ratio: 0.1 }, { ...FACTS, sampled: 0, matched: 0 })).toBe(false);
   });
 
+  it("location globs ignore case and trailing spaces on every engine (N1)", () => {
+    const upper = { ...FACTS, databaseName: "CRM ", schemaName: "Public", objectName: "CLIENTS  " };
+    expect(findingMatches({ location: { database: "crm", schema: "public", object: "clients" } }, upper)).toBe(true);
+    expect(findingMatches({ location: { object: "clients " } }, FACTS)).toBe(true);
+    expect(findingMatches({ location: { object: "client" } }, upper)).toBe(false);
+    expect(findingMatches({ location: { database: "crm", object: "orders" } }, upper)).toBe(false);
+  });
+
   it("location globs; a missing schema only matches `*`", () => {
     expect(findingMatches({ location: { database: "crm", object: "cli*", field: "e?ail" } }, FACTS)).toBe(true);
     expect(findingMatches({ location: { object: "orders" } }, FACTS)).toBe(false);
@@ -187,6 +233,34 @@ describe("exceptionCovers", () => {
     expect(exceptionCovers({ ...base, location: { field: "phone" } }, "p1", FACTS, NOW)).toBe(false);
     expect(exceptionCovers({ ...base, expiresAt: new Date(NOW.getTime() + 1) }, "p1", FACTS, NOW)).toBe(true);
     expect(exceptionCovers({ ...base, expiresAt: NOW }, "p1", FACTS, NOW)).toBe(false);
+  });
+
+  it("location: case-insensitive on every engine (ADR-0014), trailing spaces ignored only on SQL Server and MySQL / MariaDB (N1)", () => {
+    const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
+    const upper = { ...FACTS, databaseName: "CRM", schemaName: "PUBLIC", objectName: "Clients" };
+    const padded = { ...upper, objectName: "Clients " };
+    for (const engine of ["postgres", "mongodb", "redis", "sqlserver", "mysql", "mariadb"]) {
+      expect(exceptionCovers(x, "p1", { ...upper, engine }, NOW)).toBe(true);
+      expect(exceptionCovers(x, "p1", { ...upper, engine, objectName: "orders" }, NOW)).toBe(false);
+    }
+    for (const engine of ["sqlserver", "mysql", "mariadb"]) {
+      expect(exceptionCovers(x, "p1", { ...padded, engine }, NOW)).toBe(true);
+      expect(exceptionCovers({ ...x, location: { object: "clients " } }, "p1", { ...upper, engine }, NOW)).toBe(true);
+      expect(exceptionCovers(x, "p1", { ...padded, engine, objectName: "client " }, NOW)).toBe(false);
+    }
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap", "cas"]) {
+      expect(exceptionCovers(x, "p1", { ...padded, engine }, NOW)).toBe(false);
+      expect(exceptionCovers({ ...x, location: { object: "clients " } }, "p1", { ...upper, engine }, NOW)).toBe(false);
+    }
+  });
+
+  it("location: an unknown or empty engine never ignores trailing spaces, still ignores case (review L4)", () => {
+    const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
+    for (const engine of ["", "oracle", "SQLSERVER", "mysql "]) {
+      expect(exceptionCovers(x, "p1", { ...FACTS, engine, objectName: "Clients" }, NOW)).toBe(true);
+      expect(exceptionCovers(x, "p1", { ...FACTS, engine, objectName: "Clients " }, NOW)).toBe(false);
+      expect(exceptionCovers({ ...x, location: { object: "clients " } }, "p1", { ...FACTS, engine }, NOW)).toBe(false);
+    }
   });
 });
 

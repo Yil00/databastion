@@ -3,6 +3,7 @@ import { validateSchema } from "@/lib/protocol/validate";
 
 import {
   ENGINES,
+  exceptionGlobOptions,
   fail,
   globMatch,
   isGlob,
@@ -10,6 +11,7 @@ import {
   onlyKeys,
   stringList,
   UUID,
+  type GlobOptions,
   type Parsed,
 } from "./policy-common";
 
@@ -20,14 +22,16 @@ import {
  * none (ADR-0007), only names, counts and signals.
  *
  * ## Sensitivity (per object)
- * From the Discovery findings of the object (same agent, target, database, schema and object; any
- * column; false positives excluded): for each classifier found, its weight (table below) times the
+ * From the Discovery findings of the object (same agent, target, database, schema and object, the
+ * names compared after dropping trailing spaces and lowercasing, `foldName`, on every engine:
+ * end-of-phase-9 review N1; any column; false positives excluded): for each classifier found, its
+ * weight (table below) times the
  * highest confidence among the object's columns for it, summed over the classifiers and capped at
  * `SENSITIVITY_CAP`. An object without finding has sensitivity 0. An event's sensitivity is the
  * highest sensitivity among its objects. An event object without a schema (MySQL, MongoDB, or a
  * source that does not log it) matches the findings of that database and object in any schema.
- * OpenLDAP events carry the entry's container as `schema` (ADR-0029 decision 6), matched exactly;
- * an OpenLDAP object `*` (no sensitive object reachable) carries the container too.
+ * OpenLDAP events carry the entry's container as `schema` (ADR-0029 decision 6), matched as the
+ * other names; an OpenLDAP object `*` (no sensitive object reachable) carries the container too.
  *
  * ## Score (per event)
  * `score = sensitivity x log10(1 + rows)`, rounded to 2 decimals; 0 when the event reports no
@@ -364,13 +368,17 @@ export function signalSelected(selectors: readonly string[], signal: string): bo
   return selectors.some((s) => (s.endsWith(".*") ? signal.startsWith(s.slice(0, -1)) : s === signal));
 }
 
-/** An object without schema only matches a schema glob of `*` (as for finding locations). */
-export function objectMatches(pattern: ObjectPattern, o: EventObject): boolean {
+/**
+ * An object without schema only matches a schema glob of `*` (as for finding locations). Globs are
+ * case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces (the
+ * default, N1), location exceptions only on `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ */
+export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
   return OBJECT_PARTS.every((part) => {
     const g = pattern[part];
     if (g === undefined) return true;
     const name = part === "schema" ? (o.schema ?? null) : o[part];
-    return name === null ? g === "*" : globMatch(g, name);
+    return name === null ? g === "*" : globMatch(g, name, opts);
   });
 }
 
@@ -411,7 +419,9 @@ export interface EventExceptionScope {
  * Policy exceptions applied to an event (every set scope must hold): agent, target, and a location
  * whose `database` / `schema` / `object` globs cover every retained object (a `field` glob other
  * than `*` never covers an event, which names no field). A classifier-scoped exception concerns
- * findings only and never covers an event.
+ * findings only and never covers an event. The globs are case-insensitive on every engine
+ * (ADR-0014 decision 1) and ignore trailing spaces only on the target's engine of
+ * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts) (N1; an unknown engine: never).
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,
@@ -429,7 +439,8 @@ export function exceptionCoversEvent(
     const { field, ...parts } = x.location;
     if (field !== undefined && field !== "*") return false;
     if (objectIdx.length === 0) return false;
-    return objectIdx.every((i) => objectMatches(parts, e.objects[i] as EventObject));
+    const opts = exceptionGlobOptions(e.engine);
+    return objectIdx.every((i) => objectMatches(parts, e.objects[i] as EventObject, opts));
   }
   return true;
 }

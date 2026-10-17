@@ -5,6 +5,7 @@ import { parseEventConditions, type EventConditions } from "./event-model";
 import { SEVERITIES, type Severity } from "./incident-lifecycle";
 import {
   ENGINES,
+  exceptionGlobOptions,
   fail,
   globMatch,
   isGlob,
@@ -13,6 +14,7 @@ import {
   stringList,
   TEXT,
   UUID,
+  type GlobOptions,
   type Parsed,
 } from "./policy-common";
 
@@ -246,7 +248,12 @@ export interface FindingFacts {
   matched: number;
 }
 
-export function locationMatches(pattern: LocationPattern, f: FindingFacts): boolean {
+/**
+ * Globs are case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces
+ * (the default, end-of-phase-9 review N1), location exceptions only on the engines of
+ * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ */
+export function locationMatches(pattern: LocationPattern, f: FindingFacts, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
   const names: Record<LocationPart, string | null> = {
     database: f.databaseName,
     schema: f.schemaName,
@@ -258,7 +265,7 @@ export function locationMatches(pattern: LocationPattern, f: FindingFacts): bool
     if (g === undefined) return true;
     const name = names[part];
     // A location without a schema (MySQL, MongoDB...) only matches a schema glob of `*`.
-    return name === null ? g === "*" : globMatch(g, name);
+    return name === null ? g === "*" : globMatch(g, name, opts);
   });
 }
 
@@ -293,7 +300,7 @@ export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingF
   if (e.agentId !== null && e.agentId !== f.agentId) return false;
   if (e.targetId !== null && e.targetId !== f.targetId) return false;
   if (e.classifier !== null && !classifierSelected([e.classifier], f.classifier)) return false;
-  if (e.location !== null && !locationMatches(e.location, f)) return false;
+  if (e.location !== null && !locationMatches(e.location, f, exceptionGlobOptions(f.engine))) return false;
   return true;
 }
 

@@ -118,6 +118,15 @@ docker compose --profile proxy up -d     # pulls the images, runs the migrations
 `secrets/encryption_key` protects the secrets the console stores (notification channels, masked
 samples): keep a copy offline.
 
+**Console database locale.** The console matches the object names of Audit events against its
+findings without case (an event on `CRM.CUSTOMERS` gets the sensitivity of `crm.customers`), in
+part with PostgreSQL `lower`, which folds letters beyond ASCII only under a UTF-8 character type.
+The bundled PostgreSQL image creates its database with `en_US.utf8`. With your own PostgreSQL,
+create the console database with a UTF-8 `LC_CTYPE` (for example `en_US.UTF-8` or `C.UTF-8`), not
+`C` or `POSIX`. Check it with `SELECT datctype FROM pg_database WHERE datname = current_database();`.
+Under `C` / `POSIX` the matching still works, but the worker then reads every finding of the agent
+for each batch of events that names a non-ASCII object, which is slower on large installations.
+
 **Your own reverse proxy instead of Caddy**: `cp docker-compose.own-proxy.example.yml
 compose.own-proxy.yaml`, add `COMPOSE_FILE=compose.yaml:compose.own-proxy.yaml` to `.env`, start
 with `docker compose up -d` (no `proxy` profile), and put your HTTPS reverse proxy (TLS 1.3
