@@ -1,62 +1,53 @@
-//! The objects of one access event, bounded fail closed (end-of-phase-9
-//! review, gate G1).
+//! The objects of one access event (end-of-phase-9 review, gates G1 and
+//! G7).
 //!
-//! An event holds at most [`MAX_EVENT_OBJECTS`] objects (contract
-//! `AccessEvent.objects.maxItems`), and [`MaskedEvent::with_object`]
-//! ignores the ones past that bound. A statement that names more objects
-//! than fit would otherwise lose some of them without a sign: the
-//! statement is then a read of what fits and of `*`, always reported (the
-//! rule of the MySQL / MariaDB connector for its 16 table names). One slot
-//! is kept for `*`, so that `*` always fits.
+//! The bound is the core's rule ([`MaskedEvent::with_object`]): an event
+//! keeps at most 15 named objects and a slot for `*`; an object past that
+//! makes the event name `*` (covering it, widened to `(*, -, *)` across
+//! databases) and always reported, never lost without a sign. This list
+//! only collects the distinct objects of a statement (bounded upstream:
+//! the grouping's 64 record objects, the analyzer's relation bound) and
+//! the databases of objects lost upstream, and hands them all to the core.
 
-use databastion_classifiers::masking::{EventObject, MAX_EVENT_OBJECTS, MaskedEvent};
+use databastion_classifiers::masking::{EventObject, MaskedEvent};
+use databastion_classifiers::names::NormalizedName;
 
-/// Distinct objects kept besides `*`.
-const KEPT: usize = MAX_EVENT_OBJECTS - 1;
-
-/// The distinct objects of one event, at most [`KEPT`], and whether some
-/// did not fit.
+/// The distinct objects of one event, and the databases of objects lost
+/// before reaching it.
 #[derive(Debug, Default)]
 pub(crate) struct Objects {
     list: Vec<EventObject>,
-    overflow: bool,
+    unlisted: Vec<NormalizedName>,
 }
 
 impl Objects {
-    /// Adds an object (duplicates ignored); one past the bound marks the
-    /// list as overflowed instead.
+    /// Adds an object (duplicates ignored).
     pub(crate) fn push(&mut self, o: EventObject) {
-        if self.list.contains(&o) {
-            return;
-        }
-        if self.list.len() < KEPT {
+        if !self.list.contains(&o) {
             self.list.push(o);
-        } else {
-            self.overflow = true;
         }
     }
 
-    /// Records that objects were lost before they reached this list (a
-    /// bound upstream).
-    pub(crate) fn mark_overflow(&mut self) {
-        self.overflow = true;
-    }
-
-    /// Whether some object did not fit: the event must name `*` and be
-    /// always reported.
-    pub(crate) fn overflow(&self) -> bool {
-        self.overflow
+    /// Records that objects of `database` (`*`: several or unknown) were
+    /// lost before they reached this list (a bound upstream): the event
+    /// gets the core's overflow ([`MaskedEvent::with_unlisted_objects`]).
+    pub(crate) fn mark_unlisted(&mut self, database: NormalizedName) {
+        if !self.unlisted.contains(&database) {
+            self.unlisted.push(database);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.list.is_empty() && self.unlisted.is_empty()
     }
 
-    /// Adds the objects to `ev`. A caller that names `*` adds it to `ev`
-    /// first: one slot is always left for it.
+    /// Adds the objects to `ev`, through the core's bound.
     pub(crate) fn apply(self, mut ev: MaskedEvent) -> MaskedEvent {
         for o in self.list {
             ev = ev.with_object(o);
+        }
+        for db in self.unlisted {
+            ev = ev.with_unlisted_objects(db);
         }
         ev
     }
@@ -70,13 +61,12 @@ mod tests {
     use databastion_classifiers::masking::{
         EventAction, EventPrincipal, EventSource, MAX_EVENT_OBJECTS, MaskedEvent,
     };
-    use databastion_classifiers::names::NormalizedName;
 
     use super::*;
     use crate::discover::normalize;
 
-    fn obj(name: &str) -> EventObject {
-        EventObject::new(normalize("db"), None, normalize(name))
+    fn obj(db: &str, name: &str) -> EventObject {
+        EventObject::new(normalize(db), None, normalize(name))
     }
 
     fn event() -> MaskedEvent {
@@ -88,29 +78,48 @@ mod tests {
         )
     }
 
+    fn stars(ev: &MaskedEvent) -> Vec<&str> {
+        ev.objects()
+            .iter()
+            .filter(|o| o.object().as_str() == "*")
+            .map(|o| o.database().as_str())
+            .collect()
+    }
+
     #[test]
-    fn star_always_fits_and_overflow_is_marked() {
-        let star = || EventObject::new(normalize("db"), None, NormalizedName::wildcard());
+    fn the_core_rule_applies() {
+        let name = |i: usize| format!("t{}", char::from(b'a' + u8::try_from(i).unwrap()));
+        // 15 named objects: no overflow.
         let mut o = Objects::default();
-        for i in 0..KEPT {
-            o.push(obj(&format!(
-                "t{}",
-                char::from(b'a' + u8::try_from(i).unwrap())
-            )));
-            o.push(obj("ta"));
+        for i in 0..15 {
+            o.push(obj("db", &name(i)));
+            o.push(obj("db", "ta"));
         }
-        assert!(!o.overflow());
-        let ev = std::mem::take(&mut o).apply(event());
-        assert_eq!(ev.objects().len(), KEPT);
-        for i in 0..MAX_EVENT_OBJECTS {
-            o.push(obj(&format!(
-                "t{}",
-                char::from(b'a' + u8::try_from(i).unwrap())
-            )));
+        let ev = o.apply(event());
+        assert_eq!(ev.objects().len(), 15);
+        assert!(!ev.objects_overflowed() && !ev.always_report());
+        // 16: `*` of that database, always reported.
+        let mut o = Objects::default();
+        for i in 0..16 {
+            o.push(obj("db", &name(i)));
         }
-        assert!(o.overflow());
-        let ev = o.apply(event().with_object(star()));
+        let ev = o.apply(event());
         assert_eq!(ev.objects().len(), MAX_EVENT_OBJECTS);
-        assert!(ev.objects().contains(&star()));
+        assert!(ev.objects_overflowed() && ev.always_report());
+        assert_eq!(stars(&ev), ["db"]);
+        // Then one of another database: widened.
+        let mut o = Objects::default();
+        for i in 0..16 {
+            o.push(obj("db", &name(i)));
+        }
+        o.push(obj("crm", "customers"));
+        assert_eq!(stars(&o.apply(event())), ["*"]);
+        // Objects lost upstream: the overflow too, even with room.
+        let mut o = Objects::default();
+        o.push(obj("db", "t"));
+        o.mark_unlisted(normalize("crm"));
+        let ev = o.apply(event());
+        assert!(ev.objects_overflowed() && ev.always_report());
+        assert_eq!(stars(&ev), ["crm"]);
     }
 }

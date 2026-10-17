@@ -739,6 +739,111 @@ mod tests {
         assert!(reportable(&c, &ev("u", "other", None)));
     }
 
+    /// G7 (end-of-phase-9 review): a sensitive object past the event's
+    /// object bound is not hidden. The event names `*` and is reported
+    /// below `min_rows`, also after aggregation.
+    #[test]
+    fn a_sensitive_object_past_the_bound_is_reported() {
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "schema": "crm", "object": "customers",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        let wide = || {
+            let mut e = ev("u", "a_harmless", Some(1));
+            for i in 0..15u8 {
+                e = e.with_object(EventObject::new(
+                    normalize_path("shop"),
+                    Some(normalize_path("crm")),
+                    normalize_path(&format!("harmless_{}", char::from(b'b' + i))),
+                ));
+            }
+            e.with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path("customers"),
+            ))
+        };
+        let e = wide();
+        assert!(e.objects_overflowed() && e.always_report());
+        assert!(
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "*" && o.database().as_str() == "shop")
+        );
+        assert!(reportable(&c, &e));
+        let now = Instant::now();
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        a.push(wide(), now);
+        a.push(wide(), now);
+        let out = a.drain();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].objects_overflowed() && reportable(&c, &out[0]));
+    }
+
+    /// N1 (end-of-phase-9 review): names from a statement text keep the
+    /// spelling of the text; the sensitive-object match ignores case and
+    /// trailing spaces (SQL Server `[customers ]`, `CRM.CUSTOMERS` under a
+    /// case-insensitive collation or `lower_case_table_names`).
+    #[test]
+    fn the_sensitive_object_match_ignores_case_and_trailing_spaces() {
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [
+                {"database": "shop", "schema": "crm", "object": "customers",
+                 "classifiers": ["pii.email"]},
+                {"database": "Ventes", "object": "Clients", "classifiers": ["pii.email"]}
+            ]
+        }));
+        let at = |db: &str, schema: Option<&str>, object: &str| {
+            MaskedEvent::new(
+                EventSource::SqlserverXevents,
+                EventAction::Read,
+                EventPrincipal::account("u"),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            )
+            .with_object(EventObject::new(
+                normalize_path(db),
+                schema.map(normalize_path),
+                normalize_path(object),
+            ))
+            .with_rows(Some(1))
+        };
+        assert!(reportable(&c, &at("SHOP", Some("CRM"), "CUSTOMERS")));
+        assert!(reportable(&c, &at("shop", Some("Crm"), "Customers")));
+        assert!(reportable(&c, &at("ventes", Some("dbo"), "CLIENTS")));
+        assert!(reportable(&c, &at("ventes", None, "clients")));
+        let spaced = at("shop", Some("crm"), "customers ");
+        assert_eq!(spaced.objects()[0].object().as_str(), "customers ");
+        assert!(reportable(&c, &spaced));
+        // Unicode letters fold too.
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "object": "élèves",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        assert!(reportable(&c, &at("shop", None, "ÉLÈVES")));
+        // Final sigma: `Σ` lowercases to `σ`, text often writes `ς`.
+        let c2 = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "object": "πελατες",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        assert!(reportable(&c2, &at("shop", None, "ΠΕΛΑΤΕΣ")));
+        assert!(reportable(&c2, &at("shop", None, "πελατεσ")));
+        // Still exact otherwise: a different name or a schema the listed
+        // object does not have does not match.
+        assert!(!reportable(&c, &at("shop", None, "eleves")));
+        assert!(!reportable(&c, &at("shop", None, "élèves_x")));
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "schema": "crm", "object": "customers",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        assert!(!reportable(&c, &at("shop", None, "customers")));
+        assert!(!reportable(&c, &at("shop", Some("hr"), "CUSTOMERS")));
+    }
+
     /// Events a connector marks always reported (writes to a database's
     /// own instrumentation) pass `min_rows` whatever their rows, also after
     /// aggregation with unmarked events of their group.

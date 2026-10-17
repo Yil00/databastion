@@ -2126,7 +2126,7 @@ impl EventBuilder {
         }
         // Reads of statement-text tables (ADR-0045 decisions 1 to 4) and
         // of statistics tables (ADR-0048 decisions 1 to 4): named first
-        // (an event names 16 objects at most), always reported, and never
+        // (an event names 15 objects and `*` at most), always reported, and never
         // the agent's own (its exact texts are left out above; it names
         // no statistics table).
         let text_tables = objects.iter().any(|(db, t)| {
@@ -2166,9 +2166,11 @@ impl EventBuilder {
             a.rows
         };
         let mut e = MaskedEvent::new(a.source, action, a.principal.clone(), ts).with_rows(rows);
-        // An event names 16 objects at most: `*` keeps its place.
+        // An event names 15 objects and `*` at most: past that, the core
+        // adds `*` and always reports the event (`MaskedEvent::with_object`,
+        // end-of-phase-9 review G7), so no table is hidden.
         let star = unknown || (dquoted && rw);
-        for (db, name) in objects.iter().take(if star { 15 } else { 16 }) {
+        for (db, name) in &objects {
             e = e.with_object(object(db, name));
         }
         if star {
@@ -3209,6 +3211,85 @@ mod tests {
             "{out:#?}"
         );
         assert_eq!(b.failed, 2);
+    }
+
+    /// End-of-phase-9 review G7: 16 harmless tables before a sensitive
+    /// one do not hide it, from `TABLE` records (a view's base tables) or
+    /// from a two-statement text (each statement under the 16-name rule):
+    /// the event names `*`, is always reported and marked overflowed.
+    #[test]
+    fn objects_past_the_event_bound_name_star() {
+        let harmless: Vec<String> = (0..16u8)
+            .map(|i| format!("harmless_{}", char::from(b'a' + i)))
+            .collect();
+        let check = |e: &MaskedEvent, db: &str| {
+            assert!(e.objects_overflowed(), "{}", show(e));
+            assert!(e.always_report());
+            assert_eq!(e.objects().len(), 16);
+            assert!(
+                e.objects()
+                    .iter()
+                    .any(|o| o.object().as_str() == "*" && o.database().as_str() == db),
+                "{}",
+                show(e)
+            );
+        };
+        // `server_audit` TABLE records.
+        let mut lines: Vec<String> = harmless
+            .iter()
+            .map(|t| format!("20260929 09:41:34,h,app,10.0.0.5,37,1,READ,support,{t},"))
+            .collect();
+        lines.push("20260929 09:41:34,h,app,10.0.0.5,37,1,READ,support,customers,".to_owned());
+        lines.push(
+            "20260929 09:41:34,h,app,10.0.0.5,37,1,QUERY,support,'select * from v_all',0"
+                .to_owned(),
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&lines, 1024),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1);
+        check(&ev[0], "support");
+        // Percona `audit_log` table records, then the statement's status.
+        let mut recs: Vec<FileRecord> = harmless
+            .iter()
+            .map(String::as_str)
+            .chain(["customers"])
+            .map(|t| {
+                let r = format!(
+                    r#"{{"timestamp":"2026-09-29 10:06:12","class":"table_access","event":"read","connection_id":7,"login":{{"user":"app","ip":"10.0.0.5"}},"table_access_data":{{"db":"support","table":"{t}","query":"select * from v_all","sql_command":"select"}}}}"#
+                );
+                parse_json(r.as_bytes()).unwrap()
+            })
+            .collect();
+        recs.push(
+            parse_json(br#"{"timestamp":"2026-09-29 10:06:12","class":"general","event":"status","connection_id":7,"login":{"user":"app","ip":"10.0.0.5"},"general_data":{"command":"Query","query":"select * from v_all","status":0}}"#)
+                .unwrap(),
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+        assert_eq!(ev.len(), 1, "{:?}", ev.iter().map(show).collect::<Vec<_>>());
+        check(&ev[0], "support");
+        // A two-statement text, 8 then 9 tables (no TABLE record).
+        let first = harmless[..8].join(", ");
+        let second = format!("{}, customers", harmless[8..].join(", "));
+        let line = sa_query(
+            "app",
+            "10.0.0.5",
+            2,
+            &format!("select * from {first}; select * from {second}"),
+            None,
+        );
+        let mut b = EventBuilder::new(own());
+        let ev = b.convert_file(
+            sa_at(&[line], 4096),
+            EventSource::MariadbServerAudit,
+            SystemTime::now(),
+        );
+        assert_eq!(ev.len(), 1, "{:?}", ev.iter().map(show).collect::<Vec<_>>());
+        check(&ev[0], "shop");
     }
 
     #[test]

@@ -986,15 +986,47 @@ impl AuditConfig {
 
     /// Whether an object (normalized names, as sent in events) is listed
     /// in `sensitive_objects`. A listed object without a schema matches
-    /// any schema.
+    /// any schema. Names are compared with [`same_name`]: case-insensitively
+    /// and ignoring trailing spaces, on every engine (end-of-phase-9
+    /// security review, N1).
     #[must_use]
     pub fn is_sensitive(&self, database: &str, schema: Option<&str>, object: &str) -> bool {
         self.sensitive_objects.iter().any(|o| {
-            o.database == database
-                && o.object == object
-                && o.schema.as_deref().is_none_or(|s| Some(s) == schema)
+            same_name(&o.database, database)
+                && same_name(&o.object, object)
+                && o.schema
+                    .as_deref()
+                    .is_none_or(|s| schema.is_some_and(|t| same_name(s, t)))
         })
     }
+}
+
+/// Whether two normalized names designate the same object for the
+/// `audit.configure` sensitive-object match: equal once trailing spaces
+/// are dropped and letters are folded
+/// ([`databastion_classifiers::names::fold_case`]: Unicode lowercase,
+/// final sigma read as sigma).
+///
+/// Names in events come from the source (a log record or the statement
+/// text) as written, and several sources compare identifiers without case
+/// or trailing spaces (SQL Server under its default case-insensitive
+/// collation, which also ignores trailing spaces; MySQL / MariaDB with
+/// `lower_case_table_names` other than 0; LDAP), while Discovery recorded
+/// the catalog's spelling. The comparison is case-insensitive on every
+/// engine: on a case-sensitive source it can only make the filter keep an
+/// event it would have dropped (an access to `Customers` next to a
+/// sensitive `customers`), never drop one, so it fails closed and needs no
+/// per-source collation knowledge. The filter is a noise filter; the
+/// console decides incidents.
+fn same_name(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches(' ');
+    let b = b.trim_end_matches(' ');
+    a == b
+        || a.chars()
+            .flat_map(databastion_classifiers::names::fold_char)
+            .eq(b
+                .chars()
+                .flat_map(databastion_classifiers::names::fold_char))
 }
 
 #[cfg(test)]

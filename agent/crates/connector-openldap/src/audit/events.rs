@@ -134,7 +134,10 @@ impl EventBuilder {
         self.contexts.iter().any(|c| c.canon == canon)
     }
 
-    /// The objects an operation on `r` could reach (at most 16).
+    /// The objects an operation on `r` could reach: every matching
+    /// sensitive object (`sensitive_objects` is bounded by the contract),
+    /// past 15 the event names `*` and is always reported
+    /// (`MaskedEvent::with_object`, end-of-phase-9 review G7).
     fn objects(&self, r: &Record, database: &NormalizedName) -> Vec<EventObject> {
         let parent = dn::parent(&r.target);
         // The container named for the operation, and the rule selecting
@@ -171,9 +174,6 @@ impl EventBuilder {
                         Some(databastion_classifiers::names::normalize_ldap_dn(schema)),
                         databastion_classifiers::names::normalize_path(&o.object),
                     ));
-                }
-                if out.len() >= 16 {
-                    break;
                 }
             }
         }
@@ -523,6 +523,36 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// End-of-phase-9 review G7: a search reaching 17 sensitive
+    /// containers does not hide the last ones: the event names `*` and is
+    /// always reported.
+    #[test]
+    fn a_search_reaching_more_containers_than_an_event_names_is_always_reported() {
+        let sensitive: Vec<SensitiveObject> = (0..17u8)
+            .map(|i| SensitiveObject {
+                database: "dc=example,dc=org".to_owned(),
+                schema: Some(format!("ou=unit{},dc=example,dc=org", char::from(b'a' + i))),
+                object: "inetOrgPerson".to_owned(),
+                classifiers: Vec::new(),
+            })
+            .collect();
+        let mut b = builder(sensitive);
+        let root = S {
+            base: "dc=example,dc=org",
+            ..DEFAULT
+        };
+        let e = b
+            .convert(vec![search(&root)], Instant::now())
+            .pop()
+            .unwrap();
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        let n = names(&e);
+        assert_eq!(n.len(), 16);
+        assert!(n.contains(&("dc=example,dc=org".to_owned(), None, "*".to_owned())));
+        assert_eq!(n.iter().filter(|o| o.2 == "inetOrgPerson").count(), 15);
     }
 
     #[test]

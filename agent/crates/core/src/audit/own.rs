@@ -140,9 +140,10 @@ impl OwnUsage {
     /// objects are taken.
     fn merge(&mut self, file: OwnFile, current: u64) {
         for (key, hours) in file.o {
-            // Files written before keys were lowercased: folded the same
-            // way, so a restart after the upgrade keeps the charges.
-            let key = key.to_lowercase();
+            // Files written before keys were folded (lowercased, or with a
+            // final sigma): folded the same way as `budget_key`, so a
+            // restart after the upgrade keeps the charges.
+            let key = databastion_classifiers::names::fold_case(&key);
             if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
                 break;
             }
@@ -321,11 +322,12 @@ pub fn charged_rows(e: &MaskedEvent, budget: u64) -> u64 {
 /// one budget. Two objects that really differ by case then share it too,
 /// which only reports sooner (fails closed).
 fn budget_key(database: &str, schema: &str, object: &str) -> String {
+    use databastion_classifiers::names::fold_case;
     format!(
         "{}\u{0}{}\u{0}{}",
-        database.to_lowercase(),
-        schema.to_lowercase(),
-        object.to_lowercase()
+        fold_case(database),
+        fold_case(schema),
+        fold_case(object)
     )
 }
 
@@ -444,7 +446,9 @@ impl OwnAccount {
     /// charged the whole budget, and every statement at least one row:
     /// [`charged_rows`]). The rows are charged whenever the account is the
     /// agent's. When the agent's own address is unknown, nothing is left
-    /// out.
+    /// out. An event whose objects overflowed the event's bound
+    /// (`MaskedEvent::objects_overflowed`) is never left out: the objects
+    /// it could not name were not charged.
     pub fn routine(
         &mut self,
         user: &str,
@@ -498,7 +502,11 @@ impl OwnAccount {
         if !e.objects().is_empty() {
             self.lock_usage().persist(now, false);
         }
-        identity && e.signals().is_empty() && !over
+        // An event with more objects than it can name
+        // (`MaskedEvent::objects_overflowed`) has objects that were not
+        // charged: never left out under a budget (end-of-phase-9 review
+        // G7). The agent's own sampling statements name one object.
+        identity && e.signals().is_empty() && !over && !e.objects_overflowed()
     }
 
     /// Like [`OwnAccount::routine`] (account, application, address, no
@@ -834,6 +842,14 @@ mod tests {
     /// Names that differ only in case share one budget (security review
     /// of #197, M2), and persisted keys are folded the same way.
     #[test]
+    fn budget_keys_read_final_sigma_as_sigma() {
+        assert_eq!(
+            budget_key("shop", "crm", "ΠΕΛΑΤΕΣ"),
+            budget_key("shop", "crm", "πελατες")
+        );
+    }
+
+    #[test]
     fn budget_keys_ignore_case() {
         let now = Instant::now();
         let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
@@ -885,6 +901,25 @@ mod tests {
                 .sum::<u64>(),
             7
         );
+        // A key saved with a final sigma: found again under the new fold.
+        u.merge(
+            OwnFile {
+                v: OWN_FILE_VERSION,
+                o: vec![(
+                    "db\u{0}\u{0}\u{03C0}\u{03B5}\u{03BB}\u{03B1}\u{03C4}\u{03B5}\u{03C2}"
+                        .to_owned(),
+                    vec![(current, 5)],
+                )],
+            },
+            current,
+        );
+        assert_eq!(
+            u.usage[&budget_key("db", "", "ΠΕΛΑΤΕΣ")]
+                .iter()
+                .map(|(_, n)| n)
+                .sum::<u64>(),
+            5
+        );
     }
 
     #[test]
@@ -927,6 +962,35 @@ mod tests {
             None,
             ClientSeen::NotVisible,
             &ev(None)
+        ));
+    }
+
+    /// G7: an own-identity event past the object bound is charged for the
+    /// objects it names but never left out under the budget; the
+    /// unbudgeted exact-text rule is unchanged (it charges nothing).
+    #[test]
+    fn overflowed_events_are_never_left_out_under_a_budget() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let mut e = ev(Some(1));
+        for i in 0..16u8 {
+            e = e.with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path(&format!("t_{}", char::from(b'a' + i))),
+            ));
+        }
+        assert!(e.objects_overflowed());
+        let mut o = own(Some("192.0.2.14"));
+        assert!(!o.routine("databastion", Some("databastion-agent"), logged, &e, now));
+        assert!(o.routine_unbudgeted("databastion", Some("databastion-agent"), logged, &e));
+        // A plain own read still is.
+        assert!(o.routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &ev(Some(1)),
+            now
         ));
     }
 

@@ -287,8 +287,8 @@ pub fn tsql(data: &[u8]) {
 /// records built from the input (actions and classes from the closed
 /// tables and others, any text, any sequence numbers and groups) are
 /// reassembled, grouped and converted without panicking; a converted
-/// event never carries text beyond normalized names, and one at the object
-/// bound names `*` and is always reported.
+/// event never carries text beyond normalized names, and one past the
+/// object bound names `*` and is always reported.
 pub fn audit_records(data: &[u8]) {
     use crate::audit::records::{Record, convert, group, reassemble};
     const ACTIONS: &[&str] = &[
@@ -344,11 +344,16 @@ pub fn audit_records(data: &[u8]) {
     for s in group(reassemble(records)) {
         if let Some((ev, _)) = convert(&s) {
             for o in ev.objects() {
-                assert!(o.object().as_str().len() <= 256);
+                // Contract `Identifier.maxLength` counts characters, not
+                // bytes (a lossy U+FFFD is 3 bytes; run 39021675369).
+                assert!(
+                    o.object().as_str().chars().count()
+                        <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
+                );
             }
-            // At the bound, `*` and always reported: no object lost without
-            // a sign (end-of-phase-9 review, gate G1).
-            if ev.objects().len() == databastion_classifiers::masking::MAX_EVENT_OBJECTS {
+            // Past the bound, `*` and always reported: no object lost
+            // without a sign (end-of-phase-9 review, gates G1 and G7).
+            if ev.objects_overflowed() {
                 assert!(ev.always_report());
                 assert!(
                     ev.objects()
@@ -412,12 +417,11 @@ pub fn xe_event_xml(data: &[u8]) {
 /// sessions, activities, procedures and texts drawn from it) go through
 /// the context pass (procedure names, duplicate failed logins, statistics
 /// builds) and the conversion without panicking; an event never names
-/// more than normalized names, and a statement that names `*` is always
-/// reported, unless that `*` is a masked name (a name of the text, or the
-/// procedure, that normalization replaced: protocol "The object `*`",
-/// which stays under the filters as on SQL Server Audit; end-of-phase-9
-/// review, gate G1); and an event at the object bound names `*` and is
-/// always reported (no object lost without a sign).
+/// more than normalized names; a statement whose objects cannot all be
+/// told from its analysis, or an event past the object bound, names `*`
+/// and is always reported (a `*` that is only a masked name stays under
+/// the filters, protocol "The object `*`"; end-of-phase-9 review, gates G1
+/// and G7, and L-a of the #260 review).
 pub fn xe_records(data: &[u8]) {
     use crate::audit::xe::events::{XeRecord, context, convert};
     use crate::audit::xe::xml::parse;
@@ -483,32 +487,30 @@ pub fn xe_records(data: &[u8]) {
     );
     for r in &records {
         if let Some((ev, a)) = convert(r) {
-            let masked = |schema: Option<&str>| {
-                let star = |n: &str| crate::discover::normalize(n).as_str() == "*";
-                let same = |s: Option<&String>| {
-                    s.map(|s| crate::discover::normalize(s))
-                        .as_ref()
-                        .map(|n| n.as_str())
-                        == schema
-                };
-                a.as_ref().is_some_and(|a| {
-                    a.relations
-                        .iter()
-                        .any(|rel| star(&rel.name) && same(rel.schema.as_ref()))
-                }) || (schema.is_none() && r.procedure.as_deref().is_some_and(star))
-            };
             for o in ev.objects() {
-                assert!(o.object().as_str().len() <= 256);
-                if o.object().as_str() == "*"
-                    && r.kind().is_statement()
-                    && !masked(o.schema().map(|s| s.as_str()))
-                {
-                    assert!(ev.always_report());
-                }
+                // Contract `Identifier.maxLength` counts characters, not
+                // bytes (a lossy U+FFFD is 3 bytes; run 39021675369).
+                assert!(
+                    o.object().as_str().chars().count()
+                        <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
+                );
             }
-            // At the bound, the event names `*` and is always reported: a
-            // statement with more objects never loses one without a sign.
-            if ev.objects().len() == databastion_classifiers::masking::MAX_EVENT_OBJECTS {
+            // The exemption of masked names (a name normalization replaced
+            // by `*`, protocol "The object `*`", under the filters as on
+            // SQL Server Audit) follows from the analysis, never from the
+            // names: whenever the statement's objects cannot all be told
+            // (relations past the analyzer's bound, dynamic SQL, a user
+            // function, a four-part name, remote access) or did not all
+            // fit the event (the core's overflow), the event names `*`
+            // and is always reported (end-of-phase-9 review of #260, L-a).
+            let unknown = a.as_ref().is_some_and(|a| {
+                !a.relations_complete
+                    || a.dynamic_sql
+                    || a.user_function
+                    || a.four_part
+                    || a.remote_access
+            });
+            if (r.kind().is_statement() && unknown) || ev.objects_overflowed() {
                 assert!(ev.always_report());
                 assert!(
                     ev.objects()
@@ -516,6 +518,47 @@ pub fn xe_records(data: &[u8]) {
                         .any(|o| o.object().as_str() == "*" && o.schema().is_none())
                 );
             }
+            // No relation of a usable text is lost without a sign: each is
+            // named, or the event overflowed and names a `*` (without
+            // schema) that covers it (end-of-phase-9 review, G7; security
+            // review of the G7 branch, L2).
+            if let (Some(a), Some(e)) = (a.as_ref(), r.event.as_ref())
+                && a.usable()
+                && !a.comment_only
+                && !matches!(
+                    a.kind,
+                    databastion_classifiers::query::tsql::TsqlKind::Ddl
+                        | databastion_classifiers::query::tsql::TsqlKind::Dcl
+                )
+            {
+                use databastion_classifiers::masking::EventObject;
+                use databastion_classifiers::names::NormalizedName;
+                let n = crate::discover::normalize;
+                let db = |d: Option<&str>| match d {
+                    Some(d) if !d.is_empty() => n(d),
+                    _ => NormalizedName::wildcard(),
+                };
+                for rel in &a.relations {
+                    let rdb = db(rel.database.as_deref().or(e.database.as_deref()));
+                    let o =
+                        EventObject::new(rdb.clone(), rel.schema.as_deref().map(n), n(&rel.name));
+                    let covered = ev.objects().contains(&o)
+                        || (ev.objects_overflowed()
+                            && ev.objects().iter().any(|s| {
+                                s.object().as_str() == "*"
+                                    && s.schema().is_none()
+                                    && (s.database().as_str() == "*" || *s.database() == rdb)
+                            }));
+                    assert!(covered, "a relation lost without a sign");
+                }
+            }
+            // Never more than 15 named objects.
+            let named = ev
+                .objects()
+                .iter()
+                .filter(|o| o.object().as_str() != "*")
+                .count();
+            assert!(named < databastion_classifiers::masking::MAX_EVENT_OBJECTS);
         }
     }
 }

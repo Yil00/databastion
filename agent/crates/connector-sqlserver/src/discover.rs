@@ -49,9 +49,12 @@ pub(crate) const MAX_SAMPLED_COLUMNS: usize = 512;
 const CLR_TYPE: i64 = 240;
 
 /// Normalizes a catalog name (ADR-0009): one key; a name with a dot or a
-/// value in it becomes `*`.
+/// value in it becomes `*`. Trailing spaces are dropped first: SQL Server
+/// ignores them when it compares identifiers (`[customers ]` is the table
+/// `customers`), so Discovery locations and the names of a statement text
+/// agree (end-of-phase-9 review, N1).
 pub(crate) fn normalize(raw: &str) -> NormalizedName {
-    normalize_field_path(&[PathPart::Key(raw)])
+    normalize_field_path(&[PathPart::Key(raw.trim_end_matches(' '))])
 }
 
 /// A table of the catalog.
@@ -648,6 +651,12 @@ mod tests {
     #[test]
     fn value_bearing_names_are_normalized() {
         assert_eq!(normalize("customers").as_str(), "customers");
+        // N1: trailing spaces are not part of the name; leading ones are.
+        assert_eq!(normalize("customers  ").as_str(), "customers");
+        assert_eq!(
+            normalize("customers").as_str(),
+            normalize("customers ").as_str()
+        );
         assert_eq!(normalize("export_jean.richard@example.com").as_str(), "*");
     }
 }
