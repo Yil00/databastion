@@ -401,8 +401,8 @@ ROADMAP P9-D, [ADR-0052](../../docs/adr/0052-redis-valkey-connector.md) decision
 healthchecks), Compose project `databastion-load-redis`, one server: `LOAD_REDIS_ENGINE=valkey` (the
 default, Valkey 9.0.6) or `redis` (Redis 8.10.2), target `valkey-load` or `redis-load`
 (`tls: verify_full`, the agent's defaults: every database, all key patterns, `max_keys` 100 000). The
-CI job is `load-redis` in [`load.yml`](../../.github/workflows/load.yml) (Valkey, artifact
-`load-redis-results`, 60 min budget).
+CI job is `load-redis` in [`load.yml`](../../.github/workflows/load.yml) (a matrix over Valkey and Redis since #258, artifacts
+`load-valkey-results` and `load-redis-results`, 60 min budget each).
 
 1. **Scaled keyspace**, written by the server (`EVAL` of [`seed.py redis`](seed.py) in chunks of
    100 000, as `admin` on its socket): `LOAD_REDIS_KEYS` keys (default 1 000 000) in `db0` next to
