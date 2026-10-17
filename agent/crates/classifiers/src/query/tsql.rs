@@ -2452,6 +2452,7 @@ mod tests {
         // closed: a user function).
         assert!(an("EXEC crm.report if .a(").user_function);
         assert!(!an("EXEC crm.report x.a(").user_function);
+        assert!(an("EXEC crm.report _.dbcc._.a(").user_function);
     }
 
     #[test]
@@ -2948,11 +2949,16 @@ mod proptests {
         }
 
         /// Arguments of `EXEC` are never names. The generator has no letter
-        /// from `f` on, so no statement keyword (`if`, `select`…), which
-        /// ends the arguments: what follows one is analysed as a new
-        /// statement, fail closed (`exec_arguments_end_at_a_statement`).
+        /// from `f` on, so no statement keyword (`if`, `select`…) except
+        /// `dbcc`, which is left out: a statement keyword ends the
+        /// arguments, and what follows it is analysed as a new statement,
+        /// fail closed (`exec_arguments_end_at_a_statement`; found by CI on
+        /// `_.dbcc._.a(`).
         #[test]
         fn exec_arguments_never_named(args in "[a-e_.,() ]{0,80}") {
+            prop_assume!(!args
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w.eq_ignore_ascii_case("dbcc")));
             let a = analyze_tsql(&format!("EXEC crm.report {args}"), false);
             prop_assert!(!a.user_function);
             prop_assert!(a.listed.is_empty());
