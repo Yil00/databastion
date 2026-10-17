@@ -30,7 +30,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 | MySQL/MariaDB | Own client for the MySQL protocol + rustls, no driver crate | P2-C ([ADR-0018](adr/0018-mysql-mariadb-grants-and-connector.md) decision 3) |
 | MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A, #74 ([ADR-0026](adr/0026-mongodb-connector.md) decision 1); see below |
 | OpenLDAP | Own bounded LDAPv3 client (bind, search, StartTLS and Who am I? only; bounded BER reader) + rustls, no LDAP crate | Phase 6, #79 ([ADR-0029](adr/0029-openldap-connector.md) decision 1); see below |
-| Redis / Valkey | Own bounded RESP3 client (closed read-only command set, replies bounded before allocation) + rustls, no client crate | Phase 9, #237 ([ADR-0052](adr/0052-redis-valkey-connector.md) decision 1: the `redis` crate pulls `xxhash-rust`, BSL-1.0, outside the `deny.toml` allow-list, and has no reply bounds; `fred` had no release for 19 months); on `dev`, not released yet |
+| Redis / Valkey | Own bounded RESP3 client (closed read-only command set, replies bounded before allocation) + rustls, no client crate | Phase 9, #237 ([ADR-0052](adr/0052-redis-valkey-connector.md) decision 1: the `redis` crate pulls `xxhash-rust`, BSL-1.0, outside the `deny.toml` allow-list, and has no reply bounds; `fred` had no release for 19 months); since 0.8.0 |
 | HTTP client (uplink) | reqwest + rustls (`ring` provider, system trust store) | No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
 | Packaging | Distroless Docker image + `.deb` | |
 | Architectures | x86_64 + arm64 | |
