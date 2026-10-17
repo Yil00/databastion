@@ -138,7 +138,8 @@ impl NormalizedName {
 /// (`char::to_lowercase`), then final sigma `ς` (U+03C2) read as `σ`
 /// (U+03C3), since `Σ` lowercases to `σ` while text often writes `ς`
 /// (`ΠΕΛΑΤΕΣ` and `πελατες`). Strictly looser than lowercase alone; the
-/// console folds the same way (`foldCase`).
+/// console folds the same way (`foldCase` in
+/// `console/src/lib/policy-common.ts`).
 #[must_use]
 pub fn fold_case(s: &str) -> String {
     s.chars()

@@ -140,9 +140,10 @@ impl OwnUsage {
     /// objects are taken.
     fn merge(&mut self, file: OwnFile, current: u64) {
         for (key, hours) in file.o {
-            // Files written before keys were lowercased: folded the same
-            // way, so a restart after the upgrade keeps the charges.
-            let key = key.to_lowercase();
+            // Files written before keys were folded (lowercased, or with a
+            // final sigma): folded the same way as `budget_key`, so a
+            // restart after the upgrade keeps the charges.
+            let key = databastion_classifiers::names::fold_case(&key);
             if !self.usage.contains_key(&key) && self.usage.len() >= OWN_MAX_OBJECTS {
                 break;
             }
@@ -899,6 +900,25 @@ mod tests {
                 .map(|(_, n)| n)
                 .sum::<u64>(),
             7
+        );
+        // A key saved with a final sigma: found again under the new fold.
+        u.merge(
+            OwnFile {
+                v: OWN_FILE_VERSION,
+                o: vec![(
+                    "db\u{0}\u{0}\u{03C0}\u{03B5}\u{03BB}\u{03B1}\u{03C4}\u{03B5}\u{03C2}"
+                        .to_owned(),
+                    vec![(current, 5)],
+                )],
+            },
+            current,
+        );
+        assert_eq!(
+            u.usage[&budget_key("db", "", "ΠΕΛΑΤΕΣ")]
+                .iter()
+                .map(|(_, n)| n)
+                .sum::<u64>(),
+            5
         );
     }
 

@@ -1820,7 +1820,7 @@ fn relations(toks: &[Tok]) -> (Vec<TsqlRelation>, bool, bool) {
     let is_alias = |n: &str| {
         aliases
             .iter()
-            .any(|(a, d)| *d == 0 && *a == n.to_lowercase())
+            .any(|(a, d)| *d == 0 && *a == crate::names::fold_case(n))
     };
     for (r, maybe_alias) in out {
         if maybe_alias && r.schema.is_none() && is_alias(&r.name) {
@@ -2654,6 +2654,9 @@ mod tests {
             assert!(a.writes_table, "{t}");
             assert!(a.relations.iter().any(|r| r.name == "cards"), "{t}");
         }
+        // An alias that differs by final sigma only is still the alias.
+        let (got, _) = rel("UPDATE πελατες SET a = 1 FROM crm.ΠΕΛΑΤΕΣ πελατες");
+        assert_eq!(got.len(), 1, "{got:?}");
         let (got, complete) = rel("INSERT crm.copy (a, b) SELECT a, b FROM crm.src");
         assert_eq!(got, ["-.crm.copy", "-.crm.src"]);
         assert!(complete);
