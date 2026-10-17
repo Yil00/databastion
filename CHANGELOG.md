@@ -78,6 +78,9 @@ From 0.7.x: upgrade the console first, then the agents, as for every release (a 
 - `rustls` 0.23.46 (RUSTSEC-2026-0346 to 0349, #236).
 - `aws-lc-rs` and `aws-lc-sys` are banned in `agent/deny.toml`: the agent keeps a single TLS crypto provider, `ring` ([ADR-0051](docs/adr/0051-sqlserver-connector.md) decision 1, #242).
 
+### ✅ Tests
+- Held-out classifier corpus seed rotated for this release (#265, seed 626547125, holdout gate green).
+
 ### 👷 CI
 - New required end-to-end jobs `e2e-sqlserver` (SQL Server 2022 Express with SQL Server Audit) and `e2e-redis` (Valkey 9.0.6 and Redis 8.10.2), with Discovery against the ground truth, Audit, export incidents and the I2 check; new load jobs `load-sqlserver` and `load-redis` in `load.yml` (#254; `load-redis` runs on Valkey and, since #258, on Redis too). Load run 38978357006 on `dev` at `a529e13`: Discovery at 0.74 % (SQL Server) and 0.267 % (Valkey) of a 2-CPU server, every Audit record received, no loss ([docs/08](docs/08-engine-capabilities.md#load-and-database-impact-measured)).
 - New required jobs `agent-redis` (connector integration tests against Valkey 9.0.6 and Redis 8.10.2 over TLS) and `agent-keys-sweep` (the release-mode key-pattern contract sweep). The weekly engine matrix gains 13 Redis and Valkey lines: Redis 6.2.24, 7.2.16, 7.4.11, 8.2.10, 8.4.7, 8.6.7, 8.8.3, 8.10.2; Valkey 7.2.14, 8.0.11, 8.1.10, 9.0.6, 9.1.2 (#238).
