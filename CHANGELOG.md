@@ -7,7 +7,7 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
-Planned for the next minor release (0.8.0), with phase 9: Microsoft SQL Server, Redis and Valkey. The entries below are merged on `dev`. The end-of-phase-9 security review is done (no Critical or High finding); the release waits for its open gates G1, G2 and G6 ([RELEASE.md](RELEASE.md#open-release-gates)).
+Planned for the next minor release (0.8.0), with phase 9: Microsoft SQL Server, Redis and Valkey. The entries below are merged on `dev`. The end-of-phase-9 security review is done (no Critical or High finding); the release waits for its open gates G2 and G6 ([RELEASE.md](RELEASE.md#open-release-gates)).
 
 ### ⚠️ Upgrade notes
 From 0.7.x: upgrade the console first, then the agents, as for every release (a console `X.Y` accepts agents `X.Y` and `X.(Y-1)`, [RELEASE.md](RELEASE.md#compatibility)). This release adds three engines; existing targets keep their grants (one recommended MySQL / MariaDB setting below).
