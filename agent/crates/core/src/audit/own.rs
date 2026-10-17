@@ -444,7 +444,9 @@ impl OwnAccount {
     /// charged the whole budget, and every statement at least one row:
     /// [`charged_rows`]). The rows are charged whenever the account is the
     /// agent's. When the agent's own address is unknown, nothing is left
-    /// out.
+    /// out. An event whose objects overflowed the event's bound
+    /// (`MaskedEvent::objects_overflowed`) is never left out: the objects
+    /// it could not name were not charged.
     pub fn routine(
         &mut self,
         user: &str,
@@ -498,7 +500,11 @@ impl OwnAccount {
         if !e.objects().is_empty() {
             self.lock_usage().persist(now, false);
         }
-        identity && e.signals().is_empty() && !over
+        // An event with more objects than it can name
+        // (`MaskedEvent::objects_overflowed`) has objects that were not
+        // charged: never left out under a budget (end-of-phase-9 review
+        // G7). The agent's own sampling statements name one object.
+        identity && e.signals().is_empty() && !over && !e.objects_overflowed()
     }
 
     /// Like [`OwnAccount::routine`] (account, application, address, no
@@ -927,6 +933,35 @@ mod tests {
             None,
             ClientSeen::NotVisible,
             &ev(None)
+        ));
+    }
+
+    /// G7: an own-identity event past the object bound is charged for the
+    /// objects it names but never left out under the budget; the
+    /// unbudgeted exact-text rule is unchanged (it charges nothing).
+    #[test]
+    fn overflowed_events_are_never_left_out_under_a_budget() {
+        let now = Instant::now();
+        let logged = ClientSeen::Logged(ClientAddr::parse("192.0.2.14"));
+        let mut e = ev(Some(1));
+        for i in 0..16u8 {
+            e = e.with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path(&format!("t_{}", char::from(b'a' + i))),
+            ));
+        }
+        assert!(e.objects_overflowed());
+        let mut o = own(Some("192.0.2.14"));
+        assert!(!o.routine("databastion", Some("databastion-agent"), logged, &e, now));
+        assert!(o.routine_unbudgeted("databastion", Some("databastion-agent"), logged, &e));
+        // A plain own read still is.
+        assert!(o.routine(
+            "databastion",
+            Some("databastion-agent"),
+            logged,
+            &ev(Some(1)),
+            now
         ));
     }
 

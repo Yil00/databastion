@@ -739,6 +739,48 @@ mod tests {
         assert!(reportable(&c, &ev("u", "other", None)));
     }
 
+    /// G7 (end-of-phase-9 review): a sensitive object past the event's
+    /// object bound is not hidden. The event names `*` and is reported
+    /// below `min_rows`, also after aggregation.
+    #[test]
+    fn a_sensitive_object_past_the_bound_is_reported() {
+        let c = cfg(serde_json::json!({
+            "enabled": true, "min_rows": 100,
+            "sensitive_objects": [{"database": "shop", "schema": "crm", "object": "customers",
+                                   "classifiers": ["pii.email"]}]
+        }));
+        let wide = || {
+            let mut e = ev("u", "a_harmless", Some(1));
+            for i in 0..15u8 {
+                e = e.with_object(EventObject::new(
+                    normalize_path("shop"),
+                    Some(normalize_path("crm")),
+                    normalize_path(&format!("harmless_{}", char::from(b'b' + i))),
+                ));
+            }
+            e.with_object(EventObject::new(
+                normalize_path("shop"),
+                Some(normalize_path("crm")),
+                normalize_path("customers"),
+            ))
+        };
+        let e = wide();
+        assert!(e.objects_overflowed() && e.always_report());
+        assert!(
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "*" && o.database().as_str() == "shop")
+        );
+        assert!(reportable(&c, &e));
+        let now = Instant::now();
+        let mut a = Aggregator::new(Duration::from_secs(60));
+        a.push(wide(), now);
+        a.push(wide(), now);
+        let out = a.drain();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].objects_overflowed() && reportable(&c, &out[0]));
+    }
+
     /// Events a connector marks always reported (writes to a database's
     /// own instrumentation) pass `min_rows` whatever their rows, also after
     /// aggregation with unmarked events of their group.

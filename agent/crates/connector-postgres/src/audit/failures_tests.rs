@@ -1002,3 +1002,30 @@ fn item_4_overriding_roles_and_stale_marks() {
         );
     }
 }
+
+/// End-of-phase-9 review G7: a failed multi-statement text naming 16
+/// harmless tables before a sensitive one (one table per statement, so no
+/// statement reaches the analyzer's bound) does not hide it: the event
+/// names `*`, is always reported and marked overflowed.
+#[test]
+fn a_failed_text_past_the_object_bound_names_star() {
+    let mut text: String = (0..16u8)
+        .map(|i| format!("SELECT * FROM public.harmless_{};", char::from(b'a' + i)))
+        .collect();
+    text.push_str("SELECT email::integer FROM crm.customers");
+    for format in FORMATS {
+        let line = Line {
+            statement: Some(&text),
+            ..Line::default()
+        };
+        let e = one(format, &line);
+        assert_eq!(e.len(), 1, "{format:?}");
+        let e = &e[0];
+        assert_eq!(e.action(), EventAction::Read);
+        assert!(e.objects_overflowed(), "{format:?}");
+        assert!(e.always_report());
+        let names = objects(e);
+        assert_eq!(names.len(), 16);
+        assert!(names.contains(&".*".to_owned()), "{names:?}");
+    }
+}

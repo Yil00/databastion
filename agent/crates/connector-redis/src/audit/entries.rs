@@ -30,6 +30,13 @@ use crate::resp::Value;
 
 /// Contract `AccessEvent.objects.maxItems`.
 const MAX_OBJECTS: usize = 16;
+/// Distinct key patterns an entry keeps: one more than an event can name,
+/// so that a command with more patterns than that always reaches the
+/// core's bound, which then names `*` and always reports the event
+/// (`MaskedEvent::with_object`, end-of-phase-9 review G7). Every pattern
+/// of an entry is in its one database, so that `*` covers the patterns
+/// left out here.
+const KEPT_OBJECTS: usize = MAX_OBJECTS + 1;
 /// A `SCAN` with a `COUNT` above this sets `shape.keyspace_enumeration`.
 pub(crate) const ENUMERATION_COUNT: u64 = 1000;
 /// Longest user name kept (longer: cut, then fingerprinted by the core).
@@ -313,6 +320,7 @@ fn own_shape(args: &[Option<&[u8]>]) -> OwnShape {
 /// store guard is `*`, with `signature.cas_ticket_read` on a name-guard or
 /// strict-prefix match (N5); any other key its learned pattern, its
 /// longest learned literal prefix then `*`, or `*`; an oversized one `*`.
+/// At most [`KEPT_OBJECTS`] distinct objects.
 fn objects_of(
     args: &[Option<&[u8]>],
     indices: &[usize],
@@ -337,7 +345,7 @@ fn objects_of(
                 }
             }
         };
-        if out.len() < MAX_OBJECTS && !out.contains(&obj) {
+        if out.len() < KEPT_OBJECTS && !out.contains(&obj) {
             out.push(obj);
         }
     }
@@ -483,8 +491,10 @@ fn reduce(args: &[Option<&[u8]>], ctx: &Context<'_>) -> Reduced {
             }
             None => vec![NormalizedName::wildcard()],
         };
+        // Whatever the number of keys: the core keeps a slot for `*`
+        // (end-of-phase-9 review G7).
         let star = NormalizedName::wildcard();
-        if sort_patterns && !objects.contains(&star) && objects.len() < MAX_OBJECTS {
+        if sort_patterns && !objects.contains(&star) {
             objects.push(star);
         }
         objects

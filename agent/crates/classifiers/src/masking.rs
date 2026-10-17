@@ -77,6 +77,8 @@ use crate::names::NormalizedName;
 
 /// Fully redacted placeholder, used when no format applies.
 const FULLY_REDACTED: &str = "***";
+/// The object name `*` (docs/09, "The object `*`").
+const WILDCARD_NAME: &str = "*";
 /// Longest run of letters or digits a masked sample may keep (contract
 /// `MaskedSample`: no run of more than 4). Also the bound of the property
 /// tests: no run of more than 4 consecutive digits of the raw value can
@@ -1386,7 +1388,9 @@ impl EventObject {
     }
 }
 
-/// Contract `AccessEvent.objects.maxItems`.
+/// Contract `AccessEvent.objects.maxItems`. An event keeps at most
+/// `MAX_EVENT_OBJECTS - 1` objects that are not `*` and reserves the last
+/// slot for `*` (see [`MaskedEvent::with_object`]).
 pub const MAX_EVENT_OBJECTS: usize = 16;
 /// Contract `AccessEvent.aggregated_count.maximum`.
 pub const MAX_AGGREGATED_COUNT: u64 = 1_000_000;
@@ -1419,8 +1423,13 @@ pub struct MaskedEvent {
     ts_last: Option<std::time::SystemTime>,
     principal: EventPrincipal,
     action: EventAction,
-    /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`].
+    /// Sorted, without duplicates, at most [`MAX_EVENT_OBJECTS`], of which
+    /// at most `MAX_EVENT_OBJECTS - 1` are not `*`.
     objects: Vec<EventObject>,
+    /// Agent-internal, never sent: an object was not listed because the
+    /// event was full; a `*` object stands for it and the event is always
+    /// reported (see [`Self::with_object`]).
+    objects_overflowed: bool,
     rows: Option<u64>,
     /// Bytes returned, when the source records it (contract
     /// `AccessEvent.bytes`).
@@ -1465,6 +1474,7 @@ impl MaskedEvent {
             source,
             aggregated_count: 1,
             always_report: false,
+            objects_overflowed: false,
         }
     }
 
@@ -1486,8 +1496,18 @@ impl MaskedEvent {
         self.always_report
     }
 
-    /// Adds an object (duplicates and objects past [`MAX_EVENT_OBJECTS`]
-    /// are ignored).
+    /// Adds an object (duplicates are ignored). Fails closed at the
+    /// contract bound ([`MAX_EVENT_OBJECTS`]): the event keeps at most
+    /// `MAX_EVENT_OBJECTS - 1` objects that are not `*` and reserves the
+    /// last slot for a `*` object. An object that does not fit is never
+    /// dropped silently: the event gets `(<its database>, -, *)` once (or
+    /// `(*, -, *)` once overflowed objects of several databases, or the
+    /// reserved slot already taken, call for it), unless a `*` object
+    /// already covers it, and is marked always reported
+    /// ([`Self::always_report`]) and overflowed
+    /// ([`Self::objects_overflowed`]). A sensitive object past the bound
+    /// therefore still gets the event reported, whatever its row count
+    /// (end-of-phase-9 security review, G7).
     #[must_use]
     pub fn with_object(mut self, object: EventObject) -> Self {
         self.add_object(object);
@@ -1495,10 +1515,72 @@ impl MaskedEvent {
     }
 
     fn add_object(&mut self, object: EventObject) {
-        if self.objects.len() < MAX_EVENT_OBJECTS && !self.objects.contains(&object) {
-            self.objects.push(object);
-            self.objects.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        if self.objects.contains(&object) {
+            return;
         }
+        let fits = self.objects.len() < MAX_EVENT_OBJECTS
+            && (object.object.as_str() == WILDCARD_NAME
+                || self
+                    .objects
+                    .iter()
+                    .filter(|o| o.object.as_str() != WILDCARD_NAME)
+                    .count()
+                    < MAX_EVENT_OBJECTS - 1);
+        if fits {
+            self.insert_object(object);
+            return;
+        }
+        self.overflow(&object);
+    }
+
+    fn insert_object(&mut self, object: EventObject) {
+        let (Ok(pos) | Err(pos)) = self
+            .objects
+            .binary_search_by(|o| o.sort_key().cmp(&object.sort_key()));
+        self.objects.insert(pos, object);
+    }
+
+    /// `object` does not fit (see [`Self::with_object`]).
+    fn overflow(&mut self, object: &EventObject) {
+        self.always_report = true;
+        self.objects_overflowed = true;
+        let covers = |o: &EventObject| {
+            o.object.as_str() == WILDCARD_NAME
+                && (o.database.as_str() == WILDCARD_NAME || o.database == object.database)
+                && o.schema
+                    .as_ref()
+                    .is_none_or(|s| object.schema.as_ref() == Some(s))
+        };
+        if self.objects.iter().any(covers) {
+            return;
+        }
+        let wildcard = NormalizedName::wildcard;
+        if self.objects.len() < MAX_EVENT_OBJECTS {
+            self.insert_object(EventObject::new(object.database.clone(), None, wildcard()));
+            return;
+        }
+        // Full: the reserved slot holds a `*` object (only `*` objects
+        // reach it) that does not cover `object`. Widen one `*` object to
+        // `(*, -, *)`, which covers both.
+        if let Some(pos) = self
+            .objects
+            .iter()
+            .rposition(|o| o.object.as_str() == WILDCARD_NAME)
+        {
+            self.objects.remove(pos);
+        } else {
+            // Unreachable by construction; keep the bound anyway.
+            self.objects.pop();
+        }
+        self.insert_object(EventObject::new(wildcard(), None, wildcard()));
+    }
+
+    /// Whether an object was not listed because the event was full (see
+    /// [`Self::with_object`]): the event then names `*` and is always
+    /// reported.
+    #[must_use]
+    pub fn objects_overflowed(&self) -> bool {
+        self.objects_overflowed
     }
 
     /// Sets the rows returned or affected (saturated at [`MAX_COUNT`]).
@@ -1574,6 +1656,7 @@ impl MaskedEvent {
             self.add_signal(s);
         }
         self.always_report |= other.always_report;
+        self.objects_overflowed |= other.objects_overflowed;
     }
 
     /// First occurrence.
@@ -2085,5 +2168,152 @@ mod tests {
         let mut c = ev(2);
         c.merge(ev(3));
         assert_eq!(c.rows(), Some(5));
+    }
+
+    fn read_event() -> MaskedEvent {
+        MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("report"),
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    fn obj(db: &str, schema: Option<&str>, name: &str) -> EventObject {
+        use crate::names::normalize_path;
+        EventObject::new(
+            normalize_path(db),
+            schema.map(normalize_path),
+            if name == "*" {
+                NormalizedName::wildcard()
+            } else {
+                normalize_path(name)
+            },
+        )
+    }
+
+    fn star_of(e: &MaskedEvent) -> Vec<(String, Option<String>)> {
+        e.objects()
+            .iter()
+            .filter(|o| o.object().as_str() == "*")
+            .map(|o| {
+                (
+                    o.database().as_str().to_owned(),
+                    o.schema().map(|s| s.as_str().to_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sixteen_named_objects_keep_fifteen_and_name_star() {
+        // G7: 16 harmless tables, then the sensitive one.
+        let mut e = read_event();
+        for i in 0..16u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", Some("public"), &name));
+        }
+        e = e.with_object(obj("shop", Some("crm"), "customers"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        // Fifteen named objects, never more.
+        let named = e.objects().iter().filter(|o| o.object().as_str() != "*");
+        assert_eq!(named.count(), MAX_EVENT_OBJECTS - 1);
+    }
+
+    #[test]
+    fn fifteen_named_objects_do_not_overflow() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // A duplicate is not an overflow.
+        e = e.with_object(obj("shop", None, "t_a"));
+        assert!(!e.objects_overflowed());
+        assert!(!e.always_report());
+        assert_eq!(e.objects().len(), 15);
+        // The reserved slot takes a `*` object without overflowing.
+        e = e.with_object(obj("shop", None, "*"));
+        assert!(!e.objects_overflowed());
+        assert!(!e.always_report());
+        assert_eq!(e.objects().len(), 16);
+        // A further named object is covered by the `*` already present:
+        // no second `*`.
+        e = e.with_object(obj("shop", None, "customers"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(e.objects().len(), 16);
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+    }
+
+    #[test]
+    fn overflow_of_another_database_widens_star() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        e = e.with_object(obj("shop", None, "u"));
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        e = e.with_object(obj("crm", None, "customers"));
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+        // Then everything is covered, and a further `*` adds nothing.
+        e = e.with_object(obj("hr", None, "salaries"));
+        e = e.with_object(obj("hr", None, "*"));
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), MAX_EVENT_OBJECTS);
+    }
+
+    #[test]
+    fn a_schema_scoped_star_does_not_cover_other_schemas() {
+        let mut e = read_event();
+        for i in 0..13u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // `*` objects do not count against the 15 named ones.
+        e = e.with_object(obj("shop", Some("s_a"), "*"));
+        e = e.with_object(obj("shop", Some("s_b"), "x"));
+        e = e.with_object(obj("shop", Some("s_b"), "y"));
+        assert!(!e.objects_overflowed());
+        assert_eq!(e.objects().len(), 16);
+        // `(shop, s_a, *)` does not cover `s_b`, and the event is full:
+        // the `*` object is widened to `(*, -, *)`.
+        e = e.with_object(obj("shop", Some("s_b"), "z"));
+        assert!(e.objects_overflowed());
+        assert!(e.always_report());
+        assert_eq!(star_of(&e), [("*".to_owned(), None)]);
+        assert_eq!(e.objects().len(), 16);
+    }
+
+    #[test]
+    fn the_overflow_star_names_no_schema() {
+        let mut e = read_event();
+        for i in 0..15u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            e = e.with_object(obj("shop", None, &name));
+        }
+        // The 16th slot is free: the overflow adds `(shop, -, *)`.
+        e = e.with_object(obj("shop", Some("s_b"), "z"));
+        assert!(e.objects_overflowed());
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+    }
+
+    #[test]
+    fn merged_events_keep_the_overflow() {
+        let mut a = read_event();
+        let mut b = read_event();
+        for i in 0..17u8 {
+            let name = format!("t_{}", char::from(b'a' + i));
+            b = b.with_object(obj("shop", None, &name));
+        }
+        assert!(b.objects_overflowed());
+        a.merge(b);
+        assert!(a.objects_overflowed());
+        assert!(a.always_report());
     }
 }
