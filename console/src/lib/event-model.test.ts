@@ -221,6 +221,14 @@ describe("access_event conditions", () => {
     expect(eventMatches({ signals: ["signature.*"], event_actions: ["write"] }, FACTS)).toBeNull();
     expect(eventMatches({ principals: ["BACK*"] }, FACTS)).toEqual([0, 1]);
     expect(eventMatches({ principals: ["*"], exclude_principals: ["backup"] }, FACTS)).toBeNull();
+    // Review M1: the final sigma folds as sigma, on principals and exclusions too.
+    const greek = { ...FACTS, principal: "λογαριασμος" };
+    expect(eventMatches({ principals: ["ΛΟΓΑΡΙΑΣΜΟΣ"] }, greek)).toEqual([0, 1]);
+    expect(eventMatches({ principals: ["λογαριασμοσ"] }, greek)).toEqual([0, 1]);
+    expect(eventMatches({ principals: ["λογαριασμα"] }, greek)).toBeNull();
+    expect(eventMatches({ principals: ["*"], exclude_principals: ["ΛΟΓΑΡΙΑΣΜΟΣ"] }, greek)).toBeNull();
+    expect(eventMatches({ principals: ["*"], exclude_principals: ["λογαριασμοσ"] }, { ...greek, principal: "ΛΟΓΑΡΙΑΣΜΟΣ" })).toBeNull();
+    expect(eventMatches({ principals: ["*"], exclude_principals: ["λογαριασμα"] }, greek)).toEqual([0, 1]);
     // P9-E review L1: an unrecorded account only matches `*`, and exclusions never hide it.
     const unrecorded = { ...FACTS, principal: "", accountNotRecorded: true };
     expect(eventMatches({ principals: ["*"] }, unrecorded)).toEqual([0, 1]);

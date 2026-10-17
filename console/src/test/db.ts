@@ -43,16 +43,18 @@ export function roleUrl(role: string, database?: string): string {
 /**
  * Creates a fresh database for the calling test file, owned by a fresh NON-superuser owner role
  * (as in production), migrates it as that owner and points `DATABASE_URL` at the owner.
+ * `ctype: "C"` creates it with the `C` character type and collation instead of the cluster's.
  * Returns a teardown that drops both.
  */
-export async function setupTestDatabase(): Promise<() => Promise<void>> {
+export async function setupTestDatabase(opts: { ctype?: "C" } = {}): Promise<() => Promise<void>> {
   const suffix = randomBytes(6).toString("hex");
   const name = `t_${suffix}`;
   const owner = `o_${suffix}`;
   await asAdmin(async (c) => {
     await ensureGroupRole(c);
     await c.query(`create role ${owner} login nosuperuser nocreatedb nocreaterole`);
-    await c.query(`create database ${name} owner ${owner}`);
+    // `ctype: "C"`: a database whose `lower` folds ASCII only (event-engine security review L1).
+    await c.query(`create database ${name} owner ${owner}${opts.ctype === "C" ? " template template0 lc_ctype 'C' lc_collate 'C'" : ""}`);
   });
   const url = roleUrl(owner, name);
   await runMigrations(url);

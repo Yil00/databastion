@@ -42,14 +42,18 @@ export function isGlob(v: unknown): v is string {
 }
 
 /**
- * Lowercases each code point on its own (Unicode default mapping, no context), as the agent's
- * `char::to_lowercase` does. `String.prototype.toLowerCase` gives the same result except for the
- * context-dependent final sigma (`Σ` at the end of a word becomes `ς` there, `σ` here), so a name
- * is folded the same way wherever it stands in the string.
+ * Unicode lowercase with the final sigma unified (security review M1): `ς` (U+03C2) becomes `σ`
+ * (U+03C3), so `ΠΕΛΑΤΕΣ`, `πελατες` and `πελατεσ` fold alike whatever the position of the letter
+ * (`String.prototype.toLowerCase` maps a word-final `Σ` to `ς`, a per-code-point lowercase to `σ`).
+ * The agent's `same_name` applies the same mapping, and the sensitivity pre-filter in SQL too.
  */
 export function foldCase(s: string): string {
-  return s.includes("\u03a3") ? Array.from(s, (c) => c.toLowerCase()).join("") : s.toLowerCase();
+  return s.toLowerCase().replaceAll(FINAL_SIGMA, SIGMA);
 }
+
+/** Final sigma and sigma (security review M1), also bound as parameters in SQL. */
+export const FINAL_SIGMA = "\u03c2";
+export const SIGMA = "\u03c3";
 
 /** Drops trailing spaces (U+0020 only, as the agent and SQL `rtrim` do). Linear, no regex. */
 export function trimTrailingSpaces(s: string): string {

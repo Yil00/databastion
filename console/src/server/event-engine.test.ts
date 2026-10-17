@@ -208,7 +208,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
 
     it("matches the findings of an object without case or trailing spaces, on database, schema and object (N1)", async () => {
       const auth = await agentWithTargets();
-      await scanWith(auth, [finding("email", "pii.email", 1), finding("name", "pii.person_name", 1, "clientèle")]);
+      await scanWith(auth, [finding("email", "pii.email", 1), finding("name", "pii.person_name", 1, "clientèle"), finding("phone", "pii.phone", 1, "πελατες")]);
       await send(auth, [
         dumpEvent({ objects: [{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }], rows: 99 }),
         dumpEvent({ objects: [{ database: "Crm", object: "Clients" }], rows: 99 }),
@@ -217,11 +217,14 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         dumpEvent({ objects: [{ database: "CRM", schema: "PRIVATE", object: "CLIENTS" }], rows: 99 }),
         dumpEvent({ objects: [{ database: "SHOP", schema: "PUBLIC", object: "CLIENTS" }], rows: 99 }),
         dumpEvent({ objects: [{ database: "crm", schema: "public", object: " clients" }], rows: 99 }),
+        // Review M1: final sigma.
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "ΠΕΛΑΤΕΣ" }], rows: 99 }),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "ΠΕΛΑΤΗΣ" }], rows: 99 }),
       ]);
       await drainPolicyWork(getDb());
       const rows = await eventsOf(auth.agentId);
-      expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0, 0, 0]);
-      expect(rows.map((r) => r.score)).toEqual([6, 6, 4, 0, 0, 0, 0]);
+      expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0, 0, 0, 3, 0]);
+      expect(rows.map((r) => r.score)).toEqual([6, 6, 4, 0, 0, 0, 0, 6, 0]);
       // The event keeps the names as the agent sent them.
       expect(rows[0]?.objects).toEqual([{ database: "CRM ", schema: "PUBLIC", object: "CLIENTS  " }]);
     });

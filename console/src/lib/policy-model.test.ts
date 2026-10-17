@@ -59,9 +59,14 @@ describe("globMatch", () => {
     expect(performance.now() - start).toBeLessThan(200);
   });
 
-  it("folds each code point on its own, as the agent (N1): final sigma, non-ASCII letters", () => {
+  it("folds non-ASCII letters, with the final sigma unified (N1, review M1)", () => {
     expect(globMatch("ΚΑΤΆΛΟΓΟΣ", "κατάλογοσ")).toBe(true);
     expect(globMatch("κατάλογοσ", "ΚΑΤΆΛΟΓΟΣ")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤΕΣ", "πελατες")).toBe(true);
+    expect(globMatch("πελατες", "ΠΕΛΑΤΕΣ")).toBe(true);
+    expect(globMatch("πελατες", "πελατεσ")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤ*Σ", "πελατες")).toBe(true);
+    expect(globMatch("ΠΕΛΑΤΕΣ", "πελατε")).toBe(false);
     expect(globMatch("CLIENTÈLE", "clientèle")).toBe(true);
     expect(globMatch("clientèle", "clientele")).toBe(false);
   });
@@ -85,6 +90,7 @@ describe("foldName (N1)", () => {
     expect(foldName("  Customers  ")).toBe("  customers");
     expect(foldName("CUSTOMERS\t")).toBe("customers\t");
     expect(foldName("ΟΔΟΣ")).toBe("οδοσ");
+    expect(foldName("πελατες ")).toBe("πελατεσ");
     expect(foldName("*")).toBe("*");
     expect(foldName("")).toBe("");
   });
@@ -245,6 +251,15 @@ describe("exceptionCovers", () => {
     for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap", "cas"]) {
       expect(exceptionCovers(x, "p1", { ...padded, engine }, NOW)).toBe(false);
       expect(exceptionCovers({ ...x, location: { object: "clients " } }, "p1", { ...upper, engine }, NOW)).toBe(false);
+    }
+  });
+
+  it("location: an unknown or empty engine never ignores trailing spaces, still ignores case (review L4)", () => {
+    const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
+    for (const engine of ["", "oracle", "SQLSERVER", "mysql "]) {
+      expect(exceptionCovers(x, "p1", { ...FACTS, engine, objectName: "Clients" }, NOW)).toBe(true);
+      expect(exceptionCovers(x, "p1", { ...FACTS, engine, objectName: "Clients " }, NOW)).toBe(false);
+      expect(exceptionCovers({ ...x, location: { object: "clients " } }, "p1", { ...FACTS, engine }, NOW)).toBe(false);
     }
   });
 });
