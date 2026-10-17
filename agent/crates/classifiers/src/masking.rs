@@ -1575,6 +1575,22 @@ impl MaskedEvent {
         self.insert_object(EventObject::new(wildcard(), None, wildcard()));
     }
 
+    /// Records that objects of `database` (`*`: of several or unknown
+    /// databases) reached by the access were lost before reaching the
+    /// event (a bound in a connector): the same rule as an object past the
+    /// event's bound ([`Self::with_object`]): `(database, -, *)` unless a
+    /// `*` object already covers it, widened to `(*, -, *)` when the event
+    /// is full, always reported and overflowed.
+    #[must_use]
+    pub fn with_unlisted_objects(mut self, database: NormalizedName) -> Self {
+        self.overflow(&EventObject::new(
+            database,
+            None,
+            NormalizedName::wildcard(),
+        ));
+        self
+    }
+
     /// Whether an object was not listed because the event was full (see
     /// [`Self::with_object`]): the event then names `*` and is always
     /// reported.
@@ -2301,6 +2317,38 @@ mod tests {
         e = e.with_object(obj("shop", Some("s_b"), "z"));
         assert!(e.objects_overflowed());
         assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+    }
+
+    #[test]
+    fn unlisted_objects_follow_the_overflow_rule() {
+        let e = read_event()
+            .with_object(obj("shop", None, "t"))
+            .with_unlisted_objects(normalize_name("shop"));
+        assert!(e.objects_overflowed() && e.always_report());
+        assert_eq!(star_of(&e), [("shop".to_owned(), None)]);
+        // Covered: nothing added; another database: a second `*` while
+        // there is room.
+        let e = e
+            .with_unlisted_objects(normalize_name("shop"))
+            .with_unlisted_objects(NormalizedName::wildcard());
+        assert_eq!(
+            star_of(&e),
+            [("*".to_owned(), None), ("shop".to_owned(), None)]
+        );
+        // A full event widens its `*`.
+        let mut f = read_event();
+        for i in 0..15u8 {
+            f = f.with_object(obj("shop", None, &format!("t_{}", char::from(b'a' + i))));
+        }
+        f = f.with_object(obj("shop", None, "*"));
+        assert!(!f.objects_overflowed());
+        let f = f.with_unlisted_objects(normalize_name("crm"));
+        assert_eq!(star_of(&f), [("*".to_owned(), None)]);
+        assert_eq!(f.objects().len(), MAX_EVENT_OBJECTS);
+    }
+
+    fn normalize_name(n: &str) -> NormalizedName {
+        crate::names::normalize_path(n)
     }
 
     #[test]

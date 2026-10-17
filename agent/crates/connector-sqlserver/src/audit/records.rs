@@ -216,8 +216,12 @@ pub(crate) struct Statement {
     /// [`MAX_GROUP_OBJECTS`].
     pub(crate) objects: Vec<(String, String, String, String)>,
     /// Records of the statement whose objects did not fit: the event names
-    /// `*` and is always reported.
+    /// `*` and is always reported (the core's overflow).
     pub(crate) objects_dropped: bool,
+    /// The database of the objects that did not fit when they share one;
+    /// `None` when they are of several databases (the event's `*` is then
+    /// `(*, -, *)`).
+    pub(crate) dropped_database: Option<String>,
 }
 
 /// Distinct record objects kept per statement.
@@ -259,6 +263,11 @@ pub(crate) fn group(records: Vec<Record>) -> Vec<Statement> {
                 if s.objects.len() < MAX_GROUP_OBJECTS {
                     s.objects.push(obj);
                 } else {
+                    s.dropped_database = if s.objects_dropped {
+                        s.dropped_database.take().filter(|d| *d == obj.0)
+                    } else {
+                        Some(obj.0)
+                    };
                     s.objects_dropped = true;
                 }
             }
@@ -268,6 +277,7 @@ pub(crate) fn group(records: Vec<Record>) -> Vec<Statement> {
             head: r,
             objects: vec![obj],
             objects_dropped: false,
+            dropped_database: None,
         });
     }
     out
@@ -396,7 +406,10 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
     // (end-of-phase-9 review, gate G1).
     let mut objects = Objects::default();
     if s.objects_dropped {
-        objects.mark_overflow();
+        objects.mark_unlisted(match s.dropped_database.as_deref() {
+            Some(db) if !db.is_empty() => normalize(db),
+            _ => wildcard(),
+        });
     }
     // Objects of the records.
     for (db, schema, object, class) in &s.objects {
@@ -473,10 +486,8 @@ pub(crate) fn convert(s: &Statement) -> Option<(MaskedEvent, Option<TsqlAnalysis
             star = true;
         }
     }
-    if objects.overflow() {
-        star = true;
-        always = true;
-    }
+    // Past the event's bound, the core names `*` and always reports the
+    // event (`MaskedEvent::with_object`, end-of-phase-9 review G7).
     if star || objects.is_empty() {
         let db = if h.database.is_empty() {
             wildcard()
@@ -619,6 +630,21 @@ pub(crate) mod tests {
         assert!(g[0].objects_dropped && g[0].objects.len() == MAX_GROUP_OBJECTS);
         let (ev, _) = convert(&g[0]).unwrap();
         assert!(ev.always_report() && names(&ev).contains(&"retail.-.*".to_owned()));
+        assert!(ev.objects_overflowed());
+        // Records dropped from two databases: `(*, -, *)`, which covers
+        // both (G7: the core's widening).
+        let mut recs = many(MAX_GROUP_OBJECTS);
+        for (i, db) in ["hr", "crm"].iter().enumerate() {
+            let mut r = rec("SL", "U", "dbo", &format!("lost_{i}"), text);
+            r.database = (*db).to_owned();
+            recs.push(r);
+        }
+        let g = group(reassemble(recs));
+        assert_eq!(g.len(), 1);
+        assert!(g[0].objects_dropped && g[0].dropped_database.is_none());
+        let (ev, _) = convert(&g[0]).unwrap();
+        assert!(ev.always_report() && ev.objects_overflowed());
+        assert!(names(&ev).contains(&"*.-.*".to_owned()), "{:?}", names(&ev));
         // Duplicates do not count.
         let mut dup = many(3);
         dup.extend(many(3));

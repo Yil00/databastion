@@ -762,11 +762,12 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
     }
     let mut always = false;
     let mut wildcard = false;
-    // A statement that names more objects than an event holds would lose
-    // some without a sign: it names `*` and is always reported instead
-    // (end-of-phase-9 review, gate G1). A name normalized to `*` (a masked
-    // name, protocol "The object `*`") stays a name, under the filters, as
-    // the same name on SQL Server Audit.
+    // A statement that names more objects than an event holds names `*`
+    // and is always reported instead of losing some (the core's bound,
+    // `MaskedEvent::with_object`; end-of-phase-9 review, gates G1 and G7).
+    // A name normalized to `*` (a masked name, protocol "The object `*`")
+    // stays a name, under the filters, as the same name on SQL Server
+    // Audit.
     let mut objects = Objects::default();
     for rel in &a.relations {
         let rdb = rel.database.as_deref().or(db);
@@ -787,7 +788,9 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
         ));
         always = true;
     }
-    if objects.overflow() || !a.relations_complete {
+    // Past the event's bound, the core names `*` and always reports the
+    // event (`MaskedEvent::with_object`, end-of-phase-9 review G7).
+    if !a.relations_complete {
         wildcard = true;
     }
     if a.remote_access {
@@ -945,6 +948,37 @@ pub(crate) mod tests {
                 "{t}"
             );
         }
+    }
+
+    /// End-of-phase-9 review, N1: a bracketed name with trailing spaces is
+    /// the name without them, as SQL Server compares identifiers and as
+    /// Discovery records it.
+    #[test]
+    fn trailing_spaces_of_bracketed_names_are_dropped() {
+        let ev = one(&stmt(
+            "sql_statement_completed",
+            "SELECT * FROM [crm  ].[customers ]",
+            1,
+            "51",
+        ));
+        assert_eq!(names(&ev), ["retail.crm.customers"]);
+    }
+
+    /// End-of-phase-9 review, G7: past the bound, a table of another
+    /// database widens the event's `*` to `(*, -, *)` (the core's rule).
+    #[test]
+    fn objects_past_the_bound_in_another_database_widen_star() {
+        let tables: Vec<String> = (0..16u8)
+            .map(|i| format!("crm.t{}", char::from(b'a' + i)))
+            .collect();
+        let ev = one(&stmt(
+            "sql_statement_completed",
+            &format!("SELECT * FROM {}, hr.dbo.salaries", tables.join(", ")),
+            1,
+            "51",
+        ));
+        assert!(ev.always_report() && ev.objects_overflowed());
+        assert!(names(&ev).contains(&"*.-.*".to_owned()), "{:?}", names(&ev));
     }
 
     /// End-of-phase-9 review, gate G1 (the nightly fuzz run 39014225515):
