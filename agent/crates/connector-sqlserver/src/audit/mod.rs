@@ -53,6 +53,7 @@
 //!   rule shared by `check()` and the stream, re-evaluated every 5
 //!   minutes: a stream whose choice changes ends and is restarted).
 
+pub(crate) mod objects;
 pub(crate) mod own;
 pub(crate) mod probe;
 pub(crate) mod records;

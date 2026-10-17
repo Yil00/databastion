@@ -21,10 +21,12 @@
 //!   database of a three-part name or the event's `database_name`. When
 //!   the text does not tell every object (not lexed, ambiguous, cut, an
 //!   unknown call in a table position, dynamic SQL, a user function, a
-//!   four-part name, remote access) the event names `*` and is always
-//!   reported. DDL and DCL keep their kind, never text: `*`, always
-//!   reported. A password-bearing statement (its text is never read past
-//!   its class, the #82 rule; Extended Events records some as a comment,
+//!   four-part name, remote access), or when it names more objects than
+//!   an event holds ([`crate::audit::objects`]), the event names `*` and is
+//!   always reported; a name that normalization masks (`*`) stays a name.
+//!   DDL and DCL keep their kind, never text: `*`, always reported. A
+//!   password-bearing statement (its text is never read past its class,
+//!   the #82 rule; Extended Events records some as a comment,
 //!   `-- CREATE LOGIN`, measured) is DCL, `*`, always reported.
 //! - **Rows**: `row_count`, so `volume.large_result` and the agent's own
 //!   row budget apply as on the other engines.
@@ -53,6 +55,7 @@ use zeroize::Zeroizing;
 
 use super::xml::{self, Kind, XeEvent};
 use crate::audit::Positioned;
+use crate::audit::objects::Objects;
 use crate::audit::records::LARGE_LIMIT;
 use crate::discover::normalize;
 use crate::token::Value;
@@ -759,26 +762,32 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
     }
     let mut always = false;
     let mut wildcard = false;
+    // A statement that names more objects than an event holds would lose
+    // some without a sign: it names `*` and is always reported instead
+    // (end-of-phase-9 review, gate G1). A name normalized to `*` (a masked
+    // name, protocol "The object `*`") stays a name, under the filters, as
+    // the same name on SQL Server Audit.
+    let mut objects = Objects::default();
     for rel in &a.relations {
         let rdb = rel.database.as_deref().or(db);
-        ev = ev.with_object(EventObject::new(
+        objects.push(EventObject::new(
             db_name(rdb),
             rel.schema.as_deref().map(normalize),
             normalize(&rel.name),
         ));
     }
     if let Some(p) = &r.procedure {
-        ev = ev.with_object(EventObject::new(db_name(db), None, normalize(p)));
+        objects.push(EventObject::new(db_name(db), None, normalize(p)));
     }
     for n in &a.listed {
-        ev = ev.with_object(EventObject::new(
+        objects.push(EventObject::new(
             db_name(db),
             Some(normalize("sys")),
             normalize(n),
         ));
         always = true;
     }
-    if !a.relations_complete {
+    if objects.overflow() || !a.relations_complete {
         wildcard = true;
     }
     if a.remote_access {
@@ -796,7 +805,7 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
     if a.dynamic_sql || a.user_function || a.four_part {
         wildcard = true;
     }
-    let touches = !ev.objects().is_empty() || wildcard;
+    let touches = !objects.is_empty() || wildcard;
     if !touches {
         // `SET`, `PRINT`, `BEGIN TRAN`, a `SELECT` of constants: no data.
         return None;
@@ -811,9 +820,13 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
         ev = ev.with_signal(Signal::Bcp);
     }
     if wildcard {
-        ev = star(ev);
-    } else if always {
-        ev = ev.with_always_report();
+        // `*` first, so that it always fits.
+        ev = objects.apply(star(ev));
+    } else {
+        ev = objects.apply(ev);
+        if always {
+            ev = ev.with_always_report();
+        }
     }
     Some((ev, Some(a)))
 }
@@ -932,6 +945,63 @@ pub(crate) mod tests {
                 "{t}"
             );
         }
+    }
+
+    /// End-of-phase-9 review, gate G1 (the nightly fuzz run 39014225515):
+    /// a statement with more objects than an event holds would lose some,
+    /// so it names `*` and is always reported. A name that normalization
+    /// masks (the fuzz input's bracketed name, a value, a long digit run)
+    /// is a masked name, not an unknown object (protocol "The object
+    /// `*`"): it stays under the filters, as on SQL Server Audit.
+    #[test]
+    fn objects_past_the_bound_are_always_reported_and_masked_names_stay_names() {
+        for (t, name) in [
+            (
+                "SELECT * FROM crm.customers c CROSS APPLY [insert/\"[] d",
+                "retail.-.*",
+            ),
+            ("SELECT * FROM crm.[jane@example.com]", "retail.crm.*"),
+            ("SELECT * FROM crm.orders_12345678901", "retail.crm.*"),
+        ] {
+            let ev = one(&stmt("sql_statement_completed", t, 1, "51"));
+            assert!(!ev.always_report(), "{t:?}");
+            assert!(names(&ev).contains(&name.to_owned()), "{t:?}");
+        }
+        let kept = databastion_classifiers::masking::MAX_EVENT_OBJECTS - 1;
+        let tables = |n: usize| -> String {
+            (0..n)
+                .map(|i| format!("crm.t{}", char::from(b'a' + u8::try_from(i).unwrap())))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ev = one(&stmt(
+            "sql_statement_completed",
+            &format!("SELECT * FROM {}", tables(kept)),
+            1,
+            "51",
+        ));
+        assert!(!ev.always_report() && ev.objects().len() == kept);
+        for n in [kept, 20] {
+            // The last table named would be lost.
+            let ev = one(&stmt(
+                "sql_statement_completed",
+                &format!("SELECT * FROM {}, crm.zcustomers", tables(n)),
+                1,
+                "51",
+            ));
+            assert!(ev.always_report(), "{n}");
+            assert!(names(&ev).contains(&"retail.-.*".to_owned()), "{n}");
+        }
+        // With a procedure from the request's rpc_completed.
+        let mut r = stmt(
+            "sp_statement_completed",
+            &format!("SELECT * FROM {}", tables(kept)),
+            1,
+            "51",
+        );
+        r.procedure = Some("get_x".to_owned());
+        let ev = one(&r);
+        assert!(ev.always_report() && names(&ev).contains(&"retail.-.*".to_owned()));
     }
 
     #[test]
