@@ -549,10 +549,20 @@ impl Session {
 
     /// Closes the connection (the server ends whatever ran on it). A
     /// session with nothing in flight and not poisoned ends cleanly (no
-    /// grace, decision 6, re-review N4); otherwise it is lost.
+    /// grace, decision 6, re-review N4); otherwise it is lost. A clean
+    /// close first waits, idle, until
+    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer, so
+    /// that no record of a statement it sent is stamped after its end.
     pub(crate) async fn close(mut self) {
         let lost = self.poisoned || self.in_flight;
         let grace = self.statement_timeout + crate::audit::own::LOST_GRACE;
+        if !lost && self.own.is_some() {
+            let wait =
+                crate::audit::own::CLEAN_CLOSE_SETTLE.saturating_sub(self.last_used.elapsed());
+            if !wait.is_zero() {
+                ::tokio::time::sleep(wait).await;
+            }
+        }
         let _ = ::tokio::time::timeout(Duration::from_secs(1), self.io.shutdown()).await;
         if let Some(h) = self.own.as_mut() {
             h.end(lost, grace);
@@ -1403,5 +1413,84 @@ pub(crate) mod tests {
         s.login("databastion", "pw").await.unwrap();
         assert_eq!(s.packet_size, 8000);
         assert_eq!(s.info.loginack_major, 16);
+    }
+
+    /// CI failure of PR #262 (SQL Server Audit, 2022): the Discovery
+    /// `columns` read of the scan's last table was reported as another
+    /// session's. Its 1-row sample answered at once and the session closed
+    /// right after: SQL Server Audit's clock, a few ms ahead of the
+    /// `SYSUTCDATETIME()` the end is computed on, stamped the `columns`
+    /// records after the computed end, and only the last statement (the
+    /// sample) has a tolerance after a clean end. A clean close now waits
+    /// until `CLEAN_CLOSE_SETTLE` after the last answer: the records of
+    /// every statement sent fall inside the lifetime, and nothing after the
+    /// end is matched.
+    #[::tokio::test]
+    async fn a_clean_close_settles_after_the_last_answer() {
+        use crate::audit::own;
+        let target = "conn-test-clean-close-settle";
+        own::reset(target);
+        let columns = crate::sql::columns("retail", 1_013_578_649).unwrap();
+        let sample = crate::sql::sample_statement(
+            "retail",
+            "crm",
+            "export_x",
+            &[("phone", crate::sql::Sampled::Text)],
+            5,
+            None,
+        )
+        .unwrap();
+        let mut ok = build::colmeta_int(&["a"]);
+        ok.extend(build::row_int(&[Some(7)]));
+        ok.extend(build::done(tok::DONE, done::COUNT, 1));
+        let server_us = 1_800_000_000_000_000;
+        let lead = 2_500;
+
+        // The failure, without the wait: the session ends at once after
+        // its last answer, and the `columns` records stamped `lead` later
+        // on the audit clock fall after the computed end.
+        let mut h = own::opened(target, 64, server_us, 0, None, Instant::now());
+        h.sent(&columns);
+        h.sent(&sample);
+        h.end(false, Duration::ZERO);
+        let end = own::session_at(target, 64, server_us, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        assert!(own::session_at(target, 64, end + lead, &sample).is_some());
+        assert!(
+            own::session_at(target, 64, end + lead, &columns).is_none(),
+            "the mechanism: an earlier statement after the end"
+        );
+
+        // Through `Session::close`: the end is at least the settle time
+        // after the last answer.
+        let (mut s, _srv) = scripted(vec![ok.clone(), ok]);
+        let at = Instant::now();
+        s.own = Some(own::opened(target, 65, server_us, 0, None, at));
+        s.rows(&columns, Stage::Columns, Shape::rows(1, 1))
+            .await
+            .unwrap();
+        s.rows(&sample, Stage::Sample, Shape::rows(1, 1))
+            .await
+            .unwrap();
+        let answered = server_us + i64::try_from(at.elapsed().as_micros()).unwrap();
+        s.close().await;
+        let end = own::session_at(target, 65, server_us, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        let settle = i64::try_from(own::CLEAN_CLOSE_SETTLE.as_micros()).unwrap();
+        // `answered` is read a few µs after the answer the wait counts from.
+        assert!(end + 1_000 >= answered + settle, "{end} {answered}");
+        assert!(
+            own::session_at(target, 65, answered + lead, &columns).is_some(),
+            "the earlier statement's records, stamped ahead, are the session's"
+        );
+        // Nothing is widened: after the end, only the last text keeps its
+        // tolerance.
+        assert!(own::session_at(target, 65, end + 1, &columns).is_none());
+        assert!(own::session_at(target, 65, end + 1, &sample).is_some());
+        assert!(own::session_at(target, 65, end + own::CLOCK_TOLERANCE_US + 1, &sample).is_none());
     }
 }
