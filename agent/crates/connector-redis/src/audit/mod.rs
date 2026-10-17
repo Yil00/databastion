@@ -47,7 +47,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use databastion_classifiers::keys::LearnedPatterns;
 use databastion_classifiers::masking::{
-    ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent, Signal,
+    ClientAddr, EventAction, EventObject, EventPrincipal, EventSource, MAX_EVENT_OBJECTS,
+    MaskedEvent, Signal,
 };
 use databastion_classifiers::names::{self, NormalizedName};
 use databastion_core::audit::CursorStore;
@@ -544,9 +545,17 @@ impl Stream<'_> {
                     // databases), each within the scaled budget
                     // (`max_sample_rows × PER_KEY_MAX`, ADR-0052
                     // refinement of 2026-10-16).
-                    let charged = {
+                    // The charge goes in events of at most 15 objects
+                    // (16 databases can match one key): an internal
+                    // event past the core's object bound would overflow
+                    // and never be left out (security review of the G7
+                    // branch, L1). Every chunk is charged; the entry is
+                    // left out only when every chunk is within budget.
+                    let scaled = self.own.budget().saturating_mul(PER_KEY_MAX);
+                    let mut within = true;
+                    for chunk in e.budget.chunks(MAX_EVENT_OBJECTS - 1) {
                         let mut c = MaskedEvent::new(source, action, ev.principal().clone(), ts);
-                        for (db, p) in &e.budget {
+                        for (db, p) in chunk {
                             c = c.with_object(EventObject::new(
                                 names::normalize_path(&format!("db{db}")),
                                 None,
@@ -556,17 +565,17 @@ impl Stream<'_> {
                         for s in &e.signals {
                             c = c.with_signal(*s);
                         }
-                        c.with_rows(Some(rows))
-                    };
-                    let scaled = self.own.budget().saturating_mul(PER_KEY_MAX);
-                    self.own.routine_within(
-                        &user,
-                        None,
-                        ClientSeen::NotRecorded,
-                        &charged,
-                        Instant::now(),
-                        scaled,
-                    )
+                        let c = c.with_rows(Some(rows));
+                        within &= self.own.routine_within(
+                            &user,
+                            None,
+                            ClientSeen::NotRecorded,
+                            &c,
+                            Instant::now(),
+                            scaled,
+                        );
+                    }
+                    within
                 }
             };
             if routine {

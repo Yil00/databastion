@@ -981,3 +981,67 @@ fn a_command_past_the_object_bound_names_star_and_is_always_reported() {
     let objects: Vec<&str> = e.objects.iter().map(NormalizedName::as_str).collect();
     assert_eq!(objects, ["customer:*", "*"]);
 }
+
+/// Security review of the G7 branch, L1: a key whose pattern was learned
+/// in 16 databases is charged in all 16 (more objects than one event
+/// names), and the agent's own read is still left out within budget,
+/// not refused as an overflowed event.
+#[test]
+fn own_reads_matching_sixteen_databases_are_left_out() {
+    let (cfg, target, state) = stream_parts();
+    let run = Some(4244);
+    let mut st = Stream {
+        cfg: &cfg,
+        target: &target,
+        state: &state,
+        own: OwnAccount::new("databastion", None, None, 2, state.audit.own_usage("own-t")),
+        store: None,
+        cursor: Cursor::default(),
+        saved: None,
+        skip: 0,
+        acl_ident_key: std::collections::hash_map::RandomState::new(),
+        acl_idents: None,
+        run,
+    };
+    let mut learned = state::Learned::default();
+    for db in 0..16u16 {
+        learned
+            .dbs
+            .insert(db, Arc::new(LearnedPatterns::new(["user:*:profile"])));
+    }
+    let dbs: Vec<u16> = (0..16).collect();
+    let (database, log_set) = log_database(&learned, &dbs);
+    let sets: Vec<(u16, &LearnedPatterns)> =
+        learned.dbs.iter().map(|(d, s)| (*d, s.as_ref())).collect();
+    let ctx = Context {
+        learned: &log_set,
+        stores: None,
+        dbs: &sets,
+    };
+    let now_s = i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let _own = own::register("own-t", 4301, None, run, SystemTime::now());
+    own::seen("own-t", 4301, run, "10.0.42.3:4000".parse().unwrap());
+    let mut e = entries::parse_log_entry(
+        &decode(&resp_entry(
+            1,
+            1,
+            &[b"HRANDFIELD", b"user:jdupont:profile", b"17"],
+            "10.0.42.3:4000",
+        )),
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(e.budget.len(), 16);
+    e.ts = now_s;
+    assert!(
+        st.log_event(&e, EventSource::RedisSlowlog, &database, &[], now_s, 0)
+            .is_none(),
+        "the agent's own read, within budget in every database"
+    );
+}
