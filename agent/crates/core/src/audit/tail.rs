@@ -6,7 +6,18 @@
 //!   complete record whose events were submitted; it is saved through the
 //!   core's `CursorStore` (`0600`, atomic).
 //! - First start (no cursor): reading starts at the **end** of the file;
-//!   history is not replayed.
+//!   history is not replayed. That end may lie inside a record the server
+//!   is still writing (PostgreSQL writes a csvlog record of more than
+//!   4 KiB in several `write`s): a record begun before it is dropped, and
+//!   with CSV framing the quote state is unknown until a quote settles it
+//!   ([`Splitter::reset_unaligned`]); a start inside a quoted field taken
+//!   as "outside" would leave the state inverted for good, with no record
+//!   ever complete again.
+//! - CSV quote state: every quote is checked against the CSV quoting
+//!   rules under the current and the inverted state; a state that only the
+//!   inverted one explains is corrected and the record in progress dropped
+//!   (counted in [`Tailer::malformed`] when the state was known before: a
+//!   damaged record).
 //! - Restart with a cursor on the same file: reading resumes at the saved
 //!   offset. A different inode at the path means the file was rotated
 //!   while the agent was stopped: the new file is read from its start (the
@@ -136,7 +147,8 @@ pub struct Splitter {
     ends: Vec<(usize, u64)>,
     /// Records skipped for their size.
     pub oversized: u64,
-    /// Records dropped as damaged ([`Framing::JsonObjects`]).
+    /// Records dropped as damaged ([`Framing::JsonObjects`]; with
+    /// [`Framing::Csv`], a record whose quotes were found inconsistent).
     pub malformed: u64,
     max: usize,
     /// [`Framing::JsonObjects`]: nesting depth, inside a string, after a
@@ -145,6 +157,40 @@ pub struct Splitter {
     in_string: bool,
     escaped: bool,
     line_start: bool,
+    /// [`Framing::Csv`]: whether `in_quotes` is known to be right. False
+    /// after [`Self::reset_unaligned`] (reading starts at an offset that
+    /// may lie inside a quoted field) until a quote settles it.
+    parity_known: bool,
+    /// [`Framing::Csv`]: the byte before the current one (`None`: start of
+    /// the data, or unknown).
+    prev: Option<u8>,
+    /// [`Framing::Csv`]: the last byte was a quote whose check needs the
+    /// next byte: (it opened a field under `in_quotes`, the byte before it
+    /// allows an opening quote).
+    quote: Option<(bool, bool)>,
+    /// [`Framing::Csv`], quote state not settled: the length of `buf` after
+    /// its last newline, taken as inside a quoted field. If the state turns
+    /// out inverted, that newline ended a record and the record in
+    /// progress starts after it.
+    cut: Option<usize>,
+    /// The record in progress is dropped at its end (see [`Discard`]).
+    discard: Discard,
+    /// [`Framing::Csv`]: times the quote state was found inverted and
+    /// corrected.
+    pub realigned: u64,
+}
+
+/// Why the record in progress is dropped at its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Discard {
+    /// Kept.
+    No,
+    /// It started before the offset reading started from: dropped
+    /// silently (history is not replayed).
+    Unaligned,
+    /// Its quotes were inconsistent (a damaged record): dropped and
+    /// counted in [`Splitter::malformed`].
+    Damaged,
 }
 
 impl Splitter {
@@ -172,6 +218,12 @@ impl Splitter {
             in_string: false,
             escaped: false,
             line_start: true,
+            parity_known: true,
+            prev: None,
+            quote: None,
+            cut: None,
+            discard: Discard::No,
+            realigned: 0,
         }
     }
 
@@ -191,6 +243,91 @@ impl Splitter {
         self.in_string = false;
         self.escaped = false;
         self.line_start = true;
+        self.parity_known = true;
+        self.prev = None;
+        self.quote = None;
+        self.cut = None;
+        self.discard = Discard::No;
+    }
+
+    /// Forgets any incomplete record before reading from an offset that
+    /// is not known to be a record boundary (first start at the end of a
+    /// file the server is writing: a record can be half written, a
+    /// PostgreSQL csvlog record of more than 4 KiB is written in several
+    /// `write`s). `after_newline`: the byte before the offset is a
+    /// newline.
+    ///
+    /// - [`Framing::Lines`]: the first record is dropped unless the offset
+    ///   follows a newline.
+    /// - [`Framing::Csv`]: the offset may lie inside a quoted field, where
+    ///   a newline does not end a record; a quote state taken as "outside"
+    ///   there would stay inverted for every later record (each record has
+    ///   an even number of quotes): no record would ever be complete
+    ///   again. Records are dropped until a quote settles the state (see
+    ///   [`Self::feed`]); the first one also unless the offset follows a
+    ///   newline.
+    /// - [`Framing::JsonObjects`]: records start at a `{` outside any
+    ///   object; nothing more is needed.
+    pub fn reset_unaligned(&mut self, after_newline: bool) {
+        self.reset();
+        match self.framing {
+            Framing::Lines | Framing::Csv => {
+                self.parity_known = !self.csv;
+                if !after_newline {
+                    self.discard = Discard::Unaligned;
+                }
+            }
+            Framing::JsonObjects => {}
+        }
+    }
+
+    /// [`Framing::Csv`]: checks the quote before `b` and notes a quote at
+    /// `b`. In a well-formed CSV record, an opening quote follows a comma,
+    /// a newline (record start) or a quote (`""` inside a field), and a
+    /// closing quote is followed by a comma, a newline, a carriage return
+    /// or a quote (`""`). Each quote is checked under the current state
+    /// and under the inverted one: when only the inverted state is
+    /// consistent, the state is inverted and the record in progress
+    /// (begun at a false boundary) dropped; when only the current one is,
+    /// it is known to be right. PostgreSQL quotes every non-empty text
+    /// field (the message is never empty), so the state is settled within
+    /// a record.
+    fn csv_byte(&mut self, b: u8) {
+        if let Some((opened, prev_ok)) = self.quote.take() {
+            let next_ok = matches!(b, b'"' | b',' | b'\n' | b'\r');
+            let (ours, inverted) = if opened {
+                (prev_ok, next_ok)
+            } else {
+                (next_ok, prev_ok)
+            };
+            if !ours && inverted {
+                self.in_quotes = !self.in_quotes;
+                self.realigned += 1;
+                self.discard = if self.parity_known {
+                    Discard::Damaged
+                } else if let Some(k) = self.cut.take().filter(|_| !self.skipping) {
+                    // The last newline taken as quoted ended a record: the
+                    // record in progress starts after it (`b` is counted
+                    // in `pending`, not yet in `buf`).
+                    self.buf.drain(..k);
+                    self.pending = self.buf.len() as u64 + 1;
+                    Discard::No
+                } else {
+                    Discard::Unaligned
+                };
+                self.parity_known = true;
+                self.cut = None;
+            } else if ours && !inverted {
+                self.parity_known = true;
+                self.cut = None;
+            }
+        }
+        if b == b'"' {
+            let prev_ok = self.prev.is_none_or(|p| matches!(p, b',' | b'\n' | b'"'));
+            self.quote = Some((!self.in_quotes, prev_ok));
+            self.in_quotes = !self.in_quotes;
+        }
+        self.prev = Some(b);
     }
 
     /// Where the records of the last [`Self::feed`] end: (index after their
@@ -210,11 +347,20 @@ impl Splitter {
         }
         for (i, &b) in data.iter().enumerate() {
             self.pending += 1;
-            if self.csv && b == b'"' {
-                self.in_quotes = !self.in_quotes;
+            if self.csv {
+                self.csv_byte(b);
             }
             if b == b'\n' && !self.in_quotes {
-                if self.skipping {
+                // A record that started before a false boundary, or before
+                // the quote state is settled, is dropped.
+                let drop = std::mem::replace(&mut self.discard, Discard::No);
+                if drop == Discard::Damaged {
+                    self.malformed += 1;
+                }
+                self.cut = None;
+                if drop != Discard::No || !self.parity_known {
+                    self.skipping = false;
+                } else if self.skipping {
                     self.skipping = false;
                     self.oversized += 1;
                 } else if !self.buf.is_empty() {
@@ -236,9 +382,13 @@ impl Splitter {
             if self.buf.len() >= self.max {
                 self.skipping = true;
                 self.buf.clear();
+                self.cut = None;
                 continue;
             }
             self.buf.push(b);
+            if self.csv && b == b'\n' && !self.parity_known {
+                self.cut = Some(self.buf.len());
+            }
         }
     }
 }
@@ -639,8 +789,8 @@ impl Tailer {
         self
     }
 
-    /// Damaged records dropped by the splitter
-    /// ([`Framing::JsonObjects`]).
+    /// Damaged records dropped by the splitter ([`Framing::JsonObjects`],
+    /// and [`Framing::Csv`] records with inconsistent quotes).
     #[must_use]
     pub fn malformed(&self) -> u64 {
         self.splitter.malformed
@@ -672,7 +822,11 @@ impl Tailer {
             return Ok(());
         }
         let (mut file, dev, ino, len) = open_regular(&self.path, self.open_check.as_ref())?;
-        let start = match self.load_cursor() {
+        let cursor = self.load_cursor();
+        // First start: the end of a file being written need not be a record
+        // boundary (see `Splitter::reset_unaligned`).
+        let unaligned = cursor.is_none() && len > 0;
+        let start = match cursor {
             Some(mut c) if c.dev == dev && c.ino == ino => {
                 // A replay whose end lies before the offset is not one the
                 // tailer saves: ignored, as before.
@@ -716,9 +870,14 @@ impl Tailer {
                 self.tail.clear();
             }
         }
+        if unaligned {
+            let after_newline = self.tail.last() == Some(&b'\n');
+            self.splitter.reset_unaligned(after_newline);
+        } else {
+            self.splitter.reset();
+        }
         self.file = Some((file, dev, ino));
         self.offset = start;
-        self.splitter.reset();
         Ok(())
     }
 
@@ -1640,6 +1799,132 @@ mod tests {
         let got: Vec<Vec<u8>> = out.iter().map(|r| r.to_vec()).collect();
         assert_eq!(got, [b"a,\"b\nc\"".to_vec(), b"d".to_vec()]);
         assert_eq!(s.pending(), "partial,\"open".len() as u64);
+    }
+
+    /// A PostgreSQL csvlog record whose statement spans lines and holds
+    /// quotes and commas (as pgaudit writes it inside the message).
+    fn csvlog_record(n: u32) -> String {
+        format!(
+            "2026-10-17 12:34:28.{n:03} UTC,\"databastion\",\"shop\",4242,\"127.0.0.1:5555\",\
+             6710f0a4.4d2,{n},\"SELECT\",2026-10-17 12:34:27 UTC,3/45,0,LOG,00000,\
+             \"AUDIT: SESSION,{n},1,READ,SELECT,,,\"\"SELECT id, \"\"e,mail\"\" /* a, \"\"b\"\" */\n\
+             FROM crm.t_{n}\nWHERE x = ',\"\"'\"\",<not logged>\",,,,,,,,,\"databastion-it\",\
+             \"client backend\",,0\n"
+        )
+    }
+
+    fn strings(out: &[Zeroizing<Vec<u8>>]) -> Vec<String> {
+        out.iter()
+            .map(|r| String::from_utf8(r.to_vec()).unwrap())
+            .collect()
+    }
+
+    /// The first start of a csvlog stream at an end of file that lies
+    /// anywhere inside a record the server is still writing (PostgreSQL
+    /// writes a record of more than 4 KiB in several `write`s, such as the
+    /// agent's own probes): the records after it are all read. A start
+    /// inside a quoted field taken as "outside" left the quote state
+    /// inverted, and no record was ever complete again (CI job
+    /// 117395163577, `failed_reads_and_what_is_reported`: no csvlog event
+    /// in 30 s).
+    #[test]
+    fn a_csv_start_inside_a_record_realigns() {
+        let cut = csvlog_record(1);
+        let next = [csvlog_record(2), csvlog_record(3)];
+        let want: Vec<String> = next
+            .iter()
+            .map(|r| r.trim_end_matches('\n').to_owned())
+            .collect();
+        // Every offset of the record, inside and outside its quoted fields.
+        for at in 0..=cut.len() {
+            let mut s = Splitter::with_max(Framing::Csv, MAX_RECORD_BYTES);
+            let after_newline = at == 0 || cut.as_bytes()[at - 1] == b'\n';
+            s.reset_unaligned(after_newline);
+            let mut out = Vec::new();
+            let mut rest = cut.as_bytes()[at..].to_vec();
+            for r in &next {
+                rest.extend_from_slice(r.as_bytes());
+            }
+            // Fed in two chunks: the quote checks span `feed` calls.
+            let (a, b) = rest.split_at(rest.len() / 3);
+            s.feed(a, &mut out);
+            s.feed(b, &mut out);
+            let got = strings(&out);
+            if at == 0 {
+                assert_eq!(got.len(), 3, "start at the record's start");
+                assert_eq!(got[1..], want[..]);
+            } else {
+                assert_eq!(got, want, "start at byte {at} of the record");
+            }
+            assert_eq!(s.pending(), 0);
+            assert_eq!(s.malformed, 0, "start at byte {at}");
+        }
+        // Through the tailer: no cursor, the file ends inside a quoted field
+        // of the record being written.
+        let d = Dir::new("csvcut");
+        let log = d.0.join("postgresql.csv");
+        let split = cut.find("FROM crm").unwrap() + 4;
+        append(&log, &csvlog_record(0));
+        append(&log, &cut[..split]);
+        let mut t = Tailer::new(log.clone(), Framing::Csv, None);
+        assert!(lines(t.poll().unwrap()).is_empty());
+        append(&log, &cut[split..]);
+        append(&log, &next[0]);
+        append(&log, &next[1]);
+        assert_eq!(lines(t.poll().unwrap()), want);
+        append(&log, &csvlog_record(4));
+        assert_eq!(lines(t.poll().unwrap()).len(), 1);
+        assert_eq!(t.malformed(), 0);
+    }
+
+    /// A csvlog record cut short (an odd number of quotes, e.g. a server
+    /// stopped while writing it) no longer swallows every later record:
+    /// the quote state is corrected at the next record's first quoted
+    /// field, that record is dropped with the damaged one (counted), and
+    /// the following ones are read.
+    #[test]
+    fn a_damaged_csv_record_is_dropped_and_the_state_corrected() {
+        let full = csvlog_record(1);
+        let damaged = &full[..full.find("WHERE").unwrap()];
+        let mut s = Splitter::with_max(Framing::Csv, MAX_RECORD_BYTES);
+        let mut out = Vec::new();
+        let data = format!(
+            "{}{damaged}\n{}{}{}",
+            csvlog_record(0),
+            csvlog_record(2),
+            csvlog_record(3),
+            csvlog_record(4)
+        );
+        s.feed(data.as_bytes(), &mut out);
+        let got = strings(&out);
+        assert_eq!(got.len(), 3, "{got:#?}");
+        assert!(got[0].contains("crm.t_0"));
+        assert!(got[1].contains("crm.t_3"));
+        assert!(got[2].contains("crm.t_4"));
+        assert_eq!(s.malformed, 1);
+        assert_eq!(s.realigned, 1);
+        // Well-formed records never trip the checks.
+        let mut s = Splitter::with_max(Framing::Csv, MAX_RECORD_BYTES);
+        let mut out = Vec::new();
+        let many: String = (0..50).map(csvlog_record).collect();
+        for chunk in many.as_bytes().chunks(7) {
+            s.feed(chunk, &mut out);
+        }
+        assert_eq!(out.len(), 50);
+        assert_eq!((s.malformed, s.realigned), (0, 0));
+    }
+
+    /// A line-framed log whose end is not after a newline at the first
+    /// start: the cut line is dropped, the next ones read.
+    #[test]
+    fn a_line_start_inside_a_record_drops_it() {
+        let d = Dir::new("linecut");
+        let log = d.0.join("postgresql.json");
+        append(&log, "{\"a\":1}\n{\"half");
+        let mut t = Tailer::new(log.clone(), Framing::Lines, None);
+        assert!(lines(t.poll().unwrap()).is_empty());
+        append(&log, "\":2}\n{\"b\":3}\n");
+        assert_eq!(lines(t.poll().unwrap()), ["{\"b\":3}"]);
     }
 
     #[test]
