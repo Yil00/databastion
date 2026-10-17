@@ -369,7 +369,12 @@ during the scan (their first 70 characters, which may name a value-bearing table
 `diag-top-statements.txt` in the log directory. Results go to `$LOAD_RESULTS_DIR` (default
 `e2e/load/.results-sqlserver/`), logs to `$LOAD_LOG_DIR` (default `e2e/load/.logs-sqlserver/`).
 
-**Status: local runs only (2026-10-16), no CI run yet**, with a debug build of the agent (its CPU
+**Status: CI run 38978357006 on `dev` at `a529e13` (2026-10-16, soak 600 s): PASS.** Discovery 0.74 % of the
+2-CPU server (111 tables, 500 000 rows, 224.6 s scan); Audit 180 000 / 180 000 statements at 300/s, drain 11.9 s;
+no added latency; agent 0.009 core and 21.1 MiB, no growth, no loss. The earlier local runs below
+found the SQL Server Audit loss fixed by #253.
+
+Earlier local runs (2026-10-16), with a debug build of the agent (its CPU
 figures are upper bounds) on a 4-CPU host shared with the console:
 - Discovery: **0.884 %** of the 2-CPU server at the CI seed (100 load tables, 500 000 rows, 111
   tables with the dev seed; a 444 s scan; 0.161 % against the agent-idle baseline), **0.719 %**
@@ -380,8 +385,8 @@ figures are upper bounds) on a 4-CPU host shared with the console:
   (`fn_get_audit_file`), no agent counter showed a loss (`events_lost_total`,
   `audit_records_skipped_total`, panics, spool: all 0), and the source side had no grouping-key
   collision and at most about 300 records per audit buffer (a probe at the same rate). The ratio
-  stays within the 1 % bound, but `drain_s` fails (not every statement arrives): **an open agent
-  issue**, to investigate in the SQL Server Audit source.
+  stays within the 1 % bound, but `drain_s` failed (not every statement arrived): buffers larger
+  than the 500-record client-side skip, fixed by #253 (server-side skip).
 - Latency: the mean duration per statement was 0.419 ms without and with Audit; the server's CPU
   0.217 / 0.249 core without / with the agent's stream.
 - Agent: 0.114 core with Audit on (debug build: 377 ms of CPU per 1 000 statements), 35.4 MiB peak
@@ -433,7 +438,11 @@ Results go to `$LOAD_RESULTS_DIR` (default `e2e/load/.results-redis/`), logs to 
 (default `e2e/load/.logs-redis/`); the target's TLS port is published on
 `127.0.0.1:${LOAD_VALKEY_PORT:-16479}` (or `LOAD_REDIS_PORT`, 16489) for the host-side client.
 
-**Status: local runs only (2026-10-16), no CI run yet**, Valkey 9.0.6, a debug build of the agent
+**Status: CI run 38978357006 on `dev` at `a529e13` (2026-10-16, soak 600 s): PASS.** Discovery 0.267 % (1 000 146
+keys, 51.9 s scan); Audit 120 000 / 120 000 GETs at 200/s, drain 6 s; no added latency; agent 0.0024 core
+and 17.1 MiB, no growth, no loss.
+
+Earlier local runs (2026-10-16), Valkey 9.0.6, a debug build of the agent
 (its CPU figures are upper bounds) on a 4-CPU host shared with the console; 60 s without and 180 s
 with Audit; every check passed:
 - Discovery of 1 000 146 keys (the walk stops at 100 000 per database): **0.133 %** of the 2-CPU
