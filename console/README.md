@@ -1120,8 +1120,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   token goes out without its key patterns (logged with their count, recorded in
   `jobs.delivered_without_key_patterns` and shown on the Audit settings page). A heartbeat that
   changes the agent's stored list queues the enabled Redis / Valkey settings again from the
-  stored ones (`requeueAuditSettingsOnAcceptsChange`, a system `audit.configure`, no
-  confirmation; nothing is queued when no object changes; a narrowing leaves its warning). Manual objects are typed
+  objects sent last time (`requeueAuditSettingsOnAcceptsChange`, a system `audit.configure`, no
+  confirmation): the plain names are kept as sent, only the key patterns are added or removed
+  (within what the 1000 cap leaves), nothing is queued when that changes nothing, and the stored
+  warning is replaced only when the requeue removes objects. At most 4 such changes per agent and
+  hour (`audit.requeue_per_agent`); past it, one `agent.accepts_flapping` integrity event an hour
+  (`audit.requeue_flapping_alerts`) and no requeue. Manual objects are typed
   `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
   typed by hand for a target of any other engine is refused (`400 invalid_params`).
 

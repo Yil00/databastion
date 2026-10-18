@@ -2,7 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { agents, auditConfigs, auditLog, jobs, users } from "@/db/schema";
+import { agents, auditConfigs, auditLog, jobs, securityEvents, users } from "@/db/schema";
 import { minRowsWarning } from "@/lib/audit-warning";
 import { validateSchema } from "@/lib/protocol/validate";
 import { failuresPerAgent } from "@/server/agent-api/auth";
@@ -416,21 +416,44 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(row).toMatchObject({ warning: "shrunk", warningRemoved: 1 });
     const [audit] = await audits(auth.agentId);
     expect(audit).toMatchObject({ actorType: "system", actorId: null });
-    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", skipped_key_patterns: 1, removed_objects: 1 });
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", key_patterns: 0, removed_objects: 1, warning: "shrunk" });
     // The same heartbeat again changes nothing: no new job.
     expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HB }))).status).toBe(200);
     expect(await auditJobs(auth.agentId)).toHaveLength(2);
   });
 
-  it("#280 review M2: an upgraded agent gets the key patterns left out before, without a new save", async () => {
+  it("#280 review M2 and re-review N2: an upgraded agent gets the key patterns left out before; plain names and the stored warning are kept", async () => {
     const auth = await redisAgentWithFindings();
     const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
     expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
+    expect((await auditJobs(auth.agentId))[0]?.params).toMatchObject({ sensitive_objects: [{ object: "profiles" }] });
+    // What was sent last is the base, never today's findings: a plain name sent before stays, one
+    // that was not sent is not added (here, `profiles` taken out of the record of what was sent),
+    // and an earlier warning on the target stays.
+    await getDb()
+      .update(auditConfigs)
+      .set({ sentObjects: [{ database: "db0", object: "kept_plain", classifiers: ["pii.email"] }], warning: "shrunk", warningRemoved: 7 })
+      .where(eq(auditConfigs.agentId, auth.agentId));
     expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } }))).status).toBe(200);
     const [latest] = await auditJobs(auth.agentId);
-    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort()).toEqual(["profiles", "user:*:profile"]);
+    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object)).toEqual(["kept_plain", "user:*:profile"]);
     const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
-    expect(row?.warning).toBeNull();
+    expect(row).toMatchObject({ warning: "shrunk", warningRemoved: 7 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", added_objects: 1, removed_objects: 0, key_patterns: 1, warning: null });
+  });
+
+  it("#280 re-review N1: an agent flipping its tokens gets at most 4 requeues an hour, then one accepts_flapping integrity event", async () => {
+    const auth = await redisAgentWithFindings();
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    for (let i = 0; i < 8; i++) {
+      const body = i % 2 === 0 ? { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } : REDIS_HB;
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    }
+    // 8 changes: the first 4 are requeued (each one changes the key patterns sent), then none.
+    expect(await auditJobs(auth.agentId)).toHaveLength(1 + 4);
+    const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, auth.agentId));
+    expect(events.filter((e) => e.kind === "agent.accepts_flapping")).toHaveLength(1);
   });
 
   it("#280 review M2 and L4: a job carrying key patterns is delivered without them to an agent that never listed the token, recorded on the job", async () => {

@@ -8,6 +8,8 @@ import { isKeyPatternEngine } from "@/lib/location-labels";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { agentAccepts } from "./agent-api/capabilities";
+import { recordIntegrityEvent } from "./integrity";
+import { RateLimiter } from "./rate-limit";
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
@@ -366,9 +368,7 @@ export async function configureAudit(
   actor: { userId: string; ip: string | null },
 ): Promise<AuditConfigureOutcome> {
   const result = await db.transaction(async (tx): Promise<AuditConfigureOutcome> => {
-    const r = await queueAuditSettings(tx, agentId, targetId, input, { kind: "user", ...actor });
-    // Only a system requeue can be "unchanged".
-    return r.outcome === "unchanged" ? { outcome: "invalid" } : r;
+    return queueAuditSettings(tx, agentId, targetId, input, actor);
   });
   if (result.outcome !== "queued") {
     await writeAudit(db, {
@@ -397,23 +397,14 @@ export async function configureAudit(
   return result;
 }
 
-/** Who changes the settings: an administrator, or the console itself (security review of #280, M2). */
-type SettingsActor =
-  | { kind: "user"; userId: string; ip: string | null }
-  | { kind: "system"; reason: "agent_accepts_changed" };
-
-/**
- * The settings computation and queueing of {@link configureAudit}, inside the caller's transaction.
- * A `system` actor needs no confirmation (it records the warning of a narrowing change, shown on the
- * target like any other) and queues nothing when no object changes (`unchanged`).
- */
+/** The settings computation and queueing of {@link configureAudit}, inside its transaction. */
 async function queueAuditSettings(
   tx: Tx,
   agentId: string,
   targetId: string,
   input: AuditConfigInput,
-  actor: SettingsActor,
-): Promise<AuditConfigureOutcome | { outcome: "unchanged" }> {
+  actor: { userId: string; ip: string | null },
+): Promise<AuditConfigureOutcome> {
     // Serializes the changes of the agent's settings (and its jobs), as for scan requests.
     const [agent] = await tx
       .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
@@ -456,9 +447,7 @@ async function queueAuditSettings(
       { enabled: params.enabled, objects: params.sensitive_objects ?? [] },
     );
     const digest = settingsDigest(params);
-    // A system requeue (the agent's capabilities changed) that changes no object is not queued.
-    if (actor.kind === "system" && change.added === 0 && change.removed === 0) return { outcome: "unchanged" };
-    if (actor.kind === "user" && change.warning !== null && input.confirm !== digest) {
+    if (change.warning !== null && input.confirm !== digest) {
       return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
@@ -468,7 +457,7 @@ async function queueAuditSettings(
       .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure"), eq(jobs.status, "pending")));
     const [job] = await tx
       .insert(jobs)
-      .values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: actor.kind === "user" ? actor.userId : null })
+      .values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: actor.userId })
       .returning({ id: jobs.id });
     if (!job) throw new Error("job insert returned no row");
     const values = {
@@ -483,28 +472,122 @@ async function queueAuditSettings(
       warning: change.warning,
       warningRemoved: change.warning !== null ? change.removed : null,
       updatedAt: sql`now()`,
-      updatedBy: actor.kind === "user" ? actor.userId : null,
+      updatedBy: actor.userId,
     };
     await tx
       .insert(auditConfigs)
       .values({ agentId, targetId, ...values })
       .onConflictDoUpdate({ target: [auditConfigs.agentId, auditConfigs.targetId], set: values });
     await writeAudit(tx, {
-      actorType: actor.kind,
-      actorId: actor.kind === "user" ? actor.userId : null,
+      actorType: "user",
+      actorId: actor.userId,
       action: "audit.configure",
       targetType: "job",
       targetId: job.id,
-      sourceIp: actor.kind === "user" ? actor.ip : null,
+      sourceIp: actor.ip,
       details: {
-        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, actor.kind === "user"),
+        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
         skipped_key_patterns: skippedKeyPatterns,
         min_rows_warning: rowsWarning,
-        ...(actor.kind === "system" ? { reason: actor.reason } : {}),
       },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
     return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
+}
+
+/**
+ * Requeues of an agent's Audit settings after a capability change, per agent and hour (re-review
+ * N1), shared by the console processes with the per-process fallback (an audit budget, as the
+ * integrity limiters, ADR-0024 decision 4). An upgrade or a downgrade needs one; 4 leave room for a
+ * rollback and a retry.
+ */
+export const auditRequeueBudget = RateLimiter.shared("audit.requeue_per_agent", 4, 60 * 60_000, "local");
+/** The `accepts_flapping` integrity events of an agent past {@link auditRequeueBudget}: one per hour. */
+export const acceptsFlappingAlertBudget = RateLimiter.shared("audit.requeue_flapping_alerts", 1, 60 * 60_000, "local");
+
+/**
+ * One target of {@link requeueAuditSettingsOnAcceptsChange} (re-review N2): the objects sent last
+ * time keep their plain names (`Identifier`s, never derived again from today's findings); only the
+ * key patterns are added (from the findings, if derived, and the manual objects, most sensitive
+ * first, within what the 1000 cap leaves after the plain names) or removed, as the agent can now
+ * receive them. Nothing is queued when that changes nothing. The stored warning is kept unless this
+ * requeue removes objects, which records its own (`shrunk` or `emptied`). Whether the job was queued.
+ */
+async function requeueKeyPatterns(db: Database, agentId: string, targetId: string): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const [agent] = await tx
+      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .for("update")
+      .limit(1);
+    if (!agent || agent.revokedAt || agent.lockedAt) return false;
+    await lockAgentJobs(tx, agentId);
+    const [c] = await tx
+      .select()
+      .from(auditConfigs)
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
+      .limit(1);
+    if (!c?.enabled) return false;
+    const sent = c.sentObjects as unknown as SensitiveObject[];
+    const plain = sent.filter((o) => validateSchema("Identifier", o.object).ok);
+    let keys: SensitiveObject[] = [];
+    if (agentAcceptsKeyPatterns(agent.accepts)) {
+      const derived = c.deriveFromFindings ? (await deriveSensitiveObjects(tx, agentId, targetId)).filter((o) => isKeyPatternObject(o.object)) : [];
+      const manual = (c.manualObjects as unknown as SensitiveObject[]).filter((o) => isKeyPatternObject(o.object));
+      keys = mergeSensitiveObjects(derived, manual).objects.slice(0, Math.max(0, MAX_SENSITIVE_OBJECTS - plain.length));
+    }
+    const next = [...plain, ...keys];
+    const change = assessAuditChange({ enabled: true, objects: sent }, { enabled: true, objects: next });
+    if (change.added === 0 && change.removed === 0) return false;
+    const input: AuditConfigInput = {
+      enabled: true,
+      aggregationWindowS: c.aggregationWindowS,
+      pollIntervalS: c.pollIntervalS,
+      minRows: c.minRows ?? null,
+      deriveFromFindings: c.deriveFromFindings,
+      manualObjects: c.manualObjects as unknown as SensitiveObject[],
+      confirm: null,
+    };
+    const params = buildAuditParams(input, next);
+    if (!params) return false;
+    await tx
+      .update(jobs)
+      .set({ status: "cancelled", finishedAt: sql`now()` })
+      .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure"), eq(jobs.status, "pending")));
+    const [job] = await tx.insert(jobs).values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: null }).returning({ id: jobs.id });
+    if (!job) throw new Error("job insert returned no row");
+    // Only a requeue that removes objects records a warning; otherwise the stored one stays.
+    const narrows = change.removed > 0;
+    await tx
+      .update(auditConfigs)
+      .set({
+        sentObjects: next as unknown as Record<string, unknown>[],
+        lastJobId: job.id,
+        ...(narrows ? { warning: change.warning ?? "shrunk", warningRemoved: change.removed } : {}),
+        updatedAt: sql`now()`,
+      })
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)));
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "audit.configure",
+      targetType: "job",
+      targetId: job.id,
+      details: {
+        agent_id: agentId,
+        target_id: targetId,
+        reason: "agent_accepts_changed",
+        previous_objects: change.previousCount,
+        next_objects: change.nextCount,
+        added_objects: change.added,
+        removed_objects: change.removed,
+        key_patterns: keys.length,
+        warning: narrows ? (change.warning ?? "shrunk") : null,
+      },
+    });
+    await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
+    return true;
+  });
 }
 
 /**
@@ -513,10 +596,18 @@ async function queueAuditSettings(
  * that stops), the enabled Audit settings of its Redis / Valkey targets are computed again from the
  * stored settings and queued when their objects change, so key patterns are neither withheld from
  * an upgraded agent nor silently lost by a downgraded one. Audited as `audit.configure` by the
- * system, with `reason: "agent_accepts_changed"`; a narrowing change leaves its warning on the
- * target. Returns the number of jobs queued.
+ * system, with `reason: "agent_accepts_changed"`. At most `auditRequeueBudget` per agent and
+ * hour (re-review N1). Returns the number of jobs queued.
  */
 export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId: string): Promise<number> {
+  // Re-review N1: an agent that flips its tokens at every heartbeat must not write jobs, settings
+  // and audit entries without bound. Past the budget, one integrity event an hour, no requeue.
+  if (!(await auditRequeueBudget.reserveShared(agentId)).ok) {
+    if ((await acceptsFlappingAlertBudget.reserveShared(agentId)).ok) {
+      await recordIntegrityEvent(db, { agentId, kind: "accepts_flapping", endpoint: "heartbeat", status: 200, ip: null });
+    }
+    return 0;
+  }
   const rows = await db
     .select({ targetId: auditConfigs.targetId, engine: agentTargets.engine })
     .from(auditConfigs)
@@ -525,25 +616,7 @@ export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId:
   let queued = 0;
   for (const { targetId, engine } of rows) {
     if (!isKeyPatternEngine(engine)) continue;
-    const outcome = await db.transaction(async (tx) => {
-      const [c] = await tx
-        .select()
-        .from(auditConfigs)
-        .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
-        .limit(1);
-      if (!c?.enabled) return "skipped";
-      const input: AuditConfigInput = {
-        enabled: true,
-        aggregationWindowS: c.aggregationWindowS,
-        pollIntervalS: c.pollIntervalS,
-        minRows: c.minRows ?? null,
-        deriveFromFindings: c.deriveFromFindings,
-        manualObjects: c.manualObjects as unknown as SensitiveObject[],
-        confirm: null,
-      };
-      return (await queueAuditSettings(tx, agentId, targetId, input, { kind: "system", reason: "agent_accepts_changed" })).outcome;
-    });
-    if (outcome === "queued") queued++;
+    if (await requeueKeyPatterns(db, agentId, targetId)) queued++;
   }
   return queued;
 }

@@ -40,14 +40,20 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * starts on another target within the hour is not hidden), within `targetMismatchChangeBudget`;
  * the heartbeats in between are counted (`suppressed_before` of the next `target_mismatch` row,
  * separately from the other kinds). The system alert stays at most one per agent, kind and hour.
+ *
+ * `accepts_flapping` (security review of #280 re-review, N1): the agent's capability tokens changed
+ * more often than the Audit settings requeue budget allows (`auditRequeueBudget`,
+ * src/server/audit-config.ts); recorded at most once per agent and hour
+ * (`acceptsFlappingAlertBudget`), within `integrityWriteBudget`.
  */
-export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target" | "target_mismatch";
+export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target" | "target_mismatch" | "accepts_flapping";
 
 const ACTION: Record<IntegrityKind, AuditAction> = {
   batch_rejected: "agent.batch_rejected",
   batch_conflict: "agent.batch_conflict",
   foreign_target: "agent.foreign_target",
   target_mismatch: "agent.target_mismatch",
+  accepts_flapping: "agent.accepts_flapping",
 };
 
 /**
