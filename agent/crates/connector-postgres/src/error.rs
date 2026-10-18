@@ -58,7 +58,7 @@ pub(crate) struct PgError {
 impl PgError {
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             sqlstate: None,
             stage,
             fatal: true,
@@ -94,7 +94,7 @@ impl PgError {
                 )
             });
         Self {
-            code,
+            code: at_stage(code, stage),
             sqlstate: sqlstate.map(str::to_owned),
             stage,
             fatal,
@@ -138,6 +138,16 @@ fn failure_of(sqlstate: &str) -> FailureCode {
         s if s.starts_with("08") || s.starts_with("57P") => FailureCode::TargetUnreachable,
         s if s.starts_with("53") => FailureCode::ResourceLimit,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

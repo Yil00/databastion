@@ -500,7 +500,9 @@ pub(crate) struct DefaultUser {
 }
 
 type Cached<T> = Mutex<HashMap<String, (Instant, T)>>;
-/// A node's report and the server it was read on.
+/// A node's report and the server it was read on, with the instant it
+/// stops being fresh (an expiry rather than an evaluation time: a stale
+/// entry needs no instant before the process or the machine started).
 type NodeReports = Mutex<HashMap<(String, Which), (Instant, Report, Server)>>;
 
 /// Reports per target and node, and the `default` user probe per target,
@@ -518,22 +520,33 @@ impl Reports {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(target_id.to_owned(), which))
-            .filter(|(at, _, _)| at.elapsed() < REPORT_INTERVAL)
+            .filter(|(until, _, _)| Instant::now() < *until)
             .map(|(_, r, s)| (r.clone(), *s))
     }
 
     fn store(&self, target_id: &str, which: Which, report: Report, server: Server) {
-        self.store_at(target_id, which, report, server, Instant::now());
+        self.store_aged(target_id, which, report, server, Duration::ZERO);
     }
 
-    fn store_at(&self, target_id: &str, which: Which, report: Report, server: Server, at: Instant) {
+    /// Stores a report evaluated `age` ago: fresh for what is left of
+    /// [`REPORT_INTERVAL`] (stale at once from that age on).
+    fn store_aged(
+        &self,
+        target_id: &str,
+        which: Which,
+        report: Report,
+        server: Server,
+        age: Duration,
+    ) {
+        let until = Instant::now() + REPORT_INTERVAL.saturating_sub(age);
         self.nodes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((target_id.to_owned(), which), (at, report, server));
+            .insert((target_id.to_owned(), which), (until, report, server));
     }
 
-    /// Stores a report as evaluated at `at` (unit tests).
+    /// Stores a report as evaluated `age` ago (unit tests; any age, on a
+    /// machine up for less than it too).
     #[cfg(test)]
     pub(crate) fn store_for_test(
         &self,
@@ -541,9 +554,9 @@ impl Reports {
         which: Which,
         report: Report,
         server: Server,
-        at: Instant,
+        age: Duration,
     ) {
-        self.store_at(&target.id, node_of(target, which), report, server, at);
+        self.store_aged(&target.id, node_of(target, which), report, server, age);
     }
 
     /// The last report of the node `which` of a target, fresh or not, with

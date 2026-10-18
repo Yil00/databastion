@@ -104,7 +104,7 @@ impl SsError {
     /// A local, transport or protocol failure: the connection is unusable.
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             number: None,
             stage,
             fatal: true,
@@ -125,7 +125,7 @@ impl SsError {
     /// An `ERROR` token (class 11 and above). Class 20 and above closes the
     /// connection on the server side.
     pub(crate) fn server(number: i32, class: u8, stage: Stage) -> Self {
-        let code = failure_of(number);
+        let code = at_stage(failure_of(number), stage);
         Self {
             code,
             number: Some(number),
@@ -169,6 +169,16 @@ pub(crate) fn failure_of(number: i32) -> FailureCode {
         // Invalid object or column name.
         207 | 208 => FailureCode::UnknownTarget,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

@@ -50,7 +50,7 @@ impl RdError {
     /// A local, transport or protocol failure: the connection is unusable.
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             word: None,
             stage,
             fatal: true,
@@ -60,7 +60,7 @@ impl RdError {
     /// An error reply. Fatal during the handshake.
     pub(crate) fn reply(word: ErrorWord, stage: Stage) -> Self {
         Self {
-            code: failure_of(word),
+            code: at_stage(failure_of(word), stage),
             word: Some(word),
             stage,
             fatal: matches!(stage, Stage::Auth | Stage::SessionSetup | Stage::Connect),
@@ -111,6 +111,16 @@ pub(crate) fn failure_of(word: ErrorWord) -> FailureCode {
         | ErrorWord::Tryagain => FailureCode::TargetUnreachable,
         ErrorWord::Moved | ErrorWord::Ask => FailureCode::UnknownTarget,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

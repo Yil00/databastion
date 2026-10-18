@@ -64,7 +64,7 @@ pub(crate) struct MgError {
 impl MgError {
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             server_code: None,
             stage,
             fatal: true,
@@ -78,7 +78,7 @@ impl MgError {
             Stage::Connect | Stage::Tls | Stage::SessionSetup | Stage::Auth | Stage::Secret
         );
         Self {
-            code: server_code.map_or(FailureCode::Internal, failure_of),
+            code: at_stage(server_code.map_or(FailureCode::Internal, failure_of), stage),
             server_code,
             stage,
             fatal: setup || server_code.is_some_and(closes_connection),
@@ -156,6 +156,16 @@ pub(crate) fn failure_of(code: i32) -> FailureCode {
         // InvalidOptions.
         59 | 115 | 166 | 72 => FailureCode::Unsupported,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

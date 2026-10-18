@@ -699,7 +699,6 @@ async fn read(
         }
         Err(e) => return Err(e.into_connector_error()),
     };
-    st.state.audit.note_dropped(&target_id, polled.malformed);
     let positions: Vec<(String, i64)> = polled
         .records
         .iter()
@@ -715,8 +714,20 @@ async fn read(
     // last re-probe); a file still beyond it is a gap, its events are left
     // out and the position stays before it.
     if beyond_current(st.probe.as_ref(), &positions).is_some() {
+        let before = (st.cursor.pattern.clone(), st.cursor.session);
         Box::pin(reprobe(st, s)).await?;
+        // #276 re-review N1: a re-probe that moved to a new file set (the
+        // cursor was reset to its start) or found the session started
+        // again: this batch was read from the cursor before it, and its
+        // next position must not replace the reset one. The read ends
+        // without consuming it; the next read starts from the cursor the
+        // re-probe left (the gap is already noted).
+        if reprobe_moved(&before, &st.cursor) {
+            tracing::info!(target_id = %target_id, "Extended Events: the session's file set or start changed during a read: reading again from the new position");
+            return Ok(true);
+        }
     }
+    st.state.audit.note_dropped(&target_id, polled.malformed);
     let clamped = beyond_current(st.probe.as_ref(), &positions);
     if let Some(at) = clamped {
         tracing::warn!(target_id = %target_id, "Extended Events: a file of the session's set is named after the session's current file: its events are left out and the position stays before it (a gap)");
@@ -847,6 +858,24 @@ async fn read(
     );
     // A cut read ends the cycle: the next read waits a poll interval.
     Ok(b.full && cut.is_none() && clamped.is_none())
+}
+
+/// Whether the re-probe inside a read changed what `before` (the cursor's
+/// pattern and session start before it) described (#276 re-review N1): a
+/// new file pattern (the cursor was reset, as [`super::on_pattern`]
+/// reports it) or another start of the session (beyond the `create_time`
+/// jitter, as [`observe`] reports it). A first pattern or start is not a
+/// change.
+pub(crate) fn reprobe_moved(before: &(Option<String>, Option<i64>), after: &Cursor) -> bool {
+    let pattern = before
+        .0
+        .as_deref()
+        .is_some_and(|p| after.pattern.as_deref() != Some(p));
+    let session = matches!(
+        (before.1, after.session),
+        (Some(a), Some(b)) if !probe::same_start(a, b)
+    );
+    pattern || session
 }
 
 /// The index of the first read position in a file whose order key is
@@ -980,5 +1009,55 @@ mod current_file_tests {
         let (next, gap) = xe_next(&Cursor::default(), &crafted[..2], true);
         assert!(!gap);
         assert_ne!(next.file.as_deref(), Some(crafted[2].0.as_str()));
+    }
+
+    /// #276 re-review N1: the re-probe of a read that finds a new file set
+    /// or another start of the session ends the read without its batch;
+    /// the next read starts from the cursor the re-probe left, not from the
+    /// position computed before it.
+    #[test]
+    fn a_reprobe_that_moves_ends_the_read() {
+        let mut c = Cursor {
+            file: Some("/x/databastion_xe_0_133.xel".to_owned()),
+            offset: 4096,
+            pattern: Some("/x/databastion_xe*.xel".to_owned()),
+            session: Some(1_000_000),
+            ..Cursor::default()
+        };
+        let snapshot = |c: &Cursor| (c.pattern.clone(), c.session);
+        // The batch's next position, computed before the re-probe.
+        let positions = vec![("/x/databastion_xe_0_133.xel".to_owned(), 8192)];
+        let (next, _) = xe_next(&c, &positions, true);
+        assert!(next.file.is_some(), "a position in the old set");
+        // Same set, the same start within the jitter: the batch is kept.
+        let before = snapshot(&c);
+        assert!(!on_pattern(&mut c, "/x/databastion_xe*.xel"));
+        c.session = Some(1_000_000 + 3_000);
+        assert!(!reprobe_moved(&before, &c));
+        // A new file set: the cursor is reset, and the read must end so
+        // that `next` does not overwrite it.
+        let before = snapshot(&c);
+        assert!(on_pattern(&mut c, "/y/databastion_xe*.xel"));
+        assert!(reprobe_moved(&before, &c));
+        assert_eq!((c.file.as_deref(), c.offset), (None, 0));
+        assert_ne!(
+            next.file, c.file,
+            "writing `next` back would undo the reset"
+        );
+        assert_ne!(
+            next.pattern, c.pattern,
+            "the old position belongs to the old set"
+        );
+        // The session started again (same set): the read ends too.
+        let before = snapshot(&c);
+        c.session = Some(9_000_000);
+        assert!(reprobe_moved(&before, &c));
+        // A first pattern or start is not a change.
+        let first = Cursor {
+            pattern: Some("/x/databastion_xe*.xel".to_owned()),
+            session: Some(1),
+            ..Cursor::default()
+        };
+        assert!(!reprobe_moved(&(None, None), &first));
     }
 }

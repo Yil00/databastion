@@ -575,10 +575,10 @@ mod tests {
     /// without a refusal adds nothing.
     #[tokio::test]
     async fn a_down_discovery_node_keeps_its_last_refusal() {
-        let Some(old) = Instant::now().checked_sub(node::REPORT_INTERVAL + Duration::from_secs(60))
-        else {
-            return;
-        };
+        // Evaluated past the report interval: stale, whatever the
+        // machine's uptime (the cache keeps an expiry, not an instant
+        // before the boot).
+        let old = node::REPORT_INTERVAL + Duration::from_secs(60);
         let server = crate::info::Server::Valkey(crate::info::Version(9, 0, 6));
         for (id, refused) in [("check-dn-refused", true), ("check-dn-clean", false)] {
             // Only the target's node answers; the Discovery node is down.

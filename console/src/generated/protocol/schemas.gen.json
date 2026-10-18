@@ -278,7 +278,7 @@
       ]
     },
     "FailureCode": {
-      "description": "Closed set of failure causes. Driver or engine messages are never sent (they can contain values\nor query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no\nTLS-specific code. The reliable sign of a TLS problem is the `stage_tls` label of the\ntarget's `check.stage_failed` note; the code depends on the cause and the engine: usually\n`target_unreachable` (a failed handshake or certificate verification) or `timeout`;\n`internal` for a TLS setup error on some engines and for an OpenLDAP StartTLS anomaly;\n`unsupported` for a SQL Server server that refuses encryption or sends a malformed\nPRELOGIN.\n",
+      "description": "Closed set of failure causes. Driver or engine messages are never sent (they can contain values\nor query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no\nTLS-specific code. The reliable sign of a TLS problem is the `stage_tls` label of the\ntarget's `check.stage_failed` note. A failure at the TLS stage has the same code on every\nengine: `timeout` (or `cancelled`) when the handshake was cut, otherwise\n`target_unreachable` (a failed handshake or certificate verification, a server that refuses\nor does not offer TLS, an anomaly around the negotiation such as bytes after an OpenLDAP\nStartTLS response or a malformed SQL Server PRELOGIN, a local TLS setup error). Agents up\nto 0.8.0 sent `internal` for some of these and `unsupported` for a SQL Server server that\nrefuses encryption or sends a malformed PRELOGIN.\n",
       "type": "string",
       "enum": [
         "target_unreachable",
