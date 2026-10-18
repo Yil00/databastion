@@ -71,6 +71,16 @@ impl Session {
         timeout: Duration,
     ) -> Result<Self, RdError> {
         let io = endpoint.open(tls).await?;
+        Self::handshake(io, user, password, timeout).await
+    }
+
+    /// The handshake of [`Session::open`] on a connection already open.
+    pub(crate) async fn handshake(
+        io: Transport,
+        user: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self, RdError> {
         // Connected, before the first command (review L1).
         let started = std::time::SystemTime::now();
         let mut s = Self {
@@ -131,8 +141,9 @@ impl Session {
     /// account is known to hold `+client|list` ([`own::should_learn`]).
     /// An error reply is recorded (a `NOPERM` is sticky for the server run,
     /// any other error stops the command for the run); a transport failure
-    /// or a timeout too, and is returned: the session's stream may be out
-    /// of step, so the caller must not reuse it.
+    /// or a timeout pauses it for a bounded time (#244 re-review L1), an
+    /// unreadable reply stops it for the run, and either is returned: the
+    /// session's stream may be out of step, so the caller must not reuse it.
     ///
     /// [`own::should_learn`]: crate::audit::own::should_learn
     pub(crate) async fn learn_own_address(
@@ -158,7 +169,16 @@ impl Session {
                 Ok(())
             }
             Err(e) => {
-                own::note_client_list(target_id, run, account, own::ClientList::Unsupported);
+                // A timeout or a transport failure is transient: a bounded
+                // pause (#244 re-review L1). An unreadable or oversized
+                // reply is not: stopped for the run.
+                let what = match e.code {
+                    FailureCode::Timeout | FailureCode::TargetUnreachable => {
+                        own::ClientList::Failed
+                    }
+                    _ => own::ClientList::Unsupported,
+                };
+                own::note_client_list(target_id, run, account, what);
                 Err(e)
             }
         }
