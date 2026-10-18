@@ -32,7 +32,7 @@ import {
   sweepDeadScans,
 } from "@/server/scans";
 import { lockAgentForConflict } from "@/server/rotation";
-import { integrityStats, integrityWriteBudget, recordIntegrityEvent, targetMismatchWriteBudget } from "@/server/integrity";
+import { integrityStats, integrityWriteBudget, recordIntegrityEvent, targetMismatchChangeBudget, targetMismatchWriteBudget } from "@/server/integrity";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { pgBossOptions } from "@/worker/queues";
@@ -102,6 +102,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     jobsPollsPerAgent.clear();
     integrityWriteBudget.clear();
     targetMismatchWriteBudget.clear();
+    targetMismatchChangeBudget.clear();
   });
 
   describe("POST /enroll", () => {
@@ -805,7 +806,14 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         .from(securityEvents)
         .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
       expect(events).toHaveLength(1);
-      expect(events[0]?.details).toMatchObject({ endpoint: "heartbeat", status: 200, details_count: 3, pointer: "/targets/1/audit_source", keyword: "const" });
+      expect(events[0]?.details).toMatchObject({
+        endpoint: "heartbeat",
+        status: 200,
+        details_count: 3,
+        pointer: "/targets/1/audit_source",
+        keyword: "const",
+        target_ids: "cache-2,pg-odd,sales",
+      });
       // A conforming heartbeat records no integrity event.
       const ok = { ...body, targets: body.targets.filter((_t, i) => ![1, 4, 5].includes(i)) };
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: ok }))).status).toBe(200);
@@ -857,6 +865,38 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       const rows = (await mismatchRows()).sort((a, b) => b.at.getTime() - a.at.getTime());
       expect(rows).toHaveLength(2);
       expect(rows[0]?.details).toMatchObject({ suppressed_before: integrityWriteBudget.limit + 4 });
+    });
+
+    it("PR #274 review L1: a mismatch that starts on another target within the hour is recorded at once, with the target ids", async () => {
+      const auth = await enroll();
+      const t = (target_id: string, audit_source: string) => ({ target_id, engine: "postgres", reachable: true, audit_level: "limited", audit_source });
+      const hb = (targets: ReturnType<typeof t>[]) => ({ ...MINIMAL_HEARTBEAT, connectors: ["postgres", "redis"], targets });
+      const rows = async () =>
+        (
+          await getDb()
+            .select()
+            .from(securityEvents)
+            .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")))
+        )
+          .sort((a, b) => a.at.getTime() - b.at.getTime())
+          .map((r) => (r.details as { target_ids: string }).target_ids);
+      const send = async (targets: ReturnType<typeof t>[]) =>
+        expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb(targets) }))).status).toBe(200);
+      const a = [t("pg-a", "redis_slowlog"), t("pg-b", "pg_stat_statements")];
+      const ab = [t("pg-a", "redis_slowlog"), t("pg-b", "redis_slowlog")];
+      await send(a);
+      await send(a);
+      expect(await rows()).toEqual(["pg-a"]);
+      // The second target starts mismatching within the hour: recorded at once.
+      await send(ab);
+      await send(ab);
+      expect(await rows()).toEqual(["pg-a", "pg-a,pg-b"]);
+      // Back to the first set: a change again.
+      await send(a);
+      expect(await rows()).toEqual(["pg-a", "pg-a,pg-b", "pg-a"]);
+      // An agent alternating at every heartbeat is bounded by the change budget (3 used above).
+      for (let i = 0; i < targetMismatchChangeBudget.limit + 4; i++) await send(i % 2 === 0 ? ab : a);
+      expect(await rows()).toHaveLength(targetMismatchChangeBudget.limit);
     });
 
     it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {

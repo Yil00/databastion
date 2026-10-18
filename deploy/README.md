@@ -124,9 +124,9 @@ part with PostgreSQL `lower`, which folds letters beyond ASCII only under a UTF-
 The bundled PostgreSQL image creates its database with `en_US.utf8`. With your own PostgreSQL,
 create the console database with a UTF-8 `LC_CTYPE` (for example `en_US.UTF-8` or `C.UTF-8`), not
 `C` or `POSIX`. Check it with `SELECT datctype FROM pg_database WHERE datname = current_database();`.
-Under `C` / `POSIX` the matching still works, but for each batch of events that names a non-ASCII
-object the worker then reads, of the targets of that batch, every finding whose object name is not
-pure ASCII (and the ASCII names that match), which is slower on large installations.
+Under `C` / `POSIX` the matching still works, but for each batch of events the worker then reads,
+of the targets of that batch, every finding whose object name is not pure ASCII (and the ASCII
+names that match), which is slower on large installations.
 
 **Your own reverse proxy instead of Caddy**: `cp docker-compose.own-proxy.example.yml
 compose.own-proxy.yaml`, add `COMPOSE_FILE=compose.yaml:compose.own-proxy.yaml` to `.env`, start

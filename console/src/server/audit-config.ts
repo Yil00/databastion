@@ -434,6 +434,7 @@ export async function configureAudit(
               previous_objects: result.change.previousCount,
               next_objects: result.change.nextCount,
               removed_objects: result.change.removed,
+              min_rows_warning: result.minRowsWarning,
             }
           : {}),
       },

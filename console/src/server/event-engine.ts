@@ -27,7 +27,7 @@ import {
   type EventObject,
 } from "@/lib/event-model";
 import { logger } from "@/lib/logger";
-import { FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
+import { dedupDatabaseName, FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
 import { unregisteredSignals } from "@/lib/protocol/signals";
 import {
@@ -44,6 +44,7 @@ import { sha256Hex } from "./crypto";
 import { baselinesPerTarget, clientNetwork, eventIncidentsPerPolicyHour, principalLabel } from "./events";
 import type { Tx } from "./findings";
 import { enqueueIncidentNotifications } from "./notifications";
+import { processGlobal } from "./process-global";
 
 /**
  * Correlation of Audit access events (P4-C, worker). Pending events (`evaluated_at` null) are
@@ -179,17 +180,31 @@ async function lowerFoldsUnicode(tx: Tx): Promise<boolean> {
   return r.rows[0]?.folds === true;
 }
 
+/**
+ * {@link lowerFoldsUnicode} once per console database and process (the character type of a
+ * database cannot change): keyed by the `Database` handle, so a new pool probes again.
+ */
+const lowerFoldsCache = processGlobal("eventEngine.lowerFoldsUnicode", () => new WeakMap<object, boolean>());
+
+async function cachedLowerFoldsUnicode(db: Database, tx: Tx): Promise<boolean> {
+  const known = lowerFoldsCache.get(db);
+  if (known !== undefined) return known;
+  const folds = await lowerFoldsUnicode(tx);
+  lowerFoldsCache.set(db, folds);
+  return folds;
+}
+
 /** `foldName` in SQL: `replace(lower(rtrim(x)), 'ς', 'σ')`, both letters bound as parameters. */
 const sqlFold = (x: SQL) => sql`replace(lower(rtrim(${x})), ${FINAL_SIGMA}::text, ${SIGMA}::text)`;
 
-const nonAscii = (s: string) => [...s].some((c) => c.charCodeAt(0) > 0x7f);
-
 /**
  * The name pre-filter of `loadObjectHits`:
- * - `fold`: when the database's `lower` folds Unicode, or every event name is ASCII: every event
- *   name and its `foldName`, both compared through `sqlFold` (as before the C-ctype change);
- * - `ascii`: when the database's `lower` folds ASCII only (`C` / `POSIX` ctype) and a name holds
- *   another character (security review L1). The SQL `lower` is then exact on ASCII names only:
+ * - `fold`: when the database's `lower` folds Unicode: every event name and its `foldName`, both
+ *   compared through `sqlFold`;
+ * - `ascii`: when the database's `lower` folds ASCII only (`C` / `POSIX` ctype; security review
+ *   L1), for every chunk (PR #274 review L2: a finding whose non-ASCII name folds to ASCII in
+ *   JavaScript, such as the Kelvin sign `K` in `Kunden`, also matches an ASCII event name). The
+ *   SQL `lower` is then exact on ASCII names only:
  *   the pre-filter keeps the findings whose ASCII name, through `sqlFold`, equals the
  *   JavaScript `foldName` of an event name (`folded`), and every finding whose name holds a
  *   non-ASCII character, left to `objectKey` (JavaScript `foldName`) to decide. Together with the
@@ -199,7 +214,7 @@ const nonAscii = (s: string) => [...s].some((c) => c.charCodeAt(0) > 0x7f);
 export type NamePrefilter = { kind: "fold"; names: string[] } | { kind: "ascii"; folded: string[] };
 
 export function prefilterNames(objectNames: readonly string[], unicodeLower: boolean): NamePrefilter {
-  if (!unicodeLower && objectNames.some(nonAscii)) return { kind: "ascii", folded: [...new Set(objectNames.map(foldName))] };
+  if (!unicodeLower) return { kind: "ascii", folded: [...new Set(objectNames.map(foldName))] };
   return { kind: "fold", names: [...new Set(objectNames.flatMap((n) => [n, foldName(n)]))] };
 }
 
@@ -214,20 +229,21 @@ const NON_ASCII_RE = "[^\\x01-\\x7f]";
  * for its `foldName`, so both sides go through the same PostgreSQL `lower` and the pre-filter
  * keeps every finding whose object name differs by case or trailing spaces; `objectKey` then
  * decides. PostgreSQL folds non-ASCII letters only under a UTF-8 character type (deploy/README.md:
- * the console database needs one, as the images' `en_US.utf8`); under `C` / `POSIX` a chunk with a
- * non-ASCII name uses the `ascii` pre-filter of {@link prefilterNames}, restricted to the chunk's
- * (agent, target) pairs. No index covers `object_name`, so the expression costs no index.
+ * the console database needs one, as the images' `en_US.utf8`); under `C` / `POSIX` every chunk
+ * uses the `ascii` pre-filter of {@link prefilterNames}, restricted to the chunk's (agent, target)
+ * pairs. `unicodeLower`: the probe's answer when the caller has it (cached), else probed here. No index covers `object_name`, so the expression costs no index.
  * Exported for the tests (event-engine-c-locale.test.ts).
  */
 export async function loadObjectHits(
   tx: Tx,
   events: readonly Pick<PendingEvent, "agentId" | "targetId" | "objects">[],
+  unicodeLower?: boolean,
 ): Promise<Map<string, ClassifierHit[]>> {
   const agentIds = [...new Set(events.map((e) => e.agentId))];
   const objectNames = [...new Set(events.flatMap((e) => e.objects.map((o) => o.object)))];
   const out = new Map<string, ClassifierHit[]>();
   if (objectNames.length === 0) return out;
-  const pre = prefilterNames(objectNames, !objectNames.some(nonAscii) || (await lowerFoldsUnicode(tx)));
+  const pre = prefilterNames(objectNames, unicodeLower ?? (await lowerFoldsUnicode(tx)));
   let sameName: SQL;
   if (pre.kind === "fold") {
     sameName = sql`${sqlFold(sql`${findings.objectName}`)} in (${sql.join(
@@ -413,8 +429,9 @@ function rowsSinceFalsePositiveSql() {
 }
 
 /**
- * The latest incident of `key`. `legacyKey`: the key of the same event before the database name
- * was folded (ADR-0021 implementation note of 2026-10-18), given only when it differs. Incidents
+ * The latest incident of `key`. `legacyKey`: the key of the same event before trailing spaces were
+ * dropped from the database name (ADR-0021 implementation note of 2026-10-18), given only when it
+ * differs. Incidents
  * opened by an earlier console under it are found too, an active one first, so an incident of the
  * hour of the upgrade keeps collecting its events instead of a second one opening.
  */
@@ -545,8 +562,8 @@ async function applyEventPolicy(
   const oi = dedupObject(kept, ev.objectSensitivities);
   const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
-  // ADR-0021 decision 6, implementation note of 2026-10-18: the database part hashes the folded
-  // name (`foldName`, as the object matching of N1), so `CRM` and `crm` share one incident.
+  // ADR-0021 decision 6, implementation note of 2026-10-18 (PR #274 review M1): the database part
+  // keeps the case as sent and drops trailing spaces only on the engines that ignore them.
   const keyOf = (databaseKey: string) =>
     eventDedupKey({
       policyId: policy.id,
@@ -562,8 +579,11 @@ async function applyEventPolicy(
       databaseKey,
       bucket,
     });
-  const key = keyOf(database === null ? "-" : sha256Hex(foldName(database)));
-  const legacyKey = database === null || foldName(database) === database ? null : keyOf(sha256Hex(database));
+  const keyed = database === null ? null : dedupDatabaseName(database, facts.engine);
+  const key = keyOf(keyed === null ? "-" : sha256Hex(keyed));
+  // Consoles before the note hashed the name as sent: only a name with trailing spaces on such an
+  // engine has another key, looked up so an incident open across the upgrade keeps its events.
+  const legacyKey = database === null || keyed === database ? null : keyOf(sha256Hex(database));
   const latest = await latestIncident(tx, state, key, legacyKey);
   if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) {
     await rematch(tx, latest, e, facts);
@@ -746,7 +766,7 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       .from(agentTargets)
       .where(inArray(agentTargets.agentId, [...new Set(events.map((e) => e.agentId))]));
     const engines = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, t.engine]));
-    const hits = await loadObjectHits(tx, events);
+    const hits = await loadObjectHits(tx, events, await cachedLowerFoldsUnicode(db, tx));
     const active = await loadEventPolicies(tx);
     const exceptions = await loadExceptions(tx);
     const baselines = await loadBaselines(tx, events);

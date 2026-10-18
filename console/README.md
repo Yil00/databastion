@@ -652,8 +652,11 @@ per 10 minutes; beyond, they are counted, logged once per window, and the next r
 agent carries the count (`suppressed_before`). The budget is shared by all console processes (see "Shared
 rate limits"; per-process fallback if the shared store fails). `agent.target_mismatch` has a budget
 of its own (#235 review N1), since it is detected at every heartbeat for as long as the mismatch
-lasts: one row per agent and hour, the heartbeats in between counted in the next row's
-`suppressed_before`; it never uses the 20 rows of the other kinds.
+lasts: one row per agent and hour while the set of mismatched targets stays the same, and a row at
+once when it differs from the last recorded one (at most 12 such rows per agent and hour, PR #274
+review L1); the heartbeats in between are counted in the next row's `suppressed_before`, and its
+details carry `target_ids` (the sorted, comma-separated ids of the mismatched targets). It never
+uses the 20 rows of the other kinds.
 
 ## Metrics
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
@@ -1035,13 +1038,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   and stored event, this process). Every `signature.*` id stays severe (cap bypass), registered or
   not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
   them.
-- **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the folded name, or ->|hour:<UTC hour of the event ts>`.
-  The database name is folded as object names are (`foldName`: trailing spaces dropped, Unicode
-  lowercase, final sigma read as `σ`), so `CRM`, `crm` and `crm ` share one incident per hour
-  (ADR-0021 implementation note of 2026-10-18). Consoles before it hashed the name as sent: an
-  event whose name differs from its fold also looks up the key of the name as sent (one query for
-  both keys, an active incident first), so an incident opened before the upgrade keeps its events
-  of that hour; another spelling of that database in the same hour opens one more incident, once.
+- **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
+  The name keeps its case on every engine (case can tell databases apart), and drops trailing
+  spaces only on `sqlserver`, `mysql` and `mariadb`, as location exceptions (`dedupDatabaseName`,
+  ADR-0021 implementation note of 2026-10-18): on MySQL `crm ` and `crm` share one incident, on
+  PostgreSQL they do not, and `CRM` and `crm` never do. Consoles before it hashed the name as
+  sent: for a name with trailing spaces on these engines the key of the name as sent is also
+  looked up (one query for both keys, an active incident first), so an incident opened before the
+  upgrade keeps its events of that hour.
   For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot

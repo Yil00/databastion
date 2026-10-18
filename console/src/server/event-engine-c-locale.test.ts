@@ -19,9 +19,10 @@ import { drainPolicyWork } from "./incidents";
  * character and lets `objectKey` (JavaScript `foldName`) decide.
  */
 describe("sensitivity name pre-filter (pure)", () => {
-  it("keeps every name and its fold; the ASCII form under an ASCII-only `lower` with a non-ASCII name", () => {
+  it("keeps every name and its fold; the ASCII form under an ASCII-only `lower`", () => {
     expect(prefilterNames(["CLIENTS ", "orders"], true)).toEqual({ kind: "fold", names: ["CLIENTS ", "clients", "orders"] });
-    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual({ kind: "fold", names: ["CLIENTS ", "clients", "orders"] });
+    // PR #274 review L2: under an ASCII-only `lower`, the ASCII form for every chunk.
+    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual({ kind: "ascii", folded: ["clients", "orders"] });
     expect(prefilterNames(["ΠΕΛΑΤΕΣ"], true)).toEqual({ kind: "fold", names: ["ΠΕΛΑΤΕΣ", "πελατεσ"] });
     // Phase 9 follow-up after N1: the JavaScript folds, compared with the SQL fold of ASCII names.
     expect(prefilterNames(["clients", "CLIENTÈLE", "Clients "], false)).toEqual({ kind: "ascii", folded: ["clients", "clientèle"] });
@@ -124,5 +125,43 @@ describe.skipIf(!hasDb)("sensitivity on a console database with the C character 
     // Non-ASCII names of the chunk's targets are all read (JavaScript decides); ASCII ones only
     // when they fold to an event name; nothing of the other target of the same agent.
     expect(read.sort()).toEqual(["pg-prod-1/clients", "pg-prod-1/clientèle"]);
+  });
+  it("PR #274 review L2: an ASCII event name gets the sensitivity of a finding spelled with the Kelvin sign", async () => {
+    const auth = await enroll();
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: HEARTBEAT }))).status).toBe(200);
+    await enqueueJob(getDb(), {
+      agentId: auth.agentId,
+      type: "discovery.scan",
+      targetId: "pg-prod-1",
+      classifiersVersion: "2026.09.1",
+      params: { sample_rows: 200, max_duration_s: 900 },
+    });
+    const { jobs } = (await (await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).json()) as { jobs: { job_id: string }[] };
+    // `\u212a` is the Kelvin sign: JavaScript lowercases it to an ASCII `k`, `C`-ctype `lower` does not.
+    const kunden = {
+      target_id: "pg-prod-1",
+      location: { engine: "postgres", database: "crm", schema: "public", object: "\u212aunden", field: "email" },
+      classifier: "pii.email",
+      confidence: 1,
+      sampled: 200,
+      matched: 150,
+    };
+    const body = { batch_id: uuidv7(), job_id: jobs[0]?.job_id, classifiers_version: "2026.09.1", findings: [kunden] };
+    expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+    const event = {
+      target_id: "pg-prod-1",
+      ts: "2026-09-27T11:05:00.000Z",
+      principal: { db_user: "backup" },
+      action: "read",
+      objects: [{ database: "crm", schema: "public", object: "kunden" }],
+      rows: 99,
+      signals: [],
+      source: "pgaudit",
+      aggregated_count: 1,
+    };
+    expect((await handleEvents(agentRequest("POST", "/events", { auth, body: { batch_id: uuidv7(), events: [event] } }))).status).toBe(202);
+    await drainPolicyWork(getDb());
+    const [row] = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId));
+    expect(row?.sensitivity).toBe(3);
   });
 });

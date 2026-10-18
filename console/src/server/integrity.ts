@@ -1,3 +1,5 @@
+import { and, desc, eq, sql } from "drizzle-orm";
+
 import type { Database } from "@/db/client";
 import { securityEvents } from "@/db/schema";
 import { logger } from "@/lib/logger";
@@ -18,7 +20,10 @@ import { notifyIntegrityEvent } from "./system-alerts";
  *
  * Details are console-computed scalars only: the endpoint, the HTTP status, the number of error
  * details and the first `{pointer, keyword}` (pointers are built from contract property names and
- * array indices only, see `validate.ts`). Never a submitted value, sample or fingerprint.
+ * array indices only, see `validate.ts`); for `target_mismatch` also `target_ids`, the sorted,
+ * comma-separated ids of the mismatched targets (agent-declared identifiers, validated against
+ * the contract `TargetId` slug pattern, which has no comma; at most `MAX_VALIDATION_DETAILS`).
+ * Never another submitted value, a sample or a fingerprint.
  *
  * A misbehaving agent can send such batches in a loop: writes are bounded per agent
  * (`integrityWriteBudget`); beyond it, events are only counted (`integrityStats.suppressed`) and
@@ -28,8 +33,11 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * detected at every heartbeat for as long as the target's `audit_source` does not serve its
  * engine, so in the shared budget a single persistent mismatch would use the slots of the
  * other kinds (a rejected findings batch, a `batch_conflict`, a foreign target) every window.
- * It is recorded at most once per agent and hour; the heartbeats in between are counted
- * (`suppressed_before` of the next `target_mismatch` row, separately from the other kinds).
+ * It is recorded once per agent and hour while the set of mismatched targets stays the same, and
+ * at once when that set differs from the last recorded row's (PR #274 review L1: a mismatch that
+ * starts on another target within the hour is not hidden), within `targetMismatchChangeBudget`;
+ * the heartbeats in between are counted (`suppressed_before` of the next `target_mismatch` row,
+ * separately from the other kinds). The system alert stays at most one per agent, kind and hour.
  */
 export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target" | "target_mismatch";
 
@@ -54,11 +62,35 @@ export const integrityWriteBudget = RateLimiter.shared("integrity.writes_per_age
  * itself is stored without `audit_source` at every heartbeat, whatever this budget decides.
  */
 export const targetMismatchWriteBudget = RateLimiter.shared("integrity.target_mismatch_per_agent", 1, 60 * 60_000, "local");
+/**
+ * `target_mismatch` rows written per agent and hour because the set of mismatched targets changed
+ * (review L1): bounds an agent that alternates between sets at every heartbeat.
+ */
+export const targetMismatchChangeBudget = RateLimiter.shared("integrity.target_mismatch_changes", 12, 60 * 60_000, "local");
 export const integrityStats = { recorded: 0, suppressed: 0 };
 
-/** The write budget of an integrity kind, and the namespace of its suppression counters. */
-function budgetOf(kind: IntegrityKind): { budget: RateLimiter; scope: string } {
-  return kind === "target_mismatch" ? { budget: targetMismatchWriteBudget, scope: "target_mismatch" } : { budget: integrityWriteBudget, scope: "shared" };
+/** The comma-separated, sorted set of mismatched target ids (`TargetId` slugs have no comma). */
+function targetIdSet(ids: readonly string[] | undefined): string {
+  return [...new Set(ids ?? [])].sort().join(",");
+}
+
+/**
+ * Whether a `target_mismatch` row may be written: when the set of mismatched targets differs from
+ * the agent's last recorded row, within the change budget (the hourly slot is used as well, so the
+ * next heartbeat with the same set waits for the next hour); otherwise within the hourly budget.
+ */
+async function reserveTargetMismatch(db: Database, agentId: string, ids: string): Promise<boolean> {
+  const [last] = await db
+    .select({ ids: sql<string | null>`${securityEvents.details}->>'target_ids'` })
+    .from(securityEvents)
+    .where(and(eq(securityEvents.agentId, agentId), eq(securityEvents.kind, "agent.target_mismatch")))
+    .orderBy(desc(securityEvents.at))
+    .limit(1);
+  if (last === undefined || last.ids !== ids) {
+    await targetMismatchWriteBudget.reserveShared(agentId);
+    return (await targetMismatchChangeBudget.reserveShared(agentId)).ok;
+  }
+  return (await targetMismatchWriteBudget.reserveShared(agentId)).ok;
 }
 /** Log de-duplication only: per process by design (each process logs its own suppressions). */
 const warnedSuppression = new RateLimiter(1, 10 * 60_000);
@@ -75,13 +107,17 @@ export interface IntegrityEvent {
   endpoint: "findings" | "events" | "heartbeat";
   status: number;
   details?: readonly ValidationDetail[];
+  /** `target_mismatch`: the ids of the mismatched targets (contract `TargetId`). */
+  targetIds?: readonly string[];
   ip: string | null;
 }
 
 export async function recordIntegrityEvent(db: Database, event: IntegrityEvent): Promise<boolean> {
-  const { budget, scope } = budgetOf(event.kind);
-  const counterKey = `${scope}:${event.agentId}`;
-  if (!(await budget.reserveShared(event.agentId)).ok) {
+  const mismatch = event.kind === "target_mismatch";
+  const ids = mismatch ? targetIdSet(event.targetIds) : "";
+  const counterKey = `${mismatch ? "target_mismatch" : "shared"}:${event.agentId}`;
+  const allowed = mismatch ? await reserveTargetMismatch(db, event.agentId, ids) : (await integrityWriteBudget.reserveShared(event.agentId)).ok;
+  if (!allowed) {
     integrityStats.suppressed++;
     if (suppressedSince.has(counterKey) || suppressedSince.size < MAX_SUPPRESSED_KEYS) {
       suppressedSince.set(counterKey, (suppressedSince.get(counterKey) ?? 0) + 1);
@@ -102,6 +138,7 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
     pointer: first?.pointer ?? null,
     keyword: first?.keyword ?? null,
     suppressed_before: suppressedSince.get(counterKey) ?? 0,
+    ...(mismatch ? { target_ids: ids } : {}),
   };
   suppressedSince.delete(counterKey);
   await db.transaction(async (tx) => {
