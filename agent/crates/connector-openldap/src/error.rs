@@ -57,7 +57,7 @@ impl LdError {
     /// A local or transport failure: the connection is unusable.
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             result: None,
             stage,
             fatal: true,
@@ -72,7 +72,7 @@ impl LdError {
             Stage::Connect | Stage::Tls | Stage::SessionSetup | Stage::Auth | Stage::Secret
         );
         Self {
-            code: failure_of(code),
+            code: at_stage(failure_of(code), stage),
             result: Some(code),
             stage,
             fatal: setup || matches!(code, 1 | 2 | 52 | 80),
@@ -112,6 +112,16 @@ pub(crate) fn failure_of(code: u32) -> FailureCode {
         // noSuchObject.
         32 => FailureCode::UnknownTarget,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

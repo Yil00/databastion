@@ -205,6 +205,9 @@ async fn start_tls_refuses_bytes_after_the_response() {
     }));
     let e = conn::start_tls(client, timeouts()).await.unwrap_err();
     assert_eq!(e.stage, Stage::Tls);
+    // An injection indicator, not an agent bug: the same code as any TLS
+    // failure (P9-A lot 1 contract review L2).
+    assert_eq!(e.code, FailureCode::TargetUnreachable);
     // Refused: no fallback.
     let (client, _) = serve(Box::new(|id, _| {
         vec![encode::extended_response(id, 52, None)]
@@ -212,6 +215,7 @@ async fn start_tls_refuses_bytes_after_the_response() {
     let e = conn::start_tls(client, timeouts()).await.unwrap_err();
     assert_eq!(e.stage, Stage::Tls);
     assert_eq!(e.result, Some(52));
+    assert_eq!(e.code, FailureCode::TargetUnreachable);
 }
 
 #[tokio::test]

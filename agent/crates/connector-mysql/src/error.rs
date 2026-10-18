@@ -65,7 +65,7 @@ pub(crate) struct MyError {
 impl MyError {
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             errno: None,
             sqlstate: None,
             stage,
@@ -81,7 +81,7 @@ impl MyError {
             Stage::Connect | Stage::Auth | Stage::Tls | Stage::SessionSetup
         );
         Self {
-            code: failure_of(e.errno),
+            code: at_stage(failure_of(e.errno), stage),
             errno: Some(e.errno),
             sqlstate: e.sqlstate().map(str::to_owned),
             stage,
@@ -165,6 +165,16 @@ pub(crate) fn failure_of(errno: u16) -> FailureCode {
         // ER_CONNECTION_KILLED, ER_BAD_DB_ERROR
         1130 | 1129 | 1053 | 1927 | 1049 => FailureCode::TargetUnreachable,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

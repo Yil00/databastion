@@ -1314,6 +1314,7 @@ pub(crate) mod tests {
         });
         let e = s.prelogin().await.unwrap_err();
         assert_eq!(e.stage, Stage::Tls);
+        assert_eq!(e.code, FailureCode::TargetUnreachable);
         assert!(s.is_poisoned());
         drop(srv.await.unwrap());
         // Without trailing bytes the response is accepted and nothing is
