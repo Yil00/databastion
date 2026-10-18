@@ -145,10 +145,21 @@ export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targe
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
+/** Indices of the targets pointed at by `targetSourceDetails` pointers. */
+function mismatchedIndices(details: readonly ValidationDetail[]): Set<number> {
+  return new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
+}
+
+/** The ids (contract `TargetId`) of the targets pointed at by `details` (#274 review L1). */
+export function mismatchedTargetIds(hb: Pick<Schemas["HeartbeatRequest"], "targets">, details: readonly ValidationDetail[]): string[] {
+  const at = mismatchedIndices(details);
+  return hb.targets.filter((_t, i) => at.has(i)).map((t) => t.target_id);
+}
+
 /** The heartbeat with `audit_source` removed from the targets pointed at by `details`. */
 export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], details: readonly ValidationDetail[]): Schemas["HeartbeatRequest"] {
   if (details.length === 0) return hb;
-  const drop = new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
+  const drop = mismatchedIndices(details);
   return {
     ...hb,
     targets: hb.targets.map((t, i) => {

@@ -354,6 +354,56 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
     }
 }
 
+/// #237: a declared Discovery node that is down does not make the target
+/// unreachable: the target's node answers, so `check()` reports it
+/// reachable, with the Discovery node's failure as a `check.stage_failed`
+/// note and as the target's failure; the scan fails.
+#[tokio::test]
+async fn a_discovery_node_down_is_a_note_not_an_unreachable_target() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // Nothing listens on port 1.
+    let t = target(
+        "valkey",
+        TargetEngine::Valkey,
+        "databastion",
+        "discovery_node: {host: 127.0.0.1, port: 1}",
+    );
+    let h = RedisConnector::new().check(&t).await;
+    let c = codes(&h);
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(h.failure, Some(FailureCode::TargetUnreachable), "{c:?}");
+    let stage = databastion_core::NoteLabel::stage(crate::error::Stage::Connect.as_str());
+    assert!(
+        h.notes
+            .iter()
+            .any(|n| n.code() == NoteCode::CheckStageFailed && n.labels().contains(&stage)),
+        "{c:?}"
+    );
+    // The target's node was evaluated: its notes are there.
+    assert!(c.contains(&NoteCode::AuditStreamNotAvailable), "{c:?}");
+    assert!(
+        c.contains(&NoteCode::PrivilegeTicketCredentialsReadable),
+        "{c:?}"
+    );
+    // Discovery reads the Discovery node: it cannot run.
+    let s = scan(&t).await;
+    assert!(
+        matches!(
+            s.result,
+            Err(ConnectorError::Target {
+                code: FailureCode::TargetUnreachable,
+                ..
+            })
+        ),
+        "{:?}",
+        s.result
+    );
+    assert!(s.findings.is_empty());
+}
+
 /// The contract findings, as the core would send them.
 fn findings_json(findings: &[MaskedFinding], engine: TargetEngine) -> Vec<serde_json::Value> {
     databastion_core::test_support::contract_findings_json(findings, engine)
@@ -1635,6 +1685,118 @@ async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
         );
         assert!(
             budgets.iter().any(|k| k.starts_with("db0\u{0}")),
+            "{name}: {budgets:?}"
+        );
+    }
+}
+
+/// #275 review L6: with merged `*:*` families (`phone:<n>` first, then
+/// `addressbook:<n>`, so the late family is sampled only through the
+/// round-robin), the scan's own reads under Audit are never reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_reads_of_merged_families_are_not_reported() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // Few sample keys per pattern, so the round-robin decides which keys
+    // are read.
+    const MAX_ROWS: u32 = 4;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "databases: [7]").await;
+        let mut seed: Vec<Vec<Vec<u8>>> = vec![vec![b"SELECT".to_vec(), b"7".to_vec()]];
+        seed.push(vec![b"FLUSHDB".to_vec()]);
+        for i in 1..=40 {
+            seed.push(vec![
+                b"SET".to_vec(),
+                format!("phone:{i}").into_bytes(),
+                b"v".to_vec(),
+            ]);
+        }
+        for i in 1..=3 {
+            seed.push(vec![
+                b"SET".to_vec(),
+                format!("addressbook:{i}").into_bytes(),
+                b"v".to_vec(),
+            ]);
+        }
+        let cmds: Vec<Vec<&[u8]>> = seed
+            .iter()
+            .map(|c| c.iter().map(Vec::as_slice).collect())
+            .collect();
+        admin(&t, &cmds).await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-merged-{}-{name}",
+            std::process::id()
+        ));
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            let limits = Limits {
+                max_sample_rows: MAX_ROWS,
+                ..unpaced()
+            };
+            // The patterns the stream maps keys to.
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &limits, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+
+            std::fs::create_dir_all(&dir).unwrap();
+            let audit_limits = Limits {
+                min_audit_poll_interval_s: 1,
+                max_sample_rows: MAX_ROWS,
+                ..Limits::default()
+            };
+            let cfg = databastion_core::AuditConfig::local(&t, 1, &audit_limits)
+                .with_state_dir(dir.clone());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{:?}", stream.await);
+            // The agent's own scan while the stream polls.
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &limits, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            (connector, events)
+        })
+        .await;
+        admin(&t, &[vec![b"SELECT", b"7"], vec![b"FLUSHDB"]]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let (connector, events) = match run {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
+        let json = events_json(&events);
+        assert!(json.is_empty(), "{name}: {json:#?}");
+        // Not vacuous: the scan's reads were charged to the merged pattern.
+        let budgets = connector
+            .state
+            .audit
+            .own_usage(&t.id)
+            .lock()
+            .unwrap()
+            .budgeted_objects();
+        assert!(
+            budgets.iter().any(|k| k == "db7\u{0}\u{0}*:*"),
             "{name}: {budgets:?}"
         );
     }

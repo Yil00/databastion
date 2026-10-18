@@ -85,6 +85,19 @@ export function foldName(s: string): string {
  */
 export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb"];
 
+/**
+ * Database name as hashed in the access-event incident dedup key (ADR-0021 decision 6,
+ * implementation note of 2026-10-18, review M1 of PR #274): the case as sent on every engine,
+ * since case can tell two databases apart (PostgreSQL quoted names, SQL Server under a
+ * case-sensitive collation, MySQL / MariaDB with `lower_case_table_names=0`), and trailing spaces
+ * dropped only on {@link TRAILING_SPACE_BLIND_ENGINES}, as location exceptions. A merged key would
+ * link a later dump of another database to a closed incident; a null or unknown engine is never
+ * loosened.
+ */
+export function dedupDatabaseName(name: string, engine: string | null): string {
+  return engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) ? trimTrailingSpaces(name) : name;
+}
+
 export function exceptionGlobOptions(engine: string | null): GlobOptions {
   return { ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) };
 }

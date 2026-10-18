@@ -27,6 +27,7 @@ use crate::check::{CheckState, ScanFacts};
 use crate::cmd::{Cmd, InfoSection, MEMBERS_PER_KEY, SCAN_COUNT, VALUE_BYTES};
 use crate::conn::{MAX_PIPELINE, Session};
 use crate::error::{RdError, Stage};
+use crate::families::Families;
 use crate::guard;
 use crate::info;
 use crate::node::{self, NodeInfo, Refusal, Which};
@@ -197,7 +198,7 @@ pub(crate) async fn discover(
     // (decision 4; security review M2).
     let report = match state
         .reports
-        .of_session(&mut session, target, Which::Discovery, info.server, timeout)
+        .of_session(&mut session, target, Which::Discovery, info, timeout)
         .await
     {
         Ok(r) => r,
@@ -345,6 +346,8 @@ async fn walk(
     let max_calls = (4 * max_keys / u64::from(SCAN_COUNT)).max(1);
     let stores = job.cas_stores();
     let mut builder = PatternBuilder::new(job.sample_rows() as usize);
+    // Round-robin sampling across the families a pattern merges (#237).
+    let mut families = Families::new(job.sample_rows() as usize);
     let (mut cursor, mut calls, mut examined) = (0u64, 0u64, 0u64);
     let mut limited = false;
     let mut cov = ScanCoverage::default();
@@ -391,6 +394,7 @@ async fn walk(
         }
         examined += batch.listed;
         for (raw, kind) in batch.keys {
+            families.add(raw.expose(), kind as u8);
             builder.add(raw.expose(), keys::split_key(raw.expose()), kind as u8);
         }
         cursor = batch.next;
@@ -411,7 +415,9 @@ async fn walk(
     let _ = info;
     sink.add_coverage(cov);
     let complete = !limited && builder.overflow() == 0;
-    Ok(Some((builder.finish(), complete)))
+    let mut emitted = builder.finish();
+    families.rebalance(&mut emitted);
+    Ok(Some((emitted, complete)))
 }
 
 enum Walk {
