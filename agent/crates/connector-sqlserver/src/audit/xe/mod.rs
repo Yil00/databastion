@@ -819,8 +819,17 @@ async fn read(
             .and_then(|p| p.dispatch_latency)
             .unwrap_or(events::MAX_DEFERRAL);
         let bound = latency.min(st.poll.saturating_mul(2));
-        cut = st.deferrals.cut(&records, statman, Instant::now(), bound);
+        // A full read: more rows follow on the server (its index space is
+        // every row it returned and read).
+        let full = b.full.then_some(positions.len());
+        cut = st
+            .deferrals
+            .cut(&records, statman, Instant::now(), bound, full);
     }
+    // A deferral waits a poll interval; a cut of a full read reads on at
+    // once.
+    let waits = cut.is_some_and(|c| c.wait);
+    let cut = cut.map(|c| c.at);
     if let Some(at) = cut {
         records.retain(|r| r.index < at);
         for r in &mut records {
@@ -878,8 +887,10 @@ async fn read(
         gap,
         b.out_of_order,
     );
-    // A cut read ends the cycle: the next read waits a poll interval.
-    Ok(b.full && cut.is_none() && clamped.is_none())
+    // A deferral ends the cycle: the next read waits a poll interval. A
+    // full read cut before a build whose pair may be in the rows that
+    // follow reads on (it moved the position by half the read at least).
+    Ok(b.full && !waits && clamped.is_none())
 }
 
 /// Whether the re-probe inside a read changed what `before` (the cursor's

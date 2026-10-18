@@ -544,36 +544,72 @@ const DEFERRAL_KEEP: Duration = Duration::from_secs(600);
 /// 2026-10-18 for any session's build), in memory only: a read that holds
 /// one ends just before it (or before one of its internal statements that
 /// comes earlier in file order), so that the next read, which starts
-/// there, can pair it. One deferral per build (by its causality activity
-/// and sequence number), for at most its bound from when it was first
-/// seen; after that, the build is handled as it stands (reported when
-/// still unpaired). The position never moves past a deferred build, so an
-/// agent restart reads it again (deferred once more at most, never lost).
+/// there, can pair it. The position never moves past a deferred build, so
+/// an agent restart reads it again (deferred once more at most, never
+/// lost). Two kinds of cut:
 ///
-/// The stream is held behind deferrals for at most [`MAX_DEFERRAL`] in a
-/// row: once reads have been cut that long without a read ending uncut, no
-/// read is cut (its builds are handled as they stand), so that a client
-/// writing a new unpaired build at each read can delay what follows by at
-/// most that long, never hold the stream back for good.
+/// - **A full read** (more rows follow it on the server): a build in the
+///   second half of the read, or within [`CONTEXT_WINDOW`] of its end, may
+///   be unpaired only because its pair is in rows not fetched yet. The read
+///   ends before it and the next read follows at once (no poll wait); this
+///   is not a deferral (it uses none of the build's), and it moves the
+///   position by at least half the read. A build earlier in the read is
+///   handled as it stands, and so is one at the start of the read (its
+///   window is the whole read).
+/// - **A read that reached the end of the file** (not full): the pair may
+///   not be written yet. The read ends before the first unpaired build,
+///   once per build (by its causality activity and sequence number), for
+///   at most its bound from when it was first seen, and the stream waits a
+///   poll interval; after that, the build is handled as it stands
+///   (reported when still unpaired).
+///
+/// **The hold is bounded per position**: from the first deferral, until a
+/// read reaches the end of the file without a cut, the stream is held; once
+/// it has been held for [`MAX_DEFERRAL`], nothing is deferred until it has
+/// caught up (full reads follow at once). So an event that can be read is
+/// handled within [`MAX_DEFERRAL`] plus one bound and one poll interval,
+/// plus the time the stream needs to catch up (when the agent reads faster
+/// than the server writes), whatever builds a client writes.
 #[derive(Debug, Default)]
 pub(crate) struct Deferrals {
     until: std::collections::HashMap<(String, u64), Instant>,
-    /// When the reads started being cut in a row (`None`: the last read
-    /// ended uncut).
+    /// When the stream started being held (`None`: the last read that
+    /// reached the end of the file was not cut).
     held_since: Option<Instant>,
 }
 
+/// Where a read ends ([`Deferrals::cut`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cut {
+    /// The index (in its read, [`XeRecord::index`]) before which it ends.
+    pub(crate) at: usize,
+    /// A deferral: the stream waits a poll interval before the next read
+    /// (else the next read follows at once).
+    pub(crate) wait: bool,
+}
+
 impl Deferrals {
-    /// The index (in its read, [`XeRecord::index`]) before which the read
-    /// ends, if one of `records` (after [`context`], in index order) is a
-    /// build to defer.
+    /// Where the read ends, if one of `records` (after [`context`], in
+    /// index order) is a build to read again; `full` is the number of rows
+    /// of the read (its index space) when more rows follow it.
     pub(crate) fn cut(
         &mut self,
         records: &[XeRecord],
         statman: bool,
         now: Instant,
         bound: Duration,
-    ) -> Option<usize> {
+        full: Option<usize>,
+    ) -> Option<Cut> {
+        if let Some(len) = full {
+            // At least half the read is handled: the position always moves.
+            let from = (len / 2).max(len.saturating_sub(CONTEXT_WINDOW)).max(1);
+            return records
+                .iter()
+                .filter(|r| unpaired_build(r, statman))
+                .map(|r| cut_index(records, r))
+                .find(|at| *at >= from)
+                .map(|at| Cut { at, wait: false });
+        }
         let bound = bound.min(MAX_DEFERRAL);
         self.until
             .retain(|_, until| now.saturating_duration_since(*until) <= DEFERRAL_KEEP);
@@ -583,7 +619,7 @@ impl Deferrals {
         } else {
             self.held_since = None;
         }
-        at
+        at.map(|at| Cut { at, wait: true })
     }
 
     fn find(
@@ -1536,8 +1572,20 @@ mod statistics_tests {
         seq: u64,
         shape: (i64, &str, i64, i64),
     ) -> XeRecord {
+        sp_on(login, "56", text, guid, seq, shape)
+    }
+
+    /// [`sp`] on session `session`.
+    fn sp_on(
+        login: &str,
+        session: &str,
+        text: &str,
+        guid: Option<&str>,
+        seq: u64,
+        shape: (i64, &str, i64, i64),
+    ) -> XeRecord {
         let (nest, otype, off, end) = shape;
-        let mut a: Vec<(&str, String)> = who(login, "56");
+        let mut a: Vec<(&str, String)> = who(login, session);
         if let Some(g) = guid {
             a.push(("attach_activity_id", format!("{g}-{seq}")));
         }
@@ -1570,7 +1618,12 @@ mod statistics_tests {
 
     /// A statement of `login` in activity (`guid`, `seq`).
     fn stmt_in(login: &str, text: &str, guid: Option<&str>, seq: u64) -> XeRecord {
-        let mut a: Vec<(&str, String)> = who(login, "56");
+        stmt_on(login, "56", text, guid, seq)
+    }
+
+    /// [`stmt_in`] on session `session`.
+    fn stmt_on(login: &str, session: &str, text: &str, guid: Option<&str>, seq: u64) -> XeRecord {
+        let mut a: Vec<(&str, String)> = who(login, session);
         if let Some(g) = guid {
             a.push(("attach_activity_id", format!("{g}-{seq}")));
         }
@@ -2583,7 +2636,9 @@ mod statistics_tests {
                 recs.iter().map(|r| (r.file.clone(), r.offset)).collect();
             context(&mut recs, true, &own);
             let now = t0 + Duration::from_secs(u64::try_from(read).unwrap());
-            let cut = deferrals.cut(&recs, true, now, Duration::from_secs(5));
+            let cut = deferrals
+                .cut(&recs, true, now, Duration::from_secs(5), None)
+                .map(|c| c.at);
             let times: Vec<(usize, i64)> = recs.iter().map(|r| (r.index, r.time_us)).collect();
             seen = crate::audit::advance_seen(seen, &times, cut);
             seens.push(seen);
@@ -2694,33 +2749,42 @@ mod statistics_tests {
         let mut d = Deferrals::default();
         let mut recs = lone();
         context(&mut recs, true, &own);
-        assert_eq!(d.cut(&recs, true, t0, bound), Some(7));
+        assert_eq!(d.cut(&recs, true, t0, bound, None).map(|c| c.at), Some(7));
         assert_eq!(
-            d.cut(&recs, true, t0 + Duration::from_secs(4), bound),
+            d.cut(&recs, true, t0 + Duration::from_secs(4), bound, None)
+                .map(|c| c.at),
             Some(7),
             "within its bound"
         );
         assert_eq!(
-            d.cut(&recs, true, t0 + Duration::from_secs(5), bound),
+            d.cut(&recs, true, t0 + Duration::from_secs(5), bound, None)
+                .map(|c| c.at),
             None,
             "after its bound: reported"
         );
         assert_eq!(reported(&recs), [0]);
         assert_eq!(
-            d.cut(&recs, true, t0 + Duration::from_secs(6), bound),
+            d.cut(&recs, true, t0 + Duration::from_secs(6), bound, None)
+                .map(|c| c.at),
             None,
             "one deferral per build"
         );
         // Capped at 60 s whatever the bound.
         let mut d = Deferrals::default();
-        assert!(d.cut(&recs, true, t0, Duration::from_secs(3600)).is_some());
+        assert!(
+            d.cut(&recs, true, t0, Duration::from_secs(3600), None)
+                .map(|c| c.at)
+                .is_some()
+        );
         assert!(
             d.cut(
                 &recs,
                 true,
                 t0 + Duration::from_secs(60),
-                Duration::from_secs(3600)
+                Duration::from_secs(3600),
+                None
             )
+            .map(|c| c.at)
             .is_none()
         );
         // Case 1 (2026-10-18): another session's build, a client's build on
@@ -2731,12 +2795,16 @@ mod statistics_tests {
         user[0].index = 7;
         context(&mut user, true, &own);
         assert_eq!(
-            Deferrals::default().cut(&user, true, t0, bound),
+            Deferrals::default()
+                .cut(&user, true, t0, bound, None)
+                .map(|c| c.at),
             Some(7),
             "a client's build"
         );
         assert_eq!(
-            Deferrals::default().cut(&recs, true, t0, bound),
+            Deferrals::default()
+                .cut(&recs, true, t0, bound, None)
+                .map(|c| c.at),
             Some(7),
             "the agent's build"
         );
@@ -2751,7 +2819,9 @@ mod statistics_tests {
             );
             context(&mut off, true, &own);
             assert_eq!(
-                Deferrals::default().cut(&off, true, t0, bound),
+                Deferrals::default()
+                    .cut(&off, true, t0, bound, None)
+                    .map(|c| c.at),
                 Some(0),
                 "{table}"
             );
@@ -2762,12 +2832,16 @@ mod statistics_tests {
         nocause[0] = sp("app", USER_BUILD, None, 1, CLIENT_BUILD_SHAPE);
         context(&mut nocause, true, &own);
         assert_eq!(
-            Deferrals::default().cut(&nocause, true, t0, bound),
+            Deferrals::default()
+                .cut(&nocause, true, t0, bound, None)
+                .map(|c| c.at),
             None,
             "no causality"
         );
         assert_eq!(
-            Deferrals::default().cut(&recs, false, t0, bound),
+            Deferrals::default()
+                .cut(&recs, false, t0, bound, None)
+                .map(|c| c.at),
             None,
             "not allow-listed"
         );
@@ -2775,17 +2849,33 @@ mod statistics_tests {
         if let Some(e) = cut[0].event.as_mut() {
             e.statement_cut = true;
         }
-        assert_eq!(Deferrals::default().cut(&cut, true, t0, bound), None, "cut");
+        assert_eq!(
+            Deferrals::default()
+                .cut(&cut, true, t0, bound, None)
+                .map(|c| c.at),
+            None,
+            "cut"
+        );
         let mut paired = own_build(Some(GUID));
         context(&mut paired, true, &own);
-        assert_eq!(Deferrals::default().cut(&paired, true, t0, bound), None);
+        assert_eq!(
+            Deferrals::default()
+                .cut(&paired, true, t0, bound, None)
+                .map(|c| c.at),
+            None
+        );
         let mut paired = vec![
             sp("app", USER_BUILD, Some(GUID2), 1, CLIENT_BUILD_SHAPE),
             stmt_in("app", "SELECT TOP (5) id FROM crm.t", Some(GUID2), 3),
         ];
         context(&mut paired, true, &own);
         assert!(paired[0].skip);
-        assert_eq!(Deferrals::default().cut(&paired, true, t0, bound), None);
+        assert_eq!(
+            Deferrals::default()
+                .cut(&paired, true, t0, bound, None)
+                .map(|c| c.at),
+            None
+        );
     }
 
     /// Refinement of 2026-10-18 (case 1 builds): a client's build whose
@@ -2849,7 +2939,7 @@ mod statistics_tests {
                 .collect();
             context(&mut recs, true, &own);
             let now = t0 + Duration::from_secs(u64::try_from(read).unwrap());
-            if let Some(at) = d.cut(&recs, true, now, bound) {
+            if let Some(at) = d.cut(&recs, true, now, bound, None).map(|c| c.at) {
                 recs.truncate(at);
                 for r in &mut recs {
                     r.skip = false;
@@ -2887,6 +2977,29 @@ mod statistics_tests {
             for k in 1..n {
                 let got = split_reads(file, &[&[k][..], &[n; 7]].concat(), Duration::from_secs(5));
                 assert_eq!(got, want, "{file}: cut after {k} events");
+                // Several read boundaries (review L3).
+                for k2 in k + 1..n {
+                    let got = split_reads(
+                        file,
+                        &[&[k, k2][..], &[n; 8]].concat(),
+                        Duration::from_secs(5),
+                    );
+                    assert_eq!(got, want, "{file}: cuts after {k} and {k2} events");
+                    // Three boundaries on the fixture of the CI failure.
+                    let three = if file == "statistics-16.0.4305.5.xml" {
+                        n
+                    } else {
+                        0
+                    };
+                    for k3 in k2 + 1..three {
+                        let got = split_reads(
+                            file,
+                            &[&[k, k2, k3][..], &[n; 9]].concat(),
+                            Duration::from_secs(5),
+                        );
+                        assert_eq!(got, want, "{file}: cuts after {k}, {k2} and {k3} events");
+                    }
+                }
             }
         }
         // Without a deferral (a zero bound), the cut after the client's
@@ -2919,13 +3032,24 @@ mod statistics_tests {
             v
         };
         for seq in 0..4096 {
-            assert_eq!(d.cut(&build(seq * 8), true, t0, bound), Some(0), "{seq}");
+            assert_eq!(
+                d.cut(&build(seq * 8), true, t0, bound, None).map(|c| c.at),
+                Some(0),
+                "{seq}"
+            );
         }
         let over = build(4096 * 8);
-        assert_eq!(d.cut(&over, true, t0, bound), None, "past the cap");
+        assert_eq!(
+            d.cut(&over, true, t0, bound, None).map(|c| c.at),
+            None,
+            "past the cap"
+        );
         assert_eq!(reported(&over), [0], "reported");
         // A remembered build is still deferred within its bound.
-        assert_eq!(d.cut(&build(8), true, t0, bound), Some(0));
+        assert_eq!(
+            d.cut(&build(8), true, t0, bound, None).map(|c| c.at),
+            Some(0)
+        );
     }
 
     /// The stream is held behind deferrals for at most 60 s in a row: a
@@ -2944,17 +3068,323 @@ mod statistics_tests {
         };
         let at = |s: u64| t0 + Duration::from_secs(s);
         for s in (0..60).step_by(10) {
-            assert_eq!(d.cut(&build(s * 8), true, at(s), bound), Some(0), "{s}");
+            assert_eq!(
+                d.cut(&build(s * 8), true, at(s), bound, None).map(|c| c.at),
+                Some(0),
+                "{s}"
+            );
         }
         assert_eq!(
-            d.cut(&build(60 * 8), true, at(60), bound),
+            d.cut(&build(60 * 8), true, at(60), bound, None)
+                .map(|c| c.at),
             None,
             "held 60 s"
         );
-        assert_eq!(d.cut(&build(70 * 8), true, at(70), bound), Some(0), "again");
+        assert_eq!(
+            d.cut(&build(70 * 8), true, at(70), bound, None)
+                .map(|c| c.at),
+            Some(0),
+            "again"
+        );
         // A read that ends uncut starts the count again.
-        assert_eq!(d.cut(&[], true, at(100), bound), None);
-        assert_eq!(d.cut(&build(110 * 8), true, at(110), bound), Some(0));
-        assert_eq!(d.cut(&build(160 * 8), true, at(160), bound), Some(0));
+        assert_eq!(d.cut(&[], true, at(100), bound, None).map(|c| c.at), None);
+        assert_eq!(
+            d.cut(&build(110 * 8), true, at(110), bound, None)
+                .map(|c| c.at),
+            Some(0)
+        );
+        assert_eq!(
+            d.cut(&build(160 * 8), true, at(160), bound, None)
+                .map(|c| c.at),
+            Some(0)
+        );
+    }
+
+    /// One event of a simulated session file, written at `at_ms`.
+    #[derive(Clone)]
+    struct Spec {
+        id: i64,
+        at_ms: u64,
+        kind: SpecKind,
+        session: u32,
+        guid: String,
+        seq: u64,
+    }
+
+    #[derive(Clone)]
+    enum SpecKind {
+        /// A statistics build on `crm.<table>`.
+        Build(String),
+        /// A build's internal statement.
+        Internal,
+        /// A client's read of `crm.<table>` (a build's pair when the same
+        /// request holds the build).
+        Read(String),
+    }
+
+    impl Spec {
+        fn record(&self, index: usize) -> XeRecord {
+            let session = self.session.to_string();
+            let guid = Some(self.guid.as_str());
+            let mut r = match &self.kind {
+                SpecKind::Build(t) => sp_on(
+                    "app",
+                    &session,
+                    &USER_BUILD.replace("[crm].[t]", &format!("[crm].[{t}]")),
+                    guid,
+                    self.seq,
+                    CLIENT_BUILD_SHAPE,
+                ),
+                SpecKind::Internal => sp_on("app", &session, "", guid, self.seq, CLIENT_INTERNAL),
+                SpecKind::Read(t) => stmt_on(
+                    "app",
+                    &session,
+                    &format!("SELECT TOP (5) id FROM crm.{t}"),
+                    guid,
+                    self.seq,
+                ),
+            };
+            r.time_us = self.id;
+            r.index = index;
+            r
+        }
+    }
+
+    /// The stream over `file` (sorted by `at_ms`) as `read` and `cycle`
+    /// run it: reads of at most `batch` rows from the position; a full read
+    /// that is not a deferral reads on at once (5 ms), at most 20 s in a
+    /// cycle (`CATCH_UP`); a deferral or a read that reached the end waits
+    /// `poll_ms`. Returns, per event id, when it was handled and whether it
+    /// was left out; asserts that none is handled twice.
+    fn simulate(
+        file: &[Spec],
+        batch: usize,
+        poll_ms: u64,
+        bound: Duration,
+        end_ms: u64,
+    ) -> std::collections::BTreeMap<i64, (u64, bool)> {
+        let t0 = Instant::now();
+        let mut d = Deferrals::default();
+        let mut handled = std::collections::BTreeMap::new();
+        let (mut t, mut pos, mut cycle) = (0u64, 0usize, 0u64);
+        while t <= end_ms {
+            let written = file.iter().take_while(|s| s.at_ms <= t).count();
+            let mut recs: Vec<XeRecord> = file[pos..written]
+                .iter()
+                .take(batch)
+                .enumerate()
+                .map(|(i, s)| s.record(i))
+                .collect();
+            let len = recs.len();
+            let full = len == batch;
+            context(&mut recs, true, &own);
+            let now = t0 + Duration::from_millis(t);
+            let cut = d.cut(&recs, true, now, bound, full.then_some(len));
+            if let Some(c) = cut {
+                assert!(c.at > 0 || c.wait, "a full read always moves");
+                recs.truncate(c.at);
+                for r in &mut recs {
+                    r.skip = false;
+                }
+                context(&mut recs, true, &own);
+            }
+            pos += recs.len();
+            for r in &recs {
+                assert!(
+                    handled.insert(r.time_us, (t, r.skip)).is_none(),
+                    "event {} handled twice",
+                    r.time_us
+                );
+            }
+            let waits = cut.is_some_and(|c| c.wait) || !full || t - cycle >= 20_000;
+            if waits {
+                t += poll_ms;
+                cycle = t;
+            } else {
+                t += 5;
+            }
+        }
+        handled
+    }
+
+    /// Writes `n` requests of a session: a build on `table`, its internal
+    /// statement and, `pair_ms` later (if any), the read that made it.
+    fn requests(
+        file: &mut Vec<Spec>,
+        session: u32,
+        every_ms: u64,
+        until_ms: u64,
+        pair_ms: Option<u64>,
+        table: &str,
+    ) {
+        let mut at = every_ms;
+        while at < until_ms {
+            let guid = format!("{session:08X}-0000-0000-0000-{at:012X}");
+            let t = format!("{table}{at}");
+            let mut push = |at_ms: u64, kind: SpecKind, seq: u64| {
+                file.push(Spec {
+                    id: 0,
+                    at_ms,
+                    kind,
+                    session,
+                    guid: guid.clone(),
+                    seq,
+                });
+            };
+            push(at, SpecKind::Build(t.clone()), 1);
+            push(at, SpecKind::Internal, 2);
+            if let Some(p) = pair_ms {
+                push(at + p, SpecKind::Read(t), 3);
+            }
+            at += every_ms;
+        }
+    }
+
+    /// Other clients' reads, `per_s` a second over sessions 60 to 63.
+    fn fillers(file: &mut Vec<Spec>, per_s: u64, until_ms: u64) {
+        let step = 1000 / per_s;
+        for (i, at) in (0..until_ms)
+            .step_by(usize::try_from(step).unwrap())
+            .enumerate()
+        {
+            file.push(Spec {
+                id: 0,
+                at_ms: at,
+                kind: SpecKind::Read("f".to_owned()),
+                session: 60 + u32::try_from(i % 4).unwrap(),
+                guid: format!("F0000000-0000-0000-0000-{i:012X}"),
+                seq: 1,
+            });
+        }
+    }
+
+    fn sorted(mut file: Vec<Spec>) -> Vec<Spec> {
+        file.sort_by_key(|s| s.at_ms);
+        for (i, s) in file.iter_mut().enumerate() {
+            s.id = i64::try_from(i).unwrap();
+        }
+        file
+    }
+
+    /// Security review of the 2026-10-18 refinement, H1 and L3: under a
+    /// constant load (other clients' reads, clients whose builds are paired
+    /// 300 ms later, interleaved) and a client writing a new unpaired build
+    /// every second, every event is handled once, within `MAX_DEFERRAL` +
+    /// the bound + a poll interval (+ 1 s of catch-up) of being written;
+    /// without that client, every paired build is left out.
+    #[test]
+    fn continuous_load_handles_every_event_within_the_bound() {
+        let (poll, bound) = (1000u64, Duration::from_secs(2));
+        let limit = u64::try_from(MAX_DEFERRAL.as_millis()).unwrap() + 2000 + poll + 1000;
+        // (name, other clients' reads a second, the hostile client, length):
+        // at 5 reads a second, the rows behind the hostile builds stay
+        // below a full read for minutes, so only the hold bound applies.
+        for (name, per_s, attacked, end) in [
+            ("quiet", 100, false, 240_000u64),
+            ("attacked", 100, true, 240_000),
+            ("attacked, slow", 5, true, 480_000),
+        ] {
+            let mut file = Vec::new();
+            fillers(&mut file, per_s, end);
+            requests(&mut file, 80, 7000, end, Some(300), "l");
+            requests(&mut file, 81, 13_000, end, Some(250), "m");
+            if attacked {
+                requests(&mut file, 70, 1000, end, None, "tmp");
+            }
+            let file = sorted(file);
+            let handled = simulate(&file, BATCH_FOR_TESTS, poll, bound, end + limit + 5000);
+            for s in &file {
+                let Some((at, skip)) = handled.get(&s.id) else {
+                    panic!("{name}: event {} lost", s.id);
+                };
+                assert!(
+                    at - s.at_ms <= limit,
+                    "{name}: event {} handled {} ms after it was written",
+                    s.id,
+                    at - s.at_ms
+                );
+                match (&s.kind, s.session) {
+                    (SpecKind::Read(_), _) => assert!(!skip, "{name}: a read is reported"),
+                    (_, 70) => assert!(!skip, "{name}: an unpaired build is reported"),
+                    _ if !attacked => {
+                        assert!(skip, "{name}: a paired build and its internal statement");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    const BATCH_FOR_TESTS: usize = crate::audit::BATCH;
+
+    /// Review M1: a full read (more rows on the server) whose build's pair
+    /// is in the rows not fetched yet ends before the build and reads on at
+    /// once, using none of the build's deferral; a build at the start of a
+    /// full read is handled as it stands (the position always moves).
+    #[test]
+    fn full_reads_cut_before_a_late_build_and_read_on() {
+        let filler = |at: u64| Spec {
+            id: 0,
+            at_ms: at,
+            kind: SpecKind::Read("f".to_owned()),
+            session: 60,
+            guid: "F0000000-0000-0000-0000-000000000000".to_owned(),
+            seq: 1,
+        };
+        let request = |kind: SpecKind, seq: u64| Spec {
+            id: 0,
+            at_ms: 0,
+            kind,
+            session: 80,
+            guid: "A0000000-0000-0000-0000-000000000000".to_owned(),
+            seq,
+        };
+        // 1 000 rows written at once: the build at 410, its pair at 600.
+        let mut file: Vec<Spec> = (0..1000).map(|_| filler(0)).collect();
+        file[410] = request(SpecKind::Build("x".to_owned()), 1);
+        file[411] = request(SpecKind::Internal, 2);
+        file[600] = request(SpecKind::Read("x".to_owned()), 3);
+        let file = sorted(file);
+        let handled = simulate(&file, 500, 1000, Duration::from_secs(2), 10);
+        assert_eq!(handled.len(), 1000, "every event once");
+        assert_eq!(handled[&410], (5, true), "paired by the next read, at once");
+        assert_eq!(handled[&411], (5, true));
+        assert!(!handled[&600].1);
+        // The deferral memory is untouched by a full read's cut.
+        let mut d = Deferrals::default();
+        let mut recs: Vec<XeRecord> = file
+            .iter()
+            .take(500)
+            .enumerate()
+            .map(|(i, s)| s.record(i))
+            .collect();
+        context(&mut recs, true, &own);
+        let t0 = Instant::now();
+        let bound = Duration::from_secs(2);
+        assert_eq!(
+            d.cut(&recs, true, t0, bound, Some(500)),
+            Some(Cut {
+                at: 410,
+                wait: false
+            })
+        );
+        assert!(d.until.is_empty() && d.held_since.is_none());
+        // Paired in the read: no cut.
+        let mut early: Vec<XeRecord> = file
+            .iter()
+            .skip(300)
+            .take(500)
+            .enumerate()
+            .map(|(i, s)| s.record(i))
+            .collect();
+        context(&mut early, true, &own);
+        assert_eq!(d.cut(&early, true, t0, bound, Some(500)), None);
+        // A batch smaller than the distance to the pair (16 rows, the pair
+        // 200 rows on): the full read ends before the build; the next one
+        // starts at it and cannot cut at 0, so the build is reported, once.
+        let handled = simulate(&file, 16, 1000, Duration::from_secs(2), 2000);
+        assert_eq!(handled.len(), 1000, "every event once");
+        assert!(!handled[&410].1, "reported (fail closed)");
+        assert!(!handled[&411].1);
     }
 }
