@@ -640,13 +640,43 @@ reaches `sqlcmd` through the environment (`PW`, a scripting variable), never its
    passwords (whole, 16-character windows, base64 / hex; `scan --secret-file`). No generated secret
    in any log (the target's included), the console database, the pages or the agent's state.
 
-Not covered: the Extended Events source (`sqlserver_xevents`; a second target on the same server
-would see the first target's sessions as another login's), SQL Server 2019 and 2025 (the
-connector's integration tests and the engine matrix cover them).
+**Other versions and the Extended Events source** (ROADMAP phase 9 follow-up P9-D).
+`E2E_SQLSERVER_VERSION` selects `2022` (default, the dev pin), `2019` or `2025` (the engine
+matrix's pins, checked against [`engine-matrix.yml`](../.github/workflows/engine-matrix.yml));
+`E2E_SQLSERVER_AUDIT_SOURCE` selects `sqlserver_audit` (default on 2022 and 2025) or
+`sqlserver_xevents` (the dev session `databastion_xe`; the only source on 2019 and its default
+there, `sqlserver_audit` refused). One source per run: a second target on the same server would see
+the first target's sessions as another login's. The same scenario, with these differences:
+- Step 1: the server reports the selected major (15, 16 or 17). With `sqlserver_xevents` the agent
+  login holds exactly `CONNECT SQL` and the session's grant: `VIEW SERVER STATE` on 2019 (the dev
+  script's grant there), `VIEW SERVER PERFORMANCE STATE` on 2022 and 2025, where `sqlserver.sh`
+  revokes the two SQL Server Audit grants and grants it as `sa` before the agent starts.
+- Step 2: 2025 runs without `network.forcestrict` (the engine matrix covers forced strict); the
+  agent's `auto` tries strict first, and the run prints the mode it reached (`strict` or
+  `mandatory`, both accepted; `mandatory` also raises a GitHub Actions warning). This is
+  temporary: once the first run has measured the mode, the check becomes an assertion of that mode
+  (`strict` expected). 2019 and 2022: `mandatory`, as above.
+- Step 4, `sqlserver_xevents`: **Partial** from `sqlserver_xevents` **without**
+  `audit.log_without_row_counts` (this source has row counts), and none of `audit.xe_events_missing`,
+  `audit.xe_session_filtered`, `audit.xe_causality_off` either.
+- Step 6, `sqlserver_xevents`: every event's source is `sqlserver_xevents`; the positive controls
+  read the session's files (`sys.fn_xe_file_target_read_file`, as `sa`): the analyst's literals,
+  statement events of the agent's login, the `CREATE LOGIN` placeholder (`-- CREATE LOGIN`: the
+  server never writes that statement's text) and `DROP LOGIN e2e_dcl_probe`.
+
+The required `e2e-sqlserver` job of `ci.yml` runs the default (2022, SQL Server Audit). The job
+`e2e-sqlserver` of [`engine-matrix.yml`](../.github/workflows/engine-matrix.yml) (not required:
+weekly, on `workflow_dispatch`, and on pull requests that change this scenario or the engine
+matrix's inputs) runs 2022 with Extended Events, 2019 with Extended Events, and 2025 with each
+source, one job per entry; the step summary keeps each entry's TLS mode, dump-to-incident time and
+result.
 
 ```sh
 e2e/sqlserver.sh                     # about 7 minutes once the images exist
 E2E_SKIP_BUILD=1 e2e/sqlserver.sh    # reuse databastion-console:e2e and databastion-agent:e2e
+E2E_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents e2e/sqlserver.sh   # 2022, Extended Events
+E2E_SQLSERVER_VERSION=2019 e2e/sqlserver.sh                     # 2019, Extended Events (pulls 2.3 GB)
+E2E_SQLSERVER_VERSION=2025 E2E_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents e2e/sqlserver.sh
 ```
 
 ## Valkey and Redis targets
@@ -655,8 +685,9 @@ a Valkey target and a Redis one with Discovery, Audit from the slow log and the 
 **and key names**. [`redis.sh`](redis.sh) merges [`docker-compose.redis.yml`](docker-compose.redis.yml)
 over this stack (Compose project `databastion-e2e-redis`) and starts only `db`, `migrate`, `web`,
 `worker`, `proxy`, `redis-tls-init`, `target-valkey`, `target-redis` and `agent`; the client traffic
-comes from [`redis_scenario.py`](redis_scenario.py) on the host (Python standard library, a
-minimal RESP2 client over TLS; unit tests in [`test_redis_scenario.py`](test_redis_scenario.py)).
+comes from [`redis_scenario.py`](redis_scenario.py) (Python standard library, a minimal RESP2
+client over TLS; unit tests in [`test_redis_scenario.py`](test_redis_scenario.py)), run in the
+one-shot `redis-client` container on `agent-net`.
 The CI job is `e2e-redis` in [`ci.yml`](../.github/workflows/ci.yml) (40 min budget, `redis.sh` at
 most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `shared/`, `e2e/`,
 `deploy/initdb/`, `dev/redis/`, `dev/seed/out/redis.txt`, `dev/ground-truth.json`,
@@ -665,7 +696,8 @@ most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `
 | Service | Image | Role |
 |---------|-------|------|
 | `redis-tls-init` | PostgreSQL 17 (pinned, for its `openssl`) | One-shot, no network: [`dev/redis/tls-init.sh`](../dev/redis/tls-init.sh), a dev CA (key deleted at once) and a server certificate naming `valkey`, `redis`, `localhost` and `127.0.0.1` |
-| `target-valkey`, `target-redis` | Valkey 9.0.6, Redis 8.10.2 (the dev pins) | The dev services' setup ([`dev/redis/entrypoint.sh`](../dev/redis/entrypoint.sh)): the committed keyspace [`dev/seed/out/redis.txt`](../dev/seed/out/redis.txt) (keys in `db0` and `db1`, names that embed e-mail addresses and phone numbers), the agent's ACL user `databastion` with the ADR-0052 decision 4 allow-list, `default` off, TLS only on TCP, the slow log at every command (`slowlog-log-slower-than 0`, 1024 entries); the test clients' ACL users from a file of `user` lines written by `redis.sh` (`DATABASTION_DEV_REDIS_EXTRA_ACL`, passwords as SHA-256): `e2e_exporter` (`+@read`, `SYNC` / `PSYNC`), `e2e_analyst` (`+@read`). The agent and admin passwords are Docker secrets that a wrapper exports for the entrypoint only; the admin password reaches `redis-cli` / `valkey-cli` through `REDISCLI_AUTH`, never their command line. On `agent-net` (aliases `valkey`, `redis`) and `redis-net`, which publishes their TLS port on `127.0.0.1:${E2E_VALKEY_PORT:-16379}` / `${E2E_REDIS_PORT:-16389}` for the host-side client (certificate verified against the same CA); the agent is not on `redis-net` |
+| `target-valkey`, `target-redis` | Valkey 9.0.6, Redis 8.10.2 (the dev pins) | The dev services' setup ([`dev/redis/entrypoint.sh`](../dev/redis/entrypoint.sh)): the committed keyspace [`dev/seed/out/redis.txt`](../dev/seed/out/redis.txt) (keys in `db0` and `db1`, names that embed e-mail addresses and phone numbers), the agent's ACL user `databastion` with the ADR-0052 decision 4 allow-list, `default` off, TLS only on TCP, the slow log at every command (`slowlog-log-slower-than 0`, 1024 entries); the test clients' ACL users from a file of `user` lines written by `redis.sh` (`DATABASTION_DEV_REDIS_EXTRA_ACL`, passwords as SHA-256): `e2e_exporter` (`+@read`, `SYNC` / `PSYNC`), `e2e_analyst` (`+@read`). The agent and admin passwords are Docker secrets that a wrapper exports for the entrypoint only; the admin password reaches `redis-cli` / `valkey-cli` through `REDISCLI_AUTH`, never their command line. On `agent-net` only (aliases `valkey`, `redis`), an internal network: no egress, nothing published |
+| `redis-client` | Python 3.13.16 slim (pinned by digest) | One-shot client (`tools` profile): [`redis_scenario.py`](redis_scenario.py), mounted read-only and run with `python3 -I -B` as `65534:65534` on a read-only file system, on `agent-net`, against `valkey:6379` / `redis:6379` (certificate verified against the targets' dev CA, host name checked), as `e2e_exporter` or `e2e_analyst` (never the agent's user); the password from the secret file, the analyst's key list on stdin |
 | `agent` | [`agent/Dockerfile`](../agent/Dockerfile) | Targets `valkey-e2e` (`engine: valkey`, host `valkey`) and `redis-e2e` (`engine: redis`, host `redis`): `tls: verify_full` with the dev CA as `ca_file`, the agent's defaults otherwise (all key patterns, every database) |
 
 **Scenario**, for each target.
@@ -709,12 +741,13 @@ most 1980 s), required through `CI result`; it runs when `agent/`, `console/`, `
    value-bearing key or field name; the analyst's key names alone; no generated secret in any log
    (the targets' included), the console database, the pages or the agent's state.
 
-**Residual: egress of the targets.** `redis-net` is an ordinary (not internal) bridge network: the
-host-side client needs a published port, and Docker publishes no port from an internal network.
-So `target-valkey` and `target-redis` can open outbound connections to the internet for the run's
-length (nothing in them does: the pinned dev images, the server only). The agent is not on
-`redis-net`, and nothing listens outside `127.0.0.1`. Running the client from a container on
-`agent-net` instead (an image with Python, pinned by digest) would remove it; not done yet.
+**Egress of the targets (#254 review L5, fixed).** The targets and the scenario client are on
+the internal `agent-net` only: nothing is published and no container of the run has egress. The
+load run ([`load/redis.sh`](load/README.md#valkey-and-redis-targets)) keeps a host-side client,
+which measures latency from the host: its overlay publishes the target's TLS port on `127.0.0.1`
+through `redis-net`, an ordinary bridge network, so there the target has egress for the run's
+length (nothing in it uses it: the pinned dev image, the server only); the agent is not on
+`redis-net`.
 
 **Known issue (agent, found by this scenario).** On Valkey 9.0.6, the agent's own Discovery
 sampling commands read by the stream while it runs come back as one aggregated `read` of `*` by the
