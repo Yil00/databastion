@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
-import { enrollAgent, mismatchedTargetIds, recordHeartbeat, targetSourceDetails, withoutMismatchedSources } from "@/server/agents";
+import { enrollAgent, mismatchedTargetIds, recordHeartbeat, targetSourceMismatches, withoutMismatchedSources } from "@/server/agents";
 import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
@@ -106,20 +106,21 @@ export function handleHeartbeat(req: Request): Promise<Response> {
     if (unlisted.length > 0) return invalidRequest(unlisted);
     // P9-E (review M2, contract "Heartbeat target checks"): a target whose audit source does not
     // serve its engine is stored without `audit_source`, as an agent-integrity event; the rest of
-    // the heartbeat is processed (no `400`).
-    const mismatched = targetSourceDetails(body.value);
-    if (mismatched.length > 0) {
+    // the heartbeat is processed (no `400`). Every mismatched target loses its source and is
+    // listed in `target_ids`; only the stored details are capped (#274 review L5).
+    const mismatched = targetSourceMismatches(body.value);
+    if (mismatched.indices.length > 0) {
       await recordIntegrityEvent(getDb(), {
         agentId: auth.agent.id,
         kind: "target_mismatch",
         endpoint: "heartbeat",
         status: 200,
-        details: mismatched,
-        targetIds: mismatchedTargetIds(body.value, mismatched),
+        details: mismatched.details,
+        targetIds: mismatchedTargetIds(body.value, mismatched.indices),
         ip: clientIp(req),
       });
     }
-    await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched));
+    await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched.indices));
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,
