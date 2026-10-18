@@ -316,6 +316,9 @@ pub(crate) struct Session {
     pub(crate) own: Option<crate::audit::own::Handle>,
     /// A request is in flight (a drop then loses the session).
     in_flight: bool,
+    /// Tests only: the session may send texts off the allow-list.
+    #[cfg(test)]
+    pub(crate) any_text: bool,
 }
 
 impl Drop for Session {
@@ -546,6 +549,8 @@ impl Session {
             statement_timeout,
             own: None,
             in_flight: false,
+            #[cfg(test)]
+            any_text: false,
         }
     }
 
@@ -910,6 +915,31 @@ impl Session {
         Ok(rows)
     }
 
+    /// The run-time checks of a text before it is sent: the deny-list of
+    /// refinement item 7 (M4), then the reviewed allow-list
+    /// (`sql::STATEMENTS`, end-of-phase-9 review L1). Either refusal is an
+    /// agent bug: nothing is sent, `internal` (fail closed). Only a test
+    /// session (`any_text`, the integration tests' `sa` and foreign
+    /// sessions, the unit tests' scripted servers) skips the allow-list.
+    fn vet(&self, text: &str, stage: Stage) -> Result<(), SsError> {
+        if !crate::sql::checked(text) {
+            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
+            return Err(SsError::new(FailureCode::Internal, stage));
+        }
+        #[cfg(test)]
+        let any = self.any_text;
+        #[cfg(not(test))]
+        let any = false;
+        if !any && !crate::sql::allowed(text) {
+            tracing::error!(
+                stage = stage.as_str(),
+                "statement refused: not on the allow-list"
+            );
+            return Err(SsError::new(FailureCode::Internal, stage));
+        }
+        Ok(())
+    }
+
     /// Runs one statement of the closed set as a `SQLBatch`, handing each
     /// value to `on_cell`. Exactly one result of `shape.columns` columns
     /// (none for `columns: 0`), at most `shape.max_rows` rows.
@@ -920,11 +950,9 @@ impl Session {
         shape: Shape,
         on_cell: impl FnMut(Cell) -> Flow,
     ) -> Result<Ended, SsError> {
-        // The deny-list of refinement item 7 (M4), at run time too.
-        if !crate::sql::checked(sql) {
-            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
-            return Err(SsError::new(FailureCode::Internal, stage));
-        }
+        // The deny-list of refinement item 7 (M4) and the allow-list, at
+        // run time too.
+        self.vet(sql, stage)?;
         let payload =
             tds::sql_batch(sql).map_err(|_| SsError::new(FailureCode::Internal, stage))?;
         if let Some(h) = self.own.as_mut() {
@@ -943,10 +971,7 @@ impl Session {
         shape: Shape,
         on_cell: impl FnMut(Cell) -> Flow,
     ) -> Result<Ended, SsError> {
-        if !crate::sql::checked(text) {
-            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
-            return Err(SsError::new(FailureCode::Internal, stage));
-        }
+        self.vet(text, stage)?;
         let payload = tds::rpc_executesql(text, params)
             .map_err(|_| SsError::new(FailureCode::Internal, stage))?;
         if let Some(h) = self.own.as_mut() {
@@ -1134,6 +1159,9 @@ pub(crate) mod tests {
         let handle = ::tokio::spawn(crate::fake::serve(server, responses));
         let mut s = Session::new(Box::new(client), Mode::Mandatory, Duration::from_secs(2));
         s.info.tds_version = tds::TDS_74;
+        // Scripted servers answer any text (the allow-list has its own
+        // test, `texts_off_the_allow_list_are_never_sent`).
+        s.any_text = true;
         (s, handle)
     }
 
@@ -1613,5 +1641,48 @@ pub(crate) mod tests {
             s.last_used.duration_since(sent) >= Duration::from_millis(200),
             "the settle counts from the acknowledgement"
         );
+    }
+
+    /// End-of-phase-9 review L1: a text off the allow-list is refused
+    /// before anything is sent (`internal`), the session staying usable;
+    /// an allow-listed text is sent.
+    #[::tokio::test]
+    async fn texts_off_the_allow_list_are_never_sent() {
+        let mut ok = build::colmeta_int(&["a"]);
+        ok.extend(build::row_int(&[Some(7)]));
+        ok.extend(build::done(tok::DONE, done::COUNT, 1));
+        let (mut s, h) = scripted(vec![ok]);
+        s.any_text = false;
+        for text in [
+            "SELECT 7",
+            "SELECT name FROM sys.databases",
+            // A near copy of an allow-listed constant.
+            &format!("{} ", crate::sql::VERSION),
+        ] {
+            let e = s
+                .rows(text, Stage::Check, Shape::rows(1, 1))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, FailureCode::Internal, "{text}");
+            assert!(!s.is_poisoned(), "{text}");
+        }
+        let e = s
+            .rpc(
+                "SELECT 7",
+                &[],
+                Stage::Introspection,
+                Shape::rows(1, 1),
+                |_| Flow::Continue,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Internal);
+        // Not a column count: only the parsing of the answer matters here.
+        let _ = s
+            .rows(crate::sql::VERSION, Stage::Check, Shape::rows(1, 1))
+            .await;
+        drop(s);
+        let sent = h.await.unwrap();
+        assert_eq!(sent.len(), 1, "only the allow-listed text was sent");
     }
 }

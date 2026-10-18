@@ -165,9 +165,12 @@ fn throwaway_target(name: &str, sqlserver: &str) -> TargetConfig {
 async fn sa() -> Session {
     let t = target("sa", "SQLSERVER_SA_PASSWORD", own_tls());
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    // The test's own statements are off the agent's allow-list.
+    s.any_text = true;
+    s
 }
 
 async fn exec(s: &mut Session, sql: &str) {
@@ -1016,6 +1019,7 @@ async fn measure_credential_bearing_reads() {
         let mut sess = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
             .await
             .unwrap();
+        sess.any_text = true;
         for (label, sql) in probes {
             let r = sess.rows(sql, Stage::Check, Shape::rows(2, 1)).await;
             let shown = match r {
@@ -1135,9 +1139,11 @@ async fn foreign_session(account: &str, secret_env: &str) -> Session {
     let mut t = target(account, secret_env, own_tls());
     t.id = "it-foreign".to_owned();
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    s.any_text = true;
+    s
 }
 
 /// Rows of `sql` (tests only), errors ignored.
