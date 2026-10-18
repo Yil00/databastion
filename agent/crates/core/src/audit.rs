@@ -602,18 +602,20 @@ pub(crate) fn reportable(cfg: &AuditConfig, e: &MaskedEvent) -> bool {
     if !matches!(e.action(), EventAction::Read | EventAction::Write) {
         return true;
     }
-    let sensitive = e.objects().iter().any(|o| {
-        cfg.is_sensitive(
-            o.database().as_str(),
-            o.schema().map(|s| s.as_str()),
-            o.object().as_str(),
-        )
-    });
-    sensitive
-        || match cfg.min_rows() {
-            None => true,
-            Some(min) => e.rows().is_some_and(|r| r >= min),
-        }
+    // Without `min_rows` every event passes: the sensitive-object match
+    // (a glob overlap on Redis / Valkey) runs only when it can decide
+    // (security review of #280, L1).
+    let Some(min) = cfg.min_rows() else {
+        return true;
+    };
+    e.rows().is_some_and(|r| r >= min)
+        || e.objects().iter().any(|o| {
+            cfg.is_sensitive(
+                o.database().as_str(),
+                o.schema().map(|s| s.as_str()),
+                o.object().as_str(),
+            )
+        })
 }
 
 /// Path of the persisted `audit.configure` settings of a target.

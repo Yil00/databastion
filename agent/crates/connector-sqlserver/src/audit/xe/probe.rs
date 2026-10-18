@@ -115,6 +115,11 @@ pub(crate) struct Probe {
     pub(crate) filtered: bool,
     /// `error_reported` is in the session (failed logins).
     pub(crate) failed_logins: bool,
+    /// That `error_reported` has a predicate. The agent never reads a
+    /// predicate (it can hold literals), so a filtered `error_reported` is
+    /// proven to admit failed logins only by one read in the last 24 h
+    /// (`StreamFacts::failed_login_seen`).
+    pub(crate) failed_logins_filtered: bool,
     /// A catalog read failed or was cut.
     pub(crate) incomplete: bool,
 }
@@ -192,6 +197,7 @@ pub(crate) async fn probe(s: &mut Session, name: &str, stage: Stage) -> Result<P
                 let no_statement = r.get(3).and_then(Value::as_int).unwrap_or(0) > 0;
                 if name == "error_reported" {
                     p.failed_logins = true;
+                    p.failed_logins_filtered = !no_predicate;
                 }
                 if !REQUIRED_EVENTS.contains(&name) {
                     continue;
@@ -294,12 +300,23 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         out.notes
             .push(TargetNote::new(NoteCode::AuditXeCausalityOff));
     }
+    // Security review of #280, L2: a predicate on `error_reported` may
+    // keep 18456 out; without reading it, only a failed login read in the
+    // last 24 h proves it admits them.
     if !p.failed_logins {
         out.notes
             .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
         out.details.push(
             "Extended Events: the session has no error_reported event (error 18456): failed \
              logins are not seen",
+        );
+    } else if p.failed_logins_filtered && !i.stream.failed_login_seen {
+        out.notes
+            .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
+        out.details.push(
+            "Extended Events: error_reported has a predicate, which the agent does not read, \
+             and no failed login (error 18456) was read in the last 24 h: failed logins are not \
+             proven to be recorded",
         );
     }
     out.details.push(match p.retention_mode() {
@@ -366,6 +383,7 @@ mod tests {
             missing: 0,
             filtered: false,
             failed_logins: true,
+            failed_logins_filtered: false,
             incomplete: false,
         }
     }
@@ -392,6 +410,7 @@ mod tests {
         fresh: true,
         gap: false,
         dropped: 0,
+        failed_login_seen: false,
     };
 
     #[test]
@@ -502,6 +521,29 @@ mod tests {
         let l = at(&q, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial);
         assert!(codes(&l).contains(&"audit.failed_logins_not_audited"));
+        // Security review of #280, L2: `error_reported` with a predicate
+        // (never read) is proven only by a failed login read in 24 h.
+        let mut q = full_probe();
+        q.failed_logins_filtered = true;
+        let l = at(&q, 15, &[GRANT_2019], LIVE);
+        assert_eq!(l.level, AuditLevel::Partial);
+        assert!(codes(&l).contains(&"audit.failed_logins_not_audited"));
+        assert!(
+            l.details
+                .iter()
+                .any(|d| d.contains("error_reported has a predicate"))
+        );
+        let seen = StreamFacts {
+            failed_login_seen: true,
+            ..LIVE
+        };
+        let l = at(&q, 15, &[GRANT_2019], seen);
+        assert!(!codes(&l).contains(&"audit.failed_logins_not_audited"));
+        // Without a predicate, the event alone is the proof.
+        assert!(
+            !codes(&at(&full_probe(), 15, &[GRANT_2019], LIVE))
+                .contains(&"audit.failed_logins_not_audited")
+        );
     }
 
     #[test]

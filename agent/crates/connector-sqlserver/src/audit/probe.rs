@@ -188,6 +188,9 @@ pub(crate) struct StreamFacts {
     pub(crate) gap: bool,
     /// Records dropped in the last 24 h.
     pub(crate) dropped: u64,
+    /// A failed login (error 18456) was read in the last 24 h (Extended
+    /// Events: the proof that a filtered `error_reported` admits it).
+    pub(crate) failed_login_seen: bool,
 }
 
 /// Everything the level depends on.
@@ -494,6 +497,7 @@ mod tests {
                 fresh: true,
                 gap: false,
                 dropped: 0,
+                failed_login_seen: false,
             },
         };
         let l = level(&i);
@@ -560,6 +564,7 @@ mod tests {
                         fresh,
                         gap: false,
                         dropped: 0,
+                        failed_login_seen: false,
                     },
                 })
             };
@@ -586,6 +591,7 @@ mod tests {
                 fresh: true,
                 gap: false,
                 dropped: 0,
+                failed_login_seen: false,
             },
         };
         let l = level(&base(15, &pm, false));
@@ -620,6 +626,7 @@ mod tests {
                 fresh: true,
                 gap: false,
                 dropped: 0,
+                failed_login_seen: false,
             },
         });
         // Not a Partial proof (ADR-0051 decision 6): a note only, with

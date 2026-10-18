@@ -615,6 +615,8 @@ fn key_patterns_match_as_star_globs_on_redis_and_valkey() {
     assert!(cfg.is_sensitive("db0", None, "user:*:profile:*:email"));
     // Unrelated patterns, another database.
     assert!(!cfg.is_sensitive("db0", None, "user:*:name"));
+    // An overlap neither glob shows alone (M1): `*:email` and `user:*`.
+    assert!(cfg.is_sensitive("db0", None, "*:email"));
     assert!(!cfg.is_sensitive("db0", None, "order:*:email"));
     assert!(!cfg.is_sensitive("db1", None, "user:*:email"));
     assert!(!cfg.is_sensitive("db0", None, "sessions"));
@@ -653,20 +655,83 @@ fn identifier_targets_keep_the_exact_folded_match() {
 }
 
 #[test]
-fn star_glob_is_bounded_and_exact() {
+fn star_globs_intersect_exactly() {
     let c = |s: &str| s.chars().collect::<Vec<char>>();
-    assert!(star_glob(&c("*"), &c("")));
-    assert!(star_glob(&c(""), &c("")));
-    assert!(!star_glob(&c(""), &c("a")));
-    assert!(star_glob(&c("a*b*c"), &c("aXbYc")));
-    assert!(!star_glob(&c("a*b*c"), &c("aXbY")));
-    assert!(star_glob(&c("**"), &c("abc")));
-    // The worst case of the contract's bound stays fast.
-    let long_pattern = c(&"*a".repeat(128));
-    let long_name = c(&"a".repeat(255));
+    let x = |a: &str, b: &str| globs_intersect(&c(a), &c(b)) && globs_intersect(&c(b), &c(a));
+    // Security review of #280, M1: overlaps that neither glob alone shows.
+    assert!(x("*:email", "user:*"));
+    assert!(x("user:42:*", "*:email"));
+    assert!(!x("a:*:b", "c:*"));
+    assert!(!x("a:*:b", "*:c"));
+    assert!(x("user:*:email", "user:*:email"));
+    assert!(x("user:*", "user:*:email"));
+    assert!(x("*", "anything"));
+    assert!(x("*", "*"));
+    assert!(!x("user", "users"));
+    assert!(x("user", "user"));
+    // One side literal: the other must match it.
+    assert!(x("a*b*c", "aXbYc"));
+    assert!(!x("a*b*c", "aXbY"));
+    assert!(x("**", "abc"));
+    assert!(x("*", ""));
+    assert!(!x("ab*ba", "aba"));
+    assert!(x("ab*ba", "abba"));
+    assert!(star_match(&c("*"), &c("")));
+    assert!(!star_match(&c(""), &c("a")));
+}
+
+/// Security review of #280, L1: the worst case of the contract's bounds
+/// (1000 listed patterns of 256 characters, 16 event objects of 256)
+/// stays fast.
+#[test]
+fn the_key_pattern_match_is_bounded() {
+    let listed: Vec<serde_json::Value> = (0..1000)
+        .map(|i| {
+            let pattern = if i % 2 == 0 {
+                // A long middle segment that almost matches a run of `a`.
+                format!("*{}b*", "a".repeat(250))
+            } else {
+                "a*".repeat(128)
+            };
+            serde_json::json!({"database": "db0", "object": pattern, "classifiers": ["pii.email"]})
+        })
+        .collect();
+    let json = serde_json::json!({"enabled": true, "min_rows": 1, "sensitive_objects": listed});
+    let p: p::AuditConfigureParams = serde_json::from_value(json).unwrap();
+    let cfg = AuditConfig::new(
+        AuditParams::try_from(&p).unwrap(),
+        &redis_target(),
+        &Limits::default(),
+    );
+    let event = "a".repeat(256);
     let t = std::time::Instant::now();
-    let _ = star_glob(&long_pattern, &long_name);
-    assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    for _ in 0..16 {
+        assert!(cfg.is_sensitive("db0", None, &event));
+        assert!(!cfg.is_sensitive("db1", None, &event));
+        assert!(!cfg.is_sensitive("db0", None, &"c".repeat(256)));
+    }
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+/// Security review of #280, L3: trailing spaces never lose an overlap.
+#[test]
+fn trailing_spaces_never_lose_a_key_pattern_match() {
+    let params = key_objects(serde_json::json!([
+        {"database": "db0", "object": "x *", "classifiers": ["pii.email"]},
+        {"database": "db1", "object": "tag:*:end ", "classifiers": ["pii.email"]}
+    ]));
+    let cfg = AuditConfig::new(params, &redis_target(), &Limits::default());
+    // `x *` matches `x  ` untrimmed only.
+    assert!(cfg.is_sensitive("db0", None, "x  "));
+    assert!(cfg.is_sensitive("db0", None, "x y"));
+    // A listed trailing space, trimmed or not.
+    assert!(cfg.is_sensitive("db1", None, "tag:*:end"));
+    assert!(cfg.is_sensitive("db1", None, "tag:*:end  "));
+    assert!(cfg.is_sensitive("db1", None, "tag:a:end"));
 }
 
 #[test]

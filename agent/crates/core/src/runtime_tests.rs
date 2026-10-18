@@ -3944,6 +3944,41 @@ async fn audit_configure_refuses_key_patterns_for_other_engines() {
     );
 }
 
+/// Security review of #280, L4: settings saved with a key pattern for a
+/// target whose engine has since changed (here `pg-main`, now PostgreSQL)
+/// are ignored on restart; plain names are restored.
+#[tokio::test]
+async fn saved_key_patterns_of_a_target_whose_engine_changed_are_not_restored() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let dir = env.config.state_dir.join(crate::audit::AUDIT_DIR);
+    let make = || {
+        Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(FakeAudit {
+                events: 0,
+                seen: Arc::new(StdMutex::new(Vec::new())),
+            })],
+        )
+        .unwrap()
+    };
+    let saved = |object: &str| {
+        let json = serde_json::json!({"enabled": true, "sensitive_objects": [
+            {"database": "db0", "object": object, "classifiers": ["pii.email"]}
+        ]});
+        crate::audit::save_settings(&dir, "pg-main", &serde_json::to_vec(&json).unwrap()).unwrap();
+    };
+    saved("user:*:email");
+    let rt = make();
+    rt.restore_audits();
+    assert!(rt.lock_audits().snapshot().is_empty());
+    saved("customers");
+    let rt = make();
+    rt.restore_audits();
+    assert_eq!(rt.lock_audits().snapshot().len(), 1);
+}
+
 /// The agent lists the console -> agent value forms it decodes
 /// (ADR-0022 decision 3) in every heartbeat.
 #[tokio::test]

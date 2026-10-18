@@ -821,7 +821,7 @@ pub struct AuditConfig {
     /// On a Redis / Valkey target: each sensitive object's name, trailing
     /// spaces dropped and folded, for the key-pattern match (in the order
     /// of `sensitive_objects`); empty on every other target.
-    key_globs: Vec<Vec<char>>,
+    key_globs: Vec<KeyForms>,
     max_sample_rows: u32,
     /// The cursors used by the stream, and the core's isolation / skip
     /// request (see [`crate::audit::CursorStore::skip_records`]).
@@ -879,7 +879,7 @@ impl AuditConfig {
             params
                 .sensitive_objects
                 .iter()
-                .map(|o| folded(&o.object))
+                .map(|o| KeyForms::of(&o.object))
                 .collect()
         } else {
             Vec::new()
@@ -1076,72 +1076,132 @@ impl AuditConfig {
 
     /// The key-pattern match of a Redis / Valkey target (contract
     /// `SensitiveObject`, `sensitive_object.key_pattern`). An event's key
-    /// pattern and a listed one match when either, read as a Redis glob
-    /// whose only wildcard is `*` (any run of characters, separators
-    /// included, as `stringmatchlen`), matches the other: a listed
-    /// `user:*:email` covers the event objects `user:*:email`, `user:*`
-    /// (a key no learned pattern names but that starts with `user:`) and
-    /// `*` (a key with no learned prefix), and a listed `user:*` covers
-    /// `user:*:email`. The other glob characters (`?`, `[`, `\`) are
+    /// pattern and a listed one match when they **overlap**: some key name
+    /// matches both, each read as a Redis glob whose only wildcard is `*`
+    /// (any run of characters, separators included, as `stringmatchlen`;
+    /// [`globs_intersect`], security review of #280, M1). A listed
+    /// `user:*:email` covers the event objects `user:*:email`, `user:*` (a
+    /// key no learned pattern names but that starts with `user:`), `*` (a
+    /// key with no learned prefix) and `*:email`, and a listed `*:email`
+    /// covers `user:*`. The other glob characters (`?`, `[`, `\`) are
     /// literal: the agent's normalizer never makes them wildcards. The
     /// database matches when equal (as [`same_name`]) or when either side
     /// is `*` (a source that does not tell the database). Redis has no
     /// schema: it is not compared. Names are folded as on every engine
-    /// (N1), although Redis compares keys exactly: like the rest of this
-    /// match, that can only keep an event the exact match would drop
-    /// (fails closed; the filter is a noise filter).
+    /// (N1), although Redis compares keys exactly, and compared both with
+    /// and without their trailing spaces (L3: trimming one side only
+    /// could lose an overlap). Like the overlap itself, that can only keep
+    /// an event an exact match would drop (fails closed; the filter is a
+    /// noise filter). The event object is folded once per call.
     fn is_sensitive_key(&self, database: &str, object: &str) -> bool {
-        let event = folded(object);
+        let event = KeyForms::of(object);
         self.sensitive_objects
             .iter()
             .zip(&self.key_globs)
             .any(|(o, listed)| {
                 (database == "*" || o.database == "*" || same_name(&o.database, database))
-                    && (*listed == event || star_glob(listed, &event) || star_glob(&event, listed))
+                    && listed.overlaps(&event)
             })
     }
 }
 
-/// `name` with trailing spaces dropped and folded as [`same_name`] does.
-fn folded(name: &str) -> Vec<char> {
-    name.trim_end_matches(' ')
-        .chars()
-        .flat_map(databastion_classifiers::names::fold_char)
-        .collect()
+/// A key pattern folded as [`same_name`] does, with and without its
+/// trailing spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyForms {
+    trimmed: Vec<char>,
+    /// `None` when the name has no trailing space.
+    untrimmed: Option<Vec<char>>,
 }
 
-/// Whether `name` matches `pattern`, in which `*` (any run of characters,
-/// empty included) is the only wildcard. Linear in practice: `*`
-/// backtracks to its last occurrence only (at most `len(pattern) ×
-/// len(name)` steps, both bounded by the contract's 256 characters).
-fn star_glob(pattern: &[char], name: &[char]) -> bool {
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while ni < name.len() {
-        match pattern.get(pi) {
-            Some('*') => {
-                star = Some((pi, ni));
-                pi += 1;
-            }
-            Some(c) if Some(c) == name.get(ni) => {
-                pi += 1;
-                ni += 1;
-            }
-            _ => match star {
-                Some((sp, sn)) => {
-                    pi = sp + 1;
-                    ni = sn + 1;
-                    star = Some((sp, sn + 1));
-                }
-                None => return false,
-            },
+impl KeyForms {
+    fn of(name: &str) -> Self {
+        let fold = |s: &str| -> Vec<char> {
+            s.chars()
+                .flat_map(databastion_classifiers::names::fold_char)
+                .collect()
+        };
+        let trimmed = name.trim_end_matches(' ');
+        Self {
+            trimmed: fold(trimmed),
+            untrimmed: (trimmed.len() != name.len()).then(|| fold(name)),
         }
     }
-    pattern
-        .get(pi..)
-        .unwrap_or_default()
-        .iter()
-        .all(|c| *c == '*')
+
+    fn forms(&self) -> impl Iterator<Item = &[char]> {
+        std::iter::once(self.trimmed.as_slice()).chain(self.untrimmed.as_deref())
+    }
+
+    /// Whether any form of `self` overlaps any form of `other`.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.forms()
+            .any(|a| other.forms().any(|b| globs_intersect(a, b)))
+    }
+}
+
+/// Whether some name matches both `a` and `b`, two globs whose only
+/// wildcard is `*` (any run of characters, empty included). Linear in the
+/// lengths of the two:
+/// - neither has `*`: they are equal;
+/// - one has none: the other matches it ([`star_match`]);
+/// - both have one: the literal prefixes before their first `*` agree
+///   (one is a prefix of the other) and the literal suffixes after their
+///   last `*` agree (one is a suffix of the other). Then the longer
+///   prefix, the middle segments of `a`, those of `b` and the longer
+///   suffix, in that order, make a name both match.
+fn globs_intersect(a: &[char], b: &[char]) -> bool {
+    let star = |p: &[char]| p.contains(&'*');
+    match (star(a), star(b)) {
+        (false, false) => a == b,
+        (true, false) => star_match(a, b),
+        (false, true) => star_match(b, a),
+        (true, true) => {
+            let prefix =
+                |p: &[char]| -> usize { p.iter().position(|c| *c == '*').unwrap_or(p.len()) };
+            let suffix = |p: &[char]| -> usize {
+                p.iter()
+                    .rposition(|c| *c == '*')
+                    .map_or(p.len(), |i| p.len() - i - 1)
+            };
+            let (pa, pb) = (&a[..prefix(a)], &b[..prefix(b)]);
+            let (sa, sb) = (&a[a.len() - suffix(a)..], &b[b.len() - suffix(b)..]);
+            (pa.starts_with(pb) || pb.starts_with(pa)) && (sa.ends_with(sb) || sb.ends_with(sa))
+        }
+    }
+}
+
+/// Whether the literal `name` matches `pattern` (only `*` is a
+/// wildcard): the segments between stars are found left to right, each at
+/// its first place after the previous one (greedy, which is exact for
+/// `*`-only globs), the first one at the start and the last one at the
+/// end. At most `len(name) × len(segment)` steps per segment, both bounded
+/// by the contract's 256 characters.
+fn star_match(pattern: &[char], name: &[char]) -> bool {
+    let segments: Vec<&[char]> = pattern.split(|c| *c == '*').collect();
+    let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
+        return name.is_empty();
+    };
+    if segments.len() == 1 {
+        return pattern == name;
+    }
+    if name.len() < first.len() + last.len() || !name.starts_with(first) || !name.ends_with(last) {
+        return false;
+    }
+    let end = name.len() - last.len();
+    let mut at = first.len();
+    for seg in &segments[1..segments.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        let Some(found) = name
+            .get(at..end)
+            .and_then(|hay| hay.windows(seg.len()).position(|w| w == *seg))
+        else {
+            return false;
+        };
+        at += found + seg.len();
+    }
+    true
 }
 
 /// Whether two normalized names designate the same object for the

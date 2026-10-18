@@ -136,6 +136,9 @@ pub(crate) struct Shared {
     running: Mutex<HashMap<String, usize>>,
     fresh: Mutex<HashMap<String, Instant>>,
     gap: Mutex<HashMap<String, Instant>>,
+    /// The last failed login (error 18456) read from the target's
+    /// Extended Events session.
+    failed_login: Mutex<HashMap<String, Instant>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
@@ -191,6 +194,12 @@ impl Shared {
         lock(&self.fresh).insert(target_id.to_owned(), Instant::now());
     }
 
+    /// A failed login (error 18456) was read: the session's
+    /// `error_reported`, whatever its predicate, admits it.
+    pub(crate) fn note_failed_login(&self, target_id: &str) {
+        lock(&self.failed_login).insert(target_id.to_owned(), Instant::now());
+    }
+
     fn note_gap(&self, target_id: &str) {
         lock(&self.gap).insert(target_id.to_owned(), Instant::now());
     }
@@ -220,6 +229,7 @@ impl Shared {
             running: self.is_running(target_id),
             fresh: within(&self.fresh),
             gap: within(&self.gap),
+            failed_login_seen: within(&self.failed_login),
             dropped: lock(&self.dropped)
                 .get(target_id)
                 .filter(|(_, at)| at.elapsed() < FRESHNESS)

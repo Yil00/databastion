@@ -742,6 +742,9 @@ async fn read(
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
+    if b.kept.iter().any(XeRecord::is_failed_login_18456) {
+        st.state.audit.note_failed_login(&target_id);
+    }
     // Events stamped before the first start are history, whenever they
     // reach the file (the dispatch latency delays them past the first,
     // caught-up read); after that read, until the floor ends, they are
