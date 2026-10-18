@@ -292,6 +292,9 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         .push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
     // Decision 6 measurement obligation (M2): what this source cannot see.
     out.details.push(AUDIT_INVISIBLE_DETAIL);
+    if !invisible_measured(i.major) {
+        out.details.push(INVISIBLE_NOT_MEASURED);
+    }
     let mut proofs = !p.incomplete;
     if !p.enabled {
         proofs = false;
@@ -380,15 +383,36 @@ pub(crate) struct Invisible {
     /// refusals are recorded (`succeeded = 0`).
     pub(crate) audit_refused: &'static [i32],
     /// Extended Events: statements calling these leave no statement event
-    /// at all (the server hides them); a read refused as it compiles
-    /// leaves none either (one refused while it runs does).
+    /// at all (the server hides them).
     pub(crate) xevents: &'static [&'static str],
+    /// Extended Events: the reads refused **while they run** (object,
+    /// error), which leave a statement event; every other refused or
+    /// failed read is refused as it compiles and leaves none.
+    pub(crate) xevents_runtime_errors: &'static [(&'static str, i32)],
+    /// SQL Server Audit: the P9-D join (`dm_exec_query_stats` ×
+    /// `dm_exec_sql_text`) refused for a low-privilege login leaves a
+    /// record (`true`, measured on 2022 on 2026-10-18) or not (P9-D).
+    pub(crate) audit_p9d_join_refused: bool,
 }
+
+/// The versions (major) [`AUDIT_INVISIBLE_DETAIL`] and
+/// [`XE_INVISIBLE_DETAIL`] were measured on; on another, the local detail
+/// adds [`INVISIBLE_NOT_MEASURED`] (security review of #276, L1).
+pub(crate) const INVISIBLE_MEASURED: &[u32] = &[16];
+
+/// Whether the invisible reads were measured on SQL Server `major`.
+pub(crate) fn invisible_measured(major: i64) -> bool {
+    u32::try_from(major).is_ok_and(|m| INVISIBLE_MEASURED.contains(&m))
+}
+
+/// The local detail on a version not measured yet.
+pub(crate) const INVISIBLE_NOT_MEASURED: &str = "reads of the always-reported objects not measured \
+on this SQL Server version: other reads may be invisible on this source";
 
 /// See [`Invisible`].
 #[cfg(test)]
 pub(crate) const INVISIBLE: Invisible = Invisible {
-    measured: &[16],
+    measured: INVISIBLE_MEASURED,
     audit: &[
         "inputbuffer",
         "show_statistics",
@@ -399,13 +423,16 @@ pub(crate) const INVISIBLE: Invisible = Invisible {
     ],
     audit_refused: &[262, 2571],
     xevents: &["certprivatekey", "pwdcompare"],
+    xevents_runtime_errors: &[("dm_exec_input_buffer", 300), ("sp_readerrorlog", 27219)],
+    audit_p9d_join_refused: true,
 };
 
 /// The local detail of `INVISIBLE` for SQL Server Audit.
 pub(crate) const AUDIT_INVISIBLE_DETAIL: &str = "reads invisible on SQL Server Audit (measured on \
 2022): DBCC INPUTBUFFER, DBCC SHOW_STATISTICS and DBCC PAGE without DBCC_GROUP in a specification, \
 LOGINPROPERTY, CERTPRIVATEKEY and PWDCOMPARE (built-in functions, no permission check recorded), \
-and DBCC or Query Store reads refused by a permission";
+DBCC or Query Store reads refused by a permission, and reads refused by a missing server permission \
+may leave no record";
 
 /// The local detail of `INVISIBLE` for Extended Events.
 pub(crate) const XE_INVISIBLE_DETAIL: &str = "Extended Events: reads invisible (measured on 2022): \
@@ -471,6 +498,11 @@ mod tests {
         let l = level(&i);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // Review of #276, L1: a version not measured says so.
+        assert!(!l.details.contains(&INVISIBLE_NOT_MEASURED));
+        // (2019 has no SQL Server Audit source: the rule stops before.)
+        let other = level(&Inputs { major: 17, ..i });
+        assert!(other.details.contains(&INVISIBLE_NOT_MEASURED));
         // Decision 6 measurement obligation (M2): the reads this source
         // cannot see are named in the local detail.
         assert!(

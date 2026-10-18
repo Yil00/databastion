@@ -1515,6 +1515,15 @@ async fn audit_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2: no ground-truth value, nor the DCL password, in what is sent.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_audit\""), "{json}");
@@ -1959,6 +1968,15 @@ async fn xe_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_xevents\""), "{json}");
@@ -2772,6 +2790,9 @@ async fn trailing_spaces_in_bracketed_names_resolve_to_the_listed_views() {
     }
 }
 
+/// The M2 case of P9-D's join (not an object of the lists).
+const P9D_JOIN: &str = "p9d_join";
+
 /// What a read of the decision 6 measurement (M2) gave on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum M2Outcome {
@@ -2871,6 +2892,15 @@ fn m2_read(object: &str, stats: &str) -> Result<(String, usize), &'static str> {
             from_src("retail.sys.dm_db_stats_histogram(OBJECT_ID(N'retail.crm.customers'), 1)")
         }
         "clonedatabase" => return Err("it creates a database"),
+        // P9-D's read refused for a missing server permission (security
+        // review of #276, M1): the join of the statement-text views, as the
+        // load harness writes it (`e2e/load/sqlserver.sh`), a low-privilege
+        // case only.
+        P9D_JOIN => raw(
+            "SELECT TOP (1) st.text FROM sys.dm_exec_query_stats qs CROSS APPLY \
+             sys.dm_exec_sql_text(qs.sql_handle) st",
+            1,
+        ),
         "fn_dblog" => from_src("retail.sys.fn_dblog(NULL, NULL)"),
         "fn_dblog_xtp" => from_src("retail.sys.fn_dblog_xtp(NULL, NULL)"),
         "fn_dump_dblog" | "fn_dump_dblog_xtp" => return Err("it needs a backup file"),
@@ -2941,6 +2971,7 @@ async fn m2_scenario() {
         .chain(databastion_classifiers::query::tsql::CREDENTIAL_OBJECTS)
         .chain(databastion_classifiers::query::tsql::VALUE_OBJECTS)
         .copied()
+        .chain([P9D_JOIN])
         .collect();
     let low_session = || async {
         let t = throwaway_target(low, own_tls());
@@ -2957,6 +2988,9 @@ async fn m2_scenario() {
     let mut outcomes: Vec<(&str, &str, M2Outcome, String)> = Vec::new();
     for account in ["low", "high"] {
         for object in &objects {
+            if *object == P9D_JOIN && account == "high" {
+                continue;
+            }
             let (read, columns) = match m2_read(object, &stats.replace(']', "]]")) {
                 Ok(r) => r,
                 Err(why) => {
@@ -3061,13 +3095,18 @@ async fn m2_scenario() {
         let (want_audit, want_xe) = match outcome {
             M2Outcome::Unavailable(_) => continue,
             M2Outcome::Ran => (!inv.audit.contains(object), !inv.xevents.contains(object)),
+            // P9-D's join, refused: as measured on 2022 on 2026-10-18.
+            M2Outcome::Error(n) if *object == P9D_JOIN => (
+                inv.audit_p9d_join_refused,
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
+            ),
             // A read that did not complete: on Extended Events, an event
-            // only when the error came while it ran (`dm_exec_input_buffer`
-            // and `sp_readerrorlog` for a low-privilege login), none when
-            // it was refused as it compiled: not compared.
+            // only when the error came while it ran (the listed run-time
+            // refusals), none when it was refused as it compiled (security
+            // review of #276, M1).
             M2Outcome::Error(n) => (
                 !inv.audit.contains(object) && !inv.audit_refused.contains(n),
-                on_xe,
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
             ),
         };
         // SQL Server Audit is a source on 2022 and later only.

@@ -1083,7 +1083,7 @@ fn the_gap_memory_survives_a_restart() {
     assert!(other.facts(t).gap);
     // Nothing to remember: an empty memory.
     assert_eq!(Shared::default().encode_gap(t), b"v1\n");
-    // A file not understood restores nothing.
+    // A file not understood is a gap now (review of #276, L4).
     for bad in [
         "",
         "v2\n",
@@ -1094,11 +1094,44 @@ fn the_gap_memory_survives_a_restart() {
     ] {
         let s = Shared::default();
         s.restore_gap(t, bad.as_bytes());
-        assert!(!s.facts(t).gap, "{bad:?}");
+        let f = s.facts(t);
+        assert!(f.gap && f.dropped == 1, "{bad:?}");
         assert!(decode_gap(bad.as_bytes()).is_none(), "{bad:?}");
     }
     // The level rule reads the restored gap: Limited, not Partial.
     let s = Shared::default();
     s.restore_gap(t, &bytes);
     assert!(s.facts(t).gap);
+}
+
+/// #276 review L6: the stream-level wiring of a read's faults, on both
+/// sources: a read out of file order and a buffer over the bound are each
+/// a gap with one dropped record; a clean read notes nothing.
+#[test]
+fn read_faults_are_gaps_on_both_sources() {
+    for source in [Source::Audit, Source::Xevents] {
+        let state = CheckState::default();
+        let t = "faults-test";
+        note_read_faults(&state, t, source, false, false);
+        let facts = state.audit.facts(t);
+        assert!(!facts.gap && facts.dropped == 0, "{source:?}");
+        note_read_faults(&state, t, source, false, true);
+        let facts = state.audit.facts(t);
+        assert!(facts.gap && facts.dropped == 1, "{source:?}: out of order");
+        assert_eq!(state.audit.out_of_order_reads(t), 1);
+        note_read_faults(&state, t, source, true, true);
+        assert_eq!(state.audit.facts(t).dropped, 3, "{source:?}: both");
+        // From a batch out of order, through `batch`.
+        let folder = "/var/opt/mssql/audit/";
+        let got = batch(
+            &Cursor::default(),
+            vec![at(&f(folder, 2), 4096), at(&f(folder, 1), 4096)],
+            2,
+            500,
+            file_key,
+        );
+        let state = CheckState::default();
+        note_read_faults(&state, t, source, got.gap, got.out_of_order);
+        assert!(state.audit.facts(t).gap, "{source:?}");
+    }
 }

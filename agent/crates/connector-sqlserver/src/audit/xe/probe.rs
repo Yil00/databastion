@@ -274,6 +274,10 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
     out.source = true;
     // Decision 6 measurement obligation (M2): what this source cannot see.
     out.details.push(crate::audit::probe::XE_INVISIBLE_DETAIL);
+    if !crate::audit::probe::invisible_measured(i.major) {
+        out.details
+            .push(crate::audit::probe::INVISIBLE_NOT_MEASURED);
+    }
     let mut proofs = !p.incomplete;
     if p.missing > 0 {
         proofs = false;
@@ -393,6 +397,16 @@ mod tests {
         let l = at(&p, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // Review of #276, L1: 2019 is not measured yet; 2022 is.
+        assert!(
+            l.details
+                .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+        );
+        assert!(
+            !at(&p, 16, &[GRANT_2022], LIVE)
+                .details
+                .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+        );
         // Decision 6 measurement obligation (M2): the reads this source
         // cannot see are named in the local detail.
         assert!(

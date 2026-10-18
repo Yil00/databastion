@@ -148,6 +148,8 @@ pub(crate) struct Shared {
     /// sampling, credited polls, statistics builds and their internal
     /// statements), for the logs and the tests.
     own_left_out: Mutex<HashMap<String, [u64; 4]>>,
+    /// Reads out of file order, for the logs and the tests.
+    out_of_order: Mutex<HashMap<String, u64>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -328,7 +330,11 @@ impl Shared {
     /// when more recent. A file not understood restores nothing.
     pub(crate) fn restore_gap(&self, target_id: &str, bytes: &[u8]) {
         let Some((gap_ms, dropped)) = decode_gap(bytes) else {
-            tracing::warn!(target_id = %target_id, "SQL Server Audit: the gap memory file is not understood: not restored");
+            // What it held is unknown: a gap now (security review of #276,
+            // L4), as for a cursor that is not understood.
+            tracing::warn!(target_id = %target_id, "SQL Server Audit: the gap memory file is not understood: a gap is assumed (Limited for 24 h)");
+            self.note_gap(target_id);
+            self.note_dropped(target_id, 1);
             return;
         };
         let now_ms = agent_now_ms();
@@ -361,6 +367,15 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Reads out of file order (tests).
+    #[cfg(test)]
+    pub(crate) fn out_of_order_reads(&self, target_id: &str) -> u64 {
+        lock(&self.out_of_order)
+            .get(target_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Statements left out: exact texts, credited sampling, credited
@@ -408,8 +423,15 @@ fn restore_gap_store(
     target_id: &str,
 ) -> Option<CursorStore> {
     let store = cfg.counters(GAP_FACTS);
-    if let Some(Ok(Some(bytes))) = store.as_ref().map(CursorStore::load) {
-        state.audit.restore_gap(target_id, &bytes);
+    match store.as_ref().map(CursorStore::load) {
+        Some(Ok(Some(bytes))) => state.audit.restore_gap(target_id, &bytes),
+        Some(Err(e)) => {
+            // Unreadable: a gap now (security review of #276, L4).
+            tracing::warn!(error = %e, target_id = %target_id, "SQL Server Audit: the gap memory file is not readable: a gap is assumed (Limited for 24 h)");
+            state.audit.note_gap(target_id);
+            state.audit.note_dropped(target_id, 1);
+        }
+        _ => {}
     }
     store
 }
@@ -420,6 +442,36 @@ fn save_gap(store: Option<&CursorStore>, state: &CheckState, target_id: &str) {
         && let Err(e) = store.save(&state.audit.encode_gap(target_id))
     {
         tracing::warn!(error = %e, "SQL Server Audit gap memory not saved");
+    }
+}
+
+/// What one read of either source revealed (the stream-level wiring of
+/// #253 review L1, tested): a buffer over [`MAX_SKIP`] records (`gap`) or
+/// a read out of file order ([`in_file_order`]), each a gap
+/// (`audit.records_dropped`, Limited for 24 h) with a warning.
+pub(crate) fn note_read_faults(
+    state: &CheckState,
+    target_id: &str,
+    source: Source,
+    gap: bool,
+    out_of_order: bool,
+) {
+    let name = match source {
+        Source::Audit => "SQL Server Audit",
+        Source::Xevents => "Extended Events",
+    };
+    if gap {
+        tracing::warn!(target_id = %target_id, source = name, "one buffer holds more records than the bound: the rest of it is dropped");
+        state.audit.note_gap(target_id);
+        state.audit.note_dropped(target_id, 1);
+    }
+    if out_of_order {
+        *lock(&state.audit.out_of_order)
+            .entry(target_id.to_owned())
+            .or_default() += 1;
+        tracing::warn!(target_id = %target_id, source = name, "the server did not return the files in their order: records skipped on the server may never have been read (a gap)");
+        state.audit.note_gap(target_id);
+        state.audit.note_dropped(target_id, 1);
     }
 }
 
@@ -1127,13 +1179,17 @@ pub(crate) async fn audit_stream(
         return Err(target_error(FailureCode::Unsupported));
     }
     let _running = state.audit.started(&target.id);
-    let _streaming = own::stream_started(&target.id);
+    // Restored before the stream registers (security review of #276, L8):
+    // credits are granted only while a stream runs, so none granted before
+    // the file is read can give the target another salt and make the
+    // persisted sampling credits unreadable.
     let own_store = cfg.counters(OWN_SESSIONS);
     if let Some(Ok(Some(bytes))) = own_store.as_ref().map(CursorStore::load)
         && let Some(persisted) = own::decode(&bytes)
     {
         own::restore(&target.id, persisted);
     }
+    let _streaming = own::stream_started(&target.id);
     // The 24 h gap memory, both sources (end-of-phase-9 review L5).
     let gap_store = restore_gap_store(cfg, state, &target.id);
     let tls = tls::configs(settings.ca_file.as_deref())
@@ -1548,16 +1604,7 @@ async fn read(
     if !b.full {
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
-    if b.gap {
-        tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
-        st.state.audit.note_gap(&target_id);
-        st.state.audit.note_dropped(&target_id, 1);
-    }
-    if b.out_of_order {
-        tracing::warn!(target_id = %target_id, "SQL Server Audit: the server did not return the audit files in their order: records skipped on the server may never have been read (a gap)");
-        st.state.audit.note_gap(&target_id);
-        st.state.audit.note_dropped(&target_id, 1);
-    }
+    note_read_faults(st.state, &target_id, Source::Audit, b.gap, b.out_of_order);
     if reprobe {
         // An AUDIT_CHANGE_GROUP record: the proofs at once (re-review N3).
         st.probe = None;

@@ -46,8 +46,12 @@
 //! too, at most [`PERSISTED_CREDITS`] per target, each by a 128-bit tag of
 //! its text (HMAC-SHA256 under a random per-target salt kept in the same
 //! file, so the tag is the same for the next process and still never the
-//! text), so that a Discovery sample whose record is read only after an
-//! agent restart is still the agent's own (P9-A lot 2 follow-up).
+//! text: salted, not secret, since the salt is in the same file), so that
+//! a Discovery sample whose record is read only after an agent restart is
+//! still the agent's own (P9-A lot 2 follow-up). The file is restored
+//! before the stream registers, and a restored credit whose window is
+//! longer than [`MAX_CREDIT_TTL`] plus its slacks, or starts after the
+//! save, is dropped (security review of #276, L2 and L8).
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -908,6 +912,20 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
         s.saturating_add(i64::try_from((OPEN_AT_SAVE_GRACE).as_micros()).unwrap_or(0))
             .min(restart_us)
     });
+    // A restored credit is a window the agent granted (security review of
+    // #276, L2): never longer than the longest credit plus its slacks, and
+    // never starting after the save that wrote it. Others are dropped (the
+    // records they would have matched are reported).
+    let max_window_us = i64::try_from((MAX_CREDIT_TTL + CREDIT_SLACK * 2).as_micros())
+        .unwrap_or(i64::MAX)
+        .saturating_add(CREDIT_SLACK_US);
+    let plausible = |c: &Credit| {
+        c.until_us >= c.from_us
+            && c.until_us.saturating_sub(c.from_us) <= max_window_us
+            && saved_us.is_none_or(|saved| c.from_us <= saved)
+    };
+    let polls: Vec<Credit> = polls.into_iter().filter(|c| plausible(c)).collect();
+    let sampling: Vec<Credit> = sampling.into_iter().filter(|c| plausible(c)).collect();
     let mut reg = lock();
     let t = reg.targets.entry(target_id.to_owned()).or_default();
     for c in polls {
@@ -1549,6 +1567,42 @@ mod tests {
         let tiny = encode(big, 200);
         assert!(tiny.len() <= 200 && decode(&tiny).unwrap().sampling.is_empty());
         drop(s4);
+    }
+
+    /// Security review of #276, L2: a restored credit is a window the
+    /// agent granted: one longer than the longest credit plus its slacks,
+    /// or starting after the save that wrote it, is dropped.
+    #[test]
+    fn implausible_restored_credits_are_dropped() {
+        let salt = [7u8; 32];
+        let q = "SELECT TOP (10) [phone] FROM [retail].[crm].[customers]";
+        let tag = hex(&Salt::new(salt).unwrap().tag(q));
+        let saved = 10_000_000_000i64;
+        let file = |from: i64, until: i64| {
+            format!(
+                "v1\noffset 0\nsaved {saved}\nk {}\ns 80 {from} {until} {tag} -\np 80 {from} {until} from\n",
+                hex(&salt)
+            )
+        };
+        let ok_from = saved - 2_000_000;
+        let cases = [
+            (ok_from, ok_from + 30_000_000, true),
+            (ok_from, ok_from + 3_600_000_000, false),
+            (saved + 1, saved + 30_000_000, false),
+            (ok_from, ok_from - 1, false),
+        ];
+        for (i, (from, until, kept)) in cases.into_iter().enumerate() {
+            let t = format!("own-test-plausible-{i}");
+            reset(&t);
+            restore(&t, decode(file(from, until).as_bytes()).unwrap());
+            let at = from.max(until.min(from + 1));
+            assert_eq!(take_credit(&t, 80, q, None, at, 1), kept, "sampling {i}");
+            assert_eq!(
+                take_credit(&t, 80, "any", Some(PollKind::From), at, 2),
+                kept,
+                "poll {i}"
+            );
+        }
     }
 
     #[test]
