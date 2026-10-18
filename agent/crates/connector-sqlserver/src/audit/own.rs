@@ -42,7 +42,12 @@
 //! (SipHash with a per-process random key), never the text. Poll credits
 //! are also persisted (by kind, the poll's text being rebuilt from the
 //! catalog), so the last polls before an agent restart are recognized by
-//! the next process.
+//! the next process. Sampling (and ticket-count) credits are persisted
+//! too, at most [`PERSISTED_CREDITS`] per target, each by a 128-bit tag of
+//! its text (HMAC-SHA256 under a random per-target salt kept in the same
+//! file, so the tag is the same for the next process and still never the
+//! text), so that a Discovery sample whose record is read only after an
+//! agent restart is still the agent's own (P9-A lot 2 follow-up).
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -103,6 +108,10 @@ pub(crate) const MAX_CREDIT_TTL: Duration = Duration::from_secs(900);
 pub(crate) const CREDIT_SLACK: Duration = Duration::from_secs(5);
 /// Credits held per target at most.
 pub(crate) const MAX_CREDITS: usize = 4096;
+/// Sampling credits persisted per target at most (the newest).
+pub(crate) const PERSISTED_CREDITS: usize = 1024;
+/// HMAC purpose of the persisted credit tags.
+const CREDIT_TAG_PURPOSE: &str = "sqlserver.own.credit.v1";
 /// Texts a session remembers having sent, at most (ADR-0051 refinement of
 /// 2026-10-16, item 1): the last ones, by keyed hash.
 pub(crate) const SENT_TEXTS: usize = 16;
@@ -225,9 +234,12 @@ pub(crate) enum PollKind {
 #[derive(Debug, Clone, Copy)]
 struct Credit {
     spid: i64,
-    /// Keyed hash of the text (`None`: a poll credit restored from the
-    /// file, matched by its kind).
+    /// Keyed hash of the text (`None`: a credit restored from the file, a
+    /// poll credit matched by its kind or a sampling credit by its tag).
     hash: Option<u64>,
+    /// The text's tag under the target's salt ([`Salt`]), for the file:
+    /// sampling credits only.
+    tag: Option<[u8; 16]>,
     poll: Option<PollKind>,
     /// Window on the server's clock (µs).
     from_us: i64,
@@ -243,10 +255,49 @@ const CREDIT_SLACK_US: i64 = 1_000_000;
 /// Credits are forgotten this long after their window.
 const CREDIT_KEEP_US: i64 = 3600 * 1_000_000;
 
+/// The per-target salt of the persisted credit tags and its HMAC key: a
+/// random value written in the own-sessions file, never sent; the next
+/// process takes it from the file to read the tags back.
+struct Salt {
+    bytes: [u8; 32],
+    key: databastion_classifiers::masking::LocalTagKey,
+}
+
+impl Salt {
+    fn new(bytes: [u8; 32]) -> Option<Self> {
+        let key = databastion_classifiers::masking::HmacKey::new(&bytes)
+            .ok()?
+            .local_tag_key(CREDIT_TAG_PURPOSE)?;
+        Some(Self { bytes, key })
+    }
+
+    /// A fresh salt. Its bytes come from the process's random hasher keys
+    /// (seeded by the system's random source): a salt, not a secret, kept
+    /// in the same file as the tags it salts.
+    fn fresh() -> Option<Self> {
+        let rs = RandomState::new();
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in bytes.chunks_mut(8).enumerate() {
+            chunk.copy_from_slice(&rs.hash_one((i, agent_now_us())).to_le_bytes());
+        }
+        Self::new(bytes)
+    }
+
+    fn tag(&self, text: &str) -> [u8; 16] {
+        let full = self.key.tag(&[text.as_bytes()]);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&full[..16]);
+        out
+    }
+}
+
 #[derive(Default)]
 struct Target {
     sessions: Vec<OwnSession>,
     credits: VecDeque<Credit>,
+    /// The salt of the persisted credit tags (set at the first sampling
+    /// credit or from the file).
+    salt: Option<Salt>,
     streams: usize,
     /// Server time minus agent time (µs), last measured.
     offset_us: i64,
@@ -359,9 +410,18 @@ impl Handle {
         while t.credits.len() >= MAX_CREDITS {
             t.credits.pop_front();
         }
+        let tag = if poll.is_none() {
+            if t.salt.is_none() {
+                t.salt = Salt::fresh();
+            }
+            t.salt.as_ref().map(|s| s.tag(text))
+        } else {
+            None
+        };
         t.credits.push_back(Credit {
             spid: self.spid,
             hash: Some(text_hash(text)),
+            tag,
             poll,
             from_us: now_us.saturating_sub(CREDIT_SLACK_US),
             until_us: now_us.saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX / 4)),
@@ -531,13 +591,22 @@ pub(crate) fn take_credit(
         return false;
     };
     let h = text_hash(text);
+    // The tag is computed only when a restored sampling credit may match.
+    let tag = t
+        .credits
+        .iter()
+        .any(|c| c.hash.is_none() && c.tag.is_some())
+        .then(|| t.salt.as_ref().map(|s| s.tag(text)))
+        .flatten();
     let same = |c: &Credit| {
         c.spid == spid
             && c.from_us <= at_us
             && at_us <= c.until_us
-            && match c.hash {
-                Some(ch) => ch == h,
-                None => poll.is_some() && c.poll == poll,
+            && match (c.hash, c.tag) {
+                (Some(ch), _) => ch == h,
+                // Restored sampling credit: by its tag (never by kind).
+                (None, Some(ct)) => poll.is_none() && tag == Some(ct),
+                (None, None) => poll.is_some() && c.poll == poll,
             }
     };
     // Another record of the same execution; a record without a
@@ -609,7 +678,37 @@ pub(crate) fn encode(target_id: &str, max_bytes: usize) -> Vec<u8> {
             )
         })
         .collect();
-    let mut total = head.len();
+    // Sampling credits whose window or keep time has not passed, the
+    // newest first, at most PERSISTED_CREDITS (counted in the bound).
+    let mut sampling: Vec<String> = Vec::new();
+    if let Some(salt) = &t.salt {
+        sampling.push(format!("k {}\n", hex(&salt.bytes)));
+        for (c, tag) in t
+            .credits
+            .iter()
+            .rev()
+            .filter(|c| c.poll.is_none() && saved_us.saturating_sub(c.until_us) <= CREDIT_KEEP_US)
+            .filter_map(|c| c.tag.map(|tag| (c, tag)))
+            .take(PERSISTED_CREDITS)
+        {
+            sampling.push(format!(
+                "s {} {} {} {} {}\n",
+                c.spid,
+                c.from_us,
+                c.until_us,
+                hex(&tag),
+                c.used_tx.map_or("-".to_owned(), |x| x.to_string())
+            ));
+        }
+        if sampling.len() == 1 {
+            sampling.clear();
+        }
+    }
+    let mut total = head.len() + sampling.iter().map(String::len).sum::<usize>();
+    if total > max_bytes {
+        sampling.clear();
+        total = head.len();
+    }
     let mut keep = 0;
     for l in lines.iter().rev() {
         if total + l.len() > max_bytes {
@@ -641,10 +740,28 @@ pub(crate) fn encode(target_id: &str, max_bytes: usize) -> Vec<u8> {
             format!("p {} {} {} {kind}\n", c.spid, c.from_us, c.until_us).as_bytes(),
         );
     }
+    for l in &sampling {
+        out.extend_from_slice(l.as_bytes());
+    }
     for l in &lines[lines.len() - keep..] {
         out.extend_from_slice(l.as_bytes());
     }
     out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// What a persisted file holds.
@@ -655,6 +772,9 @@ pub(crate) struct Persisted {
     pub(crate) saved_us: Option<i64>,
     pub(crate) sessions: Vec<OwnSession>,
     polls: Vec<Credit>,
+    /// The salt of the persisted sampling credits, and those credits.
+    salt: Option<[u8; 32]>,
+    sampling: Vec<Credit>,
 }
 
 /// The sessions and poll credits of a persisted file (`None` when not
@@ -669,9 +789,41 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
     let mut out = Vec::new();
     let mut polls = Vec::new();
     let mut saved_us = None;
+    let mut salt = None;
+    let mut sampling = Vec::new();
     for l in lines {
         if let Some(v) = l.strip_prefix("saved ") {
             saved_us = Some(v.parse().ok()?);
+            continue;
+        }
+        if let Some(v) = l.strip_prefix("k ") {
+            salt = Some(unhex::<32>(v)?);
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("s ") {
+            let mut p = rest.split(' ');
+            let spid = p.next()?.parse().ok()?;
+            let from_us = p.next()?.parse().ok()?;
+            let until_us = p.next()?.parse().ok()?;
+            let tag = unhex::<16>(p.next()?)?;
+            let used_tx = match p.next()? {
+                "-" => None,
+                x => Some(x.parse().ok()?),
+            };
+            if p.next().is_some() {
+                return None;
+            }
+            if sampling.len() < PERSISTED_CREDITS {
+                sampling.push(Credit {
+                    spid,
+                    hash: None,
+                    tag: Some(tag),
+                    poll: None,
+                    from_us,
+                    until_us,
+                    used_tx,
+                });
+            }
             continue;
         }
         if let Some(rest) = l.strip_prefix("p ") {
@@ -688,6 +840,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
                 polls.push(Credit {
                     spid,
                     hash: None,
+                    tag: None,
                     poll: Some(poll),
                     from_us,
                     until_us,
@@ -721,11 +874,17 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Persisted> {
             clock: SourceClock::Unknown,
         });
     }
+    // Tags without their salt cannot be read back.
+    if salt.is_none() {
+        sampling.clear();
+    }
     Some(Persisted {
         offset_us,
         saved_us,
         sessions: out,
         polls,
+        salt,
+        sampling,
     })
 }
 
@@ -738,6 +897,8 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
         saved_us,
         sessions,
         polls,
+        salt,
+        sampling,
     } = persisted;
     let restart_us = agent_now_us().saturating_add(offset_us);
     // A session open at the last save ends at that save plus the grace of
@@ -756,6 +917,30 @@ pub(crate) fn restore(target_id: &str, persisted: Persisted) {
             .any(|k| k.spid == c.spid && k.from_us == c.from_us)
         {
             t.credits.push_front(c);
+        }
+    }
+    // Sampling credits: read back under the file's salt. A target that
+    // already has another salt (credits granted by this process before the
+    // file was read) cannot read them: they are dropped, and their records
+    // are reported (fail closed).
+    if let Some(bytes) = salt {
+        if t.salt.is_none() {
+            t.salt = Salt::new(bytes);
+        }
+        if t.salt.as_ref().is_some_and(|s| s.bytes == bytes) {
+            // Newest first in the file: each goes before the older ones.
+            for c in sampling {
+                if t.credits.len() >= MAX_CREDITS {
+                    break;
+                }
+                if !t
+                    .credits
+                    .iter()
+                    .any(|k| k.spid == c.spid && k.from_us == c.from_us && k.tag == c.tag)
+                {
+                    t.credits.push_front(c);
+                }
+            }
         }
     }
     let mut restored: Vec<OwnSession> = sessions
@@ -1257,6 +1442,115 @@ mod tests {
         ));
     }
 
+    /// P9-A lot 2 follow-up: sampling credits are persisted by tag, so a
+    /// sample whose record is read only after a restart is still the
+    /// agent's own, with every rule of a live credit (session, text,
+    /// window, one execution); the file never holds the text.
+    #[test]
+    fn sampling_credits_survive_a_restart() {
+        let t = "own-test-sampling-persist";
+        reset(t);
+        let now = agent_now_us();
+        let h = opened(t, 80, now, 0, None, Instant::now());
+        let s = stream_started(t);
+        let q = "SELECT TOP (10) [phone] FROM [retail].[crm].[customers]";
+        let used = "SELECT TOP (10) [email] FROM [retail].[crm].[customers]";
+        h.credit(q, Duration::from_secs(30), None);
+        h.credit(used, Duration::from_secs(30), None);
+        // One record of `used` was read before the restart (tx 7).
+        assert!(take_credit(t, 80, used, None, now + 1_000, 7));
+        drop(s);
+        let bytes = encode(t, 64 * 1024);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !text.contains("phone") && !text.contains("SELECT"),
+            "no text in the file"
+        );
+        assert_eq!(text.lines().filter(|l| l.starts_with("s ")).count(), 2);
+        assert_eq!(text.lines().filter(|l| l.starts_with("k ")).count(), 1);
+
+        // The next process (another registry entry, as after a restart).
+        let next = "own-test-sampling-persist-2";
+        reset(next);
+        restore(next, decode(&bytes).unwrap());
+        assert!(
+            !take_credit(next, 81, q, None, now + 2_000, 1),
+            "another session"
+        );
+        assert!(
+            !take_credit(
+                next,
+                80,
+                "SELECT TOP (11) [phone] FROM [retail].[crm].[customers]",
+                None,
+                now + 2_000,
+                1
+            ),
+            "another text"
+        );
+        assert!(
+            !take_credit(next, 80, q, Some(PollKind::From), now + 2_000, 1),
+            "never as a poll"
+        );
+        assert!(
+            !take_credit(next, 80, q, None, now + 3_600_000_000, 1),
+            "after the window"
+        );
+        assert!(take_credit(next, 80, q, None, now + 2_000, 3));
+        assert!(
+            take_credit(next, 80, q, None, now + 2_500, 3),
+            "the same execution"
+        );
+        assert!(
+            !take_credit(next, 80, q, None, now + 2_000, 4),
+            "consumed once"
+        );
+        // The rest of the execution read before the restart still matches;
+        // another execution does not.
+        assert!(take_credit(next, 80, used, None, now + 1_200, 7));
+        assert!(!take_credit(next, 80, used, None, now + 1_200, 8));
+
+        // A file whose salt is not the target's: its tags are dropped.
+        let other = "own-test-sampling-persist-3";
+        reset(other);
+        let s3 = stream_started(other);
+        let h3 = opened(other, 80, now, 0, None, Instant::now());
+        h3.credit("SELECT 1", Duration::from_secs(5), None);
+        restore(other, decode(&bytes).unwrap());
+        assert!(
+            !take_credit(other, 80, q, None, now + 2_000, 1),
+            "another salt"
+        );
+        drop(s3);
+        // Without its salt line, a file's tags are not read.
+        let no_salt: String = text
+            .lines()
+            .filter(|l| !l.starts_with("k "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(decode(no_salt.as_bytes()).unwrap().sampling.is_empty());
+        // Malformed lines are refused.
+        assert!(decode(b"v1\noffset 0\nk 00\n").is_none());
+        assert!(decode(b"v1\noffset 0\ns 1 2 3 zz -\n").is_none());
+        // Bounded: the newest PERSISTED_CREDITS, within the file bound.
+        let big = "own-test-sampling-persist-4";
+        reset(big);
+        let s4 = stream_started(big);
+        let h4 = opened(big, 80, now, 0, None, Instant::now());
+        for i in 0..PERSISTED_CREDITS + 10 {
+            h4.credit(
+                &format!("SELECT TOP ({i}) x FROM [d].[s].[t]"),
+                Duration::from_secs(5),
+                None,
+            );
+        }
+        let bytes = encode(big, 2 * 1024 * 1024);
+        assert_eq!(decode(&bytes).unwrap().sampling.len(), PERSISTED_CREDITS);
+        let tiny = encode(big, 200);
+        assert!(tiny.len() <= 200 && decode(&tiny).unwrap().sampling.is_empty());
+        drop(s4);
+    }
+
     #[test]
     fn persisted_sessions_round_trip_and_close_at_restart() {
         let t = "own-test-persist";
@@ -1320,6 +1614,8 @@ mod tests {
                     clock: SourceClock::Unknown,
                 }],
                 polls: Vec::new(),
+                salt: None,
+                sampling: Vec::new(),
             },
         );
         assert!(lock().targets[t].sessions.is_empty());
