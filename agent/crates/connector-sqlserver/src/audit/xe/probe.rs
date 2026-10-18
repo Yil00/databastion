@@ -272,6 +272,8 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         );
     }
     out.source = true;
+    // Decision 6 measurement obligation (M2): what this source cannot see.
+    out.details.push(crate::audit::probe::XE_INVISIBLE_DETAIL);
     let mut proofs = !p.incomplete;
     if p.missing > 0 {
         proofs = false;
@@ -391,6 +393,14 @@ mod tests {
         let l = at(&p, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // Decision 6 measurement obligation (M2): the reads this source
+        // cannot see are named in the local detail.
+        assert!(
+            l.details
+                .contains(&crate::audit::probe::XE_INVISIBLE_DETAIL),
+            "{:?}",
+            l.details
+        );
         assert!(!codes(&l).contains(&"audit.log_without_row_counts"));
         // 2022 needs VIEW SERVER PERFORMANCE STATE.
         assert_eq!(at(&p, 16, &[GRANT_2019], LIVE).level, AuditLevel::None);

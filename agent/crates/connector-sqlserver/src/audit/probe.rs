@@ -290,6 +290,8 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
     out.source = true;
     out.notes
         .push(TargetNote::new(NoteCode::AuditLogWithoutRowCounts));
+    // Decision 6 measurement obligation (M2): what this source cannot see.
+    out.details.push(AUDIT_INVISIBLE_DETAIL);
     let mut proofs = !p.incomplete;
     if !p.enabled {
         proofs = false;
@@ -355,6 +357,61 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
     out
 }
 
+/// The measurement obligation of decision 6 (M2), measured by the
+/// integration drift test `listed_object_reads_are_recorded_or_named_invisible`
+/// on each listed version: objects of the three always-reported lists
+/// whose reads **that run** leave no record on each source, whatever the
+/// account (a low-privilege login and `sa` alike). Measured on 2022
+/// (16.0.4305.5, 2026-10-18) with the dev service's specification
+/// (`SCHEMA_OBJECT_ACCESS_GROUP`, no `DBCC_GROUP`) and session. The local
+/// details below ([`AUDIT_INVISIBLE_DETAIL`], [`XE_INVISIBLE_DETAIL`]) say
+/// the same, and are updated with it.
+#[cfg(test)]
+pub(crate) struct Invisible {
+    /// SQL Server versions (major) the lists were measured on; on any
+    /// other, the drift test prints its table and asks for a measurement.
+    pub(crate) measured: &'static [u32],
+    /// SQL Server Audit: the `DBCC` reads (no `DBCC_GROUP` in the
+    /// specification) and the built-in functions, which check no object
+    /// permission.
+    pub(crate) audit: &'static [&'static str],
+    /// SQL Server Audit: reads refused with these errors leave no record
+    /// (a `DBCC` permission, 2571; a Query Store read refused, 262); other
+    /// refusals are recorded (`succeeded = 0`).
+    pub(crate) audit_refused: &'static [i32],
+    /// Extended Events: statements calling these leave no statement event
+    /// at all (the server hides them); a read refused as it compiles
+    /// leaves none either (one refused while it runs does).
+    pub(crate) xevents: &'static [&'static str],
+}
+
+/// See [`Invisible`].
+#[cfg(test)]
+pub(crate) const INVISIBLE: Invisible = Invisible {
+    measured: &[16],
+    audit: &[
+        "inputbuffer",
+        "show_statistics",
+        "page",
+        "loginproperty",
+        "certprivatekey",
+        "pwdcompare",
+    ],
+    audit_refused: &[262, 2571],
+    xevents: &["certprivatekey", "pwdcompare"],
+};
+
+/// The local detail of `INVISIBLE` for SQL Server Audit.
+pub(crate) const AUDIT_INVISIBLE_DETAIL: &str = "reads invisible on SQL Server Audit (measured on \
+2022): DBCC INPUTBUFFER, DBCC SHOW_STATISTICS and DBCC PAGE without DBCC_GROUP in a specification, \
+LOGINPROPERTY, CERTPRIVATEKEY and PWDCOMPARE (built-in functions, no permission check recorded), \
+and DBCC or Query Store reads refused by a permission";
+
+/// The local detail of `INVISIBLE` for Extended Events.
+pub(crate) const XE_INVISIBLE_DETAIL: &str = "Extended Events: reads invisible (measured on 2022): \
+statements calling CERTPRIVATEKEY or PWDCOMPARE (the server leaves no statement event) and reads \
+refused by a permission as they compile (no statement completes)";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +471,13 @@ mod tests {
         let l = level(&i);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // Decision 6 measurement obligation (M2): the reads this source
+        // cannot see are named in the local detail.
+        assert!(
+            l.details.contains(&AUDIT_INVISIBLE_DETAIL),
+            "{:?}",
+            l.details
+        );
         // No stream running: Limited at most (review L2).
         i.stream.running = false;
         assert_eq!(level(&i).level, AuditLevel::Limited);

@@ -319,6 +319,11 @@ pub(crate) struct Session {
     /// Tests only: the session may send texts off the allow-list.
     #[cfg(test)]
     pub(crate) any_text: bool,
+    /// Tests only: the session may send texts the deny-list refuses too
+    /// (the measurement of the listed objects' reads, as `sa` and a
+    /// throwaway login).
+    #[cfg(test)]
+    pub(crate) raw_text: bool,
 }
 
 impl Drop for Session {
@@ -551,6 +556,8 @@ impl Session {
             in_flight: false,
             #[cfg(test)]
             any_text: false,
+            #[cfg(test)]
+            raw_text: false,
         }
     }
 
@@ -922,6 +929,10 @@ impl Session {
     /// session (`any_text`, the integration tests' `sa` and foreign
     /// sessions, the unit tests' scripted servers) skips the allow-list.
     fn vet(&self, text: &str, stage: Stage) -> Result<(), SsError> {
+        #[cfg(test)]
+        if self.raw_text {
+            return Ok(());
+        }
         if !crate::sql::checked(text) {
             tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
             return Err(SsError::new(FailureCode::Internal, stage));
