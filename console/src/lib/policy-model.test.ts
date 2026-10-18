@@ -15,7 +15,7 @@ import {
   type FindingFacts,
   type IncidentStatus,
 } from "./policy-model";
-import { foldName } from "./policy-common";
+import { dedupDatabaseName, foldName } from "./policy-common";
 
 const FACTS: FindingFacts = {
   agentId: "01890a5d-ac96-774b-bcce-b302099a8058",
@@ -81,6 +81,15 @@ describe("globMatch", () => {
     expect(globMatch("clients", " clients", { ignoreTrailingSpaces: true })).toBe(false);
     expect(globMatch("cli ents", "clients", { ignoreTrailingSpaces: true })).toBe(false);
     expect(globMatch("orders", "clients ", { ignoreTrailingSpaces: true })).toBe(false);
+  });
+});
+
+describe("dedupDatabaseName (ADR-0021 note of 2026-10-18, PR #274 review M1)", () => {
+  it("keeps the case on every engine; drops trailing spaces only on SQL Server, MySQL and MariaDB", () => {
+    for (const engine of ["mysql", "mariadb", "sqlserver"]) expect(dedupDatabaseName("CRM  ", engine)).toBe("CRM");
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap", "unknown"]) expect(dedupDatabaseName("CRM  ", engine)).toBe("CRM  ");
+    expect(dedupDatabaseName("crm ", null)).toBe("crm ");
+    expect(dedupDatabaseName("crm\t", "mysql")).toBe("crm\t");
   });
 });
 

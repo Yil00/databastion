@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
-import { enrollAgent, recordHeartbeat, targetSourceDetails, withoutMismatchedSources } from "@/server/agents";
+import { enrollAgent, mismatchedTargetIds, recordHeartbeat, targetSourceDetails, withoutMismatchedSources } from "@/server/agents";
 import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
@@ -115,6 +115,7 @@ export function handleHeartbeat(req: Request): Promise<Response> {
         endpoint: "heartbeat",
         status: 200,
         details: mismatched,
+        targetIds: mismatchedTargetIds(body.value, mismatched),
         ip: clientIp(req),
       });
     }
