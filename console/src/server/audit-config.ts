@@ -273,7 +273,11 @@ export interface AuditConfigView {
   warning: AuditWarning | null;
   warningRemoved: number | null;
   updatedAt: Date | null;
-  lastJob: { id: string; status: string; errorCode: string | null; createdAt: Date } | null;
+  /**
+   * `deliveredWithoutKeyPatterns`: key patterns left out of its last delivery, the agent no longer
+   * listing `sensitive_object.key_pattern` (security review of #280, M2); null when none.
+   */
+  lastJob: { id: string; status: string; errorCode: string | null; createdAt: Date; deliveredWithoutKeyPatterns: number | null } | null;
 }
 
 /** Audit settings of a target (defaults when never configured), or null for an unknown target. */
@@ -291,7 +295,7 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
     .limit(1);
   const [job] = await db
-    .select({ id: jobs.id, status: jobs.status, error: jobs.error, createdAt: jobs.createdAt })
+    .select({ id: jobs.id, status: jobs.status, error: jobs.error, createdAt: jobs.createdAt, withoutKeys: jobs.deliveredWithoutKeyPatterns })
     .from(jobs)
     .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure")))
     .orderBy(desc(jobs.createdAt))
@@ -314,7 +318,9 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     warning: (c?.warning as AuditWarning | null | undefined) ?? null,
     warningRemoved: c?.warningRemoved ?? null,
     updatedAt: c?.updatedAt ?? null,
-    lastJob: job ? { id: job.id, status: job.status, errorCode: job.error?.code ?? null, createdAt: job.createdAt } : null,
+    lastJob: job
+      ? { id: job.id, status: job.status, errorCode: job.error?.code ?? null, createdAt: job.createdAt, deliveredWithoutKeyPatterns: job.withoutKeys ?? null }
+      : null,
   };
 }
 
@@ -360,6 +366,54 @@ export async function configureAudit(
   actor: { userId: string; ip: string | null },
 ): Promise<AuditConfigureOutcome> {
   const result = await db.transaction(async (tx): Promise<AuditConfigureOutcome> => {
+    const r = await queueAuditSettings(tx, agentId, targetId, input, { kind: "user", ...actor });
+    // Only a system requeue can be "unchanged".
+    return r.outcome === "unchanged" ? { outcome: "invalid" } : r;
+  });
+  if (result.outcome !== "queued") {
+    await writeAudit(db, {
+      actorType: "user",
+      actorId: actor.userId,
+      action: "audit.configure",
+      outcome: "failure",
+      targetType: "agent",
+      targetId: agentId,
+      sourceIp: actor.ip,
+      details: {
+        target_id: targetId,
+        reason: result.outcome,
+        ...(result.outcome === "confirmation_required"
+          ? {
+              warning: result.change.warning,
+              previous_objects: result.change.previousCount,
+              next_objects: result.change.nextCount,
+              removed_objects: result.change.removed,
+              min_rows_warning: result.minRowsWarning,
+            }
+          : {}),
+      },
+    });
+  }
+  return result;
+}
+
+/** Who changes the settings: an administrator, or the console itself (security review of #280, M2). */
+type SettingsActor =
+  | { kind: "user"; userId: string; ip: string | null }
+  | { kind: "system"; reason: "agent_accepts_changed" };
+
+/**
+ * The settings computation and queueing of {@link configureAudit}, inside the caller's transaction.
+ * A `system` actor needs no confirmation (it records the warning of a narrowing change, shown on the
+ * target like any other) and queues nothing when no object changes (`unchanged`).
+ */
+async function queueAuditSettings(
+  tx: Tx,
+  agentId: string,
+  targetId: string,
+  input: AuditConfigInput,
+  actor: SettingsActor,
+): Promise<AuditConfigureOutcome | { outcome: "unchanged" }> {
     // Serializes the changes of the agent's settings (and its jobs), as for scan requests.
     const [agent] = await tx
       .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
@@ -402,7 +456,9 @@ export async function configureAudit(
       { enabled: params.enabled, objects: params.sensitive_objects ?? [] },
     );
     const digest = settingsDigest(params);
-    if (change.warning !== null && input.confirm !== digest) {
+    // A system requeue (the agent's capabilities changed) that changes no object is not queued.
+    if (actor.kind === "system" && change.added === 0 && change.removed === 0) return { outcome: "unchanged" };
+    if (actor.kind === "user" && change.warning !== null && input.confirm !== digest) {
       return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
@@ -412,7 +468,7 @@ export async function configureAudit(
       .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure"), eq(jobs.status, "pending")));
     const [job] = await tx
       .insert(jobs)
-      .values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: actor.userId })
+      .values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: actor.kind === "user" ? actor.userId : null })
       .returning({ id: jobs.id });
     if (!job) throw new Error("job insert returned no row");
     const values = {
@@ -427,53 +483,69 @@ export async function configureAudit(
       warning: change.warning,
       warningRemoved: change.warning !== null ? change.removed : null,
       updatedAt: sql`now()`,
-      updatedBy: actor.userId,
+      updatedBy: actor.kind === "user" ? actor.userId : null,
     };
     await tx
       .insert(auditConfigs)
       .values({ agentId, targetId, ...values })
       .onConflictDoUpdate({ target: [auditConfigs.agentId, auditConfigs.targetId], set: values });
     await writeAudit(tx, {
-      actorType: "user",
-      actorId: actor.userId,
+      actorType: actor.kind,
+      actorId: actor.kind === "user" ? actor.userId : null,
       action: "audit.configure",
       targetType: "job",
       targetId: job.id,
-      sourceIp: actor.ip,
+      sourceIp: actor.kind === "user" ? actor.ip : null,
       details: {
-        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
+        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, actor.kind === "user"),
         skipped_key_patterns: skippedKeyPatterns,
         min_rows_warning: rowsWarning,
+        ...(actor.kind === "system" ? { reason: actor.reason } : {}),
       },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
     return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
-  });
-  if (result.outcome !== "queued") {
-    await writeAudit(db, {
-      actorType: "user",
-      actorId: actor.userId,
-      action: "audit.configure",
-      outcome: "failure",
-      targetType: "agent",
-      targetId: agentId,
-      sourceIp: actor.ip,
-      details: {
-        target_id: targetId,
-        reason: result.outcome,
-        ...(result.outcome === "confirmation_required"
-          ? {
-              warning: result.change.warning,
-              previous_objects: result.change.previousCount,
-              next_objects: result.change.nextCount,
-              removed_objects: result.change.removed,
-              min_rows_warning: result.minRowsWarning,
-            }
-          : {}),
-      },
+}
+
+/**
+ * Security review of #280, M2: when a heartbeat changes the agent's stored capability list
+ * (`agents.accepts`: an upgrade that starts listing `sensitive_object.key_pattern`, or a downgrade
+ * that stops), the enabled Audit settings of its Redis / Valkey targets are computed again from the
+ * stored settings and queued when their objects change, so key patterns are neither withheld from
+ * an upgraded agent nor silently lost by a downgraded one. Audited as `audit.configure` by the
+ * system, with `reason: "agent_accepts_changed"`; a narrowing change leaves its warning on the
+ * target. Returns the number of jobs queued.
+ */
+export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId: string): Promise<number> {
+  const rows = await db
+    .select({ targetId: auditConfigs.targetId, engine: agentTargets.engine })
+    .from(auditConfigs)
+    .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
+    .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
+  let queued = 0;
+  for (const { targetId, engine } of rows) {
+    if (!isKeyPatternEngine(engine)) continue;
+    const outcome = await db.transaction(async (tx) => {
+      const [c] = await tx
+        .select()
+        .from(auditConfigs)
+        .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
+        .limit(1);
+      if (!c?.enabled) return "skipped";
+      const input: AuditConfigInput = {
+        enabled: true,
+        aggregationWindowS: c.aggregationWindowS,
+        pollIntervalS: c.pollIntervalS,
+        minRows: c.minRows ?? null,
+        deriveFromFindings: c.deriveFromFindings,
+        manualObjects: c.manualObjects as unknown as SensitiveObject[],
+        confirm: null,
+      };
+      return (await queueAuditSettings(tx, agentId, targetId, input, { kind: "system", reason: "agent_accepts_changed" })).outcome;
     });
+    if (outcome === "queued") queued++;
   }
-  return result;
+  return queued;
 }
 
 function auditDetails(

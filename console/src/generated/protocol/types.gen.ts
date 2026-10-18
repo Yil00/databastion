@@ -988,12 +988,13 @@ export interface components {
          *     out, and counts it). The console checks the object against the schema of the **target's**
          *     engine, as for `ObjectRef`, and the agent refuses an `audit.configure` job whose key
          *     pattern names a target of any other engine (`invalid_params`). On a Redis / Valkey target
-         *     the agent matches an event's key pattern against a listed one as a Redis glob in which
-         *     `*` is the only wildcard (any run of characters, separators included), in both
-         *     directions, so a listed `user:*:email` covers the event objects `user:*:email` and
-         *     `user:*`, and the event object `*` (a key no learned pattern names) matches every listed
-         *     pattern of its database; the database `*` (a source that does not tell the database)
-         *     matches any database. The match ignores case and trailing spaces, as on every engine.
+         *     the agent keeps an event whose key pattern overlaps a listed one: some key name matches
+         *     both, each read as a Redis glob in which `*` is the only wildcard (any run of
+         *     characters, separators included). So a listed `user:*:email` covers the event objects
+         *     `user:*:email`, `user:*` and `*:email`, and the event object `*` (a key no learned
+         *     pattern names) matches every listed pattern of its database; the database `*` (a
+         *     source that does not tell the database) matches any database. The match ignores case,
+         *     and compares names with and without their trailing spaces, as on every engine.
          */
         SensitiveObject: {
             database: components["schemas"]["Identifier"];

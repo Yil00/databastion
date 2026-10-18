@@ -117,7 +117,9 @@ function isKeyPatternName(object: unknown): boolean {
  * `sensitive_object.key_pattern`. The settings are computed with the agent's list of the moment
  * (`audit-config.ts`); an agent downgraded or rolled back before the delivery would fail to decode
  * the whole job, so its key-pattern objects are left out of what is delivered (logged with their
- * count, never their names). The stored job and settings are unchanged.
+ * count, never their names, and counted in `jobs.delivered_without_key_patterns`, shown on the
+ * Audit settings page). The stored params and settings are unchanged; the heartbeat that changed the
+ * agent's list also queues the settings again (`requeueAuditSettingsOnAcceptsChange`).
  */
 async function withoutUnacceptedKeyPatterns(db: Database, agentId: string, rows: ClaimedRow[]): Promise<void> {
   const carrying = rows.filter((r) => {
@@ -130,11 +132,14 @@ async function withoutUnacceptedKeyPatterns(db: Database, agentId: string, rows:
   for (const r of carrying) {
     const params = r.params as { sensitive_objects: { object?: unknown }[] };
     const kept = params.sensitive_objects.filter((o) => !isKeyPatternName(o?.object));
+    const leftOut = params.sensitive_objects.length - kept.length;
     logger.warn(
-      { jobId: r.id, agentId, left_out: params.sensitive_objects.length - kept.length },
+      { jobId: r.id, agentId, left_out: leftOut },
       "audit.configure delivered without its key-pattern sensitive objects: the agent does not list sensitive_object.key_pattern",
     );
     r.params = { ...r.params, sensitive_objects: kept };
+    // Security review of #280, M2: recorded on the job, shown on the Audit settings page.
+    await db.update(jobs).set({ deliveredWithoutKeyPatterns: leftOut }).where(eq(jobs.id, r.id));
   }
 }
 

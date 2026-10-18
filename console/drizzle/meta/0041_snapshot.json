@@ -1,5 +1,5 @@
 {
-  "id": "39ff9969-1f37-43cc-95ee-2e53909e67ee",
+  "id": "09473e30-f40b-430e-a4fd-89cfafd51831",
   "prevId": "5aed9ada-39d4-476e-b7ab-2ad02092cf7b",
   "version": "7",
   "dialect": "postgresql",
@@ -2240,6 +2240,12 @@
         "created_by": {
           "name": "created_by",
           "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "delivered_without_key_patterns": {
+          "name": "delivered_without_key_patterns",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false
         }

@@ -381,14 +381,14 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.agentAcceptsKeyPatterns).toBe(true);
     const on = await configure(
       auth,
-      { enabled: true, manual_objects: [{ database: "db1", object: "session|*|token", classifiers: ["pii.phone"] }] },
+      { enabled: true, manual_objects: [{ database: "db1", object: "session:*:token", classifiers: ["pii.phone"] }] },
       { target: "cache-redis" },
     );
     expect(on.status).toBe(202);
     expect(await on.json()).toMatchObject({ next_objects: 3, skipped_key_patterns: 0 });
     const [job] = await auditJobs(auth.agentId);
     const sent = (job?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
-    expect(sent).toEqual(["profiles", "session|*|token", "user:*:profile"]);
+    expect(sent).toEqual(["profiles", "session:*:token", "user:*:profile"]);
     // Delivered as such, and a conforming JobList.
     const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
     const { jobs: list } = (await polled.json()) as { jobs: { type: string; params: { sensitive_objects: SensitiveObject[] } }[] };
@@ -397,23 +397,60 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(validateSchema("JobList", { jobs: list }).ok).toBe(true);
   });
 
-  it("phase 9 follow-ups: a job queued for an agent that listed the token is delivered without its key patterns once the agent no longer lists it", async () => {
+  const REDIS_HB = {
+    ...HEARTBEAT,
+    connectors: ["postgres", "redis"],
+    targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+  };
+
+  it("#280 review M2: a downgraded agent's settings are queued again without key patterns, with a warning, by the system", async () => {
     const auth = await redisAgentWithFindings(["sensitive_object.key_pattern"]);
     expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
     // A rolled-back agent: its next heartbeat lists nothing.
-    const hb = {
-      ...HEARTBEAT,
-      connectors: ["postgres", "redis"],
-      targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HB }))).status).toBe(200);
+    const [latest, first] = await auditJobs(auth.agentId);
+    expect(first?.status).toBe("cancelled");
+    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object)).toEqual(["profiles"]);
+    expect(latest?.createdBy).toBeNull();
+    const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
+    expect(row).toMatchObject({ warning: "shrunk", warningRemoved: 1 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit).toMatchObject({ actorType: "system", actorId: null });
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", skipped_key_patterns: 1, removed_objects: 1 });
+    // The same heartbeat again changes nothing: no new job.
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HB }))).status).toBe(200);
+    expect(await auditJobs(auth.agentId)).toHaveLength(2);
+  });
+
+  it("#280 review M2: an upgraded agent gets the key patterns left out before, without a new save", async () => {
+    const auth = await redisAgentWithFindings();
+    const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
+    expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } }))).status).toBe(200);
+    const [latest] = await auditJobs(auth.agentId);
+    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort()).toEqual(["profiles", "user:*:profile"]);
+    const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
+    expect(row?.warning).toBeNull();
+  });
+
+  it("#280 review M2 and L4: a job carrying key patterns is delivered without them to an agent that never listed the token, recorded on the job", async () => {
+    const auth = await redisAgentWithFindings();
+    const params = {
+      enabled: true,
+      sensitive_objects: [
+        { database: "db0", object: "user:*:email", classifiers: ["pii.email"] },
+        { database: "db0", object: "profiles", classifiers: ["pii.email"] },
+      ],
     };
-    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "audit.configure", targetId: "cache-redis", params });
     const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
-    const { jobs: list } = (await polled.json()) as { jobs: { type: string; params: { sensitive_objects: SensitiveObject[] } }[] };
-    const delivered = list.find((j) => j.type === "audit.configure");
+    const { jobs: list } = (await polled.json()) as { jobs: { job_id: string; params: { sensitive_objects: SensitiveObject[] } }[] };
+    const delivered = list.find((j) => j.job_id === id);
     expect(delivered?.params.sensitive_objects.map((o) => o.object)).toEqual(["profiles"]);
-    // The stored job is unchanged.
-    const [job] = await auditJobs(auth.agentId);
-    expect((job?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects).toHaveLength(2);
+    const [job] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+    expect(job?.deliveredWithoutKeyPatterns).toBe(1);
+    expect((job?.params as typeof params).sensitive_objects).toHaveLength(2);
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.lastJob?.deliveredWithoutKeyPatterns).toBe(1);
   });
 
   it("phase 9 follow-ups: a key pattern typed by hand for a target of another engine is refused", async () => {

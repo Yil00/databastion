@@ -67,6 +67,13 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
           {MIN_ROWS_WARNING_TEXT[rowsWarning]}
         </p>
       )}
+      {config.lastJob?.deliveredWithoutKeyPatterns ? (
+        <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
+          The last settings job was delivered without its {config.lastJob.deliveredWithoutKeyPatterns} key-pattern sensitive
+          objects: the agent no longer accepted key patterns when it fetched the job (an agent downgraded or rolled back). Accesses
+          to them are only reported with a signal or above the row threshold until the agent is upgraded again.
+        </p>
+      ) : null}
       {keyPatterns && !config.agentAcceptsKeyPatterns && (
         <p role="note" className="rounded-md border p-3 text-sm text-muted-foreground">
           This agent cannot receive key patterns as sensitive objects (its version does not list them): the Audit settings sent to it

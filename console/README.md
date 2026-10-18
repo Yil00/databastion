@@ -1117,7 +1117,11 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   in `skipped_key_patterns` of the answer and in the audit entry; the save never fails because
   of them, and turning Audit off always works), and the Audit page says so. The check is made
   again at delivery (`src/server/jobs.ts`): a job queued for an agent that no longer lists the
-  token goes out without its key patterns (logged with their count). Manual objects are typed
+  token goes out without its key patterns (logged with their count, recorded in
+  `jobs.delivered_without_key_patterns` and shown on the Audit settings page). A heartbeat that
+  changes the agent's stored list queues the enabled Redis / Valkey settings again from the
+  stored ones (`requeueAuditSettingsOnAcceptsChange`, a system `audit.configure`, no
+  confirmation; nothing is queued when no object changes; a narrowing leaves its warning). Manual objects are typed
   `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
   typed by hand for a target of any other engine is refused (`400 invalid_params`).
 

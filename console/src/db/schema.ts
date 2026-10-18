@@ -384,6 +384,12 @@ export const jobs = pgTable(
     error: jsonb("error").$type<{ code: string; engine_code?: string }>(),
     finishedAt: tsz("finished_at"),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * `audit.configure` only: the key-pattern sensitive objects left out of the last delivery
+     * because the agent no longer listed `sensitive_object.key_pattern` (src/server/jobs.ts,
+     * security review of #280, M2); null when nothing was left out. `params` is unchanged.
+     */
+    deliveredWithoutKeyPatterns: integer("delivered_without_key_patterns"),
   },
   (t) => [index("jobs_agent_status_idx").on(t.agentId, t.status, t.createdAt)],
 );
