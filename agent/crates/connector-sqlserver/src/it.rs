@@ -1854,6 +1854,35 @@ async fn xe_scenario() {
     .await;
     Box::pin(exec(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
     Box::pin(drop_login(&mut s, "it_xcred")).await;
+    // The e2e DCL batch (e2e/sqlserver.sh) by a login holding ALTER ANY
+    // LOGIN only: the server records the first two as `-- CREATE LOGIN`
+    // and `-- ALTER LOGIN` (measured on 2022), the third with its text;
+    // three DCL events (the fix of 2026-10-18: `DROP LOGIN` was DDL).
+    Box::pin(drop_login(&mut s, "it_xdcl_probe")).await;
+    Box::pin(throwaway(
+        &mut s,
+        "it_xadmin",
+        &[in_db("master", "GRANT ALTER ANY LOGIN TO [it_xadmin]")],
+    ))
+    .await;
+    {
+        let mut a = Box::pin(foreign_session(
+            "it_xadmin",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(exec_ok(
+            &mut a,
+            &format!(
+                "CREATE LOGIN it_xdcl_probe WITH PASSWORD = N'{marker}A1', CHECK_POLICY = OFF;\n\
+                 ALTER LOGIN it_xdcl_probe WITH PASSWORD = N'{marker}B2';\n\
+                 DROP LOGIN it_xdcl_probe;\n"
+            ),
+        ))
+        .await;
+        a.close().await;
+    }
+    Box::pin(drop_login(&mut s, "it_xdcl_probe")).await;
 
     // The session's dispatch latency is 5 s.
     tokio::time::sleep(Duration::from_secs(12)).await;
@@ -1932,6 +1961,20 @@ async fn xe_scenario() {
     assert!(
         by("sa").iter().any(|e| e.action() == EventAction::Dcl),
         "no DCL reported"
+    );
+    let admin_dcl: Vec<&MaskedEvent> = by("it_xadmin")
+        .into_iter()
+        .filter(|e| e.action() == EventAction::Dcl)
+        .collect();
+    assert_eq!(
+        admin_dcl.len(),
+        3,
+        "CREATE / ALTER LOGIN … WITH PASSWORD and DROP LOGIN: three DCL events"
+    );
+    assert!(
+        admin_dcl
+            .iter()
+            .all(|e| e.always_report() && names_of(e).iter().all(|n| n.ends_with(".-.*")))
     );
     // The agent's login: only the foreign session's statements.
     let agent_events = by("databastion");
@@ -2050,6 +2093,7 @@ async fn xe_scenario() {
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
     assert!(has(&h, NoteCode::AuditRecordsDropped), "{:?}", codes(&h));
     Box::pin(drop_login(&mut s, "it_xdump")).await;
+    Box::pin(drop_login(&mut s, "it_xadmin")).await;
     if major >= 16 {
         Box::pin(exec(
             &mut s,

@@ -7,7 +7,10 @@
 -- 2026-10-15): VIEW SERVER SECURITY AUDIT (reads the audit) and VIEW ANY SECURITY DEFINITION
 -- (shows the audit and specification catalogs; no password hash, measured), and no VIEW SERVER
 -- SECURITY STATE (the audit's own AUSC records prove its restarts). On 2019, VIEW SERVER STATE for
--- the Extended Events source (not read by this agent build yet: reported as an unused Audit grant).
+-- the Extended Events source, its only Audit source (reported as an unused Audit grant while no
+-- Extended Events stream reads the target). Tests of the Extended Events source on 2022+ grant
+-- VIEW SERVER PERFORMANCE STATE themselves (the integration tests; e2e/sqlserver.sh with
+-- E2E_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents, which revokes the two grants above).
 -- Row-level security visibility (ADR-0051 refinement item 2, option (iv), open question 5): the
 -- dev and E2E account holds database VIEW DEFINITION in `retail` and its targets declare
 -- `sqlserver.rls_visibility: view_definition`, so Discovery is tested; the integration tests

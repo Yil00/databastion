@@ -436,7 +436,10 @@ LOAD_REDIS_ENGINE=redis LOAD_SKIP_BUILD=1 e2e/load/redis.sh
 
 Results go to `$LOAD_RESULTS_DIR` (default `e2e/load/.results-redis/`), logs to `$LOAD_LOG_DIR`
 (default `e2e/load/.logs-redis/`); the target's TLS port is published on
-`127.0.0.1:${LOAD_VALKEY_PORT:-16479}` (or `LOAD_REDIS_PORT`, 16489) for the host-side client.
+`127.0.0.1:${LOAD_VALKEY_PORT:-16479}` (or `LOAD_REDIS_PORT`, 16489) for the host-side client, by
+this run's overlay ([`docker-compose.redis.yml`](docker-compose.redis.yml)) through `redis-net`, an
+ordinary bridge network: the target has egress for the run's length (the end-to-end run's targets
+do not: [e2e/README.md](../README.md#valkey-and-redis-targets)).
 
 **Status: CI run 38978357006 on `dev` at `a529e13` (2026-10-16, soak 600 s): PASS.** Discovery 0.267 % (1 000 146
 keys, 51.9 s scan); Audit 120 000 / 120 000 GETs at 200/s, drain 6 s; no added latency; agent 0.0024 core

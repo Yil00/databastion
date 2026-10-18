@@ -114,6 +114,8 @@ make dev
 make agent-it ENGINE=postgres
 ```
 
+One engine's run takes the test binary's arguments after the engine name, for example a single test: `dev/agent-it.sh sqlserver listed_object_reads_are_recorded_or_named_invisible`. The engine matrix also records measurements this way (uploaded as `measure-*` artifacts): on SQL Server, the fresh-server test first on the new data volume (`DATABASTION_IT_SQLSERVER_FRESH=1 dev/agent-it.sh sqlserver xe_fresh_server_own_reads_raise_no_event`, with `DATABASTION_IT_SQLSERVER_CAPTURE=<file>` for its fixture capture) and the `M2 | …` table of the main run; on MySQL / MariaDB, after the tests, [capture-poll-digests.sh](capture-poll-digests.sh), which prints the digests of the agent's `performance_schema` poll and stats texts as each running `mysql`, `mariadb` and `percona` service renders them, in the format of the connector's fixture `poll_digests.tsv`.
+
 The PostgreSQL 18+ images keep their data in `/var/lib/postgresql/data` like the older ones ([postgres/Dockerfile](postgres/Dockerfile) sets `PGDATA`), so the same volume layout works for every major. `make dev-smoke` checks the default configuration (it reads the `jsonlog` file).
 
 ## Keycloak (OIDC test realm)

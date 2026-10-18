@@ -22,6 +22,13 @@
 #     console and agent logs, the pages or the agent's state; the literals of the analyst's queries
 #     nowhere on the console side (positive control: they are in SQL Server's own audit file); the
 #     DCL marker passwords nowhere either; no generated secret in any container log.
+# Version and source (ROADMAP P9-D follow-up): E2E_SQLSERVER_VERSION 2022 (default: the dev pin), 2019
+# or 2025 (the engine matrix pins, Express); E2E_SQLSERVER_AUDIT_SOURCE sqlserver_audit (default on
+# 2022 and 2025) or sqlserver_xevents (the dev session `databastion_xe`; the only source on 2019,
+# and its default there). With sqlserver_xevents the agent login holds the session's grant only
+# (VIEW SERVER STATE on 2019, VIEW SERVER PERFORMANCE STATE on 2022+: the two SQL Server Audit
+# grants are revoked before the agent starts), the level is Partial without
+# audit.log_without_row_counts, and the positive controls read the session's files.
 # See e2e/README.md "SQL Server target". Requires: docker (compose v2.24+), openssl, curl, jq, python3.
 #
 # Every secret is generated here at run time (never committed), kept under a private temporary
@@ -61,6 +68,42 @@ fi
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
   unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_MSSQL_IMAGE
 fi
+
+# The version under test and its Audit source. 2019 and 2025: the engine matrix's pins (the same
+# strings as engine-matrix.yml, checked below), which override E2E_MSSQL_IMAGE.
+MSSQL_VERSION="${E2E_SQLSERVER_VERSION:-2022}"
+MSSQL_PIN=""
+case "$MSSQL_VERSION" in
+  2019) MSSQL_MAJOR=15 default_source=sqlserver_xevents
+    MSSQL_PIN="mcr.microsoft.com/mssql/server:2019-latest@sha256:07d7dedecdbfcf6776035dc5eefb5bfd9aa1804b2f6b99f7dedb397d8a599069" ;;
+  2022) MSSQL_MAJOR=16 default_source=sqlserver_audit ;;
+  2025) MSSQL_MAJOR=17 default_source=sqlserver_audit
+    MSSQL_PIN="mcr.microsoft.com/mssql/server:2025-latest@sha256:742481d1b1186cccc81220a1eaacef244ca8d0f7d19c8e5c70df8ae541ffbab2" ;;
+  *) echo "E2E_SQLSERVER_VERSION must be 2019, 2022 or 2025 (got '$MSSQL_VERSION')" >&2; exit 2 ;;
+esac
+AUDIT_SOURCE="${E2E_SQLSERVER_AUDIT_SOURCE:-$default_source}"
+case "$AUDIT_SOURCE" in
+  sqlserver_audit)
+    # SQL Server Audit is a source on 2022 and later only (ADR-0051 decision 6).
+    [ "$MSSQL_MAJOR" -ge 16 ] || { echo "sqlserver_audit is not a source on SQL Server $MSSQL_VERSION" >&2; exit 2; }
+    AUDIT_YAML="{source: sqlserver_audit, audit_name: databastion_audit}" ;;
+  sqlserver_xevents) AUDIT_YAML="{source: sqlserver_xevents, xe_session: databastion_xe}" ;;
+  *) echo "E2E_SQLSERVER_AUDIT_SOURCE must be sqlserver_audit or sqlserver_xevents (got '$AUDIT_SOURCE')" >&2; exit 2 ;;
+esac
+if [ -n "$MSSQL_PIN" ]; then
+  grep -qF "sqlserver_image: $MSSQL_PIN" "$HERE/../.github/workflows/engine-matrix.yml" || {
+    echo "the SQL Server $MSSQL_VERSION pin of sqlserver.sh must be the one of engine-matrix.yml" >&2
+    exit 1
+  }
+  export E2E_MSSQL_IMAGE="$MSSQL_PIN"
+fi
+# The statement events of the session's files (the positive controls on sqlserver_xevents): text and
+# login of each sql_statement_completed / sp_statement_completed, read as `sa`.
+XE_STATEMENTS="SELECT CONVERT(nvarchar(4000), x.value('(event/data[@name=\"statement\"]/value)[1]', 'nvarchar(4000)')) AS stmt_text,
+    CONVERT(nvarchar(128), x.value('(event/action[@name=\"server_principal_name\"]/value)[1]', 'nvarchar(128)')) AS principal_name
+  FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe*.xel', NULL, NULL, NULL) f
+  CROSS APPLY (SELECT CONVERT(xml, f.event_data)) e(x)
+  WHERE f.object_name IN (N'sql_statement_completed', N'sp_statement_completed')"
 
 umask 077
 E2E_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-e2e-sqlserver.XXXXXX")"
@@ -132,7 +175,7 @@ targets:
       ca_file: /etc/databastion/sqlserver-ca.pem
       databases: [retail]
       rls_visibility: view_definition
-      audit: {source: sqlserver_audit, audit_name: databastion_audit}
+      audit: ${AUDIT_YAML}
   - id: ${BADCA}
     engine: sqlserver
     host: sqlserver
@@ -181,7 +224,7 @@ else
 fi
 phase_done build
 
-log "starting the console and SQL Server 2022 Express (first start: seed, agent login, audit)"
+log "starting the console and SQL Server ${MSSQL_VERSION} Express (first start: seed, agent login, audit; source ${AUDIT_SOURCE})"
 timeout 900 docker compose "${COMPOSE_ARGS[@]}" up -d db web worker proxy target-mssql
 start_console
 deadline=$(( $(date +%s) + 420 ))
@@ -199,7 +242,7 @@ chmod 0644 "$T/sqlserver-ca.pem"
 version="$(mssql_sa_q "SELECT CONCAT(CONVERT(nvarchar(64), SERVERPROPERTY('ProductVersion')), ' ', CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), ' engine ', CONVERT(int, SERVERPROPERTY('EngineEdition')))")" \
   || fail "cannot read the server version"
 log "target-mssql: $version"
-[[ "$version" == 16.* ]] || fail "target-mssql is not SQL Server 2022 ($version)"
+[[ "$version" == "${MSSQL_MAJOR}".* ]] || fail "target-mssql is not SQL Server ${MSSQL_VERSION} ($version)"
 [[ "$version" == *" engine 4" ]] || fail "target-mssql is not the Express edition ($version)"
 phase_done start
 
@@ -207,13 +250,27 @@ phase_done start
 # ADR-0051 decision 4, minimal variant (dev/sqlserver/initdb/20-databastion.sql): server-level
 # exactly CONNECT SQL and the two SQL Server Audit grants of 2022 (refinement item 1, option (a')),
 # no server role; in `retail` CONNECT, the RLS opt-in VIEW DEFINITION, SELECT on the schemas crm and
-# finance, the three columns of cas.cas_tickets, no database role.
+# finance, the three columns of cas.cas_tickets, no database role. On 2019 the dev script grants
+# VIEW SERVER STATE instead (the Extended Events grant of 2019). With the Extended Events source on
+# 2022+, the operator's grant set of that source (docs/08 "Extended Events: source and grants"): the
+# two SQL Server Audit grants revoked, VIEW SERVER PERFORMANCE STATE granted, before the agent
+# starts (an unused Audit grant would be reported as privilege.audit_grant_without_audit).
+if [ "$AUDIT_SOURCE" = sqlserver_xevents ] && [ "$MSSQL_MAJOR" -ge 16 ]; then
+  log "Extended Events source on ${MSSQL_VERSION}: the agent login gets VIEW SERVER PERFORMANCE STATE, not the SQL Server Audit grants"
+  mssql_sa_q "REVOKE VIEW SERVER SECURITY AUDIT FROM databastion; REVOKE VIEW ANY SECURITY DEFINITION FROM databastion;
+    GRANT VIEW SERVER PERFORMANCE STATE TO databastion;" >/dev/null || fail "cannot set the Extended Events grant of the agent login"
+fi
+case "${AUDIT_SOURCE}:${MSSQL_MAJOR}" in
+  sqlserver_audit:*) want_perms="CONNECT SQL+VIEW ANY SECURITY DEFINITION+VIEW SERVER SECURITY AUDIT" ;;
+  sqlserver_xevents:15) want_perms="CONNECT SQL+VIEW SERVER STATE" ;;
+  sqlserver_xevents:*) want_perms="CONNECT SQL+VIEW SERVER PERFORMANCE STATE" ;;
+esac
 log "checking the agent login (ADR-0051 minimal variant, read-only: I4)"
 perms="$(mssql_sa_q "SELECT STRING_AGG(permission_name, '+') WITHIN GROUP (ORDER BY permission_name)
   FROM sys.server_permissions p JOIN sys.server_principals s ON s.principal_id = p.grantee_principal_id
   WHERE s.name = N'databastion' AND p.state IN ('G', 'W')")"
-[ "$perms" = "CONNECT SQL+VIEW ANY SECURITY DEFINITION+VIEW SERVER SECURITY AUDIT" ] \
-  || fail "unexpected server permissions of the agent login: $perms"
+[ "$perms" = "$want_perms" ] \
+  || fail "unexpected server permissions of the agent login: $perms (expected $want_perms)"
 roles="$(mssql_sa_q "SELECT COUNT(*) FROM sys.server_role_members m JOIN sys.server_principals s
   ON s.principal_id = m.member_principal_id WHERE s.name = N'databastion'")"
 [ "$roles" = 0 ] || fail "the agent login is a member of $roles server role(s)"
@@ -261,14 +318,28 @@ t="$(target_json "$TARGET")"
 log "target ${TARGET}: $(target_summary "$t")"
 # Before any Audit stream: Limited at most (no stream runs), never Partial or Full; and not None
 # (every other proof holds on the dev audit).
-jq -e '.auditLevel == "limited" and .auditSource == "sqlserver_audit"' <<<"$t" >/dev/null \
-  || fail "${TARGET}: level $(jq -r .auditLevel <<<"$t") / source $(jq -r .auditSource <<<"$t") before the Audit stream, expected limited / sqlserver_audit"
-# TLS: SQL Server 2022 on Linux has no TDS 8.0 strict mode: the `auto` mode falls back to the
-# mandatory (TDS 7.x) encryption, certificate verified (ADR-0051 refinement item 3).
+jq -e --arg s "$AUDIT_SOURCE" '.auditLevel == "limited" and .auditSource == $s' <<<"$t" >/dev/null \
+  || fail "${TARGET}: level $(jq -r .auditLevel <<<"$t") / source $(jq -r .auditSource <<<"$t") before the Audit stream, expected limited / ${AUDIT_SOURCE}"
+# TLS: SQL Server 2019 and 2022 on Linux have no TDS 8.0 strict mode: the `auto` mode falls back to
+# the mandatory (TDS 7.x) encryption, certificate verified (ADR-0051 refinement item 3). 2025 runs
+# here without network.forcestrict (the engine matrix covers forced strict): `auto` tries strict
+# first; the mode it reaches is printed (a measurement: no CI entry ran 2025 unforced before).
 line="$(compose logs --no-color agent 2>/dev/null | grep -F '"SQL Server checked"' | grep -F "\"target_id\":\"${TARGET}\"" | tail -n 1)"
-[[ "$line" == *"(edition 4), mandatory encryption"* ]] \
-  || fail "${TARGET}: no 'SQL Server checked' line with the Express edition and mandatory encryption in the agent log"
-log "${TARGET}: checked over mandatory encryption (TDS 7.x, certificate verified against the dev CA)"
+if [ "$MSSQL_MAJOR" -ge 17 ]; then
+  [[ "$line" == *"(edition 4), strict encryption"* || "$line" == *"(edition 4), mandatory encryption"* ]] \
+    || fail "${TARGET}: no 'SQL Server checked' line with the Express edition and strict or mandatory encryption in the agent log"
+  mode=mandatory
+  [[ "$line" != *"(edition 4), strict encryption"* ]] || mode=strict
+  log "${TARGET}: SQL Server ${MSSQL_VERSION} without forced strict: \`auto\` reached ${mode} encryption (certificate verified against the dev CA)"
+  # Accepted until a first run has measured the mode (e2e/README.md); then asserted strict.
+  if [ "$mode" = mandatory ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
+    echo "::warning title=SQL Server ${MSSQL_VERSION} TLS::tls auto reached mandatory, not strict, on SQL Server ${MSSQL_VERSION} without forced strict"
+  fi
+else
+  [[ "$line" == *"(edition 4), mandatory encryption"* ]] \
+    || fail "${TARGET}: no 'SQL Server checked' line with the Express edition and mandatory encryption in the agent log"
+  log "${TARGET}: checked over mandatory encryption (TDS 7.x, certificate verified against the dev CA)"
+fi
 # Negative TLS control: the same server declared with a CA that did not sign its certificate (the
 # console's test CA): the target must be reported unreachable, failing at the TLS stage
 # (`check.stage_failed` with `stage_tls`; the contract has no TLS failure code), never connected.
@@ -302,10 +373,18 @@ rm -f -- "$E2E_WORK_DIR/findings.json"
 phase_done discovery
 
 # Partial once the stream read a record (its own polls count: refinement, last proof), never Full.
-log "Audit: waiting for the heartbeat level of ${TARGET} (partial, sqlserver_audit)"
+log "Audit: waiting for the heartbeat level of ${TARGET} (partial, ${AUDIT_SOURCE})"
 FORBIDDEN_NOTES="audit.partial_pending_first_record audit.records_dropped audit.reads_not_logged
   audit.audit_changes_not_audited audit.server_audit_filtered audit.source_not_configured
   privilege.refused privilege.audit_grant_without_audit audit.stream_stopped check.stage_failed check.timed_out"
+# SQL Server Audit has no row counts (audit.log_without_row_counts, required); Extended Events has
+# them (never noted), and its own proofs must hold (docs/08 "Extended Events: proofs and level").
+if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
+  FORBIDDEN_NOTES+=" audit.log_without_row_counts audit.xe_events_missing audit.xe_session_filtered audit.xe_causality_off"
+  REQUIRED_NOTE=""
+else
+  REQUIRED_NOTE="audit.log_without_row_counts"
+fi
 deadline=$(( $(date +%s) + 120 ))
 while :; do
   t="$(target_json "$TARGET")"
@@ -313,13 +392,13 @@ while :; do
   bad=""
   # shellcheck disable=SC2086 # a list of note codes
   for c in $FORBIDDEN_NOTES; do [[ " $notes " != *" $c "* ]] || bad+=" $c"; done
-  if jq -e '.auditLevel == "partial" and .auditSource == "sqlserver_audit"' <<<"$t" >/dev/null \
-      && [[ " $notes " == *" audit.log_without_row_counts "* ]] && [ -z "$bad" ]; then break; fi
+  if jq -e --arg s "$AUDIT_SOURCE" '.auditLevel == "partial" and .auditSource == $s' <<<"$t" >/dev/null \
+      && { [ -z "$REQUIRED_NOTE" ] || [[ " $notes " == *" $REQUIRED_NOTE "* ]]; } && [ -z "$bad" ]; then break; fi
   [ "$(date +%s)" -lt "$deadline" ] \
-    || fail "${TARGET}: level $(jq -r .auditLevel <<<"$t") / source $(jq -r .auditSource <<<"$t"), notes '${notes}' (expected partial, sqlserver_audit, audit.log_without_row_counts, none of:${bad:- the forbidden notes})"
+    || fail "${TARGET}: level $(jq -r .auditLevel <<<"$t") / source $(jq -r .auditSource <<<"$t"), notes '${notes}' (expected partial, ${AUDIT_SOURCE}${REQUIRED_NOTE:+, $REQUIRED_NOTE}, none of:${bad:- the forbidden notes})"
   sleep 3
 done
-log "${TARGET}: audit level partial (sqlserver_audit); notes: $notes"
+log "${TARGET}: audit level partial (${AUDIT_SOURCE}); notes: $notes"
 
 # The agent's own statements are never reported: after the scan and two poll intervals, no event at
 # all on the target (nobody else used the server since the stream started).
@@ -439,10 +518,10 @@ objs="$(console_sql "SELECT concat_ws(',', count(DISTINCT o->>'schema' || '.' ||
   AND e.target_id = '${TARGET}' AND e.db_user = 'e2e_analyst'")"
 [ "$objs" = "2,t,t" ] \
   || fail "Audit: the analyst's events should name exactly crm.customers and finance.payment_cards ($(objects_summary "$TARGET" "$ENGINE" "e.db_user = 'e2e_analyst'"))"
-# Every event is SQL Server Audit's.
+# Every event is the configured source's.
 events_json "$TARGET" >"$E2E_WORK_DIR/events.json" || fail "cannot read the access events"
 incidents_json "$TARGET" >"$E2E_WORK_DIR/incidents.json" || fail "cannot read the incidents"
-jq -e 'all(.[]; .source == "sqlserver_audit")' "$E2E_WORK_DIR/events.json" >/dev/null \
+jq -e --arg s "$AUDIT_SOURCE" 'all(.[]; .source == $s)' "$E2E_WORK_DIR/events.json" >/dev/null \
   || fail "Audit: an event of ${TARGET} has another source"
 log "Audit: principals $(jq -c '[.[] | (.db_user // "-")] | unique' "$E2E_WORK_DIR/events.json"), actions $(jq -c '[.[].action] | unique' "$E2E_WORK_DIR/events.json")"
 timeout 60 python3 "$I2_CHECK" audit --ground-truth "$GROUND_TRUTH" --engine "$ENGINE" --agent-account databastion \
@@ -453,35 +532,56 @@ timeout 60 python3 "$I2_CHECK" audit --ground-truth "$GROUND_TRUTH" --engine "$E
   --require-incident "${POLICY_DCL}:e2e_admin" >&2 || fail "Audit check of ${TARGET} failed (see above)"
 rm -f -- "$E2E_WORK_DIR/events.json" "$E2E_WORK_DIR/incidents.json"
 
-# The source side (positive control of the literal scan below): SQL Server's own audit file holds
-# the analyst's statements with their literals, and the DCL statements (read as sa, kept private).
-mssql_sa_q "SELECT statement FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
-  WHERE server_principal_name IN (N'e2e_analyst', N'e2e_admin')" >"$E2E_WORK_DIR/target-audit.log" \
-  || fail "cannot read the server audit"
+# The source side (positive control of the literal scan below): the source's own files hold the
+# analyst's statements with their literals, and the DCL statements (read as sa, kept private).
+# SQL Server Audit: the audit file. Extended Events: the session's files, where a password-bearing
+# statement is a placeholder (`-- CREATE LOGIN`, `-- ALTER LOGIN`, docs/08 "Extended Events: what
+# is kept"); the agent reports both, and the DROP LOGIN, as DCL.
+if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
+  SRC_LABEL="the Extended Events files"
+  mssql_sa_q "SELECT s.stmt_text FROM (${XE_STATEMENTS}) s WHERE s.principal_name IN (N'e2e_analyst', N'e2e_admin')" \
+    >"$E2E_WORK_DIR/target-audit.log" || fail "cannot read the Extended Events files"
+else
+  SRC_LABEL="SQL Server's audit file"
+  mssql_sa_q "SELECT statement FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
+    WHERE server_principal_name IN (N'e2e_analyst', N'e2e_admin')" >"$E2E_WORK_DIR/target-audit.log" \
+    || fail "cannot read the server audit"
+fi
 needles=()
 for id in $LITERAL_IDS; do needles+=(--needle "$id"); done
 rc=0
 timeout 120 python3 "$I2_CHECK" scan --ground-truth "$GROUND_TRUTH" --engine "$ENGINE" \
-  --label "sqlserver audit file (positive control)" "${needles[@]}" "$E2E_WORK_DIR/target-audit.log" \
+  --label "sqlserver ${AUDIT_SOURCE} files (positive control)" "${needles[@]}" "$E2E_WORK_DIR/target-audit.log" \
   >"$E2E_WORK_DIR/literal-control.out" 2>&1 || rc=$?
 for id in $LITERAL_IDS; do
   if [ "$rc" != 1 ] || ! grep -q "^LEAK ${id//./\\.} " "$E2E_WORK_DIR/literal-control.out"; then
-    fail "Audit: literal $id not in SQL Server's audit file (positive control)"
+    fail "Audit: literal $id not in ${SRC_LABEL} (positive control)"
   fi
 done
-# The agent's own statements are in the audit file too (seen and left out, not missed).
-n_own="$(mssql_sa_q "SELECT COUNT(*) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
-  WHERE server_principal_name = N'databastion' AND action_id = 'SL'")" || fail "cannot count the agent's own audit records"
-[ "${n_own:-0}" -ge 1 ] || fail "Audit: no SELECT record of the agent's login in the audit file (positive control of 'no own event')"
-log "Audit: SQL Server's audit file holds ${n_own} SELECT record(s) of the agent's login (left out)"
-grep -qiE 'CREATE LOGIN .*e2e_dcl_probe' "$E2E_WORK_DIR/target-audit.log" \
-  || fail "Audit: no CREATE LOGIN of e2e_dcl_probe in SQL Server's audit file"
-if leak_scan "$E2E_WORK_DIR/target-audit.log" "$NP" >/dev/null; then
-  log "Audit: the DCL statements are in SQL Server's audit file, their passwords masked by the server"
+# The agent's own statements are in the source's files too (seen and left out, not missed).
+if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
+  n_own="$(mssql_sa_q "SELECT COUNT(*) FROM (${XE_STATEMENTS}) s WHERE s.principal_name = N'databastion'")" \
+    || fail "cannot count the agent's own statement events"
+  grep -qiE 'CREATE LOGIN' "$E2E_WORK_DIR/target-audit.log" \
+    || fail "Audit: no CREATE LOGIN (or its placeholder) in ${SRC_LABEL}"
+  grep -qiE 'ALTER LOGIN' "$E2E_WORK_DIR/target-audit.log" \
+    || fail "Audit: no ALTER LOGIN (or its placeholder) in ${SRC_LABEL}"
+  grep -qiE 'DROP LOGIN .*e2e_dcl_probe' "$E2E_WORK_DIR/target-audit.log" \
+    || fail "Audit: no DROP LOGIN of e2e_dcl_probe in ${SRC_LABEL}"
 else
-  log "Audit: note: SQL Server's audit file keeps a DCL marker password (the agent must still drop it)"
+  n_own="$(mssql_sa_q "SELECT COUNT(*) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
+    WHERE server_principal_name = N'databastion' AND action_id = 'SL'")" || fail "cannot count the agent's own audit records"
+  grep -qiE 'CREATE LOGIN .*e2e_dcl_probe' "$E2E_WORK_DIR/target-audit.log" \
+    || fail "Audit: no CREATE LOGIN of e2e_dcl_probe in ${SRC_LABEL}"
 fi
-log "Audit: the literals ($LITERAL_IDS) are in SQL Server's audit file (positive control)"
+[ "${n_own:-0}" -ge 1 ] || fail "Audit: no statement of the agent's login in ${SRC_LABEL} (positive control of 'no own event')"
+log "Audit: ${SRC_LABEL} hold ${n_own} statement(s) of the agent's login (left out)"
+if leak_scan "$E2E_WORK_DIR/target-audit.log" "$NP" >/dev/null; then
+  log "Audit: the DCL statements are in ${SRC_LABEL}, their passwords masked by the server"
+else
+  log "Audit: note: ${SRC_LABEL} keep a DCL marker password (the agent must still drop it)"
+fi
+log "Audit: the literals ($LITERAL_IDS) are in ${SRC_LABEL} (positive control)"
 rm -f -- "$E2E_WORK_DIR/target-audit.log" "$E2E_WORK_DIR/literal-control.out"
 phase_done audit
 

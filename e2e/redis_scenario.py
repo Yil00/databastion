@@ -3,8 +3,9 @@
 Python standard library only; unit tests in test_redis_scenario.py.
 
 A minimal RESP2 client over TLS (the server certificate verified against --ca, host name or address
-checked), driven from the host against a port the e2e stack publishes on 127.0.0.1
-(e2e/docker-compose.redis.yml). Every connection authenticates with `AUTH <user> <password>`, the
+checked). The end-to-end run (e2e/redis.sh) runs it in the one-shot `redis-client` container on the
+internal agent-net, against the targets' network aliases (e2e/docker-compose.redis.yml); the load run
+(e2e/load/redis.sh) runs it on the host, against the port its overlay publishes on 127.0.0.1. Every connection authenticates with `AUTH <user> <password>`, the
 password read from --password-file. A connection waits --settle seconds after its AUTH before its
 first command and stays open --linger seconds after its last one: the agent attributes a slow-log
 entry to a user only through the connection still open at its poll, and only when the connection

@@ -24,10 +24,13 @@
 //!   four-part name, remote access), or when it names more objects than
 //!   an event holds ([`crate::audit::objects`]), the event names `*` and is
 //!   always reported; a name that normalization masks (`*`) stays a name.
-//!   DDL and DCL keep their kind, never text: `*`, always reported. A
+//!   DDL and DCL keep their kind, never text: `*`, always reported
+//!   (`CREATE` / `ALTER` / `DROP` of a principal or credential is DCL, as
+//!   the principal classes of SQL Server Audit). A
 //!   password-bearing statement (its text is never read past its class,
 //!   the #82 rule; Extended Events records some as a comment,
-//!   `-- CREATE LOGIN`, measured) is DCL, `*`, always reported.
+//!   `-- CREATE LOGIN`, `-- ALTER LOGIN`, measured) is DCL, `*`, always
+//!   reported.
 //! - **Rows**: `row_count`, so `volume.large_result` and the agent's own
 //!   row budget apply as on the other engines.
 //! - **Failed logins**: `error_reported` with a login failure number
@@ -735,7 +738,8 @@ pub(crate) fn convert(r: &XeRecord) -> Option<(MaskedEvent, Option<TsqlAnalysis>
     let a = tsql::analyze_tsql(text, e.statement_cut);
     if a.comment_only {
         // The server's placeholder for a statement it does not record
-        // (measured on 2019): `-- CREATE LOGIN`, `-- CREATE CREDENTIAL`,
+        // (measured on 2019, and `-- ALTER LOGIN` on 2022): `-- CREATE
+        // LOGIN`, `-- ALTER LOGIN`, `-- CREATE CREDENTIAL`,
         // `-- sp_addlogin` (password-bearing: DCL), `-- SELECT` (a read
         // calling ENCRYPTBYPASSPHRASE), `-- Encrypted text` (a statement of
         // an encrypted module: code that runs out of sight). The kind its
@@ -1129,11 +1133,18 @@ pub(crate) mod tests {
         }
         for t in [
             "-- CREATE LOGIN",
+            "-- ALTER LOGIN",
             "-- CREATE CREDENTIAL",
             "-- sp_addlogin",
             "-- sp_addlinkedsrvlogin",
             "CREATE LOGIN jane WITH PASSWORD = 'Marker-123'",
             "EXEC sp_addlogin jane, Pa55wordMarker",
+            // Principal changes with no password: DCL, as on SQL Server
+            // Audit (`DR` on a principal class), not DDL.
+            "DROP LOGIN e2e_dcl_probe;",
+            "DROP USER jane",
+            "ALTER ROLE r ADD MEMBER jane",
+            "ALTER SERVER ROLE sysadmin ADD MEMBER jane",
         ] {
             let (ev, _) = convert(&stmt("sql_statement_completed", t, 0, "51")).unwrap();
             assert_eq!(ev.action(), EventAction::Dcl, "{t}");
@@ -1736,6 +1747,118 @@ mod statistics_tests {
                 "{file}"
             );
         }
+    }
+
+    /// The e2e DCL batch on the Extended Events source (captured on 2022,
+    /// 16.0.4305.5): `CREATE LOGIN … WITH PASSWORD`, `ALTER LOGIN … WITH
+    /// PASSWORD` and `DROP LOGIN` by a login holding `ALTER ANY LOGIN`.
+    /// The server records the first two as `-- CREATE LOGIN` and `-- ALTER
+    /// LOGIN`; `DROP LOGIN` keeps its text. All three are DCL, `*`, always
+    /// reported, like the three `CR` / `AL` / `DR` records of SQL Server
+    /// Audit; no other event of the batch (the `sp_droplogin` internals)
+    /// is DCL.
+    #[test]
+    fn password_dcl_batch_is_three_dcl_events() {
+        let mut recs = fixture("password-dcl-16.0.4305.5.xml");
+        assert_eq!(recs.len(), 24);
+        context(&mut recs, true, &|_| false);
+        let texts: Vec<&str> = recs
+            .iter()
+            .filter(|r| r.kind() == Kind::SqlStatementCompleted)
+            .filter_map(|r| r.event.as_ref()?.statement.as_deref().map(|t| t.trim()))
+            .filter(|t| t.to_ascii_lowercase().contains("login"))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "-- CREATE LOGIN",
+                "-- ALTER LOGIN",
+                "DROP LOGIN e2e_dcl_probe;"
+            ],
+            "the server's forms"
+        );
+        let evs: Vec<MaskedEvent> = recs
+            .iter()
+            .filter(|r| !r.skip)
+            .filter_map(convert)
+            .map(|(e, _)| e)
+            .collect();
+        let dcl: Vec<&MaskedEvent> = evs
+            .iter()
+            .filter(|e| e.action() == EventAction::Dcl)
+            .collect();
+        assert_eq!(dcl.len(), 3, "{evs:?}");
+        for e in &dcl {
+            assert!(e.always_report());
+            assert_eq!(names(e), ["retail.-.*"]);
+            assert_eq!(
+                e.principal(),
+                &EventPrincipal::account("e2e_admin").with_application("SQLCMD")
+            );
+        }
+        // The one DDL: `create table #retval` inside `sp_droplogin` (a
+        // statement of the server's procedure, reported as DDL as any).
+        assert_eq!(
+            evs.iter()
+                .filter(|e| e.action() == EventAction::Ddl)
+                .count(),
+            1
+        );
+        // No password, nor anything of the statement text, in the events.
+        let dump = format!("{evs:?}");
+        assert!(!dump.contains("e2e_dcl_probe") && !dump.to_ascii_lowercase().contains("password"));
+    }
+
+    /// The principal changes of the security review of d4175ea (L2),
+    /// captured on 2022 (16.0.4305.5), one batch each: the inner
+    /// statements of `sp_addrolemember`, `sp_addsrvrolemember`,
+    /// `sp_dropuser` and `sp_droplogin` are statement events of their own,
+    /// and so is the `DROP LOGIN` of `IF 1=1 DROP LOGIN x`: each is DCL,
+    /// with the batches' statements, `ALTER AUTHORIZATION` and the
+    /// password placeholders. Nothing else is; the only DDL is the
+    /// `#retval` table of `sp_droplogin`.
+    #[test]
+    fn principal_changes_and_their_procedures_are_dcl() {
+        let mut recs = fixture("dcl-procedures-16.0.4305.5.xml");
+        assert_eq!(recs.len(), 144);
+        context(&mut recs, true, &|_| false);
+        let text = |r: &XeRecord| {
+            r.event
+                .as_ref()
+                .and_then(|e| e.statement.as_deref())
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let mut dcl = Vec::new();
+        for r in recs.iter().filter(|r| !r.skip) {
+            if let Some((e, _)) = convert(r) {
+                // The one DDL: `sp_droplogin`'s own `#retval` table.
+                if e.action() == EventAction::Ddl {
+                    assert!(text(r).starts_with("create table #retval"), "{}", text(r));
+                }
+                if e.action() == EventAction::Dcl {
+                    assert!(e.always_report() && names(&e).iter().all(|n| n.ends_with(".-.*")));
+                    dcl.push(text(r));
+                }
+            }
+        }
+        dcl.sort();
+        let mut want = vec![
+            "-- CREATE LOGIN",
+            "-- CREATE LOGIN",
+            "CREATE USER m_u1 FOR LOGIN m_l1;",
+            "CREATE ROLE m_r1;",
+            "alter role [m_r1] add member [m_u1]",
+            "alter server role [bulkadmin] add member [m_l1]",
+            "ALTER AUTHORIZATION ON ROLE::m_r1 TO dbo;",
+            "ALTER AUTHORIZATION ON SCHEMA::crm TO dbo;",
+            "drop user [m_u1]",
+            "DROP ROLE m_r1;",
+            "drop login [m_l1]",
+            "DROP LOGIN m_l2;",
+        ];
+        want.sort_unstable();
+        assert_eq!(dcl, want);
     }
 
     /// Case 1, condition 4 as revised on 2026-10-16: the build's nest
