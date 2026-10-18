@@ -158,7 +158,7 @@ export function AuditForm({
     const truncated = typeof json?.truncated_objects === "number" && json.truncated_objects > 0 ? ` ${json.truncated_objects} objects over the limit of 1000 were left out.` : "";
     const skipped =
       typeof json?.skipped_key_patterns === "number" && json.skipped_key_patterns > 0
-        ? ` ${json.skipped_key_patterns} key-pattern objects with findings cannot be listed as sensitive objects yet and were left out.`
+        ? ` ${json.skipped_key_patterns} key-pattern objects were left out: this agent cannot receive key patterns as sensitive objects (upgrade it, then save again).`
         : "";
     // #235 review N2: saved, with a warning (min_rows on a Redis / Valkey target).
     const rows = json?.min_rows_warning === "no_row_counts" ? ` Warning: ${MIN_ROWS_WARNING_TEXT.no_row_counts}` : "";

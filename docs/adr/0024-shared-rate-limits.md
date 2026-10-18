@@ -56,3 +56,10 @@ Recorded with the #274 review L5 follow-up; it changes no decision above. Two li
 - `integrity.target_mismatch_changes`: up to 12 more rows per agent and hour when the set of mismatched targets differs from the last recorded row's.
 
 Both are audit budgets with the **per-process fallback** of decision 4, like `integrity.writes_per_agent`: the rows go to the same database, and failing closed would hide integrity events. Neither decides what is stored for the targets: every mismatched target is stored without its `audit_source` at every heartbeat.
+
+## Implementation note (2026-10-18): Audit settings requeue limiters
+Recorded with the re-review of #280 (N1); it changes no decision above. When a heartbeat changes an agent's console -> agent capability tokens (`agents.accepts`, [ADR-0022](0022-protocol-capability-negotiation.md) decision 3), the console queues the Audit settings of its Redis / Valkey targets again. An agent that flips its tokens at every heartbeat would otherwise write jobs, settings and audit entries without bound. Two limiters:
+- `audit.requeue_per_agent`: 4 capability changes acted on per agent and hour (an upgrade, a rollback and a retry fit); past it, nothing is requeued;
+- `audit.requeue_flapping_alerts`: 1 `agent.accepts_flapping` agent-integrity event per agent and hour past that budget, written within `integrity.writes_per_agent`.
+
+Both use the **per-process fallback** of decision 4: they bound writes to the same database, and failing closed would only drop a requeue or an integrity event a single process can still bound.

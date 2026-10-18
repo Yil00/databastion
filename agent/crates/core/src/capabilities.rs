@@ -19,6 +19,12 @@
 //! `redis` / `valkey` (`engine.redis`, `engine.valkey`, ADR-0052 decision
 //! 12); the `redis` connector and the `redis_*` audit sources serve both
 //! engines, so they wait for **both** tokens.
+//!
+//! In the other direction (ADR-0022 decision 3), the agent lists in
+//! `HeartbeatRequest.accepts` the console -> agent fields and value forms
+//! introduced after protocol 0.1.0 that this build decodes
+//! ([`AGENT_ACCEPTS`]): the console sends one only when the agent's latest
+//! heartbeat listed it.
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
@@ -56,10 +62,36 @@ pub(crate) mod token {
     /// permissions the connector judges by name, and the `check()` reads
     /// named with `privilege.not_evaluated`.
     pub(crate) const NOTE_LABELS_2026_10_B: &str = "target_status.note_labels.2026_10_b";
+    /// The `TargetNoteLabel` value of the third Microsoft SQL Server
+    /// revision (ADR-0051 refinement option (a'); ADR-0022 decision 4):
+    /// `on_failure_probe`.
+    pub(crate) const NOTE_LABELS_2026_10_C: &str = "target_status.note_labels.2026_10_c";
     /// The `redis` value of `Engine` (ADR-0052 decision 12).
     pub(crate) const ENGINE_REDIS: &str = "engine.redis";
     /// The `valkey` value of `Engine` (ADR-0052 decision 12).
     pub(crate) const ENGINE_VALKEY: &str = "engine.valkey";
+}
+
+/// Tokens of the console -> agent fields and value forms this build
+/// accepts (contract `HeartbeatRequest.accepts`, ADR-0022 decision 3).
+pub(crate) mod agent_token {
+    /// A `KeyPattern` as `SensitiveObject.object` in `audit.configure` jobs
+    /// for Redis / Valkey targets (agents built before decode it as an
+    /// `Identifier` and would lose the whole job).
+    pub(crate) const SENSITIVE_OBJECT_KEY_PATTERN: &str = "sensitive_object.key_pattern";
+}
+
+/// What this build lists in `HeartbeatRequest.accepts`.
+pub(crate) const AGENT_ACCEPTS: &[&str] = &[agent_token::SENSITIVE_OBJECT_KEY_PATTERN];
+
+/// [`AGENT_ACCEPTS`] as the contract list (every token is a well-formed
+/// `Capability`; checked by a test).
+pub(crate) fn agent_accepts() -> Option<CapabilityList> {
+    let list: Vec<databastion_protocol::Capability> = AGENT_ACCEPTS
+        .iter()
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    (!list.is_empty()).then_some(CapabilityList(list))
 }
 
 /// No token: a value of protocol 0.1.0.
@@ -262,6 +294,18 @@ mod tests {
 
     fn list(tokens: &[&str]) -> CapabilityList {
         serde_json::from_value(serde_json::json!(tokens)).unwrap()
+    }
+
+    #[test]
+    fn the_agent_lists_every_token_it_decodes() {
+        let sent = agent_accepts().unwrap();
+        let tokens: Vec<&str> = sent.iter().map(|c| c.as_str()).collect();
+        assert_eq!(tokens, AGENT_ACCEPTS);
+        assert_eq!(tokens, ["sensitive_object.key_pattern"]);
+        // A contract `CapabilityList` once serialized.
+        let json = serde_json::to_value(&sent).unwrap();
+        let back: CapabilityList = serde_json::from_value(json).unwrap();
+        assert_eq!(back.len(), AGENT_ACCEPTS.len());
     }
 
     #[test]

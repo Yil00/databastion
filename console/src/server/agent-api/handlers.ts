@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 
 import { getDb } from "@/db/client";
+import { logger } from "@/lib/logger";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
 import { enrollAgent, mismatchedTargetIds, recordHeartbeat, targetSourceMismatches, withoutMismatchedSources } from "@/server/agents";
@@ -8,6 +9,7 @@ import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
 import { requestPolicyEvaluation } from "@/server/policy-queue";
+import { requeueAuditSettingsOnAcceptsChange } from "@/server/audit-config";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
 import {
@@ -120,7 +122,17 @@ export function handleHeartbeat(req: Request): Promise<Response> {
         ip: clientIp(req),
       });
     }
-    await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched.indices));
+    const recorded = await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched.indices));
+    // Security review of #280, M2: the agent's capabilities changed (an upgrade or a downgrade):
+    // its Redis / Valkey Audit settings are queued again with what it can now receive. A failure
+    // here never fails the heartbeat (logged; the next change or save queues them).
+    if (recorded.acceptsChanged) {
+      try {
+        await requeueAuditSettingsOnAcceptsChange(getDb(), auth.agent.id);
+      } catch (e) {
+        logger.error({ agentId: auth.agent.id, err: e instanceof Error ? e.name : "error" }, "audit settings not queued again after a capability change");
+      }
+    }
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,

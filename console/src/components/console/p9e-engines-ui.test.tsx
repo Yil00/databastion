@@ -282,6 +282,17 @@ describe("engines (P9-E)", () => {
     expect(refused.text).toContain("(ALTER ANY DATABASE EVENT SESSION)");
   });
 
+  it("the SQL Server note label of revision 2026_10_c and the source-neutral failed-logins note render (phase 9 follow-ups)", () => {
+    expect(labelDisplayName("on_failure_probe")).toBe("on_failure_probe");
+    const onFailure = renderTargetNote({ code: "privilege.not_evaluated", labels: ["on_failure_probe"] });
+    expect(onFailure.known).toBe(true);
+    expect(onFailure.text).toContain("on_failure_probe");
+    const failedLogins = renderTargetNote({ code: "audit.failed_logins_not_audited" });
+    expect(failedLogins.known).toBe(true);
+    expect(failedLogins.text).toContain("FAILED_LOGIN_GROUP");
+    expect(failedLogins.text).toContain("error_reported");
+  });
+
   it("the new target notes render from the catalog", () => {
     for (const code of [
       "privilege.server_roles",

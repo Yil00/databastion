@@ -36,6 +36,9 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * 2026-10-14, items 5 to 7): the second SQL Server revision (database-scoped event-session
  * permissions, the other permissions the connector judges by name, and the `check()` reads named
  * with `privilege.not_evaluated`), accepted and rendered the same way.
+ * `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9 follow-ups):
+ * `on_failure_probe`, the `ON_FAILURE = CONTINUE` failure counter the agent's grants do not read,
+ * accepted and rendered the same way.
  */
 export const CONSOLE_ACCEPTS = [
   "access_event.bytes",
@@ -46,10 +49,39 @@ export const CONSOLE_ACCEPTS = [
   "job_progress.coverage",
   "target_status.note_labels.2026_10",
   "target_status.note_labels.2026_10_b",
+  "target_status.note_labels.2026_10_c",
   "target_status.notes",
 ] as const;
 
 export type ConsoleCapability = (typeof CONSOLE_ACCEPTS)[number];
+
+// ------------------------------------------------------------- console -> agent (ADR-0022 decision 3)
+
+/**
+ * The console -> agent fields and value forms added after protocol 0.1.0 that this console can send,
+ * each only to an agent whose latest `HeartbeatRequest.accepts` listed its token (an agent built
+ * before it cannot decode it and would lose the whole job):
+ * - `sensitive_object.key_pattern`: a `KeyPattern` that is not an `Identifier` as
+ *   `SensitiveObject.object` in `audit.configure` jobs of Redis / Valkey targets
+ *   (`src/server/audit-config.ts`, checked again at delivery in `src/server/jobs.ts`).
+ *
+ * The console stores, per agent, the tokens of this list its latest heartbeat named
+ * (`agents.accepts`); other tokens are ignored (ADR-0022: unknown tokens are ignored).
+ */
+export const AGENT_TOKENS = ["sensitive_object.key_pattern"] as const;
+
+export type AgentCapability = (typeof AGENT_TOKENS)[number];
+
+/** The tokens of {@link AGENT_TOKENS} that a heartbeat's `accepts` lists, sorted (stored as is). */
+export function agentAcceptsToStore(accepts: readonly string[] | undefined): AgentCapability[] {
+  const listed = new Set(accepts ?? []);
+  return AGENT_TOKENS.filter((t) => listed.has(t)).sort();
+}
+
+/** Whether a stored agent capability list (`agents.accepts`) names `token`. */
+export function agentAccepts(stored: unknown, token: AgentCapability): boolean {
+  return Array.isArray(stored) && stored.includes(token);
+}
 
 // ------------------------------------------------------------------------------ engine tokens
 

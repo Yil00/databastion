@@ -2349,9 +2349,11 @@ impl ::std::convert::TryFrom<String> for HeartbeatIntervalSeconds {
 pub struct HeartbeatRequest {
     /**Optional **response and job** fields and features this agent build accepts
 (ADR-0022). Agents reject unknown fields in every console -> agent body, so the
-console sends a console -> agent field introduced after protocol 0.1.0 (in a response
-or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
-agent omits the list. Unknown tokens are ignored by the console.
+console sends a console -> agent field or value form introduced after protocol 0.1.0
+(in a response or in a job) only when the agent's latest heartbeat listed it. Tokens:
+`sensitive_object.key_pattern` (a `KeyPattern` as `SensitiveObject.object` in
+`audit.configure` jobs for Redis / Valkey targets). An agent built before it omits the
+list. Unknown tokens are ignored by the console.
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub accepts: ::std::option::Option<CapabilityList>,
@@ -3063,12 +3065,15 @@ impl<'de> ::serde::Deserialize<'de> for MetricsMapKey {
             })
     }
 }
-/**Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the
-`redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
+/**Name of an object (`Location.object`, `ObjectRef.object`, `SensitiveObject.object`): an
+`Identifier`, or, for the `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
 `engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit
 sources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also
 checks each event's objects against the schema of the **target's** engine (a `KeyPattern`
 that is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).
+`SensitiveObject` names no engine either: the console checks it against the target's
+engine before it queues the job, and the agent against its declared target's engine
+(see `SensitiveObject` for the negotiation).
 
 Written as "exactly one of `Identifier`, or `KeyPattern` but not `Identifier`", which
 accepts exactly the union of the two (a name valid under both, such as `orders` or `*`,
@@ -3725,13 +3730,32 @@ impl ::std::convert::TryFrom<::std::string::String> for RotateSecretParamsReason
         value.parse()
     }
 }
-///`SensitiveObject`
+/**An object whose accesses are always reported, named as Discovery names it in a finding's
+`Location` (`database`, `schema`, `object`).
+
+**Redis / Valkey key patterns** (`sensitive_object.key_pattern`, ADR-0022 decision 3).
+`object` is an `ObjectName`: an `Identifier`, or, on a `redis` or `valkey` target only, a
+`KeyPattern` (e.g. `user:*:email`). An agent built before this change decodes `object` as
+an `Identifier` and cannot decode a job carrying a key pattern that is not one, so the
+console sends such an object only when the agent's latest `HeartbeatRequest.accepts` lists
+`sensitive_object.key_pattern`, and never to an agent that does not (it leaves the object
+out, and counts it). The console checks the object against the schema of the **target's**
+engine, as for `ObjectRef`, and the agent refuses an `audit.configure` job whose key
+pattern names a target of any other engine (`invalid_params`). On a Redis / Valkey target
+the agent keeps an event whose key pattern overlaps a listed one: some key name matches
+both, each read as a Redis glob in which `*` is the only wildcard (any run of
+characters, separators included). So a listed `user:*:email` covers the event objects
+`user:*:email`, `user:*` and `*:email`, and the event object `*` (a key no learned
+pattern names) matches every listed pattern of its database; the database `*` (a
+source that does not tell the database) matches any database. The match ignores case,
+and compares names with and without their trailing spaces, as on every engine.
+*/
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SensitiveObject {
     pub classifiers: ::std::vec::Vec<ClassifierId>,
     pub database: Identifier,
-    pub object: Identifier,
+    pub object: ObjectName,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
 }
@@ -4036,8 +4060,15 @@ Revisions:
   cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the
   minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,
   so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's
-  column read cut or failed). Each revision is negotiated on its own: a value is sent
-  only when the token of its own revision is listed.
+  column read cut or failed).
+- `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9
+  follow-ups): the SQL Server label below `cas_store_guard_probe`, `on_failure_probe`
+  for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
+  whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
+  read, so records lost to a failing audit target are not counted.
+
+Each revision is negotiated on its own: a value is sent only when the token of its own
+revision is listed.
 */
 #[derive(
     ::serde::Deserialize,
@@ -4440,6 +4471,8 @@ pub enum TargetNoteLabel {
     RefusalListProbe,
     #[serde(rename = "cas_store_guard_probe")]
     CasStoreGuardProbe,
+    #[serde(rename = "on_failure_probe")]
+    OnFailureProbe,
 }
 impl ::std::fmt::Display for TargetNoteLabel {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -4700,6 +4733,7 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::LogonTriggerProbe => f.write_str("logon_trigger_probe"),
             Self::RefusalListProbe => f.write_str("refusal_list_probe"),
             Self::CasStoreGuardProbe => f.write_str("cas_store_guard_probe"),
+            Self::OnFailureProbe => f.write_str("on_failure_probe"),
         }
     }
 }
@@ -4933,6 +4967,7 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "logon_trigger_probe" => Ok(Self::LogonTriggerProbe),
             "refusal_list_probe" => Ok(Self::RefusalListProbe),
             "cas_store_guard_probe" => Ok(Self::CasStoreGuardProbe),
+            "on_failure_probe" => Ok(Self::OnFailureProbe),
             _ => Err("invalid value".into()),
         }
     }

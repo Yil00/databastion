@@ -228,6 +228,13 @@ impl XeRecord {
         Kind::of(&self.name)
     }
 
+    /// An `error_reported` of error 18456 (a failed login): read, it
+    /// proves that the session's `error_reported` admits failed logins.
+    pub(crate) fn is_failed_login_18456(&self) -> bool {
+        self.kind() == Kind::ErrorReported
+            && self.event.as_ref().and_then(|e| e.error_number) == Some(18_456)
+    }
+
     /// The acting login: the session's login (`session_server_principal_name`,
     /// the impersonator under `EXECUTE AS`), else the event's principal.
     pub(crate) fn login(&self) -> &str {

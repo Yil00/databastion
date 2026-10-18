@@ -215,6 +215,13 @@ export const agents = pgTable(
     spool: jsonb("spool").$type<Record<string, number>>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
     detectedTargets: jsonb("detected_targets").$type<unknown[]>(),
+    /**
+     * The console -> agent capability tokens the agent's latest heartbeat listed in `accepts`
+     * (ADR-0022 decision 3), restricted to the ones this console knows (`AGENT_TOKENS`,
+     * src/server/agent-api/capabilities.ts). A console -> agent field or value form added after
+     * protocol 0.1.0 is sent only when its token is here.
+     */
+    accepts: jsonb("accepts").$type<string[]>().notNull().default([]),
     /** argon2id PHC string of the current secret; NULL once revoked or locked. */
     currentSecretHash: text("current_secret_hash"),
     /** argon2id PHC string of the pending secret during a rotation (ADR-0008, `/rotate`). */
@@ -377,6 +384,12 @@ export const jobs = pgTable(
     error: jsonb("error").$type<{ code: string; engine_code?: string }>(),
     finishedAt: tsz("finished_at"),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * `audit.configure` only: the key-pattern sensitive objects left out of the last delivery
+     * because the agent no longer listed `sensitive_object.key_pattern` (src/server/jobs.ts,
+     * security review of #280, M2); null when nothing was left out. `params` is unchanged.
+     */
+    deliveredWithoutKeyPatterns: integer("delivered_without_key_patterns"),
   },
   (t) => [index("jobs_agent_status_idx").on(t.agentId, t.status, t.createdAt)],
 );

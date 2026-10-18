@@ -12,6 +12,7 @@ import { raiseAuditStreamStoppedAlert, recordAuditStreamStops, stoppedStreams } 
 import { addDroppedBatches, droppedBatchesDelta, raiseDroppedBatchesAlert } from "./dropped-batches";
 import { requestNotificationDelivery } from "./notification-queue";
 import { purgeSecretCache } from "./agent-api/auth";
+import { agentAcceptsToStore } from "./agent-api/capabilities";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
@@ -174,7 +175,8 @@ export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], indice
 }
 
 /**
- * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
+ * Stores a (validated) heartbeat: agent status, targets, detections, spool, metrics and the agent's
+ * capability tokens (`acceptsChanged` when they differ from the stored ones). A rise of
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
@@ -182,8 +184,9 @@ export async function recordHeartbeat(
   db: Database,
   agentId: string,
   hb: Schemas["HeartbeatRequest"],
-): Promise<void> {
+): Promise<{ acceptsChanged: boolean }> {
   const skew = Date.parse(hb.ts) - Date.now();
+  const accepts = agentAcceptsToStore(hb.accepts);
   const clockSkewMs = Math.max(-2_000_000_000, Math.min(2_000_000_000, Math.round(skew)));
   const alerted = await db.transaction(async (tx) => {
     // The previous spool counters, under the row lock (concurrent heartbeats count a rise once).
@@ -193,6 +196,7 @@ export async function recordHeartbeat(
         uptimeS: agents.uptimeS,
         unalerted: agents.droppedBatchesUnalerted,
         stopsUnalerted: agents.auditStreamStopsUnalerted,
+        accepts: agents.accepts,
       })
       .from(agents)
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
@@ -205,6 +209,8 @@ export async function recordHeartbeat(
         classifiersVersion: hb.classifiers_version ?? null,
         connectors: hb.connectors,
         detectedTargets: hb.detected_targets,
+        // ADR-0022 decision 3: what the agent decodes, from its latest heartbeat only.
+        accepts,
         spool: { ...hb.spool },
         metrics: hb.metrics ?? null,
         clockSkewMs,
@@ -241,7 +247,9 @@ export async function recordHeartbeat(
           ? and(eq(agentTargets.agentId, agentId), notInArray(agentTargets.targetId, ids))
           : eq(agentTargets.agentId, agentId),
       );
-    if (!previous) return false;
+    if (!previous) return { raised: false, acceptsChanged: false };
+    // Security review of #280, M2: the caller queues the settings again when this changes.
+    const acceptsChanged = JSON.stringify(previous.accepts ?? []) !== JSON.stringify(accepts);
     const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
     await addDroppedBatches(tx, agentId, delta);
     const stops = stoppedStreams(hb.targets);
@@ -249,9 +257,10 @@ export async function recordHeartbeat(
     let raised = false;
     if (previous.unalerted + delta > 0) raised = (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
     if (previous.stopsUnalerted + stops > 0) raised = (await raiseAuditStreamStoppedAlert(tx, agentId)) !== null || raised;
-    return raised;
+    return { raised, acceptsChanged };
   });
-  if (alerted) void requestNotificationDelivery();
+  if (alerted.raised) void requestNotificationDelivery();
+  return { acceptsChanged: alerted.acceptsChanged };
 }
 
 /**

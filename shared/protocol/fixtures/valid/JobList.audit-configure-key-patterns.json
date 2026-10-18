@@ -1,0 +1,38 @@
+{
+  "jobs": [
+    {
+      "job_id": "01920f5e-9b20-7d5e-9f32-1a2b3c4d5e70",
+      "type": "audit.configure",
+      "created_at": "2026-10-18T09:00:00Z",
+      "target_id": "valkey-sessions",
+      "params": {
+        "enabled": true,
+        "aggregation_window_s": 60,
+        "poll_interval_s": 10,
+        "sensitive_objects": [
+          {
+            "database": "db0",
+            "object": "user:*:email",
+            "classifiers": [
+              "pii.email"
+            ]
+          },
+          {
+            "database": "db0",
+            "object": "session|*|card.number",
+            "classifiers": [
+              "pii.card_number"
+            ]
+          },
+          {
+            "database": "db1",
+            "object": "orders",
+            "classifiers": [
+              "pii.iban"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

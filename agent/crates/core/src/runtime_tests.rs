@@ -2003,6 +2003,7 @@ async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
             TargetNote::new(NoteCode::PrivilegeNotEvaluated).with_labels([
                 NoteLabel::sqlserver("password_hash_probe"),
                 NoteLabel::sqlserver("logon_trigger_probe"),
+                NoteLabel::sqlserver("on_failure_probe"),
             ]),
         ],
     };
@@ -2049,7 +2050,7 @@ async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
             vec!["other", "logon_trigger_probe"]
         ]
     );
-    // Both: every label as the connector built it.
+    // The first two: `on_failure_probe` (2026_10_c) is still `other`.
     accept_tokens(
         &rt,
         &[
@@ -2058,12 +2059,42 @@ async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
             token::NOTE_LABELS_2026_10_B,
         ],
     );
+    assert_eq!(
+        labels(&rt.target_statuses(&env.config).await),
+        vec![
+            vec!["control_server", "alter_any_database_event_session"],
+            vec!["other", "password_hash_probe", "logon_trigger_probe"]
+        ]
+    );
+    // The third revision only.
+    accept_tokens(
+        &rt,
+        &[token::TARGET_STATUS_NOTES, token::NOTE_LABELS_2026_10_C],
+    );
+    assert_eq!(
+        labels(&rt.target_statuses(&env.config).await),
+        vec![vec!["other"], vec!["other", "on_failure_probe"]]
+    );
+    // All three: every label as the connector built it.
+    accept_tokens(
+        &rt,
+        &[
+            token::TARGET_STATUS_NOTES,
+            token::NOTE_LABELS_2026_10,
+            token::NOTE_LABELS_2026_10_B,
+            token::NOTE_LABELS_2026_10_C,
+        ],
+    );
     let statuses = rt.target_statuses(&env.config).await;
     assert_eq!(
         labels(&statuses),
         vec![
             vec!["control_server", "alter_any_database_event_session"],
-            vec!["password_hash_probe", "logon_trigger_probe"]
+            vec![
+                "password_hash_probe",
+                "logon_trigger_probe",
+                "on_failure_probe"
+            ]
         ]
     );
     for s in &statuses {
@@ -3870,6 +3901,98 @@ async fn audit_configure_needs_an_audit_connector() {
     let got = statuses(&server).await;
     assert_eq!(got[0].1["error"]["code"], "unsupported");
     assert!(rt.lock_audits().snapshot().is_empty());
+}
+
+/// Phase 9 follow-ups (contract `SensitiveObject.object` as an
+/// `ObjectName`): a key pattern names a Redis / Valkey object only; for a
+/// target of another engine the job is refused and nothing is installed.
+#[tokio::test]
+async fn audit_configure_refuses_key_patterns_for_other_engines() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(STATUS_PATH))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(FakeAudit {
+            events: 0,
+            seen: Arc::new(StdMutex::new(Vec::new())),
+        })],
+    )
+    .unwrap();
+    const ID: &str = "01920f5f-0c30-7e6f-a043-2b3c4d5e6f85";
+    let body = serde_json::json!({ "jobs": [audit_job(ID, serde_json::json!({
+        "enabled": true,
+        "sensitive_objects": [
+            {"database": "shop", "object": "user:*:email", "classifiers": ["pii.email"]}
+        ]}))] });
+    rt.handle_job_list(&serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let got = statuses(&server).await;
+    assert_eq!(got[0].1["error"]["code"], "invalid_params");
+    assert!(rt.lock_audits().snapshot().is_empty());
+    assert!(
+        !env.config
+            .state_dir
+            .join("audit/pg-main.settings.json")
+            .exists()
+    );
+}
+
+/// Security review of #280, L4: settings saved with a key pattern for a
+/// target whose engine has since changed (here `pg-main`, now PostgreSQL)
+/// are ignored on restart; plain names are restored.
+#[tokio::test]
+async fn saved_key_patterns_of_a_target_whose_engine_changed_are_not_restored() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let dir = env.config.state_dir.join(crate::audit::AUDIT_DIR);
+    let make = || {
+        Runtime::new(
+            &env.config_path,
+            env.config.clone(),
+            vec![Box::new(FakeAudit {
+                events: 0,
+                seen: Arc::new(StdMutex::new(Vec::new())),
+            })],
+        )
+        .unwrap()
+    };
+    let saved = |object: &str| {
+        let json = serde_json::json!({"enabled": true, "sensitive_objects": [
+            {"database": "db0", "object": object, "classifiers": ["pii.email"]}
+        ]});
+        crate::audit::save_settings(&dir, "pg-main", &serde_json::to_vec(&json).unwrap()).unwrap();
+    };
+    saved("user:*:email");
+    let rt = make();
+    rt.restore_audits();
+    assert!(rt.lock_audits().snapshot().is_empty());
+    saved("customers");
+    let rt = make();
+    rt.restore_audits();
+    assert_eq!(rt.lock_audits().snapshot().len(), 1);
+}
+
+/// The agent lists the console -> agent value forms it decodes
+/// (ADR-0022 decision 3) in every heartbeat.
+#[tokio::test]
+async fn heartbeats_list_what_the_agent_accepts() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    let hb = rt.build_heartbeat().await.unwrap();
+    let tokens: Vec<String> = hb
+        .accepts
+        .iter()
+        .flat_map(|l| l.iter().map(|c| c.as_str().to_owned()))
+        .collect();
+    assert_eq!(tokens, ["sensitive_object.key_pattern"]);
 }
 
 // ------------------------------------------- gated fields (ADR-0022)

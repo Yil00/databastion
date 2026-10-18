@@ -36,6 +36,7 @@ export type AuditAction =
   | "agent.batch_conflict"
   | "agent.foreign_target"
   | "agent.target_mismatch"
+  | "agent.accepts_flapping"
   | "discovery.scan_request"
   | "audit.configure"
   | "finding.false_positive"
