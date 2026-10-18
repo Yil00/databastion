@@ -315,8 +315,8 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
             .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
         out.details.push(
             "Extended Events: error_reported has a predicate, which the agent does not read, \
-             and no failed login (error 18456) was read in the last 24 h: failed logins are not \
-             proven to be recorded",
+             and no 18456 was recorded in the last 24 h: failed logins are not proven to be \
+             recorded",
         );
     }
     out.details.push(match p.retention_mode() {

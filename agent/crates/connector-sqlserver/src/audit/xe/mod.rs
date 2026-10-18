@@ -240,6 +240,17 @@ impl Stream<'_> {
 /// lifetime, with both principals the agent's login and, when present, its
 /// application name (decision 6; the source records no client address):
 /// the own-session part of the rule, without the text and credit part.
+/// The event time (µs) of the latest failed login (error 18456) among
+/// `records` whose name tried is not the agent's `account` (re-review of
+/// #280, N3).
+fn failed_login_proof(records: &[XeRecord], account: &str) -> Option<i64> {
+    records
+        .iter()
+        .filter(|r| r.is_failed_login_18456() && !r.login().eq_ignore_ascii_case(account))
+        .map(|r| r.time_us)
+        .max()
+}
+
 fn own_session(target: &TargetConfig, r: &XeRecord) -> bool {
     let Some(e) = &r.event else { return false };
     if e.statement_cut {
@@ -483,6 +494,8 @@ fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
     {
         tracing::warn!(target_id = %target_id, "Extended Events: the session was stopped and started (create_time changed): what happened in between was not recorded");
         st.state.audit.note_gap(target_id);
+        // Its events may have changed: the failed-login proof starts over.
+        st.state.audit.clear_failed_login(target_id);
         st.state.audit.note_dropped(target_id, 1);
     }
     st.cursor.session = Some(p.create_us);
@@ -522,6 +535,7 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     if on_pattern(&mut st.cursor, &pattern) {
         tracing::warn!(target_id = %target.id, "Extended Events: the session's file set changed (folder or file name): reading the new set from its start");
         st.state.audit.note_gap(&target.id);
+        st.state.audit.clear_failed_login(&target.id);
         st.state.audit.note_dropped(&target.id, 1);
     }
     observe(st, &p);
@@ -742,9 +756,6 @@ async fn read(
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
-    if b.kept.iter().any(XeRecord::is_failed_login_18456) {
-        st.state.audit.note_failed_login(&target_id);
-    }
     // Events stamped before the first start are history, whenever they
     // reach the file (the dispatch latency delays them past the first,
     // caught-up read); after that read, until the floor ends, they are
@@ -776,6 +787,13 @@ async fn read(
         records.drain(..n);
         st.state.audit.note_dropped(&target_id, n as u64);
         st.skip = 0;
+    }
+    // The proof that a filtered `error_reported` admits failed logins
+    // (re-review of #280, N3): from records past the history and floor
+    // filter only, by their event time, never a failed login of the
+    // agent's own account.
+    if let Some(at) = failed_login_proof(&records, &st.target.account) {
+        st.state.audit.note_failed_login(&target_id, at);
     }
     let unreadable = records.iter().filter(|r| r.unreadable).count();
     if unreadable > 0 {
@@ -1062,5 +1080,62 @@ mod current_file_tests {
             ..Cursor::default()
         };
         assert!(!reprobe_moved(&(None, None), &first));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod failed_login_proof_tests {
+    use super::*;
+    use crate::audit::xe::events::tests::rec;
+
+    fn failed(login: &str, number: &str, time_us: i64) -> XeRecord {
+        let mut r = rec(
+            "error_reported",
+            &[("error_number", number)],
+            &[
+                ("session_id", "51"),
+                ("session_server_principal_name", login),
+            ],
+        );
+        r.time_us = time_us;
+        r
+    }
+
+    /// Re-review of #280, N3: the latest 18456 by event time, never a
+    /// failed login of the agent's own account nor another error.
+    #[test]
+    fn the_proof_is_an_18456_of_another_account_by_event_time() {
+        let recs = vec![
+            failed("jane", "18456", 10),
+            failed("Databastion_Agent", "18456", 30),
+            failed("bob", "18452", 40),
+            failed("bob", "18456", 20),
+        ];
+        assert_eq!(failed_login_proof(&recs, "databastion_agent"), Some(20));
+        assert_eq!(failed_login_proof(&recs[1..3], "databastion_agent"), None);
+        assert_eq!(failed_login_proof(&[], "databastion_agent"), None);
+    }
+
+    #[test]
+    fn the_proof_is_fresh_by_event_time_and_cleared_on_a_change() {
+        let shared = crate::audit::Shared::default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let day = 24 * 3_600 * 1_000_000i64;
+        // An old event read now proves nothing.
+        shared.note_failed_login("t", now - day - 1_000_000);
+        assert!(!shared.facts("t").failed_login_seen);
+        shared.note_failed_login("t", now - 1_000_000);
+        assert!(shared.facts("t").failed_login_seen);
+        // An older event read later does not move the proof back.
+        shared.note_failed_login("t", now - 2 * day);
+        assert!(shared.facts("t").failed_login_seen);
+        // A session restart or a new file set: taken again.
+        shared.clear_failed_login("t");
+        assert!(!shared.facts("t").failed_login_seen);
+        assert!(!shared.facts("other").failed_login_seen);
     }
 }

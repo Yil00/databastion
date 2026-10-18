@@ -110,6 +110,13 @@ const REEVALUATE: Duration = Duration::from_secs(600);
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The level proofs last this long.
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
+
+/// The agent's clock, µs since 1970 (0 before it).
+fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+}
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
 const OWN_SESSIONS: &str = "sqlserver_own_sessions";
@@ -136,9 +143,9 @@ pub(crate) struct Shared {
     running: Mutex<HashMap<String, usize>>,
     fresh: Mutex<HashMap<String, Instant>>,
     gap: Mutex<HashMap<String, Instant>>,
-    /// The last failed login (error 18456) read from the target's
-    /// Extended Events session.
-    failed_login: Mutex<HashMap<String, Instant>>,
+    /// The event time (µs since 1970) of the last failed login (error
+    /// 18456) read from the target's Extended Events session.
+    failed_login: Mutex<HashMap<String, i64>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
@@ -194,10 +201,26 @@ impl Shared {
         lock(&self.fresh).insert(target_id.to_owned(), Instant::now());
     }
 
-    /// A failed login (error 18456) was read: the session's
-    /// `error_reported`, whatever its predicate, admits it.
-    pub(crate) fn note_failed_login(&self, target_id: &str) {
-        lock(&self.failed_login).insert(target_id.to_owned(), Instant::now());
+    /// A failed login (error 18456) was recorded at `at_us` (event time):
+    /// the session's `error_reported`, whatever its predicate, admits it.
+    pub(crate) fn note_failed_login(&self, target_id: &str, at_us: i64) {
+        let mut map = lock(&self.failed_login);
+        let e = map.entry(target_id.to_owned()).or_insert(at_us);
+        *e = (*e).max(at_us);
+    }
+
+    /// The session was restarted or its file set changed: the proof is
+    /// taken again.
+    pub(crate) fn clear_failed_login(&self, target_id: &str) {
+        lock(&self.failed_login).remove(target_id);
+    }
+
+    /// Whether a failed login was recorded in the 24 h before `now_us`.
+    fn failed_login_within(&self, target_id: &str, now_us: i64) -> bool {
+        let window = i64::try_from(FRESHNESS.as_micros()).unwrap_or(i64::MAX);
+        lock(&self.failed_login)
+            .get(target_id)
+            .is_some_and(|at| now_us.saturating_sub(*at) < window)
     }
 
     fn note_gap(&self, target_id: &str) {
@@ -229,7 +252,7 @@ impl Shared {
             running: self.is_running(target_id),
             fresh: within(&self.fresh),
             gap: within(&self.gap),
-            failed_login_seen: within(&self.failed_login),
+            failed_login_seen: self.failed_login_within(target_id, now_us()),
             dropped: lock(&self.dropped)
                 .get(target_id)
                 .filter(|(_, at)| at.elapsed() < FRESHNESS)
