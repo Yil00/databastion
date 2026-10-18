@@ -577,6 +577,8 @@ export function handleRequestScan(req: Request, agentId: string, targetId: strin
  * that disables Audit, empties `sensitive_objects` or removes many objects answers
  * `409 confirmation_required` with the counts and the `digest` to send back as `confirm`; nothing is
  * queued until then. `202 {job_id, ...counts}` when the `audit.configure` job is queued. Audited.
+ * Both answers carry `min_rows_warning` (`"no_row_counts"` for `min_rows` on a Redis / Valkey
+ * target, #235 review N2, else `null`): a warning, never a refusal.
  */
 export function handleConfigureAudit(req: Request, agentId: string, targetId: string): Promise<Response> {
   return guardedUser("audit.configure", async () => {
@@ -597,10 +599,26 @@ export function handleConfigureAudit(req: Request, agentId: string, targetId: st
     });
     switch (r.outcome) {
       case "queued":
-        return json({ job_id: r.jobId, ...counts(r.change), truncated_objects: r.truncated, skipped_key_patterns: r.skippedKeyPatterns }, 202);
+        return json(
+          {
+            job_id: r.jobId,
+            ...counts(r.change),
+            truncated_objects: r.truncated,
+            skipped_key_patterns: r.skippedKeyPatterns,
+            min_rows_warning: r.minRowsWarning,
+          },
+          202,
+        );
       case "confirmation_required":
         return json(
-          { error: "confirmation_required", ...counts(r.change), truncated_objects: r.truncated, skipped_key_patterns: r.skippedKeyPatterns, digest: r.digest },
+          {
+            error: "confirmation_required",
+            ...counts(r.change),
+            truncated_objects: r.truncated,
+            skipped_key_patterns: r.skippedKeyPatterns,
+            min_rows_warning: r.minRowsWarning,
+            digest: r.digest,
+          },
           409,
         );
       case "invalid":

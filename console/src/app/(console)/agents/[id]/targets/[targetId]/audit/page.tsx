@@ -9,7 +9,7 @@ import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
 import { validateSchema } from "@/lib/protocol/validate";
 import { getAgentDetail } from "@/server/agents";
-import { auditWarningText } from "@/lib/audit-warning";
+import { auditWarningText, MIN_ROWS_WARNING_TEXT, minRowsWarning } from "@/lib/audit-warning";
 import { engineDisplayName, isKeyPatternEngine } from "@/lib/location-labels";
 import { deriveSensitiveObjects, getAuditConfig, sendableDerivedObjects, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
 import { requestTime, requirePageSession } from "@/server/ui-session";
@@ -32,6 +32,8 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   const keyPatterns = isKeyPatternEngine(config.engine);
   // Key-pattern objects (Redis / Valkey) are not `SensitiveObject`s yet (P9-E review M3).
   const notSendable = sendableDerivedObjects(derived).skipped;
+  // #235 review N2: a row threshold drops the events of a key-pattern target (no row counts).
+  const rowsWarning = config.configured ? minRowsWarning(keyPatterns, config.minRows) : null;
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const active = agent.revokedAt === null && agent.lockedAt === null && config.present;
@@ -57,6 +59,11 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
       {config.warning && (
         <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
           {auditWarningText(config.warning, config.warningRemoved)}
+        </p>
+      )}
+      {rowsWarning && (
+        <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
+          {MIN_ROWS_WARNING_TEXT[rowsWarning]}
         </p>
       )}
       {keyPatterns && (

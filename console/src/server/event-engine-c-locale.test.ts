@@ -1,14 +1,16 @@
+import { createHash, randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { accessEvents } from "@/db/schema";
+import { accessEvents, findings as findingsTable } from "@/db/schema";
 import { handleEvents, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
 import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
-import { prefilterNames } from "./event-engine";
+import { loadObjectHits, prefilterNames } from "./event-engine";
 import { drainPolicyWork } from "./incidents";
 
 /**
@@ -17,11 +19,12 @@ import { drainPolicyWork } from "./incidents";
  * character and lets `objectKey` (JavaScript `foldName`) decide.
  */
 describe("sensitivity name pre-filter (pure)", () => {
-  it("keeps every name and its fold; none under an ASCII-only `lower` with a non-ASCII name", () => {
-    expect(prefilterNames(["CLIENTS ", "orders"], true)).toEqual(["CLIENTS ", "clients", "orders"]);
-    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual(["CLIENTS ", "clients", "orders"]);
-    expect(prefilterNames(["ΠΕΛΑΤΕΣ"], true)).toEqual(["ΠΕΛΑΤΕΣ", "πελατεσ"]);
-    expect(prefilterNames(["clients", "CLIENTÈLE"], false)).toBeNull();
+  it("keeps every name and its fold; the ASCII form under an ASCII-only `lower` with a non-ASCII name", () => {
+    expect(prefilterNames(["CLIENTS ", "orders"], true)).toEqual({ kind: "fold", names: ["CLIENTS ", "clients", "orders"] });
+    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual({ kind: "fold", names: ["CLIENTS ", "clients", "orders"] });
+    expect(prefilterNames(["ΠΕΛΑΤΕΣ"], true)).toEqual({ kind: "fold", names: ["ΠΕΛΑΤΕΣ", "πελατεσ"] });
+    // Phase 9 follow-up after N1: the JavaScript folds, compared with the SQL fold of ASCII names.
+    expect(prefilterNames(["clients", "CLIENTÈLE", "Clients "], false)).toEqual({ kind: "ascii", folded: ["clients", "clientèle"] });
   });
 });
 
@@ -83,5 +86,43 @@ describe.skipIf(!hasDb)("sensitivity on a console database with the C character 
     await drainPolicyWork(getDb());
     const rows = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId)).orderBy(accessEvents.ts);
     expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0]);
+  });
+  it("phase 9 follow-up after N1: the fallback reads the chunk's targets only, and of their ASCII names the matching ones", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      targets: [...HEARTBEAT.targets, { target_id: "pg-prod-2", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const row = (targetId: string, object: string) => ({
+      id: randomUUID(),
+      agentId: auth.agentId,
+      targetId,
+      locationKey: createHash("sha256").update(`${targetId}/crm/public/${object}/c`).digest("hex"),
+      engine: "postgres",
+      databaseName: "crm",
+      schemaName: "public",
+      objectName: object,
+      fieldName: "c",
+      classifier: "pii.email",
+      classifiersVersion: "2026.09.1",
+      confidence: 1,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    await getDb()
+      .insert(findingsTable)
+      .values([row("pg-prod-1", "CLIENTÈLE"), row("pg-prod-1", "CLIENTS"), row("pg-prod-1", "invoices"), row("pg-prod-2", "CLIENTÈLE"), row("pg-prod-2", "clients")]);
+    const hits = await getDb().transaction((tx) =>
+      loadObjectHits(tx, [
+        { agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database: "crm", schema: "public", object: "clientèle" }] },
+        { agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database: "crm", schema: "public", object: "clients " }] },
+      ]),
+    );
+    const read = [...hits.keys()].filter((k) => k.includes("\u0000=public\u0000")).map((k) => k.split("\u0000").filter((_p, i) => i === 1 || i === 4).join("/"));
+    // Non-ASCII names of the chunk's targets are all read (JavaScript decides); ASCII ones only
+    // when they fold to an event name; nothing of the other target of the same agent.
+    expect(read.sort()).toEqual(["pg-prod-1/clients", "pg-prod-1/clientèle"]);
   });
 });

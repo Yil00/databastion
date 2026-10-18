@@ -2,8 +2,9 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, auditConfigs, findings, jobs } from "@/db/schema";
-import type { AuditWarning } from "@/lib/audit-warning";
+import { minRowsWarning, type AuditWarning, type MinRowsWarning } from "@/lib/audit-warning";
 import { objectSensitivity } from "@/lib/event-model";
+import { isKeyPatternEngine } from "@/lib/location-labels";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
@@ -31,6 +32,10 @@ import { lockAgentJobs } from "./job-lock";
  *   `SHRINK_RATIO` (50 %) of the objects sent last time.
  * The confirmation is the digest of the exact settings shown to the administrator: if the findings
  * change in between, the digest no longer matches and the change must be confirmed again.
+ *
+ * `min_rows` on a key-pattern (Redis / Valkey) target is saved, with a `minRowsWarning` in the
+ * answer and the audit entry (#235 review N2): it is not a narrowing of the sensitive objects,
+ * but it drops the target's events that carry no signal, since they have no row count.
  */
 
 export const SHRINK_MIN_REMOVED = 20;
@@ -304,9 +309,16 @@ export async function auditSummaries(db: Database, agentId: string): Promise<Map
 }
 
 export type AuditConfigureOutcome =
-  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number }
+  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number; minRowsWarning: MinRowsWarning | null }
   /** A narrowing change without (or with an outdated) confirmation: nothing is queued. */
-  | { outcome: "confirmation_required"; change: AuditChange; digest: string; truncated: number; skippedKeyPatterns: number }
+  | {
+      outcome: "confirmation_required";
+      change: AuditChange;
+      digest: string;
+      truncated: number;
+      skippedKeyPatterns: number;
+      minRowsWarning: MinRowsWarning | null;
+    }
   | { outcome: "not_found" }
   | { outcome: "invalid" };
 
@@ -333,11 +345,12 @@ export async function configureAudit(
     if (!agent || agent.revokedAt || agent.lockedAt) return { outcome: "not_found" };
     await lockAgentJobs(tx, agentId);
     const [target] = await tx
-      .select({ present: agentTargets.present })
+      .select({ present: agentTargets.present, engine: agentTargets.engine })
       .from(agentTargets)
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
+    const rowsWarning = minRowsWarning(isKeyPatternEngine(target.engine), input.minRows);
     // Key-pattern objects (Redis / Valkey findings) are not `SensitiveObject`s yet: left out (M3).
     const { objects: derived, skipped: skippedKeyPatterns } = sendableDerivedObjects(
       input.deriveFromFindings ? await deriveSensitiveObjects(tx, agentId, targetId) : [],
@@ -357,7 +370,7 @@ export async function configureAudit(
     );
     const digest = settingsDigest(params);
     if (change.warning !== null && input.confirm !== digest) {
-      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns };
+      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
     await tx
@@ -394,10 +407,14 @@ export async function configureAudit(
       targetType: "job",
       targetId: job.id,
       sourceIp: actor.ip,
-      details: { ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true), skipped_key_patterns: skippedKeyPatterns },
+      details: {
+        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
+        skipped_key_patterns: skippedKeyPatterns,
+        min_rows_warning: rowsWarning,
+      },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
-    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns };
+    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
   });
   if (result.outcome !== "queued") {
     await writeAudit(db, {

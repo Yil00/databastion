@@ -23,6 +23,13 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * A misbehaving agent can send such batches in a loop: writes are bounded per agent
  * (`integrityWriteBudget`); beyond it, events are only counted (`integrityStats.suppressed`) and
  * logged at most once per window per agent.
+ *
+ * `target_mismatch` has its own budget (`targetMismatchWriteBudget`, #235 review N1): it is
+ * detected at every heartbeat for as long as the target's `audit_source` does not serve its
+ * engine, so in the shared budget a single persistent mismatch would use the slots of the
+ * other kinds (a rejected findings batch, a `batch_conflict`, a foreign target) every window.
+ * It is recorded at most once per agent and hour; the heartbeats in between are counted
+ * (`suppressed_before` of the next `target_mismatch` row, separately from the other kinds).
  */
 export type IntegrityKind = "batch_rejected" | "batch_conflict" | "foreign_target" | "target_mismatch";
 
@@ -39,7 +46,20 @@ const ACTION: Record<IntegrityKind, AuditAction> = {
  * (`local`): the rows go to the same database, and failing closed would hide integrity events.
  */
 export const integrityWriteBudget = RateLimiter.shared("integrity.writes_per_agent", 20, 10 * 60_000, "local");
+/**
+ * `target_mismatch` rows written per agent per hour (#235 review N1), shared by every console
+ * process with the same per-process fallback. One row an hour is enough to show a persistent
+ * mismatch (the system alert is sent at most once per agent, kind and hour anyway), and a
+ * mismatch on another target of the same agent within the hour is in the next row. The target
+ * itself is stored without `audit_source` at every heartbeat, whatever this budget decides.
+ */
+export const targetMismatchWriteBudget = RateLimiter.shared("integrity.target_mismatch_per_agent", 1, 60 * 60_000, "local");
 export const integrityStats = { recorded: 0, suppressed: 0 };
+
+/** The write budget of an integrity kind, and the namespace of its suppression counters. */
+function budgetOf(kind: IntegrityKind): { budget: RateLimiter; scope: string } {
+  return kind === "target_mismatch" ? { budget: targetMismatchWriteBudget, scope: "target_mismatch" } : { budget: integrityWriteBudget, scope: "shared" };
+}
 /** Log de-duplication only: per process by design (each process logs its own suppressions). */
 const warnedSuppression = new RateLimiter(1, 10 * 60_000);
 /**
@@ -59,15 +79,17 @@ export interface IntegrityEvent {
 }
 
 export async function recordIntegrityEvent(db: Database, event: IntegrityEvent): Promise<boolean> {
-  if (!(await integrityWriteBudget.reserveShared(event.agentId)).ok) {
+  const { budget, scope } = budgetOf(event.kind);
+  const counterKey = `${scope}:${event.agentId}`;
+  if (!(await budget.reserveShared(event.agentId)).ok) {
     integrityStats.suppressed++;
-    if (suppressedSince.has(event.agentId) || suppressedSince.size < MAX_SUPPRESSED_KEYS) {
-      suppressedSince.set(event.agentId, (suppressedSince.get(event.agentId) ?? 0) + 1);
+    if (suppressedSince.has(counterKey) || suppressedSince.size < MAX_SUPPRESSED_KEYS) {
+      suppressedSince.set(counterKey, (suppressedSince.get(counterKey) ?? 0) + 1);
     }
-    if (warnedSuppression.reserve(event.agentId)) {
+    if (warnedSuppression.reserve(counterKey)) {
       logger.warn(
         { agentId: event.agentId, kind: event.kind },
-        "agent-integrity events over the per-agent budget: further events are counted, not recorded",
+        "agent-integrity events over their per-agent budget: further events are counted, not recorded",
       );
     }
     return false;
@@ -79,9 +101,9 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
     details_count: event.details?.length ?? 0,
     pointer: first?.pointer ?? null,
     keyword: first?.keyword ?? null,
-    suppressed_before: suppressedSince.get(event.agentId) ?? 0,
+    suppressed_before: suppressedSince.get(counterKey) ?? 0,
   };
-  suppressedSince.delete(event.agentId);
+  suppressedSince.delete(counterKey);
   await db.transaction(async (tx) => {
     const [row] = await tx
       .insert(securityEvents)

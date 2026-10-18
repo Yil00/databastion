@@ -185,14 +185,26 @@ const sqlFold = (x: SQL) => sql`replace(lower(rtrim(${x})), ${FINAL_SIGMA}::text
 const nonAscii = (s: string) => [...s].some((c) => c.charCodeAt(0) > 0x7f);
 
 /**
- * Names for the SQL pre-filter of `loadObjectHits`: every event name and its `foldName`, or `null`
- * (no name pre-filter, `objectKey` alone decides) when the database's `lower` folds ASCII only and
- * a name holds another character (security review L1).
+ * The name pre-filter of `loadObjectHits`:
+ * - `fold`: when the database's `lower` folds Unicode, or every event name is ASCII: every event
+ *   name and its `foldName`, both compared through `sqlFold` (as before the C-ctype change);
+ * - `ascii`: when the database's `lower` folds ASCII only (`C` / `POSIX` ctype) and a name holds
+ *   another character (security review L1). The SQL `lower` is then exact on ASCII names only:
+ *   the pre-filter keeps the findings whose ASCII name, through `sqlFold`, equals the
+ *   JavaScript `foldName` of an event name (`folded`), and every finding whose name holds a
+ *   non-ASCII character, left to `objectKey` (JavaScript `foldName`) to decide. Together with the
+ *   chunk's (agent, target) pairs this replaces the read of every finding of the chunk's agents
+ *   (phase 9 follow-up after N1).
  */
-export function prefilterNames(objectNames: readonly string[], unicodeLower: boolean): string[] | null {
-  if (!unicodeLower && objectNames.some(nonAscii)) return null;
-  return [...new Set(objectNames.flatMap((n) => [n, foldName(n)]))];
+export type NamePrefilter = { kind: "fold"; names: string[] } | { kind: "ascii"; folded: string[] };
+
+export function prefilterNames(objectNames: readonly string[], unicodeLower: boolean): NamePrefilter {
+  if (!unicodeLower && objectNames.some(nonAscii)) return { kind: "ascii", folded: [...new Set(objectNames.map(foldName))] };
+  return { kind: "fold", names: [...new Set(objectNames.flatMap((n) => [n, foldName(n)]))] };
 }
+
+/** A character outside U+0001..U+007F (a byte above 0x7F under `SQL_ASCII`), as a regex parameter. */
+const NON_ASCII_RE = "[^\\x01-\\x7f]";
 
 /**
  * Findings (false positives excluded) of the objects reached by `events`, by object key: the
@@ -202,23 +214,36 @@ export function prefilterNames(objectNames: readonly string[], unicodeLower: boo
  * for its `foldName`, so both sides go through the same PostgreSQL `lower` and the pre-filter
  * keeps every finding whose object name differs by case or trailing spaces; `objectKey` then
  * decides. PostgreSQL folds non-ASCII letters only under a UTF-8 character type (deploy/README.md:
- * the console database needs one, as the images' `en_US.utf8`); under `C` / `POSIX` the name
- * pre-filter is dropped for a chunk with a non-ASCII name (all findings of its agents are read,
- * L1). No index covers `object_name`, so the expression costs no index.
+ * the console database needs one, as the images' `en_US.utf8`); under `C` / `POSIX` a chunk with a
+ * non-ASCII name uses the `ascii` pre-filter of {@link prefilterNames}, restricted to the chunk's
+ * (agent, target) pairs. No index covers `object_name`, so the expression costs no index.
+ * Exported for the tests (event-engine-c-locale.test.ts).
  */
-async function loadObjectHits(tx: Tx, events: readonly PendingEvent[]): Promise<Map<string, ClassifierHit[]>> {
+export async function loadObjectHits(
+  tx: Tx,
+  events: readonly Pick<PendingEvent, "agentId" | "targetId" | "objects">[],
+): Promise<Map<string, ClassifierHit[]>> {
   const agentIds = [...new Set(events.map((e) => e.agentId))];
   const objectNames = [...new Set(events.flatMap((e) => e.objects.map((o) => o.object)))];
   const out = new Map<string, ClassifierHit[]>();
   if (objectNames.length === 0) return out;
-  const names = prefilterNames(objectNames, !objectNames.some(nonAscii) || (await lowerFoldsUnicode(tx)));
-  const sameName =
-    names === null
-      ? undefined
-      : sql`${sqlFold(sql`${findings.objectName}`)} in (${sql.join(
-          names.map((n) => sqlFold(sql`${n}::text`)),
-          sql`, `,
-        )})`;
+  const pre = prefilterNames(objectNames, !objectNames.some(nonAscii) || (await lowerFoldsUnicode(tx)));
+  let sameName: SQL;
+  if (pre.kind === "fold") {
+    sameName = sql`${sqlFold(sql`${findings.objectName}`)} in (${sql.join(
+      pre.names.map((n) => sqlFold(sql`${n}::text`)),
+      sql`, `,
+    )})`;
+  } else {
+    const pairs = [...new Map(events.map((e) => [targetKey(e), [e.agentId, e.targetId] as const])).values()];
+    sameName = sql`(${findings.agentId}, ${findings.targetId}) in (${sql.join(
+      pairs.map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )}) and (${sqlFold(sql`${findings.objectName}`)} in (${sql.join(
+      pre.folded.map((n) => sql`${n}::text`),
+      sql`, `,
+    )}) or ${findings.objectName} ~ ${NON_ASCII_RE}::text)`;
+  }
   const rows = await tx
     .select({
       agentId: findings.agentId,
@@ -387,8 +412,15 @@ function rowsSinceFalsePositiveSql() {
       where ie.incident_id = incidents.id and ie.created_at >= incidents.false_positive_at), 0) else 0 end::double precision`;
 }
 
-async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<LatestIncident | null> {
+/**
+ * The latest incident of `key`. `legacyKey`: the key of the same event before the database name
+ * was folded (ADR-0021 implementation note of 2026-10-18), given only when it differs. Incidents
+ * opened by an earlier console under it are found too, an active one first, so an incident of the
+ * hour of the upgrade keeps collecting its events instead of a second one opening.
+ */
+async function latestIncident(tx: Tx, state: ChunkState, key: string, legacyKey: string | null = null): Promise<LatestIncident | null> {
   if (state.latest.has(key)) return state.latest.get(key) ?? null;
+  const keys = legacyKey === null || legacyKey === key ? [key] : [key, legacyKey];
   const [row] = await tx
     .select({
       id: incidents.id,
@@ -400,8 +432,12 @@ async function latestIncident(tx: Tx, state: ChunkState, key: string): Promise<L
       rowsSinceFalsePositive: rowsSinceFalsePositiveSql(),
     })
     .from(incidents)
-    .where(eq(incidents.dedupKey, key))
-    .orderBy(desc(incidents.createdAt), desc(incidents.id))
+    .where(keys.length === 1 ? eq(incidents.dedupKey, key) : inArray(incidents.dedupKey, keys))
+    .orderBy(
+      ...(keys.length === 1 ? [] : [desc(sql`${incidents.status} in ('open', 'acknowledged')`)]),
+      desc(incidents.createdAt),
+      desc(incidents.id),
+    )
     .limit(1);
   const latest = row ? { ...row, rowsSinceFalsePositive: Number(row.rowsSinceFalsePositive) } : null;
   state.latest.set(key, latest);
@@ -509,21 +545,26 @@ async function applyEventPolicy(
   const oi = dedupObject(kept, ev.objectSensitivities);
   const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
-  const key = eventDedupKey({
-    policyId: policy.id,
-    agentId: e.agentId,
-    targetId: e.targetId,
-    principalKey: dedupPrincipal({
-      action: e.action,
-      principalKey: e.principalKey,
-      networkHash: sha256Hex(clientNetwork(e.clientAddr)),
-      accountNotRecorded: e.accountNotRecorded,
-      clientAddr: e.clientAddr,
-    }),
-    databaseKey: database === null ? "-" : sha256Hex(database),
-    bucket,
-  });
-  const latest = await latestIncident(tx, state, key);
+  // ADR-0021 decision 6, implementation note of 2026-10-18: the database part hashes the folded
+  // name (`foldName`, as the object matching of N1), so `CRM` and `crm` share one incident.
+  const keyOf = (databaseKey: string) =>
+    eventDedupKey({
+      policyId: policy.id,
+      agentId: e.agentId,
+      targetId: e.targetId,
+      principalKey: dedupPrincipal({
+        action: e.action,
+        principalKey: e.principalKey,
+        networkHash: sha256Hex(clientNetwork(e.clientAddr)),
+        accountNotRecorded: e.accountNotRecorded,
+        clientAddr: e.clientAddr,
+      }),
+      databaseKey,
+      bucket,
+    });
+  const key = keyOf(database === null ? "-" : sha256Hex(foldName(database)));
+  const legacyKey = database === null || foldName(database) === database ? null : keyOf(sha256Hex(database));
+  const latest = await latestIncident(tx, state, key, legacyKey);
   if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) {
     await rematch(tx, latest, e, facts);
     return "rematched";

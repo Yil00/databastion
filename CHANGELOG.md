@@ -7,6 +7,20 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+### ⚠️ Upgrade notes
+
+- **Incidents of one database spelled differently are merged** (console, [ADR-0021](docs/adr/0021-access-event-correlation.md) implementation note of 2026-10-18). The access-event incident dedup key now hashes the database name without case or trailing spaces, so events on `CRM` and `crm` in the same hour add to one incident per policy and principal. An incident open across the upgrade keeps the events of its own spelling; in the hour of the upgrade, an event with another spelling of that database may open one more incident, once.
+- **Policies with `exclude_principals: ["*"]`** (unchanged since 0.8.0, recalled for upgrades from 0.7.x): they do not hide Redis / Valkey events whose account is not recorded (`account_not_recorded`), by design. Such an event has no account name to match; scope these policies with targets or objects instead ([user guide](docs/10-user-guide.md#11-policies-incidents-and-notifications)).
+
+### ✨ Features
+
+- **Console: warning for minimum rows on Redis / Valkey targets** (#235 review N2). Saving Audit settings with `min_rows` on a key-pattern target still works, and now returns `min_rows_warning: "no_row_counts"`, recorded in the audit entry and shown on the target's Audit settings page: these events carry no row count, so the threshold drops those without a signal.
+- **Console: `agent.target_mismatch` has its own integrity write budget** (#235 review N1): one row per agent and hour while a target's `audit_source` does not serve its engine, the heartbeats in between counted in `suppressed_before`. It no longer uses the per-agent budget of the other agent-integrity events (20 rows per 10 minutes).
+
+### ⚡️ Performance
+
+- **Console: faster sensitivity lookup on a `C` / `POSIX`-ctype console database**: a batch of events naming a non-ASCII object reads only the findings of its own targets, and of those the ASCII names that match plus the non-ASCII names, instead of every finding of its agents. A UTF-8 character type is still recommended ([deploy/README.md](deploy/README.md#1-console)).
+
 ## [0.8.0](https://github.com/Yil00/databastion/compare/0.7.0...0.8.0) (2026-10-17)
 
 Planned for the next minor release (0.8.0), with phase 9: Microsoft SQL Server, Redis and Valkey. The entries below are merged on `dev`. The end-of-phase-9 security review is done (no Critical or High finding); every release gate is met ([RELEASE.md](RELEASE.md#open-release-gates)).

@@ -322,6 +322,37 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(list[3]?.eventBucket?.toISOString()).toBe("2026-09-27T11:00:00.000Z");
     });
 
+    it("ADR-0021 decision 6 note of 2026-10-18: the dedup key hashes the folded database name; an incident opened under the name as sent keeps its events", async () => {
+      const auth = await agentWithTargets();
+      await policy({ signals: ["signature.pg_dump"] });
+      const db = (database: string, ms: number) => dumpEvent({ ts: at(ms), objects: [{ database, schema: "public", object: "clients" }] });
+      await send(auth, [db("CRM", 0), db("crm ", 1000), db("crm", 2000)]);
+      await drainPolicyWork(getDb());
+      let list = await incidentsOf(auth.agentId);
+      expect(list.map((i) => [i.eventDatabase, i.matchCount])).toEqual([["CRM", 3]]);
+      expect(list[0]?.dedupKey).toContain(`|database:${sha256Hex("crm")}|`);
+      // An incident opened by an earlier console under the name as sent (`Billing`), in this hour.
+      await send(auth, [db("billing", 3000)]);
+      await drainPolicyWork(getDb());
+      list = await incidentsOf(auth.agentId);
+      const billing = list.find((i) => i.eventDatabase === "billing");
+      expect(billing).toBeDefined();
+      const legacy = String(billing?.dedupKey).replace(`|database:${sha256Hex("billing")}|`, `|database:${sha256Hex("Billing")}|`);
+      await getDb().update(incidents).set({ dedupKey: legacy, eventDatabase: "Billing" }).where(eq(incidents.id, String(billing?.id)));
+      // The same spelling after the upgrade: added to it, no second incident of the hour.
+      await send(auth, [db("Billing", 4000)]);
+      await drainPolicyWork(getDb());
+      list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      expect(list.find((i) => i.id === billing?.id)?.matchCount).toBe(2);
+      // Once it is resolved, the legacy incident is still the key's latest (M1: linked, not reopened).
+      expect((await transitionIncident(getDb(), String(billing?.id), "resolved", actor())).outcome).toBe("ok");
+      await send(auth, [db("Billing", 5000)]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(2);
+      expect(await incidentEventCount(getDb(), String(billing?.id))).toBe(3);
+    });
+
     it("every enabled access_event policy applies; exclusions, exceptions and finding policies do not", async () => {
       const auth = await agentWithTargets();
       await policy({ signals: ["signature.*"], exclude_principals: ["back*"] });

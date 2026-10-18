@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { auditConfigs, auditLog, jobs, users } from "@/db/schema";
+import { minRowsWarning } from "@/lib/audit-warning";
 import { validateSchema } from "@/lib/protocol/validate";
 import { failuresPerAgent } from "@/server/agent-api/auth";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
@@ -36,6 +37,13 @@ const obj = (object: string, classifiers = ["pii.email"], schema: string | null 
 const objs = (n: number, prefix = "t") => Array.from({ length: n }, (_, i) => obj(`${prefix}${i}`));
 
 describe("audit settings model", () => {
+  it("#235 review N2: warns on min_rows only on a key-pattern engine, 0 included", () => {
+    expect(minRowsWarning(true, 0)).toBe("no_row_counts");
+    expect(minRowsWarning(true, 1000)).toBe("no_row_counts");
+    expect(minRowsWarning(true, null)).toBeNull();
+    expect(minRowsWarning(false, 1000)).toBeNull();
+  });
+
   it("parses a request with the contract defaults made explicit", () => {
     expect(parseAuditConfigInput({ enabled: true })).toEqual({
       ok: true,
@@ -228,7 +236,7 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     const res = await configure(auth, { enabled: true, min_rows: 10_000 });
     expect(res.status).toBe(202);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toMatchObject({ warning: null, previous_objects: 0, next_objects: 2, added_objects: 2, removed_objects: 0 });
+    expect(body).toMatchObject({ warning: null, previous_objects: 0, next_objects: 2, added_objects: 2, removed_objects: 0, min_rows_warning: null });
     const [job] = await auditJobs(auth.agentId);
     expect(job).toMatchObject({ id: body.job_id, status: "pending", targetId: "pg-prod-1", createdBy: adminId });
     expect(job?.params).toEqual({
@@ -341,6 +349,36 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     // A key pattern typed by hand is still refused (not a SensitiveObject yet).
     const manual = await configure(auth, { enabled: true, manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }] }, { target: "cache-redis" });
     expect(manual.status).toBe(400);
+  });
+
+  it("#235 review N2: min_rows on a Redis / Valkey target is saved with a warning, in the answer and the audit entry", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "redis"],
+      targets: [
+        ...HEARTBEAT.targets,
+        { target_id: "cache-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+      ],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const withRows = await configure(auth, { enabled: true, min_rows: 100 }, { target: "cache-valkey" });
+    expect(withRows.status).toBe(202);
+    expect(await withRows.json()).toMatchObject({ min_rows_warning: "no_row_counts" });
+    const [job] = await auditJobs(auth.agentId);
+    expect(job?.params).toMatchObject({ enabled: true, min_rows: 100 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ target_id: "cache-valkey", min_rows: 100, min_rows_warning: "no_row_counts" });
+    // Without min_rows: no warning; on a SQL target, min_rows carries none either.
+    const without = await configure(auth, { enabled: true }, { target: "cache-valkey" });
+    expect(await without.json()).toMatchObject({ min_rows_warning: null });
+    const sql = await configure(auth, { enabled: true, min_rows: 100 });
+    expect(sql.status).toBe(202);
+    expect(await sql.json()).toMatchObject({ min_rows_warning: null });
+    // The warning rides along with a confirmation request too.
+    const off = await configure(auth, { enabled: false, min_rows: 5 }, { target: "cache-valkey" });
+    expect(off.status).toBe(409);
+    expect(await off.json()).toMatchObject({ error: "confirmation_required", min_rows_warning: "no_row_counts" });
   });
 
   it("supersedes the settings jobs not delivered yet", async () => {
