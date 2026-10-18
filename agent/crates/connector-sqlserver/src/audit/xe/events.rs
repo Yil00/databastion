@@ -1809,6 +1809,58 @@ mod statistics_tests {
         assert!(!dump.contains("e2e_dcl_probe") && !dump.to_ascii_lowercase().contains("password"));
     }
 
+    /// The principal changes of the security review of d4175ea (L2),
+    /// captured on 2022 (16.0.4305.5), one batch each: the inner
+    /// statements of `sp_addrolemember`, `sp_addsrvrolemember`,
+    /// `sp_dropuser` and `sp_droplogin` are statement events of their own,
+    /// and so is the `DROP LOGIN` of `IF 1=1 DROP LOGIN x`: each is DCL,
+    /// with the batches' statements, `ALTER AUTHORIZATION` and the
+    /// password placeholders. Nothing else is; the only DDL is the
+    /// `#retval` table of `sp_droplogin`.
+    #[test]
+    fn principal_changes_and_their_procedures_are_dcl() {
+        let mut recs = fixture("dcl-procedures-16.0.4305.5.xml");
+        assert_eq!(recs.len(), 144);
+        context(&mut recs, true, &|_| false);
+        let text = |r: &XeRecord| {
+            r.event
+                .as_ref()
+                .and_then(|e| e.statement.as_deref())
+                .map(|t| t.trim().to_owned())
+                .unwrap_or_default()
+        };
+        let mut dcl = Vec::new();
+        for r in recs.iter().filter(|r| !r.skip) {
+            if let Some((e, _)) = convert(r) {
+                // The one DDL: `sp_droplogin`'s own `#retval` table.
+                if e.action() == EventAction::Ddl {
+                    assert!(text(r).starts_with("create table #retval"), "{}", text(r));
+                }
+                if e.action() == EventAction::Dcl {
+                    assert!(e.always_report() && names(&e).iter().all(|n| n.ends_with(".-.*")));
+                    dcl.push(text(r));
+                }
+            }
+        }
+        dcl.sort();
+        let mut want = vec![
+            "-- CREATE LOGIN",
+            "-- CREATE LOGIN",
+            "CREATE USER m_u1 FOR LOGIN m_l1;",
+            "CREATE ROLE m_r1;",
+            "alter role [m_r1] add member [m_u1]",
+            "alter server role [bulkadmin] add member [m_l1]",
+            "ALTER AUTHORIZATION ON ROLE::m_r1 TO dbo;",
+            "ALTER AUTHORIZATION ON SCHEMA::crm TO dbo;",
+            "drop user [m_u1]",
+            "DROP ROLE m_r1;",
+            "drop login [m_l1]",
+            "DROP LOGIN m_l2;",
+        ];
+        want.sort_unstable();
+        assert_eq!(dcl, want);
+    }
+
     /// Case 1, condition 4 as revised on 2026-10-16: the build's nest
     /// level minus one, the build at nest level 2 or more.
     #[test]
