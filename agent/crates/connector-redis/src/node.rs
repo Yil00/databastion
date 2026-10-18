@@ -80,6 +80,17 @@ static TEST_TRANSPORTS: std::sync::LazyLock<
     Mutex<HashMap<String, std::collections::VecDeque<net::Transport>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Hands `io` to the next session of `target_id` (unit tests).
+#[cfg(test)]
+pub(crate) fn push_test_transport(target_id: &str, io: net::Transport) {
+    TEST_TRANSPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(target_id.to_owned())
+        .or_default()
+        .push_back(io);
+}
+
 #[cfg(test)]
 fn test_transport(target_id: &str) -> Option<net::Transport> {
     TEST_TRANSPORTS
@@ -512,13 +523,39 @@ impl Reports {
     }
 
     fn store(&self, target_id: &str, which: Which, report: Report, server: Server) {
+        self.store_at(target_id, which, report, server, Instant::now());
+    }
+
+    fn store_at(&self, target_id: &str, which: Which, report: Report, server: Server, at: Instant) {
         self.nodes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (target_id.to_owned(), which),
-                (Instant::now(), report, server),
-            );
+            .insert((target_id.to_owned(), which), (at, report, server));
+    }
+
+    /// Stores a report as evaluated at `at` (unit tests).
+    #[cfg(test)]
+    pub(crate) fn store_for_test(
+        &self,
+        target: &TargetConfig,
+        which: Which,
+        report: Report,
+        server: Server,
+        at: Instant,
+    ) {
+        self.store_at(&target.id, node_of(target, which), report, server, at);
+    }
+
+    /// The last report of the node `which` of a target, fresh or not, with
+    /// the server it was read on. Only its refusal may be used once it is
+    /// stale (#275 review L3): a node that cannot be reached cannot clear a
+    /// refusal it was last seen with; a new evaluation replaces it.
+    pub(crate) fn last(&self, target: &TargetConfig, which: Which) -> Option<(Report, Server)> {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(target.id.clone(), node_of(target, which)))
+            .map(|(_, r, s)| (r.clone(), *s))
     }
 
     /// The account's report on the node `session` is open on (`which`),
@@ -754,75 +791,6 @@ mod tests {
         ));
     }
 
-    /// A stand-in for a server on one end of socket pairs (tests only, no
-    /// listening socket): `connections` sessions of `target_id` get one
-    /// each. It answers `AUTH`, `HELLO 3`, `INFO` and `ACL DRYRUN` (`OK`,
-    /// so every probe is allowed), and never answers the first
-    /// connection's `CLIENT LIST`, so its `CLIENT LIST ID` times out and
-    /// the session is replaced. The connections after the first report
-    /// `run_id` `later_run`.
-    fn fake_server(target_id: &str, connections: i64, later_run: &'static str) {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        for id in 1..=connections {
-            let (client, server) = tokio::net::UnixStream::pair().unwrap();
-            TEST_TRANSPORTS
-                .lock()
-                .unwrap()
-                .entry(target_id.to_owned())
-                .or_default()
-                .push_back(net::Transport::Unix(client));
-            let run = if id == 1 { "run-a" } else { later_run };
-            tokio::spawn(async move {
-                let (r, mut w) = server.into_split();
-                let mut r = BufReader::new(r);
-                loop {
-                    // One request: an array of bulk strings.
-                    let mut line = String::new();
-                    if r.read_line(&mut line).await.unwrap_or(0) == 0 {
-                        return;
-                    }
-                    let count: usize = line.trim_start_matches('*').trim().parse().unwrap();
-                    let mut args = Vec::new();
-                    for _ in 0..count {
-                        let mut len = String::new();
-                        r.read_line(&mut len).await.unwrap();
-                        let len: usize = len.trim_start_matches('$').trim().parse().unwrap();
-                        let mut buf = vec![0u8; len + 2];
-                        r.read_exact(&mut buf).await.unwrap();
-                        buf.truncate(len);
-                        args.push(String::from_utf8(buf).unwrap().to_ascii_uppercase());
-                    }
-                    let reply = match args.first().map(String::as_str) {
-                        Some("HELLO") => format!(
-                            "%3\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:{id}\r\n\
-                             $4\r\nmode\r\n$10\r\nstandalone\r\n"
-                        ),
-                        Some("INFO") => {
-                            let text = match args.get(1).map(String::as_str) {
-                                Some("SERVER") => format!(
-                                    "server_name:valkey\r\nvalkey_version:9.0.6\r\n\
-                                     redis_version:7.2.4\r\nrun_id:{run}\r\n"
-                                ),
-                                Some("REPLICATION") => "role:master\r\n".to_owned(),
-                                _ => "cluster_enabled:0\r\n".to_owned(),
-                            };
-                            format!("${}\r\n{text}\r\n", text.len())
-                        }
-                        Some("CLIENT") if id == 1 => {
-                            // Never answered: the client's deadline.
-                            std::future::pending::<()>().await;
-                            return;
-                        }
-                        _ => "+OK\r\n".to_owned(),
-                    };
-                    if w.write_all(reply.as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    }
-
     fn fake_target(id: &str) -> TargetConfig {
         databastion_core::AgentConfig::parse(&format!(
             "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: {id}, \
@@ -845,7 +813,20 @@ mod tests {
             ("replace-same-run", "run-a", true),
             ("replace-new-run", "run-b", false),
         ] {
-            fake_server(id, 2, later_run);
+            crate::testserver::serve(
+                id,
+                &[
+                    // Its `CLIENT LIST ID` never answered: replaced.
+                    crate::testserver::Fake {
+                        hang_on: Some("CLIENT"),
+                        ..crate::testserver::Fake::new(1)
+                    },
+                    crate::testserver::Fake {
+                        run: later_run,
+                        ..crate::testserver::Fake::new(2)
+                    },
+                ],
+            );
             let target = fake_target(id);
             let _stream = crate::audit::own::audit_started(id);
             let (mut session, info) = open(&target, Which::Target, timeout).await.unwrap();

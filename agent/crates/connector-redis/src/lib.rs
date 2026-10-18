@@ -52,6 +52,8 @@ pub mod fuzz;
 mod it;
 #[cfg(test)]
 mod proptests;
+#[cfg(test)]
+mod testserver;
 
 use async_trait::async_trait;
 use databastion_classifiers::masking::EventSource;

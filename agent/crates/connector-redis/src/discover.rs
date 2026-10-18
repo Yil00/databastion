@@ -394,9 +394,8 @@ async fn walk(
         }
         examined += batch.listed;
         for (raw, kind) in batch.keys {
-            let units = keys::split_key(raw.expose());
-            families.add(raw.expose(), units.pattern().as_str(), kind as u8);
-            builder.add(raw.expose(), units, kind as u8);
+            families.add(raw.expose(), kind as u8);
+            builder.add(raw.expose(), keys::split_key(raw.expose()), kind as u8);
         }
         cursor = batch.next;
         if cursor == 0 {

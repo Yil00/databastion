@@ -24,6 +24,11 @@ use crate::node::{self, Refusal, Reports, Which};
 const CHECK_OP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound of a whole `check()` (the core allows 10 s).
 const CHECK_TIMEOUT: Duration = Duration::from_secs(9);
+/// Bound of the declared Discovery node's whole step (opening, identifying
+/// and evaluating it): a node that accepts the connection and then hangs
+/// or answers slowly costs at most this, so the target's own result still
+/// fits in [`CHECK_TIMEOUT`] (#275 review L2).
+const DISCOVERY_NODE_TIMEOUT: Duration = Duration::from_millis(3500);
 
 /// What the latest scan of a target saw, reported by `check()`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,9 +78,68 @@ fn stage_note(stage: Stage) -> TargetNote {
     TargetNote::new(NoteCode::CheckStageFailed).with_labels([NoteLabel::stage(stage.as_str())])
 }
 
+/// Adds a `check.stage_failed` label: into the note already there, if any
+/// (one note per code is sent, the first kept), so no stage hides another
+/// (#275 review L4).
+fn push_stage(notes: &mut Vec<TargetNote>, stage: Stage) {
+    match notes
+        .iter_mut()
+        .find(|n| n.code() == NoteCode::CheckStageFailed)
+    {
+        Some(n) => {
+            let note = std::mem::replace(n, TargetNote::new(NoteCode::CheckStageFailed));
+            *n = note.with_labels([NoteLabel::stage(stage.as_str())]);
+        }
+        None => notes.push(stage_note(stage)),
+    }
+}
+
+/// The declared Discovery node, opened and evaluated under
+/// [`DISCOVERY_NODE_TIMEOUT`]: whether it reports a replica role (`None`:
+/// not opened), and its report and server.
+async fn discovery_node(
+    state: &CheckState,
+    target: &TargetConfig,
+) -> (
+    Option<bool>,
+    Result<(node::Report, crate::info::Server), RdError>,
+) {
+    let deadline = tokio::time::Instant::now() + DISCOVERY_NODE_TIMEOUT;
+    let opened = tokio::time::timeout_at(
+        deadline,
+        node::open(target, Which::Discovery, CHECK_OP_TIMEOUT),
+    )
+    .await
+    .map_err(|_| RdError::new(FailureCode::Timeout, Stage::Connect));
+    let (mut s, dinfo) = match opened {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) | Err(e) => return (None, Err(e)),
+    };
+    let d = tokio::time::timeout_at(
+        deadline,
+        state
+            .reports
+            .of_session(&mut s, target, Which::Discovery, dinfo, CHECK_OP_TIMEOUT),
+    )
+    .await;
+    let r = match d {
+        Ok(Ok(d)) => {
+            s.close().await;
+            Ok((d, dinfo.server))
+        }
+        Ok(Err(e)) => {
+            s.close().await;
+            Err(e)
+        }
+        // Timed out: the session is dropped, not closed politely.
+        Err(_) => Err(RdError::new(FailureCode::Timeout, Stage::Check)),
+    };
+    (Some(dinfo.replica), r)
+}
+
 fn failed(e: RdError, notes: Vec<TargetNote>) -> TargetHealth {
     let mut notes = notes;
-    notes.push(stage_note(e.stage));
+    push_stage(&mut notes, e.stage);
     TargetHealth {
         reachable: false,
         audit_level: AuditLevel::None,
@@ -145,23 +209,11 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     // counts in the worse of the two.
     let mut discovery_failed: Option<RdError> = None;
     if settings.discovery_node.is_some() {
-        let evaluated = match node::open(target, Which::Discovery, CHECK_OP_TIMEOUT).await {
-            Ok((mut s, dinfo)) => {
-                if !dinfo.replica {
-                    tracing::warn!(
-                        "Redis / Valkey: redis.discovery_node does not report a replica role"
-                    );
-                    notes.push(stage_note(Stage::Check));
-                }
-                let d = state
-                    .reports
-                    .of_session(&mut s, target, Which::Discovery, dinfo, CHECK_OP_TIMEOUT)
-                    .await;
-                s.close().await;
-                d.map(|d| (d, dinfo.server))
-            }
-            Err(e) => Err(e),
-        };
+        let (replica, evaluated) = discovery_node(state, target).await;
+        if replica == Some(false) {
+            tracing::warn!("Redis / Valkey: redis.discovery_node does not report a replica role");
+            push_stage(&mut notes, Stage::Check);
+        }
         let evaluated = match evaluated {
             Ok(x) => Some(x),
             Err(e) => {
@@ -172,7 +224,17 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
                      Discovery cannot run"
                 );
                 discovery_failed = Some(e);
-                state.reports.cached(target, Which::Discovery)
+                // Its fresh report counts whole; a stale one only by its
+                // refusal, which only a new evaluation clears (L3).
+                match state.reports.cached(target, Which::Discovery) {
+                    Some(fresh) => Some(fresh),
+                    None => {
+                        if let Some((d, dserver)) = state.reports.last(target, Which::Discovery) {
+                            refusal = refusal.or(d.refusal(&settings, dserver));
+                        }
+                        None
+                    }
+                }
             }
         };
         if let Some((d, dserver)) = evaluated {
@@ -242,14 +304,14 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         Some(Refusal::NotEvaluated | Refusal::MisplacedOptIn) => Some(FailureCode::Unsupported),
     };
     if let Some(e) = &discovery_failed {
-        notes.push(stage_note(e.stage));
+        push_stage(&mut notes, e.stage);
     }
     if refusal == Some(Refusal::MisplacedOptIn) {
         tracing::warn!(
             "Redis / Valkey: redis.unevaluated_acl applies to Redis 6.2 only; remove it \
              (the target is refused until then)"
         );
-        notes.push(stage_note(Stage::Check));
+        push_stage(&mut notes, Stage::Check);
     }
     TargetHealth {
         reachable: true,
@@ -401,4 +463,147 @@ async fn default_user_grade(target: &TargetConfig) -> Option<u64> {
     }
     s.close().await;
     Some(allowed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testserver::{Fake, serve};
+    use std::time::Instant;
+
+    fn target(id: &str) -> TargetConfig {
+        // Nothing listens on port 1: only the stand-in connections handed
+        // through the test transports answer (the `default` user probe
+        // finds nothing).
+        databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: {id}, \
+             engine: valkey, host: 127.0.0.1, port: 1, account: databastion, \
+             secret: {{env: PATH}}, redis: {{tls: disable, \
+             discovery_node: {{host: 127.0.0.1, port: 1}}}}}}]}}"
+        ))
+        .unwrap()
+        .targets[0]
+            .clone()
+    }
+
+    /// The target's node: answers, every probe denied (no refusal).
+    fn healthy() -> Fake {
+        Fake {
+            deny_dryrun: true,
+            ..Fake::new(1)
+        }
+    }
+
+    fn stages(h: &TargetHealth) -> Vec<Vec<NoteLabel>> {
+        h.notes
+            .iter()
+            .filter(|n| n.code() == NoteCode::CheckStageFailed)
+            .map(|n| n.labels().to_vec())
+            .collect()
+    }
+
+    /// #275 review L2: a Discovery node that never answers, or answers
+    /// each command just under the per-command timeout, costs at most its
+    /// own deadline: the target stays reachable.
+    #[tokio::test]
+    async fn a_hanging_discovery_node_keeps_the_target_reachable() {
+        for (id, fake) in [
+            (
+                "check-dn-silent",
+                Fake {
+                    hang_on: Some("AUTH"),
+                    ..Fake::new(2)
+                },
+            ),
+            (
+                "check-dn-slow",
+                Fake {
+                    delay: Duration::from_millis(2500),
+                    ..Fake::new(2)
+                },
+            ),
+        ] {
+            serve(id, &[healthy(), fake]);
+            let started = Instant::now();
+            let h = check(&CheckState::default(), &target(id)).await;
+            assert!(started.elapsed() < Duration::from_secs(6), "{id}");
+            assert!(h.reachable, "{id}: {h:?}");
+            assert_eq!(h.failure, Some(FailureCode::Timeout), "{id}");
+            assert_eq!(stages(&h).len(), 1, "{id}: {h:?}");
+            assert!(!h.notes.iter().any(|n| n.code() == NoteCode::CheckTimedOut));
+        }
+    }
+
+    /// #275 review L4: a Discovery node that is not a replica and then
+    /// fails gives one `check.stage_failed` note holding every stage.
+    #[tokio::test]
+    async fn a_failing_primary_as_discovery_node_gives_one_stage_note() {
+        let id = "check-dn-primary";
+        serve(
+            id,
+            &[
+                healthy(),
+                Fake {
+                    hang_on: Some("ACL"),
+                    ..Fake::new(2)
+                },
+            ],
+        );
+        let h = check(&CheckState::default(), &target(id)).await;
+        assert!(h.reachable, "{h:?}");
+        assert_eq!(h.failure, Some(FailureCode::Timeout));
+        assert_eq!(
+            stages(&h),
+            [vec![NoteLabel::stage(Stage::Check.as_str())]],
+            "{h:?}"
+        );
+        // Labels of different stages are merged, never dropped.
+        let mut notes = vec![stage_note(Stage::Check)];
+        push_stage(&mut notes, Stage::Connect);
+        push_stage(&mut notes, Stage::Check);
+        assert_eq!(notes.len(), 1);
+        let mut want = vec![
+            NoteLabel::stage(Stage::Check.as_str()),
+            NoteLabel::stage(Stage::Connect.as_str()),
+        ];
+        want.sort_unstable();
+        assert_eq!(notes[0].labels(), want.as_slice());
+    }
+
+    /// #275 review L3: the Discovery node's last refusal still refuses the
+    /// target while the node cannot be reached, however old; a stale report
+    /// without a refusal adds nothing.
+    #[tokio::test]
+    async fn a_down_discovery_node_keeps_its_last_refusal() {
+        let Some(old) = Instant::now().checked_sub(node::REPORT_INTERVAL + Duration::from_secs(60))
+        else {
+            return;
+        };
+        let server = crate::info::Server::Valkey(crate::info::Version(9, 0, 6));
+        for (id, refused) in [("check-dn-refused", true), ("check-dn-clean", false)] {
+            // Only the target's node answers; the Discovery node is down.
+            serve(id, &[healthy()]);
+            let t = target(id);
+            let state = CheckState::default();
+            let report = node::Report {
+                eval: Some(crate::acl::Evaluation {
+                    refused: u64::from(refused),
+                    ..crate::acl::Evaluation::default()
+                }),
+                ..node::Report::default()
+            };
+            state
+                .reports
+                .store_for_test(&t, Which::Discovery, report, server, old);
+            assert!(state.reports.cached(&t, Which::Discovery).is_none());
+            let h = check(&state, &t).await;
+            assert!(h.reachable, "{id}: {h:?}");
+            if refused {
+                assert_eq!(h.failure, Some(FailureCode::PermissionDenied), "{id}");
+                assert_eq!(h.audit_level, AuditLevel::None);
+            } else {
+                assert_eq!(h.failure, Some(FailureCode::TargetUnreachable), "{id}");
+            }
+        }
+    }
 }

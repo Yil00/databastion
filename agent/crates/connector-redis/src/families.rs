@@ -10,10 +10,17 @@
 //! per **family**, and after the walk gives each pattern that merged two
 //! or more families its `n` sample keys taken in turn from each family.
 //!
-//! - A family is the key's own pattern (the per-key rules alone, no walk
-//!   rule) reduced to its first segment, its segment count and its Redis
-//!   type: `phone:1` and `phone:2` are one family, `addressbook:2`
-//!   another. Only a keyed hash of it is kept, never its text.
+//! - A family is the key name's first segment, its segment count and its
+//!   Redis type: `phone:1` and `phone:2` are one family, `addressbook:2`
+//!   another. A first segment that may be a value (a digit, a character
+//!   other than an ASCII letter, `_` or `-`, or more than
+//!   [`MAX_FAMILY_NAME`] bytes) counts as one shared marker, so names that
+//!   start with a value make one family per shape rather than one per
+//!   value. The id is a keyed hash computed on the raw bytes in place: no
+//!   rendered name, no copy of the key name outside the zeroized sample
+//!   buffers (#275 review L1). A keyspace built to hold more than
+//!   [`MAX_FAMILIES`] families (decoys) only leaves the later families to
+//!   the builder's first keys: coverage, never what leaves the agent.
 //! - Bounded: at most [`MAX_FAMILIES`] families (beyond, a new family is
 //!   not tracked and the builder's samples stand), at most `n` keys per
 //!   family, and at most `2n + MAX_FAMILIES` keys in all, where every
@@ -28,8 +35,8 @@
 //! - The values found in names (`#key`) follow the chosen keys first, then
 //!   the builder's, still at most `n`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
 
 use databastion_classifiers::keys::{self, EmittedPattern, LearnedPatterns, SecretBytes};
@@ -64,11 +71,28 @@ impl std::fmt::Debug for Families {
     }
 }
 
-/// The first segment and the segment count of a key's own pattern.
-fn family_of(own: &str) -> (&str, usize) {
-    let mut parts = own.split([':', '/', '|', '.']);
-    let first = parts.next().unwrap_or_default();
-    (first, 1 + parts.count())
+/// Longest first segment kept as a family name.
+pub(crate) const MAX_FAMILY_NAME: usize = 32;
+
+fn is_segment_sep(b: u8) -> bool {
+    matches!(b, b':' | b'/' | b'|' | b'.')
+}
+
+/// The family of a raw key name: its first segment (`None` when it may be
+/// a value) and its segment count. Borrows `raw`, copies nothing.
+fn family_of(raw: &[u8]) -> (Option<&[u8]>, usize) {
+    let end = raw
+        .iter()
+        .position(|b| is_segment_sep(*b))
+        .unwrap_or(raw.len());
+    let first = raw.get(..end).unwrap_or_default();
+    let count = 1 + raw.iter().filter(|b| is_segment_sep(**b)).count();
+    let name = !first.is_empty()
+        && first.len() <= MAX_FAMILY_NAME
+        && first
+            .iter()
+            .all(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'-');
+    (name.then_some(first), count)
 }
 
 impl Families {
@@ -101,13 +125,12 @@ impl Families {
         self.held
     }
 
-    /// One key of the walk: `raw` its name, `own` its own pattern
-    /// ([`keys::KeyUnits::pattern`]), `kind` its type code.
-    pub(crate) fn add(&mut self, raw: &[u8], own: &str, kind: u8) {
+    /// One key of the walk: `raw` its name, `kind` its type code.
+    pub(crate) fn add(&mut self, raw: &[u8], kind: u8) {
         if self.cap == 0 {
             return;
         }
-        let (first, count) = family_of(own);
+        let (first, count) = family_of(raw);
         let id = self.state.hash_one((first, count, kind));
         let idx = match self.index.get(&id) {
             Some(i) => *i,
@@ -157,7 +180,8 @@ impl Families {
         // order.
         let mut per: Vec<Vec<Vec<SecretBytes>>> = Vec::new();
         per.resize_with(emitted.len(), Vec::new);
-        for family in self.list {
+        let Self { state, list, .. } = self;
+        for family in list {
             // This family's bucket in each pattern it feeds.
             let mut buckets: HashMap<usize, usize> = HashMap::new();
             for key in family.keys {
@@ -189,17 +213,23 @@ impl Families {
             for k in &chosen {
                 names.extend(keys::split_key(k.expose()).name_values);
             }
+            // Duplicates found by keyed hashes (linear, #275 review L5); a
+            // collision only leaves one more key out.
+            let hash = |b: &[u8]| state.hash_one(b);
+            let mut have: HashSet<u64> = chosen.iter().map(|k| hash(k.expose())).collect();
             let mut samples = chosen;
             for s in std::mem::take(&mut group.samples) {
                 if samples.len() >= cap {
                     break;
                 }
-                if !samples.contains(&s) {
+                if have.insert(hash(s.expose())) {
                     samples.push(s);
                 }
             }
+            let mut have: HashSet<u64> =
+                names.iter().map(|v| hash(v.expose().as_bytes())).collect();
             for v in std::mem::take(&mut group.name_values) {
-                if !names.contains(&v) {
+                if have.insert(hash(v.expose().as_bytes())) {
                     names.push(v);
                 }
             }
@@ -243,7 +273,7 @@ mod tests {
         let mut families = Families::new(n);
         for name in names {
             let units = keys::split_key(name.as_bytes());
-            families.add(name.as_bytes(), units.pattern().as_str(), 0);
+            families.add(name.as_bytes(), 0);
             builder.add(name.as_bytes(), units, 0);
         }
         let mut emitted = builder.finish();
@@ -355,12 +385,24 @@ mod tests {
         assert!(p.group.name_values.len() <= 4);
     }
 
+    /// A letters-only name for `i` (base 26).
+    fn letters(mut i: usize) -> String {
+        let mut out = String::new();
+        loop {
+            out.push(char::from(b'a' + (i % 26) as u8));
+            i /= 26;
+            if i == 0 {
+                return out;
+            }
+        }
+    }
+
     #[test]
     fn bounds() {
         let mut f = Families::new(3);
         for i in 0..(MAX_FAMILIES + 50) {
             for j in 0..5 {
-                f.add(format!("f{i}:{j}").as_bytes(), &format!("f{i}:*"), 0);
+                f.add(format!("f{}:{j}", letters(i)).as_bytes(), 0);
             }
         }
         assert_eq!(f.len(), MAX_FAMILIES);
@@ -369,10 +411,83 @@ mod tests {
         assert!(f.list.iter().all(|fam| !fam.keys.is_empty()));
         assert!(f.list.iter().all(|fam| fam.keys.len() <= 3));
         let mut none = Families::new(0);
-        none.add(b"a:1", "a:*", 0);
+        none.add(b"a:1", 0);
         assert_eq!(none.len(), 0);
-        assert_eq!(family_of("user:*:email"), ("user", 3));
-        assert_eq!(family_of("*"), ("*", 1));
+        assert_eq!(family_of(b"user:42:email"), (Some(&b"user"[..]), 3));
+        assert_eq!(family_of(b"session"), (Some(&b"session"[..]), 1));
+        // A first segment that may be a value: one shared marker.
+        assert_eq!(family_of(b"jane@example.com:cart"), (None, 3));
+        assert_eq!(family_of(b"42:x"), (None, 2));
+        assert_eq!(family_of(b":x"), (None, 2));
+        assert_eq!(family_of("é:x".as_bytes()), (None, 2));
+        assert_eq!(family_of(&[b'a'; MAX_FAMILY_NAME + 1]), (None, 1));
+    }
+
+    /// A walk where the families may be told another type than the
+    /// builder: `(name, builder kind, family kind)`.
+    fn walk_kinds(n: usize, names: &[(String, u8, u8)]) -> Vec<EmittedPattern> {
+        let mut builder = PatternBuilder::new(n);
+        let mut families = Families::new(n);
+        for (name, kind, family_kind) in names {
+            families.add(name.as_bytes(), *family_kind);
+            builder.add(name.as_bytes(), keys::split_key(name.as_bytes()), *kind);
+        }
+        let mut emitted = builder.finish();
+        families.rebalance(&mut emitted);
+        emitted
+    }
+
+    /// #275 review L6: a family key whose whole-match pattern is another
+    /// pattern is not given to the merged one.
+    #[test]
+    fn a_key_of_another_pattern_is_not_given_to_the_merged_one() {
+        let mut names = vec!["phone:x".to_owned()];
+        names.extend((1..=40).map(|i| format!("phone:{i}")));
+        names.extend((1..=3).map(|i| format!("addressbook:{i}")));
+        let emitted = walk(4, &names);
+        let mut patterns: Vec<&str> = emitted.iter().map(|p| p.pattern.as_str()).collect();
+        patterns.sort_unstable();
+        assert_eq!(patterns, ["*:*", "*:x"]);
+        let merged = emitted
+            .iter()
+            .find(|p| p.pattern.as_str() == "*:*")
+            .unwrap();
+        let s = sampled(merged);
+        // `phone:x` is in the `phone` family, but its pattern is `*:x`.
+        assert!(!s.contains(&"phone:x".to_owned()), "{s:?}");
+        assert!(s.iter().any(|k| k.starts_with("addressbook:")), "{s:?}");
+        let other = emitted
+            .iter()
+            .find(|p| p.pattern.as_str() == "*:x")
+            .unwrap();
+        assert_eq!(sampled(other), ["phone:x"]);
+    }
+
+    /// #275 review L6: a family key of the same pattern but another type is
+    /// not given to that pattern's slot.
+    #[test]
+    fn a_key_of_another_type_is_not_given_to_the_slot() {
+        let mut names: Vec<(String, u8, u8)> =
+            (1..=40).map(|i| (format!("phone:{i}"), 0, 0)).collect();
+        names.extend((1..=3).map(|i| (format!("addressbook:{i}"), 0, 0)));
+        // The families take this key for a hash (type 1): no `*:*` hash
+        // pattern exists, so it goes nowhere.
+        names.push(("contact:9".to_owned(), 0, 1));
+        let emitted = walk_kinds(4, &names);
+        assert_eq!(emitted.len(), 1);
+        let s = sampled(&emitted[0]);
+        assert!(!s.contains(&"contact:9".to_owned()), "{s:?}");
+        assert_eq!(s, ["phone:1", "addressbook:1", "phone:2", "addressbook:2"]);
+        // Two types, one pattern each: the hash key stays with its own.
+        let mut names: Vec<(String, u8, u8)> =
+            (1..=40).map(|i| (format!("phone:{i}"), 0, 0)).collect();
+        names.extend((1..=3).map(|i| (format!("addressbook:{i}"), 0, 0)));
+        names.push(("phone:41".to_owned(), 1, 1));
+        let emitted = walk_kinds(4, &names);
+        let strings = emitted.iter().find(|p| p.kind == 0).unwrap();
+        assert!(!sampled(strings).contains(&"phone:41".to_owned()));
+        let hashes = emitted.iter().find(|p| p.kind == 1).unwrap();
+        assert_eq!(sampled(hashes), ["phone:41"]);
     }
 
     #[test]
