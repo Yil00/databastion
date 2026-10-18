@@ -68,6 +68,7 @@ jobs:
           - { target: sqlserver_audit_records, seconds: 180 }
           - { target: sqlserver_xe_xml, seconds: 300 }
           - { target: sqlserver_xe_records, seconds: 180 }
+          - { target: core_csv_splitter, seconds: 180 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

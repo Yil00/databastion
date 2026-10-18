@@ -309,6 +309,7 @@ dependencies = [
  "databastion-connector-openldap",
  "databastion-connector-redis",
  "databastion-connector-sqlserver",
+ "databastion-core",
  "libfuzzer-sys",
  "serde_yaml_ng",
 ]
