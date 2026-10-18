@@ -89,6 +89,7 @@ struct Stream<'a> {
     own: OwnAccount,
     store: Option<CursorStore>,
     own_store: Option<CursorStore>,
+    gap_store: Option<CursorStore>,
     cursor: Cursor,
     saved: Option<Vec<u8>>,
     skip: u32,
@@ -128,6 +129,7 @@ impl Stream<'_> {
         {
             tracing::warn!(error = %e, "SQL Server own sessions not saved");
         }
+        super::save_gap(self.gap_store.as_ref(), self.state, &self.target.id);
     }
 
     /// Whether a statement of one of the agent's sessions is its own
@@ -370,6 +372,7 @@ pub(crate) async fn stream(
         .persisted(cfg),
         store,
         own_store,
+        gap_store: cfg.counters(super::GAP_FACTS),
         cursor,
         saved: None,
         skip,
@@ -702,7 +705,29 @@ async fn read(
         .iter()
         .map(|r| (r.file.clone(), r.offset))
         .collect();
-    let b = xe_batch(&st.cursor, polled.records, polled.returned, top);
+    let mut b = xe_batch(&st.cursor, polled.records, polled.returned, top);
+    let mut positions = positions;
+    // Security review of #276, L7: a file of the set whose order key is
+    // above the session's current file is not one the session wrote yet (a
+    // file named by someone else in its folder): the position must not
+    // move past the current file, or what the session writes next would be
+    // skipped. The current file is read again first (a rollover since the
+    // last re-probe); a file still beyond it is a gap, its events are left
+    // out and the position stays before it.
+    if beyond_current(st.probe.as_ref(), &positions).is_some() {
+        Box::pin(reprobe(st, s)).await?;
+    }
+    let clamped = beyond_current(st.probe.as_ref(), &positions);
+    if let Some(at) = clamped {
+        tracing::warn!(target_id = %target_id, "Extended Events: a file of the session's set is named after the session's current file: its events are left out and the position stays before it (a gap)");
+        b.kept.retain(|r| r.index < at);
+        positions.truncate(at);
+        (b.next, b.gap) = xe_next(&st.cursor, &positions, true);
+        // No settle of the history phase on a clamped read.
+        b.full = true;
+        st.state.audit.note_gap(&target_id);
+        st.state.audit.note_dropped(&target_id, 1);
+    }
     if !b.kept.is_empty() {
         st.state.audit.note_record(&target_id);
     }
@@ -807,22 +832,33 @@ async fn read(
         }
     }
     let prev_history = st.cursor.history_us;
-    let seen = handled
-        .iter()
-        .filter(|(i, _)| cut.is_none_or(|at| *i < at))
-        .fold(st.cursor.max_seen_us, |m, (_, t)| Cursor::seen(m, *t));
+    let seen = super::advance_seen(st.cursor.max_seen_us, &handled, cut);
     st.cursor = next;
     st.cursor.max_seen_us = seen;
     if !b.full && cut.is_none() {
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
-    if gap {
-        tracing::warn!(target_id = %target_id, "Extended Events: one buffer holds more events than the bound: the rest of it is dropped");
-        st.state.audit.note_gap(&target_id);
-        st.state.audit.note_dropped(&target_id, 1);
-    }
+    super::note_read_faults(
+        st.state,
+        &target_id,
+        super::Source::Xevents,
+        gap,
+        b.out_of_order,
+    );
     // A cut read ends the cycle: the next read waits a poll interval.
-    Ok(b.full && cut.is_none())
+    Ok(b.full && cut.is_none() && clamped.is_none())
+}
+
+/// The index of the first read position in a file whose order key is
+/// above that of the session's current file (`probe`), if any.
+pub(crate) fn beyond_current(
+    probe: Option<&probe::Probe>,
+    positions: &[(String, i64)],
+) -> Option<usize> {
+    let current = sql::xe_file_key(&probe?.current_file)?;
+    positions
+        .iter()
+        .position(|(f, _)| sql::xe_file_key(f).is_some_and(|k| k > current))
 }
 
 #[cfg(test)]
@@ -907,5 +943,42 @@ mod readback_tests {
             own::session_at(t, 81, at, "").unwrap().clock,
             own::SourceClock::Offset(38_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod current_file_tests {
+    use super::*;
+
+    /// Security review of #276, L7: a read position in a file named after
+    /// the session's current file is found; files up to the current one,
+    /// names of another form and an unknown current file are not.
+    #[test]
+    fn positions_beyond_the_current_file_are_found() {
+        let p = probe::Probe {
+            current_file: "/x/databastion_xe_0_134.xel".to_owned(),
+            ..probe::Probe::default()
+        };
+        let pos = |list: &[&str]| -> Vec<(String, i64)> {
+            list.iter().map(|f| ((*f).to_owned(), 4096)).collect()
+        };
+        let ok = pos(&["/x/databastion_xe_0_133.xel", "/x/databastion_xe_0_134.xel"]);
+        assert_eq!(beyond_current(Some(&p), &ok), None);
+        let crafted = pos(&[
+            "/x/databastion_xe_0_133.xel",
+            "/x/databastion_xe_0_134.xel",
+            "/x/databastion_xe_0_999999999999999999.xel",
+        ]);
+        assert_eq!(beyond_current(Some(&p), &crafted), Some(2));
+        assert_eq!(beyond_current(None, &crafted), None);
+        let odd = probe::Probe {
+            current_file: "/x/other.xel".to_owned(),
+            ..probe::Probe::default()
+        };
+        assert_eq!(beyond_current(Some(&odd), &crafted), None);
+        // The position stays before the file: the read is cut there.
+        let (next, gap) = xe_next(&Cursor::default(), &crafted[..2], true);
+        assert!(!gap);
+        assert_ne!(next.file.as_deref(), Some(crafted[2].0.as_str()));
     }
 }

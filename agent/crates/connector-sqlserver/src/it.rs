@@ -165,9 +165,12 @@ fn throwaway_target(name: &str, sqlserver: &str) -> TargetConfig {
 async fn sa() -> Session {
     let t = target("sa", "SQLSERVER_SA_PASSWORD", own_tls());
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    // The test's own statements are off the agent's allow-list.
+    s.any_text = true;
+    s
 }
 
 async fn exec(s: &mut Session, sql: &str) {
@@ -1016,6 +1019,7 @@ async fn measure_credential_bearing_reads() {
         let mut sess = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
             .await
             .unwrap();
+        sess.any_text = true;
         for (label, sql) in probes {
             let r = sess.rows(sql, Stage::Check, Shape::rows(2, 1)).await;
             let shown = match r {
@@ -1135,9 +1139,11 @@ async fn foreign_session(account: &str, secret_env: &str) -> Session {
     let mut t = target(account, secret_env, own_tls());
     t.id = "it-foreign".to_owned();
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    s.any_text = true;
+    s
 }
 
 /// Rows of `sql` (tests only), errors ignored.
@@ -1509,6 +1515,15 @@ async fn audit_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2: no ground-truth value, nor the DCL password, in what is sent.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_audit\""), "{json}");
@@ -1953,6 +1968,15 @@ async fn xe_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_xevents\""), "{json}");
@@ -2361,9 +2385,15 @@ async fn xe_fresh_scenario() {
     // The same target naming an audit too: its `check()` sends the
     // `audit_file` proof (2022 and later). The own-session registry is
     // keyed by the target id, as for one agent's check and stream. The
-    // audit does not exist, so the proof stops there: the next proof
-    // (`audit_specifications`) builds statistics on `sys.sysaudacts`, which
-    // is not on case 2's list (measured on 2022 on 2026-10-16; reported).
+    // audit does not exist, so the proof stops there. A third `check()`
+    // names the dev service's audit: its next proof
+    // (`audit_specifications`) builds statistics on `sys.sysaudacts`
+    // (measured on 2022 on 2026-10-16), on case 2's list since 2026-10-18.
+    let t_spec = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: databastion_audit, \
+         xe_session: databastion_xe}}",
+        own_tls()
+    ));
     let t_audit = agent(&format!(
         "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: it_no_such_audit, \
          xe_session: databastion_xe}}",
@@ -2372,6 +2402,7 @@ async fn xe_fresh_scenario() {
     let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
         let _ = Box::pin(c.check(&t)).await;
         let _ = Box::pin(SqlserverConnector::new().check(&t_audit)).await;
+        let _ = Box::pin(SqlserverConnector::new().check(&t_spec)).await;
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         let (sink, mut frx) = FindingSink::channel(10_000);
         let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
@@ -2489,6 +2520,27 @@ async fn xe_fresh_sysguidrefs(
             .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysguidrefs"))),
         "the build on sysguidrefs paired with the audit_file proof is left out"
     );
+    // The `audit_specifications` proof's build on `sys.sysaudacts` (ADR-0051
+    // note of 2026-10-18): left out when the server built one.
+    let audacts = read(
+        Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
+                 WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+                 AND event_data LIKE N'%sysaudacts%' AND event_data LIKE N'%databastion%'"
+            ),
+            1,
+        ))
+        .await,
+    );
+    eprintln!("[it] xe fresh: builds on sysaudacts {}", audacts.len());
+    assert!(
+        !own.iter()
+            .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysaudacts"))),
+        "the build on sysaudacts paired with the audit_specifications proof is left out"
+    );
+    let builds: Vec<String> = builds.into_iter().chain(audacts).collect();
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;
     };
@@ -2736,4 +2788,436 @@ async fn trailing_spaces_in_bracketed_names_resolve_to_the_listed_views() {
         let a = databastion_classifiers::query::tsql::analyze_tsql(text, false);
         assert!(a.listed.contains(&listed), "{text}: {:?}", a.listed);
     }
+}
+
+/// The M2 case of P9-D's join (not an object of the lists).
+const P9D_JOIN: &str = "p9d_join";
+
+/// What a read of the decision 6 measurement (M2) gave on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum M2Outcome {
+    /// It ran (rows or not).
+    Ran,
+    /// It did not complete: refused by a permission (229, 262, 297, 300,
+    /// 2571, 8189, 9010, 27219…) or failed on its argument (569).
+    Error(i32),
+    /// The object or form does not exist on this image (208, 2812, 4121,
+    /// 313…): not measured.
+    Unavailable(i32),
+}
+
+/// The read of each object of decision 6's three always-reported lists
+/// (`tsql::STATEMENT_TEXT_OBJECTS`, `CREDENTIAL_OBJECTS`, `VALUE_OBJECTS`)
+/// the measurement sends; `None`: not sent (why).
+fn m2_read(object: &str, stats: &str) -> Result<(String, usize), &'static str> {
+    // One `int` answered (the session's closed type set reads it), so the
+    // read is never cancelled: a cancelled statement leaves no completion
+    // event.
+    let from_src = |src: &str| {
+        (
+            format!("SELECT CONVERT(int, COUNT(*)) FROM (SELECT TOP (1) 1 AS a FROM {src}) x"),
+            1,
+        )
+    };
+    let scalar = |e: &str| {
+        (
+            format!("SELECT CONVERT(int, CASE WHEN {e} IS NULL THEN 0 ELSE 1 END)"),
+            1,
+        )
+    };
+    let raw = |t: &str, columns: usize| (t.to_owned(), columns);
+    Ok(match object {
+        "dm_exec_sql_text" => from_src("sys.dm_exec_sql_text(0x01)"),
+        "dm_exec_input_buffer" => from_src("sys.dm_exec_input_buffer(@@SPID, NULL)"),
+        "dm_exec_query_stats" => from_src("sys.dm_exec_query_stats"),
+        "dm_exec_cached_plans" => from_src("sys.dm_exec_cached_plans"),
+        "dm_exec_query_plan" => from_src("sys.dm_exec_query_plan(0x01)"),
+        "dm_exec_text_query_plan" => from_src("sys.dm_exec_text_query_plan(0x01, 0, -1)"),
+        "dm_exec_query_statistics_xml" => from_src("sys.dm_exec_query_statistics_xml(@@SPID)"),
+        "dm_exec_query_plan_stats" => from_src("sys.dm_exec_query_plan_stats(0x01)"),
+        "fn_get_sql" => from_src("sys.fn_get_sql(0x01)"),
+        "query_store_query_text" => from_src("retail.sys.query_store_query_text"),
+        "query_store_plan" => from_src("retail.sys.query_store_plan"),
+        "fn_get_audit_file" => {
+            from_src("sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL)")
+        }
+        "fn_get_audit_file_v2" => from_src(
+            "sys.fn_get_audit_file_v2(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL, NULL, NULL)",
+        ),
+        "fn_xe_file_target_read_file" => from_src(
+            "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, NULL)",
+        ),
+        "dm_xe_session_targets" => from_src("sys.dm_xe_session_targets"),
+        "fn_trace_gettable" => {
+            from_src("sys.fn_trace_gettable(N'/var/opt/mssql/log/log.trc', DEFAULT)")
+        }
+        "inputbuffer" => raw("DBCC INPUTBUFFER(1)", 3),
+        "sp_readerrorlog" => raw("EXEC sys.sp_readerrorlog 0, 1, N'databastion-m2-none'", 0),
+        "xp_readerrorlog" => raw(
+            "EXEC master.sys.xp_readerrorlog 0, 1, N'databastion-m2-none'",
+            0,
+        ),
+        "sysjobsteps" => from_src("msdb.dbo.sysjobsteps"),
+        "sysmail_mailitems" => from_src("msdb.dbo.sysmail_mailitems"),
+        "fn_sqlagent_jobsteps" => from_src("msdb.dbo.fn_sqlagent_jobsteps(NULL, NULL)"),
+        "sql_logins" => from_src("sys.sql_logins"),
+        "syslogins" => from_src("sys.syslogins"),
+        "loginproperty" => scalar("LOGINPROPERTY(N'sa', N'PasswordLastSetTime')"),
+        "credentials" => from_src("sys.credentials"),
+        "database_scoped_credentials" => from_src("retail.sys.database_scoped_credentials"),
+        "linked_logins" => from_src("sys.linked_logins"),
+        "servers" => from_src("sys.servers"),
+        "external_data_sources" => from_src("retail.sys.external_data_sources"),
+        "master_key_passwords" => from_src("sys.master_key_passwords"),
+        "symmetric_keys" => from_src("retail.sys.symmetric_keys"),
+        "key_encryptions" => from_src("retail.sys.key_encryptions"),
+        "column_master_keys" => from_src("retail.sys.column_master_keys"),
+        "column_encryption_key_values" => from_src("retail.sys.column_encryption_key_values"),
+        "certprivatekey" => scalar("CERTPRIVATEKEY(1, N'databastion-m2-x')"),
+        "pwdcompare" => scalar("PWDCOMPARE(N'databastion-m2-x', 0x0100)"),
+        "syslnklgns" => from_src("master.sys.syslnklgns"),
+        "sysoledbusers" => from_src("master.sys.sysoledbusers"),
+        "sysxlgns" => from_src("master.sys.sysxlgns"),
+        "sysmail_server" => from_src("msdb.dbo.sysmail_server"),
+        "sysmail_account" => from_src("msdb.dbo.sysmail_account"),
+        "sysproxies" => from_src("msdb.dbo.sysproxies"),
+        "sysssispackages" => from_src("msdb.dbo.sysssispackages"),
+        "environment_variables" => from_src("SSISDB.catalog.environment_variables"),
+        "fn_getproviderstring" => from_src("sys.fn_getproviderstring(N'databastion-m2-x')"),
+        "show_statistics" => (
+            format!("DBCC SHOW_STATISTICS(N'retail.crm.customers', [{stats}]) WITH NO_INFOMSGS"),
+            0,
+        ),
+        "dm_db_stats_histogram" => {
+            from_src("retail.sys.dm_db_stats_histogram(OBJECT_ID(N'retail.crm.customers'), 1)")
+        }
+        "clonedatabase" => return Err("it creates a database"),
+        // P9-D's read refused for a missing server permission (security
+        // review of #276, M1): the join of the statement-text views, as the
+        // load harness writes it (`e2e/load/sqlserver.sh`), a low-privilege
+        // case only.
+        P9D_JOIN => raw(
+            "SELECT TOP (1) st.text FROM sys.dm_exec_query_stats qs CROSS APPLY \
+             sys.dm_exec_sql_text(qs.sql_handle) st",
+            1,
+        ),
+        "fn_dblog" => from_src("retail.sys.fn_dblog(NULL, NULL)"),
+        "fn_dblog_xtp" => from_src("retail.sys.fn_dblog_xtp(NULL, NULL)"),
+        "fn_dump_dblog" | "fn_dump_dblog_xtp" => return Err("it needs a backup file"),
+        "fn_full_dblog" => from_src(
+            "sys.fn_full_dblog(NULL, NULL, DB_ID(N'retail'), NULL, NULL, NULL, NULL, NULL)",
+        ),
+        "fn_dbslog" => from_src("sys.fn_dbslog(NULL, NULL)"),
+        "page" => raw("DBCC PAGE(N'retail', 1, 0, 0)", 0),
+        "dm_db_page_info" => from_src("sys.dm_db_page_info(DB_ID(N'retail'), 1, 0, N'LIMITED')"),
+        _ => return Err("no read written for this object"),
+    })
+}
+
+/// ADR-0051 decision 6 measurement obligation (M2), as a drift test: on
+/// the image under test, each object of the three always-reported lists
+/// is read once by a low-privilege login (the throwaway login: `SELECT` on
+/// two `retail` schemas, nothing else) and once by a privileged one
+/// (`sa`), each read marked by a comment; then the records of both sources
+/// are read back as `sa`. A read that ran or was refused by a permission
+/// must show on each source exactly as `audit::probe::INVISIBLE` says
+/// for that version, which `check()`'s local detail of each source names
+/// (a drift fails the test, so that a changed image is measured again; a
+/// version not measured yet prints its table and passes). Every row is
+/// printed (`M2 | …`).
+#[tokio::test]
+async fn listed_object_reads_are_recorded_or_named_invisible() {
+    Box::pin(m2_scenario()).await;
+}
+
+async fn m2_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let low = "it_m2_low";
+    Box::pin(throwaway(&mut s, low, &[])).await;
+    let stats = try_rows(
+        &mut s,
+        "SELECT TOP (1) CONVERT(nvarchar(128), name) FROM retail.sys.stats \
+         WHERE object_id = OBJECT_ID(N'retail.crm.customers') ORDER BY stats_id",
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+    .unwrap_or_default();
+    // Records from now on (server UTC), matched by exact text and login:
+    // neither source keeps a trailing comment of a statement. (A
+    // `timestamp_utc` compared as `datetime2` matched nothing on 2022: it
+    // is compared in microseconds, as the polls read it.)
+    let start = try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(30), SYSUTCDATETIME(), 126)",
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+    .unwrap();
+    assert!(
+        start
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.T".contains(&b))
+    );
+    let objects: Vec<&str> = databastion_classifiers::query::tsql::STATEMENT_TEXT_OBJECTS
+        .iter()
+        .chain(databastion_classifiers::query::tsql::CREDENTIAL_OBJECTS)
+        .chain(databastion_classifiers::query::tsql::VALUE_OBJECTS)
+        .copied()
+        .chain([P9D_JOIN])
+        .collect();
+    let low_session = || async {
+        let t = throwaway_target(low, own_tls());
+        let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+        let mut ls = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        ls.any_text = true;
+        ls.raw_text = true;
+        ls
+    };
+    let mut low_s = low_session().await;
+    s.raw_text = true;
+    let mut outcomes: Vec<(&str, &str, M2Outcome, String)> = Vec::new();
+    for account in ["low", "high"] {
+        for object in &objects {
+            if *object == P9D_JOIN && account == "high" {
+                continue;
+            }
+            let (read, columns) = match m2_read(object, &stats.replace(']', "]]")) {
+                Ok(r) => r,
+                Err(why) => {
+                    eprintln!("M2 | {major} | {object} | {account} | not sent: {why}");
+                    continue;
+                }
+            };
+            let text = read.clone();
+            let sess = if account == "low" { &mut low_s } else { &mut s };
+            let r = sess
+                .run(&text, Stage::Check, Shape::rows(columns, 64), |_| {
+                    conn::Flow::Continue
+                })
+                .await;
+            let outcome = match r {
+                Ok(_) => M2Outcome::Ran,
+                Err(e) => match e.number {
+                    // Not on this image, or not without what the dev server lacks.
+                    Some(
+                        n @ (102 | 174 | 195 | 208 | 313 | 2812 | 4121 | 8144 | 911 | 2520 | 7202
+                        | 567 | 22004 | 2560),
+                    ) => M2Outcome::Unavailable(n),
+                    Some(n) => M2Outcome::Error(n),
+                    // Sent, answered, and not read by the session's
+                    // closed type set: it ran.
+                    None if e.code != databastion_core::FailureCode::Internal => M2Outcome::Ran,
+                    None => panic!("{object} {account}: not sent ({e:?})"),
+                },
+            };
+            // A result the session's closed type set does not read: the
+            // server ran the read and answered; the session is replaced.
+            if sess.is_poisoned() {
+                if account == "low" {
+                    low_s = low_session().await;
+                } else {
+                    s = Box::pin(sa()).await;
+                    s.raw_text = true;
+                }
+            }
+            outcomes.push((object, account, outcome, text));
+        }
+    }
+    low_s.close().await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    // (text, login) of each record of both sources since `start`.
+    let audit_read = format!(
+        "SELECT TOP (20000) CONVERT(nvarchar(4000), statement), CONVERT(nvarchar(128), server_principal_name) \
+         FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL) \
+         WHERE event_time >= CONVERT(datetime2, N'{start}', 126) AND server_principal_name IN (N'sa', N'{low}')"
+    );
+    let xe_read = format!(
+        "SELECT TOP (20000) CONVERT(nvarchar(4000), x.value('(event/data[@name=\"statement\"]/value)[1]', \
+         'nvarchar(4000)')), CONVERT(nvarchar(128), x.value('(event/action[@name=\"server_principal_name\"]/value)[1]', \
+         'nvarchar(128)')) FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', \
+         NULL, NULL, NULL) f CROSS APPLY (SELECT CONVERT(xml, f.event_data)) e(x) \
+         WHERE DATEDIFF_BIG(microsecond, '19700101', f.timestamp_utc) >= \
+         DATEDIFF_BIG(microsecond, '19700101', CONVERT(datetime2, N'{start}', 126)) \
+         AND f.object_name IN (N'sql_statement_completed', N'sp_statement_completed')"
+    );
+    let audit_rows: Vec<(String, String)> = try_rows(&mut s, &audit_read, 2)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_text().unwrap_or_default().trim().to_owned(),
+                r[1].as_text().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let xe_rows: Vec<(String, String)> = try_rows(&mut s, &xe_read, 2)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_text().unwrap_or_default().trim().to_owned(),
+                r[1].as_text().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    eprintln!(
+        "[it] m2: {} audit records, {} statement events",
+        audit_rows.len(),
+        xe_rows.len()
+    );
+    let login = |account: &str| if account == "low" { low } else { "sa" };
+    let seen = |rows: &[(String, String)], text: &str, account: &str| {
+        rows.iter()
+            .any(|(t, p)| t == text.trim() && p.eq_ignore_ascii_case(login(account)))
+    };
+    // The drift: what each source shows against `audit::probe::INVISIBLE`.
+    let inv = &crate::audit::probe::INVISIBLE;
+    let measured = inv.measured.contains(&major);
+    let mut drift = Vec::new();
+    for (object, account, outcome, text) in &outcomes {
+        let on_audit = seen(&audit_rows, text, account);
+        let on_xe = seen(&xe_rows, text, account);
+        eprintln!(
+            "M2 | {major} | {object} | {account} | {outcome:?} | audit {on_audit} | xevents {on_xe}"
+        );
+        let (want_audit, want_xe) = match outcome {
+            M2Outcome::Unavailable(_) => continue,
+            M2Outcome::Ran => (!inv.audit.contains(object), !inv.xevents.contains(object)),
+            // P9-D's join, refused: as measured on 2022 on 2026-10-18.
+            M2Outcome::Error(n) if *object == P9D_JOIN => (
+                inv.audit_p9d_join_refused,
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
+            ),
+            // A read that did not complete: on Extended Events, an event
+            // only when the error came while it ran (the listed run-time
+            // refusals), none when it was refused as it compiled (security
+            // review of #276, M1).
+            M2Outcome::Error(n) => (
+                !inv.audit.contains(object) && !inv.audit_refused.contains(n),
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
+            ),
+        };
+        // SQL Server Audit is a source on 2022 and later only.
+        if major >= 16 && on_audit != want_audit {
+            drift.push(format!(
+                "{object} ({account}, {outcome:?}): SQL Server Audit {on_audit}"
+            ));
+        }
+        if on_xe != want_xe {
+            drift.push(format!(
+                "{object} ({account}, {outcome:?}): Extended Events {on_xe}"
+            ));
+        }
+    }
+    Box::pin(drop_login(&mut s, low)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    if !measured {
+        eprintln!(
+            "[it] m2: SQL Server {major} is not measured yet: record its table above in \
+             audit::probe::INVISIBLE and docs/08 (drift {drift:?})"
+        );
+        return;
+    }
+    assert!(
+        drift.is_empty(),
+        "reads of listed objects differ from audit::probe::INVISIBLE (measure and update it, \
+         check()'s detail and docs/08): {drift:#?}"
+    );
+}
+
+/// End-of-phase-9 review M3 (drift test of ADR-0051 refinement item 4):
+/// on the image under test, `StatMan` cannot be called by users (error
+/// 195, for a low-privilege login and for `sa`, as a batch and inside
+/// `sp_executesql`), and the server's build is on the allow-list of the
+/// statistics exclusions (`events::STATMAN_BUILDS`). A new build (a
+/// cumulative update of a matrix image) fails here until it is measured
+/// and listed; until then the agent turns the exclusions off on it (fail
+/// closed).
+#[tokio::test]
+async fn statman_is_not_callable_and_the_build_is_listed() {
+    Box::pin(statman_scenario()).await;
+}
+
+async fn statman_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let c = SqlserverConnector::new();
+    let t = agent("");
+    assert!(Box::pin(c.check(&t)).await.reachable);
+    let build = c.server_version(&t).unwrap();
+    let mut s = Box::pin(sa()).await;
+    s.raw_text = true;
+    let low = "it_statman";
+    Box::pin(throwaway(&mut s, low, &[])).await;
+    let mut low_s = {
+        let t = throwaway_target(low, own_tls());
+        let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+        let mut ls = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        ls.raw_text = true;
+        ls
+    };
+    let call = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM \
+                [retail].[crm].[customers] WITH (READUNCOMMITTED) ORDER BY [SC0]) AS _MS_UPDSTATS_TBL \
+                OPTION (MAXDOP 16)";
+    let forms = [
+        call.to_owned(),
+        format!("EXEC sp_executesql N'{}'", call.replace('\'', "''")),
+    ];
+    let mut callable = Vec::new();
+    for (who, sess) in [("low", &mut low_s), ("sa", &mut s)] {
+        for form in &forms {
+            let r = sess
+                .run(form, Stage::Check, Shape::rows(1, 1), |_| {
+                    conn::Flow::Continue
+                })
+                .await;
+            let number = r.err().and_then(|e| e.number);
+            eprintln!(
+                "[it] statman {build}: {who}, {}: error {number:?}",
+                if form.starts_with("EXEC") {
+                    "sp_executesql"
+                } else {
+                    "batch"
+                }
+            );
+            if number != Some(195) {
+                callable.push(format!("{who}: {number:?}"));
+            }
+        }
+    }
+    low_s.close().await;
+    Box::pin(drop_login(&mut s, low)).await;
+    assert!(
+        callable.is_empty(),
+        "StatMan answered other than error 195 on {build}: {callable:?}: the statistics \
+         exclusions must stay off on this build"
+    );
+    assert!(
+        crate::audit::xe::events::STATMAN_BUILDS.contains(&build.as_str()),
+        "build {build} is not on events::STATMAN_BUILDS: StatMan is not callable on it (checked \
+         above); measure the statistics builds and their internal statements on it (the fixtures \
+         of refinement item 4) before adding it"
+    );
 }

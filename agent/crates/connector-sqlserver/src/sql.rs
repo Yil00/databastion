@@ -702,6 +702,38 @@ pub(crate) fn matches_template(template: &str, text: &str) -> bool {
                 take_literal(rest).and_then(|(v, r)| quote_literal(&v).map(|q| (q, r)))
             }
             "guid" => take_literal(rest).and_then(|(v, r)| quote_guid(&v).map(|q| (q, r))),
+            // The slots of the credit-only statements ([`allowed`]).
+            "col" => take_bracketed(rest).and_then(|(v, r)| quote_ident(&v).map(|q| (q, r))),
+            "from" => (|| {
+                let (a, r) = take_bracketed(rest)?;
+                let (b, r) = take_bracketed(r.strip_prefix('.')?)?;
+                let (c, r) = take_bracketed(r.strip_prefix('.')?)?;
+                Some((from(&a, &b, &c)?, r))
+            })(),
+            "select" => (|| {
+                let (mut out, mut r) = take_sample_expr(rest)?;
+                while let Some(next) = r.strip_prefix(", ") {
+                    let (e, after) = take_sample_expr(next)?;
+                    out.push_str(", ");
+                    out.push_str(&e);
+                    r = after;
+                }
+                Some((out, r))
+            })(),
+            "sample" => match rest.strip_prefix(" TABLESAMPLE SYSTEM (") {
+                None => Some((String::new(), rest)),
+                Some(r) => (|| {
+                    let len = r
+                        .char_indices()
+                        .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+                        .count();
+                    let p: f64 = r.get(..len)?.parse().ok()?;
+                    let r = r.get(len..)?.strip_prefix(" PERCENT)")?;
+                    Some((format!(" TABLESAMPLE SYSTEM ({p:.2} PERCENT)"), r))
+                })(),
+            },
+            "audit_pattern" => take_pattern(rest, ".sqlaudit"),
+            "xe_pattern" => take_pattern(rest, ".xel"),
             "n" | "obj" => {
                 let len = rest
                     .char_indices()
@@ -984,6 +1016,71 @@ pub(crate) fn raw_predicate(text: &str) -> bool {
     false
 }
 
+/// Whether `text` is one of the reviewed statements of [`STATEMENTS`] as
+/// the connector renders it (end-of-phase-9 review L1: the allow-list at
+/// run time, next to the deny-list of [`checked`]): a constant exactly, or
+/// a template whose every slot holds what the quoting functions produce,
+/// rendered again from the values read and compared exactly
+/// ([`matches_template`]). The polls take their own column list, the
+/// sampling statement only the expressions of [`sample_expr`] over
+/// bracketed columns of a three-part bracketed name and an optional
+/// `TABLESAMPLE` percentage, and a ticket count one bracketed column. Any
+/// other text is refused before it is sent (fail closed).
+pub(crate) fn allowed(text: &str) -> bool {
+    STATEMENTS
+        .iter()
+        .any(|(name, template)| allowed_as(name, template, text))
+}
+
+/// Whether `text` is the allow-listed statement `name` ([`allowed`]).
+fn allowed_as(name: &str, template: &str, text: &str) -> bool {
+    let poll = match name {
+        "audit_poll_start" | "audit_poll_from" => Some((AUDIT_COLUMNS, "{audit_pattern}")),
+        "xe_poll_start" | "xe_poll_from" => Some((XE_COLUMNS, "{xe_pattern}")),
+        _ => None,
+    };
+    match poll {
+        Some((columns, pattern)) => matches_template(
+            &template
+                .replace("{columns}", columns)
+                .replace("{pattern}", pattern),
+            text,
+        ),
+        None => template == text || (template.contains('{') && matches_template(template, text)),
+    }
+}
+
+/// Reads one sampled expression of [`sample_expr`] at the start of `s`.
+fn take_sample_expr(s: &str) -> Option<(String, &str)> {
+    for (head, tail) in [
+        ("CONVERT(nvarchar(4000), LEFT(", ", 4000))"),
+        ("CONVERT(nvarchar(4000), SUBSTRING(", ", 1, 4000))"),
+        ("CONVERT(nvarchar(64), ", ")"),
+        ("CONVERT(nvarchar(10), ", ", 23)"),
+    ] {
+        if let Some(r) = s.strip_prefix(head)
+            && let Some((col, r)) = take_bracketed(r)
+            && let Some(r) = r.strip_prefix(tail)
+        {
+            return Some((format!("{head}{}{tail}", quote_ident(&col)?), r));
+        }
+    }
+    None
+}
+
+/// Reads a file pattern literal of the polls: `N'…'`, one `*` (the file
+/// name's timestamp), no `?`, no control character, ending `_*` and
+/// `suffix`, at most 400 characters.
+fn take_pattern<'a>(s: &'a str, suffix: &str) -> Option<(String, &'a str)> {
+    let (v, r) = take_literal(s)?;
+    let ok = v.chars().count() <= 400
+        && !v.chars().any(|c| c.is_control() || c == '?')
+        && v.matches('*').count() == 1
+        && v.strip_suffix(suffix)
+            .is_some_and(|p| p.ends_with("_*") && p.len() > 2);
+    ok.then(|| (format!("N'{}'", v.replace('\'', "''")), r))
+}
+
 /// Whether the session may send `text`: the exact `password_hash` probe
 /// (one bit, decision 4), or a text that names no denied token and no
 /// raw audit predicate.
@@ -1022,6 +1119,172 @@ mod tests {
         assert!(!catalog_text(VERSION));
         assert!(!catalog_text(SERVER_INTERNAL[0]));
         assert!(!catalog_text("SELECT name FROM sys.objects"));
+    }
+
+    /// End-of-phase-9 review L1: every text the connector's builders
+    /// produce is on the allow-list at run time, and near copies, other
+    /// slot contents and other statements are not.
+    #[test]
+    fn the_allow_list_holds_every_built_text_and_nothing_else() {
+        let built: Vec<String> = {
+            let mut v: Vec<String> = Vec::new();
+            for (name, t) in STATEMENTS {
+                if !t.contains('{') {
+                    v.push((*t).to_owned());
+                    continue;
+                }
+                // Every slot of the catalog templates, filled as the
+                // connector fills them.
+                let (db, dbname) = (
+                    quote_ident("re]tail 'x").unwrap(),
+                    quote_literal("re]tail 'x").unwrap(),
+                );
+                let guid = quote_guid("B5BEF79B-88AC-4A47-91AE-0081BBD71D51").unwrap();
+                let audit = quote_literal("databastion_audit").unwrap();
+                if let Some(x) = render(
+                    t,
+                    &[
+                        ("db", &db),
+                        ("dbname", &dbname),
+                        ("guid", &guid),
+                        ("audit", &audit),
+                        ("session", "N'databastion_xe'"),
+                        ("n", "513"),
+                        ("obj", "1013578649"),
+                    ],
+                ) {
+                    v.push(x);
+                }
+                let _ = name;
+            }
+            v.push(tables("retail", 4096).unwrap());
+            v.push(columns("retail", 1_013_578_649).unwrap());
+            v.push(columns("retail", -7).unwrap());
+            for kind in [
+                Sampled::Text,
+                Sampled::LargeText,
+                Sampled::Number,
+                Sampled::Date,
+            ] {
+                v.push(
+                    sample_statement(
+                        "re]tail",
+                        "crm",
+                        "cust'omers",
+                        &[("ph]one", kind)],
+                        10,
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+            v.push(
+                sample_statement(
+                    "retail",
+                    "crm",
+                    "customers",
+                    &[
+                        ("phone", Sampled::Text),
+                        ("born", Sampled::Date),
+                        ("id", Sampled::Number),
+                    ],
+                    50,
+                    tablesample_percent(50, Some(1_000_000)),
+                )
+                .unwrap(),
+            );
+            v.push(ticket_type_counts("cas", "dbo", "tickets", "type").unwrap());
+            let ap = audit_pattern(
+                "/var/opt/mssql/audit/",
+                "databastion_audit",
+                "B5BEF79B-88AC-4A47-91AE-0081BBD71D51",
+            )
+            .unwrap();
+            v.push(audit_poll(&ap, false).unwrap());
+            v.push(audit_poll(&ap, true).unwrap());
+            let xp =
+                xe_pattern("/var/opt/mssql/xe/databastion_xe_0_133974019253430000.xel").unwrap();
+            v.push(xe_poll(&xp, false).unwrap());
+            v.push(xe_poll(&xp, true).unwrap());
+            let name = quote_literal("Audit 'x'").unwrap();
+            v.push(render(AUDIT_FILE, &[("audit", &name)]).unwrap());
+            let guid = quote_guid("B5BEF79B-88AC-4A47-91AE-0081BBD71D51").unwrap();
+            v.push(render(AUDIT_SPECIFICATIONS, &[("guid", &guid)]).unwrap());
+            v.push(render(XE_SESSION, &[("session", "N'databastion_xe'")]).unwrap());
+            v.push(render(XE_EVENTS, &[("session", "N'databastion_xe'")]).unwrap());
+            v
+        };
+        for text in &built {
+            assert!(allowed(text), "{text}");
+            assert!(checked(text), "{text}");
+            // Any appended or changed character is refused.
+            assert!(!allowed(&format!("{text} ")), "{text}");
+            assert!(!allowed(&format!("{text}; SELECT 1")), "{text}");
+            let spaced = text.replacen(' ', "  ", 1);
+            assert!(!allowed(&spaced), "{text}");
+        }
+        // Every entry is reached by one of the built texts.
+        for (name, t) in STATEMENTS {
+            assert!(built.iter().any(|b| allowed_as(name, t, b)), "{name}");
+        }
+        let ap = audit_pattern(
+            "/var/opt/mssql/audit/",
+            "databastion_audit",
+            "B5BEF79B-88AC-4A47-91AE-0081BBD71D51",
+        )
+        .unwrap();
+        let xp = xe_pattern("/var/opt/mssql/xe/databastion_xe_0_1.xel").unwrap();
+        let sample = sample_statement(
+            "retail",
+            "crm",
+            "customers",
+            &[("phone", Sampled::Text)],
+            10,
+            None,
+        )
+        .unwrap();
+        for bad in [
+            // Other statements, the server's internal one (never sent).
+            "SELECT 1".to_owned(),
+            "SELECT name FROM sys.databases".to_owned(),
+            SERVER_INTERNAL[0].to_owned(),
+            // A sampled expression of another form, an unbracketed column,
+            // a two-part name, an expression in the row count.
+            sample.replace("LEFT([phone], 4000)", "LEFT([phone], 8000)"),
+            sample.replace("[phone]", "phone"),
+            sample.replace("[retail].[crm].[customers]", "[crm].[customers]"),
+            sample.replace("TOP (10)", "TOP (10 + 1)"),
+            sample.replace(
+                " OPTION (MAXDOP 1)",
+                " TABLESAMPLE SYSTEM (1e3 PERCENT) OPTION (MAXDOP 1)",
+            ),
+            sample.replace(
+                " OPTION (MAXDOP 1)",
+                " TABLESAMPLE SYSTEM (1.5 PERCENT) OPTION (MAXDOP 1)",
+            ),
+            sample.replace("[customers]", "[customers] WHERE 1 = 1 --]"),
+            // The other source's columns in a poll, a pattern with another
+            // wildcard or suffix, a parameter for the pattern.
+            render(
+                AUDIT_POLL_START,
+                &[("columns", XE_COLUMNS), ("pattern", &ap)],
+            )
+            .unwrap(),
+            render(
+                XE_POLL_START,
+                &[("columns", AUDIT_COLUMNS), ("pattern", &xp)],
+            )
+            .unwrap(),
+            audit_poll("N'/var/opt/mssql/audit/*.sqlaudit'", false).unwrap(),
+            audit_poll("N'/var/opt/mssql/audit/a_?_*.sqlaudit'", false).unwrap(),
+            audit_poll(&xp, false).unwrap(),
+            xe_poll(&ap, false).unwrap(),
+            audit_poll("@p9", false).unwrap(),
+            // A database template whose two names differ.
+            render(CAS_COLUMNS, &[("db", "[a]"), ("dbname", "N'b'")]).unwrap(),
+        ] {
+            assert!(!allowed(&bad), "{bad}");
+        }
     }
 
     #[test]

@@ -113,6 +113,8 @@ pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
 const OWN_SESSIONS: &str = "sqlserver_own_sessions";
+/// The 24 h gap memory's file (end-of-phase-9 review L5).
+const GAP_FACTS: &str = "sqlserver_gap";
 /// Largest own-sessions file written (the core's counters bound).
 const OWN_FILE_BYTES: usize = 2 * 1024 * 1024 - 4096;
 /// The server's error for a position outside the audit's file set.
@@ -146,6 +148,8 @@ pub(crate) struct Shared {
     /// sampling, credited polls, statistics builds and their internal
     /// statements), for the logs and the tests.
     own_left_out: Mutex<HashMap<String, [u64; 4]>>,
+    /// Reads out of file order, for the logs and the tests.
+    out_of_order: Mutex<HashMap<String, u64>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -293,6 +297,87 @@ impl Shared {
         }
     }
 
+    /// The 24 h gap memory of `target_id` for its counters file
+    /// (end-of-phase-9 review L5): the agent's wall-clock time (Unix ms)
+    /// of the last gap and of the start of the dropped-records count, and
+    /// that count; nothing older than [`FRESHNESS`].
+    pub(crate) fn encode_gap(&self, target_id: &str) -> Vec<u8> {
+        let now_ms = agent_now_ms();
+        let at_ms = |t: &Instant| {
+            now_ms.saturating_sub(i64::try_from(t.elapsed().as_millis()).unwrap_or(i64::MAX))
+        };
+        let mut out = String::from("v1\n");
+        if let Some(t) = lock(&self.gap)
+            .get(target_id)
+            .filter(|t| t.elapsed() < FRESHNESS)
+        {
+            out.push_str(&format!("gap {}\n", at_ms(t)));
+        }
+        if let Some((n, t)) = lock(&self.dropped)
+            .get(target_id)
+            .filter(|(n, t)| *n > 0 && t.elapsed() < FRESHNESS)
+        {
+            out.push_str(&format!("dropped {n} {}\n", at_ms(t)));
+        }
+        out.into_bytes()
+    }
+
+    /// Restores the gap memory of [`Self::encode_gap`] at a stream's start,
+    /// so that an agent restart within the 24 h after a gap does not show
+    /// Partial again before they are over. A time ahead of the agent's
+    /// clock (the clock went back) counts from now: the gap is kept the
+    /// full 24 h again (fail closed). Facts already in memory are kept
+    /// when more recent. A file not understood restores nothing.
+    pub(crate) fn restore_gap(&self, target_id: &str, bytes: &[u8]) {
+        let Some((gap_ms, dropped)) = decode_gap(bytes) else {
+            // What it held is unknown: a gap now (security review of #276,
+            // L4), as for a cursor that is not understood.
+            tracing::warn!(target_id = %target_id, "SQL Server Audit: the gap memory file is not understood: a gap is assumed (Limited for 24 h)");
+            self.note_gap(target_id);
+            self.note_dropped(target_id, 1);
+            return;
+        };
+        let now_ms = agent_now_ms();
+        let freshness_ms = i64::try_from(FRESHNESS.as_millis()).unwrap_or(i64::MAX);
+        let instant = |at_ms: i64| -> Option<Instant> {
+            let ago = now_ms.saturating_sub(at_ms);
+            if ago >= freshness_ms {
+                return None;
+            }
+            let ago = Duration::from_millis(u64::try_from(ago.max(0)).unwrap_or(0));
+            Some(Instant::now().checked_sub(ago).unwrap_or_else(Instant::now))
+        };
+        if let Some(t) = gap_ms.and_then(instant) {
+            let mut map = lock(&self.gap);
+            let e = map.entry(target_id.to_owned()).or_insert(t);
+            if t > *e {
+                *e = t;
+            }
+        }
+        if let Some((n, at)) = dropped
+            && let Some(t) = instant(at)
+        {
+            let mut map = lock(&self.dropped);
+            match map.get_mut(target_id) {
+                // The same process wrote the file (a stream restarted):
+                // its count already holds the file's.
+                Some(e) if e.1.elapsed() < FRESHNESS => e.0 = e.0.max(n),
+                _ => {
+                    map.insert(target_id.to_owned(), (n, t));
+                }
+            }
+        }
+    }
+
+    /// Reads out of file order (tests).
+    #[cfg(test)]
+    pub(crate) fn out_of_order_reads(&self, target_id: &str) -> u64 {
+        lock(&self.out_of_order)
+            .get(target_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Statements left out: exact texts, credited sampling, credited
     /// polls, statistics statements.
     #[cfg(test)]
@@ -301,6 +386,92 @@ impl Shared {
             .get(target_id)
             .copied()
             .unwrap_or_default()
+    }
+}
+
+/// What the gap memory file holds: the last gap, and the dropped count
+/// with its start, in Unix ms.
+type GapFacts = (Option<i64>, Option<(u64, i64)>);
+
+/// The gap memory file ([`Shared::encode_gap`]).
+fn decode_gap(bytes: &[u8]) -> Option<GapFacts> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let (mut gap, mut dropped) = (None, None);
+    for l in lines {
+        let mut p = l.split(' ');
+        match p.next()? {
+            "gap" => gap = Some(p.next()?.parse().ok()?),
+            "dropped" => dropped = Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?)),
+            _ => return None,
+        }
+        if p.next().is_some() {
+            return None;
+        }
+    }
+    Some((gap, dropped))
+}
+
+/// Loads and restores the gap memory of a stream's target; the store, for
+/// the stream's saves.
+fn restore_gap_store(
+    cfg: &AuditConfig,
+    state: &CheckState,
+    target_id: &str,
+) -> Option<CursorStore> {
+    let store = cfg.counters(GAP_FACTS);
+    match store.as_ref().map(CursorStore::load) {
+        Some(Ok(Some(bytes))) => state.audit.restore_gap(target_id, &bytes),
+        Some(Err(e)) => {
+            // Unreadable: a gap now (security review of #276, L4).
+            tracing::warn!(error = %e, target_id = %target_id, "SQL Server Audit: the gap memory file is not readable: a gap is assumed (Limited for 24 h)");
+            state.audit.note_gap(target_id);
+            state.audit.note_dropped(target_id, 1);
+        }
+        _ => {}
+    }
+    store
+}
+
+/// Saves the gap memory of `target_id` (end-of-phase-9 review L5).
+fn save_gap(store: Option<&CursorStore>, state: &CheckState, target_id: &str) {
+    if let Some(store) = store
+        && let Err(e) = store.save(&state.audit.encode_gap(target_id))
+    {
+        tracing::warn!(error = %e, "SQL Server Audit gap memory not saved");
+    }
+}
+
+/// What one read of either source revealed (the stream-level wiring of
+/// #253 review L1, tested): a buffer over [`MAX_SKIP`] records (`gap`) or
+/// a read out of file order ([`in_file_order`]), each a gap
+/// (`audit.records_dropped`, Limited for 24 h) with a warning.
+pub(crate) fn note_read_faults(
+    state: &CheckState,
+    target_id: &str,
+    source: Source,
+    gap: bool,
+    out_of_order: bool,
+) {
+    let name = match source {
+        Source::Audit => "SQL Server Audit",
+        Source::Xevents => "Extended Events",
+    };
+    if gap {
+        tracing::warn!(target_id = %target_id, source = name, "one buffer holds more records than the bound: the rest of it is dropped");
+        state.audit.note_gap(target_id);
+        state.audit.note_dropped(target_id, 1);
+    }
+    if out_of_order {
+        *lock(&state.audit.out_of_order)
+            .entry(target_id.to_owned())
+            .or_default() += 1;
+        tracing::warn!(target_id = %target_id, source = name, "the server did not return the files in their order: records skipped on the server may never have been read (a gap)");
+        state.audit.note_gap(target_id);
+        state.audit.note_dropped(target_id, 1);
     }
 }
 
@@ -582,6 +753,28 @@ impl Cursor {
     }
 }
 
+/// The latest time of the records a read handled, for the next position
+/// (`Cursor::max_seen_us`, the history boundary by order; #255 review),
+/// shared by both sources: `seen` advanced by the time of each record of
+/// `handled` (its index in the read, its time, in read order) that comes
+/// before `cut`. `cut` is the index of the record an Extended Events read
+/// ends before (the deferral of an unpaired statistics build): that record
+/// and those after it are read again by the next read, so their times are
+/// not seen yet, and a deferred build stamped late never moves the
+/// boundary past records the next read still has to class. Records the
+/// read drops (history, below the floor, a skip the core asks for) are
+/// handled too: they were read.
+pub(crate) fn advance_seen(
+    seen: Option<i64>,
+    handled: &[(usize, i64)],
+    cut: Option<usize>,
+) -> Option<i64> {
+    handled
+        .iter()
+        .filter(|(i, _)| cut.is_none_or(|at| *i < at))
+        .fold(seen, |m, (_, t)| Cursor::seen(m, *t))
+}
+
 /// The position after a read from `cursor` that returned records at
 /// `positions` (in order), `full` when more may follow; and whether one
 /// buffer went over [`MAX_SKIP`] (a gap). Both sources: the server skipped
@@ -740,6 +933,50 @@ pub(crate) struct Batch<T> {
     /// A buffer above [`MAX_SKIP`] records: the rest of it is lost.
     pub(crate) gap: bool,
     pub(crate) full: bool,
+    /// The read did not come in file order ([`in_file_order`]): the
+    /// server-side skip may have passed over records never handled (a
+    /// gap, #253 review L1).
+    pub(crate) out_of_order: bool,
+}
+
+/// Whether a read from `cursor` returned its records (`positions`, in the
+/// order received) in the order the server-side skip and the position
+/// rely on (#253 review L1, checked at run time): files by their order key
+/// (`key`), then buffer offsets, never going back; the first record after
+/// the position's buffer (a read starts after it) and not before the
+/// buffer whose first records the server skipped. A file name the key
+/// cannot read is out of order too: the order cannot be checked (fail
+/// closed). This is the order `fn_get_audit_file` and
+/// `fn_xe_file_target_read_file` were seen to return (files oldest first,
+/// each in buffer order), which `ORDER BY (SELECT NULL)` does not promise:
+/// any other order is a gap, never trusted.
+pub(crate) fn in_file_order(cursor: &Cursor, positions: &[(String, i64)], key: FileKey) -> bool {
+    let mut keyed = Vec::with_capacity(positions.len());
+    for (f, o) in positions {
+        let Some(k) = key(f) else { return false };
+        keyed.push((k, *o));
+    }
+    if keyed.windows(2).any(|w| w[1] < w[0]) {
+        return false;
+    }
+    let Some(first) = keyed.first() else {
+        return true;
+    };
+    if let Some(f) = &cursor.file {
+        match key(f) {
+            Some(k) if *first > (k, cursor.offset) => {}
+            _ => return false,
+        }
+    }
+    if cursor.skip > 0
+        && let Some((f, o)) = &cursor.buffer
+    {
+        match key(f) {
+            Some(k) if *first >= (k, *o) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The records of a read from `cursor` (the server skipped the first
@@ -763,12 +1000,14 @@ pub(crate) fn batch<T: Positioned>(
         kept.retain(|r| key(r.file()).is_none_or(|rk| (rk, r.offset()) > (k, offset)));
     }
     let full = returned >= asked;
+    let out_of_order = !in_file_order(cursor, &positions, key);
     let (next, gap) = next_position(cursor, &positions, full, key);
     Batch {
         kept,
         next,
         gap,
         full,
+        out_of_order,
     }
 }
 
@@ -779,6 +1018,7 @@ struct Stream<'a> {
     own: OwnAccount,
     store: Option<CursorStore>,
     own_store: Option<CursorStore>,
+    gap_store: Option<CursorStore>,
     cursor: Cursor,
     saved: Option<Vec<u8>>,
     skip: u32,
@@ -810,6 +1050,7 @@ impl Stream<'_> {
         {
             tracing::warn!(error = %e, "SQL Server own sessions not saved");
         }
+        save_gap(self.gap_store.as_ref(), self.state, &self.target.id);
     }
 
     /// Whether a statement of one of the agent's sessions is its own
@@ -938,13 +1179,19 @@ pub(crate) async fn audit_stream(
         return Err(target_error(FailureCode::Unsupported));
     }
     let _running = state.audit.started(&target.id);
-    let _streaming = own::stream_started(&target.id);
+    // Restored before the stream registers (security review of #276, L8):
+    // credits are granted only while a stream runs, so none granted before
+    // the file is read can give the target another salt and make the
+    // persisted sampling credits unreadable.
     let own_store = cfg.counters(OWN_SESSIONS);
     if let Some(Ok(Some(bytes))) = own_store.as_ref().map(CursorStore::load)
         && let Some(persisted) = own::decode(&bytes)
     {
         own::restore(&target.id, persisted);
     }
+    let _streaming = own::stream_started(&target.id);
+    // The 24 h gap memory, both sources (end-of-phase-9 review L5).
+    let gap_store = restore_gap_store(cfg, state, &target.id);
     let tls = tls::configs(settings.ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
     let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
@@ -1034,6 +1281,7 @@ pub(crate) async fn audit_stream(
         .persisted(cfg),
         store,
         own_store,
+        gap_store,
         cursor,
         saved: None,
         skip,
@@ -1292,6 +1540,13 @@ async fn read(
         st.state.audit.note_record(&target_id);
     }
     let mut statements = records::group(records::reassemble(b.kept));
+    // Every statement of the read is handled (`max_seen_us`), those the
+    // core asks to skip included; no cut on this source.
+    let handled: Vec<(usize, i64)> = statements
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.head.time_us))
+        .collect();
     if st.skip > 0 {
         let n = (st.skip as usize).min(statements.len());
         statements.drain(..n);
@@ -1343,16 +1598,13 @@ async fn read(
         st.state.audit.note_dropped(&target_id, below_floor);
     }
     let prev_history = st.cursor.history_us;
+    let seen = advance_seen(st.cursor.max_seen_us, &handled, None);
     st.cursor = b.next;
     st.cursor.max_seen_us = seen;
     if !b.full {
         st.cursor.settle(prev_history, read_started_ms, delay);
     }
-    if b.gap {
-        tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
-        st.state.audit.note_gap(&target_id);
-        st.state.audit.note_dropped(&target_id, 1);
-    }
+    note_read_faults(st.state, &target_id, Source::Audit, b.gap, b.out_of_order);
     if reprobe {
         // An AUDIT_CHANGE_GROUP record: the proofs at once (re-review N3).
         st.probe = None;

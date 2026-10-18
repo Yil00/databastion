@@ -568,6 +568,10 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// (in `master`, a build paired with the `audit_file` proof, measured on
 /// 2022 and 2025) joined the list on 2026-10-16 (ADR-0051, addendum to the
 /// refinement of 2026-10-16), under the same conditions as the others.
+/// `sysaudacts` (in `master`, a build on `audit_spec_id` at `nest_level`
+/// 2 paired with the `audit_specifications` proof, measured on 2022)
+/// joined it on 2026-10-18 (ADR-0051 note of that day, accepted by the
+/// maintainer), under the same conditions.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysschobjs",
     "sysrowsets",
@@ -580,6 +584,7 @@ pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysprivs",
     "sysdbreg",
     "sysguidrefs",
+    "sysaudacts",
 ];
 
 /// The `object_type` map value of `ADHOC`.
@@ -2019,6 +2024,51 @@ mod statistics_tests {
         }
     }
 
+    /// The `audit_specifications` proof's build on a fresh 2022 server
+    /// (captured on 2026-10-18 from a new data volume by the fresh-server
+    /// integration test, the dev service's audit named): the build on
+    /// `sysaudacts` at nest level 2 and its internal statement at 1, in the
+    /// proof's activity, left out; the proof itself is not touched. Each is
+    /// reported without causality, from a foreign session, or off the
+    /// allow-listed builds (ADR-0051 note of 2026-10-18).
+    #[test]
+    fn sysaudacts_fixture_of_2022() {
+        let file = "sysaudacts-16.0.4305.5.xml";
+        let recs = fixture(file);
+        assert_eq!(recs.len(), 3, "{file}");
+        let builds: Vec<&XeRecord> = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
+            .collect();
+        assert_eq!(builds.len(), 1, "{file}");
+        assert_eq!(builds[0].event.as_ref().and_then(|e| e.nest_level), Some(2));
+        let proof = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
+            .count();
+        assert_eq!(proof, 1, "{file}: the audit_specifications proof");
+        let mut left = fixture(file);
+        assert_eq!(context(&mut left, true, &own), 2, "{file}");
+        for r in &left {
+            assert_eq!(
+                r.skip,
+                !statement(r).is_some_and(crate::sql::catalog_text),
+                "{file}"
+            );
+        }
+        let mut off = fixture(file);
+        assert_eq!(context(&mut off, false, &own), 0, "{file}");
+        let mut foreign = fixture(file);
+        assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
+        let mut no_causality = fixture(file);
+        for r in &mut no_causality {
+            if let Some(e) = r.event.as_mut() {
+                e.activity = None;
+            }
+        }
+        assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
+    }
+
     /// The credential-bearing tables stay reported next to a `sysguidrefs`
     /// build left out in the same activity (item 3, unchanged by the
     /// addendum).
@@ -2047,6 +2097,152 @@ mod statistics_tests {
         }
     }
 
+    /// A build on `sys.sysaudacts` (in `master`), of the shape measured on
+    /// 2022 after the `audit_specifications` proof (`audit_spec_id`,
+    /// `nest_level` 2, an internal statement at 1).
+    const AUDACTS_BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [audit_spec_id] AS [SC0] \
+        FROM [sys].[sysaudacts] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+
+    /// The `audit_specifications` proof of decision 6 (one of case 2's
+    /// catalog reads), as the agent renders it.
+    fn audit_specifications() -> String {
+        let guid = crate::sql::quote_guid("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0").unwrap();
+        crate::sql::render(crate::sql::AUDIT_SPECIFICATIONS, &[("guid", &guid)]).unwrap()
+    }
+
+    /// The `sysaudacts` build, its internal statement and a partner, as
+    /// [`guidrefs`] builds them.
+    fn audacts(
+        build_login: &str,
+        partner_login: &str,
+        partner: &str,
+        guid: Option<&str>,
+        partner_first: bool,
+    ) -> Vec<XeRecord> {
+        let mut recs = guidrefs(build_login, partner_login, partner, guid, partner_first);
+        let at = usize::from(partner_first);
+        recs[at] = sp(build_login, AUDACTS_BUILD, guid, 2, GUIDREFS_SHAPE);
+        recs
+    }
+
+    /// ADR-0051 note of 2026-10-18 (accepted by the maintainer):
+    /// `sys.sysaudacts` is on case 2's closed list, paired with the
+    /// `audit_specifications` proof, every other condition of case 2
+    /// unchanged; the same both-sided cases as `sysguidrefs`.
+    #[test]
+    fn sysaudacts_build_paired_with_the_audit_specifications_proof() {
+        assert!(SYS_BASE_TABLES.contains(&"sysaudacts"));
+        let proof = audit_specifications();
+        assert!(crate::sql::catalog_text(&proof));
+        for first in [false, true] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), first);
+            assert_eq!(context(&mut recs, true, &own), 2, "partner first {first}");
+            for r in &recs {
+                assert_eq!(
+                    r.skip,
+                    statement(r) != Some(proof.as_str()),
+                    "partner first {first}"
+                );
+            }
+        }
+        // The `audit_file` proof is a catalog read too: paired with it.
+        let mut recs = audacts(
+            "databastion",
+            "databastion",
+            &audit_file(),
+            Some(GUID),
+            false,
+        );
+        assert_eq!(context(&mut recs, true, &own), 2);
+        // Reported: no causality.
+        let mut recs = audacts("databastion", "databastion", &proof, None, false);
+        assert_eq!(context(&mut recs, true, &own), 0);
+        assert_eq!(reported(&recs), [0, 1, 2], "no causality");
+        // Reported: a foreign session's build, or the proof's text from a
+        // foreign session.
+        for (build, partner) in [("app", "databastion"), ("databastion", "app")] {
+            let mut recs = audacts(build, partner, &proof, Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(
+                !recs[0].skip && !recs[1].skip,
+                "build {build}, partner {partner}"
+            );
+            let ev = convert(&recs[0]).unwrap().0;
+            assert_eq!(names(&ev), ["retail.sys.sysaudacts"], "build {build}");
+        }
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip, "no own session at all");
+        // Reported: a partner that is not a catalog read.
+        for text in [
+            crate::sql::VERSION.to_owned(),
+            crate::sql::AUDIT_POLL_START.to_owned(),
+            proof.replace("TOP (513)", "TOP (514)"),
+            "SELECT audit_action_name FROM sys.server_audit_specification_details".to_owned(),
+        ] {
+            assert!(!crate::sql::catalog_text(&text), "{text}");
+            let mut recs = audacts("databastion", "databastion", &text, Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip && !recs[1].skip, "not a catalog read: {text}");
+        }
+        // Reported: the proof in another activity.
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        recs[2] = stmt_in(
+            "databastion",
+            &proof,
+            Some("AAAAAAAA-0000-0000-0000-000000000000"),
+            1,
+        );
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip, "the proof in another activity");
+        // Reported: off the allow-listed builds.
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        assert_eq!(context(&mut recs, false, &own), 0);
+        assert!(!unpaired_case_2(&recs[0], false, &own));
+        // Unpaired in its read: a deferral candidate (item 4) for the
+        // agent's session only.
+        let mut recs = audacts(
+            "databastion",
+            "databastion",
+            crate::sql::VERSION,
+            Some(GUID),
+            false,
+        );
+        context(&mut recs, true, &own);
+        assert!(unpaired_case_2(&recs[0], true, &own));
+        assert!(!unpaired_case_2(&recs[0], true, &|_| false));
+        // Only `sys.sysaudacts` by its exact name.
+        for table in [
+            "[sys].[sysaudacts2]",
+            "[sys].[sysaudact]",
+            "[dbo].[sysaudacts]",
+        ] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+            recs[0] = sp(
+                "databastion",
+                &AUDACTS_BUILD.replace("[sys].[sysaudacts]", table),
+                Some(GUID),
+                2,
+                GUIDREFS_SHAPE,
+            );
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "{table}");
+        }
+        // The credential-bearing tables stay reported next to it.
+        for table in ["sysowners", "sysxlgns"] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+            recs.push(sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", &format!("[sys].[{table}]")),
+                Some(GUID),
+                5,
+                BUILD_SHAPE,
+            ));
+            context(&mut recs, true, &own);
+            assert!(recs[0].skip && recs[1].skip && !recs[3].skip, "{table}");
+        }
+    }
+
     /// One row of a simulated event file: its buffer offset and what it is.
     #[derive(Clone, Copy)]
     enum Row {
@@ -2064,6 +2260,16 @@ mod statistics_tests {
     /// read, the rows written so far and the rows asked. Returns the
     /// events handled (time, left out) and the malformed rows met.
     fn walk(rows: &[(i64, Row)], schedule: &[(usize, usize)]) -> (Vec<(i64, bool)>, usize) {
+        let (handled, malformed, _) = walk_seen(rows, schedule);
+        (handled, malformed)
+    }
+
+    /// [`walk`], with the latest time seen after each read
+    /// (`crate::audit::advance_seen`, the stream's rule with the cut).
+    fn walk_seen(
+        rows: &[(i64, Row)],
+        schedule: &[(usize, usize)],
+    ) -> (Vec<(i64, bool)>, usize, Vec<Option<i64>>) {
         use crate::audit::Cursor;
         use crate::audit::xe::xe_next;
         let make = |offset: i64, row: Row| {
@@ -2097,6 +2303,8 @@ mod statistics_tests {
         let mut cursor = Cursor::default();
         let mut handled = Vec::new();
         let mut malformed = 0;
+        let mut seen = None;
+        let mut seens = Vec::new();
         let t0 = Instant::now();
         for (read, &(written, asked)) in schedule.iter().enumerate() {
             // The server: after the buffer at the position, skip rows, then
@@ -2129,6 +2337,9 @@ mod statistics_tests {
             context(&mut recs, true, &own);
             let now = t0 + Duration::from_secs(u64::try_from(read).unwrap());
             let cut = deferrals.cut(&recs, true, &own, now, Duration::from_secs(5));
+            let times: Vec<(usize, i64)> = recs.iter().map(|r| (r.index, r.time_us)).collect();
+            seen = crate::audit::advance_seen(seen, &times, cut);
+            seens.push(seen);
             let (next, gap) = match cut {
                 Some(i) => {
                     recs.retain(|r| r.index < i);
@@ -2144,7 +2355,7 @@ mod statistics_tests {
             handled.extend(recs.iter().map(|r| (r.time_us, r.skip)));
             cursor = next;
         }
-        (handled, malformed)
+        (handled, malformed, seens)
     }
 
     /// Refinement of 2026-10-16, item 4: a read whose own-session build on
@@ -2168,8 +2379,11 @@ mod statistics_tests {
             (4096, Internal),
             (8192, Catalog),
         ];
-        let (handled, _) = walk(&rows, &[(3, 500), (4, 500), (4, 500)]);
+        let (handled, _, seen) = walk_seen(&rows, &[(3, 500), (4, 500), (4, 500)]);
         assert_eq!(handled, want(&[0]), "no duplicate, no drop");
+        // #255 review: the cut read sees only the client's event (0), not
+        // the deferred build (101), read again by the next read.
+        assert_eq!(seen, [Some(0), Some(103), Some(103)]);
 
         // The cut buffer's first events were handled by an earlier full
         // read (`cursor.skip > 0`): the cut adds to the skip count.
