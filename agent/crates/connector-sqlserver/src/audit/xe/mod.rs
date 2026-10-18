@@ -1040,7 +1040,10 @@ mod current_file_tests {
         assert!(on_pattern(&mut c, "/y/databastion_xe*.xel"));
         assert!(reprobe_moved(&before, &c));
         assert_eq!((c.file.as_deref(), c.offset), (None, 0));
-        assert_ne!(next.file, c.file, "writing `next` back would undo the reset");
+        assert_ne!(
+            next.file, c.file,
+            "writing `next` back would undo the reset"
+        );
         assert_ne!(
             next.pattern, c.pattern,
             "the old position belongs to the old set"
