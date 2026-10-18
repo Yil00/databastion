@@ -2024,6 +2024,51 @@ mod statistics_tests {
         }
     }
 
+    /// The `audit_specifications` proof's build on a fresh 2022 server
+    /// (captured on 2026-10-18 from a new data volume by the fresh-server
+    /// integration test, the dev service's audit named): the build on
+    /// `sysaudacts` at nest level 2 and its internal statement at 1, in the
+    /// proof's activity, left out; the proof itself is not touched. Each is
+    /// reported without causality, from a foreign session, or off the
+    /// allow-listed builds (ADR-0051 note of 2026-10-18).
+    #[test]
+    fn sysaudacts_fixture_of_2022() {
+        let file = "sysaudacts-16.0.4305.5.xml";
+        let recs = fixture(file);
+        assert_eq!(recs.len(), 3, "{file}");
+        let builds: Vec<&XeRecord> = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
+            .collect();
+        assert_eq!(builds.len(), 1, "{file}");
+        assert_eq!(builds[0].event.as_ref().and_then(|e| e.nest_level), Some(2));
+        let proof = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
+            .count();
+        assert_eq!(proof, 1, "{file}: the audit_specifications proof");
+        let mut left = fixture(file);
+        assert_eq!(context(&mut left, true, &own), 2, "{file}");
+        for r in &left {
+            assert_eq!(
+                r.skip,
+                !statement(r).is_some_and(crate::sql::catalog_text),
+                "{file}"
+            );
+        }
+        let mut off = fixture(file);
+        assert_eq!(context(&mut off, false, &own), 0, "{file}");
+        let mut foreign = fixture(file);
+        assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
+        let mut no_causality = fixture(file);
+        for r in &mut no_causality {
+            if let Some(e) = r.event.as_mut() {
+                e.activity = None;
+            }
+        }
+        assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
+    }
+
     /// The credential-bearing tables stay reported next to a `sysguidrefs`
     /// build left out in the same activity (item 3, unchanged by the
     /// addendum).
