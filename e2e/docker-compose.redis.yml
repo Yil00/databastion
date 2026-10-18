@@ -16,12 +16,18 @@
 #                   secrets, exported by the wrapper below for the server's entrypoint only (never
 #                   in the container's environment, so never in `docker inspect`). The test clients'
 #                   ACL users (e2e_exporter, e2e_analyst, load_app) come from a file of `user` lines
-#                   (passwords as SHA-256 hashes) written by redis.sh. On agent-net (aliases `valkey`
-#                   and `redis`, the names in the certificate) for the agent; their TLS port is
-#                   published on 127.0.0.1 only, through redis-net, for the host-side client
-#                   (e2e/redis_scenario.py, certificate verified against the same CA).
+#                   (passwords as SHA-256 hashes) written by redis.sh. On agent-net only (aliases
+#                   `valkey` and `redis`, the names in the certificate), an internal network: no
+#                   egress, nothing published (#254 review L5). The load run (e2e/load/redis.sh)
+#                   publishes their TLS port on 127.0.0.1 through redis-net in its own overlay.
+#   redis-client    one-shot client of the Audit test (`tools` profile): e2e/redis_scenario.py
+#                   (Python standard library only) in a pinned Python image, on agent-net, against
+#                   `valkey:6379` / `redis:6379` (certificate verified against the same CA, host
+#                   name checked), as the test users e2e_exporter / e2e_analyst (never the agent's);
+#                   the password from the secret file, key lists on stdin.
 
 x-valkey-image: &valkey-image ${E2E_VALKEY_IMAGE:-valkey/valkey:9.0.6@sha256:63346cb24a61221e76bdf41acce99b3968a9fa83d8122144deab45394b27b4f2}
+x-python-image: &python-image python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
 x-redis-image: &redis-image ${E2E_REDIS_IMAGE:-redis:8.10.2@sha256:2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6}
 
 x-redis-target: &redis-target
@@ -76,12 +82,9 @@ services:
       - ../dev/redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
       - ../dev/seed/out/redis.txt:/seed/redis.txt:ro
       - ${E2E_WORK_DIR:?set by redis.sh}/redis/clients.acl:/etc/e2e/redis-clients.acl:ro
-    ports:
-      - "127.0.0.1:${E2E_VALKEY_PORT:-16379}:6379"
     networks:
       agent-net:
         aliases: [valkey]
-      redis-net: {}
 
   target-redis:
     <<: *redis-target
@@ -92,12 +95,26 @@ services:
       - ../dev/redis/entrypoint.sh:/usr/local/bin/databastion-entrypoint.sh:ro
       - ../dev/seed/out/redis.txt:/seed/redis.txt:ro
       - ${E2E_WORK_DIR:?set by redis.sh}/redis/clients.acl:/etc/e2e/redis-clients.acl:ro
-    ports:
-      - "127.0.0.1:${E2E_REDIS_PORT:-16389}:6379"
     networks:
       agent-net:
         aliases: [redis]
-      redis-net: {}
+
+  redis-client:
+    image: *python-image
+    profiles: [tools]
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # -I: isolated (no user site, no PYTHON* variables, not the script's directory first); -B: no
+    # bytecode written (the file system is read-only anyway).
+    entrypoint: ["python3", "-I", "-B", "/opt/e2e/redis_scenario.py"]
+    secrets: [target_client_password]
+    volumes:
+      - ./redis_scenario.py:/opt/e2e/redis_scenario.py:ro
+      - ${E2E_WORK_DIR:?set by redis.sh}/tls/redis-ca.pem:/etc/e2e/redis-ca.pem:ro
+    tmpfs: [/tmp]
+    networks: [agent-net]
 
   agent:
     # Only the mounts of this run: agent.yaml, the console CA, the secrets volume and the dev CA of
@@ -121,11 +138,6 @@ services:
     volumes: !override
       - agent-state:/state
       - agent-secrets:/secrets
-
-networks:
-  # The published TLS ports of the targets (an internal network cannot publish one); the agent is
-  # not on it.
-  redis-net: {}
 
 volumes:
   redis-tls: {}

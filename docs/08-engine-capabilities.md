@@ -1235,7 +1235,7 @@ Residual: another session that reuses the SPID within those 20 ms, with both of 
 - **Statistics builds** are counted on builds outside the allow-list, and asynchronous statistics updates always ([above](#extended-events-statistics-builds)).
 - **First start**: during the history phase, a step back of the server's clock smaller than the tolerance (the delivery delay, at least 5 s) is not told apart from history ([above](#extended-events-polls-and-position)).
 - **Plan cache source** (`sqlserver_query_stats`, ADR-0051 open question 11): not implemented. With neither SQL Server Audit nor the session usable, the level is None.
-- **Not measured**: Windows servers, the Developer edition, an `event_file` rollover while the agent reads, `sql_batch_completed`, RPC calls of user procedures. The Extended Events source is not in the end-to-end test nor in the load harness, which use SQL Server Audit on 2022 (#254); it is covered by the integration tests and the engine matrix on 2019, 2022 and 2025 strict.
+- **Not measured**: Windows servers, the Developer edition, an `event_file` rollover while the agent reads, `sql_batch_completed`, RPC calls of user procedures. The load harness uses SQL Server Audit on 2022 only (#254). The required end-to-end job runs SQL Server Audit on 2022; the Extended Events source end to end (2019 and 2022, and 2025 with each source, without forced strict) runs in the non-required job `e2e-sqlserver` of the engine matrix ([e2e/README.md](../e2e/README.md#sql-server-target)), next to the integration tests on 2019, 2022 and 2025 strict.
 
 ## Known export signatures
 | Tool | Observable signature | Engine |

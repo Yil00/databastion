@@ -5,6 +5,8 @@
 # agent-redis, agent-sqlserver).
 #
 #   dev/agent-it.sh postgres|mysql|mongodb|openldap|redis|sqlserver|all   (or: make agent-it [ENGINE=...])
+#   dev/agent-it.sh ENGINE [TEST_FILTER...]   one engine, the test binary's arguments after --nocapture
+#                                             (a test name filter, --exact, ...); not with `all`
 #
 # `redis` needs the opt-in profile (`make dev-redis`: Valkey and Redis) and is not part of `all`;
 # `sqlserver` needs `make dev-sqlserver` and is not part of `all` either.
@@ -62,7 +64,7 @@ it_postgres() {
     *) echo "DATABASTION_DEV_POSTGRES_LOG_FORMAT must be jsonlog or csvlog" >&2; exit 2 ;;
   esac
   export DATABASTION_TEST_REQUIRE=pg,admin,pss,pgaudit,pgaudit-log
-  cargo_it databastion-connector-postgres
+  cargo_it databastion-connector-postgres "$@"
 }
 
 it_mysql() {
@@ -89,7 +91,7 @@ it_mysql() {
   export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
   export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
   export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
-  cargo_it databastion-connector-mysql
+  cargo_it databastion-connector-mysql "$@"
 }
 
 it_mongodb() {
@@ -105,7 +107,7 @@ it_mongodb() {
   export DATABASTION_TEST_MONGO_DUMP_CMD="timeout 120 docker compose -f $COMPOSE_FILE exec -T mongo mongodump --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --archive=/dev/null"
   export DATABASTION_TEST_MONGO_EXPORT_CMD="timeout 120 docker compose -f $COMPOSE_FILE exec -T mongo mongoexport --quiet --uri 'mongodb://root:${MONGO_ROOT_PASSWORD}@127.0.0.1:27017/?authSource=admin' --db app --collection users --out /dev/null"
   export DATABASTION_TEST_REQUIRE=mongo,mongo-admin,mongo-log,mongodump
-  cargo_it databastion-connector-mongodb
+  cargo_it databastion-connector-mongodb "$@"
 }
 
 it_openldap() {
@@ -119,7 +121,7 @@ it_openldap() {
   export DATABASTION_TEST_LDAP_CA_FILE="$ROOT/dev/.state/tls/ldap-ca.pem"
   export DATABASTION_TEST_LDAP_EXPORT_CMD="timeout 120 docker compose -f $COMPOSE_FILE exec -T openldap ldapsearch -x -H ldap://127.0.0.1 -D cn=admin,dc=example,dc=org -w '${LDAP_ADMIN_PASSWORD}' -b dc=example,dc=org -E pr=20/noprompt '(objectClass=*)'"
   export DATABASTION_TEST_REQUIRE=ldap,ldap-admin,ldap-export,ldap-tls
-  cargo_it databastion-connector-openldap --test-threads 1
+  cargo_it databastion-connector-openldap --test-threads 1 "$@"
 }
 
 # Valkey and Redis (ADR-0052, opt-in profile `redis`): both services, over TLS with the dev CA of
@@ -137,7 +139,7 @@ it_redis() {
   export DATABASTION_IT_REDIS_CA="$ROOT/dev/.state/tls/redis-ca.pem"
   # Clients on the Valkey server's Unix socket (inside the container): the socket attribution test.
   export DATABASTION_IT_REDIS_EXEC_VALKEY="timeout 120 docker compose -f $COMPOSE_FILE exec -T valkey"
-  cargo_it databastion-connector-redis --test-threads 1
+  cargo_it databastion-connector-redis --test-threads 1 "$@"
 }
 
 it_sqlserver() {
@@ -151,13 +153,17 @@ it_sqlserver() {
   export DATABASTION_IT_SQLSERVER_THROWAWAY=Fake-IT-Passw0rd-marker
   # Read by the tests from the environment as given (the engine matrix sets them):
   # DATABASTION_DEV_SQLSERVER_FORCE_STRICT=1 (the service forces strict: the tests expect `strict`)
-  # and DATABASTION_IT_SQLSERVER_MAJOR (the major version the server must report).
-  cargo_it databastion-connector-sqlserver --test-threads 1
+  # and DATABASTION_IT_SQLSERVER_MAJOR (the major version the server must report); the measurement
+  # switches DATABASTION_IT_SQLSERVER_FRESH=1 (a new data volume: the fresh-server test) and
+  # DATABASTION_IT_SQLSERVER_CAPTURE=<file> (its fixture capture), set by the engine matrix.
+  cargo_it databastion-connector-sqlserver --test-threads 1 "$@"
 }
 
 case "$ENGINE" in
-  postgres | mysql | mongodb | openldap | redis | sqlserver) "it_$ENGINE" ;;
+  postgres | mysql | mongodb | openldap | redis | sqlserver) "it_$ENGINE" "${@:2}" ;;
   # Subshells: each engine exports its own DATABASTION_TEST_REQUIRE.
-  all) for e in postgres mysql mongodb openldap; do (echo "== $e"; "it_$e"); done ;;
+  all)
+    [ "$#" -le 1 ] || { echo "no test filter with \`all\`" >&2; exit 2; }
+    for e in postgres mysql mongodb openldap; do (echo "== $e"; "it_$e"); done ;;
   *) echo "unknown ENGINE '$ENGINE' (postgres, mysql, mongodb, openldap, redis, sqlserver or all)" >&2; exit 2 ;;
 esac
