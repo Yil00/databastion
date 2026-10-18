@@ -12,9 +12,10 @@
 //!   with CSV framing the quote state is unknown until a quote settles it
 //!   ([`Splitter::reset_unaligned`]); a start inside a quoted field taken
 //!   as "outside" would leave the state inverted for good, with no record
-//!   ever complete again. No cursor is saved until a record ends where
-//!   the state is known ([`Splitter::aligned`]): a restart from a cursor
-//!   is read as aligned (#267 review L1).
+//!   ever complete again. A cursor saved before a record ends where the
+//!   state is known ([`Splitter::aligned`]) says so (`unaligned`): a
+//!   restart resumes at its position unaligned, as at the first start
+//!   (#267 review L1, security review of #278 L1).
 //! - CSV quote state: every quote is checked against the CSV quoting
 //!   rules under the current and the inverted state; a state that only the
 //!   inverted one explains is corrected and the record in progress dropped
@@ -102,6 +103,47 @@ use super::CursorStore;
 /// (`agent/fuzz`); `fuzzing` feature (and tests) only.
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod fuzz;
+
+/// Whether `seg` is the start of a csvlog record up to its first quote: a
+/// log time (`YYYY-MM-DD HH:MM:SS[.f…] ZONE`), one comma, the quote
+/// (security review of #278, M1). Bytes only, nothing logged.
+fn csv_record_start(seg: &[u8]) -> bool {
+    let Some(time) = seg.strip_suffix(b",\"") else {
+        return false;
+    };
+    // Date and time of day: fixed positions.
+    if time.len() < 21 {
+        return false;
+    }
+    let (fixed, rest) = time.split_at(19);
+    let shape_ok = fixed.iter().enumerate().all(|(i, &b)| match i {
+        4 | 7 => b == b'-',
+        10 => b == b' ',
+        13 | 16 => b == b':',
+        _ => b.is_ascii_digit(),
+    });
+    if !shape_ok {
+        return false;
+    }
+    // Optional fraction, then one space and the zone.
+    let rest = match rest.strip_prefix(b".") {
+        Some(r) => {
+            let n = r.iter().take_while(|b| b.is_ascii_digit()).count();
+            if !(1..=9).contains(&n) {
+                return false;
+            }
+            &r[n..]
+        }
+        None => rest,
+    };
+    let Some(zone) = rest.strip_prefix(b" ") else {
+        return false;
+    };
+    (1..=16).contains(&zone.len())
+        && zone
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b':'))
+}
 
 /// Most bytes read per poll.
 pub const MAX_POLL_BYTES: u64 = 8 * 1024 * 1024;
@@ -194,7 +236,7 @@ pub struct Splitter {
     /// quote state is settled (CSV) or the first newline ([`Framing::Lines`]
     /// not after a newline): a cursor saved there would lose the unaligned
     /// state at a restart (#267 review L1), so [`Tailer::commit_from`] saves
-    /// nothing until then.
+    /// it with the cursor.
     aligned: bool,
     /// The record in progress is dropped at its end (see [`Discard`]).
     discard: Discard,
@@ -343,13 +385,19 @@ impl Splitter {
                 let cut = self.cut.take();
                 self.discard = if self.parity_known {
                     // A known state found inverted: the record in progress
-                    // is damaged (cut short inside a quoted field). When the
-                    // quote that tells it is the first one after the last
-                    // newline taken as quoted, that newline ended the
-                    // damaged record (#267 review L2): it is dropped and
-                    // counted now, and the record after it kept. Otherwise
+                    // is damaged (cut short inside a quoted field). That
+                    // newline ended the damaged record (#267 review L2)
+                    // only if what follows it up to the quote that tells
+                    // the inversion is the start of a csvlog record: a log
+                    // time, one comma, that quote. Then the damaged record
+                    // is dropped and counted now, and the record after it
+                    // kept. Otherwise (a quoted newline of the statement,
+                    // the write cut later: security review of #278, M1)
                     // the whole record in progress is dropped at its end.
-                    match cut.filter(|_| self.cut_quotes == 1) {
+                    let starts_record = |k: &usize| {
+                        self.cut_quotes == 1 && self.buf.get(*k..).is_some_and(csv_record_start)
+                    };
+                    match cut.filter(starts_record) {
                         Some(k) => {
                             self.drop_before(k);
                             if self.discard != Discard::Unaligned {
@@ -589,6 +637,12 @@ struct Cursor {
     /// ([`key_id`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kid: Option<String>,
+    /// Saved before the first record boundary of a first start was known
+    /// ([`Splitter::aligned`]): a restart resumes at `offset` unaligned,
+    /// as at that first start (security review of #278, L1). Absent (an
+    /// older agent, or a known boundary): aligned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unaligned: bool,
 }
 
 /// Label of the key identifier (see [`key_id`]).
@@ -914,8 +968,9 @@ impl Tailer {
         let (mut file, dev, ino, len) = open_regular(&self.path, self.open_check.as_ref())?;
         let cursor = self.load_cursor();
         // First start: the end of a file being written need not be a record
-        // boundary (see `Splitter::reset_unaligned`).
-        let unaligned = cursor.is_none() && len > 0;
+        // boundary (see `Splitter::reset_unaligned`); nor the position of a
+        // cursor saved before one was known.
+        let mut unaligned = cursor.is_none() && len > 0;
         let start = match cursor {
             Some(mut c) if c.dev == dev && c.ino == ino => {
                 // A replay whose end lies before the offset is not one the
@@ -926,6 +981,7 @@ impl Tailer {
                         file: (dev, ino),
                         replay,
                     });
+                    unaligned = c.unaligned && c.offset > 0;
                     c.offset
                 } else {
                     self.rotations += 1;
@@ -1175,14 +1231,12 @@ impl Tailer {
         else {
             return;
         };
-        if !self.splitter.aligned() {
-            // First start, before the first record boundary is known: a
-            // position saved now would be resumed as aligned (#267 review
-            // L1). Nothing was read yet, so nothing is lost: a restart
-            // starts at the end of the file again.
-            tracing::debug!("audit cursor not saved: no record boundary known yet");
-            return;
-        }
+        // First start, before the first record boundary is known: the
+        // position is saved with that state, so that a restart resumes
+        // there unaligned instead of as aligned (#267 review L1), and reads
+        // what was written while the agent was stopped (security review of
+        // #278, L1). Nothing is held then (no record was read).
+        let unaligned = !self.splitter.aligned();
         let end = self.offset.saturating_sub(self.splitter.pending());
         let here: Vec<(u64, u64)> = held
             .iter()
@@ -1218,6 +1272,7 @@ impl Tailer {
             fp: key.map(|k| fingerprint(k, offset)),
             end_fp: key.filter(|_| from.is_some()).map(|k| fingerprint(k, end)),
             kid: key.map(key_id),
+            unaligned,
         };
         match serde_json::to_vec(&cursor) {
             Ok(bytes) => {
@@ -2020,6 +2075,55 @@ mod tests {
         assert_eq!(ends[1], cut + r(2));
         assert_eq!(lines(p), want);
         assert_eq!(t.malformed(), 1);
+        // Security review of #278, M1: a statement whose text, after a
+        // quoted newline, looks like the unquoted fields of a record, cut
+        // later with the next record written right after it. That newline
+        // is not a record boundary (what follows it up to the inverting
+        // quote is not a log time and one comma): the hybrid is dropped,
+        // never read as a record of another user.
+        let forged = "SELECT x\n2026-10-18 09:00:00.000 UTC,mallory,shop,1,,s,1,,\
+                      2026-10-18 09:00:00 UTC,3/1,0,ERROR,57014,,,,,,,,,,psql,client backend,,";
+        let victim = csvlog_record(1).replace("AUDIT: SESSION", &format!("statement: {forged}"));
+        let cut_at = victim.find("ERROR,57014,").unwrap() + "ERROR,57014,".len();
+        for sep in ["", "\n"] {
+            let data = format!(
+                "{}{}{sep}{}{}",
+                csvlog_record(0),
+                &victim[..cut_at],
+                csvlog_record(2),
+                csvlog_record(3)
+            );
+            let mut s = Splitter::with_max(Framing::Csv, MAX_RECORD_BYTES);
+            let mut out = Vec::new();
+            s.feed(data.as_bytes(), &mut out);
+            let got = strings(&out);
+            assert!(got.iter().all(|r| !r.contains("mallory")), "{sep:?}");
+            let mut want = vec![csvlog_record(0)];
+            if !sep.is_empty() {
+                // The cut ends at a record boundary: the next record is kept.
+                want.push(csvlog_record(2));
+            }
+            want.push(csvlog_record(3));
+            let want: Vec<String> = want
+                .iter()
+                .map(|r| r.trim_end_matches('\n').to_owned())
+                .collect();
+            assert_eq!(got, want, "{sep:?}");
+            assert_eq!(s.malformed, 1);
+        }
+        // Record starts.
+        assert!(csv_record_start(b"2026-10-18 09:00:00.123 UTC,\""));
+        assert!(csv_record_start(b"2026-10-18 09:00:00 +02,\""));
+        for no in [
+            &b"2026-10-18 09:00:00.123 UTC,mallory,\""[..],
+            b"x2026-10-18 09:00:00.123 UTC,\"",
+            b"2026-10-18 09:00:00.123 UTC\"",
+            b"2026-10-18 09:00:00. UTC,\"",
+            b"2026-10-18T09:00:00 UTC,\"",
+            b",\"",
+        ] {
+            assert!(!csv_record_start(no));
+        }
         // When another quote comes between the newline and the quote that
         // tells the state is inverted, the newline is not trusted as a
         // boundary: the record in progress is dropped whole (one count).
@@ -2040,9 +2144,10 @@ mod tests {
     }
 
     /// A restart while the CSV quote state is still unknown at the first
-    /// start: no cursor was saved, so the restart starts at the end of the
-    /// file again, unaligned; nothing is counted as damaged, and the
-    /// records after it are read (#267 review L1).
+    /// start: the cursor is saved with that state and the restart resumes
+    /// there unaligned; nothing is counted as damaged, and the records
+    /// written while the agent was stopped are read (#267 review L1,
+    /// security review of #278 L1).
     #[test]
     fn a_restart_while_the_csv_state_is_unknown() {
         let d = Dir::new("csvrestart");
@@ -2061,25 +2166,36 @@ mod tests {
         assert!(lines(t.poll().unwrap()).is_empty());
         assert!(!t.splitter.aligned());
         t.commit();
-        assert!(
-            store().unwrap().load().unwrap().is_none(),
-            "no cursor while unaligned"
-        );
+        // Saved with the unaligned state (security review of #278, L1).
+        let c = saved(&store().unwrap());
+        assert!(c.unaligned);
+        assert_eq!(c.offset, std::fs::metadata(&log).unwrap().len());
         drop(t);
-        // The restart: the rest of the record, then new records.
+        // While the agent is stopped: the rest of the record, then two
+        // records. The restart resumes at the saved position, unaligned:
+        // both records are read, nothing is counted as damaged.
         append(&log, &rec[at + "JOIN a\nJOIN b\n".len()..]);
-        let mut t = Tailer::new(log.clone(), Framing::Csv, store());
-        assert!(lines(t.poll().unwrap()).is_empty());
         append(&log, &csvlog_record(2));
         append(&log, &csvlog_record(3));
-        assert_eq!(lines(t.poll().unwrap()).len(), 2);
+        let mut t = Tailer::new(log.clone(), Framing::Csv, store());
+        let want: Vec<String> = [2, 3]
+            .map(|n| csvlog_record(n).trim_end_matches('\n').to_owned())
+            .to_vec();
+        assert_eq!(lines(t.poll().unwrap()), want);
         assert_eq!(t.malformed(), 0);
         assert!(t.splitter.aligned());
         t.commit();
-        assert_eq!(
-            saved(&store().unwrap()).offset,
-            std::fs::metadata(&log).unwrap().len()
-        );
+        let c = saved(&store().unwrap());
+        assert!(!c.unaligned);
+        assert_eq!(c.offset, std::fs::metadata(&log).unwrap().len());
+        // An aligned cursor does not carry the field (older agents read
+        // it unchanged).
+        let raw = String::from_utf8(store().unwrap().load().unwrap().unwrap()).unwrap();
+        assert!(!raw.contains("unaligned"));
+        drop(t);
+        append(&log, &csvlog_record(4));
+        let mut t = Tailer::new(log.clone(), Framing::Csv, store());
+        assert_eq!(lines(t.poll().unwrap()).len(), 1);
         // The old behaviour: a cursor saved inside the quoted field, read
         // as aligned at the restart, counted one false damaged record.
         let mut s = Splitter::new(Framing::Csv);
@@ -2173,9 +2289,11 @@ mod tests {
     }
 
     /// A line-framed log cut inside a line at the first start, with a
-    /// commit before the line ends: no cursor is saved there, so a restart
-    /// does not read the end of the cut line as a record (#267 review L1);
-    /// once a line ended, the cursor is saved and a restart resumes there.
+    /// commit before the line ends: the cursor is saved unaligned, so a
+    /// restart does not read the end of the cut line as a record (#267
+    /// review L1) and reads the lines written while the agent was stopped
+    /// (security review of #278, L1); once a line ended, the cursor is
+    /// aligned again.
     #[test]
     fn lines_after_a_restart() {
         let d = Dir::new("linerestart");
@@ -2185,15 +2303,12 @@ mod tests {
         let mut t = Tailer::new(log.clone(), Framing::Lines, store());
         assert!(lines(t.poll().unwrap()).is_empty());
         t.commit();
-        assert!(store().unwrap().load().unwrap().is_none());
+        assert!(saved(&store().unwrap()).unaligned);
         drop(t);
-        append(&log, "\":2}\n");
+        // Written while the agent is stopped: the end of the cut line is
+        // not read as a record, the next line is.
+        append(&log, "\":2}\n{\"b\":3}\n");
         let mut t = Tailer::new(log.clone(), Framing::Lines, store());
-        assert!(
-            lines(t.poll().unwrap()).is_empty(),
-            "the cut line is not read"
-        );
-        append(&log, "{\"b\":3}\n");
         assert_eq!(lines(t.poll().unwrap()), ["{\"b\":3}"]);
         t.commit();
         drop(t);

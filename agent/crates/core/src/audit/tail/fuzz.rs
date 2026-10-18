@@ -16,7 +16,9 @@
 //! - a first start at any offset of the first record (after a newline or
 //!   not): exactly the records after it, nothing counted as damaged;
 //! - a record cut short inside a quoted field: exactly the other records,
-//!   one damaged record counted (#267 review L2);
+//!   one damaged record counted (#267 review L2); with the next record
+//!   written right after the cut (no newline), only records written, byte
+//!   for byte (security review of #278, L3);
 //! - a record bound smaller than some records, aligned or not: exactly the
 //!   records that fit after the start, the others counted as oversized
 //!   when the start is aligned; never a forged record.
@@ -203,6 +205,41 @@ pub fn check(statements: &[&[u8]], chunk: usize, at: usize, damage: usize, max: 
         (s.malformed, s.realigned, s.pending()),
         (1, 1, 0),
         "record {j} cut at byte {p}: malformed, realigned, pending"
+    );
+
+    // The same cut with the next record written right after it, no newline
+    // in between (security review of #278, L3): the damaged record may take
+    // the next one with it, but every record emitted is one of the records
+    // written, byte for byte (a quoted newline of the statement before the
+    // cut never becomes a record boundary), and the records after those two
+    // are all read.
+    let mut glued = damaged.clone();
+    let newline = records[..j].iter().map(Vec::len).sum::<usize>() + p;
+    glued.remove(newline);
+    let mut s = Splitter::new(Framing::Csv);
+    let out = feed(&mut s, &glued, chunk);
+    let mut next = 0usize;
+    for o in &out {
+        let i = want[next..].iter().position(|w| o.as_slice() == *w);
+        assert!(
+            i.is_some(),
+            "record {j} cut at byte {p}, glued: a record that was not written"
+        );
+        next += i.unwrap_or_default() + 1;
+        assert_ne!(
+            next - 1,
+            j,
+            "record {j} cut at byte {p}, glued: the damaged record"
+        );
+    }
+    let after = &want[(j + 2).min(want.len())..];
+    assert!(
+        out.len() >= after.len() && same(&out[out.len() - after.len()..], after),
+        "record {j} cut at byte {p}, glued: the records after it"
+    );
+    assert_eq!(
+        s.malformed, 1,
+        "record {j} cut at byte {p}, glued: malformed"
     );
 
     // A record bound smaller than some records: aligned, then from the
