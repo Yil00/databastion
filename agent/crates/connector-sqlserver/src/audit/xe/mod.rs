@@ -109,7 +109,8 @@ struct Stream<'a> {
     perms: std::collections::BTreeSet<String>,
     /// The poll interval (the bound of a deferral).
     poll: std::time::Duration,
-    /// Unpaired case 2 builds deferred (refinement of 2026-10-16, item 4).
+    /// Unpaired statistics builds deferred (refinement of 2026-10-16,
+    /// item 4, for case 2 builds; of 2026-10-18 for any session's).
     deferrals: events::Deferrals,
 }
 
@@ -803,9 +804,11 @@ async fn read(
     let target = st.target;
     let own = |r: &XeRecord| own_session(target, r);
     let mut context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
-    // An unpaired case 2 build: the read ends just before it, once and
-    // for a bounded time (refinement of 2026-10-16, item 4); what follows
-    // it is read again by the next read, from it.
+    // An unpaired statistics build (case 2's of the agent's sessions, or
+    // any session's): the read ends just before it, once and for a bounded
+    // time (refinement of 2026-10-16, item 4, and of 2026-10-18); what
+    // follows it is read again by the next read, from it. The position
+    // stays before it, so a restart reads it again: never lost.
     let mut next = b.next;
     let mut gap = b.gap;
     let mut cut = None;
@@ -816,10 +819,17 @@ async fn read(
             .and_then(|p| p.dispatch_latency)
             .unwrap_or(events::MAX_DEFERRAL);
         let bound = latency.min(st.poll.saturating_mul(2));
+        // A full read: more rows follow on the server (its index space is
+        // every row it returned and read).
+        let full = b.full.then_some(positions.len());
         cut = st
             .deferrals
-            .cut(&records, statman, &own, Instant::now(), bound);
+            .cut(&records, statman, Instant::now(), bound, full);
     }
+    // A deferral waits a poll interval; a cut of a full read reads on at
+    // once.
+    let waits = cut.is_some_and(|c| c.wait);
+    let cut = cut.map(|c| c.at);
     if let Some(at) = cut {
         records.retain(|r| r.index < at);
         for r in &mut records {
@@ -828,7 +838,7 @@ async fn read(
         }
         context = databastion_core::isolate(|| events::context(&mut records, statman, &own));
         (next, gap) = xe_next(&st.cursor, positions.get(..at).unwrap_or_default(), true);
-        tracing::debug!(target_id = %target_id, "Extended Events: a statistics build of the agent's not paired yet: the read ends before it");
+        tracing::debug!(target_id = %target_id, "Extended Events: a statistics build not paired yet: the read ends before it");
     }
     let below_floor = below_floor
         .iter()
@@ -877,8 +887,10 @@ async fn read(
         gap,
         b.out_of_order,
     );
-    // A cut read ends the cycle: the next read waits a poll interval.
-    Ok(b.full && cut.is_none() && clamped.is_none())
+    // A deferral ends the cycle: the next read waits a poll interval. A
+    // full read cut before a build whose pair may be in the rows that
+    // follow reads on (it moved the position by half the read at least).
+    Ok(b.full && !waits && clamped.is_none())
 }
 
 /// Whether the re-probe inside a read changed what `before` (the cursor's
