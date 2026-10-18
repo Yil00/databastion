@@ -26,6 +26,16 @@ use crate::tds::{self, ptype};
 use crate::tls::{self, PreloginWrap};
 use crate::token::{Decoder, Event, Limits, TokenError, Value, done};
 
+/// Bound of the TLS / TCP shutdown of a close.
+const CLOSE_SHUTDOWN: Duration = Duration::from_secs(1);
+/// What a clean close may take at most (its settle, then its shutdown): a
+/// caller bounding a session's work by a deadline stops that work this
+/// long before it, so that the close itself is not cancelled (#264 review
+/// L1).
+pub(crate) const CLOSE_ROOM: Duration = crate::audit::own::CLEAN_CLOSE_SETTLE
+    .saturating_add(CLOSE_SHUTDOWN)
+    .saturating_add(Duration::from_millis(100));
+
 /// TCP connect, TLS handshake and login timeout.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the `ATTENTION` acknowledgement is waited for (decision 5).
@@ -551,22 +561,39 @@ impl Session {
     /// session with nothing in flight and not poisoned ends cleanly (no
     /// grace, decision 6, re-review N4); otherwise it is lost. A clean
     /// close first waits, idle, until
-    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer, so
-    /// that no record of a statement it sent is stamped after its end.
+    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer
+    /// (`last_used`: the end of the last response read, or of the
+    /// `ATTENTION` acknowledgement of a cancelled statement), so that no
+    /// record of a statement it sent is stamped after its end.
+    ///
+    /// The future must run to its end for the close to be clean: dropped
+    /// during the settle or the shutdown (a caller's deadline), the
+    /// session is dropped, hence recorded as lost with the lost
+    /// connection's grace (fail closed, #264 review L1). A caller with a
+    /// deadline leaves [`CLOSE_ROOM`] for it (`check::check`).
     pub(crate) async fn close(mut self) {
         let lost = self.poisoned || self.in_flight;
         let grace = self.statement_timeout + crate::audit::own::LOST_GRACE;
-        if !lost && self.own.is_some() {
-            let wait =
-                crate::audit::own::CLEAN_CLOSE_SETTLE.saturating_sub(self.last_used.elapsed());
-            if !wait.is_zero() {
-                ::tokio::time::sleep(wait).await;
-            }
+        let wait = self.settle_wait();
+        if !wait.is_zero() {
+            ::tokio::time::sleep(wait).await;
         }
-        let _ = ::tokio::time::timeout(Duration::from_secs(1), self.io.shutdown()).await;
+        let _ = ::tokio::time::timeout(CLOSE_SHUTDOWN, self.io.shutdown()).await;
         if let Some(h) = self.own.as_mut() {
             h.end(lost, grace);
         }
+    }
+
+    /// How long a close waits before it shuts the connection down: until
+    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer for
+    /// a clean close of one of the agent's own sessions; nothing for a
+    /// lost one (poisoned or in flight: it keeps its grace instead) or for
+    /// a session idle for longer than that already.
+    fn settle_wait(&self) -> Duration {
+        if self.poisoned || self.in_flight || self.own.is_none() {
+            return Duration::ZERO;
+        }
+        crate::audit::own::CLEAN_CLOSE_SETTLE.saturating_sub(self.last_used.elapsed())
     }
 
     /// Grants an Audit credit for `text` on this session (decision 6, L5):
@@ -1023,6 +1050,9 @@ impl Session {
         if let Some(outcome) = stop {
             self.cancel(stage).await;
             self.in_flight = self.poisoned;
+            // The acknowledgement is the statement's last answer: a clean
+            // close settles from it, not from the send (#264 review L2).
+            self.last_used = Instant::now();
             return outcome;
         }
         self.in_flight = false;
@@ -1492,5 +1522,96 @@ pub(crate) mod tests {
         assert!(own::session_at(target, 65, end + 1, &columns).is_none());
         assert!(own::session_at(target, 65, end + 1, &sample).is_some());
         assert!(own::session_at(target, 65, end + own::CLOCK_TOLERANCE_US + 1, &sample).is_none());
+    }
+
+    /// #264 review L3: a lost close (poisoned, or a request in flight)
+    /// does not wait and keeps its grace; a session idle for longer than
+    /// the settle closes at once, cleanly; a session that is not one of
+    /// the agent's own never waits.
+    #[::tokio::test]
+    async fn lost_and_idle_closes_do_not_wait() {
+        use crate::audit::own;
+        let target = "conn-test-close-no-wait";
+        own::reset(target);
+        let server_us = 1_800_000_000_000_000;
+        let grace = i64::try_from((Duration::from_secs(30) + own::LOST_GRACE).as_micros()).unwrap();
+        for (spid, poisoned, in_flight) in [(70, true, false), (71, false, true)] {
+            let (mut s, _srv) = scripted(vec![]);
+            let at = Instant::now();
+            s.own = Some(own::opened(target, spid, server_us, 0, None, at));
+            s.statement_timeout = Duration::from_secs(30);
+            s.poisoned = poisoned;
+            s.in_flight = in_flight;
+            s.last_used = Instant::now();
+            assert!(s.settle_wait().is_zero(), "spid {spid}");
+            let t0 = Instant::now();
+            s.close().await;
+            assert!(
+                t0.elapsed() < own::CLEAN_CLOSE_SETTLE,
+                "spid {spid}: a lost close waited"
+            );
+            let end = own::session_at(target, spid, server_us, "")
+                .unwrap()
+                .end_us
+                .unwrap();
+            assert!(end >= server_us + grace, "spid {spid}: the grace is kept");
+        }
+        // Idle for longer than the settle: clean, at once.
+        let (mut s, _srv) = scripted(vec![]);
+        let at = Instant::now();
+        s.own = Some(own::opened(target, 72, server_us, 0, None, at));
+        s.last_used = Instant::now()
+            .checked_sub(own::CLEAN_CLOSE_SETTLE * 3)
+            .unwrap();
+        assert!(s.settle_wait().is_zero());
+        let t0 = Instant::now();
+        s.close().await;
+        assert!(
+            t0.elapsed() < own::CLEAN_CLOSE_SETTLE,
+            "an idle session waited"
+        );
+        let end = own::session_at(target, 72, server_us, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        assert!(end < server_us + grace, "a clean end: no grace");
+        // Just answered: the wait is the rest of the settle.
+        let (mut s, _srv) = scripted(vec![]);
+        s.own = Some(own::opened(target, 73, server_us, 0, None, Instant::now()));
+        s.last_used = Instant::now();
+        let w = s.settle_wait();
+        assert!(!w.is_zero() && w <= own::CLEAN_CLOSE_SETTLE);
+        // Not an own session: no wait.
+        s.own = None;
+        assert!(s.settle_wait().is_zero());
+    }
+
+    /// #264 review L2: after a statement stopped early and cancelled, the
+    /// settle counts from the `ATTENTION` acknowledgement (the last
+    /// answer), not from the send.
+    #[::tokio::test]
+    async fn a_cancelled_statement_settles_from_its_acknowledgement() {
+        // The statement times out (no answer for 200 ms), then the
+        // `ATTENTION` is acknowledged: the last answer is that
+        // acknowledgement, 200 ms or more after the send.
+        let (mut s, _h) = scripted(vec![
+            crate::fake::SILENT.to_vec(),
+            build::done(tok::DONE, done::ATTN, 0),
+        ]);
+        s.statement_timeout = Duration::from_millis(200);
+        let sent = Instant::now();
+        let e = s
+            .rows("SELECT 1", Stage::Check, Shape::rows(1, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Timeout);
+        assert!(
+            !s.is_poisoned() && !s.in_flight,
+            "acknowledged: a clean close"
+        );
+        assert!(
+            s.last_used.duration_since(sent) >= Duration::from_millis(200),
+            "the settle counts from the acknowledgement"
+        );
     }
 }

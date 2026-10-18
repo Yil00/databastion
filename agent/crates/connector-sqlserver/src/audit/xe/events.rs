@@ -568,6 +568,10 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// (in `master`, a build paired with the `audit_file` proof, measured on
 /// 2022 and 2025) joined the list on 2026-10-16 (ADR-0051, addendum to the
 /// refinement of 2026-10-16), under the same conditions as the others.
+/// `sysaudacts` (in `master`, a build on `audit_spec_id` at `nest_level`
+/// 2 paired with the `audit_specifications` proof, measured on 2022)
+/// joined it on 2026-10-18 (ADR-0051 note of that day, accepted by the
+/// maintainer), under the same conditions.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysschobjs",
     "sysrowsets",
@@ -580,6 +584,7 @@ pub(crate) const SYS_BASE_TABLES: &[&str] = &[
     "sysprivs",
     "sysdbreg",
     "sysguidrefs",
+    "sysaudacts",
 ];
 
 /// The `object_type` map value of `ADHOC`.
@@ -2044,6 +2049,152 @@ mod statistics_tests {
             assert_eq!(reported(&recs), [2, 3], "{table}");
             let ev = convert(&recs[3]).unwrap().0;
             assert_eq!(names(&ev), [format!("retail.sys.{table}")], "{table}");
+        }
+    }
+
+    /// A build on `sys.sysaudacts` (in `master`), of the shape measured on
+    /// 2022 after the `audit_specifications` proof (`audit_spec_id`,
+    /// `nest_level` 2, an internal statement at 1).
+    const AUDACTS_BUILD: &str = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [audit_spec_id] AS [SC0] \
+        FROM [sys].[sysaudacts] WITH (READUNCOMMITTED)  ORDER BY [SC0] ) AS _MS_UPDSTATS_TBL  OPTION (MAXDOP 16)";
+
+    /// The `audit_specifications` proof of decision 6 (one of case 2's
+    /// catalog reads), as the agent renders it.
+    fn audit_specifications() -> String {
+        let guid = crate::sql::quote_guid("0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0").unwrap();
+        crate::sql::render(crate::sql::AUDIT_SPECIFICATIONS, &[("guid", &guid)]).unwrap()
+    }
+
+    /// The `sysaudacts` build, its internal statement and a partner, as
+    /// [`guidrefs`] builds them.
+    fn audacts(
+        build_login: &str,
+        partner_login: &str,
+        partner: &str,
+        guid: Option<&str>,
+        partner_first: bool,
+    ) -> Vec<XeRecord> {
+        let mut recs = guidrefs(build_login, partner_login, partner, guid, partner_first);
+        let at = usize::from(partner_first);
+        recs[at] = sp(build_login, AUDACTS_BUILD, guid, 2, GUIDREFS_SHAPE);
+        recs
+    }
+
+    /// ADR-0051 note of 2026-10-18 (accepted by the maintainer):
+    /// `sys.sysaudacts` is on case 2's closed list, paired with the
+    /// `audit_specifications` proof, every other condition of case 2
+    /// unchanged; the same both-sided cases as `sysguidrefs`.
+    #[test]
+    fn sysaudacts_build_paired_with_the_audit_specifications_proof() {
+        assert!(SYS_BASE_TABLES.contains(&"sysaudacts"));
+        let proof = audit_specifications();
+        assert!(crate::sql::catalog_text(&proof));
+        for first in [false, true] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), first);
+            assert_eq!(context(&mut recs, true, &own), 2, "partner first {first}");
+            for r in &recs {
+                assert_eq!(
+                    r.skip,
+                    statement(r) != Some(proof.as_str()),
+                    "partner first {first}"
+                );
+            }
+        }
+        // The `audit_file` proof is a catalog read too: paired with it.
+        let mut recs = audacts(
+            "databastion",
+            "databastion",
+            &audit_file(),
+            Some(GUID),
+            false,
+        );
+        assert_eq!(context(&mut recs, true, &own), 2);
+        // Reported: no causality.
+        let mut recs = audacts("databastion", "databastion", &proof, None, false);
+        assert_eq!(context(&mut recs, true, &own), 0);
+        assert_eq!(reported(&recs), [0, 1, 2], "no causality");
+        // Reported: a foreign session's build, or the proof's text from a
+        // foreign session.
+        for (build, partner) in [("app", "databastion"), ("databastion", "app")] {
+            let mut recs = audacts(build, partner, &proof, Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(
+                !recs[0].skip && !recs[1].skip,
+                "build {build}, partner {partner}"
+            );
+            let ev = convert(&recs[0]).unwrap().0;
+            assert_eq!(names(&ev), ["retail.sys.sysaudacts"], "build {build}");
+        }
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        context(&mut recs, true, &|_| false);
+        assert!(!recs[0].skip, "no own session at all");
+        // Reported: a partner that is not a catalog read.
+        for text in [
+            crate::sql::VERSION.to_owned(),
+            crate::sql::AUDIT_POLL_START.to_owned(),
+            proof.replace("TOP (513)", "TOP (514)"),
+            "SELECT audit_action_name FROM sys.server_audit_specification_details".to_owned(),
+        ] {
+            assert!(!crate::sql::catalog_text(&text), "{text}");
+            let mut recs = audacts("databastion", "databastion", &text, Some(GUID), false);
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip && !recs[1].skip, "not a catalog read: {text}");
+        }
+        // Reported: the proof in another activity.
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        recs[2] = stmt_in(
+            "databastion",
+            &proof,
+            Some("AAAAAAAA-0000-0000-0000-000000000000"),
+            1,
+        );
+        context(&mut recs, true, &own);
+        assert!(!recs[0].skip, "the proof in another activity");
+        // Reported: off the allow-listed builds.
+        let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+        assert_eq!(context(&mut recs, false, &own), 0);
+        assert!(!unpaired_case_2(&recs[0], false, &own));
+        // Unpaired in its read: a deferral candidate (item 4) for the
+        // agent's session only.
+        let mut recs = audacts(
+            "databastion",
+            "databastion",
+            crate::sql::VERSION,
+            Some(GUID),
+            false,
+        );
+        context(&mut recs, true, &own);
+        assert!(unpaired_case_2(&recs[0], true, &own));
+        assert!(!unpaired_case_2(&recs[0], true, &|_| false));
+        // Only `sys.sysaudacts` by its exact name.
+        for table in [
+            "[sys].[sysaudacts2]",
+            "[sys].[sysaudact]",
+            "[dbo].[sysaudacts]",
+        ] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+            recs[0] = sp(
+                "databastion",
+                &AUDACTS_BUILD.replace("[sys].[sysaudacts]", table),
+                Some(GUID),
+                2,
+                GUIDREFS_SHAPE,
+            );
+            context(&mut recs, true, &own);
+            assert!(!recs[0].skip, "{table}");
+        }
+        // The credential-bearing tables stay reported next to it.
+        for table in ["sysowners", "sysxlgns"] {
+            let mut recs = audacts("databastion", "databastion", &proof, Some(GUID), false);
+            recs.push(sp(
+                "databastion",
+                &BUILD.replace("[sys].[sysschobjs]", &format!("[sys].[{table}]")),
+                Some(GUID),
+                5,
+                BUILD_SHAPE,
+            ));
+            context(&mut recs, true, &own);
+            assert!(recs[0].skip && recs[1].skip && !recs[3].skip, "{table}");
         }
     }
 

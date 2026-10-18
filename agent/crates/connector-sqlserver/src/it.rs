@@ -2361,9 +2361,15 @@ async fn xe_fresh_scenario() {
     // The same target naming an audit too: its `check()` sends the
     // `audit_file` proof (2022 and later). The own-session registry is
     // keyed by the target id, as for one agent's check and stream. The
-    // audit does not exist, so the proof stops there: the next proof
-    // (`audit_specifications`) builds statistics on `sys.sysaudacts`, which
-    // is not on case 2's list (measured on 2022 on 2026-10-16; reported).
+    // audit does not exist, so the proof stops there. A third `check()`
+    // names the dev service's audit: its next proof
+    // (`audit_specifications`) builds statistics on `sys.sysaudacts`
+    // (measured on 2022 on 2026-10-16), on case 2's list since 2026-10-18.
+    let t_spec = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: databastion_audit, \
+         xe_session: databastion_xe}}",
+        own_tls()
+    ));
     let t_audit = agent(&format!(
         "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: it_no_such_audit, \
          xe_session: databastion_xe}}",
@@ -2372,6 +2378,7 @@ async fn xe_fresh_scenario() {
     let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
         let _ = Box::pin(c.check(&t)).await;
         let _ = Box::pin(SqlserverConnector::new().check(&t_audit)).await;
+        let _ = Box::pin(SqlserverConnector::new().check(&t_spec)).await;
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         let (sink, mut frx) = FindingSink::channel(10_000);
         let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
@@ -2489,6 +2496,27 @@ async fn xe_fresh_sysguidrefs(
             .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysguidrefs"))),
         "the build on sysguidrefs paired with the audit_file proof is left out"
     );
+    // The `audit_specifications` proof's build on `sys.sysaudacts` (ADR-0051
+    // note of 2026-10-18): left out when the server built one.
+    let audacts = read(
+        Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
+                 WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+                 AND event_data LIKE N'%sysaudacts%' AND event_data LIKE N'%databastion%'"
+            ),
+            1,
+        ))
+        .await,
+    );
+    eprintln!("[it] xe fresh: builds on sysaudacts {}", audacts.len());
+    assert!(
+        !own.iter()
+            .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysaudacts"))),
+        "the build on sysaudacts paired with the audit_specifications proof is left out"
+    );
+    let builds: Vec<String> = builds.into_iter().chain(audacts).collect();
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;
     };

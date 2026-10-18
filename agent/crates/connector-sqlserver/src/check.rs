@@ -843,7 +843,8 @@ fn failed(e: SsError, target: &TargetConfig) -> TargetHealth {
 
 /// `check()` of one target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
-    match tokio::time::timeout(CHECK_TOTAL, run(state, target)).await {
+    let deadline = tokio::time::Instant::now() + CHECK_TOTAL;
+    match tokio::time::timeout_at(deadline, run(state, target, deadline)).await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             state.set_version(&target.id, None);
@@ -853,12 +854,29 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
     }
 }
 
-async fn run(state: &CheckState, target: &TargetConfig) -> Result<TargetHealth, SsError> {
+/// Connects, checks, then closes; the checks stop [`conn::CLOSE_ROOM`]
+/// before `deadline`, so that a clean close (its settle and shutdown) is
+/// not cancelled by [`CHECK_TOTAL`] and recorded as lost (#264 review
+/// L1). Checks cut by that bound leave a statement in flight: the close is
+/// then lost, as it should be.
+async fn run(
+    state: &CheckState,
+    target: &TargetConfig,
+    deadline: tokio::time::Instant,
+) -> Result<TargetHealth, SsError> {
     let settings = target.sqlserver_settings();
     let tls = tls::configs(settings.ca_file.as_deref())
         .ok_or(SsError::new(FailureCode::Internal, Stage::Tls))?;
     let mut s = conn::connect(target, &tls, &state.choice, CHECK_STATEMENT).await?;
-    let result = checked(state, target, &mut s).await;
+    let result = match tokio::time::timeout_at(
+        deadline.checked_sub(conn::CLOSE_ROOM).unwrap_or(deadline),
+        checked(state, target, &mut s),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(SsError::new(FailureCode::Timeout, Stage::Check)),
+    };
     s.close().await;
     result
 }
