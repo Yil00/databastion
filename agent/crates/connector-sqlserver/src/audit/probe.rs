@@ -324,7 +324,8 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
     if p.on_failure == 0 {
         // Option (a'): the failure counter of `ON_FAILURE = CONTINUE` is in
         // sys.dm_server_audit_status, which this grant set does not read.
-        // No contract label yet: sent as `other`.
+        // Label revision `2026_10_c` (core `notes`): `other` until the
+        // console lists it.
         out.notes.push(
             TargetNote::new(NoteCode::PrivilegeNotEvaluated)
                 .with_labels([NoteLabel::sqlserver("on_failure_probe")]),
@@ -621,8 +622,16 @@ mod tests {
                 dropped: 0,
             },
         });
-        // Not a Partial proof (ADR-0051 decision 6): a note only.
+        // Not a Partial proof (ADR-0051 decision 6): a note only, with
+        // its own label (revision `2026_10_c`), never `other`.
         assert_eq!(l.level, AuditLevel::Partial);
         assert!(codes(&l).contains(&"privilege.not_evaluated"));
+        let note = l
+            .notes
+            .iter()
+            .find(|n| n.code().as_str() == "privilege.not_evaluated")
+            .unwrap();
+        let labels: Vec<String> = note.labels().iter().map(|l| l.as_str()).collect();
+        assert_eq!(labels, ["on_failure_probe"]);
     }
 }

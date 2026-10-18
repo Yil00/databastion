@@ -81,6 +81,7 @@ pub fn sent_labels(note: &crate::TargetNote, all_revisions: bool) -> Vec<String>
     let revisions = crate::notes::LabelRevisions {
         r2026_10: all_revisions,
         r2026_10_b: all_revisions,
+        r2026_10_c: all_revisions,
     };
     crate::notes::to_protocol(std::slice::from_ref(note), revisions)
         .first()

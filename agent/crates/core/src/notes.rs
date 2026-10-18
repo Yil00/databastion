@@ -689,6 +689,14 @@ pub(crate) const LABELS_REVISION_2026_10_B: &[&str] = &[
     "cas_store_guard_probe",
 ];
 
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10_c` (Microsoft SQL Server, ADR-0051
+/// refinement option (a'); phase 9 follow-ups): `on_failure_probe`, the
+/// `ON_FAILURE = CONTINUE` failure counter that the option (a') grants do
+/// not read (`privilege.not_evaluated`). Negotiated on its own token, like
+/// [`LABELS_REVISION_2026_10_B`]: `other` until the console lists it.
+pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
+
 /// The `target_status.note_labels.<revision>` tokens the console listed in
 /// its latest heartbeat response (ADR-0022 decision 4). Each revision is
 /// negotiated on its own: a label is sent only when the token of its own
@@ -699,6 +707,8 @@ pub(crate) struct LabelRevisions {
     pub(crate) r2026_10: bool,
     /// `target_status.note_labels.2026_10_b` ([`LABELS_REVISION_2026_10_B`]).
     pub(crate) r2026_10_b: bool,
+    /// `target_status.note_labels.2026_10_c` ([`LABELS_REVISION_2026_10_C`]).
+    pub(crate) r2026_10_c: bool,
 }
 
 impl LabelRevisions {
@@ -707,18 +717,22 @@ impl LabelRevisions {
     pub(crate) const ALL: Self = Self {
         r2026_10: true,
         r2026_10_b: true,
+        r2026_10_c: true,
     };
 
     /// Whether `value` (a contract `TargetNoteLabel` value) may be sent.
     fn allows(self, value: &str) -> bool {
         (self.r2026_10 || !LABELS_REVISION_2026_10.contains(&value))
             && (self.r2026_10_b || !LABELS_REVISION_2026_10_B.contains(&value))
+            && (self.r2026_10_c || !LABELS_REVISION_2026_10_C.contains(&value))
     }
 }
 
 /// Whether `value` belongs to a revision after protocol 0.1.0.
 fn in_a_revision(value: &str) -> bool {
-    LABELS_REVISION_2026_10.contains(&value) || LABELS_REVISION_2026_10_B.contains(&value)
+    LABELS_REVISION_2026_10.contains(&value)
+        || LABELS_REVISION_2026_10_B.contains(&value)
+        || LABELS_REVISION_2026_10_C.contains(&value)
 }
 
 /// Closed label of a note: a value of the contract `TargetNoteLabel` enum.
@@ -729,8 +743,9 @@ fn in_a_revision(value: &str) -> bool {
 /// `target_status.note_labels.<revision>` token (ADR-0022 decision 4). The
 /// values of this build are those of protocol 0.1.0, sent without a token,
 /// and those of the SQL Server revisions `2026_10`
-/// ([`LABELS_REVISION_2026_10`]) and `2026_10_b`
-/// ([`LABELS_REVISION_2026_10_B`]), each sent only once the console lists
+/// ([`LABELS_REVISION_2026_10`]), `2026_10_b`
+/// ([`LABELS_REVISION_2026_10_B`]) and `2026_10_c`
+/// ([`LABELS_REVISION_2026_10_C`]), each sent only once the console lists
 /// its own token, `other` before ([`to_protocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLabel(TargetNoteLabel);
@@ -742,8 +757,9 @@ impl NoteLabel {
     /// A label given as its exact contract value (lower snake case, e.g.
     /// `bypassrls`, `pg_monitor`, `logging_on`); anything else is `other`,
     /// and so are the values of the SQL Server revisions
-    /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`]), which
-    /// only [`sqlserver`](Self::sqlserver) builds: a MySQL / MariaDB server
+    /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
+    /// [`LABELS_REVISION_2026_10_C`]), which only
+    /// [`sqlserver`](Self::sqlserver) builds: a MySQL / MariaDB server
     /// could name a dynamic privilege after one of them.
     #[must_use]
     pub fn parse(value: &str) -> Self {
@@ -803,8 +819,8 @@ impl NoteLabel {
     }
 
     /// A Microsoft SQL Server label (ADR-0051 decision 4): any contract
-    /// value, the revisions `target_status.note_labels.2026_10` and
-    /// `2026_10_b` included (each sent as `other` until the console lists
+    /// value, the revisions `target_status.note_labels.2026_10`,
+    /// `2026_10_b` and `2026_10_c` included (each sent as `other` until the console lists
     /// its token, see [`to_protocol`]); anything else is `other`.
     #[must_use]
     pub fn sqlserver(value: &str) -> Self {
@@ -1040,8 +1056,8 @@ fn sent_labels(labels: &[NoteLabel], revisions: LabelRevisions) -> Vec<TargetNot
 /// bound.
 ///
 /// The labels of a revision after protocol 0.1.0
-/// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`]) are sent
-/// only when `revisions` holds its token (the console listed it), `other`
+/// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
+/// [`LABELS_REVISION_2026_10_C`]) are sent only when `revisions` holds its token (the console listed it), `other`
 /// otherwise (ADR-0022 decision 4). Negotiation comes first, then the
 /// ranking by [`SEVERITY`] (`other` last), then the cut to [`MAX_LABELS`]:
 /// labels the console cannot receive never push out labels it can.
@@ -1097,6 +1113,7 @@ mod tests {
     }
 
     const REVISION_B_MARKER: &str = "        # Revision target_status.note_labels.2026_10_b (ADR-0051 refinement of 2026-10-14):\n";
+    const REVISION_C_MARKER: &str = "        # Revision target_status.note_labels.2026_10_c (ADR-0051 refinement option (a')):\n";
 
     /// The labels sent for `note` with `revisions`.
     fn sent(note: &TargetNote, revisions: LabelRevisions) -> Vec<String> {
@@ -1145,10 +1162,12 @@ mod tests {
         let a = LabelRevisions {
             r2026_10: true,
             r2026_10_b: false,
+            r2026_10_c: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
+            r2026_10_c: false,
         };
         assert_eq!(sent(&note, none), vec!["other", "select"]);
         assert_eq!(sent(&note, b), vec!["other", "select"]);
@@ -1162,9 +1181,9 @@ mod tests {
 
     #[test]
     fn labels_of_revision_2026_10_b_are_sent_as_other_until_negotiated() {
-        // The list is exactly the contract values of the revision, the
-        // last ones of the enum.
-        let revision = contract_revision(REVISION_B_MARKER, "    DetectedTarget:");
+        // The list is exactly the contract values of the revision, up to
+        // the next one.
+        let revision = contract_revision(REVISION_B_MARKER, REVISION_C_MARKER);
         assert_eq!(revision, super::LABELS_REVISION_2026_10_B);
         for value in super::LABELS_REVISION_2026_10_B {
             assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
@@ -1207,10 +1226,12 @@ mod tests {
         let a = LabelRevisions {
             r2026_10: true,
             r2026_10_b: false,
+            r2026_10_c: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
+            r2026_10_c: false,
         };
         // Not negotiated: every revision value is `other`, once.
         assert_eq!(sent(&refused, LabelRevisions::default()), vec!["other"]);
@@ -1251,6 +1272,44 @@ mod tests {
                 "logon_trigger_probe",
                 "refusal_list_probe"
             ]
+        );
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_c_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values of the revision, the
+        // last ones of the enum.
+        let revision = contract_revision(REVISION_C_MARKER, "    DetectedTarget:");
+        assert_eq!(revision, super::LABELS_REVISION_2026_10_C);
+        for value in super::LABELS_REVISION_2026_10_C {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert_eq!(super::NoteLabel::sqlserver(value).as_str(), *value);
+            assert!(
+                !super::LABELS_REVISION_2026_10.contains(value)
+                    && !super::LABELS_REVISION_2026_10_B.contains(value),
+                "a value belongs to one revision only"
+            );
+        }
+        let note = super::TargetNote::new(super::NoteCode::PrivilegeNotEvaluated).with_labels(
+            ["password_hash_probe", "on_failure_probe"].map(super::NoteLabel::sqlserver),
+        );
+        let ab = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: true,
+            r2026_10_c: false,
+        };
+        let c = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: false,
+            r2026_10_c: true,
+        };
+        assert_eq!(sent(&note, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&note, ab), vec!["other", "password_hash_probe"]);
+        assert_eq!(sent(&note, c), vec!["other", "on_failure_probe"]);
+        assert_eq!(
+            sent(&note, LabelRevisions::ALL),
+            vec!["password_hash_probe", "on_failure_probe"]
         );
     }
 
@@ -1388,6 +1447,7 @@ mod tests {
         let a = LabelRevisions {
             r2026_10: true,
             r2026_10_b: false,
+            r2026_10_c: false,
         };
         // 14 labels of 2026_10 outside the severity list, the hash probe,
         // and the 20 labels of 2026_10_b (three of them in the severity

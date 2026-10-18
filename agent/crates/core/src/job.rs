@@ -6,7 +6,8 @@
 //!    `TryFrom<&AuditConfigureParams>` for [`AuditParams`] enforce the
 //!    contract ranges and the keywords serde does not (`minItems`,
 //!    `maxItems`, `uniqueItems` of classifier lists, the `Identifier` `not`
-//!    rule), and map classifier ids through `ClassifierId::parse` (unknown
+//!    rule, a `SensitiveObject` key pattern checked against the whole
+//!    `KeyPattern` schema), and map classifier ids through `ClassifierId::parse` (unknown
 //!    or duplicate id = error). An empty filter list (`Some([])`) is
 //!    rejected: it never means "all". Duplicate name patterns in
 //!    `databases` / `schemas` / `include_objects` / `exclude_objects` (no
@@ -28,9 +29,13 @@ use databastion_classifiers::column::{ColumnClassifier, ColumnFinding};
 use databastion_classifiers::id::ClassifierId;
 use databastion_classifiers::masking::{HmacKey, PhoneRegion, RawSample};
 use databastion_classifiers::names::violates_numeric_rule;
-use databastion_protocol::{AuditConfigureParams, DiscoveryScanParams, IdentifierPattern};
+use databastion_protocol::{
+    AuditConfigureParams, DiscoveryScanParams, IdentifierPattern, ObjectName,
+};
 
-use crate::config::{Limits, SAMPLE_ROWS_RANGE, STATEMENT_TIMEOUT_MS_RANGE, TargetConfig};
+use crate::config::{
+    Limits, SAMPLE_ROWS_RANGE, STATEMENT_TIMEOUT_MS_RANGE, TargetConfig, TargetEngine,
+};
 use crate::pacing::{Cancelled, Paced, Pacer, ScanCancel};
 
 /// Contract range of `max_duration_s` (seconds).
@@ -680,7 +685,8 @@ pub struct SensitiveObject {
     pub database: String,
     /// Schema (PostgreSQL).
     pub schema: Option<String>,
-    /// Table / collection.
+    /// Table / collection; on a Redis / Valkey target, a key pattern
+    /// (contract `ObjectName`).
     pub object: String,
     /// Classifiers found there by Discovery.
     pub classifiers: Vec<ClassifierId>,
@@ -695,6 +701,9 @@ pub struct AuditParams {
     poll_interval_s: u32,
     min_rows: Option<u64>,
     sensitive_objects: Vec<SensitiveObject>,
+    /// How many `sensitive_objects` are key patterns that are not
+    /// `Identifier`s (Redis / Valkey targets only).
+    key_patterns: usize,
 }
 
 impl AuditParams {
@@ -703,6 +712,28 @@ impl AuditParams {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
+
+    /// Refuses key patterns for a target of an engine without them
+    /// (contract `SensitiveObject`: a `KeyPattern` that is not an
+    /// `Identifier` names an object of a `redis` or `valkey` target only).
+    ///
+    /// # Errors
+    /// The key-pattern field when `engine` is not Redis or Valkey and a
+    /// sensitive object is a key pattern.
+    pub fn check_engine(&self, engine: TargetEngine) -> Result<(), ParamsError> {
+        if self.key_patterns > 0 && !key_pattern_engine(engine) {
+            return Err(err(
+                "sensitive_objects.object",
+                "a key pattern for a target that is not Redis or Valkey",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Engines whose objects are key patterns (contract `KeyPattern`).
+const fn key_pattern_engine(engine: TargetEngine) -> bool {
+    matches!(engine, TargetEngine::Redis | TargetEngine::Valkey)
 }
 
 fn identifier(field: &'static str, id: &str) -> Result<String, ParamsError> {
@@ -727,14 +758,30 @@ impl TryFrom<&AuditConfigureParams> for AuditParams {
             return Err(err("sensitive_objects", "too many items"));
         }
         let mut sensitive_objects = Vec::with_capacity(p.sensitive_objects.len());
+        let mut key_patterns = 0usize;
         for o in &p.sensitive_objects {
+            let object = match &o.object {
+                ObjectName::Variant0(id) => identifier("sensitive_objects.object", id.as_str())?,
+                // Serde checks the pattern only: the whole `KeyPattern`
+                // schema (its `not` rules) is checked here.
+                ObjectName::Variant1(kp) => {
+                    if !databastion_classifiers::keys::is_key_pattern(kp.as_str()) {
+                        return Err(err(
+                            "sensitive_objects.object",
+                            "violates the KeyPattern schema",
+                        ));
+                    }
+                    key_patterns += 1;
+                    kp.as_str().to_owned()
+                }
+            };
             sensitive_objects.push(SensitiveObject {
                 database: identifier("sensitive_objects.database", o.database.as_str())?,
                 schema: match &o.schema {
                     Some(s) => Some(identifier("sensitive_objects.schema", s.as_str())?),
                     None => None,
                 },
-                object: identifier("sensitive_objects.object", o.object.as_str())?,
+                object,
                 classifiers: classifier_list(
                     "sensitive_objects.classifiers",
                     o.classifiers.iter().map(|c| c.as_str()),
@@ -752,6 +799,7 @@ impl TryFrom<&AuditConfigureParams> for AuditParams {
             poll_interval_s: in_range("poll_interval_s", poll, POLL_INTERVAL_S_RANGE)?,
             min_rows,
             sensitive_objects,
+            key_patterns,
         })
     }
 }
@@ -770,6 +818,10 @@ pub struct AuditConfig {
     statement_timeout: Duration,
     min_rows: Option<u64>,
     sensitive_objects: Vec<SensitiveObject>,
+    /// On a Redis / Valkey target: each sensitive object's name, trailing
+    /// spaces dropped and folded, for the key-pattern match (in the order
+    /// of `sensitive_objects`); empty on every other target.
+    key_globs: Vec<Vec<char>>,
     max_sample_rows: u32,
     /// The cursors used by the stream, and the core's isolation / skip
     /// request (see [`crate::audit::CursorStore::skip_records`]).
@@ -807,6 +859,7 @@ impl Default for AuditConfig {
             statement_timeout: limits.clamp_statement_timeout(0),
             min_rows: None,
             sensitive_objects: Vec::new(),
+            key_globs: Vec::new(),
             max_sample_rows: limits.max_sample_rows,
             positions: None,
             isolate: false,
@@ -822,6 +875,15 @@ impl AuditConfig {
     /// `limits.min_audit_poll_interval_s`.
     #[must_use]
     pub fn new(params: AuditParams, target: &TargetConfig, limits: &Limits) -> Self {
+        let key_globs = if key_pattern_engine(target.engine) {
+            params
+                .sensitive_objects
+                .iter()
+                .map(|o| folded(&o.object))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             target_id: target.id.clone(),
             target: Some(target.clone()),
@@ -834,6 +896,7 @@ impl AuditConfig {
             statement_timeout: limits.clamp_statement_timeout(0),
             min_rows: params.min_rows,
             sensitive_objects: params.sensitive_objects,
+            key_globs,
             max_sample_rows: limits.max_sample_rows,
             positions: None,
             isolate: false,
@@ -864,6 +927,7 @@ impl AuditConfig {
                 poll_interval_s: poll,
                 min_rows: None,
                 sensitive_objects: Vec::new(),
+                key_patterns: 0,
             },
             target,
             limits,
@@ -989,8 +1053,18 @@ impl AuditConfig {
     /// any schema. Names are compared with [`same_name`]: case-insensitively
     /// and ignoring trailing spaces, on every engine (end-of-phase-9
     /// security review, N1).
+    ///
+    /// On a Redis / Valkey target, objects are key patterns
+    /// ([`Self::is_sensitive_key`]).
     #[must_use]
     pub fn is_sensitive(&self, database: &str, schema: Option<&str>, object: &str) -> bool {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| key_pattern_engine(t.engine))
+        {
+            return self.is_sensitive_key(database, object);
+        }
         self.sensitive_objects.iter().any(|o| {
             same_name(&o.database, database)
                 && same_name(&o.object, object)
@@ -999,6 +1073,75 @@ impl AuditConfig {
                     .is_none_or(|s| schema.is_some_and(|t| same_name(s, t)))
         })
     }
+
+    /// The key-pattern match of a Redis / Valkey target (contract
+    /// `SensitiveObject`, `sensitive_object.key_pattern`). An event's key
+    /// pattern and a listed one match when either, read as a Redis glob
+    /// whose only wildcard is `*` (any run of characters, separators
+    /// included, as `stringmatchlen`), matches the other: a listed
+    /// `user:*:email` covers the event objects `user:*:email`, `user:*`
+    /// (a key no learned pattern names but that starts with `user:`) and
+    /// `*` (a key with no learned prefix), and a listed `user:*` covers
+    /// `user:*:email`. The other glob characters (`?`, `[`, `\`) are
+    /// literal: the agent's normalizer never makes them wildcards. The
+    /// database matches when equal (as [`same_name`]) or when either side
+    /// is `*` (a source that does not tell the database). Redis has no
+    /// schema: it is not compared. Names are folded as on every engine
+    /// (N1), although Redis compares keys exactly: like the rest of this
+    /// match, that can only keep an event the exact match would drop
+    /// (fails closed; the filter is a noise filter).
+    fn is_sensitive_key(&self, database: &str, object: &str) -> bool {
+        let event = folded(object);
+        self.sensitive_objects
+            .iter()
+            .zip(&self.key_globs)
+            .any(|(o, listed)| {
+                (database == "*" || o.database == "*" || same_name(&o.database, database))
+                    && (*listed == event || star_glob(listed, &event) || star_glob(&event, listed))
+            })
+    }
+}
+
+/// `name` with trailing spaces dropped and folded as [`same_name`] does.
+fn folded(name: &str) -> Vec<char> {
+    name.trim_end_matches(' ')
+        .chars()
+        .flat_map(databastion_classifiers::names::fold_char)
+        .collect()
+}
+
+/// Whether `name` matches `pattern`, in which `*` (any run of characters,
+/// empty included) is the only wildcard. Linear in practice: `*`
+/// backtracks to its last occurrence only (at most `len(pattern) ×
+/// len(name)` steps, both bounded by the contract's 256 characters).
+fn star_glob(pattern: &[char], name: &[char]) -> bool {
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < name.len() {
+        match pattern.get(pi) {
+            Some('*') => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(c) if Some(c) == name.get(ni) => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    pi = sp + 1;
+                    ni = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern
+        .get(pi..)
+        .unwrap_or_default()
+        .iter()
+        .all(|c| *c == '*')
 }
 
 /// Whether two normalized names designate the same object for the

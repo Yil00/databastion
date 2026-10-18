@@ -514,3 +514,175 @@ mod guard_props {
         }
     }
 }
+
+fn redis_target() -> TargetConfig {
+    crate::config::AgentConfig::parse(
+        "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: cache
+    engine: valkey
+    host: cache.internal
+    account: databastion
+    secret:
+      env: VALKEY_PASSWORD
+",
+    )
+    .unwrap()
+    .targets
+    .remove(0)
+}
+
+fn key_objects(objects: serde_json::Value) -> AuditParams {
+    AuditParams::try_from(&audit(serde_json::json!({
+        "enabled": true, "min_rows": 10, "sensitive_objects": objects
+    })))
+    .unwrap()
+}
+
+/// Phase 9 follow-ups (contract `SensitiveObject.object` as an
+/// `ObjectName`): key patterns are accepted for Redis / Valkey targets
+/// only, and checked against the whole `KeyPattern` schema.
+#[test]
+fn key_pattern_sensitive_objects_are_gated() {
+    let params = key_objects(serde_json::json!([
+        {"database": "db0", "object": "user:*:email", "classifiers": ["pii.email"]},
+        {"database": "db0", "object": "orders", "classifiers": ["pii.email"]}
+    ]));
+    assert!(params.check_engine(TargetEngine::Valkey).is_ok());
+    assert!(params.check_engine(TargetEngine::Redis).is_ok());
+    for engine in [
+        TargetEngine::Postgres,
+        TargetEngine::Mysql,
+        TargetEngine::Mariadb,
+        TargetEngine::Mongodb,
+        TargetEngine::Openldap,
+        TargetEngine::Cas,
+        TargetEngine::Sqlserver,
+    ] {
+        let e = params.check_engine(engine).unwrap_err();
+        assert_eq!(e.field, "sensitive_objects.object", "{engine:?}");
+    }
+    // Identifiers only: every engine.
+    let plain = key_objects(serde_json::json!([
+        {"database": "db0", "object": "orders", "classifiers": ["pii.email"]}
+    ]));
+    assert!(plain.check_engine(TargetEngine::Postgres).is_ok());
+    // The `KeyPattern` `not` rules, which serde does not check: a phone
+    // number across segments, an IPv4 address, a URL scheme, a
+    // percent-encoded byte.
+    let mut refused = 0;
+    for object in [
+        "tel:06.12.34.56.78",
+        "host:10.0.0.1",
+        "javascript:alert",
+        "user:%40:x",
+    ] {
+        let json = serde_json::json!({"enabled": true, "sensitive_objects": [
+            {"database": "db0", "object": object, "classifiers": ["pii.email"]}
+        ]});
+        let parsed: Result<p::AuditConfigureParams, _> = serde_json::from_value(json);
+        if let Ok(parsed) = parsed {
+            let e = AuditParams::try_from(&parsed).unwrap_err();
+            assert_eq!(e.field, "sensitive_objects.object", "{object}");
+            refused += 1;
+        }
+    }
+    // Serde accepts them (pattern only): the agent-side check refuses.
+    assert_eq!(refused, 4);
+}
+
+#[test]
+fn key_patterns_match_as_star_globs_on_redis_and_valkey() {
+    let params = key_objects(serde_json::json!([
+        {"database": "db0", "object": "user:*:email", "classifiers": ["pii.email"]},
+        {"database": "db1", "object": "session:*", "classifiers": ["pii.email"]},
+        {"database": "db2", "object": "Card|Num", "classifiers": ["pii.email"]}
+    ]));
+    let cfg = AuditConfig::new(params, &redis_target(), &Limits::default());
+    // The same learned pattern.
+    assert!(cfg.is_sensitive("db0", None, "user:*:email"));
+    // A coarser event pattern (a key no learned pattern names, with a
+    // learned literal prefix), and the unknown key `*`.
+    assert!(cfg.is_sensitive("db0", None, "user:*"));
+    assert!(cfg.is_sensitive("db0", None, "*"));
+    // A finer event pattern under a listed coarse one.
+    assert!(cfg.is_sensitive("db1", None, "session:*:token"));
+    assert!(cfg.is_sensitive("db1", None, "session:*"));
+    // `*` spans separators, as in a Redis glob.
+    assert!(cfg.is_sensitive("db0", None, "user:*:profile:*:email"));
+    // Unrelated patterns, another database.
+    assert!(!cfg.is_sensitive("db0", None, "user:*:name"));
+    assert!(!cfg.is_sensitive("db0", None, "order:*:email"));
+    assert!(!cfg.is_sensitive("db1", None, "user:*:email"));
+    assert!(!cfg.is_sensitive("db0", None, "sessions"));
+    // The database `*` (a source that does not tell it) matches any.
+    assert!(cfg.is_sensitive("*", None, "user:*:email"));
+    assert!(cfg.is_sensitive("*", None, "session:*"));
+    assert!(!cfg.is_sensitive("*", None, "order:*"));
+    // The N1 fold: case and trailing spaces.
+    assert!(cfg.is_sensitive("DB0", None, "USER:*:Email"));
+    assert!(cfg.is_sensitive("db2", None, "card|num "));
+    // No schema on Redis: a schema never narrows the match.
+    assert!(cfg.is_sensitive("db0", Some("x"), "user:*:email"));
+    // `?` and `[` are literal (never produced as wildcards).
+    let params = key_objects(serde_json::json!([
+        {"database": "db0", "object": "a?b", "classifiers": ["pii.email"]},
+        {"database": "db0", "object": "c[x]", "classifiers": ["pii.email"]}
+    ]));
+    let cfg = AuditConfig::new(params, &redis_target(), &Limits::default());
+    assert!(cfg.is_sensitive("db0", None, "a?b"));
+    assert!(!cfg.is_sensitive("db0", None, "acb"));
+    assert!(cfg.is_sensitive("db0", None, "c[x]"));
+    assert!(!cfg.is_sensitive("db0", None, "cx"));
+}
+
+#[test]
+fn identifier_targets_keep_the_exact_folded_match() {
+    // On a PostgreSQL target `*` is a literal name, never a wildcard.
+    let params = key_objects(serde_json::json!([
+        {"database": "shop", "schema": "crm", "object": "customers", "classifiers": ["pii.email"]}
+    ]));
+    let cfg = AuditConfig::new(params, &target(), &Limits::default());
+    assert!(cfg.is_sensitive("shop", Some("crm"), "Customers "));
+    assert!(!cfg.is_sensitive("shop", Some("crm"), "*"));
+    assert!(!cfg.is_sensitive("*", Some("crm"), "customers"));
+    assert!(!cfg.is_sensitive("shop", Some("hr"), "customers"));
+}
+
+#[test]
+fn star_glob_is_bounded_and_exact() {
+    let c = |s: &str| s.chars().collect::<Vec<char>>();
+    assert!(star_glob(&c("*"), &c("")));
+    assert!(star_glob(&c(""), &c("")));
+    assert!(!star_glob(&c(""), &c("a")));
+    assert!(star_glob(&c("a*b*c"), &c("aXbYc")));
+    assert!(!star_glob(&c("a*b*c"), &c("aXbY")));
+    assert!(star_glob(&c("**"), &c("abc")));
+    // The worst case of the contract's bound stays fast.
+    let long_pattern = c(&"*a".repeat(128));
+    let long_name = c(&"a".repeat(255));
+    let t = std::time::Instant::now();
+    let _ = star_glob(&long_pattern, &long_name);
+    assert!(t.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn the_key_pattern_fixture_is_accepted_for_a_valkey_target() {
+    let list: p::JobList = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/JobList.audit-configure-key-patterns.json"
+    ))
+    .unwrap();
+    let p::Job::AuditConfigureJob(job) = &list.jobs[0] else {
+        panic!("audit.configure expected");
+    };
+    let params = AuditParams::try_from(&job.params).unwrap();
+    params.check_engine(TargetEngine::Valkey).unwrap();
+    assert!(params.check_engine(TargetEngine::Postgres).is_err());
+    let cfg = AuditConfig::new(params, &redis_target(), &Limits::default());
+    assert!(cfg.is_sensitive("db0", None, "session|*|card.number"));
+    assert!(cfg.is_sensitive("db1", None, "orders"));
+    assert!(!cfg.is_sensitive("db1", None, "user:*:email"));
+}

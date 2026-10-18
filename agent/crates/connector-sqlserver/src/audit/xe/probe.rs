@@ -28,9 +28,10 @@
 //! 5. a record parsed in the last 24 h (`audit.partial_pending_first_record`).
 //!
 //! Failed logins are seen only when the session has `error_reported`
-//! (error 18456); without it, a local detail says so (the
-//! `audit.failed_logins_not_audited` text names SQL Server Audit's group:
-//! not sent for this source).
+//! (error 18456); without it, `check()` notes
+//! `audit.failed_logins_not_audited` (its registry text names both
+//! sources since the phase 9 follow-ups) and a local detail says so. Not
+//! required for Partial, as on the SQL Server Audit source.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -294,6 +295,8 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
             .push(TargetNote::new(NoteCode::AuditXeCausalityOff));
     }
     if !p.failed_logins {
+        out.notes
+            .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
         out.details.push(
             "Extended Events: the session has no error_reported event (error 18456): failed \
              logins are not seen",
@@ -489,6 +492,16 @@ mod tests {
         let l = at(&q, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial);
         assert!(codes(&l).contains(&"audit.xe_causality_off"));
+        // No error_reported (phase 9 follow-ups): the source-neutral note,
+        // no effect on the level, as on SQL Server Audit.
+        assert!(
+            !codes(&at(&p, 15, &[GRANT_2019], LIVE)).contains(&"audit.failed_logins_not_audited")
+        );
+        let mut q = full_probe();
+        q.failed_logins = false;
+        let l = at(&q, 15, &[GRANT_2019], LIVE);
+        assert_eq!(l.level, AuditLevel::Partial);
+        assert!(codes(&l).contains(&"audit.failed_logins_not_audited"));
     }
 
     #[test]

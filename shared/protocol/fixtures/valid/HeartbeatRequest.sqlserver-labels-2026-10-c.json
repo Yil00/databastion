@@ -1,0 +1,53 @@
+{
+  "ts": "2026-10-18T09:00:00Z",
+  "agent_version": "0.8.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "redis",
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-audit",
+      "engine": "sqlserver",
+      "server_version": "16.0.4305.5",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "sqlserver_audit",
+      "notes": [
+        {
+          "code": "audit.failed_logins_not_audited"
+        },
+        {
+          "code": "privilege.not_evaluated",
+          "labels": [
+            "on_failure_probe"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "mssql-xe",
+      "engine": "sqlserver",
+      "server_version": "15.0.4430.1",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "sqlserver_xevents",
+      "notes": [
+        {
+          "code": "audit.failed_logins_not_audited"
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  },
+  "accepts": [
+    "sensitive_object.key_pattern"
+  ]
+}

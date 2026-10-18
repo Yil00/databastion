@@ -1,0 +1,22 @@
+{
+  "jobs": [
+    {
+      "job_id": "01920f5e-9b20-7d5e-9f32-1a2b3c4d5e71",
+      "type": "audit.configure",
+      "created_at": "2026-10-18T09:00:00Z",
+      "target_id": "valkey-sessions",
+      "params": {
+        "enabled": true,
+        "sensitive_objects": [
+          {
+            "database": "db0",
+            "object": "user:jane@example.com:email",
+            "classifiers": [
+              "pii.email"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

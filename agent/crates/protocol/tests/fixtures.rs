@@ -86,6 +86,10 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "JobList.scan-empty-schemas.json",
         "minItems (Some([]), distinct from absent)",
     ),
+    (
+        "JobList.sensitive-object-key-with-phone.json",
+        "not (KeyPattern digit-run rule; the agent's AuditParams mapping checks it)",
+    ),
     ("JobList.too-many-jobs.json", "maxItems"),
     (
         "JobStatusUpdate.negative-skipped-count.json",

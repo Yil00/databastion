@@ -1177,6 +1177,9 @@ impl Runtime {
                     r2026_10_b: self
                         .console_caps
                         .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_B),
+                    r2026_10_c: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_C),
                 },
             )
         } else {
@@ -1350,8 +1353,9 @@ impl Runtime {
         let spool = self.lock_spool().status();
         let detected_targets = self.detected_targets(&config).await;
         let mut heartbeat = HeartbeatRequest {
-            // No console -> agent field needs negotiating yet (ADR-0022).
-            accepts: None,
+            // The console -> agent fields and value forms this build
+            // decodes (ADR-0022 decision 3).
+            accepts: crate::capabilities::agent_accepts(),
             agent_version: agent_version()?,
             classifiers_version: classifiers_version(),
             connectors: connector_list(&engines),
@@ -2216,6 +2220,11 @@ impl Runtime {
             tracing::warn!(job_id = %id, "audit.configure for an undeclared target");
             return Outcome::failed(FailureCode::UnknownTarget);
         };
+        // Key patterns name Redis / Valkey objects only (contract
+        // `SensitiveObject`).
+        if let Err(e) = params.check_engine(target.engine) {
+            return self.invalid_params(id, &e);
+        }
         let supported = self
             .connectors
             .iter()
@@ -2278,7 +2287,8 @@ impl Runtime {
             let params =
                 serde_json::from_slice::<databastion_protocol::AuditConfigureParams>(&json)
                     .ok()
-                    .and_then(|p| AuditParams::try_from(&p).ok());
+                    .and_then(|p| AuditParams::try_from(&p).ok())
+                    .filter(|p| p.check_engine(target.engine).is_ok());
             match params {
                 Some(p) if p.enabled() => {
                     tracing::info!(target_id = %target.id, "audit settings restored");
