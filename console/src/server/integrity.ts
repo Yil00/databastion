@@ -22,7 +22,9 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * details and the first `{pointer, keyword}` (pointers are built from contract property names and
  * array indices only, see `validate.ts`); for `target_mismatch` also `target_ids`, the sorted,
  * comma-separated ids of the mismatched targets (agent-declared identifiers, validated against
- * the contract `TargetId` slug pattern, which has no comma; at most `MAX_VALIDATION_DETAILS`).
+ * the contract `TargetId` slug pattern, which has no comma; every mismatched target, up to the
+ * contract's 64 targets per heartbeat, while the error details stay capped at
+ * `MAX_VALIDATION_DETAILS`, #274 review L5).
  * Never another submitted value, a sample or a fingerprint.
  *
  * A misbehaving agent can send such batches in a loop: writes are bounded per agent

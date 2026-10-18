@@ -49,3 +49,10 @@ Until P4-D every console rate limiter kept its counters in memory, per web proce
 - **Storing the keys in clear**: the table would record IPs, usernames as typed (possibly a password), device nonces and agent ids.
 - **Failing open on store failure**: a database outage or saturation would remove every bound on password and secret guessing.
 - **Failing closed everywhere**: a limiter hiccup would make every agent back off on ingest, and the stale-retry limiter would lock agents irreversibly.
+
+## Implementation note (2026-10-18): `target_mismatch` limiters
+Recorded with the #274 review L5 follow-up; it changes no decision above. Two limiters bound the `target_mismatch` agent-integrity rows (a heartbeat target whose `audit_source` does not serve its `engine`, recorded at every heartbeat while it lasts), separately from `integrity.writes_per_agent` so that a persistent mismatch does not use the slots of the other integrity kinds (#235 review N1, #274 review L1):
+- `integrity.target_mismatch_per_agent`: 1 row per agent and hour while the set of mismatched targets stays the same.
+- `integrity.target_mismatch_changes`: up to 12 more rows per agent and hour when the set of mismatched targets differs from the last recorded row's.
+
+Both are audit budgets with the **per-process fallback** of decision 4, like `integrity.writes_per_agent`: the rows go to the same database, and failing closed would hide integrity events. Neither decides what is stored for the targets: every mismatched target is stored without its `audit_source` at every heartbeat.

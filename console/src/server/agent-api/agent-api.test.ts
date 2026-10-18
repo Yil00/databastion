@@ -7,10 +7,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
-import { validateSchema } from "@/lib/protocol/validate";
+import { MAX_VALIDATION_DETAILS, validateSchema } from "@/lib/protocol/validate";
 import schemasBundle from "@/generated/protocol/schemas.gen.json";
 import { MAX_TARGET_NOTES_BYTES } from "@/lib/target-notes";
-import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceDetails } from "@/server/agents";
+import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceMismatches } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
@@ -785,11 +785,14 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         ],
       };
       expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
-      expect(targetSourceDetails(body as never)).toEqual([
-        { pointer: "/targets/1/audit_source", keyword: "const" },
-        { pointer: "/targets/4/audit_source", keyword: "const" },
-        { pointer: "/targets/5/audit_source", keyword: "const" },
-      ]);
+      expect(targetSourceMismatches(body as never)).toEqual({
+        indices: [1, 4, 5],
+        details: [
+          { pointer: "/targets/1/audit_source", keyword: "const" },
+          { pointer: "/targets/4/audit_source", keyword: "const" },
+          { pointer: "/targets/5/audit_source", keyword: "const" },
+        ],
+      });
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);
       const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
@@ -823,6 +826,53 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
           .from(securityEvents)
           .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch"))),
       ).toHaveLength(1);
+    });
+
+    it("#274 review L5: with 25 mismatched targets, every one is stored without its source and listed; only the details are capped", async () => {
+      const auth = await enroll();
+      const bad = Array.from({ length: 25 }, (_v, i) => ({
+        target_id: `pg-${String(i).padStart(2, "0")}`,
+        engine: "postgres",
+        reachable: true,
+        audit_level: "limited",
+        audit_source: "redis_slowlog",
+      }));
+      const good = [
+        { target_id: "pg-ok-a", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "pg_stat_statements" },
+        { target_id: "pg-ok-b", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "pg_stat_statements" },
+      ];
+      // A conforming target first, one in the middle, so the indices are not just 0..24.
+      const targets = [good[0], ...bad.slice(0, 12), good[1], ...bad.slice(12)];
+      const body = { ...MINIMAL_HEARTBEAT, connectors: ["postgres"], targets };
+      expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
+      const found = targetSourceMismatches(body as never);
+      expect(found.indices).toHaveLength(25);
+      expect(found.details).toHaveLength(MAX_VALIDATION_DETAILS);
+      expect(found.details[0]).toEqual({ pointer: "/targets/1/audit_source", keyword: "const" });
+      // The 20th mismatch: positions 1..12, then 14 onwards (position 13 conforms).
+      expect(found.details[MAX_VALIDATION_DETAILS - 1]).toEqual({ pointer: "/targets/21/audit_source", keyword: "const" });
+      expect(found.indices).toEqual([...Array.from({ length: 12 }, (_v, i) => i + 1), ...Array.from({ length: 13 }, (_v, i) => i + 14)]);
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(200);
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(Object.fromEntries(stored.map((t) => [t.targetId, t.auditSource]))).toEqual({
+        ...Object.fromEntries(bad.map((t) => [t.target_id, null])),
+        "pg-ok-a": "pg_stat_statements",
+        "pg-ok-b": "pg_stat_statements",
+      });
+      const events = await getDb()
+        .select()
+        .from(securityEvents)
+        .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
+      expect(events).toHaveLength(1);
+      expect(events[0]?.details).toMatchObject({
+        endpoint: "heartbeat",
+        status: 200,
+        details_count: MAX_VALIDATION_DETAILS,
+        pointer: "/targets/1/audit_source",
+        keyword: "const",
+        target_ids: bad.map((t) => t.target_id).sort().join(","),
+      });
     });
 
     it("#235 review N1: a persistent target_mismatch is recorded once an hour, in its own budget; other integrity events keep theirs", async () => {

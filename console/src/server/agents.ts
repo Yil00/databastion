@@ -128,38 +128,41 @@ async function auditEnrollFailure(db: Database, ip: string | null): Promise<void
  * agent-integrity event; per target (P9-E review M2): the target is stored **without**
  * `audit_source` ({@link withoutMismatchedSources}) and the rest of the heartbeat is processed
  * (no `400`, so a non-conforming target never makes the agent look silent).
+ *
+ * `indices` is the full set of mismatched targets (up to the contract's 64 targets, #274 review
+ * L5): every one of them loses its source and is listed in the event's `target_ids`. Only the
+ * `{pointer, keyword}` `details` are capped at `MAX_VALIDATION_DETAILS`, like every other
+ * validation detail list.
  */
-export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targets">): ValidationDetail[] {
-  const details: ValidationDetail[] = [];
+export interface TargetSourceMismatches {
+  /** Indices (in `hb.targets`) of every mismatched target, ascending. */
+  indices: number[];
+  /** The first `MAX_VALIDATION_DETAILS` of them as validation details. */
+  details: ValidationDetail[];
+}
+
+export function targetSourceMismatches(hb: Pick<Schemas["HeartbeatRequest"], "targets">): TargetSourceMismatches {
+  const indices: number[] = [];
   hb.targets.forEach((t, i) => {
-    if (details.length >= MAX_VALIDATION_DETAILS || t.audit_source === undefined) return;
-    if (!(auditSourceEngines(t.audit_source) as readonly string[]).includes(t.engine)) {
-      details.push({ pointer: `/targets/${i}/audit_source`, keyword: "const" });
-    }
+    if (t.audit_source === undefined) return;
+    if (!(auditSourceEngines(t.audit_source) as readonly string[]).includes(t.engine)) indices.push(i);
   });
-  return details;
+  const details = indices
+    .slice(0, MAX_VALIDATION_DETAILS)
+    .map((i): ValidationDetail => ({ pointer: `/targets/${i}/audit_source`, keyword: "const" }));
+  return { indices, details };
 }
 
-/**
- * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
- * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
- * `dropped-batches.ts`), in the same transaction.
- */
-/** Indices of the targets pointed at by `targetSourceDetails` pointers. */
-function mismatchedIndices(details: readonly ValidationDetail[]): Set<number> {
-  return new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
-}
-
-/** The ids (contract `TargetId`) of the targets pointed at by `details` (#274 review L1). */
-export function mismatchedTargetIds(hb: Pick<Schemas["HeartbeatRequest"], "targets">, details: readonly ValidationDetail[]): string[] {
-  const at = mismatchedIndices(details);
+/** The ids (contract `TargetId`) of the targets at `indices`, all of them (#274 review L1, L5). */
+export function mismatchedTargetIds(hb: Pick<Schemas["HeartbeatRequest"], "targets">, indices: readonly number[]): string[] {
+  const at = new Set(indices);
   return hb.targets.filter((_t, i) => at.has(i)).map((t) => t.target_id);
 }
 
-/** The heartbeat with `audit_source` removed from the targets pointed at by `details`. */
-export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], details: readonly ValidationDetail[]): Schemas["HeartbeatRequest"] {
-  if (details.length === 0) return hb;
-  const drop = mismatchedIndices(details);
+/** The heartbeat with `audit_source` removed from every target at `indices`. */
+export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], indices: readonly number[]): Schemas["HeartbeatRequest"] {
+  if (indices.length === 0) return hb;
+  const drop = new Set(indices);
   return {
     ...hb,
     targets: hb.targets.map((t, i) => {
@@ -170,6 +173,11 @@ export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], detail
   };
 }
 
+/**
+ * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
+ * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
+ * `dropped-batches.ts`), in the same transaction.
+ */
 export async function recordHeartbeat(
   db: Database,
   agentId: string,

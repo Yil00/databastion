@@ -655,7 +655,8 @@ of its own (#235 review N1), since it is detected at every heartbeat for as long
 lasts: one row per agent and hour while the set of mismatched targets stays the same, and a row at
 once when it differs from the last recorded one (at most 12 such rows per agent and hour, PR #274
 review L1); the heartbeats in between are counted in the next row's `suppressed_before`, and its
-details carry `target_ids` (the sorted, comma-separated ids of the mismatched targets). It never
+details carry `target_ids` (the sorted, comma-separated ids of every mismatched target, up to the
+contract's 64, while `details_count` stays capped at 20, #274 review L5). It never
 uses the 20 rows of the other kinds.
 
 ## Metrics
