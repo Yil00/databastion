@@ -2215,6 +2215,16 @@ mod statistics_tests {
     /// read, the rows written so far and the rows asked. Returns the
     /// events handled (time, left out) and the malformed rows met.
     fn walk(rows: &[(i64, Row)], schedule: &[(usize, usize)]) -> (Vec<(i64, bool)>, usize) {
+        let (handled, malformed, _) = walk_seen(rows, schedule);
+        (handled, malformed)
+    }
+
+    /// [`walk`], with the latest time seen after each read
+    /// (`crate::audit::advance_seen`, the stream's rule with the cut).
+    fn walk_seen(
+        rows: &[(i64, Row)],
+        schedule: &[(usize, usize)],
+    ) -> (Vec<(i64, bool)>, usize, Vec<Option<i64>>) {
         use crate::audit::Cursor;
         use crate::audit::xe::xe_next;
         let make = |offset: i64, row: Row| {
@@ -2248,6 +2258,8 @@ mod statistics_tests {
         let mut cursor = Cursor::default();
         let mut handled = Vec::new();
         let mut malformed = 0;
+        let mut seen = None;
+        let mut seens = Vec::new();
         let t0 = Instant::now();
         for (read, &(written, asked)) in schedule.iter().enumerate() {
             // The server: after the buffer at the position, skip rows, then
@@ -2280,6 +2292,9 @@ mod statistics_tests {
             context(&mut recs, true, &own);
             let now = t0 + Duration::from_secs(u64::try_from(read).unwrap());
             let cut = deferrals.cut(&recs, true, &own, now, Duration::from_secs(5));
+            let times: Vec<(usize, i64)> = recs.iter().map(|r| (r.index, r.time_us)).collect();
+            seen = crate::audit::advance_seen(seen, &times, cut);
+            seens.push(seen);
             let (next, gap) = match cut {
                 Some(i) => {
                     recs.retain(|r| r.index < i);
@@ -2295,7 +2310,7 @@ mod statistics_tests {
             handled.extend(recs.iter().map(|r| (r.time_us, r.skip)));
             cursor = next;
         }
-        (handled, malformed)
+        (handled, malformed, seens)
     }
 
     /// Refinement of 2026-10-16, item 4: a read whose own-session build on
@@ -2319,8 +2334,11 @@ mod statistics_tests {
             (4096, Internal),
             (8192, Catalog),
         ];
-        let (handled, _) = walk(&rows, &[(3, 500), (4, 500), (4, 500)]);
+        let (handled, _, seen) = walk_seen(&rows, &[(3, 500), (4, 500), (4, 500)]);
         assert_eq!(handled, want(&[0]), "no duplicate, no drop");
+        // #255 review: the cut read sees only the client's event (0), not
+        // the deferred build (101), read again by the next read.
+        assert_eq!(seen, [Some(0), Some(103), Some(103)]);
 
         // The cut buffer's first events were handled by an earlier full
         // read (`cursor.skip > 0`): the cut adds to the skip count.

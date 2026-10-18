@@ -582,6 +582,28 @@ impl Cursor {
     }
 }
 
+/// The latest time of the records a read handled, for the next position
+/// (`Cursor::max_seen_us`, the history boundary by order; #255 review),
+/// shared by both sources: `seen` advanced by the time of each record of
+/// `handled` (its index in the read, its time, in read order) that comes
+/// before `cut`. `cut` is the index of the record an Extended Events read
+/// ends before (the deferral of an unpaired statistics build): that record
+/// and those after it are read again by the next read, so their times are
+/// not seen yet, and a deferred build stamped late never moves the
+/// boundary past records the next read still has to class. Records the
+/// read drops (history, below the floor, a skip the core asks for) are
+/// handled too: they were read.
+pub(crate) fn advance_seen(
+    seen: Option<i64>,
+    handled: &[(usize, i64)],
+    cut: Option<usize>,
+) -> Option<i64> {
+    handled
+        .iter()
+        .filter(|(i, _)| cut.is_none_or(|at| *i < at))
+        .fold(seen, |m, (_, t)| Cursor::seen(m, *t))
+}
+
 /// The position after a read from `cursor` that returned records at
 /// `positions` (in order), `full` when more may follow; and whether one
 /// buffer went over [`MAX_SKIP`] (a gap). Both sources: the server skipped
@@ -740,6 +762,50 @@ pub(crate) struct Batch<T> {
     /// A buffer above [`MAX_SKIP`] records: the rest of it is lost.
     pub(crate) gap: bool,
     pub(crate) full: bool,
+    /// The read did not come in file order ([`in_file_order`]): the
+    /// server-side skip may have passed over records never handled (a
+    /// gap, #253 review L1).
+    pub(crate) out_of_order: bool,
+}
+
+/// Whether a read from `cursor` returned its records (`positions`, in the
+/// order received) in the order the server-side skip and the position
+/// rely on (#253 review L1, checked at run time): files by their order key
+/// (`key`), then buffer offsets, never going back; the first record after
+/// the position's buffer (a read starts after it) and not before the
+/// buffer whose first records the server skipped. A file name the key
+/// cannot read is out of order too: the order cannot be checked (fail
+/// closed). This is the order `fn_get_audit_file` and
+/// `fn_xe_file_target_read_file` were seen to return (files oldest first,
+/// each in buffer order), which `ORDER BY (SELECT NULL)` does not promise:
+/// any other order is a gap, never trusted.
+pub(crate) fn in_file_order(cursor: &Cursor, positions: &[(String, i64)], key: FileKey) -> bool {
+    let mut keyed = Vec::with_capacity(positions.len());
+    for (f, o) in positions {
+        let Some(k) = key(f) else { return false };
+        keyed.push((k, *o));
+    }
+    if keyed.windows(2).any(|w| w[1] < w[0]) {
+        return false;
+    }
+    let Some(first) = keyed.first() else {
+        return true;
+    };
+    if let Some(f) = &cursor.file {
+        match key(f) {
+            Some(k) if *first > (k, cursor.offset) => {}
+            _ => return false,
+        }
+    }
+    if cursor.skip > 0
+        && let Some((f, o)) = &cursor.buffer
+    {
+        match key(f) {
+            Some(k) if *first >= (k, *o) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The records of a read from `cursor` (the server skipped the first
@@ -763,12 +829,14 @@ pub(crate) fn batch<T: Positioned>(
         kept.retain(|r| key(r.file()).is_none_or(|rk| (rk, r.offset()) > (k, offset)));
     }
     let full = returned >= asked;
+    let out_of_order = !in_file_order(cursor, &positions, key);
     let (next, gap) = next_position(cursor, &positions, full, key);
     Batch {
         kept,
         next,
         gap,
         full,
+        out_of_order,
     }
 }
 
@@ -1292,6 +1360,13 @@ async fn read(
         st.state.audit.note_record(&target_id);
     }
     let mut statements = records::group(records::reassemble(b.kept));
+    // Every statement of the read is handled (`max_seen_us`), those the
+    // core asks to skip included; no cut on this source.
+    let handled: Vec<(usize, i64)> = statements
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.head.time_us))
+        .collect();
     if st.skip > 0 {
         let n = (st.skip as usize).min(statements.len());
         statements.drain(..n);
@@ -1343,6 +1418,7 @@ async fn read(
         st.state.audit.note_dropped(&target_id, below_floor);
     }
     let prev_history = st.cursor.history_us;
+    let seen = advance_seen(st.cursor.max_seen_us, &handled, None);
     st.cursor = b.next;
     st.cursor.max_seen_us = seen;
     if !b.full {
@@ -1350,6 +1426,11 @@ async fn read(
     }
     if b.gap {
         tracing::warn!(target_id = %target_id, "SQL Server Audit: one buffer holds more records than the bound: the rest of it is dropped");
+        st.state.audit.note_gap(&target_id);
+        st.state.audit.note_dropped(&target_id, 1);
+    }
+    if b.out_of_order {
+        tracing::warn!(target_id = %target_id, "SQL Server Audit: the server did not return the audit files in their order: records skipped on the server may never have been read (a gap)");
         st.state.audit.note_gap(&target_id);
         st.state.audit.note_dropped(&target_id, 1);
     }

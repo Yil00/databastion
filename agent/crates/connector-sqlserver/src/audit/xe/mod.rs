@@ -807,10 +807,7 @@ async fn read(
         }
     }
     let prev_history = st.cursor.history_us;
-    let seen = handled
-        .iter()
-        .filter(|(i, _)| cut.is_none_or(|at| *i < at))
-        .fold(st.cursor.max_seen_us, |m, (_, t)| Cursor::seen(m, *t));
+    let seen = super::advance_seen(st.cursor.max_seen_us, &handled, cut);
     st.cursor = next;
     st.cursor.max_seen_us = seen;
     if !b.full && cut.is_none() {
@@ -818,6 +815,11 @@ async fn read(
     }
     if gap {
         tracing::warn!(target_id = %target_id, "Extended Events: one buffer holds more events than the bound: the rest of it is dropped");
+        st.state.audit.note_gap(&target_id);
+        st.state.audit.note_dropped(&target_id, 1);
+    }
+    if b.out_of_order {
+        tracing::warn!(target_id = %target_id, "Extended Events: the server did not return the session's files in their order: events skipped on the server may never have been read (a gap)");
         st.state.audit.note_gap(&target_id);
         st.state.audit.note_dropped(&target_id, 1);
     }
