@@ -66,7 +66,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.failed_logins_not_audited": {
-    "description": "No enabled audit specification records failed logins (FAILED_LOGIN_GROUP): failed authentications are not seen.",
+    "description": "The audit source records no failed logins (SQL Server Audit: no enabled audit specification with FAILED_LOGIN_GROUP; Extended Events: no error_reported event in the session): failed authentications are not seen.",
     "engines": [
       "sqlserver"
     ]

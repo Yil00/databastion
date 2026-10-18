@@ -12,6 +12,7 @@ import { raiseAuditStreamStoppedAlert, recordAuditStreamStops, stoppedStreams } 
 import { addDroppedBatches, droppedBatchesDelta, raiseDroppedBatchesAlert } from "./dropped-batches";
 import { requestNotificationDelivery } from "./notification-queue";
 import { purgeSecretCache } from "./agent-api/auth";
+import { agentAcceptsToStore } from "./agent-api/capabilities";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
@@ -205,6 +206,8 @@ export async function recordHeartbeat(
         classifiersVersion: hb.classifiers_version ?? null,
         connectors: hb.connectors,
         detectedTargets: hb.detected_targets,
+        // ADR-0022 decision 3: what the agent decodes, from its latest heartbeat only.
+        accepts: agentAcceptsToStore(hb.accepts),
         spool: { ...hb.spool },
         metrics: hb.metrics ?? null,
         clockSkewMs,

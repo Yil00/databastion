@@ -288,6 +288,13 @@
       "when": 1792012647311,
       "tag": "0040_p9e_account_not_recorded",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1792330847834,
+      "tag": "0041_p9_agent_accepts",
+      "breakpoints": true
     }
   ]
 }

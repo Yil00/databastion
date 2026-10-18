@@ -424,12 +424,15 @@ export interface components {
          */
         KeyPattern: string;
         /**
-         * @description Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the
-         *     `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
+         * @description Name of an object (`Location.object`, `ObjectRef.object`, `SensitiveObject.object`): an
+         *     `Identifier`, or, for the `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
          *     `engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit
          *     sources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also
          *     checks each event's objects against the schema of the **target's** engine (a `KeyPattern`
          *     that is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).
+         *     `SensitiveObject` names no engine either: the console checks it against the target's
+         *     engine before it queues the job, and the agent against its declared target's engine
+         *     (see `SensitiveObject` for the negotiation).
          *
          *     Written as "exactly one of `Identifier`, or `KeyPattern` but not `Identifier`", which
          *     accepts exactly the union of the two (a name valid under both, such as `orders` or `*`,
@@ -695,9 +698,11 @@ export interface components {
             /**
              * @description Optional **response and job** fields and features this agent build accepts
              *     (ADR-0022). Agents reject unknown fields in every console -> agent body, so the
-             *     console sends a console -> agent field introduced after protocol 0.1.0 (in a response
-             *     or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
-             *     agent omits the list. Unknown tokens are ignored by the console.
+             *     console sends a console -> agent field or value form introduced after protocol 0.1.0
+             *     (in a response or in a job) only when the agent's latest heartbeat listed it. Tokens:
+             *     `sensitive_object.key_pattern` (a `KeyPattern` as `SensitiveObject.object` in
+             *     `audit.configure` jobs for Redis / Valkey targets). An agent built before it omits the
+             *     list. Unknown tokens are ignored by the console.
              */
             accepts?: components["schemas"]["CapabilityList"];
         };
@@ -785,11 +790,18 @@ export interface components {
          *       cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the
          *       minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,
          *       so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's
-         *       column read cut or failed). Each revision is negotiated on its own: a value is sent
-         *       only when the token of its own revision is listed.
+         *       column read cut or failed).
+         *     - `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9
+         *       follow-ups): the SQL Server label below `cas_store_guard_probe`, `on_failure_probe`
+         *       for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
+         *       whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
+         *       read, so records lost to a failing audit target are not counted.
+         *
+         *     Each revision is negotiated on its own: a value is sent only when the token of its own
+         *     revision is listed.
          * @enum {string}
          */
-        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe";
+        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe" | "on_failure_probe";
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
@@ -963,10 +975,30 @@ export interface components {
              */
             sensitive_objects?: components["schemas"]["SensitiveObject"][];
         };
+        /**
+         * @description An object whose accesses are always reported, named as Discovery names it in a finding's
+         *     `Location` (`database`, `schema`, `object`).
+         *
+         *     **Redis / Valkey key patterns** (`sensitive_object.key_pattern`, ADR-0022 decision 3).
+         *     `object` is an `ObjectName`: an `Identifier`, or, on a `redis` or `valkey` target only, a
+         *     `KeyPattern` (e.g. `user:*:email`). An agent built before this change decodes `object` as
+         *     an `Identifier` and cannot decode a job carrying a key pattern that is not one, so the
+         *     console sends such an object only when the agent's latest `HeartbeatRequest.accepts` lists
+         *     `sensitive_object.key_pattern`, and never to an agent that does not (it leaves the object
+         *     out, and counts it). The console checks the object against the schema of the **target's**
+         *     engine, as for `ObjectRef`, and the agent refuses an `audit.configure` job whose key
+         *     pattern names a target of any other engine (`invalid_params`). On a Redis / Valkey target
+         *     the agent matches an event's key pattern against a listed one as a Redis glob in which
+         *     `*` is the only wildcard (any run of characters, separators included), in both
+         *     directions, so a listed `user:*:email` covers the event objects `user:*:email` and
+         *     `user:*`, and the event object `*` (a key no learned pattern names) matches every listed
+         *     pattern of its database; the database `*` (a source that does not tell the database)
+         *     matches any database. The match ignores case and trailing spaces, as on every engine.
+         */
         SensitiveObject: {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
-            object: components["schemas"]["Identifier"];
+            object: components["schemas"]["ObjectName"];
             classifiers: components["schemas"]["ClassifierId"][];
         };
         /**

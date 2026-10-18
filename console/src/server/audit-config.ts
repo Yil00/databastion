@@ -7,6 +7,7 @@ import { objectSensitivity } from "@/lib/event-model";
 import { isKeyPatternEngine } from "@/lib/location-labels";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
+import { agentAccepts } from "./agent-api/capabilities";
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
@@ -35,7 +36,15 @@ import { lockAgentJobs } from "./job-lock";
  *
  * `min_rows` on a key-pattern (Redis / Valkey) target is saved, with a `minRowsWarning` in the
  * answer and the audit entry (#235 review N2): it is not a narrowing of the sensitive objects,
- * but it drops the target's events that carry no signal, since they have no row count.
+ * but it drops the target's events that carry no signal and name no listed key pattern, since
+ * they have no row count.
+ *
+ * Key patterns as sensitive objects (phase 9 follow-ups, contract `SensitiveObject`,
+ * `sensitive_object.key_pattern`, ADR-0022 decision 3): on a Redis / Valkey target, objects named
+ * by a key pattern (`user:*:email`, from findings or typed by hand) are sent only when the agent's
+ * latest heartbeat listed the token (`agents.accepts`); otherwise they are left out and counted
+ * (`skippedKeyPatterns`), since an older agent cannot decode them and would lose the whole job.
+ * On any other target, a hand-typed object that is not an `Identifier` is refused (`invalid`).
  */
 
 export const SHRINK_MIN_REMOVED = 20;
@@ -146,16 +155,28 @@ export async function deriveSensitiveObjects(db: Database | Tx, agentId: string,
   }));
 }
 
+/** The capability token of key patterns as `SensitiveObject.object` (contract `HeartbeatRequest.accepts`). */
+export const KEY_PATTERN_TOKEN = "sensitive_object.key_pattern" as const;
+
+/** Whether `object` is a contract `KeyPattern` that is not an `Identifier` (the `ObjectName` second branch). */
+export function isKeyPatternObject(object: string): boolean {
+  return !validateSchema("Identifier", object).ok && validateSchema("KeyPattern", object).ok;
+}
+
 /**
- * Derived objects the contract can carry as `SensitiveObject`s (P9-E review M3): `object` must be
- * an `Identifier`. A Redis / Valkey finding names a key pattern (`user:*:email`), which is not
- * one: such objects are left out (counted in `skipped`), so the save never fails and Audit can
- * always be turned off. Follow-up: a contract change making `SensitiveObject.object` an
- * `ObjectName` checked against the target's engine (as `ObjectRef`).
+ * Objects the agent can receive as `SensitiveObject`s (P9-E review M3, phase 9 follow-ups): an
+ * `Identifier` always; a key pattern (`user:*:email`, a Redis / Valkey finding) only when
+ * `keyPatterns` (a Redis / Valkey target whose agent listed {@link KEY_PATTERN_TOKEN}). The others
+ * are left out (counted in `skipped`), so the save never fails and Audit can always be turned off.
  */
-export function sendableDerivedObjects<T extends SensitiveObject>(derived: readonly T[]): { objects: T[]; skipped: number } {
-  const objects = derived.filter((o) => validateSchema("Identifier", o.object).ok);
+export function sendableDerivedObjects<T extends SensitiveObject>(derived: readonly T[], keyPatterns = false): { objects: T[]; skipped: number } {
+  const objects = derived.filter((o) => validateSchema("Identifier", o.object).ok || (keyPatterns && isKeyPatternObject(o.object)));
   return { objects, skipped: derived.length - objects.length };
+}
+
+/** Whether the agent's stored capability list (`agents.accepts`) names {@link KEY_PATTERN_TOKEN}. */
+export function agentAcceptsKeyPatterns(accepts: unknown): boolean {
+  return agentAccepts(accepts, KEY_PATTERN_TOKEN);
 }
 
 /**
@@ -247,6 +268,8 @@ export interface AuditConfigView {
   deriveFromFindings: boolean;
   manualObjects: SensitiveObject[];
   sentObjects: SensitiveObject[];
+  /** The agent's latest heartbeat listed {@link KEY_PATTERN_TOKEN} (key patterns can be sent). */
+  agentAcceptsKeyPatterns: boolean;
   warning: AuditWarning | null;
   warningRemoved: number | null;
   updatedAt: Date | null;
@@ -261,6 +284,7 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
     .limit(1);
   if (!t) return null;
+  const [agent] = await db.select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, agentId)).limit(1);
   const [c] = await db
     .select()
     .from(auditConfigs)
@@ -286,6 +310,7 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     deriveFromFindings: c?.deriveFromFindings ?? true,
     manualObjects: (c?.manualObjects ?? []) as unknown as SensitiveObject[],
     sentObjects: (c?.sentObjects ?? []) as unknown as SensitiveObject[],
+    agentAcceptsKeyPatterns: agentAcceptsKeyPatterns(agent?.accepts),
     warning: (c?.warning as AuditWarning | null | undefined) ?? null,
     warningRemoved: c?.warningRemoved ?? null,
     updatedAt: c?.updatedAt ?? null,
@@ -337,7 +362,7 @@ export async function configureAudit(
   const result = await db.transaction(async (tx): Promise<AuditConfigureOutcome> => {
     // Serializes the changes of the agent's settings (and its jobs), as for scan requests.
     const [agent] = await tx
-      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt })
+      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
       .from(agents)
       .where(eq(agents.id, agentId))
       .for("update")
@@ -350,12 +375,20 @@ export async function configureAudit(
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
-    const rowsWarning = minRowsWarning(isKeyPatternEngine(target.engine), input.minRows);
-    // Key-pattern objects (Redis / Valkey findings) are not `SensitiveObject`s yet: left out (M3).
-    const { objects: derived, skipped: skippedKeyPatterns } = sendableDerivedObjects(
+    const keyPatternTarget = isKeyPatternEngine(target.engine);
+    const rowsWarning = minRowsWarning(keyPatternTarget, input.minRows);
+    // A key pattern names a Redis / Valkey object only (contract `SensitiveObject`, as `ObjectRef`).
+    if (!keyPatternTarget && input.manualObjects.some((o) => !validateSchema("Identifier", o.object).ok)) return { outcome: "invalid" };
+    // Key patterns go only to an agent that listed the token (ADR-0022 decision 3); otherwise
+    // they are left out and counted (M3), from the findings and from the manual objects alike.
+    const keyPatterns = keyPatternTarget && agentAcceptsKeyPatterns(agent.accepts);
+    const { objects: derived, skipped: skippedDerived } = sendableDerivedObjects(
       input.deriveFromFindings ? await deriveSensitiveObjects(tx, agentId, targetId) : [],
+      keyPatterns,
     );
-    const { objects, truncated } = mergeSensitiveObjects(derived, input.manualObjects);
+    const { objects: manual, skipped: skippedManual } = sendableDerivedObjects(input.manualObjects, keyPatterns);
+    const skippedKeyPatterns = skippedDerived + skippedManual;
+    const { objects, truncated } = mergeSensitiveObjects(derived, manual);
     // Turning Audit off always works (M3): the objects are only a hint while it is off.
     const params = buildAuditParams(input, objects) ?? (input.enabled ? null : buildAuditParams(input, []));
     if (!params) return { outcome: "invalid" };

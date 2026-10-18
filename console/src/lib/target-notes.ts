@@ -96,10 +96,10 @@ const ROLE_ATTRIBUTES = new Set(["superuser", "bypassrls", "replication", "creat
 /**
  * Labels shown as sent: predefined roles, audit collection states, check stages, `other`; SQL
  * Server fixed database roles (`db_owner`…) and check probes (revisions
- * `target_status.note_labels.2026_10` and `2026_10_b`).
+ * `target_status.note_labels.2026_10`, `2026_10_b` and `2026_10_c`).
  */
 const VERBATIM =
-  /^(pg_|stage_|db_)|^(logging_on|logging_off|file_output|non_file_output|other|password_hash_probe|logon_trigger_probe|refusal_list_probe|cas_store_guard_probe)$/;
+  /^(pg_|stage_|db_)|^(logging_on|logging_off|file_output|non_file_output|other|password_hash_probe|logon_trigger_probe|refusal_list_probe|cas_store_guard_probe|on_failure_probe)$/;
 /** SQL Server fixed server roles, shown in lower case as SQL Server names them. */
 const SQL_SERVER_FIXED_SERVER_ROLES = new Set([
   "sysadmin",
@@ -120,7 +120,8 @@ const SQL_SERVER_FIXED_SERVER_ROLES = new Set([
  * roles as SQL Server names them (`sysadmin`, `db_owner`), the SQL Server 2022 roles in their
  * `##MS_…##` form (`ms_login_manager` -> `##MS_LoginManager##`), permissions in upper case with
  * spaces (`CONTROL SERVER`, `ALTER ANY EVENT SESSION`; revision `2026_10_b`: `ALTER ANY DATABASE
- * EVENT SESSION`), check probes as sent (`logon_trigger_probe`). A label that is not a contract value (e.g.
+ * EVENT SESSION`), check probes as sent (`logon_trigger_probe`; revision `2026_10_c`:
+ * `on_failure_probe`). A label that is not a contract value (e.g.
  * stored by a newer console build) is shown raw.
  */
 export function labelDisplayName(label: string): string {

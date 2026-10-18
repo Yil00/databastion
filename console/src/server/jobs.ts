@@ -1,10 +1,11 @@
 import { and, eq, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
-import { jobs } from "@/db/schema";
+import { agents, jobs } from "@/db/schema";
 import { logger } from "@/lib/logger";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
+import { agentAccepts } from "./agent-api/capabilities";
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { lockAgentJobs } from "./job-lock";
 import { AGENT_ONLINE_WINDOW_S, heldScanExpirySql, scanAnchorSql, scanBudgetSql, scanInFlightSql, sweepDeadScans } from "./scans";
@@ -105,6 +106,38 @@ function toContractJob(r: ClaimedRow): Record<string, unknown> {
   return job;
 }
 
+/** Whether a sensitive object's name is a key pattern that is not an `Identifier` (contract `ObjectName`). */
+function isKeyPatternName(object: unknown): boolean {
+  return typeof object === "string" && !validateSchema("Identifier", object).ok;
+}
+
+/**
+ * ADR-0022 decision 3, checked again at delivery (phase 9 follow-ups): an `audit.configure` job
+ * carries key patterns as `SensitiveObject.object` only for an agent whose latest heartbeat listed
+ * `sensitive_object.key_pattern`. The settings are computed with the agent's list of the moment
+ * (`audit-config.ts`); an agent downgraded or rolled back before the delivery would fail to decode
+ * the whole job, so its key-pattern objects are left out of what is delivered (logged with their
+ * count, never their names). The stored job and settings are unchanged.
+ */
+async function withoutUnacceptedKeyPatterns(db: Database, agentId: string, rows: ClaimedRow[]): Promise<void> {
+  const carrying = rows.filter((r) => {
+    const objects = (r.params as { sensitive_objects?: { object?: unknown }[] }).sensitive_objects;
+    return r.type === "audit.configure" && Array.isArray(objects) && objects.some((o) => isKeyPatternName(o?.object));
+  });
+  if (carrying.length === 0) return;
+  const [agent] = await db.select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, agentId)).limit(1);
+  if (agentAccepts(agent?.accepts, "sensitive_object.key_pattern")) return;
+  for (const r of carrying) {
+    const params = r.params as { sensitive_objects: { object?: unknown }[] };
+    const kept = params.sensitive_objects.filter((o) => !isKeyPatternName(o?.object));
+    logger.warn(
+      { jobId: r.id, agentId, left_out: params.sensitive_objects.length - kept.length },
+      "audit.configure delivered without its key-pattern sensitive objects: the agent does not list sensitive_object.key_pattern",
+    );
+    r.params = { ...r.params, sensitive_objects: kept };
+  }
+}
+
 /**
  * Leases up to 16 deliverable jobs of the agent (pending, or delivered with an expired lease),
  * oldest first (`FOR UPDATE SKIP LOCKED`: concurrent polls never get the same job twice within a
@@ -193,6 +226,7 @@ async function claimOnce(
       );
     }
   }
+  await withoutUnacceptedKeyPatterns(db, agentId, claimed);
   const out: Schemas["Job"][] = [];
   let rejectedScan = false;
   for (const row of [...claimed].sort((a, b) => iso(a.created_at).localeCompare(iso(b.created_at)))) {

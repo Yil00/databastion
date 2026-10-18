@@ -723,8 +723,9 @@ integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQ
 and MySQL / MariaDB privileges in upper case, SQL Server permissions in upper case with spaces,
 SQL Server fixed roles as SQL Server names them, `##MS_…##` for the SQL Server 2022 roles, the
 other labels, the `check()` probes such as `logon_trigger_probe` included, as sent; the SQL Server
-labels are those of revisions `target_status.note_labels.2026_10` and
-`target_status.note_labels.2026_10_b`, both listed by the console in `accepts`), in one
+labels are those of revisions `target_status.note_labels.2026_10`,
+`target_status.note_labels.2026_10_b` and `target_status.note_labels.2026_10_c`
+(`on_failure_probe`), all listed by the console in `accepts`), in one
 non-recursive pass;
 a code this console does not know is shown raw with its count and labels. Everything is rendered as
 text (escaped). The console never derives a decision from notes.
@@ -1106,12 +1107,19 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   of those sent last time needs a confirmation of the exact settings (a digest: if the findings
   change in between, confirm again), is audited, and leaves a warning on the target until a later
   change that does not narrow Audit. The first configuration of a target never warns.
-  Redis / Valkey targets (P9-E review M3): the contract's `SensitiveObject.object` is an
-  `Identifier`, so derived objects named by a key pattern are left out of the settings sent
-  (counted in `skipped_key_patterns` of the answer and in the audit entry; the save never fails
-  because of them, and turning Audit off always works), the Audit page says so, and manual
-  objects are typed `database; object; classifier, …` (split on `;` only, never on `/` or `:`).
-  Key patterns typed by hand are refused until the contract carries them.
+  Redis / Valkey targets (P9-E review M3, phase 9 follow-ups): the contract's
+  `SensitiveObject.object` is an `ObjectName`, so a key pattern (`user:*:email`) can be a
+  sensitive object of a Redis / Valkey target, but it is sent only to an agent whose latest
+  heartbeat listed `sensitive_object.key_pattern` in `HeartbeatRequest.accepts` (ADR-0022
+  decision 3; the console stores the known tokens in `agents.accepts`, migration `0041`, and
+  lists them in `AGENT_TOKENS`, `src/server/agent-api/capabilities.ts`). For an older agent,
+  derived and manual objects named by a key pattern are left out of the settings sent (counted
+  in `skipped_key_patterns` of the answer and in the audit entry; the save never fails because
+  of them, and turning Audit off always works), and the Audit page says so. The check is made
+  again at delivery (`src/server/jobs.ts`): a job queued for an agent that no longer lists the
+  token goes out without its key patterns (logged with their count). Manual objects are typed
+  `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
+  typed by hand for a target of any other engine is refused (`400 invalid_params`).
 
 ## Alerting
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:

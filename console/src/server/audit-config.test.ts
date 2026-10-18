@@ -2,7 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { auditConfigs, auditLog, jobs, users } from "@/db/schema";
+import { agents, auditConfigs, auditLog, jobs, users } from "@/db/schema";
 import { minRowsWarning } from "@/lib/audit-warning";
 import { validateSchema } from "@/lib/protocol/validate";
 import { failuresPerAgent } from "@/server/agent-api/auth";
@@ -306,12 +306,14 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(row).toMatchObject({ enabled: false, warning: "disabled" });
   });
 
-  it("P9-E review M3: on a Redis target, key-pattern findings are left out of the settings, never failing the save; turning Audit off works", async () => {
+  /** An agent with a Redis target and two findings there: a key pattern and a plain name. */
+  async function redisAgentWithFindings(accepts?: string[]): Promise<Auth> {
     const auth = await enroll();
     const hb = {
       ...HEARTBEAT,
       connectors: ["postgres", "redis"],
       targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+      ...(accepts ? { accepts } : {}),
     };
     expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
     await enqueueJob(getDb(), {
@@ -332,6 +334,11 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     });
     const body = { batch_id: uuidv7(), job_id: list[0]?.job_id, classifiers_version: "2026.09.1", findings: [redisFinding("user:*:profile"), redisFinding("profiles")] };
     expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+    return auth;
+  }
+
+  it("P9-E review M3: on a Redis target of an agent without sensitive_object.key_pattern, key patterns are left out, never failing the save; turning Audit off works", async () => {
+    const auth = await redisAgentWithFindings();
     const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
     expect(on.status).toBe(202);
     expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
@@ -339,6 +346,7 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(job?.params).toMatchObject({ enabled: true, sensitive_objects: [{ database: "db0", schema: "hash", object: "profiles", classifiers: ["pii.email"] }] });
     const [audit] = await audits(auth.agentId);
     expect(audit?.details).toMatchObject({ derived_objects: 1, skipped_key_patterns: 1 });
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.agentAcceptsKeyPatterns).toBe(false);
     // Turning Audit off: confirmation, then queued.
     const off = await configure(auth, { enabled: false }, { target: "cache-redis" });
     expect(off.status).toBe(409);
@@ -346,9 +354,73 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect((await configure(auth, { enabled: false, confirm: d.digest }, { target: "cache-redis" })).status).toBe(202);
     const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
     expect(row).toMatchObject({ enabled: false });
-    // A key pattern typed by hand is still refused (not a SensitiveObject yet).
-    const manual = await configure(auth, { enabled: true, manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }] }, { target: "cache-redis" });
-    expect(manual.status).toBe(400);
+    // A key pattern typed by hand is kept in the settings but left out of the job, and counted
+    // (here the change empties the objects sent: a confirmation first).
+    const settings = {
+      enabled: true,
+      derive_from_findings: false,
+      manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }],
+    };
+    const emptied = await configure(auth, settings, { target: "cache-redis" });
+    expect(emptied.status).toBe(409);
+    const e = (await emptied.json()) as { digest: string; skipped_key_patterns: number; warning: string };
+    expect(e).toMatchObject({ warning: "emptied", skipped_key_patterns: 1 });
+    const manual = await configure(auth, { ...settings, confirm: e.digest }, { target: "cache-redis" });
+    expect(manual.status).toBe(202);
+    expect(await manual.json()).toMatchObject({ next_objects: 0, skipped_key_patterns: 1 });
+    const [latest] = await auditJobs(auth.agentId);
+    expect(latest?.params).toMatchObject({ enabled: true, sensitive_objects: [] });
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.manualObjects).toEqual([{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }]);
+  });
+
+  it("phase 9 follow-ups: an agent that lists sensitive_object.key_pattern receives the key patterns, from findings and typed by hand", async () => {
+    const auth = await redisAgentWithFindings(["future.feature", "sensitive_object.key_pattern"]);
+    const [stored] = await getDb().select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, auth.agentId));
+    // Only the tokens this console knows are stored.
+    expect(stored?.accepts).toEqual(["sensitive_object.key_pattern"]);
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.agentAcceptsKeyPatterns).toBe(true);
+    const on = await configure(
+      auth,
+      { enabled: true, manual_objects: [{ database: "db1", object: "session|*|token", classifiers: ["pii.phone"] }] },
+      { target: "cache-redis" },
+    );
+    expect(on.status).toBe(202);
+    expect(await on.json()).toMatchObject({ next_objects: 3, skipped_key_patterns: 0 });
+    const [job] = await auditJobs(auth.agentId);
+    const sent = (job?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    expect(sent).toEqual(["profiles", "session|*|token", "user:*:profile"]);
+    // Delivered as such, and a conforming JobList.
+    const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+    const { jobs: list } = (await polled.json()) as { jobs: { type: string; params: { sensitive_objects: SensitiveObject[] } }[] };
+    const delivered = list.find((j) => j.type === "audit.configure");
+    expect(delivered?.params.sensitive_objects.map((o) => o.object).sort()).toEqual(sent);
+    expect(validateSchema("JobList", { jobs: list }).ok).toBe(true);
+  });
+
+  it("phase 9 follow-ups: a job queued for an agent that listed the token is delivered without its key patterns once the agent no longer lists it", async () => {
+    const auth = await redisAgentWithFindings(["sensitive_object.key_pattern"]);
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    // A rolled-back agent: its next heartbeat lists nothing.
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "redis"],
+      targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+    const { jobs: list } = (await polled.json()) as { jobs: { type: string; params: { sensitive_objects: SensitiveObject[] } }[] };
+    const delivered = list.find((j) => j.type === "audit.configure");
+    expect(delivered?.params.sensitive_objects.map((o) => o.object)).toEqual(["profiles"]);
+    // The stored job is unchanged.
+    const [job] = await auditJobs(auth.agentId);
+    expect((job?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects).toHaveLength(2);
+  });
+
+  it("phase 9 follow-ups: a key pattern typed by hand for a target of another engine is refused", async () => {
+    const auth = await agentWithFindings([]);
+    const r = await configure(auth, { enabled: true, manual_objects: [{ database: "crm", object: "user:*:email", classifiers: ["pii.email"] }] });
+    expect(r.status).toBe(400);
+    expect(await auditJobs(auth.agentId)).toHaveLength(0);
   });
 
   it("#235 review N2: min_rows on a Redis / Valkey target is saved with a warning, in the answer and the audit entry", async () => {
