@@ -327,6 +327,26 @@ jobs:
                 -Q "REVOKE VIEW SERVER PERFORMANCE STATE FROM databastion"' || true
           fi
           exit "$status"
+      # Not continue-on-error: the main run must never start with the fresh-server test's
+      # Extended Events grant still held by the agent login (2022+; on 2019 the grant is the dev
+      # script's own). Fails the job when the grant is still there or cannot be read.
+      - name: SQL Server grants after the measurement
+        if: matrix.it == 'sqlserver' && matrix.sqlserver_major != '15'
+        run: |
+          # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+          n="$(timeout 120 docker compose -f dev/docker-compose.yml exec -T sqlserver bash -c '
+            enc=(-C)
+            if [ "${DATABASTION_DEV_SQLSERVER_FORCE_STRICT:-0}" = 1 ]; then enc=(-N s -J /var/opt/mssql/databastion-tls/server.pem); fi
+            SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa "${enc[@]}" -b -h -1 -W \
+              -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.server_permissions p JOIN sys.server_principals s
+                  ON s.principal_id = p.grantee_principal_id WHERE s.name = N'"'"'databastion'"'"'
+                  AND p.permission_name = N'"'"'VIEW SERVER PERFORMANCE STATE'"'"' AND p.state IN ('"'"'G'"'"', '"'"'W'"'"')"' \
+            | tr -d '[:space:]')"
+          if [ "$n" != 0 ]; then
+            echo "::error title=Extended Events grant left::the agent login still holds VIEW SERVER PERFORMANCE STATE after the fresh-server measurement (count '${n}'): the main run would start with an extra grant"
+            exit 1
+          fi
+          echo "the agent login holds no VIEW SERVER PERFORMANCE STATE: the main run starts from the dev grants"
       # Same commands, variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the ci.yml
       # job of this engine (dev/agent-it.sh); every probe is required.
       - name: Connector integration tests
@@ -430,11 +450,21 @@ jobs:
       - name: shellcheck
         run: timeout 60 shellcheck -x e2e/sqlserver.sh e2e/lib.sh
       - name: Run e2e/sqlserver.sh
-        # Within the job budget (45 min): cleanup always completes. The scenario's own lines (never a
-        # secret: sqlserver.sh masks them in the job log) are kept for the summary.
+        # Within the job budget (45 min): cleanup always completes. Every line goes to the job log
+        # unchanged (the runner reads the `::add-mask::` commands there); the copy kept for the
+        # summary leaves those commands out, since each one holds a secret in clear text. A plain
+        # loop rather than `tee >(…)`: it ends with the pipeline, so the copy is complete when the
+        # step ends, and pipefail keeps sqlserver.sh's exit status.
         run: |
           set -o pipefail
-          timeout 2280 e2e/sqlserver.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          : >"$RUNNER_TEMP/e2e.log"
+          timeout 2280 e2e/sqlserver.sh 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+            case "$line" in
+              ::add-mask::*) ;;
+              *) printf '%s\n' "$line" >>"$RUNNER_TEMP/e2e.log" ;;
+            esac
+          done
       - name: Summary
         if: always()
         run: |

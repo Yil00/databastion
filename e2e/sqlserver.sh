@@ -331,6 +331,10 @@ if [ "$MSSQL_MAJOR" -ge 17 ]; then
   mode=mandatory
   [[ "$line" != *"(edition 4), strict encryption"* ]] || mode=strict
   log "${TARGET}: SQL Server ${MSSQL_VERSION} without forced strict: \`auto\` reached ${mode} encryption (certificate verified against the dev CA)"
+  # Accepted until a first run has measured the mode (e2e/README.md); then asserted strict.
+  if [ "$mode" = mandatory ] && [ "${GITHUB_ACTIONS:-}" = true ]; then
+    echo "::warning title=SQL Server ${MSSQL_VERSION} TLS::tls auto reached mandatory, not strict, on SQL Server ${MSSQL_VERSION} without forced strict"
+  fi
 else
   [[ "$line" == *"(edition 4), mandatory encryption"* ]] \
     || fail "${TARGET}: no 'SQL Server checked' line with the Express edition and mandatory encryption in the agent log"

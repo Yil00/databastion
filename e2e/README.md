@@ -653,7 +653,9 @@ the first target's sessions as another login's. The same scenario, with these di
   revokes the two SQL Server Audit grants and grants it as `sa` before the agent starts.
 - Step 2: 2025 runs without `network.forcestrict` (the engine matrix covers forced strict); the
   agent's `auto` tries strict first, and the run prints the mode it reached (`strict` or
-  `mandatory`, both accepted). 2019 and 2022: `mandatory`, as above.
+  `mandatory`, both accepted; `mandatory` also raises a GitHub Actions warning). This is
+  temporary: once the first run has measured the mode, the check becomes an assertion of that mode
+  (`strict` expected). 2019 and 2022: `mandatory`, as above.
 - Step 4, `sqlserver_xevents`: **Partial** from `sqlserver_xevents` **without**
   `audit.log_without_row_counts` (this source has row counts), and none of `audit.xe_events_missing`,
   `audit.xe_session_filtered`, `audit.xe_causality_off` either.
