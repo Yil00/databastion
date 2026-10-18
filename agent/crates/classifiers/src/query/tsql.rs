@@ -849,18 +849,37 @@ impl<'a> Lexer<'a> {
 }
 
 /// The first significant keyword's kind.
-fn kind_of(first: Option<&str>, second: Option<&str>) -> TsqlKind {
-    match first {
+fn kind_of<'a>(words: impl IntoIterator<Item = &'a str>) -> TsqlKind {
+    let w: Vec<&str> = words.into_iter().take(4).collect();
+    let rest = w.get(1..).unwrap_or_default();
+    match w.first().copied() {
         Some("select") => TsqlKind::Select,
         Some("insert" | "update" | "delete" | "merge") => TsqlKind::Write,
         Some("exec" | "execute") => TsqlKind::Execute,
         Some("backup" | "restore") => TsqlKind::Backup,
         Some("dbcc") => TsqlKind::Dbcc,
-        Some("bulk") if second == Some("insert") => TsqlKind::Bulk,
+        Some("bulk") if rest.first() == Some(&"insert") => TsqlKind::Bulk,
+        Some("create" | "alter" | "drop") if principal_securable(rest) => TsqlKind::Dcl,
         Some("create" | "alter" | "drop" | "truncate") => TsqlKind::Ddl,
         Some("grant" | "deny" | "revoke") => TsqlKind::Dcl,
         _ => TsqlKind::Other,
     }
+}
+
+/// Whether the words after `CREATE` / `ALTER` / `DROP` name a principal or
+/// a credential: the securables of the SQL Server Audit principal classes
+/// (`sys.dm_audit_class_type_map`: login, user, role, application role,
+/// server role, credential, database scoped credential), whose `CREATE` /
+/// `ALTER` / `DROP` that source reports as DCL. The Extended Events source,
+/// which has the text only, reports them as DCL too (`DROP LOGIN x` is a
+/// principal change, as on SQL Server Audit, not DDL).
+fn principal_securable(rest: &[&str]) -> bool {
+    matches!(
+        rest,
+        ["login" | "user" | "role" | "credential", ..]
+            | ["application" | "server", "role", ..]
+            | ["database", "scoped", "credential", ..]
+    )
 }
 
 /// Whether the first words name a password-bearing statement.
@@ -946,10 +965,7 @@ pub fn analyze_tsql(text: &str, truncated: bool) -> TsqlAnalysis {
             }
         }
     }
-    let kind = main_kind(&toks).unwrap_or_else(|| {
-        let mut words = toks.iter().filter_map(Tok::word);
-        kind_of(words.next(), words.next())
-    });
+    let kind = main_kind(&toks).unwrap_or_else(|| kind_of(toks.iter().filter_map(Tok::word)));
     if !lexed || truncated {
         let mut a = TsqlAnalysis::kind_only(kind);
         // A cut or unlexable text still says what it is when its first
@@ -990,10 +1006,7 @@ fn placeholder(text: &str) -> (TsqlKind, bool) {
     let refs: Vec<&str> = lower.iter().map(String::as_str).collect();
     let credential =
         credential_prefix(&refs) || refs.first().is_some_and(|w| credential_procedure(w));
-    (
-        kind_of(refs.first().copied(), refs.get(1).copied()),
-        credential,
-    )
+    (kind_of(refs.iter().copied()), credential)
 }
 
 /// The lexer stopped at the name of a password-taking procedure (the last
@@ -1027,8 +1040,7 @@ fn at_credential_procedure(toks: &[Tok]) -> TsqlAnalysis {
         a.credential = true;
         return a;
     }
-    let mut words = toks.iter().filter_map(Tok::word);
-    let kind = main_kind(toks).unwrap_or_else(|| kind_of(words.next(), words.next()));
+    let kind = main_kind(toks).unwrap_or_else(|| kind_of(toks.iter().filter_map(Tok::word)));
     TsqlAnalysis::kind_only(kind)
 }
 
@@ -1053,7 +1065,7 @@ fn main_kind(toks: &[Tok]) -> Option<TsqlKind> {
             && let Some(w) = t.word()
             && matches!(w, "select" | "insert" | "update" | "delete" | "merge")
         {
-            return Some(kind_of(Some(w), None));
+            return Some(kind_of([w]));
         }
     }
     None
@@ -2469,6 +2481,36 @@ mod tests {
         assert_eq!(an("").kind, TsqlKind::Other);
         assert_eq!(an("GRANT SELECT ON t TO u").kind, TsqlKind::Dcl);
         assert_eq!(an("DROP TABLE t").kind, TsqlKind::Ddl);
+        // Principals and credentials: DCL, as the SQL Server Audit
+        // principal classes (`DROP LOGIN` is `DR` on class `SL` there).
+        for dcl in [
+            "DROP LOGIN e2e_dcl_probe;",
+            "drop login [x]",
+            "DROP USER u",
+            "CREATE ROLE r",
+            "ALTER ROLE r ADD MEMBER u",
+            "DROP APPLICATION ROLE a",
+            "ALTER SERVER ROLE sysadmin ADD MEMBER x",
+            "DROP CREDENTIAL c",
+            "DROP DATABASE SCOPED CREDENTIAL c",
+            "/* c */ DROP LOGIN x",
+        ] {
+            let a = an(dcl);
+            assert_eq!(a.kind, TsqlKind::Dcl, "{dcl}");
+            assert!(!a.credential && a.relations.is_empty(), "{dcl}");
+        }
+        for ddl in [
+            "DROP TABLE [user]",
+            "DROP TABLE dbo.login",
+            "ALTER DATABASE retail SET RECOVERY SIMPLE",
+            "ALTER SERVER AUDIT a WITH (STATE = ON)",
+            "ALTER SERVER CONFIGURATION SET PROCESS AFFINITY CPU = AUTO",
+            "CREATE DATABASE AUDIT SPECIFICATION s FOR SERVER AUDIT a",
+            "DROP SCHEMA login",
+            "TRUNCATE TABLE login",
+        ] {
+            assert_eq!(an(ddl).kind, TsqlKind::Ddl, "{ddl}");
+        }
     }
 
     /// `db.schema.name` of each relation (`-` for a missing part).
@@ -2737,8 +2779,12 @@ mod tests {
         // statement.
         let a = an("-- CREATE LOGIN");
         assert!(a.comment_only && a.relations.is_empty());
-        assert_eq!(a.kind, TsqlKind::Ddl);
+        assert_eq!(a.kind, TsqlKind::Dcl);
         assert!(a.credential);
+        // `ALTER LOGIN … WITH PASSWORD` (measured on 2022, 16.0.4305.5).
+        let a = an("-- ALTER LOGIN");
+        assert!(a.comment_only && a.credential);
+        assert_eq!(a.kind, TsqlKind::Dcl);
         assert!(an("-- CREATE CREDENTIAL").credential);
         assert!(an("-- sp_addlogin").credential);
         let s = an("-- SELECT");

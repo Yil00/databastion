@@ -535,7 +535,8 @@ rm -f -- "$E2E_WORK_DIR/events.json" "$E2E_WORK_DIR/incidents.json"
 # The source side (positive control of the literal scan below): the source's own files hold the
 # analyst's statements with their literals, and the DCL statements (read as sa, kept private).
 # SQL Server Audit: the audit file. Extended Events: the session's files, where a password-bearing
-# statement is a placeholder (`-- CREATE LOGIN`, docs/08 "Extended Events: what is kept").
+# statement is a placeholder (`-- CREATE LOGIN`, `-- ALTER LOGIN`, docs/08 "Extended Events: what
+# is kept"); the agent reports both, and the DROP LOGIN, as DCL.
 if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
   SRC_LABEL="the Extended Events files"
   mssql_sa_q "SELECT s.stmt_text FROM (${XE_STATEMENTS}) s WHERE s.principal_name IN (N'e2e_analyst', N'e2e_admin')" \
@@ -563,6 +564,8 @@ if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
     || fail "cannot count the agent's own statement events"
   grep -qiE 'CREATE LOGIN' "$E2E_WORK_DIR/target-audit.log" \
     || fail "Audit: no CREATE LOGIN (or its placeholder) in ${SRC_LABEL}"
+  grep -qiE 'ALTER LOGIN' "$E2E_WORK_DIR/target-audit.log" \
+    || fail "Audit: no ALTER LOGIN (or its placeholder) in ${SRC_LABEL}"
   grep -qiE 'DROP LOGIN .*e2e_dcl_probe' "$E2E_WORK_DIR/target-audit.log" \
     || fail "Audit: no DROP LOGIN of e2e_dcl_probe in ${SRC_LABEL}"
 else
