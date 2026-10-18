@@ -89,6 +89,7 @@ struct Stream<'a> {
     own: OwnAccount,
     store: Option<CursorStore>,
     own_store: Option<CursorStore>,
+    gap_store: Option<CursorStore>,
     cursor: Cursor,
     saved: Option<Vec<u8>>,
     skip: u32,
@@ -128,6 +129,7 @@ impl Stream<'_> {
         {
             tracing::warn!(error = %e, "SQL Server own sessions not saved");
         }
+        super::save_gap(self.gap_store.as_ref(), self.state, &self.target.id);
     }
 
     /// Whether a statement of one of the agent's sessions is its own
@@ -370,6 +372,7 @@ pub(crate) async fn stream(
         .persisted(cfg),
         store,
         own_store,
+        gap_store: cfg.counters(super::GAP_FACTS),
         cursor,
         saved: None,
         skip,

@@ -1038,3 +1038,67 @@ fn a_statement_split_across_reads_gives_two_events() {
     let (ev, _) = records::convert(&parts[1]).unwrap();
     assert!(ev.always_report(), "the cut part is always reported");
 }
+
+/// End-of-phase-9 review L5: the 24 h gap memory survives an agent
+/// restart (another `Shared`, as in the next process), so the target does
+/// not show Partial again before the 24 h after a gap are over.
+#[test]
+fn the_gap_memory_survives_a_restart() {
+    let t = "gap-test";
+    let before = Shared::default();
+    before.note_gap(t);
+    before.note_dropped(t, 3);
+    let bytes = before.encode_gap(t);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.starts_with("v1\ngap ") && text.contains("\ndropped 3 "),
+        "{text}"
+    );
+
+    let after = Shared::default();
+    assert!(!after.facts(t).gap);
+    after.restore_gap(t, &bytes);
+    let f = after.facts(t);
+    assert!(f.gap, "the gap is remembered");
+    assert_eq!(f.dropped, 3);
+    // A stream restarted in the same process: not counted twice.
+    after.restore_gap(t, &bytes);
+    assert_eq!(after.facts(t).dropped, 3);
+    after.note_dropped(t, 1);
+    after.restore_gap(t, &bytes);
+    assert_eq!(after.facts(t).dropped, 4);
+
+    // Older than 24 h: forgotten.
+    let old_ms = agent_now_ms() - i64::try_from(FRESHNESS.as_millis()).unwrap() - 1_000;
+    let other = Shared::default();
+    other.restore_gap(
+        t,
+        format!("v1\ngap {old_ms}\ndropped 5 {old_ms}\n").as_bytes(),
+    );
+    let f = other.facts(t);
+    assert!(!f.gap && f.dropped == 0);
+    // Ahead of the agent's clock (it went back): counted from now.
+    let ahead = agent_now_ms() + 3_600_000;
+    other.restore_gap(t, format!("v1\ngap {ahead}\n").as_bytes());
+    assert!(other.facts(t).gap);
+    // Nothing to remember: an empty memory.
+    assert_eq!(Shared::default().encode_gap(t), b"v1\n");
+    // A file not understood restores nothing.
+    for bad in [
+        "",
+        "v2\n",
+        "v1\ngap x\n",
+        "v1\ngap 1 2\n",
+        "v1\nother 1\n",
+        "v1\ndropped 1\n",
+    ] {
+        let s = Shared::default();
+        s.restore_gap(t, bad.as_bytes());
+        assert!(!s.facts(t).gap, "{bad:?}");
+        assert!(decode_gap(bad.as_bytes()).is_none(), "{bad:?}");
+    }
+    // The level rule reads the restored gap: Limited, not Partial.
+    let s = Shared::default();
+    s.restore_gap(t, &bytes);
+    assert!(s.facts(t).gap);
+}

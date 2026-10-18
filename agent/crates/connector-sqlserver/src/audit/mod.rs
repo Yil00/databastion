@@ -113,6 +113,8 @@ pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
 const OWN_SESSIONS: &str = "sqlserver_own_sessions";
+/// The 24 h gap memory's file (end-of-phase-9 review L5).
+const GAP_FACTS: &str = "sqlserver_gap";
 /// Largest own-sessions file written (the core's counters bound).
 const OWN_FILE_BYTES: usize = 2 * 1024 * 1024 - 4096;
 /// The server's error for a position outside the audit's file set.
@@ -293,6 +295,74 @@ impl Shared {
         }
     }
 
+    /// The 24 h gap memory of `target_id` for its counters file
+    /// (end-of-phase-9 review L5): the agent's wall-clock time (Unix ms)
+    /// of the last gap and of the start of the dropped-records count, and
+    /// that count; nothing older than [`FRESHNESS`].
+    pub(crate) fn encode_gap(&self, target_id: &str) -> Vec<u8> {
+        let now_ms = agent_now_ms();
+        let at_ms = |t: &Instant| {
+            now_ms.saturating_sub(i64::try_from(t.elapsed().as_millis()).unwrap_or(i64::MAX))
+        };
+        let mut out = String::from("v1\n");
+        if let Some(t) = lock(&self.gap)
+            .get(target_id)
+            .filter(|t| t.elapsed() < FRESHNESS)
+        {
+            out.push_str(&format!("gap {}\n", at_ms(t)));
+        }
+        if let Some((n, t)) = lock(&self.dropped)
+            .get(target_id)
+            .filter(|(n, t)| *n > 0 && t.elapsed() < FRESHNESS)
+        {
+            out.push_str(&format!("dropped {n} {}\n", at_ms(t)));
+        }
+        out.into_bytes()
+    }
+
+    /// Restores the gap memory of [`Self::encode_gap`] at a stream's start,
+    /// so that an agent restart within the 24 h after a gap does not show
+    /// Partial again before they are over. A time ahead of the agent's
+    /// clock (the clock went back) counts from now: the gap is kept the
+    /// full 24 h again (fail closed). Facts already in memory are kept
+    /// when more recent. A file not understood restores nothing.
+    pub(crate) fn restore_gap(&self, target_id: &str, bytes: &[u8]) {
+        let Some((gap_ms, dropped)) = decode_gap(bytes) else {
+            tracing::warn!(target_id = %target_id, "SQL Server Audit: the gap memory file is not understood: not restored");
+            return;
+        };
+        let now_ms = agent_now_ms();
+        let freshness_ms = i64::try_from(FRESHNESS.as_millis()).unwrap_or(i64::MAX);
+        let instant = |at_ms: i64| -> Option<Instant> {
+            let ago = now_ms.saturating_sub(at_ms);
+            if ago >= freshness_ms {
+                return None;
+            }
+            let ago = Duration::from_millis(u64::try_from(ago.max(0)).unwrap_or(0));
+            Some(Instant::now().checked_sub(ago).unwrap_or_else(Instant::now))
+        };
+        if let Some(t) = gap_ms.and_then(instant) {
+            let mut map = lock(&self.gap);
+            let e = map.entry(target_id.to_owned()).or_insert(t);
+            if t > *e {
+                *e = t;
+            }
+        }
+        if let Some((n, at)) = dropped
+            && let Some(t) = instant(at)
+        {
+            let mut map = lock(&self.dropped);
+            match map.get_mut(target_id) {
+                // The same process wrote the file (a stream restarted):
+                // its count already holds the file's.
+                Some(e) if e.1.elapsed() < FRESHNESS => e.0 = e.0.max(n),
+                _ => {
+                    map.insert(target_id.to_owned(), (n, t));
+                }
+            }
+        }
+    }
+
     /// Statements left out: exact texts, credited sampling, credited
     /// polls, statistics statements.
     #[cfg(test)]
@@ -301,6 +371,55 @@ impl Shared {
             .get(target_id)
             .copied()
             .unwrap_or_default()
+    }
+}
+
+/// What the gap memory file holds: the last gap, and the dropped count
+/// with its start, in Unix ms.
+type GapFacts = (Option<i64>, Option<(u64, i64)>);
+
+/// The gap memory file ([`Shared::encode_gap`]).
+fn decode_gap(bytes: &[u8]) -> Option<GapFacts> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let (mut gap, mut dropped) = (None, None);
+    for l in lines {
+        let mut p = l.split(' ');
+        match p.next()? {
+            "gap" => gap = Some(p.next()?.parse().ok()?),
+            "dropped" => dropped = Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?)),
+            _ => return None,
+        }
+        if p.next().is_some() {
+            return None;
+        }
+    }
+    Some((gap, dropped))
+}
+
+/// Loads and restores the gap memory of a stream's target; the store, for
+/// the stream's saves.
+fn restore_gap_store(
+    cfg: &AuditConfig,
+    state: &CheckState,
+    target_id: &str,
+) -> Option<CursorStore> {
+    let store = cfg.counters(GAP_FACTS);
+    if let Some(Ok(Some(bytes))) = store.as_ref().map(CursorStore::load) {
+        state.audit.restore_gap(target_id, &bytes);
+    }
+    store
+}
+
+/// Saves the gap memory of `target_id` (end-of-phase-9 review L5).
+fn save_gap(store: Option<&CursorStore>, state: &CheckState, target_id: &str) {
+    if let Some(store) = store
+        && let Err(e) = store.save(&state.audit.encode_gap(target_id))
+    {
+        tracing::warn!(error = %e, "SQL Server Audit gap memory not saved");
     }
 }
 
@@ -847,6 +966,7 @@ struct Stream<'a> {
     own: OwnAccount,
     store: Option<CursorStore>,
     own_store: Option<CursorStore>,
+    gap_store: Option<CursorStore>,
     cursor: Cursor,
     saved: Option<Vec<u8>>,
     skip: u32,
@@ -878,6 +998,7 @@ impl Stream<'_> {
         {
             tracing::warn!(error = %e, "SQL Server own sessions not saved");
         }
+        save_gap(self.gap_store.as_ref(), self.state, &self.target.id);
     }
 
     /// Whether a statement of one of the agent's sessions is its own
@@ -1013,6 +1134,8 @@ pub(crate) async fn audit_stream(
     {
         own::restore(&target.id, persisted);
     }
+    // The 24 h gap memory, both sources (end-of-phase-9 review L5).
+    let gap_store = restore_gap_store(cfg, state, &target.id);
     let tls = tls::configs(settings.ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
     let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
@@ -1102,6 +1225,7 @@ pub(crate) async fn audit_stream(
         .persisted(cfg),
         store,
         own_store,
+        gap_store,
         cursor,
         saved: None,
         skip,
