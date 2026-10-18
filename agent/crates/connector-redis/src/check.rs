@@ -120,13 +120,7 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     }
     let report = match state
         .reports
-        .of_session(
-            &mut session,
-            target,
-            Which::Target,
-            info.server,
-            CHECK_OP_TIMEOUT,
-        )
+        .of_session(&mut session, target, Which::Target, info, CHECK_OP_TIMEOUT)
         .await
     {
         Ok(r) => r,
@@ -143,9 +137,15 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
     // The Discovery node: a replica (decision 5), and the account's
     // evaluation there too, since ACLs are per node: the target is refused
     // when either node refuses, and the notes show the worse of the two
-    // (security review M2).
+    // (security review M2). A Discovery node that cannot be reached or
+    // evaluated does not make the target unreachable: `check()` and Audit
+    // read the target's node, which answered (#237). It is reported as a
+    // `check.stage_failed` note with its stage and as the target's failure
+    // (Discovery cannot run); the node's last report, while fresh, still
+    // counts in the worse of the two.
+    let mut discovery_failed: Option<RdError> = None;
     if settings.discovery_node.is_some() {
-        match node::open(target, Which::Discovery, CHECK_OP_TIMEOUT).await {
+        let evaluated = match node::open(target, Which::Discovery, CHECK_OP_TIMEOUT).await {
             Ok((mut s, dinfo)) => {
                 if !dinfo.replica {
                     tracing::warn!(
@@ -155,25 +155,30 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
                 }
                 let d = state
                     .reports
-                    .of_session(
-                        &mut s,
-                        target,
-                        Which::Discovery,
-                        dinfo.server,
-                        CHECK_OP_TIMEOUT,
-                    )
+                    .of_session(&mut s, target, Which::Discovery, dinfo, CHECK_OP_TIMEOUT)
                     .await;
                 s.close().await;
-                match d {
-                    Ok(d) => {
-                        refusal = refusal.or(d.refusal(&settings, dinfo.server));
-                        report = report.worst(&d);
-                        has_dryrun = has_dryrun && dinfo.server.has_dryrun();
-                    }
-                    Err(e) => return failed(e, notes),
-                }
+                d.map(|d| (d, dinfo.server))
             }
-            Err(e) => return failed(e, notes),
+            Err(e) => Err(e),
+        };
+        let evaluated = match evaluated {
+            Ok(x) => Some(x),
+            Err(e) => {
+                tracing::warn!(
+                    stage = e.stage.as_str(),
+                    "Redis / Valkey: the declared Discovery node (redis.discovery_node) \
+                     failed; the target's node answers, check() and Audit go on, \
+                     Discovery cannot run"
+                );
+                discovery_failed = Some(e);
+                state.reports.cached(target, Which::Discovery)
+            }
+        };
+        if let Some((d, dserver)) = evaluated {
+            refusal = refusal.or(d.refusal(&settings, dserver));
+            report = report.worst(&d);
+            has_dryrun = has_dryrun && dserver.has_dryrun();
         }
     }
 
@@ -232,10 +237,13 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         .insert(target.id.clone(), audit_level);
 
     let failure = match refusal {
-        None => None,
+        None => discovery_failed.as_ref().map(|e| e.code),
         Some(Refusal::Listed) => Some(FailureCode::PermissionDenied),
         Some(Refusal::NotEvaluated | Refusal::MisplacedOptIn) => Some(FailureCode::Unsupported),
     };
+    if let Some(e) = &discovery_failed {
+        notes.push(stage_note(e.stage));
+    }
     if refusal == Some(Refusal::MisplacedOptIn) {
         tracing::warn!(
             "Redis / Valkey: redis.unevaluated_acl applies to Redis 6.2 only; remove it \
@@ -247,22 +255,37 @@ async fn run(state: &CheckState, target: &TargetConfig) -> TargetHealth {
         reachable: true,
         audit_level,
         failure,
-        detail: refusal.map(|r| {
-            match r {
-                Refusal::Listed => {
-                    "the account can run a refusal-list command (or it could not be evaluated): \
-                     Discovery does not run (ADR-0052 decision 4)"
-                }
-                Refusal::NotEvaluated => {
-                    "Redis 6.2 has no ACL DRYRUN: set redis.unevaluated_acl: accept after \
-                     reviewing the account by hand (ADR-0052 decision 4)"
-                }
-                Refusal::MisplacedOptIn => "redis.unevaluated_acl is for Redis 6.2 only",
-            }
-            .to_owned()
-        }),
+        detail: refusal
+            .map(refusal_detail)
+            .or_else(|| discovery_failed.map(discovery_detail)),
         notes,
     }
+}
+
+/// The local detail of a refusal (logs only).
+fn refusal_detail(r: Refusal) -> String {
+    match r {
+        Refusal::Listed => {
+            "the account can run a refusal-list command (or it could not be evaluated): \
+             Discovery does not run (ADR-0052 decision 4)"
+        }
+        Refusal::NotEvaluated => {
+            "Redis 6.2 has no ACL DRYRUN: set redis.unevaluated_acl: accept after \
+             reviewing the account by hand (ADR-0052 decision 4)"
+        }
+        Refusal::MisplacedOptIn => "redis.unevaluated_acl is for Redis 6.2 only",
+    }
+    .to_owned()
+}
+
+/// The local detail of a failed Discovery node (logs only).
+fn discovery_detail(e: RdError) -> String {
+    format!(
+        "the declared Discovery node (redis.discovery_node) failed at stage {} ({}): \
+         Discovery cannot run; the target's node answers",
+        e.stage.as_str(),
+        e.word.map_or("no error reply", |w| w.as_str())
+    )
 }
 
 /// The privilege notes of a report (counts only).

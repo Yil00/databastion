@@ -35,6 +35,7 @@ mod cmd;
 mod conn;
 mod discover;
 mod error;
+mod families;
 mod glob;
 mod guard;
 mod info;

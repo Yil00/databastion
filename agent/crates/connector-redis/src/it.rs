@@ -354,6 +354,56 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
     }
 }
 
+/// #237: a declared Discovery node that is down does not make the target
+/// unreachable: the target's node answers, so `check()` reports it
+/// reachable, with the Discovery node's failure as a `check.stage_failed`
+/// note and as the target's failure; the scan fails.
+#[tokio::test]
+async fn a_discovery_node_down_is_a_note_not_an_unreachable_target() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // Nothing listens on port 1.
+    let t = target(
+        "valkey",
+        TargetEngine::Valkey,
+        "databastion",
+        "discovery_node: {host: 127.0.0.1, port: 1}",
+    );
+    let h = RedisConnector::new().check(&t).await;
+    let c = codes(&h);
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(h.failure, Some(FailureCode::TargetUnreachable), "{c:?}");
+    let stage = databastion_core::NoteLabel::stage(crate::error::Stage::Connect.as_str());
+    assert!(
+        h.notes
+            .iter()
+            .any(|n| n.code() == NoteCode::CheckStageFailed && n.labels().contains(&stage)),
+        "{c:?}"
+    );
+    // The target's node was evaluated: its notes are there.
+    assert!(c.contains(&NoteCode::AuditStreamNotAvailable), "{c:?}");
+    assert!(
+        c.contains(&NoteCode::PrivilegeTicketCredentialsReadable),
+        "{c:?}"
+    );
+    // Discovery reads the Discovery node: it cannot run.
+    let s = scan(&t).await;
+    assert!(
+        matches!(
+            s.result,
+            Err(ConnectorError::Target {
+                code: FailureCode::TargetUnreachable,
+                ..
+            })
+        ),
+        "{:?}",
+        s.result
+    );
+    assert!(s.findings.is_empty());
+}
+
 /// The contract findings, as the core would send them.
 fn findings_json(findings: &[MaskedFinding], engine: TargetEngine) -> Vec<serde_json::Value> {
     databastion_core::test_support::contract_findings_json(findings, engine)

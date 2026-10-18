@@ -72,6 +72,28 @@ pub(crate) enum Refusal {
     Listed,
 }
 
+/// Connections handed to the next sessions of a target by the unit tests
+/// (one end of a socket pair, a stand-in server on the other: no listening
+/// socket, I1). Never compiled into the agent.
+#[cfg(test)]
+static TEST_TRANSPORTS: std::sync::LazyLock<
+    Mutex<HashMap<String, std::collections::VecDeque<net::Transport>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn test_transport(target_id: &str) -> Option<net::Transport> {
+    TEST_TRANSPORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(target_id)?
+        .pop_front()
+}
+
+#[cfg(not(test))]
+fn test_transport(_target_id: &str) -> Option<net::Transport> {
+    None
+}
+
 /// Opens an authenticated session to a node and identifies it.
 async fn open_plain(
     target: &TargetConfig,
@@ -86,7 +108,10 @@ async fn open_plain(
         .read()
         .map_err(|_| RdError::new(FailureCode::AuthenticationFailed, Stage::Secret))?;
     let tls = tls_of(&settings)?;
-    let mut session = Session::open(&endpoint, tls, &target.account, &password, timeout).await?;
+    let mut session = match test_transport(&target.id) {
+        Some(io) => Session::handshake(io, &target.account, &password, timeout).await?,
+        None => Session::open(&endpoint, tls, &target.account, &password, timeout).await?,
+    };
     drop(password);
     let info = identify(&mut session, timeout).await?;
     session.register_own(&target.id, info.run);
@@ -497,21 +522,29 @@ impl Reports {
     }
 
     /// The account's report on the node `session` is open on (`which`),
-    /// from the cache or evaluated now.
+    /// from the cache or evaluated now. `info` is what [`open`] reported
+    /// for that session.
+    ///
+    /// When the session is replaced (a failed `CLIENT LIST ID`, review
+    /// L3), the fresh session must be on the node `info` describes: the
+    /// same server run, engine and version, mode and role. Otherwise (the
+    /// server restarted, failed over or was replaced in between) the
+    /// report is forgotten and the call fails, so the caller never goes on
+    /// with a `NodeInfo` the session no longer matches (#244 re-review L3).
     pub(crate) async fn of_session(
         &self,
         session: &mut Session,
         target: &TargetConfig,
         which: Which,
-        server: Server,
+        info: NodeInfo,
         timeout: Duration,
     ) -> Result<Report, RdError> {
         let which = node_of(target, which);
         if let Some((r, _)) = self.fresh(&target.id, which) {
             return Ok(r);
         }
-        let r = evaluate(session, target, server, timeout).await?;
-        self.store(&target.id, which, r.clone(), server);
+        let r = evaluate(session, target, info.server, timeout).await?;
+        self.store(&target.id, which, r.clone(), info.server);
         // Best effort (review L3): a failed `CLIENT LIST ID` replaces the
         // session, whose stream may be out of step.
         if note_evaluation(target, which, &r)
@@ -520,11 +553,29 @@ impl Reports {
                 .await
                 .is_err()
         {
-            let (fresh, _) = open_plain(target, Which::Target, timeout).await?;
+            let (fresh, fresh_info) = open_plain(target, Which::Target, timeout).await?;
             let old = std::mem::replace(session, fresh);
             old.close().await;
+            if !same_node(&info, &fresh_info) {
+                tracing::warn!(
+                    "Redis / Valkey: the server changed while a session was replaced \
+                     (restart, failover or another server): the evaluation is redone"
+                );
+                self.forget(&target.id, which);
+                return Err(RdError::new(
+                    FailureCode::TargetUnreachable,
+                    Stage::Introspection,
+                ));
+            }
         }
         Ok(r)
+    }
+
+    fn forget(&self, target_id: &str, which: Which) {
+        self.nodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(target_id.to_owned(), which));
     }
 
     /// The account's report on the target's node, from the cache or on a
@@ -553,6 +604,12 @@ impl Reports {
         Ok((r, info.server))
     }
 
+    /// The fresh cached report of the node `which` of a target, if any,
+    /// with the server it was read on (never evaluated now).
+    pub(crate) fn cached(&self, target: &TargetConfig, which: Which) -> Option<(Report, Server)> {
+        self.fresh(&target.id, node_of(target, which))
+    }
+
     /// The cached `default` user probe of a target, if fresh.
     pub(crate) fn default_user(&self, target_id: &str) -> Option<DefaultUser> {
         self.default_user
@@ -569,6 +626,13 @@ impl Reports {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(target_id.to_owned(), (Instant::now(), d));
     }
+}
+
+/// Whether a replacement session reached the node the first one was on: a
+/// known server run, the same one, and the same engine, version, mode and
+/// role.
+fn same_node(first: &NodeInfo, fresh: &NodeInfo) -> bool {
+    first.run.is_some() && first == fresh
 }
 
 /// Whether the declared engine differs from the server's (decision 9).
@@ -688,5 +752,146 @@ mod tests {
             run,
             "databastion"
         ));
+    }
+
+    /// A stand-in for a server on one end of socket pairs (tests only, no
+    /// listening socket): `connections` sessions of `target_id` get one
+    /// each. It answers `AUTH`, `HELLO 3`, `INFO` and `ACL DRYRUN` (`OK`,
+    /// so every probe is allowed), and never answers the first
+    /// connection's `CLIENT LIST`, so its `CLIENT LIST ID` times out and
+    /// the session is replaced. The connections after the first report
+    /// `run_id` `later_run`.
+    fn fake_server(target_id: &str, connections: i64, later_run: &'static str) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for id in 1..=connections {
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            TEST_TRANSPORTS
+                .lock()
+                .unwrap()
+                .entry(target_id.to_owned())
+                .or_default()
+                .push_back(net::Transport::Unix(client));
+            let run = if id == 1 { "run-a" } else { later_run };
+            tokio::spawn(async move {
+                let (r, mut w) = server.into_split();
+                let mut r = BufReader::new(r);
+                loop {
+                    // One request: an array of bulk strings.
+                    let mut line = String::new();
+                    if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let count: usize = line.trim_start_matches('*').trim().parse().unwrap();
+                    let mut args = Vec::new();
+                    for _ in 0..count {
+                        let mut len = String::new();
+                        r.read_line(&mut len).await.unwrap();
+                        let len: usize = len.trim_start_matches('$').trim().parse().unwrap();
+                        let mut buf = vec![0u8; len + 2];
+                        r.read_exact(&mut buf).await.unwrap();
+                        buf.truncate(len);
+                        args.push(String::from_utf8(buf).unwrap().to_ascii_uppercase());
+                    }
+                    let reply = match args.first().map(String::as_str) {
+                        Some("HELLO") => format!(
+                            "%3\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:{id}\r\n\
+                             $4\r\nmode\r\n$10\r\nstandalone\r\n"
+                        ),
+                        Some("INFO") => {
+                            let text = match args.get(1).map(String::as_str) {
+                                Some("SERVER") => format!(
+                                    "server_name:valkey\r\nvalkey_version:9.0.6\r\n\
+                                     redis_version:7.2.4\r\nrun_id:{run}\r\n"
+                                ),
+                                Some("REPLICATION") => "role:master\r\n".to_owned(),
+                                _ => "cluster_enabled:0\r\n".to_owned(),
+                            };
+                            format!("${}\r\n{text}\r\n", text.len())
+                        }
+                        Some("CLIENT") if id == 1 => {
+                            // Never answered: the client's deadline.
+                            std::future::pending::<()>().await;
+                            return;
+                        }
+                        _ => "+OK\r\n".to_owned(),
+                    };
+                    if w.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    fn fake_target(id: &str) -> TargetConfig {
+        databastion_core::AgentConfig::parse(&format!(
+            "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: {id}, \
+             engine: valkey, host: 127.0.0.1, account: databastion, \
+             secret: {{env: PATH}}, redis: {{tls: disable}}}}]}}"
+        ))
+        .unwrap()
+        .targets[0]
+            .clone()
+    }
+
+    /// #244 re-review L3: after a failed `CLIENT LIST ID`, the session is
+    /// replaced; on the same server run the caller's `NodeInfo` still
+    /// holds and the fresh session is used, on another run the call fails
+    /// and the report is forgotten.
+    #[tokio::test]
+    async fn a_replaced_session_must_be_on_the_same_node() {
+        let timeout = Duration::from_millis(500);
+        for (id, later_run, same) in [
+            ("replace-same-run", "run-a", true),
+            ("replace-new-run", "run-b", false),
+        ] {
+            fake_server(id, 2, later_run);
+            let target = fake_target(id);
+            let _stream = crate::audit::own::audit_started(id);
+            let (mut session, info) = open(&target, Which::Target, timeout).await.unwrap();
+            assert_eq!(session.hello.id, Some(1));
+            assert!(info.run.is_some());
+            let reports = Reports::default();
+            let r = reports
+                .of_session(&mut session, &target, Which::Target, info, timeout)
+                .await;
+            // Replaced either way: the first connection's stream is out of
+            // step after its timeout.
+            assert_eq!(session.hello.id, Some(2), "{id}");
+            if same {
+                let r = r.unwrap();
+                assert_eq!(r.audit.client_list, Some(true));
+                assert!(reports.cached(&target, Which::Target).is_some());
+            } else {
+                let e = r.unwrap_err();
+                assert_eq!(e.code, FailureCode::TargetUnreachable);
+                assert!(reports.cached(&target, Which::Target).is_none());
+            }
+            // A transport failure is a pause, not a stop for the run.
+            assert!(!crate::audit::own::learns_addresses(
+                id,
+                info.run,
+                "databastion"
+            ));
+            session.close().await;
+        }
+        let a = NodeInfo {
+            server: Server::Valkey(Version(9, 0, 6)),
+            run: Some(1),
+            cluster: false,
+            replica: false,
+        };
+        assert!(same_node(&a, &a));
+        assert!(!same_node(&a, &NodeInfo { run: Some(2), ..a }));
+        assert!(!same_node(&a, &NodeInfo { replica: true, ..a }));
+        assert!(!same_node(
+            &a,
+            &NodeInfo {
+                server: Server::Valkey(Version(9, 1, 0)),
+                ..a
+            }
+        ));
+        let unknown = NodeInfo { run: None, ..a };
+        assert!(!same_node(&unknown, &unknown));
     }
 }

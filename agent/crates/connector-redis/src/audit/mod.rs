@@ -786,13 +786,7 @@ pub(crate) async fn audit_stream(
         // refusal list stops Audit (decision 4).
         let report = state
             .reports
-            .of_session(
-                &mut session,
-                target,
-                Which::Target,
-                info.server,
-                POLL_TIMEOUT,
-            )
+            .of_session(&mut session, target, Which::Target, info, POLL_TIMEOUT)
             .await
             .map_err(RdError::into_connector_error)?;
         if let Some(r) = report.refusal(&settings, info.server) {
