@@ -2130,7 +2130,24 @@ mod tests {
         fn interrupted_poll_digests_are_prefixes_of_the_poll_texts() {
             use crate::audit::events::own_poll_prefix;
             let all = poll_digests();
-            assert_eq!(all.len(), 18);
+            // 9 rows per server: MySQL 8.0.46, 8.4.11 and 9.7.2, MariaDB
+            // 10.11.19, 11.4.13 and 11.8.9 (engine-matrix run 39280421842
+            // for the versions other than the defaults).
+            assert_eq!(all.len(), 54);
+            for server in [
+                "mysql-8.0.46",
+                "mysql-8.4.11",
+                "mysql-9.7.2",
+                "mariadb-10.11.19",
+                "mariadb-11.4.13",
+                "mariadb-11.8.9",
+            ] {
+                assert_eq!(
+                    all.iter().filter(|(s, ..)| s == server).count(),
+                    9,
+                    "{server}"
+                );
+            }
             for (server, table, digest) in &all {
                 assert!(own_poll_prefix(digest.as_bytes()), "{server} {table}");
                 let main = format!("FROM `performance_schema` . `{table}`");

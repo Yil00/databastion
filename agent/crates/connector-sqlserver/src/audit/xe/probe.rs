@@ -419,13 +419,21 @@ mod tests {
         let l = at(&p, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
-        // Review of #276, L1: 2019 is not measured yet; 2022 is.
+        // Review of #276, L1: 2019, 2022 and 2025 are measured (2019 and
+        // 2025 by engine-matrix run 39139682239); a later major is not.
         assert!(
-            l.details
+            !l.details
                 .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
         );
+        for major in [16, 17] {
+            assert!(
+                !at(&p, major, &[GRANT_2022], LIVE)
+                    .details
+                    .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+            );
+        }
         assert!(
-            !at(&p, 16, &[GRANT_2022], LIVE)
+            at(&p, 18, &[GRANT_2022], LIVE)
                 .details
                 .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
         );
