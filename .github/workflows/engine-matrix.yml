@@ -385,6 +385,12 @@ jobs:
               echo '```'
             fi
           } >>"$GITHUB_STEP_SUMMARY"
+          # The full rows in the job log too (readable without the artifact): `sed -n l` shows
+          # tabs as \t and ends each row with `$`, so the MariaDB digests' trailing space stays visible.
+          if [ -f "$d/poll_digests.tsv" ]; then
+            echo "poll_digests.tsv of $ENTRY:"
+            sed -n l "$d/poll_digests.tsv"
+          fi
       - name: Upload the measurements
         if: always() && steps.measure.outcome != 'skipped'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
