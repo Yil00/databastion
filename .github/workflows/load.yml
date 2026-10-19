@@ -4,7 +4,7 @@ name: Load / database impact
 # (PostgreSQL, MariaDB, MongoDB; MVP criterion < 2 %), the Audit path under a sustained workload
 # (pgbench, sysbench; nothing dropped, p95 latency with and without Audit) and the agent's CPU / RSS
 # over a 10-minute run. About 30 minutes: NOT part of the required "CI result" check (ci.yml).
-# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey targets the same way.
+# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey / Redis targets the same way.
 # Runs weekly, on demand, and on pull requests labelled `load-test`; the harness unit tests run on
 # every pull request.
 on:
@@ -178,8 +178,8 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # The Valkey target (e2e/load/README.md "Valkey and Redis targets", ADR-0052 decision 13 "Load"):
-  # Valkey 9.0 (the dev service, 2 CPUs) with a keyspace of 1 000 000 keys, a paced Discovery scan
+  # The Valkey and Redis targets (e2e/load/README.md "Valkey and Redis targets", ADR-0052 decision 13
+  # "Load"), one matrix entry each: Valkey 9.0 or Redis 8.10 (the dev services, 2 CPUs) with a keyspace of 1 000 000 keys, a paced Discovery scan
   # against the < 2 % criterion, a fixed-rate GET workload with and without the Audit stream reading
   # the slow log at every command (the polls' cost on the server, every GET an event), the agent's
   # CPU / RSS. In parallel with the other runs, same triggers.
