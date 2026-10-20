@@ -1165,7 +1165,11 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   receivers must read `overflow`, never infer it from an empty `principal`), `database`,
   `hour` and `access` (the first event's `ts`, action,
   source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
-  missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
+  missing from the console's registry; absent in rows written before P4-D), objects and
+  `objects_overflowed` (ADR-0053: a boolean, always present in rows written since ADR-0053,
+  `true` when the agent left objects of the event out under a bound and its `*` objects stand for
+  them, `false` when not flagged or not known; receivers that reject unknown keys must be updated
+  before the console)); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
   finding, and access events carry none.
 - **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:

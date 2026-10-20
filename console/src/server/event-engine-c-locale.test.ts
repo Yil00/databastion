@@ -10,7 +10,7 @@ import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
-import { loadDatabaseBounds, loadObjectHits, prefilterNames } from "./event-engine";
+import { boundedWholeTargetCache, loadDatabaseBounds, loadObjectHits, prefilterNames } from "./event-engine";
 import { drainPolicyWork } from "./incidents";
 
 /**
@@ -212,6 +212,12 @@ describe.skipIf(!hasDb)("sensitivity on a console database with the C character 
       expect(bounds.get(auth.agentId, "pg-prod-1", "none")).toBe(0);
       expect(bounds.get(auth.agentId, "pg-prod-1", "*")).toBe(7);
       expect(bounds.get(auth.agentId, "pg-prod-2", "crm")).toBe(0);
+      // Security review L1: the per-process whole-target cache gives the same values, read or reused.
+      const cache = boundedWholeTargetCache();
+      for (let round = 0; round < 2; round++) {
+        const cached = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("*")], unicodeLower, cache));
+        for (const db of ["crm", "ΒΆΣΗ", "krm", "none", "*"]) expect(cached.get(auth.agentId, "pg-prod-1", db), db).toBe(bounds.get(auth.agentId, "pg-prod-1", db));
+      }
     }
   });
 });
