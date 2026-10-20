@@ -81,7 +81,23 @@ LOAD_SOAK_MAX_S=1800
   || { echo "LOAD_SOAK_S must be at most $LOAD_SOAK_MAX_S seconds (got $LOAD_SOAK_S)" >&2; exit 2; }
 
 log() { printf '[load %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 
 T_RUN="$(date +%s)"
@@ -170,6 +186,14 @@ redact_dir() {
 
 compose() { timeout 120 docker compose -f "$COMPOSE_FILE" "$@"; }
 
+# print_census: ADR-0053 decision 6, the agent's event census (counts only) per engine and the
+# console's per-principal counts, in the log and the job summary. Never fails the run.
+print_census() {
+  python3 "$LOADLIB" census --log "$LOAD_LOG_DIR/agent.log" --label load \
+    ${CENSUS_CONSOLE:+--console "$CENSUS_CONSOLE"} ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} \
+    2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
+
 BG_PIDS=()
 stop_background() {
   local pid
@@ -189,6 +213,7 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census
   # Measurement inputs (counters, timestamps, the raw pgbench / sysbench summaries), for a failed
   # run's investigation: logs only, never in the results artifact.
   cp -f "$W"/out/*.jsonl "$W"/out/*.summary "$LOAD_LOG_DIR/" 2>/dev/null
@@ -328,8 +353,12 @@ python3 "$SEED" pgbench --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --workload-t
   --out "$W/workload/pg"
 python3 "$SEED" sysbench --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --workload-tables "$LOAD_WORKLOAD_TABLES" \
   >"$W/workload/mariadb/point_select.lua"
-chmod 0755 "$W/workload" "$W/workload/pg" "$W/workload/mariadb"
-chmod 0644 "$W/workload/pg/"*.sql "$W/workload/mariadb/point_select.lua"
+# ADR-0053 decision 6: the ORM-style cycle of load_orm (side clients), one statement per line.
+mkdir -p "$W/workload/orm"
+python3 "$SEED" orm --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --dialect pg >"$W/workload/orm/pg.sql"
+python3 "$SEED" orm --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --dialect mariadb >"$W/workload/orm/mariadb.sql"
+chmod 0755 "$W/workload" "$W/workload/pg" "$W/workload/mariadb" "$W/workload/orm"
+chmod 0644 "$W/workload/pg/"*.sql "$W/workload/mariadb/point_select.lua" "$W/workload/orm/"*.sql
 
 # ------------------------------------------------------------------------------ build + start
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
@@ -962,6 +991,20 @@ if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
       '{kind: "pgaudit_volume", target: "pg-load", log_catalog: $lc, soak_s: $soak} + $v'
   fi
 fi
+# ADR-0053 decision 6: per target and principal, the events stored, the statements they stand for,
+# those naming an object `*` (overflowed or unknown: the console does not know which), the largest
+# object list. Every principal of the agent's events, as the console stores it (account names of
+# the load, client and agent accounts, fingerprints, `-`: no load-account filter), counts, no
+# object name. Read by print_census (cleanup), which makes the names safe to print.
+CENSUS_CONSOLE="$W/out/census-console.json"
+console_sql "SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
+    SELECT target_id AS target, coalesce(db_user, '-') AS db_user, count(*) AS events,
+      sum(aggregated_count) AS statements,
+      count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb) AS star_events,
+      coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb), 0) AS star_statements,
+      max(jsonb_array_length(objects)) AS max_objects
+    FROM access_events WHERE agent_id = '${AGENT_ID}' GROUP BY 1, 2) AS x" >"$CENSUS_CONSOLE" 2>/dev/null \
+  || rm -f -- "$CENSUS_CONSOLE"
 lost="$(timeout 30 docker compose -f "$COMPOSE_FILE" logs --no-color agent 2>/dev/null \
   | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|events dropped|rejected batch items|unreadable spool file' || true)"
 fact --argjson n "$lost" '{kind: "agent_log", lost: $n}'

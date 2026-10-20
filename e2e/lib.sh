@@ -19,7 +19,23 @@ BASE_URL="https://${HOSTNAME_CONSOLE}:${E2E_HTTPS_PORT}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[%s %s] %s\n' "$LOG_TAG" "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 
 T_RUN="$(date +%s)"
@@ -556,4 +572,15 @@ dump_logs() {
   for svc in "$@"; do
     compose logs --no-color --timestamps "$svc" >"$E2E_LOG_DIR/$svc.log" 2>&1 || true
   done
+}
+
+# print_census LABEL: ADR-0053 decision 6 measurement. The agent's last event census line per engine
+# (counts only: events spooled, overflowed, naming an unknown-object `*`) from the collected agent
+# log, and, when CENSUS_CONSOLE names a file, the console's per-principal counts; to the log and the
+# job summary. Call after dump_logs. Never fails the run.
+print_census() {
+  local line
+  python3 "$(dirname "${BASH_SOURCE[0]}")/load/loadlib.py" census --log "$E2E_LOG_DIR/agent.log" --label "$1" \
+    ${CENSUS_CONSOLE:+--console "$CENSUS_CONSOLE"} ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
 }

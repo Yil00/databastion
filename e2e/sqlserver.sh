@@ -121,6 +121,7 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs "${SERVICES[@]}"
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  print_census e2e-sqlserver
   redact_dir "$E2E_LOG_DIR" "$P"
   redact_dir "$E2E_LOG_DIR" "$NP"
   log "tearing down"

@@ -95,6 +95,7 @@ cleanup() {
   log "collecting logs into $LOAD_LOG_DIR"
   dump_logs db migrate web worker proxy redis-tls-init "$SVC" agent
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census "load-${LOAD_REDIS_ENGINE}"
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   mkdir -p "$canary_dir"
   printf 'load-canary-%s\n' "$(openssl rand -hex 16)" >"$canary_dir/canary"

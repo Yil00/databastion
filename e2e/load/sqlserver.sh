@@ -88,6 +88,7 @@ cleanup() {
   log "collecting logs into $LOAD_LOG_DIR"
   dump_logs db migrate web worker proxy target-mssql agent
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census "load-sqlserver"
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   # Leak scan before redaction (as run.sh): canary first, then the registry.
   mkdir -p "$canary_dir"
@@ -201,10 +202,13 @@ fact --argjson r "$LOAD_MSSQL_RATE" --argjson soak "$LOAD_SOAK_S" --argjson base
   '{kind: "config", harness: "sqlserver", rate: $r, soak_s: $soak, baseline_s: $base, db_cpus: $cpus,
     tables: $tables, rows: $rows}'
 
-log "creating the workload login load_app; seeding ${LOAD_MSSQL_TABLES} tables, ${LOAD_MSSQL_ROWS} rows (schema load of retail)"
+log "creating the workload logins load_app and load_orm; seeding ${LOAD_MSSQL_TABLES} tables, ${LOAD_MSSQL_ROWS} rows (schema load of retail)"
 # shellcheck disable=SC2016 # sqlcmd variable (from the environment: never on a command line)
+# load_orm (ADR-0053 decision 6): the ORM-style reader, same password; SELECT on the load schema is
+# granted with load_app's (seed.py).
 printf '%s\n' 'SET NOCOUNT ON;' "CREATE LOGIN load_app WITH PASSWORD = N'\$(PW)', CHECK_POLICY = OFF, DEFAULT_DATABASE = retail;" \
-  'GO' 'USE retail;' 'CREATE USER load_app FOR LOGIN load_app;' 'GO' \
+  "CREATE LOGIN load_orm WITH PASSWORD = N'\$(PW)', CHECK_POLICY = OFF, DEFAULT_DATABASE = retail;" \
+  'GO' 'USE retail;' 'CREATE USER load_app FOR LOGIN load_app;' 'CREATE USER load_orm FOR LOGIN load_orm;' 'GO' \
   | timeout 120 docker compose "${COMPOSE_ARGS[@]}" exec -T -e SSL_CERT_FILE=/var/opt/mssql/databastion-tls/ca.pem \
     target-mssql bash -c 'SQLCMDPASSWORD="$(cat /run/secrets/target_mssql_password)" PW="$(cat /run/secrets/target_client_password)" exec '"$SQLCMD"' -S localhost -U sa -b -I -i /dev/stdin' \
     >/dev/null || fail "cannot create the workload login"
@@ -349,15 +353,39 @@ phase_done discovery
 # ------------------------------------------------------------------------------ workloads
 python3 "$SEED" tsql --tables "$LOAD_MSSQL_TABLES" --rows "$LOAD_MSSQL_ROWS" \
   --workload-tables "$LOAD_WORKLOAD_TABLES" >"$W/workload.sql"
+# ADR-0053 decision 6: the ORM-style cycle of load_orm (seed.py orm: lazy loads, eager-loading
+# joins, select_related chains, reporting queries over 16 to 24 tables), every 2 s in one session,
+# in a T-SQL loop of $(CYCLES) cycles; prints `ORM <statements issued>`.
+python3 "$SEED" orm --tables "$LOAD_MSSQL_TABLES" --rows "$LOAD_MSSQL_ROWS" --dialect tsql >"$W/orm-stmts.sql"
+ORM_PER_CYCLE="$(wc -l <"$W/orm-stmts.sql")"
+# shellcheck disable=SC2016 # sqlcmd variable, literal on purpose
+{ printf 'SET NOCOUNT ON;\nUSE retail;\nGO\nDECLARE @i int = 0;\nWHILE @i < $(CYCLES)\nBEGIN\n'
+  cat "$W/orm-stmts.sql"
+  printf "  WAITFOR DELAY '00:00:02';\n  SET @i += 1;\nEND\nSELECT CONCAT('ORM ', @i * %d);\n" "$ORM_PER_CYCLE"
+} >"$W/orm.sql"
+rm -f -- "$W/orm-stmts.sql"
+# run_orm DURATION OUT: the load_orm session for about DURATION seconds (a cycle takes 2 s and more).
+run_orm() {
+  local cycles=$(( $1 * 10 / 21 > 0 ? $1 * 10 / 21 : 1 ))
+  timeout $(( $1 + 300 )) docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps \
+    -e "CYCLES=$cycles" mssql-client '
+      cat > /tmp/orm.sql
+      export SQLCMDPASSWORD="$(cat /run/secrets/target_client_password)"
+      '"$SQLCMD"' -S sqlserver -d retail -U load_orm -b -I -W -h -1 -v CYCLES="$CYCLES" -i /tmp/orm.sql \
+        | grep -E "^(ORM [0-9]+|Msg [0-9]+.*)$" || true' <"$W/orm.sql" >"$2" 2>&1
+}
 # run_workload PHASE DURATION: LOAD_CLIENTS sqlcmd sessions as load_app in one mssql-client
-# container, LOAD_MSSQL_RATE statements per second in total (absolute schedule per session).
+# container, LOAD_MSSQL_RATE statements per second in total (absolute schedule per session), and
+# the load_orm session next to them (run_orm).
 run_workload() {
-  local phase="$1" dur="$2" per iv t_start rc=0
+  local phase="$1" dur="$2" per iv t_start rc=0 orm_pid
   per=$(( LOAD_MSSQL_RATE * dur / LOAD_CLIENTS ))
   iv=$(( LOAD_CLIENTS * 1000000 / LOAD_MSSQL_RATE ))
   log "workload ($phase): ${LOAD_MSSQL_RATE} statements/s over ${LOAD_CLIENTS} sessions, ${dur} s"
   WL_START_UTC="$(date -u +'%Y-%m-%dT%H:%M:%S')"
   t_start="$(now_s)"
+  run_orm "$dur" "$W/out/orm-$phase.out" &
+  orm_pid=$!
   timeout $((dur + 300)) docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps \
     -e "N=$per" -e "IV_US=$iv" -e "CLIENTS=$LOAD_CLIENTS" mssql-client '
       cat > /tmp/w.sql
@@ -373,6 +401,8 @@ run_workload() {
       echo "ERRORS $(cat /tmp/out.* | grep -cE "^Msg [0-9]+" || true)"
       exit $rc' <"$W/workload.sql" >"$W/out/mssql-$phase.out" 2>"$W/out/mssql-$phase.err" || rc=$?
   WL_END="$(now_s)"
+  wait "$orm_pid" || true
+  log "ORM session ($phase): $(tr '\n' ' ' <"$W/out/orm-$phase.out" | cut -c1-200)"
   [ "$rc" = 0 ] || { tail -n 5 "$W/out/mssql-$phase.out" "$W/out/mssql-$phase.err" >&2; fail "the workload ($phase) exited $rc"; }
   fact --arg name "workload_audit_$phase" --argjson t0 "$(jq -n --argjson t "$t_start" '$t + 5')" \
     --argjson t1 "$WL_END" '{kind: "window", name: $name, t0: $t0, t1: $t1}'
@@ -455,7 +485,8 @@ console_sql "SELECT json_build_object('kind', 'events_timeline', 'target', '${TA
   FROM (SELECT (floor(extract(epoch from ts) / 10) * 10)::bigint AS b, sum(aggregated_count) AS n
         $(events_sql) GROUP BY 1) AS x" >>"$FACTS"
 other="$(console_sql "SELECT coalesce(string_agg(coalesce(db_user, '-') || ' ' || action || ' ' || aggregated_count, '; '), 'none')
-  FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}' AND (db_user IS DISTINCT FROM 'load_app' OR action <> 'read')")"
+  FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}' AND (db_user IS DISTINCT FROM 'load_app' OR action <> 'read')
+    AND db_user IS DISTINCT FROM 'load_orm'")"
 log "other events of ${TARGET}: ${other}"
 log "target notes after the run: $(target_json "$TARGET" | jq -c '[.notes[]? | {code, count}]')"
 # Source side: the workload's SELECT records in the audit file since the Audit run started.
@@ -465,6 +496,17 @@ if [[ "${src:-}" =~ ^[0-9]+$ ]]; then
   fact --arg t "$TARGET" --argjson n "$src" '{kind: "source", target: $t, statements: $n, rotated_files: 0}'
   log "audit file: ${src} SELECT record(s) of load_app since the Audit run started"
 fi
+# ADR-0053 decision 6: per principal, the events stored, the statements they stand for, those naming
+# an object `*`, the largest object list (counts only; read by print_census on exit).
+CENSUS_CONSOLE="$W/out/census-console.json"
+console_sql "SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
+    SELECT target_id AS target, coalesce(db_user, '-') AS db_user, count(*) AS events,
+      sum(aggregated_count) AS statements,
+      count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb) AS star_events,
+      coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb), 0) AS star_statements,
+      max(jsonb_array_length(objects)) AS max_objects
+    FROM access_events WHERE agent_id = '${AGENT_ID}' GROUP BY 1, 2) AS x" >"$CENSUS_CONSOLE" 2>/dev/null \
+  || rm -f -- "$CENSUS_CONSOLE"
 if wait_spool_empty "$(now_s)"; then fact '{kind: "spool_drained", ok: true, batches: 0}'
 else fact '{kind: "spool_drained", ok: false}'; fi
 lost="$(timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color agent 2>/dev/null \

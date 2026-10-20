@@ -11,6 +11,8 @@
 # pg_roles, pg_proc and pg_subscription without their secret columns; same password.
 # load_pgbouncer (ADR-0050 load scenario): a PgBouncer-like account, LOGIN and a member of
 # pg_read_all_data (to read pg_shadow), running PgBouncer's default auth_query; same password.
+# load_orm (ADR-0053 decision 6, pg-side-clients.sh): an ORM-style application account, LOGIN with
+# no other attribute; its SELECT grants on the scaled tables are given with load_app's; same password.
 # The password is read by psql itself from the Docker secret and passed as a quoted literal
 # (as e2e/target-initdb/01-agent-role.sh): never on a command line nor in the environment, and
 # not recorded (pgaudit is not set for the database yet, pg_stat_statements does not track this
@@ -28,8 +30,10 @@ CREATE ROLE load_pgexp LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION N
   PASSWORD :'load_password';
 CREATE ROLE load_pgbouncer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   PASSWORD :'load_password';
+CREATE ROLE load_orm LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD :'load_password';
 \unset load_password
-GRANT CONNECT ON DATABASE :"DBNAME" TO load_app, load_pgmon, load_pgexp, load_pgbouncer;
+GRANT CONNECT ON DATABASE :"DBNAME" TO load_app, load_pgmon, load_pgexp, load_pgbouncer, load_orm;
 GRANT pg_monitor TO load_pgmon;
 GRANT pg_read_all_data TO load_pgbouncer;
 SQL

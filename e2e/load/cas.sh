@@ -63,7 +63,31 @@ UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SPOOL_TIMEOUT_S=120
 
 log() { printf '[load-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+
+# print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
+# (counts only) per engine from the collected agent log, to the log and the job summary. Never fails.
+print_census() {
+  local line
+  python3 "$HERE/loadlib.py" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" \
+    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 T_RUN="$(date +%s)"
 T_PHASE="$T_RUN"
@@ -169,6 +193,7 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census load-cas
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   # Leak scan before redaction (as run.sh): canary first, then the registry.
   mkdir -p "$canary_dir"

@@ -11,6 +11,9 @@
 #   - load_pgbouncer, a PgBouncer-like account (member of pg_read_all_data) running PgBouncer's
 #     default `auth_query` on `pg_shadow` every second (ADR-0050: a secret read, at most one event
 #     per principal, object set and aggregation window).
+#   - load_orm, an ORM-style application (ADR-0053 decision 6): the cycle of /orm/pg.sql (seed.py
+#     orm: lazy loads, eager-loading joins, select_related chains, reporting queries over 16 to 24
+#     tables) every 2 seconds, when run.sh mounts it.
 # One session per account, kept for the whole run, as those tools do. The statements are written to
 # the client one period at a time, so it runs them as they come. Prints one line per account:
 #   side <account> <statements issued> <0 | 1: the client failed>
@@ -68,4 +71,10 @@ run load_pgexp 5 "${EXPORTER[@]}" &
 exp=$!
 run load_pgbouncer 1 "${AUTH_QUERY[@]}" &
 bouncer=$!
-wait "$mon" "$exp" "$bouncer"
+pids=("$mon" "$exp" "$bouncer")
+if [ -s /orm/pg.sql ]; then
+  mapfile -t ORM </orm/pg.sql
+  run load_orm 2 "${ORM[@]}" &
+  pids+=("$!")
+fi
+wait "${pids[@]}"

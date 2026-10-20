@@ -79,6 +79,7 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs "${SERVICES[@]}"
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  print_census e2e-redis
   redact_dir "$E2E_LOG_DIR" "$P"
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1

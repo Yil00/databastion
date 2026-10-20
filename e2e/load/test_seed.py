@@ -102,7 +102,7 @@ class SqlTest(unittest.TestCase):
         sql = seed.pg_sql(self.p)
         self.assertEqual(sql.count("CREATE TABLE "), 8)
         self.assertEqual(sql.count("INSERT INTO "), 8)
-        self.assertIn("GRANT SELECT ON ALL TABLES IN SCHEMA load_a, load_b, load_c, load_d TO databastion_agent, load_app;", sql)
+        self.assertIn("GRANT SELECT ON ALL TABLES IN SCHEMA load_a, load_b, load_c, load_d TO databastion_agent, load_app, load_orm;", sql)
         self.assertIn("VACUUM (ANALYZE) ", sql)
         for t in self.p:
             self.assertIn(f"generate_series(1, {t.rows})", sql)
@@ -196,6 +196,7 @@ class SqlServerTest(unittest.TestCase):
         self.assertEqual(sql.count("\nGO\n"), 1 + 2 + 2)
         self.assertIn("GRANT SELECT ON SCHEMA::load TO databastion;", sql)
         self.assertIn("GRANT SELECT ON SCHEMA::load TO load_app;", sql)
+        self.assertIn("GRANT SELECT ON SCHEMA::load TO load_orm;", sql)
         for t in p:
             self.assertIn(f"GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))", sql)
         # No value literal of a row: the server generates them.
@@ -264,6 +265,48 @@ class RedisTest(unittest.TestCase):
         out = subprocess.run([sys.executable, os.path.join(os.path.dirname(seed.__file__), "seed.py"),
                               "redis", "--rows", "1000"], capture_output=True, text=True, timeout=60, check=True).stdout
         self.assertTrue(out.startswith("local F = {"))
+
+class OrmTest(unittest.TestCase):
+    """ADR-0053 decision 6: the ORM-style cycle reads the declared number of distinct tables per
+    statement; three of its statements read more than the agent's 15 named objects."""
+
+    NAME_RE = {
+        "pg": r"\bload_[abcd]\.t\d{3}\b",
+        "mariadb": r"\bsupport\.load_t\d{3}\b",
+        "tsql": r"\bload\.t\d{3}\b",
+    }
+
+    def test_tables_per_statement(self) -> None:
+        import re
+        p = seed.plan(400, 1000000)
+        for dialect, rx in self.NAME_RE.items():
+            stmts = seed.orm_statements(p, dialect)
+            self.assertEqual(len(stmts), len(seed.ORM_SHAPES))
+            for text, n in stmts:
+                self.assertEqual(len(set(re.findall(rx, text))), n, (dialect, text[:80]))
+                self.assertEqual(text.count("("), text.count(")"))
+                self.assertTrue(text.endswith(";") and "\n" not in text)
+                self.assertIn("WHERE", text)
+            self.assertEqual(seed.orm_expected(stmts), {"statements": 18, "past_bound": 3})
+            # At the bound, not past it: the 15-table chain.
+            self.assertIn(15, [n for _, n in stmts])
+
+    def test_needs_enough_tables(self) -> None:
+        with self.assertRaises(ValueError):
+            seed.orm_statements(seed.plan(20, 4000), "pg")
+        with self.assertRaises(ValueError):
+            seed.orm_statements(seed.plan(40, 4000), "oracle")
+
+    def test_cli(self) -> None:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(seed.main(["orm", "--tables", "100", "--rows", "500000", "--dialect", "tsql"]), 0)
+        self.assertEqual(len(buf.getvalue().splitlines()), 18)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(seed.main(["orm", "--tables", "100", "--rows", "500000"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
