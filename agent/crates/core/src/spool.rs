@@ -66,6 +66,9 @@ struct Entry {
     /// Its gated-engine items were already kept once after a `400` `enum`
     /// (ADR-0042 decision 4). In memory only: an agent restart forgets it.
     kept_once: bool,
+    /// It was sent at least once (security review L2): sent again as it
+    /// is. In memory only: an agent restart forgets it.
+    attempted: bool,
 }
 
 /// What a batch is, for the eviction priority.
@@ -143,6 +146,10 @@ fn file_name(key: &[u64], findings: bool) -> String {
     name
 }
 
+/// Suffix of the marker written once every replacement of a batch is
+/// written (see [`Spool::replace`]): `<batch file name>.replaced`.
+const REPLACED_SUFFIX: &str = ".replaced";
+
 fn parse_name(name: &str) -> Option<(Key, bool)> {
     let (stem, findings) = if let Some(s) = name.strip_suffix("-f.json") {
         (s, true)
@@ -185,6 +192,7 @@ impl Spool {
             counters: SpoolCounters::default(),
         };
         let mut found = Vec::new();
+        let mut replaced = Vec::new();
         for entry in fs::read_dir(&spool.dir)? {
             let entry = entry?;
             let os_name = entry.file_name();
@@ -197,6 +205,13 @@ impl Spool {
             }
             if name.starts_with('.') && name.ends_with(".tmp") {
                 let _ = fs::remove_file(entry.path());
+                continue;
+            }
+            if let Some(batch) = name.strip_suffix(REPLACED_SUFFIX) {
+                match parse_name(batch) {
+                    Some(parsed) => replaced.push((parsed, entry.path())),
+                    None => spool.quarantine(&os_name),
+                }
                 continue;
             }
             let Some((key, findings)) = parse_name(name) else {
@@ -219,6 +234,7 @@ impl Spool {
                         gates: batch.gates().to_vec(),
                         fields: batch.fields().to_vec(),
                         kept_once: false,
+                        attempted: false,
                     });
                 }
                 Err(ReadError::Corrupt) => spool.quarantine(&os_name),
@@ -228,6 +244,7 @@ impl Spool {
                 Err(ReadError::Transient(e)) => return Err(e),
             }
         }
+        spool.settle_replacements(&mut found, replaced);
         found.sort_by(|a, b| a.key.cmp(&b.key));
         spool.next_seq = found
             .iter()
@@ -240,8 +257,48 @@ impl Spool {
         Ok(spool)
     }
 
+    /// Finishes or rolls back the replacements a crash interrupted
+    /// (security review L3), so a batch is never sent both as itself and as
+    /// its replacements: a batch whose marker is present was fully
+    /// replaced, it is removed (with the marker); a batch still present
+    /// without a marker was not, so its descendants are the partial
+    /// replacement and are removed. Nothing is counted as dropped.
+    fn settle_replacements(
+        &mut self,
+        found: &mut Vec<Entry>,
+        replaced: Vec<((Key, bool), PathBuf)>,
+    ) {
+        for ((key, findings), marker) in replaced {
+            if let Some(i) = found
+                .iter()
+                .position(|e| e.key == key && e.findings == findings)
+            {
+                let e = found.remove(i);
+                let _ = fs::remove_file(self.path(&e.key, e.findings));
+                tracing::warn!("spool: a batch replaced before a crash removed at start");
+            }
+            let _ = fs::remove_file(marker);
+        }
+        let parents: Vec<(Key, bool)> = found.iter().map(|e| (e.key.clone(), e.findings)).collect();
+        found.retain(|e| {
+            let partial = parents
+                .iter()
+                .any(|(p, f)| *f == e.findings && p.len() < e.key.len() && e.key.starts_with(p));
+            if partial {
+                let _ = fs::remove_file(self.path(&e.key, e.findings));
+                tracing::warn!("spool: a partial replacement from before a crash removed at start");
+            }
+            !partial
+        });
+    }
+
     fn path(&self, key: &[u64], findings: bool) -> PathBuf {
         self.dir.join(file_name(key, findings))
+    }
+
+    fn marker_path(&self, key: &[u64], findings: bool) -> PathBuf {
+        self.dir
+            .join(format!("{}{REPLACED_SUFFIX}", file_name(key, findings)))
     }
 
     /// Reads and parses a spooled batch.
@@ -432,6 +489,7 @@ impl Spool {
             gates: batch.gates().to_vec(),
             fields: batch.fields().to_vec(),
             kept_once: batch.kept_once(),
+            attempted: batch.attempted(),
         }))
     }
 
@@ -470,7 +528,7 @@ impl Spool {
         &mut self,
         endpoint: impl FnMut(bool) -> bool,
     ) -> Option<(Key, ResultBatch)> {
-        self.front_sendable(endpoint, |_| false, |_| false)
+        self.front_sendable(endpoint, |_| false, |_, _| false)
     }
 
     /// Number of spooled batches whose engine tokens `held` refuses
@@ -487,28 +545,39 @@ impl Spool {
     /// value of an engine the console has not listed (ADR-0042) wait until
     /// it does; and those whose gated-field tokens `waits` refuses: those
     /// carrying a gated field while the console's capabilities are not
-    /// known yet (ADR-0053 decision 2). Decided from the entry's tokens
+    /// known yet (ADR-0053 decision 2). `waits` is told whether the batch
+    /// holds a `signature.*` signal, and is not asked for a batch already
+    /// sent once (sent again as it is). Decided from the entry's tokens
     /// (recorded when the batch was written or loaded), so a held batch is
     /// never read here.
     pub(crate) fn front_sendable(
         &mut self,
         mut endpoint: impl FnMut(bool) -> bool,
         mut held: impl FnMut(&[&'static str]) -> bool,
-        mut waits: impl FnMut(&[&'static str]) -> bool,
+        mut waits: impl FnMut(&[&'static str], bool) -> bool,
     ) -> Option<(Key, ResultBatch)> {
         let mut index = 0;
         loop {
             let entry = self.entries.get(index)?;
             if !endpoint(entry.findings)
                 || (!entry.gates.is_empty() && held(&entry.gates))
-                || (!entry.fields.is_empty() && waits(&entry.fields))
+                || (!entry.fields.is_empty()
+                    && !entry.attempted
+                    && waits(&entry.fields, entry.signature))
             {
                 index += 1;
                 continue;
             }
             let entry = entry.clone();
             match self.read(&entry.key, entry.findings) {
-                Ok(batch) => return Some((entry.key, batch.with_kept_once(entry.kept_once))),
+                Ok(batch) => {
+                    return Some((
+                        entry.key,
+                        batch
+                            .with_kept_once(entry.kept_once)
+                            .with_attempted(entry.attempted),
+                    ));
+                }
                 Err(ReadError::Transient(e)) => {
                     tracing::warn!(kind = %e.kind(), "spool read failed; will retry");
                     return None;
@@ -526,6 +595,15 @@ impl Spool {
 
     fn position(&self, key: &[u64]) -> Option<usize> {
         self.entries.iter().position(|e| e.key == key)
+    }
+
+    /// Marks a batch as sent at least once (before its request goes out).
+    pub(crate) fn mark_attempted(&mut self, key: &[u64]) {
+        if let Some(i) = self.position(key)
+            && let Some(e) = self.entries.get_mut(i)
+        {
+            e.attempted = true;
+        }
     }
 
     /// Removes a batch after it was accepted (it may already have been
@@ -548,8 +626,11 @@ impl Spool {
     /// place in the queue; `dropped_items` counts the items left out, only
     /// once every replacement is written. Child keys never reuse a key
     /// already in the queue (e.g. left by a crash during an earlier
-    /// replacement). The old file is removed last: a crash in between may
-    /// resend the old `batch_id` (idempotent on the console).
+    /// replacement). Once every replacement is written, a marker records
+    /// it, then the old file and the marker are removed: a crash before the
+    /// marker keeps the old batch (its replacements are removed at the next
+    /// start), a crash after it keeps the replacements (the old batch is
+    /// removed then), so a batch is never sent both ways.
     pub(crate) fn replace(
         &mut self,
         key: &[u64],
@@ -591,11 +672,34 @@ impl Spool {
                 }
             }
         }
+        let old_path = self.path(&old.key, old.findings);
+        let marker = self.marker_path(&old.key, old.findings);
+        if !written.is_empty()
+            && let Err(e) = fsutil::write_private_atomic(&marker, b"")
+        {
+            for w in written {
+                let _ = fs::remove_file(self.path(&w.key, w.findings));
+                self.total = self.total.saturating_sub(w.bytes);
+            }
+            self.total += old.bytes;
+            self.insert_sorted(old);
+            return Err(e);
+        }
         self.counters.dropped_items += dropped_items;
         for e in written {
             self.insert_sorted(e);
         }
-        let _ = fs::remove_file(self.path(&old.key, old.findings));
+        // The marker goes only once the old file is gone: otherwise the next
+        // start still finishes the replacement.
+        match fs::remove_file(old_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(marker);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(marker);
+            }
+            Err(_) => {}
+        }
         Ok(())
     }
 

@@ -550,6 +550,11 @@ pub(crate) struct ResultBatch {
     /// (ADR-0042 decision 4): a second such rejection drops them. Kept in
     /// memory with the spool entry, not in the file.
     kept_once: bool,
+    /// It was sent at least once (security review L2): it is sent again
+    /// as it is, never stripped at send time under a new `batch_id` (the
+    /// console may hold it already if an ack was lost; a refused field
+    /// takes the `400` path). In memory with the spool entry only.
+    attempted: bool,
 }
 
 /// Whether a batch carrying the engine tokens `gates` must wait: one of
@@ -624,6 +629,7 @@ impl Parsed {
             gates: self.gates(),
             fields: self.fields(),
             kept_once: false,
+            attempted: false,
         })
     }
 
@@ -685,6 +691,7 @@ impl ResultBatch {
             gates,
             fields,
             kept_once: false,
+            attempted: false,
         })
     }
 
@@ -708,17 +715,16 @@ impl ResultBatch {
     /// would have built without those fields, apart from `batch_id`.
     pub(crate) fn for_console(
         &self,
-        caps: &crate::capabilities::ConsoleCapabilities,
+        caps: &crate::capabilities::Snapshot,
     ) -> Result<Option<Self>, Unserializable> {
-        if self.fields.iter().all(|t| caps.console_accepts(t)) {
+        if self.fields.iter().all(|t| caps.accepts(t)) {
             return Ok(None);
         }
         let Some(Parsed::Events(b)) = Self::decode(self.findings, &self.bytes) else {
             return Err(Unserializable);
         };
-        let bytes = caps.console_accepts(crate::capabilities::token::ACCESS_EVENT_BYTES);
-        let overflowed =
-            caps.console_accepts(crate::capabilities::token::ACCESS_EVENT_OBJECTS_OVERFLOWED);
+        let bytes = caps.accepts(crate::capabilities::token::ACCESS_EVENT_BYTES);
+        let overflowed = caps.accepts(crate::capabilities::token::ACCESS_EVENT_OBJECTS_OVERFLOWED);
         let events = b
             .events
             .into_iter()
@@ -758,6 +764,18 @@ impl ResultBatch {
     /// `enum` (see [`stripped`](Self::stripped)).
     pub(crate) fn kept_once(&self) -> bool {
         self.kept_once
+    }
+
+    /// Whether it was sent at least once (see the field).
+    pub(crate) fn attempted(&self) -> bool {
+        self.attempted
+    }
+
+    /// The same batch, marked as sent at least once (restored from its
+    /// spool entry).
+    pub(crate) fn with_attempted(mut self, attempted: bool) -> Self {
+        self.attempted = attempted;
+        self
     }
 
     /// The same batch, marked as kept once (restored from its spool entry).
@@ -1660,6 +1678,7 @@ mod tests {
             gates: Vec::new(),
             fields: Vec::new(),
             kept_once: false,
+            attempted: false,
         };
         assert_eq!(batch.without(&[0]).unwrap_err(), Unserializable);
         assert_eq!(batch.halves().unwrap_err(), Unserializable);
@@ -1837,12 +1856,8 @@ mod tests {
         v["events"].as_array().unwrap().clone()
     }
 
-    fn caps(tokens: &[&str]) -> crate::capabilities::ConsoleCapabilities {
-        let caps = crate::capabilities::ConsoleCapabilities::default();
-        caps.record(Some(
-            &serde_json::from_value(serde_json::json!(tokens)).unwrap(),
-        ));
-        caps
+    fn caps(tokens: &[&str]) -> crate::capabilities::Snapshot {
+        crate::capabilities::Snapshot::listing(tokens)
     }
 
     /// ADR-0053 decision 2, applied to `bytes` too: spooled in full, sent

@@ -1435,6 +1435,18 @@ impl Runtime {
                     // (rolled back): send none until a response lists them
                     // again (ADR-0022).
                     self.console_caps.clear();
+                } else if matches!(
+                    e,
+                    CallError::Uplink(
+                        UplinkError::Transport(_)
+                            | UplinkError::Server { .. }
+                            | UplinkError::Throttled { .. }
+                            | UplinkError::UnexpectedResponse { .. }
+                    )
+                ) {
+                    // Not answered: a hold waiting for the console's
+                    // capabilities restarts (ADR-0053 decision 2).
+                    self.console_caps.unanswered();
                 }
                 return Err(e);
             }
@@ -1715,22 +1727,34 @@ impl Runtime {
             // (ADR-0039 decision 8) waits, spooled; the others still go. So
             // does a batch carrying a gated field while the console's
             // capabilities are not known yet (ADR-0053 decision 2): events
-            // spooled before a heartbeat answer keep the fields it lists.
-            let settled = self.console_caps.settled(now);
-            self.lock_spool().front_sendable(
+            // spooled before a heartbeat answer keep the fields it lists. A
+            // batch with a `signature.*` signal never waits (its detection
+            // matters more than its gated fields); one already sent once is
+            // sent again as it is.
+            let caps = self.console_caps.snapshot(now);
+            let front = self.lock_spool().front_sendable(
                 |findings| !parked.is_parked(findings, now),
                 |gates| uplink::held_back(gates, &self.console_caps),
-                |_fields| !settled,
-            )
+                |_fields, signature| !signature && !caps.settled(),
+            );
+            front.map(|f| (f, caps))
         };
-        let Some((key, batch)) = front else {
+        let Some(((key, batch), caps)) = front else {
             return Ok(Flush::Idle);
         };
         // Spooled in full, stripped at send time (ADR-0053 decision 2): the
         // fields whose tokens the console does not list are dropped, under
         // a new `batch_id`, and the replacement takes the batch's place in
-        // the spool before it is sent (a retry resends the same bytes).
-        match batch.for_console(&self.console_caps) {
+        // the spool before it is sent (a retry resends the same bytes). A
+        // batch already sent once is sent as it is (security review L2: the
+        // console may hold it if an ack was lost; a refused field takes the
+        // `400` path below).
+        let decided = if batch.attempted() {
+            Ok(None)
+        } else {
+            batch.for_console(&caps)
+        };
+        match decided {
             Ok(None) => {}
             Ok(Some(stripped)) => {
                 bump(&self.counters.gated_fields_stripped_at_send, 1);
@@ -1749,6 +1773,7 @@ impl Runtime {
                 return Ok(Flush::Progress);
             }
         }
+        self.lock_spool().mark_attempted(&key);
         let result = self
             .session
             .call(

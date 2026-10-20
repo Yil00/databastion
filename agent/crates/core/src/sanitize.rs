@@ -312,14 +312,23 @@ fn is_wildcard_object(o: &ObjectRef) -> bool {
 }
 
 /// Keeps a `*` object in an event whose objects overflowed (ADR-0053
-/// decision 1 item 3: the contract requires one). Fail closed: never
-/// clears the flag; adds `(<database>, -, *)` when every object it names
+/// decision 1 item 3: the contract requires one) that covers the objects
+/// the sanitizer itself left out. Fail closed: never clears the flag; adds `(<database>, -, *)` when every object it names
 /// and every one left out (`left_out`, their databases) share a database,
 /// `(*, -, *)` otherwise, in the last slot when the list is full (that
 /// object is then left out too). The `MaskedEvent` invariant makes this a
 /// no-op for events built by the core.
 fn keep_overflow_wildcard(e: &mut AccessEvent, left_out: &[Identifier]) {
-    if e.objects.iter().any(is_wildcard_object) {
+    // A `*` already there covers objects the sanitizer left out only when
+    // its database is `*` or theirs (security review L4); any `*` covers
+    // the connector's own overflow (the core's database rule).
+    let covers = |o: &ObjectRef| {
+        is_wildcard_object(o)
+            && (left_out.is_empty()
+                || o.database.as_str() == "*"
+                || left_out.iter().all(|d| *d == o.database))
+    };
+    if e.objects.iter().any(covers) {
         return;
     }
     let Some(star) = wildcard() else {
@@ -809,5 +818,20 @@ pub(crate) mod tests {
         assert!(check_event(&mut e));
         assert_eq!(objects_of(&e)[15], ("*".to_owned(), None, "*".to_owned()));
         assert!(!serde_json::to_string(&e).unwrap().contains("123456789012"));
+        // Security review L4: a `*` of another database does not cover the
+        // objects cut here; `(*, -, *)` takes the last slot.
+        let mut list: Vec<(&str, &str)> = names.iter().map(|n| ("crm", n.as_str())).collect();
+        list[3] = ("billing", "*");
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        let objects = objects_of(&e);
+        assert_eq!(objects.len(), 16);
+        assert_eq!(objects[3], ("billing".to_owned(), None, "*".to_owned()));
+        assert_eq!(objects[15], ("*".to_owned(), None, "*".to_owned()));
+        // A `*` of their own database does.
+        list[3] = ("crm", "*");
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e)[15].2, "t15");
     }
 }

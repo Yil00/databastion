@@ -5583,3 +5583,137 @@ async fn heartbeat_metrics_stay_within_the_contract_bound() {
     let rt = runtime(&env);
     assert!(rt.metrics().0.len() <= 128, "{}", rt.metrics().0.len());
 }
+
+/// Security review M1: a misconfigured older replica refuses the flag after
+/// every heartbeat that lists it. Only the first clear holds; the next
+/// ones, within the hold window, leave the set known and empty, so the
+/// spooled flagged batches drain without a heartbeat wait each.
+#[tokio::test]
+async fn a_replica_refusing_the_flag_after_each_heartbeat_does_not_throttle_the_spool() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(
+        &server,
+        vec![
+            Step::Unknown(&["/events/0"]),
+            Step::Ack(false),
+            Step::Unknown(&["/events/0"]),
+        ],
+    )
+    .await;
+    let rt = runtime(&env);
+    let listed = [token::ACCESS_EVENT_OBJECTS_OVERFLOWED];
+    accept_tokens(&rt, &listed);
+    let target = TargetId::try_from("pg-main").unwrap();
+    for _ in 0..4 {
+        rt.spool_events(&target, &overflowed_events(1, &[0]));
+    }
+    // First refusal: the hold starts; batch 1 is resent stripped, the
+    // others wait for the next answer.
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 2);
+    // The heartbeat lists the token again: batch 2 goes with the flag and
+    // is refused again. No second hold: batch 2 resent stripped, batches 3
+    // and 4 stripped at send time, all without another answer.
+    accept_tokens(&rt, &listed);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 6, "{sent:?}");
+    let flagged: Vec<bool> = sent
+        .iter()
+        .map(|b| flags(b, "objects_overflowed")[0])
+        .collect();
+    assert_eq!(flagged, [true, false, true, false, false, false]);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    // Every batch carries `bytes`, which is never listed here: 1 and 2 lose
+    // it at send time, 3 and 4 lose both fields.
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 4.0);
+}
+
+/// Security review L2: a batch sent once whose ack was lost is sent again
+/// as it is (same `batch_id`, same fields) even after the capabilities
+/// changed; never re-stripped under a new `batch_id`.
+#[tokio::test]
+async fn a_batch_sent_once_is_resent_as_it_is_after_a_token_change() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+        ],
+    );
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[0]),
+    );
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
+    // A heartbeat answer without the token, before the retry.
+    accept_tokens(&rt, &[]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], sent[1], "the same body, same batch_id");
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [true]);
+    assert_eq!(flags(&sent[1], "bytes"), [true]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+}
+
+/// Security review I-5: a batch with a `signature.*` signal does not wait
+/// for the capabilities; it is sent at once without the unlisted fields.
+#[tokio::test]
+async fn a_signature_batch_does_not_wait_for_the_capabilities() {
+    use databastion_classifiers::masking::Signal;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let target = TargetId::try_from("pg-main").unwrap();
+    let signed: Vec<_> = overflowed_events(1, &[0])
+        .into_iter()
+        .map(|e| e.with_signal(Signal::PgDump))
+        .collect();
+    rt.spool_events(&target, &signed);
+    rt.spool_events(&target, &overflowed_events(1, &[0]));
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "only the signature batch: {sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false]);
+    assert!(sent[0].to_string().contains("signature.pg_dump"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+}
+
+/// Security review L1: a heartbeat the console does not answer restarts
+/// the hold, so batches keep waiting through an outage.
+#[tokio::test]
+async fn an_unanswered_heartbeat_keeps_the_hold() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let before = std::time::Instant::now();
+    assert!(rt.heartbeat_once().await.is_err());
+    // The hold now runs from the failed attempt, not from the start.
+    assert!(
+        !rt.console_caps
+            .settled(before + crate::capabilities::UNKNOWN_HOLD)
+    );
+}
