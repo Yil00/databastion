@@ -125,6 +125,8 @@ Before this ADR is accepted, the rate of flagged events is measured and recorded
 - **`min_sensitivity` with rows.** A flagged event is kept by `min_sensitivity` through its bound only when it reports `rows > 0` or no `rows` at all; a flagged event that reports 0 rows uses its named sensitivity there.
 - **A per-policy opt-out.** A policy condition that makes the policy use the named score and the literal-`*` rule for flagged events, for policies whose author accepts the gap (audited like any policy change).
 
+**Measurement note (2026-10-20).** A first measurement is recorded in [docs/measurements/adr-0053-flagged-event-rate.md](../measurements/adr-0053-flagged-event-rate.md): load run 39453966277, a 600 s soak with an ORM-style principal next to the regular load on PostgreSQL, MariaDB and SQL Server, plus Valkey and CAS. Overflowed events: 5.18 % of events (0.47 % of statements) on PostgreSQL, 4.80 % (0.48 %) on MariaDB, 12.93 % (0.47 %) on SQL Server, of which 74 of 120 are the agent's own reads (under investigation), none on Valkey and CAS; none from the regular application principal. Unknown-object `*` events without overflow: 8.26 % on PostgreSQL, 1.60 % on MariaDB, every event on Valkey. Not yet covered: the end-to-end runs, MongoDB Audit, and engines other than those five. This note records data only; the decision above and the choice of a mitigation are unchanged and remain the maintainer's.
+
 ## Consequences
 
 - Object-scoped and sensitivity-scoped policies see an event that reached a sensitive object past the 15th, or one a connector dropped under its own bound; a statement can no longer hide one behind 15 harmless names from those policies.
