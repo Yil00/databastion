@@ -369,6 +369,10 @@ services:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/root_password
       DATABASTION_DB_PASSWORD_FILE: /run/secrets/agent_password
+      # MongoDB 8.0 refuses to start on Linux kernel 6.19+ (SERVER-121912): TCMalloc per-CPU cache off.
+      MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES: "0"
+      # glibc keeps rseq, so TCMalloc cannot use its per-CPU cache (the image sets rseq=0).
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
       # mongosh (initialization scripts): no telemetry attempt from the internal network.
       DO_NOT_TRACK: "1"
     command:
