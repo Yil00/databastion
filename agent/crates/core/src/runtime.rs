@@ -1435,17 +1435,10 @@ impl Runtime {
                     // (rolled back): send none until a response lists them
                     // again (ADR-0022).
                     self.console_caps.clear();
-                } else if matches!(
-                    e,
-                    CallError::Uplink(
-                        UplinkError::Transport(_)
-                            | UplinkError::Server { .. }
-                            | UplinkError::Throttled { .. }
-                            | UplinkError::UnexpectedResponse { .. }
-                    )
-                ) {
-                    // Not answered: a hold waiting for the console's
-                    // capabilities restarts (ADR-0053 decision 2).
+                } else if matches!(e, CallError::Uplink(UplinkError::Transport(_))) {
+                    // Not reached: a hold waiting for the console's
+                    // capabilities restarts (ADR-0053 decision 2), unless a
+                    // result endpoint answered since it started.
                     self.console_caps.unanswered();
                 }
                 return Err(e);
@@ -1820,6 +1813,9 @@ impl Runtime {
         ) {
             // The endpoint is implemented: its `501` streak ends.
             self.lock_parked().answered(batch.is_findings());
+            // The console is reachable: unanswered heartbeats no longer
+            // extend a capability hold (ADR-0053 decision 2).
+            self.console_caps.result_answered();
         }
         match result {
             Ok(ack) => {

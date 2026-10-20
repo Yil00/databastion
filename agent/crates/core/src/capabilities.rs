@@ -185,15 +185,15 @@ pub(crate) fn audit_source_token(source: AuditSource) -> &'static [&'static str]
 /// capability set is not known (see [`ConsoleCapabilities::settled`]): two
 /// of the longest heartbeat intervals the agent accepts, so one heartbeat
 /// lost on the way does not strip them. Counted from the latest heartbeat
-/// attempt the console did not answer (transport error, `5xx`, throttled):
-/// during an outage the hold does not run out.
+/// attempt that failed with a transport error, until a result endpoint
+/// answers: during an outage the hold does not run out.
 pub(crate) const UNKNOWN_HOLD: std::time::Duration =
     std::time::Duration::from_secs(2 * crate::backoff::HEARTBEAT_MAX_S.unsigned_abs());
 
 /// The longest the set may stay not known before gated fields are stripped
 /// anyway, whatever the heartbeats do (heartbeats failing while `/events`
 /// works must not hold events until the spool evicts them).
-pub(crate) const UNKNOWN_MAX: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+pub(crate) const UNKNOWN_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// What the console accepts, from its latest heartbeat response.
 ///
@@ -221,6 +221,10 @@ struct Accepted {
     /// When a clear last started a hold (security review M1): a clear
     /// within [`UNKNOWN_HOLD`] of it does not hold again.
     last_hold: Option<Instant>,
+    /// A result endpoint (`/events`, `/findings`) answered since the set
+    /// became unknown: the console is reachable, so unanswered heartbeats
+    /// no longer restart the hold (re-review N1).
+    results_answered: bool,
 }
 
 /// The capability set read once (security review I-2): the tokens and
@@ -261,6 +265,7 @@ impl Default for ConsoleCapabilities {
                 unknown_since: Some(now),
                 hold_from: Some(now),
                 last_hold: None,
+                results_answered: false,
             }),
         }
     }
@@ -315,11 +320,12 @@ impl ConsoleCapabilities {
         accepted.unknown_since = Some(now);
         accepted.hold_from = Some(now);
         accepted.last_hold = Some(now);
+        accepted.results_answered = false;
     }
 
-    /// A heartbeat attempt the console did not answer (transport error,
-    /// `5xx`, throttled, unexpected answer): while the set is not known,
-    /// the hold restarts from it (security review L1), so batches spooled
+    /// A heartbeat attempt that failed with a transport error: while the
+    /// set is not known, and no result endpoint has answered since, the
+    /// hold restarts from it (security review L1), so batches spooled
     /// during an outage keep their fields until the console answers.
     pub(crate) fn unanswered(&self) {
         self.unanswered_at(Instant::now());
@@ -327,8 +333,18 @@ impl ConsoleCapabilities {
 
     pub(crate) fn unanswered_at(&self, now: Instant) {
         let mut accepted = self.write();
-        if accepted.unknown_since.is_some() {
+        if accepted.unknown_since.is_some() && !accepted.results_answered {
             accepted.hold_from = Some(now);
+        }
+    }
+
+    /// A result endpoint answered (an ack or a contract error): the console
+    /// is reachable, so the current hold is no longer extended by
+    /// unanswered heartbeats.
+    pub(crate) fn result_answered(&self) {
+        let mut accepted = self.write();
+        if accepted.unknown_since.is_some() && !accepted.results_answered {
+            accepted.results_answered = true;
         }
     }
 
@@ -556,6 +572,26 @@ mod tests {
         assert!(!caps.settled(later), "a new window: holds again");
     }
 
+    /// Re-review N1: once a result endpoint has answered, unanswered
+    /// heartbeats no longer restart the hold; a new hold starts afresh.
+    #[test]
+    fn a_result_answer_stops_extending_the_hold() {
+        use std::time::Duration;
+        let caps = ConsoleCapabilities::default();
+        let t0 = Instant::now();
+        caps.unanswered_at(t0 + Duration::from_secs(300));
+        assert!(!caps.settled(t0 + Duration::from_secs(800)));
+        caps.result_answered();
+        caps.unanswered_at(t0 + Duration::from_secs(600));
+        assert!(caps.settled(t0 + Duration::from_secs(900)), "not extended");
+        // A later hold (after an answer and a clear) is extended again.
+        caps.record(None);
+        let t1 = t0 + Duration::from_secs(2000);
+        caps.clear_at(t1);
+        caps.unanswered_at(t1 + Duration::from_secs(300));
+        assert!(!caps.settled(t1 + Duration::from_secs(800)));
+    }
+
     /// Security review L1: unanswered heartbeat attempts restart the hold,
     /// up to [`UNKNOWN_MAX`]; they do nothing while the set is known.
     #[test]
@@ -571,6 +607,7 @@ mod tests {
         }
         caps.unanswered_at(t0 + UNKNOWN_MAX);
         assert!(caps.settled(t0 + UNKNOWN_MAX), "the cap");
+        assert_eq!(UNKNOWN_MAX, Duration::from_secs(3600));
         caps.record(None);
         caps.unanswered_at(t0 + UNKNOWN_MAX);
         assert!(caps.settled(t0), "known: an outage does not unsettle it");

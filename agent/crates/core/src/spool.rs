@@ -691,14 +691,14 @@ impl Spool {
         }
         // The marker goes only once the old file is gone: otherwise the next
         // start still finishes the replacement.
-        match fs::remove_file(old_path) {
-            Ok(()) => {
-                let _ = fs::remove_file(marker);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let _ = fs::remove_file(marker);
-            }
-            Err(_) => {}
+        // The directory is synced in between, so the removal of the old
+        // file is durable before the marker goes.
+        let gone = match fs::remove_file(old_path) {
+            Ok(()) => true,
+            Err(e) => e.kind() == io::ErrorKind::NotFound,
+        };
+        if gone && fs::File::open(&self.dir).and_then(|d| d.sync_all()).is_ok() {
+            let _ = fs::remove_file(marker);
         }
         Ok(())
     }

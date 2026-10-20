@@ -5697,11 +5697,14 @@ async fn a_signature_batch_does_not_wait_for_the_capabilities() {
     assert_eq!(rt.lock_spool().status().batches.0, 1);
 }
 
-/// Security review L1: a heartbeat the console does not answer restarts
-/// the hold, so batches keep waiting through an outage.
+/// Security review L1, re-review N1: a heartbeat that fails with a
+/// transport error restarts the hold; a heartbeat answered with `503` does
+/// not.
 #[tokio::test]
-async fn an_unanswered_heartbeat_keeps_the_hold() {
-    let server = MockServer::start().await;
+async fn only_an_unreachable_console_keeps_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    // Not from the pool: dropping it closes its port.
+    let server = MockServer::builder().start().await;
     let env = enrolled(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/agent/v1/heartbeat"))
@@ -5709,11 +5712,46 @@ async fn an_unanswered_heartbeat_keeps_the_hold() {
         .mount(&server)
         .await;
     let rt = runtime(&env);
-    let before = std::time::Instant::now();
+    let started = std::time::Instant::now();
     assert!(rt.heartbeat_once().await.is_err());
-    // The hold now runs from the failed attempt, not from the start.
     assert!(
-        !rt.console_caps
-            .settled(before + crate::capabilities::UNKNOWN_HOLD)
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1)),
+        "a 503 is an answer: the hold is not restarted"
+    );
+    // Unreachable: the hold restarts from the failed attempt.
+    drop(server);
+    let before = std::time::Instant::now();
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(!rt.console_caps.settled(before + UNKNOWN_HOLD));
+}
+
+/// Re-review N1: once `/events` has answered, a transport error on the
+/// heartbeat no longer restarts the hold.
+#[tokio::test]
+async fn an_events_answer_stops_extending_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    let server = MockServer::builder().start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let started = std::time::Instant::now();
+    // A batch without gated fields does not wait: answered.
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[]),
+    );
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 1);
+    drop(server);
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1))
     );
 }
