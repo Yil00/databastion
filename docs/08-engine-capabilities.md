@@ -1039,7 +1039,7 @@ What the SQL Server connector does, as implemented in phase 9 (P9-A lot 1, #242 
   - **computed columns**: never selected, counted in the note `coverage.computed_columns_not_sampled`;
   - **Always Encrypted columns**: never selected (the server holds ciphertext only), counted in the note `coverage.encrypted_columns`;
   - columns under **dynamic data masking** are sampled as the agent's account sees them, masked, and counted in the note `coverage.masked_columns`.
-- **CAS store guard**: as on the other SQL engines ([below](#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap)); a ticket registry is counted (`type` only), never sampled.
+- **CAS store guard**: as on the other SQL engines ([below](#cas-store-guard-postgresql-mysql--mariadb-mongodb-openldap)); a ticket registry is counted (`type` only), never sampled. `check()` checks column `SELECT` only on recognized CAS stores with a credential column, one table per statement, at most 64 per database (else `privilege.not_evaluated`, label `cas_store_guard_probe`); in 0.8.0 it checked every user table at once, which on a SQL Server Audit target with a database of more than 15 user tables was reported as the agent's own read of `*` at every check (fixed by #293, [docs/05](05-security.md#apereo-cas-connector)).
 
 ### Schema-stability locks (ADR-0051 obligation L9)
 

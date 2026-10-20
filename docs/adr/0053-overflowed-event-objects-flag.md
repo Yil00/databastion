@@ -1,6 +1,6 @@
 # ADR-0053: Tell the console that an event's `*` may hide objects past the 15-object bound
 
-- **Status**: Proposed (revised on 2026-10-18 after its security review, "sound after changes": H1, M1 to M3, L1 to L3)
+- **Status**: Accepted (2026-10-20). **Accepted** by the maintainer on 2026-10-20: option (a), with no mitigation from decision 6, and the proposed answers to open questions 1 to 3 (see [Open questions](#open-questions-answered)). History: proposed on 2026-10-18, revised the same day after its security review ("sound after changes": H1, M1 to M3, L1 to L3); flagged-event rate measured on 2026-10-20 (decision 6)
 - **Date**: 2026-10-18
 - **Refines**: [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decisions 3 (score), 5 (conditions and exceptions), 6 (dedup scope) and 10 (notifications), for events whose objects overflowed; uses [ADR-0022](0022-protocol-capability-negotiation.md) (capability negotiation) without changing it
 - **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Contract, after G7"; [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine); [09-agent-protocol.md, the object `*`](../09-agent-protocol.md#the-object-); `MaskedEvent` in `agent/crates/classifiers/src/masking.rs`; `to_batches` and `stripped` in `agent/crates/core/src/uplink.rs`; `console/src/lib/event-model.ts` and `console/src/server/event-engine.ts` (read at `72e87d5`, `dev`)
@@ -60,9 +60,9 @@ A form-only registry id, for example `shape.objects_overflowed`, needs no negoti
 - Being a new signal, it makes a later event "worse" than a resolved incident without it (ADR-0021 decision 7), so it would reopen incidents for a reason that is not about the access.
 - Object-scoped and sensitivity-scoped policies, the actual gap, still need the console code of option (a) to see the event.
 
-## Decision (proposed)
+## Decision
 
-Option (a), under the precondition of decision 6 (measure first).
+Option (a). The precondition of decision 6 (measure first) is met; no mitigation is taken.
 
 ### 1. Contract (`shared/protocol/`, `security-reviewer` review)
 
@@ -125,7 +125,9 @@ Before this ADR is accepted, the rate of flagged events is measured and recorded
 - **`min_sensitivity` with rows.** A flagged event is kept by `min_sensitivity` through its bound only when it reports `rows > 0` or no `rows` at all; a flagged event that reports 0 rows uses its named sensitivity there.
 - **A per-policy opt-out.** A policy condition that makes the policy use the named score and the literal-`*` rule for flagged events, for policies whose author accepts the gap (audited like any policy change).
 
-**Measurement note (2026-10-20).** A first measurement is recorded in [docs/measurements/adr-0053-flagged-event-rate.md](../measurements/adr-0053-flagged-event-rate.md): load run 39453966277, a 600 s soak with an ORM-style principal next to the regular load on PostgreSQL, MariaDB and SQL Server, plus Valkey and CAS. Overflowed events: 5.18 % of events (0.47 % of statements) on PostgreSQL, 4.80 % (0.48 %) on MariaDB, 12.93 % (0.47 %) on SQL Server, of which 74 of 120 are the agent's own reads (under investigation), none on Valkey and CAS; none from the regular application principal. Unknown-object `*` events without overflow: 8.26 % on PostgreSQL, 1.60 % on MariaDB, every event on Valkey. Not yet covered: the end-to-end runs, MongoDB Audit, and engines other than those five. This note records data only; the decision above and the choice of a mitigation are unchanged and remain the maintainer's.
+**Measurement note (2026-10-20).** A first measurement is recorded in [docs/measurements/adr-0053-flagged-event-rate.md](../measurements/adr-0053-flagged-event-rate.md): load run 39453966277, a 600 s soak with an ORM-style principal next to the regular load on PostgreSQL, MariaDB and SQL Server, plus Valkey and CAS. Overflowed events: 5.18 % of events (0.47 % of statements) on PostgreSQL, 4.80 % (0.48 %) on MariaDB, 12.93 % (0.47 %) on SQL Server, of which 74 of 120 were the agent's own reads, none on Valkey and CAS; none from the regular application principal. Unknown-object `*` events without overflow: 8.26 % on PostgreSQL, 1.60 % on MariaDB, every event on Valkey. The 74 own SQL Server events were the CAS store guard's `check()` read, which wrote one SQL Server Audit record per user table (fixed by #293, [ADR-0041 implementation note of 2026-10-20](0041-cas-connector.md#implementation-note-2026-10-20-the-sql-server-guard-check-one-table-at-a-time)); a second SQL Server run after the fix (load run 39476569869 at `bbfcab7`) gave 43 overflowed events of 805 (5.34 %), all from the ORM-style principal, and no event of the agent's own account. Not covered: the end-to-end runs, MongoDB Audit, and engines other than those five (a ROADMAP [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups)).
+
+**Decision 6 met (2026-10-20).** The maintainer took the measurement above as meeting this precondition and chose no mitigation: flagged events use the bound for `min_sensitivity` whatever their `rows`, and no per-policy opt-out is added.
 
 ## Consequences
 
@@ -155,9 +157,17 @@ Before this ADR is accepted, the rate of flagged events is measured and recorded
 - **A count of the objects left out**: it tells the console nothing it can act on, and a count of distinct objects is engine text the agent would have to bound and the console to trust.
 - **Sensitivity of the whole target for an overflow `*` with a named database**: the core keeps the database whenever every left-out object shares it, so the database bound is already fail closed and the target bound would only add noise.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
 
 1. Should the agent also set the flag (or a sibling field, `objects_unknown`) for an unknown-object `*`? Proposed answer: not in this change. Unknown-object `*` events are much more frequent (every dynamic SQL, user function or unparsable text on every engine), and selecting each of them like the database's most sensitive object would raise incidents on most application traffic; decide after measuring how often they occur, with the measurement of decision 6.
+   **Answer (decided by the maintainer on 2026-10-20)**: not in this change; no flag for an unknown-object `*`. The measurement found unknown-object `*` events more frequent than overflowed ones on PostgreSQL and Valkey.
 2. Should the bound sensitivity of an overflow `*` be the database's highest object sensitivity (proposed) or the sum over the database's objects capped at 30? Proposed answer: the highest, as ADR-0021 decision 3 takes the event's most sensitive object, not a sum.
+   **Answer (decided by the maintainer on 2026-10-20)**: the database's highest object sensitivity (decision 3 item 3).
 3. Should a flagged event bypass the per-target hourly cap as a severe event (ADR-0021 decision 8)? Proposed answer: no. It bypasses the cap through the existing rule only, on its named score. Using the bound there would not help: once a bound entered the overflow incident's highest score, later events would need a higher score to bypass the cap, so bypasses would become less likely, not more; this is why decision 3 item 4 keeps the overflow incident's highest score on named scores.
+   **Answer (decided by the maintainer on 2026-10-20)**: no; no cap bypass beyond the existing rule, on the named score.
 4. Which mitigation of decision 6, if any, once the rate is measured? Proposed answer: decided on the measurement; `min_sensitivity` with rows first, since it needs no new policy key.
+   **Answer (decided by the maintainer on 2026-10-20)**: none (decision 6 met).
+
+## Implementation (from 2026-10-20)
+
+In ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), one lot per owner, in this order: the contract (decision 1, `security-reviewer` review), then the agent (decision 2), the console (decision 3) and the documentation (decision 5). Until both sides ship, the behaviour of the Context stays (Residual risks).
