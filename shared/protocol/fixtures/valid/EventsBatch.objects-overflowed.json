@@ -1,0 +1,177 @@
+{
+  "batch_id": "01925f10-2a3b-7c4d-8e5f-6a7b8c9d0e1f",
+  "events": [
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-10-20T08:15:00Z",
+      "principal": {
+        "db_user": "report_job",
+        "client_addr": "198.51.100.30",
+        "application": "metabase"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "accounts"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "addresses"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "contacts"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "contracts"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "customers"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "invoices"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "leads"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "notes"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "opportunities"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "orders"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "payments"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "products"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "quotes"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "refunds"
+        },
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "tickets"
+        },
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "rows": 1200,
+      "source": "pgaudit",
+      "aggregated_count": 1,
+      "objects_overflowed": true
+    },
+    {
+      "target_id": "mysql-crm",
+      "ts": "2026-10-20T08:15:30Z",
+      "principal": {
+        "db_user": "etl"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "accounts"
+        },
+        {
+          "database": "crm",
+          "object": "addresses"
+        },
+        {
+          "database": "crm",
+          "object": "contacts"
+        },
+        {
+          "database": "crm",
+          "object": "contracts"
+        },
+        {
+          "database": "crm",
+          "object": "customers"
+        },
+        {
+          "database": "crm",
+          "object": "invoices"
+        },
+        {
+          "database": "crm",
+          "object": "leads"
+        },
+        {
+          "database": "crm",
+          "object": "notes"
+        },
+        {
+          "database": "crm",
+          "object": "opportunities"
+        },
+        {
+          "database": "crm",
+          "object": "orders"
+        },
+        {
+          "database": "crm",
+          "object": "payments"
+        },
+        {
+          "database": "crm",
+          "object": "products"
+        },
+        {
+          "database": "crm",
+          "object": "quotes"
+        },
+        {
+          "database": "crm",
+          "object": "refunds"
+        },
+        {
+          "database": "billing",
+          "object": "invoices"
+        },
+        {
+          "database": "*",
+          "object": "*"
+        }
+      ],
+      "source": "mysql_audit_log",
+      "aggregated_count": 1,
+      "objects_overflowed": true
+    }
+  ]
+}

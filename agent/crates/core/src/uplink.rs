@@ -1090,6 +1090,10 @@ fn event_item(
         // `access_event.bytes`.
         bytes: e.bytes().map(sanitize::clamped_count),
         objects,
+        // ADR-0053 decision 1: in the contract, gated by
+        // `access_event.objects_overflowed`. Not sent yet: the send-time
+        // gate of decision 2 is a separate change.
+        objects_overflowed: None,
         principal,
         rows: e.rows().map(sanitize::clamped_count),
         signals: (!signals.is_empty()).then_some(signals),

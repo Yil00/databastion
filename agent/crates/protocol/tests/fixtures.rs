@@ -167,6 +167,14 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "const: true on a boolean (generated as bool)",
     ),
     (
+        "EventsBatch.objects-overflowed-false.json",
+        "const: true on a boolean (generated as bool)",
+    ),
+    (
+        "EventsBatch.objects-overflowed-without-star.json",
+        "contains (via if/then, removed before generation)",
+    ),
+    (
         "EventsBatch.account-not-recorded-on-auth-failure.json",
         "not (via if/then, removed before generation)",
     ),
