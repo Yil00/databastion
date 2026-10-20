@@ -27,7 +27,9 @@ concurrency:
 jobs:
   dev-env:
     name: Dev environment
-    runs-on: ubuntu-latest
+    # ubuntu-24.04: MongoDB does not start on kernel 6.19+ (ubuntu-latest is Ubuntu 26 since 2026-10-19),
+    # SERVER-121912; unpin once the pinned MongoDB images carry the fix.
+    runs-on: ubuntu-24.04
     # The opt-in CAS step builds its overlay image (about 170 MB of modules from Maven Central).
     timeout-minutes: 55
     steps:

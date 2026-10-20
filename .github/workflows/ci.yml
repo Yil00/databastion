@@ -491,7 +491,9 @@ jobs:
     name: Agent MongoDB integration
     needs: detect
     if: needs.detect.outputs.agent == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-24.04: MongoDB does not start on kernel 6.19+ (ubuntu-latest is Ubuntu 26 since 2026-10-19),
+    # SERVER-121912; unpin once the pinned MongoDB images carry the fix.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -778,7 +780,7 @@ jobs:
     name: E2E (enrollment, Discovery, Audit, invariant I2)
     needs: detect
     if: needs.detect.outputs.e2e == 'true' && needs.detect.outputs.console == 'true' && needs.detect.outputs.agent == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       E2E_LOG_DIR: ${{ github.workspace }}/e2e-logs

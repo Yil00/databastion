@@ -35,7 +35,9 @@ jobs:
       github.event_name == 'pull_request' && (github.base_ref == 'main'
       || (contains(github.event.pull_request.labels.*.name, 'e2e-compat')
           && (github.event.action != 'labeled' || github.event.label.name == 'e2e-compat')))
-    runs-on: ubuntu-latest
+    # ubuntu-24.04: MongoDB does not start on kernel 6.19+ (ubuntu-latest is Ubuntu 26 since 2026-10-19),
+    # SERVER-121912; unpin once the pinned MongoDB images carry the fix.
+    runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
       contents: read
