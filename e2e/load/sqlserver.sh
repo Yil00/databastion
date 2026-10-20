@@ -366,7 +366,7 @@ ORM_PER_CYCLE="$(wc -l <"$W/orm-stmts.sql")"
 rm -f -- "$W/orm-stmts.sql"
 # run_orm DURATION OUT: the load_orm session for about DURATION seconds (a cycle takes 2 s and more).
 run_orm() {
-  local cycles=$(( $1 / 3 > 0 ? $1 / 3 : 1 ))
+  local cycles=$(( $1 * 10 / 21 > 0 ? $1 * 10 / 21 : 1 ))
   timeout $(( $1 + 300 )) docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps \
     -e "CYCLES=$cycles" mssql-client '
       cat > /tmp/orm.sql
