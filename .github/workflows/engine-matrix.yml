@@ -64,9 +64,7 @@ concurrency:
 jobs:
   engine:
     name: ${{ matrix.engine }} ${{ matrix.version }}
-    # ubuntu-24.04 for the MongoDB entries: MongoDB does not start on kernel 6.19+ (ubuntu-latest is
-    # Ubuntu 26 since 2026-10-19), SERVER-121912; unpin once the pinned MongoDB images carry the fix.
-    runs-on: ${{ matrix.it == 'mongodb' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # 60: the SQL Server entries also run the fresh-server measurement before the tests.
     timeout-minutes: 60
     strategy:

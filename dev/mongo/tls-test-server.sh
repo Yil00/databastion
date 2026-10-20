@@ -83,7 +83,10 @@ start() {
   rm -rf "$tmp"
   # Read by mongod as the image's `mongodb` user (dev only, throwaway key).
   chmod 0644 "$BASE/ca.pem" "$BASE/server.pem"
-  docker run -d --name "$NAME" -p "127.0.0.1:${PORT}:27017" -v "$BASE:/tls:ro" "$img" \
+  # MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=0: MongoDB 8.0 refuses to start on kernel 6.19+
+  # otherwise (SERVER-121912).
+  docker run -d --name "$NAME" -p "127.0.0.1:${PORT}:27017" -v "$BASE:/tls:ro" \
+    -e MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES=0 "$img" \
     mongod --bind_ip_all --auth --tlsMode requireTLS \
     --tlsCertificateKeyFile /tls/server.pem --tlsCAFile /tls/ca.pem \
     --tlsAllowConnectionsWithoutCertificates >/dev/null
