@@ -395,18 +395,52 @@ export async function loadDatabaseBounds(
           )}) or ${findings.databaseName} ~ ${NON_ASCII_RE}::text)`;
     scopes.push(sql`(${pairsIn(dbPairs)} and ${sameDb})`);
   }
-  const rows = await tx
-    .select({
-      agentId: findings.agentId,
-      targetId: findings.targetId,
-      databaseName: findings.databaseName,
-      objectName: findings.objectName,
-      classifier: findings.classifier,
-      confidence: sql<number>`max(${findings.confidence})`,
-    })
-    .from(findings)
-    .where(and(isNull(findings.falsePositiveAt), sql`(${sql.join(scopes, sql` or `)})`))
-    .groupBy(findings.agentId, findings.targetId, findings.databaseName, findings.objectName, findings.classifier);
+  // One statement, so one snapshot (ADR-0053 re-review N2): the grouped rows and, for the whole
+  // targets to cache, their stamp over the same rows. The stamp checked before (statement 1) only
+  // decides whether to read; the cache keeps the stamp of what was read.
+  const stamped = cache && fresh.size > 0 ? [...fresh.keys()].map((k) => whole.get(k) as readonly [string, string]) : [];
+  const res = await tx.execute<{
+    kind: "g" | "s";
+    agent_id: string;
+    target_id: string;
+    database_name: string | null;
+    object_name: string | null;
+    classifier: string | null;
+    confidence: number | null;
+    stamp: string | null;
+  }>(sql`
+    with base as (
+      select agent_id, target_id, database_name, object_name, classifier, confidence, id, false_positive_at
+      from findings where (${sql.join(scopes, sql` or `)}))
+    select 'g' as kind, agent_id, target_id, database_name, object_name, classifier, max(confidence)::float8 as confidence, null::text as stamp
+    from base where false_positive_at is null
+    group by agent_id, target_id, database_name, object_name, classifier
+    ${
+      stamped.length > 0
+        ? sql`union all
+    select 's', agent_id, target_id, null, null, null, null, ${STAMP_SQL}
+    from base where (agent_id, target_id) in (${sql.join(
+      stamped.map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )})
+    group by agent_id, target_id`
+        : sql``
+    }`);
+  const readStamps = new Map<string, string>();
+  const rows: { agentId: string; targetId: string; databaseName: string; objectName: string; classifier: string; confidence: number }[] = [];
+  for (const r of res.rows) {
+    if (r.kind === "s") readStamps.set(targetKey({ agentId: r.agent_id, targetId: r.target_id }), String(r.stamp));
+    else {
+      rows.push({
+        agentId: r.agent_id,
+        targetId: r.target_id,
+        databaseName: String(r.database_name),
+        objectName: String(r.object_name),
+        classifier: String(r.classifier),
+        confidence: Number(r.confidence),
+      });
+    }
+  }
   // Hits per object (database and object folded, any schema), then the highest per database.
   const objects = new Map<string, { db: string; target: string; hits: ClassifierHit[] }>();
   for (const r of rows) {
@@ -430,7 +464,7 @@ export async function loadDatabaseBounds(
       perTarget.set(o.target, m);
     }
   }
-  if (cache) for (const [k, stamp] of fresh) cache.set(k, { stamp, bounds: perTarget.get(k) ?? new Map() });
+  if (cache) for (const k of fresh.keys()) cache.set(k, { stamp: readStamps.get(k) ?? "0", bounds: perTarget.get(k) ?? new Map() });
   return boundsOf(bounds);
 }
 
@@ -471,12 +505,13 @@ export function boundedWholeTargetCache(max = WHOLE_TARGET_CACHE_MAX): WholeTarg
  * the commit order of concurrent scans (timestamps would not: `now()` is a transaction's start).
  * One row per target; a target without findings has none ("0").
  */
+const STAMP_SQL = sql.raw(`concat_ws('|', count(*),
+             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 1)::numeric),
+             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 2)::numeric))`);
+
 async function findingsStamps(tx: Tx, pairs: readonly (readonly [string, string])[]): Promise<Map<string, string>> {
   const r = await tx.execute<{ agent_id: string; target_id: string; stamp: string }>(sql`
-    select agent_id, target_id,
-           concat_ws('|', count(*),
-             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 1)::numeric),
-             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 2)::numeric)) as stamp
+    select agent_id, target_id, ${STAMP_SQL} as stamp
     from findings
     where (agent_id, target_id) in (${sql.join(
       pairs.map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
@@ -844,7 +879,10 @@ async function applyEventPolicy(
       return "rematched";
     }
     if (namedLatest && !worseThanClosedIncident(namedLatest, e, facts)) {
+      // Re-review N1: linked to both closed incidents, so the named scope's false positive keeps
+      // counting the rows linked since it was marked (ADR-0031 decision 2, anti-splitting).
       await linkClosed(tx, latest, e);
+      await linkClosed(tx, namedLatest, e);
       return "linked";
     }
     ({ database, key } = named);

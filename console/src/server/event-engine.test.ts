@@ -1212,6 +1212,35 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       }
     });
 
+    it("re-review N1: with both scopes closed as false positives, split flagged reads still count against the named scope's false positive", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ min_sensitivity: 1 });
+      const principal = { db_user: "splitter" };
+      const staff = { database: "hr", schema: "public", object: "staff" };
+      // hr: score 90 over 1 M rows; crm: score 20.04 over 100 rows; both marked false positives.
+      await send(auth, [quiet({ principal, objects: [staff], rows: 1_000_000 }), quiet({ ts: at(1000), principal, objects: [clients], rows: 100 })]);
+      await drainPolicyWork(getDb());
+      const before = await incidentsOf(auth.agentId);
+      expect(before.map((x) => x.eventDatabase).sort()).toEqual(["crm", "hr"]);
+      for (const inc of before) await transitionIncident(getDb(), inc.id, "false_positive", actor());
+      // Flagged reads of 60 rows (named score 17.85 < 20.04): the bound picks hr, the named objects crm.
+      const split = (i: number) => quiet({ ts: at(2000 + i * 1000), principal, objects: [clients, { database: "hr", object: "*" }], rows: 60, objects_overflowed: true });
+      await send(auth, [split(0)]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(2);
+      const crm = before.find((x) => x.eventDatabase === "crm");
+      const hr = before.find((x) => x.eventDatabase === "hr");
+      expect(await incidentEventCount(getDb(), String(crm?.id))).toBe(2);
+      expect(await incidentEventCount(getDb(), String(hr?.id))).toBe(2);
+      // 120 rows since the mark, above crm's 100: an incident opens under crm.
+      await send(auth, [split(1)]);
+      await drainPolicyWork(getDb());
+      const after = await incidentsOf(auth.agentId);
+      expect(after).toHaveLength(3);
+      expect(after[2]).toMatchObject({ status: "open", eventDatabase: "crm", eventObjectsOverflowed: true });
+    });
+
     it("security review L1: whole-target bounds are cached per process and read again when the target's findings change", async () => {
       const auth = await agentWithTargets();
       await seed(auth);
