@@ -36,6 +36,8 @@ mod it;
 #[cfg(test)]
 mod it_cas_guard;
 #[cfg(test)]
+mod it_names;
+#[cfg(test)]
 mod it_secrets;
 #[cfg(test)]
 mod it_user_code;
