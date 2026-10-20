@@ -5353,3 +5353,405 @@ async fn a_held_batch_survives_an_agent_restart() {
     assert_eq!(sent[0]["findings"][0]["location"]["engine"], "cas");
     assert_eq!(rt.lock_spool().status().batches.0, 0);
 }
+
+// ------------------------------------------------- ADR-0053 send-time gate
+
+/// Masked events of `n` reads, those at `flagged` with objects left out
+/// under a connector's bound (`objects_overflowed`) and `bytes`.
+fn overflowed_events(
+    n: usize,
+    flagged: &[usize],
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    use databastion_classifiers::masking::{EventAction, EventObject, EventPrincipal, EventSource};
+    use databastion_classifiers::names::normalize_path;
+    (0..n)
+        .map(|i| {
+            let e = databastion_classifiers::masking::MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("report"),
+                std::time::SystemTime::now(),
+            )
+            .with_object(EventObject::new(
+                normalize_path("crm"),
+                Some(normalize_path("public")),
+                normalize_path("orders"),
+            ));
+            if flagged.contains(&i) {
+                e.with_unlisted_objects(normalize_path("crm"))
+                    .with_bytes(Some(4096))
+            } else {
+                e
+            }
+        })
+        .collect()
+}
+
+async fn events_mock(server: &MockServer, steps: Vec<Step>) -> Env {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    env
+}
+
+fn flags(batch: &serde_json::Value, field: &str) -> Vec<bool> {
+    batch["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.get(field).is_some())
+        .collect()
+}
+
+/// ADR-0053 decision 2 item 4 (1): events flagged and spooled before the
+/// first heartbeat answer survive a restart with the flag; a console that
+/// lists the token receives it, one that does not receives the events
+/// without it, none dropped.
+#[tokio::test]
+async fn events_spooled_before_the_first_answer_keep_the_flag_across_a_restart() {
+    use crate::capabilities::token;
+    let target = TargetId::try_from("pg-main").unwrap();
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let env = events_mock(&server, Vec::new()).await;
+        let rt = runtime(&env);
+        rt.spool_events(&target, &overflowed_events(3, &[1]));
+        // Not known yet: the batch waits, nothing is sent.
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        drop(rt);
+        let rt = runtime(&env);
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        if listed {
+            accept_tokens(&rt, &[token::ACCESS_EVENT_OBJECTS_OVERFLOWED]);
+        } else {
+            accept_tokens(&rt, &[]);
+        }
+        drain(&rt).await;
+        let sent = sent_event_batches(&server).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["events"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            flags(&sent[0], "objects_overflowed"),
+            [false, listed, false]
+        );
+        assert_eq!(flags(&sent[0], "bytes"), [false, false, false]);
+        if listed {
+            assert_eq!(sent[0]["events"][1]["objects_overflowed"], true);
+        }
+        serde_json::from_value::<databastion_protocol::EventsBatch>(sent[0].clone()).unwrap();
+        // `bytes` is not listed in either case: stripped at send time.
+        assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 1.0);
+        let status = rt.lock_spool().status();
+        assert_eq!(
+            (status.batches.0, status.dropped_items.map_or(0, |c| c.0)),
+            (0, 0)
+        );
+    }
+}
+
+/// `bytes` keeps its own token at send time: a console that lists
+/// `access_event.bytes` but not the flag gets `bytes` only.
+#[tokio::test]
+async fn bytes_are_kept_for_a_console_that_lists_only_bytes() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    accept_tokens(&rt, &[token::ACCESS_EVENT_BYTES]);
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(2, &[0]),
+    );
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(flags(&sent[0], "bytes"), [true, false]);
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false, false]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 1.0);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+}
+
+/// ADR-0053 decision 2 item 4 (2): after a `400` clears the capabilities
+/// (the rejected batch resent once with every gated field stripped), events
+/// converted before the next heartbeat answer wait, and are sent with the
+/// flag once the token is listed again.
+#[tokio::test]
+async fn after_a_400_events_converted_before_the_next_answer_keep_the_flag() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, vec![Step::Unknown(&["/events/0"])]).await;
+    let rt = runtime(&env);
+    let both = [
+        token::ACCESS_EVENT_BYTES,
+        token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+    ];
+    accept_tokens(&rt, &both);
+    let target = TargetId::try_from("pg-main").unwrap();
+    rt.spool_events(&target, &overflowed_events(2, &[0]));
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [true, false]);
+    // Every gated field stripped after the 400, both events kept.
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [false, false]);
+    assert_eq!(flags(&sent[1], "bytes"), [false, false]);
+    assert!(
+        !rt.console_caps
+            .console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED)
+    );
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    // Converted while the capabilities are cleared: waits.
+    rt.spool_events(&target, &overflowed_events(2, &[1]));
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 2);
+    accept_tokens(&rt, &both);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3);
+    assert_eq!(flags(&sent[2], "objects_overflowed"), [false, true]);
+    assert_eq!(flags(&sent[2], "bytes"), [false, true]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+}
+
+/// Contract review M2: a `400` `contains` / `if` on a flagged event (the
+/// console found no `*`) resends it once without the flag, keeping the
+/// capabilities; the other rejected items take the ordinary rule, and a
+/// second refusal of the unflagged item drops it.
+#[tokio::test]
+async fn a_flagged_event_refused_by_the_overflow_rule_is_resent_once_without_the_flag() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(
+        &server,
+        vec![
+            Step::Details(&[
+                ("/events/1/objects", "contains"),
+                ("/events/1", "if"),
+                ("/events/2/ts", "formatMinimum"),
+            ]),
+            Step::Details(&[("/events/1/objects", "contains"), ("/events/1", "if")]),
+        ],
+    )
+    .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+        ],
+    );
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(3, &[1]),
+    );
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false, true, false]);
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [false, false]);
+    assert_eq!(
+        flags(&sent[1], "bytes"),
+        [false, true],
+        "only the flag stripped"
+    );
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    // The second refusal: the ordinary item rule.
+    assert_eq!(sent[2]["events"].as_array().unwrap().len(), 1);
+    assert!(
+        rt.console_caps
+            .console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED)
+    );
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "overflow_flags_refused_total"), 1.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    let status = rt.lock_spool().status();
+    assert_eq!((status.batches.0, status.dropped_items.unwrap().0), (0, 2));
+}
+
+/// The heartbeat metrics stay within the contract's `maxProperties`.
+#[tokio::test]
+async fn heartbeat_metrics_stay_within_the_contract_bound() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    assert!(rt.metrics().0.len() <= 128, "{}", rt.metrics().0.len());
+}
+
+/// Security review M1: a misconfigured older replica refuses the flag after
+/// every heartbeat that lists it. Only the first clear holds; the next
+/// ones, within the hold window, leave the set known and empty, so the
+/// spooled flagged batches drain without a heartbeat wait each.
+#[tokio::test]
+async fn a_replica_refusing_the_flag_after_each_heartbeat_does_not_throttle_the_spool() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(
+        &server,
+        vec![
+            Step::Unknown(&["/events/0"]),
+            Step::Ack(false),
+            Step::Unknown(&["/events/0"]),
+        ],
+    )
+    .await;
+    let rt = runtime(&env);
+    let listed = [token::ACCESS_EVENT_OBJECTS_OVERFLOWED];
+    accept_tokens(&rt, &listed);
+    let target = TargetId::try_from("pg-main").unwrap();
+    for _ in 0..4 {
+        rt.spool_events(&target, &overflowed_events(1, &[0]));
+    }
+    // First refusal: the hold starts; batch 1 is resent stripped, the
+    // others wait for the next answer.
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 2);
+    // The heartbeat lists the token again: batch 2 goes with the flag and
+    // is refused again. No second hold: batch 2 resent stripped, batches 3
+    // and 4 stripped at send time, all without another answer.
+    accept_tokens(&rt, &listed);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 6, "{sent:?}");
+    let flagged: Vec<bool> = sent
+        .iter()
+        .map(|b| flags(b, "objects_overflowed")[0])
+        .collect();
+    assert_eq!(flagged, [true, false, true, false, false, false]);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    // Every batch carries `bytes`, which is never listed here: 1 and 2 lose
+    // it at send time, 3 and 4 lose both fields.
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 4.0);
+}
+
+/// Security review L2: a batch sent once whose ack was lost is sent again
+/// as it is (same `batch_id`, same fields) even after the capabilities
+/// changed; never re-stripped under a new `batch_id`.
+#[tokio::test]
+async fn a_batch_sent_once_is_resent_as_it_is_after_a_token_change() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+        ],
+    );
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[0]),
+    );
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
+    // A heartbeat answer without the token, before the retry.
+    accept_tokens(&rt, &[]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], sent[1], "the same body, same batch_id");
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [true]);
+    assert_eq!(flags(&sent[1], "bytes"), [true]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+}
+
+/// Security review I-5: a batch with a `signature.*` signal does not wait
+/// for the capabilities; it is sent at once without the unlisted fields.
+#[tokio::test]
+async fn a_signature_batch_does_not_wait_for_the_capabilities() {
+    use databastion_classifiers::masking::Signal;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let target = TargetId::try_from("pg-main").unwrap();
+    let signed: Vec<_> = overflowed_events(1, &[0])
+        .into_iter()
+        .map(|e| e.with_signal(Signal::PgDump))
+        .collect();
+    rt.spool_events(&target, &signed);
+    rt.spool_events(&target, &overflowed_events(1, &[0]));
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "only the signature batch: {sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false]);
+    assert!(sent[0].to_string().contains("signature.pg_dump"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+}
+
+/// Security review L1, re-review N1: a heartbeat that fails with a
+/// transport error restarts the hold; a heartbeat answered with `503` does
+/// not.
+#[tokio::test]
+async fn only_an_unreachable_console_keeps_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    // Not from the pool: dropping it closes its port.
+    let server = MockServer::builder().start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let started = std::time::Instant::now();
+    assert!(rt.heartbeat_once().await.is_err());
+    assert!(
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1)),
+        "a 503 is an answer: the hold is not restarted"
+    );
+    // Unreachable: the hold restarts from the failed attempt.
+    drop(server);
+    let before = std::time::Instant::now();
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(!rt.console_caps.settled(before + UNKNOWN_HOLD));
+}
+
+/// Re-review N1: once `/events` has answered, a transport error on the
+/// heartbeat no longer restarts the hold.
+#[tokio::test]
+async fn an_events_answer_stops_extending_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    let server = MockServer::builder().start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let started = std::time::Instant::now();
+    // A batch without gated fields does not wait: answered.
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[]),
+    );
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 1);
+    drop(server);
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1))
+    );
+}
