@@ -18,6 +18,11 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * `job_progress.coverage` counters are stored with the job's progress and shown with the target's
  * latest scan (src/lib/scan-coverage.ts).
  *
+ * Exception, on purpose: `access_event.objects_overflowed` (ADR-0053) is accepted by the generated
+ * schema since the contract change (decision 1), but it is not listed here and the field is not
+ * stored or used: it is listed only by the console change of ADR-0053 decision 3, which gives
+ * the `*` objects of a flagged event their meaning. A conforming agent does not send it before.
+ *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
  * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):

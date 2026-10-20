@@ -874,13 +874,15 @@ impl ResultBatch {
 
 /// Whether an event carries a gated field (ADR-0022).
 fn event_carries_gated(e: &AccessEvent) -> bool {
-    e.bytes.is_some()
+    e.bytes.is_some() || e.objects_overflowed.is_some()
 }
 
-/// Removes every gated field of an event (ADR-0022): `bytes`. A new gated
-/// `AccessEvent` field must be added here and in [`event_carries_gated`].
+/// Removes every gated field of an event (ADR-0022): `bytes` and
+/// `objects_overflowed` (ADR-0053). A new gated `AccessEvent` field must be
+/// added here and in [`event_carries_gated`].
 fn strip_gated_event(e: &mut AccessEvent) {
     e.bytes = None;
+    e.objects_overflowed = None;
 }
 
 /// Batches built from masked results, and the items dropped on the way.
@@ -1734,6 +1736,40 @@ mod tests {
         let (none, left_out) = only.batches[0].stripped(&[0], &[0], &[]).unwrap();
         assert!(none.is_none());
         assert_eq!(left_out, 1);
+    }
+
+    /// ADR-0053: `objects_overflowed` is a gated field. A batch holding a
+    /// flagged event that a console rejects as an unknown field
+    /// (`additionalProperties` at `/events/<i>`) is resent with the field
+    /// stripped, the event kept, never dropped.
+    #[test]
+    fn objects_overflowed_is_a_gated_field_stripped_and_resent() {
+        let plain = crate::sanitize::tests::event("read", 1);
+        let mut flagged: AccessEvent = serde_json::from_value(serde_json::json!({
+            "target_id": "pg-main", "ts": "2026-09-28T14:02:11Z",
+            "principal": {"db_user": "report"}, "action": "read",
+            "objects": [{"database": "crm", "object": "orders"}, {"database": "crm", "object": "*"}],
+            "source": "pgaudit", "aggregated_count": 1
+        }))
+        .unwrap();
+        assert!(!event_carries_gated(&flagged));
+        flagged.objects_overflowed = Some(true);
+        assert!(event_carries_gated(&flagged));
+        let built = pack_events(vec![plain, flagged], true);
+        assert_eq!(built.batches.len(), 1);
+        let batch = &built.batches[0];
+        assert!(batch.carries_gated());
+        assert_eq!(events_of(batch)[1]["objects_overflowed"], true);
+        // Item 1 (flagged) pointed at as an unknown field: kept, stripped.
+        let (again, left_out) = batch.stripped(&[1], &[1], &[]).unwrap();
+        let again = again.unwrap();
+        assert_eq!((again.len(), left_out), (2, 0));
+        assert_ne!(again.batch_id(), batch.batch_id());
+        assert!(!again.carries_gated(), "the flag is stripped");
+        let events = events_of(&again);
+        assert!(events.iter().all(|e| e.get("objects_overflowed").is_none()));
+        // The event itself is unchanged apart from the flag: still its `*`.
+        assert_eq!(events[1]["objects"][1]["object"], "*");
     }
 
     #[test]
