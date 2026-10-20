@@ -1,11 +1,13 @@
+import { eq } from "drizzle-orm";
 import type { Job, PgBoss } from "pg-boss";
 
 import type { Database } from "@/db/client";
+import { users } from "@/db/schema";
 import { errorSummary, type Logger } from "@/lib/logger";
 import { UUID } from "@/lib/policy-common";
 import { silentAgentThresholdS } from "@/server/alerting-config";
 import { CASE_INVENTORY_QUEUE } from "@/server/case-inventory-queue";
-import { runCaseInventory } from "@/server/exception-case-inventory";
+import { recordCaseInventoryFailure, runCaseInventory } from "@/server/exception-case-inventory";
 import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
@@ -256,7 +258,8 @@ export async function scheduleRateLimitsPruneQueue(boss: PgBoss): Promise<void> 
 /**
  * `policy_exceptions.case_inventory` (ADR-0054 decision 6, security review M1): the on-demand case
  * inventory queued by an administrator from the policies page, run here rather than in the web
- * process. `stately` (one queued, one active), no retry (a failed run is audited, the
+ * process, only while the requesting user is still an enabled administrator (else an audited
+ * `actor_gone` failure). `stately` (one queued, one active), no retry (a failed run is audited, the
  * administrator can queue another), finished jobs (which hold the user id and source IP) kept one
  * day.
  */
@@ -268,7 +271,14 @@ export function createCaseInventoryHandler(db: () => Database, log: Logger) {
         log.warn({ queue: CASE_INVENTORY_QUEUE, jobId: job.id }, "case inventory job with an invalid payload: skipped");
         continue;
       }
-      await runCaseInventory(db(), log, { userId, ip: typeof ip === "string" ? ip.slice(0, 64) : null });
+      const actor = { userId, ip: typeof ip === "string" ? ip.slice(0, 64) : null };
+      // The requesting administrator may have been removed, disabled or demoted since (N2).
+      const [u] = await db().select({ role: users.role, disabledAt: users.disabledAt }).from(users).where(eq(users.id, userId)).limit(1);
+      if (!u || u.role !== "admin" || u.disabledAt !== null) {
+        await recordCaseInventoryFailure(db(), log, "user", actor, "actor_gone");
+        continue;
+      }
+      await runCaseInventory(db(), log, actor);
     }
   };
 }

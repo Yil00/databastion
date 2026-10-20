@@ -1,4 +1,4 @@
-import { and, desc, eq, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, sql, type SQL } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { auditLog, policyExceptions } from "@/db/schema";
@@ -100,6 +100,9 @@ export interface InventoryResult {
   entries: InventoryEntry[];
   findingNamesCompared: number;
   eventNamesCompared: number;
+  /** Active location exceptions compared, of all of them (fewer when the budget ran out). */
+  exceptionsCompared: number;
+  exceptionsTotal: number;
   boundReached: boolean;
 }
 
@@ -135,10 +138,41 @@ export function eventCaseChange(x: InventoryException, g: EventNameGroup): boole
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+/** Groups indexed by agent, target and both, for the agent / target scope of an exception. */
+function scopeIndex<G extends { agentId: string; targetId: string }>(groups: readonly G[]) {
+  const by = new Map<string, G[]>();
+  const add = (k: string, g: G) => {
+    const list = by.get(k);
+    if (list) list.push(g);
+    else by.set(k, [g]);
+  };
+  for (const g of groups) {
+    add(`a\0${g.agentId}`, g);
+    add(`t\0${g.targetId}`, g);
+    add(`at\0${g.agentId}\0${g.targetId}`, g);
+  }
+  return (x: InventoryException): readonly G[] =>
+    x.agentId === null && x.targetId === null
+      ? groups
+      : (by.get(x.agentId === null ? `t\0${x.targetId}` : x.targetId === null ? `a\0${x.agentId}` : `at\0${x.agentId}\0${x.targetId}`) ?? []);
+}
+
+export interface CompareResult {
+  findings: Map<string, number>;
+  eventNames: Map<string, EventNameGroup[]>;
+  budgetReached: boolean;
+  /** Active location exceptions compared, and all of them (security re-review N1). */
+  exceptionsCompared: number;
+  exceptionsTotal: number;
+}
+
 /**
  * The pure part of the inventory: per active location exception, the findings it no longer
  * covers (summed over the groups) and the event names it no longer covers (counted by the caller).
- * At most `budget` exception x name evaluations; yields to the event loop between exceptions.
+ * Each exception is charged the names in its agent / target scope only; at most `budget`
+ * evaluations, in the order given (oldest exception first, `loadExceptions`): when the budget
+ * runs out the remaining (newest) exceptions are left out and counted. Yields to the event loop
+ * between exceptions.
  */
 export async function compareNames(
   exceptions: readonly InventoryException[],
@@ -146,23 +180,29 @@ export async function compareNames(
   eventGroups: readonly EventNameGroup[],
   now: Date,
   budget = COMPARISON_BUDGET,
-): Promise<{ findings: Map<string, number>; eventNames: Map<string, EventNameGroup[]>; budgetReached: boolean }> {
+): Promise<CompareResult> {
   const findings = new Map<string, number>();
   const eventNames = new Map<string, EventNameGroup[]>();
-  const perException = findingGroups.length + eventGroups.length;
+  const activeOnes = exceptions.filter((x) => active(x, now));
+  const findingScope = scopeIndex(findingGroups);
+  const eventScope = scopeIndex(eventGroups);
   let left = budget;
-  for (const x of exceptions) {
-    if (!active(x, now)) continue;
-    if (left < perException) return { findings, eventNames, budgetReached: true };
-    left -= perException;
+  let compared = 0;
+  for (const x of activeOnes) {
+    const fs = findingScope(x);
+    const es = eventScope(x);
+    const cost = fs.length + es.length;
+    if (cost > left) return { findings, eventNames, budgetReached: true, exceptionsCompared: compared, exceptionsTotal: activeOnes.length };
+    left -= cost;
+    compared += 1;
     let n = 0;
-    for (const g of findingGroups) if (findingCaseChange(x, g)) n += g.n;
+    for (const g of fs) if (findingCaseChange(x, g)) n += g.n;
     if (n > 0) findings.set(x.id, n);
-    const names = eventGroups.filter((g) => eventCaseChange(x, g));
+    const names = es.filter((g) => eventCaseChange(x, g));
     if (names.length > 0) eventNames.set(x.id, names);
     await yieldToEventLoop();
   }
-  return { findings, eventNames, budgetReached: false };
+  return { findings, eventNames, budgetReached: false, exceptionsCompared: compared, exceptionsTotal: activeOnes.length };
 }
 
 async function loadExceptions(tx: Tx): Promise<InventoryException[]> {
@@ -176,7 +216,9 @@ async function loadExceptions(tx: Tx): Promise<InventoryException[]> {
       expiresAt: policyExceptions.expiresAt,
     })
     .from(policyExceptions)
-    .where(sql`${policyExceptions.location} is not null`);
+    .where(sql`${policyExceptions.location} is not null`)
+    // Deterministic order: when the comparison budget runs out, the newest are left out (N1).
+    .orderBy(asc(policyExceptions.createdAt), asc(policyExceptions.id));
   return rows.map((r) => ({ ...r, location: (r.location as LocationPattern | null) ?? null }));
 }
 
@@ -297,13 +339,15 @@ export async function computeCaseInventory(
   const bound = opts.bound ?? NAMES_BOUND;
   const retentionDays = opts.retentionDays ?? eventsRetentionDays();
   const exceptions = await loadExceptions(tx);
-  if (!exceptions.some((x) => active(x, now))) return { entries: [], findingNamesCompared: 0, eventNamesCompared: 0, boundReached: false };
+  if (!exceptions.some((x) => active(x, now))) {
+    return { entries: [], findingNamesCompared: 0, eventNamesCompared: 0, exceptionsCompared: 0, exceptionsTotal: 0, boundReached: false };
+  }
   const fg = await findingGroups(tx, bound);
   const eg = await eventGroups(tx, bound, retentionDays);
   const boundReached = fg.length > bound || eg.length > bound;
   const fCompared = fg.slice(0, bound);
   const eCompared = eg.slice(0, bound);
-  const { findings, eventNames, budgetReached } = await compareNames(exceptions, fCompared, eCompared, now, opts.comparisonBudget);
+  const { findings, eventNames, budgetReached, exceptionsCompared, exceptionsTotal } = await compareNames(exceptions, fCompared, eCompared, now, opts.comparisonBudget);
   let pairs = 0;
   let pairsCut = false;
   for (const [x, names] of eventNames) {
@@ -320,7 +364,14 @@ export async function computeCaseInventory(
     .filter((x) => ids.has(x.id))
     .map((x) => ({ exceptionId: x.id, findings: findings.get(x.id) ?? 0, events: events.get(x.id) ?? 0 }))
     .sort((a, b) => b.findings + b.events - (a.findings + a.events) || a.exceptionId.localeCompare(b.exceptionId));
-  return { entries, findingNamesCompared: fCompared.length, eventNamesCompared: eCompared.length, boundReached: boundReached || pairsCut || budgetReached };
+  return {
+    entries,
+    findingNamesCompared: fCompared.length,
+    eventNamesCompared: eCompared.length,
+    exceptionsCompared,
+    exceptionsTotal,
+    boundReached: boundReached || pairsCut || budgetReached,
+  };
 }
 
 /** Audit / log details: exception ids and counts only (`<id>:<findings>:<events>`, space-separated). */
@@ -334,6 +385,8 @@ export function inventoryDetails(r: InventoryResult, trigger: "startup" | "user"
       .join(" "),
     exceptions_truncated: r.entries.length > MAX_LISTED,
     finding_names_compared: r.findingNamesCompared,
+    exceptions_compared: r.exceptionsCompared,
+    exceptions_total: r.exceptionsTotal,
     event_names_compared: r.eventNamesCompared,
     names_bound: NAMES_BOUND,
     bound_reached: r.boundReached,
@@ -357,8 +410,11 @@ async function runLocked(db: Database, fn: (tx: Tx) => Promise<InventoryResult |
   });
 }
 
-/** A failed run: one failure audit entry with an error code only (security review L3). */
-async function recordFailure(db: Database, log: Logger, trigger: Trigger, actor: CaseInventoryJob | null, code: string): Promise<void> {
+/**
+ * A failed run: one failure audit entry with an error code only (security review L3). The
+ * `actor_id` column is plain text (no foreign key), so a removed user is still named.
+ */
+export async function recordCaseInventoryFailure(db: Database, log: Logger, trigger: Trigger, actor: CaseInventoryJob | null, code: string): Promise<void> {
   log.warn({ trigger, error_code: code }, "case-sensitive exception inventory failed");
   try {
     await writeAudit(db, {
@@ -405,7 +461,7 @@ export async function runStartupCaseInventory(
     logInventory(log, r, "startup");
     return r;
   } catch (err) {
-    await recordFailure(db, log, "startup", null, errorCode(err));
+    await recordCaseInventoryFailure(db, log, "startup", null, errorCode(err));
     return null;
   }
 }
@@ -435,13 +491,13 @@ export async function runCaseInventory(
       return res;
     });
     if (r === "busy" || r === null) {
-      await recordFailure(db, log, "user", actor, "inventory_running");
+      await recordCaseInventoryFailure(db, log, "user", actor, "inventory_running");
       return null;
     }
     logInventory(log, r, "user");
     return r;
   } catch (err) {
-    await recordFailure(db, log, "user", actor, errorCode(err));
+    await recordCaseInventoryFailure(db, log, "user", actor, errorCode(err));
     return null;
   }
 }
@@ -475,6 +531,9 @@ export interface LatestInventory {
   truncated: boolean;
   findingNamesCompared: number;
   eventNamesCompared: number;
+  /** Active location exceptions compared, of all of them (fewer when the budget ran out). */
+  exceptionsCompared: number;
+  exceptionsTotal: number;
   boundReached: boolean;
 }
 
@@ -513,6 +572,8 @@ export function parseInventoryDetails(at: Date, d: Record<string, unknown>): Lat
     exceptionsListed: num(d.exceptions_listed),
     truncated: d.exceptions_truncated === true,
     findingNamesCompared: num(d.finding_names_compared),
+    exceptionsCompared: num(d.exceptions_compared),
+    exceptionsTotal: num(d.exceptions_total),
     eventNamesCompared: num(d.event_names_compared),
     boundReached: d.bound_reached === true,
   };

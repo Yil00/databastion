@@ -5,7 +5,7 @@ import type { Job } from "pg-boss";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { getDb, type Database } from "@/db/client";
-import { accessEvents, agentTargets, auditLog, findings, policyExceptions } from "@/db/schema";
+import { accessEvents, agentTargets, auditLog, findings, policyExceptions, users } from "@/db/schema";
 import type { Logger } from "@/lib/logger";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, enroll } from "@/test/helpers";
@@ -110,16 +110,39 @@ describe("case inventory comparison (ADR-0054 decision 6, pure)", () => {
     const r = await compareNames(xs, [F()], [E()], NOW, 5);
     expect(r.budgetReached).toBe(true);
     expect([...r.findings.keys()]).toEqual([xs[0]?.id, xs[1]?.id]);
+    expect(r.exceptionsCompared).toBe(2);
+    expect(r.exceptionsTotal).toBe(3);
     expect((await compareNames(xs, [F()], [E()], NOW, 6)).budgetReached).toBe(false);
+  });
+
+  it("charges each exception only the names in its agent / target scope (N1)", async () => {
+    // Out-of-scope exceptions cost nothing: a budget of 2 still compares all three.
+    const xs = [X({ agentId: "other" }), X({ targetId: "other" }), X({ agentId: "a", targetId: "t" })];
+    const r = await compareNames(xs, [F(), F({ agentId: "b" })], [E({ targetId: "u" })], NOW, 1);
+    expect(r).toMatchObject({ budgetReached: false, exceptionsCompared: 3, exceptionsTotal: 3 });
+    expect(r.findings.get(xs[2]?.id ?? "")).toBe(3);
+    // The unscoped exception is charged every name.
+    expect((await compareNames([X()], [F(), F({ agentId: "b" })], [E({ targetId: "u" })], NOW, 2)).budgetReached).toBe(true);
   });
 
   it("audit / log details hold ids and counts only, and read back", () => {
     const id = randomUUID();
-    const d = inventoryDetails({ entries: [{ exceptionId: id, findings: 4, events: 7 }], findingNamesCompared: 10, eventNamesCompared: 3, boundReached: true }, "startup");
-    expect(d).toMatchObject({ exceptions: `${id}:4:7`, exceptions_listed: 1, bound_reached: true, trigger: "startup" });
+    const d = inventoryDetails(
+      {
+        entries: [{ exceptionId: id, findings: 4, events: 7 }],
+        findingNamesCompared: 10,
+        eventNamesCompared: 3,
+        exceptionsCompared: 5,
+        exceptionsTotal: 9,
+        boundReached: true,
+      },
+      "startup",
+    );
+    expect(d).toMatchObject({ exceptions: `${id}:4:7`, exceptions_listed: 1, bound_reached: true, trigger: "startup", exceptions_compared: 5, exceptions_total: 9 });
     const back = parseInventoryDetails(NOW, d);
     expect(back.entries).toEqual([{ exceptionId: id, findings: 4, events: 7 }]);
     expect(back.boundReached).toBe(true);
+    expect(back).toMatchObject({ exceptionsCompared: 5, exceptionsTotal: 9 });
     // Anything else in the string is dropped.
     expect(parseInventoryDetails(NOW, { exceptions: "crm.customers:1:1 <b>:2:2" }).entries).toEqual([]);
   });
@@ -261,6 +284,21 @@ describe.skipIf(!hasDb)("case inventory against the console database (ADR-0054 d
     expect(after.latest?.trigger).toBe("user");
     expect(after.latest?.entries).toHaveLength(2);
 
+    // The requesting user is gone, demoted or disabled when the worker takes the job (N2).
+    const [analyst] = await db.insert(users).values({ username: "inv-analyst", passwordHash: "x", role: "analyst" }).returning({ id: users.id });
+    const [disabled] = await db
+      .insert(users)
+      .values({ username: "inv-disabled", passwordHash: "x", role: "admin", disabledAt: new Date() })
+      .returning({ id: users.id });
+    const gone = randomUUID();
+    for (const id of [gone, analyst?.id, disabled?.id]) await handler([job({ userId: id, ip: null })]);
+    const refused = await db
+      .select()
+      .from(auditLog)
+      .where(and(eq(auditLog.action, "policy_exception.case_inventory"), eq(auditLog.outcome, "failure"), sql`${auditLog.details}->>'error_code' = 'actor_gone'`));
+    expect(refused.map((r) => r.actorId).sort()).toEqual([gone, analyst?.id, disabled?.id].sort());
+    expect((await caseInventoryStatus(db)).failure).toMatchObject({ trigger: "user", errorCode: "actor_gone" });
+
     // Another run holds the lock: the on-demand run does not wait, and is audited as a failure.
     await db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('policy_exception.case_inventory', 0))`);
@@ -329,7 +367,13 @@ describe.skipIf(!hasDb)("case inventory against the console database (ADR-0054 d
     expect(r.boundReached).toBe(true);
     expect(r.findingNamesCompared).toBe(1);
     expect(r.eventNamesCompared).toBe(1);
-    // The comparison budget too.
-    expect((await getDb().transaction((tx) => computeCaseInventory(tx, { comparisonBudget: 1 }))).boundReached).toBe(true);
+    // The comparison budget too: the oldest exceptions are compared, the others counted, and two
+    // runs compare the same ones (N1).
+    const cut = () => getDb().transaction((tx) => computeCaseInventory(tx, { comparisonBudget: 3 }));
+    const [one, two] = [await cut(), await cut()];
+    expect(one.boundReached).toBe(true);
+    expect(one.exceptionsTotal).toBe(3);
+    expect(one.exceptionsCompared).toBeLessThan(3);
+    expect(two).toEqual(one);
   });
 });

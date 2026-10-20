@@ -256,7 +256,11 @@ export function CaseInventoryView({
       {failure && (
         <p role="alert" className="text-sm text-destructive">
           The inventory run of {when(failure.at)} ({failure.trigger === "user" ? "on demand" : "worker start"}) failed
-          {failure.errorCode === "inventory_running" ? ": another run was in progress." : ` (error ${failure.errorCode}); the worker log has the details.`}
+          {failure.errorCode === "inventory_running"
+            ? ": another run was in progress."
+            : failure.errorCode === "actor_gone"
+              ? ": the administrator who requested it is no longer an enabled administrator."
+              : ` (error ${failure.errorCode}); the worker log has the details.`}
         </p>
       )}
       {inventory === null ? (
@@ -266,11 +270,15 @@ export function CaseInventoryView({
           <p className="text-xs text-muted-foreground">
             Last run {when(inventory.at)} ({inventory.trigger === "user" ? "on demand" : "worker start"}):
             {" "}
-            {inventory.findingNamesCompared} finding names and {inventory.eventNamesCompared} event object names compared.
+            {inventory.exceptionsCompared} of {inventory.exceptionsTotal} active location exceptions compared against{" "}
+            {inventory.findingNamesCompared} finding names and {inventory.eventNamesCompared} event object names.
           </p>
           {inventory.boundReached && (
             <p role="alert" className="text-sm text-destructive">
-              The run reached its bound: only the names compared above were checked, so other exceptions may be affected.
+              The run reached its bound: only the names and exceptions compared above were checked, so other exceptions may be
+              affected.
+              {inventory.exceptionsCompared < inventory.exceptionsTotal &&
+                ` The ${inventory.exceptionsTotal - inventory.exceptionsCompared} most recently created exceptions were not compared.`}
             </p>
           )}
           {inventory.entries.length === 0 ? (

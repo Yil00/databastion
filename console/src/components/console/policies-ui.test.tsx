@@ -234,6 +234,8 @@ describe("case-sensitive exceptions (ADR-0054)", () => {
       truncated: false,
       findingNamesCompared: 40,
       eventNamesCompared: 7,
+      exceptionsCompared: 4,
+      exceptionsTotal: 6,
       boundReached: true,
     };
     const html = renderToStaticMarkup(<CaseInventoryView status={{ latest: inventory, failure: null }} exceptions={[ex]} isAdmin csrfToken="c" />);
@@ -242,6 +244,8 @@ describe("case-sensitive exceptions (ADR-0054)", () => {
     expect(html).toContain(">12<");
     expect(html).toContain(`deleted exception ${gone}`);
     expect(html).toContain("reached its bound");
+    expect(html).toContain("4 of 6 active location exceptions compared");
+    expect(html).toContain("The 2 most recently created exceptions were not compared.");
     expect(html).toContain("upper bounds");
     expect(html).toContain("(up to)");
     expect(html).not.toContain("failed");
