@@ -318,6 +318,12 @@ struct Counters {
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
+    /// Batches whose gated fields the console does not list, stripped at
+    /// send time (ADR-0053 decision 2).
+    gated_fields_stripped_at_send: AtomicU64,
+    /// Batches resent without `objects_overflowed` after the console found
+    /// a flagged event naming no `*` (ADR-0053; never expected).
+    overflow_flags_refused: AtomicU64,
     /// Scans whose terminal status was sent while some of their findings
     /// batches were still spooled (flush wait elapsed, or `/findings`
     /// parked).
@@ -1241,6 +1247,11 @@ impl Runtime {
             ("audit_records_skipped_total", &c.audit_records_skipped),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
             (
+                "gated_fields_stripped_at_send_total",
+                &c.gated_fields_stripped_at_send,
+            ),
+            ("overflow_flags_refused_total", &c.overflow_flags_refused),
+            (
                 "scan_status_before_flush_total",
                 &c.scan_status_before_flush,
             ),
@@ -1701,15 +1712,43 @@ impl Runtime {
             let now = Instant::now();
             let mut parked = self.lock_parked();
             // A batch carrying an engine value the console has not listed
-            // (ADR-0039 decision 8) waits, spooled; the others still go.
+            // (ADR-0039 decision 8) waits, spooled; the others still go. So
+            // does a batch carrying a gated field while the console's
+            // capabilities are not known yet (ADR-0053 decision 2): events
+            // spooled before a heartbeat answer keep the fields it lists.
+            let settled = self.console_caps.settled(now);
             self.lock_spool().front_sendable(
                 |findings| !parked.is_parked(findings, now),
                 |gates| uplink::held_back(gates, &self.console_caps),
+                |_fields| !settled,
             )
         };
         let Some((key, batch)) = front else {
             return Ok(Flush::Idle);
         };
+        // Spooled in full, stripped at send time (ADR-0053 decision 2): the
+        // fields whose tokens the console does not list are dropped, under
+        // a new `batch_id`, and the replacement takes the batch's place in
+        // the spool before it is sent (a retry resends the same bytes).
+        match batch.for_console(&self.console_caps) {
+            Ok(None) => {}
+            Ok(Some(stripped)) => {
+                bump(&self.counters.gated_fields_stripped_at_send, 1);
+                if let Err(e) = self.lock_spool().replace(&key, &[stripped], 0) {
+                    tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+                    return Ok(Flush::Retry(spool_backoff(
+                        failures,
+                        backoff::random_fraction(),
+                    )));
+                }
+                return Ok(Flush::Progress);
+            }
+            Err(uplink::Unserializable) => {
+                self.count_unserializable(1);
+                self.lock_spool().drop_batch(&key);
+                return Ok(Flush::Progress);
+            }
+        }
         let result = self
             .session
             .call(
@@ -1794,6 +1833,7 @@ impl Runtime {
                 items,
                 unknown_field,
                 unknown_value,
+                overflow_rule,
             })) if (!unknown_field.is_empty() && batch.carries_gated())
                 || (!unknown_value.is_empty()
                     && batch.carries_gated_engine()
@@ -1805,15 +1845,29 @@ impl Runtime {
                     &items,
                     &unknown_field,
                     &unknown_value,
+                    &overflow_rule,
                     failures,
                 ))
+            }
+            // ADR-0053 decision 1 item 3 (contract review M2): a flagged
+            // event the console finds without a `*` (`contains` / `if`) is
+            // resent once without the flag, never lost. The capabilities are
+            // kept: the console knows the field. The resent items no longer
+            // carry the flag, so a second refusal takes the ordinary path.
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                status: 400,
+                items,
+                overflow_rule,
+                ..
+            })) if !overflow_rule.is_empty() && batch.flagged_at(&overflow_rule) => {
+                Ok(self.resend_unflagged(&key, &batch, &items, &overflow_rule, failures))
             }
             Err(CallError::Uplink(UplinkError::Rejected {
                 status: 400,
                 code: Some(_),
                 unknown_field: true,
             })) if batch.carries_gated() => {
-                Ok(self.resend_stripped(&key, &batch, &[], &[], &[], failures))
+                Ok(self.resend_stripped(&key, &batch, &[], &[], &[], &[], failures))
             }
             Err(CallError::Uplink(UplinkError::ItemsRejected {
                 items,
@@ -1925,6 +1979,7 @@ impl Runtime {
     /// value (`enum`, `unknown_value`) are kept too: with the capabilities
     /// cleared, the replacement is held (`ResultBatch::held_back`) until a
     /// heartbeat response lists the engine's token again.
+    #[allow(clippy::too_many_arguments)]
     fn resend_stripped(
         &self,
         key: &[u64],
@@ -1932,11 +1987,49 @@ impl Runtime {
         rejected: &[usize],
         unknown: &[usize],
         unknown_value: &[usize],
+        overflow_rule: &[usize],
         failures: u32,
     ) -> Flush {
         self.console_caps.clear();
         bump(&self.counters.gated_fields_stripped, 1);
-        let (again, left_out) = match batch.stripped(rejected, unknown, unknown_value) {
+        let (again, left_out) =
+            match batch.stripped(rejected, unknown, unknown_value, overflow_rule) {
+                Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
+                Err(uplink::Unserializable) => {
+                    self.count_unserializable(1);
+                    (Vec::new(), batch.len())
+                }
+            };
+        tracing::warn!(
+            path = batch.path(),
+            left_out,
+            "batch with gated fields rejected (400): console capabilities cleared, items sent \
+             again without them"
+        );
+        let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
+        if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
+            tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+            return Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
+        }
+        Flush::Progress
+    }
+
+    /// A batch was rejected with `400` reporting the overflow rule on items
+    /// carrying `objects_overflowed` (an event flagged without a `*`,
+    /// ADR-0053 decision 1 item 3): those items are sent again without the
+    /// flag under a new `batch_id`, the other rejected items are left out.
+    /// The capabilities are kept (the console knows the field); at most once
+    /// per item, since the resent items no longer carry the flag.
+    fn resend_unflagged(
+        &self,
+        key: &[u64],
+        batch: &ResultBatch,
+        rejected: &[usize],
+        overflow_rule: &[usize],
+        failures: u32,
+    ) -> Flush {
+        bump(&self.counters.overflow_flags_refused, 1);
+        let (again, left_out) = match batch.unflagged(rejected, overflow_rule) {
             Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
             Err(uplink::Unserializable) => {
                 self.count_unserializable(1);
@@ -1946,8 +2039,8 @@ impl Runtime {
         tracing::warn!(
             path = batch.path(),
             left_out,
-            "batch with gated fields rejected (400): console capabilities cleared, items sent \
-             again without them"
+            "events with objects_overflowed refused for naming no `*` (400): sent again \
+             without the flag"
         );
         let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
         if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
@@ -2327,9 +2420,6 @@ impl Runtime {
             target_id,
             events,
             fingerprints: &fingerprints,
-            accept_bytes: self
-                .console_caps
-                .console_accepts(crate::capabilities::token::ACCESS_EVENT_BYTES),
         });
         self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();

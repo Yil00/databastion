@@ -59,6 +59,10 @@ struct Entry {
     /// Capability tokens of the engine values its items carry (ADR-0042):
     /// whether it is held is decided from here, without reading the file.
     gates: Vec<&'static str>,
+    /// Capability tokens of the gated fields its items carry (ADR-0053
+    /// decision 2): whether it waits for a heartbeat answer is decided from
+    /// here, without reading the file.
+    fields: Vec<&'static str>,
     /// Its gated-engine items were already kept once after a `400` `enum`
     /// (ADR-0042 decision 4). In memory only: an agent restart forgets it.
     kept_once: bool,
@@ -213,6 +217,7 @@ impl Spool {
                         items: to_u64(batch.len()),
                         created,
                         gates: batch.gates().to_vec(),
+                        fields: batch.fields().to_vec(),
                         kept_once: false,
                     });
                 }
@@ -425,6 +430,7 @@ impl Spool {
             items,
             created: SystemTime::now(),
             gates: batch.gates().to_vec(),
+            fields: batch.fields().to_vec(),
             kept_once: batch.kept_once(),
         }))
     }
@@ -464,7 +470,7 @@ impl Spool {
         &mut self,
         endpoint: impl FnMut(bool) -> bool,
     ) -> Option<(Key, ResultBatch)> {
-        self.front_sendable(endpoint, |_| false)
+        self.front_sendable(endpoint, |_| false, |_| false)
     }
 
     /// Number of spooled batches whose engine tokens `held` refuses
@@ -479,17 +485,24 @@ impl Spool {
     /// As [`front_where`](Self::front_where), also skipping (and keeping)
     /// the batches whose engine tokens `held` refuses: those carrying a
     /// value of an engine the console has not listed (ADR-0042) wait until
-    /// it does. Decided from the entry's tokens (recorded when the batch
-    /// was written or loaded), so a held batch is never read here.
+    /// it does; and those whose gated-field tokens `waits` refuses: those
+    /// carrying a gated field while the console's capabilities are not
+    /// known yet (ADR-0053 decision 2). Decided from the entry's tokens
+    /// (recorded when the batch was written or loaded), so a held batch is
+    /// never read here.
     pub(crate) fn front_sendable(
         &mut self,
         mut endpoint: impl FnMut(bool) -> bool,
         mut held: impl FnMut(&[&'static str]) -> bool,
+        mut waits: impl FnMut(&[&'static str]) -> bool,
     ) -> Option<(Key, ResultBatch)> {
         let mut index = 0;
         loop {
             let entry = self.entries.get(index)?;
-            if !endpoint(entry.findings) || (!entry.gates.is_empty() && held(&entry.gates)) {
+            if !endpoint(entry.findings)
+                || (!entry.gates.is_empty() && held(&entry.gates))
+                || (!entry.fields.is_empty() && waits(&entry.fields))
+            {
                 index += 1;
                 continue;
             }

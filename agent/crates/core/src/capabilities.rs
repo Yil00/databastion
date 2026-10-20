@@ -45,6 +45,8 @@ pub(crate) mod token {
     pub(crate) const TARGET_STATUS_NOTES: &str = "target_status.notes";
     /// `AccessEvent.bytes`.
     pub(crate) const ACCESS_EVENT_BYTES: &str = "access_event.bytes";
+    /// `AccessEvent.objects_overflowed` (ADR-0053).
+    pub(crate) const ACCESS_EVENT_OBJECTS_OVERFLOWED: &str = "access_event.objects_overflowed";
     /// `JobProgress.objects_sampled` and `skipped_*`.
     pub(crate) const JOB_PROGRESS_COVERAGE: &str = "job_progress.coverage";
     /// The `cas` values of `Engine` and `Connector`, and `cas_audit_log` of
@@ -178,17 +180,52 @@ pub(crate) fn audit_source_token(source: AuditSource) -> &'static [&'static str]
     }
 }
 
+/// How long gated fields may wait for a heartbeat answer while the
+/// capability set is not known (see [`ConsoleCapabilities::settled`]): two
+/// of the longest heartbeat intervals the agent accepts, so one heartbeat
+/// lost on the way does not strip them.
+pub(crate) const UNKNOWN_HOLD: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::backoff::HEARTBEAT_MAX_S.unsigned_abs());
+
 /// What the console accepts, from its latest heartbeat response.
-#[derive(Debug, Default)]
+///
+/// The set is **not known** from the start of the agent until the first
+/// heartbeat response, and again from a [`clear`](Self::clear) (a `400` on
+/// a gated field or on a heartbeat) until the next response. Gated
+/// `AccessEvent` fields are spooled in full and stripped at send time
+/// (ADR-0053 decision 2): batches carrying them wait while the set is not
+/// known (at most [`UNKNOWN_HOLD`]), so that events spooled before a
+/// response keep fields the console then lists.
+#[derive(Debug)]
 pub(crate) struct ConsoleCapabilities {
-    accepted: RwLock<BTreeSet<String>>,
+    accepted: RwLock<Accepted>,
+}
+
+#[derive(Debug)]
+struct Accepted {
+    tokens: BTreeSet<String>,
+    /// Since when the set has not been known; `None` once a heartbeat
+    /// response recorded it.
+    unknown_since: Option<std::time::Instant>,
+}
+
+impl Default for ConsoleCapabilities {
+    fn default() -> Self {
+        Self {
+            accepted: RwLock::new(Accepted {
+                tokens: BTreeSet::new(),
+                unknown_since: Some(std::time::Instant::now()),
+            }),
+        }
+    }
 }
 
 impl ConsoleCapabilities {
     /// Replaces the set with the `accepts` of a heartbeat response (absent:
-    /// nothing is accepted). Only the first [`MAX_CAPABILITIES`] tokens are
-    /// kept, so a hostile or buggy console cannot grow the set.
-    /// Returns whether the set changed.
+    /// nothing is accepted); the set is then known. Only the first
+    /// [`MAX_CAPABILITIES`] tokens are kept, so a hostile or buggy console
+    /// cannot grow the set. Returns whether the set changed, or became
+    /// known.
     pub(crate) fn record(&self, accepts: Option<&CapabilityList>) -> bool {
         let set: BTreeSet<String> = accepts
             .map(|list| {
@@ -198,18 +235,44 @@ impl ConsoleCapabilities {
                     .collect()
             })
             .unwrap_or_default();
-        let mut accepted = self
-            .accepted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = *accepted != set;
-        *accepted = set;
+        let mut accepted = self.write();
+        let changed = accepted.tokens != set || accepted.unknown_since.is_some();
+        accepted.tokens = set;
+        accepted.unknown_since = None;
         changed
     }
 
-    /// Forgets every capability (heartbeat rejected with `400`).
+    /// Forgets every capability (a `400` on a heartbeat or on a gated
+    /// field): nothing is accepted, and the set is not known until the next
+    /// heartbeat response.
     pub(crate) fn clear(&self) {
-        self.record(None);
+        let mut accepted = self.write();
+        accepted.tokens.clear();
+        if accepted.unknown_since.is_none() {
+            accepted.unknown_since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Whether gated fields may be decided now: the set was recorded from a
+    /// heartbeat response, or it has not been known for [`UNKNOWN_HOLD`]
+    /// already (a console whose heartbeats keep failing must not hold
+    /// events forever; they are then sent without the unlisted fields).
+    pub(crate) fn settled(&self, now: std::time::Instant) -> bool {
+        self.read()
+            .unknown_since
+            .is_none_or(|since| now.saturating_duration_since(since) >= UNKNOWN_HOLD)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Accepted> {
+        self.accepted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Accepted> {
+        self.accepted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether the console accepts every one of `tokens` (none: a value of
@@ -235,10 +298,7 @@ impl ConsoleCapabilities {
 
     /// Whether the latest heartbeat response listed `token`.
     pub(crate) fn console_accepts(&self, token: &str) -> bool {
-        self.accepted
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(token)
+        self.read().tokens.contains(token)
     }
 }
 
@@ -341,6 +401,33 @@ mod tests {
         caps.record(Some(&list(&[token::TARGET_STATUS_NOTES])));
         caps.clear();
         assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
+    }
+
+    /// ADR-0053 decision 2: the set is not known before the first
+    /// response and after a clear, until the next response or
+    /// [`UNKNOWN_HOLD`].
+    #[test]
+    fn the_set_is_settled_by_a_response_or_after_the_hold() {
+        use std::time::{Duration, Instant};
+        let caps = ConsoleCapabilities::default();
+        let now = Instant::now();
+        assert!(!caps.settled(now));
+        assert!(caps.settled(now + UNKNOWN_HOLD + Duration::from_secs(1)));
+        // An empty answer is an answer: the set became known.
+        assert!(caps.record(None), "known now");
+        assert!(caps.settled(now));
+        assert!(!caps.record(None), "unchanged");
+        caps.record(Some(&list(&[token::ACCESS_EVENT_OBJECTS_OVERFLOWED])));
+        caps.clear();
+        let cleared = Instant::now();
+        assert!(!caps.settled(cleared));
+        assert!(!caps.console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED));
+        // A second clear does not restart the hold.
+        caps.clear();
+        assert!(caps.settled(cleared + UNKNOWN_HOLD));
+        assert!(caps.record(Some(&list(&[token::ACCESS_EVENT_OBJECTS_OVERFLOWED]))));
+        assert!(caps.settled(cleared));
+        assert_eq!(UNKNOWN_HOLD, Duration::from_secs(600));
     }
 
     #[test]
