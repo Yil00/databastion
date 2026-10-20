@@ -555,6 +555,12 @@ export interface IncidentView {
     anomaly: boolean;
     /** Per-policy overflow incident of an hour (H1). */
     overflow: boolean;
+    /**
+     * ADR-0053: an event of the incident reached more objects than it lists, and the highest
+     * bound score of its events (an upper bound, display only; null before ADR-0053).
+     */
+    objectsOverflowed: boolean;
+    boundScore: number | null;
   } | null;
   createdAt: Date;
   updatedAt: Date;
@@ -611,6 +617,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       lastEventAt: incidents.lastEventAt,
       eventAnomaly: incidents.eventAnomaly,
       eventOverflow: incidents.eventOverflow,
+      eventObjectsOverflowed: incidents.eventObjectsOverflowed,
+      eventBoundScore: incidents.eventBoundScore,
       createdAt: incidents.createdAt,
       updatedAt: incidents.updatedAt,
       acknowledgedAt: incidents.acknowledgedAt,
@@ -642,6 +650,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       lastEventAt,
       eventAnomaly,
       eventOverflow,
+      eventObjectsOverflowed,
+      eventBoundScore,
       ...r
     }) => ({
     ...r,
@@ -658,6 +668,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
             lastEventAt,
             anomaly: eventAnomaly === true,
             overflow: eventOverflow,
+            objectsOverflowed: eventObjectsOverflowed === true,
+            boundScore: eventBoundScore,
           }
         : null,
     location:

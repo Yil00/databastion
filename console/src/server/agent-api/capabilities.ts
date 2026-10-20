@@ -18,10 +18,15 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * `job_progress.coverage` counters are stored with the job's progress and shown with the target's
  * latest scan (src/lib/scan-coverage.ts).
  *
- * Exception, on purpose: `access_event.objects_overflowed` (ADR-0053) is accepted by the generated
- * schema since the contract change (decision 1), but it is not listed here and the field is not
- * stored or used: it is listed only by the console change of ADR-0053 decision 3, which gives
- * the `*` objects of a flagged event their meaning. A conforming agent does not send it before.
+ * `access_event.objects_overflowed` (ADR-0053 decisions 1 and 3) is stored with the event
+ * (`access_events.objects_overflowed`) and gives every `*` object of a flagged event the meaning
+ * "objects of its database the event does not name": policy selection on the bound score and on
+ * the database, location exceptions only when they cover the whole database, display and the
+ * `incident.opened` payload (src/lib/event-model.ts, src/server/event-engine.ts). As for every
+ * token, a console running several replicas lists it only once every replica runs this build
+ * (ADR-0022 decision 8): an agent sends the field as soon as one replica lists it, and an older
+ * replica (0.8.0 or earlier) rejects it with `400`; the agent then strips it and resends
+ * (ADR-0022 decision 9): no event is lost, but the events resent that way lose the flag.
  *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
@@ -47,6 +52,7 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  */
 export const CONSOLE_ACCEPTS = [
   "access_event.bytes",
+  "access_event.objects_overflowed",
   "engine.cas",
   "engine.redis",
   "engine.sqlserver",
