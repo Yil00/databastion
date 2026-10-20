@@ -81,7 +81,13 @@ LOAD_SOAK_MAX_S=1800
   || { echo "LOAD_SOAK_S must be at most $LOAD_SOAK_MAX_S seconds (got $LOAD_SOAK_S)" >&2; exit 2; }
 
 log() { printf '[load %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::error title=%s::%s\n' "${LOG_TAG:-load}" "$*" | tr -d '\r'; fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 
 T_RUN="$(date +%s)"

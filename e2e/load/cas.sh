@@ -71,7 +71,13 @@ print_census() {
   python3 "$HERE/loadlib.py" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" \
     ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
 }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::error title=%s::%s\n' "${LOG_TAG:-load}" "$*" | tr -d '\r'; fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 T_RUN="$(date +%s)"
 T_PHASE="$T_RUN"

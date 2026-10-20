@@ -19,7 +19,13 @@ BASE_URL="https://${HOSTNAME_CONSOLE}:${E2E_HTTPS_PORT}"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[%s %s] %s\n' "$LOG_TAG" "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::error title=%s::%s\n' "${LOG_TAG:-load}" "$*" | tr -d '\r'; fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 
 T_RUN="$(date +%s)"
