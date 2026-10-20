@@ -236,15 +236,27 @@ describe("case-sensitive exceptions (ADR-0054)", () => {
       eventNamesCompared: 7,
       boundReached: true,
     };
-    const html = renderToStaticMarkup(<CaseInventoryView inventory={inventory} exceptions={[ex]} isAdmin csrfToken="c" />);
+    const html = renderToStaticMarkup(<CaseInventoryView status={{ latest: inventory, failure: null }} exceptions={[ex]} isAdmin csrfToken="c" />);
     expect(html).not.toContain("<img");
     expect(html).toContain(ESCAPED);
     expect(html).toContain(">12<");
     expect(html).toContain(`deleted exception ${gone}`);
     expect(html).toContain("reached its bound");
+    expect(html).toContain("upper bounds");
+    expect(html).toContain("(up to)");
+    expect(html).not.toContain("failed");
     expect(html).toContain("Run the inventory again");
-    const analyst = renderToStaticMarkup(<CaseInventoryView inventory={null} exceptions={[]} isAdmin={false} csrfToken="c" />);
+    const analyst = renderToStaticMarkup(
+      <CaseInventoryView
+        status={{ latest: null, failure: { at: new Date(NOW), trigger: "startup", errorCode: "57014" } }}
+        exceptions={[]}
+        isAdmin={false}
+        csrfToken="c"
+      />,
+    );
     expect(analyst).toContain("No inventory has run yet");
+    expect(analyst).toContain("failed");
+    expect(analyst).toContain("error 57014");
     expect(analyst).not.toContain("Run the inventory again");
   });
 });

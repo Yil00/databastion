@@ -4,7 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { EventConditions, ObjectPattern } from "@/lib/event-model";
 import type { FindingConditions, LocationPattern, PolicyConditions, PolicySource } from "@/lib/policy-model";
-import type { LatestInventory } from "@/server/exception-case-inventory";
+import type { CaseInventoryStatus } from "@/server/exception-case-inventory";
 import type { ExceptionView, PolicyView } from "@/server/policies";
 
 import { SeverityBadge } from "./incidents-table";
@@ -229,20 +229,23 @@ export function exceptionScopeLabels(e: ExceptionView): string[] {
 /**
  * Exceptions whose effect changed with case-sensitive matching (ADR-0054 decision 6): the latest
  * inventory (worker start after the upgrade, or an administrator's run), with the findings and
- * events each one no longer covers. Exceptions deleted since are shown by id.
+ * events each one may no longer cover (upper bounds), and a failed run more recent than it.
+ * Exceptions deleted since are shown by id.
  */
 export function CaseInventoryView({
-  inventory,
+  status,
   exceptions,
   isAdmin,
   csrfToken,
 }: {
-  inventory: LatestInventory | null;
+  status: CaseInventoryStatus;
   exceptions: ExceptionView[];
   isAdmin: boolean;
   csrfToken: string;
 }) {
   const byId = new Map(exceptions.map((e) => [e.id, e]));
+  const { latest: inventory, failure } = status;
+  const when = (d: Date) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm text-muted-foreground">
@@ -250,12 +253,18 @@ export function CaseInventoryView({
         targets. The exceptions below covered stored findings or access events only because case was ignored: review them, and
         correct a pattern written in another case than the real name.
       </p>
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          The inventory run of {when(failure.at)} ({failure.trigger === "user" ? "on demand" : "worker start"}) failed
+          {failure.errorCode === "inventory_running" ? ": another run was in progress." : ` (error ${failure.errorCode}); the worker log has the details.`}
+        </p>
+      )}
       {inventory === null ? (
         <p className="text-sm text-muted-foreground">No inventory has run yet (the worker runs one at its first start).</p>
       ) : (
         <>
           <p className="text-xs text-muted-foreground">
-            Last run {inventory.at.toISOString().slice(0, 16).replace("T", " ")} UTC ({inventory.trigger === "user" ? "on demand" : "worker start"}):
+            Last run {when(inventory.at)} ({inventory.trigger === "user" ? "on demand" : "worker start"}):
             {" "}
             {inventory.findingNamesCompared} finding names and {inventory.eventNamesCompared} event object names compared.
           </p>
@@ -267,12 +276,17 @@ export function CaseInventoryView({
           {inventory.entries.length === 0 ? (
             <p className="text-sm text-muted-foreground">No exception is affected.</p>
           ) : (
+            <>
+            <p className="text-xs text-muted-foreground">
+              Counts are upper bounds: another exception may still cover an item, and an event is counted when at least one of its
+              objects is no longer covered by this exception.
+            </p>
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Exception</TableHead>
-                  <TableHead>Findings no longer covered</TableHead>
-                  <TableHead>Events no longer covered</TableHead>
+                  <TableHead>Findings no longer covered (up to)</TableHead>
+                  <TableHead>Events no longer covered (up to)</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -296,6 +310,7 @@ export function CaseInventoryView({
                 })}
               </TableBody>
             </Table>
+            </>
           )}
           {inventory.truncated && (
             <p className="text-xs text-muted-foreground">

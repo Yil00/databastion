@@ -34,7 +34,7 @@ import { buildScanParams, requestScan } from "@/server/scans";
 import { configureAudit, parseAuditConfigInput } from "@/server/audit-config";
 import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
-import { runCaseInventory } from "@/server/exception-case-inventory";
+import { requestCaseInventory } from "@/server/case-inventory-queue";
 import {
   clearSessionCookie,
   createSession,
@@ -754,16 +754,46 @@ export function handleDeleteException(req: Request, id: string): Promise<Respons
 }
 
 /**
- * Runs the inventory of the location exceptions whose effect changed with case-sensitive matching
- * (ADR-0054 decision 6; admin, CSRF). Audited `policy_exception.case_inventory` with exception ids
- * and counts only. `200 {listed, bound_reached}`.
+ * On-demand case inventories per administrator (security review M1): shared by every console
+ * process (ADR-0024) and fail closed. A refused request is audited and counts toward nothing.
+ */
+export const caseInventoriesPerUser = RateLimiter.shared("case_inventory.per_user", 3, 10 * 60_000, "closed");
+
+/**
+ * Queues the inventory of the location exceptions whose effect changed with case-sensitive
+ * matching (ADR-0054 decision 6; admin, CSRF). The worker runs it (`policy_exceptions.case_inventory`,
+ * stately: a request while one is queued coalesces) and audits the result as the administrator's
+ * `policy_exception.case_inventory`; the request itself is audited as
+ * `policy_exception.case_inventory_request`. `202 {queued}`, `429` over the limit, `503` when the
+ * job cannot be queued.
  */
 export function handleCaseInventory(req: Request): Promise<Response> {
-  return guardedUser("policy_exception.case_inventory", async () => {
-    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy_exception.case_inventory" });
+  return guardedUser("policy_exception.case_inventory_request", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy_exception.case_inventory_request" });
     if (!g.ok) return g.response;
-    const r = await runCaseInventory(getDb(), logger, { userId: g.session.user.id, ip: g.ip });
-    return json({ listed: r.entries.length, bound_reached: r.boundReached });
+    const audit = (outcome: "success" | "failure", details: Record<string, string | boolean>) =>
+      writeAudit(getDb(), {
+        actorType: "user",
+        actorId: g.session.user.id,
+        action: "policy_exception.case_inventory_request",
+        outcome,
+        targetType: "policy_exception",
+        sourceIp: g.ip,
+        details,
+      });
+    const slot = await caseInventoriesPerUser.reserveShared(g.session.user.id);
+    if (!slot.ok) {
+      await audit("failure", { reason: "rate_limited" });
+      return error(429, "rate_limited", { "Retry-After": String(slot.retryAfterS) });
+    }
+    const r = await requestCaseInventory({ userId: g.session.user.id, ip: g.ip });
+    if (r === "unavailable") {
+      slot.refund();
+      await audit("failure", { reason: "queue_unavailable" });
+      return error(503, "unavailable");
+    }
+    await audit("success", { coalesced: r === "coalesced" });
+    return json({ queued: true, coalesced: r === "coalesced" }, 202);
   });
 }
 

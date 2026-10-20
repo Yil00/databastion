@@ -3,11 +3,13 @@ import { and, desc, eq, sql, type SQL } from "drizzle-orm";
 import type { Database } from "@/db/client";
 import { auditLog, policyExceptions } from "@/db/schema";
 import { objectMatches, type EventObject } from "@/lib/event-model";
+import { auditSourceEngine, auditSourceTable } from "@/lib/location-labels";
 import { errorSummary, type Logger } from "@/lib/logger";
 import { CASE_BLIND_EXCEPTION_ENGINES, exceptionGlobOptions, exceptionMatchesCase, UUID } from "@/lib/policy-common";
 import { classifierSelected, locationMatches, type FindingFacts, type LocationPattern } from "@/lib/policy-model";
 
 import { writeAudit } from "./audit";
+import type { CaseInventoryJob } from "./case-inventory-queue";
 import { eventsRetentionDays } from "./events";
 
 type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
@@ -26,12 +28,21 @@ type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
  *   findings and distinct (agent, target, database, schema, object) names of the event objects,
  *   at most `NAMES_BOUND` of each per run: a run that reaches the bound says so
  *   (`boundReached`) and counts only what it compared.
- * - The findings count of an exception is the number of findings whose name it no longer covers;
- *   the events count, the number of events holding at least one object it no longer covers.
- * - Ran by the worker at its first start after the upgrade (no earlier inventory in the audit log),
- *   and on demand by an administrator from the policies page. The result is recorded in one audit
- *   entry (`policy_exception.case_inventory`) and the log with exception ids and counts only, never
- *   a glob or a name; the policies page reads the latest entry.
+ * - The comparison is bounded too (`COMPARISON_BUDGET` exception x name evaluations, each at
+ *   most 8 `globMatch` calls) and yields to the event loop between exceptions; a run that reaches
+ *   it says so (`boundReached`).
+ * - Counts are upper bounds (security review L2): the findings count of an exception is the number
+ *   of findings whose name it no longer covers, the events count the number of events holding at
+ *   least one object it no longer covers; another exception may still cover them, and an event
+ *   with other objects may still raise nothing.
+ * - The engine of an event is the one its source tells (`auditSourceEngine`, checked at ingest),
+ *   else its target's (security review L1).
+ * - Ran by the worker only: at its first start after the upgrade (no successful inventory in the
+ *   audit log yet), and on demand through the `policy_exceptions.case_inventory` queue, which an
+ *   administrator fills from the policies page (security review M1). The result is recorded in one
+ *   audit entry (`policy_exception.case_inventory`) and the log with exception ids and counts only,
+ *   never a glob or a name; a failed run in a failure entry with an error code only (L3). The
+ *   policies page reads the latest entries.
  *
  * The exception's policy scope is not considered: the inventory names the exceptions, whatever the
  * policies that would match the item.
@@ -42,7 +53,10 @@ export const NAMES_BOUND = 20_000;
 export const PAIRS_BOUND = 100_000;
 /** Exceptions listed in the audit entry and the log (the count of all of them is always given). */
 export const MAX_LISTED = 100;
+/** Exception x name evaluations per run (each at most 8 `globMatch` calls: <= 2 * 10^7). */
+export const COMPARISON_BUDGET = 2_500_000;
 const STATEMENT_TIMEOUT_MS = 120_000;
+const LOCK_TIMEOUT_MS = 5_000;
 const LOCK_KEY = "policy_exception.case_inventory";
 
 export interface InventoryException {
@@ -69,7 +83,7 @@ export interface FindingNameGroup {
 export interface EventNameGroup {
   agentId: string;
   targetId: string;
-  /** Engine of the target as last reported (null: unknown, compared with case). */
+  /** Engine told by the event source, else the target's (null: unknown, compared with case). */
   engine: string | null;
   database: string;
   schema: string | null;
@@ -119,27 +133,36 @@ export function eventCaseChange(x: InventoryException, g: EventNameGroup): boole
   return objectMatches(parts, o, { ...strict, matchCase: false }) && !objectMatches(parts, o, strict);
 }
 
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 /**
  * The pure part of the inventory: per active location exception, the findings it no longer
  * covers (summed over the groups) and the event names it no longer covers (counted by the caller).
+ * At most `budget` exception x name evaluations; yields to the event loop between exceptions.
  */
-export function compareNames(
+export async function compareNames(
   exceptions: readonly InventoryException[],
   findingGroups: readonly FindingNameGroup[],
   eventGroups: readonly EventNameGroup[],
   now: Date,
-): { findings: Map<string, number>; eventNames: Map<string, EventNameGroup[]> } {
+  budget = COMPARISON_BUDGET,
+): Promise<{ findings: Map<string, number>; eventNames: Map<string, EventNameGroup[]>; budgetReached: boolean }> {
   const findings = new Map<string, number>();
   const eventNames = new Map<string, EventNameGroup[]>();
+  const perException = findingGroups.length + eventGroups.length;
+  let left = budget;
   for (const x of exceptions) {
     if (!active(x, now)) continue;
+    if (left < perException) return { findings, eventNames, budgetReached: true };
+    left -= perException;
     let n = 0;
     for (const g of findingGroups) if (findingCaseChange(x, g)) n += g.n;
     if (n > 0) findings.set(x.id, n);
     const names = eventGroups.filter((g) => eventCaseChange(x, g));
     if (names.length > 0) eventNames.set(x.id, names);
+    await yieldToEventLoop();
   }
-  return { findings, eventNames };
+  return { findings, eventNames, budgetReached: false };
 }
 
 async function loadExceptions(tx: Tx): Promise<InventoryException[]> {
@@ -196,36 +219,70 @@ async function findingGroups(tx: Tx, bound: number): Promise<FindingNameGroup[]>
   }));
 }
 
+/**
+ * Event rows whose engine compares names with case: the engine the source tells when it tells one
+ * (MySQL / MariaDB and Redis / Valkey sources serve engines of one kind), else the target's.
+ */
+function caseSensitiveEvent(): SQL {
+  const table = auditSourceTable();
+  const list = (sources: readonly string[]) => sql.join(sources.map((x) => sql`${x}::text`), sql`, `);
+  const blind = table.filter(([, engines]) => engines.every((e) => !exceptionMatchesCase(e))).map(([x]) => x);
+  return sql`(e.source not in (${list(blind)}) and (e.source in (${list(table.map(([x]) => x))}) or ${caseSensitiveEngine(sql`t.engine`)}))`;
+}
+
 async function eventGroups(tx: Tx, bound: number, retentionDays: number): Promise<EventNameGroup[]> {
-  const res = await tx.execute<{ agent_id: string; target_id: string; engine: string | null; database: string; schema: string | null; object: string }>(sql`
-    select e.agent_id, e.target_id, t.engine, o->>'database' as database, o->>'schema' as schema, o->>'object' as object
+  const res = await tx.execute<{
+    agent_id: string;
+    target_id: string;
+    source: string;
+    engine: string | null;
+    database: string;
+    schema: string | null;
+    object: string;
+  }>(sql`
+    select e.agent_id, e.target_id, e.source, t.engine, o->>'database' as database, o->>'schema' as schema, o->>'object' as object
     from access_events e
     left join agent_targets t on t.agent_id = e.agent_id and t.target_id = e.target_id
     cross join lateral jsonb_array_elements(e.objects) o
-    where e.ts >= now() - make_interval(days => ${retentionDays}::int) and ${caseSensitiveEngine(sql`t.engine`)}
-    group by 1, 2, 3, 4, 5, 6
-    order by 1, 2, 3, 4, 5, 6
+    where e.ts >= now() - make_interval(days => ${retentionDays}::int) and ${caseSensitiveEvent()}
+    group by 1, 2, 3, 4, 5, 6, 7
+    order by 1, 2, 3, 4, 5, 6, 7
     limit ${bound + 1}`);
   return res.rows
     .filter((r) => typeof r.database === "string" && typeof r.object === "string")
-    .map((r) => ({ agentId: r.agent_id, targetId: r.target_id, engine: r.engine, database: r.database, schema: r.schema, object: r.object }));
+    .map((r) => ({
+      agentId: r.agent_id,
+      targetId: r.target_id,
+      engine: auditSourceEngine(r.source) ?? r.engine,
+      database: r.database,
+      schema: r.schema,
+      object: r.object,
+    }));
 }
 
 /** Events holding at least one of the listed names, per exception (exact `=`, one scan). */
 async function countEvents(tx: Tx, names: Map<string, EventNameGroup[]>, retentionDays: number): Promise<Map<string, number>> {
   const out = new Map<string, number>();
-  const pairs = [...names].filter(([, gs]) => gs.length > 0).flatMap(([x, gs]) =>
-    gs.map((g) => ({ x, agent_id: g.agentId, target_id: g.targetId, database: g.database, schema: g.schema, object: g.object })),
-  );
+  // The same name may come from groups of two sources: one pair per (exception, name).
+  const seen = new Set<string>();
+  const pairs = [...names]
+    .flatMap(([x, gs]) => gs.map((g) => ({ x, agent_id: g.agentId, target_id: g.targetId, database: g.database, schema: g.schema, object: g.object })))
+    .filter((p) => {
+      const k = JSON.stringify(p);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
   if (pairs.length === 0) return out;
   const res = await tx.execute<{ x: string; n: number }>(sql`
     select p.x, count(distinct e.id)::int as n
     from access_events e
+    left join agent_targets t on t.agent_id = e.agent_id and t.target_id = e.target_id
     cross join lateral jsonb_array_elements(e.objects) o
     join jsonb_to_recordset(${JSON.stringify(pairs)}::jsonb) as p(x uuid, agent_id uuid, target_id text, database text, schema text, object text)
       on p.agent_id = e.agent_id and p.target_id = e.target_id
       and p.database = o->>'database' and p.schema is not distinct from o->>'schema' and p.object = o->>'object'
-    where e.ts >= now() - make_interval(days => ${retentionDays}::int)
+    where e.ts >= now() - make_interval(days => ${retentionDays}::int) and ${caseSensitiveEvent()}
     group by p.x`);
   for (const r of res.rows) out.set(String(r.x), Number(r.n));
   return out;
@@ -234,7 +291,7 @@ async function countEvents(tx: Tx, names: Map<string, EventNameGroup[]>, retenti
 /** Computes the inventory in `tx` (read-only; bounded per run). */
 export async function computeCaseInventory(
   tx: Tx,
-  opts: { now?: Date; bound?: number; retentionDays?: number } = {},
+  opts: { now?: Date; bound?: number; retentionDays?: number; comparisonBudget?: number } = {},
 ): Promise<InventoryResult> {
   const now = opts.now ?? new Date();
   const bound = opts.bound ?? NAMES_BOUND;
@@ -246,7 +303,7 @@ export async function computeCaseInventory(
   const boundReached = fg.length > bound || eg.length > bound;
   const fCompared = fg.slice(0, bound);
   const eCompared = eg.slice(0, bound);
-  const { findings, eventNames } = compareNames(exceptions, fCompared, eCompared, now);
+  const { findings, eventNames, budgetReached } = await compareNames(exceptions, fCompared, eCompared, now, opts.comparisonBudget);
   let pairs = 0;
   let pairsCut = false;
   for (const [x, names] of eventNames) {
@@ -263,7 +320,7 @@ export async function computeCaseInventory(
     .filter((x) => ids.has(x.id))
     .map((x) => ({ exceptionId: x.id, findings: findings.get(x.id) ?? 0, events: events.get(x.id) ?? 0 }))
     .sort((a, b) => b.findings + b.events - (a.findings + a.events) || a.exceptionId.localeCompare(b.exceptionId));
-  return { entries, findingNamesCompared: fCompared.length, eventNamesCompared: eCompared.length, boundReached: boundReached || pairsCut };
+  return { entries, findingNamesCompared: fCompared.length, eventNamesCompared: eCompared.length, boundReached: boundReached || pairsCut || budgetReached };
 }
 
 /** Audit / log details: exception ids and counts only (`<id>:<findings>:<events>`, space-separated). */
@@ -283,64 +340,131 @@ export function inventoryDetails(r: InventoryResult, trigger: "startup" | "user"
   };
 }
 
-async function runLocked(
-  db: Database,
-  fn: (tx: Tx) => Promise<InventoryResult | null>,
-): Promise<InventoryResult | null> {
+type Trigger = "startup" | "user";
+
+/**
+ * Runs `fn` in a transaction under the inventory's advisory lock, taken without waiting
+ * (`"busy"` when another run holds it); `lock_timeout` and `statement_timeout` are set first, so
+ * no statement of the run waits or runs unbounded (security review M1).
+ */
+async function runLocked(db: Database, fn: (tx: Tx) => Promise<InventoryResult | null>): Promise<InventoryResult | null | "busy"> {
   return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${LOCK_KEY}, 0))`);
+    await tx.execute(sql.raw(`set local lock_timeout = ${LOCK_TIMEOUT_MS}`));
     await tx.execute(sql.raw(`set local statement_timeout = ${STATEMENT_TIMEOUT_MS}`));
+    const res = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${LOCK_KEY}, 0)) as locked`);
+    if (res.rows[0]?.locked !== true) return "busy";
     return fn(tx);
   });
 }
 
+/** A failed run: one failure audit entry with an error code only (security review L3). */
+async function recordFailure(db: Database, log: Logger, trigger: Trigger, actor: CaseInventoryJob | null, code: string): Promise<void> {
+  log.warn({ trigger, error_code: code }, "case-sensitive exception inventory failed");
+  try {
+    await writeAudit(db, {
+      actorType: actor ? "user" : "system",
+      actorId: actor?.userId ?? null,
+      action: "policy_exception.case_inventory",
+      outcome: "failure",
+      targetType: "policy_exception",
+      sourceIp: actor?.ip ?? null,
+      details: { trigger, error_code: code },
+    });
+  } catch (err) {
+    log.warn({ error: errorSummary(err) }, "case-sensitive exception inventory failure not audited");
+  }
+}
+
+/** SQLSTATE of a database error, else `internal`: never a message (it may quote a name). */
+const errorCode = (err: unknown) => errorSummary(err).code ?? "internal";
+
 /**
- * At the worker's start: runs the inventory once, when the audit log holds none yet (the first
- * start after the upgrade to ADR-0054). Never throws; a failed run is retried at the next start.
+ * At the worker's start: runs the inventory once, when the audit log holds no successful one yet
+ * (the first start after the upgrade to ADR-0054). Never throws; a failed run is audited and
+ * retried at the next start.
  */
-export async function runStartupCaseInventory(db: Database, log: Logger, opts: { bound?: number } = {}): Promise<InventoryResult | null> {
+export async function runStartupCaseInventory(
+  db: Database,
+  log: Logger,
+  opts: { bound?: number; comparisonBudget?: number } = {},
+): Promise<InventoryResult | null> {
   try {
     const r = await runLocked(db, async (tx) => {
-      const [done] = await tx.select({ id: auditLog.id }).from(auditLog).where(eq(auditLog.action, "policy_exception.case_inventory")).limit(1);
+      const [done] = await tx
+        .select({ id: auditLog.id })
+        .from(auditLog)
+        .where(and(eq(auditLog.action, "policy_exception.case_inventory"), eq(auditLog.outcome, "success")))
+        .limit(1);
       if (done) return null;
       const res = await computeCaseInventory(tx, opts);
       await writeAudit(tx, { actorType: "system", action: "policy_exception.case_inventory", targetType: "policy_exception", details: inventoryDetails(res, "startup") });
       return res;
     });
-    if (r !== null) logInventory(log, r, "startup");
+    // Another run holds the lock: it records its own result.
+    if (r === "busy" || r === null) return null;
+    logInventory(log, r, "startup");
     return r;
   } catch (err) {
-    log.warn({ error: errorSummary(err) }, "case-sensitive exception inventory failed (retried at the next start)");
+    await recordFailure(db, log, "startup", null, errorCode(err));
     return null;
   }
 }
 
-/** On demand (administrator, policies page): runs the inventory and audits it. */
-export async function runCaseInventory(db: Database, log: Logger, actor: { userId: string; ip: string | null }): Promise<InventoryResult> {
-  const r = await runLocked(db, async (tx) => {
-    const res = await computeCaseInventory(tx);
-    await writeAudit(tx, {
-      actorType: "user",
-      actorId: actor.userId,
-      action: "policy_exception.case_inventory",
-      targetType: "policy_exception",
-      sourceIp: actor.ip,
-      details: inventoryDetails(res, "user"),
+/**
+ * On demand (worker, `policy_exceptions.case_inventory` job queued by an administrator): runs the
+ * inventory and audits it as the administrator's action. Never throws: a failure, or another run
+ * in progress (`inventory_running`), is audited as a failure and not retried.
+ */
+export async function runCaseInventory(
+  db: Database,
+  log: Logger,
+  actor: CaseInventoryJob,
+  opts: { bound?: number; comparisonBudget?: number } = {},
+): Promise<InventoryResult | null> {
+  try {
+    const r = await runLocked(db, async (tx) => {
+      const res = await computeCaseInventory(tx, opts);
+      await writeAudit(tx, {
+        actorType: "user",
+        actorId: actor.userId,
+        action: "policy_exception.case_inventory",
+        targetType: "policy_exception",
+        sourceIp: actor.ip,
+        details: inventoryDetails(res, "user"),
+      });
+      return res;
     });
-    return res;
-  });
-  if (r === null) throw new Error("inventory not run");
-  logInventory(log, r, "user");
-  return r;
+    if (r === "busy" || r === null) {
+      await recordFailure(db, log, "user", actor, "inventory_running");
+      return null;
+    }
+    logInventory(log, r, "user");
+    return r;
+  } catch (err) {
+    await recordFailure(db, log, "user", actor, errorCode(err));
+    return null;
+  }
 }
 
-function logInventory(log: Logger, r: InventoryResult, trigger: "startup" | "user"): void {
+function logInventory(log: Logger, r: InventoryResult, trigger: Trigger): void {
   const details = inventoryDetails(r, trigger);
   if (r.entries.length > 0 || r.boundReached) {
     log.warn(details, "location exceptions that no longer cover names differing by case only (ADR-0054): review them on the policies page");
   } else {
     log.info(details, "case-sensitive exception inventory: no exception affected (ADR-0054)");
   }
+}
+
+export interface InventoryFailure {
+  at: Date;
+  trigger: string;
+  errorCode: string;
+}
+
+export interface CaseInventoryStatus {
+  latest: LatestInventory | null;
+  /** The latest failed run, when more recent than the latest successful one. */
+  failure: InventoryFailure | null;
 }
 
 export interface LatestInventory {
@@ -354,16 +478,24 @@ export interface LatestInventory {
   boundReached: boolean;
 }
 
-/** The latest inventory, read back from its audit entry (null: none yet). */
-export async function latestCaseInventory(db: Database): Promise<LatestInventory | null> {
-  const [row] = await db
-    .select({ at: auditLog.at, details: auditLog.details })
-    .from(auditLog)
-    .where(and(eq(auditLog.action, "policy_exception.case_inventory"), eq(auditLog.outcome, "success")))
-    .orderBy(desc(auditLog.at), desc(auditLog.id))
-    .limit(1);
-  if (!row) return null;
-  return parseInventoryDetails(row.at, row.details ?? {});
+/** The latest inventory, read back from its audit entry (null: none yet), and a later failure. */
+export async function caseInventoryStatus(db: Database): Promise<CaseInventoryStatus> {
+  const latestOf = (outcome: "success" | "failure") =>
+    db
+      .select({ at: auditLog.at, details: auditLog.details })
+      .from(auditLog)
+      .where(and(eq(auditLog.action, "policy_exception.case_inventory"), eq(auditLog.outcome, outcome)))
+      .orderBy(desc(auditLog.at), desc(auditLog.id))
+      .limit(1);
+  const [[ok], [failed]] = await Promise.all([latestOf("success"), latestOf("failure")]);
+  const latest = ok ? parseInventoryDetails(ok.at, ok.details ?? {}) : null;
+  let failure: InventoryFailure | null = null;
+  if (failed && (!ok || failed.at.getTime() >= ok.at.getTime())) {
+    const d = failed.details ?? {};
+    const code = typeof d.error_code === "string" && /^[a-z0-9_]{1,40}$/i.test(d.error_code) ? d.error_code : "internal";
+    failure = { at: failed.at, trigger: d.trigger === "user" ? "user" : "startup", errorCode: code };
+  }
+  return { latest, failure };
 }
 
 export function parseInventoryDetails(at: Date, d: Record<string, unknown>): LatestInventory {

@@ -141,25 +141,33 @@ export const EXCEPTION_MATCHING_NOTE =
 /** Runs the case-sensitive exception inventory (admin, ADR-0054 decision 6). */
 export function RunCaseInventoryButton({ csrfToken }: { csrfToken: string }) {
   const router = useRouter();
-  const [state, setState] = useState<"idle" | "running" | "failed">("idle");
+  const [state, setState] = useState<"idle" | "sending" | "queued" | "limited" | "failed">("idle");
   return (
     <div className="flex items-center gap-3">
       <Button
         size="sm"
         variant="outline"
-        disabled={state === "running"}
+        disabled={state === "sending"}
         onClick={async () => {
-          setState("running");
+          setState("sending");
           const res = await userApi("/api/policy-exceptions/case-inventory", { method: "POST", csrfToken }).catch(() => null);
-          setState(res?.ok ? "idle" : "failed");
+          setState(res?.status === 202 ? "queued" : res?.status === 429 ? "limited" : "failed");
           router.refresh();
         }}
       >
-        {state === "running" ? "Running..." : "Run the inventory again"}
+        {state === "sending" ? "Queuing..." : "Run the inventory again"}
       </Button>
+      {state === "queued" && (
+        <span className="text-xs text-muted-foreground">Queued: the worker runs it; reload this page to see the result.</span>
+      )}
+      {state === "limited" && (
+        <span role="alert" className="text-xs text-destructive">
+          Too many runs requested: try again in a few minutes.
+        </span>
+      )}
       {state === "failed" && (
         <span role="alert" className="text-xs text-destructive">
-          The inventory failed.
+          The inventory could not be queued.
         </span>
       )}
     </div>

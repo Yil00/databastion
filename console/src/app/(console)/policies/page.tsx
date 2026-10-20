@@ -4,7 +4,7 @@ import { PolicyForm } from "@/components/console/policy-form";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
 import { listChannels } from "@/server/channels";
-import { latestCaseInventory } from "@/server/exception-case-inventory";
+import { caseInventoryStatus } from "@/server/exception-case-inventory";
 import { listExceptions, listPolicies } from "@/server/policies";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -22,7 +22,7 @@ export default async function PoliciesPage() {
     listPolicies(db),
     listExceptions(db),
     isAdmin ? listChannels(db) : [],
-    latestCaseInventory(db),
+    caseInventoryStatus(db),
   ]);
   const channels = channelRows.map((c) => ({ slug: c.slug, enabled: c.enabled }));
   return (
@@ -57,7 +57,7 @@ export default async function PoliciesPage() {
           <CardTitle>Exceptions affected by case-sensitive names</CardTitle>
         </CardHeader>
         <CardContent>
-          <CaseInventoryView inventory={inventory} exceptions={exceptions} isAdmin={isAdmin} csrfToken={session.csrfToken} />
+          <CaseInventoryView status={inventory} exceptions={exceptions} isAdmin={isAdmin} csrfToken={session.csrfToken} />
         </CardContent>
       </Card>
       {isAdmin ? (

@@ -26,6 +26,7 @@ import {
   type EventFacts,
   type EventObject,
 } from "@/lib/event-model";
+import { auditSourceEngine } from "@/lib/location-labels";
 import { logger } from "@/lib/logger";
 import { dedupDatabaseName, FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
@@ -793,7 +794,9 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       const facts: EventFacts = {
         agentId: e.agentId,
         targetId: e.targetId,
-        engine: engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
+        // The engine the source tells (checked against the target at ingest), else the target's
+        // current one (security review L1 of ADR-0054: a target's engine may change after ingest).
+        engine: auditSourceEngine(e.source) ?? engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
         accountNotRecorded: e.accountNotRecorded,
         action: e.action,

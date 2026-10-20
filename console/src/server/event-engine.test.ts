@@ -8,7 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 import { getDb } from "@/db/client";
 import * as schema from "@/db/schema";
-import { accessEvents, auditLog, incidentEvents, incidents, notificationDeliveries, policies, principalBaselines } from "@/db/schema";
+import { accessEvents, agentTargets, auditLog, incidentEvents, incidents, notificationDeliveries, policies, principalBaselines } from "@/db/schema";
 import { BASELINE_WARMUP, eventScore, objectSensitivity } from "@/lib/event-model";
 import { failuresPerAgent } from "@/server/agent-api/auth";
 import {
@@ -439,6 +439,12 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         mysql("CLIENT", at(2000)),
         dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients" }], principal: { db_user: "e" }, ts: at(3000) }),
       ]);
+      // The target's engine changes after ingest: the events keep the engine their source tells
+      // (pgaudit: PostgreSQL), not the target's current one (ADR-0054 review L1).
+      await getDb()
+        .update(agentTargets)
+        .set({ engine: "mysql" })
+        .where(and(eq(agentTargets.agentId, auth.agentId), eq(agentTargets.targetId, "pg-prod-1")));
       await drainPolicyWork(getDb());
       const evs = await eventsOf(auth.agentId);
       const linked = async (policyId: string) => {
