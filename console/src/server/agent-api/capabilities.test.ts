@@ -31,6 +31,7 @@ type RevisionToken = Extract<Token, `target_status.note_labels.${string}`>;
 /** The contract fields each field capability token stands for (ADR-0022). */
 const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: string, ...properties: string[]]> = {
   "access_event.bytes": ["AccessEvent", "bytes"],
+  "access_event.objects_overflowed": ["AccessEvent", "objects_overflowed"],
   "job_progress.coverage": [
     "JobProgress",
     "objects_sampled",

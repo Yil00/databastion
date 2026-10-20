@@ -16,7 +16,11 @@ import {
   eventOverflowKey,
   eventScore,
   exceptionCoversEvent,
+  exceptionCoversOverflowStar,
+  isOverflowStar,
   mergeSignals,
+  overflowStarMatches,
+  objectMatches,
   objectSensitivity,
   parseEventConditions,
   SENSITIVITY_CAP,
@@ -26,8 +30,12 @@ import {
   worseThanFalsePositive,
   baselineVerdict,
   type BaselineState,
+  type EventExceptionScope,
   type EventFacts,
+  type EventObject,
+  type ObjectPattern,
 } from "./event-model";
+import { exceptionGlobOptions } from "./policy-common";
 import { parsePolicyConditions } from "./policy-model";
 
 const FACTS: EventFacts = {
@@ -427,3 +435,174 @@ describe("dedup scope", () => {
     expect(mergeSignals(["volume.x", "shape.y"], ["signature.a"])).toEqual(["signature.a", "shape.y", "volume.x"]);
   });
 });
+
+describe("overflowed objects (ADR-0053 decision 3)", () => {
+  const now = new Date("2026-09-28T12:00:00Z");
+  const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null };
+  const named = { database: "crm", schema: "public", object: "audit_log" };
+  const dbStar = { database: "crm", object: "*" };
+  const allStar = { database: "*", object: "*" };
+  const schemaStar = { database: "crm", schema: "public", object: "*" };
+  const flagged = (objects: EventObject[], over: Partial<EventFacts> = {}): EventFacts => ({ ...FACTS, objects, objectsOverflowed: true, ...over });
+
+  it("every `*` object of a flagged event is an overflow `*`, whatever its shape; never without the flag", () => {
+    for (const o of [dbStar, allStar, schemaStar]) {
+      expect(isOverflowStar({ objectsOverflowed: true }, o)).toBe(true);
+      expect(isOverflowStar({ objectsOverflowed: false }, o)).toBe(false);
+      expect(isOverflowStar({}, o)).toBe(false);
+      expect(isOverflowStar({ objectsOverflowed: null }, o)).toBe(false);
+    }
+    expect(isOverflowStar({ objectsOverflowed: true }, named)).toBe(false);
+    // Redis / Valkey: a real `*` key pattern of a flagged event is treated as an overflow (fail closed).
+    expect(isOverflowStar({ objectsOverflowed: true }, { object: "*" })).toBe(true);
+    // Only the exact name: a pattern holding `*` is a name.
+    expect(isOverflowStar({ objectsOverflowed: true }, { object: "user:*" })).toBe(false);
+  });
+
+  it("`objects` conditions: only the database glob applies to an overflow `*`; the database `*` is retained by every pattern", () => {
+    const e = flagged([named, dbStar]);
+    expect(eventMatches({ objects: { database: "crm", object: "customers" } }, e)).toEqual([1]);
+    expect(eventMatches({ objects: { schema: "billing", object: "card*" } }, e)).toEqual([1]);
+    expect(eventMatches({ objects: { database: "CRM ", object: "customers" } }, e)).toEqual([1]);
+    expect(eventMatches({ objects: { database: "shop", object: "customers" } }, e)).toBeNull();
+    expect(eventMatches({ objects: { object: "audit_*" } }, e)).toEqual([0, 1]);
+    for (const pattern of [{ database: "shop" }, { database: "shop", schema: "x", object: "y" }, { object: "customers" }] as ObjectPattern[]) {
+      expect(eventMatches({ objects: pattern }, flagged([named, allStar]))).toEqual([1]);
+    }
+    // A `*` with a schema that absorbed the overflow is still any object of its database.
+    expect(eventMatches({ objects: { schema: "billing", object: "cards" } }, flagged([schemaStar]))).toEqual([0]);
+    // Without the flag, as before: the literal name `*` only.
+    const plain = { ...e, objectsOverflowed: undefined };
+    expect(eventMatches({ objects: { database: "crm", object: "customers" } }, plain)).toBeNull();
+    expect(eventMatches({ objects: { database: "crm", object: "*" } }, plain)).toEqual([0, 1]);
+    expect(eventMatches({ objects: { database: "crm", object: "customers" } }, { ...e, objectsOverflowed: false })).toBeNull();
+    expect(eventMatches({ objects: { database: "shop" } }, { ...flagged([named, allStar]), objectsOverflowed: undefined })).toBeNull();
+    expect(overflowStarMatches({ database: "c?m" }, dbStar)).toBe(true);
+  });
+
+  it("min_score and min_sensitivity use the bound; the named values without it", () => {
+    const e = flagged([named, dbStar], { sensitivity: 2, score: 4, boundSensitivity: 8, boundScore: 16 });
+    expect(eventMatches({ min_score: 10 }, e)).toEqual([0, 1]);
+    expect(eventMatches({ min_sensitivity: 8 }, e)).toEqual([0, 1]);
+    expect(eventMatches({ min_score: 16.01 }, e)).toBeNull();
+    expect(eventMatches({ min_score: 10 }, { ...e, boundScore: undefined, boundSensitivity: undefined })).toBeNull();
+    expect(eventMatches({ min_sensitivity: 3 }, { ...FACTS, sensitivity: 2 })).toBeNull();
+  });
+
+  it("exceptions cover an overflow `*` only when they cover every object of its database (case rules of ADR-0054)", () => {
+    const x = (location: EventExceptionScope["location"]) => ({ ...base, location });
+    const e = (objects: EventObject[], engine = "postgres") => flagged(objects, { engine });
+    // Named objects as before; the overflow `*` needs a whole-database exception.
+    expect(exceptionCoversEvent(x({ database: "crm" }), "p", e([named, dbStar]), [0, 1], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm", schema: "*", object: "*" }), "p", e([dbStar]), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "c*" }), "p", e([dbStar]), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm", object: "audit_*" }), "p", e([named, dbStar]), [0, 1], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ database: "crm", object: "audit_*" }), "p", e([named, dbStar]), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm", schema: "public" }), "p", e([schemaStar]), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ object: "*" }), "p", e([dbStar]), [0], now)).toBe(true);
+    // `\*` selects the literal name only: it covers the literal `*` of an unflagged event, not an overflow.
+    expect(exceptionCoversEvent(x({ database: "crm", object: "\\*" }), "p", e([dbStar]), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ database: "crm", object: "\\*" }), "p", { ...FACTS, objects: [dbStar] }, [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "shop" }), "p", e([dbStar]), [0], now)).toBe(false);
+    // The database `*`: only an exception without a database glob, or with exactly `*`.
+    expect(exceptionCoversEvent(x({ database: "*" }), "p", e([allStar]), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ schema: "*" }), "p", e([allStar]), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm" }), "p", e([allStar]), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ database: "?" }), "p", e([allStar]), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ database: "\\*" }), "p", e([allStar]), [0], now)).toBe(false);
+    // Case: with case on PostgreSQL (ADR-0054), without on MySQL; trailing spaces on MySQL only (N1).
+    expect(exceptionCoversEvent(x({ database: "CRM" }), "p", e([dbStar], "postgres"), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(x({ database: "CRM" }), "p", e([dbStar], "mysql"), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm" }), "p", e([{ database: "crm ", object: "*" }], "mysql"), [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x({ database: "crm" }), "p", e([{ database: "crm ", object: "*" }], "postgres"), [0], now)).toBe(false);
+    // Agent- or target-scoped exceptions apply as today.
+    expect(exceptionCoversEvent({ ...base, targetId: "pg-prod-1", location: null }, "p", e([allStar]), [0], now)).toBe(true);
+    expect(exceptionCoversOverflowStar({ field: "*" } as ObjectPattern, dbStar, {})).toBe(true);
+  });
+
+  it("an unflagged event (a 0.8.0 agent, or no token) behaves exactly as before, for every condition and exception", () => {
+    for (const { pattern, objects, engine, location } of grid()) {
+      const old = { ...FACTS, engine, objects };
+      for (const variant of [{ ...old, objectsOverflowed: undefined }, { ...old, objectsOverflowed: false }]) {
+        expect(eventMatches({ objects: pattern }, variant)).toEqual(literalMatches(pattern, old));
+        const idx = objects.map((_, i) => i);
+        expect(exceptionCoversEvent({ ...base, location }, "p", variant, idx, now)).toBe(literalCovers(location, old, idx));
+      }
+    }
+  });
+
+  it("fail closed: the flag only adds retained objects and only removes exception coverage", () => {
+    for (const { pattern, objects, engine, location } of grid()) {
+      const plain = { ...FACTS, engine, objects };
+      const marked = { ...plain, objectsOverflowed: true };
+      const before = eventMatches({ objects: pattern }, plain) ?? [];
+      const after = eventMatches({ objects: pattern }, marked) ?? [];
+      for (const i of before) expect(after).toContain(i);
+      // Every overflow `*` a pattern's database glob admits is retained.
+      objects.forEach((o, i) => {
+        if (o.object === "*" && (o.database === "*" || pattern.database === undefined)) expect(after).toContain(i);
+      });
+      // For the same retained objects, an exception covers a flagged event only if it covers the unflagged one.
+      for (const idx of [objects.map((_, i) => i), ...objects.map((_, i) => [i])]) {
+        if (exceptionCoversEvent({ ...base, location }, "p", marked, idx, now)) {
+          expect(exceptionCoversEvent({ ...base, location }, "p", plain, idx, now)).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("the dedup object is chosen on the bound sensitivities the caller passes", () => {
+    expect(dedupObject([0, 1], [2, 8])).toBe(1);
+    expect(dedupObject([0, 1], [2, 2])).toBe(0);
+  });
+
+  it("incident comparisons use the named score only (review H1): the caller passes it, never the bound", () => {
+    const e = flagged([named, dbStar], { score: 4, boundScore: 40, signals: [] });
+    // Closed incident opened by this flagged event: its recorded score is the named one (4).
+    const closed = { status: "resolved", eventScore: e.score, eventSignals: [], eventAnomaly: false };
+    expect(worseThanClosed(closed, { score: 10, anomaly: false, signals: [] })).toBe(true);
+    expect(worseThanClosed({ ...closed, status: "false_positive" }, { score: 10, anomaly: false, signals: [] })).toBe(true);
+    expect(severeEvent({ signals: [], anomaly: false, score: 10 }, e.score)).toBe(true);
+    // Had the bound been recorded, the later named-object event would have been hidden.
+    expect(worseThanClosed({ ...closed, eventScore: e.boundScore ?? 0 }, { score: 10, anomaly: false, signals: [] })).toBe(false);
+  });
+});
+
+/** Patterns, object lists, engines and exception locations to cross (small, exhaustive). */
+function grid(): { pattern: ObjectPattern; objects: EventObject[]; engine: string; location: EventExceptionScope["location"] }[] {
+  const patterns: ObjectPattern[] = [{ database: "crm" }, { object: "*" }, { object: "\\*" }, { database: "shop", object: "c*" }, { schema: "public" }, { database: "*" }, { database: "CRM" }];
+  const lists: EventObject[][] = [
+    [{ database: "crm", schema: "public", object: "clients" }, { database: "crm", object: "*" }],
+    [{ database: "*", object: "*" }],
+    [{ database: "crm", schema: "public", object: "*" }],
+    [{ database: "shop", object: "carts" }, { database: "shop", object: "*" }, { database: "crm", object: "*" }],
+  ];
+  const locations: EventExceptionScope["location"][] = [
+    null,
+    { database: "crm" },
+    { database: "*" },
+    { object: "*" },
+    { object: "\\*" },
+    { database: "crm", object: "clients" },
+    { schema: "public" },
+    { database: "CRM", schema: "*", object: "*" },
+    { field: "email" },
+  ];
+  const out = [];
+  for (const pattern of patterns) for (const objects of lists) for (const engine of ["postgres", "mysql"]) for (const location of locations) out.push({ pattern, objects, engine, location });
+  return out;
+}
+
+/** The rules before ADR-0053, restated with `objectMatches`: every object (`*` included) is a literal name. */
+function literalMatches(pattern: ObjectPattern, e: EventFacts): number[] | null {
+  const kept = e.objects.map((_, i) => i).filter((i) => objectMatches(pattern, e.objects[i] as EventObject));
+  return kept.length > 0 ? kept : null;
+}
+
+function literalCovers(location: EventExceptionScope["location"], e: EventFacts, idx: number[]): boolean {
+  if (location === null) return true;
+  const { field, ...parts } = location;
+  if (field !== undefined && field !== "*") return false;
+  if (idx.length === 0) return false;
+  return idx.every((i) => objectMatches(parts, e.objects[i] as EventObject, exceptionGlobOptions(e.engine)));
+}

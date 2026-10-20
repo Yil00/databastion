@@ -678,6 +678,19 @@ export const incidents = pgTable(
      * further matches of that hour are counted here (P4-C security review H1).
      */
     eventOverflow: boolean("event_overflow").notNull().default(false),
+    /**
+     * ADR-0053 decision 3 item 4: an event that joined this incident was flagged
+     * `objects_overflowed` (objects left out under a bound); null before the first such event or
+     * on rows written before ADR-0053. Display only, never compared with later events.
+     */
+    eventObjectsOverflowed: boolean("event_objects_overflowed"),
+    /**
+     * ADR-0053 decision 3 item 4: highest bound score of the events that joined this incident
+     * (equal to `event_score` while none was flagged). Display only ("up to ..."): the
+     * comparisons with later events (`worseThanClosed`, the cap bypass) use `event_score`, the
+     * named score (review H1 of ADR-0053).
+     */
+    eventBoundScore: doublePrecision("event_bound_score"),
   },
   (t) => [
     uniqueIndex("incidents_active_dedup_key")
@@ -875,7 +888,8 @@ export const eventsBatches = pgTable(
  * migration 0040, validated outside the migration transaction).
  *
  * The runtime role may only INSERT and SELECT, plus UPDATE of the evaluation columns
- * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`) written by the worker:
+ * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`, and since ADR-0053
+ * `bound_sensitivity`, `bound_score`) written by the worker:
  * what the agent reported can never be rewritten nor deleted by the console process (migration
  * 0022). Rows older than the retention bound are deleted by `databastion_purge_access_events`.
  */
@@ -913,6 +927,13 @@ export const accessEvents = pgTable(
      * shown, not used by the score (ADR-0021: volume is rows only).
      */
     bytes: bigint("bytes", { mode: "number" }),
+    /**
+     * Contract `AccessEvent.objects_overflowed` (ADR-0053): true when the agent sent the field
+     * (objects of the event were left out under a bound; its `*` objects stand for them), null
+     * otherwise (absent means "not known": an agent up to 0.8.0, or a console that did not list
+     * the token). No constraint: the contract allows `true` only.
+     */
+    objectsOverflowed: boolean("objects_overflowed"),
     signals: jsonb("signals").$type<string[]>().notNull().default([]),
     source: text("source").notNull(),
     aggregatedCount: integer("aggregated_count").notNull(),
@@ -926,8 +947,16 @@ export const accessEvents = pgTable(
     evaluatedAt: tsz("evaluated_at"),
     /** Sensitivity of the most sensitive object reached (see src/lib/event-model.ts). */
     sensitivity: doublePrecision("sensitivity"),
-    /** Volume x sensitivity score. */
+    /** Volume x sensitivity score (the named score of ADR-0053: from the named objects only). */
     score: doublePrecision("score"),
+    /**
+     * ADR-0053 decision 3 item 3: the bound sensitivity and score, where every `*` object of a
+     * flagged event takes the highest object sensitivity of its database (of the target, for the
+     * database `*`). Equal to `sensitivity` / `score` for an event without the flag; null on rows
+     * evaluated before ADR-0053.
+     */
+    boundSensitivity: doublePrecision("bound_sensitivity"),
+    boundScore: doublePrecision("bound_score"),
     /** Volume above the principal's baseline (after its warm-up). */
     anomaly: boolean("anomaly"),
     /** Baseline volume (rows) of the principal when the event was evaluated; null during warm-up. */

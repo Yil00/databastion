@@ -10,7 +10,7 @@ import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
-import { loadObjectHits, prefilterNames } from "./event-engine";
+import { loadDatabaseBounds, loadObjectHits, prefilterNames } from "./event-engine";
 import { drainPolicyWork } from "./incidents";
 
 /**
@@ -163,5 +163,55 @@ describe.skipIf(!hasDb)("sensitivity on a console database with the C character 
     await drainPolicyWork(getDb());
     const [row] = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId));
     expect(row?.sensitivity).toBe(3);
+  });
+  it("ADR-0053 test obligation 3: the per-database bound folds names and reads only the event's target through the fallback", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      targets: [...HEARTBEAT.targets, { target_id: "pg-prod-2", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const row = (targetId: string, database: string, object: string, classifier: string) => ({
+      id: randomUUID(),
+      agentId: auth.agentId,
+      targetId,
+      locationKey: createHash("sha256").update(`${targetId}/${database}/public/${object}/${classifier}`).digest("hex"),
+      engine: "postgres",
+      databaseName: database,
+      schemaName: "public",
+      objectName: object,
+      fieldName: "c",
+      classifier,
+      classifiersVersion: "2026.09.1",
+      confidence: 1,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    // The same rows as the UTF-8 test of event-engine.test.ts, with the same expected bounds.
+    await getDb()
+      .insert(findingsTable)
+      .values([
+        row("pg-prod-1", "Crm", "a", "pii.email"),
+        row("pg-prod-1", "ΒΆΣΗ", "b", "pii.iban"),
+        row("pg-prod-1", "\u212arm", "c", "pii.phone"),
+        row("pg-prod-2", "crm", "z", "secret.aws_key"),
+        row("pg-prod-2", "βάση", "z", "secret.aws_key"),
+      ]);
+    const star = (database: string) => ({ agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database, object: "*" }], objectsOverflowed: true });
+    // Probed (the C ctype: the ASCII form) and forced: the same result. Without the database `*`
+    // (which reads the whole target), the per-database pre-filter alone.
+    for (const unicodeLower of [undefined, false]) {
+      const only = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none")], unicodeLower));
+      expect([only.get(auth.agentId, "pg-prod-1", "crm"), only.get(auth.agentId, "pg-prod-1", "ΒΆΣΗ"), only.get(auth.agentId, "pg-prod-1", "krm")]).toEqual([3, 7, 3]);
+      expect(only.get(auth.agentId, "pg-prod-1", "*")).toBe(0);
+      const bounds = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none"), star("*")], unicodeLower));
+      expect(bounds.get(auth.agentId, "pg-prod-1", "crm  "), String(unicodeLower)).toBe(3);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "Βάση"), String(unicodeLower)).toBe(7);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "KRM"), String(unicodeLower)).toBe(3);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "none")).toBe(0);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "*")).toBe(7);
+      expect(bounds.get(auth.agentId, "pg-prod-2", "crm")).toBe(0);
+    }
   });
 });

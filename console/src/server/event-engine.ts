@@ -15,6 +15,7 @@ import {
   eventMatches,
   eventScore,
   exceptionCoversEvent,
+  isOverflowStar,
   mergeSignals,
   objectSensitivity,
   parseEventConditions,
@@ -50,13 +51,17 @@ import { processGlobal } from "./process-global";
 /**
  * Correlation of Audit access events (P4-C, worker). Pending events (`evaluated_at` null) are
  * processed in arrival order, in chunks of `EVENT_CHUNK` per transaction; one transaction:
- * 1. computes each event's sensitivity (from the findings of its objects) and score;
+ * 1. computes each event's sensitivity (from the findings of its objects) and score, and for an
+ *    event flagged `objects_overflowed` (ADR-0053) its bound sensitivity and score, from the
+ *    highest object sensitivity of the database of each `*` object (`loadDatabaseBounds`, one
+ *    aggregate per target and database for the whole chunk);
  * 2. judges its volume against the principal's baseline, then updates the baseline;
  * 3. applies every enabled `access_event` policy: incidents are deduplicated per policy, agent,
  *    target, principal, database and hour (src/lib/event-model.ts), linked to every matching event
  *    (`incident_events`) and notified through the outbox, in the same transaction;
  * 4. records the evaluation on the event (`evaluated_at`, `sensitivity`, `score`, `anomaly`,
- *    `baseline_rows`), the only columns of an event the runtime role may update.
+ *    `baseline_rows`, `bound_sensitivity`, `bound_score`), the only columns of an event the
+ *    runtime role may update.
  * Evaluations are serialized by a transaction-scoped advisory lock, so the baselines see the
  * events of a principal in order and two workers never race on an incident. A lost wake-up delays
  * nothing beyond the one-minute schedule of `policies.evaluate`; a crash rolls the chunk back and it
@@ -143,6 +148,7 @@ const PENDING_COLUMNS = {
   rows: accessEvents.rows,
   signals: accessEvents.signals,
   source: accessEvents.source,
+  objectsOverflowed: accessEvents.objectsOverflowed,
 };
 
 type PendingEvent = {
@@ -161,6 +167,8 @@ type PendingEvent = {
   rows: number | null;
   signals: string[];
   source: string;
+  /** Contract `AccessEvent.objects_overflowed` (ADR-0053): true when sent, else null. */
+  objectsOverflowed: boolean | null;
 };
 
 const SEP = "\u0000";
@@ -288,6 +296,115 @@ export async function loadObjectHits(
   return out;
 }
 
+/** Key of a database bound: agent, target and the `foldName` of the database (`*`: the target). */
+const databaseKey = (agentId: string, targetId: string, database: string) => [agentId, targetId, foldName(database)].join(SEP);
+const wholeTargetKey = (agentId: string, targetId: string) => [agentId, targetId, ""].join(SEP);
+
+/**
+ * Highest object sensitivities per target and database, for the overflow `*` objects of the
+ * chunk (ADR-0053 decision 3 item 3): `get(agentId, targetId, database)` is the highest object
+ * sensitivity among the target's findings (false positives excluded) in that database, compared
+ * with `foldName` as `objectKey` does, or among all the target's findings for the database `*`;
+ * 0 when there is none.
+ */
+export interface DatabaseBounds {
+  get(agentId: string, targetId: string, database: string): number;
+}
+
+const NO_BOUNDS: DatabaseBounds = { get: () => 0 };
+
+/**
+ * Loads the {@link DatabaseBounds} the chunk needs: nothing (no query) when no event of the chunk
+ * is flagged with a `*` object, so a chunk without the flag reads exactly what it read before.
+ * One aggregate query per chunk, always restricted to the (agent, target) pairs of the flagged
+ * events (a bound never reads another target's findings) and, except for the database `*`, to
+ * their databases through the same pre-filter as `loadObjectHits`: `sqlFold` when the console
+ * database's `lower` folds Unicode, else the ASCII form and every non-ASCII database name, left to
+ * the JavaScript `foldName` (the `C` / `POSIX`-ctype fallback). The rows are grouped per database,
+ * object name and classifier in SQL and folded in JavaScript, so both paths give the same result.
+ *
+ * An object's sensitivity here takes its findings in every schema (as an event object without a
+ * schema does, `loadObjectHits`), so the bound is at least the named sensitivity any object of the
+ * database could get, whatever schema the left-out objects had (fail closed: only higher).
+ * Exported for the tests.
+ */
+export async function loadDatabaseBounds(
+  tx: Tx,
+  events: readonly Pick<PendingEvent, "agentId" | "targetId" | "objects" | "objectsOverflowed">[],
+  unicodeLower?: boolean,
+): Promise<DatabaseBounds> {
+  const whole = new Map<string, readonly [string, string]>();
+  const perDb = new Map<string, readonly [string, string]>();
+  const names = new Set<string>();
+  for (const e of events) {
+    for (const o of e.objects) {
+      if (!isOverflowStar(e, o)) continue;
+      const pair = [e.agentId, e.targetId] as const;
+      if (o.database === "*") whole.set(targetKey(e), pair);
+      else {
+        perDb.set(targetKey(e), pair);
+        names.add(o.database);
+      }
+    }
+  }
+  if (whole.size === 0 && perDb.size === 0) return NO_BOUNDS;
+  const pairsIn = (pairs: Iterable<readonly [string, string]>) =>
+    sql`(${findings.agentId}, ${findings.targetId}) in (${sql.join(
+      [...pairs].map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )})`;
+  const scopes: SQL[] = [];
+  if (whole.size > 0) scopes.push(pairsIn(whole.values()));
+  const dbPairs = [...perDb.entries()].filter(([k]) => !whole.has(k)).map(([, p]) => p);
+  if (dbPairs.length > 0) {
+    const pre = prefilterNames([...names], unicodeLower ?? (await lowerFoldsUnicode(tx)));
+    const sameDb =
+      pre.kind === "fold"
+        ? sql`${sqlFold(sql`${findings.databaseName}`)} in (${sql.join(
+            pre.names.map((n) => sqlFold(sql`${n}::text`)),
+            sql`, `,
+          )})`
+        : sql`(${sqlFold(sql`${findings.databaseName}`)} in (${sql.join(
+            pre.folded.map((n) => sql`${n}::text`),
+            sql`, `,
+          )}) or ${findings.databaseName} ~ ${NON_ASCII_RE}::text)`;
+    scopes.push(sql`(${pairsIn(dbPairs)} and ${sameDb})`);
+  }
+  const rows = await tx
+    .select({
+      agentId: findings.agentId,
+      targetId: findings.targetId,
+      databaseName: findings.databaseName,
+      objectName: findings.objectName,
+      classifier: findings.classifier,
+      confidence: sql<number>`max(${findings.confidence})`,
+    })
+    .from(findings)
+    .where(and(isNull(findings.falsePositiveAt), sql`(${sql.join(scopes, sql` or `)})`))
+    .groupBy(findings.agentId, findings.targetId, findings.databaseName, findings.objectName, findings.classifier);
+  // Hits per object (database and object folded, any schema), then the highest per database.
+  const objects = new Map<string, { db: string; target: string; hits: ClassifierHit[] }>();
+  for (const r of rows) {
+    const db = databaseKey(r.agentId, r.targetId, r.databaseName);
+    const key = [db, foldName(r.objectName)].join(SEP);
+    const entry = objects.get(key) ?? { db, target: targetKey(r), hits: [] };
+    entry.hits.push({ classifier: r.classifier, confidence: Number(r.confidence) });
+    objects.set(key, entry);
+  }
+  const bounds = new Map<string, number>();
+  const raise = (k: string, v: number) => bounds.set(k, Math.max(bounds.get(k) ?? 0, v));
+  for (const o of objects.values()) {
+    const s = objectSensitivity(o.hits);
+    raise(o.db, s);
+    const pair = whole.get(o.target);
+    if (pair) raise(wholeTargetKey(...pair), s);
+  }
+  return {
+    get: (agentId, targetId, database) =>
+      bounds.get(database === "*" ? wholeTargetKey(agentId, targetId) : databaseKey(agentId, targetId, database)) ?? 0,
+  };
+}
+
 type BaselineRow = BaselineState & {
   rowsTotal: number;
   maxScore: number;
@@ -393,6 +510,10 @@ type ApplyResult = "created" | "reopened" | "overflow_created" | "overflow" | "r
 interface Evaluated {
   event: PendingEvent;
   facts: EventFacts;
+  /**
+   * Bound sensitivity of each object (ADR-0053): the named one, raised to its database's bound
+   * for an overflow `*`. Sets the dedup object (decision 3 item 4).
+   */
   objectSensitivities: number[];
 }
 
@@ -524,6 +645,8 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
       eventRows: sql`coalesce(${incidents.eventRows}, 0) + ${e.rows ?? 0}::double precision`,
       eventSignals: signals,
       eventAnomaly: sql`coalesce(${incidents.eventAnomaly}, false) or ${facts.anomaly}`,
+      // ADR-0053 decision 3 item 4: display only, never read back by the comparisons.
+      ...overflowColumns(facts),
       lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
       updatedAt: sql`now()`,
     })
@@ -547,6 +670,17 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
   latest.eventAnomaly = latest.eventAnomaly === true || facts.anomaly;
   latest.eventRows = (latest.eventRows ?? 0) + (e.rows ?? 0);
   await link(tx, latest.id, e.id);
+}
+
+/**
+ * The incident columns of ADR-0053 updated when an event joins an active incident: the highest
+ * bound score (from `event_score` on an incident opened before ADR-0053; equal to it while no
+ * flagged event joined) and the flag, set once a flagged event joins. Display only: no comparison
+ * reads them back (review H1 of ADR-0053).
+ */
+function overflowColumns(facts: EventFacts) {
+  const eventBoundScore = sql`greatest(coalesce(${incidents.eventBoundScore}, ${incidents.eventScore}, 0), ${facts.boundScore ?? facts.score}::double precision)`;
+  return facts.objectsOverflowed === true ? { eventBoundScore, eventObjectsOverflowed: true } : { eventBoundScore };
 }
 
 async function applyEventPolicy(
@@ -641,6 +775,8 @@ async function applyEventPolicy(
       eventSignals: mergeSignals([], facts.signals),
       eventAnomaly: facts.anomaly,
       eventOverflow: overflow,
+      eventObjectsOverflowed: facts.objectsOverflowed === true ? true : null,
+      eventBoundScore: facts.boundScore ?? facts.score,
       lastEventAt: e.ts,
     })
     .onConflictDoNothing({ target: incidents.dedupKey, where: sql`${incidents.status} in ('open', 'acknowledged')` })
@@ -702,6 +838,8 @@ async function applyEventPolicy(
       signals: [...facts.signals],
       unregistered_signals: unregisteredSignals(facts.signals),
       objects: facts.objects.map((o) => ({ database: o.database, schema: o.schema ?? null, object: o.object })),
+      // ADR-0053 decision 3 item 7: the event reached more objects than it lists.
+      objects_overflowed: facts.objectsOverflowed === true,
     },
   };
   await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, payload);
@@ -767,7 +905,9 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       .from(agentTargets)
       .where(inArray(agentTargets.agentId, [...new Set(events.map((e) => e.agentId))]));
     const engines = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, t.engine]));
-    const hits = await loadObjectHits(tx, events, await cachedLowerFoldsUnicode(db, tx));
+    const unicodeLower = await cachedLowerFoldsUnicode(db, tx);
+    const hits = await loadObjectHits(tx, events, unicodeLower);
+    const bounds = await loadDatabaseBounds(tx, events, unicodeLower);
     const active = await loadEventPolicies(tx);
     const exceptions = await loadExceptions(tx);
     const baselines = await loadBaselines(tx, events);
@@ -777,6 +917,13 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       const objectSensitivities = e.objects.map((o) => objectSensitivity(hits.get(objectKey(e.agentId, e.targetId, o)) ?? []));
       const sensitivity = objectSensitivities.reduce((m, s) => Math.max(m, s), 0);
       const score = eventScore(sensitivity, e.rows);
+      // ADR-0053 decision 3 item 3: the bound; the named values for an event without the flag.
+      const boundSensitivities = objectSensitivities.map((s, i) => {
+        const o = e.objects[i] as EventObject;
+        return isOverflowStar(e, o) ? Math.max(s, bounds.get(e.agentId, e.targetId, o.database)) : s;
+      });
+      const boundSensitivity = boundSensitivities.reduce((m, s) => Math.max(m, s), 0);
+      const boundScore = eventScore(boundSensitivity, e.rows);
       const bk = baselineKey(e);
       const base = baselineEligible(e) ? baselines.get(bk) : undefined;
       const verdict = base ? baselineVerdict(base, e.rows) : { anomaly: false, baselineRows: null };
@@ -806,16 +953,19 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         signals: e.signals,
         sensitivity,
         score,
+        objectsOverflowed: e.objectsOverflowed === true,
+        boundSensitivity,
+        boundScore,
         anomaly: verdict.anomaly,
       };
       for (const p of active) {
-        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities }, exceptions, state);
+        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities: boundSensitivities }, exceptions, state);
         if (r === "created" || r === "reopened" || r === "overflow_created") stats.created += 1;
       }
       if (verdict.anomaly) stats.anomalies += 1;
       await tx
         .update(accessEvents)
-        .set({ evaluatedAt: sql`now()`, sensitivity, score, anomaly: verdict.anomaly, baselineRows: verdict.baselineRows })
+        .set({ evaluatedAt: sql`now()`, sensitivity, score, boundSensitivity, boundScore, anomaly: verdict.anomaly, baselineRows: verdict.baselineRows })
         .where(eq(accessEvents.id, e.id));
     }
     await saveBaselines(tx, baselines, touched);
