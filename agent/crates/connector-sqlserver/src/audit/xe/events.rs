@@ -1820,6 +1820,37 @@ mod statistics_tests {
             .collect()
     }
 
+    /// Security review L2 of bbfcab7: the 2022 drift fixture's CAS guard
+    /// partner text was substituted by hand (`sql::CAS_COLUMNS` lost its
+    /// `HAS_PERMS_BY_NAME` column). The file says so in a comment right
+    /// before that event, and the substituted text is exactly the current
+    /// statement (a re-capture replaces both).
+    #[test]
+    fn synthesized_fixture_text_is_marked_and_current() {
+        let raw = std::fs::read_to_string(format!(
+            "{}/fixtures/xe/statistics-16.0.4305.5.xml",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        let marked: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("<!-- SYNTHESIZED"))
+            .map(|(i, _)| i)
+            .collect();
+        let current = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
+        let with_text: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(&format!("<![CDATA[{current}]]>")))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(with_text, [marked[0] + 1]);
+        assert!(!raw.contains("N'SELECT', c.name, N'COLUMN')) FROM [retail].sys.tables"));
+    }
+
     /// The drift fixtures, one per matrix image (captured on 2026-10-16:
     /// the agent's own builds on a fresh server, and a client's first reads
     /// of two columns, in a batch, build at nest level 2, and inside

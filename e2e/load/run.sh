@@ -83,9 +83,19 @@ LOAD_SOAK_MAX_S=1800
 log() { printf '[load %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 # Under GitHub Actions the reason is also an error annotation (readable through the check-run API
 # when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
 fail() {
   log "FAIL: $*"
-  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::error title=%s::%s\n' "${LOG_TAG:-load}" "$*" | tr -d '\r'; fi
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
   exit 1
 }
 now_s() { date +%s.%3N; }
@@ -983,8 +993,9 @@ if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
 fi
 # ADR-0053 decision 6: per target and principal, the events stored, the statements they stand for,
 # those naming an object `*` (overflowed or unknown: the console does not know which), the largest
-# object list. Principal names of the load accounts only; counts, no object name. Read by
-# print_census (cleanup).
+# object list. Every principal of the agent's events, as the console stores it (account names of
+# the load, client and agent accounts, fingerprints, `-`: no load-account filter), counts, no
+# object name. Read by print_census (cleanup), which makes the names safe to print.
 CENSUS_CONSOLE="$W/out/census-console.json"
 console_sql "SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
     SELECT target_id AS target, coalesce(db_user, '-') AS db_user, count(*) AS events,

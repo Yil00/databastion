@@ -706,5 +706,21 @@ class CensusTest(unittest.TestCase):
             self.assertEqual(L.cmd_census(args), 0)
 
 
+    def test_console_rows_are_safe_to_print(self) -> None:
+        good = {"target": "mssql-load", "db_user": "\\fb45bc05628d$", "events": 4, "statements": 4,
+                "star_events": 0, "star_statements": 0, "max_objects": 2}
+        bad_name = dict(good, db_user="a|b`c d\n::error::x\r\u0007")
+        rows = L.console_rows([good, bad_name, dict(good, target=7), dict(good, events=-1),
+                               dict(good, events=True), dict(good, events="4"), {"target": "t"}, 3])
+        self.assertEqual([r["db_user"] for r in rows], ["\\fb45bc05628d$", "a?b?c?d?::error::x??"])
+        self.assertEqual(L.console_rows({"x": 1}), [])
+        self.assertEqual(len(L.console_rows([dict(good, db_user="u" * 500)])[0]["db_user"]),
+                         L.CONSOLE_NAME_MAX)
+        md = L.census_markdown({}, rows, "load")
+        for line in md.splitlines():
+            if line.startswith("| mssql-load"):
+                self.assertEqual(line.count("|"), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

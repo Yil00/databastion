@@ -73,9 +73,19 @@ print_census() {
 }
 # Under GitHub Actions the reason is also an error annotation (readable through the check-run API
 # when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
 fail() {
   log "FAIL: $*"
-  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::error title=%s::%s\n' "${LOG_TAG:-load}" "$*" | tr -d '\r'; fi
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
   exit 1
 }
 now_s() { date +%s.%3N; }

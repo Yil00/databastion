@@ -714,15 +714,43 @@ fn cas_candidates(
     (out, cut)
 }
 
-/// Whether a column read of one table ([`sql::COLUMNS`]) shows a
-/// credential column of `kind` the account can read.
-fn cas_credential_readable(kind: cas_guard::StoreKind, rows: &[Vec<Value>]) -> bool {
-    rows.iter().any(|r| {
-        r.first()
-            .and_then(Value::as_text)
-            .is_some_and(|c| cas_guard::is_credential_column(kind, c))
-            && r.get(8).and_then(Value::as_int) == Some(1)
-    })
+/// What a column read of one recognized table ([`sql::COLUMNS`]) shows of
+/// its credential columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CasColumns {
+    /// A credential column of the store's kind the account can read.
+    Readable,
+    /// Credential columns, none readable, each with a permission answer.
+    NotReadable,
+    /// No row, no credential column of that kind (the table changed since
+    /// the catalog read), or a credential column whose permission cell is
+    /// not an integer (`NULL`): not evaluated, fail closed (security
+    /// review L1).
+    Unknown,
+}
+
+fn cas_credential_readable(kind: cas_guard::StoreKind, rows: &[Vec<Value>]) -> CasColumns {
+    let mut seen = false;
+    let mut unknown = false;
+    for r in rows {
+        let Some(name) = r.first().and_then(Value::as_text) else {
+            continue;
+        };
+        if !cas_guard::is_credential_column(kind, name) {
+            continue;
+        }
+        seen = true;
+        match r.get(8).and_then(Value::as_int) {
+            Some(1) => return CasColumns::Readable,
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    if seen && !unknown {
+        CasColumns::NotReadable
+    } else {
+        CasColumns::Unknown
+    }
 }
 
 /// The CAS guard's credential columns readable by the account in the
@@ -765,11 +793,11 @@ async fn cas_readable(
                 continue;
             };
             match s.rows(&stmt, Stage::Check, Shape::rows(9, 4096)).await {
-                Ok(cols) => {
-                    if cas_credential_readable(kind, &cols) {
-                        out.readable += 1;
-                    }
-                }
+                Ok(cols) => match cas_credential_readable(kind, &cols) {
+                    CasColumns::Readable => out.readable += 1,
+                    CasColumns::NotReadable => {}
+                    CasColumns::Unknown => out.complete = false,
+                },
                 Err(e) if !e.fatal => out.complete = false,
                 Err(e) => return Err(e),
             }
@@ -1221,15 +1249,27 @@ mod tests {
             r
         };
         let k = cas_guard::StoreKind::TicketRegistry;
-        assert!(!cas_credential_readable(
-            k,
-            &[col("type", 1), col("body", 0)]
-        ));
-        assert!(cas_credential_readable(
-            k,
-            &[col("type", 1), col("body", 1)]
-        ));
-        assert!(!cas_credential_readable(k, &[]));
+        let r = |rows: &[Vec<Value>]| cas_credential_readable(k, rows);
+        assert_eq!(
+            r(&[col("type", 1), col("body", 0)]),
+            CasColumns::NotReadable
+        );
+        assert_eq!(r(&[col("type", 1), col("body", 1)]), CasColumns::Readable);
+        // Security review L1: nothing to decide on is never "not readable".
+        // No row (the table is gone or hidden):
+        assert_eq!(r(&[]), CasColumns::Unknown);
+        // No credential column of the kind (metadata columns only):
+        assert_eq!(
+            r(&[col("type", 1), col("creation_time", 1)]),
+            CasColumns::Unknown
+        );
+        // A permission cell that is not an integer (NULL):
+        let mut null = col("body", 0);
+        null[8] = Value::Null;
+        assert_eq!(r(&[col("type", 1), null.clone()]), CasColumns::Unknown);
+        assert_eq!(r(&[col("id", 0), null.clone()]), CasColumns::Unknown);
+        // A readable credential column still decides.
+        assert_eq!(r(&[null, col("id", 1)]), CasColumns::Readable);
         // The statement holds no `HAS_PERMS_BY_NAME`: no record per table.
         let stmt = sql::in_database(sql::CAS_COLUMNS, "retail").unwrap();
         assert!(!stmt.to_uppercase().contains("HAS_PERMS_BY_NAME"));

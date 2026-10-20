@@ -9,6 +9,14 @@
 //! [`CENSUS_MESSAGE`]), written by the heartbeat loop when the counts
 //! changed since the previous line and once when the audit worker stops.
 //! The counts are cumulative since the agent started.
+//!
+//! The counts are taken when the aggregator is flushed, after the
+//! `audit.configure` filter and **before** `spool_events`: an event that
+//! is then dropped as invalid while built into batches (per-item
+//! sanitization, ADR-0009), part of a batch that cannot be serialized, or
+//! lost on a spool error is still counted here. Those losses are reported
+//! by the spool's `dropped_items`, `batches_serialization_failed_total`
+//! and `events_lost_total` counters and their log lines.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

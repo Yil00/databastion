@@ -1020,15 +1020,38 @@ def census_lines(census: dict[str, dict[str, int]], label: str) -> list[str]:
 CONSOLE_KEYS = ("target", "db_user", "events", "statements", "star_events", "star_statements", "max_objects")
 
 
+CONSOLE_NAME_MAX = 128
+
+
+def _console_name(v: object) -> str | None:
+    """A target id or principal as printed (a `key=value` log line, a Markdown table cell): at most
+    CONSOLE_NAME_MAX characters, with `|`, backticks, every whitespace character (spaces included,
+    which would split a `key=value` field) and every control or non-printable character replaced
+    by `?`, so that a stored name can neither break a line, a field or a cell nor start a workflow
+    command. `None` for a value that is not a string."""
+    if not isinstance(v, str):
+        return None
+    return "".join("?" if (c in "|`" or c.isspace() or not c.isprintable()) else c
+                   for c in v[:CONSOLE_NAME_MAX])
+
+
 def console_rows(data: object) -> list[dict]:
     """Rows of the console query (run.sh): per target and principal, the events, the statements
-    they stand for and those naming an object `*` (the console does not know the overflow flag)."""
+    they stand for and those naming an object `*` (the console does not know the overflow flag).
+    Names are made safe to print (`_console_name`); a row whose names are not strings or whose
+    counts are not non-negative integers is dropped."""
     if not isinstance(data, list):
         return []
     rows = []
     for r in data:
-        if isinstance(r, dict) and all(k in r for k in CONSOLE_KEYS):
-            rows.append({k: r[k] for k in CONSOLE_KEYS})
+        if not (isinstance(r, dict) and all(k in r for k in CONSOLE_KEYS)):
+            continue
+        target, user = _console_name(r["target"]), _console_name(r["db_user"])
+        counts = [r[k] for k in CONSOLE_KEYS[2:]]
+        if target is None or user is None or not all(
+                isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in counts):
+            continue
+        rows.append({"target": target, "db_user": user, **{k: r[k] for k in CONSOLE_KEYS[2:]}})
     return rows
 
 
