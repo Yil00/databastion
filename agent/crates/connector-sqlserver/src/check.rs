@@ -668,11 +668,67 @@ pub(crate) async fn monitored_databases(
     Ok((dbs, cut))
 }
 
-/// A table of the CAS guard's read: id, name, columns with their `SELECT`.
-type CasTable = (i64, String, Vec<(String, bool)>);
+/// Tables of a database whose column `SELECT` the CAS guard checks, at
+/// most (one statement each); beyond, the check is incomplete.
+const CAS_CHECKED_TABLES: usize = 64;
+
+/// The tables of the CAS guard's catalog read ([`sql::CAS_COLUMNS`]) that
+/// it recognizes as a store with a credential column (by name or shape,
+/// over every column, as before), with their kind, at most
+/// [`CAS_CHECKED_TABLES`] (`true`: more were recognized). Only these get
+/// the column-level permission check: every `HAS_PERMS_BY_NAME` of a table
+/// writes an audit record on it.
+fn cas_candidates(
+    stores: Option<&cas_guard::CasStores>,
+    rows: &[Vec<Value>],
+) -> (Vec<(i64, cas_guard::StoreKind)>, bool) {
+    // Group per table: (id, name, columns); the rows come by object id.
+    let mut tables: Vec<(i64, &str, Vec<&str>)> = Vec::new();
+    for row in rows {
+        let id = row.first().and_then(Value::as_int).unwrap_or(-1);
+        let name = row.get(1).and_then(Value::as_text).unwrap_or_default();
+        let col = row.get(2).and_then(Value::as_text).unwrap_or_default();
+        match tables.last_mut() {
+            Some((last, _, cols)) if *last == id => cols.push(col),
+            _ => tables.push((id, name, vec![col])),
+        }
+    }
+    let mut out = Vec::new();
+    let mut cut = false;
+    for (id, name, cols) in &tables {
+        let Some(kind) = cas_guard::recognize(stores, [*name], cols.iter().copied()) else {
+            continue;
+        };
+        if !cols
+            .iter()
+            .any(|c| cas_guard::is_credential_column(kind, c))
+        {
+            continue;
+        }
+        if out.len() == CAS_CHECKED_TABLES {
+            cut = true;
+            break;
+        }
+        out.push((*id, kind));
+    }
+    (out, cut)
+}
+
+/// Whether a column read of one table ([`sql::COLUMNS`]) shows a
+/// credential column of `kind` the account can read.
+fn cas_credential_readable(kind: cas_guard::StoreKind, rows: &[Vec<Value>]) -> bool {
+    rows.iter().any(|r| {
+        r.first()
+            .and_then(Value::as_text)
+            .is_some_and(|c| cas_guard::is_credential_column(kind, c))
+            && r.get(8).and_then(Value::as_int) == Some(1)
+    })
+}
 
 /// The CAS guard's credential columns readable by the account in the
-/// monitored databases (ADR-0041 decision 6).
+/// monitored databases (ADR-0041 decision 6): the catalog read of every
+/// user table's columns, then the column `SELECT` of the recognized
+/// tables only, one table per statement.
 async fn cas_readable(
     s: &mut Session,
     dbs: &[String],
@@ -688,7 +744,7 @@ async fn cas_readable(
             out.complete = false;
             continue;
         };
-        let rows = match s.rows(&stmt, Stage::Check, Shape::rows(4, 20_001)).await {
+        let rows = match s.rows(&stmt, Stage::Check, Shape::rows(3, 20_001)).await {
             Ok(r) => r,
             Err(e) if !e.fatal => {
                 out.complete = false;
@@ -699,30 +755,23 @@ async fn cas_readable(
         if rows.len() > 20_000 {
             out.complete = false;
         }
-        // Group per table: (name, [(column, readable)]).
-        let mut tables: Vec<CasTable> = Vec::new();
-        for row in rows.iter().take(20_000) {
-            let id = row.first().and_then(Value::as_int).unwrap_or(-1);
-            let name = row.get(1).and_then(Value::as_text).unwrap_or_default();
-            let col = row.get(2).and_then(Value::as_text).unwrap_or_default();
-            let readable = row.get(3).and_then(Value::as_int) == Some(1);
-            match tables.last_mut() {
-                Some((last, _, cols)) if *last == id => cols.push((col.to_owned(), readable)),
-                _ => tables.push((id, name.to_owned(), vec![(col.to_owned(), readable)])),
-            }
+        let (candidates, cut) = cas_candidates(stores, rows.get(..20_000).unwrap_or(&rows));
+        if cut {
+            out.complete = false;
         }
-        for (_, name, cols) in &tables {
-            let kind = cas_guard::recognize(
-                stores,
-                [name.as_str()],
-                cols.iter().map(|(c, _)| c.as_str()),
-            );
-            if let Some(kind) = kind
-                && cols
-                    .iter()
-                    .any(|(c, r)| *r && cas_guard::is_credential_column(kind, c))
-            {
-                out.readable += 1;
+        for (id, kind) in candidates {
+            let Some(stmt) = sql::columns(db, id) else {
+                out.complete = false;
+                continue;
+            };
+            match s.rows(&stmt, Stage::Check, Shape::rows(9, 4096)).await {
+                Ok(cols) => {
+                    if cas_credential_readable(kind, &cols) {
+                        out.readable += 1;
+                    }
+                }
+                Err(e) if !e.fatal => out.complete = false,
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1101,6 +1150,90 @@ async fn checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cas_row(id: i64, table: &str, col: &str) -> Vec<Value> {
+        vec![
+            Value::Int(id),
+            Value::Text(table.into()),
+            Value::Text(col.into()),
+        ]
+    }
+
+    /// Load run 39453966277: the guard's permission check runs on the
+    /// recognized stores only, so that 100 plain user tables write no
+    /// audit record (a statement over more than 15 of them was always
+    /// reported as the agent's read of `*`).
+    #[test]
+    fn cas_guard_checks_only_the_recognized_tables() {
+        let mut rows = Vec::new();
+        for i in 0..100 {
+            rows.push(cas_row(i, &format!("t{i}"), "id"));
+            rows.push(cas_row(i, &format!("t{i}"), "body"));
+        }
+        // A ticket registry by name, one by shape, a service registry
+        // (no credential column), and a store with metadata columns only.
+        for c in ["id", "type", "body"] {
+            rows.push(cas_row(200, "cas_tickets", c));
+        }
+        for c in ["id", "type", "body", "principal_id", "expiration_time"] {
+            rows.push(cas_row(201, "tgt", c));
+        }
+        for c in ["id", "body"] {
+            rows.push(cas_row(202, "registered_services", c));
+        }
+        for c in ["type", "creation_time"] {
+            rows.push(cas_row(203, "CasTickets", c));
+        }
+        let (got, cut) = cas_candidates(None, &rows);
+        assert!(!cut);
+        assert_eq!(
+            got,
+            [
+                (200, cas_guard::StoreKind::TicketRegistry),
+                (201, cas_guard::StoreKind::TicketRegistry)
+            ]
+        );
+        // A configured name.
+        let stores = cas_guard::CasStores {
+            ticket_registry: vec!["t7".into()],
+            ..Default::default()
+        };
+        let (got, _) = cas_candidates(Some(&stores), &rows);
+        assert_eq!(
+            got.first(),
+            Some(&(7, cas_guard::StoreKind::TicketRegistry))
+        );
+        // Past the bound: incomplete, never more statements.
+        let many: Vec<Vec<Value>> = (0..=i64::try_from(CAS_CHECKED_TABLES).unwrap())
+            .map(|i| cas_row(i, "cas_tickets", "body"))
+            .collect();
+        let (got, cut) = cas_candidates(None, &many);
+        assert!(cut);
+        assert_eq!(got.len(), CAS_CHECKED_TABLES);
+    }
+
+    #[test]
+    fn cas_credential_readable_reads_the_column_select() {
+        let col = |name: &str, readable: i64| {
+            let mut r = vec![Value::Text(name.into())];
+            r.extend((1..8).map(|_| Value::Int(0)));
+            r.push(Value::Int(readable));
+            r
+        };
+        let k = cas_guard::StoreKind::TicketRegistry;
+        assert!(!cas_credential_readable(
+            k,
+            &[col("type", 1), col("body", 0)]
+        ));
+        assert!(cas_credential_readable(
+            k,
+            &[col("type", 1), col("body", 1)]
+        ));
+        assert!(!cas_credential_readable(k, &[]));
+        // The statement holds no `HAS_PERMS_BY_NAME`: no record per table.
+        let stmt = sql::in_database(sql::CAS_COLUMNS, "retail").unwrap();
+        assert!(!stmt.to_uppercase().contains("HAS_PERMS_BY_NAME"));
+    }
 
     #[test]
     fn contract_versions() {

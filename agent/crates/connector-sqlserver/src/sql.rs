@@ -439,13 +439,24 @@ DB_ID({dbname}))) + N'.' + QUOTENAME(OBJECT_NAME(c.object_id, DB_ID({dbname}))),
 N'SELECT', c.name, N'COLUMN')) FROM {db}.sys.columns c WHERE c.object_id = {obj} ORDER BY c.column_id";
 
 /// The CAS store guard's `check()` read (ADR-0041 decision 6): table and
-/// column names with the column `SELECT`, bounded.
+/// column names, bounded, **without** the column `SELECT`: a column-level
+/// `HAS_PERMS_BY_NAME` writes one SQL Server Audit `SL` record on each
+/// table it checks (measured on 2022), so checking every column of every
+/// user table at each `check()` wrote a record per user table of every
+/// monitored database, and a statement of more than 15 objects is the
+/// core's overflow, always reported: the agent's own read surfaced as a
+/// read of `*` at every heartbeat on a database of more than 15 tables
+/// (load run 39453966277). The permission is checked only on the tables
+/// the guard recognizes, one at a time ([`COLUMNS`], `check::cas_readable`).
+///
+/// The catalog views read are those of the earlier text (with the column
+/// `SELECT`), so that the system base tables a fresh server builds
+/// statistics on for it stay those measured (case 2 of the ADR-0051
+/// refinement of 2026-10-15; the 2022 fixture's partner is this text).
 pub(crate) const CAS_COLUMNS: &str = "SELECT TOP (20001) CONVERT(int, t.object_id), \
-CONVERT(nvarchar(128), t.name), CONVERT(nvarchar(128), c.name), CONVERT(int, \
-HAS_PERMS_BY_NAME(QUOTENAME({dbname}) + N'.' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), \
-N'OBJECT', N'SELECT', c.name, N'COLUMN')) FROM {db}.sys.tables t JOIN {db}.sys.schemas s ON \
-s.schema_id = t.schema_id JOIN {db}.sys.columns c ON c.object_id = t.object_id WHERE t.type = 'U' \
-AND t.is_ms_shipped = 0 ORDER BY t.object_id";
+CONVERT(nvarchar(128), t.name), CONVERT(nvarchar(128), c.name) FROM {db}.sys.tables t JOIN \
+{db}.sys.schemas s ON s.schema_id = t.schema_id JOIN {db}.sys.columns c ON c.object_id = \
+t.object_id WHERE t.type = 'U' AND t.is_ms_shipped = 0 ORDER BY t.object_id";
 
 /// A CAS ticket registry's metadata (ADR-0041 decision 5): counts per
 /// `type`, never a ticket.
@@ -1281,7 +1292,7 @@ mod tests {
             xe_poll(&ap, false).unwrap(),
             audit_poll("@p9", false).unwrap(),
             // A database template whose two names differ.
-            render(CAS_COLUMNS, &[("db", "[a]"), ("dbname", "N'b'")]).unwrap(),
+            render(COLUMNS, &[("db", "[a]"), ("dbname", "N'b'"), ("obj", "1")]).unwrap(),
         ] {
             assert!(!allowed(&bad), "{bad}");
         }
