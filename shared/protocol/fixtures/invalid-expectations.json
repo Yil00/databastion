@@ -29,6 +29,8 @@
   "EventsBatch.malformed-signal.json": "pattern",
   "EventsBatch.missing-batch-id.json": "required",
   "EventsBatch.negative-bytes.json": "minimum",
+  "EventsBatch.objects-overflowed-false.json": "const",
+  "EventsBatch.objects-overflowed-without-star.json": "contains",
   "EventsBatch.postgres-key-pattern-in-object.json": "pattern",
   "EventsBatch.principal-name-and-fingerprint.json": "oneOf",
   "EventsBatch.principal-without-account.json": "oneOf",

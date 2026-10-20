@@ -1972,7 +1972,8 @@ components:
         accepts:
           description: |
             Optional **request** fields and features this console accepts (ADR-0022), e.g.
-            `target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines
+            `target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,
+            `job_progress.coverage`, and the engines
             added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
             the list of the latest heartbeat response and sends an optional request field
             introduced after protocol 0.1.0 only when that list names it; before its first
@@ -2544,6 +2545,16 @@ components:
             neither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the
             latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
           $ref: "#/components/schemas/Count"
+        objects_overflowed:
+          description: |
+            Objects of this event were left out under a bound (the agent core's 15 named objects,
+            or a connector's own bound); the event's `*` objects stand for them (see `ObjectRef`,
+            the name `*`). Carries no value, no name and no count. Only `true` is valid; absent
+            otherwise. An event that carries it names at least one object `*` (checked by this
+            schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+            `access_event.objects_overflowed` (ADR-0022, ADR-0053).
+          type: boolean
+          const: true
         signals:
           description: Signal ids of the registry `signals.json` (see `Signal`).
           type: array
@@ -2616,6 +2627,30 @@ components:
                       $ref: "#/components/schemas/Identifier"
                     object:
                       $ref: "#/components/schemas/Identifier"
+        - description: |
+            An event whose objects overflowed (`objects_overflowed`) names at least one object
+            `*` (ADR-0053 decision 1 item 3).
+          if:
+            required: [objects_overflowed]
+            properties:
+              objects_overflowed:
+                const: true
+          then:
+            properties:
+              objects:
+                type: array
+                contains:
+                  description: "An `ObjectRef` named `*` (keep in step with `ObjectRef`)."
+                  type: object
+                  additionalProperties: false
+                  required: [database, object]
+                  properties:
+                    database:
+                      $ref: "#/components/schemas/Identifier"
+                    schema:
+                      $ref: "#/components/schemas/Identifier"
+                    object:
+                      const: "*"
         - description: |
             A failed authentication always names, or fingerprints, the name tried: never
             `account_not_recorded` (ADR-0052 implementation obligations).
@@ -2706,7 +2741,7 @@ components:
         Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
 
         **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
-        one of two reasons:
+        one of three reasons:
         - **unknown object**: the source does not say which objects were reached and the agent
           cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
           it cannot parse). `database` is the session's database and `schema` is absent. Such a
@@ -2714,9 +2749,17 @@ components:
           `*`, the objects the agent could tell;
         - **masked name**: normalization replaced the name (a name matched by a classifier, or
           one that does not conform to `Identifier`). This also applies to `database` and
-          `schema`.
+          `schema`;
+        - **overflowed objects**: the event reached more objects than it may list (the agent
+          core keeps at most 15 named objects, and a connector may drop objects under a bound of
+          its own), and the `*` stands for the objects left out. It is `(<database>, -, *)` when
+          they share a database, `(*, -, *)` once objects of another database are left out too,
+          and none is added when a `*` already in the event covers them. Such an event is always
+          reported, and carries `AccessEvent.objects_overflowed` when the console lists
+          `access_event.objects_overflowed` (ADR-0053); without the field, the overflow is not
+          known to the console.
 
-        In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+        In every case `*` is a **literal name, not a wildcard**: it never means "every object".
         The console compares it as the string `*` (ADR-0021): an `objects` condition or a
         location exception selects it only when its glob matches the string `*` (the glob `*`,
         or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its

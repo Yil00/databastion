@@ -940,7 +940,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }
@@ -1649,6 +1649,11 @@
           "description": "Size in bytes of the result returned (or of the data affected), when the source\nreports it; absent otherwise, never estimated. For a pre-aggregated event, the total\nof the merged events, as for `rows`. Not produced by the PostgreSQL connector:\nneither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the\nlatest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).\n",
           "$ref": "#/$defs/Count"
         },
+        "objects_overflowed": {
+          "description": "Objects of this event were left out under a bound (the agent core's 15 named objects,\nor a connector's own bound); the event's `*` objects stand for them (see `ObjectRef`,\nthe name `*`). Carries no value, no name and no count. Only `true` is valid; absent\notherwise. An event that carries it names at least one object `*` (checked by this\nschema). Sent only when the latest `HeartbeatResponse.accepts` lists\n`access_event.objects_overflowed` (ADR-0022, ADR-0053).\n",
+          "type": "boolean",
+          "const": true
+        },
         "signals": {
           "description": "Signal ids of the registry `signals.json` (see `Signal`).",
           "type": "array",
@@ -1776,6 +1781,46 @@
           }
         },
         {
+          "description": "An event whose objects overflowed (`objects_overflowed`) names at least one object\n`*` (ADR-0053 decision 1 item 3).\n",
+          "if": {
+            "required": [
+              "objects_overflowed"
+            ],
+            "properties": {
+              "objects_overflowed": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "objects": {
+                "type": "array",
+                "contains": {
+                  "description": "An `ObjectRef` named `*` (keep in step with `ObjectRef`).",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "database",
+                    "object"
+                  ],
+                  "properties": {
+                    "database": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "schema": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "object": {
+                      "const": "*"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
           "description": "A failed authentication always names, or fingerprints, the name tried: never\n`account_not_recorded` (ADR-0052 implementation obligations).\n",
           "if": {
             "required": [
@@ -1856,7 +1901,7 @@
       ]
     },
     "ObjectRef": {
-      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of two reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`.\n\nIn both cases `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n\n**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log\nentry is reported under the pattern learned by the last scan, its longest learned literal\nprefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.\n`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its\n`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),\nand by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`\ntargets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.\n",
+      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of three reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`;\n- **overflowed objects**: the event reached more objects than it may list (the agent\n  core keeps at most 15 named objects, and a connector may drop objects under a bound of\n  its own), and the `*` stands for the objects left out. It is `(<database>, -, *)` when\n  they share a database, `(*, -, *)` once objects of another database are left out too,\n  and none is added when a `*` already in the event covers them. Such an event is always\n  reported, and carries `AccessEvent.objects_overflowed` when the console lists\n  `access_event.objects_overflowed` (ADR-0053); without the field, the overflow is not\n  known to the console.\n\nIn every case `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n\n**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log\nentry is reported under the pattern learned by the last scan, its longest learned literal\nprefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.\n`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its\n`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),\nand by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`\ntargets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
