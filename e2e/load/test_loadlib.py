@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -650,6 +651,59 @@ class ReportTest(unittest.TestCase):
             with open(f"{d}/out/results.json") as f:
                 self.assertTrue(json.load(f)["pass"])
             self.assertTrue(os.path.exists(f"{d}/out/results.md"))
+
+
+class CensusTest(unittest.TestCase):
+    @staticmethod
+    def line(engine: str, events: int, **kw: int) -> str:
+        fields = {"message": "audit event census", "engine": engine, "events": events,
+                  "statements": events, "overflowed": 0, "overflowed_statements": 0, "unknown_star": 0,
+                  "unknown_star_statements": 0, "filtered": 0}
+        fields.update(kw)
+        rec = {"timestamp": "2026-10-20T10:00:00Z", "level": "INFO", "fields": fields,
+               "target": "databastion_core::audit::census"}
+        return "agent-1  | 2026-10-20T10:00:00.000000000Z " + json.dumps(rec)
+
+    def test_last_line_per_engine_wins(self) -> None:
+        lines = [
+            self.line("postgres", 10, overflowed=1),
+            "agent-1  | not json at all audit event census",
+            self.line("mariadb", 5, unknown_star=2),
+            self.line("postgres", 20, overflowed=3, overflowed_statements=7),
+            '{"fields": {"message": "audit stream started", "engine": "postgres", "events": 99}}',
+            self.line("BAD ENGINE", 1),
+            self.line("redis", -1),
+        ]
+        c = L.census_from_log(lines)
+        self.assertEqual(sorted(c), ["mariadb", "postgres"])
+        self.assertEqual(c["postgres"]["events"], 20)
+        self.assertEqual(c["postgres"]["overflowed_statements"], 7)
+        self.assertEqual(c["mariadb"]["unknown_star"], 2)
+        out = L.census_lines(c, "load")
+        self.assertIn("CENSUS load engine=postgres events=20", out[1])
+        self.assertIn("overflowed_rate=15.000%", out[1])
+        md = L.census_markdown(c, [], "load")
+        self.assertIn("| postgres | 20 | 20 | 3 | 7 |", md)
+
+    def test_cmd_census_never_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "agent.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(self.line("sqlserver", 4, overflowed=1) + "\n")
+            con = os.path.join(d, "console.json")
+            with open(con, "w", encoding="utf-8") as f:
+                json.dump([{"target": "mssql-load", "db_user": "load_orm", "events": 4, "statements": 9,
+                            "star_events": 1, "star_statements": 3, "max_objects": 16}, {"bad": 1}], f)
+            summary = os.path.join(d, "summary.md")
+            args = argparse.Namespace(log=log, console=con, label="t", summary=summary)
+            self.assertEqual(L.cmd_census(args), 0)
+            with open(summary, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("| sqlserver | 4 |", text)
+            self.assertIn("| mssql-load | load_orm | 4 | 9 | 1 | 3 | 16 |", text)
+            args = argparse.Namespace(log=os.path.join(d, "missing"), console=None,
+                                                            label="t", summary=None)
+            self.assertEqual(L.cmd_census(args), 0)
 
 
 if __name__ == "__main__":

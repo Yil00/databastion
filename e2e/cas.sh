@@ -63,6 +63,14 @@ SPOOL_TIMEOUT_S=90
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[e2e-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
+# (counts only) per engine from the collected agent log, to the log and the job summary. Never fails.
+print_census() {
+  local line
+  python3 "$HERE/load/loadlib.py" census --log "$E2E_LOG_DIR/agent.log" --label "$1" \
+    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
 fail() { log "FAIL: $*"; exit 1; }
 
 T_RUN="$(date +%s)"
@@ -195,6 +203,7 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  print_census e2e-cas
   redact_dir "$E2E_LOG_DIR" "$P"
   redact_dir "$E2E_LOG_DIR" "$TP"
   redact_dir "$E2E_LOG_DIR" "$NP"

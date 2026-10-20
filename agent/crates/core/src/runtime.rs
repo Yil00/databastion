@@ -1469,6 +1469,8 @@ impl Runtime {
                     self.on_call_error("heartbeat", &e, failures, interval)?
                 }
             };
+            // ADR-0053 decision 6 measurement: counts only, local log.
+            audit::census::log_changed();
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 _ = shutdown.changed() => return Ok(()),
@@ -2360,6 +2362,9 @@ impl Runtime {
             .drain()
             .into_iter()
             .partition(|e| audit::reportable(cfg, e));
+        if let Some(t) = cfg.target() {
+            audit::census::record(t.engine, &keep, drop.len());
+        }
         bump(
             &self.counters.events_filtered,
             u64::try_from(drop.len()).unwrap_or(u64::MAX),
@@ -2410,6 +2415,7 @@ impl Runtime {
             while tasks.next().await.is_some() {}
         })
         .await;
+        audit::census::log_changed();
         Ok(())
     }
 

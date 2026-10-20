@@ -17,6 +17,14 @@ Subcommands (stdlib only; unit tests in test_loadlib.py):
   sysbench --summary FILE
       Events, read queries, errors and the 95th percentile latency of a sysbench summary.
 
+  census --log FILE [--console FILE] [--label TEXT] [--summary FILE]
+      ADR-0053 decision 6 measurement: the agent's last "audit event census" line per engine in a
+      `docker compose logs` file of the agent (counts only: events spooled, the statements they
+      stand for, overflowed events, events naming an unknown-object `*`, events filtered), and
+      optionally the console's per-principal event counts (a JSON array from run.sh). Prints one
+      `CENSUS ...` / `CENSUS-CONSOLE ...` line each to stdout and appends a Markdown section to
+      --summary (the job step summary). Never fails the run (exit 0, also without data).
+
   report --facts FILE --samples FILE... --heartbeats FILE --out DIR
       Computes every measure from the samples and the facts run.sh recorded (windows, counts),
       evaluates the checks, writes results.json and results.md, exits 1 if a check failed.
@@ -956,6 +964,131 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0 if ck.passed else 1
 
 
+
+# ------------------------------------------------------------------------------------ census
+CENSUS_MESSAGE = "audit event census"
+CENSUS_FIELDS = ("events", "statements", "overflowed", "overflowed_statements", "unknown_star",
+                 "unknown_star_statements", "filtered")
+# Engine names the agent writes (agent/crates/core/src/audit/census.rs).
+CENSUS_ENGINE_RE = re.compile(r"^[a-z]{1,16}$")
+
+
+def census_from_log(lines: list[str]) -> dict[str, dict[str, int]]:
+    """The last census line per engine of an agent log (JSON lines, possibly behind a `docker
+    compose logs` prefix). The counts are cumulative, so the last line is the run's total."""
+    out: dict[str, dict[str, int]] = {}
+    for line in lines:
+        if CENSUS_MESSAGE not in line:
+            continue
+        i = line.find("{")
+        if i < 0:
+            continue
+        try:
+            rec = json.loads(line[i:])
+        except ValueError:
+            continue
+        f = rec.get("fields") if isinstance(rec, dict) else None
+        if not isinstance(f, dict) or f.get("message") != CENSUS_MESSAGE:
+            continue
+        engine = f.get("engine")
+        if not isinstance(engine, str) or not CENSUS_ENGINE_RE.match(engine):
+            continue
+        counts = {k: f.get(k) for k in CENSUS_FIELDS}
+        if not all(isinstance(v, int) and v >= 0 for v in counts.values()):
+            continue
+        out[engine] = counts  # type: ignore[assignment]
+    return out
+
+
+def _pct(n: int, d: int) -> str:
+    return f"{100.0 * n / d:.3f} %" if d else "-"
+
+
+def census_lines(census: dict[str, dict[str, int]], label: str) -> list[str]:
+    out = []
+    for engine in sorted(census):
+        c = census[engine]
+        out.append(
+            f"CENSUS {label} engine={engine} events={c['events']} statements={c['statements']} "
+            f"overflowed={c['overflowed']} overflowed_statements={c['overflowed_statements']} "
+            f"unknown_star={c['unknown_star']} unknown_star_statements={c['unknown_star_statements']} "
+            f"filtered={c['filtered']} overflowed_rate={_pct(c['overflowed'], c['events']).replace(' ', '')} "
+            f"unknown_star_rate={_pct(c['unknown_star'], c['events']).replace(' ', '')}")
+    return out
+
+
+CONSOLE_KEYS = ("target", "db_user", "events", "statements", "star_events", "star_statements", "max_objects")
+
+
+def console_rows(data: object) -> list[dict]:
+    """Rows of the console query (run.sh): per target and principal, the events, the statements
+    they stand for and those naming an object `*` (the console does not know the overflow flag)."""
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for r in data:
+        if isinstance(r, dict) and all(k in r for k in CONSOLE_KEYS):
+            rows.append({k: r[k] for k in CONSOLE_KEYS})
+    return rows
+
+
+def census_markdown(census: dict[str, dict[str, int]], rows: list[dict], label: str) -> str:
+    out = [f"## Event census ({label}): ADR-0053 decision 6", "",
+           "Agent side, events spooled since the agent started (after aggregation and the "
+           "`audit.configure` filter); statements: the raw statements they stand for.", ""]
+    if census:
+        out += ["| Engine | Events | Statements | Overflowed | (statements) | Unknown `*` | (statements) "
+                "| Filtered | Overflowed rate | Unknown `*` rate |",
+                "|---|---|---|---|---|---|---|---|---|---|"]
+        for engine in sorted(census):
+            c = census[engine]
+            out.append(f"| {engine} | {c['events']} | {c['statements']} | {c['overflowed']} | "
+                       f"{c['overflowed_statements']} | {c['unknown_star']} | {c['unknown_star_statements']} | "
+                       f"{c['filtered']} | {_pct(c['overflowed'], c['events'])} | "
+                       f"{_pct(c['unknown_star'], c['events'])} |")
+    else:
+        out.append("No census line in the agent log.")
+    if rows:
+        out += ["", "Console side, per target and principal (an object `*`, overflowed or unknown):", "",
+                "| Target | Principal | Events | Statements | Events with `*` | (statements) | Max objects |",
+                "|---|---|---|---|---|---|---|"]
+        for r in rows:
+            out.append(f"| {r['target']} | {r['db_user']} | {r['events']} | {r['statements']} | "
+                       f"{r['star_events']} | {r['star_statements']} | {r['max_objects']} |")
+    return "\n".join(out) + "\n"
+
+
+def cmd_census(args: argparse.Namespace) -> int:
+    try:
+        with open(args.log, encoding="utf-8", errors="replace") as f:
+            census = census_from_log(f.read().splitlines())
+    except OSError as e:
+        print(f"loadlib: census: cannot read the agent log: {e.strerror}", file=sys.stderr)
+        census = {}
+    rows: list[dict] = []
+    if args.console:
+        try:
+            with open(args.console, encoding="utf-8") as f:
+                rows = console_rows(json.loads(f.read() or "[]"))
+        except (OSError, ValueError):
+            rows = []
+    for line in census_lines(census, args.label):
+        print(line)
+    for r in rows:
+        print(f"CENSUS-CONSOLE {args.label} target={r['target']} principal={r['db_user']} events={r['events']} "
+              f"statements={r['statements']} star_events={r['star_events']} "
+              f"star_statements={r['star_statements']} max_objects={r['max_objects']}")
+    if not census:
+        print(f"CENSUS {args.label} none")
+    if args.summary:
+        try:
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(census_markdown(census, rows, args.label))
+        except OSError:
+            pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -974,6 +1107,11 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--below", type=float, default=0.05)
     q.add_argument("--window", type=float, default=5.0)
     q.add_argument("--timeout", type=float, default=120.0)
+    c = sub.add_parser("census")
+    c.add_argument("--log", required=True)
+    c.add_argument("--console")
+    c.add_argument("--label", default="run")
+    c.add_argument("--summary")
     r = sub.add_parser("report")
     r.add_argument("--facts", required=True)
     r.add_argument("--samples", nargs="+", required=True)
@@ -981,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", required=True)
     a = p.parse_args(argv)
     return {"sample": cmd_sample, "pgbench": cmd_pgbench, "sysbench": cmd_sysbench, "quiet": cmd_quiet,
-            "report": cmd_report}[a.cmd](a)
+            "report": cmd_report, "census": cmd_census}[a.cmd](a)
 
 
 if __name__ == "__main__":

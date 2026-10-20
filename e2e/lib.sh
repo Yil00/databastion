@@ -557,3 +557,14 @@ dump_logs() {
     compose logs --no-color --timestamps "$svc" >"$E2E_LOG_DIR/$svc.log" 2>&1 || true
   done
 }
+
+# print_census LABEL: ADR-0053 decision 6 measurement. The agent's last event census line per engine
+# (counts only: events spooled, overflowed, naming an unknown-object `*`) from the collected agent
+# log, and, when CENSUS_CONSOLE names a file, the console's per-principal counts; to the log and the
+# job summary. Call after dump_logs. Never fails the run.
+print_census() {
+  local line
+  python3 "$(dirname "${BASH_SOURCE[0]}")/load/loadlib.py" census --log "$E2E_LOG_DIR/agent.log" --label "$1" \
+    ${CENSUS_CONSOLE:+--console "$CENSUS_CONSOLE"} ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
+}

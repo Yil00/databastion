@@ -63,6 +63,14 @@ UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SPOOL_TIMEOUT_S=120
 
 log() { printf '[load-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
+# (counts only) per engine from the collected agent log, to the log and the job summary. Never fails.
+print_census() {
+  local line
+  python3 "$HERE/loadlib.py" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" \
+    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
 fail() { log "FAIL: $*"; exit 1; }
 now_s() { date +%s.%3N; }
 T_RUN="$(date +%s)"
@@ -169,6 +177,7 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census load-cas
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   # Leak scan before redaction (as run.sh): canary first, then the registry.
   mkdir -p "$canary_dir"

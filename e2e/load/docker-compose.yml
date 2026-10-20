@@ -311,6 +311,8 @@ services:
     secrets: [load_client_password]
     volumes:
       - ./side-clients.sh:/usr/local/bin/side-clients.sh:ro
+      # The ORM-style cycle of load_orm (ADR-0053 decision 6, seed.py orm).
+      - ${LOAD_WORK_DIR:?set by run.sh}/workload/orm:/orm:ro
     tmpfs: [/tmp]
     networks: [agent-net]
 
@@ -327,6 +329,8 @@ services:
     secrets: [load_client_password]
     volumes:
       - ./pg-side-clients.sh:/usr/local/bin/pg-side-clients.sh:ro
+      # The ORM-style cycle of load_orm (ADR-0053 decision 6, seed.py orm).
+      - ${LOAD_WORK_DIR:?set by run.sh}/workload/orm:/orm:ro
     tmpfs: [/tmp]
     networks: [agent-net]
 
