@@ -11,7 +11,7 @@ import type { IncidentView } from "@/server/incidents";
 import type { PolicyView } from "@/server/policies";
 
 import { AuditForm, confirmationText, formatManualObjects, parseManualObjects } from "./audit-form";
-import { EventsTable, formatBytes, formatCount, objectsLabel, PrincipalLabel, PrincipalsTable, SignalBadge, UNREGISTERED_SIGNAL_TITLE } from "./events-table";
+import { boundScoreLabel, EventsTable, formatBytes, formatCount, objectsLabel, PrincipalLabel, PrincipalsTable, SignalBadge, UNREGISTERED_SIGNAL_TITLE } from "./events-table";
 import { incidentLocation, IncidentsTable } from "./incidents-table";
 import { conditionLines, PoliciesTable, policyFormValues } from "./policies-table";
 import { PolicyForm, policyErrorMessage, policyRequestBody } from "./policy-form";
@@ -50,6 +50,9 @@ const event = (over: Partial<EventView> = {}): EventView => ({
   evaluated: true,
   sensitivity: 10.5,
   score: 64.1,
+  objectsOverflowed: false,
+  boundSensitivity: null,
+  boundScore: null,
   anomaly: true,
   baselineRows: 1000,
   incidentIds: ["01890a5d-ac96-774b-bcce-b302099a8057"],
@@ -57,6 +60,31 @@ const event = (over: Partial<EventView> = {}): EventView => ({
 });
 
 describe("access events view", () => {
+  it("ADR-0053: marks a flagged event and shows its bound as an upper bound; an unflagged event as before", () => {
+    const flagged = event({
+      objects: [{ database: HOSTILE, object: "*" }],
+      objectsOverflowed: true,
+      sensitivity: 0,
+      score: 0,
+      boundSensitivity: 10,
+      boundScore: 20,
+    });
+    const html = renderToStaticMarkup(<EventsTable events={[flagged]} now={NOW} />);
+    expect(html).toContain("more objects than listed (left out)");
+    expect(html).toContain("data-objects-overflowed");
+    expect(html).toContain("up to 20 (sensitivity 10)");
+    expect(html).not.toContain("<img");
+    expect(html).toContain(ESCAPED);
+    // The bound equal to the named score is not repeated; an unflagged event shows neither.
+    expect(renderToStaticMarkup(<EventsTable events={[{ ...flagged, boundScore: 0 }]} now={NOW} />)).not.toContain("up to");
+    const plain = renderToStaticMarkup(<EventsTable events={[event({ boundScore: 64.1, boundSensitivity: 10.5 })]} now={NOW} />);
+    expect(plain).not.toContain("left out");
+    expect(plain).not.toContain("up to");
+    expect(boundScoreLabel(4, 40)).toBe("up to 40");
+    expect(boundScoreLabel(4, 4)).toBeNull();
+    expect(boundScoreLabel(4, null)).toBeNull();
+  });
+
   it("escapes every agent-provided string and links principal, signals and incidents", () => {
     const html = renderToStaticMarkup(
       <EventsTable
@@ -237,7 +265,7 @@ describe("OpenLDAP events (ADR-0029)", () => {
     };
     expect(renderToStaticMarkup(<PrincipalsTable principals={[p]} now={NOW} />)).toContain("LDAP principal fingerprint");
     const i = {
-      access: { eventId: null, principal: FP, database: "dc=example,dc=org", bucket: new Date(NOW), score: 1, rows: 1, signals: [], lastEventAt: null, anomaly: false, overflow: false },
+      access: { eventId: null, principal: FP, database: "dc=example,dc=org", bucket: new Date(NOW), score: 1, rows: 1, signals: [], lastEventAt: null, anomaly: false, overflow: false, objectsOverflowed: false, boundScore: null },
       location: null,
       engine: "openldap",
     };
@@ -280,7 +308,7 @@ describe("CAS events (ADR-0041)", () => {
     // `*` is only the aggregate on CAS: elsewhere it is shown as sent.
     expect(renderToStaticMarkup(<PrincipalLabel principal="*" fingerprinted={false} engine="postgres" />)).toBe('<span class="break-all">*</span>');
     const i = {
-      access: { eventId: null, principal: "*", database: null, bucket: new Date(NOW), score: 0, rows: null, signals: ["volume.failed_logins_many_accounts"], lastEventAt: null, anomaly: false, overflow: false },
+      access: { eventId: null, principal: "*", database: null, bucket: new Date(NOW), score: 0, rows: null, signals: ["volume.failed_logins_many_accounts"], lastEventAt: null, anomaly: false, overflow: false, objectsOverflowed: false, boundScore: null },
       location: null,
       engine: "cas",
     };
@@ -303,7 +331,7 @@ describe("incidents raised from access events", () => {
       policyName: "Dumps",
       policyRevision: 1,
       source: "access_event",
-      access: { eventId: null, principal: HOSTILE, database: "crm", bucket: new Date(NOW), score: 64.1, rows: 10, signals: [], lastEventAt: null, anomaly: false, overflow: false },
+      access: { eventId: null, principal: HOSTILE, database: "crm", bucket: new Date(NOW), score: 64.1, rows: 10, signals: [], lastEventAt: null, anomaly: false, overflow: false, objectsOverflowed: false, boundScore: null },
       findingId: null,
       agentId: AGENT,
       agentName: "db-host-1",

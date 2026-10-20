@@ -95,6 +95,31 @@ export function formatBytes(n: number | null): string {
   return u === 0 ? `${n} B` : `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
 }
 
+/** ADR-0053: what the "objects left out" mark of a flagged event means (tooltip). */
+export const OBJECTS_OVERFLOWED_TITLE =
+  "The access reached more objects than the event lists: the agent left the others out under a bound (15 named objects per event, or a connector's own bound), and the event's * objects stand for them. Policies treat each * as possibly any object of its database (of the target, for the database *).";
+
+/** The mark of an event flagged `objects_overflowed` (ADR-0053 decision 3 item 7). */
+export function ObjectsOverflowedNote() {
+  return (
+    <div className="text-xs text-muted-foreground" title={OBJECTS_OVERFLOWED_TITLE} data-objects-overflowed="">
+      more objects than listed (left out)
+    </div>
+  );
+}
+
+/**
+ * The bound score of a flagged event, shown for information as an upper bound ("up to ...");
+ * nothing when it is the named score (ADR-0053 decision 3 item 7).
+ */
+export function boundScoreLabel(score: number | null, boundScore: number | null): string | null {
+  if (boundScore === null || boundScore <= (score ?? 0)) return null;
+  return `up to ${boundScore}`;
+}
+
+export const BOUND_SCORE_TITLE =
+  "Upper bound: the score if each * of the event were the most sensitive object of its database. Used by min_score and min_sensitivity conditions; incidents compare the named score only.";
+
 export const UNREGISTERED_SIGNAL_TITLE =
   "Not in this console's signal registry: registered after this console was built, or sent by a non-conforming agent. Stored and matched like the others; a signature.* id is still treated as severe.";
 
@@ -210,6 +235,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
             <TableCell>{e.action}</TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal text-xs">
               <ObjectsCell objects={e.objects} engine={e.engine} />
+              {e.objectsOverflowed && <ObjectsOverflowedNote />}
             </TableCell>
             <TableCell>
               {formatCount(e.rows)}
@@ -238,6 +264,12 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
               {e.evaluated ? (e.score ?? 0) : <span className="text-muted-foreground">pending</span>}
               {e.evaluated && e.sensitivity !== null && e.sensitivity > 0 && (
                 <div className="text-xs text-muted-foreground">sensitivity {e.sensitivity}</div>
+              )}
+              {e.evaluated && e.objectsOverflowed && boundScoreLabel(e.score, e.boundScore) !== null && (
+                <div className="text-xs text-muted-foreground" title={BOUND_SCORE_TITLE} data-bound-score="">
+                  {boundScoreLabel(e.score, e.boundScore)}
+                  {e.boundSensitivity !== null && ` (sensitivity ${e.boundSensitivity})`}
+                </div>
               )}
             </TableCell>
             <TableCell className="text-xs">

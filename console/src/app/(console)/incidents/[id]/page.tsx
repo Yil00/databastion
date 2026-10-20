@@ -2,7 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { DeliveriesTable } from "@/components/console/deliveries-table";
-import { EventsTable, PrincipalLabel, SignalBadge } from "@/components/console/events-table";
+import { BOUND_SCORE_TITLE, boundScoreLabel, EventsTable, OBJECTS_OVERFLOWED_TITLE, PrincipalLabel, SignalBadge } from "@/components/console/events-table";
 import { FindingsTable } from "@/components/console/findings-table";
 import { IncidentActions } from "@/components/console/incident-actions";
 import { IncidentStatusBadge, SeverityBadge } from "@/components/console/incidents-table";
@@ -111,6 +111,17 @@ export default async function IncidentPage({ params }: { params: Promise<{ id: s
                 <dd>
                   {incident.matchCount} event{incident.matchCount > 1 ? "s" : ""}, {Math.round(access.rows ?? 0)} rows, highest score{" "}
                   {access.score ?? 0}
+                  {access.objectsOverflowed && boundScoreLabel(access.score, access.boundScore) !== null && (
+                    <span className="text-muted-foreground" title={BOUND_SCORE_TITLE} data-bound-score="">
+                      {" "}
+                      ({boundScoreLabel(access.score, access.boundScore)})
+                    </span>
+                  )}
+                  {access.objectsOverflowed && (
+                    <div className="text-xs text-muted-foreground" title={OBJECTS_OVERFLOWED_TITLE} data-objects-overflowed="">
+                      An event of this incident reached more objects than it lists: the agent left the others out under a bound.
+                    </div>
+                  )}
                 </dd>
                 <dt className="text-muted-foreground">Signals</dt>
                 <dd className="flex flex-wrap items-center gap-1">

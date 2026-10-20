@@ -50,6 +50,28 @@ import {
  * uses the baseline before the event; the event then updates it with `x` capped at that threshold
  * (so one dump cannot inflate the baseline, while a lasting increase still raises it gradually).
  * The same statistics are kept on `ln(1 + score)` for display. Only these aggregates are stored.
+ *
+ * ## Overflowed objects (ADR-0053 decision 3)
+ * An event the agent flags `objects_overflowed` left objects out under a bound (the core's 15
+ * named objects, or a connector's own); every object named `*` of such an event is an **overflow
+ * `*`** (`isOverflowStar`), whatever its shape (`(<db>, -, *)`, `(*, -, *)`, or a `*` with a
+ * schema; on Redis / Valkey a real `*` key pattern too, fail closed): "one or more objects of this
+ * database (of the target, for the database `*`) that the event does not name". Fail closed for
+ * selection, never for comparison between incidents:
+ * - the **named score** (`score`, `sensitivity`) is the one above, from the named objects only
+ *   (a `*` keeps its literal-name sensitivity); it is the only one compared with incidents
+ *   (`worseThanClosed`, `severeEvent`, the incidents' highest score, the baselines);
+ * - the **bound score** (`boundScore`, `boundSensitivity`) gives each overflow `*` the highest
+ *   object sensitivity of its database (of the target for the database `*`), and is used by
+ *   `min_score` / `min_sensitivity` and for the choice of the dedup object, and shown as an upper
+ *   bound;
+ * - an `objects` condition retains an overflow `*` when its `database` glob, if any, matches its
+ *   database (always for the database `*`); its `schema` and `object` globs are not applied;
+ * - a location exception covers an overflow `*` only when it covers every object of its database
+ *   (`schema` and `object` absent or exactly `*`, `database` absent or matching it; for the
+ *   database `*`: absent or exactly `*`).
+ * Without the flag (an agent up to 0.8.0, or a console that did not list the token) every `*` is
+ * a literal name, as before, and both scores are the same.
  */
 
 // ---------------------------------------------------------------------------- scoring
@@ -359,9 +381,59 @@ export interface EventFacts {
   objects: readonly EventObject[];
   rows: number | null;
   signals: readonly string[];
+  /** Named sensitivity and score (ADR-0053: from the named objects only). */
   sensitivity: number;
   score: number;
+  /**
+   * Contract `AccessEvent.objects_overflowed` (ADR-0053): every `*` object of the event is an
+   * overflow `*` (`isOverflowStar`). Absent or false: "not known", every `*` is a literal name.
+   */
+  objectsOverflowed?: boolean;
+  /**
+   * Bound sensitivity and score (ADR-0053 decision 3 item 3), used by `min_sensitivity` and
+   * `min_score`; the named ones when absent (an event without the flag has the same values).
+   */
+  boundSensitivity?: number;
+  boundScore?: number;
   anomaly: boolean;
+}
+
+/** The literal object name the agent uses for an unknown, masked or overflowed object. */
+export const STAR_OBJECT = "*";
+
+/**
+ * Whether `o` is an overflow `*` of the event (ADR-0053 decision 3 item 1): the event is flagged
+ * `objects_overflowed` and the object is named `*`, whatever its database and schema. The console
+ * does not infer the bound from the shape, and never guesses an overflow without the flag.
+ */
+export function isOverflowStar(e: { objectsOverflowed?: boolean | null }, o: Pick<EventObject, "object">): boolean {
+  return e.objectsOverflowed === true && o.object === STAR_OBJECT;
+}
+
+/**
+ * Whether an `objects` condition retains an overflow `*` (ADR-0053 decision 3 item 5): it may be
+ * any object of its database, so only the pattern's `database` glob applies (policy globs: without
+ * case, trailing spaces ignored); with the database `*` (objects of several databases left out) it
+ * may be any object of the target, and every pattern retains it.
+ */
+export function overflowStarMatches(pattern: ObjectPattern, o: EventObject): boolean {
+  if (o.database === STAR_OBJECT) return true;
+  return pattern.database === undefined || globMatch(pattern.database, o.database, { ignoreTrailingSpaces: true });
+}
+
+/**
+ * Whether a location exception's globs cover an overflow `*` (ADR-0053 decision 3 item 6): only
+ * when they would cover every object of its database. `schema` and `object` absent or exactly `*`
+ * (the glob `\*`, which selects the literal name only, does not), and `database` absent or
+ * matching the database with the exception's options (`exceptionGlobOptions`, ADR-0054); for the
+ * database `*`: absent or exactly `*`.
+ */
+export function exceptionCoversOverflowStar(parts: ObjectPattern, o: EventObject, opts: GlobOptions): boolean {
+  if (parts.schema !== undefined && parts.schema !== STAR_OBJECT) return false;
+  if (parts.object !== undefined && parts.object !== STAR_OBJECT) return false;
+  if (parts.database === undefined) return true;
+  if (o.database === STAR_OBJECT) return parts.database === STAR_OBJECT;
+  return globMatch(parts.database, o.database, opts);
 }
 
 export function signalSelected(selectors: readonly string[], signal: string): boolean {
@@ -397,13 +469,17 @@ export function eventMatches(c: EventConditions, e: EventFacts): number[] | null
   if (c.principals && !c.principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.exclude_principals && e.accountNotRecorded !== true && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.min_rows !== undefined && (e.rows === null || e.rows < c.min_rows)) return null;
-  if (c.min_score !== undefined && e.score < c.min_score) return null;
-  if (c.min_sensitivity !== undefined && e.sensitivity < c.min_sensitivity) return null;
+  // ADR-0053 decision 3 item 4: thresholds on the bound (the named values without the flag).
+  if (c.min_score !== undefined && (e.boundScore ?? e.score) < c.min_score) return null;
+  if (c.min_sensitivity !== undefined && (e.boundSensitivity ?? e.sensitivity) < c.min_sensitivity) return null;
   if (c.anomaly && !e.anomaly) return null;
   const all = e.objects.map((_, i) => i);
   if (!c.objects) return all;
   const pattern = c.objects;
-  const kept = all.filter((i) => objectMatches(pattern, e.objects[i] as EventObject));
+  const kept = all.filter((i) => {
+    const o = e.objects[i] as EventObject;
+    return isOverflowStar(e, o) ? overflowStarMatches(pattern, o) : objectMatches(pattern, o);
+  });
   return kept.length > 0 ? kept : null;
 }
 
@@ -423,7 +499,9 @@ export interface EventExceptionScope {
  * findings only and never covers an event. The globs compare with case unless the target's engine
  * is in `CASE_BLIND_EXCEPTION_ENGINES` (ADR-0054; an unknown engine: always with case) and ignore
  * trailing spaces only on the target's engine of `TRAILING_SPACE_BLIND_ENGINES`
- * (src/lib/policy-common.ts) (N1; an unknown engine: never).
+ * (src/lib/policy-common.ts) (N1; an unknown engine: never). An overflow `*` of a flagged event
+ * (ADR-0053) is covered only by an exception that covers every object of its database
+ * (`exceptionCoversOverflowStar`).
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,
@@ -442,7 +520,10 @@ export function exceptionCoversEvent(
     if (field !== undefined && field !== "*") return false;
     if (objectIdx.length === 0) return false;
     const opts = exceptionGlobOptions(e.engine);
-    return objectIdx.every((i) => objectMatches(parts, e.objects[i] as EventObject, opts));
+    return objectIdx.every((i) => {
+      const o = e.objects[i] as EventObject;
+      return isOverflowStar(e, o) ? exceptionCoversOverflowStar(parts, o, opts) : objectMatches(parts, o, opts);
+    });
   }
   return true;
 }
@@ -607,7 +688,11 @@ export function worseThanClosed(
   return false;
 }
 
-/** Index of the retained object that sets the dedup database: the most sensitive, first on a tie. */
+/**
+ * Index of the retained object that sets the dedup database: the most sensitive, first on a tie.
+ * The caller passes the bound sensitivities (ADR-0053 decision 3 item 4), so an overflow `*` and
+ * its database (or `*`) can be the one; for an event without the flag they are the named ones.
+ */
 export function dedupObject(objectIdx: readonly number[], sensitivities: readonly number[]): number | null {
   let best: number | null = null;
   for (const i of objectIdx) {
