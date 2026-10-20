@@ -1,7 +1,8 @@
 # ADR-0054: Case-sensitive location exceptions on case-sensitive engines
 
-- **Status**: Proposed (revised on 2026-10-18 after its security review, "sound after changes": M1, M2, L1 to L3)
+- **Status**: Accepted (2026-10-20). **Accepted** by the maintainer on 2026-10-20 with the proposed answer to every open question (see [Open questions](#open-questions-answered)). History: proposed on 2026-10-18, revised the same day after its security review ("sound after changes": M1, M2, L1 to L3)
 - **Date**: 2026-10-18
+- **Refined by**: [ADR-0055](0055-agent-reported-name-case-semantics.md) (Proposed), option D: case semantics reported by the agent for MySQL / MariaDB and SQL Server
 - **Refines**: [ADR-0014](0014-policy-and-incident-model.md) (which stays Accepted), decision 1 ("globs … are case-insensitive"), for location exceptions only, and [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decision 5 (exceptions on access events)
 - **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Console, after N1"; ADR-0014 implementation note of 2026-10-17; [ADR-0009](0009-name-normalization-and-item-sanitization.md) (name normalization); [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine); [09-agent-protocol.md, location mapping per engine](../09-agent-protocol.md#location-mapping-per-engine); `console/src/lib/policy-common.ts` (`foldName`, `exceptionGlobOptions`), `console/src/lib/policy-model.ts` (`exceptionCovers`), `console/src/lib/event-model.ts` (`exceptionCoversEvent`), `agent/crates/classifiers/src/names.rs` (read at `72e87d5`, `dev`)
 
@@ -47,9 +48,9 @@ Exceptions stay case-insensitive on every engine; docs/08 and the user guide say
 
 The agent reports, per monitored database, whether its object names compare with case (MySQL / MariaDB `lower_case_table_names`, SQL Server's database and server collation through `COLLATIONPROPERTY(…, 'ComparisonStyle')` or the collation name), in an optional `TargetStatus` field negotiated by a capability token (ADR-0022), and the console applies case-sensitive exceptions to the databases reported sensitive. A protocol change with its own security review; it extends A to the two engines whose case depends on configuration.
 
-## Decision (proposed)
+## Decision
 
-Option A now; option D in a separate ADR, whose timing is the maintainer's (open question 3).
+Option A now; option D in a separate ADR, [ADR-0055](0055-agent-reported-name-case-semantics.md), written on 2026-10-20 (open question 3).
 
 1. **Rule.** `exceptionGlobOptions(engine)` gains a `matchCase` option, true for `postgres`, `mongodb`, `redis`, `valkey`, `cas` and for an unknown engine (`null`). With `matchCase`, an exception covers a name only when **both** the current folded match (`foldName`, the N1 rules) **and** an exact match without the case fold (same matcher, same trailing-space handling) hold. The conjunction, rather than the exact match alone, is required because `?` and case mappings that change a string's length (`İ` lowercases to two code points) make the two matches differ in both directions: with the conjunction, the case-sensitive result is a subset of today's. The matcher stays linear (two passes). It applies to finding exceptions (`exceptionCovers`) and to access-event exceptions (`exceptionCoversEvent`) on every location part (`database`, `schema`, `object`, `field`).
 2. **Unchanged.** Policy conditions, per-object sensitivity and scores, the dedup key, the agent's `sensitive_objects` match, and exceptions on `sqlserver`, `mysql`, `mariadb` and `openldap`.
@@ -92,9 +93,28 @@ Option A now; option D in a separate ADR, whose timing is the maintainer's (open
 - **Grandfathering existing exceptions as case-insensitive**: it keeps every current over-suppression with no end date, and needs the per-exception flag of option B in storage. The inventory and the upgrade notes give administrators the same chance to adapt without keeping the hole. This is open question 1.
 - **CAS case-insensitive like OpenLDAP**: CAS locations are definition strings, not directory names under case-insensitive matching rules; nothing on CAS treats `Portal` and `portal` as one service.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
+
+Each answer is the proposed one, accepted by the maintainer on 2026-10-20.
 
 1. Cut over at upgrade (proposed) or grandfather the existing exceptions as case-insensitive until an administrator converts them? Proposed answer: cut over, with the inventory and upgrade notes of decision 6; grandfathering keeps the over-suppression indefinitely when nobody acts.
+   **Answer (decided by the maintainer on 2026-10-20)**: cut over at upgrade, with the inventory and the upgrade notes of decision 6; no grandfathering.
 2. MongoDB database names: case-sensitive like collections (proposed, one rule per engine), or insensitive since one server cannot hold two databases differing only by case? Proposed answer: sensitive; it can only make an exception written in the wrong case cover less.
+   **Answer (decided by the maintainer on 2026-10-20)**: case-sensitive, like collections.
 3. Option D (agent-reported case semantics for MySQL / MariaDB and SQL Server): when to write its ADR? Since `lower_case_table_names = 0` is the Linux default, the residual of decision 3 covers most MySQL / MariaDB targets, which weighs for writing it soon, possibly with this ADR's implementation; waiting for the phase 10 connector ADRs would let SQLite and Firebird share the same field. Recommendation: weigh writing it sooner; the timing is the maintainer's decision.
+   **Answer (decided by the maintainer on 2026-10-20)**: write it now: [ADR-0055](0055-agent-reported-name-case-semantics.md), proposed on 2026-10-20.
 4. The ADR-0009 "altered by normalization" marker of the residual risks: record it as a ROADMAP follow-up now? Proposed answer: yes, as a follow-up needing its own ADR and a `security-reviewer` review, not part of this change.
+   **Answer (decided by the maintainer on 2026-10-20)**: yes, recorded as a ROADMAP [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups) needing its own ADR and a `security-reviewer` review, not part of this change.
+
+## Implementation note (2026-10-20)
+
+Implemented by #291 (console, decisions 1, 6 and 7) and #289 (agent test of decision 5). The decisions are unchanged; the choices the ADR left open:
+
+- **Engine list.** `exceptionMatchesCase(engine)` is true for every engine that is not in `CASE_BLIND_EXCEPTION_ENGINES` (`sqlserver`, `mysql`, `mariadb`, `openldap`), and for a null engine, rather than for a list of case-sensitive engines: an engine added without a decision gets the stricter rule, as decision 1 requires for an unknown engine.
+- **Engine of an event.** The engine an access event's exceptions use is the one its Audit source tells (`auditSourceEngine`, checked against the target at ingest), else its target's current engine (security review L1: a target's engine may change after ingest). The sources MySQL and MariaDB share, and those Redis and Valkey share, give no single engine; each pair has the same rule.
+- **Startup trigger.** The worker runs the inventory at its start while the audit log holds no successful `policy_exception.case_inventory` entry; a failed run is audited and retried at the next start.
+- **Stored result.** The audit entry is the stored result: the policies page reads the latest success and failure entries (exception ids and counts only; a failure holds an error code only: a SQLSTATE, `internal`, `actor_gone` or `inventory_running`). No table was added.
+- **On demand.** An administrator's request is queued on `policy_exceptions.case_inventory` (stately, no retry, finished jobs kept one day) and run by the worker, never in the web process (security review M1), under the shared limiter `case_inventory.per_user` (3 per 10 minutes, fail closed). Details in [05-security.md](../05-security.md#access-events-ingestion-and-correlation).
+- **Bounds.** Per run: 20 000 distinct finding names and 20 000 distinct event object names, 100 000 (exception, event name) pairs, and a comparison budget of 2.5·10^6 exception × name evaluations, each exception charged only the names within its agent / target scope. Exceptions are compared oldest first (creation time, then id), so when the budget runs out the most recently created ones are left out, and the page says how many. A run that reaches any bound says so.
+- **Counts are upper bounds** (security review L2): a finding or event counted for an exception may still be covered by another exception, and an event is counted when at least one of its objects is no longer covered by that exception, even if it raises no incident. The exception's policy scope is not considered.
+- **Agent test (decision 5).** `agent/crates/connector-postgres/src/it_names.rs`: a quoted mixed-case relation in a quoted mixed-case schema is named as in the catalog by the pgaudit `jsonlog` and `csvlog`, `pg_stat_statements` and Discovery, and its lowercase twin keeps its own name; relations whose names differ from `crm.names_it` only by U+200B or a fullwidth `ｎ` reach the console as `crm.names_it`, which pins the normalization residual as the current behaviour.

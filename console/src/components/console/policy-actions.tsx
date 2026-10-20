@@ -132,6 +132,48 @@ export function exceptionErrorMessage(status: number, body: unknown): string {
   return `The exception could not be saved (${status}).`;
 }
 
+/** How location patterns compare names (ADR-0054 decision 7, N1). */
+export const EXCEPTION_MATCHING_NOTE =
+  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS targets, without case elsewhere " +
+  "(SQL Server, MySQL, MariaDB, OpenLDAP); trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only. " +
+  "To cover two spellings, use one exception per spelling or a ? in place of the letter.";
+
+/** Runs the case-sensitive exception inventory (admin, ADR-0054 decision 6). */
+export function RunCaseInventoryButton({ csrfToken }: { csrfToken: string }) {
+  const router = useRouter();
+  const [state, setState] = useState<"idle" | "sending" | "queued" | "limited" | "failed">("idle");
+  return (
+    <div className="flex items-center gap-3">
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={state === "sending"}
+        onClick={async () => {
+          setState("sending");
+          const res = await userApi("/api/policy-exceptions/case-inventory", { method: "POST", csrfToken }).catch(() => null);
+          setState(res?.status === 202 ? "queued" : res?.status === 429 ? "limited" : "failed");
+          router.refresh();
+        }}
+      >
+        {state === "sending" ? "Queuing..." : "Run the inventory again"}
+      </Button>
+      {state === "queued" && (
+        <span className="text-xs text-muted-foreground">Queued: the worker runs it; reload this page to see the result.</span>
+      )}
+      {state === "limited" && (
+        <span role="alert" className="text-xs text-destructive">
+          Too many runs requested: try again in a few minutes.
+        </span>
+      )}
+      {state === "failed" && (
+        <span role="alert" className="text-xs text-destructive">
+          The inventory could not be queued.
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** Exception creation form (admin). `policyId` fixes the policy; otherwise it applies to all. */
 export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; policyId?: string }) {
   const router = useRouter();
@@ -184,7 +226,7 @@ export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; poli
         </div>
       </div>
       <p className="text-xs text-muted-foreground">
-        Patterns are case-insensitive; trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only.
+        {EXCEPTION_MATCHING_NOTE}
       </p>
       <div className="flex flex-col gap-1">
         <Label htmlFor={id("reason")}>Reason</Label>

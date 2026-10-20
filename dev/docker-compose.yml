@@ -165,6 +165,11 @@ services:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+      # MongoDB 8.0 refuses to start on Linux kernel 6.19+ (SERVER-121912, GitHub runners since
+      # 2026-10-19): TCMalloc per-CPU cache (its rseq path) off. Test environments only.
+      MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES: "0"
+      # glibc keeps rseq, so TCMalloc cannot use its per-CPU cache (the image sets rseq=0).
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     # Community edition: no audit log. Profiler level 1 + structured JSON log (ADR-0027: Limited).
     command:
       - mongod
@@ -205,6 +210,11 @@ services:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
+      # MongoDB 8.0 refuses to start on Linux kernel 6.19+ (SERVER-121912, GitHub runners since
+      # 2026-10-19): TCMalloc per-CPU cache (its rseq path) off. Test environments only.
+      MONGO_TCMALLOC_PER_CPU_CACHE_SIZE_BYTES: "0"
+      # glibc keeps rseq, so TCMalloc cannot use its per-CPU cache (the image sets rseq=0).
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     command:
       - mongod
       - --auditDestination

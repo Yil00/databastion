@@ -98,8 +98,37 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
   return engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) ? trimTrailingSpaces(name) : name;
 }
 
+/**
+ * Engines whose object names a location exception compares without case (ADR-0054 decision 1):
+ * SQL Server (case-insensitive under the default collation) and MySQL / MariaDB (with
+ * `lower_case_table_names` other than 0) until the agent reports their case semantics (ADR-0054
+ * decision 3, option D), and OpenLDAP (case-insensitive matching rules of the naming attributes).
+ * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
+ * Redis, Valkey and Apereo CAS by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES}), and an
+ * engine added later is never loosened before its connector ADR decides. Policy conditions,
+ * per-object sensitivity and scores stay case-insensitive on every engine (looser matching only
+ * reports more).
+ */
+export const CASE_BLIND_EXCEPTION_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "openldap"];
+
+/** The contract engines on which location exceptions compare names with case (ADR-0054). */
+export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas"];
+
+/** Whether location exceptions compare names with case on `engine` (ADR-0054 decision 1). */
+export function exceptionMatchesCase(engine: string | null): boolean {
+  return engine === null || !CASE_BLIND_EXCEPTION_ENGINES.includes(engine);
+}
+
+/**
+ * Glob options of location exceptions on an item of `engine`: trailing spaces ignored only on
+ * {@link TRAILING_SPACE_BLIND_ENGINES} (N1), case compared everywhere but on
+ * {@link CASE_BLIND_EXCEPTION_ENGINES} (ADR-0054). A null (unknown) engine gets neither loosening.
+ */
 export function exceptionGlobOptions(engine: string | null): GlobOptions {
-  return { ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) };
+  return {
+    ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine),
+    matchCase: exceptionMatchesCase(engine),
+  };
 }
 
 export interface GlobOptions {
@@ -108,6 +137,14 @@ export interface GlobOptions {
    * the pattern (N1). Strictly looser: a match without it is still a match.
    */
   ignoreTrailingSpaces?: boolean;
+  /**
+   * Also require the match of the pattern and the value as written, without the case fold (same
+   * matcher, same trailing-space handling), on top of the folded match (ADR-0054 decision 1).
+   * Strictly stricter: thanks to the conjunction, a match with it is a match without it, although
+   * `?` and case mappings that change a string's length (`İ`) make the folded and the exact match
+   * differ in both directions.
+   */
+  matchCase?: boolean;
 }
 
 /**
@@ -120,8 +157,12 @@ export interface GlobOptions {
  * patterns are cached (policies reuse the same few patterns for every event or finding).
  */
 export function globMatch(pattern: string, value: string, opts: GlobOptions = {}): boolean {
-  const p = compiled(pattern);
-  const s = [...foldCase(value)];
+  if (!matchWith(compiled(pattern, true), [...foldCase(value)], opts)) return false;
+  // ADR-0054: the exact match is a second pass of the same linear matcher, never a replacement.
+  return !opts.matchCase || matchWith(compiled(pattern, false), [...value], opts);
+}
+
+function matchWith(p: readonly GlobToken[], s: readonly string[], opts: GlobOptions): boolean {
   if (matchTokens(p, s)) return true;
   if (!opts.ignoreTrailingSpaces) return false;
   let pe = p.length;
@@ -160,14 +201,17 @@ function matchTokens(p: readonly GlobToken[], s: readonly string[]): boolean {
 type GlobToken = { kind: "star" } | { kind: "any" } | { kind: "char"; ch: string };
 
 const GLOB_CACHE_MAX = 1000;
-const globCache = new Map<string, GlobToken[]>();
+const foldedGlobCache = new Map<string, GlobToken[]>();
+const exactGlobCache = new Map<string, GlobToken[]>();
 
-function compiled(pattern: string): GlobToken[] {
-  let t = globCache.get(pattern);
+/** Tokens of `pattern`, folded with {@link foldCase} or as written (`matchCase`, ADR-0054). */
+function compiled(pattern: string, fold: boolean): GlobToken[] {
+  const cache = fold ? foldedGlobCache : exactGlobCache;
+  let t = cache.get(pattern);
   if (!t) {
-    if (globCache.size >= GLOB_CACHE_MAX) globCache.clear();
-    t = tokens(foldCase(pattern));
-    globCache.set(pattern, t);
+    if (cache.size >= GLOB_CACHE_MAX) cache.clear();
+    t = tokens(fold ? foldCase(pattern) : pattern);
+    cache.set(pattern, t);
   }
   return t;
 }

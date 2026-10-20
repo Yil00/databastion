@@ -268,27 +268,53 @@ describe("access_event conditions", () => {
     expect(eventMatches({ objects: { schema: "public" } }, { ...FACTS, objects: [{ database: "CRM", object: "CLIENTS" }] })).toBeNull();
   });
 
-  it("exceptions: case-insensitive on every engine (ADR-0014), trailing spaces ignored only on SQL Server and MySQL / MariaDB (N1)", () => {
+  it("exceptions: with case on PostgreSQL, MongoDB, Redis, Valkey and CAS, without case elsewhere (ADR-0054); trailing spaces ignored only on SQL Server and MySQL / MariaDB (N1)", () => {
     const now = new Date("2026-09-28T12:00:00Z");
     const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null };
     const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
+    const exact = { ...FACTS, objects: [{ database: "crm", schema: "public", object: "clients" }] };
     const upper = { ...FACTS, objects: [{ database: "CRM", schema: "PUBLIC", object: "Clients" }] };
     const padded = { ...FACTS, objects: [{ database: "CRM ", schema: "PUBLIC", object: "Clients " }] };
-    for (const engine of ["postgres", "mongodb", "redis", "sqlserver", "mysql", "mariadb"]) {
+    const one = (database: string, schema: string, object: string) => ({ ...FACTS, objects: [{ database, schema, object }] });
+    for (const engine of ["sqlserver", "mysql", "mariadb", "openldap"]) {
       expect(exceptionCoversEvent(x, "p", { ...upper, engine }, [0], now)).toBe(true);
       expect(exceptionCoversEvent(x, "p", { ...upper, engine, objects: [{ database: "CRM", schema: "PUBLIC", object: "orders" }] }, [0], now)).toBe(false);
+    }
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "cas"]) {
+      expect(exceptionCoversEvent(x, "p", { ...exact, engine }, [0], now)).toBe(true);
+      expect(exceptionCoversEvent(x, "p", { ...upper, engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent(x, "p", { ...one("Crm", "public", "clients"), engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent(x, "p", { ...one("crm", "Public", "clients"), engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent(x, "p", { ...one("crm", "public", "Clients"), engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent({ ...base, location: { database: "CRM", schema: "PUBLIC", object: "Clients" } }, "p", { ...upper, engine }, [0], now)).toBe(true);
+      expect(exceptionCoversEvent({ ...base, location: { object: "?lients" } }, "p", { ...upper, engine }, [0], now)).toBe(true);
+      // A field glob of `*` is the only one an event takes, whatever the case rule.
+      expect(exceptionCoversEvent({ ...base, location: { object: "clients", field: "*" } }, "p", { ...exact, engine }, [0], now)).toBe(true);
+      // Every retained object must be covered with case.
+      const two = { ...FACTS, engine, objects: [{ database: "crm", schema: "public", object: "clients" }, { database: "crm", schema: "public", object: "Clients" }] };
+      expect(exceptionCoversEvent(x, "p", two, [0], now)).toBe(true);
+      expect(exceptionCoversEvent(x, "p", two, [0, 1], now)).toBe(false);
     }
     for (const engine of ["sqlserver", "mysql", "mariadb"]) {
       expect(exceptionCoversEvent(x, "p", { ...padded, engine }, [0], now)).toBe(true);
       expect(exceptionCoversEvent({ ...base, location: { object: "clients " } }, "p", { ...upper, engine }, [0], now)).toBe(true);
       expect(exceptionCoversEvent(x, "p", { ...padded, engine, objects: [{ database: "crm", schema: "public", object: "client " }] }, [0], now)).toBe(false);
     }
-    for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap"]) {
-      expect(exceptionCoversEvent(x, "p", { ...padded, engine }, [0], now)).toBe(false);
-      expect(exceptionCoversEvent({ ...base, location: { object: "clients " } }, "p", { ...upper, engine }, [0], now)).toBe(false);
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "openldap", "cas"]) {
+      const cased = { ...base, location: { database: "CRM", schema: "PUBLIC", object: "Clients" } };
+      expect(exceptionCoversEvent(cased, "p", { ...padded, engine }, [0], now)).toBe(false);
+      expect(exceptionCoversEvent({ ...base, location: { object: "Clients " } }, "p", { ...upper, engine }, [0], now)).toBe(false);
     }
-    // Unknown engine (the target never reported one): never loosened.
+    // Unknown engine (the target never reported one): never loosened, with case.
+    expect(exceptionCoversEvent(x, "p", { ...exact, engine: null }, [0], now)).toBe(true);
+    expect(exceptionCoversEvent(x, "p", { ...upper, engine: null }, [0], now)).toBe(false);
     expect(exceptionCoversEvent(x, "p", { ...padded, engine: null }, [0], now)).toBe(false);
+  });
+
+  it("`objects` conditions stay case-insensitive on case-sensitive engines (ADR-0054 decision 2)", () => {
+    for (const engine of ["postgres", "mongodb", "redis", "valkey", "cas"]) {
+      expect(eventMatches({ objects: { database: "crm", object: "clients" } }, { ...FACTS, engine, objects: [{ database: "CRM", object: "Clients" }] })).toEqual([0]);
+    }
   });
 
   it("exceptions: agent, target and database / schema / object location only; never classifier-scoped", () => {
