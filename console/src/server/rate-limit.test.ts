@@ -247,7 +247,7 @@ describe.skipIf(!hasDb)("RateLimiter.shared (PostgreSQL)", () => {
       // Duck-typed: modules reloaded by `vi.resetModules` have their own copy of the class.
       const isLimiter = (v: unknown): v is RateLimiter => typeof v === "object" && v !== null && "reserveShared" in v;
       const limiters = modules.flatMap((m) => Object.values(m).filter(isLimiter));
-      expect(limiters).toHaveLength(25);
+      expect(limiters).toHaveLength(26);
       const names = limiters.map((l) => l.name);
       expect(names.every((n) => n !== null)).toBe(true);
       expect(new Set(names).size).toBe(names.length);
@@ -256,6 +256,7 @@ describe.skipIf(!hasDb)("RateLimiter.shared (PostgreSQL)", () => {
         "agent_auth.cheap_failures_per_ip",
         "agent_auth.failures_per_agent_ip",
         "agent_auth.failures_per_ip",
+        "case_inventory.per_user",
         "channel_test.per_channel",
         "channel_test.per_user",
         "enroll.per_ip",

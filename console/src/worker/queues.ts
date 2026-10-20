@@ -1,8 +1,13 @@
+import { eq } from "drizzle-orm";
 import type { Job, PgBoss } from "pg-boss";
 
 import type { Database } from "@/db/client";
+import { users } from "@/db/schema";
 import { errorSummary, type Logger } from "@/lib/logger";
+import { UUID } from "@/lib/policy-common";
 import { silentAgentThresholdS } from "@/server/alerting-config";
+import { CASE_INVENTORY_QUEUE } from "@/server/case-inventory-queue";
+import { recordCaseInventoryFailure, runCaseInventory } from "@/server/exception-case-inventory";
 import { runPolicyEvaluation } from "@/server/incidents";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
@@ -248,4 +253,37 @@ export async function registerRateLimitsPruneQueue(boss: PgBoss, db: () => Datab
 export async function scheduleRateLimitsPruneQueue(boss: PgBoss): Promise<void> {
   await boss.schedule(RATE_LIMITS_PRUNE_QUEUE, RATE_LIMITS_PRUNE_CRON, {});
   await boss.send(RATE_LIMITS_PRUNE_QUEUE, {});
+}
+
+/**
+ * `policy_exceptions.case_inventory` (ADR-0054 decision 6, security review M1): the on-demand case
+ * inventory queued by an administrator from the policies page, run here rather than in the web
+ * process, only while the requesting user is still an enabled administrator (else an audited
+ * `actor_gone` failure). `stately` (one queued, one active), no retry (a failed run is audited, the
+ * administrator can queue another), finished jobs (which hold the user id and source IP) kept one
+ * day.
+ */
+export function createCaseInventoryHandler(db: () => Database, log: Logger) {
+  return async (jobs: Job<Record<string, unknown>>[]): Promise<void> => {
+    for (const job of jobs) {
+      const { userId, ip } = job.data;
+      if (typeof userId !== "string" || !UUID.test(userId) || (ip !== null && typeof ip !== "string")) {
+        log.warn({ queue: CASE_INVENTORY_QUEUE, jobId: job.id }, "case inventory job with an invalid payload: skipped");
+        continue;
+      }
+      const actor = { userId, ip: typeof ip === "string" ? ip.slice(0, 64) : null };
+      // The requesting administrator may have been removed, disabled or demoted since (N2).
+      const [u] = await db().select({ role: users.role, disabledAt: users.disabledAt }).from(users).where(eq(users.id, userId)).limit(1);
+      if (!u || u.role !== "admin" || u.disabledAt !== null) {
+        await recordCaseInventoryFailure(db(), log, "user", actor, "actor_gone");
+        continue;
+      }
+      await runCaseInventory(db(), log, actor);
+    }
+  };
+}
+
+export async function registerCaseInventoryQueue(boss: PgBoss, db: () => Database, log: Logger, opts: { pollingIntervalSeconds?: number } = {}): Promise<void> {
+  await boss.createQueue(CASE_INVENTORY_QUEUE, { policy: "stately", retryLimit: 0, expireInSeconds: 900, deleteAfterSeconds: 86_400 });
+  await boss.work(CASE_INVENTORY_QUEUE, { pollingIntervalSeconds: opts.pollingIntervalSeconds ?? 2 }, createCaseInventoryHandler(db, log));
 }
