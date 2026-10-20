@@ -13,6 +13,7 @@ import { startupErrors, startupFatal } from "@/server/startup-checks";
 
 import { getDb } from "@/db/client";
 import { alertingWarnings } from "@/server/alerting-config";
+import { runStartupCaseInventory } from "@/server/exception-case-inventory";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 
@@ -90,6 +91,10 @@ async function main(): Promise<void> {
   // P4-D: expired shared rate-limit windows.
   await registerRateLimitsPruneQueue(boss, getDb, log);
   await scheduleRateLimitsPruneQueue(boss);
+
+  // ADR-0054 decision 6: at the first start after the upgrade, the location exceptions that no
+  // longer cover names differing by case only (ids and counts only; never blocks the start).
+  void runStartupCaseInventory(getDb(), log);
 
   log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE, RATE_LIMITS_PRUNE_QUEUE] }, "worker started");
 }

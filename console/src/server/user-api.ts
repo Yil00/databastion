@@ -34,6 +34,7 @@ import { buildScanParams, requestScan } from "@/server/scans";
 import { configureAudit, parseAuditConfigInput } from "@/server/audit-config";
 import { validateSchema } from "@/lib/protocol/validate";
 import { writeAudit } from "@/server/audit";
+import { runCaseInventory } from "@/server/exception-case-inventory";
 import {
   clearSessionCookie,
   createSession,
@@ -749,6 +750,20 @@ export function handleDeleteException(req: Request, id: string): Promise<Respons
     const ok = await deleteException(getDb(), id, { userId: g.session.user.id, ip: g.ip });
     if (ok) void requestPolicyEvaluation();
     return ok ? new Response(null, { status: 204, headers: NO_STORE }) : error(404, "not_found");
+  });
+}
+
+/**
+ * Runs the inventory of the location exceptions whose effect changed with case-sensitive matching
+ * (ADR-0054 decision 6; admin, CSRF). Audited `policy_exception.case_inventory` with exception ids
+ * and counts only. `200 {listed, bound_reached}`.
+ */
+export function handleCaseInventory(req: Request): Promise<Response> {
+  return guardedUser("policy_exception.case_inventory", async () => {
+    const g = await requireUser(req, { admin: true, stateChanging: true, route: "policy_exception.case_inventory" });
+    if (!g.ok) return g.response;
+    const r = await runCaseInventory(getDb(), logger, { userId: g.session.user.id, ip: g.ip });
+    return json({ listed: r.entries.length, bound_reached: r.boundReached });
   });
 }
 

@@ -416,11 +416,12 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(list.every((i) => i.policyId !== disabled)).toBe(true);
     });
 
-    it("`objects` conditions ignore case and trailing spaces; exceptions ignore trailing spaces on MySQL only (N1)", async () => {
+    it("`objects` conditions ignore case and trailing spaces; exceptions compare with case on PostgreSQL (ADR-0054) and ignore trailing spaces on MySQL only (N1)", async () => {
       const auth = await agentWithTargets();
       const pid = await policy({ objects: { database: "crm", object: "clients" } });
-      // Exception of a second policy, scoped to the location only: case-insensitive on every
-      // engine (ADR-0014), blind to trailing spaces on SQL Server and MySQL / MariaDB only.
+      // Exception of a second policy, scoped to the location only: with case on PostgreSQL,
+      // without case on MySQL (ADR-0054), blind to trailing spaces on SQL Server and MySQL /
+      // MariaDB only (N1).
       const xp = await policy({ objects: { object: "clients" } });
       await createException(
         getDb(),
@@ -436,6 +437,7 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         dumpEvent({ objects: [{ database: "crm", schema: "public", object: "client" }], principal: { db_user: "d" } }),
         mysql("Clients ", at(1000)),
         mysql("CLIENT", at(2000)),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients" }], principal: { db_user: "e" }, ts: at(3000) }),
       ]);
       await drainPolicyWork(getDb());
       const evs = await eventsOf(auth.agentId);
@@ -445,10 +447,10 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         return evs.flatMap((e, i) => (links.some((l) => l.eventId === e.id) ? [i] : []));
       };
       // Policy: every spelling of crm.clients, never `client`.
-      expect(await linked(pid)).toEqual([0, 1, 2, 4]);
-      // Exception: `Clients` excepted on PostgreSQL, `CLIENTS ` / `clients ` not (a distinct quoted
-      // name there), `Clients ` excepted on MySQL.
-      expect(await linked(xp)).toEqual([0, 2]);
+      expect(await linked(pid)).toEqual([0, 1, 2, 4, 6]);
+      // Exception: on PostgreSQL only the exact `crm.clients` is excepted; `Clients`, `CLIENTS `
+      // and `clients ` are distinct (quoted) names there. `Clients ` is excepted on MySQL.
+      expect(await linked(xp)).toEqual([0, 1, 2]);
     });
 
     it("a policy change applies to the events evaluated after it, never to past ones", async () => {

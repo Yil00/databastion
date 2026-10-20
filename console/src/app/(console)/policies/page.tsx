@@ -1,9 +1,10 @@
-import { ExceptionsTable, PoliciesTable } from "@/components/console/policies-table";
+import { CaseInventoryView, ExceptionsTable, PoliciesTable } from "@/components/console/policies-table";
 import { ExceptionForm } from "@/components/console/policy-actions";
 import { PolicyForm } from "@/components/console/policy-form";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { getDb } from "@/db/client";
 import { listChannels } from "@/server/channels";
+import { latestCaseInventory } from "@/server/exception-case-inventory";
 import { listExceptions, listPolicies } from "@/server/policies";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -17,7 +18,12 @@ export default async function PoliciesPage() {
   const session = await requirePageSession();
   const isAdmin = session.user.role === "admin";
   const db = getDb();
-  const [rows, exceptions, channelRows] = await Promise.all([listPolicies(db), listExceptions(db), isAdmin ? listChannels(db) : []]);
+  const [rows, exceptions, channelRows, inventory] = await Promise.all([
+    listPolicies(db),
+    listExceptions(db),
+    isAdmin ? listChannels(db) : [],
+    latestCaseInventory(db),
+  ]);
   const channels = channelRows.map((c) => ({ slug: c.slug, enabled: c.enabled }));
   return (
     <div className="flex flex-col gap-6">
@@ -44,6 +50,14 @@ export default async function PoliciesPage() {
           </p>
           <ExceptionsTable exceptions={exceptions} isAdmin={isAdmin} csrfToken={session.csrfToken} now={requestTime()} />
           {isAdmin && <ExceptionForm csrfToken={session.csrfToken} />}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Exceptions affected by case-sensitive names</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <CaseInventoryView inventory={inventory} exceptions={exceptions} isAdmin={isAdmin} csrfToken={session.csrfToken} />
         </CardContent>
       </Card>
       {isAdmin ? (

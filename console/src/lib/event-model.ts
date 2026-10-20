@@ -369,9 +369,10 @@ export function signalSelected(selectors: readonly string[], signal: string): bo
 }
 
 /**
- * An object without schema only matches a schema glob of `*` (as for finding locations). Globs are
- * case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces (the
- * default, N1), location exceptions only on `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ * An object without schema only matches a schema glob of `*` (as for finding locations). Globs in
+ * policy conditions are case-insensitive (ADR-0014 decision 1) and ignore trailing spaces (the
+ * default, N1); location exceptions pass `exceptionGlobOptions(engine)` (src/lib/policy-common.ts,
+ * N1 and ADR-0054).
  */
 export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
   return OBJECT_PARTS.every((part) => {
@@ -419,9 +420,10 @@ export interface EventExceptionScope {
  * Policy exceptions applied to an event (every set scope must hold): agent, target, and a location
  * whose `database` / `schema` / `object` globs cover every retained object (a `field` glob other
  * than `*` never covers an event, which names no field). A classifier-scoped exception concerns
- * findings only and never covers an event. The globs are case-insensitive on every engine
- * (ADR-0014 decision 1) and ignore trailing spaces only on the target's engine of
- * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts) (N1; an unknown engine: never).
+ * findings only and never covers an event. The globs compare with case unless the target's engine
+ * is in `CASE_BLIND_EXCEPTION_ENGINES` (ADR-0054; an unknown engine: always with case) and ignore
+ * trailing spaces only on the target's engine of `TRAILING_SPACE_BLIND_ENGINES`
+ * (src/lib/policy-common.ts) (N1; an unknown engine: never).
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,

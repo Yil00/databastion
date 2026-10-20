@@ -132,6 +132,40 @@ export function exceptionErrorMessage(status: number, body: unknown): string {
   return `The exception could not be saved (${status}).`;
 }
 
+/** How location patterns compare names (ADR-0054 decision 7, N1). */
+export const EXCEPTION_MATCHING_NOTE =
+  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS targets, without case elsewhere " +
+  "(SQL Server, MySQL, MariaDB, OpenLDAP); trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only. " +
+  "To cover two spellings, use one exception per spelling or a ? in place of the letter.";
+
+/** Runs the case-sensitive exception inventory (admin, ADR-0054 decision 6). */
+export function RunCaseInventoryButton({ csrfToken }: { csrfToken: string }) {
+  const router = useRouter();
+  const [state, setState] = useState<"idle" | "running" | "failed">("idle");
+  return (
+    <div className="flex items-center gap-3">
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={state === "running"}
+        onClick={async () => {
+          setState("running");
+          const res = await userApi("/api/policy-exceptions/case-inventory", { method: "POST", csrfToken }).catch(() => null);
+          setState(res?.ok ? "idle" : "failed");
+          router.refresh();
+        }}
+      >
+        {state === "running" ? "Running..." : "Run the inventory again"}
+      </Button>
+      {state === "failed" && (
+        <span role="alert" className="text-xs text-destructive">
+          The inventory failed.
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** Exception creation form (admin). `policyId` fixes the policy; otherwise it applies to all. */
 export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; policyId?: string }) {
   const router = useRouter();
@@ -184,7 +218,7 @@ export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; poli
         </div>
       </div>
       <p className="text-xs text-muted-foreground">
-        Patterns are case-insensitive; trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only.
+        {EXCEPTION_MATCHING_NOTE}
       </p>
       <div className="flex flex-col gap-1">
         <Label htmlFor={id("reason")}>Reason</Label>

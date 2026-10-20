@@ -249,9 +249,11 @@ export interface FindingFacts {
 }
 
 /**
- * Globs are case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces
- * (the default, end-of-phase-9 review N1), location exceptions only on the engines of
- * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ * Globs are case-insensitive (ADR-0014 decision 1) in policy conditions, which also ignore trailing
+ * spaces (the default, end-of-phase-9 review N1); location exceptions pass
+ * `exceptionGlobOptions(engine)` (src/lib/policy-common.ts): trailing spaces ignored only on
+ * `TRAILING_SPACE_BLIND_ENGINES`, case compared on every engine but `CASE_BLIND_EXCEPTION_ENGINES`
+ * (ADR-0054).
  */
 export function locationMatches(pattern: LocationPattern, f: FindingFacts, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
   const names: Record<LocationPart, string | null> = {
@@ -293,7 +295,12 @@ export interface ExceptionScope {
   expiresAt: Date | null;
 }
 
-/** The exception is active at `now` and covers `f` for `policyId` (every set scope must match). */
+/**
+ * The exception is active at `now` and covers `f` for `policyId` (every set scope must match). Its
+ * location globs compare `database`, `schema`, `object` and `field` with case on PostgreSQL,
+ * MongoDB, Redis, Valkey, CAS and an unknown engine, without case on SQL Server, MySQL, MariaDB
+ * and OpenLDAP (ADR-0054 decision 1).
+ */
 export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingFacts, now: Date): boolean {
   if (e.expiresAt !== null && e.expiresAt.getTime() <= now.getTime()) return false;
   if (e.policyId !== null && e.policyId !== policyId) return false;
