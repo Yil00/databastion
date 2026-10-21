@@ -224,6 +224,13 @@ export const agents = pgTable(
      * protocol 0.1.0 is sent only when its token is here.
      */
     accepts: jsonb("accepts").$type<string[]>().notNull().default([]),
+    /**
+     * Set when a change of `accepts` could not be acted on (#280 re-review L-a): the requeue
+     * budget (`audit.requeue_per_agent`) was spent, or the requeue failed. The Audit settings of the
+     * agent's Redis / Valkey targets are then queued again from a later heartbeat, once the budget
+     * allows, and this is cleared. Millisecond precision, so the clearing compare-and-set is exact.
+     */
+    auditRequeueDueAt: tsz("audit_requeue_due_at"),
     /** argon2id PHC string of the current secret; NULL once revoked or locked. */
     currentSecretHash: text("current_secret_hash"),
     /** argon2id PHC string of the pending secret during a rotation (ADR-0008, `/rotate`). */
