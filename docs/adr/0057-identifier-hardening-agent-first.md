@@ -1,15 +1,24 @@
 # ADR-0057: `Identifier` hardening, agent first: the `KeyPattern` digit-run, address and escape rules for every normalized name
 
-- **Status**: Proposed (2026-10-21), for the maintainer's decision; needs a `security-reviewer` review before acceptance
+- **Status**: Proposed (2026-10-21), for the maintainer's decision
+- **Security review (2026-10-21)**: sound after changes, revised (M1: the agent's current masking stated from the code; L1 to L6)
 - **Date**: 2026-10-21
 - **Refines** (on acceptance): [ADR-0009](0009-name-normalization-and-item-sanitization.md) (which stays Accepted), its normalized names, with stricter producer rules; uses [ADR-0013](0013-frozen-error-codes.md) and [ADR-0022](0022-protocol-capability-negotiation.md) decision 6 (narrowing a pattern is incompatible) without changing them
-- **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Contract: `Identifier` hardening"; [ADR-0052](0052-redis-valkey-connector.md) decision 7 (`KeyPattern`); `shared/protocol/openapi.yaml` (`Identifier`, `KeyPattern`, `ObjectName`, `SensitiveObject`); `agent/crates/classifiers/src/names.rs` (`NormalizedName`, `MAX_INDEX_DIGITS`, `MAX_TOTAL_DIGITS`, `has_percent_escape`), `agent/crates/core/src/sanitize.rs` (read at `c2ae105`, `dev`)
+- **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Contract: `Identifier` hardening"; [ADR-0052](0052-redis-valkey-connector.md) decision 7 (`KeyPattern`); `shared/protocol/openapi.yaml` (`Identifier`, `KeyPattern`, `ObjectName`, `SensitiveObject`); `agent/crates/classifiers/src/names.rs` (`NormalizedName`, `normalize_path`, `normalize_field_path`, `segment_looks_like_value`, `MAX_INDEX_DIGITS`, `MAX_TOTAL_DIGITS`, `has_percent_escape`), `agent/crates/core/src/sanitize.rs`; `shared/protocol/redocly.yaml` (`recommended-strict`); `console/src/db/schema.ts` (per-agent share of the system-alert budget) (read at `c2ae105`, `dev`)
 
 ## Context
 
-`KeyPattern` (Redis / Valkey key patterns, phase 9) was written after `Identifier` and has stricter `not` rules: no segment of 9 or more digits, spaces, `_`, `+` or `-`; no digit-to-digit run of 9 or more digits and separators across segments (`06.12.34.56.78`); no IPv4 address as whole segments; no percent-encoded byte; no IPv6 or MAC address; no first segment naming a URL scheme. Digits and spaces are any Unicode decimal digit and space separator. `Identifier`, the schema of every other name (database, schema, table, collection, column, field path, LDAP container), has only one such rule: no name or `.`-separated segment made only of 9 or more digits and separators. Its pattern already forbids `:`, `/` and `@`, so the IPv6, `:`-separated MAC and URL-scheme rules cannot apply to it; the others can.
+`KeyPattern` (Redis / Valkey key patterns, phase 9) was written after `Identifier` and has stricter `not` rules: no segment of 9 or more digits, spaces, `_`, `+` or `-`; no digit-to-digit run of 9 or more digits and separators across segments (`06.12.34.56.78`); no IPv4 address as whole segments; no percent-encoded byte; no IPv6 or MAC address; no first segment naming a URL scheme. Digits and spaces are any Unicode decimal digit and space separator. `Identifier`, the schema of every other name (database, schema, table, collection, column, field path, LDAP container), has only one such rule: no name or `.`-separated segment made only of 9 or more digits and separators. Its pattern already forbids `:`, `/` and `@`: a name holding no `:` cannot hold a URL scheme followed by its `:`, nor an IPv6 or `:`-separated MAC address, so those three rules have nothing to add; the others can.
 
-The contract schema is the console's check, not the agent's only defense: the agent normalizer (`names.rs`) is already stricter on some points. It masks a segment with a percent-encoded byte or a `%uXXXX` escape, treats a segment with more than 6 digits (consecutive or in total) as a value (`cust_12345678`, `events_2026_10_21`), and replaces a name with more than 8 numeric characters in total, in any script, by `*`. So most names the `KeyPattern` digit rules refuse are already masked. What the agent does not mask by these rules: runs of short digit groups below both bounds (`1.2.3.4.5`, 5 digits in 9 characters), the dotted IPv4 form (`10.0.0.1`, 5 digits) and the dashed or dotted MAC forms (12 hexadecimal characters, of which possibly 8 or fewer digits); whether another rule (the classifiers, the first-name or hexadecimal-key rules) masks them is not established here.
+The contract schema is the console's check, not the agent's only defense: the agent normalizer (`names.rs`) is already stricter, and masks most of what the `KeyPattern` rules refuse. Its actual gate on every name it builds:
+
+- no run of more than 6 numeric characters (`MAX_INDEX_DIGITS`), and no more than 8 numeric characters in total (`MAX_TOTAL_DIGITS`), counted in any script (`is_numeric_like`); a segment with more than 6 digits, consecutive or in total, is a value (`cust_12345678`, `events_2026_10_21`);
+- no percent-encoded byte (`%XX`) and no `%uXXXX` escape (`has_percent_escape`);
+- in dotted paths (`normalize_path`), a segment made only of digits and of at most 6 of them becomes `[]` after the previous segment, or `*` when it is the first: `10.0.0.1` becomes `*[][][]`, and `1.2.3.4.5` the same way;
+- in field paths with real keys (`normalize_field_path`), any key holding a `.` is a dynamic key and becomes `*`;
+- a long hexadecimal segment (16 or more hexadecimal characters once `-` is removed, with at least one digit: UUIDs, ObjectIds, hashes) is a value, which catches the dashed MAC form `00-1a-2b-3c-4d-5e` as one segment.
+
+What survives today: the dotted MAC form (`001a.2b3c.4d5e`: three 4-character segments, none digit-only, none long enough for the hexadecimal rule) and short runs separated by `_`, `+` or `-` inside one segment that stay below both bounds (`1_2_3_4_5`, 5 digits in 9 characters).
 
 Narrowing `Identifier` in the contract is incompatible (ADR-0022 decision 6), in both directions:
 
@@ -26,7 +35,7 @@ The agent normalizer applies the `KeyPattern` rules that fit `Identifier` (below
 
 ### (B) Option (A), then a console-side mask instead of a refusal
 
-As (A). In addition, the console checks every incoming `Identifier` against `IdentifierProduced` after schema validation. A name that fails is not refused: the console stores `*` in its place (the contract's "masked name"), keeps the item, and records an agent-integrity event for the agent (per agent and hour, inside the existing agent-integrity budget). Every party keeps accepting what it accepts today, so this is compatible; it moves the check from refusal to masking, as ADR-0009's "sanitize, don't drop" does on the agent.
+As (A). In addition, the console checks every incoming `Identifier` against `IdentifierProduced` after schema validation. A name that fails is not refused: the console stores `*` in its place (the contract's "masked name"), keeps the item, and records a security event for the agent (at most one per agent, endpoint and hour, with a daily notification outside the system-alert budget; decision 3). Every party keeps accepting what it accepts today, so this is compatible; it moves the check from refusal to masking, as ADR-0009's "sanitize, don't drop" does on the agent.
 
 ### (C) Option (A), then a refusal negotiated per agent
 
@@ -50,24 +59,29 @@ The `Identifier` schema, plus these `not` rules, applied to the name and to each
 
 1. no segment made only of 9 or more digits, spaces, `_`, `+` and `-` (today's rule extended to `_`, `\p{Nd}` and `\p{Zs}`);
 2. no run of 9 or more characters made of digits, separators (`.`, `_`, `+`, `-`, spaces, any `\p{Pd}` dash, U+FF0E), that starts and ends with a digit (a phone or card number split across segments: `06.12.34.56.78`, `06_12_34_56_78`);
-3. no IPv4 address as whole segments (`host.10.0.0.1`, `10.0.0.1`), no MAC address in the dashed or dotted form (`00-1a-2b-3c-4d-5e`, `001a.2b3c.4d5e`);
-4. no percent-encoded byte (`%` and two hexadecimal digits).
+3. no IPv4 address as whole segments (`host.10.0.0.1`, `10.0.0.1`), no MAC address in the dashed form (`00-1a-2b-3c-4d-5e`), and no dotted MAC form (`001a.2b3c.4d5e`: three segments of 4 hexadecimal characters, at least one of which holds a digit, so that a dotted name of hexadecimal-looking words such as `face.cafe.beef` is not refused);
+4. no percent-encoded byte (`%` and two hexadecimal digits) and no `%uXXXX` escape;
+5. the agent's gate, stated so that the contract says what a conforming agent sends: no run of more than 6 numeric characters, and no more than 8 numeric characters in the whole name.
 
 The LDAP container DN form of `Identifier` gets the same rules on each RDN value.
 
 ### 2. Agent (`agent-engineer`), first release
 
 1. `names.rs` applies the rules of item 1 before its final conformance check, so a name that violates one becomes `*` (its segment, where the existing segment rules apply, else the whole name).
-2. `IdentifierProduced` is added to `shared/protocol/openapi.yaml` as an unreferenced schema (no request or response uses it; compatible, `security-reviewer` review), and the agent's contract tests and fuzz oracles check that every `NormalizedName` that is not a `KeyPattern` matches it.
+2. `IdentifierProduced` is added to the contract (compatible, `security-reviewer` review), and the agent's contract tests and fuzz oracles check that every `NormalizedName` that is not a `KeyPattern` matches it. No request or response uses it, and the contract lint (`recommended-strict`, `npm run lint`) refuses unused components (`no-unused-components`), so it is held either in a separate schema file under `shared/protocol/` used by the tests, or referenced from `Identifier` through an `x-databastion-produced` extension; if neither suits the generators, the lint exception is recorded in `redocly.yaml` with this ADR as its reason. The implementation PR picks one; a separate file is preferred, since it changes nothing the generators read.
 3. The agent's decoding of `SensitiveObject.object` is unchanged (today's `Identifier`), so jobs from any console still decode.
-4. **Measurement first.** Before the rule is merged, the agent tests run it over the dev ground truth, the engine-matrix fixtures and the Discovery findings of the `load` and end-to-end runs, and the ADR records how many names it masks that today's agent keeps. The expected additions are version-like names with several short numeric segments (`1.2.3.4.5`), IPv4 addresses and MAC addresses; dated names (`events_2026_10_21`) are already masked by the 6-digit segment rule; open question 2.
+4. **Measurement first.** Before the rule is merged, the agent tests run it over the dev ground truth, the engine-matrix fixtures and the Discovery findings of the `load` and end-to-end runs, and the ADR records how many names it masks that today's agent keeps. Given the current gate (Context), the expected additions are only the dotted MAC form and short separated runs inside one segment (`1_2_3_4_5`, `v1-2-3-4-5`); IPv4 addresses, the dashed MAC form and dated names are already masked; open question 2.
 
 ### 3. Console (`console-engineer`), a later release
 
 1. After schema validation, every `Identifier` of an incoming finding or event is checked against `IdentifierProduced`. A name that fails is stored as `*`, and the item is kept. The console never refuses an item for it.
-2. An agent-integrity event, at most one per agent and hour, inside the per-agent budget shared with the other agent-integrity events, names the agent, the endpoint and the number of masked names, never the name.
-3. Every agent is treated alike: the console makes no decision on the agent's version (ADR-0022 rejected alternative: negotiating on `agent_version`). From an agent of the release of section 2 or later, an integrity event points at a bug, since a conforming agent never sends such a name.
+2. Each masking is recorded as a `security_events` row (agent, endpoint, number of masked names; never the name), at most one per agent, endpoint and hour. It does not raise a system alert through the per-agent share of the system-alert budget (`console/src/db/schema.ts`, `max(2, ceil(limit / 4))` per channel and hour): an older agent masked at every batch would spend that share and hide the agent's other alerts. Instead, one daily notification lists the agents with masked names in the last 24 h, outside that budget.
+3. Every agent is treated alike: the console makes no decision on the agent's version (ADR-0022 rejected alternative: negotiating on `agent_version`). From an agent of the release of section 2 or later, such a security event points at a bug, since a conforming agent never sends such a name.
 4. The console's `audit.configure` jobs keep sending names as stored; a masked name is `*` there too.
+5. **What the masking does not cover.**
+   - Names outside findings and events: `TargetNameCaseException.database` in heartbeats (ADR-0055) and the other `Identifier` fields of heartbeats are checked by the schema only.
+   - Rows stored before the console change keep their names.
+   - A sensitive object derived from a masked finding is `*`: an older agent matches it as the literal `*` only, so its events on the real object below `min_rows` are no longer kept by the `sensitive_objects` filter (an upgraded agent sends no such name, so the case is limited to agents older than section 2).
 
 ### 4. Version 2
 
@@ -75,15 +89,16 @@ When `/api/agent/v2` is introduced for any reason, `Identifier` in v2 is `Identi
 
 ## Consequences
 
-- Names that look like phone or card numbers split by `_` or spread across segments, IPv4 and MAC addresses, and percent-encoded bytes no longer reach the console from an upgraded agent, on every engine, as they already do not on Redis / Valkey.
-- Few legitimate names change on an upgraded agent, since its digit bounds already mask most of what the new rules refuse: version-like names with several short numeric segments, and names holding an IPv4 or MAC address, become `*`. The console shows less detail for them (ADR-0009 consequence); the measurement of section 2 item 4 says how many.
+- On an upgraded agent, the dotted MAC form and short separated digit runs inside one segment no longer reach the console; IPv4 addresses, the dashed MAC form, percent escapes and longer digit runs were already masked. The rules are now stated in the contract on every engine, as they are for Redis / Valkey key patterns.
+- Few legitimate names change on an upgraded agent: version-like names written with `_` or `-` (`v1_2_3_4_5`) and dotted names of three 4-character hexadecimal words with a digit become `*`. The console shows less detail for them (ADR-0009 consequence); the measurement of section 2 item 4 says how many.
 - The main gain is on the console side (section 3): the contract states, and the console enforces by masking, a rule that today only the agent's code holds.
-- With the console part, an older or non-conforming agent's value-bearing names are not stored, but they still reach the console process: masking at the console is defense in depth, not I2. The agent-integrity event makes such an agent visible.
+- With the console part, an older or non-conforming agent's value-bearing names are not stored, but they still reach the console process: masking at the console is defense in depth, not I2. The security events and the daily notification make such an agent visible.
 - No released party refuses anything it accepts today: agents and consoles can be upgraded in either order.
 
 ### Residual risks
 
 - Until agents are upgraded, the console (with section 3) masks what it stores but has received the name. Without section 3, the contract's weaker rule stays the console's only check.
+- The gaps of section 3 item 5.
 - The rules are pattern rules: they do not recognize a value without these shapes (ADR-0009 known gap).
 
 ## Rejected alternatives
@@ -92,7 +107,8 @@ When `/api/agent/v2` is introduced for any reason, `Identifier` in v2 is `Identi
 - **(E) Narrowing in v1**: incompatible; older agents' items refused and dropped, older consoles' jobs lost.
 - **(D) alone, with nothing until v2**: no date, and the agent can apply the stricter rule today without any compatibility cost.
 - **Narrowing the agent's decoder of `SensitiveObject.object`**: an older console's job with such a name would be lost as a whole; the names come from the console's own findings, and matching them is looser only.
-- **The URL-scheme, IPv6 and `:`-separated MAC rules of `KeyPattern`**: `Identifier` already forbids `:`, `/` and `@`, so they cannot match.
+- **The URL-scheme, IPv6 and `:`-separated MAC rules of `KeyPattern`**: `Identifier` forbids `:`, so a name can hold none of these forms.
+- **An agent-integrity alert in the per-agent system-alert share**: an older agent would spend it at every batch.
 
 ## Open questions (for the maintainer)
 

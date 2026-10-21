@@ -737,7 +737,7 @@ Records #293 (decision 5, the CAS store guard of ADR-0041 decisions 5 and 6); de
 
 ## Proposed refinement (2026-10-21, for the maintainer's decision): an exact own text whose only always-report reason is the core overflow
 
-Status: **Proposed**, not accepted; needs a `security-reviewer` review before acceptance. It would refine decision 6 ("The agent's own statements and the always-reported rules") and the implementation note of 2026-10-17 (at most 15 named objects per event). ROADMAP: [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "possible ADR-0051 refinement: let an exact own text through when the core overflow is its only always-report reason".
+Status: **Proposed**, not accepted. Security review (2026-10-21): sound after changes, revised (L1: the unit of the mark is the statement group; L2: `SERVER_INTERNAL` texts not eligible). It would refine decision 6 ("The agent's own statements and the always-reported rules") and the implementation note of 2026-10-17 (at most 15 named objects per event). ROADMAP: [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "possible ADR-0051 refinement: let an exact own text through when the core overflow is its only always-report reason".
 
 ### Context
 
@@ -757,10 +757,10 @@ The connector keeps, next to the core's flags, its own mark of the always-report
 
 1. **A separate connector-side flag.** The core's `always_report` and `objects_overflowed` are not changed or cleared; the connector's mark is computed independently and only the exact-text check reads it.
 2. **Never for `NeedsCredit` texts.** Sampling, ticket counts and the Audit polls read rows or statement texts; their objects must be charged or are listed, so an overflow on them stays always reported, as today.
-3. **Per record, before aggregation.** The mark is computed for each record from **all** the objects the record names, before the core bound and before records are grouped into one event (grouping merges flags with OR, so a mark taken after it would let one record's overflow hide another's listed object). A record whose objects were dropped by the SQL Server Audit grouping bound (64 per statement) is not eligible: those objects were not seen, so a listed one could be among them.
+3. **Per statement group, before aggregation.** The unit is the statement group: on SQL Server Audit, all the `SL` rows of one statement grouped into one `Statement` by `records::group` (same session, transaction, time, action, result, principals and text); on Extended Events, the one event of the statement. The mark is computed from **all** the objects of the group, before `objects.apply`, before the core bound and before events are merged by the aggregation (which merges flags with OR, so a mark taken after it would let one group's overflow hide another's listed object). The local `always` flag of `audit/records.rs` (set for a listed object, an extraction signal, dynamic SQL, a user function or a four-part name, then applied with `with_always_report`) is that separate connector-side mark today; the Extended Events path (`audit/xe/events.rs`) has the same form. A group whose objects were dropped by the SQL Server Audit grouping bound (64 per statement) is not eligible: those objects were not seen, so a listed one could be among them.
 4. **Test obligation.** A record of an exact own text whose objects include a listed `sys` object (a statement-text or credential-bearing object) past the 15th stays reported, always, on both sources; and one whose objects are only user tables past the 15th is the agent's own.
 
-The exact texts eligible are the constants and catalog templates of `sql.rs` matched by exact text (never by prefix or shape); they read catalog views and permission functions, never user rows (sampling and counts are credit-only).
+The exact texts eligible are the constants and catalog templates of `sql.rs` matched by exact text (never by prefix or shape); they read catalog views and permission functions, never user rows (sampling and counts are credit-only). The texts of `SERVER_INTERNAL` (statements the server runs inside a built-in the agent calls, also `OwnText::Exact`) are **not** eligible: they are the server's code, recorded under the agent's session, and the agent does not control which objects they reach.
 
 #### (c) Clear the overflow for the agent's own events in the core
 
