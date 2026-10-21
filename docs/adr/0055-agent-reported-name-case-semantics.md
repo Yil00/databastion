@@ -1,6 +1,6 @@
 # ADR-0055: Name case semantics reported by the agent for MySQL / MariaDB and SQL Server
 
-- **Status**: Proposed (revised on 2026-10-20 after its security review, "sound after changes": H1, M1 to M3, L1 to L9). Acceptance is the maintainer's; it changes `shared/protocol/` and what location exceptions suppress
+- **Status**: Accepted (2026-10-21). **Accepted** by the maintainer on 2026-10-21 with the proposed answer to every open question (see [Open questions](#open-questions-answered)). History: proposed on 2026-10-20, revised the same day after its security review ("sound after changes": H1, M1 to M3, L1 to L9)
 - **Date**: 2026-10-20
 - **Refines**: [ADR-0054](0054-case-sensitive-location-exceptions.md) (which stays Accepted), decision 3 (exceptions on MySQL / MariaDB and SQL Server stay case-insensitive "until the agent reports the case semantics"); this is its option D, whose ADR the maintainer asked for on 2026-10-20 (ADR-0054 open question 3). Uses [ADR-0022](0022-protocol-capability-negotiation.md) (capability negotiation) without changing it
 - **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups); [ADR-0009](0009-name-normalization-and-item-sanitization.md) (name normalization), [ADR-0014](0014-policy-and-incident-model.md) decision 1, [ADR-0018](0018-mysql-mariadb-grants-and-connector.md) / [ADR-0020](0020-mysql-mariadb-connector-as-merged.md) (MySQL / MariaDB account and statements), [ADR-0021](0021-access-event-correlation.md) decision 5, [ADR-0045](0045-mysql-mariadb-statement-text-tables-and-unqualified-calls.md) (the agent's own constant texts), [ADR-0051](0051-sqlserver-connector.md) decisions 4 and 5 and its statement allow-list (end-of-phase-9 review L1); [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine) (collation residuals); `shared/protocol/openapi.yaml` (`TargetStatus`, `Identifier`); `console/src/lib/policy-common.ts` (`exceptionGlobOptions`, `TRAILING_SPACE_BLIND_ENGINES`), `console/src/lib/policy-model.ts` (`exceptionCovers`), `console/src/lib/event-model.ts` (`exceptionCoversEvent`), `console/src/server/agent-api/capabilities.ts`; `agent/crates/classifiers/src/query.rs` (MySQL tokenizer and `RelationName`), `agent/crates/classifiers/src/tsql.rs`, `agent/crates/connector-mysql/src/sql.rs`, `check.rs` and `audit/own_threads.rs` (`ServerRun`), `agent/crates/connector-sqlserver/src/sql.rs` (`STATEMENTS`, `VERSION`, `ACCESSIBLE_DATABASES`, `USER_DATABASES`) and `check.rs` (read at `4cd45dd`, `dev`)
@@ -45,7 +45,7 @@ A registered note code (`check.names_case_sensitive`) needs no negotiation (ADR-
 
 A per-target setting "names compare with case". The console cannot verify it, it is wrong after a server is rebuilt, and on SQL Server it is per database. Only a "stricter only" form would be safe (open question 4).
 
-## Decision (proposed)
+## Decision
 
 Option (1).
 
@@ -146,10 +146,17 @@ Option (1).
 - **Listing only the databases the login can enter** (the existing `ACCESSIBLE_DATABASES` read): databases it cannot enter, snapshots and offline databases would silently take `objects` (security review M3).
 - **Reporting the collation names or the setting values**: free-form strings the console does not need; three closed values say what matters.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
+
+Each answer is the proposed one, accepted by the maintainer on 2026-10-21.
 
 1. A missing `name_case` (agents built before this ADR): keep today's case-insensitive behaviour (proposed), or treat it as `unknown`, so as `sensitive`, from a given release on? Proposed answer: today's behaviour; the upgrade notes ask to upgrade agents, and the target page shows "not reported".
+   **Answer (decided by the maintainer on 2026-10-21)**: today's case-insensitive behaviour for a missing `name_case`; the upgrade notes ask to upgrade agents, and the target page shows "not reported".
 2. A MariaDB forced to `lower_case_table_names = 0` with `lower_case_file_system = ON` (MySQL 8.0+ refuses to start in that state): report `sensitive` (proposed, stricter) or `unknown` (also strict, but shown as unknown on the target page)? Proposed answer: `sensitive`, with a local detail in `check()`; both behave the same in the console.
+   **Answer (decided by the maintainer on 2026-10-21)**: `sensitive`, with a local detail in `check()`.
 3. The `except` bounds: 32 entries and 8 KiB (proposed), overflowing to `objects: unknown`? Proposed answer: yes; servers with more databases of a non-default collation than that are rare, and the overflow is strict.
+   **Answer (decided by the maintainer on 2026-10-21)**: 32 entries and 8 KiB at most; past either bound, `objects: unknown` with `except` omitted.
 4. A console-side "names compare with case" setting per target, stricter only (it can turn `insensitive` or a missing value into `sensitive`, never the reverse), for targets whose agents cannot be upgraded soon? Proposed answer: not now; reconsider if agents lag behind consoles in practice.
+   **Answer (decided by the maintainer on 2026-10-21)**: no per-target console setting for now; reconsider if agents lag behind consoles in practice.
 5. Timing: implement together with the ADR-0054 console change, or after it? Proposed answer: after, so that the ADR-0054 cut-over and its inventory ship first and this change reuses them; the SQL Server part may ship before the MySQL / MariaDB spelling change of decision 3.
+   **Answer (decided by the maintainer on 2026-10-21)**: after the ADR-0054 console change (done, #291) and after the decision 3 prerequisite (security review H1: the agent sends unquoted MySQL / MariaDB identifiers as written); the SQL Server part may ship before the MySQL / MariaDB spelling change.
