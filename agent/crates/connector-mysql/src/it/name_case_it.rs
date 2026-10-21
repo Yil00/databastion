@@ -6,6 +6,14 @@
 //! table each read was written with, unquoted or backquoted, never the
 //! other one. A server with another `lower_case_table_names` is skipped
 //! with a message (never a failure, also under `DATABASTION_TEST_REQUIRE`).
+//!
+//! Also (the #300 review and follow-up): a common table expression hides
+//! only a table named as it is written, and the servers' system-schema
+//! rules, `Performance_Schema` and `Information_Schema` refused in any
+//! case, `SYS` and `MySQL` user databases that Discovery samples. And
+//! (ADR-0055 decision 10) the reported value against the setting the
+//! engine matrix initialized the server with,
+//! `DATABASTION_TEST_<S>_LOWER_CASE_TABLE_NAMES` (`dev/agent-it.sh`).
 
 use databastion_classifiers::masking::{EventAction, EventSource, MaskedEvent};
 
@@ -107,7 +115,89 @@ async fn reads_are_named_as_written(
             }
         }
     }
-    exec(a, &format!("DROP DATABASE IF EXISTS {CASE_DB}")).await;
+}
+
+/// The #300 review: a common table expression hides only the relation
+/// named exactly as it (`classifiers::query`, MySQL: under
+/// `lower_case_table_names = 0` the servers resolve `FROM Customers` to the
+/// table `Customers`, not to a CTE `customers`; a CTE named in another
+/// case is reported as a read, fail closed). Each statement, unqualified
+/// in the test database, on a stream of its own:
+/// - `WITH customers AS (SELECT 9 AS id) SELECT id FROM Customers`: when
+///   the server read the table (no row `9`), an event names `Customers`;
+/// - `WITH customers AS (SELECT id FROM Customers) SELECT id FROM
+///   customers`: an event names `Customers`, the table read in the CTE.
+///
+/// Neither names the table `customers`, which neither statement reads.
+async fn ctes_follow_the_server_case_rule(
+    label: &str,
+    a: &mut Session,
+    admin_user: &str,
+    connector: &Arc<MysqlConnector>,
+    t: &TargetConfig,
+    source: EventSource,
+) {
+    exec(a, &format!("USE {CASE_DB}")).await;
+    let names_table = |e: &MaskedEvent| {
+        e.action() == EventAction::Read
+            && e.principal().account_name() == admin_user
+            && e.objects()
+                .iter()
+                .any(|o| o.database().as_str() == CASE_DB && o.object().as_str() == "Customers")
+    };
+    for (i, text) in [
+        "WITH customers AS (SELECT 9 AS id) SELECT id FROM Customers",
+        "WITH customers AS (SELECT id FROM Customers) SELECT id FROM customers",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = TempDir::new();
+        let (task, mut rx) = start_audit(Arc::clone(connector), t, &state.0);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let rows = a.query(Stage::Check, text).await.unwrap();
+        let from_cte = rows
+            .iter()
+            .any(|r| r.first().and_then(|v| v.as_deref()) == Some("9"));
+        let table_read = i == 1 || !from_cte;
+        eprintln!(
+            "[it] name_case: {label}: `{text}` read {}",
+            if from_cte {
+                "the CTE"
+            } else {
+                "the table Customers"
+            }
+        );
+        let done = |ev: &[MaskedEvent]| ev.iter().any(&names_table);
+        let mut events: Vec<MaskedEvent> = Vec::new();
+        let wait = if table_read { 30 } else { 10 };
+        collect_until(&mut rx, &mut events, Duration::from_secs(wait), done).await;
+        collect_until(&mut rx, &mut events, Duration::from_secs(2), |_| false).await;
+        task.abort();
+        let all: Vec<String> = events.iter().map(describe).collect();
+        eprintln!(
+            "{label} `{text}` events ({}):\n{}",
+            all.len(),
+            all.join("\n")
+        );
+        if table_read {
+            assert!(done(&events), "{label}: `{text}`: {all:#?}");
+        }
+        for e in &events {
+            assert_eq!(e.source(), source, "{label}: {all:#?}");
+            if e.principal().account_name() != admin_user {
+                continue;
+            }
+            for o in e.objects() {
+                if o.database().as_str().eq_ignore_ascii_case(CASE_DB) {
+                    assert!(
+                        ["Customers", "*"].contains(&o.object().as_str()),
+                        "{label}: `{text}`: {all:#?}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The log-file sources: `server_audit` (MariaDB) and `audit_log_filter`
@@ -154,7 +244,17 @@ async fn audit_logs_name_tables_as_written() {
         let health = connector.check(&t).await;
         assert!(health.reachable, "{label}: {health:?}");
         assert_eq!(connector.audit_source(&t), Some(source), "{label}");
-        reads_are_named_as_written(label, &mut a, &admin.user, connector, &t, source).await;
+        reads_are_named_as_written(
+            label,
+            &mut a,
+            &admin.user,
+            Arc::clone(&connector),
+            &t,
+            source,
+        )
+        .await;
+        ctes_follow_the_server_case_rule(label, &mut a, &admin.user, &connector, &t, source).await;
+        exec(&mut a, &format!("DROP DATABASE IF EXISTS {CASE_DB}")).await;
     }
 }
 
@@ -209,11 +309,21 @@ async fn performance_schema_names_tables_as_written() {
             label,
             &mut a,
             &admin.user,
-            connector,
+            Arc::clone(&connector),
             &t,
             EventSource::PerformanceSchema,
         )
         .await;
+        ctes_follow_the_server_case_rule(
+            label,
+            &mut a,
+            &admin.user,
+            &connector,
+            &t,
+            EventSource::PerformanceSchema,
+        )
+        .await;
+        exec(&mut a, &format!("DROP DATABASE IF EXISTS {CASE_DB}")).await;
         exec(
             &mut a,
             &format!("DROP USER IF EXISTS '{CASE_PFS_USER}'@'%'"),
@@ -239,13 +349,28 @@ async fn check_reports_the_name_case_of_the_server() {
             .unwrap();
         let value = scalar(&mut s, "SELECT @@GLOBAL.lower_case_table_names").await;
         s.close().await;
+        // The setting the dev service was started with (the engine
+        // matrix's `lower_case_table_names = 1` entries, decision 10): the
+        // server must run with it.
+        let var = format!(
+            "DATABASTION_TEST_{}_LOWER_CASE_TABLE_NAMES",
+            server.name.to_uppercase()
+        );
+        if let Some(expected) = std::env::var(&var).ok().filter(|v| !v.is_empty()) {
+            assert_eq!(
+                value.as_deref(),
+                Some(expected.as_str()),
+                "{}: {var}",
+                server.name
+            );
+        }
         let want = match value.as_deref() {
             Some("0") => NameCase::Sensitive,
             Some("1" | "2") => NameCase::Insensitive,
             other => panic!("{}: lower_case_table_names {other:?}", server.name),
         };
         eprintln!(
-            "{}: lower_case_table_names {value:?}: name case {want:?}",
+            "[it] name_case: {}: lower_case_table_names {value:?}: name case {want:?}",
             server.name
         );
         let connector = MysqlConnector::new();
@@ -276,5 +401,152 @@ async fn check_reports_the_name_case_of_the_server() {
             "{}",
             server.name
         );
+    }
+}
+
+/// The #300 review: the servers refuse a database named
+/// `performance_schema` or `information_schema` in another case, whatever
+/// `lower_case_table_names` (they compare those names without case), so
+/// that the agent may recognize them in any case (`audit::events`,
+/// `sql::is_system_schema`) without hiding a user database.
+#[tokio::test]
+async fn system_schemas_in_another_case_are_refused() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let label = server.name;
+        let mut a = admin_session(&server, &admin).await;
+        for name in [
+            "Performance_Schema",
+            "PERFORMANCE_SCHEMA",
+            "Information_Schema",
+        ] {
+            let created = a
+                .exec(Stage::Check, &format!("CREATE DATABASE `{name}`"))
+                .await;
+            eprintln!(
+                "[it] name_case: {label}: CREATE DATABASE `{name}`: {}",
+                match &created {
+                    Ok(_) => "accepted".to_owned(),
+                    Err(e) => format!("refused (errno {:?})", e.errno),
+                }
+            );
+            if created.is_ok() {
+                // A database of that spelling now exists: removed (by the
+                // same spelling) before the failure.
+                let _ = a
+                    .exec(Stage::Check, &format!("DROP DATABASE `{name}`"))
+                    .await;
+                panic!("{label}: a database `{name}` was created");
+            }
+            let n = count(
+                &mut a,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.SCHEMATA \
+                     WHERE CAST(SCHEMA_NAME AS BINARY) = '{name}'"
+                ),
+            )
+            .await;
+            assert_eq!(n, 0, "{label}: {name}");
+        }
+    }
+}
+
+/// Fake e-mail addresses of the `SYS` / `MySQL` user databases.
+const SYSTEM_LIKE_ROWS: u32 = 40;
+/// Discovery account of [`user_databases_named_like_system_schemas_are_sampled`].
+const SYSTEM_LIKE_USER: &str = "databastion_it_case_scan";
+
+/// The #300 follow-up: under `lower_case_table_names = 0` the user
+/// databases `SYS` and `MySQL` are not the system schemas `sys` and
+/// `mysql`, and Discovery samples them (its table list compares `mysql`
+/// and `sys` as bytes, as the server does). A database the server refuses
+/// to create in that case is left out with a message. A server with
+/// another setting is skipped.
+#[tokio::test]
+async fn user_databases_named_like_system_schemas_are_sampled() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let label = server.name;
+        let mut a = admin_session(&server, &admin).await;
+        if !compares_with_case(label, &mut a).await {
+            continue;
+        }
+        exec(
+            &mut a,
+            &format!("DROP USER IF EXISTS '{SYSTEM_LIKE_USER}'@'%'"),
+        )
+        .await;
+        let plugin = match server.flavor() {
+            Flavor::Mysql => "IDENTIFIED WITH caching_sha2_password BY",
+            Flavor::Mariadb => "IDENTIFIED BY",
+        };
+        exec(
+            &mut a,
+            &format!("CREATE USER '{SYSTEM_LIKE_USER}'@'%' {plugin} '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        let mut made = Vec::new();
+        for db in ["SYS", "MySQL"] {
+            let _ = a
+                .exec(Stage::Check, &format!("DROP DATABASE IF EXISTS `{db}`"))
+                .await;
+            if let Err(e) = a
+                .exec(Stage::Check, &format!("CREATE DATABASE `{db}`"))
+                .await
+            {
+                eprintln!(
+                    "[it] name_case: {label}: CREATE DATABASE `{db}` refused (errno {:?}): \
+                     not tested",
+                    e.errno
+                );
+                continue;
+            }
+            for statement in [
+                format!("CREATE TABLE `{db}`.people (id INT PRIMARY KEY, email VARCHAR(120))"),
+                format!(
+                    "INSERT INTO `{db}`.people (id, email) \
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                     WHERE i < {SYSTEM_LIKE_ROWS}) \
+                     SELECT i, CONCAT('case.user', i, '@example.com') FROM n"
+                ),
+                format!("GRANT SELECT ON `{db}`.* TO '{SYSTEM_LIKE_USER}'@'%'"),
+            ] {
+                exec(&mut a, &statement).await;
+            }
+            made.push(db);
+        }
+        let (_dir, t) = target(&server, SYSTEM_LIKE_USER, IT_PASSWORD);
+        let (r, findings) = scan(&t).await;
+        r.unwrap();
+        let found = located(&findings);
+        eprintln!(
+            "[it] name_case: {label}: user databases {made:?}: findings in {:?}",
+            found.iter().map(|k| k.0.as_str()).collect::<BTreeSet<_>>()
+        );
+        for db in &made {
+            let want = key_of(normalize(db).as_str(), "people", "email", "pii.email");
+            assert!(found.contains(&want), "{label}: {db}: {found:?}");
+        }
+        for k in &found {
+            assert!(
+                !["mysql", "sys", "information_schema", "performance_schema"]
+                    .contains(&k.0.as_str()),
+                "{label}: {k:?}"
+            );
+        }
+        for db in &made {
+            exec(&mut a, &format!("DROP DATABASE IF EXISTS `{db}`")).await;
+        }
+        exec(
+            &mut a,
+            &format!("DROP USER IF EXISTS '{SYSTEM_LIKE_USER}'@'%'"),
+        )
+        .await;
     }
 }
