@@ -496,10 +496,20 @@ jobs:
           {
             echo "### E2E SQL Server $E2E_SQLSERVER_VERSION ($E2E_SQLSERVER_AUDIT_SOURCE)"
             echo '```'
-            grep -E '\] (target-mssql: |mssql-e2e: (checked|SQL Server|audit level)|Audit: (bcp start|exporter events|.* hold .* statement)|all checks passed|PASS$|FAIL: |timings: )' \
+            grep -E '\] (target-mssql: |mssql-e2e: (checked|SQL Server|audit level)|Audit: (bcp start|exporter events|.* hold .* statement)|(CENSUS|XE-CATCHUP) |all checks passed|PASS$|FAIL: |timings: )' \
               "$RUNNER_TEMP/e2e.log" || true
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
+      # ADR-0053 decision 6 and #282 review N3: the event census (counts, target ids, principals as
+      # stored, the `*` events by kind; no value), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-census-${{ matrix.version }}-${{ matrix.source }}
+          path: e2e-sqlserver-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

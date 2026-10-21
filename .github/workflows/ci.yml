@@ -801,6 +801,16 @@ jobs:
       # with the containers. If the invariant I2 check fails, the logs may hold seeded values:
       # they are fake (dev/seed/generate.py) and already public in the repository; the job log
       # itself only holds needle ids and file names.
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-census
+          path: e2e-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -890,6 +900,16 @@ jobs:
         run: timeout 2280 e2e/cas.sh
       # cas.sh redacts every generated secret, every ticket of the run and every typed name of a
       # failed login from the logs on exit, whatever the result (and masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-cas-census
+          path: e2e-cas-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -937,6 +957,16 @@ jobs:
         run: timeout 2280 e2e/sqlserver.sh
       # sqlserver.sh redacts every generated secret and the DCL marker passwords from the logs on
       # exit, whatever the result (and masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-census
+          path: e2e-sqlserver-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -985,6 +1015,16 @@ jobs:
         run: timeout 1980 e2e/redis.sh
       # redis.sh redacts every generated secret from the logs on exit, whatever the result (and
       # masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-redis-census
+          path: e2e-redis-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

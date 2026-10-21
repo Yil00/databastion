@@ -17,13 +17,33 @@ Subcommands (stdlib only; unit tests in test_loadlib.py):
   sysbench --summary FILE
       Events, read queries, errors and the 95th percentile latency of a sysbench summary.
 
-  census --log FILE [--console FILE] [--label TEXT] [--summary FILE]
+  census --log FILE [--console FILE] [--star FILE] [--label TEXT] [--out-dir DIR]
       ADR-0053 decision 6 measurement: the agent's last "audit event census" line per engine in a
       `docker compose logs` file of the agent (counts only: events spooled, the statements they
       stand for, overflowed events, events naming an unknown-object `*`, events filtered), and
       optionally the console's per-principal event counts (a JSON array from run.sh). Prints one
-      `CENSUS ...` / `CENSUS-CONSOLE ...` line each to stdout and appends a Markdown section to
-      --summary (the job step summary). Never fails the run (exit 0, also without data).
+      `CENSUS ...` / `CENSUS-CONSOLE ...` line each to stdout. With --star FILE (the `census-sql
+      --star` result), also the events naming `*` by kind (`STAR-EVENTS ...`, `STAR-FINDINGS ...`
+      lines). With --out-dir DIR, writes census-<label>.json and census-<label>.md there (the
+      collected census, kept as a job artifact). Never writes to the job summary: the harnesses
+      append census-<label>.md to it on exit, after redacting the directory. Never fails the run
+      (exit 0, also without data).
+
+  census-sql [--agent-id UUID] [--star]
+      Prints the console query whose JSON result `census --console` (or, with --star, `census
+      --star`) reads: counts, target ids, principals as stored (fingerprints as an 8-digit
+      prefix), sources, actions, signals and the databases of `*` objects; no other object name.
+
+  xe-catchup --log FILE [--builds FILE] [--console FILE] [--issued PRINCIPAL=N]... [--since T]
+             [--gap S] [--label TEXT] [--md FILE] [--json FILE]
+      #282 review N3 (SQL Server Extended Events source under load): the agent's cut lines before
+      unpaired statistics builds, grouped in runs (cuts at most S seconds apart), the runs that
+      reached the 60 s hold, the statistics builds and workload SELECTs the session's files hold
+      per principal (--builds, read by sqlserver.sh), and the workload principals' events naming
+      `*` without the overflow flag and their statements beyond those issued (--console). Prints
+      `XE-CATCHUP` / `XE-BUILDS` / `XE-SELECTS` / `XE-NOISE` lines, and writes the Markdown section
+      to --md (appended to the job summary by the harness after redaction) and the figures to
+      --json. Never fails the run.
 
   report --facts FILE --samples FILE... --heartbeats FILE --out DIR
       Computes every measure from the samples and the facts run.sh recorded (windows, counts),
@@ -1018,28 +1038,102 @@ def census_lines(census: dict[str, dict[str, int]], label: str) -> list[str]:
 
 
 CONSOLE_KEYS = ("target", "db_user", "events", "statements", "star_events", "star_statements", "max_objects")
+# Added with ADR-0053 (the console stores `objects_overflowed`): optional, so that a file written by
+# an older query still reads.
+CONSOLE_OPTIONAL_KEYS = ("overflowed_events", "overflowed_statements")
 
 
 CONSOLE_NAME_MAX = 128
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# The console's `access_events` columns read by the census queries (console/src/db/schema.ts):
+# counts, the principal as stored (an account name, a fingerprint prefix or a marker), the target
+# id, the source, the action, the signals and the databases of `*` objects. Never an object name
+# other than `*`, never a row value (there is none in that table: ADR-0007).
+_STAR = "objects @> '[{\"object\": \"*\"}]'::jsonb"
+_PRINCIPAL = ("CASE WHEN db_user IS NOT NULL THEN db_user WHEN account_not_recorded THEN '(not-recorded)' "
+              "WHEN db_user_fingerprint IS NOT NULL "
+              "THEN 'fp:' || left(regexp_replace(db_user_fingerprint, '^[a-z0-9-]+:', ''), 8) ELSE '-' END")
+_PRINCIPAL_KIND = ("CASE WHEN account_not_recorded THEN 'not_recorded' WHEN db_user_fingerprint IS NOT NULL "
+                   "THEN 'fingerprint' WHEN db_user IS NOT NULL THEN 'account' ELSE 'none' END")
+
+
+def _agent_filter(agent_id: str | None, column: str = "agent_id") -> str:
+    if agent_id is None:
+        return "TRUE"
+    if not UUID_RE.match(agent_id):
+        raise ValueError("the agent id must be a UUID")
+    return f"{column} = '{agent_id}'"
+
+
+def census_sql(agent_id: str | None = None) -> str:
+    """The console query of the census (a JSON array, CONSOLE_KEYS and CONSOLE_OPTIONAL_KEYS): per
+    target and principal, the events stored, the statements they stand for, those naming an object
+    `*` (overflowed or unknown), those the agent flagged `objects_overflowed` (ADR-0053), the
+    largest object list. Every event of the agent (or of the console database: e2e runs) is
+    counted, whatever its principal (no load-account filter). Counts and names only."""
+    return f"""SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
+    SELECT target_id AS target, {_PRINCIPAL} AS db_user, count(*) AS events,
+      sum(aggregated_count) AS statements,
+      count(*) FILTER (WHERE {_STAR}) AS star_events,
+      coalesce(sum(aggregated_count) FILTER (WHERE {_STAR}), 0) AS star_statements,
+      count(*) FILTER (WHERE objects_overflowed IS TRUE) AS overflowed_events,
+      coalesce(sum(aggregated_count) FILTER (WHERE objects_overflowed IS TRUE), 0) AS overflowed_statements,
+      max(jsonb_array_length(objects)) AS max_objects
+    FROM access_events WHERE {_agent_filter(agent_id)} GROUP BY 1, 2) AS x"""
+
+
+def star_sql(agent_id: str | None = None) -> str:
+    """The console query of the `*` events (a JSON object `{events, findings}`): every event naming
+    an object `*`, grouped by target, source, action, principal kind (account, fingerprint, not
+    recorded), signals, the databases of its `*` objects, whether `*` is its only object and
+    whether the agent flagged it overflowed; and per target and database the number of distinct
+    finding objects (on Redis / Valkey the key patterns Discovery reported) and whether `*` is one
+    of them. For the open question of ADR-0053 decision 6: whether an event's `*` stands for a real
+    `*` key pattern, a key the agent could not attribute, a script or a full synchronization. No
+    object name other than `*`, no principal name."""
+    flt = _agent_filter(agent_id)
+    return f"""WITH e AS (
+    SELECT target_id AS target, source, action, {_PRINCIPAL_KIND} AS principal_kind,
+      coalesce((SELECT string_agg(s, '+' ORDER BY s) FROM jsonb_array_elements_text(signals) s), '-') AS signals,
+      coalesce((SELECT string_agg(DISTINCT o->>'database', ',' ORDER BY o->>'database')
+        FROM jsonb_array_elements(objects) o WHERE o->>'object' = '*'), '-') AS star_databases,
+      jsonb_array_length(objects) = 1 AS only_star, objects_overflowed IS TRUE AS overflowed,
+      aggregated_count, coalesce(rows, 0) AS r
+    FROM access_events WHERE {_STAR} AND {flt})
+  SELECT json_build_object(
+    'events', coalesce((SELECT json_agg(x ORDER BY x.target, x.events DESC, x.source, x.action) FROM (
+      SELECT target, source, action, principal_kind, signals, star_databases, only_star, overflowed,
+        count(*) AS events, sum(aggregated_count) AS statements, sum(r) AS rows_sum
+      FROM e GROUP BY 1, 2, 3, 4, 5, 6, 7, 8) AS x), '[]'::json),
+    'findings', coalesce((SELECT json_agg(y ORDER BY y.target, y.database) FROM (
+      SELECT target_id AS target, engine, database_name AS database, count(DISTINCT object_name) AS objects,
+        bool_or(object_name = '*') AS star_object
+      FROM findings WHERE {flt} GROUP BY 1, 2, 3) AS y), '[]'::json))"""
 
 
 def _console_name(v: object) -> str | None:
     """A target id or principal as printed (a `key=value` log line, a Markdown table cell): at most
-    CONSOLE_NAME_MAX characters, with `|`, backticks, every whitespace character (spaces included,
-    which would split a `key=value` field) and every control or non-printable character replaced
-    by `?`, so that a stored name can neither break a line, a field or a cell nor start a workflow
-    command. `None` for a value that is not a string."""
+    CONSOLE_NAME_MAX characters, with `|`, backticks, `<`, `>`, `&` (no HTML in the job summary),
+    every whitespace character (spaces included, which would split a `key=value` field) and every
+    control or non-printable character replaced by `?`, so that a stored name can neither break a
+    line, a field or a cell, nor carry markup, nor start a workflow command. `None` for a value
+    that is not a string."""
     if not isinstance(v, str):
         return None
-    return "".join("?" if (c in "|`" or c.isspace() or not c.isprintable()) else c
+    return "".join("?" if (c in "|`<>&" or c.isspace() or not c.isprintable()) else c
                    for c in v[:CONSOLE_NAME_MAX])
 
 
+def _count(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
 def console_rows(data: object) -> list[dict]:
-    """Rows of the console query (run.sh): per target and principal, the events, the statements
-    they stand for and those naming an object `*` (the console does not know the overflow flag).
-    Names are made safe to print (`_console_name`); a row whose names are not strings or whose
-    counts are not non-negative integers is dropped."""
+    """Rows of the console query (census_sql): per target and principal, the events, the statements
+    they stand for, those naming an object `*` and, when present, those flagged overflowed. Names
+    are made safe to print (`_console_name`); a row whose names are not strings or whose counts are
+    not non-negative integers is dropped (an optional count that is not one is left out)."""
     if not isinstance(data, list):
         return []
     rows = []
@@ -1048,14 +1142,60 @@ def console_rows(data: object) -> list[dict]:
             continue
         target, user = _console_name(r["target"]), _console_name(r["db_user"])
         counts = [r[k] for k in CONSOLE_KEYS[2:]]
-        if target is None or user is None or not all(
-                isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in counts):
+        if target is None or user is None or not all(_count(c) for c in counts):
             continue
-        rows.append({"target": target, "db_user": user, **{k: r[k] for k in CONSOLE_KEYS[2:]}})
+        row = {"target": target, "db_user": user, **{k: r[k] for k in CONSOLE_KEYS[2:]}}
+        for k in CONSOLE_OPTIONAL_KEYS:
+            row[k] = r[k] if _count(r.get(k)) else None
+        rows.append(row)
     return rows
 
 
-def census_markdown(census: dict[str, dict[str, int]], rows: list[dict], label: str) -> str:
+STAR_KEYS = ("target", "source", "action", "principal_kind", "signals", "star_databases", "only_star",
+             "overflowed", "events", "statements", "rows_sum")
+STAR_FINDING_KEYS = ("target", "engine", "database", "objects", "star_object")
+
+
+def star_rows(data: object) -> tuple[list[dict], list[dict]]:
+    """The two lists of star_sql, names made safe to print; malformed rows dropped."""
+    if not isinstance(data, dict):
+        return [], []
+    events, findings = [], []
+    for r in data.get("events") or []:
+        if not (isinstance(r, dict) and all(k in r for k in STAR_KEYS)):
+            continue
+        names = {k: _console_name(r[k]) for k in STAR_KEYS[:6]}
+        if any(v is None for v in names.values()) or not all(isinstance(r[k], bool) for k in STAR_KEYS[6:8]) \
+                or not all(_count(r[k]) for k in STAR_KEYS[8:]):
+            continue
+        events.append({**names, **{k: r[k] for k in STAR_KEYS[6:]}})
+    for r in data.get("findings") or []:
+        if not (isinstance(r, dict) and all(k in r for k in STAR_FINDING_KEYS)):
+            continue
+        names = {k: _console_name(r[k]) for k in STAR_FINDING_KEYS[:3]}
+        if any(v is None for v in names.values()) or not _count(r["objects"]) \
+                or not isinstance(r["star_object"], bool):
+            continue
+        findings.append({**names, "objects": r["objects"], "star_object": r["star_object"]})
+    return events, findings
+
+
+def star_lines(events: list[dict], findings: list[dict], label: str) -> list[str]:
+    out = [f"STAR-EVENTS {label} target={e['target']} source={e['source']} action={e['action']} "
+           f"principal={e['principal_kind']} signals={e['signals']} star_databases={e['star_databases']} "
+           f"only_star={str(e['only_star']).lower()} overflowed={str(e['overflowed']).lower()} "
+           f"events={e['events']} statements={e['statements']} rows={e['rows_sum']}" for e in events]
+    out += [f"STAR-FINDINGS {label} target={f['target']} engine={f['engine']} database={f['database']} "
+            f"finding_objects={f['objects']} star_object={str(f['star_object']).lower()}" for f in findings]
+    return out
+
+
+def _opt(v: object) -> str:
+    return "-" if v is None else str(v)
+
+
+def census_markdown(census: dict[str, dict[str, int]], rows: list[dict], label: str,
+                    star: tuple[list[dict], list[dict]] | None = None) -> str:
     out = [f"## Event census ({label}): ADR-0053 decision 6", "",
            "Agent side, events spooled since the agent started (after aggregation and the "
            "`audit.configure` filter); statements: the raw statements they stand for.", ""]
@@ -1072,13 +1212,48 @@ def census_markdown(census: dict[str, dict[str, int]], rows: list[dict], label: 
     else:
         out.append("No census line in the agent log.")
     if rows:
-        out += ["", "Console side, per target and principal (an object `*`, overflowed or unknown):", "",
-                "| Target | Principal | Events | Statements | Events with `*` | (statements) | Max objects |",
-                "|---|---|---|---|---|---|---|"]
+        out += ["", "Console side, per target and principal (an object `*`, overflowed or unknown; "
+                "flagged: `objects_overflowed` stored):", "",
+                "| Target | Principal | Events | Statements | Events with `*` | (statements) | Flagged overflowed "
+                "| (statements) | Max objects |",
+                "|---|---|---|---|---|---|---|---|---|"]
         for r in rows:
             out.append(f"| {r['target']} | {r['db_user']} | {r['events']} | {r['statements']} | "
-                       f"{r['star_events']} | {r['star_statements']} | {r['max_objects']} |")
+                       f"{r['star_events']} | {r['star_statements']} | {_opt(r.get('overflowed_events'))} | "
+                       f"{_opt(r.get('overflowed_statements'))} | {r['max_objects']} |")
+    if star is not None:
+        events, findings = star
+        out += ["", "Console side, events naming `*`, by kind (no object name other than `*`, no principal "
+                "name):", ""]
+        if events:
+            out += ["| Target | Source | Action | Principal | Signals | `*` databases | Only `*` | Flagged "
+                    "| Events | Statements | Rows |",
+                    "|---|---|---|---|---|---|---|---|---|---|---|"]
+            for e in events:
+                out.append(f"| {e['target']} | {e['source']} | {e['action']} | {e['principal_kind']} | "
+                           f"{e['signals']} | {e['star_databases']} | {'yes' if e['only_star'] else 'no'} | "
+                           f"{'yes' if e['overflowed'] else 'no'} | {e['events']} | {e['statements']} | "
+                           f"{e['rows_sum']} |")
+        else:
+            out.append("No event names `*`.")
+        if findings:
+            out += ["", "Discovery findings per database (distinct objects; on Redis / Valkey the key patterns "
+                    "Audit maps keys to come from the same scan):", "",
+                    "| Target | Engine | Database | Finding objects | `*` among them |", "|---|---|---|---|---|"]
+            for f in findings:
+                out.append(f"| {f['target']} | {f['engine']} | {f['database']} | {f['objects']} | "
+                           f"{'yes' if f['star_object'] else 'no'} |")
     return "\n".join(out) + "\n"
+
+
+def _read_json(path: str | None) -> object:
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.loads(f.read() or "null")
+    except (OSError, ValueError):
+        return None
 
 
 def cmd_census(args: argparse.Namespace) -> int:
@@ -1088,27 +1263,227 @@ def cmd_census(args: argparse.Namespace) -> int:
     except OSError as e:
         print(f"loadlib: census: cannot read the agent log: {e.strerror}", file=sys.stderr)
         census = {}
-    rows: list[dict] = []
-    if args.console:
-        try:
-            with open(args.console, encoding="utf-8") as f:
-                rows = console_rows(json.loads(f.read() or "[]"))
-        except (OSError, ValueError):
-            rows = []
+    rows = console_rows(_read_json(args.console)) if args.console else []
+    star_path = getattr(args, "star", None)
+    star = star_rows(_read_json(star_path)) if star_path else None
     for line in census_lines(census, args.label):
         print(line)
     for r in rows:
         print(f"CENSUS-CONSOLE {args.label} target={r['target']} principal={r['db_user']} events={r['events']} "
               f"statements={r['statements']} star_events={r['star_events']} "
-              f"star_statements={r['star_statements']} max_objects={r['max_objects']}")
+              f"star_statements={r['star_statements']} overflowed_events={_opt(r.get('overflowed_events'))} "
+              f"overflowed_statements={_opt(r.get('overflowed_statements'))} max_objects={r['max_objects']}")
+    if star is not None:
+        for line in star_lines(*star, args.label):
+            print(line)
     if not census:
         print(f"CENSUS {args.label} none")
-    if args.summary:
+    out_dir = getattr(args, "out_dir", None)
+    if out_dir:
+        # The collected census (an artifact of the job): the same counts and names as printed.
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", args.label)[:64] or "run"
+        doc = {"label": args.label, "agent": census, "console": rows,
+               "star_events": star[0] if star else None, "star_findings": star[1] if star else None}
         try:
-            with open(args.summary, "a", encoding="utf-8") as f:
-                f.write(census_markdown(census, rows, args.label))
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f"census-{name}.json"), "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=1, sort_keys=True)
+                f.write("\n")
+            with open(os.path.join(out_dir, f"census-{name}.md"), "w", encoding="utf-8") as f:
+                f.write(census_markdown(census, rows, args.label, star))
         except OSError:
             pass
+    return 0
+
+
+def cmd_census_sql(args: argparse.Namespace) -> int:
+    try:
+        print(star_sql(args.agent_id) if args.star else census_sql(args.agent_id))
+    except ValueError as e:
+        print(f"loadlib: census-sql: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+# ------------------------------------------------------------------------- xe-catchup (#282 N3)
+# The agent's debug line of a read cut before an unpaired statistics build (connector-sqlserver,
+# audit/xe/mod.rs): logged for a deferral (the stream waits a poll interval) and for the cut of a
+# full read alike, once per read.
+XE_CUT_MESSAGE = "Extended Events: a statistics build not paired yet: the read ends before it"
+# The hold of a stream behind deferrals is bounded to 60 s in a row (MAX_DEFERRAL, audit/xe/events.rs).
+XE_MAX_HOLD_S = 60.0
+
+
+def _log_time(rec: dict) -> float | None:
+    ts = rec.get("timestamp")
+    if not isinstance(ts, str):
+        return None
+    m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$", ts)
+    if not m:
+        return None
+    frac = (m.group(2) or ".0")[:7]
+    tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(m.group(1) + frac + tz).timestamp()
+    except ValueError:
+        return None
+
+
+def xe_cut_times(lines: list[str], since: float | None = None) -> list[float]:
+    """The times of the agent's cut lines (XE_CUT_MESSAGE), at or after `since`, sorted."""
+    out = []
+    for line in lines:
+        if XE_CUT_MESSAGE not in line:
+            continue
+        i = line.find("{")
+        try:
+            rec = json.loads(line[i:]) if i >= 0 else None
+        except ValueError:
+            continue
+        f = rec.get("fields") if isinstance(rec, dict) else None
+        if not isinstance(f, dict) or f.get("message") != XE_CUT_MESSAGE:
+            continue
+        t = _log_time(rec)
+        if t is not None and (since is None or t >= since):
+            out.append(t)
+    return sorted(out)
+
+
+def xe_episodes(times: list[float], gap: float) -> list[tuple[float, float, int]]:
+    """Runs of cuts no more than `gap` seconds apart: (first, last, cuts)."""
+    eps: list[tuple[float, float, int]] = []
+    for t in times:
+        if eps and t - eps[-1][1] <= gap:
+            a, _, n = eps[-1]
+            eps[-1] = (a, t, n + 1)
+        else:
+            eps.append((t, t, 1))
+    return eps
+
+
+def xe_builds(text: str) -> dict[str, dict[str, int]]:
+    """The source counts sqlserver.sh read from the session's files (`<kind> <principal> <n>`
+    lines: kind `build`, a statistics build, or `select`, a workload SELECT), per kind and
+    principal (made safe to print)."""
+    out: dict[str, dict[str, int]] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[0] not in ("build", "select") or not parts[2].isdigit():
+            continue
+        p = _console_name(parts[1]) or "-"
+        out.setdefault(parts[0], {})[p] = out.get(parts[0], {}).get(p, 0) + int(parts[2])
+    return out
+
+
+XE_NOISE_KEYS = ("db_user", "events", "statements", "read_statements", "unknown_star_events",
+                 "unknown_star_statements", "star_only_events", "star_only_statements", "overflowed_events")
+
+
+def xe_noise_rows(data: object) -> list[dict]:
+    if not isinstance(data, list):
+        return []
+    rows = []
+    for r in data:
+        if not (isinstance(r, dict) and all(k in r for k in XE_NOISE_KEYS)):
+            continue
+        user = _console_name(r["db_user"])
+        if user is None or not all(_count(r[k]) for k in XE_NOISE_KEYS[1:]):
+            continue
+        rows.append({"db_user": user, **{k: r[k] for k in XE_NOISE_KEYS[1:]}})
+    return rows
+
+
+def xe_catchup(lines: list[str], builds: dict, noise: list[dict], issued: dict[str, int],
+               since: float | None, gap: float) -> dict:
+    times = xe_cut_times(lines, since)
+    eps = xe_episodes(times, gap)
+    spans = [b - a for a, b, _ in eps]
+    # A run of cuts lasting about the bound (5 s of slack for the poll and the read times): the
+    # stream was held for 60 s, after which nothing is deferred until it catches up (#282 N3).
+    at_cap = [s for s in spans if s >= XE_MAX_HOLD_S - 5.0]
+    rows = []
+    for r in noise:
+        n_issued = issued.get(r["db_user"])
+        # A build reported is a read of its table, its internal statements reads of `*`: the read
+        # statements beyond those the workload issued.
+        rows.append({**r, "issued": n_issued,
+                     "excess_statements": (r["read_statements"] - n_issued) if n_issued is not None else None})
+    return {"cuts": len(times), "episodes": len(eps), "longest_episode_s": round(max(spans), 1) if spans else 0.0,
+            "episodes_at_cap": len(at_cap), "gap_s": gap,
+            "source_builds": builds.get("build", {}), "source_selects": builds.get("select", {}),
+            "principals": rows}
+
+
+def xe_catchup_lines(r: dict, label: str) -> list[str]:
+    out = [f"XE-CATCHUP {label} cuts={r['cuts']} episodes={r['episodes']} longest_episode_s={r['longest_episode_s']} "
+           f"episodes_at_60s_cap={r['episodes_at_cap']} gap_s={r['gap_s']}"]
+    for p, n in sorted(r["source_builds"].items()):
+        out.append(f"XE-BUILDS {label} principal={p} statistics_builds_in_session_files={n}")
+    for p, n in sorted(r["source_selects"].items()):
+        out.append(f"XE-SELECTS {label} principal={p} workload_selects_in_session_files={n}")
+    for x in r["principals"]:
+        out.append(f"XE-NOISE {label} principal={x['db_user']} events={x['events']} statements={x['statements']} "
+                   f"read_statements={x['read_statements']} issued={_opt(x['issued'])} "
+                   f"excess_read_statements={_opt(x['excess_statements'])} "
+                   f"unknown_star_events={x['unknown_star_events']} unknown_star_statements={x['unknown_star_statements']} "
+                   f"star_only_events={x['star_only_events']} star_only_statements={x['star_only_statements']} "
+                   f"overflowed_events={x['overflowed_events']}")
+    return out
+
+
+def xe_catchup_markdown(r: dict, label: str) -> str:
+    out = [f"## Extended Events catch-up noise ({label}): #282 review N3", "",
+           f"- Agent cut lines (a read ended before an unpaired statistics build: deferrals and full-read cuts): "
+           f"**{r['cuts']}**, in {r['episodes']} runs (cuts at most {r['gap_s']} s apart); longest run "
+           f"{r['longest_episode_s']} s; runs reaching the 60 s hold: **{r['episodes_at_cap']}**.",
+           "- Statistics builds in the session's files since Audit started, per principal: "
+           + (", ".join(f"`{p}` {n}" for p, n in sorted(r["source_builds"].items())) or "none") + ".",
+           "- Workload SELECTs in the session's files: "
+           + (", ".join(f"`{p}` {n}" for p, n in sorted(r["source_selects"].items())) or "not read") + ".", ""]
+    if r["principals"]:
+        out += ["Console side, events of the workload principals (unknown `*`: a `*` the agent did not flag "
+                "overflowed; only `*`: an event whose only object is `*`, the shape of a reported build's "
+                "internal statement):", "",
+                "| Principal | Events | Statements | Read statements | Issued | Excess reads | Unknown `*` events "
+                "| (statements) | Only-`*` events | (statements) | Flagged overflowed |",
+                "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for x in r["principals"]:
+            out.append(f"| {x['db_user']} | {x['events']} | {x['statements']} | {x['read_statements']} | {_opt(x['issued'])} | "
+                       f"{_opt(x['excess_statements'])} | {x['unknown_star_events']} | {x['unknown_star_statements']} | "
+                       f"{x['star_only_events']} | {x['star_only_statements']} | {x['overflowed_events']} |")
+    return "\n".join(out) + "\n"
+
+
+def cmd_xe_catchup(args: argparse.Namespace) -> int:
+    """Never fails the run: a measurement."""
+    try:
+        with open(args.log, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    try:
+        with open(args.builds, encoding="utf-8", errors="replace") as f:
+            builds = xe_builds(f.read())
+    except (OSError, TypeError):
+        builds = {}
+    noise = xe_noise_rows(_read_json(args.console))
+    issued = {}
+    for item in args.issued or []:
+        user, _, n = item.partition("=")
+        if user and n.isdigit():
+            issued[user] = int(n)
+    r = xe_catchup(lines, builds, noise, issued, args.since, args.gap)
+    for line in xe_catchup_lines(r, args.label):
+        print(line)
+    md = xe_catchup_markdown(r, args.label)
+    for path, text, mode in ((args.md, md, "w"), (args.json, json.dumps(r, indent=1, sort_keys=True) + "\n", "w")):
+        if path:
+            try:
+                with open(path, mode, encoding="utf-8") as f:
+                    f.write(text)
+            except OSError:
+                pass
     return 0
 
 
@@ -1133,8 +1508,22 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("census")
     c.add_argument("--log", required=True)
     c.add_argument("--console")
+    c.add_argument("--star")
     c.add_argument("--label", default="run")
-    c.add_argument("--summary")
+    c.add_argument("--out-dir", dest="out_dir")
+    cs = sub.add_parser("census-sql")
+    cs.add_argument("--agent-id", dest="agent_id")
+    cs.add_argument("--star", action="store_true")
+    x = sub.add_parser("xe-catchup")
+    x.add_argument("--log", required=True)
+    x.add_argument("--builds")
+    x.add_argument("--console")
+    x.add_argument("--issued", action="append", help="PRINCIPAL=N, statements issued while Audit ran")
+    x.add_argument("--since", type=float, help="Unix time: cut lines before it are not counted")
+    x.add_argument("--gap", type=float, default=30.0)
+    x.add_argument("--label", default="run")
+    x.add_argument("--md")
+    x.add_argument("--json")
     r = sub.add_parser("report")
     r.add_argument("--facts", required=True)
     r.add_argument("--samples", nargs="+", required=True)
@@ -1142,7 +1531,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", required=True)
     a = p.parse_args(argv)
     return {"sample": cmd_sample, "pgbench": cmd_pgbench, "sysbench": cmd_sysbench, "quiet": cmd_quiet,
-            "report": cmd_report, "census": cmd_census}[a.cmd](a)
+            "report": cmd_report, "census": cmd_census, "census-sql": cmd_census_sql,
+            "xe-catchup": cmd_xe_catchup}[a.cmd](a)
 
 
 if __name__ == "__main__":

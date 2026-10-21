@@ -186,12 +186,32 @@ redact_dir() {
 
 compose() { timeout 120 docker compose -f "$COMPOSE_FILE" "$@"; }
 
-# print_census: ADR-0053 decision 6, the agent's event census (counts only) per engine and the
-# console's per-principal counts, in the log and the job summary. Never fails the run.
+# print_census: ADR-0053 decision 6, the agent's event census (counts only) per engine, the console's
+# per-target and per-principal counts (census-sql, overflow flag included) and its events naming `*`
+# by kind (census-sql --star), read here (console_sql, once defined), in the log and
+# $LOAD_RESULTS_DIR/census-load.json / .md (the results artifact; added to the job summary by
+# summary_append once redacted). Never fails the run.
 print_census() {
-  python3 "$LOADLIB" census --log "$LOAD_LOG_DIR/agent.log" --label load \
-    ${CENSUS_CONSOLE:+--console "$CENSUS_CONSOLE"} ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} \
+  local line con="$W/out/census-console.json" star="$W/out/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$LOADLIB" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$LOADLIB" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$LOADLIB" census --log "$LOAD_LOG_DIR/agent.log" --label load --console "$con" --star "$star" \
+    --out-dir "$LOAD_RESULTS_DIR" \
     2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
 }
 
 BG_PIDS=()
@@ -241,6 +261,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR"
   redact_dir "$LOAD_RESULTS_DIR"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose -f "$COMPOSE_FILE" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"
@@ -578,7 +600,7 @@ python3 "$LOADLIB" sample --out "$SAMPLES_AGENT" --interval 1 "agent=${CID[agent
 BG_PIDS+=("$!")
 
 console_sql() {
-  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T db \
+  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" db \
     psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
 }
 agent_json() {
@@ -991,20 +1013,8 @@ if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
       '{kind: "pgaudit_volume", target: "pg-load", log_catalog: $lc, soak_s: $soak} + $v'
   fi
 fi
-# ADR-0053 decision 6: per target and principal, the events stored, the statements they stand for,
-# those naming an object `*` (overflowed or unknown: the console does not know which), the largest
-# object list. Every principal of the agent's events, as the console stores it (account names of
-# the load, client and agent accounts, fingerprints, `-`: no load-account filter), counts, no
-# object name. Read by print_census (cleanup), which makes the names safe to print.
-CENSUS_CONSOLE="$W/out/census-console.json"
-console_sql "SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
-    SELECT target_id AS target, coalesce(db_user, '-') AS db_user, count(*) AS events,
-      sum(aggregated_count) AS statements,
-      count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb) AS star_events,
-      coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb), 0) AS star_statements,
-      max(jsonb_array_length(objects)) AS max_objects
-    FROM access_events WHERE agent_id = '${AGENT_ID}' GROUP BY 1, 2) AS x" >"$CENSUS_CONSOLE" 2>/dev/null \
-  || rm -f -- "$CENSUS_CONSOLE"
+# ADR-0053 decision 6: the console's per-principal counts and `*` events are read by print_census
+# (cleanup), with the agent's census.
 lost="$(timeout 30 docker compose -f "$COMPOSE_FILE" logs --no-color agent 2>/dev/null \
   | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|events dropped|rejected batch items|unreadable spool file' || true)"
 fact --argjson n "$lost" '{kind: "agent_log", lost: $n}'
