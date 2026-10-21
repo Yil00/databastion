@@ -422,10 +422,14 @@ pub(crate) async fn audit_stream(
         .map_err(MyError::into_connector_error)?;
         match pre.source {
             Source::File(format) => {
+                let mut held = ps.take().and_then(|p| p.session);
+                if let Some(session) = probe_session.as_mut().or(held.as_mut()) {
+                    refresh_name_case(state, target, session).await;
+                }
                 if let Some(s) = probe_session.take() {
                     s.close().await;
                 }
-                if let Some(old) = ps.take().and_then(|p| p.session) {
+                if let Some(old) = held {
                     old.close().await;
                 }
                 if file.as_ref().is_some_and(|st| st.format != format) {
@@ -529,6 +533,25 @@ pub(crate) async fn audit_stream(
     }
 }
 
+/// The audit-log file sources hold no session of the agent's, so no
+/// stream sees a server restart as the `performance_schema` poller does
+/// (ADR-0055 decision 2, the #303 residual follow-up): at the stream start
+/// and at each re-probe ([`REPROBE`]), the probe's session reads the name
+/// case with the server run, the same constant own text `check()` sends
+/// (`sql::name_case_settings`, ADR-0045), and keeps it as a check would. A
+/// failed read leaves the kept value to the next check.
+async fn refresh_name_case(state: &CheckState, target: &TargetConfig, session: &mut Session) {
+    match check::read_name_case(session).await {
+        Ok(read) => state.set_name_case_read(&target.id, read.run, read.report, read.read_at),
+        Err(e) => tracing::warn!(
+            target_id = %target.id,
+            stage = e.stage.as_str(),
+            code = %e.code,
+            "name case not read on the audit probe session; kept until the next check"
+        ),
+    }
+}
+
 fn file_source(format: MysqlLogFormat) -> EventSource {
     match format {
         MysqlLogFormat::ServerAudit => EventSource::MariadbServerAudit,
@@ -597,6 +620,7 @@ async fn file_run(
         let (t, polled) = tokio::task::spawn_blocking(move || {
             let polled = t.poll().map(|p| {
                 let mut unparsed = 0u64;
+                let mut starts = Vec::new();
                 let mut records = Vec::with_capacity(p.records.len());
                 for (r, pos) in p.records.iter().zip(p.positions.iter()) {
                     // Per-record isolation: a record that makes the parser
@@ -613,10 +637,21 @@ async fn file_run(
                             rec.pos = Some(*pos);
                             records.push(rec);
                         }
+                        // A server start the JSON log records (the #303
+                        // residual follow-up): not an access record, not
+                        // dropped either.
+                        None if format == MysqlLogFormat::Json => {
+                            match databastion_core::isolate(|| records::json_server_start(r))
+                                .flatten()
+                            {
+                                Some(at) => starts.push(at),
+                                None => unparsed += 1,
+                            }
+                        }
                         None => unparsed += 1,
                     }
                 }
-                (records, p.more, unparsed)
+                (records, p.more, unparsed, starts)
             });
             (t, polled)
         })
@@ -627,13 +662,25 @@ async fn file_run(
             let _ = databastion_core::resume_panic(e);
             internal()
         })?;
-        let (records, more, unparsed) = match polled {
+        let (records, more, unparsed, starts) = match polled {
             Ok(p) => p,
             Err(TailError::Unreadable(kind)) => {
                 st.tailer = Some(t);
                 return Ok(Err(kind));
             }
         };
+        // ADR-0055 decision 2 on the audit-log sources (the #303 residual
+        // follow-up): a value read before a server start the log records
+        // is no longer kept.
+        if !starts.is_empty() {
+            let name_case = state.name_case_runs(&target.id);
+            for at in starts {
+                name_case.server_started(
+                    at.and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs()),
+                );
+            }
+        }
         let mut t = t;
         if let Some(from) = t.take_replay() {
             st.replay = Some(ReplayFilter::new(from, t.rotations));
@@ -907,6 +954,100 @@ mod tests {
         // Its late statement record, without the table records: counted
         // from the text only (no memory across streams).
         assert_eq!(reads(&mut rx), ["z"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0055 decision 2 on the JSON audit log (the #303 residual
+    /// follow-up): a server start the log records after the kept name
+    /// case was read resets it to `unknown`; one recorded before it (a
+    /// re-read log) keeps it; neither counts as a dropped record.
+    #[tokio::test]
+    async fn a_server_start_in_the_json_log_resets_the_name_case() {
+        use databastion_core::audit::own::SharedOwnUsage;
+        use databastion_core::name_case::{NameCase, NameCaseReport};
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-my-start-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit_filter.log");
+        std::fs::write(&log, "").unwrap();
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        let yaml = format!(
+            "console: {{url: \"https://c.example\"}}\nstate_dir: /s\ntargets:\n  - id: my-t\n    \
+             engine: mysql\n    host: \"127.0.0.1\"\n    account: databastion\n    \
+             secret: {{env: DATABASTION_TEST_UNUSED}}\n    mysql: {{tls: disable, audit_log: \
+             {{path: \"{}\", format: json}}}}\n",
+            log.display()
+        );
+        let config = databastion_core::AgentConfig::parse(&yaml).unwrap();
+        let target = config.targets[0].clone();
+        let limits = databastion_core::config::Limits {
+            min_audit_poll_interval_s: 1,
+            ..databastion_core::config::Limits::default()
+        };
+        let cfg = AuditConfig::local(&target, 1, &limits).with_state_dir(dir.clone());
+        let state = CheckState::default();
+        let pre = Prerequisites {
+            source: Source::File(MysqlLogFormat::Json),
+            own_addr: None,
+            flavor: crate::conn::Flavor::Mysql,
+            version: (8, 4, 4),
+            utc_offset: 0,
+            query_limit: DEFAULT_QUERY_LIMIT,
+        };
+        let mut st = FileStream::new(
+            MysqlLogFormat::Json,
+            Tailer::new(
+                log.clone(),
+                Framing::JsonObjects,
+                cfg.cursor(cursor_name(MysqlLogFormat::Json)),
+            ),
+            EventBuilder::new(OwnAccount::new(
+                "databastion",
+                Some(PROGRAM_NAME),
+                None,
+                1000,
+                SharedOwnUsage::default(),
+            )),
+        );
+        let (sink, _rx) = EventSink::channel(64);
+        // The cursor starts at the end of the (empty) log.
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = own_threads::ServerRun::new(&[Some("db".to_owned()), Some("3306".to_owned())], 1);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        // 2026-10-21 08:00:05 UTC.
+        let start = "{\"timestamp\": \"2026-10-21 08:00:05\", \"id\": 0, \"class\": \"audit\", \
+                     \"event\": \"startup\", \"connection_id\": 0, \"startup_data\": {\"server_id\": 1}}\n";
+        // Read after that start: kept.
+        state.set_name_case_read("my-t", run.clone(), sensitive.clone(), Some(1_792_569_606));
+        append(start);
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.name_case("my-t"), Some(sensitive.clone()));
+        // Read before it: unknown until the next check.
+        state.set_name_case_read("my-t", run, sensitive, Some(1_792_569_600));
+        append(start);
+        file_run(&cfg, &target, &sink, &state, &mut st, &pre)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.name_case("my-t"), Some(NameCaseReport::unknown()));
+        assert_eq!(state.dropped("my-t"), 0, "a start is not a dropped record");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
