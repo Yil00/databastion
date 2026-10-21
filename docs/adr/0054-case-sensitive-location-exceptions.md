@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (2026-10-20). **Accepted** by the maintainer on 2026-10-20 with the proposed answer to every open question (see [Open questions](#open-questions-answered)). History: proposed on 2026-10-18, revised the same day after its security review ("sound after changes": M1, M2, L1 to L3)
 - **Date**: 2026-10-18
-- **Refined by**: [ADR-0055](0055-agent-reported-name-case-semantics.md) (Proposed), option D: case semantics reported by the agent for MySQL / MariaDB and SQL Server
+- **Refined by**: [ADR-0055](0055-agent-reported-name-case-semantics.md) (Accepted 2026-10-21), option D: case semantics reported by the agent for MySQL / MariaDB and SQL Server
 - **Refines**: [ADR-0014](0014-policy-and-incident-model.md) (which stays Accepted), decision 1 ("globs … are case-insensitive"), for location exceptions only, and [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decision 5 (exceptions on access events)
 - **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Console, after N1"; ADR-0014 implementation note of 2026-10-17; [ADR-0009](0009-name-normalization-and-item-sanitization.md) (name normalization); [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine); [09-agent-protocol.md, location mapping per engine](../09-agent-protocol.md#location-mapping-per-engine); `console/src/lib/policy-common.ts` (`foldName`, `exceptionGlobOptions`), `console/src/lib/policy-model.ts` (`exceptionCovers`), `console/src/lib/event-model.ts` (`exceptionCoversEvent`), `agent/crates/classifiers/src/names.rs` (read at `72e87d5`, `dev`)
 
