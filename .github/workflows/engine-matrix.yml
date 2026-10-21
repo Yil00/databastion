@@ -370,11 +370,17 @@ jobs:
             if [ "$IT_ENGINE" = sqlserver ]; then
               # With --nocapture the first line of a test can follow its `test … ...` prefix.
               grep -oE '(M2 \| |\[it\] m2: ).*' "$RUNNER_TEMP/it.log" >"$d/m2.txt" 2>/dev/null || true
+              # ADR-0055 name case facts (catalog_collation_type, ComparisonStyle, case-only duplicates).
+              grep -oE '\[it\] name_case: .*' "$RUNNER_TEMP/it.log" >"$d/name_case.txt" 2>/dev/null || true
               grep -oE '(\[it\] xe fresh|panicked at|^test .* (ok|FAILED|ignored)$|test result: ).*' \
                 "$d/fresh.log" >"$d/fresh-summary.txt" 2>/dev/null || true
               echo "M2 drift table: $(grep -c '^M2 | ' "$d/m2.txt" || true) row(s) (m2.txt); fresh-server test: ${FRESH_OUTCOME:-not run}"
               echo '```'
               cat "$d/fresh-summary.txt" 2>/dev/null || true
+              echo '```'
+              echo "name case: $(grep -c 'name_case: ' "$d/name_case.txt" || true) line(s) (name_case.txt)"
+              echo '```'
+              cat "$d/name_case.txt" 2>/dev/null || true
               echo '```'
             else
               timeout 300 dev/capture-poll-digests.sh >"$d/poll_digests.tsv" || echo "capture incomplete (see poll_digests.tsv)"
