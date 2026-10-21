@@ -513,7 +513,7 @@ export const acceptsFlappingAlertBudget = RateLimiter.shared("audit.requeue_flap
  * receive them. Nothing is queued when that changes nothing. The stored warning is kept unless this
  * requeue removes objects, which records its own (`shrunk` or `emptied`). Whether the job was queued.
  */
-async function requeueKeyPatterns(db: Database, agentId: string, targetId: string): Promise<boolean> {
+async function requeueKeyPatterns(db: Database, agentId: string, targetId: string, deferred: boolean): Promise<boolean> {
   return db.transaction(async (tx) => {
     const [agent] = await tx
       .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
@@ -583,12 +583,54 @@ async function requeueKeyPatterns(db: Database, agentId: string, targetId: strin
         removed_objects: change.removed,
         key_patterns: keys.length,
         warning: narrows ? (change.warning ?? "shrunk") : null,
+        // #280 re-review L-a: queued from a heartbeat after a change the budget had deferred.
+        deferred,
       },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
     return true;
   });
 }
+
+/**
+ * Marks the agent's Audit settings requeue as due (#280 re-review L-a): the heartbeat that changed
+ * its capability tokens was stored (delivery reads `agents.accepts`, so it must follow the latest
+ * heartbeat, ADR-0022 decision 3), but its settings were not queued again, because the requeue
+ * budget was spent or the requeue failed. Fail closed: the change is never dropped; a later
+ * heartbeat queues the settings from the agent's latest tokens once the budget allows. Only for an
+ * agent with enabled Audit settings on a present Redis / Valkey target (nothing to requeue
+ * otherwise). Compare-and-set: the audit entry `audit.requeue_deferred` is written when the mark
+ * is set, not at every heartbeat while it stays set, so at most once more per hour than the
+ * budget's requeues. Whether the mark was set by this call.
+ */
+async function deferAuditRequeue(db: Database, agentId: string, reason: "budget_spent" | "requeue_failed"): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const configs = await tx
+      .select({ engine: agentTargets.engine })
+      .from(auditConfigs)
+      .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
+    if (!configs.some((c) => isKeyPatternEngine(c.engine))) return false;
+    const marked = await tx
+      .update(agents)
+      .set({ auditRequeueDueAt: sql`date_trunc('milliseconds', now())` })
+      .where(and(eq(agents.id, agentId), isNull(agents.auditRequeueDueAt), isNull(agents.revokedAt), isNull(agents.lockedAt)))
+      .returning({ id: agents.id });
+    if (marked.length === 0) return false;
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "audit.requeue_deferred",
+      outcome: "failure",
+      targetType: "agent",
+      targetId: agentId,
+      details: { agent_id: agentId, reason },
+    });
+    return true;
+  });
+}
+
+/** What made the heartbeat handler call {@link requeueAuditSettingsOnAcceptsChange}. */
+export type AuditRequeueCause = "accepts_changed" | "due";
 
 /**
  * Security review of #280, M2: when a heartbeat changes the agent's stored capability list
@@ -598,27 +640,53 @@ async function requeueKeyPatterns(db: Database, agentId: string, targetId: strin
  * an upgraded agent nor silently lost by a downgraded one. Audited as `audit.configure` by the
  * system, with `reason: "agent_accepts_changed"`. At most `auditRequeueBudget` per agent and
  * hour (re-review N1). Returns the number of jobs queued.
+ *
+ * #280 re-review L-a: past the budget, the change is not acted on but it is not dropped either:
+ * the agent is marked (`agents.audit_requeue_due_at`, audited as `audit.requeue_deferred`) and
+ * every later heartbeat calls this again (`cause: "due"`, refused locally at no store cost while the
+ * window lasts) until the budget allows a requeue, which starts from the agent's latest tokens and
+ * clears the mark. A requeue that throws marks the agent the same way. A due call past the budget
+ * raises no `accepts_flapping` event: only a change does.
  */
-export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId: string): Promise<number> {
+export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId: string, cause: AuditRequeueCause = "accepts_changed"): Promise<number> {
   // Re-review N1: an agent that flips its tokens at every heartbeat must not write jobs, settings
   // and audit entries without bound. Past the budget, one integrity event an hour, no requeue.
   if (!(await auditRequeueBudget.reserveShared(agentId)).ok) {
-    if ((await acceptsFlappingAlertBudget.reserveShared(agentId)).ok) {
-      await recordIntegrityEvent(db, { agentId, kind: "accepts_flapping", endpoint: "heartbeat", status: 200, ip: null });
+    if (cause === "accepts_changed") {
+      await deferAuditRequeue(db, agentId, "budget_spent");
+      if ((await acceptsFlappingAlertBudget.reserveShared(agentId)).ok) {
+        await recordIntegrityEvent(db, { agentId, kind: "accepts_flapping", endpoint: "heartbeat", status: 200, ip: null });
+      }
     }
     return 0;
   }
-  const rows = await db
-    .select({ targetId: auditConfigs.targetId, engine: agentTargets.engine })
-    .from(auditConfigs)
-    .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
-    .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
-  let queued = 0;
-  for (const { targetId, engine } of rows) {
-    if (!isKeyPatternEngine(engine)) continue;
-    if (await requeueKeyPatterns(db, agentId, targetId)) queued++;
+  try {
+    // Read before the requeue: a mark set meanwhile (by a concurrent heartbeat) is a later value
+    // and stays, so its change is acted on too.
+    const [mark] = await db.select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, agentId)).limit(1);
+    const rows = await db
+      .select({ targetId: auditConfigs.targetId, engine: agentTargets.engine })
+      .from(auditConfigs)
+      .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
+    let queued = 0;
+    for (const { targetId, engine } of rows) {
+      if (!isKeyPatternEngine(engine)) continue;
+      if (await requeueKeyPatterns(db, agentId, targetId, cause === "due")) queued++;
+    }
+    if (mark?.dueAt) {
+      await db
+        .update(agents)
+        .set({ auditRequeueDueAt: null })
+        .where(and(eq(agents.id, agentId), eq(agents.auditRequeueDueAt, mark.dueAt)));
+    }
+    return queued;
+  } catch (e) {
+    // Fail closed: the settings are queued again from a later heartbeat (best effort here: the
+    // database may be what failed, and the caller logs the original error).
+    await deferAuditRequeue(db, agentId, "requeue_failed").catch(() => false);
+    throw e;
   }
-  return queued;
 }
 
 function auditDetails(

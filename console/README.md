@@ -656,7 +656,8 @@ lasts: one row per agent and hour while the set of mismatched targets stays the 
 once when it differs from the last recorded one (at most 12 such rows per agent and hour, PR #274
 review L1); the heartbeats in between are counted in the next row's `suppressed_before`, and its
 details carry `target_ids` (the sorted, comma-separated ids of every mismatched target, up to the
-contract's 64, while `details_count` stays capped at 20, #274 review L5). It never
+contract's 64, #274 review L5); its `details_count` counts every mismatched target too (#277;
+rows written before count at most 20), while the stored error details stay capped at 20. It never
 uses the 20 rows of the other kinds.
 
 ## Metrics
@@ -1125,7 +1126,12 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   (within what the 1000 cap leaves), nothing is queued when that changes nothing, and the stored
   warning is replaced only when the requeue removes objects. At most 4 such changes per agent and
   hour (`audit.requeue_per_agent`); past it, one `agent.accepts_flapping` integrity event an hour
-  (`audit.requeue_flapping_alerts`) and no requeue. Manual objects are typed
+  (`audit.requeue_flapping_alerts`) and no requeue then, but the change is not dropped (#280
+  re-review L-a): the agent is marked (`agents.audit_requeue_due_at`, audited once as a system
+  `audit.requeue_deferred`, `reason: "budget_spent"`, only for an agent with enabled Redis /
+  Valkey settings), and the first heartbeat after the window queues the settings from the agent's
+  latest tokens (`deferred: true` in the `audit.configure` entry) and clears the mark. A requeue
+  that fails marks the agent the same way (`reason: "requeue_failed"`). Manual objects are typed
   `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
   typed by hand for a target of any other engine is refused (`400 invalid_params`).
 

@@ -15,6 +15,7 @@ import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
 import {
   assessAuditChange,
+  auditRequeueBudget,
   auditSummaries,
   getAuditConfig,
   MAX_SENSITIVE_OBJECTS,
@@ -454,6 +455,60 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(await auditJobs(auth.agentId)).toHaveLength(1 + 4);
     const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, auth.agentId));
     expect(events.filter((e) => e.kind === "agent.accepts_flapping")).toHaveLength(1);
+  });
+
+  it("#280 re-review L-a: a change past the requeue budget is deferred, audited once, and acted on from a later heartbeat", async () => {
+    const auth = await redisAgentWithFindings();
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    const withToken = { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] };
+    const hb = async (body: unknown) => expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    const sentObjects = async () => ((await auditJobs(auth.agentId))[0]?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    const mark = async () => (await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, auth.agentId)))[0]?.dueAt;
+    const deferrals = async () =>
+      (await getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, auth.agentId))));
+    // Four changes spend the budget (each one requeued), ending without the token.
+    for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+    expect(await auditJobs(auth.agentId)).toHaveLength(1 + 4);
+    expect(await mark()).toBeNull();
+    // The fifth change (an upgrade) is stored but not requeued: the agent is marked, audited once.
+    await hb(withToken);
+    expect((await getDb().select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, auth.agentId)))[0]?.accepts).toEqual(["sensitive_object.key_pattern"]);
+    expect(await auditJobs(auth.agentId)).toHaveLength(5);
+    expect(await sentObjects()).toEqual(["profiles"]);
+    expect(await mark()).toBeInstanceOf(Date);
+    const [deferred] = await deferrals();
+    expect(deferred).toMatchObject({ actorType: "system", outcome: "failure", targetType: "agent" });
+    expect(deferred?.details).toEqual({ agent_id: auth.agentId, reason: "budget_spent" });
+    // Later heartbeats in the same window: nothing queued, no second audit entry or integrity event.
+    await hb(withToken);
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(5);
+    expect(await deferrals()).toHaveLength(1);
+    const flapping = async () => (await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, auth.agentId))).filter((e) => e.kind === "agent.accepts_flapping");
+    expect(await flapping()).toHaveLength(1);
+    // The window is over: the next heartbeat, with no change, queues the settings from the latest
+    // tokens and clears the mark.
+    auditRequeueBudget.clear();
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(6);
+    expect(await sentObjects()).toEqual(["profiles", "user:*:profile"]);
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", added_objects: 1, deferred: true });
+    expect(await mark()).toBeNull();
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(6);
+    expect(await flapping()).toHaveLength(1);
+  });
+
+  it("#280 re-review L-a: an agent without Redis / Valkey Audit settings is not marked past the budget", async () => {
+    const auth = await enroll();
+    for (let i = 0; i < 6; i++) {
+      const body = i % 2 === 0 ? { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } : REDIS_HB;
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    }
+    const [row] = await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, auth.agentId));
+    expect(row?.dueAt).toBeNull();
+    expect((await getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, auth.agentId))))).toHaveLength(0);
   });
 
   it("#280 review M2 and L4: a job carrying key patterns is delivered without them to an agent that never listed the token, recorded on the job", async () => {

@@ -24,7 +24,10 @@ import { notifyIntegrityEvent } from "./system-alerts";
  * comma-separated ids of the mismatched targets (agent-declared identifiers, validated against
  * the contract `TargetId` slug pattern, which has no comma; every mismatched target, up to the
  * contract's 64 targets per heartbeat, while the error details stay capped at
- * `MAX_VALIDATION_DETAILS`, #274 review L5).
+ * `MAX_VALIDATION_DETAILS`, #274 review L5). `details_count` is the number of details found: for
+ * `target_mismatch`, every mismatched target (#277; rows written before count at most 20, and their
+ * `target_ids` give the true count); the other kinds' validators stop at `MAX_VALIDATION_DETAILS`,
+ * so theirs is at most 20.
  * Never another submitted value, a sample or a fingerprint.
  *
  * A misbehaving agent can send such batches in a loop: writes are bounded per agent
@@ -115,6 +118,12 @@ export interface IntegrityEvent {
   endpoint: "findings" | "events" | "heartbeat";
   status: number;
   details?: readonly ValidationDetail[];
+  /**
+   * The number of error details found, when `details` holds only the first
+   * `MAX_VALIDATION_DETAILS` of them (`target_mismatch`: every mismatched target, #277). Defaults to
+   * `details.length`.
+   */
+  detailsCount?: number;
   /** `target_mismatch`: the ids of the mismatched targets (contract `TargetId`). */
   targetIds?: readonly string[];
   ip: string | null;
@@ -142,7 +151,8 @@ export async function recordIntegrityEvent(db: Database, event: IntegrityEvent):
   const details = {
     endpoint: event.endpoint,
     status: event.status,
-    details_count: event.details?.length ?? 0,
+    // #277: the true count when the caller knows it, the stored details staying capped.
+    details_count: Math.max(event.detailsCount ?? 0, event.details?.length ?? 0),
     pointer: first?.pointer ?? null,
     keyword: first?.keyword ?? null,
     suppressed_before: suppressedSince.get(counterKey) ?? 0,
