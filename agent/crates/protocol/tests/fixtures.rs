@@ -51,6 +51,16 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
     ),
     ("HeartbeatRequest.duplicate-connectors.json", "uniqueItems"),
     ("HeartbeatRequest.duplicate-note-labels.json", "uniqueItems"),
+    // ADR-0055: the engine rule and the `except` bound of
+    // `TargetStatus.name_case`; the agent does not send the field yet.
+    (
+        "HeartbeatRequest.name-case-on-postgres.json",
+        "enum (via if/then, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.name-case-too-many-except.json",
+        "maxItems",
+    ),
     (
         "HeartbeatRequest.note-negative-count.json",
         "minimum on an integer newtype (Count)",

@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use databastion_protocol::{
     AuditSource, CapabilityList, Connector, ConnectorList, DetectedTargetProcess, Engine,
-    HeartbeatRequest, TargetId,
+    HeartbeatRequest, TargetId, TargetStatus,
 };
 
 /// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
@@ -413,6 +413,38 @@ impl ConsoleCapabilities {
     pub(crate) fn console_accepts(&self, token: &str) -> bool {
         self.read().tokens.contains(token)
     }
+}
+
+/// Whether a target status carries a gated field (ADR-0022):
+/// `notes` (`target_status.notes`; the note-label revisions are values
+/// inside it) and `name_case` (`target_status.name_case`, ADR-0055). A new
+/// gated `TargetStatus` field must be added here and in
+/// [`strip_gated_target_status`].
+pub(crate) fn target_status_carries_gated(t: &TargetStatus) -> bool {
+    !t.notes.is_empty() || t.name_case.is_some()
+}
+
+/// Removes every gated field of a target status (see
+/// [`target_status_carries_gated`]).
+pub(crate) fn strip_gated_target_status(t: &mut TargetStatus) {
+    t.notes.clear();
+    t.name_case = None;
+}
+
+/// Strips the gated fields of every target status of a heartbeat, for its
+/// resend after a `400` reporting an unknown field (ADR-0022 decision 9).
+/// Returns whether anything was stripped: `false` means the heartbeat
+/// carried no gated field, so the refusal is not about one and the
+/// heartbeat is not resent.
+pub(crate) fn strip_gated_heartbeat(heartbeat: &mut HeartbeatRequest) -> bool {
+    let mut stripped = false;
+    for t in &mut heartbeat.targets {
+        if target_status_carries_gated(t) {
+            strip_gated_target_status(t);
+            stripped = true;
+        }
+    }
+    stripped
 }
 
 /// Removes from a heartbeat every value of an engine the console has not
@@ -848,6 +880,39 @@ mod tests {
             serde_json::to_value(&sent).unwrap(),
             serde_json::json!(["postgres", "mysql", "mongodb", "openldap"])
         );
+    }
+
+    /// ADR-0055: `name_case` is a gated `TargetStatus` field, like
+    /// `notes`: a heartbeat carrying either is stripped of both for its
+    /// resend; one carrying neither is not resent.
+    #[test]
+    fn gated_target_status_fields_are_stripped_for_a_resend() {
+        for fixture in [
+            include_str!(
+                "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.name-case-sqlserver.json"
+            ),
+            include_str!(
+                "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.name-case-mysql-mariadb.json"
+            ),
+        ] {
+            let mut hb: HeartbeatRequest = serde_json::from_str(fixture).unwrap();
+            assert!(hb.targets.iter().all(target_status_carries_gated));
+            assert!(strip_gated_heartbeat(&mut hb));
+            assert!(!hb.targets.iter().any(target_status_carries_gated));
+            let text = serde_json::to_string(&hb).unwrap();
+            assert!(!text.contains("name_case") && !text.contains("notes"));
+            // The rest of each status is kept.
+            assert_eq!(hb.targets.len(), 3);
+            assert!(!strip_gated_heartbeat(&mut hb), "nothing left to strip");
+        }
+
+        let mut notes_only: HeartbeatRequest = serde_json::from_str(include_str!(
+            "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.target-notes.json"
+        ))
+        .unwrap();
+        assert!(notes_only.targets.iter().any(target_status_carries_gated));
+        assert!(strip_gated_heartbeat(&mut notes_only));
+        assert!(notes_only.targets.iter().all(|t| t.notes.is_empty()));
     }
 
     #[test]

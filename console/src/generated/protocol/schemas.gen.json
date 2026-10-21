@@ -599,8 +599,87 @@
             "$ref": "#/$defs/TargetNote"
           }
         },
+        "name_case": {
+          "description": "How the target compares names that differ only by case, from the last `check()`\n(ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this\nschema). Sent only when the latest `HeartbeatResponse.accepts` lists\n`target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055\nsends it in every `TargetStatus` of those engines, also when `check()` fails or\ntimes out (then the last value read on the same server run, else `unknown` for both\nparts). Absent, the console keeps comparing these engines' names without case.\n",
+          "$ref": "#/$defs/TargetNameCase"
+        },
         "metrics": {
           "$ref": "#/$defs/MetricsMap"
+        }
+      },
+      "if": {
+        "required": [
+          "name_case"
+        ],
+        "properties": {
+          "name_case": {
+            "$ref": "#/$defs/TargetNameCase"
+          }
+        }
+      },
+      "then": {
+        "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).\n",
+        "properties": {
+          "engine": {
+            "enum": [
+              "mysql",
+              "mariadb",
+              "sqlserver"
+            ]
+          }
+        }
+      }
+    },
+    "NameCase": {
+      "description": "How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;\n`insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it\nas `sensitive`, the stricter rule). A closed value: never a collation name, a setting value\nor free text.\n",
+      "type": "string",
+      "enum": [
+        "sensitive",
+        "insensitive",
+        "unknown"
+      ]
+    },
+    "TargetNameCase": {
+      "description": "Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the\nserver's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL\nServer). Three closed values and normalized database names only (invariant I2).\n",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "databases",
+        "objects"
+      ],
+      "properties": {
+        "databases": {
+          "description": "How database names compare.",
+          "$ref": "#/$defs/NameCase"
+        },
+        "objects": {
+          "description": "How schema, object and column names compare in every database not listed in `except`.\n",
+          "$ref": "#/$defs/NameCase"
+        },
+        "except": {
+          "description": "Databases whose schema, object and column names compare otherwise than `objects`\n(SQL Server catalog collations; MySQL / MariaDB send none, their setting is\nserver-wide). Database names are `Identifier`s, normalized and sanitized like every\nlocation (ADR-0009): two databases whose names reach the console as one name (`*`,\nstripped characters) are one entry with the stricter value (`sensitive`, then\n`unknown`, then `insensitive`). It may name databases the agent never sends in a\nfinding or an event (outside the scan's scope, snapshots, databases its login cannot\nenter; ADR-0055 decision 9).\n\nAt most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8\nJSON: an agent-side bound, which the console does not check (its request size limit\napplies). A conforming agent that would pass either bound, or that cannot list every\ndatabase, sends `objects: unknown` without `except`.\n",
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/TargetNameCaseException"
+          }
+        }
+      }
+    },
+    "TargetNameCaseException": {
+      "description": "One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "database",
+        "objects"
+      ],
+      "properties": {
+        "database": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "objects": {
+          "$ref": "#/$defs/NameCase"
         }
       }
     },
@@ -940,7 +1019,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }

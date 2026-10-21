@@ -28,6 +28,13 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * replica (0.8.0 or earlier) rejects it with `400`; the agent then strips it and resends
  * (ADR-0022 decision 9): no event is lost, but the events resent that way lose the flag.
  *
+ * Exception, on purpose: `target_status.name_case` (ADR-0055) is accepted by the generated schema
+ * since the contract change (decision 1: `mysql`, `mariadb` and `sqlserver` targets only, checked by
+ * the schema), but it is not listed here and the field is not stored or used: it is listed only by
+ * the console change of ADR-0055 decisions 5 to 7 (the per-part exception rule, the compare-and-set
+ * storage and the debounced inventory), so that an agent sends it only to a console that applies it.
+ * A conforming agent does not send it before.
+ *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
  * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):

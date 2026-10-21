@@ -109,6 +109,10 @@ info:
     - response and job fields (console -> agent): the agent lists them in
       `HeartbeatRequest.accepts`; the console sends such a field only when the agent's latest
       heartbeat named it.
+    A `400` reporting an unknown field (keyword `additionalProperties`) on a request that carried
+    such a field makes the agent forget the console's list and send the request once more with
+    those fields removed (ADR-0022 decision 9): a heartbeat, a job status update, or the items
+    pointed at in a result batch are resent, never dropped for the field alone.
     Tokens are `Capability` values; unknown tokens are ignored. New enum values in a request
     (e.g. `TargetNoteLabel`) are negotiated the same way, with a revision token. A value form
     that a console -> agent field accepts only after protocol 0.1.0 is negotiated like a new
@@ -1598,8 +1602,82 @@ components:
           maxItems: 16
           items:
             $ref: "#/components/schemas/TargetNote"
+        name_case:
+          description: |
+            How the target compares names that differ only by case, from the last `check()`
+            (ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this
+            schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+            `target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055
+            sends it in every `TargetStatus` of those engines, also when `check()` fails or
+            times out (then the last value read on the same server run, else `unknown` for both
+            parts). Absent, the console keeps comparing these engines' names without case.
+          $ref: "#/components/schemas/TargetNameCase"
         metrics:
           $ref: "#/components/schemas/MetricsMap"
+      if:
+        required: [name_case]
+        properties:
+          name_case:
+            $ref: "#/components/schemas/TargetNameCase"
+      then:
+        description: |
+          `name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).
+        properties:
+          engine:
+            enum: [mysql, mariadb, sqlserver]
+    NameCase:
+      description: |
+        How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
+        `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
+        as `sensitive`, the stricter rule). A closed value: never a collation name, a setting value
+        or free text.
+      type: string
+      enum: [sensitive, insensitive, unknown]
+    TargetNameCase:
+      description: |
+        Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the
+        server's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL
+        Server). Three closed values and normalized database names only (invariant I2).
+      type: object
+      additionalProperties: false
+      required: [databases, objects]
+      properties:
+        databases:
+          description: How database names compare.
+          $ref: "#/components/schemas/NameCase"
+        objects:
+          description: |
+            How schema, object and column names compare in every database not listed in `except`.
+          $ref: "#/components/schemas/NameCase"
+        except:
+          description: |
+            Databases whose schema, object and column names compare otherwise than `objects`
+            (SQL Server catalog collations; MySQL / MariaDB send none, their setting is
+            server-wide). Database names are `Identifier`s, normalized and sanitized like every
+            location (ADR-0009): two databases whose names reach the console as one name (`*`,
+            stripped characters) are one entry with the stricter value (`sensitive`, then
+            `unknown`, then `insensitive`). It may name databases the agent never sends in a
+            finding or an event (outside the scan's scope, snapshots, databases its login cannot
+            enter; ADR-0055 decision 9).
+
+            At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
+            JSON: an agent-side bound, which the console does not check (its request size limit
+            applies). A conforming agent that would pass either bound, or that cannot list every
+            database, sends `objects: unknown` without `except`.
+          type: array
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/TargetNameCaseException"
+    TargetNameCaseException:
+      description: One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`.
+      type: object
+      additionalProperties: false
+      required: [database, objects]
+      properties:
+        database:
+          $ref: "#/components/schemas/Identifier"
+        objects:
+          $ref: "#/components/schemas/NameCase"
     TargetNote:
       description: |
         One explanation of a target's status: a registered `code`, an optional `count` and
@@ -1972,8 +2050,8 @@ components:
         accepts:
           description: |
             Optional **request** fields and features this console accepts (ADR-0022), e.g.
-            `target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,
-            `job_progress.coverage`, and the engines
+            `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
+            `access_event.objects_overflowed`, `job_progress.coverage`, and the engines
             added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
             the list of the latest heartbeat response and sends an optional request field
             introduced after protocol 0.1.0 only when that list names it; before its first

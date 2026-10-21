@@ -730,7 +730,57 @@ export interface components {
              *     Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
              */
             notes?: components["schemas"]["TargetNote"][];
+            /**
+             * @description How the target compares names that differ only by case, from the last `check()`
+             *     (ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this
+             *     schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+             *     `target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055
+             *     sends it in every `TargetStatus` of those engines, also when `check()` fails or
+             *     times out (then the last value read on the same server run, else `unknown` for both
+             *     parts). Absent, the console keeps comparing these engines' names without case.
+             */
+            name_case?: components["schemas"]["TargetNameCase"];
             metrics?: components["schemas"]["MetricsMap"];
+        };
+        /**
+         * @description How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
+         *     `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
+         *     as `sensitive`, the stricter rule). A closed value: never a collation name, a setting value
+         *     or free text.
+         * @enum {string}
+         */
+        NameCase: "sensitive" | "insensitive" | "unknown";
+        /**
+         * @description Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the
+         *     server's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL
+         *     Server). Three closed values and normalized database names only (invariant I2).
+         */
+        TargetNameCase: {
+            /** @description How database names compare. */
+            databases: components["schemas"]["NameCase"];
+            /** @description How schema, object and column names compare in every database not listed in `except`. */
+            objects: components["schemas"]["NameCase"];
+            /**
+             * @description Databases whose schema, object and column names compare otherwise than `objects`
+             *     (SQL Server catalog collations; MySQL / MariaDB send none, their setting is
+             *     server-wide). Database names are `Identifier`s, normalized and sanitized like every
+             *     location (ADR-0009): two databases whose names reach the console as one name (`*`,
+             *     stripped characters) are one entry with the stricter value (`sensitive`, then
+             *     `unknown`, then `insensitive`). It may name databases the agent never sends in a
+             *     finding or an event (outside the scan's scope, snapshots, databases its login cannot
+             *     enter; ADR-0055 decision 9).
+             *
+             *     At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
+             *     JSON: an agent-side bound, which the console does not check (its request size limit
+             *     applies). A conforming agent that would pass either bound, or that cannot list every
+             *     database, sends `objects: unknown` without `except`.
+             */
+            except?: components["schemas"]["TargetNameCaseException"][];
+        };
+        /** @description One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`. */
+        TargetNameCaseException: {
+            database: components["schemas"]["Identifier"];
+            objects: components["schemas"]["NameCase"];
         };
         /**
          * @description One explanation of a target's status: a registered `code`, an optional `count` and
@@ -845,8 +895,8 @@ export interface components {
             server_time: components["schemas"]["Timestamp"];
             /**
              * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
-             *     `target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,
-             *     `job_progress.coverage`, and the engines
+             *     `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
+             *     `access_event.objects_overflowed`, `job_progress.coverage`, and the engines
              *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
