@@ -190,7 +190,8 @@ static PASSWORD_HASH: LazyLock<Regex> = LazyLock::new(|| {
             r"|unsalted_(?:md5|sha1)\$\$?[0-9a-f]{32,40}",
             // PostgreSQL SCRAM and md5, MySQL native and caching_sha2
             r"|SCRAM-SHA-(?:1|256)\$[0-9]+:[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*",
-            r"|md5[0-9a-f]{32}",
+            // Any case: a name or text kept as written (`MD5…`) still matches.
+            r"|(?i:md5[0-9a-f]{32})",
             r"|\*[0-9A-F]{40}",
             r"|\$A\$[0-9]{3}\$[!-~]{20}[./A-Za-z0-9]{43}",
             // LDAP / RFC 2307 schemes, Atlassian PKCS5S2
@@ -2408,6 +2409,7 @@ mod tests {
             "{SSHA}DnKiYrOFTEkn+VpML/5/mBX+VpPyx0J0rjW88Q==",
             "{PKCS5S2}QnVpbGRlclNhbHQxMjM0NTY3ODkwYWJjZGVmZ2hpamtsbW5vcA==",
             "md5c2b1a09f8e7d6c5b4a39281706f5e4d3",
+            "MD5C2B1A09F8E7D6C5B4A39281706F5E4D3",
             "*6BB4837EB74329105EE4568DDA7DC67ED2CA2AD9",
             "SCRAM-SHA-256$4096:c2FsdHNhbHQ=$c3RvcmVka2V5c3RvcmVka2V5:c2VydmVya2V5c2VydmVy",
         ] {

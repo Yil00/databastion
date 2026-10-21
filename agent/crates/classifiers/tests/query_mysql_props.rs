@@ -525,3 +525,67 @@ proptest! {
         }
     }
 }
+
+/// A table or schema name: a non-reserved keyword MySQL / MariaDB accept as
+/// a plain name (review of ADR-0055 decision 3), or a mixed-case name.
+fn keyword_like_name() -> impl Strategy<Value = String> {
+    prop_oneof![
+        prop::sample::select(vec![
+            "Status", "User", "Data", "Users", "Value", "Text", "Date", "Name", "Event", "Comment",
+            "Account", "Password", "Role", "Names", "Level", "Session",
+        ])
+        .prop_map(str::to_owned),
+        spelled_name(),
+    ]
+}
+
+/// Statements naming two relations `{}` (keywords lowercase here).
+const TWO_RELATIONS: &[&str] = &[
+    "select * from {} join {} on 1 = 1",
+    "select * from {}, {}",
+    "select * from {} left join {} using (a)",
+    "select * from {} where a in (select b from {})",
+    "select * from {} union all select * from {}",
+    "insert into {} select * from {}",
+    "update {}, {} set a = 1",
+    "select (select count(*) from {}) from {}",
+];
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// ADR-0055 decision 3 with keyword-like names and several relations:
+    /// every relation keeps its spelling, whatever the case of the
+    /// keywords, and none is lost or added.
+    #[test]
+    fn keyword_like_names_and_several_relations_keep_their_spelling(
+        template in prop::sample::select(TWO_RELATIONS.to_vec()),
+        first in (prop::option::of(keyword_like_name()), keyword_like_name()),
+        second in (prop::option::of(keyword_like_name()), keyword_like_name()),
+        quote in prop::collection::vec(any::<bool>(), 4),
+        mask in prop::collection::vec(any::<bool>(), 1..16),
+    ) {
+        let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+        let rel = |(s, t): &(Option<String>, String), qs: bool, qt: bool| match s {
+            Some(s) => format!("{}.{}", q(s, qs), q(t, qt)),
+            None => q(t, qt),
+        };
+        let keywords = recase(template, &mask);
+        let text = keywords
+            .replacen("{}", &rel(&first, quote[0], quote[1]), 1)
+            .replacen("{}", &rel(&second, quote[2], quote[3]), 1);
+        let a = analyze(&text, AnalyzeOptions::mysql());
+        prop_assert!(a.lexed(), "{}", text);
+        let mut named: Vec<(Option<String>, String)> = a
+            .relations()
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone()))
+            .collect();
+        named.sort();
+        named.dedup();
+        let mut want = vec![first.clone(), second.clone()];
+        want.sort();
+        want.dedup();
+        prop_assert_eq!(&named, &want, "{}", text);
+    }
+}

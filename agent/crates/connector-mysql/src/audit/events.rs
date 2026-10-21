@@ -37,7 +37,16 @@
 //! `lower_case_table_names = 0`, the Linux default, `Customers` and
 //! `customers` are two tables), but `information_schema` and
 //! `performance_schema`, which the servers compare without case, named in
-//! lower case. `information_schema`,
+//! lower case. Residual (security review of ADR-0055 decision 3, L1): the
+//! core's pre-aggregation groups key on the objects as written, so reads
+//! of one table spelled in two cases are two groups, and under
+//! `lower_case_table_names = 1` or `2` (where they are one table) each
+//! group is compared with `min_rows` on its own and may be dropped where
+//! the sum would pass, as backquoted names in another case already were
+//! before; groups keyed on folded names for `mysql` / `mariadb` are
+//! planned with ADR-0055 decision 4 (the agent reading
+//! `lower_case_table_names`).
+//! `information_schema`,
 //! `performance_schema` (in any case), `sys`, `DUAL` and the internal
 //! statistics tables (`mysql.*_stats`; `sys` and `mysql` as stored, since
 //! `SYS` or `MySQL` may be another database) are skipped from the objects
@@ -8259,6 +8268,195 @@ mod tests {
             b"SELECT \xff",
         ] {
             assert!(text_shape(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// Each ASCII letter of `text` uppercased where `mask` says so.
+    fn recased(text: &str, mask: &[bool]) -> String {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if mask.get(i % mask.len().max(1)).copied().unwrap_or(false) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// An event as compared across spellings: action, objects folded to
+    /// ASCII lowercase (sorted, deduplicated), signals, always-reported
+    /// mark.
+    fn folded_view(e: &MaskedEvent) -> String {
+        let mut o: Vec<String> = e
+            .objects()
+            .iter()
+            .map(|o| {
+                format!("{}.{}", o.database().as_str(), o.object().as_str()).to_ascii_lowercase()
+            })
+            .collect();
+        // Two spellings of one name are two objects: one folded name.
+        o.sort_unstable();
+        o.dedup();
+        format!(
+            "{} {o:?} {:?} {}",
+            e.action().as_str(),
+            e.signals(),
+            e.always_report()
+        )
+    }
+
+    /// Statements naming one relation `{}` (review of ADR-0055 decision 3).
+    const ONE_RELATION: &[&str] = &[
+        "SELECT * FROM {}",
+        "SELECT a FROM {} WHERE b = 1 LIMIT 5",
+        "SELECT COUNT(*) FROM {}",
+        "SELECT * FROM {} JOIN hr.orders USING (id)",
+        "SELECT * FROM {} INTO OUTFILE '/tmp/x'",
+        "SELECT * FROM {} INTO @x",
+        "UPDATE {} SET a = 1",
+        "INSERT INTO {} VALUES (1)",
+        "DELETE FROM {}",
+        "SHOW CREATE TABLE {}",
+        "EXPLAIN SELECT * FROM {}",
+        "DROP TABLE {}",
+        "GRANT SELECT ON {} TO u",
+        "CREATE TABLE hr.copy AS SELECT * FROM {}",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Review of ADR-0055 decision 3 (a): for an account that is not
+        /// the agent's, writing a name in another case never removes an
+        /// event, nor changes its action, signals, always-reported mark or
+        /// objects (folded), on any of the three sources.
+        #[test]
+        fn recasing_identifiers_keeps_every_event(
+            template in proptest::sample::select(ONE_RELATION.to_vec()),
+            schema in proptest::sample::select(vec!["hr", "crm", "app_db"]),
+            table in proptest::sample::select(vec!["customers", "orders", "user", "status", "data"]),
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 2),
+            mask in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..12),
+        ) {
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let lower = template.replacen("{}", &format!("{}.{}", q(schema, quote[0]), q(table, quote[1])), 1);
+            let written = template.replacen(
+                "{}",
+                &format!("{}.{}", q(&recased(schema, &mask), quote[0]), q(&recased(table, &mask[1..].iter().chain(&mask[..1]).copied().collect::<Vec<_>>()), quote[1])),
+                1,
+            );
+            let base = on_every_source("app", &lower);
+            let other = on_every_source("app", &written);
+            for ((source, a), (_, b)) in base.iter().zip(&other) {
+                proptest::prop_assert_eq!(
+                    a.as_ref().map(folded_view),
+                    b.as_ref().map(folded_view),
+                    "{:?}: {} / {}", source, lower, written
+                );
+            }
+        }
+
+        /// Review of ADR-0055 decision 3 (b): a read of a system schema is
+        /// left out only when written exactly `sys` or `mysql`, or as
+        /// `information_schema` / `performance_schema` in any case; a
+        /// statement-text or statistics table is reported in any case.
+        #[test]
+        fn recasing_system_schemas_leaves_out_only_server_equal_names(
+            relation in proptest::sample::select(vec![
+                ("sys", "statement_analysis", false),
+                ("sys", "processlist", true),
+                ("mysql", "table_stats", false),
+                ("mysql", "column_stats", true),
+                ("information_schema", "columns", false),
+                ("information_schema", "processlist", true),
+                ("performance_schema", "setup_instruments", false),
+                ("performance_schema", "events_statements_history", true),
+            ]),
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 2),
+            mask in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..12),
+        ) {
+            let (schema, table, listed) = relation;
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let s = recased(schema, &mask);
+            let t = recased(table, &mask[1..].iter().chain(&mask[..1]).copied().collect::<Vec<_>>());
+            let text = format!("SELECT * FROM {}.{}", q(&s, quote[0]), q(&t, quote[1]));
+            let may_skip = s == "sys"
+                || s == "mysql"
+                || s.eq_ignore_ascii_case("information_schema")
+                || s.eq_ignore_ascii_case("performance_schema");
+            for (source, ev) in on_every_source("app", &text) {
+                if ev.is_none() {
+                    proptest::prop_assert!(may_skip && !listed, "{:?}: {}", source, text);
+                }
+                if !may_skip || listed {
+                    proptest::prop_assert!(ev.is_some(), "{:?}: {}", source, text);
+                }
+                if listed {
+                    proptest::prop_assert!(
+                        ev.as_ref().is_some_and(MaskedEvent::always_report),
+                        "{:?}: {}", source, text
+                    );
+                }
+            }
+        }
+
+        /// Review of ADR-0055 decision 3 (c): a `server_audit` statistics
+        /// load (`READ,mysql,table_stats` and `READ,mysql,column_stats`
+        /// next to the read tables' records, as stored in lower case) is
+        /// dropped only when every relation of the text, as written,
+        /// equals a record exactly; otherwise `mysql.column_stats` is
+        /// named and the event always reported.
+        #[test]
+        fn statistics_loads_drop_only_on_exact_records(
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 4),
+            masks in proptest::collection::vec(proptest::collection::vec(proptest::prelude::any::<bool>(), 1..10), 4),
+        ) {
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let names: Vec<String> = ["hr", "customers", "hr", "orders"]
+                .iter()
+                .zip(&masks)
+                .map(|(n, m)| recased(n, m))
+                .collect();
+            let text = format!(
+                "SELECT * FROM {}.{} c JOIN {}.{} o ON 1 = 1",
+                q(&names[0], quote[0]),
+                q(&names[1], quote[1]),
+                q(&names[2], quote[2]),
+                q(&names[3], quote[3]),
+            );
+            let rec = |db: &str, t: &str| {
+                format!("20260929 09:40:35,h,app,10.0.0.5,30,12,READ,{db},{t},")
+            };
+            let mut lines = vec![
+                rec("hr", "customers"),
+                rec("hr", "orders"),
+                rec("mysql", "table_stats"),
+                rec("mysql", "column_stats"),
+            ];
+            lines.push(sa_line("app", "10.0.0.5", 12, &text));
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 4096),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            let exact = names.iter().zip(["hr", "customers", "hr", "orders"]).all(|(n, l)| n == l);
+            let named: Vec<String> = ev
+                .iter()
+                .flat_map(|e| e.objects().iter())
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect();
+            let kept = named.iter().any(|n| n == "mysql.column_stats");
+            proptest::prop_assert_eq!(kept, !exact, "{}: {:?}", text, named);
+            if kept {
+                proptest::prop_assert!(ev.iter().any(MaskedEvent::always_report), "{}", text);
+            }
         }
     }
 }
