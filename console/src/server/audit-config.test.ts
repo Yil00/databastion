@@ -1,5 +1,5 @@
 import { and, desc, eq } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
 import { agents, auditConfigs, auditLog, jobs, securityEvents, users } from "@/db/schema";
@@ -16,7 +16,9 @@ import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 import {
   assessAuditChange,
   auditRequeueBudget,
+  auditRequeueTestHooks,
   auditSummaries,
+  deferAuditRequeue,
   getAuditConfig,
   MAX_SENSITIVE_OBJECTS,
   mergeSensitiveObjects,
@@ -498,6 +500,88 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     await hb(withToken);
     expect(await auditJobs(auth.agentId)).toHaveLength(6);
     expect(await flapping()).toHaveLength(1);
+  });
+
+  describe("#280 re-review L-a, security review of 34db5b8", () => {
+    const withToken = { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] };
+    const hbOf = (auth: Auth) => async (body: unknown) =>
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    const markOf = async (agentId: string) => (await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, agentId)))[0]?.dueAt ?? null;
+    const deferralsOf = async (agentId: string) =>
+      getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, agentId)));
+    const sentOf = async (agentId: string) =>
+      ((await auditJobs(agentId))[0]?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    afterEach(() => {
+      auditRequeueTestHooks.beforeTarget = null;
+    });
+
+    it("L3: a requeue that fails marks the agent once; a later heartbeat queues the settings and clears the mark", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      auditRequeueTestHooks.beforeTarget = async () => {
+        throw new Error("injected");
+      };
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(1);
+      expect(await markOf(auth.agentId)).toBeInstanceOf(Date);
+      const [entry] = await deferralsOf(auth.agentId);
+      expect(entry?.details).toEqual({ agent_id: auth.agentId, reason: "requeue_failed" });
+      // Still failing: the mark stays, no second entry.
+      await hb(withToken);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      auditRequeueTestHooks.beforeTarget = null;
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(2);
+      expect(await sentOf(auth.agentId)).toEqual(["profiles", "user:*:profile"]);
+      expect(await markOf(auth.agentId)).toBeNull();
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+    });
+
+    it("L3: a deferred change reverted before the window ends queues nothing and clears the mark", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+      expect(await auditJobs(auth.agentId)).toHaveLength(5);
+      await hb(withToken);
+      const first = await markOf(auth.agentId);
+      expect(first).toBeInstanceOf(Date);
+      // Reverted: the mark moves forward, still one audit entry.
+      await hb(REDIS_HB);
+      const moved = await markOf(auth.agentId);
+      expect(moved?.getTime()).toBeGreaterThan(first?.getTime() ?? Infinity);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      auditRequeueBudget.clear();
+      await hb(REDIS_HB);
+      expect(await auditJobs(auth.agentId)).toHaveLength(5);
+      expect(await sentOf(auth.agentId)).toEqual(["profiles"]);
+      expect(await markOf(auth.agentId)).toBeNull();
+    });
+
+    it("L1: a mark moved during a requeue (another replica deferring a change) stays set", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+      await hb(withToken);
+      const before = await markOf(auth.agentId);
+      expect(before).toBeInstanceOf(Date);
+      auditRequeueBudget.clear();
+      auditRequeueTestHooks.beforeTarget = async (agentId) => {
+        expect(await deferAuditRequeue(getDb(), agentId, "budget_spent")).toBe(false);
+      };
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(6);
+      const after = await markOf(auth.agentId);
+      expect(after?.getTime()).toBeGreaterThan(before?.getTime() ?? Infinity);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      // The next heartbeat acts on it (nothing left to change) and clears it.
+      auditRequeueTestHooks.beforeTarget = null;
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(6);
+      expect(await markOf(auth.agentId)).toBeNull();
+    });
   });
 
   it("#280 re-review L-a: an agent without Redis / Valkey Audit settings is not marked past the budget", async () => {

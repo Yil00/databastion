@@ -1130,7 +1130,8 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   re-review L-a): the agent is marked (`agents.audit_requeue_due_at`, audited once as a system
   `audit.requeue_deferred`, `reason: "budget_spent"`, only for an agent with enabled Redis /
   Valkey settings), and the first heartbeat after the window queues the settings from the agent's
-  latest tokens (`deferred: true` in the `audit.configure` entry) and clears the mark. A requeue
+  latest tokens (`deferred: true` in the `audit.configure` entry) and clears the mark, unless it
+  moved meanwhile (the mark only moves forward, under the agent's row lock). A requeue
   that fails marks the agent the same way (`reason: "requeue_failed"`). Manual objects are typed
   `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
   typed by hand for a target of any other engine is refused (`400 invalid_params`).
