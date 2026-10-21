@@ -107,3 +107,30 @@ Not measured on SQL Server: the Developer edition (not used, maintainer decision
 | CAS Redis ticket registry key prefix | – | **Not measured**: the CAS dev image does not include the Redis ticket registry module, and the CAS sources are not reachable from this environment | – | Open question 9 stays open; the dev keyspace has ticket-id-shaped keys (`sso:TGT-…`) for the shape guard only |
 
 Not measured on Redis / Valkey: `redis-cli --rdb` and `sync_full`; `SCAN` with a start cursor other than 0; Valkey 9 databases in cluster mode; Valkey 8.0 `CLIENT LIST` network counters; distribution socket paths; end-of-support dates.
+
+## Name case semantics (ADR-0055, 2026-10-21)
+
+Facts that [ADR-0055](../adr/0055-agent-reported-name-case-semantics.md) decision 4 and its test obligations (decision 10) asked to record, measured on 2026-10-21 for the ADR-0055 agent lot (#303), on the dev services and servers of the same images, with the agent's integration tests (`check_reports_the_name_case_of_the_server` in `connector-mysql`, `name_case_follows_the_collations` in `connector-sqlserver`). Their use in the agent: [ADR-0055 implementation note](../adr/0055-agent-reported-name-case-semantics.md#implementation-note-2026-10-21).
+
+### SQL Server
+
+| Fact | Method | Result | Version | ADR impact |
+|---|---|---|---|---|
+| `sys.databases.catalog_collation_type` | The column read for every database, a contained database created with `CONTAINMENT = PARTIAL` | The column exists; values **0** (every non-contained database) and **1** (the contained database, `catalog_collation_type_desc` `Latin1_General_100_CI_AS_KS_WS_SC`); a second table whose name differs by case only is refused in the contained database (error 2714) | 2022 Express (16.0.4305.5) | Only 0 and 2 are mapped (accepted text); 1 is `unknown`, so a contained database is reported `unknown`. A refinement "1 on a contained database is `insensitive`" waits for the 2019 / 2025 measurement and a maintainer decision |
+| `AUTO_CLOSE` default | `is_auto_close_on` of a database created without options | **1** on every new database | 2022 Express | Every new Express database closes when unused: the decision 4 memory is needed on Express |
+| A closed `AUTO_CLOSE` database | `sys.databases.collation_name` and `DATABASEPROPERTYEX(name, 'Collation')` once the database closed | `state` 0 (online), both **`NULL`** | 2022 Express | `DATABASEPROPERTYEX` cannot replace the memory; a database never seen open is `unknown` |
+| Opening by a read | A three-part-name read (`SELECT … FROM db.schema.table`) of a closed database, then `collation_name` | The read opens it (collation readable again); it closes again **under 1 s** after the read | 2022 Express | The agent sees the collation only when a check happens to run while the database is open, hence the memory per (`database_id`, `create_date`) |
+| `COLLATIONPROPERTY(…, 'ComparisonStyle')` | Server and database collations | `_BIN2`: **0**; `_CS_AS`: **196608**; the default `_CI_AS`: **196609** (ignore-case bit 1 set) | 2022 Express | Confirms the decision 4 test on bit 1: binary and `_CS_` collations compare with case |
+
+Not measured yet: `catalog_collation_type` on 2019 and 2025, and contained databases there (ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups)).
+
+### MySQL / MariaDB
+
+| Fact | Method | Result | Version | ADR impact |
+|---|---|---|---|---|
+| `lower_case_table_names` on the dev services | `SELECT @@GLOBAL.lower_case_table_names` | **0** | MySQL 8.4.11, MariaDB 11.4.13 | The dev and CI targets report `sensitive` |
+| MariaDB started with 2 on a case-sensitive file system | Server started with `--lower-case-table-names=2` on a case-sensitive file system (the Linux default) | Reads **0**: the server forces it | MariaDB 11.4.13 | Confirms the agent reads the effective `@@GLOBAL` value, never the configuration |
+| MariaDB started with 1 | Server started with `--lower-case-table-names=1` | Reads **1** | MariaDB 11.4.13 | `insensitive` |
+| MySQL initialized with 1 | Data directory initialized with `--lower-case-table-names=1` | Reads **1** | MySQL 8.4.11 | `insensitive`; the setting is fixed at initialization |
+
+Not measured: a MariaDB forced to 0 on a case-insensitive file system (open question 2, reported `sensitive`), and engine-matrix entries initialized with 1 (ROADMAP follow-ups).
