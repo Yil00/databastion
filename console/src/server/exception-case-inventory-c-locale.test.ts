@@ -60,4 +60,59 @@ describe.skipIf(!hasDb)("case inventory on a console database with the C charact
     );
     expect(r.entries).toHaveLength(2);
   });
+
+  it("compares a name_case target's names in JavaScript too (ADR-0055): per part, as on a UTF-8 database", async () => {
+    const db = getDb();
+    const { agentId } = await enroll();
+    await db.insert(agentTargets).values([
+      { agentId, targetId: "mssql-c", engine: "sqlserver", reachable: true, auditLevel: "partial", nameCase: { databases: "insensitive", objects: "insensitive", except: [{ database: "ΒΆΣΗ", objects: "sensitive" }] } },
+      { agentId, targetId: "my-c", engine: "mysql", reachable: true, auditLevel: "partial", nameCase: { databases: "sensitive", objects: "sensitive" } },
+    ]);
+    const row = (targetId: string, engine: string, databaseName: string, schemaName: string | null, objectName: string, fieldName: string) => ({
+      id: randomUUID(),
+      agentId,
+      targetId,
+      locationKey: randomBytes(32).toString("hex"),
+      engine,
+      databaseName,
+      schemaName,
+      objectName,
+      fieldName,
+      classifier: "pii.email",
+      classifiersVersion: "2026.09.1",
+      confidence: 0.9,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    await db.insert(findings).values([
+      // The database `βάση` is listed (folded lookup, final sigma): object names with case.
+      row("mssql-c", "sqlserver", "βάση", "dbo", "ΠΕΛΑΤΕΣ", "email"),
+      // Another database: without case.
+      row("mssql-c", "sqlserver", "crm", "dbo", "ÉCOLE", "email"),
+      // MySQL: object names with case, column names never.
+      row("my-c", "mysql", "crm", null, "ÉCOLE", "ÉMAIL"),
+    ]);
+    const [greek, french, column] = await db
+      .insert(policyExceptions)
+      .values([
+        { agentId, location: { object: "πελατεσ" }, reason: "greek" },
+        { agentId, location: { object: "école" }, reason: "french" },
+        { agentId, targetId: "my-c", location: { field: "émail" }, reason: "column" },
+      ])
+      .returning({ id: policyExceptions.id });
+    const run = (scope?: { agentId: string; targetId: string }) => db.transaction((tx) => computeCaseInventory(tx, { scope }));
+    const all = await run();
+    expect(all.entries.filter((e) => [greek?.id, french?.id, column?.id].includes(e.exceptionId))).toEqual(
+      expect.arrayContaining([
+        { exceptionId: greek?.id, findings: 1, events: 0 },
+        { exceptionId: french?.id, findings: 1, events: 0 },
+      ]),
+    );
+    expect(all.entries.some((e) => e.exceptionId === column?.id)).toBe(false);
+    // One target's run: only that target's names (the earlier test's global exceptions filtered out).
+    const ours = (r: Awaited<ReturnType<typeof run>>) => r.entries.filter((e) => [greek?.id, french?.id, column?.id].includes(e.exceptionId));
+    expect(ours(await run({ agentId, targetId: "mssql-c" }))).toEqual([{ exceptionId: greek?.id, findings: 1, events: 0 }]);
+    expect(ours(await run({ agentId, targetId: "my-c" }))).toEqual([{ exceptionId: french?.id, findings: 1, events: 0 }]);
+  });
 });

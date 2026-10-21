@@ -48,6 +48,7 @@ export type AuditAction =
   | "policy_exception.delete"
   | "policy_exception.case_inventory"
   | "policy_exception.case_inventory_request"
+  | "policy_exception.name_case_inventory"
   | "incident.create"
   | "incident.transition"
   | "notification_channel.create"

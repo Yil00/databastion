@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gt, inArray, or, sql, type SQL } from "drizzle-orm"
 import type { Database } from "@/db/client";
 import { agents, agentTargets, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
+import { canonicalNameCase, type NameCaseRule } from "@/lib/name-case";
 import {
   ACTIVE_STATUSES,
   canTransition,
@@ -131,6 +132,15 @@ const FACT_COLUMNS = {
    * value of that revision was read before it. Null for a job that is gone (then `last_seen_at`).
    * A scalar subquery, so the `FOR UPDATE` of the callers only locks the findings rows.
    */
+  /**
+   * ADR-0055: the target's stored `name_case`, canonical (null: not reported, today's rule). A
+   * scalar subquery too, so `FOR UPDATE` locks no `agent_targets` row (heartbeats never wait).
+   */
+  // Qualified by hand: drizzle renders the columns of a single-table select unqualified, which
+  // would resolve both sides of the join condition to `agent_targets`.
+  nameCase: sql<NameCaseRule | null>`(select nc.name_case from agent_targets nc where nc.agent_id = "findings"."agent_id" and nc.target_id = "findings"."target_id")`.mapWith(
+    (v: unknown) => canonicalNameCase(v),
+  ),
   scanClaimedAt: sql<Date | null>`(select coalesce(${jobs.firstDeliveredAt}, ${jobs.deliveredAt}) from ${jobs} where ${jobs.id} = ${findings.lastJobId})`.mapWith(
     jobs.deliveredAt,
   ),

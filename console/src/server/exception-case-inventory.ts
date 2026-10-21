@@ -5,7 +5,8 @@ import { auditLog, policyExceptions } from "@/db/schema";
 import { objectMatches, type EventObject } from "@/lib/event-model";
 import { auditSourceEngine, auditSourceTable } from "@/lib/location-labels";
 import { errorSummary, type Logger } from "@/lib/logger";
-import { CASE_BLIND_EXCEPTION_ENGINES, exceptionGlobOptions, exceptionMatchesCase, UUID } from "@/lib/policy-common";
+import { anyWithCase, canonicalNameCase, exceptionPartOptions, withoutCase, type NameCaseRule } from "@/lib/name-case";
+import { CASE_BLIND_EXCEPTION_ENGINES, exceptionMatchesCase, UUID, type PartGlobOptions } from "@/lib/policy-common";
 import { classifierSelected, locationMatches, type FindingFacts, type LocationPattern } from "@/lib/policy-model";
 
 import { writeAudit } from "./audit";
@@ -37,9 +38,13 @@ type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
  *   with other objects may still raise nothing.
  * - The engine of an event is the one its source tells (`auditSourceEngine`, checked at ingest),
  *   else its target's (security review L1).
+ * - Targets whose agent reports `name_case` (ADR-0055 decision 7) are compared too, with the rule
+ *   they report (`exceptionPartOptions`): an exception counts when it covers a name of such a target
+ *   without case but not under that rule. Their stored `name_case` is read at the run.
  * - Ran by the worker only: at its first start after the upgrade (no successful inventory in the
- *   audit log yet), and on demand through the `policy_exceptions.case_inventory` queue, which an
- *   administrator fills from the policies page (security review M1). The result is recorded in one
+ *   audit log yet), on demand through the `policy_exceptions.case_inventory` queue, which an
+ *   administrator fills from the policies page (security review M1), and for one target when its
+ *   `name_case` changed (src/server/name-case-inventory.ts, debounced, audited apart). The result is recorded in one
  *   audit entry (`policy_exception.case_inventory`) and the log with exception ids and counts only,
  *   never a glob or a name; a failed run in a failure entry with an error code only (L3). The
  *   policies page reads the latest entries.
@@ -78,6 +83,8 @@ export interface FindingNameGroup {
   fieldName: string;
   classifier: string;
   n: number;
+  /** The target's stored `name_case` (ADR-0055), canonical; null or absent: not reported. */
+  nameCase?: NameCaseRule | null;
 }
 
 export interface EventNameGroup {
@@ -88,6 +95,8 @@ export interface EventNameGroup {
   database: string;
   schema: string | null;
   object: string;
+  /** The target's stored `name_case` (ADR-0055), canonical; null or absent: not reported. */
+  nameCase?: NameCaseRule | null;
 }
 
 export interface InventoryEntry {
@@ -108,15 +117,31 @@ export interface InventoryResult {
 
 const active = (x: InventoryException, now: Date) => x.location !== null && (x.expiresAt === null || x.expiresAt.getTime() > now.getTime());
 
-/** Whether the location exception covers the finding name without case but not with case. */
+/** Options of a name group, computed once per group (each is compared with every exception). */
+const optionsCache = new WeakMap<object, { strict: PartGlobOptions; loose: PartGlobOptions }>();
+function groupOptions(g: { engine: string | null; nameCase?: NameCaseRule | null }, database: string): { strict: PartGlobOptions; loose: PartGlobOptions } {
+  let o = optionsCache.get(g);
+  if (o === undefined) {
+    const strict = exceptionPartOptions(g.engine, g.nameCase ?? null, database);
+    o = { strict, loose: withoutCase(strict) };
+    optionsCache.set(g, o);
+  }
+  return o;
+}
+
+/**
+ * Whether the location exception covers the finding name without case but not with the rule of
+ * its engine and target (with case per ADR-0054, per part per the target's `name_case`, ADR-0055).
+ */
 export function findingCaseChange(x: InventoryException, g: FindingNameGroup): boolean {
-  if (x.location === null || !exceptionMatchesCase(g.engine)) return false;
+  if (x.location === null) return false;
+  const { strict, loose } = groupOptions(g, g.databaseName);
+  if (!anyWithCase(strict)) return false;
   if (x.agentId !== null && x.agentId !== g.agentId) return false;
   if (x.targetId !== null && x.targetId !== g.targetId) return false;
   if (x.classifier !== null && !classifierSelected([x.classifier], g.classifier)) return false;
-  const strict = exceptionGlobOptions(g.engine);
   const f: FindingFacts = { ...g, confidence: 0, sampled: 0, matched: 0 };
-  return locationMatches(x.location, f, { ...strict, matchCase: false }) && !locationMatches(x.location, f, strict);
+  return locationMatches(x.location, f, loose) && !locationMatches(x.location, f, strict);
 }
 
 /**
@@ -125,15 +150,16 @@ export function findingCaseChange(x: InventoryException, g: FindingNameGroup): b
  * `exceptionCoversEvent`).
  */
 export function eventCaseChange(x: InventoryException, g: EventNameGroup): boolean {
-  if (x.location === null || !exceptionMatchesCase(g.engine)) return false;
+  if (x.location === null) return false;
+  const { strict, loose } = groupOptions(g, g.database);
+  if (!anyWithCase(strict, ["database", "schema", "object"])) return false;
   if (x.classifier !== null) return false;
   if (x.agentId !== null && x.agentId !== g.agentId) return false;
   if (x.targetId !== null && x.targetId !== g.targetId) return false;
   const { field, ...parts } = x.location;
   if (field !== undefined && field !== "*") return false;
   const o: EventObject = g.schema === null ? { database: g.database, object: g.object } : { database: g.database, schema: g.schema, object: g.object };
-  const strict = exceptionGlobOptions(g.engine);
-  return objectMatches(parts, o, { ...strict, matchCase: false }) && !objectMatches(parts, o, strict);
+  return objectMatches(parts, o, loose) && !objectMatches(parts, o, strict);
 }
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -229,7 +255,17 @@ const caseSensitiveEngine = (engine: SQL) =>
     sql`, `,
   )}))`;
 
-async function findingGroups(tx: Tx, bound: number): Promise<FindingNameGroup[]> {
+/** One target of an inventory run (ADR-0055 decision 7), or every target. */
+export interface InventoryScope {
+  agentId: string;
+  targetId: string;
+}
+
+/** Rows of the scoped target only (`alias` holds `agent_id` and `target_id`); bound parameters. */
+const inScope = (alias: string, scope: InventoryScope | undefined): SQL =>
+  scope === undefined ? sql`true` : sql`(${sql.raw(alias)}.agent_id = ${scope.agentId}::uuid and ${sql.raw(alias)}.target_id = ${scope.targetId}::text)`;
+
+async function findingGroups(tx: Tx, bound: number, scope?: InventoryScope): Promise<FindingNameGroup[]> {
   const res = await tx.execute<{
     agent_id: string;
     target_id: string;
@@ -239,13 +275,15 @@ async function findingGroups(tx: Tx, bound: number): Promise<FindingNameGroup[]>
     object_name: string;
     field_name: string;
     classifier: string;
+    name_case: unknown;
     n: number;
   }>(sql`
     select f.agent_id, f.target_id, f.engine, f.database_name, f.schema_name, f.object_name, f.field_name, f.classifier,
-      count(*)::int as n
+      t.name_case, count(*)::int as n
     from findings f
-    where ${caseSensitiveEngine(sql`f.engine`)}
-    group by 1, 2, 3, 4, 5, 6, 7, 8
+    left join agent_targets t on t.agent_id = f.agent_id and t.target_id = f.target_id
+    where (${caseSensitiveEngine(sql`f.engine`)} or t.name_case is not null) and ${inScope("f", scope)}
+    group by 1, 2, 3, 4, 5, 6, 7, 8, 9
     order by 1, 2, 3, 4, 5, 6, 7, 8
     limit ${bound + 1}`);
   return res.rows.map((r) => ({
@@ -258,6 +296,7 @@ async function findingGroups(tx: Tx, bound: number): Promise<FindingNameGroup[]>
     fieldName: r.field_name,
     classifier: r.classifier,
     n: Number(r.n),
+    nameCase: canonicalNameCase(r.name_case),
   }));
 }
 
@@ -269,10 +308,11 @@ function caseSensitiveEvent(): SQL {
   const table = auditSourceTable();
   const list = (sources: readonly string[]) => sql.join(sources.map((x) => sql`${x}::text`), sql`, `);
   const blind = table.filter(([, engines]) => engines.every((e) => !exceptionMatchesCase(e))).map(([x]) => x);
-  return sql`(e.source not in (${list(blind)}) and (e.source in (${list(table.map(([x]) => x))}) or ${caseSensitiveEngine(sql`t.engine`)}))`;
+  // ADR-0055: a target reporting `name_case` is compared with its rule, whatever the source.
+  return sql`((e.source not in (${list(blind)}) and (e.source in (${list(table.map(([x]) => x))}) or ${caseSensitiveEngine(sql`t.engine`)})) or t.name_case is not null)`;
 }
 
-async function eventGroups(tx: Tx, bound: number, retentionDays: number): Promise<EventNameGroup[]> {
+async function eventGroups(tx: Tx, bound: number, retentionDays: number, scope?: InventoryScope): Promise<EventNameGroup[]> {
   const res = await tx.execute<{
     agent_id: string;
     target_id: string;
@@ -281,13 +321,15 @@ async function eventGroups(tx: Tx, bound: number, retentionDays: number): Promis
     database: string;
     schema: string | null;
     object: string;
+    name_case: unknown;
   }>(sql`
-    select e.agent_id, e.target_id, e.source, t.engine, o->>'database' as database, o->>'schema' as schema, o->>'object' as object
+    select e.agent_id, e.target_id, e.source, t.engine, o->>'database' as database, o->>'schema' as schema, o->>'object' as object,
+      t.name_case
     from access_events e
     left join agent_targets t on t.agent_id = e.agent_id and t.target_id = e.target_id
     cross join lateral jsonb_array_elements(e.objects) o
-    where e.ts >= now() - make_interval(days => ${retentionDays}::int) and ${caseSensitiveEvent()}
-    group by 1, 2, 3, 4, 5, 6, 7
+    where e.ts >= now() - make_interval(days => ${retentionDays}::int) and ${caseSensitiveEvent()} and ${inScope("e", scope)}
+    group by 1, 2, 3, 4, 5, 6, 7, 8
     order by 1, 2, 3, 4, 5, 6, 7
     limit ${bound + 1}`);
   return res.rows
@@ -299,6 +341,7 @@ async function eventGroups(tx: Tx, bound: number, retentionDays: number): Promis
       database: r.database,
       schema: r.schema,
       object: r.object,
+      nameCase: canonicalNameCase(r.name_case),
     }));
 }
 
@@ -333,7 +376,7 @@ async function countEvents(tx: Tx, names: Map<string, EventNameGroup[]>, retenti
 /** Computes the inventory in `tx` (read-only; bounded per run). */
 export async function computeCaseInventory(
   tx: Tx,
-  opts: { now?: Date; bound?: number; retentionDays?: number; comparisonBudget?: number } = {},
+  opts: { now?: Date; bound?: number; retentionDays?: number; comparisonBudget?: number; scope?: InventoryScope } = {},
 ): Promise<InventoryResult> {
   const now = opts.now ?? new Date();
   const bound = opts.bound ?? NAMES_BOUND;
@@ -342,8 +385,8 @@ export async function computeCaseInventory(
   if (!exceptions.some((x) => active(x, now))) {
     return { entries: [], findingNamesCompared: 0, eventNamesCompared: 0, exceptionsCompared: 0, exceptionsTotal: 0, boundReached: false };
   }
-  const fg = await findingGroups(tx, bound);
-  const eg = await eventGroups(tx, bound, retentionDays);
+  const fg = await findingGroups(tx, bound, opts.scope);
+  const eg = await eventGroups(tx, bound, retentionDays, opts.scope);
   const boundReached = fg.length > bound || eg.length > bound;
   const fCompared = fg.slice(0, bound);
   const eCompared = eg.slice(0, bound);
@@ -375,7 +418,7 @@ export async function computeCaseInventory(
 }
 
 /** Audit / log details: exception ids and counts only (`<id>:<findings>:<events>`, space-separated). */
-export function inventoryDetails(r: InventoryResult, trigger: "startup" | "user"): Record<string, string | number | boolean> {
+export function inventoryDetails(r: InventoryResult, trigger: Trigger): Record<string, string | number | boolean> {
   return {
     trigger,
     exceptions_listed: r.entries.length,
@@ -393,14 +436,15 @@ export function inventoryDetails(r: InventoryResult, trigger: "startup" | "user"
   };
 }
 
-type Trigger = "startup" | "user";
+/** `name_case`: the run of one target whose `name_case` changed (ADR-0055 decision 7). */
+export type Trigger = "startup" | "user" | "name_case";
 
 /**
  * Runs `fn` in a transaction under the inventory's advisory lock, taken without waiting
  * (`"busy"` when another run holds it); `lock_timeout` and `statement_timeout` are set first, so
  * no statement of the run waits or runs unbounded (security review M1).
  */
-async function runLocked(db: Database, fn: (tx: Tx) => Promise<InventoryResult | null>): Promise<InventoryResult | null | "busy"> {
+export async function runLocked(db: Database, fn: (tx: Tx) => Promise<InventoryResult | null>): Promise<InventoryResult | null | "busy"> {
   return db.transaction(async (tx) => {
     await tx.execute(sql.raw(`set local lock_timeout = ${LOCK_TIMEOUT_MS}`));
     await tx.execute(sql.raw(`set local statement_timeout = ${STATEMENT_TIMEOUT_MS}`));
@@ -432,7 +476,7 @@ export async function recordCaseInventoryFailure(db: Database, log: Logger, trig
 }
 
 /** SQLSTATE of a database error, else `internal`: never a message (it may quote a name). */
-const errorCode = (err: unknown) => errorSummary(err).code ?? "internal";
+export const errorCode = (err: unknown) => errorSummary(err).code ?? "internal";
 
 /**
  * At the worker's start: runs the inventory once, when the audit log holds no successful one yet
@@ -567,7 +611,7 @@ export function parseInventoryDetails(at: Date, d: Record<string, unknown>): Lat
   }
   return {
     at,
-    trigger: d.trigger === "user" ? "user" : "startup",
+    trigger: d.trigger === "user" || d.trigger === "name_case" ? d.trigger : "startup",
     entries,
     exceptionsListed: num(d.exceptions_listed),
     truncated: d.exceptions_truncated === true,

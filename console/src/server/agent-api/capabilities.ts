@@ -28,12 +28,17 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * replica (0.8.0 or earlier) rejects it with `400`; the agent then strips it and resends
  * (ADR-0022 decision 9): no event is lost, but the events resent that way lose the flag.
  *
- * Exception, on purpose: `target_status.name_case` (ADR-0055) is accepted by the generated schema
- * since the contract change (decision 1: `mysql`, `mariadb` and `sqlserver` targets only, checked by
- * the schema), but it is not listed here and the field is not stored or used: it is listed only by
- * the console change of ADR-0055 decisions 5 to 7 (the per-part exception rule, the compare-and-set
- * storage and the debounced inventory), so that an agent sends it only to a console that applies it.
- * A conforming agent does not send it before.
+ * `target_status.name_case` (ADR-0055 decisions 5 to 8): the `mysql`, `mariadb` and `sqlserver`
+ * targets' name case semantics (the engine gate is the schema's) are stored per target in canonical
+ * form by a compare-and-set in the heartbeat's transaction (`storeNameCase`,
+ * src/server/name-case-inventory.ts), never answered with `400` for their size (an `except` past
+ * 8 KiB is stored in the strict form, #301 review L3), applied by location exceptions per part
+ * (`exceptionPartOptions`, src/lib/name-case.ts), shown on the agent page, and each change of a
+ * target's rule runs its debounced inventory. A heartbeat without it keeps today's rule for that
+ * target. Multi-replica consoles: as for every token, list it only once every replica runs this
+ * build (ADR-0022 decision 8); an older replica answers `400` to a heartbeat that carries it, the
+ * agent strips the field and resends (decision 9), and the target falls back to today's rule
+ * until the next heartbeat reaches a replica of this build.
  *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
@@ -65,6 +70,7 @@ export const CONSOLE_ACCEPTS = [
   "engine.sqlserver",
   "engine.valkey",
   "job_progress.coverage",
+  "target_status.name_case",
   "target_status.note_labels.2026_10",
   "target_status.note_labels.2026_10_b",
   "target_status.note_labels.2026_10_c",

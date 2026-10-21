@@ -9,6 +9,7 @@ import { silentAgentThresholdS } from "@/server/alerting-config";
 import { CASE_INVENTORY_QUEUE } from "@/server/case-inventory-queue";
 import { recordCaseInventoryFailure, runCaseInventory } from "@/server/exception-case-inventory";
 import { runPolicyEvaluation } from "@/server/incidents";
+import { runDueNameCaseInventories } from "@/server/name-case-inventory";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { eventsRetentionDays, purgeAccessEvents } from "@/server/events";
 import { pruneRateLimitCounters } from "@/server/rate-limit";
@@ -286,4 +287,31 @@ export function createCaseInventoryHandler(db: () => Database, log: Logger) {
 export async function registerCaseInventoryQueue(boss: PgBoss, db: () => Database, log: Logger, opts: { pollingIntervalSeconds?: number } = {}): Promise<void> {
   await boss.createQueue(CASE_INVENTORY_QUEUE, { policy: "stately", retryLimit: 0, expireInSeconds: 900, deleteAfterSeconds: 86_400 });
   await boss.work(CASE_INVENTORY_QUEUE, { pollingIntervalSeconds: opts.pollingIntervalSeconds ?? 2 }, createCaseInventoryHandler(db, log));
+}
+
+/**
+ * `targets.name_case_inventory` (ADR-0055 decision 7, M2): the ADR-0054 inventory of each target
+ * whose `name_case` changed (marked due by the heartbeat's compare-and-set), at most once per
+ * target and hour, changes within the hour coalesced (src/server/name-case-inventory.ts). Every
+ * 5 minutes and at worker start; `stately`, no payload.
+ */
+export const NAME_CASE_INVENTORY_QUEUE = "targets.name_case_inventory";
+export const NAME_CASE_INVENTORY_CRON = "*/5 * * * *";
+
+export function createNameCaseInventoryHandler(db: () => Database, log: Logger) {
+  return async (jobs: Job<Record<string, unknown>>[]): Promise<void> => {
+    if (jobs.length === 0) return;
+    const stats = await runDueNameCaseInventories(db(), log);
+    if (stats.ran + stats.failed + stats.busy > 0) log.info({ queue: NAME_CASE_INVENTORY_QUEUE, ...stats }, "name case inventories");
+  };
+}
+
+export async function registerNameCaseInventoryQueue(boss: PgBoss, db: () => Database, log: Logger): Promise<void> {
+  await boss.createQueue(NAME_CASE_INVENTORY_QUEUE, { policy: "stately", retryLimit: 0, expireInSeconds: 900 });
+  await boss.work(NAME_CASE_INVENTORY_QUEUE, { pollingIntervalSeconds: 30 }, createNameCaseInventoryHandler(db, log));
+}
+
+export async function scheduleNameCaseInventoryQueue(boss: PgBoss): Promise<void> {
+  await boss.schedule(NAME_CASE_INVENTORY_QUEUE, NAME_CASE_INVENTORY_CRON, {});
+  await boss.send(NAME_CASE_INVENTORY_QUEUE, {});
 }
