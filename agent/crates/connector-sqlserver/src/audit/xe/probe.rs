@@ -124,7 +124,26 @@ pub(crate) struct Probe {
     pub(crate) incomplete: bool,
 }
 
+/// What the agent sees of a session's events ([`Probe::event_facts`]):
+/// `error_reported` present, with a predicate; a predicate on a required
+/// event; required events, actions or statement collection missing; a
+/// catalog read that failed or was cut.
+pub(crate) type EventFacts = (bool, bool, bool, u64, bool);
+
 impl Probe {
+    /// The session's event facts: two probes that differ mean its events
+    /// changed (#280 re-review L-b; the predicates themselves are never
+    /// read).
+    pub(crate) fn event_facts(&self) -> EventFacts {
+        (
+            self.failed_logins,
+            self.failed_logins_filtered,
+            self.filtered,
+            self.missing,
+            self.incomplete,
+        )
+    }
+
     /// The quoted file pattern of the poll (`sql::xe_pattern`).
     pub(crate) fn pattern(&self) -> Option<String> {
         sql::xe_pattern(&self.current_file)
