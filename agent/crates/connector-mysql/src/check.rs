@@ -607,6 +607,13 @@ pub(crate) type SharedNameCases = std::sync::Arc<Mutex<HashMap<String, KeptNameC
 /// log is noted at most (seconds): three times the longest heartbeat
 /// interval (300 s), so that a check still in flight across a restart
 /// stays ordered before it.
+///
+/// Residual (security review of 49143f6): when no read was stored for more
+/// than this before a restart (checks failing for over 15 minutes) and a
+/// check of the previous run is still in flight across it, that check's
+/// read may land after the clamped start and be stored, restoring the
+/// previous run's value until the next re-probe of the audit-log stream
+/// (5 minutes) or the next check reads the new run.
 const START_AHEAD_MAX_S: u64 = 900;
 
 /// One target's kept name-case value (ADR-0055 decision 2).

@@ -431,6 +431,10 @@ async fn system_schemas_in_another_case_follow_the_server() {
             "PERFORMANCE_SCHEMA",
             "Information_Schema",
             "INFORMATION_SCHEMA",
+            // The servers fold these names with `utf8mb3_general_ci`,
+            // where `ſ` is `S` and `ı` is `I` (security review L8).
+            "performance_\u{17F}chema",
+            "\u{131}nformation_\u{17F}chema",
         ] {
             assert!(crate::sql::is_system_schema(name), "{name}");
             let created = a
@@ -489,11 +493,14 @@ async fn system_schemas_in_another_case_follow_the_server() {
                     Err(e) => format!("refused (errno {:?})", e.errno),
                 }
             );
-            assert_eq!(
-                server.flavor(),
-                Flavor::Mariadb,
-                "{label}: MySQL accepted `{name}`"
-            );
+            // The ASCII spellings, measured: MySQL refuses them (1044).
+            if name.is_ascii() {
+                assert_eq!(
+                    server.flavor(),
+                    Flavor::Mariadb,
+                    "{label}: MySQL accepted `{name}`"
+                );
+            }
             assert!(
                 !name.eq_ignore_ascii_case("information_schema"),
                 "{label}: `{name}` accepted: Audit leaves its reads out in any case"
@@ -579,17 +586,37 @@ async fn accepted_spelling_holds_nothing(server: Server, admin: Url, name: Strin
             Err(e) => format!("refused (errno {:?})", e.errno),
         }
     );
-    let (_dir, t) = target(server, PFS_LIKE_USER, IT_PASSWORD);
-    let (r, findings) = scan(&t).await;
-    r.unwrap();
-    let found = located(&findings);
-    for k in &found {
-        assert!(
-            !k.0.eq_ignore_ascii_case("information_schema")
-                && !k.0.eq_ignore_ascii_case("performance_schema")
-                && !["mysql", "sys"].contains(&k.0.as_str()),
-            "{label}: {name}: a system schema sampled: {k:?}"
+    // Discovery while the alias exists, as the test account granted on it
+    // and as the dev agent account (security review L9): no table of a
+    // system schema, under any spelling the servers fold to it, sampled.
+    let (_dir, granted_t) = target(server, PFS_LIKE_USER, IT_PASSWORD);
+    let (_dir2, agent_t) = agent_target(server);
+    for (who, t) in [("granted account", &granted_t), ("agent account", &agent_t)] {
+        let mut s = Session::connect(t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let seen = count(
+            &mut s,
+            &format!(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE CAST(TABLE_SCHEMA AS BINARY) = '{name}'"
+            ),
+        )
+        .await;
+        s.close().await;
+        let (r, findings) = scan(t).await;
+        r.unwrap();
+        let found = located(&findings);
+        eprintln!(
+            "[it] name_case: {label}: {who}: tables listed in `{name}`: {seen}; findings in {:?}",
+            found.iter().map(|k| k.0.as_str()).collect::<BTreeSet<_>>()
         );
+        for k in &found {
+            assert!(
+                !crate::sql::is_system_schema(&k.0),
+                "{label}: {name}: {who}: a system schema sampled: {k:?}"
+            );
+        }
     }
     if !answered || server.flavor() != Flavor::Mariadb {
         return;

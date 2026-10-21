@@ -183,26 +183,38 @@ pub(crate) const SYSTEM_SCHEMAS_AS_WRITTEN: [&str; 2] = ["mysql", "sys"];
 
 /// Whether `schema`, as the catalog spells it, is a system schema
 /// ([`SYSTEM_SCHEMAS_ANY_CASE`], [`SYSTEM_SCHEMAS_AS_WRITTEN`]).
+///
+/// "Any case" follows the servers' own folding of these names
+/// (`my_strcasecmp` with `utf8mb3_general_ci`, security review L8), which
+/// also reads `ſ` (U+017F) as `S` and `ı` (U+0131) as `I`: a name whose
+/// Unicode uppercase or lowercase is one of them is skipped too.
 #[must_use]
 pub(crate) fn is_system_schema(schema: &str) -> bool {
-    SYSTEM_SCHEMAS_ANY_CASE
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(schema))
-        || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
+    let upper = schema.to_uppercase();
+    let lower = schema.to_lowercase();
+    SYSTEM_SCHEMAS_ANY_CASE.iter().any(|s| {
+        s.eq_ignore_ascii_case(schema)
+            || s.eq_ignore_ascii_case(&upper)
+            || s.eq_ignore_ascii_case(&lower)
+    }) || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
 }
 
 /// The same rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
 /// or `COLUMNS`): `mysql` and `sys` compared as bytes, since the column's
 /// collation ignores case on MariaDB (and on MySQL with
-/// `lower_case_table_names` 1 or 2).
+/// `lower_case_table_names` 1 or 2); `information_schema` and
+/// `performance_schema` under `utf8mb3_general_ci`, the collation the
+/// servers fold these names with (`ſ` as `S`, `ı` as `I`; security review
+/// L8).
 macro_rules! user_schemas {
     ($col:literal) => {
         concat!(
             "CAST(",
             $col,
-            " AS BINARY) NOT IN ('mysql', 'sys') AND LOWER(",
+            " AS BINARY) NOT IN ('mysql', 'sys') AND CONVERT(",
             $col,
-            ") NOT IN ('information_schema', 'performance_schema')"
+            " USING utf8mb3) COLLATE utf8mb3_general_ci NOT IN \
+             ('information_schema', 'performance_schema')"
         )
     };
 }
@@ -1541,16 +1553,32 @@ mod tests {
             "Performance_Schema",
             "PERFORMANCE_SCHEMA",
             "performance_schema",
+            // The servers' folding (security review L8).
+            "performance_\u{17F}chema",
+            "\u{131}nformation_\u{17F}chema",
+            "PERFORMANCE_\u{17F}CHEMA",
             "mysql",
             "sys",
         ] {
             assert!(is_system_schema(s), "{s}");
         }
-        for s in ["MySQL", "MYSQL", "SYS", "Sys", "hr", "mysql ", "sys_x", ""] {
+        for s in [
+            "MySQL",
+            "MYSQL",
+            "SYS",
+            "Sys",
+            "\u{17F}ys",
+            "hr",
+            "mysql ",
+            "sys_x",
+            "performance_schemas",
+            "",
+        ] {
             assert!(!is_system_schema(s), "{s:?}");
         }
         let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
-                      LOWER(t.TABLE_SCHEMA) NOT IN ('information_schema', 'performance_schema')";
+                      CONVERT(t.TABLE_SCHEMA USING utf8mb3) COLLATE utf8mb3_general_ci NOT IN \
+                      ('information_schema', 'performance_schema')";
         assert!(INTROSPECT.contains(filter), "{INTROSPECT}");
         let guard = filter.replace("t.TABLE_SCHEMA", "TABLE_SCHEMA");
         assert_eq!(CAS_GUARD_SCHEMAS, guard);

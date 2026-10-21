@@ -106,6 +106,8 @@ The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environ
 | `DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES` | `mariadb` | the same for MariaDB (read at each start; names created under another value keep their spelling on disk, so reset the volume too) |
 | `DATABASTION_DEV_MONGO_IMAGE` | `mongo` | `mongo:<version>@sha256:…` (5.0+, the connector's minimum) |
 
+The MySQL / MariaDB integration test `system_schemas_in_another_case_follow_the_server` creates databases spelled like the system schemas (`Performance_Schema`, …) and drops them again; MariaDB may refuse to drop a spelling it resolves to `performance_schema`, leaving an empty alias database on a persistent dev volume. It holds nothing and the test accepts it on the next run; `make dev-reset` removes it.
+
 A data volume is initialized by the engine version that created it: switch versions on fresh volumes (`make dev-reset` first), and keep the variables exported for `make agent-it` too. For example, PostgreSQL 14 (digest from the workflow):
 
 ```sh
