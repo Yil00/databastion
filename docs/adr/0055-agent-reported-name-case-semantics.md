@@ -202,7 +202,7 @@ Implemented by #300 (the decision 3 prerequisite), #301 (contract, decision 1), 
 - **SQL Server.** `DATABASE_COLLATIONS` reads every `sys.databases` row with `TOP (1025)` (1 024 databases, one more meaning the list is cut), without the `HAS_DBACCESS`, `state` or `source_database_id` filters: `database_id`, name, `create_date`, the `ComparisonStyle` of the database collation, `containment`, `is_auto_close_on`, `state`, `catalog_collation_type`, and on every row the server collation's `ComparisonStyle`, `HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')` and the server name. Collation names are never read. `DATABASE_COLLATIONS_V0`, identical but for a `NULL` in place of `catalog_collation_type`, is used when the column is missing (error 207); the target then reports `objects: unknown`. Both are on the allow-list, pass the deny-list and are matched as exact own texts.
 - **`CATALOG_READS`.** Both statements join the connector's catalog reads (the Extended Events case 2 rule of [ADR-0051](0051-sqlserver-connector.md)): statistics builds in their activity are left out only when they are the agent's own builds on listed `sys` base tables. The review checked that this widening cannot hide a client read; the fresh-server Extended Events test shows no new base-table build.
 - **Server run** (decision 2). The ADR suggested `sqlserver_start_time` from `sys.dm_os_sys_info`, which needs `VIEW SERVER STATE`, not held by the minimal account; the server run is the server name with `tempdb`'s `create_date` (`tempdb` is created at every start and always listed).
-- **`catalog_collation_type`.** Only 0 (the database collation, or the fixed `Latin1_General_100_CI_AS_KS_WS_SC` for a contained database) and 2 (`SQL_Latin1_General_CP1_CI_AS`) are mapped, as the accepted text says; any other value is `unknown` (agent review M2). Measured on 2022 (16.0.4305.5): a contained database reads **1**, with `catalog_collation_type_desc` `Latin1_General_100_CI_AS_KS_WS_SC`, and refuses a second table whose name differs by case only (error 2714). A contained database is therefore reported `unknown`, the stricter reading (more incidents, never fewer). A refinement mapping 1 on a contained database to `insensitive` is pending a maintainer decision and the measurement on 2019 and 2025 (ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups)).
+- **`catalog_collation_type`.** Only 0 (the database collation, or the fixed `Latin1_General_100_CI_AS_KS_WS_SC` for a contained database) and 2 (`SQL_Latin1_General_CP1_CI_AS`) are mapped, as the accepted text says; any other value is `unknown` (agent review M2). Measured on 2022 (16.0.4305.5): a contained database reads **1**, with `catalog_collation_type_desc` `Latin1_General_100_CI_AS_KS_WS_SC`, and refuses a second table whose name differs by case only (error 2714). A contained database was therefore reported `unknown` in #303, the stricter reading (more incidents, never fewer). Since the [refinement of 2026-10-21](#refinement-2026-10-21-accepted-by-the-maintainer-contained-databases), measured on 2019, 2022 and 2025, 1 on a contained database is `insensitive`; 1 elsewhere and every other value stay `unknown`.
 - **`AUTO_CLOSE` memory** (M2). Measured: `DATABASEPROPERTYEX(name, 'Collation')` returns `NULL` on a closed database, like `collation_name`, so it cannot replace the memory. An online `AUTO_CLOSE` database whose collation reads `NULL` keeps its last known value for the same (`database_id`, `create_date`) on the same server run. Express sets `AUTO_CLOSE` on every new database, so a database never seen open since the agent started (or since the server run changed) is `unknown`, treated as sensitive: more incidents on that database until a read opens it.
 - **Database names** go through the ADR-0009 normalization; a name matched by a classifier becomes `*` (decision 4, L3), merged with the stricter value.
 - **Security review** (`security-reviewer`, two rounds): on `57b4749` approved, no Critical or High finding; M1 (rotation probe), M2 (catalog type 1) and L1 (server-run reset) fixed in `c7d79e0`; L2 to L4 documented or checked. On `c7d79e0` approved; L5 (the reset at stream start) fixed in `c94b166`.
@@ -211,3 +211,43 @@ Implemented by #300 (the decision 3 prerequisite), #301 (contract, decision 1), 
 ### Residuals
 
 Those of the ADR stand. In addition: events and findings judged while one console replica does not list the token, or after a heartbeat resent without `name_case`, use today's case-insensitive rule until the next heartbeat; the upgrade notes say to upgrade every console replica before the agents.
+
+## Refinement (2026-10-21, accepted by the maintainer): contained databases
+
+Refines decision 4 (each database's catalog collation). Accepted by the maintainer on 2026-10-21, after the measurement below; it answers the follow-up left by the [implementation note](#implementation-note-2026-10-21) (`catalog_collation_type`, agent review M2).
+
+### Decision
+
+The SQL Server reader maps `sys.databases.catalog_collation_type` as follows:
+
+| `catalog_collation_type` | Database | `objects` for that database |
+|---|---|---|
+| 0 | not contained | from the database collation's `ComparisonStyle` (unchanged) |
+| 0 | contained | `insensitive`, the fixed `Latin1_General_100_CI_AS_KS_WS_SC` (unchanged) |
+| **1** | **contained** (`containment` not 0) | **`insensitive`** (new) |
+| 1 | not contained | `unknown` (unchanged) |
+| 2 | any | `insensitive`, `SQL_Latin1_General_CP1_CI_AS` (unchanged) |
+| any other value | any | `unknown` (unchanged) |
+
+Everything else in decision 4 is unchanged: a database whose collation cannot be read (offline, or closed by `AUTO_CLOSE` with no value kept) is `unknown` unless its `catalog_collation_type` names a fixed collation (2, or 0 or 1 on a contained database), as before; a missing column, a revoked `VIEW ANY DATABASE` and the row, entry and byte bounds still give `objects: unknown`.
+
+### Basis
+
+Engine matrix run 39579407465 (2026-10-21), integration test `name_case_follows_the_collations` (`[it] name_case:` lines), on SQL Server 2019 (15.0.4500.2), 2022 (16.0.4305.5) and 2025 (17.0.5015.4):
+
+- the contained database (`CONTAINMENT = PARTIAL`, a `_CS_` database collation) reads `catalog_collation_type` **1** with `catalog_collation_type_desc` `Latin1_General_100_CI_AS_KS_WS_SC` on all three versions, and `CREATE TABLE T` after `CREATE TABLE t` fails with error **2714**: the server refuses a second table whose name differs by case only;
+- every non-contained test database reads **0** (`DATABASE_DEFAULT`);
+- `COLLATIONPROPERTY(…, 'ComparisonStyle')`: `_BIN2` 0, `_CS_AS` 196608, the case-insensitive collations 196609, an offline database `NULL`;
+- the server collation is `SQL_Latin1_General_CP1_CI_AS` (196609).
+
+The value 1 on a contained database thus names the fixed case-insensitive catalog collation that SQL Server documents for contained databases, on every supported version. Details: [phase 9 engine facts](../measurements/phase9-engine-facts.md#name-case-semantics-adr-0055-2026-10-21).
+
+### Consequences
+
+- Contained databases are listed with `objects: insensitive` (or left out of `except` when that equals the target's `objects`), so exceptions on them compare without case, as the server does. Before, they were `unknown` (treated as `sensitive`): exceptions written in another case than the stored names did not cover them.
+- The integration test expects `insensitive` for a contained database reading 1 (and the decision 4 values otherwise), and prints one `[it] name_case:` line per test database plus the server's answer to a case-only duplicate table; the engine matrix's "Measurement tables" step keeps them in `name_case.txt` in each SQL Server entry's measurement artifact.
+- No contract, console or grant change.
+
+### Residual risk
+
+- A future SQL Server version that gives the value 1 another meaning would still be read `insensitive`, but only for contained databases, whose catalog collation is documented as fixed and case-insensitive. A wrong `insensitive` loosens that database's exceptions back to the behaviour before this ADR, no further (ADR residual "A wrong `insensitive` report").
