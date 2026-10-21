@@ -734,3 +734,43 @@ Records #293 (decision 5, the CAS store guard of ADR-0041 decisions 5 and 6); de
 - **Now.** `CAS_COLUMNS` reads table and column names only (the same catalog views, so the system base tables a fresh server builds statistics on for it, case 2 of the refinement of 2026-10-15, stay those measured). Column `SELECT` is checked one table per statement with the existing exact `COLUMNS` statement, only on recognized CAS stores with a credential column, at most 64 per database; past the cut, or on an empty answer, a missing credential column or a `NULL` permission cell, the check is incomplete and `check()` reports `privilege.not_evaluated` with the label `cas_store_guard_probe` (unless a readable credential column was found). No new statement on the allow-list, no grant change. Load run 39476569869 at `bbfcab7`: no event of the agent's own account.
 - **Residuals.** The Extended Events fixture `xe/statistics-16.0.4305.5.xml` holds the guard's earlier text as captured; its partner statement text was replaced by the current `CAS_COLUMNS` text and marked `SYNTHESIZED` (re-capture on 16.0.4305.5 is a ROADMAP follow-up). Whether Discovery's `TABLES` statement (an object-level `HAS_PERMS_BY_NAME` per table) also writes one `SL` record per table, which would make a scan under Audit of a database of more than 15 tables an own overflowed read, is not measured yet (ROADMAP follow-up).
 - **Disclosure.** Maintainer decision of 2026-10-20: the release notes only, no SECURITY.md entry and no advisory.
+
+## Proposed refinement (2026-10-21, for the maintainer's decision): an exact own text whose only always-report reason is the core overflow
+
+Status: **Proposed**, not accepted; needs a `security-reviewer` review before acceptance. It would refine decision 6 ("The agent's own statements and the always-reported rules") and the implementation note of 2026-10-17 (at most 15 named objects per event). ROADMAP: [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "possible ADR-0051 refinement: let an exact own text through when the core overflow is its only always-report reason".
+
+### Context
+
+- **Today's rule.** On both sources (`audit/mod.rs`, `audit/xe/mod.rs`), a record from one of the agent's own sessions whose text is one of the connector's constant statements (`OwnText::Exact`) is the agent's own only while its event is not always reported, or when the text is the one-bit `password_hash` probe or the Extended Events session read (`own_listed_read`). The event's always-report mark (`MaskedEvent::always_report`) has several sources: the listed statement-text, credential and value-bearing objects, the analysis flags (dynamic SQL, user functions, four-part names, remote access), and, since gate G7 (#262), the agent core's overflow, set when the event holds more than 15 named objects or when a connector bound dropped objects (`with_object`, `with_unlisted_objects`). The check cannot tell these reasons apart.
+- **Effect.** An exact own text whose record reaches more than 15 objects is reported as the agent's own read of 15 objects and `*`, always, and matches "every read" policies. On SQL Server Audit this happens when a statement makes the server check permissions on many objects: SQL Server Audit writes one record per object checked, grouped per statement (`SL` records, measured on 2022). The one known case, the CAS store guard's column-level `HAS_PERMS_BY_NAME` read in `check()`, was fixed by reshaping the statement (#293, [implementation note of 2026-10-20](#implementation-note-2026-10-20-the-cas-store-guards-check-no-longer-reads-as-the-agents-own-overflowed-read)). A possible second case, Discovery's `TABLES` statement (an object-level `HAS_PERMS_BY_NAME` per table), is a ROADMAP measurement item. On Extended Events the objects come from the statement text, and the connector's exact texts name far fewer than 15 objects.
+- **Why the overflow mark is there.** For a read of user data, the objects past the 15th are not named, so the own-read budget could not charge them, and a listed object could be among them; hence "always reported, never left out by the own-read budget" (ADR-0053 Context).
+
+### Options
+
+#### (a) Keep the rule; reshape each own statement found to overflow
+
+As for the CAS guard (#293): a statement that makes SQL Server Audit write more than 15 records is rewritten (one object per statement, a bound per database), with no change to the own-session rules. Found by the end-to-end and load census (no event of the agent's own account, #293) and by the `TABLES` measurement item. Each case costs a connector change and, sometimes, more round trips.
+
+#### (b) A separate connector-side mark, with the security review's conditions
+
+The connector keeps, next to the core's flags, its own mark of the always-report reasons that are not the core overflow (listed objects, analysis flags, signals), and the exact-text check uses that mark instead of `MaskedEvent::always_report`. An `OwnText::Exact` record from an own session whose **only** always-report reason is the core overflow is then the agent's own, under the unbudgeted rule of the other exact texts. Conditions, from the security review that recorded the follow-up:
+
+1. **A separate connector-side flag.** The core's `always_report` and `objects_overflowed` are not changed or cleared; the connector's mark is computed independently and only the exact-text check reads it.
+2. **Never for `NeedsCredit` texts.** Sampling, ticket counts and the Audit polls read rows or statement texts; their objects must be charged or are listed, so an overflow on them stays always reported, as today.
+3. **Per record, before aggregation.** The mark is computed for each record from **all** the objects the record names, before the core bound and before records are grouped into one event (grouping merges flags with OR, so a mark taken after it would let one record's overflow hide another's listed object). A record whose objects were dropped by the SQL Server Audit grouping bound (64 per statement) is not eligible: those objects were not seen, so a listed one could be among them.
+4. **Test obligation.** A record of an exact own text whose objects include a listed `sys` object (a statement-text or credential-bearing object) past the 15th stays reported, always, on both sources; and one whose objects are only user tables past the 15th is the agent's own.
+
+The exact texts eligible are the constants and catalog templates of `sql.rs` matched by exact text (never by prefix or shape); they read catalog views and permission functions, never user rows (sampling and counts are credit-only).
+
+#### (c) Clear the overflow for the agent's own events in the core
+
+Rejected: the core's overflow serves the own-read budget on every engine and the console's ADR-0053 rules; clearing it for "own" events would let an own read of user data past the bound go uncharged.
+
+### Recommendation
+
+Option (a) now, with option (b) kept as the fallback: implement (b), under its four conditions and with a `security-reviewer` review, only if the `TABLES` measurement (or a later census) finds an exact own text that cannot be reshaped at a reasonable cost. No such text is known since #293, and (a) keeps the own-session rules unchanged.
+
+### Open questions (for the maintainer)
+
+1. (a) with (b) as a fallback (recommended), or (b) now as a general guard against future catalog statements? Proposed answer: (a); (b) adds a second always-report mark that every later change to the connector's always-report rules must keep in step.
+2. If (b) is taken, should an eligible record still count in the heartbeat metrics of own events (as the other exact texts do) or in a metric of its own? Proposed answer: a metric of its own, so a census can tell how often the exception applies.

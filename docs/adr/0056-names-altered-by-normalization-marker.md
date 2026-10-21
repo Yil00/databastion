@@ -1,0 +1,122 @@
+# ADR-0056: A marker on names altered by ADR-0009 normalization, which location exceptions refuse to cover
+
+- **Status**: Proposed (2026-10-21), for the maintainer's decision; needs a `security-reviewer` review before acceptance
+- **Date**: 2026-10-21
+- **Refines** (on acceptance): [ADR-0009](0009-name-normalization-and-item-sanitization.md) (which stays Accepted), its normalized names, which would carry a negotiated marker when normalization changed them; [ADR-0054](0054-case-sensitive-location-exceptions.md) (which stays Accepted), decision 4 and its residual risk "Normalization merges names"; [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decision 5 (exceptions on access events), and [ADR-0014](0014-policy-and-incident-model.md) (which stays Accepted), decision 1, for location exceptions only. Uses [ADR-0022](0022-protocol-capability-negotiation.md) (capability negotiation) and the send-time stripping of [ADR-0053](0053-overflowed-event-objects-flag.md) decision 2 without changing them
+- **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Contract: a marker on names altered by ADR-0009 normalization"; ADR-0054 open question 4 (decided on 2026-10-20: a follow-up with its own ADR and a `security-reviewer` review); ADR-0054 implementation note of 2026-10-20 (`connector-postgres/src/it_names.rs` pins the residual); [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine); `shared/protocol/openapi.yaml` (`Identifier`, `KeyPattern`, `Location`, `ObjectRef`); `agent/crates/classifiers/src/names.rs` (`NormalizedName`); `agent/crates/connector-cas/src/registry.rs` (`snake()`); `console/src/lib/policy-model.ts` (`exceptionCovers`), `console/src/lib/event-model.ts` (`exceptionCoversEvent`) (read at `c2ae105`, `dev`)
+
+## Context
+
+ADR-0009 normalization runs on every name before the uplink. Its first step strips control and format characters (zero-width characters such as U+200B, the soft hyphen U+00AD, bidirectional controls) and applies NFKC, so compatibility forms (fullwidth letters, ligatures) become their plain forms. The later steps turn value-like segments into `*`, array indices into `[]`, and LDAP entry DNs into their parent container.
+
+The first step can merge two names the engine keeps apart. A table `"customers<U+200B>"` and a fullwidth `ｃｕｓｔｏｍｅｒｓ` both reach the console as `customers`, next to the real `customers`. The engine holds three objects; the console sees one name. ADR-0054 made location exceptions compare with case on PostgreSQL, MongoDB, Redis, Valkey, CAS and unknown engines (and, with ADR-0055, on MySQL / MariaDB and SQL Server databases reported case-sensitive), but an exception written for `customers` still covers the two look-alikes. Anyone who can create an object in a covered schema can therefore place data under a name the exception covers by accident: an exception is the console's only durable suppression besides false positives (ADR-0014 decision 3). ADR-0054 recorded this as a residual risk and a follow-up, and its implementation test pins the current behaviour (`it_names.rs`).
+
+A related case is the CAS `field`: the agent converts definition keys to snake_case and lowercases their ASCII capitals while doing so (`snake()`), so `userName`, `UserName` and `user_name` all arrive as `user_name` (ADR-0054 residual risks).
+
+Not every change made by normalization merges distinct objects in a way that matters for exceptions:
+
+- A name or segment replaced by `*` (classifier match, value-like segment, non-conforming name) is already the literal name `*`: an exception covers it only when its glob matches `*` (contract, "the name `*`").
+- Array indices as `[]`, and dynamic keys as `*`, are field-path rules: they merge elements of one logical field on purpose.
+- LDAP attribute types lowercased, and an entry DN reduced to its container: LDAP compares those without case, and the container is the location by design (ADR-0029).
+- SQL Server and MySQL / MariaDB trailing spaces: the engines compare names that way, and N1 already handles them per engine.
+
+What is left is the first step (stripping and NFKC) and the CAS key conversion: changes after which the name sent is a different string from the engine's, and another engine object may be sent under the same string.
+
+Constraints:
+
+- **ADR-0013 and ADR-0022.** Every schema is closed. A new optional field is compatible only when negotiated with a capability token; changing `Identifier` or `KeyPattern` to carry the mark inside the name would be a narrowing (incompatible, ADR-0022 decision 6).
+- **I2.** The marker must carry no value, no removed character and no original spelling: only that the name was changed.
+- **I6.** The change is made in `shared/protocol/openapi.yaml`, and the types are regenerated.
+- **Old parties.** Agents up to this change cannot send the marker; consoles up to this change do not know it.
+
+## Options
+
+### (A) One boolean per item: `Finding.names_altered`, `AccessEvent.names_altered`
+
+Set when any name of the item was altered. Simple, one token per schema. A finding has one location, so for findings this is per location. An access event lists up to 16 objects: one altered object would make every object of the event uncoverable by an exception that names a part, which raises incidents for the other 15.
+
+### (B) A closed list of altered parts on each location and object: `Location.altered`, `ObjectRef.altered`
+
+An optional array of at most 4 unique values from the closed enum `database`, `schema`, `object`, `field`, present only when non-empty, naming the parts whose names normalization altered. The console refuses to cover an altered part with a glob that names it; a glob that is absent or exactly `*` for that part still covers it, as for an overflow `*` (ADR-0053 decision 3 item 6). Per object, so the other objects of an event are unaffected, and per part, so an exception that covers a whole database still covers an altered table name in it.
+
+### (C) Replace altered names by `*` in the agent
+
+No protocol change: the agent treats an altered name like a non-conforming one. But `*` is a literal name for policy conditions too: an `objects` condition for `crm.customers` would no longer retain a read of the fullwidth twin, and its sensitivity would come from findings under `*`. Exceptions would stop covering the look-alike, but conditions would stop selecting it as well, and every name with a ligature, a fullwidth form or an invisible character (common in names created by copy and paste) would lose its detail in the console.
+
+### (D) A target note
+
+A registered note code (`coverage.names_altered`) needs no negotiation (ADR-0022 decision 5), but notes carry no location: the console could not tell which exception to restrict, and notes are a human-facing registry, not a matching input (ADR-0055 rejected alternative (4)).
+
+### (E) Keep as is and document
+
+The residual is documented in docs/08 and the user guide since ADR-0054. No change; exceptions keep covering look-alikes.
+
+## Decision (proposed)
+
+Option (B).
+
+### 1. Contract (`shared/protocol/`, `security-reviewer` review)
+
+1. `AlteredParts`: an array of 1 to 4 unique `LocationPart` values (`database`, `schema`, `object`, `field`), closed. `Location.altered` and `ObjectRef.altered` are optional and of that type; `ObjectRef.altered` never names `field` (an event names no field), checked in the schema if the generators support it, otherwise by the console.
+2. Description: "the agent's name normalization (ADR-0009: control and format characters stripped, NFKC; on CAS, definition keys converted to snake_case) changed these parts, so another object of the engine may be sent under the same name. Never set for a name sent as `*`." It carries no value, no character and no count (I2).
+3. Capability tokens `location.altered` and `object_ref.altered`, under the ADR-0022 decision 9 obligations (capabilities cleared on a `400` whose body carried a gated field, the items resent with the field stripped). A console lists both or neither, and lists them only once every replica accepts them (ADR-0022 decision 8).
+4. On Redis / Valkey, the duplicated `ObjectRef` form of `AccessEvent` (the `KeyPattern` shape) gains the same field.
+5. No new `Error.code`, no new value in an existing enum, no removed or renamed field: a compatible change (ADR-0013).
+
+### 2. Agent (`agent-engineer`)
+
+1. `NormalizedName` records whether the stripping and NFKC step changed the input (compared on the input as read from the engine, before any other rule), and whether the result is `*` (then not altered). The CAS registry records it for a `field` whose snake_case conversion changed the key.
+2. The marker is spooled in full and stripped per token at send time, through the ADR-0053 decision 2 path (#297): a batch is rewritten without the field when the current capability set does not list its token, held while the set is not known as for `objects_overflowed`.
+3. Aggregation of access events merges the parts of objects merged together (union), so an aggregated object is altered when any merged one was.
+4. The agent's `sensitive_objects` filter is unchanged: it matches looser only.
+5. **Test obligations.** The `it_names.rs` relations whose names differ by U+200B and a fullwidth letter reach the console with `object` in `altered`, and the plain relation without it; a property test that a name is marked if and only if the first step changed it and the result is not `*`; the CAS `userName` key marked, `user_name` not.
+
+### 3. Console (`console-engineer`)
+
+1. **Storage.** The parts as sent, with the finding's location and with each stored event object; nullable, a Drizzle migration with no constraint to validate, never updatable by the runtime role (agent-reported, like `objects_overflowed`).
+2. **Exceptions (refines ADR-0054 decision 1 and ADR-0021 decision 5).** For an altered part, an exception covers the name only when its glob for that part is absent or exactly `*`. For the parts not altered, today's rules apply (with ADR-0054's case rules). The glob `\*` does not cover an altered part. This applies to finding exceptions (`exceptionCovers`) and access-event exceptions (`exceptionCoversEvent`).
+3. **Unchanged.** Policy conditions, per-object sensitivity and scores, the dedup key, and the bound of an overflow `*`: they keep matching the name as sent, which can only report more.
+4. **Display.** The finding and event views say that the name was altered by normalization, so the administrator checks the database for look-alike names. Notifications are unchanged.
+5. **Without the field** (an older agent, or a console that does not list the tokens): today's behaviour. The console does not guess an alteration from the name.
+6. **Test obligations.** For every glob and name, a cover of an altered part implies a glob absent or exactly `*` for that part; an unaltered object of the same event keeps today's result.
+
+### 4. Compatibility
+
+| Agent | Console | Behaviour |
+|---|---|---|
+| older | this change | No field; as today. |
+| this change | older | Tokens never listed, so the field is stripped at send time; as today. |
+| this change | this change | Field sent; altered parts are covered only by `*` or absent globs. |
+| this change | console rolled back | A `400` on the field clears the capabilities, and the items are resent without it (ADR-0022 decision 9). |
+
+### 5. Documentation (`docs-keeper`)
+
+When implemented: docs/08 "Objects per event and sensitive objects" and the user guide's policy section (what an altered name is and what exceptions do with it), docs/09, the ADR-0054 residual updated, and the upgrade notes (findings and events from upgraded agents may reopen incidents an exception suppressed through an altered name).
+
+## Consequences
+
+- An exception written for `customers` no longer suppresses `"customers<U+200B>"` or `ｃｕｓｔｏｍｅｒｓ` reported by an upgraded agent; an exception that covers the whole schema or database still does.
+- More incidents where legitimate names contain invisible characters or compatibility forms and are covered by named exceptions; bounded by the dedup and the per-target hourly cap (ADR-0021 decisions 6 and 8). An administrator who accepts them can write an exception on the enclosing database or schema, which also covers every other object there.
+- On CAS, every definition key in camelCase becomes an altered `field`: CAS exceptions naming a field cover those findings no longer. This may be noisy; open question 2.
+- One more optional field in two schemas, two tokens, a column on findings and on event objects. Stored rows from before the change have no marker forever.
+
+### Residual risks
+
+- Until both sides run this change, the residual of ADR-0054 stays.
+- Names changed by other rules (a segment turned into `*`, array indices) are not marked; they are covered by the literal `*` rule or are field-path merges by design.
+- A name that differs only by case on a case-insensitive engine, or only by trailing spaces where the engine ignores them, is not an alteration and is not marked.
+
+## Rejected alternatives
+
+- **(A) One boolean per item**: on access events, one altered object would make every object of the event uncoverable by named exceptions, and an exception covering the whole database would still have to be special-cased; per object and per part says what exceptions can act on.
+- **(C) Altered names as `*`**: conditions would stop selecting the look-alike and the console would lose the name's detail; exceptions are the only rule that must be stricter.
+- **(D) A target note**: no location, and a rendering registry used as a matching input.
+- **(E) Keep and document**: leaves a suppression any account with `CREATE` can exploit; ADR-0054 chose the stricter rule for case with the same argument.
+- **A marker inside the name** (a reserved suffix or prefix): collides with real names unless `Identifier` and `KeyPattern` are narrowed (incompatible), and older consoles would read it as part of the name.
+- **Sending the original spelling, or a fingerprint of it**: the console needs only to know that the name changed; the stripped characters could carry a value (I2), and a fingerprint would be a new keyed identifier with nothing to compare it to.
+
+## Open questions (for the maintainer)
+
+1. Option (B) per part (proposed), or (A) per item for simplicity? Proposed answer: (B); (A) makes events with one altered object uncoverable as a whole.
+2. CAS `field` keys converted to snake_case: marked (proposed, the rule is the same: two keys may arrive as one), or left out because CAS definitions are written by administrators? Proposed answer: marked; measure on the dev registry how many findings it affects before the implementation.
+3. Should the console offer an inventory of the exceptions whose effect changes, as ADR-0054 decision 6 did? Proposed answer: no. Stored rows have no marker, so there is nothing to compare at upgrade; the change shows only as agents are upgraded, and the upgrade notes say so.
