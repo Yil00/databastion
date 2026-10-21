@@ -18,6 +18,8 @@
 // - #/$defs/Location/else
 // - #/$defs/Location/if
 // - #/$defs/Location/then
+// - #/$defs/TargetStatus/if
+// - #/$defs/TargetStatus/then
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
@@ -2394,8 +2396,8 @@ console's configuration wizard. Never a target network address, never a process 
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatResponse {
     /**Optional **request** fields and features this console accepts (ADR-0022), e.g.
-`target_status.notes`, `access_event.bytes`, `access_event.objects_overflowed`,
-`job_progress.coverage`, and the engines
+`target_status.notes`, `target_status.name_case`, `access_event.bytes`,
+`access_event.objects_overflowed`, `job_progress.coverage`, and the engines
 added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
 the list of the latest heartbeat response and sends an optional request field
 introduced after protocol 0.1.0 only when that list names it; before its first
@@ -3076,6 +3078,69 @@ impl<'de> ::serde::Deserialize<'de> for MetricsMapKey {
             .map_err(|e: self::error::ConversionError| {
                 <D::Error as ::serde::de::Error>::custom(e.to_string())
             })
+    }
+}
+/**How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
+`insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
+as `sensitive`, the stricter rule). A closed value: never a collation name, a setting value
+or free text.
+*/
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum NameCase {
+    #[serde(rename = "sensitive")]
+    Sensitive,
+    #[serde(rename = "insensitive")]
+    Insensitive,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+impl ::std::fmt::Display for NameCase {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Sensitive => f.write_str("sensitive"),
+            Self::Insensitive => f.write_str("insensitive"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+impl ::std::str::FromStr for NameCase {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "sensitive" => Ok(Self::Sensitive),
+            "insensitive" => Ok(Self::Insensitive),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for NameCase {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for NameCase {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
     }
 }
 /**Name of an object (`Location.object`, `ObjectRef.object`, `SensitiveObject.object`): an
@@ -3955,6 +4020,48 @@ impl<'de> ::serde::Deserialize<'de> for TargetId {
                 <D::Error as ::serde::de::Error>::custom(e.to_string())
             })
     }
+}
+/**Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the
+server's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL
+Server). Three closed values and normalized database names only (invariant I2).
+*/
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct TargetNameCase {
+    ///How database names compare.
+    pub databases: NameCase,
+    /**Databases whose schema, object and column names compare otherwise than `objects`
+(SQL Server catalog collations; MySQL / MariaDB send none, their setting is
+server-wide). Database names are `Identifier`s, normalized and sanitized like every
+location (ADR-0009): two databases whose names reach the console as one name (`*`,
+stripped characters) are one entry with the stricter value (`sensitive`, then
+`unknown`, then `insensitive`). It may name databases the agent never sends in a
+finding or an event (outside the scan's scope, snapshots, databases its login cannot
+enter; ADR-0055 decision 9).
+
+One entry per `database` name, and entries sorted by `database` in the byte order of
+its UTF-8 form (after normalization): a conforming agent merges the entries of one
+name into one, with the stricter value. Not checked by this schema (`uniqueItems`
+compares whole entries, not names); the console reads several entries of one name as
+the stricter of their values (ADR-0055 decision 6).
+
+At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
+JSON: an agent-side bound, which the console does not check (its request size limit
+applies). A conforming agent that would pass either bound, or that cannot list every
+database, sends `objects: unknown` without `except`.
+*/
+    #[serde(default, skip_serializing_if = "::std::vec::Vec::is_empty")]
+    pub except: ::std::vec::Vec<TargetNameCaseException>,
+    /**How schema, object and column names compare in every database not listed in `except`.
+*/
+    pub objects: NameCase,
+}
+///One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`.
+#[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct TargetNameCaseException {
+    pub database: Identifier,
+    pub objects: NameCase,
 }
 /**One explanation of a target's status: a registered `code`, an optional `count` and
 optional closed `labels`. No free text, so no field can carry a sampled value, a
@@ -5024,6 +5131,16 @@ pub struct TargetStatus {
     pub last_error: ::std::option::Option<FailureCode>,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub metrics: ::std::option::Option<MetricsMap>,
+    /**How the target compares names that differ only by case, from the last `check()`
+(ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this
+schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+`target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055
+sends it in every `TargetStatus` of those engines, also when `check()` fails or
+times out (then the last value read on the same server run, else `unknown` for both
+parts). Absent, the console keeps comparing these engines' names without case.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub name_case: ::std::option::Option<TargetNameCase>,
     /**Explanations of the target's status from the last `check()`: why the audit level is
 degraded, what is not covered, over-privilege, an insecure setting. Closed codes with
 bounded parameters, never free text; the console renders them (see `TargetNote`).

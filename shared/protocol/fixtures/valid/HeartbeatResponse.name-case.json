@@ -1,0 +1,10 @@
+{
+  "console_min_protocol": 1,
+  "heartbeat_interval_s": 60,
+  "server_time": "2026-10-21T09:00:01Z",
+  "accepts": [
+    "target_status.notes",
+    "target_status.name_case",
+    "engine.sqlserver"
+  ]
+}

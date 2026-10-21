@@ -1984,6 +1984,78 @@ async fn target_notes_are_sent_only_while_the_console_accepts_them() {
     assert!(bodies[3]["targets"][0].get("notes").is_none());
 }
 
+/// ADR-0022 decision 9 on heartbeats (ADR-0055 contract): a `400`
+/// reporting an unknown field to a heartbeat carrying a gated
+/// `TargetStatus` field clears the capabilities and sends the same
+/// heartbeat once more stripped, instead of losing it; a second refusal is
+/// not retried (never a loop), and a `400` for another keyword is not
+/// resent.
+#[tokio::test]
+async fn a_heartbeat_rejected_for_a_gated_field_is_resent_once_stripped() {
+    use crate::capabilities::token;
+    use crate::notes::TargetNote;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // 1: lists the notes; 2: unknown field on the notes; 3: the stripped
+    // resend accepted, listing the notes again; 4: unknown field again;
+    // 5: the stripped resend refused too; 6: listing the notes;
+    // 7: another keyword.
+    let steps = vec![
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        rejected_400("/targets/0/notes"),
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        rejected_400("/targets/0/name_case"),
+        rejected_400("/targets/0/notes"),
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        details_400([("/ts", "formatMaximum")].into_iter()),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(seq(steps, heartbeat_response(30)))
+        .mount(&server)
+        .await;
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: vec![TargetNote::new(NoteCode::SecurityTlsDisabled)],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(health))],
+    )
+    .unwrap();
+    rt.heartbeat_once().await.unwrap();
+    // Refused for the field, resent stripped and accepted.
+    rt.heartbeat_once().await.unwrap();
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    // Refused twice: resent once only, then lost.
+    rt.heartbeat_once().await.unwrap_err();
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    // Another keyword: capabilities cleared (any heartbeat `400`), not
+    // resent.
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap_err();
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    let bodies = heartbeat_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 7, "{bodies:?}");
+    let notes = |i: usize| bodies[i]["targets"][0].get("notes").is_some();
+    assert_eq!(
+        (0..7).map(notes).collect::<Vec<_>>(),
+        [false, true, false, true, false, false, true]
+    );
+    // The resend is the same heartbeat, the gated field aside.
+    for (sent, resent) in [(1, 2), (3, 4)] {
+        let (mut a, b) = (bodies[sent].clone(), bodies[resent].clone());
+        a["targets"][0].as_object_mut().unwrap().remove("notes");
+        assert_eq!(a, b);
+    }
+}
+
 #[tokio::test]
 async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
     use crate::capabilities::token;

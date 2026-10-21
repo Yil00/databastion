@@ -1198,6 +1198,11 @@ impl Runtime {
             engine: proto_engine(target.engine),
             last_error,
             metrics: None,
+            // ADR-0055 decision 1: in the contract, gated by
+            // `target_status.name_case`. Not sent yet: the connectors'
+            // reports (decisions 2 to 4) are a separate change. A gated
+            // field: see `capabilities::strip_gated_target_status`.
+            name_case: None,
             notes,
             reachable,
             server_version: connector
@@ -1406,42 +1411,66 @@ impl Runtime {
     }
 
     /// Sends one heartbeat; returns the clamped interval from the console.
+    ///
+    /// A `400` reporting an unknown field (`additionalProperties`) to a
+    /// heartbeat that carried a gated `TargetStatus` field (`notes`,
+    /// `name_case`) clears the capabilities and sends the same heartbeat
+    /// once more with those fields stripped, instead of losing it (ADR-0022
+    /// decision 9): the console may be an older replica or a rolled-back
+    /// build. Never a loop: the stripped heartbeat carries no gated field.
+    /// Its engine values are kept as built (the refusal named a field, not
+    /// a value; an `enum` refusal of the resend takes the ordinary path,
+    /// and the next heartbeat withholds them, ADR-0039 decision 8).
     async fn heartbeat_once(&self) -> Result<Option<u64>, CallError> {
-        let request = self
+        let mut request = self
             .build_heartbeat()
             .await
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let body = serde_json::to_vec(&request)
-            .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let result: Result<HeartbeatResponse, CallError> = self
-            .session
-            .call(
-                Method::POST,
-                "/heartbeat",
-                &[],
-                Some(&body),
-                uplink::REQUEST_TIMEOUT,
-                uplink::accept::heartbeat,
-            )
-            .await;
-        let response = match result {
-            Ok(r) => r,
-            Err(e) => {
-                if matches!(
-                    e,
-                    CallError::Uplink(UplinkError::Rejected { status: 400, .. })
-                ) {
-                    // The console may not accept a negotiated field any more
-                    // (rolled back): send none until a response lists them
-                    // again (ADR-0022).
-                    self.console_caps.clear();
-                } else if matches!(e, CallError::Uplink(UplinkError::Transport(_))) {
-                    // Not reached: a hold waiting for the console's
-                    // capabilities restarts (ADR-0053 decision 2), unless a
-                    // result endpoint answered since it started.
-                    self.console_caps.unanswered();
+        let response = loop {
+            let body = serde_json::to_vec(&request)
+                .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
+            let result: Result<HeartbeatResponse, CallError> = self
+                .session
+                .call(
+                    Method::POST,
+                    "/heartbeat",
+                    &[],
+                    Some(&body),
+                    uplink::REQUEST_TIMEOUT,
+                    uplink::accept::heartbeat,
+                )
+                .await;
+            match result {
+                Ok(r) => break r,
+                Err(e) => {
+                    if let CallError::Uplink(UplinkError::Rejected {
+                        status: 400,
+                        unknown_field,
+                        ..
+                    }) = &e
+                    {
+                        // The console may not accept a negotiated field any
+                        // more (rolled back): send none until a response
+                        // lists them again (ADR-0022).
+                        self.console_caps.clear();
+                        if *unknown_field
+                            && crate::capabilities::strip_gated_heartbeat(&mut request)
+                        {
+                            bump(&self.counters.gated_fields_stripped, 1);
+                            tracing::warn!(
+                                "heartbeat with gated target fields rejected (400): console \
+                                 capabilities cleared, heartbeat sent again without them"
+                            );
+                            continue;
+                        }
+                    } else if matches!(e, CallError::Uplink(UplinkError::Transport(_))) {
+                        // Not reached: a hold waiting for the console's
+                        // capabilities restarts (ADR-0053 decision 2), unless
+                        // a result endpoint answered since it started.
+                        self.console_caps.unanswered();
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         if self.console_caps.record(response.accepts.as_ref()) {

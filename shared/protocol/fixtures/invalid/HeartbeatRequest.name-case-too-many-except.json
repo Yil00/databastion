@@ -1,0 +1,161 @@
+{
+  "ts": "2026-10-21T09:00:00Z",
+  "agent_version": "0.9.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-prod",
+      "engine": "sqlserver",
+      "reachable": true,
+      "audit_level": "partial",
+      "name_case": {
+        "databases": "insensitive",
+        "objects": "insensitive",
+        "except": [
+          {
+            "database": "db_cs_aa",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ab",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ac",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ad",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ae",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_af",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ag",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ah",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ai",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_aj",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ak",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_al",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_am",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_an",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ao",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ap",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_aq",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ar",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_as",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_at",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_au",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_av",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_aw",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ax",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ay",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_az",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_ba",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_bb",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_bc",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_bd",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_be",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_bf",
+            "objects": "sensitive"
+          },
+          {
+            "database": "db_cs_bg",
+            "objects": "sensitive"
+          }
+        ]
+      }
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}
