@@ -164,34 +164,45 @@ pub(crate) fn kill_query(connection_id: u32) -> String {
     format!("KILL QUERY {connection_id}")
 }
 
-/// System schemas, never sampled, compared as stored: the catalog
-/// (`information_schema.TABLES`) always spells them in lowercase, and a
-/// database spelled otherwise is a user database (the #300 follow-up,
-/// ADR-0055 decision 3): with `lower_case_table_names = 0` (the Linux
-/// default) `MySQL` and `SYS` are user databases on both servers, and
-/// MariaDB lets a user create `Performance_Schema` too (measured in CI,
-/// PR #308); MySQL refuses `information_schema` and `performance_schema`
-/// in another case. With 1 (names stored in lowercase) or 2 (compared in
-/// lowercase) no database in another case can stand next to them.
-pub(crate) const SYSTEM_SCHEMAS: [&str; 4] =
-    ["mysql", "sys", "information_schema", "performance_schema"];
+/// System schemas, never sampled nor guarded (the #300 follow-up, ADR-0055
+/// decision 3, measured in the CI runs of PR #308):
+/// - `information_schema` and `performance_schema` in any case: no user
+///   table can exist under any spelling of them. MySQL refuses the
+///   database in another case (1044); MariaDB accepts `CREATE DATABASE
+///   Performance_Schema` but refuses a table in it (1142), reads the
+///   system schema through that spelling, and MariaDB 11.8 even lists the
+///   `performance_schema` tables under it in `information_schema.TABLES`
+///   (81 tables; 10.11 and 11.4 list none). Skipped in any case, the
+///   system tables (other sessions' statement texts) are never sampled.
+/// - `mysql` and `sys` only as written: with `lower_case_table_names = 0`
+///   (the Linux default) `MySQL` and `SYS` are user databases on both
+///   servers. With 1 (names stored in lowercase) or 2 (compared in
+///   lowercase) no database in another case can stand next to them.
+pub(crate) const SYSTEM_SCHEMAS_ANY_CASE: [&str; 2] = ["information_schema", "performance_schema"];
+pub(crate) const SYSTEM_SCHEMAS_AS_WRITTEN: [&str; 2] = ["mysql", "sys"];
 
 /// Whether `schema`, as the catalog spells it, is a system schema
-/// ([`SYSTEM_SCHEMAS`], compared as stored).
+/// ([`SYSTEM_SCHEMAS_ANY_CASE`], [`SYSTEM_SCHEMAS_AS_WRITTEN`]).
 #[must_use]
 pub(crate) fn is_system_schema(schema: &str) -> bool {
-    SYSTEM_SCHEMAS.contains(&schema)
+    SYSTEM_SCHEMAS_ANY_CASE
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(schema))
+        || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
 }
 
 /// The same rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
-/// or `COLUMNS`), compared as bytes: the column's collation ignores case on
-/// MariaDB (and on MySQL with `lower_case_table_names` 1 or 2).
+/// or `COLUMNS`): `mysql` and `sys` compared as bytes, since the column's
+/// collation ignores case on MariaDB (and on MySQL with
+/// `lower_case_table_names` 1 or 2).
 macro_rules! user_schemas {
     ($col:literal) => {
         concat!(
             "CAST(",
             $col,
-            " AS BINARY) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')"
+            " AS BINARY) NOT IN ('mysql', 'sys') AND LOWER(",
+            $col,
+            ") NOT IN ('information_schema', 'performance_schema')"
         )
     };
 }
@@ -1515,34 +1526,32 @@ mod tests {
         }
     }
 
-    /// The #300 follow-up: the system schemas are compared as the catalog
-    /// stores them (`MySQL`, `SYS` and, on MariaDB, `Performance_Schema`
-    /// are user databases under `lower_case_table_names = 0`), in Rust and
-    /// in every statement that filters them (Discovery's table list, the
-    /// CAS store guard).
+    /// The #300 follow-up and the CI runs of PR #308: `information_schema`
+    /// and `performance_schema` are system schemas in any case (no user
+    /// table can exist under another spelling, and MariaDB 11.8 lists the
+    /// system tables under `Performance_Schema`), `mysql` and `sys` only as
+    /// written (`MySQL` and `SYS` are user databases under
+    /// `lower_case_table_names = 0`), in Rust and in every statement that
+    /// filters them (Discovery's table list, the CAS store guard).
     #[test]
-    fn system_schemas_compare_as_stored() {
-        for s in ["information_schema", "performance_schema", "mysql", "sys"] {
+    fn system_schemas_compare_as_the_server_allows() {
+        for s in [
+            "information_schema",
+            "INFORMATION_SCHEMA",
+            "Performance_Schema",
+            "PERFORMANCE_SCHEMA",
+            "performance_schema",
+            "mysql",
+            "sys",
+        ] {
             assert!(is_system_schema(s), "{s}");
         }
-        for s in [
-            "MySQL",
-            "MYSQL",
-            "SYS",
-            "Sys",
-            "Performance_Schema",
-            "INFORMATION_SCHEMA",
-            "hr",
-            "mysql ",
-            "sys_x",
-            "",
-        ] {
+        for s in ["MySQL", "MYSQL", "SYS", "Sys", "hr", "mysql ", "sys_x", ""] {
             assert!(!is_system_schema(s), "{s:?}");
         }
-        let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN \
-                      ('mysql', 'sys', 'information_schema', 'performance_schema')";
+        let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
+                      LOWER(t.TABLE_SCHEMA) NOT IN ('information_schema', 'performance_schema')";
         assert!(INTROSPECT.contains(filter), "{INTROSPECT}");
-        assert!(!INTROSPECT.contains("LOWER("), "{INTROSPECT}");
         let guard = filter.replace("t.TABLE_SCHEMA", "TABLE_SCHEMA");
         assert_eq!(CAS_GUARD_SCHEMAS, guard);
         let g = cas_guard_statements(&["castickets".to_owned()]).unwrap();
