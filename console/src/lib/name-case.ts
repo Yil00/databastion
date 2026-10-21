@@ -136,15 +136,20 @@ const STAR = "*";
  *   engines; `objects` without one) and every entry that matches after the fold (L2).
  */
 export function databaseObjectsCase(rule: NameCaseRule, database: string | null): NameCase {
-  const except = rule.except ?? [];
-  if (database === null || database === STAR) return except.reduce((m, e) => stricter(m, asNameCase(e.objects)), asNameCase(rule.objects));
+  // A rule that bypassed `canonicalNameCase` (review L3): a non-list `except` reads as a list
+  // that may name any database, so object names compare with case; non-object entries likewise.
+  if (rule.except !== undefined && !Array.isArray(rule.except)) return "unknown";
+  const except: readonly unknown[] = rule.except ?? [];
+  if (!except.every((e) => isPlainObject(e) && typeof e.database === "string")) return "unknown";
+  const entries = except as { database?: unknown; objects?: unknown }[];
+  if (database === null || database === STAR) return entries.reduce<NameCase>((m, e) => stricter(m, asNameCase(e.objects)), asNameCase(rule.objects));
   const exactName = trimTrailingSpaces(database);
   const foldedName = foldName(database);
   let exact: NameCase | null = null;
   let folded: NameCase | null = null;
-  for (const e of except) {
+  for (const e of entries) {
     const v = asNameCase(e.objects);
-    if (typeof e.database !== "string") continue;
+    if (typeof e.database !== "string") continue; // unreachable: checked above
     if (trimTrailingSpaces(e.database) === exactName) exact = exact === null ? v : stricter(exact, v);
     if (foldName(e.database) === foldedName) folded = folded === null ? v : stricter(folded, v);
   }
@@ -219,7 +224,8 @@ export type NameCaseDisplay = "not_reported" | "with_case" | "without_case" | "p
  */
 export function nameCaseDisplay(rule: NameCaseRule | null): NameCaseDisplay {
   if (rule === null) return "not_reported";
-  const values = new Set<NameCase>([rule.databases, rule.objects, ...(rule.except ?? []).map((e) => e.objects)]);
+  const except = Array.isArray(rule.except) ? rule.except : [];
+  const values = new Set<NameCase>([rule.databases, rule.objects, ...except.map((e) => e.objects)]);
   if (values.size > 1) return "per_database";
   const [only] = [...values];
   return only === "insensitive" ? "without_case" : only === "sensitive" ? "with_case" : "unknown";

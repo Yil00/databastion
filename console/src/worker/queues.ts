@@ -307,7 +307,9 @@ export function createNameCaseInventoryHandler(db: () => Database, log: Logger) 
 }
 
 export async function registerNameCaseInventoryQueue(boss: PgBoss, db: () => Database, log: Logger): Promise<void> {
-  await boss.createQueue(NAME_CASE_INVENTORY_QUEUE, { policy: "stately", retryLimit: 0, expireInSeconds: 900 });
+  // A job runs at most NAME_CASE_TARGETS_PER_RUN (20) inventories of at most 120 s each
+  // (statement timeout): 2 400 s, plus a margin. Finished jobs (no payload) kept one day.
+  await boss.createQueue(NAME_CASE_INVENTORY_QUEUE, { policy: "stately", retryLimit: 0, expireInSeconds: 3_000, deleteAfterSeconds: 86_400 });
   await boss.work(NAME_CASE_INVENTORY_QUEUE, { pollingIntervalSeconds: 30 }, createNameCaseInventoryHandler(db, log));
 }
 

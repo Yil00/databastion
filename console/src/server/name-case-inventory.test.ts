@@ -210,6 +210,32 @@ describe.skipIf(!hasDb)("name_case storage, inventory and correlation (ADR-0055)
     expect((await runDueNameCaseInventories(db, log)).ran).toBe(1);
   });
 
+  it("claims never-run targets first and at most 8 per agent and job, so one agent cannot starve the others (review L1)", async () => {
+    const db = getDb();
+    const { log } = captureLog();
+    await runDueNameCaseInventories(db, log, { limit: 1000 });
+    const flapping = await enroll();
+    const quiet = await enroll();
+    const targets = Array.from({ length: 12 }, (_, i) => ({ ...sqlserverTarget(SENSITIVE), target_id: `mssql-f${i}` }));
+    expect((await beat(flapping, targets)).status).toBe(200);
+    // The flapping agent's targets ran before (an hour ago); the quiet one never ran.
+    await db
+      .update(agentTargets)
+      .set({ nameCaseInventoryAt: new Date(Date.now() - 2 * 3_600_000), nameCaseInventoryDueAt: new Date(Date.now() - 3_600_000) })
+      .where(eq(agentTargets.agentId, flapping.agentId));
+    expect((await beat(quiet, [sqlserverTarget(SENSITIVE)])).status).toBe(200);
+    const stats = await runDueNameCaseInventories(db, log, { limit: 9 });
+    expect(stats.ran).toBe(9);
+    const ran = await db
+      .select({ agentId: agentTargets.agentId, at: agentTargets.nameCaseInventoryAt })
+      .from(agentTargets)
+      .where(sql`${agentTargets.agentId} in (${flapping.agentId}::uuid, ${quiet.agentId}::uuid) and ${agentTargets.nameCaseInventoryDueAt} is null`);
+    expect(ran.filter((r) => r.agentId === quiet.agentId)).toHaveLength(1);
+    expect(ran.filter((r) => r.agentId === flapping.agentId)).toHaveLength(8);
+    // The rest of the flapping agent's targets are taken by the next job.
+    expect((await runDueNameCaseInventories(db, log)).ran).toBe(4);
+  });
+
   async function policy(source: "access_event" | "finding", conditions: Record<string, unknown>): Promise<string> {
     const r = await createPolicy(
       getDb(),

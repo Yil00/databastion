@@ -36,6 +36,10 @@ export const NAME_CASE_INVENTORY_ACTION = "policy_exception.name_case_inventory"
 export const NAME_CASE_DEBOUNCE_MS = 3_600_000;
 /** Targets taken per worker job; the rest wait for the next one. */
 export const NAME_CASE_TARGETS_PER_RUN = 20;
+/** Targets of one agent taken per worker job (review L1). */
+export const NAME_CASE_TARGETS_PER_AGENT = 8;
+/** The agent page shows per-target inventories of this many days at most (review L2). */
+export const NAME_CASE_STATUS_DAYS = 30;
 
 /**
  * Stores the canonical `name_case` of one target of a heartbeat (already upserted in `tx`), with a
@@ -63,17 +67,33 @@ interface Claimed {
   dueAt: Date;
 }
 
-/** Takes the due targets whose last run is an hour old or more: due cleared, run time set. */
-async function claimDue(db: Database, limit: number): Promise<Claimed[]> {
+/**
+ * Takes the due targets whose last run is an hour old or more: due cleared, run time set. Targets
+ * never run come first (`name_case_inventory_at` nulls first), then the oldest run, then the
+ * earliest due time; at most {@link NAME_CASE_TARGETS_PER_AGENT} per agent and job, so one agent
+ * whose targets flap cannot starve the others (review L1).
+ */
+async function claimDue(db: Database, limit: number, perAgent: number): Promise<Claimed[]> {
+  const isDue = sql`name_case_inventory_due_at is not null
+        and (name_case_inventory_at is null or name_case_inventory_at <= now() - make_interval(secs => ${NAME_CASE_DEBOUNCE_MS / 1000}::int))`;
   const res = await db.execute<{ agent_id: string; target_id: string; prev: Date | string | null; due: Date | string }>(sql`
-    with due as (
-      select agent_id, target_id, name_case_inventory_at as prev, name_case_inventory_due_at as due
+    with ranked as (
+      select agent_id, target_id, name_case_inventory_at, name_case_inventory_due_at,
+        row_number() over (partition by agent_id order by name_case_inventory_at asc nulls first, name_case_inventory_due_at, target_id) as rn
       from agent_targets
-      where name_case_inventory_due_at is not null
-        and (name_case_inventory_at is null or name_case_inventory_at <= now() - make_interval(secs => ${NAME_CASE_DEBOUNCE_MS / 1000}::int))
-      order by name_case_inventory_due_at, agent_id, target_id
-      limit ${limit}
-      for update skip locked
+      where ${isDue}
+    ), picked as (
+      select agent_id, target_id from ranked
+      where rn <= ${perAgent}::int
+      order by name_case_inventory_at asc nulls first, name_case_inventory_due_at, agent_id, target_id
+      limit ${limit}::int
+    ), due as (
+      -- Locked and re-checked: a concurrent claim or heartbeat may have changed the row.
+      select a.agent_id, a.target_id, a.name_case_inventory_at as prev, a.name_case_inventory_due_at as due
+      from agent_targets a
+      join picked p on p.agent_id = a.agent_id and p.target_id = a.target_id
+      where ${isDue}
+      for update of a skip locked
     )
     update agent_targets t
     set name_case_inventory_due_at = null, name_case_inventory_at = now()
@@ -118,12 +138,12 @@ export interface NameCaseRunStats {
 export async function runDueNameCaseInventories(
   db: Database,
   log: Logger,
-  opts: { limit?: number; bound?: number; comparisonBudget?: number } = {},
+  opts: { limit?: number; perAgent?: number; bound?: number; comparisonBudget?: number } = {},
 ): Promise<NameCaseRunStats> {
   const stats: NameCaseRunStats = { ran: 0, failed: 0, busy: 0 };
   let claimed: Claimed[];
   try {
-    claimed = await claimDue(db, opts.limit ?? NAME_CASE_TARGETS_PER_RUN);
+    claimed = await claimDue(db, opts.limit ?? NAME_CASE_TARGETS_PER_RUN, opts.perAgent ?? NAME_CASE_TARGETS_PER_AGENT);
   } catch (err) {
     log.warn({ error_code: errorCode(err) }, "name case inventory: due targets not read");
     return stats;
@@ -190,12 +210,23 @@ function logRun(log: Logger, c: Claimed, r: InventoryResult): void {
   }
 }
 
-/** The latest per-target inventory (success or failure) of each target of `agentId`, by target id. */
+/**
+ * The latest per-target inventory (success or failure) of each target of `agentId`, by target id,
+ * within the last {@link NAME_CASE_STATUS_DAYS} days (review L2: the scan is bounded by the
+ * `audit_log_at_idx` range, no extra index).
+ */
 export async function latestNameCaseInventories(db: Database, agentId: string): Promise<Map<string, LatestNameCaseInventory>> {
   const rows = await db
     .selectDistinctOn([sql`${auditLog.details}->>'target_id'`], { at: auditLog.at, outcome: auditLog.outcome, details: auditLog.details })
     .from(auditLog)
-    .where(and(eq(auditLog.action, NAME_CASE_INVENTORY_ACTION), eq(auditLog.targetId, agentId), sql`${auditLog.details}->>'agent_id' = ${agentId}::text`))
+    .where(
+      and(
+        sql`${auditLog.at} >= now() - make_interval(days => ${NAME_CASE_STATUS_DAYS}::int)`,
+        eq(auditLog.action, NAME_CASE_INVENTORY_ACTION),
+        eq(auditLog.targetId, agentId),
+        sql`${auditLog.details}->>'agent_id' = ${agentId}::text`,
+      ),
+    )
     .orderBy(sql`${auditLog.details}->>'target_id'`, desc(auditLog.at), desc(auditLog.id));
   const out = new Map<string, LatestNameCaseInventory>();
   for (const r of rows) {

@@ -212,6 +212,16 @@ describe("exceptionPartOptions (ADR-0055 decision 6)", () => {
     expect(databaseObjectsCase(rule("insensitive", "insensitive", [{ database: "ΠΕΛΑΤΕΣ", objects: "sensitive" }]), "πελατες")).toBe("sensitive");
   });
 
+  it("a raw rule whose except is not a list of entries reads as unknown, never a throw (review L3)", () => {
+    for (const except of ["crm", 3, {}, [1], [{ database: 7, objects: "insensitive" }], [null]]) {
+      const rule = { databases: "insensitive", objects: "insensitive", except } as unknown as NameCaseRule;
+      expect(databaseObjectsCase(rule, "crm")).toBe("unknown");
+      expect(databaseObjectsCase(rule, "*")).toBe("unknown");
+      for (const engine of NAME_CASE_ENGINES) expect(exceptionPartOptions(engine, rule, "crm").perPart.object.matchCase).toBe(true);
+    }
+    expect(nameCaseDisplay({ databases: "sensitive", objects: "sensitive", except: "x" } as unknown as NameCaseRule)).toBe("with_case");
+  });
+
   it("the database `*` takes the strictest of objects and every except value (L1), the merged `*` entry included", () => {
     const merged: NameCaseRule = { databases: "insensitive", objects: "insensitive", except: [{ database: "*", objects: "sensitive" }] };
     expect(databaseObjectsCase(merged, "*")).toBe("sensitive");
@@ -366,14 +376,18 @@ describe("properties (ADR-0055 decision 10, L6)", () => {
   it("on the three engines, a cover under any name_case implies today's cover; the trailing-space rule is unchanged", () => {
     let covered = 0;
     let narrowed = 0;
+    let rawRules = 0;
     for (let i = 0; i < 20_000; i++) {
       const engine = pick(NAME_CASE_ENGINES);
       const f = finding({ engine, databaseName: name(), schemaName: engine === "sqlserver" ? name() : null, objectName: name(), fieldName: name() });
-      const rule = canonicalNameCase(anyNameCase());
+      // Canonical rules, and raw ones that bypass `canonicalNameCase` (hostile in-memory values, review L3).
+      const raw = rand() < 0.3;
+      const rule = raw ? (anyNameCase() as NameCaseRule) : canonicalNameCase(anyNameCase());
       const x = exception(rand() < 0.8 ? nearLocation(f) : location());
       const today = exceptionCovers(x, "p", f, NOW);
       const strict = exceptionCovers(x, "p", { ...f, nameCase: rule }, NOW);
       if (strict && !today) throw new Error(`name_case loosened ${JSON.stringify(x.location)} on ${JSON.stringify(f)} with ${JSON.stringify(rule)}`);
+      if (raw) rawRules++;
       if (strict) covered++;
       if (today && !strict) narrowed++;
       // Trailing spaces: the options of every part keep today's rule.
@@ -390,6 +404,7 @@ describe("properties (ADR-0055 decision 10, L6)", () => {
     }
     expect(covered).toBeGreaterThan(500);
     expect(narrowed).toBeGreaterThan(500);
+    expect(rawRules).toBeGreaterThan(1000);
   });
 });
 
