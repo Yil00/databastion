@@ -173,16 +173,20 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
                 .iter()
                 .filter(|f| {
                     let l = f.location().unwrap();
+                    // Without case: under `lower_case_table_names` 1
+                    // the server stores the tables in lowercase (no two
+                    // fixture tables differ by case only).
                     l.database.as_str() == GUARD_DB
-                        && l.object.as_str() == object
-                        && l.field.as_str() == field
+                        && l.object.as_str().eq_ignore_ascii_case(object)
+                        && l.field.as_str().eq_ignore_ascii_case(field)
                 })
                 .collect::<Vec<_>>()
         };
         for f in &findings {
             let o = f.location().unwrap().object.as_str();
             assert!(
-                o != "sso_sessions_v2" && o != "cas_tickets",
+                !o.eq_ignore_ascii_case("sso_sessions_v2")
+                    && !o.eq_ignore_ascii_case("cas_tickets"),
                 "{name}: {f:?}"
             );
         }
