@@ -79,6 +79,25 @@ describe("case inventory comparison (ADR-0054 decision 6, pure)", () => {
     expect(eventCaseChange(X(), E({ engine: null }))).toBe(true);
   });
 
+  it("compares targets reporting name_case with their rule (ADR-0055 decision 7)", () => {
+    const sensitive = { databases: "sensitive" as const, objects: "sensitive" as const };
+    for (const engine of ["sqlserver", "mysql", "mariadb"]) {
+      expect(findingCaseChange(X(), F({ engine, nameCase: sensitive }))).toBe(true);
+      expect(eventCaseChange(X(), E({ engine, nameCase: sensitive }))).toBe(true);
+      expect(findingCaseChange(X(), F({ engine, nameCase: { databases: "insensitive", objects: "insensitive" } }))).toBe(false);
+      // Database names only: an exception on the database part.
+      const dbOnly = { databases: "sensitive" as const, objects: "insensitive" as const };
+      expect(findingCaseChange(X({ location: { database: "crm" } }), F({ engine, databaseName: "CRM", nameCase: dbOnly }))).toBe(true);
+      expect(findingCaseChange(X(), F({ engine, nameCase: dbOnly }))).toBe(false);
+    }
+    // Column names never compare with case on MySQL / MariaDB; on SQL Server as object names.
+    const field = X({ location: { field: "email" } });
+    expect(findingCaseChange(field, F({ engine: "mysql", fieldName: "Email", nameCase: sensitive }))).toBe(false);
+    expect(findingCaseChange(field, F({ engine: "sqlserver", fieldName: "Email", nameCase: sensitive }))).toBe(true);
+    // Ignored on other engines (L6).
+    expect(findingCaseChange(X(), F({ engine: "openldap", nameCase: sensitive }))).toBe(false);
+  });
+
   it("keeps the other scopes of the exception", () => {
     expect(findingCaseChange(X({ agentId: "b" }), F())).toBe(false);
     expect(findingCaseChange(X({ targetId: "u" }), F())).toBe(false);

@@ -42,6 +42,7 @@ const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: strin
     "skipped_limit",
     "skipped_error",
   ],
+  "target_status.name_case": ["TargetStatus", "name_case"],
   "target_status.notes": ["TargetStatus", "notes"],
 };
 
