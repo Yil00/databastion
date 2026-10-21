@@ -178,7 +178,8 @@ export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], indice
 
 /**
  * Stores a (validated) heartbeat: agent status, targets, detections, spool, metrics and the agent's
- * capability tokens (`acceptsChanged` when they differ from the stored ones). A rise of
+ * capability tokens (`acceptsChanged` when they differ from the stored ones; `auditRequeueDue` when
+ * an earlier change is still to be acted on, #280 re-review L-a). A rise of
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
@@ -186,7 +187,7 @@ export async function recordHeartbeat(
   db: Database,
   agentId: string,
   hb: Schemas["HeartbeatRequest"],
-): Promise<{ acceptsChanged: boolean }> {
+): Promise<{ acceptsChanged: boolean; auditRequeueDue: boolean }> {
   const skew = Date.parse(hb.ts) - Date.now();
   const accepts = agentAcceptsToStore(hb.accepts);
   const clockSkewMs = Math.max(-2_000_000_000, Math.min(2_000_000_000, Math.round(skew)));
@@ -199,6 +200,7 @@ export async function recordHeartbeat(
         unalerted: agents.droppedBatchesUnalerted,
         stopsUnalerted: agents.auditStreamStopsUnalerted,
         accepts: agents.accepts,
+        auditRequeueDueAt: agents.auditRequeueDueAt,
       })
       .from(agents)
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
@@ -253,7 +255,7 @@ export async function recordHeartbeat(
           ? and(eq(agentTargets.agentId, agentId), notInArray(agentTargets.targetId, ids))
           : eq(agentTargets.agentId, agentId),
       );
-    if (!previous) return { raised: false, acceptsChanged: false };
+    if (!previous) return { raised: false, acceptsChanged: false, auditRequeueDue: false };
     // Security review of #280, M2: the caller queues the settings again when this changes.
     const acceptsChanged = JSON.stringify(previous.accepts ?? []) !== JSON.stringify(accepts);
     const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
@@ -263,10 +265,10 @@ export async function recordHeartbeat(
     let raised = false;
     if (previous.unalerted + delta > 0) raised = (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
     if (previous.stopsUnalerted + stops > 0) raised = (await raiseAuditStreamStoppedAlert(tx, agentId)) !== null || raised;
-    return { raised, acceptsChanged };
+    return { raised, acceptsChanged, auditRequeueDue: previous.auditRequeueDueAt !== null };
   });
   if (alerted.raised) void requestNotificationDelivery();
-  return { acceptsChanged: alerted.acceptsChanged };
+  return { acceptsChanged: alerted.acceptsChanged, auditRequeueDue: alerted.auditRequeueDue };
 }
 
 /**

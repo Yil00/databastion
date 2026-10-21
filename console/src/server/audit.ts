@@ -39,6 +39,7 @@ export type AuditAction =
   | "agent.accepts_flapping"
   | "discovery.scan_request"
   | "audit.configure"
+  | "audit.requeue_deferred"
   | "finding.false_positive"
   | "finding.false_positive_reset"
   | "policy.create"

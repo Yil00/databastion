@@ -118,6 +118,8 @@ export function handleHeartbeat(req: Request): Promise<Response> {
         endpoint: "heartbeat",
         status: 200,
         details: mismatched.details,
+        // #277: the count of every mismatched target, not of the (capped) stored details.
+        detailsCount: mismatched.indices.length,
         targetIds: mismatchedTargetIds(body.value, mismatched.indices),
         ip: clientIp(req),
       });
@@ -125,10 +127,12 @@ export function handleHeartbeat(req: Request): Promise<Response> {
     const recorded = await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched.indices));
     // Security review of #280, M2: the agent's capabilities changed (an upgrade or a downgrade):
     // its Redis / Valkey Audit settings are queued again with what it can now receive. A failure
-    // here never fails the heartbeat (logged; the next change or save queues them).
-    if (recorded.acceptsChanged) {
+    // here never fails the heartbeat (logged; the agent is marked and a later heartbeat queues
+    // them). #280 re-review L-a: a change the requeue budget deferred is acted on from a later
+    // heartbeat, once the budget allows.
+    if (recorded.acceptsChanged || recorded.auditRequeueDue) {
       try {
-        await requeueAuditSettingsOnAcceptsChange(getDb(), auth.agent.id);
+        await requeueAuditSettingsOnAcceptsChange(getDb(), auth.agent.id, recorded.acceptsChanged ? "accepts_changed" : "due");
       } catch (e) {
         logger.error({ agentId: auth.agent.id, err: e instanceof Error ? e.name : "error" }, "audit settings not queued again after a capability change");
       }
