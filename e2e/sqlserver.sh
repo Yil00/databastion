@@ -124,11 +124,15 @@ cleanup() {
   print_census e2e-sqlserver
   # #282 review N3 (informational): the agent's cut lines before unpaired statistics builds.
   if [ "$AUDIT_SOURCE" = sqlserver_xevents ]; then
+    mkdir -p "$E2E_LOG_DIR/census"
     python3 "$HERE/load/loadlib.py" xe-catchup --log "$E2E_LOG_DIR/agent.log" --label "e2e-sqlserver-${MSSQL_VERSION}" \
-      ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done
+      --md "$E2E_LOG_DIR/census/xe-catchup.md" --json "$E2E_LOG_DIR/census/xe-catchup.json" 2>&1 \
+      | while IFS= read -r line; do log "$line"; done
   fi
   redact_dir "$E2E_LOG_DIR" "$P"
   redact_dir "$E2E_LOG_DIR" "$NP"
+  # The census Markdown, redacted above, into the job summary (never written there before).
+  summary_append "$E2E_LOG_DIR"/census/*.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$E2E_WORK_DIR"

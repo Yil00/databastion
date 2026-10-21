@@ -118,6 +118,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR" "$P"
   redact_dir "$LOAD_RESULTS_DIR" "$P"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"

@@ -578,9 +578,20 @@ dump_logs() {
 # (counts only: events spooled, overflowed, naming an unknown-object `*`) from the collected agent
 # log; the console's per-target and per-principal counts (overflow flag included) and its events
 # naming `*` by kind (source, action, principal kind, signals, databases; no other object name),
-# read here from the console database (read-only; nothing when it is down); to the log, the job
-# summary and census-LABEL.json / .md in CENSUS_OUT_DIR (default $E2E_LOG_DIR/census, uploaded by
-# the CI jobs). Call after dump_logs. Never fails the run.
+# read here from the console database (read-only; nothing when it is down); to the log and to
+# census-LABEL.json / .md in CENSUS_OUT_DIR (default $E2E_LOG_DIR/census, uploaded by the CI jobs).
+# Call after dump_logs; once that directory is redacted, summary_append adds the .md to the job
+# summary. Never fails the run.
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (redact_dir / leak_scan in cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
+}
 print_census() {
   local line lib con="$E2E_WORK_DIR/census-console.json" star="$E2E_WORK_DIR/census-star.json" id=""
   lib="$(dirname "${BASH_SOURCE[0]}")/load/loadlib.py"
@@ -588,6 +599,6 @@ print_census() {
   console_sql "$(python3 "$lib" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
   console_sql "$(python3 "$lib" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
   python3 "$lib" census --log "$E2E_LOG_DIR/agent.log" --label "$1" --console "$con" --star "$star" \
-    --out-dir "${CENSUS_OUT_DIR:-$E2E_LOG_DIR/census}" ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 \
+    --out-dir "${CENSUS_OUT_DIR:-$E2E_LOG_DIR/census}" 2>&1 \
     | while IFS= read -r line; do log "$line"; done || true
 }

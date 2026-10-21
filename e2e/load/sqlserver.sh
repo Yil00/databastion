@@ -56,6 +56,8 @@ case "$LOAD_SQLSERVER_AUDIT_SOURCE" in
   *) echo "LOAD_SQLSERVER_AUDIT_SOURCE must be sqlserver_audit or sqlserver_xevents" >&2; exit 2 ;;
 esac
 LOAD_MSSQL_RATE="${LOAD_MSSQL_RATE:-$default_rate}"          # workload statements per second
+[[ "$LOAD_MSSQL_RATE" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$LOAD_MSSQL_RATE" -le 2000 ] \
+  || { echo "LOAD_MSSQL_RATE must be between 1 and 2000 statements per second" >&2; exit 2; }
 # Seconds between two drops of the load schema's auto-created statistics during the Audit run
 # (0: never, the default).
 LOAD_SQLSERVER_STATS_RESET_S="${LOAD_SQLSERVER_STATS_RESET_S:-0}"
@@ -134,6 +136,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR" "$P"
   redact_dir "$LOAD_RESULTS_DIR" "$P"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"
@@ -460,7 +464,15 @@ run_workload() {
       echo "ERRORS $(cat /tmp/out.* | grep -cE "^Msg [0-9]+" || true)"
       exit $rc' <"$W/workload.sql" >"$W/out/mssql-$phase.out" 2>"$W/out/mssql-$phase.err" || rc=$?
   WL_END="$(now_s)"
-  if [ -n "$reset_pid" ]; then kill "$reset_pid" 2>/dev/null || true; wait "$reset_pid" 2>/dev/null || true; fi
+  if [ -n "$reset_pid" ]; then
+    kill "$reset_pid" 2>/dev/null || true
+    wait "$reset_pid" 2>/dev/null || true
+    # Not stopped again by stop_background (the pid may be reused by then).
+    local -a kept=()
+    local pid
+    for pid in "${BG_PIDS[@]}"; do [ "$pid" = "$reset_pid" ] || kept+=("$pid"); done
+    BG_PIDS=("${kept[@]}")
+  fi
   wait "$orm_pid" || true
   log "ORM session ($phase): $(tr '\n' ' ' <"$W/out/orm-$phase.out" | cut -c1-200)"
   [ "$rc" = 0 ] || { tail -n 5 "$W/out/mssql-$phase.out" "$W/out/mssql-$phase.err" >&2; fail "the workload ($phase) exited $rc"; }
@@ -588,7 +600,7 @@ else
   python3 "$LOADLIB" xe-catchup --log "$W/out/agent-xe.log" --builds "$W/out/xe-source.txt" \
     --console "$W/out/xe-noise.json" --issued "load_app=${want}" ${orm_on:+--issued "load_orm=${orm_on}"} \
     --since "$AUDIT_START" --label load-sqlserver --json "$LOAD_RESULTS_DIR/xe-catchup.json" \
-    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+    --md "$LOAD_RESULTS_DIR/xe-catchup.md" 2>&1 | while IFS= read -r line; do log "$line"; done || true
   rm -f -- "$W/out/agent-xe.log"
   if [ -s "$W/out/stats-resets.txt" ]; then
     log "statistics resets: $(wc -l <"$W/out/stats-resets.txt"), statistics dropped: $(awk '$2 ~ /^[0-9]+$/ { n += $2 } END { print n + 0 }' "$W/out/stats-resets.txt"), failed: $(grep -c ' error$' "$W/out/stats-resets.txt" || true)"

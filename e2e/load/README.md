@@ -384,8 +384,9 @@ session's next reporting queries (`GROUP BY a0.status`) build them again in `loa
 statistics builds under load, which the stream may defer (ADR-0051 refinement of 2026-10-18). The
 `sa` drops are DDL events of `sa`, always reported; they are not in the figures below.
 
-After the drain, the run prints (and appends to the job summary, and writes to
-`$LOAD_RESULTS_DIR/xe-catchup.json`), never as a check:
+After the drain, the run prints (and writes to `$LOAD_RESULTS_DIR/xe-catchup.json` and
+`xe-catchup.md`, the latter added to the job summary on exit, once the results directory is
+redacted), never as a check:
 
 - `XE-CATCHUP load-sqlserver cuts=… episodes=… longest_episode_s=… episodes_at_60s_cap=…`: the
   agent's debug line "a statistics build not paired yet: the read ends before it" since Audit
@@ -540,7 +541,9 @@ reads the console database on exit (read-only, the queries of `loadlib.py census
   script (`EVAL` and the like, a write of `*`), an `ACL LOG` entry (source `redis_acl_log`) or a full synchronization
   (source `redis_sync`, signal `signature.full_sync`, principal `not_recorded`).
 
-The census is also kept as files: `census-<label>.json` and `.md` in the results directory of the
+The job summary sections are not written by `loadlib.py`: each harness appends the
+`census-<label>.md` files to the summary in its exit handler, after the leak scan and redaction of
+their directory. The census is also kept as files: `census-<label>.json` and `.md` in the results directory of the
 load runs (the `load-*-results` artifacts) and in `<log dir>/census/` of the end-to-end runs (the CI
 artifacts `e2e-census`, `e2e-cas-census`, `e2e-sqlserver-census`, `e2e-redis-census`, and
 `e2e-sqlserver-census-<version>-<source>` from the engine matrix, uploaded whatever the result).

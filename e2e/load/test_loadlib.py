@@ -694,17 +694,32 @@ class CensusTest(unittest.TestCase):
             with open(con, "w", encoding="utf-8") as f:
                 json.dump([{"target": "mssql-load", "db_user": "load_orm", "events": 4, "statements": 9,
                             "star_events": 1, "star_statements": 3, "max_objects": 16}, {"bad": 1}], f)
-            summary = os.path.join(d, "summary.md")
-            args = argparse.Namespace(log=log, console=con, label="t", summary=summary)
+            args = argparse.Namespace(log=log, console=con, label="t", out_dir=d)
             self.assertEqual(L.cmd_census(args), 0)
-            with open(summary, encoding="utf-8") as f:
+            with open(os.path.join(d, "census-t.md"), encoding="utf-8") as f:
                 text = f.read()
             self.assertIn("| sqlserver | 4 |", text)
             self.assertIn("| mssql-load | load_orm | 4 | 9 | 1 | 3 | - | - | 16 |", text)
-            args = argparse.Namespace(log=os.path.join(d, "missing"), console=None,
-                                                            label="t", summary=None)
+            args = argparse.Namespace(log=os.path.join(d, "missing"), console=None, label="t", out_dir=None)
             self.assertEqual(L.cmd_census(args), 0)
 
+
+    def test_console_names_carry_no_markup(self) -> None:
+        self.assertEqual(L._console_name("<img src=x onerror=a()>&amp;"), "?img?src=x?onerror=a()??amp;")
+        row = {"target": "<b>t</b>", "db_user": "a&b", "events": 1, "statements": 1, "star_events": 0,
+               "star_statements": 0, "max_objects": 1}
+        md = L.census_markdown({}, L.console_rows([row]), "t")
+        for c in "<>&":
+            self.assertNotIn(c, md.split("| Target |")[1])
+        events, findings = L.star_rows({"events": [{"target": "<t>", "source": "s&", "action": "read",
+                                                    "principal_kind": "account", "signals": "-",
+                                                    "star_databases": ">db", "only_star": True, "overflowed": False,
+                                                    "events": 1, "statements": 1, "rows_sum": 0}],
+                                        "findings": [{"target": "t", "engine": "valkey", "database": "<d>",
+                                                      "objects": 1, "star_object": False}]})
+        self.assertEqual((events[0]["target"], events[0]["source"], events[0]["star_databases"]), ("?t?", "s?", "?db"))
+        self.assertEqual(findings[0]["database"], "?d?")
+        self.assertEqual(L.xe_builds("build <x>&y 2\n"), {"build": {"?x??y": 2}})
 
     def test_console_rows_are_safe_to_print(self) -> None:
         good = {"target": "mssql-load", "db_user": "\\fb45bc05628d$", "events": 4, "statements": 4,
@@ -765,8 +780,7 @@ class CensusTest(unittest.TestCase):
             with open(star, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             out_dir = os.path.join(d, "census")
-            args = argparse.Namespace(log=log, console=None, star=star, label="e2e redis/x", summary=None,
-                                      out_dir=out_dir)
+            args = argparse.Namespace(log=log, console=None, star=star, label="e2e redis/x", out_dir=out_dir)
             self.assertEqual(L.cmd_census(args), 0)
             with open(os.path.join(out_dir, "census-e2e_redis_x.json"), encoding="utf-8") as f:
                 doc = json.load(f)
@@ -819,7 +833,7 @@ class XeCatchupTest(unittest.TestCase):
             summary, js = os.path.join(d, "s.md"), os.path.join(d, "x.json")
             args = argparse.Namespace(log=os.path.join(d, "missing.log"), builds=None, console=con,
                                       issued=["load_app=9", "bad", "x=y"], since=None, gap=30.0, label="t",
-                                      summary=summary, json=js)
+                                      md=summary, json=js)
             self.assertEqual(L.cmd_xe_catchup(args), 0)
             with open(js, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["principals"][0]["excess_statements"], 0)

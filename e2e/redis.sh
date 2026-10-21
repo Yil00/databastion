@@ -81,6 +81,8 @@ cleanup() {
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
   print_census e2e-redis
   redact_dir "$E2E_LOG_DIR" "$P"
+  # The census Markdown, redacted above, into the job summary (never written there before).
+  summary_append "$E2E_LOG_DIR"/census/*.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$E2E_WORK_DIR"

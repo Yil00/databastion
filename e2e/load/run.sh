@@ -188,8 +188,9 @@ compose() { timeout 120 docker compose -f "$COMPOSE_FILE" "$@"; }
 
 # print_census: ADR-0053 decision 6, the agent's event census (counts only) per engine, the console's
 # per-target and per-principal counts (census-sql, overflow flag included) and its events naming `*`
-# by kind (census-sql --star), read here (console_sql, once defined), in the log, the job summary
-# and $LOAD_RESULTS_DIR/census-load.json / .md (the results artifact). Never fails the run.
+# by kind (census-sql --star), read here (console_sql, once defined), in the log and
+# $LOAD_RESULTS_DIR/census-load.json / .md (the results artifact; added to the job summary by
+# summary_append once redacted). Never fails the run.
 print_census() {
   local line con="$W/out/census-console.json" star="$W/out/census-star.json" id=""
   [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
@@ -199,8 +200,18 @@ print_census() {
     console_sql "$(python3 "$LOADLIB" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
   fi
   python3 "$LOADLIB" census --log "$LOAD_LOG_DIR/agent.log" --label load --console "$con" --star "$star" \
-    --out-dir "$LOAD_RESULTS_DIR" ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} \
+    --out-dir "$LOAD_RESULTS_DIR" \
     2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
 }
 
 BG_PIDS=()
@@ -250,6 +261,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR"
   redact_dir "$LOAD_RESULTS_DIR"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose -f "$COMPOSE_FILE" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"
@@ -587,7 +600,7 @@ python3 "$LOADLIB" sample --out "$SAMPLES_AGENT" --interval 1 "agent=${CID[agent
 BG_PIDS+=("$!")
 
 console_sql() {
-  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T db \
+  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" db \
     psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
 }
 agent_json() {

@@ -17,16 +17,17 @@ Subcommands (stdlib only; unit tests in test_loadlib.py):
   sysbench --summary FILE
       Events, read queries, errors and the 95th percentile latency of a sysbench summary.
 
-  census --log FILE [--console FILE] [--label TEXT] [--summary FILE]
+  census --log FILE [--console FILE] [--star FILE] [--label TEXT] [--out-dir DIR]
       ADR-0053 decision 6 measurement: the agent's last "audit event census" line per engine in a
       `docker compose logs` file of the agent (counts only: events spooled, the statements they
       stand for, overflowed events, events naming an unknown-object `*`, events filtered), and
       optionally the console's per-principal event counts (a JSON array from run.sh). Prints one
-      `CENSUS ...` / `CENSUS-CONSOLE ...` line each to stdout and appends a Markdown section to
-      --summary (the job step summary). With --star FILE (the `census-sql --star` result), also
-      the events naming `*` by kind (`STAR-EVENTS ...`, `STAR-FINDINGS ...` lines). With --out-dir
-      DIR, writes census-<label>.json and census-<label>.md there (the collected census, kept as
-      a job artifact). Never fails the run (exit 0, also without data).
+      `CENSUS ...` / `CENSUS-CONSOLE ...` line each to stdout. With --star FILE (the `census-sql
+      --star` result), also the events naming `*` by kind (`STAR-EVENTS ...`, `STAR-FINDINGS ...`
+      lines). With --out-dir DIR, writes census-<label>.json and census-<label>.md there (the
+      collected census, kept as a job artifact). Never writes to the job summary: the harnesses
+      append census-<label>.md to it on exit, after redacting the directory. Never fails the run
+      (exit 0, also without data).
 
   census-sql [--agent-id UUID] [--star]
       Prints the console query whose JSON result `census --console` (or, with --star, `census
@@ -34,13 +35,15 @@ Subcommands (stdlib only; unit tests in test_loadlib.py):
       prefix), sources, actions, signals and the databases of `*` objects; no other object name.
 
   xe-catchup --log FILE [--builds FILE] [--console FILE] [--issued PRINCIPAL=N]... [--since T]
-             [--gap S] [--label TEXT] [--summary FILE] [--json FILE]
+             [--gap S] [--label TEXT] [--md FILE] [--json FILE]
       #282 review N3 (SQL Server Extended Events source under load): the agent's cut lines before
       unpaired statistics builds, grouped in runs (cuts at most S seconds apart), the runs that
       reached the 60 s hold, the statistics builds and workload SELECTs the session's files hold
       per principal (--builds, read by sqlserver.sh), and the workload principals' events naming
       `*` without the overflow flag and their statements beyond those issued (--console). Prints
-      `XE-CATCHUP` / `XE-BUILDS` / `XE-SELECTS` / `XE-NOISE` lines. Never fails the run.
+      `XE-CATCHUP` / `XE-BUILDS` / `XE-SELECTS` / `XE-NOISE` lines, and writes the Markdown section
+      to --md (appended to the job summary by the harness after redaction) and the figures to
+      --json. Never fails the run.
 
   report --facts FILE --samples FILE... --heartbeats FILE --out DIR
       Computes every measure from the samples and the facts run.sh recorded (windows, counts),
@@ -1111,13 +1114,14 @@ def star_sql(agent_id: str | None = None) -> str:
 
 def _console_name(v: object) -> str | None:
     """A target id or principal as printed (a `key=value` log line, a Markdown table cell): at most
-    CONSOLE_NAME_MAX characters, with `|`, backticks, every whitespace character (spaces included,
-    which would split a `key=value` field) and every control or non-printable character replaced
-    by `?`, so that a stored name can neither break a line, a field or a cell nor start a workflow
-    command. `None` for a value that is not a string."""
+    CONSOLE_NAME_MAX characters, with `|`, backticks, `<`, `>`, `&` (no HTML in the job summary),
+    every whitespace character (spaces included, which would split a `key=value` field) and every
+    control or non-printable character replaced by `?`, so that a stored name can neither break a
+    line, a field or a cell, nor carry markup, nor start a workflow command. `None` for a value
+    that is not a string."""
     if not isinstance(v, str):
         return None
-    return "".join("?" if (c in "|`" or c.isspace() or not c.isprintable()) else c
+    return "".join("?" if (c in "|`<>&" or c.isspace() or not c.isprintable()) else c
                    for c in v[:CONSOLE_NAME_MAX])
 
 
@@ -1274,12 +1278,6 @@ def cmd_census(args: argparse.Namespace) -> int:
             print(line)
     if not census:
         print(f"CENSUS {args.label} none")
-    if args.summary:
-        try:
-            with open(args.summary, "a", encoding="utf-8") as f:
-                f.write(census_markdown(census, rows, args.label, star))
-        except OSError:
-            pass
     out_dir = getattr(args, "out_dir", None)
     if out_dir:
         # The collected census (an artifact of the job): the same counts and names as printed.
@@ -1479,7 +1477,7 @@ def cmd_xe_catchup(args: argparse.Namespace) -> int:
     for line in xe_catchup_lines(r, args.label):
         print(line)
     md = xe_catchup_markdown(r, args.label)
-    for path, text, mode in ((args.summary, md, "a"), (args.json, json.dumps(r, indent=1, sort_keys=True) + "\n", "w")):
+    for path, text, mode in ((args.md, md, "w"), (args.json, json.dumps(r, indent=1, sort_keys=True) + "\n", "w")):
         if path:
             try:
                 with open(path, mode, encoding="utf-8") as f:
@@ -1512,7 +1510,6 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--console")
     c.add_argument("--star")
     c.add_argument("--label", default="run")
-    c.add_argument("--summary")
     c.add_argument("--out-dir", dest="out_dir")
     cs = sub.add_parser("census-sql")
     cs.add_argument("--agent-id", dest="agent_id")
@@ -1525,7 +1522,7 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--since", type=float, help="Unix time: cut lines before it are not counted")
     x.add_argument("--gap", type=float, default=30.0)
     x.add_argument("--label", default="run")
-    x.add_argument("--summary")
+    x.add_argument("--md")
     x.add_argument("--json")
     r = sub.add_parser("report")
     r.add_argument("--facts", required=True)
