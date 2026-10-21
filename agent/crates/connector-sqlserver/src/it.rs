@@ -1646,6 +1646,128 @@ async fn xe_predicate_scenario() {
     assert!(after.failed_logins && after.failed_logins_filtered);
 }
 
+/// The dev session's `error_reported` event as dev/sqlserver/initdb/30-audit.sql
+/// adds it (tests only: re-added as is by the predicate test).
+const XE_ERROR_REPORTED: &str = "ADD EVENT sqlserver.error_reported (ACTION \
+(sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id) WHERE ([error_number] = (18456)))";
+
+/// A failed login (error 18456) under the name `login`.
+async fn failed_login(login: &str) {
+    let mut bad = target(login, "DATABASTION_IT_SQLSERVER_THROWAWAY", own_tls());
+    bad.id = "it-foreign".to_owned();
+    let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
+    assert!(
+        Box::pin(conn::connect(
+            &bad,
+            &tls,
+            &TlsChoice::default(),
+            Duration::from_secs(10)
+        ))
+        .await
+        .is_err()
+    );
+}
+
+/// #280 re-review L-b (security review L7 of the follow-up): on the dev
+/// session, whose `error_reported` is filtered, a failed login read
+/// proves failed logins are recorded; replacing the event's predicate
+/// (`DROP EVENT` then `ADD EVENT`, here with the same predicate) brings
+/// `audit.failed_logins_not_audited` back, whether the `ALTER EVENT
+/// SESSION` is sent plainly, as concatenated dynamic SQL (`EXEC (N'ALTER
+/// EVENT SES' + N'SION …')`) or through `sp_executesql` with a variable;
+/// a later failed login proves it again.
+#[tokio::test]
+async fn xe_failed_login_proof_follows_event_session_changes() {
+    Box::pin(xe_predicate_proof_scenario()).await;
+}
+
+async fn xe_predicate_proof_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xepred-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let drop_add = |via: &str| -> String {
+        let drop =
+            "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported";
+        let add = format!("ALTER EVENT SESSION databastion_xe ON SERVER {XE_ERROR_REPORTED}");
+        let split = |x: &str| {
+            let rest = x.strip_prefix("ALTER EVENT SES").unwrap();
+            format!("N'ALTER EVENT SES' + N'{rest}'")
+        };
+        match via {
+            "plain" => format!("{drop}; {add}"),
+            "exec" => format!("EXEC ({}); EXEC ({})", split(drop), split(&add)),
+            _ => format!(
+                "DECLARE @d nvarchar(4000) = {}; DECLARE @a nvarchar(4000) = {}; \
+                 EXEC sp_executesql @d; EXEC sp_executesql @a",
+                split(drop),
+                split(&add)
+            ),
+        }
+    };
+    let notes = std::sync::Mutex::new(Vec::new());
+    let _ = Box::pin(xe_stream_around(&c, &t, &dir, async {
+        for (i, via) in ["plain", "exec", "sp_executesql"].into_iter().enumerate() {
+            Box::pin(failed_login(&format!("it_no_such_plogin{i}"))).await;
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let h = Box::pin(c.check(&t)).await;
+            let proven = !has(&h, NoteCode::AuditFailedLoginsNotAudited);
+            let sent = Box::pin(exec_try(&mut s, &drop_add(via))).await;
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let h = Box::pin(c.check(&t)).await;
+            let back = has(&h, NoteCode::AuditFailedLoginsNotAudited);
+            eprintln!(
+                "[it] xe predicate change: {via}: proven by a failed login {proven}, ALTER sent \
+                 {sent}, note back after it {back}"
+            );
+            notes.lock().unwrap().push((via, proven, sent, back));
+        }
+    }))
+    .await;
+    // The dev session as it was, whatever happened above.
+    Box::pin(exec_ok(
+        &mut s,
+        &format!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.server_event_session_events e JOIN \
+             sys.server_event_sessions x ON x.event_session_id = e.event_session_id WHERE \
+             x.name = N'databastion_xe' AND e.name = N'error_reported') ALTER EVENT SESSION \
+             databastion_xe ON SERVER {XE_ERROR_REPORTED}"
+        ),
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    for (via, proven, sent, back) in notes.into_inner().unwrap() {
+        assert!(sent, "{via}: the ALTER EVENT SESSION failed");
+        assert!(
+            proven,
+            "{via}: the failed login did not prove the filtered error_reported"
+        );
+        assert!(
+            back,
+            "{via}: the ALTER EVENT SESSION did not clear the failed-login proof"
+        );
+    }
+}
+
 /// ADR-0055 decision 2, the #303 residual: the server run the Audit
 /// streams read on each new session (`sql::SERVER_RUN`, the agent's own
 /// session, allow-list on) is the run `check()` keeps with its name case;

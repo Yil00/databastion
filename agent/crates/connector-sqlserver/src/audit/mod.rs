@@ -141,6 +141,10 @@ pub(crate) struct Shared {
     /// Extended Events session happened, on the agent's monotonic clock
     /// ([`Shared::note_failed_login`]).
     failed_login: Mutex<HashMap<String, Instant>>,
+    /// The Extended Events session's event facts at the last probe of a
+    /// stream ([`xe::probe::Probe::event_facts`]): a change clears the
+    /// failed-login proof (#280 re-review L-b).
+    event_facts: Mutex<HashMap<String, xe::probe::EventFacts>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
@@ -236,6 +240,15 @@ impl Shared {
     /// is taken again.
     pub(crate) fn clear_failed_login(&self, target_id: &str) {
         lock(&self.failed_login).remove(target_id);
+    }
+
+    /// Keeps `facts` as the target's last event facts; the previous ones.
+    pub(crate) fn swap_event_facts(
+        &self,
+        target_id: &str,
+        facts: xe::probe::EventFacts,
+    ) -> Option<xe::probe::EventFacts> {
+        lock(&self.event_facts).insert(target_id.to_owned(), facts)
     }
 
     /// Whether a failed login was recorded in the last 24 h (agent clock).

@@ -329,7 +329,8 @@ impl XeRecord {
         let Some(e) = &self.event else {
             return true;
         };
-        e.statement_cut || e.statement.as_deref().is_some_and(|t| event_session_ddl(t))
+        // No text kept: fail closed too (security review L3).
+        e.statement_cut || e.statement.as_deref().is_none_or(|t| event_session_ddl(t))
     }
 
     /// The acting login: the session's login (`session_server_principal_name`,
@@ -1158,6 +1159,8 @@ pub(crate) mod tests {
         let mut cut = with("sql_statement_completed", &[("statement", "SELECT 1")]);
         cut.event.as_mut().unwrap().statement_cut = true;
         assert!(cut.may_change_event_session());
+        // An event with no statement kept (security review L3).
+        assert!(with("sql_statement_completed", &[("row_count", "1")]).may_change_event_session());
         let mut unread = with("sp_statement_completed", &[("statement", "SELECT 1")]);
         unread.event = None;
         unread.unreadable = true;
