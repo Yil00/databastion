@@ -1970,6 +1970,31 @@ mod statistics_tests {
         assert!(recs[0].skip && recs[1].skip && recs[2].skip && !recs[3].skip);
     }
 
+    /// #280 re-review L-b: none of the captured events (statements with
+    /// empty texts, the statistics builds' internal statements, the
+    /// password-bearing DCL) is read as a change of an event session.
+    #[test]
+    fn captured_events_do_not_change_an_event_session() {
+        for file in [
+            "dcl-procedures-16.0.4305.5.xml",
+            "password-dcl-16.0.4305.5.xml",
+            "statistics-15.0.4500.2.xml",
+            "statistics-16.0.4305.5.xml",
+            "statistics-17.0.5015.4.xml",
+            "sysaudacts-16.0.4305.5.xml",
+            "sysguidrefs-16.0.4305.5.xml",
+            "sysguidrefs-17.0.5015.4.xml",
+        ] {
+            let flagged: Vec<usize> = fixture(file)
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.may_change_event_session())
+                .map(|(i, _)| i)
+                .collect();
+            assert!(flagged.is_empty(), "{file}: {flagged:?}");
+        }
+    }
+
     /// Reads a fixture: one event per line, captured on the image.
     fn fixture(name: &str) -> Vec<XeRecord> {
         let text =

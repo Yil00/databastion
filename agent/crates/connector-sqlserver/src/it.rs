@@ -2466,26 +2466,6 @@ async fn xe_scenario() {
         Box::pin(try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1)).await;
         f.close().await;
     }
-    // A failed login.
-    {
-        let mut bad = target(
-            "it_no_such_xlogin",
-            "DATABASTION_IT_SQLSERVER_THROWAWAY",
-            own_tls(),
-        );
-        bad.id = "it-foreign".to_owned();
-        let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
-        assert!(
-            Box::pin(conn::connect(
-                &bad,
-                &tls,
-                &TlsChoice::default(),
-                Duration::from_secs(10)
-            ))
-            .await
-            .is_err()
-        );
-    }
     // Credential DCL in forms the server does not mask itself.
     Box::pin(drop_login(&mut s, "it_xcred")).await;
     Box::pin(exec(
@@ -2530,11 +2510,36 @@ async fn xe_scenario() {
         a.close().await;
     }
     Box::pin(drop_login(&mut s, "it_xdcl_probe")).await;
+    // A failed login, last: the failed-login proof counts only an 18456
+    // after any statement that may change an event session, in the file
+    // and in time (#280 re-review L-b), and the dev session's files hold
+    // the `ALTER EVENT SESSION` statements of the tests before this one
+    // (xe_failed_login_proof_follows_event_session_changes), which this
+    // stream reads in its history.
+    Box::pin(failed_login("it_no_such_xlogin")).await;
 
     // The session's dispatch latency is 5 s.
     tokio::time::sleep(Duration::from_secs(12)).await;
-    let h = Box::pin(c.check(&t)).await;
+    let mut h = Box::pin(c.check(&t)).await;
     eprintln!("[it] xe, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    if has(&h, NoteCode::AuditFailedLoginsNotAudited) {
+        // The stream may still be reading the session's history (the
+        // whole suite's events): one more failed login, read once it has
+        // caught up.
+        eprintln!(
+            "[it] xe, streaming: failed logins not proven yet; one more failed login after the \
+             history"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        Box::pin(failed_login("it_no_such_xlogin_again")).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        h = Box::pin(c.check(&t)).await;
+        eprintln!(
+            "[it] xe, streaming again: {:?} {:?}",
+            h.audit_level,
+            codes(&h)
+        );
+    }
     assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
     // The failed login read proves the filtered `error_reported` admits
     // them, aged on the server's clock (#280 re-review L-b).
