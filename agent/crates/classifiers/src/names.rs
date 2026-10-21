@@ -508,7 +508,21 @@ pub fn segment_looks_like_value(segment: &str) -> bool {
     if segment.len() <= MAX_INPUT_BYTES && !value_spans(segment).is_empty() {
         return true;
     }
+    // Words split on camelCase boundaries (`archiveLucasMartin`), and the
+    // folded alphanumeric runs without that split: a name written in any
+    // case (`JoHn`, kept as written in MySQL / MariaDB objects since
+    // ADR-0055 decision 3) is still a first name.
     word_tokens(segment).iter().any(|w| is_first_name(w))
+        || folded_runs(segment).any(|w| is_first_name(&w))
+}
+
+/// Lowercase alphanumeric runs of `segment`, split only on characters that
+/// are not alphanumeric (never on case changes).
+fn folded_runs(segment: &str) -> impl Iterator<Item = String> + '_ {
+    segment
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
 }
 
 /// Byte ranges of `s` that hold a value: classifier tokens (as is and with
@@ -1040,6 +1054,13 @@ mod tests {
             ("contacts.mia.nielsen@example.net.phone", "*.phone"),
             ("jane.doe@example.co.uk", "*.uk"),
             ("archiveLucasMartin", "*"),
+            // Any case, without a camelCase split (ADR-0055 decision 3,
+            // review L2): MySQL / MariaDB names are kept as written.
+            ("JoHn", "*"),
+            ("crm.JoHn", "crm.*"),
+            ("crm.JOHN_orders", "crm.*"),
+            ("crm.archiveLUCAS", "crm.*"),
+            ("crm.MD5C2B1A09F8E7D6C5B4A39281706F5E4D3", "crm.*"),
         ] {
             assert_eq!(normalize_path(raw).as_str(), want, "{raw}");
         }

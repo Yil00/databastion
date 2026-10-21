@@ -90,12 +90,74 @@ const MAX_TOKENS: usize = 200_000;
 /// Deepest parenthesis nesting followed by the shape analysis.
 const MAX_DEPTH: usize = 256;
 
+/// An unquoted identifier or keyword. Compared and matched in its ASCII
+/// lowercase form (keywords, function names, the built-in lists, the
+/// agent's own analysis); [`Word::name`] is the name it gives a relation:
+/// the lowercase form on PostgreSQL (which folds unquoted names), the
+/// spelling as written on MySQL / MariaDB, where database and table names
+/// compare with case under `lower_case_table_names = 0`, the Linux
+/// default (ADR-0055 decision 3).
+#[derive(Clone, PartialEq, Eq)]
+struct Word {
+    lower: String,
+    /// The spelling as written, when it is not `lower` (MySQL / MariaDB
+    /// only).
+    spelled: Option<Box<str>>,
+}
+
+impl Word {
+    /// A word whose name is its ASCII lowercase form (PostgreSQL).
+    fn folded(raw: &str) -> Self {
+        Self {
+            lower: raw.to_ascii_lowercase(),
+            spelled: None,
+        }
+    }
+
+    /// A word that keeps its spelling as its name (MySQL / MariaDB).
+    fn spelled(raw: &str) -> Self {
+        let lower = raw.to_ascii_lowercase();
+        let spelled = (lower != raw).then(|| raw.into());
+        Self { lower, spelled }
+    }
+
+    /// The ASCII lowercase form, for every comparison.
+    fn as_str(&self) -> &str {
+        &self.lower
+    }
+
+    /// The name the word gives a relation, a schema or a common table
+    /// expression (see [`Word`]).
+    fn name(&self) -> &str {
+        self.spelled.as_deref().unwrap_or(&self.lower)
+    }
+}
+
+impl std::ops::Deref for Word {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.lower
+    }
+}
+
+impl PartialEq<str> for Word {
+    fn eq(&self, other: &str) -> bool {
+        self.lower == other
+    }
+}
+
+impl fmt::Debug for Word {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.lower, f)
+    }
+}
+
 /// A lexical token. Literal and comment content is never kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
-    /// Unquoted identifier or keyword, ASCII-lowercased (PostgreSQL folds
-    /// unquoted names).
-    Word(String),
+    /// Unquoted identifier or keyword ([`Word`]: lowercase for matching,
+    /// with its MySQL / MariaDB spelling).
+    Word(Word),
     /// Quoted identifier, unescaped.
     Quoted(String),
     /// Any literal: string, bit string, dollar-quoted, non-integer number.
@@ -466,7 +528,7 @@ fn lex_mysql_range(
                 while i < end && is_my_ident_cont(b[i]) {
                     i += 1;
                 }
-                out.push(Tok::Word(text[from..i].to_ascii_lowercase()), tok_start, i);
+                out.push(Tok::Word(Word::spelled(&text[from..i])), tok_start, i);
                 if let Some(f) = out.flags.last_mut() {
                     f.upper = text[from..i].bytes().any(|b| b.is_ascii_uppercase());
                 }
@@ -754,7 +816,7 @@ fn lex(text: &str, scs: bool) -> Result<Vec<Tok>, LexError> {
                 while i < n && is_ident_cont(b[i]) {
                     i += 1;
                 }
-                out.push(Tok::Word(text[start..i].to_ascii_lowercase()));
+                out.push(Tok::Word(Word::folded(&text[start..i])));
             }
             _ if is_op_char(c) => {
                 let start = i;
@@ -1047,9 +1109,14 @@ impl StatementKind {
     }
 }
 
-/// A relation named by a statement: raw identifiers from identifier tokens
-/// (unquoted ones lowercased). Normalize them with [`crate::names`] before
-/// they leave the agent.
+/// A relation named by a statement: raw identifiers from identifier tokens.
+/// Quoted ones are unescaped; unquoted ones are ASCII-lowercased on
+/// PostgreSQL (which folds them) and kept as written on MySQL / MariaDB
+/// (ADR-0055 decision 3: under `lower_case_table_names = 0` a statement
+/// naming a table in another case than stored fails, so the spelling that
+/// read it is the stored one). Compare them with an ASCII case fold where
+/// the server does (system schemas, column and routine names). Normalize
+/// them with [`crate::names`] before they leave the agent.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RelationName {
     /// Schema, when the name is qualified.
@@ -1927,7 +1994,8 @@ fn for_schema_at(s: &[Tok], j: usize) -> Option<&str> {
         return None;
     }
     match s.get(j + 2) {
-        Some(Tok::Word(n) | Tok::Quoted(n)) => Some(n.as_str()),
+        Some(Tok::Word(n)) => Some(n.name()),
+        Some(Tok::Quoted(n)) => Some(n.as_str()),
         _ => None,
     }
 }
@@ -2339,7 +2407,7 @@ fn has_non_ascii_call(s: &[Tok], kind: StatementKind) -> bool {
     let name = |t: &Tok| matches!(t, Tok::Word(_) | Tok::Quoted(_) | Tok::DQuoted { .. });
     s.windows(2).enumerate().any(|(i, w)| {
         let non_ascii = match &w[0] {
-            Tok::Word(n) | Tok::Quoted(n) => !n.is_ascii(),
+            Tok::Word(Word { lower: n, .. }) | Tok::Quoted(n) => !n.is_ascii(),
             Tok::DQuoted { non_ascii, .. } => *non_ascii,
             _ => false,
         };
@@ -2707,7 +2775,7 @@ fn is_audit_function(name: &[u8]) -> bool {
 /// tokens only: never in a literal or a comment.
 fn has_audit_function(s: &[Tok]) -> bool {
     s.windows(2).any(|w| {
-        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_audit_function(n.as_bytes()))
+        (matches!(&w[0], Tok::Word(Word { lower: n, .. }) | Tok::Quoted(n) if is_audit_function(n.as_bytes()))
             || matches!(
                 w[0],
                 Tok::DQuoted {
@@ -2733,7 +2801,7 @@ fn is_file_function(name: &[u8]) -> bool {
 /// a text that does not lex is scanned raw ([`raw_file_function`]).
 fn has_file_function(s: &[Tok]) -> bool {
     s.windows(2).any(|w| {
-        (matches!(&w[0], Tok::Word(n) | Tok::Quoted(n) if is_file_function(n.as_bytes()))
+        (matches!(&w[0], Tok::Word(Word { lower: n, .. }) | Tok::Quoted(n) if is_file_function(n.as_bytes()))
             || matches!(
                 w[0],
                 Tok::DQuoted {
@@ -3123,7 +3191,7 @@ fn lead_words(s: &[Tok]) -> Vec<String> {
     s.iter()
         .skip_while(|t| is_punct(Some(t), "("))
         .map_while(|t| match t {
-            Tok::Word(w) => Some(w.clone()),
+            Tok::Word(w) => Some(w.as_str().to_owned()),
             _ => None,
         })
         .take(MAX_LEAD_WORDS)
@@ -3364,8 +3432,12 @@ fn created_name(s: &[Tok], mut i: usize) -> (Option<RelationName>, usize) {
     }
     let mut parts = Vec::new();
     let mut j = i;
-    while let Some(Tok::Word(w) | Tok::Quoted(w)) = s.get(j) {
-        parts.push(w.clone());
+    loop {
+        match s.get(j) {
+            Some(Tok::Word(w)) => parts.push(w.name().to_owned()),
+            Some(Tok::Quoted(q)) => parts.push(q.clone()),
+            _ => break,
+        }
         j += 1;
         if is_punct(s.get(j), ".") && parts.len() < 2 {
             j += 1;
@@ -3552,7 +3624,7 @@ fn plpgsql_statement(s: &[Tok]) -> Option<Vec<Tok>> {
     })?;
     let mut out: Vec<Tok> = s[start..].to_vec();
     if word(out.first()) == Some("perform") {
-        out[0] = Tok::Word("select".to_owned());
+        out[0] = Tok::Word(Word::folded("select"));
     }
     if first_kind(&out) == StatementKind::Select {
         let mut depth = 0usize;
@@ -3776,7 +3848,7 @@ fn qualified_name(s: &[Tok], mut i: usize) -> Option<(Vec<String>, usize)> {
     loop {
         match s.get(i) {
             Some(Tok::Word(w)) if parts.is_empty() && reserved(w) => return None,
-            Some(Tok::Word(w)) => parts.push(w.clone()),
+            Some(Tok::Word(w)) => parts.push(w.name().to_owned()),
             Some(Tok::Quoted(q)) => parts.push(q.clone()),
             _ => return None,
         }
@@ -3974,13 +4046,19 @@ fn cte_names(s: &[Tok], pg_wrappers: bool) -> Vec<String> {
         match &s[j] {
             Tok::Punct(p) if p == "(" => depth += 1,
             Tok::Punct(p) if p == ")" => depth = depth.saturating_sub(1),
-            Tok::Word(w) | Tok::Quoted(w) if depth == 0 => {
+            Tok::Word(Word { lower: w, .. }) | Tok::Quoted(w) if depth == 0 => {
+                // Keywords compare in lowercase; the name is the
+                // spelling (MySQL), like a relation's.
+                let name = match &s[j] {
+                    Tok::Word(x) => x.name(),
+                    _ => w.as_str(),
+                };
                 let prev_ok = j == i + 1
                     || is_punct(s.get(j - 1), ",")
                     || word(s.get(j - 1)) == Some("recursive");
                 let next_ok = word(s.get(j + 1)) == Some("as") || is_punct(s.get(j + 1), "(");
                 if prev_ok && next_ok && w != "recursive" {
-                    out.push(w.clone());
+                    out.push(name.to_owned());
                 }
                 if matches!(
                     w.as_str(),
@@ -4860,6 +4938,90 @@ mod tests {
             .iter()
             .map(|r| (r.schema.clone(), r.name.clone()))
             .collect()
+    }
+
+    /// ADR-0055 decision 3: MySQL / MariaDB names keep their spelling,
+    /// quoted or not (with `lower_case_table_names = 0` `Customers` and
+    /// `customers` are two tables), while keywords still match in any case.
+    #[test]
+    fn mysql_names_keep_their_spelling() {
+        for (text, want) in [
+            ("SELECT * FROM Customers", vec![r(None, "Customers")]),
+            ("select * from customers", vec![r(None, "customers")]),
+            ("SELECT * FROM `Customers`", vec![r(None, "Customers")]),
+            (
+                "SeLeCt * FrOm Hr.Customers",
+                vec![r(Some("Hr"), "Customers")],
+            ),
+            (
+                "SELECT * FROM Customers JOIN customers USING (id)",
+                vec![r(None, "Customers"), r(None, "customers")],
+            ),
+            (
+                "SELECT * FROM `hr`.Customers, HR.`customers`",
+                vec![r(Some("hr"), "Customers"), r(Some("HR"), "customers")],
+            ),
+            (
+                "UPDATE LOW_PRIORITY Customers SET a = 1",
+                vec![r(None, "Customers")],
+            ),
+            (
+                "INSERT INTO Hr.Audit_Log VALUES (1)",
+                vec![r(Some("Hr"), "Audit_Log")],
+            ),
+            ("SHOW CREATE TABLE Customers", vec![r(None, "Customers")]),
+            (
+                "LOCK TABLES Customers READ, orders WRITE",
+                vec![r(None, "Customers"), r(None, "orders")],
+            ),
+            ("HANDLER Customers READ FIRST", vec![r(None, "Customers")]),
+            // A common table expression is not a relation, in the case it
+            // is written; one written in another case is reported (fail
+            // closed).
+            ("WITH C AS (SELECT 1) SELECT * FROM C", vec![]),
+            (
+                "WITH c AS (SELECT * FROM T) SELECT * FROM C",
+                vec![r(None, "T"), r(None, "C")],
+            ),
+            // `EXPLAIN FOR SCHEMA name`: the explained statement's schema.
+            (
+                "EXPLAIN FOR SCHEMA Hr SELECT * FROM Customers",
+                vec![r(Some("Hr"), "Customers")],
+            ),
+        ] {
+            assert_eq!(my_rels(text), want, "{text}");
+        }
+        // Statement parts and created tables too.
+        let a = my("CREATE TABLE Hr.Copy AS SELECT * FROM Hr.Customers");
+        let p = &a.parts()[0];
+        let t = p.create_target.as_ref().expect("target");
+        assert_eq!((t.schema.as_deref(), t.name.as_str()), (Some("Hr"), "Copy"));
+        assert_eq!(
+            p.relations
+                .iter()
+                .map(|r| (r.schema.clone(), r.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![r(Some("Hr"), "Customers")]
+        );
+        // The analysis is unchanged by the spelling: kinds, lead words,
+        // shapes and calls.
+        let lower = my("select sql_no_cache * from hr.customers");
+        let upper = my("SELECT SQL_NO_CACHE * FROM HR.CUSTOMERS");
+        assert_eq!(lower.kind(), upper.kind());
+        assert_eq!(lower.parts()[0].lead, upper.parts()[0].lead);
+        assert_eq!(lower.parts()[0].shape, upper.parts()[0].shape);
+        assert_eq!(lower.normalized(), upper.normalized());
+        assert!(my("SELECT LOAD_FILE('/etc/passwd')").file_read());
+        assert!(my("SELECT Audit_Log_Read()").audit_function());
+        // PostgreSQL still folds unquoted names.
+        assert_eq!(
+            rels("SELECT * FROM Hr.Customers"),
+            vec![r(Some("hr"), "customers")]
+        );
+        assert_eq!(
+            rels("SELECT * FROM \"Customers\""),
+            vec![r(None, "Customers")]
+        );
     }
 
     #[test]

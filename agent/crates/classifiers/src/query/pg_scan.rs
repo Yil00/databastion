@@ -235,7 +235,7 @@ impl PgScan {
 /// The name of an identifier token (folded or decoded).
 pub(super) fn ident(t: Option<&Tok>) -> Option<&str> {
     match t {
-        Some(Tok::Word(w) | Tok::Quoted(w)) => Some(w.as_str()),
+        Some(Tok::Word(super::Word { lower: w, .. }) | Tok::Quoted(w)) => Some(w.as_str()),
         _ => None,
     }
 }
