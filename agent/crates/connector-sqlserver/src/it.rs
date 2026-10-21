@@ -3380,7 +3380,7 @@ async fn nc_measure(
     db: &str,
     stage: &str,
 ) -> (Option<i64>, Option<i64>) {
-    let r = try_rows(
+    let r = Box::pin(try_rows(
         s,
         &format!(
             "SELECT CONVERT(int, containment), CONVERT(int, catalog_collation_type), \
@@ -3389,7 +3389,7 @@ async fn nc_measure(
              FROM sys.databases WHERE name = N'{db}'"
         ),
         4,
-    )
+    ))
     .await
     .and_then(|r| r.into_iter().next())
     .unwrap_or_default();
@@ -3411,13 +3411,13 @@ async fn nc_measure(
 /// compares names without case). Printed as an `[it] name_case:` line.
 async fn nc_duplicate(s: &mut Session, major: u32, db: &str, stage: &str, name: &str) -> bool {
     let upper = name.to_uppercase();
-    let e = exec_error(
+    let e = Box::pin(exec_error(
         s,
         &in_db(
             db,
             &format!("CREATE TABLE {name}(a int); CREATE TABLE {upper}(a int)"),
         ),
-    )
+    ))
     .await;
     eprintln!(
         "[it] name_case: major={major} db={db} stage={stage} case_only_duplicate_table \
@@ -3426,6 +3426,80 @@ async fn nc_duplicate(s: &mut Session, major: u32, db: &str, stage: &str, name: 
         e.map_or_else(|| "none".to_owned(), |n| n.to_string()),
     );
     e == Some(2714)
+}
+
+/// Security review L2 of the ADR-0055 refinement: a `_CS_` database
+/// converted to contained, then back, with the measurement lines, the
+/// case-only duplicate oracle and the reported value at each stage;
+/// skipped when the server refuses either `ALTER`.
+async fn nc_conversion(s: &mut Session, c: &SqlserverConnector, t: &TargetConfig, major: u32) {
+    // A `_CS_` database converted to contained, then back
+    // (security review L2); skipped when the server refuses.
+    Box::pin(exec(
+        s,
+        &format!("CREATE DATABASE [{NC_CONVERT}] COLLATE Latin1_General_100_CS_AS"),
+    ))
+    .await;
+    Box::pin(exec(
+        s,
+        &format!("ALTER DATABASE [{NC_CONVERT}] SET AUTO_CLOSE OFF"),
+    ))
+    .await;
+    if Box::pin(exec_try(
+        s,
+        &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = PARTIAL"),
+    ))
+    .await
+    {
+        let (containment, catalog) =
+            Box::pin(nc_measure(s, major, NC_CONVERT, "converted to partial")).await;
+        let refused = Box::pin(nc_duplicate(s, major, NC_CONVERT, "converted", "t")).await;
+        assert!(Box::pin(c.check(t)).await.reachable);
+        let got = nc_value(c, t, NC_CONVERT).0;
+        eprintln!(
+            "[it] name_case: major={major} db={NC_CONVERT} stage=converted to partial \
+             reported={got}"
+        );
+        let want = if containment == Some(1) {
+            nc_contained_expected(catalog)
+        } else {
+            "sensitive"
+        };
+        assert_eq!(got, want);
+        if got == "insensitive" {
+            assert!(
+                refused,
+                "{NC_CONVERT} reported insensitive, but the server accepted a case-only \
+                 duplicate table name"
+            );
+        }
+        if Box::pin(exec_try(
+            s,
+            &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = NONE"),
+        ))
+        .await
+        {
+            let (containment, catalog) =
+                Box::pin(nc_measure(s, major, NC_CONVERT, "back to none")).await;
+            let refused = Box::pin(nc_duplicate(s, major, NC_CONVERT, "back", "u")).await;
+            assert!(Box::pin(c.check(t)).await.reachable);
+            let got = nc_value(c, t, NC_CONVERT).0;
+            eprintln!(
+                "[it] name_case: major={major} db={NC_CONVERT} stage=back to none \
+                 reported={got}"
+            );
+            assert_eq!((containment, catalog), (Some(0), Some(0)));
+            assert_eq!(got, "sensitive");
+            assert!(
+                !refused,
+                "a _CS_ database refused a case-only duplicate name"
+            );
+        } else {
+            eprintln!("skipped: SET CONTAINMENT = NONE refused on this server");
+        }
+    } else {
+        eprintln!("skipped: SET CONTAINMENT = PARTIAL refused on this server");
+    }
 }
 
 /// The value the agent reports for a contained database's objects with
@@ -3451,20 +3525,26 @@ fn nc_contained_expected(v: Option<i64>) -> &'static str {
 /// `DATABASEPROPERTYEX` answer on a closed database).
 #[tokio::test]
 async fn name_case_follows_the_collations() {
+    Box::pin(name_case_follows_the_collations_body()).await;
+}
+
+/// The body of [`name_case_follows_the_collations`], boxed by it (its
+/// future outgrew the test thread's stack, like the other large tests).
+async fn name_case_follows_the_collations_body() {
     if !enabled() {
         return;
     }
     let _g = serial().await;
-    let mut s = sa().await;
-    nc_drop(&mut s).await;
-    let server = try_rows(
+    let mut s = Box::pin(sa()).await;
+    Box::pin(nc_drop(&mut s)).await;
+    let server = Box::pin(try_rows(
         &mut s,
         "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), CONVERT(int, \
          COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), \
          'ComparisonStyle')), CONVERT(int, COL_LENGTH('sys.databases', \
          'catalog_collation_type'))",
         3,
-    )
+    ))
     .await
     .unwrap();
     eprintln!(
@@ -3485,7 +3565,7 @@ async fn name_case_follows_the_collations() {
             " COLLATE Latin1_General_100_CS_AS",
         ),
     ] {
-        exec(&mut s, &format!("CREATE DATABASE [{db}]{collate}")).await;
+        Box::pin(exec(&mut s, &format!("CREATE DATABASE [{db}]{collate}"))).await;
     }
     // Express turns `AUTO_CLOSE` on for every new database: off on all but
     // the `AUTO_CLOSE` case, so that their collations stay readable.
@@ -3494,14 +3574,18 @@ async fn name_case_follows_the_collations() {
         "databastion_nc_bin2",
         "databastion_nc_ci",
     ] {
-        exec(&mut s, &format!("ALTER DATABASE [{db}] SET AUTO_CLOSE OFF")).await;
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER DATABASE [{db}] SET AUTO_CLOSE OFF"),
+        ))
+        .await;
     }
-    exec(
+    Box::pin(exec(
         &mut s,
         "ALTER DATABASE [databastion_nc_autoclose] SET AUTO_CLOSE ON",
-    )
+    ))
     .await;
-    let snapshot = exec_try(
+    let snapshot = Box::pin(exec_try(
         &mut s,
         "DECLARE @f nvarchar(260) = (SELECT TOP (1) physical_name FROM \
          sys.master_files WHERE database_id = DB_ID(N'databastion_nc_cs') AND type = 0); \
@@ -3510,33 +3594,33 @@ async fn name_case_follows_the_collations() {
          DECLARE @s nvarchar(max) = N'CREATE DATABASE [databastion_nc_snap] ON (NAME = ' + \
          QUOTENAME(@l) + N', FILENAME = ''' + REPLACE(@f, N'.mdf', N'_snap.ss') + N''') AS \
          SNAPSHOT OF [databastion_nc_cs]'; EXEC sp_executesql @s",
-    )
+    ))
     .await;
-    let previous_contained = try_rows(
+    let previous_contained = Box::pin(try_rows(
         &mut s,
         "SELECT CONVERT(int, value_in_use) FROM sys.configurations WHERE name = N'contained \
          database authentication'",
         1,
-    )
+    ))
     .await
     .and_then(|r| r.first().and_then(|r| r[0].as_int()));
-    let contained = exec_try(
+    let contained = Box::pin(exec_try(
         &mut s,
         "EXEC sp_configure N'contained database authentication', 1; RECONFIGURE",
-    )
+    ))
     .await
-        && exec_try(
+        && Box::pin(exec_try(
             &mut s,
             &format!(
                 "CREATE DATABASE [{NC_CONTAINED}] CONTAINMENT = PARTIAL COLLATE \
                  Latin1_General_100_CS_AS"
             ),
-        )
+        ))
         .await
-        && exec_try(
+        && Box::pin(exec_try(
             &mut s,
             &format!("ALTER DATABASE [{NC_CONTAINED}] SET AUTO_CLOSE OFF"),
-        )
+        ))
         .await;
     // The server's own answer, as an oracle: two tables whose names differ
     // by case only are two objects under a case-sensitive catalog.
@@ -3546,43 +3630,43 @@ async fn name_case_follows_the_collations() {
         "databastion_nc_ci",
         NC_CONTAINED,
     ] {
-        let two = exec_try(
+        let two = Box::pin(exec_try(
             &mut s,
             &in_db(
                 db,
                 "CREATE TABLE dbo.Customers (id int); CREATE TABLE dbo.customers (id int)",
             ),
-        )
+        ))
         .await;
         eprintln!("engine fact: {db}: Customers and customers are two tables: {two}");
     }
-    exec(
+    Box::pin(exec(
         &mut s,
         "ALTER DATABASE [databastion_nc_offline] SET OFFLINE WITH ROLLBACK IMMEDIATE",
-    )
+    ))
     .await;
     // The AUTO_CLOSE database held open by a session of its own.
-    let mut holder = sa().await;
-    exec(&mut holder, "USE [databastion_nc_autoclose]").await;
-    nc_fact(&mut s, "databastion_nc_autoclose", "open").await;
-    nc_fact(&mut s, "databastion_nc_offline", "offline").await;
-    let rows = try_rows(
+    let mut holder = Box::pin(sa()).await;
+    Box::pin(exec(&mut holder, "USE [databastion_nc_autoclose]")).await;
+    Box::pin(nc_fact(&mut s, "databastion_nc_autoclose", "open")).await;
+    Box::pin(nc_fact(&mut s, "databastion_nc_offline", "offline")).await;
+    let rows = Box::pin(try_rows(
         &mut s,
         "SELECT CONVERT(nvarchar(128), name), CONVERT(int, catalog_collation_type), \
          CONVERT(int, containment) FROM sys.databases WHERE name LIKE N'databastion_nc_%'",
         3,
-    )
+    ))
     .await;
     eprintln!("engine fact: catalog_collation_type per test database: {rows:?}");
     // One measurement line per test database (ADR-0055 refinement of
     // 2026-10-21, recorded by the engine matrix on 2019, 2022 and 2025).
-    let major = major().await;
+    let major = Box::pin(major()).await;
     let catalog = if has_catalog_column {
         "CONVERT(int, catalog_collation_type), CONVERT(nvarchar(60), catalog_collation_type_desc)"
     } else {
         "CONVERT(int, NULL), CONVERT(nvarchar(60), NULL)"
     };
-    let measured = try_rows(
+    let measured = Box::pin(try_rows(
         &mut s,
         &format!(
             "SELECT CONVERT(nvarchar(128), name), CONVERT(int, containment), {catalog}, \
@@ -3591,7 +3675,7 @@ async fn name_case_follows_the_collations() {
              ORDER BY name"
         ),
         5,
-    )
+    ))
     .await
     .unwrap_or_default();
     let mut contained_catalog = None;
@@ -3612,14 +3696,14 @@ async fn name_case_follows_the_collations() {
     // The server's answer to a case-only duplicate table name: error 2714
     // when the catalog compares names without case.
     let contained_2714 = if contained {
-        nc_duplicate(&mut s, major, NC_CONTAINED, "created", "t").await
+        Box::pin(nc_duplicate(&mut s, major, NC_CONTAINED, "created", "t")).await
     } else {
         false
     };
 
     let c = SqlserverConnector::new();
     let t = agent("");
-    let h = c.check(&t).await;
+    let h = Box::pin(c.check(&t)).await;
     assert!(h.reachable, "{:?}", h.detail);
     eprintln!("check: {:?}", h.detail);
     let (_, whole) = nc_value(&c, &t, "databastion_nc_cs");
@@ -3680,73 +3764,7 @@ async fn name_case_follows_the_collations() {
                 );
             }
 
-            // A `_CS_` database converted to contained, then back
-            // (security review L2); skipped when the server refuses.
-            exec(
-                &mut s,
-                &format!("CREATE DATABASE [{NC_CONVERT}] COLLATE Latin1_General_100_CS_AS"),
-            )
-            .await;
-            exec(
-                &mut s,
-                &format!("ALTER DATABASE [{NC_CONVERT}] SET AUTO_CLOSE OFF"),
-            )
-            .await;
-            if exec_try(
-                &mut s,
-                &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = PARTIAL"),
-            )
-            .await
-            {
-                let (containment, catalog) =
-                    nc_measure(&mut s, major, NC_CONVERT, "converted to partial").await;
-                let refused = nc_duplicate(&mut s, major, NC_CONVERT, "converted", "t").await;
-                assert!(c.check(&t).await.reachable);
-                let got = nc_value(&c, &t, NC_CONVERT).0;
-                eprintln!(
-                    "[it] name_case: major={major} db={NC_CONVERT} stage=converted to partial \
-                     reported={got}"
-                );
-                let want = if containment == Some(1) {
-                    nc_contained_expected(catalog)
-                } else {
-                    "sensitive"
-                };
-                assert_eq!(got, want);
-                if got == "insensitive" {
-                    assert!(
-                        refused,
-                        "{NC_CONVERT} reported insensitive, but the server accepted a case-only \
-                         duplicate table name"
-                    );
-                }
-                if exec_try(
-                    &mut s,
-                    &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = NONE"),
-                )
-                .await
-                {
-                    let (containment, catalog) =
-                        nc_measure(&mut s, major, NC_CONVERT, "back to none").await;
-                    let refused = nc_duplicate(&mut s, major, NC_CONVERT, "back", "u").await;
-                    assert!(c.check(&t).await.reachable);
-                    let got = nc_value(&c, &t, NC_CONVERT).0;
-                    eprintln!(
-                        "[it] name_case: major={major} db={NC_CONVERT} stage=back to none \
-                         reported={got}"
-                    );
-                    assert_eq!((containment, catalog), (Some(0), Some(0)));
-                    assert_eq!(got, "sensitive");
-                    assert!(
-                        !refused,
-                        "a _CS_ database refused a case-only duplicate name"
-                    );
-                } else {
-                    eprintln!("skipped: SET CONTAINMENT = NONE refused on this server");
-                }
-            } else {
-                eprintln!("skipped: SET CONTAINMENT = PARTIAL refused on this server");
-            }
+            Box::pin(nc_conversion(&mut s, &c, &t, major)).await;
         } else {
             eprintln!("skipped: contained databases not enabled on this server");
         }
@@ -3763,29 +3781,34 @@ async fn name_case_follows_the_collations() {
         );
 
         // The AUTO_CLOSE database closes once its last session ends.
-        holder.close().await;
+        Box::pin(holder.close()).await;
         let mut closed = false;
         for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let r = try_rows(
+            Box::pin(tokio::time::sleep(Duration::from_millis(500))).await;
+            let r = Box::pin(try_rows(
                 &mut s,
                 "SELECT CONVERT(int, CASE WHEN collation_name IS NULL THEN 1 ELSE 0 END) FROM \
                  sys.databases WHERE name = N'databastion_nc_autoclose'",
                 1,
-            )
+            ))
             .await;
             if r.and_then(|r| r.first().and_then(|r| r[0].as_int())) == Some(1) {
                 closed = true;
                 break;
             }
         }
-        nc_fact(&mut s, "databastion_nc_autoclose", "after its last session").await;
+        Box::pin(nc_fact(
+            &mut s,
+            "databastion_nc_autoclose",
+            "after its last session",
+        ))
+        .await;
         if closed {
             eprintln!("engine fact: an AUTO_CLOSE database closed reads collation_name NULL");
         } else {
             eprintln!("engine fact: the AUTO_CLOSE database's collation_name stayed readable");
         }
-        let h = c.check(&t).await;
+        let h = Box::pin(c.check(&t)).await;
         assert!(h.reachable, "{:?}", h.detail);
         assert_eq!(
             nc_value(&c, &t, "databastion_nc_autoclose").0,
@@ -3795,7 +3818,7 @@ async fn name_case_follows_the_collations() {
         // A new connector never saw it open: unknown while closed.
         if closed {
             let fresh = SqlserverConnector::new();
-            assert!(fresh.check(&t).await.reachable);
+            assert!(Box::pin(fresh.check(&t)).await.reachable);
             assert_eq!(
                 nc_value(&fresh, &t, "databastion_nc_autoclose").0,
                 "unknown"
@@ -3804,9 +3827,9 @@ async fn name_case_follows_the_collations() {
 
         // `VIEW ANY DATABASE` revoked from `public`: the list may be
         // partial.
-        exec(&mut s, "REVOKE VIEW ANY DATABASE FROM public").await;
-        let h = c.check(&t).await;
-        exec(&mut s, "GRANT VIEW ANY DATABASE TO public").await;
+        Box::pin(exec(&mut s, "REVOKE VIEW ANY DATABASE FROM public")).await;
+        let h = Box::pin(c.check(&t)).await;
+        Box::pin(exec(&mut s, "GRANT VIEW ANY DATABASE TO public")).await;
         assert!(h.reachable, "{:?}", h.detail);
         let (_, v) = nc_value(&c, &t, "databastion_nc_cs");
         assert_eq!(v["objects"], "unknown", "{v}");
@@ -3817,16 +3840,16 @@ async fn name_case_follows_the_collations() {
     let before = c.name_case(&t);
     let mut down = t.clone();
     down.port = Some(9);
-    let h = c.check(&down).await;
+    let h = Box::pin(c.check(&down)).await;
     assert!(!h.reachable);
     assert_eq!(c.name_case(&down), before);
 
-    nc_drop(&mut s).await;
+    Box::pin(nc_drop(&mut s)).await;
     if let Some(v) = previous_contained {
-        exec_ok(
+        Box::pin(exec_ok(
             &mut s,
             &format!("EXEC sp_configure N'contained database authentication', {v}; RECONFIGURE"),
-        )
+        ))
         .await;
     }
 }
