@@ -4073,6 +4073,61 @@ fn nc_value(c: &SqlserverConnector, t: &TargetConfig, db: &str) -> (String, serd
 
 /// One `sa` row of `sys.databases` for `db`: collation name and
 /// `DATABASEPROPERTYEX(…, 'Collation')`, printed as an engine fact.
+/// Whether `databastion_nc_autoclose` reads as closed (`collation_name`
+/// `NULL`).
+async fn nc_is_closed(s: &mut Session) -> bool {
+    let r = Box::pin(try_rows(
+        s,
+        "SELECT CONVERT(int, CASE WHEN collation_name IS NULL THEN 1 ELSE 0 END) FROM \
+         sys.databases WHERE name = N'databastion_nc_autoclose'",
+        1,
+    ))
+    .await;
+    r.and_then(|r| r.first().and_then(|r| r[0].as_int())) == Some(1)
+}
+
+/// Waits (at most 15 s) until `databastion_nc_autoclose` is closed.
+async fn nc_wait_closed(s: &mut Session) -> bool {
+    for _ in 0..30 {
+        if Box::pin(nc_is_closed(s)).await {
+            return true;
+        }
+        Box::pin(tokio::time::sleep(Duration::from_millis(500))).await;
+    }
+    false
+}
+
+/// How many times the server's current error log says it started
+/// `databastion_nc_autoclose` up (each open of an `AUTO_CLOSE` database is
+/// logged); `None` when the log cannot be read.
+async fn nc_startups(s: &mut Session) -> Option<i64> {
+    if !Box::pin(exec_try(
+        s,
+        "IF OBJECT_ID(N'tempdb..#nc_log') IS NULL CREATE TABLE #nc_log (d datetime, p \
+         nvarchar(128), t nvarchar(4000)); DELETE FROM #nc_log; INSERT INTO #nc_log EXEC \
+         master.dbo.xp_readerrorlog 0, 1, N'Starting up database', N'databastion_nc_autoclose'",
+    ))
+    .await
+    {
+        return None;
+    }
+    Box::pin(try_rows(
+        s,
+        "SELECT CONVERT(bigint, COUNT(*)) FROM #nc_log",
+        1,
+    ))
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_int()))
+}
+
+/// The startups between two counts, printed.
+fn nc_delta(a: Option<i64>, b: Option<i64>) -> String {
+    match (a, b) {
+        (Some(a), Some(b)) => (b - a).to_string(),
+        _ => "unknown".to_owned(),
+    }
+}
+
 async fn nc_fact(s: &mut Session, db: &str, label: &str) {
     let rows = try_rows(
         s,
@@ -4526,46 +4581,67 @@ async fn name_case_follows_the_collations_body() {
 
         // The AUTO_CLOSE database closes once its last session ends.
         Box::pin(holder.close()).await;
-        let mut closed = false;
-        for _ in 0..30 {
-            Box::pin(tokio::time::sleep(Duration::from_millis(500))).await;
-            let r = Box::pin(try_rows(
-                &mut s,
-                "SELECT CONVERT(int, CASE WHEN collation_name IS NULL THEN 1 ELSE 0 END) FROM \
-                 sys.databases WHERE name = N'databastion_nc_autoclose'",
-                1,
-            ))
-            .await;
-            if r.and_then(|r| r.first().and_then(|r| r[0].as_int())) == Some(1) {
-                closed = true;
-                break;
-            }
-        }
+        let closed = Box::pin(nc_wait_closed(&mut s)).await;
+        // What opens it again: the server logs "Starting up database" at
+        // each open of an AUTO_CLOSE database (counted around each step).
+        let n0 = Box::pin(nc_startups(&mut s)).await;
         Box::pin(nc_fact(
             &mut s,
             "databastion_nc_autoclose",
             "after its last session",
         ))
         .await;
+        let n1 = Box::pin(nc_startups(&mut s)).await;
         if closed {
             eprintln!("engine fact: an AUTO_CLOSE database closed reads collation_name NULL");
         } else {
             eprintln!("engine fact: the AUTO_CLOSE database's collation_name stayed readable");
         }
         let h = Box::pin(c.check(&t)).await;
+        let n2 = Box::pin(nc_startups(&mut s)).await;
         assert!(h.reachable, "{:?}", h.detail);
         assert_eq!(
             nc_value(&c, &t, "databastion_nc_autoclose").0,
             "sensitive",
             "no flapping across a close"
         );
-        // A new connector never saw it open: unknown while closed.
-        if closed {
-            let fresh = SqlserverConnector::new();
-            assert!(Box::pin(fresh.check(&t)).await.reachable);
-            assert_eq!(
-                nc_value(&fresh, &t, "databastion_nc_autoclose").0,
-                "unknown"
+        eprintln!(
+            "[it] name_case: major={major} autoclose startups: the fact query {}, check() {}",
+            nc_delta(n0, n1),
+            nc_delta(n1, n2)
+        );
+        // A new connector never saw it open: unknown while it stays closed
+        // across that check. Something may open it again in between (a
+        // check() itself, or the server): the database is waited closed
+        // again, and the assertion holds only when no startup was logged
+        // during the fresh check and it was closed before and after it.
+        let before = Box::pin(nc_wait_closed(&mut s)).await;
+        let n3 = Box::pin(nc_startups(&mut s)).await;
+        let fresh = SqlserverConnector::new();
+        assert!(Box::pin(fresh.check(&t)).await.reachable);
+        let n4 = Box::pin(nc_startups(&mut s)).await;
+        let after = Box::pin(nc_is_closed(&mut s)).await;
+        let value = nc_value(&fresh, &t, "databastion_nc_autoclose").0;
+        let opened = match (n3, n4) {
+            (Some(a), Some(b)) => Some(b > a),
+            _ => None,
+        };
+        eprintln!(
+            "[it] name_case: major={major} autoclose fresh check: closed before {before}, after \
+             {after}, started up during it {}, value {value}",
+            opened.map_or_else(
+                || "unknown (errorlog not readable)".to_owned(),
+                |o| o.to_string()
+            )
+        );
+        if before && after && opened == Some(false) {
+            assert_eq!(value, "unknown", "closed across the fresh check");
+        } else {
+            // Open at some point of the check: its read may see the
+            // collation, and the value is then the database's.
+            assert!(
+                value == "unknown" || value == "sensitive",
+                "unexpected {value}"
             );
         }
 
