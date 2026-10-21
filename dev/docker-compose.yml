@@ -89,7 +89,10 @@ services:
     # Creates the dev-only TLS material before any server starts (mariadb/tls-entrypoint.sh), then
     # runs the image's entrypoint. An entrypoint override drops the image's CMD: set it again.
     entrypoint: ["/bin/bash", "/usr/local/bin/databastion-tls-entrypoint.sh"]
-    command: ["mariadbd"]
+    # lower_case_table_names: 0 (the Linux default) unless set; the engine matrix starts one entry
+    # with 1 (ADR-0055 decision 10). MariaDB reads it at each start; a volume initialized with
+    # another value needs `make dev-reset`.
+    command: ["mariadbd", "--lower-case-table-names=${DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES:-0}"]
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}
@@ -116,6 +119,11 @@ services:
 
   mysql:
     image: ${DATABASTION_DEV_MYSQL_IMAGE:-mysql:8.4.11@sha256:0744ee5ef89ce6ccfa13de3e579fe6b9e27f93dd70da9c06d2c908b1b193fb8d}
+    # lower_case_table_names: 0 (the Linux default) unless set; the engine matrix starts one entry
+    # with 1 (ADR-0055 decision 10). MySQL 8.0+ takes it at data directory initialization only
+    # (the image's entrypoint passes these arguments to it): a volume initialized with another
+    # value refuses to start, `make dev-reset` first.
+    command: ["mysqld", "--lower-case-table-names=${DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES:-0}"]
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy dev/.env.example to dev/.env}
       DATABASTION_DB_PASSWORD: ${DATABASTION_DB_PASSWORD:?copy dev/.env.example to dev/.env}

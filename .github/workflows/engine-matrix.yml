@@ -135,6 +135,21 @@ jobs:
             it: mysql
             services: mysql mariadb percona
             mariadb_image: mariadb:11.8.9@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+          # ADR-0055 decision 10: a MySQL and a MariaDB server started with lower_case_table_names =
+          # 1 (names stored in lowercase, compared without case), at their default versions: check()
+          # reports `insensitive` (name_case_it asserts the setting through dev/agent-it.sh); the
+          # tests that need 0 (names as written, the CTE rule, `SYS` / `MySQL` user databases) skip
+          # with a message.
+          - engine: MySQL
+            version: "8.4.11 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mysql_lower_case_table_names: "1"
+          - engine: MariaDB
+            version: "11.4.13 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mariadb_lower_case_table_names: "1"
           # MongoDB Community (5.0+ is enforced by the connector).
           - engine: MongoDB
             version: "6.0.28"
@@ -271,6 +286,8 @@ jobs:
       DATABASTION_DEV_POSTGRES_LOG_FORMAT: ${{ matrix.postgres_log_format }}
       DATABASTION_DEV_MYSQL_IMAGE: ${{ matrix.mysql_image }}
       DATABASTION_DEV_MARIADB_IMAGE: ${{ matrix.mariadb_image }}
+      DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES: ${{ matrix.mysql_lower_case_table_names }}
+      DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES: ${{ matrix.mariadb_lower_case_table_names }}
       DATABASTION_DEV_MONGO_IMAGE: ${{ matrix.mongo_image }}
       DATABASTION_DEV_REDIS_IMAGE: ${{ matrix.redis_image }}
       DATABASTION_DEV_VALKEY_IMAGE: ${{ matrix.valkey_image }}

@@ -102,6 +102,8 @@ The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environ
 | `DATABASTION_DEV_POSTGRES_LOG_FORMAT` | `postgres` | `jsonlog` (default; PostgreSQL 15+) or `csvlog` (required on 13 and 14): the log is then `postgresql.csv`, which `make agent-it` reads |
 | `DATABASTION_DEV_MYSQL_IMAGE` | `mysql` | `mysql:<version>@sha256:…` |
 | `DATABASTION_DEV_MARIADB_IMAGE` | `mariadb` | `mariadb:<version>@sha256:…` |
+| `DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES` | `mysql` | `lower_case_table_names` of the server (default `0`, the Linux default); MySQL 8.0+ takes it when the data volume is initialized only (`make dev-reset` first); `make agent-it` then asserts the server runs with it |
+| `DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES` | `mariadb` | the same for MariaDB (read at each start; names created under another value keep their spelling on disk, so reset the volume too) |
 | `DATABASTION_DEV_MONGO_IMAGE` | `mongo` | `mongo:<version>@sha256:…` (5.0+, the connector's minimum) |
 
 A data volume is initialized by the engine version that created it: switch versions on fresh volumes (`make dev-reset` first), and keep the variables exported for `make agent-it` too. For example, PostgreSQL 14 (digest from the workflow):

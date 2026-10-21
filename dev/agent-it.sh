@@ -90,6 +90,10 @@ it_mysql() {
   export DATABASTION_TEST_MARIADB_DUMP_CMD="$exec_in -e MYSQL_PWD=${MARIADB_ROOT_PASSWORD} mariadb mariadb-dump -uroot --single-transaction support"
   export DATABASTION_TEST_MYSQL_DUMP_CMD="$exec_in -e MYSQL_PWD=${MYSQL_ROOT_PASSWORD} mysql mysqldump -uroot --single-transaction hr"
   export DATABASTION_TEST_PERCONA_DUMP_CMD="$exec_in -e MYSQL_PWD=${PERCONA_ROOT_PASSWORD} percona mysqldump -h 127.0.0.1 --protocol=TCP -uroot --single-transaction hr"
+  # The lower_case_table_names the services were started with (docker-compose.yml): the tests
+  # assert the servers run with it (the engine matrix's entries with 1, ADR-0055 decision 10).
+  export DATABASTION_TEST_MYSQL_LOWER_CASE_TABLE_NAMES="${DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES:-0}"
+  export DATABASTION_TEST_MARIADB_LOWER_CASE_TABLE_NAMES="${DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES:-0}"
   export DATABASTION_TEST_REQUIRE=mysql,mariadb,mysql-admin,mariadb-admin,mysql-tls,mariadb-tls,federated,pam,network,mariadb-audit,percona,percona-audit,mysqldump
   cargo_it databastion-connector-mysql "$@"
 }
