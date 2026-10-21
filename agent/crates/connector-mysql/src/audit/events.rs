@@ -32,9 +32,16 @@
 //! (`server_audit` `TABLE` events, `audit_log_filter` `table_access`),
 //! otherwise from the statement text (reads and writes only: DDL and DCL
 //! events take no name from text); an unqualified name is in the
-//! statement's current database. `information_schema`,
-//! `performance_schema`, `sys`, `DUAL` and the internal statistics tables
-//! (`mysql.*_stats`) are skipped from the objects of reads only: a write
+//! statement's current database. Names keep the case the records give or
+//! the text is written in, quoted or not (ADR-0055 decision 3: with
+//! `lower_case_table_names = 0`, the Linux default, `Customers` and
+//! `customers` are two tables), but `information_schema` and
+//! `performance_schema`, which the servers compare without case, named in
+//! lower case. `information_schema`,
+//! `performance_schema` (in any case), `sys`, `DUAL` and the internal
+//! statistics tables (`mysql.*_stats`; `sys` and `mysql` as stored, since
+//! `SYS` or `MySQL` may be another database) are skipped from the objects
+//! of reads only: a write
 //! names them (`UPDATE performance_schema.setup_consumers …` turns the
 //! `performance_schema` source off), and so does a table record that
 //! writes a system schema table, whatever the statement's action. The
@@ -133,16 +140,38 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
 /// included on `SQL_TEXT`, clear-text passwords on MariaDB) and its setup
 /// tables drive the `performance_schema` Audit source. Reads of them are
 /// not reported; writes are (see [`EventBuilder::statement`]).
+///
+/// Compared ASCII-case-insensitively: for what is always reported (a
+/// change that touches a system schema), the wider match fails closed.
+/// What is left out of reads uses [`is_skipped_system_schema`].
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
         .any(|s| s.eq_ignore_ascii_case(db))
 }
 
+/// [`is_system_schema`] for what is left out of reads: `information_schema`
+/// and `performance_schema` in any case (the servers compare them without
+/// case whatever `lower_case_table_names`), `sys` only as stored. `sys` is
+/// an ordinary database for name resolution: with
+/// `lower_case_table_names = 0` (the Linux default) `SYS` or `Sys` is
+/// another database, whose reads are application reads (ADR-0055
+/// decision 3; with 1 or 2 such a read is reported, failing closed).
+fn is_skipped_system_schema(db: &str) -> bool {
+    ["information_schema", "performance_schema"]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(db))
+        || db == "sys"
+}
+
 /// MariaDB's engine-independent statistics, read by the server itself for
-/// many statements, and InnoDB's persistent statistics.
+/// many statements, and InnoDB's persistent statistics. Compared as
+/// stored (the servers' records name them in lower case): it decides what
+/// is left out, and with `lower_case_table_names = 0` `MySQL.Table_stats`
+/// is another table (ADR-0055 decision 3; with 1 or 2 a text that names
+/// one in another case is reported, failing closed).
 fn is_internal_table(db: &str, table: &str) -> bool {
-    db.eq_ignore_ascii_case("mysql")
+    db == "mysql"
         && [
             "table_stats",
             "column_stats",
@@ -150,8 +179,7 @@ fn is_internal_table(db: &str, table: &str) -> bool {
             "innodb_table_stats",
             "innodb_index_stats",
         ]
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(table))
+        .contains(&table)
 }
 
 /// A relation named by a statement (unqualified: in `database`) that holds
@@ -159,7 +187,7 @@ fn is_internal_table(db: &str, table: &str) -> bool {
 /// `DUAL`. Skipped from the objects of reads only.
 fn is_system_relation(r: &RelationName, database: &str) -> bool {
     let db = r.schema.as_deref().unwrap_or(database);
-    is_system_schema(db)
+    is_skipped_system_schema(db)
         || is_internal_table(db, &r.name)
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
 }
@@ -552,7 +580,7 @@ pub(crate) fn is_dump_program(program: &str) -> bool {
 struct SessionState {
     /// Consistent snapshot, global read lock or `LOCK TABLES` taken.
     snapshot: bool,
-    /// Tables `SHOW CREATE TABLE` ran on.
+    /// Tables `SHOW CREATE TABLE` ran on ([`folded`]).
     shown: HashSet<RelationName>,
     /// `program_name` from the connect record.
     program: Option<String>,
@@ -1190,33 +1218,41 @@ pub(crate) fn text_shape(text: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Whether `text` holds `name` written in another ASCII case than `name`
-/// (anywhere: a name, a literal or a comment; fails closed).
-fn case_variant_in(text: &[u8], name: &str) -> bool {
-    let n = name.as_bytes();
-    !n.is_empty()
-        && text
-            .windows(n.len())
-            .any(|w| w.eq_ignore_ascii_case(n) && w != n)
+/// The database of an object: as written or recorded (ADR-0055 decision
+/// 3), but `information_schema` and `performance_schema` in the case the
+/// servers store them, since they compare them without case whatever
+/// `lower_case_table_names`.
+fn object_database(database: &str) -> NormalizedName {
+    if database.is_empty() {
+        NormalizedName::wildcard()
+    } else if let Some(s) = ["information_schema", "performance_schema"]
+        .into_iter()
+        .find(|s| s.eq_ignore_ascii_case(database))
+    {
+        normalize(s)
+    } else {
+        normalize(database)
+    }
 }
 
 fn object(database: &str, name: &str) -> EventObject {
-    let db = if database.is_empty() {
-        NormalizedName::wildcard()
-    } else {
-        normalize(database)
-    };
-    EventObject::new(db, None, normalize(name))
+    EventObject::new(object_database(database), None, normalize(name))
 }
 
 /// An object the source does not name: the database, and `*`.
 fn unknown_object(database: &str) -> EventObject {
-    let db = if database.is_empty() {
-        NormalizedName::wildcard()
-    } else {
-        normalize(database)
-    };
+    let db = object_database(database);
     EventObject::new(db, None, NormalizedName::wildcard())
+}
+
+/// A relation ASCII-lowercased: the dump pattern matches tables without
+/// case (a signal: matching more fails closed), while objects keep the
+/// names as written (ADR-0055 decision 3).
+fn folded(r: &RelationName) -> RelationName {
+    RelationName {
+        schema: r.schema.as_deref().map(str::to_ascii_lowercase),
+        name: r.name.to_ascii_lowercase(),
+    }
 }
 
 /// Updates the session's dump state from its utility statements.
@@ -1238,7 +1274,7 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
                             .as_deref()
                             .is_none_or(|s| s.chars().count() <= MAX_SHOWN_NAME_CHARS);
                     if short && s.shown.len() < MAX_SESSION_RELATIONS {
-                        s.shown.insert(r.clone());
+                        s.shown.insert(folded(r));
                     }
                 }
             }
@@ -1898,19 +1934,10 @@ impl EventBuilder {
                         if is_dual(r) || is_system_relation(r, a.database) {
                             continue;
                         }
-                        // The analyzer folds unquoted names to lower case:
-                        // a name written in another case anywhere in the
-                        // text (`hr.V_stats`, `HR.v_stats`) may be another
-                        // relation than the record's.
-                        let variant = |n: &str| {
-                            [a.text, a.alt_text]
-                                .into_iter()
-                                .flatten()
-                                .any(|t| case_variant_in(t, n))
-                        };
+                        // The analyzer keeps names as written, quoted or
+                        // not (ADR-0055 decision 3): `hr.V_stats` and
+                        // `HR.v_stats` are not recorded by `hr.v_stats`.
                         let recorded = !temporary
-                            && !variant(&r.name)
-                            && r.schema.as_deref().is_none_or(|s| !variant(s))
                             && a.tables
                                 .iter()
                                 .any(|(d, t, _)| *d == db && *t == r.name.as_str());
@@ -1950,12 +1977,12 @@ impl EventBuilder {
                 // loads a table's statistics (ADR-0048 decision 2). A
                 // statistics table the text names is added below.
                 let text_table = statement_text_table(self.flavor, db, table);
-                let system = (is_system_schema(db)
+                let system = (is_skipped_system_schema(db)
                     && !write
                     && *op == TableOp::Read
                     && text_table.is_none())
                     || (is_internal_table(db, table) && (!write || *op == TableOp::Read))
-                    || (!rw && db.eq_ignore_ascii_case("mysql"));
+                    || (!rw && *db == "mysql");
                 let o = text_table.map_or_else(
                     || ((*db).to_owned(), (*table).to_owned()),
                     |(d, t)| (d.to_owned(), t.to_owned()),
@@ -2248,7 +2275,7 @@ impl EventBuilder {
                     e = e.with_signal(Signal::FullTableRead);
                     let no_cache = p.lead.iter().skip(1).any(|w| w == "sql_no_cache");
                     let pattern = session.is_some_and(|s| {
-                        s.snapshot || user_relations.iter().any(|r| s.shown.contains(*r))
+                        s.snapshot || user_relations.iter().any(|r| s.shown.contains(&folded(r)))
                     });
                     if no_cache || dumper || pattern {
                         e = e.with_signal(Signal::Mysqldump);
@@ -3720,7 +3747,9 @@ mod tests {
 
     /// Names that differ only in case share one budget (security review
     /// of #197, M2): with `lower_case_table_names` 1 or 2 they are the
-    /// same table.
+    /// same table; with 0 they are two, and the shared budget only reports
+    /// the agent's own reads sooner (fails closed). The reported event
+    /// keeps the name as written (ADR-0055 decision 3).
     #[test]
     fn own_budget_ignores_the_case_of_names() {
         let usage = SharedOwnUsage::default();
@@ -3731,7 +3760,7 @@ mod tests {
             2,
             usage.clone(),
         ));
-        let reported: Vec<bool> = [
+        let reported: Vec<Option<String>> = [
             "SELECT 1 FROM hr.customers WHERE id = 1",
             "SELECT 1 FROM `HR`.`Customers` WHERE id = 2",
             "SELECT 1 FROM Hr.CUSTOMERS WHERE id = 3",
@@ -3740,10 +3769,13 @@ mod tests {
         .map(|t| {
             let mut access = pfs_access(t.as_bytes(), false, Vec::new());
             access.rows = Some(0);
-            b.statement(access, SystemTime::now()).is_some()
+            b.statement(access, SystemTime::now()).map(|e| shown(&e))
         })
         .collect();
-        assert_eq!(reported, [false, false, true]);
+        assert_eq!(
+            reported,
+            [None, None, Some("read [\"Hr.CUSTOMERS\"]".to_owned())]
+        );
         assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
     }
 
@@ -7470,7 +7502,8 @@ mod tests {
                 assert_eq!(ev.len(), 1, "{user}");
                 assert!(ev[0].always_report(), "{user}");
             }
-            // The same name in another schema is an ordinary table.
+            // The same name in another schema is an ordinary table, named
+            // as written (ADR-0055 decision 3).
             let mut b = EventBuilder::new(own());
             let ev = b.convert_file(
                 sa_at(
@@ -7487,7 +7520,7 @@ mod tests {
             );
             assert_eq!(
                 ev.iter().map(shown).collect::<Vec<_>>(),
-                [format!("read [\"hr.{}\"]", table.to_ascii_lowercase())]
+                [format!("read [\"hr.{table}\"]")]
             );
         }
         // Writes name them too, always reported.
@@ -7682,6 +7715,197 @@ mod tests {
         assert!(statistics_table("hr", "column_stats").is_none());
     }
 
+    /// The [`shown`] form of a read of `objects` (sorted, as events keep
+    /// them).
+    fn read_of(objects: &[&str], always: bool) -> String {
+        let mut o: Vec<&str> = objects.to_vec();
+        o.sort_unstable();
+        format!("read {o:?}{}", if always { " always" } else { "" })
+    }
+
+    /// ADR-0055 decision 3 (security review H1): with
+    /// `lower_case_table_names = 0` `Customers` and `customers` are two
+    /// tables, so on every source the objects taken from the statement
+    /// text (`server_audit` `QUERY` records, the `audit_log` JSON text,
+    /// `performance_schema` texts and digests) keep the names as written,
+    /// backquoted or not, and so do the objects taken from table records.
+    #[test]
+    fn names_reach_the_objects_as_written() {
+        for (text, objects) in [
+            ("SELECT * FROM hr.Customers", &["hr.Customers"][..]),
+            ("select * from hr.customers", &["hr.customers"][..]),
+            ("SELECT * FROM `hr`.`Customers`", &["hr.Customers"][..]),
+            ("SELECT * FROM `hr`.`customers`", &["hr.customers"][..]),
+            ("SELECT * FROM Hr.CUSTOMERS", &["Hr.CUSTOMERS"][..]),
+            (
+                "SELECT * FROM hr.Customers JOIN hr.customers USING (id)",
+                &["hr.Customers", "hr.customers"][..],
+            ),
+            (
+                "SELECT * FROM hr.Customers WHERE id IN (SELECT id FROM `hr`.`customers`)",
+                &["hr.Customers", "hr.customers"][..],
+            ),
+            // Keywords still match in any case.
+            ("SeLeCt * FrOm hr.Customers LiMiT 5", &["hr.Customers"][..]),
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(read_of(objects, false).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        // Writes too.
+        expect_everywhere("UPDATE hr.Customers SET a = 1", |_| {
+            "write [\"hr.Customers\"]".to_owned()
+        });
+        expect_everywhere("INSERT INTO `hr`.`customers` VALUES (1)", |_| {
+            "write [\"hr.customers\"]".to_owned()
+        });
+        // A `performance_schema` digest (identifiers backquoted, in the
+        // case written: `poll_digests.tsv`).
+        for (digest, objects) in [
+            ("SELECT * FROM `hr` . `Customers` ", &["hr.Customers"][..]),
+            ("SELECT * FROM `hr` . `customers` ", &["hr.customers"][..]),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            access.digest = true;
+            access.rows = Some(1);
+            let e = b.statement(access, SystemTime::now()).expect(digest);
+            assert_eq!(shown(&e), read_of(objects, false), "{digest}");
+        }
+        // Unqualified, in the current database as the source logs it.
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[sa_in("app", "10.0.0.5", 1, "Hr", "SELECT * FROM Customers")],
+                1024,
+            ),
+        );
+        assert_eq!(
+            out,
+            ["read [\"Hr.Customers\"] None [\"shape.full_table_read\"]"]
+        );
+        // Table records: the server's names, as the records give them.
+        for table in ["Customers", "customers"] {
+            let lines = vec![
+                format!("20260929 09:40:35,h,app,10.0.0.5,30,7,READ,hr,{table},"),
+                sa_line("app", "10.0.0.5", 7, &format!("SELECT * FROM hr.{table}")),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [read_of(&[&format!("hr.{table}")], false)],
+                "{table}"
+            );
+            let recs = filter_json(
+                "app",
+                "10.0.0.5",
+                9,
+                &[("hr", table)],
+                &format!("SELECT * FROM `hr`.`{table}`"),
+            );
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [read_of(&[&format!("hr.{table}")], false)],
+                "{table}"
+            );
+        }
+    }
+
+    /// ADR-0055 decision 3: the system schemas stay matched without case
+    /// where the servers compare them so (`information_schema`,
+    /// `performance_schema`) and wherever the match reports more (the
+    /// statement-text and statistics tables, named as listed and always
+    /// reported); a read is left out as a system read only for `sys` and
+    /// `mysql` as stored, since with `lower_case_table_names = 0` `SYS` or
+    /// `MySQL` is another database.
+    #[test]
+    fn system_schema_matching_follows_the_server_rules() {
+        for text in [
+            "SELECT * FROM INFORMATION_SCHEMA.STATISTICS",
+            "select * from Information_Schema.Columns",
+            "SELECT * FROM PERFORMANCE_SCHEMA.setup_instruments",
+            "SELECT * FROM sys.statement_analysis",
+            "SELECT * FROM mysql.table_stats",
+            "SELECT * FROM dual",
+            "SELECT 1 FROM DUAL",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+        for (text, objects) in [
+            (
+                "SELECT * FROM SYS.statement_analysis",
+                &["SYS.statement_analysis"][..],
+            ),
+            (
+                "SELECT * FROM `Sys`.`statement_analysis`",
+                &["Sys.statement_analysis"][..],
+            ),
+            (
+                "SELECT * FROM MySQL.table_stats",
+                &["MySQL.table_stats"][..],
+            ),
+            (
+                "SELECT * FROM mysql.Table_Stats",
+                &["mysql.Table_Stats"][..],
+            ),
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(read_of(objects, false).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        for (text, objects) in [
+            (
+                "SELECT * FROM PERFORMANCE_SCHEMA.EVENTS_STATEMENTS_HISTORY",
+                &["performance_schema.events_statements_history"][..],
+            ),
+            ("SELECT * FROM SYS.PROCESSLIST", &["sys.processlist"][..]),
+            (
+                "SELECT * FROM information_schema.processlist",
+                &["information_schema.PROCESSLIST"][..],
+            ),
+            (
+                "SELECT * FROM MYSQL.COLUMN_STATS",
+                &["mysql.column_stats"][..],
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert_eq!(
+                        ev.as_ref().map(shown).as_deref(),
+                        Some(read_of(objects, true).as_str()),
+                        "{user} {source:?}: {text}"
+                    );
+                }
+            }
+        }
+        // A write of a system schema in any case is always reported, the
+        // schema named as stored.
+        expect_everywhere(
+            "UPDATE Performance_Schema.Setup_Consumers SET ENABLED = 'NO'",
+            |_| "write [\"performance_schema.Setup_Consumers\"] always".to_owned(),
+        );
+    }
+
     /// Security review of #199, H2: a `READ,mysql,column_stats` record
     /// with a text that cannot be read whole, that runs code out of sight,
     /// that is a `HANDLER` read, or without the `table_stats` record of a
@@ -7851,11 +8075,10 @@ mod tests {
     }
 
     /// Security review of #199, R3-M1 and R3-L2: a relation is recorded
-    /// only by a record of exactly its name, in a text that writes it in
-    /// no other case (`lower_case_table_names = 0`: `hr.V_stats` is not
-    /// `hr.v_stats`; unquoted names are folded by the analyzer, so named
-    /// in lower case), and not at all in a text that creates or drops a
-    /// temporary table.
+    /// only by a record of exactly its name (`lower_case_table_names = 0`:
+    /// `hr.V_stats` is not `hr.v_stats`; names are kept as written, quoted
+    /// or not, ADR-0055 decision 3), and not at all in a text that creates
+    /// or drops a temporary table.
     #[test]
     fn statistics_records_next_to_case_variants_and_temporary_tables() {
         let rec = |q: u64, db: &str, t: &str| {
@@ -7865,7 +8088,7 @@ mod tests {
             (
                 21,
                 "SELECT * FROM hr.V_stats JOIN hr.v_stats ON 1=1",
-                &["hr.v_stats", "mysql.column_stats"][..],
+                &["hr.V_stats", "hr.v_stats", "mysql.column_stats"][..],
             ),
             (
                 22,
@@ -7875,7 +8098,7 @@ mod tests {
             (
                 23,
                 "SELECT * FROM HR.v_stats",
-                &["hr.v_stats", "mysql.column_stats"][..],
+                &["HR.v_stats", "hr.v_stats", "mysql.column_stats"][..],
             ),
         ] {
             let lines = vec![

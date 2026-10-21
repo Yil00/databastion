@@ -439,3 +439,89 @@ proptest! {
         prop_assert!(analyze(&with, opts).unknown_call(), "{}", with);
     }
 }
+
+/// A table or schema name that is no keyword, in mixed case.
+fn spelled_name() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9_]{0,6}".prop_map(|s| format!("Zt{s}"))
+}
+
+/// Statements naming one relation `{}` (keywords lowercase here).
+const ONE_RELATION: &[&str] = &[
+    "select * from {}",
+    "select a, b from {} where b = 1 limit 5",
+    "select count(*) from {}",
+    "update {} set a = 1 where b = 2",
+    "delete from {}",
+    "insert into {} values (1)",
+    "replace {} values (1)",
+    "explain select * from {}",
+    "show create table {}",
+    "lock tables {} read",
+    "handler {} read first",
+    "with q as (select 1) select * from {}",
+    "select * from {} into @x",
+];
+
+/// Each ASCII letter of `text` uppercased where `mask` says so.
+fn recase(text: &str, mask: &[bool]) -> String {
+    text.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if mask.get(i % mask.len().max(1)).copied().unwrap_or(false) {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// ADR-0055 decision 3: a relation keeps the spelling it is written
+    /// with, backquoted or not, whatever the case of the keywords around
+    /// it, and the analysis (kind, lead words, shape, normalized text,
+    /// calls, relations) does not depend on the case of the keywords.
+    #[test]
+    fn names_keep_their_spelling_and_analysis_ignores_case(
+        template in prop::sample::select(ONE_RELATION.to_vec()),
+        schema in prop::option::of(spelled_name()),
+        table in spelled_name(),
+        quote_schema in any::<bool>(),
+        quote_table in any::<bool>(),
+        mask in prop::collection::vec(any::<bool>(), 1..16),
+    ) {
+        let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+        let relation = match &schema {
+            Some(s) => format!("{}.{}", q(s, quote_schema), q(&table, quote_table)),
+            None => q(&table, quote_table),
+        };
+        let keywords = recase(template, &mask);
+        let text = keywords.replacen("{}", &relation, 1);
+        let a = analyze(&text, AnalyzeOptions::mysql());
+        prop_assert!(a.lexed(), "{}", text);
+        let named: Vec<(Option<String>, String)> = a
+            .relations()
+            .iter()
+            .map(|r| (r.schema.clone(), r.name.clone()))
+            .collect();
+        prop_assert_eq!(&named, &vec![(schema.clone(), table.clone())], "{}", text);
+        // The same statement, every keyword in lowercase.
+        let lower = analyze(&template.replacen("{}", &relation, 1), AnalyzeOptions::mysql());
+        prop_assert_eq!(a.kind(), lower.kind());
+        prop_assert_eq!(a.statements(), lower.statements());
+        prop_assert_eq!(a.normalized(), lower.normalized());
+        prop_assert_eq!(a.parts().len(), lower.parts().len());
+        for (x, y) in a.parts().iter().zip(lower.parts()) {
+            prop_assert_eq!(&x.lead, &y.lead);
+            prop_assert_eq!(x.kind, y.kind);
+            prop_assert_eq!(x.shape, y.shape);
+            prop_assert_eq!(x.outfile, y.outfile);
+            prop_assert_eq!(x.var_assign, y.var_assign);
+            prop_assert_eq!(x.explain_statement, y.explain_statement);
+            prop_assert_eq!(x.unknown_call, y.unknown_call);
+            prop_assert_eq!(&x.relations, &y.relations);
+        }
+    }
+}
