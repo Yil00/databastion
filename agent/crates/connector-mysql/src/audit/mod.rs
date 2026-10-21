@@ -1039,7 +1039,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.name_case("my-t"), Some(sensitive.clone()));
-        // Read before it: unknown until the next check.
+        assert_eq!(state.dropped("my-t"), 0, "a start is not a dropped record");
+        // Read before it (another connector's state): unknown until the
+        // next check.
+        let state = CheckState::default();
         state.set_name_case_read("my-t", run, sensitive, Some(1_792_569_600));
         append(start);
         file_run(&cfg, &target, &sink, &state, &mut st, &pre)

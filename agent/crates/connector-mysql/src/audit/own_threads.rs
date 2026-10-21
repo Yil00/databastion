@@ -108,6 +108,11 @@ impl ServerRun {
         Some(Self { ident, boot })
     }
 
+    /// The run's start time (Unix seconds, the server's clock).
+    pub(crate) fn boot(&self) -> u64 {
+        self.boot
+    }
+
     /// Whether `other` is the same server run.
     pub(crate) fn same(&self, other: &Self) -> bool {
         self.ident == other.ident && self.boot.abs_diff(other.boot) <= RUN_TOLERANCE_S
