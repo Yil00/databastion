@@ -164,9 +164,42 @@ pub(crate) fn kill_query(connection_id: u32) -> String {
     format!("KILL QUERY {connection_id}")
 }
 
-/// System schemas, never sampled (compared case-insensitively).
-pub(crate) const SYSTEM_SCHEMAS: [&str; 4] =
-    ["mysql", "sys", "information_schema", "performance_schema"];
+/// System schemas, never sampled, compared as the servers compare them
+/// (the #300 follow-up, ADR-0055 decision 3): `information_schema` and
+/// `performance_schema` in any case, whatever `lower_case_table_names`
+/// (the servers refuse to create either in another case); `mysql` and
+/// `sys` only as written, since with `lower_case_table_names = 0` (the
+/// Linux default) `MySQL` and `SYS` are user databases, and with 1 (names
+/// stored in lowercase) or 2 (compared in lowercase) no database in
+/// another case can stand next to them.
+pub(crate) const SYSTEM_SCHEMAS_ANY_CASE: [&str; 2] = ["information_schema", "performance_schema"];
+pub(crate) const SYSTEM_SCHEMAS_AS_WRITTEN: [&str; 2] = ["mysql", "sys"];
+
+/// Whether `schema` is a system schema ([`SYSTEM_SCHEMAS_ANY_CASE`],
+/// [`SYSTEM_SCHEMAS_AS_WRITTEN`]).
+#[must_use]
+pub(crate) fn is_system_schema(schema: &str) -> bool {
+    SYSTEM_SCHEMAS_ANY_CASE
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(schema))
+        || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
+}
+
+/// The same rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
+/// or `COLUMNS`): `mysql` and `sys` compared as bytes, since the column's
+/// collation ignores case on MariaDB (and on MySQL with
+/// `lower_case_table_names` 1 or 2).
+macro_rules! user_schemas {
+    ($col:literal) => {
+        concat!(
+            "CAST(",
+            $col,
+            " AS BINARY) NOT IN ('mysql', 'sys') AND LOWER(",
+            $col,
+            ") NOT IN ('information_schema', 'performance_schema')"
+        )
+    };
+}
 
 /// Most tables introspected per scan.
 pub(crate) const MAX_TABLES: u32 = 100_000;
@@ -182,12 +215,12 @@ pub(crate) const MAX_COLUMNS: u32 = 4096;
 /// its remote server (verified on MySQL 8.4, I5). Row estimates are read
 /// per sampled table by [`table_rows`], once [`table_engine`] showed a local
 /// engine.
-pub(crate) const INTROSPECT: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
-     FROM information_schema.TABLES t \
-     WHERE LOWER(t.TABLE_SCHEMA) NOT IN \
-       ('mysql', 'sys', 'information_schema', 'performance_schema') \
-     ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME \
-     LIMIT 100000";
+pub(crate) const INTROSPECT: &str = concat!(
+    "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
+     FROM information_schema.TABLES t WHERE ",
+    user_schemas!("t.TABLE_SCHEMA"),
+    " ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME LIMIT 100000"
+);
 
 /// Type and engine of one table (no statistics column: see
 /// [`INTROSPECT`]). Columns: type, engine.
@@ -466,9 +499,9 @@ pub(crate) fn server_audit_escaped_len(s: &str) -> usize {
             .count()
 }
 
-/// The schemas the guard never looks at.
-const CAS_GUARD_SCHEMAS: &str =
-    "LOWER(TABLE_SCHEMA) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')";
+/// The schemas the guard never looks at: the system schemas, compared as
+/// Discovery compares them ([`is_system_schema`]).
+const CAS_GUARD_SCHEMAS: &str = user_schemas!("TABLE_SCHEMA");
 
 /// The CAS store guard's table list (ADR-0041 decision 6): the schema and
 /// name of every table and view outside the system schemas, nothing else.
@@ -480,9 +513,11 @@ const CAS_GUARD_SCHEMAS: &str =
 /// keeps only the keys it knows; no name is kept. At most
 /// [`CAS_GUARD_MAX_TABLES`] + 1 rows: one more tells a cut list (the guard
 /// is then not evaluated).
-pub(crate) const CAS_GUARD_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME \
-     FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) NOT IN \
-     ('mysql', 'sys', 'information_schema', 'performance_schema') LIMIT 1000001";
+pub(crate) const CAS_GUARD_TABLES: &str = concat!(
+    "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE ",
+    user_schemas!("TABLE_SCHEMA"),
+    " LIMIT 1000001"
+);
 
 /// Most rows of [`CAS_GUARD_TABLES`] read; it asks for one more.
 pub(crate) const CAS_GUARD_MAX_TABLES: usize = 1_000_000;
@@ -1482,6 +1517,38 @@ mod tests {
             assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
             // Not taken as cut by `performance_schema` either (S1).
             assert!(stored_len(s.as_bytes()) + 4 < 1024, "{s}");
+        }
+    }
+
+    /// The #300 follow-up: `information_schema` and `performance_schema`
+    /// are system schemas in any case, `mysql` and `sys` only as written
+    /// (`MySQL` and `SYS` are user databases under
+    /// `lower_case_table_names = 0`), in Rust and in every statement that
+    /// filters them (Discovery's table list, the CAS store guard).
+    #[test]
+    fn system_schemas_compare_as_the_server_does() {
+        for s in [
+            "information_schema",
+            "INFORMATION_SCHEMA",
+            "Performance_Schema",
+            "performance_schema",
+            "mysql",
+            "sys",
+        ] {
+            assert!(is_system_schema(s), "{s}");
+        }
+        for s in ["MySQL", "MYSQL", "SYS", "Sys", "hr", "mysql ", "sys_x", ""] {
+            assert!(!is_system_schema(s), "{s:?}");
+        }
+        let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
+                      LOWER(t.TABLE_SCHEMA) NOT IN ('information_schema', 'performance_schema')";
+        assert!(INTROSPECT.contains(filter), "{INTROSPECT}");
+        assert!(!INTROSPECT.contains("LOWER(t.TABLE_SCHEMA) NOT IN ('mysql'"));
+        let guard = filter.replace("t.TABLE_SCHEMA", "TABLE_SCHEMA");
+        assert_eq!(CAS_GUARD_SCHEMAS, guard);
+        let g = cas_guard_statements(&["castickets".to_owned()]).unwrap();
+        for text in g.texts() {
+            assert!(text.contains(&guard), "{text}");
         }
     }
 
