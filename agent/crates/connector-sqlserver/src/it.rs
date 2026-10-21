@@ -3341,6 +3341,45 @@ async fn nc_fact(s: &mut Session, db: &str, label: &str) {
     eprintln!("engine fact ({label}) {db}: {rows:?}");
 }
 
+/// A value of a test row, printed: the number, the text, or `NULL`.
+fn nc_show(v: Option<&Value>) -> String {
+    match v {
+        Some(v) => v
+            .as_int()
+            .map(|i| i.to_string())
+            .or_else(|| v.as_text().map(str::to_owned))
+            .unwrap_or_else(|| "NULL".to_owned()),
+        None => "NULL".to_owned(),
+    }
+}
+
+/// The server's error number for `sql` (`None`: it ran).
+async fn exec_error(s: &mut Session, sql: &str) -> Option<i32> {
+    match s
+        .run(sql, Stage::Check, Shape::rows(0, 0), |_| {
+            conn::Flow::Continue
+        })
+        .await
+    {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("refused by the server: {sql}: {e:?}");
+            Some(e.number.unwrap_or(-1))
+        }
+    }
+}
+
+/// The value the agent reports for a contained database's objects with
+/// `catalog_collation_type` `v` (ADR-0055 decision 4 and its refinement of
+/// 2026-10-21): 0 (the fixed catalog collation), 1 (measured on 2022) and
+/// 2 are case-insensitive, anything else `unknown`.
+fn nc_contained_expected(v: Option<i64>) -> &'static str {
+    match v {
+        Some(0..=2) => "insensitive",
+        _ => "unknown",
+    }
+}
+
 /// ADR-0055 decisions 2, 4 and 10 on the dev server (the default
 /// collation): a `_CS_` and a `_BIN2` database `sensitive`, a default one
 /// and a contained `_CS_` one (when the server allows contained
@@ -3476,6 +3515,56 @@ async fn name_case_follows_the_collations() {
     )
     .await;
     eprintln!("engine fact: catalog_collation_type per test database: {rows:?}");
+    // One measurement line per test database (ADR-0055 refinement of
+    // 2026-10-21, recorded by the engine matrix on 2019, 2022 and 2025).
+    let major = major().await;
+    let catalog = if has_catalog_column {
+        "CONVERT(int, catalog_collation_type), CONVERT(nvarchar(60), catalog_collation_type_desc)"
+    } else {
+        "CONVERT(int, NULL), CONVERT(nvarchar(60), NULL)"
+    };
+    let measured = try_rows(
+        &mut s,
+        &format!(
+            "SELECT CONVERT(nvarchar(128), name), CONVERT(int, containment), {catalog}, \
+             CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), collation_name), \
+             'ComparisonStyle')) FROM sys.databases WHERE name LIKE N'databastion[_]nc[_]%' \
+             ORDER BY name"
+        ),
+        5,
+    )
+    .await
+    .unwrap_or_default();
+    let mut contained_catalog = None;
+    for r in &measured {
+        let name = nc_show(r.first());
+        let is_contained = r.get(1).and_then(Value::as_int).is_some_and(|c| c != 0);
+        if name == NC_CONTAINED {
+            contained_catalog = r.get(2).and_then(Value::as_int);
+        }
+        eprintln!(
+            "[it] name_case: major={major} db={name} contained={is_contained} \
+             catalog_collation_type={} desc={} comparison_style={}",
+            nc_show(r.get(2)),
+            nc_show(r.get(3)),
+            nc_show(r.get(4)),
+        );
+    }
+    if contained {
+        // The server's answer to a case-only duplicate table name: error
+        // 2714 when the catalog compares names without case.
+        let e = exec_error(
+            &mut s,
+            &in_db(NC_CONTAINED, "CREATE TABLE t(a int); CREATE TABLE T(a int)"),
+        )
+        .await;
+        eprintln!(
+            "[it] name_case: major={major} db={NC_CONTAINED} case_only_duplicate_table \
+             error_2714={} error={}",
+            e == Some(2714),
+            e.map_or_else(|| "none".to_owned(), |n| n.to_string()),
+        );
+    }
 
     let c = SqlserverConnector::new();
     let t = agent("");
@@ -3516,11 +3605,20 @@ async fn name_case_follows_the_collations() {
         }
         if contained {
             // 2022 reads `catalog_collation_type` 1 for a contained
-            // database: `unknown` under the accepted ADR text (security
-            // review M2), though the server compares its names without
-            // case (the oracle above). An ADR refinement may map it to
-            // `insensitive`.
-            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, "unknown");
+            // database, `insensitive` (ADR-0055 refinement of 2026-10-21;
+            // the server refuses a case-only duplicate name, the oracle
+            // above). Another value on 2019 or 2025 is recorded and
+            // follows decision 4 (0 and 2 `insensitive`, anything else
+            // `unknown`), so that the matrix records it without failing.
+            let want = nc_contained_expected(contained_catalog);
+            if contained_catalog != Some(1) {
+                eprintln!(
+                    "[it] name_case: major={major} db={NC_CONTAINED} catalog_collation_type={} \
+                     is not 1: expected {want}",
+                    contained_catalog.map_or_else(|| "NULL".to_owned(), |v| v.to_string()),
+                );
+            }
+            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, want);
         } else {
             eprintln!("skipped: contained databases not enabled on this server");
         }

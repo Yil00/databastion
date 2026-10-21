@@ -9,15 +9,16 @@
 //! - a database's catalog collation: `catalog_collation_type` 0 is the
 //!   database collation, or for a contained database the fixed
 //!   `Latin1_General_100_CI_AS_KS_WS_SC` (case-insensitive); 2 is
-//!   `SQL_Latin1_General_CP1_CI_AS` (case-insensitive); anything else is
-//!   `unknown`, as the accepted ADR text says (security review M2 of the
-//!   agent lot). Measured on 2022 (16.0.4305.5): a contained database
-//!   reads 1, not 0, with `catalog_collation_type_desc`
-//!   `Latin1_General_100_CI_AS_KS_WS_SC`, and refuses a second table whose
-//!   name differs by case only (error 2714); so a contained database is
-//!   `unknown` today, the stricter reading, until an ADR refinement maps
-//!   1 on a contained database to `insensitive`. Without the column ([`sql::DATABASE_COLLATIONS_V0`]) the
-//!   target reports `objects: unknown`;
+//!   `SQL_Latin1_General_CP1_CI_AS` (case-insensitive); 1 on a contained
+//!   database is its fixed `Latin1_General_100_CI_AS_KS_WS_SC`
+//!   (case-insensitive; ADR-0055 refinement of 2026-10-21, measured on
+//!   2022 (16.0.4305.5): `catalog_collation_type_desc`
+//!   `Latin1_General_100_CI_AS_KS_WS_SC`, and a second table whose name
+//!   differs by case only refused with error 2714); anything else,
+//!   including 1 on a database that is not contained, is `unknown`
+//!   (security review M2 of the agent lot). Without the column
+//!   ([`sql::DATABASE_COLLATIONS_V0`]) the target reports `objects:
+//!   unknown`;
 //! - a collation compares with case when its `ComparisonStyle` lacks the
 //!   ignore-case bit (1): every `_CS_` and binary collation. A `NULL`
 //!   style (a database not online, or closed by `AUTO_CLOSE`) is
@@ -174,8 +175,10 @@ pub(crate) fn evaluate(read: Option<&Read>, previous: Option<&Memory>) -> Memory
         let value = match r.catalog {
             Some(0) if r.contained => NameCase::Insensitive,
             Some(0) => collation,
-            // 1 (a contained database on 2022, measured): `unknown` until
-            // an ADR refinement decides (see the module documentation).
+            // 1 on a contained database: its fixed case-insensitive
+            // catalog collation (ADR-0055 refinement of 2026-10-21); 1 on
+            // a database that is not contained stays `unknown`.
+            Some(1) if r.contained => NameCase::Insensitive,
             Some(2) => NameCase::Insensitive,
             _ => NameCase::Unknown,
         };
@@ -319,8 +322,8 @@ mod tests {
     fn databases_are_listed_by_their_catalog_collation() {
         let mut contained = row(8, "contained_cs", Some(CS_AS));
         contained.contained = true;
-        // As measured on 2022: a contained database reads 1, `unknown`
-        // under the accepted text.
+        // As measured on 2022: a contained database reads 1,
+        // `insensitive` (ADR-0055 refinement of 2026-10-21).
         let mut contained_1 = row(13, "contained_cs_1", Some(CS_AS));
         contained_1.contained = true;
         contained_1.catalog = Some(1);
@@ -350,7 +353,6 @@ mod tests {
                 "databases": "insensitive",
                 "objects": "insensitive",
                 "except": [
-                    {"database": "contained_cs_1", "objects": "unknown"},
                     {"database": "crm_bin2", "objects": "sensitive"},
                     {"database": "crm_cs", "objects": "sensitive"},
                     {"database": "crm_cs_snapshot", "objects": "sensitive"},
@@ -359,6 +361,40 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// `catalog_collation_type` per containment (ADR-0055 refinement of
+    /// 2026-10-21): 1 on a contained database is `insensitive`; 1 on a
+    /// database that is not contained, and every value but 0, 1 and 2, is
+    /// `unknown`, contained or not.
+    #[test]
+    fn catalog_collation_type_one_is_insensitive_only_when_contained() {
+        let value = |catalog: Option<i64>, contained: bool| {
+            let mut db = row(5, "db_cs", Some(CS_AS));
+            db.catalog = catalog;
+            db.contained = contained;
+            let mut r = read(vec![db]);
+            // A case-sensitive default, so that an `insensitive` value is
+            // listed in `except` too.
+            r.server_style = Some(BIN2);
+            evaluate(Some(&r), None)
+                .report
+                .except
+                .into_iter()
+                .find(|(name, _)| name.as_str() == "db_cs")
+                .map(|(_, v)| v)
+                .unwrap()
+        };
+        assert_eq!(value(Some(1), true), NameCase::Insensitive);
+        assert_eq!(value(Some(1), false), NameCase::Unknown);
+        assert_eq!(value(Some(0), true), NameCase::Insensitive);
+        assert_eq!(value(Some(0), false), NameCase::Sensitive);
+        assert_eq!(value(Some(2), true), NameCase::Insensitive);
+        assert_eq!(value(Some(2), false), NameCase::Insensitive);
+        for other in [Some(-1), Some(3), Some(7), Some(255), None] {
+            assert_eq!(value(other, true), NameCase::Unknown, "{other:?}");
+            assert_eq!(value(other, false), NameCase::Unknown, "{other:?}");
+        }
     }
 
     /// A case-sensitive server collation: database names and the default
