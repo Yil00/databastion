@@ -165,56 +165,82 @@ pub(crate) fn kill_query(connection_id: u32) -> String {
 }
 
 /// System schemas, never sampled nor guarded (the #300 follow-up, ADR-0055
-/// decision 3, measured in the CI runs of PR #308):
-/// - `information_schema` and `performance_schema` in any case: no user
-///   table can exist under any spelling of them. MySQL refuses the
-///   database in another case (1044); MariaDB accepts `CREATE DATABASE
-///   Performance_Schema` but refuses a table in it (1142), reads the
-///   system schema through that spelling, and MariaDB 11.8 even lists the
-///   `performance_schema` tables under it in `information_schema.TABLES`
-///   (81 tables; 10.11 and 11.4 list none). Skipped in any case, the
-///   system tables (other sessions' statement texts) are never sampled.
+/// decision 3, measured in the CI runs of PR #308), by name:
+/// - `information_schema` and `performance_schema` in ASCII case only: no
+///   user table can exist under an ASCII case variant of them (MySQL
+///   refuses the database, 1044; MariaDB accepts `CREATE DATABASE
+///   Performance_Schema` but refuses a table in it, 1142, and MariaDB 11.8
+///   lists the `performance_schema` tables under that spelling). A
+///   non-ASCII spelling is not folded: MySQL lets a user create tables in
+///   `performance_ſchema` (U+017F), a user database there, while MariaDB
+///   folds names with `utf8mb3_general_ci`, where it is the system schema;
+///   no fold of a name can serve both flavors, and the flavor comes from a
+///   version string a proxy can rewrite.
 /// - `mysql` and `sys` only as written: with `lower_case_table_names = 0`
 ///   (the Linux default) `MySQL` and `SYS` are user databases on both
 ///   servers. With 1 (names stored in lowercase) or 2 (compared in
 ///   lowercase) no database in another case can stand next to them.
+///
+/// And by object, whatever the schema's name ([`is_system_object`]): the
+/// system tables an alias spelling may list are left out by their engine
+/// or type.
 pub(crate) const SYSTEM_SCHEMAS_ANY_CASE: [&str; 2] = ["information_schema", "performance_schema"];
 pub(crate) const SYSTEM_SCHEMAS_AS_WRITTEN: [&str; 2] = ["mysql", "sys"];
 
 /// Whether `schema`, as the catalog spells it, is a system schema
-/// ([`SYSTEM_SCHEMAS_ANY_CASE`], [`SYSTEM_SCHEMAS_AS_WRITTEN`]).
-///
-/// "Any case" follows the servers' own folding of these names
-/// (`my_strcasecmp` with `utf8mb3_general_ci`, security review L8), which
-/// also reads `ſ` (U+017F) as `S` and `ı` (U+0131) as `I`: a name whose
-/// Unicode uppercase or lowercase is one of them is skipped too.
+/// ([`SYSTEM_SCHEMAS_ANY_CASE`] in ASCII case, [`SYSTEM_SCHEMAS_AS_WRITTEN`]
+/// as written).
 #[must_use]
 pub(crate) fn is_system_schema(schema: &str) -> bool {
-    let upper = schema.to_uppercase();
-    let lower = schema.to_lowercase();
-    SYSTEM_SCHEMAS_ANY_CASE.iter().any(|s| {
-        s.eq_ignore_ascii_case(schema)
-            || s.eq_ignore_ascii_case(&upper)
-            || s.eq_ignore_ascii_case(&lower)
-    }) || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
+    SYSTEM_SCHEMAS_ANY_CASE
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(schema))
+        || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
 }
 
-/// The same rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
+/// Whether a catalog row (`TABLE_TYPE`, `ENGINE`) is a system object,
+/// whatever its schema's name: a `performance_schema` table (engine
+/// `PERFORMANCE_SCHEMA`) or an `information_schema` view (type
+/// `SYSTEM VIEW`), on MySQL and MariaDB. An alias of the system schema
+/// under a spelling the agent does not fold (MariaDB) never exposes them.
+#[must_use]
+pub(crate) fn is_system_object(table_type: Option<&str>, engine: Option<&str>) -> bool {
+    engine.is_some_and(|e| e.eq_ignore_ascii_case("PERFORMANCE_SCHEMA"))
+        || table_type.is_some_and(|t| t.eq_ignore_ascii_case("SYSTEM VIEW"))
+}
+
+/// The schema rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
 /// or `COLUMNS`): `mysql` and `sys` compared as bytes, since the column's
 /// collation ignores case on MariaDB (and on MySQL with
 /// `lower_case_table_names` 1 or 2); `information_schema` and
-/// `performance_schema` under `utf8mb3_general_ci`, the collation the
-/// servers fold these names with (`ſ` as `S`, `ı` as `I`; security review
-/// L8).
+/// `performance_schema` in ASCII case only (`LOWER` of a name whose bytes
+/// are its characters, so that no non-ASCII character is folded).
 macro_rules! user_schemas {
     ($col:literal) => {
         concat!(
             "CAST(",
             $col,
-            " AS BINARY) NOT IN ('mysql', 'sys') AND CONVERT(",
+            " AS BINARY) NOT IN ('mysql', 'sys') AND NOT (LENGTH(",
             $col,
-            " USING utf8mb3) COLLATE utf8mb3_general_ci NOT IN \
-             ('information_schema', 'performance_schema')"
+            ") = CHAR_LENGTH(",
+            $col,
+            ") AND LOWER(",
+            $col,
+            ") IN ('information_schema', 'performance_schema'))"
+        )
+    };
+}
+
+/// The object rule in SQL ([`is_system_object`]), on a row of
+/// `information_schema.TABLES`.
+macro_rules! user_objects {
+    ($prefix:literal) => {
+        concat!(
+            "COALESCE(",
+            $prefix,
+            "ENGINE, '') <> 'PERFORMANCE_SCHEMA' AND ",
+            $prefix,
+            "TABLE_TYPE <> 'SYSTEM VIEW'"
         )
     };
 }
@@ -237,6 +263,8 @@ pub(crate) const INTROSPECT: &str = concat!(
     "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
      FROM information_schema.TABLES t WHERE ",
     user_schemas!("t.TABLE_SCHEMA"),
+    " AND ",
+    user_objects!("t."),
     " ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME LIMIT 100000"
 );
 
@@ -534,6 +562,8 @@ const CAS_GUARD_SCHEMAS: &str = user_schemas!("TABLE_SCHEMA");
 pub(crate) const CAS_GUARD_TABLES: &str = concat!(
     "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE ",
     user_schemas!("TABLE_SCHEMA"),
+    " AND ",
+    user_objects!(""),
     " LIMIT 1000001"
 );
 
@@ -1538,25 +1568,21 @@ mod tests {
         }
     }
 
-    /// The #300 follow-up and the CI runs of PR #308: `information_schema`
-    /// and `performance_schema` are system schemas in any case (no user
-    /// table can exist under another spelling, and MariaDB 11.8 lists the
-    /// system tables under `Performance_Schema`), `mysql` and `sys` only as
-    /// written (`MySQL` and `SYS` are user databases under
-    /// `lower_case_table_names = 0`), in Rust and in every statement that
-    /// filters them (Discovery's table list, the CAS store guard).
+    /// The #300 follow-up and the CI runs of PR #308: by name,
+    /// `information_schema` and `performance_schema` in ASCII case only (a
+    /// non-ASCII spelling such as `performance_ſchema` is a user database
+    /// on MySQL), `mysql` and `sys` only as written; by object, the
+    /// `PERFORMANCE_SCHEMA` engine and `SYSTEM VIEW`s whatever the schema;
+    /// in Rust and in every statement that filters them (Discovery's table
+    /// list, the CAS store guard's).
     #[test]
-    fn system_schemas_compare_as_the_server_allows() {
+    fn system_schemas_and_objects_compare_as_the_servers_allow() {
         for s in [
             "information_schema",
             "INFORMATION_SCHEMA",
             "Performance_Schema",
             "PERFORMANCE_SCHEMA",
             "performance_schema",
-            // The servers' folding (security review L8).
-            "performance_\u{17F}chema",
-            "\u{131}nformation_\u{17F}chema",
-            "PERFORMANCE_\u{17F}CHEMA",
             "mysql",
             "sys",
         ] {
@@ -1568,6 +1594,10 @@ mod tests {
             "SYS",
             "Sys",
             "\u{17F}ys",
+            "performance_\u{17F}chema",
+            "\u{131}nformation_\u{17F}chema",
+            "PERFORMANCE_\u{17F}CHEMA",
+            "\u{130}NFORMATION_SCHEMA",
             "hr",
             "mysql ",
             "sys_x",
@@ -1576,15 +1606,38 @@ mod tests {
         ] {
             assert!(!is_system_schema(s), "{s:?}");
         }
+        assert!(is_system_object(
+            Some("BASE TABLE"),
+            Some("PERFORMANCE_SCHEMA")
+        ));
+        assert!(is_system_object(Some("SYSTEM VIEW"), None));
+        assert!(is_system_object(Some("SYSTEM VIEW"), Some("MEMORY")));
+        for (t, e) in [
+            (Some("BASE TABLE"), Some("InnoDB")),
+            (Some("SYSTEM VERSIONED"), Some("InnoDB")),
+            (Some("VIEW"), None),
+            (Some("SEQUENCE"), Some("InnoDB")),
+            (None, None),
+        ] {
+            assert!(!is_system_object(t, e), "{t:?} {e:?}");
+        }
         let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
-                      CONVERT(t.TABLE_SCHEMA USING utf8mb3) COLLATE utf8mb3_general_ci NOT IN \
-                      ('information_schema', 'performance_schema')";
+                      NOT (LENGTH(t.TABLE_SCHEMA) = CHAR_LENGTH(t.TABLE_SCHEMA) AND \
+                      LOWER(t.TABLE_SCHEMA) IN ('information_schema', 'performance_schema')) \
+                      AND COALESCE(t.ENGINE, '') <> 'PERFORMANCE_SCHEMA' AND \
+                      t.TABLE_TYPE <> 'SYSTEM VIEW'";
         assert!(INTROSPECT.contains(filter), "{INTROSPECT}");
-        let guard = filter.replace("t.TABLE_SCHEMA", "TABLE_SCHEMA");
-        assert_eq!(CAS_GUARD_SCHEMAS, guard);
+        let guard_schemas = "CAST(TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
+                             NOT (LENGTH(TABLE_SCHEMA) = CHAR_LENGTH(TABLE_SCHEMA) AND \
+                             LOWER(TABLE_SCHEMA) IN ('information_schema', 'performance_schema'))";
+        assert_eq!(CAS_GUARD_SCHEMAS, guard_schemas);
+        assert!(
+            CAS_GUARD_TABLES.contains(&filter.replace("t.", "")),
+            "{CAS_GUARD_TABLES}"
+        );
         let g = cas_guard_statements(&["castickets".to_owned()]).unwrap();
         for text in g.texts() {
-            assert!(text.contains(&guard), "{text}");
+            assert!(text.contains(guard_schemas), "{text}");
         }
     }
 

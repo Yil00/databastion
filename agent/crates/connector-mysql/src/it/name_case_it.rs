@@ -404,18 +404,27 @@ async fn check_reports_the_name_case_of_the_server() {
     }
 }
 
+/// Fake ticket ids of a user database spelled like a system schema (never
+/// valid anywhere).
+const PFS_LIKE_TICKETS: [&str; 2] = [
+    "TGT-7-FakeCaseTgtValueAaaaaaaaaaaaa-cas01",
+    "ST-8-FakeCaseStValueBbbbbbbbbbbbbbb-cas01",
+];
 /// Test account of [`system_schemas_in_another_case_follow_the_server`].
 const PFS_LIKE_USER: &str = "databastion_it_case_pfs";
 
 /// The #300 review, corrected by the CI runs of PR #308: which spellings
 /// of the system schemas a user may create, per engine. MySQL refuses
-/// `information_schema` and `performance_schema` in any other case
-/// (1044), and both servers refuse `Information_Schema`; MariaDB accepts
-/// `CREATE DATABASE Performance_Schema` under `lower_case_table_names =
-/// 0` but refuses a table in it (1142), and reads the system schema
-/// through that spelling. So Discovery and the CAS store guard skip both
-/// names in any case, while Audit reports reads of `performance_schema`
-/// written in another case (fail closed).
+/// `information_schema` and `performance_schema` in any other ASCII case
+/// (1044) but lets a user create tables in `performance_ſchema` (U+017F);
+/// both servers refuse `Information_Schema`; MariaDB accepts `CREATE
+/// DATABASE Performance_Schema` under `lower_case_table_names = 0` but
+/// refuses a table in it (1142), and reads the system schema through that
+/// spelling. For each spelling accepted, either a table can be created
+/// there, and the database is sampled, guarded and its reads reported, or
+/// none can, and nothing from a system object (engine
+/// `PERFORMANCE_SCHEMA`, `SYSTEM VIEW`) is sampled, as the agent account
+/// too.
 #[tokio::test]
 async fn system_schemas_in_another_case_follow_the_server() {
     let _serial = SERIAL.lock().await;
@@ -436,7 +445,12 @@ async fn system_schemas_in_another_case_follow_the_server() {
             "performance_\u{17F}chema",
             "\u{131}nformation_\u{17F}chema",
         ] {
-            assert!(crate::sql::is_system_schema(name), "{name}");
+            // By name, Discovery skips the ASCII spellings only.
+            assert_eq!(
+                crate::sql::is_system_schema(name),
+                name.is_ascii(),
+                "{name}"
+            );
             let created = a
                 .exec(Stage::Check, &format!("CREATE DATABASE `{name}`"))
                 .await;
@@ -509,8 +523,10 @@ async fn system_schemas_in_another_case_follow_the_server() {
     }
 }
 
-/// A database `name` (spelled like a system schema) the server accepted
-/// (MariaDB `Performance_Schema`): no table can be created in it, what
+/// A database `name` (spelled like a system schema) the server accepted:
+/// when a table can be created in it, a user database
+/// ([`table_database_is_covered`]); otherwise (MariaDB `Performance_Schema`)
+/// what
 /// reading through that spelling does and what the catalog lists under it
 /// are measured, a Discovery account granted on it samples nothing there
 /// nor in any system schema (MariaDB 11.8 lists the system tables under
@@ -543,10 +559,10 @@ async fn accepted_spelling_holds_nothing(server: Server, admin: Url, name: Strin
             Err(e) => format!("refused (errno {:?})", e.errno),
         }
     );
-    assert!(
-        table.is_err(),
-        "{label}: a table was created in `{name}`, which Discovery skips as a system schema"
-    );
+    if table.is_ok() {
+        table_database_is_covered(server, a, name).await;
+        return;
+    }
     let probe = format!("SELECT COUNT(*) FROM `{name}`.events_statements_current");
     let answered = match a.query(Stage::Check, &probe).await {
         Ok(rows) => {
@@ -574,8 +590,23 @@ async fn accepted_spelling_holds_nothing(server: Server, admin: Url, name: Strin
     )
     .await;
     // MariaDB 10.11 and 11.4 list none, 11.8 lists the system tables
-    // (CI runs of PR #308): measured, not asserted.
+    // (CI runs of PR #308): measured, not asserted, with their engines and
+    // types.
     eprintln!("[it] name_case: {label}: tables listed in `{name}`: {tables}");
+    let kinds = a
+        .query(
+            Stage::Check,
+            &format!(
+                "SELECT COALESCE(ENGINE, 'NULL'), TABLE_TYPE, COUNT(*) \
+                 FROM information_schema.TABLES WHERE CAST(TABLE_SCHEMA AS BINARY) = '{name}' \
+                 GROUP BY 1, 2"
+            ),
+        )
+        .await
+        .unwrap();
+    for row in &kinds {
+        eprintln!("[it] name_case: {label}: `{name}` lists engine / type / count {row:?}");
+    }
     let granted = a
         .exec(Stage::Check, &format!("GRANT SELECT ON `{name}`.* TO {u}"))
         .await;
@@ -611,10 +642,11 @@ async fn accepted_spelling_holds_nothing(server: Server, admin: Url, name: Strin
             "[it] name_case: {label}: {who}: tables listed in `{name}`: {seen}; findings in {:?}",
             found.iter().map(|k| k.0.as_str()).collect::<BTreeSet<_>>()
         );
+        let alias = normalize(name);
         for k in &found {
             assert!(
-                !crate::sql::is_system_schema(&k.0),
-                "{label}: {name}: {who}: a system schema sampled: {k:?}"
+                !crate::sql::is_system_schema(&k.0) && k.0 != alias.as_str(),
+                "{label}: {name}: {who}: a system object sampled: {k:?}"
             );
         }
     }
@@ -664,6 +696,139 @@ async fn accepted_spelling_holds_nothing(server: Server, admin: Url, name: Strin
         all.join(" | ")
     );
     assert!(reported(&events), "{label}: {name}: {all:#?}");
+}
+
+/// A database `name` spelled like a system schema in which the server let
+/// the administrator create a table (`people`, created by the caller): a
+/// user database (MySQL `performance_ſchema`, CI run of PR #308). Its fake
+/// e-mail addresses are sampled by Discovery, a CAS ticket table in it is
+/// counted and never sampled, `check()` reports it readable, and on
+/// MariaDB with the `server_audit` log its reads are reported under its
+/// name.
+async fn table_database_is_covered(server: &Server, a: &mut Session, name: &str) {
+    let label = server.name;
+    let [t0, t1] = PFS_LIKE_TICKETS;
+    let u = format!("'{PFS_LIKE_USER}'@'%'");
+    for statement in [
+        format!(
+            "INSERT INTO `{name}`.people (id, email) \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+             WHERE i < {SYSTEM_LIKE_ROWS}) \
+             SELECT i, CONCAT('pfs.case.user', i, '@example.com') FROM n"
+        ),
+        format!(
+            "CREATE TABLE `{name}`.cas_tickets (id varchar(255), parent_id varchar(255), \
+             body text, type varchar(255), principal_id varchar(255))"
+        ),
+        format!(
+            "INSERT INTO `{name}`.cas_tickets VALUES \
+             ('{t0}', NULL, '{{}}', 'org.apereo.cas.ticket.TicketGrantingTicketImpl', 'x'), \
+             ('{t1}', '{t0}', '{{}}', 'org.apereo.cas.ticket.ServiceTicketImpl', 'x')"
+        ),
+        format!("GRANT SELECT ON `{name}`.* TO {u}"),
+    ] {
+        exec(a, &statement).await;
+    }
+    let db = normalize(name);
+    let (_dir, t) = target(server, PFS_LIKE_USER, IT_PASSWORD);
+    let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+    let (sink, mut rx) = FindingSink::channel(100_000);
+    MysqlConnector::new().discover(&job, &sink).await.unwrap();
+    drop(sink);
+    let mut findings = Vec::new();
+    while let Some(f) = rx.recv().await {
+        findings.push(f);
+    }
+    let found = located(&findings);
+    eprintln!(
+        "[it] name_case: {label}: user database `{name}`: {} registries, findings {found:?}",
+        job.cas_guard().registries()
+    );
+    assert!(
+        found.contains(&key_of(db.as_str(), "people", "email", "pii.email")),
+        "{label}: {name}: {found:?}"
+    );
+    assert_eq!(job.cas_guard().registries(), 1, "{label}: {name}");
+    for k in &found {
+        assert_ne!(k.1, "cas_tickets", "{label}: {name}: {k:?}");
+        // ADR-0009 NFKC: `performance_ſchema` reaches the console as
+        // `performance_schema` (the normalization-marker follow-up); only
+        // its own `people` table may carry that name here.
+        assert!(
+            (k.0 == db.as_str() && k.1 == "people")
+                || !["mysql", "sys", "information_schema", "performance_schema"]
+                    .contains(&k.0.as_str()),
+            "{label}: {name}: a system schema sampled: {k:?}"
+        );
+    }
+    let text = format!("{findings:?}");
+    for v in PFS_LIKE_TICKETS {
+        assert!(!text.contains(v), "{label}: {v} leaked");
+    }
+    let health = MysqlConnector::new().check(&t).await;
+    assert!(health.reachable, "{label}: {health:?}");
+    let readable = health
+        .notes
+        .iter()
+        .find(|n| n.code() == NoteCode::PrivilegeTicketCredentialsReadable)
+        .map(|n| n.count().unwrap_or(0));
+    assert_eq!(readable, Some(1), "{label}: {name}: {:?}", health.notes);
+    // Audit: reads of the user database by the administrator, unquoted
+    // and backquoted, reported under its name (server_audit table records
+    // and texts).
+    if server.flavor() != Flavor::Mariadb {
+        return;
+    }
+    let Some(log) = env_path("DATABASTION_TEST_MARIADB_AUDIT_LOG", "mariadb-audit") else {
+        return;
+    };
+    let admin_user = server
+        .admin
+        .as_ref()
+        .map(|u| u.user.clone())
+        .unwrap_or_default();
+    let (_d, t) = audit_target(
+        server,
+        &server.url.user,
+        &server.url.password,
+        Some((&log, "server_audit")),
+    );
+    let connector = Arc::new(MysqlConnector::new());
+    let health = connector.check(&t).await;
+    assert!(health.reachable, "{label}: {health:?}");
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    for text in [
+        format!("SELECT * FROM {name}.people"),
+        format!("SELECT email FROM `{name}`.`people` WHERE id = 1"),
+    ] {
+        a.query(Stage::Check, &text).await.unwrap();
+    }
+    let reads = |ev: &[MaskedEvent]| {
+        ev.iter()
+            .filter(|e| {
+                e.action() == EventAction::Read
+                    && e.principal().account_name() == admin_user
+                    && e.objects().iter().any(|o| {
+                        o.database().as_str() == db.as_str() && o.object().as_str() == "people"
+                    })
+            })
+            .count()
+    };
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(30), |ev| {
+        reads(ev) >= 2
+    })
+    .await;
+    task.abort();
+    let all: Vec<String> = events.iter().map(describe).collect();
+    eprintln!(
+        "{label} `{name}` events ({}):\n{}",
+        all.len(),
+        all.join("\n")
+    );
+    assert!(reads(&events) >= 2, "{label}: {name}: {all:#?}");
 }
 
 /// Fake e-mail addresses of the `SYS` / `MySQL` user databases.
