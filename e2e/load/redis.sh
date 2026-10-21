@@ -68,6 +68,7 @@ LOAD_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-load-redis.XXXXXX")"
 W="$LOAD_WORK_DIR"
 export E2E_WORK_DIR="$W"
 E2E_LOG_DIR="$LOAD_LOG_DIR"
+CENSUS_OUT_DIR="$LOAD_RESULTS_DIR"  # read by ../lib.sh (print_census): the results artifact
 mkdir -p "$LOAD_LOG_DIR" "$LOAD_RESULTS_DIR" "$W/out" "$W/redis"
 COMPOSE_ARGS=(-p "$PROJECT" -f "$E2E/docker-compose.yml" -f "$E2E/docker-compose.redis.yml" -f "$HERE/docker-compose.redis.yml")
 # shellcheck source=../lib.sh

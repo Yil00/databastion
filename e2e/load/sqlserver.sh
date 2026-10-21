@@ -12,6 +12,12 @@
 #      statement with and without Audit, the server's CPU;
 #   3. the agent's CPU and RSS over the Audit run, bounded and without monotonic growth.
 # The report is loadlib.py's (same checks, limits and format as run.sh).
+# LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents (ROADMAP phase 9 follow-up "#282 review N3: measure the
+# catch-up noise under load"): the same run with the Extended Events source (the dev session
+# `databastion_xe`, as e2e/sqlserver.sh with E2E_SQLSERVER_AUDIT_SOURCE), the agent login given that
+# source's grant only, and the catch-up measurement (loadlib.py xe-catchup) after the drain; with
+# LOAD_SQLSERVER_STATS_RESET_S=N, the auto-created statistics of the load schema are dropped every N
+# seconds of the Audit run, so that the ORM-style session builds them again under load.
 #
 # Requires: docker (compose v2.24+), openssl, curl, jq, python3. Every secret is generated at run time,
 # registered, masked under GitHub Actions, redacted from the collected logs and removed on exit.
@@ -38,7 +44,23 @@ LOAD_IDLE_S="${LOAD_IDLE_S:-45}"
 LOAD_MSSQL_SETTLE_S="${LOAD_MSSQL_SETTLE_S:-480}"
 LOAD_MSSQL_TABLES="${LOAD_MSSQL_TABLES:-100}"
 LOAD_MSSQL_ROWS="${LOAD_MSSQL_ROWS:-500000}"
-LOAD_MSSQL_RATE="${LOAD_MSSQL_RATE:-300}"          # workload statements per second
+# Audit source: sqlserver_audit (SQL Server Audit, the default) or sqlserver_xevents (the Extended
+# Events session, #282 review N3). Every statement of the workload's T-SQL loop (SET, IF, WAITFOR,
+# the table variable insert: about 30 per workload SELECT) is an Extended Events event, so the
+# default rate with that source is lower: 50 SELECTs/s, about 1 500 events/s, within the session's
+# 8 x 64 MB of files over a 600 s run.
+LOAD_SQLSERVER_AUDIT_SOURCE="${LOAD_SQLSERVER_AUDIT_SOURCE:-sqlserver_audit}"
+case "$LOAD_SQLSERVER_AUDIT_SOURCE" in
+  sqlserver_audit) AUDIT_YAML="{source: sqlserver_audit, audit_name: databastion_audit}" default_rate=300 ;;
+  sqlserver_xevents) AUDIT_YAML="{source: sqlserver_xevents, xe_session: databastion_xe}" default_rate=50 ;;
+  *) echo "LOAD_SQLSERVER_AUDIT_SOURCE must be sqlserver_audit or sqlserver_xevents" >&2; exit 2 ;;
+esac
+LOAD_MSSQL_RATE="${LOAD_MSSQL_RATE:-$default_rate}"          # workload statements per second
+# Seconds between two drops of the load schema's auto-created statistics during the Audit run
+# (0: never, the default).
+LOAD_SQLSERVER_STATS_RESET_S="${LOAD_SQLSERVER_STATS_RESET_S:-0}"
+[[ "$LOAD_SQLSERVER_STATS_RESET_S" =~ ^(0|[1-9][0-9]{0,3})$ ]] \
+  || { echo "LOAD_SQLSERVER_STATS_RESET_S must be 0 or a number of seconds (at most 9999)" >&2; exit 2; }
 LOAD_CLIENTS="${LOAD_CLIENTS:-4}"
 LOAD_WORKLOAD_TABLES="${LOAD_WORKLOAD_TABLES:-40}"
 LOAD_SAMPLE_ROWS="${LOAD_SAMPLE_ROWS:-200}"
@@ -61,6 +83,7 @@ LOAD_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-load-sqlserver.XXXXXX")"
 W="$LOAD_WORK_DIR"
 export E2E_WORK_DIR="$W"
 E2E_LOG_DIR="$LOAD_LOG_DIR"
+CENSUS_OUT_DIR="$LOAD_RESULTS_DIR"  # read by ../lib.sh (print_census): the results artifact
 mkdir -p "$LOAD_LOG_DIR" "$LOAD_RESULTS_DIR" "$W/out"
 COMPOSE_ARGS=(-p "$PROJECT" -f "$E2E/docker-compose.yml" -f "$E2E/docker-compose.sqlserver.yml" -f "$HERE/docker-compose.sqlserver.yml")
 # shellcheck source=../lib.sh
@@ -148,7 +171,7 @@ targets:
       ca_file: /etc/databastion/sqlserver-ca.pem
       databases: [retail]
       rls_visibility: view_definition
-      audit: {source: sqlserver_audit, audit_name: databastion_audit}
+      audit: ${AUDIT_YAML}
 EOF
 chmod 0644 "$W/agent/agent.yaml"
 
@@ -174,7 +197,7 @@ else
 fi
 phase_done build
 
-log "starting the console and SQL Server 2022 Express (${LOAD_DB_CPUS} CPUs)"
+log "starting the console and SQL Server 2022 Express (${LOAD_DB_CPUS} CPUs; Audit source ${LOAD_SQLSERVER_AUDIT_SOURCE})"
 timeout 900 docker compose "${COMPOSE_ARGS[@]}" up -d db web worker proxy target-mssql
 start_console
 deadline=$(( $(date +%s) + 420 ))
@@ -184,6 +207,14 @@ until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q target-
 done
 compose exec -T target-mssql cat /var/opt/mssql/databastion-tls/ca.pem >"$T/sqlserver-ca.pem" || fail "cannot copy the dev CA"
 chmod 0644 "$T/sqlserver-ca.pem"
+# The Extended Events source's grant set (as e2e/sqlserver.sh, docs/08 "Extended Events: source and
+# grants"): the two SQL Server Audit grants revoked, VIEW SERVER PERFORMANCE STATE granted, before the
+# agent starts.
+if [ "$LOAD_SQLSERVER_AUDIT_SOURCE" = sqlserver_xevents ]; then
+  log "Extended Events source: the agent login gets VIEW SERVER PERFORMANCE STATE, not the SQL Server Audit grants"
+  mssql_sa_q "REVOKE VIEW SERVER SECURITY AUDIT FROM databastion; REVOKE VIEW ANY SECURITY DEFINITION FROM databastion;
+    GRANT VIEW SERVER PERFORMANCE STATE TO databastion;" >/dev/null || fail "cannot set the Extended Events grant of the agent login"
+fi
 phase_done start
 
 # ------------------------------------------------------------------------------ sampler, seed
@@ -199,8 +230,9 @@ head -n -1 "$SAMPLES_DB" | jq -e 'select(.c["target-mssql"].cpu_usec != null)' >
 fact --arg t "$TARGET" '{kind: "target", target: $t, container: "target-mssql"}'
 fact --argjson r "$LOAD_MSSQL_RATE" --argjson soak "$LOAD_SOAK_S" --argjson base "$LOAD_BASELINE_S" \
   --argjson cpus "$LOAD_DB_CPUS" --argjson tables "$LOAD_MSSQL_TABLES" --argjson rows "$LOAD_MSSQL_ROWS" \
+  --arg src "$LOAD_SQLSERVER_AUDIT_SOURCE" --argjson reset "$LOAD_SQLSERVER_STATS_RESET_S" \
   '{kind: "config", harness: "sqlserver", rate: $r, soak_s: $soak, baseline_s: $base, db_cpus: $cpus,
-    tables: $tables, rows: $rows}'
+    tables: $tables, rows: $rows, audit_source: $src, stats_reset_s: $reset}'
 
 log "creating the workload logins load_app and load_orm; seeding ${LOAD_MSSQL_TABLES} tables, ${LOAD_MSSQL_ROWS} rows (schema load of retail)"
 # shellcheck disable=SC2016 # sqlcmd variable (from the environment: never on a command line)
@@ -374,11 +406,32 @@ run_orm() {
       '"$SQLCMD"' -S sqlserver -d retail -U load_orm -b -I -W -h -1 -v CYCLES="$CYCLES" -i /tmp/orm.sql \
         | grep -E "^(ORM [0-9]+|Msg [0-9]+.*)$" || true' <"$W/orm.sql" >"$2" 2>&1
 }
+# #282 review N3: the auto-created statistics of the load schema (the ORM-style reporting queries'
+# GROUP BY columns), dropped as `sa` every LOAD_SQLSERVER_STATS_RESET_S seconds of the Audit run, so
+# that the next ORM cycle builds them again in load_orm's session (statistics builds under load).
+# Each drop: one line `<unix time> <statistics dropped>` in stats-resets.txt.
+STATS_RESET_SQL="USE retail;
+DECLARE @s nvarchar(max) = N'', @n int = 0;
+SELECT @s += N'DROP STATISTICS ' + QUOTENAME(SCHEMA_NAME(o.schema_id)) + N'.' + QUOTENAME(o.name) + N'.'
+    + QUOTENAME(st.name) + N'; ', @n += 1
+  FROM sys.stats st JOIN sys.objects o ON o.object_id = st.object_id
+  WHERE st.auto_created = 1 AND o.schema_id = SCHEMA_ID(N'load');
+IF @n > 0 EXEC (@s);
+SELECT @n;"
+stats_reset_loop() {
+  local n
+  while :; do
+    sleep "$LOAD_SQLSERVER_STATS_RESET_S"
+    n="$(mssql_sa_q "$STATS_RESET_SQL" 2>/dev/null | tail -n 1)" || n=""
+    [[ "$n" =~ ^[0-9]+$ ]] || n=error
+    printf '%s %s\n' "$(date +%s)" "$n" >>"$W/out/stats-resets.txt"
+  done
+}
 # run_workload PHASE DURATION: LOAD_CLIENTS sqlcmd sessions as load_app in one mssql-client
 # container, LOAD_MSSQL_RATE statements per second in total (absolute schedule per session), and
 # the load_orm session next to them (run_orm).
 run_workload() {
-  local phase="$1" dur="$2" per iv t_start rc=0 orm_pid
+  local phase="$1" dur="$2" per iv t_start rc=0 orm_pid reset_pid=""
   per=$(( LOAD_MSSQL_RATE * dur / LOAD_CLIENTS ))
   iv=$(( LOAD_CLIENTS * 1000000 / LOAD_MSSQL_RATE ))
   log "workload ($phase): ${LOAD_MSSQL_RATE} statements/s over ${LOAD_CLIENTS} sessions, ${dur} s"
@@ -386,6 +439,12 @@ run_workload() {
   t_start="$(now_s)"
   run_orm "$dur" "$W/out/orm-$phase.out" &
   orm_pid=$!
+  if [ "$phase" = on ] && [ "$LOAD_SQLSERVER_STATS_RESET_S" -gt 0 ]; then
+    log "dropping the load schema's auto-created statistics every ${LOAD_SQLSERVER_STATS_RESET_S} s (#282 review N3)"
+    stats_reset_loop &
+    reset_pid=$!
+    BG_PIDS+=("$reset_pid")
+  fi
   timeout $((dur + 300)) docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps \
     -e "N=$per" -e "IV_US=$iv" -e "CLIENTS=$LOAD_CLIENTS" mssql-client '
       cat > /tmp/w.sql
@@ -401,6 +460,7 @@ run_workload() {
       echo "ERRORS $(cat /tmp/out.* | grep -cE "^Msg [0-9]+" || true)"
       exit $rc' <"$W/workload.sql" >"$W/out/mssql-$phase.out" 2>"$W/out/mssql-$phase.err" || rc=$?
   WL_END="$(now_s)"
+  if [ -n "$reset_pid" ]; then kill "$reset_pid" 2>/dev/null || true; wait "$reset_pid" 2>/dev/null || true; fi
   wait "$orm_pid" || true
   log "ORM session ($phase): $(tr '\n' ' ' <"$W/out/orm-$phase.out" | cut -c1-200)"
   [ "$rc" = 0 ] || { tail -n 5 "$W/out/mssql-$phase.out" "$W/out/mssql-$phase.err" >&2; fail "the workload ($phase) exited $rc"; }
@@ -446,7 +506,9 @@ run_workload off "$LOAD_BASELINE_S"
 phase_done workload-off
 
 # ------------------------------------------------------------------------------ Audit on
-log "enabling Audit on ${TARGET}"
+log "enabling Audit on ${TARGET} (${LOAD_SQLSERVER_AUDIT_SOURCE})"
+AUDIT_START="$(date +%s)"
+AUDIT_START_UTC="$(date -u -d "@$AUDIT_START" +'%Y-%m-%dT%H:%M:%S')"
 enable_audit "$TARGET"
 sleep 5
 phase_done audit-setup
@@ -490,23 +552,54 @@ other="$(console_sql "SELECT coalesce(string_agg(coalesce(db_user, '-') || ' ' |
 log "other events of ${TARGET}: ${other}"
 log "target notes after the run: $(target_json "$TARGET" | jq -c '[.notes[]? | {code, count}]')"
 # Source side: the workload's SELECT records in the audit file since the Audit run started.
-src="$(mssql_sa_q "SELECT COUNT(*) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
-  WHERE server_principal_name = N'load_app' AND action_id = 'SL' AND event_time >= CAST(N'${SOAK_START_UTC}' AS datetime2)")" || src=""
+if [ "$LOAD_SQLSERVER_AUDIT_SOURCE" = sqlserver_audit ]; then
+  src="$(mssql_sa_q "SELECT COUNT(*) FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', DEFAULT, DEFAULT)
+    WHERE server_principal_name = N'load_app' AND action_id = 'SL' AND event_time >= CAST(N'${SOAK_START_UTC}' AS datetime2)")" || src=""
+else
+  # #282 review N3, source side (as `sa`, counts only): in the session's files, the statistics
+  # builds (`sp_statement_completed` whose text is the server's StatMan grammar) since Audit started,
+  # per principal, and the workload's SELECTs of load_app since the soak started.
+  log "Extended Events: counting the statistics builds and workload SELECTs in the session's files"
+  mssql_sa_q "SELECT CONCAT(s.k, ' ', REPLACE(COALESCE(s.p, N'-'), N' ', N'_'), ' ', COUNT(*)) FROM (
+      SELECT CASE WHEN f.object_name = N'sp_statement_completed' THEN 'build' ELSE 'select' END AS k,
+        CAST(f.event_data AS xml).value('(event/action[@name=\"server_principal_name\"]/value)[1]', 'nvarchar(128)') AS p
+      FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe*.xel', NULL, NULL, NULL) f
+      WHERE (f.object_name = N'sp_statement_completed' AND f.event_data LIKE N'%StatMan%'
+          AND f.timestamp_utc >= CAST(N'${AUDIT_START_UTC}' AS datetime2))
+        OR (f.object_name = N'sql_statement_completed' AND f.event_data LIKE N'%load[_]app%'
+          AND f.event_data LIKE N'%SELECT @v = note FROM%' AND f.timestamp_utc >= CAST(N'${SOAK_START_UTC}' AS datetime2))
+    ) s GROUP BY s.k, s.p" >"$W/out/xe-source.txt" 2>/dev/null || : >"$W/out/xe-source.txt"
+  src="$(awk '$1 == "select" && $2 == "load_app" { print $3 }' "$W/out/xe-source.txt")"
+  # Agent and console side: the agent's cut lines (debug), the workload principals' events.
+  timeout 60 docker compose "${COMPOSE_ARGS[@]}" logs --no-color agent >"$W/out/agent-xe.log" 2>/dev/null || true
+  console_sql "SELECT coalesce(json_agg(x ORDER BY x.db_user), '[]') FROM (
+      SELECT db_user, count(*) AS events, sum(aggregated_count) AS statements,
+        coalesce(sum(aggregated_count) FILTER (WHERE action = 'read'), 0) AS read_statements,
+        count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb AND objects_overflowed IS NOT TRUE) AS unknown_star_events,
+        coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb
+          AND objects_overflowed IS NOT TRUE), 0) AS unknown_star_statements,
+        count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb AND jsonb_array_length(objects) = 1) AS star_only_events,
+        coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb
+          AND jsonb_array_length(objects) = 1), 0) AS star_only_statements,
+        count(*) FILTER (WHERE objects_overflowed IS TRUE) AS overflowed_events
+      FROM access_events WHERE agent_id = '${AGENT_ID}' AND target_id = '${TARGET}' AND db_user IN ('load_app', 'load_orm')
+      GROUP BY db_user) AS x" >"$W/out/xe-noise.json" 2>/dev/null || rm -f -- "$W/out/xe-noise.json"
+  orm_on="$(sed -n 's/^ORM \([0-9][0-9]*\)$/\1/p' "$W/out/orm-on.out" | tail -n 1)"
+  python3 "$LOADLIB" xe-catchup --log "$W/out/agent-xe.log" --builds "$W/out/xe-source.txt" \
+    --console "$W/out/xe-noise.json" --issued "load_app=${want}" ${orm_on:+--issued "load_orm=${orm_on}"} \
+    --since "$AUDIT_START" --label load-sqlserver --json "$LOAD_RESULTS_DIR/xe-catchup.json" \
+    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+  rm -f -- "$W/out/agent-xe.log"
+  if [ -s "$W/out/stats-resets.txt" ]; then
+    log "statistics resets: $(wc -l <"$W/out/stats-resets.txt"), statistics dropped: $(awk '$2 ~ /^[0-9]+$/ { n += $2 } END { print n + 0 }' "$W/out/stats-resets.txt"), failed: $(grep -c ' error$' "$W/out/stats-resets.txt" || true)"
+  fi
+fi
 if [[ "${src:-}" =~ ^[0-9]+$ ]]; then
   fact --arg t "$TARGET" --argjson n "$src" '{kind: "source", target: $t, statements: $n, rotated_files: 0}'
-  log "audit file: ${src} SELECT record(s) of load_app since the Audit run started"
+  log "source (${LOAD_SQLSERVER_AUDIT_SOURCE}): ${src} SELECT record(s) of load_app since the Audit run started"
 fi
-# ADR-0053 decision 6: per principal, the events stored, the statements they stand for, those naming
-# an object `*`, the largest object list (counts only; read by print_census on exit).
-CENSUS_CONSOLE="$W/out/census-console.json"
-console_sql "SELECT coalesce(json_agg(x ORDER BY x.target, x.db_user), '[]') FROM (
-    SELECT target_id AS target, coalesce(db_user, '-') AS db_user, count(*) AS events,
-      sum(aggregated_count) AS statements,
-      count(*) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb) AS star_events,
-      coalesce(sum(aggregated_count) FILTER (WHERE objects @> '[{\"object\": \"*\"}]'::jsonb), 0) AS star_statements,
-      max(jsonb_array_length(objects)) AS max_objects
-    FROM access_events WHERE agent_id = '${AGENT_ID}' GROUP BY 1, 2) AS x" >"$CENSUS_CONSOLE" 2>/dev/null \
-  || rm -f -- "$CENSUS_CONSOLE"
+# ADR-0053 decision 6: the console's per-principal counts and `*` events are read by print_census
+# (cleanup), with the agent's census.
 if wait_spool_empty "$(now_s)"; then fact '{kind: "spool_drained", ok: true, batches: 0}'
 else fact '{kind: "spool_drained", ok: false}'; fi
 lost="$(timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color agent 2>/dev/null \

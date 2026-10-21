@@ -700,7 +700,7 @@ class CensusTest(unittest.TestCase):
             with open(summary, encoding="utf-8") as f:
                 text = f.read()
             self.assertIn("| sqlserver | 4 |", text)
-            self.assertIn("| mssql-load | load_orm | 4 | 9 | 1 | 3 | 16 |", text)
+            self.assertIn("| mssql-load | load_orm | 4 | 9 | 1 | 3 | - | - | 16 |", text)
             args = argparse.Namespace(log=os.path.join(d, "missing"), console=None,
                                                             label="t", summary=None)
             self.assertEqual(L.cmd_census(args), 0)
@@ -719,7 +719,112 @@ class CensusTest(unittest.TestCase):
         md = L.census_markdown({}, rows, "load")
         for line in md.splitlines():
             if line.startswith("| mssql-load"):
-                self.assertEqual(line.count("|"), 8)
+                self.assertEqual(line.count("|"), 10)
+
+
+    def test_census_sql_filters_on_a_uuid_only(self) -> None:
+        q = L.census_sql("0f8e2c3a-1b2c-4d5e-8f90-123456789abc")
+        self.assertIn("agent_id = '0f8e2c3a-1b2c-4d5e-8f90-123456789abc'", q)
+        self.assertIn("objects_overflowed IS TRUE", q)
+        self.assertIn("WHERE TRUE GROUP BY", L.census_sql())
+        with self.assertRaises(ValueError):
+            L.census_sql("x' OR '1'='1")
+        self.assertIn("FROM findings WHERE TRUE", L.star_sql())
+        args = argparse.Namespace(agent_id="bad", star=True)
+        self.assertEqual(L.cmd_census_sql(args), 2)
+
+    def test_console_rows_keep_the_overflow_flag_counts(self) -> None:
+        row = {"target": "pg", "db_user": "fp:0123abcd", "events": 3, "statements": 5, "star_events": 1,
+               "star_statements": 1, "overflowed_events": 1, "overflowed_statements": 2, "max_objects": 16}
+        rows = L.console_rows([row, dict(row, overflowed_events=-2)])
+        self.assertEqual(rows[0]["overflowed_statements"], 2)
+        self.assertIsNone(rows[1]["overflowed_events"])
+
+    def test_star_rows_and_out_dir(self) -> None:
+        ev = {"target": "valkey-e2e", "source": "redis_slowlog", "action": "read", "principal_kind": "account",
+              "signals": "-", "star_databases": "db0", "only_star": True, "overflowed": False, "events": 10,
+              "statements": 120, "rows_sum": 0}
+        data = {"events": [ev, dict(ev, events=-1), dict(ev, only_star="yes"), dict(ev, source="a\nb c"), 7],
+                "findings": [{"target": "valkey-e2e", "engine": "valkey", "database": "db0", "objects": 4,
+                              "star_object": False}, {"target": 1}]}
+        events, findings = L.star_rows(data)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1]["source"], "a?b?c")
+        self.assertEqual(len(findings), 1)
+        out = L.star_lines(events, findings, "e2e-redis")
+        self.assertIn("STAR-EVENTS e2e-redis target=valkey-e2e source=redis_slowlog action=read principal=account "
+                      "signals=- star_databases=db0 only_star=true overflowed=false events=10", out[0])
+        self.assertIn("STAR-FINDINGS e2e-redis target=valkey-e2e engine=valkey database=db0 finding_objects=4 "
+                      "star_object=false", out[2])
+        self.assertEqual(L.star_rows([1]), ([], []))
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "agent.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(self.line("valkey", 10, unknown_star=10) + "\n")
+            star = os.path.join(d, "star.json")
+            with open(star, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            out_dir = os.path.join(d, "census")
+            args = argparse.Namespace(log=log, console=None, star=star, label="e2e redis/x", summary=None,
+                                      out_dir=out_dir)
+            self.assertEqual(L.cmd_census(args), 0)
+            with open(os.path.join(out_dir, "census-e2e_redis_x.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["agent"]["valkey"]["unknown_star"], 10)
+            self.assertEqual(len(doc["star_events"]), 2)
+            with open(os.path.join(out_dir, "census-e2e_redis_x.md"), encoding="utf-8") as f:
+                md = f.read()
+            self.assertIn("| valkey-e2e | redis_slowlog | read | account | - | db0 | yes | no | 10 | 120 | 0 |", md)
+
+
+class XeCatchupTest(unittest.TestCase):
+    @staticmethod
+    def cut(ts: str) -> str:
+        rec = {"timestamp": ts, "level": "DEBUG", "target": "databastion_connector_sqlserver::audit::xe",
+               "fields": {"message": L.XE_CUT_MESSAGE, "target_id": "mssql-load"}}
+        return "agent-1  | " + json.dumps(rec)
+
+    def test_runs_of_cuts_and_the_cap(self) -> None:
+        lines = [self.cut(f"2026-10-21T10:00:{s:02d}.123456Z") for s in range(0, 60, 5)]
+        lines += [self.cut("2026-10-21T10:01:00.5Z"), "agent-1  | not json " + L.XE_CUT_MESSAGE]
+        lines += [self.cut("2026-10-21T10:05:00Z"), self.cut("2026-10-21T10:05:10+00:00")]
+        lines += [self.cut("2026-10-21T09:00:00Z"), self.cut("bad time")]
+        since = L._log_time({"timestamp": "2026-10-21T09:30:00Z"})
+        times = L.xe_cut_times(lines, since)
+        self.assertEqual(len(times), 15)
+        r = L.xe_catchup(lines, {"build": {"load_orm": 7}}, [], {}, since, 30.0)
+        self.assertEqual((r["cuts"], r["episodes"], r["episodes_at_cap"]), (15, 2, 1))
+        self.assertEqual(r["longest_episode_s"], 60.4)
+
+    def test_builds_noise_and_command(self) -> None:
+        b = L.xe_builds("build load_orm 4\nbuild load_orm 1\nselect load_app 900\nbuild a|b 2\njunk\nbuild x y\n")
+        self.assertEqual(b, {"build": {"load_orm": 5, "a?b": 2}, "select": {"load_app": 900}})
+        noise = L.xe_noise_rows([{"db_user": "load_orm", "events": 5, "statements": 41, "read_statements": 40,
+                                  "unknown_star_events": 2,
+                                  "unknown_star_statements": 3, "star_only_events": 1, "star_only_statements": 2,
+                                  "overflowed_events": 1}, {"db_user": "x"}])
+        r = L.xe_catchup([], b, noise, {"load_orm": 36}, None, 30.0)
+        self.assertEqual(r["principals"][0]["excess_statements"], 4)
+        out = L.xe_catchup_lines(r, "load-sqlserver")
+        self.assertIn("XE-CATCHUP load-sqlserver cuts=0 episodes=0", out[0])
+        self.assertIn("XE-NOISE load-sqlserver principal=load_orm events=5 statements=41 read_statements=40 issued=36 "
+                      "excess_read_statements=4",
+                      out[-1])
+        with tempfile.TemporaryDirectory() as d:
+            con = os.path.join(d, "noise.json")
+            with open(con, "w", encoding="utf-8") as f:
+                json.dump([{"db_user": "load_app", "events": 1, "statements": 9, "read_statements": 9, "unknown_star_events": 0,
+                            "unknown_star_statements": 0, "star_only_events": 0, "star_only_statements": 0,
+                            "overflowed_events": 0}], f)
+            summary, js = os.path.join(d, "s.md"), os.path.join(d, "x.json")
+            args = argparse.Namespace(log=os.path.join(d, "missing.log"), builds=None, console=con,
+                                      issued=["load_app=9", "bad", "x=y"], since=None, gap=30.0, label="t",
+                                      summary=summary, json=js)
+            self.assertEqual(L.cmd_xe_catchup(args), 0)
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["principals"][0]["excess_statements"], 0)
+            with open(summary, encoding="utf-8") as f:
+                self.assertIn("| load_app | 1 | 9 | 9 | 9 | 0 |", f.read())
 
 
 if __name__ == "__main__":

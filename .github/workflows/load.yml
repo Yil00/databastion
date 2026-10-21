@@ -16,6 +16,26 @@ on:
         description: Length of the workload with Audit, in seconds (also the agent resource run)
         required: false
         default: "600"
+      only:
+        description: Run one job only (all, database, cas, sqlserver, redis)
+        required: false
+        type: choice
+        options: [all, database, cas, sqlserver, redis]
+        default: all
+      sqlserver_audit_source:
+        description: "load-sqlserver: Audit source (sqlserver_xevents: the Extended Events catch-up measurement, #282 review N3)"
+        required: false
+        type: choice
+        options: [sqlserver_audit, sqlserver_xevents]
+        default: sqlserver_audit
+      sqlserver_rate:
+        description: "load-sqlserver: workload SELECTs per second (empty: 300 with sqlserver_audit, 50 with sqlserver_xevents)"
+        required: false
+        default: ""
+      sqlserver_stats_reset_s:
+        description: "load-sqlserver: drop the load schema's auto-created statistics every N seconds of the Audit run (0: never)"
+        required: false
+        default: "0"
   pull_request:
     branches: [main, dev]
     types: [opened, synchronize, reopened, labeled]
@@ -47,7 +67,7 @@ jobs:
     # Pull requests: only with the `load-test` label, and on a `labeled` event only when that label
     # is the one added (adding another label does not start a run). The label stays across new
     # commits: remove and re-apply it after reviewing new commits from a fork.
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'database')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -92,7 +112,7 @@ jobs:
   load-cas:
     name: Load / CAS target
     needs: unit
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'cas')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -135,17 +155,23 @@ jobs:
   # SQL Server 2022 Express (the dev service, 2 CPUs), a paced Discovery scan of a scaled seed
   # against the < 2 % criterion, a fixed-rate point-select workload with and without SQL Server Audit
   # read by the agent (every statement an event, the engine-measured time per statement), the agent's
-  # CPU / RSS. In parallel with the other runs, same triggers.
+  # CPU / RSS. In parallel with the other runs, same triggers. On demand with the Extended Events
+  # source (input sqlserver_audit_source, #282 review N3): the catch-up measurement in the summary and
+  # in load-sqlserver-results/xe-catchup.json.
   load-sqlserver:
     name: Load / SQL Server target
     needs: unit
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'sqlserver')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
       LOAD_LOG_DIR: ${{ github.workspace }}/load-sqlserver-logs
       LOAD_RESULTS_DIR: ${{ github.workspace }}/load-sqlserver-results
       LOAD_SOAK_S: ${{ inputs.soak_s || '600' }}
+      # Validated by sqlserver.sh (never interpolated into a script). An empty rate: the source's default.
+      LOAD_SQLSERVER_AUDIT_SOURCE: ${{ inputs.sqlserver_audit_source || 'sqlserver_audit' }}
+      LOAD_MSSQL_RATE: ${{ inputs.sqlserver_rate }}
+      LOAD_SQLSERVER_STATS_RESET_S: ${{ inputs.sqlserver_stats_reset_s || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,7 +212,7 @@ jobs:
   load-redis:
     name: Load / ${{ matrix.label }} target
     needs: unit
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'redis')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:

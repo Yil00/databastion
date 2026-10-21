@@ -89,6 +89,8 @@ local `e2e/run.sh`).
 | `LOAD_DRAIN_TIMEOUT_S` | 300 | Longest wait for the Audit run's events after the workload |
 | `LOAD_PG_AUDIT` | `pgaudit` | `pss`: local runs without the pgaudit image (above) |
 | `LOAD_HTTPS_PORT` | 8543 | Port of the TLS proxy on 127.0.0.1 |
+| `LOAD_SQLSERVER_AUDIT_SOURCE` | `sqlserver_audit` | `sqlserver.sh` only: `sqlserver_xevents` for the Extended Events source ([below](#extended-events-source-catch-up-noise-282-review-n3)) |
+| `LOAD_SQLSERVER_STATS_RESET_S` | 0 | `sqlserver.sh` only: drop the load schema's auto-created statistics every N seconds of the Audit run |
 | `LOAD_LIMIT_<NAME>` | see below | Every field of `loadlib.Limits`, upper case, e.g. `LOAD_LIMIT_DISCOVERY_PCT=2.0`, `LOAD_LIMIT_DRAIN_S=240`, `LOAD_LIMIT_AGENT_REF_CPU_CORES=0.013` (the release reference of the agent checks) |
 
 ## Flow
@@ -364,6 +366,49 @@ LOAD_SKIP_BUILD=1 e2e/load/sqlserver.sh                 # reuse the images built
 LOAD_MSSQL_DIAG=1 e2e/load/sqlserver.sh                 # local only: the scan's top statements
 ```
 
+### Extended Events source: catch-up noise (#282 review N3)
+
+`LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents` (default `sqlserver_audit`; workflow input
+`sqlserver_audit_source` of `load.yml`) runs the same measurement with the Extended Events source:
+`audit: {source: sqlserver_xevents, xe_session: databastion_xe}` (the dev session, as
+[`e2e/sqlserver.sh`](../sqlserver.sh) with `E2E_SQLSERVER_AUDIT_SOURCE`), and the agent login holds
+that source's grant only (the two SQL Server Audit grants revoked, `VIEW SERVER PERFORMANCE STATE`
+granted, before the agent starts). Every statement of the workload's T-SQL loop is an Extended
+Events event (`SET`, `IF`, `WAITFOR`, the table-variable insert: about 30 per workload `SELECT`), so
+the default rate is 50 `SELECT`s per second with this source (`LOAD_MSSQL_RATE`, workflow input
+`sqlserver_rate`), about 1 500 events per second, within the session's 8 files of 64 MB over a
+600 s run. `LOAD_SQLSERVER_STATS_RESET_S=N` (default 0, off; workflow input
+`sqlserver_stats_reset_s`) drops the load schema's auto-created statistics as `sa` every N seconds
+of the Audit run (`DROP STATISTICS`, logged as `statistics resets: …`), so that the ORM-style
+session's next reporting queries (`GROUP BY a0.status`) build them again in `load_orm`'s session:
+statistics builds under load, which the stream may defer (ADR-0051 refinement of 2026-10-18). The
+`sa` drops are DDL events of `sa`, always reported; they are not in the figures below.
+
+After the drain, the run prints (and appends to the job summary, and writes to
+`$LOAD_RESULTS_DIR/xe-catchup.json`), never as a check:
+
+- `XE-CATCHUP load-sqlserver cuts=… episodes=… longest_episode_s=… episodes_at_60s_cap=…`: the
+  agent's debug line "a statistics build not paired yet: the read ends before it" since Audit
+  started, one per read cut before an unpaired build (deferrals and full-read cuts alike: the
+  agent logs both the same way), grouped in runs of cuts at most 30 s apart; a run that lasts about
+  60 s reached the hold bound (`MAX_DEFERRAL`), after which nothing is deferred until the stream
+  has caught up, and builds still unpaired are reported. The agent has no counter of the builds
+  reported that way (the connector's left-out counts are test-only), hence the two sides below.
+- `XE-BUILDS … principal=… statistics_builds_in_session_files=…`: the statistics builds
+  (`sp_statement_completed` whose text is the `StatMan` grammar) in the session's files since
+  Audit started, per principal (as `sa`, counts only); `XE-SELECTS`: `load_app`'s workload
+  `SELECT`s there since the soak started (also the report's "In the target's log" column).
+- `XE-NOISE … principal=load_app|load_orm events=… read_statements=… issued=…
+  excess_read_statements=… unknown_star_events=… star_only_events=…`: the console's events of the
+  workload principals. A reported build is a read of its table and its internal statements reads
+  of `*`: the noise shows as read statements beyond those issued and as events naming `*` that the
+  agent did not flag overflowed (`star_only`: `*` is the event's only object, the shape of a build's
+  internal statement); `load_orm`'s overflowed reporting queries are counted apart.
+
+```sh
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_SQLSERVER_STATS_RESET_S=10 e2e/load/sqlserver.sh
+```
+
 `LOAD_MSSQL_DIAG=1` (refused under GitHub Actions) writes the 15 statements that used the most CPU
 during the scan (their first 70 characters, which may name a value-bearing table) to
 `diag-top-statements.txt` in the log directory. Results go to `$LOAD_RESULTS_DIR` (default
@@ -476,9 +521,29 @@ names only (I2); nothing reaches the console (I6).
 Every load run (`run.sh`, `cas.sh`, `sqlserver.sh`, `redis.sh`) and every end-to-end run
 (`e2e/run.sh`, `cas.sh`, `sqlserver.sh`, `redis.sh`) prints, on exit, the agent's last census line per
 engine as `CENSUS <label> engine=<engine> events=… overflowed=… unknown_star=… overflowed_rate=…`
-in its log (`loadlib.py census`), and an "Event census" section in the job summary. The load runs of
-the database targets add `CENSUS-CONSOLE` lines: per target and principal, the events stored, the
-statements, the events naming `*` (the console does not know which kind) and the longest object list.
+in its log (`loadlib.py census`), and an "Event census" section in the job summary. Every run also
+reads the console database on exit (read-only, the queries of `loadlib.py census-sql`) and adds:
+
+- `CENSUS-CONSOLE` lines: per target and principal (an account name as stored, `fp:` and the first 8
+  hex digits of a fingerprint, `(not-recorded)` for Redis / Valkey events without an account), the
+  events stored, the statements, the events naming `*`, those the agent flagged
+  `objects_overflowed` (ADR-0053) and the longest object list;
+- `STAR-EVENTS` lines: the events naming `*`, grouped by target, source, action, principal kind
+  (`account`, `fingerprint`, `not_recorded`), signals, the databases of their `*` objects, whether
+  `*` is their only object and whether they were flagged overflowed; and `STAR-FINDINGS` lines: per
+  target and database, the distinct finding objects (on Redis / Valkey the key patterns that
+  Discovery reported, from the scan whose patterns Audit maps keys to) and whether `*` is one of
+  them. No object name other than `*`, no principal name, no value (I2). For the Valkey question of
+  ADR-0053 decision 6: the agent never learns `*` as a key pattern (`LearnedPatterns` ignores it),
+  so a slow-log read of `*` is a key that matched no learned pattern (or one the second gate masked,
+  a guarded CAS key, an oversized or non-UTF-8 key), a command whose keys the agent cannot place, a
+  script (`EVAL` and the like, a write of `*`), an `ACL LOG` entry (source `redis_acl_log`) or a full synchronization
+  (source `redis_sync`, signal `signature.full_sync`, principal `not_recorded`).
+
+The census is also kept as files: `census-<label>.json` and `.md` in the results directory of the
+load runs (the `load-*-results` artifacts) and in `<log dir>/census/` of the end-to-end runs (the CI
+artifacts `e2e-census`, `e2e-cas-census`, `e2e-sqlserver-census`, `e2e-redis-census`, and
+`e2e-sqlserver-census-<version>-<source>` from the engine matrix, uploaded whatever the result).
 None of this is a check: the run never fails on it.
 
 The **ORM-style workload** runs next to the workload, in both phases (so the latency comparison is

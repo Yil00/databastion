@@ -66,11 +66,20 @@ UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 log() { printf '[e2e %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 # print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
-# (counts only) per engine from the collected agent log, to the log and the job summary. Never fails.
+# (counts only) per engine from the collected agent log, the console's per-principal counts and its
+# events naming `*` by kind (console_sql, once defined; nothing when the console database is down),
+# to the log, the job summary and $E2E_LOG_DIR/census/census-LABEL.json / .md. Never fails.
 print_census() {
-  local line
-  python3 "$HERE/load/loadlib.py" census --log "$E2E_LOG_DIR/agent.log" --label "$1" \
-    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+  local line lib="$HERE/load/loadlib.py" con="$E2E_WORK_DIR/census-console.json" star="$E2E_WORK_DIR/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$lib" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$lib" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$lib" census --log "$E2E_LOG_DIR/agent.log" --label "$1" --console "$con" --star "$star" \
+    --out-dir "$E2E_LOG_DIR/census" ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
 }
 fail() { log "FAIL: $*"; exit 1; }
 now_ms() { date +%s%3N; }

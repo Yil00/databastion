@@ -65,11 +65,20 @@ SPOOL_TIMEOUT_S=120
 log() { printf '[load-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 # print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
-# (counts only) per engine from the collected agent log, to the log and the job summary. Never fails.
+# (counts only) per engine from the collected agent log, the console's per-principal counts and its
+# events naming `*` by kind (console_sql, once defined), to the log, the job summary and
+# $LOAD_RESULTS_DIR/census-LABEL.json / .md (the results artifact). Never fails.
 print_census() {
-  local line
-  python3 "$HERE/loadlib.py" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" \
-    ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 | while IFS= read -r line; do log "$line"; done || true
+  local line lib="$HERE/loadlib.py" con="$W/out/census-console.json" star="$W/out/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$lib" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$lib" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$lib" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" --console "$con" --star "$star" \
+    --out-dir "$LOAD_RESULTS_DIR" ${GITHUB_STEP_SUMMARY:+--summary "$GITHUB_STEP_SUMMARY"} 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
 }
 # Under GitHub Actions the reason is also an error annotation (readable through the check-run API
 # when the job log is not; registered secrets are masked in it as in the log).
