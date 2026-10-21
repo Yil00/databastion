@@ -901,6 +901,23 @@ pub(crate) fn ps_own_pin(flavor: Flavor) -> String {
 /// the server start) from one of an earlier server run.
 pub(crate) const SERVER_UPTIME: &str = "SHOW GLOBAL STATUS LIKE 'Uptime'";
 
+/// How the server compares database and table names (ADR-0055 decision
+/// 4): `lower_case_table_names` and `lower_case_file_system`, both
+/// readable by any account, with the server's clock and identity
+/// (`audit::own_threads::ServerRun`, the run the value was read on; the
+/// start time is this clock minus [`SERVER_UPTIME`]). Sent at every
+/// `check()`; a constant text per flavor, among the agent's own texts
+/// (ADR-0045, security review L7). Columns: the two settings,
+/// `UNIX_TIMESTAMP()`, the identity columns.
+#[must_use]
+pub(crate) fn name_case_settings(flavor: Flavor) -> String {
+    format!(
+        "SELECT @@GLOBAL.lower_case_table_names, @@GLOBAL.lower_case_file_system, \
+         UNIX_TIMESTAMP(), {}",
+        identity_columns(flavor)
+    )
+}
+
 /// Text limits of `performance_schema` (statement text, digest text).
 pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
 pub(crate) const PS_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_digest_length";
@@ -1212,6 +1229,8 @@ mod tests {
             PS_DIGEST_LIMIT.to_owned(),
             MAX_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
+            name_case_settings(Flavor::Mysql),
+            name_case_settings(Flavor::Mariadb),
             ps_stats("events_statements_history_long"),
             ps_poll_variables(8),
         ];
@@ -1438,6 +1457,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            all.push(name_case_settings(flavor));
             all.push(session_setup(flavor, u32::MAX));
             all.push(set_statement_timeout(flavor, u32::MAX));
             all.push(session_check(flavor, "transaction_read_only"));

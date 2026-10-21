@@ -7416,6 +7416,38 @@ mod tests {
         }
     }
 
+    /// ADR-0055 decision 4 (security review L7): the name-case read of
+    /// `check()` is one of the agent's own exact texts, for both flavors,
+    /// reads no table and raises no event, from the agent or any account;
+    /// a near copy is not an own text.
+    #[test]
+    fn the_name_case_read_is_an_own_exact_text_and_quiet() {
+        let target: databastion_core::config::TargetConfig = databastion_core::AgentConfig::parse(
+            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                 engine: mariadb, host: db, account: databastion, secret: {env: X}}]}",
+        )
+        .unwrap()
+        .targets[0]
+            .clone();
+        let texts = crate::audit::own_statements(&target);
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            let text = crate::sql::name_case_settings(flavor);
+            assert!(texts.iter().any(|t| t == text.as_bytes()), "{text}");
+            let b = EventBuilder::new(own()).with_own_statements(texts.clone());
+            assert!(b.own_statement(text.as_bytes(), false, false));
+            assert!(!b.own_statement(text.as_bytes(), true, false), "cut");
+            assert!(!b.own_statement(format!("{text} ").as_bytes(), false, false));
+            for user in ["databastion", "app"] {
+                let mut b = EventBuilder::new(own()).with_own_statements(texts.clone());
+                let out = file(
+                    &mut b,
+                    sa_at(&[sa_line(user, "172.18.0.1", 1, &text)], 1024),
+                );
+                assert!(out.is_empty(), "{user}: {out:?}");
+            }
+        }
+    }
+
     #[test]
     fn dump_programs() {
         for p in [

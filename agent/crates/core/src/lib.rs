@@ -55,6 +55,7 @@ pub mod job;
 mod jobs;
 pub mod jtext;
 pub mod local_state;
+pub mod name_case;
 pub mod notes;
 pub mod pacing;
 mod panics;

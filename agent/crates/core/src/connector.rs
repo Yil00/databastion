@@ -142,6 +142,17 @@ pub trait Connector: Send + Sync {
     fn server_version(&self, _target: &TargetConfig) -> Option<String> {
         None
     }
+
+    /// How `target` compares names that differ only by case (ADR-0055):
+    /// the last value a [`check`](Self::check) read on the same server
+    /// run, kept when a later check fails, times out or cannot reach the
+    /// server (decision 2). `None` (the default) when the connector reports
+    /// none or read nothing yet: for a `mysql`, `mariadb` or `sqlserver`
+    /// target the core then sends `unknown` for both parts. Database names
+    /// in it are normalized like the connector's locations (ADR-0009).
+    fn name_case(&self, _target: &TargetConfig) -> Option<crate::name_case::NameCaseReport> {
+        None
+    }
 }
 
 #[cfg(test)]

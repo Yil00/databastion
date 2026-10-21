@@ -567,6 +567,7 @@ async fn interrupted_own_polls_are_dropped_and_foreign_ones_reported() {
                 poll_threads: connector.check_state.poll_threads(),
                 pins: connector.check_state.discovery_pins(),
                 statement_timeout: Duration::from_secs(10),
+                name_case: None,
             },
         )
         .await

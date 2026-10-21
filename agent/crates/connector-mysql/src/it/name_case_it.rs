@@ -221,3 +221,60 @@ async fn performance_schema_names_tables_as_written() {
         .await;
     }
 }
+
+/// ADR-0055 decisions 2 and 4: `check()` reports how the server compares
+/// names, from `lower_case_table_names` read with the agent's own account
+/// (0, the dev servers' setting: `sensitive`; 1 or 2, an engine-matrix
+/// entry initialized so: `insensitive`), and a later check that fails
+/// (here: a wrong password) keeps that value. Also run against a server
+/// with another setting, where the expectation follows its value.
+#[tokio::test]
+async fn check_reports_the_name_case_of_the_server() {
+    use databastion_core::name_case::{NameCase, NameCaseReport};
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let (_dir, t) = agent_target(&server);
+        let mut s = Session::connect(&t, Timeouts::new(Duration::from_secs(10)))
+            .await
+            .unwrap();
+        let value = scalar(&mut s, "SELECT @@GLOBAL.lower_case_table_names").await;
+        s.close().await;
+        let want = match value.as_deref() {
+            Some("0") => NameCase::Sensitive,
+            Some("1" | "2") => NameCase::Insensitive,
+            other => panic!("{}: lower_case_table_names {other:?}", server.name),
+        };
+        eprintln!(
+            "{}: lower_case_table_names {value:?}: name case {want:?}",
+            server.name
+        );
+        let connector = MysqlConnector::new();
+        assert_eq!(connector.name_case(&t), None, "nothing read yet");
+        let health = connector.check(&t).await;
+        assert!(health.reachable, "{}: {health:?}", server.name);
+        let detail = health.detail.unwrap_or_default();
+        assert!(
+            detail.contains("lower_case_table_names"),
+            "{}: {detail}",
+            server.name
+        );
+        assert_eq!(
+            connector.name_case(&t),
+            Some(NameCaseReport::uniform(want)),
+            "{}",
+            server.name
+        );
+        // The same connector, the target's password now wrong: the check
+        // fails and the value read on this server run is kept (M1).
+        let (_dir2, bad) = target(&server, &server.url.user, "wrong-password-FAKE");
+        assert_eq!(bad.id, t.id);
+        let health = connector.check(&bad).await;
+        assert!(!health.reachable);
+        assert_eq!(
+            connector.name_case(&bad),
+            Some(NameCaseReport::uniform(want)),
+            "{}",
+            server.name
+        );
+    }
+}
