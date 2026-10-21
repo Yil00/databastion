@@ -1136,167 +1136,6 @@ fn read_faults_are_gaps_on_both_sources() {
     }
 }
 
-/// What [`throughput_model`] measured.
-#[derive(Debug)]
-struct Modelled {
-    /// When a read first reached the end of the source (ms), if it did.
-    caught_up_ms: Option<u64>,
-    /// Events written and not read yet at the end.
-    behind: u64,
-    /// The longest an event written after the catch-up waited to be read
-    /// (ms).
-    max_lag_after_ms: u64,
-}
-
-/// The stream's cycles against a source writing `rate` events/s after a
-/// first start with `backlog` events of history, reads of at most
-/// [`BATCH`] rows taking `read_ms` each and the session's counters
-/// `probe_ms` at each cycle, for `end_ms`: with the cycle rule of today
-/// ([`cycle_end`], [`CycleEnd::pause`]) or, `legacy`, the rule of before
-/// load run 39687119269 (a poll interval after every cycle, 20 history
-/// reads per cycle for as long as the history phase lasts).
-fn throughput_model(
-    rate: u64,
-    backlog: u64,
-    read_ms: u64,
-    probe_ms: u64,
-    poll_ms: u64,
-    end_ms: u64,
-    legacy: bool,
-) -> Modelled {
-    let batch = BATCH as u64;
-    let poll = Duration::from_millis(poll_ms);
-    // Event `i`'s write time (ms; history before 0) and server stamp (µs).
-    let written_at = |i: u64| i.checked_sub(backlog).map(|n| n * 1000 / rate);
-    let stamp = |i: u64| {
-        written_at(i).map_or_else(
-            || -1_000_000 - i64::try_from(backlog - i).unwrap(),
-            |ms| i64::try_from(ms).unwrap() * 1000,
-        )
-    };
-    let available = |t: u64| backlog + t * rate / 1000;
-    let mut cursor = Cursor::default();
-    cursor.first_start(Some(0), 0);
-    let (mut t, mut pos) = (0u64, 0u64);
-    let mut out = Modelled {
-        caught_up_ms: None,
-        behind: 0,
-        max_lag_after_ms: 0,
-    };
-    while t < end_ms {
-        t += probe_ms;
-        let started = t;
-        let mut history_reads = 0usize;
-        let end = loop {
-            let in_history = if legacy {
-                cursor.history_us.is_some()
-            } else {
-                cursor.walking_history()
-            };
-            let n = available(t).saturating_sub(pos).min(batch);
-            t += read_ms;
-            for i in pos..pos + n {
-                cursor.max_seen_us = Cursor::seen(cursor.max_seen_us, stamp(i));
-                if let (Some(_), Some(w)) = (out.caught_up_ms, written_at(i)) {
-                    out.max_lag_after_ms = out.max_lag_after_ms.max(t - w);
-                }
-            }
-            pos += n;
-            let full = n == batch;
-            if !full {
-                cursor.history_us = None;
-                out.caught_up_ms.get_or_insert(t);
-            }
-            history_reads += usize::from(in_history);
-            let elapsed = Duration::from_millis(t - started);
-            if legacy {
-                if !full || elapsed >= CATCH_UP || history_reads >= HISTORY_READS {
-                    break poll;
-                }
-            } else if let Some(end) = cycle_end(full, elapsed, history_reads) {
-                break end.pause(poll);
-            }
-        };
-        t += u64::try_from(end.as_millis()).unwrap();
-    }
-    out.behind = available(end_ms).saturating_sub(pos);
-    out
-}
-
-/// Load run 39687119269 (Extended Events, 50 SELECTs/s of about 30
-/// events each over 4 sessions, the 10 s default poll interval, a first
-/// start behind about 150 s of earlier workload): the stream stored about
-/// 700 events/s, never caught up. With 20 history reads of 500 per cycle
-/// and the poll interval after each, the stream reads at most 10 000
-/// events per (10 s + 20 reads), under 1 000/s whatever the read time,
-/// and stays in the history phase, which only a read that is not full
-/// ends. Without the poll interval after a cycle that ended behind, and
-/// with only reads of the history itself paced, it catches up and then
-/// keeps up.
-#[test]
-fn a_stream_behind_its_source_catches_up() {
-    let (rate, backlog, read_ms, probe_ms, poll_ms) = (1_500, 225_000, 190, 30, 10_000);
-    let end = 1_200_000;
-    let old = throughput_model(rate, backlog, read_ms, probe_ms, poll_ms, end, true);
-    assert_eq!(old.caught_up_ms, None, "{old:?}");
-    // Read at 10 000 events per 13.8 s: about 725/s, as measured.
-    let read = available_total(rate, backlog, end) - old.behind;
-    let per_s = read * 1000 / end;
-    assert!((650..=800).contains(&per_s), "{per_s} events/s ({old:?})");
-    let new = throughput_model(rate, backlog, read_ms, probe_ms, poll_ms, end, false);
-    let caught = new.caught_up_ms.expect("caught up");
-    // History at about 2 000 events/s (20 reads, then 1 s), then the live
-    // backlog at about 2 600/s: within 5 minutes.
-    assert!(caught <= 300_000, "{new:?}");
-    // Then every event is read within a poll interval and a cycle.
-    assert!(new.max_lag_after_ms <= poll_ms + 2_000, "{new:?}");
-    assert!(new.behind <= rate * (poll_ms + 2_000) / 1000, "{new:?}");
-    // Even with no history, the old rule read at most two thirds of the
-    // read rate (20 s of reads, then 10 s): at 2 600 events/s of reads,
-    // 1 733/s; at 300 ms a read, 1 111/s, below 1 500. The new one reads
-    // on: 1 667/s.
-    let old = throughput_model(rate, 0, 300, probe_ms, poll_ms, end, true);
-    assert!(old.behind > 100_000, "{old:?}");
-    let new = throughput_model(rate, 0, 300, probe_ms, poll_ms, end, false);
-    assert!(
-        new.caught_up_ms.is_some() && new.behind <= rate * 12,
-        "{new:?}"
-    );
-}
-
-fn available_total(rate: u64, backlog: u64, end_ms: u64) -> u64 {
-    backlog + end_ms * rate / 1000
-}
-
-/// The cycle rule: a read that is not full (or that waits: a deferral, a
-/// clamped position) ends the cycle with the poll interval; 20 history
-/// reads with a 1 s pause; 20 s behind with no poll interval. Pauses never
-/// exceed the poll interval.
-#[test]
-fn cycles_end_by_their_reads() {
-    let s = Duration::from_secs;
-    assert_eq!(cycle_end(false, s(0), 0), Some(CycleEnd::CaughtUp));
-    assert_eq!(cycle_end(false, s(30), 50), Some(CycleEnd::CaughtUp));
-    assert_eq!(cycle_end(true, s(19), 19), None);
-    assert_eq!(
-        cycle_end(true, s(1), HISTORY_READS),
-        Some(CycleEnd::History)
-    );
-    assert_eq!(cycle_end(true, CATCH_UP, 0), Some(CycleEnd::Behind));
-    assert_eq!(
-        cycle_end(true, CATCH_UP, HISTORY_READS),
-        Some(CycleEnd::History)
-    );
-    let poll = s(10);
-    assert_eq!(CycleEnd::CaughtUp.pause(poll), poll);
-    assert_eq!(CycleEnd::Behind.pause(poll), BEHIND_PAUSE);
-    assert_eq!(CycleEnd::History.pause(poll), HISTORY_PAUSE);
-    for end in [CycleEnd::CaughtUp, CycleEnd::Behind, CycleEnd::History] {
-        assert!(end.pause(s(1)) <= s(1));
-        assert!(!end.pause(poll).is_zero());
-    }
-}
-
 /// Only reads of the history itself are paced as a history walk: once a
 /// record of after the first start was handled, the stream is behind live
 /// records, though the history phase lasts until a read that is not full.
@@ -1308,8 +1147,17 @@ fn the_history_walk_ends_at_the_first_live_record() {
     assert!(c.walking_history(), "nothing read yet");
     c.max_seen_us = Some(999_999);
     assert!(c.walking_history(), "history only");
-    c.max_seen_us = Some(1_000_000);
-    assert!(!c.walking_history(), "a record of the first start's time");
+    // Review L2: the threshold of `below` (the floor, the start plus the
+    // clock skew): a record within the skew is still history.
+    c.max_seen_us = Some(1_019_999);
+    assert!(c.walking_history(), "within the skew");
+    assert_eq!(
+        c.below(1_019_999, None, Duration::ZERO),
+        Some(Below::History)
+    );
+    c.max_seen_us = Some(1_020_000);
+    assert_eq!(c.below(1_020_000, None, Duration::ZERO), None);
+    assert!(!c.walking_history(), "a record at the floor");
     assert!(c.history_us.is_some(), "the history phase goes on");
     c.max_seen_us = Some(5);
     c.history_us = None;

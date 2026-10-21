@@ -32,6 +32,8 @@ limits:
   statement_timeout_ms: 30000  # 100..=600000, never 0; cap of every query
   max_scan_duration_s: 3600    # 60..=86400; cap of a whole scan
   min_audit_poll_interval_s: 5 # 1..=3600; floor of audit polling
+  # (SQL Server: a stream behind its source reads in catch-up cycles that
+  # start at most once per poll interval, its reads at most 80 % of the time)
   # Discovery duty cycle, in percent (1..=100; 100: no pacing). After each
   # object's sampling, the scan pauses so that its time in queries is at
   # most this share of the scan's time: at most 1 % of one database core per

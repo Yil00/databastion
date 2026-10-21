@@ -16,10 +16,11 @@
 //!   and the records of the next buffer already handled (skipped on the
 //!   server) are parameters. At most [`BATCH`] records per read (halved after a
 //!   response over [`POLL_BYTES`]), each turned into a record as its row
-//!   ends; a full read is followed by another, within [`CATCH_UP`] (and
-//!   [`HISTORY_READS`] reads while the first start skips the history),
-//!   and a cycle that ends while still behind is followed by the next
-//!   one at once ([`CycleEnd`]), not after the poll interval. Each poll gets a credit
+//!   ends; a full read is followed by another, within [`cycle::CATCH_UP`] (and
+//!   less while the first start's history is walked), and a cycle that
+//!   ends while still behind is followed by the next one after a pause
+//!   bounding the reads' share of the time, not after the poll interval
+//!   ([`cycle`]). Each poll gets a credit
 //!   (its own record is left out only for this session and this text).
 //! - **Position** (M4), persisted through the core: the file and the
 //!   offset of the last buffer read whole (a read starts after it,
@@ -55,6 +56,7 @@
 //!   rule shared by `check()` and the stream, re-evaluated every 5
 //!   minutes: a stream whose choice changes ends and is restarted).
 
+pub(crate) mod cycle;
 pub(crate) mod objects;
 pub(crate) mod own;
 pub(crate) mod probe;
@@ -97,70 +99,6 @@ pub(crate) const BATCH: usize = 500;
 pub(crate) const MAX_SKIP: u32 = 1_000_000;
 /// Smallest read after responses over [`POLL_BYTES`] (the read halves).
 const MIN_BATCH: usize = 16;
-/// Time spent catching up (full reads one after the other) per cycle.
-const CATCH_UP: Duration = Duration::from_secs(20);
-/// Reads of the source's history (first start, records stamped before it)
-/// per cycle: the scan of a first start's backlog is spread over cycles,
-/// [`HISTORY_PAUSE`] apart. Only reads still walking that history count
-/// ([`Cursor::walking_history`]): once a read handled a record of after
-/// the first start, the stream is behind live records, not in the
-/// history, and only [`CATCH_UP`] ends its cycle.
-const HISTORY_READS: usize = 20;
-/// The pause after a cycle that ended on [`HISTORY_READS`] while the
-/// history was still being walked.
-pub(crate) const HISTORY_PAUSE: Duration = Duration::from_secs(1);
-/// The pause after a cycle that ended on [`CATCH_UP`] with its last read
-/// full (the stream is behind the source): the next cycle (the session's
-/// counters, then reads) follows at once, without the poll interval. A
-/// stream that waited a poll interval after every 20 s of catch-up read
-/// at most two thirds of its read rate, and one still in its history
-/// phase (which only a read that is not full ends) at most 20 reads of
-/// [`BATCH`] per poll interval, 1 000 records/s at the 10 s default
-/// (load run 39687119269: about 700 Extended Events events/s against
-/// 1 500 written, never caught up). The pause only bounds a cycle that
-/// would not move (never seen).
-pub(crate) const BEHIND_PAUSE: Duration = Duration::from_millis(100);
-
-/// Why a stream's cycle of reads ended, and so how long the stream waits
-/// before the next one ([`CycleEnd::pause`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CycleEnd {
-    /// A read reached the end of the source, or must wait (a deferral, a
-    /// position clamped before a file): the poll interval.
-    CaughtUp,
-    /// [`CATCH_UP`] spent with the last read full: [`BEHIND_PAUSE`].
-    Behind,
-    /// [`HISTORY_READS`] reads of the history: [`HISTORY_PAUSE`].
-    History,
-}
-
-impl CycleEnd {
-    /// The wait before the next cycle, `poll` the poll interval. Never
-    /// longer than the poll interval.
-    pub(crate) fn pause(self, poll: Duration) -> Duration {
-        match self {
-            Self::CaughtUp => poll,
-            Self::Behind => BEHIND_PAUSE.min(poll),
-            Self::History => HISTORY_PAUSE.min(poll),
-        }
-    }
-}
-
-/// Whether a cycle ends after a read: `full` when the read asks for the
-/// next one at once, `elapsed` the cycle's time so far, `history_reads`
-/// its reads that walked the history ([`Cursor::walking_history`], this
-/// one included). `None`: the next read follows at once.
-pub(crate) fn cycle_end(full: bool, elapsed: Duration, history_reads: usize) -> Option<CycleEnd> {
-    if !full {
-        Some(CycleEnd::CaughtUp)
-    } else if history_reads >= HISTORY_READS {
-        Some(CycleEnd::History)
-    } else if elapsed >= CATCH_UP {
-        Some(CycleEnd::Behind)
-    } else {
-        None
-    }
-}
 /// Bound of one poll's response.
 const POLL_BYTES: usize = 12 * 1024 * 1024;
 /// The catalog proofs are read again this often (decision 6).
@@ -810,10 +748,18 @@ impl Cursor {
     /// or after its start. The history phase itself lasts until a read
     /// that is not full ([`Self::settle`]), however far past the history
     /// the stream is: a stream behind live records stays in it, and must
-    /// not be paced as a history walk ([`HISTORY_READS`]).
+    /// not be paced as a history walk ([`cycle::HISTORY_CATCH_UP`]).
+    ///
+    /// "Stamped at or after its start" uses the threshold of
+    /// [`Self::below`] (the later of the start and the floor, which adds
+    /// the source's clock skew): a record [`Self::below`] still classes as
+    /// history keeps the walk on (review L2).
     pub(crate) fn walking_history(&self) -> bool {
-        self.history_us
-            .is_some_and(|h| self.max_seen_us.is_none_or(|m| m < h))
+        let Some(h) = self.history_us else {
+            return false;
+        };
+        let threshold = self.floor.map_or(h, |f| f.max(h));
+        self.max_seen_us.is_none_or(|m| m < threshold)
     }
 
     /// `seen` with a record handled at `time_us`.
@@ -1448,6 +1394,7 @@ pub(crate) async fn audit_stream(
         evaluated_at: None,
         batch: BATCH,
     };
+    let mut log = cycle::BehindLog::default();
     loop {
         if session.is_poisoned() || session.is_stale() {
             let old = std::mem::replace(
@@ -1459,7 +1406,7 @@ pub(crate) async fn audit_stream(
             old.close().await;
             Box::pin(observe_server_run(state, &target.id, &mut session)).await;
         }
-        let end = match Box::pin(cycle(&mut st, &mut session, sink)).await {
+        let end = match Box::pin(cycle(&mut st, &mut session, sink, &mut log)).await {
             Ok(end) => end,
             Err(e) => {
                 st.save();
@@ -1477,7 +1424,8 @@ async fn cycle(
     st: &mut Stream<'_>,
     s: &mut Session,
     sink: &EventSink,
-) -> Result<CycleEnd, ConnectorError> {
+    log: &mut cycle::BehindLog,
+) -> Result<cycle::End, ConnectorError> {
     let target = st.target;
     if st.evaluated_at.is_none_or(|t| t.elapsed() >= REEVALUATE) {
         let v = check::version(s)
@@ -1507,50 +1455,41 @@ async fn cycle(
     if st.probe.is_none() || st.reprobe_at.elapsed() >= REPROBE {
         Box::pin(reprobe(st, s)).await?;
     }
-    let started = Instant::now();
-    let mut history_reads = 0usize;
-    let mut reads = 0usize;
-    loop {
-        let in_history = st.cursor.walking_history();
-        let full = Box::pin(read(st, s, sink)).await?;
-        st.save();
-        reads += 1;
-        history_reads += usize::from(in_history);
-        if let Some(end) = cycle_end(full, started.elapsed(), history_reads) {
-            note_behind(
-                &target.id,
-                "SQL Server Audit",
-                end,
-                reads,
-                started.elapsed(),
-            );
-            return Ok(end);
-        }
-        if st.probe.is_none() {
-            Box::pin(reprobe(st, s)).await?;
-        }
-    }
+    let mut reads = Reads { st, s, sink };
+    Box::pin(cycle::run(&mut reads, log)).await
 }
 
-/// The log line of a cycle that ended while the stream was behind the
-/// source (one per cycle at most, with its reads and time): the read rate
-/// the stream achieved, for the load runs.
-pub(crate) fn note_behind(
-    target_id: &str,
-    source: &str,
-    end: CycleEnd,
-    reads: usize,
-    elapsed: Duration,
-) {
-    if end != CycleEnd::CaughtUp {
-        tracing::info!(
-            target_id = %target_id,
-            source,
-            history = end == CycleEnd::History,
-            reads,
-            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            "Audit stream behind its source: the next cycle follows without the poll interval"
-        );
+/// One cycle's reads ([`cycle::run`]).
+struct Reads<'r, 's> {
+    st: &'r mut Stream<'s>,
+    s: &'r mut Session,
+    sink: &'r EventSink,
+}
+
+impl cycle::Reads for Reads<'_, '_> {
+    fn target_id(&self) -> &str {
+        &self.st.target.id
+    }
+
+    fn source(&self) -> &'static str {
+        "SQL Server Audit"
+    }
+
+    fn walking_history(&self) -> bool {
+        self.st.cursor.walking_history()
+    }
+
+    async fn read_once(&mut self) -> Result<bool, ConnectorError> {
+        let full = Box::pin(read(self.st, self.s, self.sink)).await?;
+        self.st.save();
+        Ok(full)
+    }
+
+    async fn between(&mut self) -> Result<(), ConnectorError> {
+        if self.st.probe.is_none() {
+            Box::pin(reprobe(self.st, self.s)).await?;
+        }
+        Ok(())
     }
 }
 

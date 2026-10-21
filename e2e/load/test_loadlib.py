@@ -843,3 +843,11 @@ class XeCatchupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeFactTest(unittest.TestCase):
+    def test_probe_lines(self) -> None:
+        text = "PROBE 40\nPROBE 60\nnoise\nPROBE x\nPROBE 50\n"
+        f = L.probe_fact(text, "t", "drain")
+        self.assertEqual((f["blocks"], f["mean_us"], f["p95_us"]), (3, 50.0, 60.0))
+        self.assertIsNone(L.probe_fact("", "t", "off")["p95_us"])

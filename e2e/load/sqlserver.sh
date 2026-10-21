@@ -518,6 +518,27 @@ phase_done warmup
 run_workload off "$LOAD_BASELINE_S"
 phase_done workload-off
 
+# The latency probe (the catch-up impact, review M1 of the read-throughput fix): as `sa`, blocks of
+# 100 constant SELECTs (no table: no access event on either source; about 60 Extended Events events/s),
+# one `PROBE <µs per statement>` line per block every 5 s, for 30 s per call (server clock: a block's
+# mean, not a statement's latency). Run once before Audit (phase off) and during the drain, while the
+# stream may still catch up and no workload runs (phase drain); compared as the `probe` facts.
+PROBE_SQL="DECLARE @end datetime2 = DATEADD(second, 30, SYSUTCDATETIME()), @t0 datetime2, @i int, @v int;
+WHILE SYSUTCDATETIME() < @end BEGIN
+  SET @t0 = SYSUTCDATETIME(); SET @i = 0;
+  WHILE @i < 100 BEGIN SELECT @v = COUNT(*) FROM (VALUES (1), (2), (3)) AS v(x); SET @i += 1; END;
+  PRINT CONCAT('PROBE ', DATEDIFF_BIG(microsecond, @t0, SYSUTCDATETIME()) / 100);
+  WAITFOR DELAY '00:00:05';
+END"
+probe_chunk() { mssql_sa_q "$PROBE_SQL" >>"$1" 2>/dev/null || true; }
+# probe_loop OUT STOP_FILE: 30 s chunks until STOP_FILE exists.
+probe_loop() { while [ ! -e "$2" ]; do probe_chunk "$1"; done; }
+log "latency probe before Audit (30 s, as sa, constant SELECTs)"
+: >"$W/out/probe-off.txt"
+probe_chunk "$W/out/probe-off.txt"
+python3 "$LOADLIB" probe --out-file "$W/out/probe-off.txt" --target "$TARGET" --phase off >>"$FACTS"
+log "probe (off): $(tail -n 1 "$FACTS" | jq -c '{blocks, mean_us, p95_us}')"
+
 # ------------------------------------------------------------------------------ Audit on
 log "enabling Audit on ${TARGET} (${LOAD_SQLSERVER_AUDIT_SOURCE})"
 AUDIT_START="$(date +%s)"
@@ -544,6 +565,12 @@ deadline=$(( $(date +%s) + LOAD_DRAIN_TIMEOUT_S ))
 # how far and how fast it catches up even when the drain times out (drain_s is then null).
 drain_samples=()
 last_log=0
+DRAIN_T0="$(now_s)"
+: >"$W/out/probe-drain.txt"
+rm -f -- "$W/out/probe-stop"
+probe_loop "$W/out/probe-drain.txt" "$W/out/probe-stop" &
+probe_pid=$!
+BG_PIDS+=("$probe_pid")
 while :; do
   got="$(console_sql "SELECT coalesce(sum(aggregated_count), 0) $(events_sql)")"
   since="$(jq -n --argjson a "$SOAK_END" --argjson b "$(now_s)" '$b - $a | . * 10 | round / 10')"
@@ -560,6 +587,16 @@ while :; do
   sleep 5
 done
 log "statements stored: ${got}/${want}"
+DRAIN_T1="$(now_s)"
+fact --arg name "drain_${TARGET}" --argjson t0 "$DRAIN_T0" --argjson t1 "$DRAIN_T1" '{kind: "window", name: $name, t0: $t0, t1: $t1}'
+# The probe's current chunk ends within 30 s.
+touch "$W/out/probe-stop"
+wait "$probe_pid" 2>/dev/null || true
+kept_pids=()
+for pid in "${BG_PIDS[@]}"; do [ "$pid" = "$probe_pid" ] || kept_pids+=("$pid"); done
+BG_PIDS=("${kept_pids[@]}")
+python3 "$LOADLIB" probe --out-file "$W/out/probe-drain.txt" --target "$TARGET" --phase drain >>"$FACTS"
+log "probe (drain): $(tail -n 1 "$FACTS" | jq -c '{blocks, mean_us, p95_us}')"
 fact --arg target "$TARGET" --argjson want "$want" --argjson got "$got" \
   --argjson samples "[$(IFS=,; printf '%s' "${drain_samples[*]}")]" \
   '{kind: "drain", target: $target, want: $want, stored: $got, samples: $samples,
