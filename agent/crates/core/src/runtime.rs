@@ -1191,6 +1191,27 @@ impl Runtime {
         } else {
             Vec::new()
         };
+        // ADR-0055: how names compare, for `mysql`, `mariadb` and
+        // `sqlserver` targets only, decided by the console's latest
+        // `accepts` alone (contract review I-4). Once listed, always sent
+        // (decision 2, security review M1): the connector's last value of
+        // the server run, kept across a failed, timed-out or skipped check,
+        // else `unknown` for both parts; never omitted. A gated field
+        // (`capabilities::strip_gated_target_status`).
+        let name_case = (matches!(
+            target.engine,
+            crate::config::TargetEngine::Mysql
+                | crate::config::TargetEngine::Mariadb
+                | crate::config::TargetEngine::Sqlserver
+        ) && self
+            .console_caps
+            .console_accepts(crate::capabilities::token::TARGET_STATUS_NAME_CASE))
+        .then(|| {
+            let report = connector
+                .and_then(|c| c.name_case(target))
+                .unwrap_or_else(crate::name_case::NameCaseReport::unknown);
+            crate::name_case::to_protocol(&report)
+        });
         let status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
@@ -1198,11 +1219,7 @@ impl Runtime {
             engine: proto_engine(target.engine),
             last_error,
             metrics: None,
-            // ADR-0055 decision 1: in the contract, gated by
-            // `target_status.name_case`. Not sent yet: the connectors'
-            // reports (decisions 2 to 4) are a separate change. A gated
-            // field: see `capabilities::strip_gated_target_status`.
-            name_case: None,
+            name_case,
             notes,
             reachable,
             server_version: connector
@@ -1404,10 +1421,29 @@ impl Runtime {
     }
 
     /// Serialized heartbeat, used as the probe request before re-sending a
-    /// `/rotate` whose outcome is unknown.
-    async fn heartbeat_body(&self) -> Option<Vec<u8>> {
-        let request = self.build_heartbeat().await.ok()?;
-        serde_json::to_vec(&request).ok()
+    /// `/rotate` whose outcome is unknown: built like any heartbeat, gated
+    /// fields included (the console reads a probe as a heartbeat, and a
+    /// missing `name_case` as a loss: ADR-0055 decision 2), with the same
+    /// heartbeat stripped of its gated fields as the fallback sent once
+    /// after a `400` reporting an unknown field (#301 contract review I-3,
+    /// ADR-0022 decision 9; `None` when it carries none).
+    async fn heartbeat_body(&self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut request = self.build_heartbeat().await.ok()?;
+        let full = serde_json::to_vec(&request).ok()?;
+        let stripped = crate::capabilities::strip_gated_heartbeat(&mut request)
+            .then(|| serde_json::to_vec(&request).ok())
+            .flatten();
+        Some((full, stripped))
+    }
+
+    /// The probe of [`Self::heartbeat_body`] as the session takes it.
+    fn probe_of(
+        body: Option<&(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<crate::session::ProbeBody<'_>> {
+        body.map(|(full, stripped)| crate::session::ProbeBody {
+            full,
+            stripped: stripped.as_deref(),
+        })
     }
 
     /// Sends one heartbeat; returns the clamped interval from the console.
@@ -1531,7 +1567,11 @@ impl Runtime {
             return Ok(());
         }
         let probe = self.heartbeat_body().await;
-        match self.session.rotate_probed(None, probe.as_deref()).await {
+        match self
+            .session
+            .rotate_probed_with(None, Self::probe_of(probe.as_ref()))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(CallError::RotationConflict) => Err(AgentError::RotationConflict),
             Err(e) => {
@@ -3273,7 +3313,11 @@ impl Runtime {
     async fn rotate_for_job(&self, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         let probe = self.heartbeat_body().await;
         for attempt in 0..3 {
-            match self.session.rotate_probed(Some(id), probe.as_deref()).await {
+            match self
+                .session
+                .rotate_probed_with(Some(id), Self::probe_of(probe.as_ref()))
+                .await
+            {
                 Ok(RotateOutcome::Registered { duplicate }) => {
                     tracing::info!(job_id = %id, duplicate, "new secret registered as pending");
                     return Ok(Some(Outcome::SUCCEEDED));

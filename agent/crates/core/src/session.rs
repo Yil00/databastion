@@ -330,11 +330,35 @@ impl Session {
     /// alone. If the console accepts it, `S1` was registered and promoted on
     /// the console side: it is promoted here and no `/rotate` is sent with
     /// `S0` (which may already be past its grace period and would count as a
-    /// rotation conflict).
+    /// rotation conflict). Tests; the runtime uses [`Self::rotate_probed_with`].
+    #[cfg(test)]
     pub(crate) async fn rotate_probed(
         &self,
         job_id: Option<Uuid>,
         probe: Option<&[u8]>,
+    ) -> Result<RotateOutcome, CallError> {
+        self.rotate_probed_with(
+            job_id,
+            probe.map(|full| ProbeBody {
+                full,
+                stripped: None,
+            }),
+        )
+        .await
+    }
+
+    /// [`Self::rotate_probed`] with a probe that has a fallback body: the
+    /// heartbeat built like any other (its gated fields included, so that
+    /// a field the console relies on, such as `name_case`, is never
+    /// missing from it: ADR-0055 decision 2), and the same heartbeat
+    /// stripped of its gated fields, sent once instead when the console
+    /// answers `400` reporting an unknown field (ADR-0022 decision 9
+    /// applied to the probe), so that such a refusal never costs a
+    /// rotation (#301 contract review I-3).
+    pub(crate) async fn rotate_probed_with(
+        &self,
+        job_id: Option<Uuid>,
+        probe: Option<ProbeBody<'_>>,
     ) -> Result<RotateOutcome, CallError> {
         let pending_before = self.lock().identity.pending.is_some();
         let s1 = match self.pending_or_create(job_id)? {
@@ -342,10 +366,25 @@ impl Session {
             Pending::AlreadyDone => return Ok(RotateOutcome::AlreadyDone),
             Pending::Deferred => return Ok(RotateOutcome::Deferred),
         };
-        if let (true, Some(body)) = (pending_before, probe)
-            && self.probe_pending(&s1, body).await?
-        {
-            return Ok(RotateOutcome::AlreadyDone);
+        if let (true, Some(body)) = (pending_before, probe) {
+            let accepted = match self.probe_pending(&s1, body.full).await {
+                Err(CallError::Uplink(UplinkError::Rejected {
+                    status: 400,
+                    unknown_field: true,
+                    ..
+                })) if body.stripped.is_some() => {
+                    tracing::warn!(
+                        "rotation probe with gated target fields rejected (400): sent again \
+                         without them"
+                    );
+                    self.probe_pending(&s1, body.stripped.unwrap_or_default())
+                        .await?
+                }
+                other => other?,
+            };
+            if accepted {
+                return Ok(RotateOutcome::AlreadyDone);
+            }
         }
         let (agent_id, s0) = {
             let mut creds = self.lock();
@@ -471,6 +510,15 @@ impl Session {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// The body of a rotation probe (`POST /heartbeat` with `S1`): the full
+/// heartbeat, and the same without its gated fields, sent once after a
+/// `400` reporting an unknown field (`None`: nothing to strip).
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeBody<'a> {
+    pub(crate) full: &'a [u8],
+    pub(crate) stripped: Option<&'a [u8]>,
 }
 
 /// Pending secret to register, or why none is needed.

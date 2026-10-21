@@ -5827,3 +5827,399 @@ async fn an_events_answer_stops_extending_the_hold() {
             .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1))
     );
 }
+
+// ------------------------------------------------------ name case (ADR-0055)
+
+/// A MySQL or SQL Server connector whose `check()` succeeds, fails or
+/// hangs, and whose last name-case value is set by the test.
+struct NameCaseConn {
+    engine: Engine,
+    hang: Arc<std::sync::atomic::AtomicBool>,
+    reachable: Arc<std::sync::atomic::AtomicBool>,
+    report: Arc<StdMutex<std::collections::HashMap<String, crate::name_case::NameCaseReport>>>,
+}
+
+#[async_trait::async_trait]
+impl Connector for NameCaseConn {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let reachable = self.reachable.load(std::sync::atomic::Ordering::SeqCst);
+        TargetHealth {
+            reachable,
+            audit_level: AuditLevel::None,
+            failure: (!reachable).then_some(FailureCode::TargetUnreachable),
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    fn name_case(
+        &self,
+        target: &crate::config::TargetConfig,
+    ) -> Option<crate::name_case::NameCaseReport> {
+        self.report.lock().unwrap().get(&target.id).cloned()
+    }
+}
+
+/// An enrolled environment with a PostgreSQL, a MySQL, a MariaDB and a SQL
+/// Server target.
+async fn name_case_env(server: &MockServer) -> Env {
+    let env = enrolled(server).await;
+    let text = std::fs::read_to_string(&env.config_path).unwrap();
+    let mut text = text;
+    for (id, engine) in [
+        ("my-main", "mysql"),
+        ("maria-main", "mariadb"),
+        ("mssql-main", "sqlserver"),
+    ] {
+        text.push_str(&format!(
+            "  - id: {id}\n    engine: {engine}\n    host: 127.0.0.1\n    port: 3306\n    \
+             account: databastion_{id}\n    secret:\n      env: DATABASTION_X\n"
+        ));
+    }
+    std::fs::write(&env.config_path, &text).unwrap();
+    Env {
+        config: AgentConfig::parse(&text).unwrap(),
+        ..env
+    }
+}
+
+fn name_case_of(statuses: &[TargetStatus], id: &str) -> Option<serde_json::Value> {
+    let s = statuses
+        .iter()
+        .find(|s| s.target_id.as_str() == id)
+        .unwrap_or_else(|| panic!("{id} reported"));
+    s.name_case
+        .as_ref()
+        .map(|n| serde_json::to_value(n).unwrap())
+}
+
+/// ADR-0055 decisions 1 and 2 (security review M1, contract review I-4):
+/// `name_case` is sent only for `mysql`, `mariadb` and `sqlserver`
+/// targets and only while the console lists the token; once listed, in
+/// every such status, also when `check()` fails or times out (the
+/// connector's last value, else `unknown` for both parts), never omitted.
+#[tokio::test]
+async fn name_case_is_always_sent_for_the_three_engines_once_accepted() {
+    use crate::capabilities::token;
+    use crate::name_case::{NameCase, NameCaseReport};
+    use databastion_classifiers::names::{PathPart, normalize_field_path};
+    let server = MockServer::start().await;
+    let env = name_case_env(&server).await;
+    let flag = |v: bool| Arc::new(std::sync::atomic::AtomicBool::new(v));
+    let (my_hang, my_up) = (flag(false), flag(true));
+    let reports = Arc::new(StdMutex::new(std::collections::HashMap::new()));
+    let ss_reports = Arc::new(StdMutex::new(std::collections::HashMap::new()));
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: Vec::new(),
+    };
+    let mut rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![
+            Box::new(Health(health)),
+            Box::new(NameCaseConn {
+                engine: Engine::Mysql,
+                hang: Arc::clone(&my_hang),
+                reachable: Arc::clone(&my_up),
+                report: Arc::clone(&reports),
+            }),
+            Box::new(NameCaseConn {
+                engine: Engine::Sqlserver,
+                hang: flag(false),
+                reachable: flag(true),
+                report: Arc::clone(&ss_reports),
+            }),
+        ],
+    )
+    .unwrap();
+    rt.check_timeout = Duration::from_millis(300);
+    reports.lock().unwrap().insert(
+        "my-main".to_owned(),
+        NameCaseReport::uniform(NameCase::Sensitive),
+    );
+    ss_reports.lock().unwrap().insert(
+        "mssql-main".to_owned(),
+        NameCaseReport {
+            databases: NameCase::Insensitive,
+            objects: NameCase::Insensitive,
+            except: vec![
+                (
+                    normalize_field_path(&[PathPart::Key("crm_cs")]),
+                    NameCase::Sensitive,
+                ),
+                (
+                    normalize_field_path(&[PathPart::Key("jane.doe@example.com")]),
+                    NameCase::Unknown,
+                ),
+            ],
+        },
+    );
+    // Not listed: never sent (an older console rejects the heartbeat).
+    accept_tokens(&rt, &[token::ENGINE_SQLSERVER, token::TARGET_STATUS_NOTES]);
+    let st = rt.target_statuses(&env.config).await;
+    assert_eq!(st.len(), 4);
+    assert!(st.iter().all(|s| s.name_case.is_none()));
+    // Listed: on the three engines only; the MariaDB target has no value
+    // yet (`unknown`), PostgreSQL none.
+    accept_tokens(
+        &rt,
+        &[token::ENGINE_SQLSERVER, token::TARGET_STATUS_NAME_CASE],
+    );
+    let st = rt.target_statuses(&env.config).await;
+    assert_eq!(name_case_of(&st, "pg-main"), None);
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    assert_eq!(
+        name_case_of(&st, "maria-main"),
+        Some(serde_json::json!({"databases": "unknown", "objects": "unknown"}))
+    );
+    assert_eq!(
+        name_case_of(&st, "mssql-main"),
+        Some(serde_json::json!({
+            "databases": "insensitive",
+            "objects": "insensitive",
+            "except": [
+                {"database": "*", "objects": "unknown"},
+                {"database": "crm_cs", "objects": "sensitive"}
+            ]
+        }))
+    );
+    let text = serde_json::to_string(&st).unwrap();
+    assert!(!text.contains("jane"), "{text}");
+    // A failed check keeps the connector's last value.
+    my_up.store(false, std::sync::atomic::Ordering::SeqCst);
+    let st = rt.target_statuses(&env.config).await;
+    let my = st
+        .iter()
+        .find(|s| s.target_id.as_str() == "my-main")
+        .unwrap();
+    assert!(!my.reachable);
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    // A check that times out too.
+    my_hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let st = rt.target_statuses(&env.config).await;
+    let my = st
+        .iter()
+        .find(|s| s.target_id.as_str() == "my-main")
+        .unwrap();
+    assert_eq!(
+        my.last_error.as_ref().map(ToString::to_string).as_deref(),
+        Some("timeout")
+    );
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    // Still running at the next heartbeat (account busy): still sent.
+    let st = rt.target_statuses(&env.config).await;
+    assert!(name_case_of(&st, "my-main").is_some());
+    // Every status conforms to the contract (the engine rule included).
+    for s in &st {
+        let v = serde_json::to_value(s).unwrap();
+        serde_json::from_value::<TargetStatus>(v).unwrap();
+    }
+    // Withdrawn by the console: no longer sent.
+    accept_tokens(&rt, &[token::ENGINE_SQLSERVER]);
+    let st = rt.target_statuses(&env.config).await;
+    assert!(st.iter().all(|s| s.name_case.is_none()));
+}
+
+/// The rotation probe is the heartbeat as built, gated fields included
+/// (ADR-0055 decision 2, security review M1 of the agent lot), with a
+/// fallback stripped of them for a `400` on an unknown field (#301
+/// contract review I-3).
+#[tokio::test]
+async fn the_rotation_probe_is_a_full_heartbeat_with_a_stripped_fallback() {
+    use crate::capabilities::token;
+    use crate::notes::TargetNote;
+    let server = MockServer::start().await;
+    let env = name_case_env(&server).await;
+    let flag = |v: bool| Arc::new(std::sync::atomic::AtomicBool::new(v));
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: vec![TargetNote::new(NoteCode::SecurityTlsDisabled)],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![
+            Box::new(Health(health)),
+            Box::new(NameCaseConn {
+                engine: Engine::Mysql,
+                hang: flag(false),
+                reachable: flag(true),
+                report: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            }),
+        ],
+    )
+    .unwrap();
+    accept_tokens(
+        &rt,
+        &[token::TARGET_STATUS_NOTES, token::TARGET_STATUS_NAME_CASE],
+    );
+    // The ordinary heartbeat carries both.
+    let hb = rt.build_heartbeat().await.unwrap();
+    assert!(hb.targets.iter().any(|t| !t.notes.is_empty()));
+    assert!(hb.targets.iter().any(|t| t.name_case.is_some()));
+    // The probe too (ADR-0055 decision 2: a probe is a heartbeat to the
+    // console); its fallback neither.
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    let probe: HeartbeatRequest = serde_json::from_slice(&full).unwrap();
+    assert_eq!(probe.targets.len(), hb.targets.len());
+    let text = String::from_utf8(full).unwrap();
+    assert!(
+        text.contains("name_case") && text.contains("notes"),
+        "{text}"
+    );
+    let stripped = stripped.expect("a fallback without the gated fields");
+    let probe: HeartbeatRequest = serde_json::from_slice(&stripped).unwrap();
+    assert_eq!(probe.targets.len(), hb.targets.len());
+    let text = String::from_utf8(stripped).unwrap();
+    assert!(
+        !text.contains("name_case") && !text.contains("notes"),
+        "{text}"
+    );
+    // Nothing gated listed: no fallback.
+    accept_tokens(&rt, &[]);
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    assert!(stripped.is_none());
+    assert!(!String::from_utf8(full).unwrap().contains("name_case"));
+}
+
+/// Security review M1 of the ADR-0055 agent lot (ADR-0022 decision 9
+/// applied to the rotation probe): a probe refused with `400` reporting an
+/// unknown field is sent once more stripped of its gated fields, and its
+/// acceptance still promotes `S1` (a `400` never costs a rotation, #301
+/// I-3); a probe with nothing to strip is not resent.
+#[tokio::test]
+async fn a_rotation_probe_refused_on_a_gated_field_is_resent_stripped_once() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(body_partial_json(serde_json::json!({"gated": true})))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .and(body_partial_json(serde_json::json!({"gated": false})))
+        .respond_with(heartbeat_response(30))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let outcome = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: Some(br#"{"gated": false}"#),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyDone);
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_eq!(stored.secret.expose(), s1);
+}
+
+/// The same refusal without a fallback (nothing gated in the probe): not
+/// resent, the error is returned and `S1` stays pending.
+#[tokio::test]
+async fn a_rotation_probe_without_a_fallback_is_not_resent() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let r = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: None,
+            }),
+        )
+        .await;
+    assert!(r.is_err());
+    assert!(env.state.load_identity().unwrap().pending.is_some());
+}

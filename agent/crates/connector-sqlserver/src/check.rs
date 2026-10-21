@@ -45,6 +45,9 @@ pub(crate) struct CheckState {
     versions: Mutex<HashMap<String, String>>,
     /// Audit facts shared with the stream.
     pub(crate) audit: crate::audit::Shared,
+    /// Per target: how names compare (ADR-0055), as last read, with its
+    /// server run and `AUTO_CLOSE` memory.
+    name_cases: Mutex<HashMap<String, crate::name_case::Memory>>,
 }
 
 impl CheckState {
@@ -54,6 +57,34 @@ impl CheckState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(target_id)
             .cloned()
+    }
+
+    /// How `target_id`'s names compare, as last read (ADR-0055): kept
+    /// when a later check fails (decision 2).
+    pub(crate) fn name_case(
+        &self,
+        target_id: &str,
+    ) -> Option<databastion_core::name_case::NameCaseReport> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .map(|m| m.report.clone())
+    }
+
+    /// Evaluates a read against the target's memory and keeps the result.
+    fn observe_name_case(
+        &self,
+        target_id: &str,
+        read: Option<&crate::name_case::Read>,
+    ) -> crate::name_case::Memory {
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = crate::name_case::evaluate(read, map.get(target_id));
+        map.insert(target_id.to_owned(), m.clone());
+        m
     }
 
     fn set_version(&self, target_id: &str, version: Option<String>) {
@@ -975,6 +1006,11 @@ async fn checked(
             conn::Mode::Mandatory => "mandatory",
         }
     )];
+    // ADR-0055 decision 4: read first, so that a later stage failing keeps
+    // this run's value (decision 2).
+    let read = crate::name_case::read(s).await?;
+    let names = state.observe_name_case(&target.id, read.as_ref());
+    detail.push(crate::name_case::summary(&names));
     let mut ev = evaluate(s, target).await?;
     // The Audit source (decision 6, option (a')): its two grants are
     // expected while a stream uses them.
