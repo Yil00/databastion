@@ -594,7 +594,46 @@ pub(crate) struct CheckState {
     /// server run it was read on (`None`: identity or start time not
     /// read). Kept when a later check fails before reading it (decision
     /// 2, security review M1).
-    name_cases: Mutex<HashMap<String, (Option<ServerRun>, NameCaseReport)>>,
+    name_cases: SharedNameCases,
+}
+
+/// The kept name-case values of every target (see [`CheckState`]), shared
+/// with the `performance_schema` Audit streams, which reset a target's
+/// value when they see another server run (security review L1 of the
+/// ADR-0055 agent lot).
+pub(crate) type SharedNameCases =
+    std::sync::Arc<Mutex<HashMap<String, (Option<ServerRun>, NameCaseReport)>>>;
+
+/// One target's kept name-case value, as an Audit stream sees it.
+pub(crate) struct NameCaseRuns {
+    pub(crate) map: SharedNameCases,
+    pub(crate) target_id: String,
+}
+
+impl NameCaseRuns {
+    /// The stream's session is on `run`: a value read on another run of
+    /// the server (a restart since, which may have changed
+    /// `lower_case_table_names` on MariaDB) is no longer kept: `unknown`
+    /// until the next check reads it. A value whose run is not known is
+    /// left as it is (nothing tells the runs apart).
+    pub(crate) fn observe(&self, run: &ServerRun) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((Some(old), report)) = map.get_mut(&self.target_id)
+            && !old.same(run)
+        {
+            if *report != NameCaseReport::unknown() {
+                tracing::info!(
+                    target_id = %self.target_id,
+                    "server restarted since the last check: name case unknown until the next one"
+                );
+            }
+            *old = run.clone();
+            *report = NameCaseReport::unknown();
+        }
+    }
 }
 
 /// An audit log record parsed within this period makes the log source
@@ -802,6 +841,14 @@ impl CheckState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(target_id)
             .map(|(_, r)| r.clone())
+    }
+
+    /// The kept name-case value of `target_id`, for its Audit streams.
+    pub(crate) fn name_case_runs(&self, target_id: &str) -> NameCaseRuns {
+        NameCaseRuns {
+            map: std::sync::Arc::clone(&self.name_cases),
+            target_id: target_id.to_owned(),
+        }
     }
 
     /// Stores what a check read; logs a server restart seen since the
@@ -1981,6 +2028,55 @@ mod tests {
         assert!(run.is_none(), "no uptime: no run");
         let (run, r, _) = name_case_row(&Vec::new(), Some(1));
         assert_eq!((run, r), (None, NameCaseReport::unknown()));
+    }
+
+    /// Security review L1 of the ADR-0055 agent lot: an Audit stream on
+    /// another server run resets the kept value to `unknown`; the same run
+    /// (within the tolerance) or an unknown one leaves it.
+    #[test]
+    fn a_new_server_run_seen_by_audit_resets_the_name_case() {
+        let run = |boot: u64| {
+            ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], boot).unwrap()
+        };
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        runs.observe(&run(100));
+        assert_eq!(state.name_case("t"), None, "nothing kept: nothing to reset");
+        state.set_name_case("t", None, NameCaseReport::uniform(NameCase::Sensitive));
+        runs.observe(&run(100));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::uniform(NameCase::Sensitive)),
+            "run unknown"
+        );
+        state.set_name_case(
+            "t",
+            Some(run(100)),
+            NameCaseReport::uniform(NameCase::Insensitive),
+        );
+        runs.observe(&run(101));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::uniform(NameCase::Insensitive)),
+            "same run"
+        );
+        runs.observe(&run(5_000));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::unknown()),
+            "a restart"
+        );
+        // Another target is not touched.
+        state.set_name_case(
+            "u",
+            Some(run(100)),
+            NameCaseReport::uniform(NameCase::Sensitive),
+        );
+        runs.observe(&run(9_000));
+        assert_eq!(
+            state.name_case("u"),
+            Some(NameCaseReport::uniform(NameCase::Sensitive))
+        );
     }
 
     #[test]

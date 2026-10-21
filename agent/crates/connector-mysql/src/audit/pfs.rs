@@ -347,6 +347,9 @@ pub(crate) struct OwnSessions {
     /// The stream's statement timeout (an interrupted poll ends within it
     /// after its session ended: ADR-0045 refinement of 2026-10-16).
     pub(crate) statement_timeout: Duration,
+    /// The target's kept name-case value, reset when the poll session is
+    /// on another server run than the one it was read on (ADR-0055).
+    pub(crate) name_case: Option<crate::check::NameCaseRuns>,
 }
 
 /// How a statement row's session is seen (see [`PsPoller::identify`]).
@@ -758,6 +761,9 @@ impl PsPoller {
             self.end_attached();
         }
         note_poll_thread(&self.own.poll_threads, &own, self.own.statement_timeout);
+        if let (Some(nc), Some(run)) = (&self.own.name_case, own.run.as_ref()) {
+            nc.observe(run);
+        }
         self.attached = next;
         self.run = own.run;
     }
@@ -1576,6 +1582,7 @@ mod tests {
                     poll_threads: Arc::clone(&polls),
                     pins: Arc::clone(&pins),
                     statement_timeout: Duration::from_secs(30),
+                    name_case: None,
                 },
                 attached: None,
                 run: poller_run,
@@ -2050,6 +2057,7 @@ mod tests {
                 poll_threads: Arc::clone(&polls),
                 pins: Arc::new(Mutex::new(DiscoveryPins::default())),
                 statement_timeout: Duration::from_secs(30),
+                name_case: None,
             };
             let builder = EventBuilder::new(OwnAccount::new(
                 AGENT,

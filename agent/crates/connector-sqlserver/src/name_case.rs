@@ -8,12 +8,15 @@
 //!   `except` (the core merges, sorts and bounds them);
 //! - a database's catalog collation: `catalog_collation_type` 0 is the
 //!   database collation, or for a contained database the fixed
-//!   `Latin1_General_100_CI_AS_KS_WS_SC` (case-insensitive); 1 is that
-//!   fixed collation (measured on 2022: a contained database reads 1, its
-//!   `catalog_collation_type_desc` naming that collation, and refuses a
-//!   second table whose name differs by case only); 2 is
+//!   `Latin1_General_100_CI_AS_KS_WS_SC` (case-insensitive); 2 is
 //!   `SQL_Latin1_General_CP1_CI_AS` (case-insensitive); anything else is
-//!   `unknown`. Without the column ([`sql::DATABASE_COLLATIONS_V0`]) the
+//!   `unknown`, as the accepted ADR text says (security review M2 of the
+//!   agent lot). Measured on 2022 (16.0.4305.5): a contained database
+//!   reads 1, not 0, with `catalog_collation_type_desc`
+//!   `Latin1_General_100_CI_AS_KS_WS_SC`, and refuses a second table whose
+//!   name differs by case only (error 2714); so a contained database is
+//!   `unknown` today, the stricter reading, until an ADR refinement maps
+//!   1 on a contained database to `insensitive`. Without the column ([`sql::DATABASE_COLLATIONS_V0`]) the
 //!   target reports `objects: unknown`;
 //! - a collation compares with case when its `ComparisonStyle` lacks the
 //!   ignore-case bit (1): every `_CS_` and binary collation. A `NULL`
@@ -171,7 +174,9 @@ pub(crate) fn evaluate(read: Option<&Read>, previous: Option<&Memory>) -> Memory
         let value = match r.catalog {
             Some(0) if r.contained => NameCase::Insensitive,
             Some(0) => collation,
-            Some(1 | 2) => NameCase::Insensitive,
+            // 1 (a contained database on 2022, measured): `unknown` until
+            // an ADR refinement decides (see the module documentation).
+            Some(2) => NameCase::Insensitive,
             _ => NameCase::Unknown,
         };
         except.push((crate::discover::normalize(&r.name), value));
@@ -314,7 +319,8 @@ mod tests {
     fn databases_are_listed_by_their_catalog_collation() {
         let mut contained = row(8, "contained_cs", Some(CS_AS));
         contained.contained = true;
-        // As measured on 2022: a contained database reads 1.
+        // As measured on 2022: a contained database reads 1, `unknown`
+        // under the accepted text.
         let mut contained_1 = row(13, "contained_cs_1", Some(CS_AS));
         contained_1.contained = true;
         contained_1.catalog = Some(1);
@@ -344,6 +350,7 @@ mod tests {
                 "databases": "insensitive",
                 "objects": "insensitive",
                 "except": [
+                    {"database": "contained_cs_1", "objects": "unknown"},
                     {"database": "crm_bin2", "objects": "sensitive"},
                     {"database": "crm_cs", "objects": "sensitive"},
                     {"database": "crm_cs_snapshot", "objects": "sensitive"},

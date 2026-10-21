@@ -3515,7 +3515,12 @@ async fn name_case_follows_the_collations() {
             eprintln!("skipped: database snapshot not available on this server");
         }
         if contained {
-            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, "insensitive");
+            // 2022 reads `catalog_collation_type` 1 for a contained
+            // database: `unknown` under the accepted ADR text (security
+            // review M2), though the server compares its names without
+            // case (the oracle above). An ADR refinement may map it to
+            // `insensitive`.
+            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, "unknown");
         } else {
             eprintln!("skipped: contained databases not enabled on this server");
         }

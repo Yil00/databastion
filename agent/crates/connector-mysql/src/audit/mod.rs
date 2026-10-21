@@ -484,6 +484,7 @@ pub(crate) async fn audit_stream(
                         statement_timeout: Duration::from_millis(u64::from(
                             timeouts.statement_ms(),
                         )),
+                        name_case: Some(state.name_case_runs(&target.id)),
                     };
                     let poller =
                         PsPoller::start(&mut session, table, builder, cfg.cursor(pfs::CURSOR), own)

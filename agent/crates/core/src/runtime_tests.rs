@@ -6056,10 +6056,12 @@ async fn name_case_is_always_sent_for_the_three_engines_once_accepted() {
     assert!(st.iter().all(|s| s.name_case.is_none()));
 }
 
-/// #301 contract review I-3: the rotation probe's heartbeat carries no
-/// gated `TargetStatus` field, whatever the console listed.
+/// The rotation probe is the heartbeat as built, gated fields included
+/// (ADR-0055 decision 2, security review M1 of the agent lot), with a
+/// fallback stripped of them for a `400` on an unknown field (#301
+/// contract review I-3).
 #[tokio::test]
-async fn the_rotation_probe_heartbeat_carries_no_gated_field() {
+async fn the_rotation_probe_is_a_full_heartbeat_with_a_stripped_fallback() {
     use crate::capabilities::token;
     use crate::notes::TargetNote;
     let server = MockServer::start().await;
@@ -6094,13 +6096,130 @@ async fn the_rotation_probe_heartbeat_carries_no_gated_field() {
     let hb = rt.build_heartbeat().await.unwrap();
     assert!(hb.targets.iter().any(|t| !t.notes.is_empty()));
     assert!(hb.targets.iter().any(|t| t.name_case.is_some()));
-    // The probe neither.
-    let body = rt.heartbeat_body().await.unwrap();
-    let probe: HeartbeatRequest = serde_json::from_slice(&body).unwrap();
+    // The probe too (ADR-0055 decision 2: a probe is a heartbeat to the
+    // console); its fallback neither.
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    let probe: HeartbeatRequest = serde_json::from_slice(&full).unwrap();
     assert_eq!(probe.targets.len(), hb.targets.len());
-    let text = String::from_utf8(body).unwrap();
+    let text = String::from_utf8(full).unwrap();
+    assert!(
+        text.contains("name_case") && text.contains("notes"),
+        "{text}"
+    );
+    let stripped = stripped.expect("a fallback without the gated fields");
+    let probe: HeartbeatRequest = serde_json::from_slice(&stripped).unwrap();
+    assert_eq!(probe.targets.len(), hb.targets.len());
+    let text = String::from_utf8(stripped).unwrap();
     assert!(
         !text.contains("name_case") && !text.contains("notes"),
         "{text}"
     );
+    // Nothing gated listed: no fallback.
+    accept_tokens(&rt, &[]);
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    assert!(stripped.is_none());
+    assert!(!String::from_utf8(full).unwrap().contains("name_case"));
+}
+
+/// Security review M1 of the ADR-0055 agent lot (ADR-0022 decision 9
+/// applied to the rotation probe): a probe refused with `400` reporting an
+/// unknown field is sent once more stripped of its gated fields, and its
+/// acceptance still promotes `S1` (a `400` never costs a rotation, #301
+/// I-3); a probe with nothing to strip is not resent.
+#[tokio::test]
+async fn a_rotation_probe_refused_on_a_gated_field_is_resent_stripped_once() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(body_partial_json(serde_json::json!({"gated": true})))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .and(body_partial_json(serde_json::json!({"gated": false})))
+        .respond_with(heartbeat_response(30))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let outcome = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: Some(br#"{"gated": false}"#),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyDone);
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_eq!(stored.secret.expose(), s1);
+}
+
+/// The same refusal without a fallback (nothing gated in the probe): not
+/// resent, the error is returned and `S1` stays pending.
+#[tokio::test]
+async fn a_rotation_probe_without_a_fallback_is_not_resent() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let r = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: None,
+            }),
+        )
+        .await;
+    assert!(r.is_err());
+    assert!(env.state.load_identity().unwrap().pending.is_some());
 }
