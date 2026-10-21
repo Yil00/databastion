@@ -3265,3 +3265,337 @@ async fn statman_scenario() {
          of refinement item 4) before adding it"
     );
 }
+
+/// Runs `sql` as `sa`; `false` (with the error) when the server refuses it
+/// (a case the dev service cannot set up is then skipped).
+async fn exec_try(s: &mut Session, sql: &str) -> bool {
+    match s
+        .run(sql, Stage::Check, Shape::rows(0, 0), |_| {
+            conn::Flow::Continue
+        })
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("refused by the server: {sql}: {e:?}");
+            false
+        }
+    }
+}
+
+/// The test databases of [`name_case_follows_the_collations`].
+const NC_DBS: [&str; 6] = [
+    "databastion_nc_snap",
+    "databastion_nc_cs",
+    "databastion_nc_bin2",
+    "databastion_nc_ci",
+    "databastion_nc_offline",
+    "databastion_nc_autoclose",
+];
+const NC_CONTAINED: &str = "databastion_nc_contained";
+
+async fn nc_drop(s: &mut Session) {
+    for db in NC_DBS.iter().chain([&NC_CONTAINED]) {
+        exec_ok(
+            s,
+            &format!("IF DB_ID(N'{db}') IS NOT NULL ALTER DATABASE [{db}] SET ONLINE"),
+        )
+        .await;
+        exec_ok(
+            s,
+            &format!("IF DB_ID(N'{db}') IS NOT NULL DROP DATABASE [{db}]"),
+        )
+        .await;
+    }
+}
+
+/// The value the agent reports for the objects of `db` (`objects` when
+/// it is not listed), and the whole value.
+fn nc_value(c: &SqlserverConnector, t: &TargetConfig, db: &str) -> (String, serde_json::Value) {
+    let report = c.name_case(t).expect("a value after a check");
+    let v = serde_json::to_value(databastion_core::name_case::to_protocol(&report)).unwrap();
+    let listed = v["except"]
+        .as_array()
+        .and_then(|e| e.iter().find(|x| x["database"] == db))
+        .map(|x| x["objects"].as_str().unwrap().to_owned());
+    (
+        listed.unwrap_or_else(|| v["objects"].as_str().unwrap().to_owned()),
+        v,
+    )
+}
+
+/// One `sa` row of `sys.databases` for `db`: collation name and
+/// `DATABASEPROPERTYEX(…, 'Collation')`, printed as an engine fact.
+async fn nc_fact(s: &mut Session, db: &str, label: &str) {
+    let rows = try_rows(
+        s,
+        &format!(
+            "SELECT CONVERT(nvarchar(128), collation_name), CONVERT(nvarchar(128), \
+             DATABASEPROPERTYEX(name, 'Collation')), CONVERT(int, state), CONVERT(int, \
+             is_auto_close_on), CONVERT(nvarchar(60), DATABASEPROPERTYEX(name, 'Status')) \
+             FROM sys.databases WHERE name = N'{db}'"
+        ),
+        5,
+    )
+    .await;
+    eprintln!("engine fact ({label}) {db}: {rows:?}");
+}
+
+/// ADR-0055 decisions 2, 4 and 10 on the dev server (the default
+/// collation): a `_CS_` and a `_BIN2` database `sensitive`, a default one
+/// and a contained `_CS_` one (when the server allows contained
+/// databases) not listed (`insensitive`), a snapshot of the `_CS_` one
+/// `sensitive`, an offline database `unknown`, an `AUTO_CLOSE` `_CS_`
+/// database closed between two checks still `sensitive` (no flapping),
+/// `VIEW ANY DATABASE` revoked from `public`: `objects: unknown` without
+/// `except`; and a failed check keeps the last value. Prints the engine
+/// facts of decision 10 (`catalog_collation_type`, `AUTO_CLOSE`, the
+/// `DATABASEPROPERTYEX` answer on a closed database).
+#[tokio::test]
+async fn name_case_follows_the_collations() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = sa().await;
+    nc_drop(&mut s).await;
+    let server = try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), CONVERT(int, \
+         COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), \
+         'ComparisonStyle')), CONVERT(int, COL_LENGTH('sys.databases', \
+         'catalog_collation_type'))",
+        3,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "engine fact: server collation, its ComparisonStyle, catalog_collation_type length: {server:?}"
+    );
+    let has_catalog_column = server[0][2].as_int().is_some();
+    let default_insensitive = server[0][1].as_int().is_some_and(|v| v & 1 == 1);
+    for (db, collate) in [
+        ("databastion_nc_cs", " COLLATE Latin1_General_100_CS_AS"),
+        ("databastion_nc_bin2", " COLLATE Latin1_General_100_BIN2"),
+        ("databastion_nc_ci", ""),
+        (
+            "databastion_nc_offline",
+            " COLLATE Latin1_General_100_CS_AS",
+        ),
+        (
+            "databastion_nc_autoclose",
+            " COLLATE Latin1_General_100_CS_AS",
+        ),
+    ] {
+        exec(&mut s, &format!("CREATE DATABASE [{db}]{collate}")).await;
+    }
+    // Express turns `AUTO_CLOSE` on for every new database: off on all but
+    // the `AUTO_CLOSE` case, so that their collations stay readable.
+    for db in [
+        "databastion_nc_cs",
+        "databastion_nc_bin2",
+        "databastion_nc_ci",
+    ] {
+        exec(&mut s, &format!("ALTER DATABASE [{db}] SET AUTO_CLOSE OFF")).await;
+    }
+    exec(
+        &mut s,
+        "ALTER DATABASE [databastion_nc_autoclose] SET AUTO_CLOSE ON",
+    )
+    .await;
+    let snapshot = exec_try(
+        &mut s,
+        "DECLARE @f nvarchar(260) = (SELECT TOP (1) physical_name FROM \
+         sys.master_files WHERE database_id = DB_ID(N'databastion_nc_cs') AND type = 0); \
+         DECLARE @l sysname = (SELECT TOP (1) name FROM sys.master_files WHERE database_id = \
+         DB_ID(N'databastion_nc_cs') AND type = 0); \
+         DECLARE @s nvarchar(max) = N'CREATE DATABASE [databastion_nc_snap] ON (NAME = ' + \
+         QUOTENAME(@l) + N', FILENAME = ''' + REPLACE(@f, N'.mdf', N'_snap.ss') + N''') AS \
+         SNAPSHOT OF [databastion_nc_cs]'; EXEC sp_executesql @s",
+    )
+    .await;
+    let previous_contained = try_rows(
+        &mut s,
+        "SELECT CONVERT(int, value_in_use) FROM sys.configurations WHERE name = N'contained \
+         database authentication'",
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_int()));
+    let contained = exec_try(
+        &mut s,
+        "EXEC sp_configure N'contained database authentication', 1; RECONFIGURE",
+    )
+    .await
+        && exec_try(
+            &mut s,
+            &format!(
+                "CREATE DATABASE [{NC_CONTAINED}] CONTAINMENT = PARTIAL COLLATE \
+                 Latin1_General_100_CS_AS"
+            ),
+        )
+        .await
+        && exec_try(
+            &mut s,
+            &format!("ALTER DATABASE [{NC_CONTAINED}] SET AUTO_CLOSE OFF"),
+        )
+        .await;
+    // The server's own answer, as an oracle: two tables whose names differ
+    // by case only are two objects under a case-sensitive catalog.
+    for db in [
+        "databastion_nc_cs",
+        "databastion_nc_bin2",
+        "databastion_nc_ci",
+        NC_CONTAINED,
+    ] {
+        let two = exec_try(
+            &mut s,
+            &in_db(
+                db,
+                "CREATE TABLE dbo.Customers (id int); CREATE TABLE dbo.customers (id int)",
+            ),
+        )
+        .await;
+        eprintln!("engine fact: {db}: Customers and customers are two tables: {two}");
+    }
+    exec(
+        &mut s,
+        "ALTER DATABASE [databastion_nc_offline] SET OFFLINE WITH ROLLBACK IMMEDIATE",
+    )
+    .await;
+    // The AUTO_CLOSE database held open by a session of its own.
+    let mut holder = sa().await;
+    exec(&mut holder, "USE [databastion_nc_autoclose]").await;
+    nc_fact(&mut s, "databastion_nc_autoclose", "open").await;
+    nc_fact(&mut s, "databastion_nc_offline", "offline").await;
+    let rows = try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(128), name), CONVERT(int, catalog_collation_type), \
+         CONVERT(int, containment) FROM sys.databases WHERE name LIKE N'databastion_nc_%'",
+        3,
+    )
+    .await;
+    eprintln!("engine fact: catalog_collation_type per test database: {rows:?}");
+
+    let c = SqlserverConnector::new();
+    let t = agent("");
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    eprintln!("check: {:?}", h.detail);
+    let (_, whole) = nc_value(&c, &t, "databastion_nc_cs");
+    eprintln!("name_case: {whole}");
+    assert_eq!(
+        whole["databases"],
+        if default_insensitive {
+            "insensitive"
+        } else {
+            "sensitive"
+        }
+    );
+    if !has_catalog_column {
+        eprintln!("engine fact: no catalog_collation_type: objects unknown for the target");
+        assert_eq!(whole["objects"], "unknown");
+        assert!(whole.get("except").is_none());
+    } else {
+        assert_eq!(nc_value(&c, &t, "databastion_nc_cs").0, "sensitive");
+        assert_eq!(nc_value(&c, &t, "databastion_nc_bin2").0, "sensitive");
+        assert_eq!(
+            nc_value(&c, &t, "databastion_nc_ci").0,
+            if default_insensitive {
+                "insensitive"
+            } else {
+                "sensitive"
+            }
+        );
+        assert_eq!(nc_value(&c, &t, "databastion_nc_offline").0, "unknown");
+        assert_eq!(nc_value(&c, &t, "databastion_nc_autoclose").0, "sensitive");
+        if snapshot {
+            assert_eq!(nc_value(&c, &t, "databastion_nc_snap").0, "sensitive");
+        } else {
+            eprintln!("skipped: database snapshot not available on this server");
+        }
+        if contained {
+            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, "insensitive");
+        } else {
+            eprintln!("skipped: contained databases not enabled on this server");
+        }
+        // Sorted, one entry per name (security review L2).
+        let names: Vec<String> = whole["except"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["database"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            names.windows(2).all(|w| w[0].as_bytes() < w[1].as_bytes()),
+            "{names:?}"
+        );
+
+        // The AUTO_CLOSE database closes once its last session ends.
+        holder.close().await;
+        let mut closed = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let r = try_rows(
+                &mut s,
+                "SELECT CONVERT(int, CASE WHEN collation_name IS NULL THEN 1 ELSE 0 END) FROM \
+                 sys.databases WHERE name = N'databastion_nc_autoclose'",
+                1,
+            )
+            .await;
+            if r.and_then(|r| r.first().and_then(|r| r[0].as_int())) == Some(1) {
+                closed = true;
+                break;
+            }
+        }
+        nc_fact(&mut s, "databastion_nc_autoclose", "after its last session").await;
+        if closed {
+            eprintln!("engine fact: an AUTO_CLOSE database closed reads collation_name NULL");
+        } else {
+            eprintln!("engine fact: the AUTO_CLOSE database's collation_name stayed readable");
+        }
+        let h = c.check(&t).await;
+        assert!(h.reachable, "{:?}", h.detail);
+        assert_eq!(
+            nc_value(&c, &t, "databastion_nc_autoclose").0,
+            "sensitive",
+            "no flapping across a close"
+        );
+        // A new connector never saw it open: unknown while closed.
+        if closed {
+            let fresh = SqlserverConnector::new();
+            assert!(fresh.check(&t).await.reachable);
+            assert_eq!(
+                nc_value(&fresh, &t, "databastion_nc_autoclose").0,
+                "unknown"
+            );
+        }
+
+        // `VIEW ANY DATABASE` revoked from `public`: the list may be
+        // partial.
+        exec(&mut s, "REVOKE VIEW ANY DATABASE FROM public").await;
+        let h = c.check(&t).await;
+        exec(&mut s, "GRANT VIEW ANY DATABASE TO public").await;
+        assert!(h.reachable, "{:?}", h.detail);
+        let (_, v) = nc_value(&c, &t, "databastion_nc_cs");
+        assert_eq!(v["objects"], "unknown", "{v}");
+        assert!(v.get("except").is_none(), "{v}");
+    }
+
+    // A failed check (unreachable port) keeps the last value (M1).
+    let before = c.name_case(&t);
+    let mut down = t.clone();
+    down.port = Some(9);
+    let h = c.check(&down).await;
+    assert!(!h.reachable);
+    assert_eq!(c.name_case(&down), before);
+
+    nc_drop(&mut s).await;
+    if let Some(v) = previous_contained {
+        exec_ok(
+            &mut s,
+            &format!("EXEC sp_configure N'contained database authentication', {v}; RECONFIGURE"),
+        )
+        .await;
+    }
+}

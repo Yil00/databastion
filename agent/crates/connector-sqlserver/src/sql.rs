@@ -24,6 +24,8 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
     ("logon_triggers", LOGON_TRIGGERS),
     ("accessible_databases", ACCESSIBLE_DATABASES),
     ("user_databases", USER_DATABASES),
+    ("database_collations", DATABASE_COLLATIONS),
+    ("database_collations_v0", DATABASE_COLLATIONS_V0),
     ("database_permissions", DATABASE_PERMISSIONS),
     ("database_roles", DATABASE_ROLES),
     ("database_grants", DATABASE_GRANTS),
@@ -329,6 +331,48 @@ pub(crate) const ACCESSIBLE_DATABASES: &str = "SELECT TOP (1025) CONVERT(nvarcha
 FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state = 0 AND source_database_id IS NULL \
 ORDER BY name";
 
+/// Rows read by [`DATABASE_COLLATIONS`] at most: one more means the list
+/// is cut (ADR-0055 decision 4: `objects: unknown`).
+pub(crate) const MAX_COLLATION_DATABASES: usize = 1024;
+
+/// How names compare (ADR-0055 decision 4, security review M3 and L5):
+/// **every** `sys.databases` row, with no `HAS_DBACCESS`, `state` or
+/// `source_database_id` filter (snapshots, offline databases and those the
+/// login cannot enter included), at most [`MAX_COLLATION_DATABASES`] + 1.
+/// Per row: `database_id`, name, `create_date` (µs since 1970), the
+/// `ComparisonStyle` of its collation (`NULL` when the collation reads
+/// `NULL`: not online, closed by `AUTO_CLOSE`), `containment`,
+/// `is_auto_close_on`, `state`, `catalog_collation_type`; and on every row
+/// the server collation's `ComparisonStyle`, whether the login holds `VIEW
+/// ANY DATABASE` (the list is whole), and the server name. Collation names
+/// themselves are never read. The server's run is the server name with
+/// `tempdb`'s `create_date` (`tempdb` is created at every start and always
+/// listed). Ordered by `database_id`, so that `master` and `tempdb` come
+/// first. A catalog read (case 2: `sys.databases`, like
+/// [`ACCESSIBLE_DATABASES`]); an exact own text.
+pub(crate) const DATABASE_COLLATIONS: &str = "SELECT TOP (1025) CONVERT(int, d.database_id), \
+CONVERT(nvarchar(128), d.name), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', d.create_date)), \
+CONVERT(int, COLLATIONPROPERTY(d.collation_name, 'ComparisonStyle')), CONVERT(int, d.containment), \
+CONVERT(int, d.is_auto_close_on), CONVERT(int, d.state), CONVERT(int, d.catalog_collation_type), \
+CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), 'ComparisonStyle')), \
+CONVERT(int, HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')), \
+CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')) FROM sys.databases d ORDER BY d.database_id";
+
+/// [`DATABASE_COLLATIONS`] on a server whose `sys.databases` has no
+/// `catalog_collation_type` (error 207 on the first): the same columns, a
+/// `NULL` in its place; the target then reports `objects: unknown`
+/// (decision 4, L5).
+pub(crate) const DATABASE_COLLATIONS_V0: &str = "SELECT TOP (1025) CONVERT(int, d.database_id), \
+CONVERT(nvarchar(128), d.name), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', d.create_date)), \
+CONVERT(int, COLLATIONPROPERTY(d.collation_name, 'ComparisonStyle')), CONVERT(int, d.containment), \
+CONVERT(int, d.is_auto_close_on), CONVERT(int, d.state), CONVERT(int, NULL), \
+CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), 'ComparisonStyle')), \
+CONVERT(int, HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')), \
+CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')) FROM sys.databases d ORDER BY d.database_id";
+
+/// The number of columns of [`DATABASE_COLLATIONS`].
+pub(crate) const DATABASE_COLLATIONS_COLUMNS: usize = 11;
+
 /// The user databases Discovery may read (decision 5).
 pub(crate) const USER_DATABASES: &str = "SELECT TOP (1025) CONVERT(nvarchar(128), name) \
 FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state = 0 AND source_database_id IS NULL \
@@ -592,6 +636,8 @@ const CATALOG_READS: &[&str] = &[
     "logon_triggers",
     "accessible_databases",
     "user_databases",
+    "database_collations",
+    "database_collations_v0",
     "database_permissions",
     "database_roles",
     "database_grants",
@@ -1498,5 +1544,42 @@ mod tests {
         ] {
             assert_eq!(sampled_kind(id), k, "{id}");
         }
+    }
+
+    /// ADR-0055 decision 4 (security review M3, L7): the name-case reads
+    /// are on the allow-list, pass the deny-list, are exact own texts and
+    /// catalog reads, read every `sys.databases` row (no filter), and the
+    /// fallback differs only by the `catalog_collation_type` column.
+    #[test]
+    fn the_collation_reads_are_reviewed_exact_own_texts() {
+        for text in [DATABASE_COLLATIONS, DATABASE_COLLATIONS_V0] {
+            assert!(allowed(text), "{text}");
+            assert!(checked(text), "{text}");
+            assert_eq!(own_text(text), OwnText::Exact, "{text}");
+            assert!(catalog_text(text), "{text}");
+            assert_eq!(denied_token(text), None);
+            let bare = unquoted(text);
+            for filter in ["has_dbaccess", "state =", "source_database_id", "where"] {
+                assert!(!bare.contains(filter), "{filter} in {text}");
+            }
+            assert!(text.starts_with(&format!("SELECT TOP ({}) ", MAX_COLLATION_DATABASES + 1)));
+            assert!(text.ends_with("FROM sys.databases d ORDER BY d.database_id"));
+            assert_eq!(
+                text.matches("CONVERT(").count()
+                    - text
+                        .matches("CONVERT(nvarchar(128), SERVERPROPERTY('Collation'))")
+                        .count(),
+                DATABASE_COLLATIONS_COLUMNS
+            );
+            // Near copies are not own texts.
+            assert_ne!(own_text(&format!("{text} ")), OwnText::Exact);
+            assert!(!allowed(&text.replace("TOP (1025)", "TOP (1026)")));
+            // No collation name, no definition-bearing column.
+            assert!(!bare.contains("collation_name)"), "{text}");
+        }
+        assert_eq!(
+            DATABASE_COLLATIONS.replace("d.catalog_collation_type", "NULL"),
+            DATABASE_COLLATIONS_V0
+        );
     }
 }

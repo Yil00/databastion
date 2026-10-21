@@ -1191,6 +1191,27 @@ impl Runtime {
         } else {
             Vec::new()
         };
+        // ADR-0055: how names compare, for `mysql`, `mariadb` and
+        // `sqlserver` targets only, decided by the console's latest
+        // `accepts` alone (contract review I-4). Once listed, always sent
+        // (decision 2, security review M1): the connector's last value of
+        // the server run, kept across a failed, timed-out or skipped check,
+        // else `unknown` for both parts; never omitted. A gated field
+        // (`capabilities::strip_gated_target_status`).
+        let name_case = (matches!(
+            target.engine,
+            crate::config::TargetEngine::Mysql
+                | crate::config::TargetEngine::Mariadb
+                | crate::config::TargetEngine::Sqlserver
+        ) && self
+            .console_caps
+            .console_accepts(crate::capabilities::token::TARGET_STATUS_NAME_CASE))
+        .then(|| {
+            let report = connector
+                .and_then(|c| c.name_case(target))
+                .unwrap_or_else(crate::name_case::NameCaseReport::unknown);
+            crate::name_case::to_protocol(&report)
+        });
         let status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
@@ -1198,11 +1219,7 @@ impl Runtime {
             engine: proto_engine(target.engine),
             last_error,
             metrics: None,
-            // ADR-0055 decision 1: in the contract, gated by
-            // `target_status.name_case`. Not sent yet: the connectors'
-            // reports (decisions 2 to 4) are a separate change. A gated
-            // field: see `capabilities::strip_gated_target_status`.
-            name_case: None,
+            name_case,
             notes,
             reachable,
             server_version: connector
@@ -1405,8 +1422,14 @@ impl Runtime {
 
     /// Serialized heartbeat, used as the probe request before re-sending a
     /// `/rotate` whose outcome is unknown.
+    ///
+    /// Built without the gated `TargetStatus` fields (`notes`,
+    /// `name_case`; #301 contract review I-3): the probe only proves the
+    /// identity, and a console that answers `400` to a field it no longer
+    /// accepts must not turn the probe into a lost rotation.
     async fn heartbeat_body(&self) -> Option<Vec<u8>> {
-        let request = self.build_heartbeat().await.ok()?;
+        let mut request = self.build_heartbeat().await.ok()?;
+        crate::capabilities::strip_gated_heartbeat(&mut request);
         serde_json::to_vec(&request).ok()
     }
 

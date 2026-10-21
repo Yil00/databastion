@@ -211,11 +211,17 @@ fn builder(
 }
 
 /// Exact texts of the statements `check()` sends that read
-/// `information_schema` only (see `EventBuilder::own_statement`).
+/// `information_schema` only, or no table at all (see
+/// `EventBuilder::own_statement`): the CAS store guard and the name-case
+/// read of both flavors (`sql::name_case_settings`, ADR-0055 security
+/// review L7).
 pub(crate) fn own_statements(target: &TargetConfig) -> Vec<Vec<u8>> {
     sql::cas_guard_statement_texts(target.cas_stores())
         .unwrap_or_default()
         .into_iter()
+        .chain(
+            [crate::conn::Flavor::Mysql, crate::conn::Flavor::Mariadb].map(sql::name_case_settings),
+        )
         .map(String::into_bytes)
         .collect()
 }

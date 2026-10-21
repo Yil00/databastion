@@ -57,6 +57,7 @@ use databastion_core::{
     AuditLevel, FailureCode, NoteCode, NoteLabel, Notes, TargetHealth, TargetNote,
 };
 
+use crate::audit::own_threads::ServerRun;
 use crate::audit::pfs::PsTable;
 use crate::catalog::{self, Coverage, EngineSkip};
 use crate::conn::{Flavor, Flow, Rows, Session, Timeouts};
@@ -64,6 +65,7 @@ use crate::discover::normalize;
 use crate::error::{MyError, Stage};
 use crate::grants::{self as grant_lines, Line, Scope};
 use crate::sql;
+use databastion_core::name_case::{NameCase, NameCaseReport};
 
 /// Statement timeout of `check()` queries.
 const CHECK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -588,6 +590,11 @@ pub(crate) struct CheckState {
     /// when it is below the agent's longest statement, with that source
     /// (review of #165: a closed note rather than a log warning only).
     text_limits: Mutex<HashMap<String, (EventSource, usize)>>,
+    /// Per target: how names compare (ADR-0055), as last read, and the
+    /// server run it was read on (`None`: identity or start time not
+    /// read). Kept when a later check fails before reading it (decision
+    /// 2, security review M1).
+    name_cases: Mutex<HashMap<String, (Option<ServerRun>, NameCaseReport)>>,
 }
 
 /// An audit log record parsed within this period makes the log source
@@ -788,6 +795,39 @@ impl CheckState {
         }
     }
 
+    /// How `target_id`'s names compare, as last read (ADR-0055).
+    pub(crate) fn name_case(&self, target_id: &str) -> Option<NameCaseReport> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .map(|(_, r)| r.clone())
+    }
+
+    /// Stores what a check read; logs a server restart seen since the
+    /// last one (another run).
+    pub(crate) fn set_name_case(
+        &self,
+        target_id: &str,
+        run: Option<ServerRun>,
+        report: NameCaseReport,
+    ) {
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some((Some(old), before)), Some(new)) = (map.get(target_id), run.as_ref())
+            && !old.same(new)
+            && *before != report
+        {
+            tracing::info!(
+                target_id,
+                "name case semantics changed with a server restart (lower_case_table_names)"
+            );
+        }
+        map.insert(target_id.to_owned(), (run, report));
+    }
+
     fn due(&self, key: &str) -> bool {
         self.reports
             .lock()
@@ -913,6 +953,15 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
             codes.add(TargetNote::new(NoteCode::CheckServerIsMysql));
         }
         _ => {}
+    }
+    // ADR-0055 decision 4: read first, so that a later stage failing
+    // keeps this run's value (decision 2).
+    match read_name_case(&mut session).await {
+        Ok((run, report, text)) => {
+            notes.push(text);
+            state.set_name_case(&target.id, run, report);
+        }
+        Err(e) => return (unreachable(&e), Source::None),
     }
     let probe = match audit_probe(&mut session).await {
         Ok(p) => p,
@@ -1172,6 +1221,79 @@ async fn optional_complete(
         Err(e) if !e.fatal => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// How names compare under `lower_case_table_names` (ADR-0055 decision
+/// 4): 0 with case, also on a file system that ignores case (a MariaDB
+/// forced to 0; the stricter answer, open question 2); 1 (stored in
+/// lowercase) and 2 (compared in lowercase) without; anything else, or no
+/// value, unknown. The prerequisite of decision 3 is met (#300): every
+/// source sends unquoted names as written.
+pub(crate) fn name_case_of(lower_case_table_names: Option<&str>) -> NameCase {
+    match lower_case_table_names.map(str::trim) {
+        Some("0") => NameCase::Sensitive,
+        Some("1" | "2") => NameCase::Insensitive,
+        _ => NameCase::Unknown,
+    }
+}
+
+/// The name case of a [`sql::name_case_settings`] row, the run it was read
+/// on (with `uptime`, `SHOW GLOBAL STATUS` `Uptime`), and the local detail
+/// (never sent). A missing row is `unknown`.
+pub(crate) fn name_case_row(
+    rows: &Rows,
+    uptime: Option<u64>,
+) -> (Option<ServerRun>, NameCaseReport, String) {
+    let lctn = cell(rows, 0, 0);
+    let lcfs = cell(rows, 0, 1);
+    let value = name_case_of(lctn);
+    let now = cell(rows, 0, 2).and_then(|v| v.trim().parse::<u64>().ok());
+    let run = match (rows.first(), now, uptime) {
+        (Some(row), Some(now), Some(up)) if row.len() > 3 && now > up => {
+            ServerRun::new(&row[3..], now - up)
+        }
+        _ => None,
+    };
+    let compared = match value {
+        NameCase::Sensitive => "with case",
+        NameCase::Insensitive => "without case",
+        NameCase::Unknown => "unknown (treated as with case)",
+    };
+    let forced = if value == NameCase::Sensitive && truthy(lcfs) {
+        " (0 on a file system that ignores case: a server forced to 0; names reported as \
+         compared with case)"
+    } else {
+        ""
+    };
+    let text = format!(
+        "lower_case_table_names {}, lower_case_file_system {}: database and table names \
+         compared {compared}{forced}",
+        lctn.unwrap_or("not read"),
+        lcfs.unwrap_or("not read"),
+    );
+    (run, NameCaseReport::uniform(value), text)
+}
+
+/// Reads how the server compares names (ADR-0055 decision 4). A read
+/// refused or failed without ending the session is `unknown`, with no run
+/// (decision 4: "a failed read, unknown"); a fatal error ends the check,
+/// and the last value is kept (decision 2).
+async fn read_name_case(
+    session: &mut Session,
+) -> Result<(Option<ServerRun>, NameCaseReport, String), MyError> {
+    let text = sql::name_case_settings(session.flavor());
+    let Some(rows) = optional(session, &text).await? else {
+        return Ok((
+            None,
+            NameCaseReport::unknown(),
+            "lower_case_table_names not readable: names compared unknown (treated as with case)"
+                .to_owned(),
+        ));
+    };
+    let uptime = optional(session, sql::SERVER_UPTIME)
+        .await?
+        .and_then(|r| cell(&r, 0, 1).and_then(|v| v.trim().parse::<u64>().ok()));
+    Ok(name_case_row(&rows, uptime))
 }
 
 fn cell(rows: &Rows, row: usize, col: usize) -> Option<&str> {
@@ -1811,6 +1933,54 @@ mod tests {
 
     fn s(db: &str, p: &str) -> (String, String, bool) {
         (db.to_owned(), p.to_owned(), false)
+    }
+
+    /// ADR-0055 decision 4: the mapping of `lower_case_table_names`, a
+    /// failed or odd read as `unknown`.
+    #[test]
+    fn lower_case_table_names_maps_to_the_name_case() {
+        for (v, want) in [
+            (Some("0"), NameCase::Sensitive),
+            (Some(" 0 "), NameCase::Sensitive),
+            (Some("1"), NameCase::Insensitive),
+            (Some("2"), NameCase::Insensitive),
+            (Some("3"), NameCase::Unknown),
+            (Some("-1"), NameCase::Unknown),
+            (Some("00"), NameCase::Unknown),
+            (Some("ON"), NameCase::Unknown),
+            (Some(""), NameCase::Unknown),
+            (None, NameCase::Unknown),
+        ] {
+            assert_eq!(name_case_of(v), want, "{v:?}");
+        }
+        let row = |lctn: Option<&str>, lcfs: &str| -> Rows {
+            vec![vec![
+                lctn.map(str::to_owned),
+                Some(lcfs.to_owned()),
+                Some("1800000000".to_owned()),
+                Some("db1".to_owned()),
+                Some("3306".to_owned()),
+                Some("1".to_owned()),
+            ]]
+        };
+        // 0 on a file system that ignores case (open question 2):
+        // sensitive, said in the local detail only.
+        let (run, r, text) = name_case_row(&row(Some("0"), "1"), Some(100));
+        assert_eq!(r, NameCaseReport::uniform(NameCase::Sensitive));
+        assert!(text.contains("forced to 0"), "{text}");
+        let run = run.expect("identity and start time read");
+        let (again, ..) = name_case_row(&row(Some("0"), "0"), Some(100));
+        assert!(run.same(&again.unwrap()));
+        let (later, ..) = name_case_row(&row(Some("0"), "0"), Some(5));
+        assert!(!run.same(&later.unwrap()), "a restart is another run");
+        let (_, r, text) = name_case_row(&row(Some("1"), "0"), None);
+        assert_eq!(r, NameCaseReport::uniform(NameCase::Insensitive));
+        assert!(!text.contains("forced"), "{text}");
+        let (run, r, _) = name_case_row(&row(None, "0"), None);
+        assert_eq!(r, NameCaseReport::unknown());
+        assert!(run.is_none(), "no uptime: no run");
+        let (run, r, _) = name_case_row(&Vec::new(), Some(1));
+        assert_eq!((run, r), (None, NameCaseReport::unknown()));
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub(crate) const MAX_CAPABILITIES: usize = 64;
 pub(crate) mod token {
     /// `TargetStatus.notes`.
     pub(crate) const TARGET_STATUS_NOTES: &str = "target_status.notes";
+    /// `TargetStatus.name_case` (ADR-0055).
+    pub(crate) const TARGET_STATUS_NAME_CASE: &str = "target_status.name_case";
     /// `AccessEvent.bytes`.
     pub(crate) const ACCESS_EVENT_BYTES: &str = "access_event.bytes";
     /// `AccessEvent.objects_overflowed` (ADR-0053).
