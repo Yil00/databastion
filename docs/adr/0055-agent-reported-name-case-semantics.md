@@ -224,7 +224,7 @@ The SQL Server reader maps `sys.databases.catalog_collation_type` as follows:
 |---|---|---|
 | 0 | not contained | from the database collation's `ComparisonStyle` (unchanged) |
 | 0 | contained | `insensitive`, the fixed `Latin1_General_100_CI_AS_KS_WS_SC` (unchanged) |
-| **1** | **contained** (`containment` not 0) | **`insensitive`** (new) |
+| **1** | **contained** (`containment` = 1 (`PARTIAL`)) | **`insensitive`** (new) |
 | 1 | not contained | `unknown` (unchanged) |
 | 2 | any | `insensitive`, `SQL_Latin1_General_CP1_CI_AS` (unchanged) |
 | any other value | any | `unknown` (unchanged) |

@@ -3293,9 +3293,12 @@ const NC_DBS: [&str; 6] = [
     "databastion_nc_autoclose",
 ];
 const NC_CONTAINED: &str = "databastion_nc_contained";
+/// A `_CS_` database converted to contained and back (security review L2
+/// of the ADR-0055 refinement).
+const NC_CONVERT: &str = "databastion_nc_convert";
 
 async fn nc_drop(s: &mut Session) {
-    for db in NC_DBS.iter().chain([&NC_CONTAINED]) {
+    for db in NC_DBS.iter().chain([&NC_CONTAINED, &NC_CONVERT]) {
         exec_ok(
             s,
             &format!("IF DB_ID(N'{db}') IS NOT NULL ALTER DATABASE [{db}] SET ONLINE"),
@@ -3367,6 +3370,62 @@ async fn exec_error(s: &mut Session, sql: &str) -> Option<i32> {
             Some(e.number.unwrap_or(-1))
         }
     }
+}
+
+/// Prints the `[it] name_case:` measurement line of `db` at `stage` and
+/// returns its `containment` and `catalog_collation_type`.
+async fn nc_measure(
+    s: &mut Session,
+    major: u32,
+    db: &str,
+    stage: &str,
+) -> (Option<i64>, Option<i64>) {
+    let r = try_rows(
+        s,
+        &format!(
+            "SELECT CONVERT(int, containment), CONVERT(int, catalog_collation_type), \
+             CONVERT(nvarchar(60), catalog_collation_type_desc), CONVERT(int, \
+             COLLATIONPROPERTY(CONVERT(nvarchar(128), collation_name), 'ComparisonStyle')) \
+             FROM sys.databases WHERE name = N'{db}'"
+        ),
+        4,
+    )
+    .await
+    .and_then(|r| r.into_iter().next())
+    .unwrap_or_default();
+    let containment = r.first().and_then(Value::as_int);
+    let catalog = r.get(1).and_then(Value::as_int);
+    eprintln!(
+        "[it] name_case: major={major} db={db} stage={stage} contained={} \
+         catalog_collation_type={} desc={} comparison_style={}",
+        containment == Some(1),
+        nc_show(r.get(1)),
+        nc_show(r.get(2)),
+        nc_show(r.get(3)),
+    );
+    (containment, catalog)
+}
+
+/// The server's answer to two tables named `name` and its upper case in
+/// `db`: `true` when it refuses the second with error 2714 (the catalog
+/// compares names without case). Printed as an `[it] name_case:` line.
+async fn nc_duplicate(s: &mut Session, major: u32, db: &str, stage: &str, name: &str) -> bool {
+    let upper = name.to_uppercase();
+    let e = exec_error(
+        s,
+        &in_db(
+            db,
+            &format!("CREATE TABLE {name}(a int); CREATE TABLE {upper}(a int)"),
+        ),
+    )
+    .await;
+    eprintln!(
+        "[it] name_case: major={major} db={db} stage={stage} case_only_duplicate_table \
+         error_2714={} error={}",
+        e == Some(2714),
+        e.map_or_else(|| "none".to_owned(), |n| n.to_string()),
+    );
+    e == Some(2714)
 }
 
 /// The value the agent reports for a contained database's objects with
@@ -3538,7 +3597,7 @@ async fn name_case_follows_the_collations() {
     let mut contained_catalog = None;
     for r in &measured {
         let name = nc_show(r.first());
-        let is_contained = r.get(1).and_then(Value::as_int).is_some_and(|c| c != 0);
+        let is_contained = r.get(1).and_then(Value::as_int) == Some(1);
         if name == NC_CONTAINED {
             contained_catalog = r.get(2).and_then(Value::as_int);
         }
@@ -3550,21 +3609,13 @@ async fn name_case_follows_the_collations() {
             nc_show(r.get(4)),
         );
     }
-    if contained {
-        // The server's answer to a case-only duplicate table name: error
-        // 2714 when the catalog compares names without case.
-        let e = exec_error(
-            &mut s,
-            &in_db(NC_CONTAINED, "CREATE TABLE t(a int); CREATE TABLE T(a int)"),
-        )
-        .await;
-        eprintln!(
-            "[it] name_case: major={major} db={NC_CONTAINED} case_only_duplicate_table \
-             error_2714={} error={}",
-            e == Some(2714),
-            e.map_or_else(|| "none".to_owned(), |n| n.to_string()),
-        );
-    }
+    // The server's answer to a case-only duplicate table name: error 2714
+    // when the catalog compares names without case.
+    let contained_2714 = if contained {
+        nc_duplicate(&mut s, major, NC_CONTAINED, "created", "t").await
+    } else {
+        false
+    };
 
     let c = SqlserverConnector::new();
     let t = agent("");
@@ -3619,6 +3670,83 @@ async fn name_case_follows_the_collations() {
                 );
             }
             assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, want);
+            // Never `insensitive` where the server accepts a case-only
+            // duplicate (security review L3).
+            if want == "insensitive" {
+                assert!(
+                    contained_2714,
+                    "{NC_CONTAINED} reported insensitive, but the server accepted a case-only \
+                     duplicate table name"
+                );
+            }
+
+            // A `_CS_` database converted to contained, then back
+            // (security review L2); skipped when the server refuses.
+            exec(
+                &mut s,
+                &format!("CREATE DATABASE [{NC_CONVERT}] COLLATE Latin1_General_100_CS_AS"),
+            )
+            .await;
+            exec(
+                &mut s,
+                &format!("ALTER DATABASE [{NC_CONVERT}] SET AUTO_CLOSE OFF"),
+            )
+            .await;
+            if exec_try(
+                &mut s,
+                &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = PARTIAL"),
+            )
+            .await
+            {
+                let (containment, catalog) =
+                    nc_measure(&mut s, major, NC_CONVERT, "converted to partial").await;
+                let refused = nc_duplicate(&mut s, major, NC_CONVERT, "converted", "t").await;
+                assert!(c.check(&t).await.reachable);
+                let got = nc_value(&c, &t, NC_CONVERT).0;
+                eprintln!(
+                    "[it] name_case: major={major} db={NC_CONVERT} stage=converted to partial \
+                     reported={got}"
+                );
+                let want = if containment == Some(1) {
+                    nc_contained_expected(catalog)
+                } else {
+                    "sensitive"
+                };
+                assert_eq!(got, want);
+                if got == "insensitive" {
+                    assert!(
+                        refused,
+                        "{NC_CONVERT} reported insensitive, but the server accepted a case-only \
+                         duplicate table name"
+                    );
+                }
+                if exec_try(
+                    &mut s,
+                    &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = NONE"),
+                )
+                .await
+                {
+                    let (containment, catalog) =
+                        nc_measure(&mut s, major, NC_CONVERT, "back to none").await;
+                    let refused = nc_duplicate(&mut s, major, NC_CONVERT, "back", "u").await;
+                    assert!(c.check(&t).await.reachable);
+                    let got = nc_value(&c, &t, NC_CONVERT).0;
+                    eprintln!(
+                        "[it] name_case: major={major} db={NC_CONVERT} stage=back to none \
+                         reported={got}"
+                    );
+                    assert_eq!((containment, catalog), (Some(0), Some(0)));
+                    assert_eq!(got, "sensitive");
+                    assert!(
+                        !refused,
+                        "a _CS_ database refused a case-only duplicate name"
+                    );
+                } else {
+                    eprintln!("skipped: SET CONTAINMENT = NONE refused on this server");
+                }
+            } else {
+                eprintln!("skipped: SET CONTAINMENT = PARTIAL refused on this server");
+            }
         } else {
             eprintln!("skipped: contained databases not enabled on this server");
         }

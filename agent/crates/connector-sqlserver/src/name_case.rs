@@ -6,8 +6,10 @@
 //!   database's catalog collation, by default the server collation's (new
 //!   databases take it); each database whose value differs goes to
 //!   `except` (the core merges, sorts and bounds them);
-//! - a database's catalog collation: `catalog_collation_type` 0 is the
-//!   database collation, or for a contained database the fixed
+//! - a database's catalog collation (contained: `containment` = 1,
+//!   `PARTIAL`, only; any other value is not contained):
+//!   `catalog_collation_type` 0 is the database collation, or for a
+//!   contained database the fixed
 //!   `Latin1_General_100_CI_AS_KS_WS_SC` (case-insensitive); 2 is
 //!   `SQL_Latin1_General_CP1_CI_AS` (case-insensitive); 1 on a contained
 //!   database is its fixed `Latin1_General_100_CI_AS_KS_WS_SC`
@@ -47,6 +49,10 @@ use crate::token::Value;
 const IGNORE_CASE: i64 = 1;
 /// `tempdb`'s `database_id`.
 const TEMPDB_ID: i64 = 2;
+/// `sys.databases.containment` of a contained database: 1 (`PARTIAL`),
+/// the only documented contained value; any other is read as not
+/// contained (security review L1 of the ADR-0055 refinement).
+const CONTAINMENT_PARTIAL: i64 = 1;
 
 /// A server run: the server name and `tempdb`'s `create_date`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +132,7 @@ pub(crate) fn parse(rows: &[Vec<Value>], catalog_column: bool) -> Option<Read> {
             name: r.get(1).and_then(Value::as_text)?.to_owned(),
             created: int(r, 2)?,
             style: int(r, 3),
-            contained: int(r, 4).is_some_and(|c| c != 0),
+            contained: int(r, 4) == Some(CONTAINMENT_PARTIAL),
             auto_close: int(r, 5) == Some(1),
             state: int(r, 6),
             catalog: int(r, 7),
@@ -586,6 +592,49 @@ mod tests {
                 catalog: None,
             }]
         );
+        // Contained only for `containment` 1 (`PARTIAL`), so a
+        // `catalog_collation_type` 1 is `insensitive` only then (L1).
+        for (containment, contained) in [
+            (Value::Int(0), false),
+            (Value::Int(1), true),
+            (Value::Int(2), false),
+            (Value::Int(-1), false),
+            (Value::Int(255), false),
+            (Value::Null, false),
+        ] {
+            let mut row = r.clone();
+            row[4] = containment.clone();
+            row[7] = Value::Int(1);
+            let read = parse(&[row], true).unwrap();
+            assert_eq!(read.rows[0].contained, contained, "{containment:?}");
+            let mut whole = read.clone();
+            whole.rows.push(DbRow {
+                id: 2,
+                name: "tempdb".to_owned(),
+                created: 1,
+                style: Some(CI_AS),
+                contained: false,
+                auto_close: false,
+                state: Some(0),
+                catalog: Some(0),
+            });
+            let value = evaluate(Some(&whole), None)
+                .report
+                .except
+                .into_iter()
+                .find(|(name, _)| name.as_str() == "crm")
+                .map(|(_, v)| v)
+                .unwrap();
+            assert_eq!(
+                value,
+                if contained {
+                    NameCase::Insensitive
+                } else {
+                    NameCase::Unknown
+                },
+                "{containment:?}"
+            );
+        }
         assert!(parse(&[], true).is_none());
         assert!(parse(&[r[..10].to_vec()], true).is_none());
         let mut no_name = r;
