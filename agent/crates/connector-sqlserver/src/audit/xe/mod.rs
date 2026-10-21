@@ -112,6 +112,10 @@ struct Stream<'a> {
     /// Unpaired statistics builds deferred (refinement of 2026-10-16,
     /// item 4, for case 2 builds; of 2026-10-18 for any session's).
     deferrals: events::Deferrals,
+    /// The session's event facts at the last probe
+    /// ([`probe::Probe::event_facts`]): a change clears the failed-login
+    /// proof (#280 re-review L-b).
+    event_facts: Option<probe::EventFacts>,
 }
 
 impl Stream<'_> {
@@ -399,6 +403,7 @@ pub(crate) async fn stream(
         perms: std::collections::BTreeSet::new(),
         poll: cfg.poll_interval(),
         deferrals: events::Deferrals::default(),
+        event_facts: None,
     };
     let tls = crate::tls::configs(target.sqlserver_settings().ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
@@ -411,6 +416,7 @@ pub(crate) async fn stream(
                     .map_err(SsError::into_connector_error)?,
             );
             old.close().await;
+            Box::pin(super::observe_server_run(state, &target.id, &mut session)).await;
         }
         let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
         if let Err(e) = r {
@@ -500,6 +506,15 @@ fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
         st.state.audit.note_dropped(target_id, 1);
     }
     st.cursor.session = Some(p.create_us);
+    // #280 re-review L-b: the events the agent can see changed (one added
+    // or dropped, a predicate added or removed, a catalog read that failed):
+    // a predicate it cannot read may have changed too.
+    let facts = p.event_facts();
+    if st.event_facts.is_some_and(|f| f != facts) {
+        tracing::info!(target_id = %target_id, "Extended Events: the session's events changed: the failed-login proof is taken again");
+        st.state.audit.clear_failed_login(target_id);
+    }
+    st.event_facts = Some(facts);
     if st.state.audit.observe_xe(target_id, p.counters()) {
         tracing::warn!(target_id = %target_id, "Extended Events: the session dropped events or was restarted");
     }
@@ -791,10 +806,23 @@ async fn read(
     }
     // The proof that a filtered `error_reported` admits failed logins
     // (re-review of #280, N3): from records past the history and floor
-    // filter only, by their event time, never a failed login of the
-    // agent's own account.
-    if let Some(at) = failed_login_proof(&records, &st.target.account) {
-        st.state.audit.note_failed_login(&target_id, at);
+    // filter only, never a failed login of the agent's own account. A
+    // statement that may change an event session (#280 re-review L-b)
+    // clears it, and only what follows it in the file proves it again.
+    let changed = records
+        .iter()
+        .rposition(events::XeRecord::may_change_event_session);
+    if changed.is_some() {
+        tracing::info!(target_id = %target_id, "Extended Events: a statement that may change an event session was read: the failed-login proof is taken again");
+        st.state.audit.clear_failed_login(&target_id);
+    }
+    let after = changed.map_or(&records[..], |i| records.get(i + 1..).unwrap_or_default());
+    if let Some(at) = failed_login_proof(after, &st.target.account) {
+        // Aged on the server's clock against the agent's own session's
+        // read-back of it, so that the 24 h window does not depend on the
+        // skew between the two clocks (#280 re-review L-b).
+        let server_now = s.own.as_ref().map(own::Handle::server_now);
+        st.state.audit.note_failed_login(&target_id, at, server_now);
     }
     let unreadable = records.iter().filter(|r| r.unreadable).count();
     if unreadable > 0 {
@@ -1129,25 +1157,101 @@ mod failed_login_proof_tests {
         assert_eq!(failed_login_proof(&[], "databastion_agent"), None);
     }
 
+    /// #280 re-review L-b: the age is taken on the server's clock (the
+    /// event time against the read-back's server time), so the window does
+    /// not move with the skew between the two clocks.
     #[test]
-    fn the_proof_is_fresh_by_event_time_and_cleared_on_a_change() {
-        let shared = crate::audit::Shared::default();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
+    fn the_proof_is_aged_on_the_server_clock_and_cleared_on_a_change() {
         let day = 24 * 3_600 * 1_000_000i64;
-        // An old event read now proves nothing.
-        shared.note_failed_login("t", now - day - 1_000_000);
-        assert!(!shared.facts("t").failed_login_seen);
-        shared.note_failed_login("t", now - 1_000_000);
-        assert!(shared.facts("t").failed_login_seen);
-        // An older event read later does not move the proof back.
-        shared.note_failed_login("t", now - 2 * day);
-        assert!(shared.facts("t").failed_login_seen);
-        // A session restart or a new file set: taken again.
-        shared.clear_failed_login("t");
-        assert!(!shared.facts("t").failed_login_seen);
-        assert!(!shared.facts("other").failed_login_seen);
+        for skew in [0, 3 * day, -3 * day, 25 * day] {
+            // The server's clock, `skew` away from the agent's.
+            let server_now = 1_800_000_000_000_000i64 + skew;
+            let shared = crate::audit::Shared::default();
+            // An old event read now proves nothing, whatever the skew.
+            shared.note_failed_login("t", server_now - day - 1_000_000, Some(server_now));
+            assert!(!shared.facts("t").failed_login_seen, "skew {skew}");
+            // A recent one does.
+            shared.note_failed_login("t", server_now - 1_000_000, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // An older event read later does not move the proof back.
+            shared.note_failed_login("t", server_now - 2 * day, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // A session restart, a new file set or changed events: taken
+            // again.
+            shared.clear_failed_login("t");
+            assert!(!shared.facts("t").failed_login_seen);
+            assert!(!shared.facts("other").failed_login_seen);
+            // Stamped ahead of the read-back (the event clock's lead): fresh.
+            shared.note_failed_login("t", server_now + 2_000, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // Without the server's time: nothing proven.
+            let none = crate::audit::Shared::default();
+            none.note_failed_login("t", server_now, None);
+            assert!(!none.facts("t").failed_login_seen);
+        }
+    }
+
+    /// #280 re-review L-b: a statement that may change an event session
+    /// clears the proof; only a failed login after it in the file proves
+    /// it again.
+    #[test]
+    fn an_event_session_statement_before_the_failed_login_is_required() {
+        use crate::audit::xe::events::tests::rec;
+        let stmt = |text: &str| {
+            rec(
+                "sql_statement_completed",
+                &[("statement", text)],
+                &[("session_server_principal_name", "admin")],
+            )
+        };
+        let recs = [
+            failed("jane", "18456", 10),
+            stmt(
+                "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported",
+            ),
+            stmt("SELECT 1"),
+        ];
+        let changed = recs
+            .iter()
+            .rposition(events::XeRecord::may_change_event_session);
+        assert_eq!(changed, Some(1));
+        let after = &recs[2..];
+        assert_eq!(failed_login_proof(after, "databastion"), None);
+        assert_eq!(failed_login_proof(&recs, "databastion"), Some(10));
+    }
+
+    #[test]
+    fn event_facts_tell_a_changed_session_apart() {
+        let base = probe::Probe {
+            failed_logins: true,
+            failed_logins_filtered: true,
+            ..probe::Probe::default()
+        };
+        assert_eq!(base.event_facts(), base.clone().event_facts());
+        for other in [
+            probe::Probe {
+                failed_logins_filtered: false,
+                ..base.clone()
+            },
+            probe::Probe {
+                failed_logins: false,
+                failed_logins_filtered: false,
+                ..base.clone()
+            },
+            probe::Probe {
+                filtered: true,
+                ..base.clone()
+            },
+            probe::Probe {
+                missing: 1,
+                ..base.clone()
+            },
+            probe::Probe {
+                incomplete: true,
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(base.event_facts(), other.event_facts());
+        }
     }
 }

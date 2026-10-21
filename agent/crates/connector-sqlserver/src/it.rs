@@ -1575,6 +1575,524 @@ async fn audit_scenario() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #280 re-review L-b, a measurement: what the agent's Extended Events
+/// proofs see when a session's `error_reported` predicate is replaced
+/// (`DROP EVENT` then `ADD EVENT` with another predicate, on a running
+/// throwaway session): `create_time` and the event facts the agent reads
+/// (`probe::Probe::event_facts`, never the predicate). Printed as `[it] xe
+/// predicate change:`; the facts are expected unchanged, which is why the
+/// stream also clears the failed-login proof on an `ALTER EVENT SESSION`
+/// statement it reads.
+#[tokio::test]
+async fn measure_xe_predicate_change() {
+    Box::pin(xe_predicate_scenario()).await;
+}
+
+async fn xe_predicate_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let drop = "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'it_xe_pred') \
+                DROP EVENT SESSION it_xe_pred ON SERVER";
+    Box::pin(exec_ok(&mut s, drop)).await;
+    Box::pin(exec(
+        &mut s,
+        "CREATE EVENT SESSION it_xe_pred ON SERVER ADD EVENT sqlserver.error_reported \
+         (WHERE ([error_number] = (18456)))",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER STATE = START",
+    ))
+    .await;
+    let before = Box::pin(crate::audit::xe::probe::probe(
+        &mut s,
+        "it_xe_pred",
+        Stage::Check,
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER DROP EVENT sqlserver.error_reported",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER ADD EVENT sqlserver.error_reported \
+         (WHERE ([error_number] = (18452)))",
+    ))
+    .await;
+    let after = Box::pin(crate::audit::xe::probe::probe(
+        &mut s,
+        "it_xe_pred",
+        Stage::Check,
+    ))
+    .await
+    .unwrap();
+    Box::pin(exec_ok(&mut s, drop)).await;
+    eprintln!(
+        "[it] xe predicate change: create_time moved {} us, event facts {:?} -> {:?} (equal: {})",
+        after.create_us - before.create_us,
+        before.event_facts(),
+        after.event_facts(),
+        before.event_facts() == after.event_facts()
+    );
+    assert!(before.failed_logins && before.failed_logins_filtered);
+    assert!(after.failed_logins && after.failed_logins_filtered);
+}
+
+/// ADR-0055 decision 2, the #303 residual: the server run the Audit
+/// streams read on each new session (`sql::SERVER_RUN`, the agent's own
+/// session, allow-list on) is the run `check()` keeps with its name case;
+/// a session on another run resets the kept value to `unknown` until the
+/// next `check()`.
+#[tokio::test]
+async fn the_streams_server_run_is_the_checks() {
+    Box::pin(server_run_scenario()).await;
+}
+
+async fn server_run_scenario() {
+    use databastion_core::name_case::NameCaseReport;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let c = SqlserverConnector::new();
+    let t = agent(own_tls());
+    let h = Box::pin(c.check(&t)).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    let kept = c.state.name_case(&t.id).unwrap();
+    assert_ne!(kept, NameCaseReport::unknown());
+    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+    let mut own = Box::pin(conn::connect(
+        &t,
+        &tls,
+        &TlsChoice::default(),
+        Duration::from_secs(30),
+    ))
+    .await
+    .unwrap();
+    let run = Box::pin(crate::name_case::read_run(&mut own))
+        .await
+        .unwrap()
+        .expect("the server run");
+    own.close().await;
+    eprintln!("[it] server run: read by the stream's statement, kept by check(): equal");
+    assert_eq!(c.state.name_case_run(&t.id).as_ref(), Some(&run));
+    // The same run: kept.
+    c.state.observe_server_run(&t.id, &run);
+    assert_eq!(c.state.name_case(&t.id).as_ref(), Some(&kept));
+    // Another run: unknown until the next check reads it again.
+    c.state.observe_server_run(&t.id, &run.restarted());
+    assert_eq!(c.state.name_case(&t.id), Some(NameCaseReport::unknown()));
+    // (Only the server-wide parts: an `AUTO_CLOSE` database of Express
+    // may have closed since, and is `unknown` with no memory of the run.)
+    let _ = Box::pin(c.check(&t)).await;
+    let again = c.state.name_case(&t.id).unwrap();
+    assert_eq!(
+        (again.databases, again.objects),
+        (kept.databases, kept.objects)
+    );
+}
+
+/// #281 review L2: role-membership changes on the SQL Server Audit source
+/// (`SERVER_ROLE_MEMBER_CHANGE_GROUP` and `DATABASE_ROLE_MEMBER_CHANGE_GROUP`
+/// in the dev specification, dev/sqlserver/initdb/30-audit.sql). The roles
+/// are created before the stream starts (their `CREATE` records are in
+/// the skipped history), so the DCL events naming them come from `ADD
+/// MEMBER` and `DROP MEMBER` alone, of a server role and of a database
+/// role. SQL Server 2019: no source (`CONTROL SERVER`).
+#[tokio::test]
+async fn audit_reports_role_membership_changes() {
+    Box::pin(role_membership_scenario()).await;
+}
+
+async fn drop_it_roles(s: &mut Session) {
+    Box::pin(exec_ok(
+        s,
+        "IF SUSER_ID(N'it_srv_role') IS NOT NULL DROP SERVER ROLE it_srv_role",
+    ))
+    .await;
+    Box::pin(exec_ok(
+        s,
+        &in_db(
+            "retail",
+            "IF DATABASE_PRINCIPAL_ID(N'it_db_role') IS NOT NULL DROP ROLE it_db_role",
+        ),
+    ))
+    .await;
+}
+
+async fn role_membership_scenario() {
+    use databastion_classifiers::masking::EventAction;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    if major < 16 {
+        return;
+    }
+    let mut s = Box::pin(sa()).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "master",
+            "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
+             DEFINITION TO databastion",
+        ),
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_member", &[])).await;
+    Box::pin(drop_it_roles(&mut s)).await;
+    Box::pin(exec(&mut s, "CREATE SERVER ROLE it_srv_role")).await;
+    Box::pin(exec(&mut s, &in_db("retail", "CREATE ROLE it_db_role"))).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {AUDIT}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-roles-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    // The first start skips the audit's history (the roles' creation).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    for sql in [
+        "ALTER SERVER ROLE it_srv_role ADD MEMBER it_member".to_owned(),
+        in_db("retail", "ALTER ROLE it_db_role ADD MEMBER it_member"),
+        in_db("retail", "ALTER ROLE it_db_role DROP MEMBER it_member"),
+        "ALTER SERVER ROLE it_srv_role DROP MEMBER it_member".to_owned(),
+    ] {
+        Box::pin(exec(&mut s, &sql)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let dcl: Vec<Vec<String>> = events
+        .iter()
+        .filter(|e| {
+            e.action() == EventAction::Dcl
+                && e.principal().account_name().eq_ignore_ascii_case("sa")
+        })
+        .map(names_of)
+        .collect();
+    for names in &dcl {
+        eprintln!("[it] roles: dcl {names:?}");
+    }
+    let naming = |name: &str| {
+        dcl.iter()
+            .filter(|names| names.iter().any(|n| n.ends_with(&format!(".{name}"))))
+            .count()
+    };
+    let (server, database, member) = (
+        naming("it_srv_role"),
+        naming("it_db_role"),
+        naming("it_member"),
+    );
+    eprintln!(
+        "[it] roles: major {major}, {} DCL event(s) of sa: naming the server role {server}, the \
+         database role {database}, the member {member}",
+        dcl.len()
+    );
+    // Nothing else of `sa`'s is DCL in the window: the two additions and
+    // the two removals.
+    assert!(
+        dcl.len() >= 4,
+        "role membership changes not reported as DCL: {dcl:?}"
+    );
+    assert!(
+        server + database + member >= 4,
+        "the DCL events name neither the roles nor the member: {dcl:?}"
+    );
+    Box::pin(drop_it_roles(&mut s)).await;
+    Box::pin(drop_login(&mut s, "it_member")).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The table list as Discovery sent it before the #293 follow-up: an
+/// object-level `HAS_PERMS_BY_NAME` per table (tests only, measured
+/// against the current [`crate::sql::TABLES`]).
+const TABLES_WITH_PERMISSION_CHECK: &str = "SELECT TOP (16385) CONVERT(int, t.object_id), \
+CONVERT(nvarchar(128), s.name), CONVERT(nvarchar(128), t.name), \
+CONVERT(int, t.is_remote_data_archive_enabled), CONVERT(int, t.is_memory_optimized), \
+CONVERT(bigint, (SELECT SUM(p.rows) FROM [retail].sys.partitions p WHERE p.object_id = t.object_id \
+AND p.index_id IN (0, 1))), CONVERT(int, HAS_PERMS_BY_NAME(QUOTENAME(N'retail') + N'.' + \
+QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), N'OBJECT', N'SELECT')) FROM [retail].sys.tables t JOIN \
+[retail].sys.schemas s ON s.schema_id = t.schema_id WHERE t.type = 'U' AND t.is_ms_shipped = 0 AND \
+t.is_external = 0 AND t.is_filetable = 0 AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', \
+N'guest') AND s.name NOT LIKE N'db[_]%' ORDER BY t.object_id";
+
+/// Tables of the throwaway schema of [`discovery_tables_write_no_audit_record_per_table`]:
+/// more than the 15 named objects an event keeps.
+const MANY_TABLES: usize = 20;
+
+/// The server's UTC time, as an ISO literal for `fn_get_audit_file`.
+async fn server_utc(s: &mut Session) -> String {
+    let at = try_rows(s, "SELECT CONVERT(nvarchar(30), SYSUTCDATETIME(), 126)", 1)
+        .await
+        .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+        .unwrap();
+    assert!(
+        at.bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.T".contains(&b))
+    );
+    at
+}
+
+/// `SL` records of the agent's login on the tables of schema `it_many` in
+/// `[from, to)` (server UTC): (records, distinct tables, distinct
+/// statement texts).
+async fn many_records(s: &mut Session, from: &str, to: &str) -> (i64, i64, i64) {
+    let sql = format!(
+        "SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, COUNT(DISTINCT object_name)), \
+         CONVERT(bigint, COUNT(DISTINCT CONVERT(nvarchar(4000), statement))) \
+         FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL) \
+         WHERE action_id = 'SL' AND database_name = N'retail' AND schema_name = N'it_many' \
+         AND server_principal_name = N'databastion' \
+         AND event_time >= CONVERT(datetime2, N'{from}', 126) \
+         AND event_time < CONVERT(datetime2, N'{to}', 126)"
+    );
+    let rows = try_rows(s, &sql, 3).await.unwrap_or_default();
+    let n = |i: usize| {
+        rows.first()
+            .and_then(|r| r.get(i))
+            .and_then(Value::as_int)
+            .unwrap_or(-1)
+    };
+    (n(0), n(1), n(2))
+}
+
+/// ROADMAP phase 9 follow-up of #293: whether Discovery's table list writes
+/// SQL Server Audit `SL` records per table. Measured with the dev audit
+/// (`SCHEMA_OBJECT_ACCESS_GROUP`) on a throwaway schema of
+/// [`MANY_TABLES`] tables, from a session of the agent's login: the
+/// earlier text (an object-level `HAS_PERMS_BY_NAME` per table) and the
+/// current [`crate::sql::TABLES`] (no permission check), each alone in a
+/// time window; printed as `[it] tables:` lines, and the current text must
+/// write none. Then, on 2022 and later, a Discovery scan under the SQL
+/// Server Audit stream: no event of the agent's own (no overflowed `*`),
+/// its statements left out.
+#[tokio::test]
+async fn discovery_tables_write_no_audit_record_per_table() {
+    Box::pin(discovery_tables_scenario()).await;
+}
+
+async fn discovery_tables_scenario() {
+    use databastion_core::AuditLevel;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let create: Vec<String> = (1..=MANY_TABLES)
+        .map(|i| format!("CREATE TABLE it_many.t{i:02} (id int)"))
+        .collect();
+    Box::pin(exec_ok(
+        &mut s,
+        &in_db(
+            "retail",
+            &(1..=MANY_TABLES)
+                .map(|i| format!("DROP TABLE IF EXISTS it_many.t{i:02};"))
+                .collect::<String>(),
+        ),
+    ))
+    .await;
+    Box::pin(exec_ok(
+        &mut s,
+        &in_db("retail", "DROP SCHEMA IF EXISTS it_many"),
+    ))
+    .await;
+    Box::pin(exec(&mut s, &in_db("retail", "CREATE SCHEMA it_many"))).await;
+    Box::pin(exec(&mut s, &in_db("retail", &create.join("; ")))).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT SELECT ON SCHEMA::it_many TO databastion"),
+    ))
+    .await;
+    let tables = crate::sql::tables("retail", 16_384).unwrap();
+    // Each text alone in its window, from a session of the agent's login.
+    let mut windows = Vec::new();
+    for (label, text, columns) in [
+        (
+            "with a per-table permission check (before)",
+            TABLES_WITH_PERMISSION_CHECK,
+            7,
+        ),
+        ("current", tables.as_str(), 6),
+    ] {
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let from = Box::pin(server_utc(&mut s)).await;
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        let rows = Box::pin(try_rows(&mut f, text, columns))
+            .await
+            .unwrap_or_default();
+        f.close().await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let to = Box::pin(server_utc(&mut s)).await;
+        windows.push((label, rows.len(), from, to));
+    }
+    // The audit's QUEUE_DELAY is 1 s.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let mut counts = Vec::new();
+    for (label, listed, from, to) in &windows {
+        let (records, objects, texts) = Box::pin(many_records(&mut s, from, to)).await;
+        eprintln!(
+            "[it] tables: major {major}, {label}: {listed} tables listed, {records} SL record(s) \
+             on {objects} of the {MANY_TABLES} it_many tables ({texts} statement text(s))"
+        );
+        counts.push((records, objects));
+    }
+    assert!(
+        windows
+            .iter()
+            .all(|(_, listed, _, _)| *listed >= MANY_TABLES),
+        "the table lists did not run"
+    );
+    assert_eq!(
+        counts[1],
+        (0, 0),
+        "the current table list writes an audit record per table"
+    );
+
+    if major >= 16 {
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {AUDIT}", own_tls()));
+        Box::pin(exec(
+            &mut s,
+            &in_db(
+                "master",
+                "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
+                 DEFINITION TO databastion",
+            ),
+        ))
+        .await;
+        Box::pin(exec(
+            &mut s,
+            &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+        ))
+        .await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-tables-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!stream.is_finished(), "{:?}", stream.await);
+        let before = c.state.audit.own_left_out(&t.id);
+        let scan = {
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (sink, mut frx) = FindingSink::channel(10_000);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            let r = Box::pin(c.discover(&job, &sink)).await;
+            let coverage = databastion_core::test_support::coverage_of(&sink);
+            drop(sink);
+            drain.await.unwrap();
+            (r, coverage)
+        };
+        scan.0.unwrap();
+        eprintln!("[it] tables: scan coverage {:?}", scan.1);
+        assert!(
+            scan.1.sampled >= MANY_TABLES as u64,
+            "the it_many tables were not sampled: {:?}",
+            scan.1
+        );
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let h = Box::pin(c.check(&t)).await;
+        assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let own: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.principal()
+                    .account_name()
+                    .eq_ignore_ascii_case("databastion")
+            })
+            .collect();
+        for e in &own {
+            eprintln!(
+                "[it] tables: own event reported {:?} {:?} overflowed={} always={}",
+                e.action(),
+                names_of(e),
+                e.objects_overflowed(),
+                e.always_report()
+            );
+        }
+        let after = c.state.audit.own_left_out(&t.id);
+        eprintln!("[it] tables: own statements left out during the scan {before:?} -> {after:?}");
+        assert!(
+            !events.iter().any(|e| e.objects_overflowed()
+                && e.principal()
+                    .account_name()
+                    .eq_ignore_ascii_case("databastion")),
+            "the scan of a database of more than 15 tables is an own overflowed read"
+        );
+        assert!(own.is_empty(), "the agent's own scan raised events");
+        // Not vacuous: the scan's catalog reads and samples were in the
+        // audit and were left out.
+        assert!(
+            after[0] > before[0] && after[1] >= before[1] + MANY_TABLES as u64,
+            "{before:?} {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "retail",
+            &(1..=MANY_TABLES)
+                .map(|i| format!("DROP TABLE it_many.t{i:02};"))
+                .collect::<String>(),
+        ),
+    ))
+    .await;
+    Box::pin(exec(&mut s, &in_db("retail", "DROP SCHEMA it_many"))).await;
+}
+
 /// P9-A obligation L4: the closed list of `sys` built-in functions
 /// (`classifiers::query::tsql::SYS_FUNCTIONS`) holds every function of
 /// the server's `sys` schema, so a schema-qualified call of a built-in is
@@ -1695,6 +2213,13 @@ async fn xe_scenario() {
     assert!(!has(&h, NoteCode::AuditXeSessionFiltered));
     assert!(!has(&h, NoteCode::AuditXeCausalityOff));
     assert!(!has(&h, NoteCode::AuditLogWithoutRowCounts));
+    // The dev session filters `error_reported` (18456 only): no failed
+    // login read yet, so none is proven recorded (#280 review L2).
+    assert!(
+        has(&h, NoteCode::AuditFailedLoginsNotAudited),
+        "{:?}",
+        codes(&h)
+    );
     assert_eq!(
         c.audit_source(&t),
         Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
@@ -1889,6 +2414,13 @@ async fn xe_scenario() {
     let h = Box::pin(c.check(&t)).await;
     eprintln!("[it] xe, streaming: {:?} {:?}", h.audit_level, codes(&h));
     assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+    // The failed login read proves the filtered `error_reported` admits
+    // them, aged on the server's clock (#280 re-review L-b).
+    assert!(
+        !has(&h, NoteCode::AuditFailedLoginsNotAudited),
+        "{:?}",
+        codes(&h)
+    );
     // The source's grant is expected while the stream uses it.
     let label = grant.to_lowercase().replace(' ', "_");
     assert!(
@@ -2463,6 +2995,9 @@ async fn xe_fresh_scenario() {
                 .eq_ignore_ascii_case("databastion")
         })
         .collect();
+    // Captured before any assertion, so that a failing run still gives
+    // its fixture source.
+    Box::pin(xe_fresh_capture_statistics(&mut s, major)).await;
     for e in &own {
         eprintln!(
             "[it] xe fresh: own event reported {:?} {:?}",
@@ -2584,35 +3119,122 @@ async fn xe_fresh_sysguidrefs(
             .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysaudacts"))),
         "the build on sysaudacts paired with the audit_specifications proof is left out"
     );
-    let builds: Vec<String> = builds.into_iter().chain(audacts).collect();
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;
     };
-    let activity = |x: &str| -> Option<String> {
-        let at = x.find("name=\"attach_activity_id\"")?;
-        let rest = &x[at..];
-        let v = &rest[rest.find("<value>")? + 7..];
-        let v = &v[..v.find("</value>")?];
-        Some(v.rsplit_once('-')?.0.to_owned())
-    };
+    // The `sysaudacts` build's activity alone too (the 2025 fixture
+    // `sysaudacts-17.0.5015.4.xml`, ROADMAP follow-up of #287).
+    let (only, cut) = Box::pin(activity_events(s, &audacts)).await;
+    eprintln!(
+        "[it] xe fresh capture: sysaudacts {} event(s), {cut} above 4000 characters",
+        only.len()
+    );
+    std::fs::write(capture_path(&path, "sysaudacts"), only.join("\n") + "\n").unwrap();
+    let builds: Vec<String> = builds.into_iter().chain(audacts).collect();
+    let (lines, cut) = Box::pin(activity_events(s, &builds)).await;
+    eprintln!(
+        "[it] xe fresh capture: sysguidrefs and sysaudacts {} event(s), {cut} above 4000 characters",
+        lines.len()
+    );
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+}
+
+/// The Extended Events files of the dev session (tests only).
+const XE_FILES: &str = "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', \
+                        NULL, NULL, NULL)";
+
+/// `base` with `-<part>` before its `.txt` extension: another capture
+/// file next to `DATABASTION_IT_SQLSERVER_CAPTURE` (the engine matrix
+/// uploads the whole directory).
+fn capture_path(base: &str, part: &str) -> String {
+    match base.strip_suffix(".txt") {
+        Some(stem) => format!("{stem}-{part}.txt"),
+        None => format!("{base}-{part}"),
+    }
+}
+
+/// The activity GUID of a captured event (`attach_activity_id`, without
+/// its sequence).
+fn activity_of(x: &str) -> Option<String> {
+    let at = x.find("name=\"attach_activity_id\"")?;
+    let rest = &x[at..];
+    let v = &rest[rest.find("<value>")? + 7..];
+    let v = &v[..v.find("</value>")?];
+    Some(v.rsplit_once('-')?.0.to_owned())
+}
+
+/// Every event of the activities of `builds` (captured events, one line
+/// each, in the order the files return them), and how many were above
+/// 4 000 characters (cut by the capture's `nvarchar(4000)`: such a line is
+/// not a fixture as is). Fake data only (the dev seed and the agent's
+/// constant texts).
+async fn activity_events(s: &mut Session, builds: &[String]) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
+    let mut cut = 0;
     let guids: std::collections::BTreeSet<String> =
-        builds.iter().filter_map(|b| activity(b)).collect();
+        builds.iter().filter_map(|b| activity_of(b)).collect();
     for guid in guids {
         assert!(guid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
-        lines.extend(read(
-            Box::pin(try_rows(
-                s,
-                &format!(
-                    "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
-                     WHERE event_data LIKE N'%{guid}-%'"
-                ),
-                1,
-            ))
-            .await,
-        ));
+        let rows = Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data), \
+                 CONVERT(bigint, DATALENGTH(event_data)) FROM {XE_FILES} \
+                 WHERE event_data LIKE N'%{guid}-%'"
+            ),
+            2,
+        ))
+        .await
+        .unwrap_or_default();
+        for r in &rows {
+            if r.get(1).and_then(Value::as_int).unwrap_or(0) > 8_000 {
+                cut += 1;
+            }
+            if let Some(x) = r.first().and_then(Value::as_text) {
+                lines.push(x.replace('\n', " "));
+            }
+        }
     }
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    (lines, cut)
+}
+
+/// Every statistics build of the agent's login in the fresh run with the
+/// events of its activity, to `<capture>-statistics.txt`: the source of
+/// the drift fixtures `statistics-<build>.xml` (the agent's own builds on
+/// a fresh server; ROADMAP follow-up of #293: the re-capture of
+/// `statistics-16.0.4305.5.xml`, whose CAS guard partner text was
+/// synthesized). Prints whether the CAS guard's current text
+/// (`sql::CAS_COLUMNS` on `retail`) is among them.
+async fn xe_fresh_capture_statistics(s: &mut Session, major: u32) {
+    let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
+        return;
+    };
+    let builds: Vec<String> = Box::pin(try_rows(
+        s,
+        &format!(
+            "SELECT TOP (256) CONVERT(nvarchar(4000), event_data) FROM {XE_FILES} \
+             WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+             AND event_data LIKE N'%databastion%'"
+        ),
+        1,
+    ))
+    .await
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|r| r.first().and_then(Value::as_text).map(str::to_owned))
+    .collect();
+    let (lines, cut) = Box::pin(activity_events(s, &builds)).await;
+    let cas = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
+    let cas_partner = lines
+        .iter()
+        .any(|l| l.contains(&format!("<![CDATA[{cas}]]>")));
+    eprintln!(
+        "[it] xe fresh capture: major {major}, {} build(s), {} event(s) of their activities, {cut} \
+         above 4000 characters, CAS guard text among them: {cas_partner}",
+        builds.len(),
+        lines.len()
+    );
+    std::fs::write(capture_path(&path, "statistics"), lines.join("\n") + "\n").unwrap();
 }
 
 /// Re-review N1: the first start's floor is bounded. A saved position

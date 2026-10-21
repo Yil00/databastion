@@ -90,6 +90,71 @@ pub(crate) struct DbRow {
     pub(crate) catalog: Option<i64>,
 }
 
+impl ServerRun {
+    /// The same server started again (tests only).
+    #[cfg(test)]
+    pub(crate) fn restarted(&self) -> Self {
+        Self {
+            server: self.server.clone(),
+            tempdb_created: self.tempdb_created + 1,
+        }
+    }
+}
+
+impl Memory {
+    /// The run of the last read (tests only).
+    #[cfg(test)]
+    pub(crate) fn run(&self) -> Option<&ServerRun> {
+        self.run.as_ref()
+    }
+
+    /// An Audit stream's session is on `run` (the #303 residual, as the
+    /// MySQL / MariaDB `performance_schema` stream does): a value read on
+    /// another run of the server (a restart since the last `check()`,
+    /// which may have changed the server or catalog collations) is no
+    /// longer kept: `unknown` until the next `check()` reads it, with no
+    /// `AUTO_CLOSE` memory. A value whose run is not known is left as it is
+    /// (nothing tells the runs apart). `true` when it was reset.
+    pub(crate) fn observe_run(&mut self, run: &ServerRun) -> bool {
+        match &self.run {
+            Some(old) if old != run => {
+                self.run = Some(run.clone());
+                self.report = NameCaseReport::unknown();
+                self.auto_close.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parses the row of [`sql::SERVER_RUN`]; `None` when there is none or it
+/// is not understood (an empty server name included).
+pub(crate) fn parse_run(rows: &[Vec<Value>]) -> Option<ServerRun> {
+    let r = rows.first()?;
+    let server = r.first().and_then(Value::as_text)?;
+    if server.is_empty() {
+        return None;
+    }
+    Some(ServerRun {
+        server: server.to_owned(),
+        tempdb_created: r.get(1).and_then(Value::as_int)?,
+    })
+}
+
+/// Reads the server run ([`sql::SERVER_RUN`]). `Ok(None)`: refused or not
+/// understood without ending the session.
+pub(crate) async fn read_run(s: &mut Session) -> Result<Option<ServerRun>, SsError> {
+    match s
+        .rows(sql::SERVER_RUN, Stage::Introspection, Shape::rows(2, 1))
+        .await
+    {
+        Ok(rows) => Ok(parse_run(&rows)),
+        Err(e) if !e.fatal => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// What [`sql::DATABASE_COLLATIONS`] returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Read {
@@ -640,5 +705,86 @@ mod tests {
         let mut no_name = r;
         no_name[1] = Value::Null;
         assert!(parse(&[no_name], true).is_none());
+    }
+
+    /// The #303 residual: an Audit stream's session on another server run
+    /// (the server name or `tempdb`'s `create_date` changed) resets the
+    /// kept value to `unknown`, with its `AUTO_CLOSE` memory; the same run,
+    /// or a value whose run is not known, is left as it is.
+    #[test]
+    fn another_server_run_seen_by_a_stream_resets_the_kept_value() {
+        let mut open = row(5, "express_cs", Some(CS_AS));
+        open.auto_close = true;
+        let mut closed = open.clone();
+        closed.style = None;
+        let first = evaluate(Some(&read(vec![open])), None);
+        let kept = sent(&first);
+        let run = first.run.clone().unwrap();
+        assert_eq!(run.tempdb_created, 1_002);
+
+        let mut same = first.clone();
+        assert!(!same.observe_run(&run));
+        assert_eq!(sent(&same), kept);
+
+        let unknown = serde_json::json!({"databases": "unknown", "objects": "unknown"});
+        for other in [
+            ServerRun {
+                server: run.server.clone(),
+                tempdb_created: run.tempdb_created + 1,
+            },
+            ServerRun {
+                server: "mssql2".to_owned(),
+                tempdb_created: run.tempdb_created,
+            },
+        ] {
+            let mut m = first.clone();
+            assert!(m.observe_run(&other));
+            assert_eq!(sent(&m), unknown);
+            assert_eq!(m.run.as_ref(), Some(&other));
+            assert!(m.auto_close.is_empty());
+            // Seen again on that run: nothing more to reset.
+            assert!(!m.observe_run(&other));
+            // The next check on that run reads the values again, and a
+            // closed `AUTO_CLOSE` database is not remembered from the
+            // earlier run.
+            let mut next = read(vec![closed.clone()]);
+            next.server = Some(other.server.clone());
+            next.rows[1].created = other.tempdb_created;
+            assert_eq!(
+                sent(&evaluate(Some(&next), Some(&m))),
+                serde_json::json!({
+                    "databases": "insensitive", "objects": "insensitive",
+                    "except": [{"database": "express_cs", "objects": "unknown"}]
+                })
+            );
+        }
+
+        // A value read without a run (no server name): left as it is.
+        let mut no_run = read(Vec::new());
+        no_run.server = None;
+        let mut m = evaluate(Some(&no_run), None);
+        let before = sent(&m);
+        assert!(!m.observe_run(&run));
+        assert_eq!(sent(&m), before);
+        assert!(m.run.is_none());
+    }
+
+    #[test]
+    fn the_server_run_row_is_parsed() {
+        let row = vec![Value::Text("mssql1".to_owned()), Value::Int(42)];
+        assert_eq!(
+            parse_run(std::slice::from_ref(&row)),
+            Some(ServerRun {
+                server: "mssql1".to_owned(),
+                tempdb_created: 42
+            })
+        );
+        assert_eq!(parse_run(&[]), None);
+        assert_eq!(
+            parse_run(&[vec![Value::Text(String::new()), Value::Int(42)]]),
+            None
+        );
+        assert_eq!(parse_run(&[vec![row[0].clone(), Value::Null]]), None);
+        assert_eq!(parse_run(&[vec![Value::Null, Value::Int(1)]]), None);
     }
 }

@@ -87,6 +87,34 @@ impl CheckState {
         m
     }
 
+    /// The server run the kept name case was read on (tests only).
+    #[cfg(test)]
+    pub(crate) fn name_case_run(&self, target_id: &str) -> Option<crate::name_case::ServerRun> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .and_then(|m| m.run().cloned())
+    }
+
+    /// An Audit stream's session is on `run`: a name case kept from
+    /// another run of the server is reset to `unknown` (the #303
+    /// residual; [`crate::name_case::Memory::observe_run`]).
+    pub(crate) fn observe_server_run(&self, target_id: &str, run: &crate::name_case::ServerRun) {
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = map.get_mut(target_id)
+            && m.observe_run(run)
+        {
+            tracing::info!(
+                target_id,
+                "SQL Server restarted since the last check: name case unknown until the next one"
+            );
+        }
+    }
+
     fn set_version(&self, target_id: &str, version: Option<String>) {
         let mut map = self
             .versions

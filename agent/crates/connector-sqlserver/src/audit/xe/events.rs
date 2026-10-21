@@ -92,6 +92,81 @@ fn system_rpc(name: &str) -> bool {
     ) || n.starts_with("sp_cursor")
 }
 
+/// Whether `text` holds `CREATE`, `ALTER` or `DROP` followed by `EVENT
+/// SESSION`, as words compared without case, with any white space or
+/// comments (`--` to the end of the line, `/* … */`, nested as T-SQL
+/// nests them) between them. String literals and bracketed names are read
+/// as words too (dynamic SQL in a literal matches; more matches only clear
+/// the proof more often). The text is never copied: each word is
+/// classified in place.
+pub(crate) fn event_session_ddl(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum W {
+        Verb,
+        Event,
+        Session,
+        Other,
+    }
+    let class = |w: &str| {
+        if ["create", "alter", "drop"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+        {
+            W::Verb
+        } else if w.eq_ignore_ascii_case("event") {
+            W::Event
+        } else if w.eq_ignore_ascii_case("session") {
+            W::Session
+        } else {
+            W::Other
+        }
+    };
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+    let mut last = [W::Other; 2];
+    let mut i = 0;
+    while let Some(rest) = text.get(i..).filter(|r| !r.is_empty()) {
+        if rest.starts_with("--") {
+            i += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut j = 0;
+            while let Some(r) = rest.get(j..).filter(|r| !r.is_empty()) {
+                if r.starts_with("/*") {
+                    depth += 1;
+                    j += 2;
+                } else if r.starts_with("*/") {
+                    depth = depth.saturating_sub(1);
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += r.chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            i += j;
+            continue;
+        }
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        if is_word(c) {
+            let len = rest.find(|c: char| !is_word(c)).unwrap_or(rest.len());
+            let w = class(rest.get(..len).unwrap_or_default());
+            if last == [W::Verb, W::Event] && w == W::Session {
+                return true;
+            }
+            last = [last[1], w];
+            i += len;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    false
+}
+
 /// One poll row.
 pub(crate) struct XeRecord {
     pub(crate) file: String,
@@ -236,6 +311,25 @@ impl XeRecord {
     pub(crate) fn is_failed_login_18456(&self) -> bool {
         self.kind() == Kind::ErrorReported
             && self.event.as_ref().and_then(|e| e.error_number) == Some(18_456)
+    }
+
+    /// Whether the record may create, change or drop an Extended Events
+    /// session (#280 re-review L-b: a predicate the agent never reads may
+    /// have changed): a statement event (`sql_statement_completed`,
+    /// `sp_statement_completed`: the texts the agent keeps; an RPC's or a
+    /// batch's text is never stored, decision 6 M5, and the statements
+    /// they run are statement events of their own) whose text names
+    /// `CREATE`, `ALTER` or `DROP` `EVENT SESSION` ([`event_session_ddl`]),
+    /// or whose text was not read whole (above the poll's bound,
+    /// unreadable, cut): fail closed.
+    pub(crate) fn may_change_event_session(&self) -> bool {
+        if !self.kind().is_statement() {
+            return false;
+        }
+        let Some(e) = &self.event else {
+            return true;
+        };
+        e.statement_cut || e.statement.as_deref().is_some_and(|t| event_session_ddl(t))
     }
 
     /// The acting login: the session's login (`session_server_principal_name`,
@@ -990,6 +1084,84 @@ pub(crate) mod tests {
             unreadable: false,
             index: 0,
         }
+    }
+
+    /// #280 re-review L-b: the statements that may change an event session.
+    #[test]
+    fn event_session_statements_are_recognized() {
+        for t in [
+            "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported",
+            "alter event session [databastion_xe] on server add event sqlserver.error_reported",
+            "DROP EVENT SESSION x ON SERVER",
+            "CREATE  EVENT\tSESSION x ON SERVER ADD EVENT sqlserver.login",
+            "ALTER/* a /* nested */ comment */EVENT -- x\n SESSION s ON SERVER STATE = STOP",
+            "EXEC (N'ALTER EVENT SESSION s ON SERVER STATE = STOP')",
+            "SELECT 1; alter event session s on server state = start",
+        ] {
+            assert!(event_session_ddl(t), "{t}");
+        }
+        for t in [
+            "SELECT event_session_address FROM sys.dm_xe_sessions",
+            "SELECT * FROM t WHERE event = 1 AND session = 2",
+            "ALTER EVENT_SESSION x",
+            "ALTER -- EVENT SESSION\n TABLE t ADD c int",
+            "ALTER /* EVENT SESSION */ TABLE t ADD c int",
+            "ALTER EVENTS SESSION",
+            "SELECT N'alter event' + N'session'",
+            "",
+        ] {
+            assert!(!event_session_ddl(t), "{t}");
+        }
+        let with = |name: &str, data: &[(&str, &str)]| rec(name, data, &[]);
+        assert!(
+            with(
+                "sql_statement_completed",
+                &[("statement", "ALTER EVENT SESSION s ON SERVER STATE = STOP")]
+            )
+            .may_change_event_session()
+        );
+        assert!(
+            with(
+                "sp_statement_completed",
+                &[("statement", "DROP EVENT SESSION s ON SERVER")]
+            )
+            .may_change_event_session()
+        );
+        // An RPC's text is never kept: its statements are events of their
+        // own.
+        assert!(
+            !with(
+                "rpc_completed",
+                &[(
+                    "statement",
+                    "exec sp_executesql N'DROP EVENT SESSION s ON SERVER'"
+                )]
+            )
+            .may_change_event_session()
+        );
+        assert!(
+            !with("sql_statement_completed", &[("statement", "SELECT 1")])
+                .may_change_event_session()
+        );
+        // Another event, even naming it: not a statement.
+        assert!(
+            !with(
+                "error_reported",
+                &[
+                    ("message", "ALTER EVENT SESSION"),
+                    ("error_number", "50000")
+                ]
+            )
+            .may_change_event_session()
+        );
+        // A statement event whose text was not read whole: fail closed.
+        let mut cut = with("sql_statement_completed", &[("statement", "SELECT 1")]);
+        cut.event.as_mut().unwrap().statement_cut = true;
+        assert!(cut.may_change_event_session());
+        let mut unread = with("sp_statement_completed", &[("statement", "SELECT 1")]);
+        unread.event = None;
+        unread.unreadable = true;
+        assert!(unread.may_change_event_session());
     }
 
     pub(crate) fn who(login: &str, session: &str) -> Vec<(&'static str, String)> {

@@ -111,12 +111,6 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The level proofs last this long.
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
 
-/// The agent's clock, µs since 1970 (0 before it).
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
-}
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
 const OWN_SESSIONS: &str = "sqlserver_own_sessions";
@@ -143,9 +137,10 @@ pub(crate) struct Shared {
     running: Mutex<HashMap<String, usize>>,
     fresh: Mutex<HashMap<String, Instant>>,
     gap: Mutex<HashMap<String, Instant>>,
-    /// The event time (µs since 1970) of the last failed login (error
-    /// 18456) read from the target's Extended Events session.
-    failed_login: Mutex<HashMap<String, i64>>,
+    /// When the last failed login (error 18456) read from the target's
+    /// Extended Events session happened, on the agent's monotonic clock
+    /// ([`Shared::note_failed_login`]).
+    failed_login: Mutex<HashMap<String, Instant>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
@@ -201,26 +196,53 @@ impl Shared {
         lock(&self.fresh).insert(target_id.to_owned(), Instant::now());
     }
 
-    /// A failed login (error 18456) was recorded at `at_us` (event time):
-    /// the session's `error_reported`, whatever its predicate, admits it.
-    pub(crate) fn note_failed_login(&self, target_id: &str, at_us: i64) {
+    /// A failed login (error 18456) was recorded at `at_us` (event time,
+    /// the server's clock), read while the server's clock read `server_now_us`
+    /// (the agent's own session's read-back, carried forward on the
+    /// agent's monotonic clock, `own::Handle::server_now`): the session's
+    /// `error_reported`, whatever its predicate, admits it.
+    ///
+    /// #280 re-review L-b: the record's age is the difference of two
+    /// readings of the **server's** clock, so a skew between the server's
+    /// and the agent's clocks cancels out, and the 24 h window then runs
+    /// on the agent's monotonic clock (an [`Instant`]), as the other
+    /// freshness facts. Without the server's time (no read-back on the
+    /// session) or with an age at or beyond the window, nothing is proven
+    /// (fail closed); an event stamped slightly ahead of the read-back
+    /// (the event clock's lead) is aged 0.
+    pub(crate) fn note_failed_login(
+        &self,
+        target_id: &str,
+        at_us: i64,
+        server_now_us: Option<i64>,
+    ) {
+        let Some(now) = server_now_us else {
+            return;
+        };
+        let age = Duration::from_micros(u64::try_from(now.saturating_sub(at_us)).unwrap_or(0));
+        if age >= FRESHNESS {
+            return;
+        }
+        let Some(at) = Instant::now().checked_sub(age) else {
+            return;
+        };
         let mut map = lock(&self.failed_login);
-        let e = map.entry(target_id.to_owned()).or_insert(at_us);
-        *e = (*e).max(at_us);
+        let e = map.entry(target_id.to_owned()).or_insert(at);
+        *e = (*e).max(at);
     }
 
-    /// The session was restarted or its file set changed: the proof is
-    /// taken again.
+    /// The session was restarted, its file set or its events changed, or
+    /// a statement that may change an event session was read: the proof
+    /// is taken again.
     pub(crate) fn clear_failed_login(&self, target_id: &str) {
         lock(&self.failed_login).remove(target_id);
     }
 
-    /// Whether a failed login was recorded in the 24 h before `now_us`.
-    fn failed_login_within(&self, target_id: &str, now_us: i64) -> bool {
-        let window = i64::try_from(FRESHNESS.as_micros()).unwrap_or(i64::MAX);
+    /// Whether a failed login was recorded in the last 24 h (agent clock).
+    fn failed_login_within(&self, target_id: &str) -> bool {
         lock(&self.failed_login)
             .get(target_id)
-            .is_some_and(|at| now_us.saturating_sub(*at) < window)
+            .is_some_and(|at| at.elapsed() < FRESHNESS)
     }
 
     fn note_gap(&self, target_id: &str) {
@@ -252,7 +274,7 @@ impl Shared {
             running: self.is_running(target_id),
             fresh: within(&self.fresh),
             gap: within(&self.gap),
-            failed_login_seen: self.failed_login_within(target_id, now_us()),
+            failed_login_seen: self.failed_login_within(target_id),
             dropped: lock(&self.dropped)
                 .get(target_id)
                 .filter(|(_, at)| at.elapsed() < FRESHNESS)
@@ -1195,6 +1217,21 @@ impl Stream<'_> {
     }
 }
 
+/// Reads the server run on a stream's new session (a restart of the server
+/// ends every session, so each new one is checked) and resets a name case
+/// kept from another run (ADR-0055 decision 2, the #303 residual). Not
+/// read: nothing changes (a fatal error ends the session's next statement
+/// and the stream reconnects).
+pub(crate) async fn observe_server_run(state: &CheckState, target_id: &str, s: &mut Session) {
+    match crate::name_case::read_run(s).await {
+        Ok(Some(run)) => state.observe_server_run(target_id, &run),
+        Ok(None) | Err(_) => tracing::debug!(
+            target_id,
+            "SQL Server: the server run could not be read on the Audit session"
+        ),
+    }
+}
+
 /// `Connector::audit_stream` for SQL Server.
 pub(crate) async fn audit_stream(
     cfg: &AuditConfig,
@@ -1230,6 +1267,7 @@ pub(crate) async fn audit_stream(
     let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
         .await
         .map_err(SsError::into_connector_error)?;
+    Box::pin(observe_server_run(state, &target.id, &mut session)).await;
     // The preference rule (decision 6): SQL Server Audit when usable, then
     // the Extended Events session.
     let use_audit = match (&audit_name, &xe_name) {
@@ -1334,6 +1372,7 @@ pub(crate) async fn audit_stream(
                     .map_err(SsError::into_connector_error)?,
             );
             old.close().await;
+            Box::pin(observe_server_run(state, &target.id, &mut session)).await;
         }
         let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
         if let Err(e) = r {
