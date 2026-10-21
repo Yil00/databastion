@@ -56,8 +56,9 @@ case "$LOAD_SQLSERVER_AUDIT_SOURCE" in
   *) echo "LOAD_SQLSERVER_AUDIT_SOURCE must be sqlserver_audit or sqlserver_xevents" >&2; exit 2 ;;
 esac
 LOAD_MSSQL_RATE="${LOAD_MSSQL_RATE:-$default_rate}"          # workload statements per second
-[[ "$LOAD_MSSQL_RATE" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$LOAD_MSSQL_RATE" -le 2000 ] \
-  || { echo "LOAD_MSSQL_RATE must be between 1 and 2000 statements per second" >&2; exit 2; }
+if ! [[ "$LOAD_MSSQL_RATE" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$LOAD_MSSQL_RATE" -gt 2000 ]; then
+  echo "LOAD_MSSQL_RATE must be between 1 and 2000 statements per second" >&2; exit 2
+fi
 # Seconds between two drops of the load schema's auto-created statistics during the Audit run
 # (0: never, the default).
 LOAD_SQLSERVER_STATS_RESET_S="${LOAD_SQLSERVER_STATS_RESET_S:-0}"
