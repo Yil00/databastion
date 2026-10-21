@@ -21,11 +21,7 @@
         "objects": "insensitive",
         "except": [
           {
-            "database": "crm_cs",
-            "objects": "sensitive"
-          },
-          {
-            "database": "ledger_bin2",
+            "database": "*",
             "objects": "sensitive"
           },
           {
@@ -33,7 +29,11 @@
             "objects": "unknown"
           },
           {
-            "database": "*",
+            "database": "crm_cs",
+            "objects": "sensitive"
+          },
+          {
+            "database": "ledger_bin2",
             "objects": "sensitive"
           }
         ]

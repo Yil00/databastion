@@ -770,6 +770,12 @@ export interface components {
              *     finding or an event (outside the scan's scope, snapshots, databases its login cannot
              *     enter; ADR-0055 decision 9).
              *
+             *     One entry per `database` name, and entries sorted by `database` in the byte order of
+             *     its UTF-8 form (after normalization): a conforming agent merges the entries of one
+             *     name into one, with the stricter value. Not checked by this schema (`uniqueItems`
+             *     compares whole entries, not names); the console reads several entries of one name as
+             *     the stricter of their values (ADR-0055 decision 6).
+             *
              *     At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
              *     JSON: an agent-side bound, which the console does not check (its request size limit
              *     applies). A conforming agent that would pass either bound, or that cannot list every

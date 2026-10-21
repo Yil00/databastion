@@ -896,6 +896,16 @@ mod tests {
             ),
         ] {
             let mut hb: HeartbeatRequest = serde_json::from_str(fixture).unwrap();
+            // Security review L2: `except` sorted by name, one entry per name.
+            for t in &hb.targets {
+                let names: Vec<&[u8]> = t
+                    .name_case
+                    .iter()
+                    .flat_map(|n| &n.except)
+                    .map(|e| e.database.as_str().as_bytes())
+                    .collect();
+                assert!(names.windows(2).all(|w| w[0] < w[1]), "{names:?}");
+            }
             assert!(hb.targets.iter().all(target_status_carries_gated));
             assert!(strip_gated_heartbeat(&mut hb));
             assert!(!hb.targets.iter().any(target_status_carries_gated));
@@ -913,6 +923,75 @@ mod tests {
         assert!(notes_only.targets.iter().any(target_status_carries_gated));
         assert!(strip_gated_heartbeat(&mut notes_only));
         assert!(notes_only.targets.iter().all(|t| t.notes.is_empty()));
+    }
+
+    /// Security review I-2 (ADR-0055 contract): a target status with every
+    /// optional field set keeps, once stripped, exactly the fields of
+    /// protocol 0.1.0. The destructuring below has no `..`: a field added
+    /// to `TargetStatus` does not compile until it is classified here (and,
+    /// if gated, in [`target_status_carries_gated`] and
+    /// [`strip_gated_target_status`]).
+    #[test]
+    fn stripping_a_target_status_leaves_only_the_0_1_0_fields() {
+        let mut t: TargetStatus = serde_json::from_value(serde_json::json!({
+            "target_id": "mssql-prod",
+            "engine": "sqlserver",
+            "edition": "enterprise",
+            "server_version": "16.0.4305.5",
+            "reachable": true,
+            "audit_level": "partial",
+            "audit_source": "sqlserver_audit",
+            "last_error": "timeout",
+            "notes": [{"code": "check.timed_out"}],
+            "name_case": {
+                "databases": "insensitive",
+                "objects": "insensitive",
+                "except": [{"database": "crm_cs", "objects": "sensitive"}]
+            },
+            "metrics": {"checks_total": 1}
+        }))
+        .unwrap();
+        let TargetStatus {
+            audit_level: _,
+            audit_source,
+            edition,
+            engine: _,
+            last_error,
+            metrics,
+            name_case,
+            notes,
+            reachable: _,
+            server_version,
+            target_id: _,
+        } = &t;
+        assert!(audit_source.is_some() && edition.is_some() && last_error.is_some());
+        assert!(metrics.is_some() && server_version.is_some());
+        assert!(name_case.is_some() && !notes.is_empty());
+        assert!(target_status_carries_gated(&t));
+        strip_gated_target_status(&mut t);
+        assert!(!target_status_carries_gated(&t));
+        let value = serde_json::to_value(&t).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "audit_level",
+                "audit_source",
+                "edition",
+                "engine",
+                "last_error",
+                "metrics",
+                "reachable",
+                "server_version",
+                "target_id",
+            ]
+        );
     }
 
     #[test]
