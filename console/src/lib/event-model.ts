@@ -1,18 +1,20 @@
 import { EVENT_ACTIONS } from "@/lib/protocol/enums";
 import { validateSchema } from "@/lib/protocol/validate";
 
+import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
   ENGINES,
-  exceptionGlobOptions,
   fail,
   globMatch,
   isGlob,
   isPlainObject,
   onlyKeys,
+  optionsFor,
   stringList,
   UUID,
   type GlobOptions,
   type Parsed,
+  type PartGlobOptions,
 } from "./policy-common";
 
 /**
@@ -367,8 +369,14 @@ export interface EventObject {
 export interface EventFacts {
   agentId: string;
   targetId: string;
-  /** Engine last reported for the target. */
+  /** Engine the event's source tells, else the one last reported for the target. */
   engine: string | null;
+  /**
+   * The target's `name_case` (ADR-0055), canonical (`canonicalNameCase`); absent or null: not
+   * reported, today's rule. Used by location exceptions only, and only when `engine` is `mysql`,
+   * `mariadb` or `sqlserver`.
+   */
+  nameCase?: NameCaseRule | null;
   /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place; empty when not recorded. */
   principal: string;
   /**
@@ -443,15 +451,15 @@ export function signalSelected(selectors: readonly string[], signal: string): bo
 /**
  * An object without schema only matches a schema glob of `*` (as for finding locations). Globs in
  * policy conditions are case-insensitive (ADR-0014 decision 1) and ignore trailing spaces (the
- * default, N1); location exceptions pass `exceptionGlobOptions(engine)` (src/lib/policy-common.ts,
+ * default, N1); location exceptions pass `exceptionPartOptions` (src/lib/name-case.ts, ADR-0055;
  * N1 and ADR-0054).
  */
-export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
+export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions | PartGlobOptions = { ignoreTrailingSpaces: true }): boolean {
   return OBJECT_PARTS.every((part) => {
     const g = pattern[part];
     if (g === undefined) return true;
     const name = part === "schema" ? (o.schema ?? null) : o[part];
-    return name === null ? g === "*" : globMatch(g, name, opts);
+    return name === null ? g === "*" : globMatch(g, name, optionsFor(opts, part));
   });
 }
 
@@ -496,8 +504,11 @@ export interface EventExceptionScope {
  * Policy exceptions applied to an event (every set scope must hold): agent, target, and a location
  * whose `database` / `schema` / `object` globs cover every retained object (a `field` glob other
  * than `*` never covers an event, which names no field). A classifier-scoped exception concerns
- * findings only and never covers an event. The globs compare with case unless the target's engine
- * is in `CASE_BLIND_EXCEPTION_ENGINES` (ADR-0054; an unknown engine: always with case) and ignore
+ * findings only and never covers an event. The globs compare with case unless the event's engine
+ * is in `CASE_BLIND_EXCEPTION_ENGINES` (ADR-0054; an unknown engine: always with case), on SQL
+ * Server, MySQL and MariaDB per part as the target's `name_case` says when it reports one
+ * (ADR-0055 decision 6, `exceptionPartOptions`; an object of the database `*` takes the strictest
+ * value, L1), and ignore
  * trailing spaces only on the target's engine of `TRAILING_SPACE_BLIND_ENGINES`
  * (src/lib/policy-common.ts) (N1; an unknown engine: never). An overflow `*` of a flagged event
  * (ADR-0053) is covered only by an exception that covers every object of its database
@@ -519,10 +530,11 @@ export function exceptionCoversEvent(
     const { field, ...parts } = x.location;
     if (field !== undefined && field !== "*") return false;
     if (objectIdx.length === 0) return false;
-    const opts = exceptionGlobOptions(e.engine);
     return objectIdx.every((i) => {
       const o = e.objects[i] as EventObject;
-      return isOverflowStar(e, o) ? exceptionCoversOverflowStar(parts, o, opts) : objectMatches(parts, o, opts);
+      // ADR-0055 decision 6: per part, from the target's `name_case` and the object's database.
+      const opts = exceptionPartOptions(e.engine, e.nameCase, o.database);
+      return isOverflowStar(e, o) ? exceptionCoversOverflowStar(parts, o, opts.perPart.database) : objectMatches(parts, o, opts);
     });
   }
   return true;

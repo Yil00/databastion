@@ -217,9 +217,12 @@ describe("case-sensitive exceptions (ADR-0054)", () => {
 
   it("the exception form says where names compare with case", () => {
     const html = renderToStaticMarkup(<ExceptionForm csrfToken="c" />);
-    expect(html).toContain(EXCEPTION_MATCHING_NOTE.split(" (")[0]);
+    expect(html).toContain((EXCEPTION_MATCHING_NOTE.split(" (")[0] ?? "").replaceAll("'", "&#x27;"));
     expect(EXCEPTION_MATCHING_NOTE).toContain("with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS");
-    expect(EXCEPTION_MATCHING_NOTE).toContain("without case elsewhere");
+    expect(EXCEPTION_MATCHING_NOTE).toContain("without case on OpenLDAP");
+    // ADR-0055 decision 7: these engines follow the server's settings.
+    expect(EXCEPTION_MATCHING_NOTE).toContain("on SQL Server, MySQL and MariaDB targets according to the server's settings");
+    expect(EXCEPTION_MATCHING_NOTE).toContain("unknown: with case");
   });
 
   it("lists the affected exceptions with their counts, escaped; a deleted one by id; the bound when reached", () => {

@@ -28,6 +28,7 @@ import {
   type EventObject,
 } from "@/lib/event-model";
 import { auditSourceEngine } from "@/lib/location-labels";
+import { canonicalNameCase } from "@/lib/name-case";
 import { logger } from "@/lib/logger";
 import { dedupDatabaseName, FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
@@ -1059,10 +1060,12 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
     const nowDate = new Date(now);
     const state: ChunkState = { now: nowDate, hour: eventBucket(nowDate), cap: eventIncidentsPerPolicyHour(), latest: new Map(), created: new Map() };
     const targets = await tx
-      .select({ agentId: agentTargets.agentId, targetId: agentTargets.targetId, engine: agentTargets.engine })
+      .select({ agentId: agentTargets.agentId, targetId: agentTargets.targetId, engine: agentTargets.engine, nameCase: agentTargets.nameCase })
       .from(agentTargets)
       .where(inArray(agentTargets.agentId, [...new Set(events.map((e) => e.agentId))]));
     const engines = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, t.engine]));
+    // ADR-0055 decision 6: each target's current `name_case`, canonical (null: today's rule).
+    const nameCases = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, canonicalNameCase(t.nameCase)]));
     const unicodeLower = await cachedLowerFoldsUnicode(db, tx);
     const hits = await loadObjectHits(tx, events, unicodeLower);
     const bounds = await loadDatabaseBounds(tx, events, unicodeLower, wholeTargetCacheOf(db));
@@ -1102,6 +1105,8 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         // The engine the source tells (checked against the target at ingest), else the target's
         // current one (security review L1 of ADR-0054: a target's engine may change after ingest).
         engine: auditSourceEngine(e.source) ?? engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
+        // Location exceptions only, and only when that engine is MySQL, MariaDB or SQL Server.
+        nameCase: nameCases.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
         accountNotRecorded: e.accountNotRecorded,
         action: e.action,

@@ -7,6 +7,7 @@ import { ScanCoverageView } from "@/components/console/scan-coverage";
 import { ScanDialog } from "@/components/console/scan-dialog";
 import { StatusBadge } from "@/components/console/status-badge";
 import { Badge } from "@/components/ui/badge";
+import { TargetNameCase } from "@/components/console/target-name-case";
 import { TargetNotes } from "@/components/console/target-notes";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -21,6 +22,7 @@ import { auditSummaries } from "@/server/audit-config";
 import { AUDIT_STREAM_ALERT_INTERVAL_S, streamStopped } from "@/server/audit-stream-alerts";
 import { DROPPED_BATCHES_ALERT_INTERVAL_S } from "@/server/dropped-batches";
 import { rotationBlocked } from "@/server/rotation";
+import { latestNameCaseInventories } from "@/server/name-case-inventory";
 import { latestScans, scanStatusLabel } from "@/server/scans";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -45,7 +47,11 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
   if (!UUID.test(id)) notFound();
   const agent = await getAgentDetail(getDb(), id);
   if (!agent) notFound();
-  const [scans, audits] = await Promise.all([latestScans(getDb(), id), auditSummaries(getDb(), id)]);
+  const [scans, audits, nameCaseInventories] = await Promise.all([
+    latestScans(getDb(), id),
+    auditSummaries(getDb(), id),
+    latestNameCaseInventories(getDb(), id),
+  ]);
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const status = displayStatus(agent, now);
@@ -207,6 +213,7 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                   <TableHead>Audit source</TableHead>
                   <TableHead>Last error</TableHead>
                   <TableHead>Notes</TableHead>
+                  <TableHead>Names compared</TableHead>
                   <TableHead>Reported</TableHead>
                   <TableHead>Last scan</TableHead>
                   <TableHead>Audit settings</TableHead>
@@ -235,6 +242,9 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                     <TableCell>{t.lastError ?? ""}</TableCell>
                     <TableCell className="max-w-80 whitespace-normal">
                       <TargetNotes notes={t.notes} />
+                    </TableCell>
+                    <TableCell className="max-w-56 whitespace-normal">
+                      <TargetNameCase engine={t.engine} rule={t.nameCase} inventory={nameCaseInventories.get(t.targetId)} now={now} />
                     </TableCell>
                     <TableCell>{formatAge(t.lastReportedAt, now)}</TableCell>
                     <TableCell className="max-w-72 whitespace-normal">

@@ -101,8 +101,10 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
 /**
  * Engines whose object names a location exception compares without case (ADR-0054 decision 1):
  * SQL Server (case-insensitive under the default collation) and MySQL / MariaDB (with
- * `lower_case_table_names` other than 0) until the agent reports their case semantics (ADR-0054
- * decision 3, option D), and OpenLDAP (case-insensitive matching rules of the naming attributes).
+ * `lower_case_table_names` other than 0) while their agent reports no case semantics (ADR-0054
+ * decision 3; with a `TargetStatus.name_case`, ADR-0055 decision 6 compares them per part,
+ * `exceptionPartOptions` in src/lib/name-case.ts), and OpenLDAP (case-insensitive matching rules
+ * of the naming attributes).
  * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
  * Redis, Valkey and Apereo CAS by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES}), and an
  * engine added later is never loosened before its connector ADR decides. Policy conditions,
@@ -129,6 +131,21 @@ export function exceptionGlobOptions(engine: string | null): GlobOptions {
     ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine),
     matchCase: exceptionMatchesCase(engine),
   };
+}
+
+/** The parts of a location (finding) or an event object (no `field`). */
+export type NamePart = "database" | "schema" | "object" | "field";
+
+/**
+ * Glob options per location part (ADR-0055 decision 6): a target's `name_case` can compare its
+ * database names and its object names differently. Built by `exceptionPartOptions`
+ * (src/lib/name-case.ts).
+ */
+export type PartGlobOptions = { readonly perPart: Readonly<Record<NamePart, GlobOptions>> };
+
+/** The options of `part`: the same for every part when `opts` is a plain {@link GlobOptions}. */
+export function optionsFor(opts: GlobOptions | PartGlobOptions, part: NamePart): GlobOptions {
+  return "perPart" in opts ? opts.perPart[part] : opts;
 }
 
 export interface GlobOptions {

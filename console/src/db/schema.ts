@@ -19,6 +19,8 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
+import type { NameCaseRule } from "../lib/name-case";
+
 /**
  * Console internal schema. Changes go through `pnpm db:generate`, which
  * writes a versioned SQL migration under drizzle/ (never edit the DB by hand).
@@ -307,6 +309,23 @@ export const agentTargets = pgTable(
      */
     notes: jsonb("notes").$type<{ code: string; count?: number; labels?: string[] }[]>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
+    /**
+     * Contract `TargetStatus.name_case` of the latest heartbeat (ADR-0055), in its canonical form
+     * (`canonicalNameCase` in src/lib/name-case.ts: `except` sorted and merged, past its bounds the
+     * strict form); null when that heartbeat carried none (today's rule). Three closed values and
+     * normalized database names only (I2). Written by a compare-and-set in the heartbeat's
+     * transaction (`storeNameCase`, decision 7, L8).
+     */
+    nameCase: jsonb("name_case").$type<NameCaseRule>(),
+    /** When `name_case` last changed (its first value, any value, or its loss). */
+    nameCaseChangedAt: tsz("name_case_changed_at"),
+    /**
+     * Set when the effective rule changed and the ADR-0054 inventory of this target is due (the
+     * earliest pending change); cleared by the worker run that takes it (decision 7, M2).
+     */
+    nameCaseInventoryDueAt: tsz("name_case_inventory_due_at"),
+    /** When the worker last ran this target's inventory: at most one run per target and hour (M2). */
+    nameCaseInventoryAt: tsz("name_case_inventory_at"),
     /** false when the target was absent from the last heartbeat (removed from agent.yaml). */
     present: boolean("present").notNull().default(true),
     firstSeenAt: tsz("first_seen_at").notNull().defaultNow(),
@@ -317,6 +336,10 @@ export const agentTargets = pgTable(
     check(
       "agent_targets_notes_bounded",
       sql`${t.notes} is null or (jsonb_typeof(${t.notes}) = 'array' and jsonb_array_length(${t.notes}) <= 16 and octet_length(${t.notes}::text) <= 16384)`,
+    ),
+    check(
+      "agent_targets_name_case_bounded",
+      sql`${t.nameCase} is null or (jsonb_typeof(${t.nameCase}) = 'object' and octet_length(${t.nameCase}::text) <= 16384)`,
     ),
   ],
 );

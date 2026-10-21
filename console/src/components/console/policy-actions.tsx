@@ -132,11 +132,12 @@ export function exceptionErrorMessage(status: number, body: unknown): string {
   return `The exception could not be saved (${status}).`;
 }
 
-/** How location patterns compare names (ADR-0054 decision 7, N1). */
+/** How location patterns compare names (ADR-0054 decision 7, ADR-0055 decision 7, N1). */
 export const EXCEPTION_MATCHING_NOTE =
-  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS targets, without case elsewhere " +
-  "(SQL Server, MySQL, MariaDB, OpenLDAP); trailing spaces are ignored on SQL Server, MySQL and MariaDB targets only. " +
-  "To cover two spellings, use one exception per spelling or a ? in place of the letter.";
+  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS targets, without case on OpenLDAP targets, " +
+  "and on SQL Server, MySQL and MariaDB targets according to the server's settings, as the agent reports them on the agent page " +
+  "(unknown: with case; not reported by an older agent: without case); trailing spaces are ignored on SQL Server, MySQL and MariaDB " +
+  "targets only. To cover two spellings, use one exception per spelling or a ? in place of the letter.";
 
 /** Runs the case-sensitive exception inventory (admin, ADR-0054 decision 6). */
 export function RunCaseInventoryButton({ csrfToken }: { csrfToken: string }) {
