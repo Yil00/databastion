@@ -384,6 +384,19 @@ session's next reporting queries (`GROUP BY a0.status`) build them again in `loa
 statistics builds under load, which the stream may defer (ADR-0051 refinement of 2026-10-18). The
 `sa` drops are DDL events of `sa`, always reported; they are not in the figures below.
 
+The stream lag (both sources): while it waits for the drain, the run samples the statements stored
+every 5 s, logs `drain: <stored>/<expected> statements stored <s> s after the workload` every 30 s,
+and records a `drain` fact (`facts.jsonl`, not a check): the samples (seconds since the last
+workload statement, statements stored), `stored_at_workload_end` and `rate_per_s`, the statements
+stored per second during the drain. `drain_s` (the check) is the time from the last workload
+statement to the last of them stored, `null` when the drain times out; the `drain` fact still shows
+how far behind the stream was and how fast it caught up. The agent logs one `info` line per cycle
+that ends behind its source ("Audit stream behind its source", with `reads` and `elapsed_ms`): the
+agent's read rate, about `reads × 500 / elapsed_ms × 1000` events per second at most. Load run
+39687119269 (Extended Events, 50 `SELECT`s/s, before the fix) stored 15 028 of 30 000 `SELECT`s
+300 s after the workload: a stream still in its first start's history phase waited the poll
+interval after every 20 reads, about 700 events/s against 1 500 written.
+
 After the drain, the run prints (and writes to `$LOAD_RESULTS_DIR/xe-catchup.json` and
 `xe-catchup.md`, the latter added to the job summary on exit, once the results directory is
 redacted), never as a check:

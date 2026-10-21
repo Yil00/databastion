@@ -538,16 +538,35 @@ events_sql() {
 want="$(grep '"kind":"workload"' "$FACTS" | jq -s 'map(select(.phase == "on"))[0].issued // 0')"
 log "waiting until every statement of the Audit run is stored (${want} expected, at most ${LOAD_DRAIN_TIMEOUT_S} s)"
 deadline=$(( $(date +%s) + LOAD_DRAIN_TIMEOUT_S ))
+# The stream lag: statements stored against the time since the last workload statement, sampled every
+# 5 s and logged every 30 s; the `drain` fact keeps the samples, the count stored when the workload
+# ended and the rate during the drain (statements/s), so a stream that falls behind its source shows
+# how far and how fast it catches up even when the drain times out (drain_s is then null).
+drain_samples=()
+last_log=0
 while :; do
   got="$(console_sql "SELECT coalesce(sum(aggregated_count), 0) $(events_sql)")"
+  since="$(jq -n --argjson a "$SOAK_END" --argjson b "$(now_s)" '$b - $a | . * 10 | round / 10')"
+  drain_samples+=("[${since},${got}]")
   [ "$got" -ge "$want" ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
     log "WARNING: not every statement stored within ${LOAD_DRAIN_TIMEOUT_S} s: ${got}/${want}"
     break
   fi
+  if [ "$(date +%s)" -ge $(( last_log + 30 )) ]; then
+    log "drain: ${got}/${want} statements stored ${since} s after the workload"
+    last_log="$(date +%s)"
+  fi
   sleep 5
 done
 log "statements stored: ${got}/${want}"
+fact --arg target "$TARGET" --argjson want "$want" --argjson got "$got" \
+  --argjson samples "[$(IFS=,; printf '%s' "${drain_samples[*]}")]" \
+  '{kind: "drain", target: $target, want: $want, stored: $got, samples: $samples,
+    stored_at_workload_end: $samples[0][1],
+    rate_per_s: (if ($samples | length) > 1 and ($samples[-1][0] - $samples[0][0]) > 0
+      then (($samples[-1][1] - $samples[0][1]) / ($samples[-1][0] - $samples[0][0]) | . * 10 | round / 10) else null end)}'
+log "drain: $(tail -n 1 "$FACTS" | jq -c '{want, stored, stored_at_workload_end, rate_per_s}')"
 console_sql "SELECT json_build_object('kind', 'events', 'target', '${TARGET}',
     'received', coalesce(sum(aggregated_count), 0), 'events', count(*),
     'lag_p95_s', round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from received_at - coalesce(ts_last, ts))::float8)::numeric, 1),
