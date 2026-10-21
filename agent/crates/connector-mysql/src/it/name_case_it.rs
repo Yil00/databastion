@@ -418,10 +418,14 @@ const PFS_LIKE_USER: &str = "databastion_it_case_pfs";
 /// `information_schema` and `performance_schema` in any other case, and
 /// both servers refuse `Information_Schema`; MariaDB lets a user create
 /// `Performance_Schema` next to the system schema under
-/// `lower_case_table_names = 0`. The agent compares `performance_schema`
-/// as stored on every engine, so a database the server accepts is a user
-/// database for it: sampled by Discovery, guarded by the CAS store guard,
-/// and its reads reported (MariaDB `server_audit`).
+/// `lower_case_table_names = 0`, but then refuses a table in it (1142, as
+/// in the system schema; second CI run of PR #308). The agent compares
+/// `performance_schema` as stored on every engine, so a database the
+/// server accepts is a user database for it: when a table can be created
+/// there, it is sampled by Discovery, guarded by the CAS store guard, and
+/// its reads reported (MariaDB `server_audit`); when none can, it holds
+/// nothing to sample, and what reading through that spelling does is
+/// measured (`[it] name_case:` lines), its statement-text reads reported.
 #[tokio::test]
 async fn system_schemas_in_another_case_follow_the_server() {
     let _serial = SERIAL.lock().await;
@@ -480,16 +484,23 @@ async fn system_schemas_in_another_case_follow_the_server() {
             } else {
                 None
             };
-            exec(&mut a, &format!("DROP DATABASE `{name}`")).await;
-            exec(
-                &mut a,
-                &format!("DROP USER IF EXISTS '{PFS_LIKE_USER}'@'%'"),
-            )
-            .await;
+            // Both cleanups run before any failure is raised.
+            let dropped = a
+                .exec(Stage::Check, &format!("DROP DATABASE `{name}`"))
+                .await;
+            let _ = a
+                .exec(
+                    Stage::Check,
+                    &format!("DROP USER IF EXISTS '{PFS_LIKE_USER}'@'%'"),
+                )
+                .await;
             match covered {
                 Some(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
                 Some(Err(e)) => panic!("{label}: {name}: {e}"),
                 _ => {}
+            }
+            if let Err(e) = dropped {
+                panic!("{label}: DROP DATABASE `{name}`: {e:?}");
             }
             assert!(
                 user_db,
@@ -503,6 +514,115 @@ async fn system_schemas_in_another_case_follow_the_server() {
             );
         }
     }
+}
+
+/// A database `name` (spelled like a system schema) the server created but
+/// holds no table in (MariaDB `Performance_Schema`): what reading the
+/// system schema's tables through that spelling does is measured, the
+/// database lists no table (nothing for Discovery to skip or sample), a
+/// Discovery account granted on it samples nothing there, and on MariaDB
+/// with the `server_audit` log a read of a statement-text table through
+/// that spelling, when the server answers it, is reported (fail closed:
+/// the agent leaves out reads of `performance_schema` only as written).
+async fn database_without_tables(server: &Server, a: &mut Session, name: &str) {
+    let label = server.name;
+    let probe = format!("SELECT COUNT(*) FROM `{name}`.events_statements_current");
+    let answered = match a.query(Stage::Check, &probe).await {
+        Ok(rows) => {
+            eprintln!(
+                "[it] name_case: {label}: `{probe}` answered ({} row(s)): the spelling reads \
+                 the system schema",
+                rows.len()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[it] name_case: {label}: `{probe}` refused (errno {:?})",
+                e.errno
+            );
+            false
+        }
+    };
+    let tables = count(
+        a,
+        &format!(
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE CAST(TABLE_SCHEMA AS BINARY) = '{name}'"
+        ),
+    )
+    .await;
+    eprintln!("[it] name_case: {label}: tables listed in `{name}`: {tables}");
+    assert_eq!(tables, 0, "{label}: {name}");
+    let u = format!("'{PFS_LIKE_USER}'@'%'");
+    let granted = a
+        .exec(Stage::Check, &format!("GRANT SELECT ON `{name}`.* TO {u}"))
+        .await;
+    eprintln!(
+        "[it] name_case: {label}: GRANT SELECT ON `{name}`.*: {}",
+        match &granted {
+            Ok(_) => "accepted".to_owned(),
+            Err(e) => format!("refused (errno {:?})", e.errno),
+        }
+    );
+    let (_dir, t) = target(server, PFS_LIKE_USER, IT_PASSWORD);
+    let (r, findings) = scan(&t).await;
+    r.unwrap();
+    let found = located(&findings);
+    let db = normalize(name);
+    for k in &found {
+        assert_ne!(k.0, db.as_str(), "{label}: {name}: {k:?}");
+        assert!(
+            !["mysql", "sys", "information_schema", "performance_schema"].contains(&k.0.as_str()),
+            "{label}: {name}: a system schema sampled: {k:?}"
+        );
+    }
+    if !answered || server.flavor() != Flavor::Mariadb {
+        return;
+    }
+    let Some(log) = env_path("DATABASTION_TEST_MARIADB_AUDIT_LOG", "mariadb-audit") else {
+        return;
+    };
+    let admin_user = server
+        .admin
+        .as_ref()
+        .map(|u| u.user.clone())
+        .unwrap_or_default();
+    let (_d, t) = audit_target(
+        server,
+        &server.url.user,
+        &server.url.password,
+        Some((&log, "server_audit")),
+    );
+    let connector = Arc::new(MysqlConnector::new());
+    let health = connector.check(&t).await;
+    assert!(health.reachable, "{label}: {health:?}");
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(&connector), &t, &state.0);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let read = format!("SELECT SQL_TEXT FROM {name}.events_statements_current LIMIT 1");
+    a.query(Stage::Check, &read).await.unwrap();
+    let reported = |ev: &[MaskedEvent]| {
+        ev.iter().any(|e| {
+            e.principal().account_name() == admin_user
+                && e.always_report()
+                && e.objects().iter().any(|o| {
+                    o.object()
+                        .as_str()
+                        .eq_ignore_ascii_case("events_statements_current")
+                })
+        })
+    };
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(30), reported).await;
+    task.abort();
+    let all: Vec<String> = events.iter().map(describe).collect();
+    eprintln!(
+        "[it] name_case: {label}: `{read}` events ({}): {}",
+        all.len(),
+        all.join(" | ")
+    );
+    assert!(reported(&events), "{label}: {name}: {all:#?}");
 }
 
 /// A user database `name` (spelled like a system schema): a table of fake
@@ -523,8 +643,24 @@ async fn user_database_is_covered(server: Server, admin: Url, name: String) {
         &format!("CREATE USER {u} IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
     )
     .await;
+    // MariaDB accepts `CREATE DATABASE Performance_Schema` but refuses a
+    // table in it (1142, as in the system schema; CI run of PR #308):
+    // measured here, and then the database can hold nothing to sample.
+    let people = format!("CREATE TABLE `{name}`.people (id INT PRIMARY KEY, email VARCHAR(120))");
+    if let Err(e) = a.exec(Stage::Check, &people).await {
+        eprintln!(
+            "[it] name_case: {label}: CREATE TABLE in the user database `{name}` as the \
+             administrator: refused (errno {:?})",
+            e.errno
+        );
+        database_without_tables(server, a, name).await;
+        return;
+    }
+    eprintln!(
+        "[it] name_case: {label}: CREATE TABLE in the user database `{name}` as the \
+         administrator: accepted"
+    );
     for statement in [
-        format!("CREATE TABLE `{name}`.people (id INT PRIMARY KEY, email VARCHAR(120))"),
         format!(
             "INSERT INTO `{name}`.people (id, email) \
              WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
