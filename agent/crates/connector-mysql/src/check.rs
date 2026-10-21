@@ -603,6 +603,12 @@ pub(crate) struct CheckState {
 /// audit-log file sources since the #303 residual follow-up).
 pub(crate) type SharedNameCases = std::sync::Arc<Mutex<HashMap<String, KeptNameCase>>>;
 
+/// How far past the newest server time seen a server start from the audit
+/// log is noted at most (seconds): three times the longest heartbeat
+/// interval (300 s), so that a check still in flight across a restart
+/// stays ordered before it.
+const START_AHEAD_MAX_S: u64 = 900;
+
 /// One target's kept name-case value (ADR-0055 decision 2).
 #[derive(Debug, Clone)]
 pub(crate) struct KeptNameCase {
@@ -676,8 +682,15 @@ impl NameCaseRuns {
         let Some(kept) = map.get_mut(&self.target_id) else {
             return;
         };
-        if let Some(s) = start {
-            kept.note_start(s);
+        // The start noted no later than [`START_AHEAD_MAX_S`] past the
+        // newest server time seen (the kept read): a start record from a
+        // clock ahead (or a forged time) makes later reads look older for
+        // that long at most (`unknown` meanwhile, fail closed; security
+        // review L6), while a check of the previous run still in flight
+        // when the start is read (read within a heartbeat of the kept
+        // one) stays refused. Without a read time, nothing is noted.
+        if let (Some(s), Some(r)) = (start, kept.read_at) {
+            kept.note_start(s.min(r.saturating_add(START_AHEAD_MAX_S)));
         }
         if kept.report == NameCaseReport::unknown() {
             return;
@@ -944,6 +957,12 @@ impl CheckState {
     /// of the previous run never restores its value after a newer read or
     /// a reset. A read whose time is not known is stored as `unknown`
     /// once the order matters (a value or a start is kept already).
+    ///
+    /// A read on a run that started after the kept read is always stored.
+    /// A read refused by that order whose run is not the kept one (a
+    /// server clock stepped back, or a slow check of the previous run)
+    /// turns the kept value into `unknown`, on that run, rather than
+    /// leaving a value of another run in place (security review L5).
     pub(crate) fn set_name_case_read(
         &self,
         target_id: &str,
@@ -956,17 +975,36 @@ impl CheckState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut last_start = None;
-        if let Some(kept) = map.get(target_id) {
+        if let Some(kept) = map.get_mut(target_id) {
             last_start = kept.last_start;
+            let newer_run = run
+                .as_ref()
+                .is_some_and(|new| kept.read_at.is_some_and(|k| new.boot() > k));
             match read_at {
                 Some(r)
-                    if kept.read_at.is_some_and(|k| r < k)
-                        || kept.last_start.is_some_and(|s| r <= s) =>
+                    if !newer_run
+                        && (kept.read_at.is_some_and(|k| r < k)
+                            || kept.last_start.is_some_and(|s| r <= s)) =>
                 {
-                    tracing::debug!(
-                        target_id,
-                        "name case read before the kept one or a server start: not stored"
-                    );
+                    let other_run = match (run.as_ref(), kept.run.as_ref()) {
+                        (Some(new), Some(old)) => !old.same(new),
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    if other_run {
+                        tracing::info!(
+                            target_id,
+                            "name case read on another server run before the kept one (server \
+                             clock stepped back?): unknown until the next check"
+                        );
+                        kept.run = run;
+                        kept.report = NameCaseReport::unknown();
+                    } else {
+                        tracing::debug!(
+                            target_id,
+                            "name case read before the kept one or a server start: not stored"
+                        );
+                    }
                     return;
                 }
                 None if kept.read_at.is_some() || kept.last_start.is_some() => {
@@ -2286,8 +2324,17 @@ mod tests {
                 runs.server_started(Some(s));
             }
             assert_eq!(state.name_case("t"), Some(new.clone()), "{start_first}");
-            // The slow check of the old run lands now.
+            // The slow check of the old run lands now: never its value
+            // (`unknown`, since its run is not the kept one, L5).
             state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r));
+            assert_eq!(
+                state.name_case("t"),
+                Some(NameCaseReport::unknown()),
+                "{start_first}"
+            );
+            // The same read on the kept run is only ignored.
+            state.set_name_case_read("t", Some(run(s)), new.clone(), Some(r1 + 30));
+            state.set_name_case_read("t", Some(run(s)), old.clone(), Some(r1));
             assert_eq!(state.name_case("t"), Some(new.clone()), "{start_first}");
             // A later read of the new run is stored.
             state.set_name_case_read("t", Some(run(s)), old.clone(), Some(r1 + 60));
@@ -2311,6 +2358,58 @@ mod tests {
         // A read whose time is not known, once the order matters.
         state.set_name_case_read("t", None, old, None);
         assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+    }
+
+    /// Security review L5: the server clock steps back across a restart
+    /// with another setting. The new run's read is older than the kept
+    /// one: the old run's value is not kept (`unknown`); a read on a run
+    /// that started after the kept read is stored at once.
+    #[test]
+    fn a_clock_stepped_back_never_keeps_the_previous_run_value() {
+        let run = |boot: u64| {
+            ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], boot).unwrap()
+        };
+        let insensitive = NameCaseReport::uniform(NameCase::Insensitive);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        let state = CheckState::default();
+        state.set_name_case_read("t", Some(run(100)), insensitive.clone(), Some(5_000));
+        // Restarted with the clock an hour back: boot 1 000, read at 1 200.
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(1_200));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // Still behind: the same run's later reads stay ignored (unknown).
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(1_300));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // Once the clock passes the floor, stored.
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(5_100));
+        assert_eq!(state.name_case("t"), Some(sensitive.clone()));
+        // A run that started after the kept read: stored at once.
+        state.set_name_case_read("t", Some(run(6_000)), insensitive.clone(), Some(6_050));
+        assert_eq!(state.name_case("t"), Some(insensitive));
+    }
+
+    /// Security review L6: a start record with a time far ahead of the
+    /// newest server time seen (a clock ahead, a forged record) resets the
+    /// value but is noted at most `START_AHEAD_MAX_S` past that time:
+    /// checks are stored again after it, not only once the clock reaches
+    /// the record's time.
+    #[test]
+    fn a_start_record_ahead_of_the_server_clock_is_clamped() {
+        let run = || ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], 100);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        state.set_name_case_read("t", run(), sensitive.clone(), Some(1_000));
+        runs.server_started(Some(4_000_000_000));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.set_name_case_read("t", run(), sensitive.clone(), Some(1_060));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.set_name_case_read(
+            "t",
+            run(),
+            sensitive.clone(),
+            Some(1_000 + START_AHEAD_MAX_S + 1),
+        );
+        assert_eq!(state.name_case("t"), Some(sensitive));
     }
 
     #[test]

@@ -436,6 +436,7 @@ async fn system_schemas_in_another_case_follow_the_server() {
             "Performance_Schema",
             "PERFORMANCE_SCHEMA",
             "Information_Schema",
+            "INFORMATION_SCHEMA",
         ] {
             let created = a
                 .exec(Stage::Check, &format!("CREATE DATABASE `{name}`"))
@@ -465,10 +466,31 @@ async fn system_schemas_in_another_case_follow_the_server() {
             // Audit. Dropped by the same spelling (a distinct database).
             let user_db = !crate::sql::is_system_schema(name)
                 && !crate::audit::events::is_skipped_system_schema(name);
-            if user_db {
-                user_database_is_covered(&server, &mut a, name).await;
-            }
+            // In a task of its own: whatever its outcome, the database and
+            // the test account are dropped before a failure is raised.
+            let covered = if user_db {
+                Some(
+                    tokio::spawn(user_database_is_covered(
+                        server.clone(),
+                        admin.clone(),
+                        name.to_owned(),
+                    ))
+                    .await,
+                )
+            } else {
+                None
+            };
             exec(&mut a, &format!("DROP DATABASE `{name}`")).await;
+            exec(
+                &mut a,
+                &format!("DROP USER IF EXISTS '{PFS_LIKE_USER}'@'%'"),
+            )
+            .await;
+            match covered {
+                Some(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Some(Err(e)) => panic!("{label}: {name}: {e}"),
+                _ => {}
+            }
             assert!(
                 user_db,
                 "{label}: the server accepts a database `{name}` that the agent treats as a \
@@ -486,8 +508,12 @@ async fn system_schemas_in_another_case_follow_the_server() {
 /// A user database `name` (spelled like a system schema): a table of fake
 /// e-mail addresses sampled by Discovery, a CAS ticket table counted and
 /// never sampled, reported by `check()` when readable, and, on MariaDB
-/// with the `server_audit` log, reads of it reported under its name.
-async fn user_database_is_covered(server: &Server, a: &mut Session, name: &str) {
+/// with the `server_audit` log, reads of it reported under its name. The
+/// caller drops the database and the test account.
+async fn user_database_is_covered(server: Server, admin: Url, name: String) {
+    let (server, name) = (&server, name.as_str());
+    let mut admin_s = admin_session(server, &admin).await;
+    let a = &mut admin_s;
     let label = server.name;
     let [t0, t1] = PFS_LIKE_TICKETS;
     let u = format!("'{PFS_LIKE_USER}'@'%'");
@@ -540,6 +566,10 @@ async fn user_database_is_covered(server: &Server, a: &mut Session, name: &str) 
     assert_eq!(job.cas_guard().registries(), 1, "{label}: {name}");
     for k in &found {
         assert_ne!(k.1, "cas_tickets", "{label}: {name}: {k:?}");
+        assert!(
+            !["mysql", "sys", "information_schema", "performance_schema"].contains(&k.0.as_str()),
+            "{label}: {name}: a system schema sampled: {k:?}"
+        );
     }
     let text = format!("{findings:?}");
     for v in PFS_LIKE_TICKETS {
@@ -553,7 +583,6 @@ async fn user_database_is_covered(server: &Server, a: &mut Session, name: &str) 
         .find(|n| n.code() == NoteCode::PrivilegeTicketCredentialsReadable)
         .map(|n| n.count().unwrap_or(0));
     assert_eq!(readable, Some(1), "{label}: {name}: {:?}", health.notes);
-    exec(a, &format!("DROP USER IF EXISTS {u}")).await;
     // Audit: reads of the user database by the administrator, unquoted
     // and backquoted, reported under its name (server_audit table records
     // and texts).
