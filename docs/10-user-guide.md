@@ -307,6 +307,8 @@ CREATE SERVER AUDIT SPECIFICATION databastion_audit_spec FOR SERVER AUDIT databa
   ADD (FAILED_LOGIN_GROUP),               -- recommended: failed logins
   ADD (SERVER_PRINCIPAL_CHANGE_GROUP),    -- recommended: logins, users, roles and passwords (DCL)
   ADD (DATABASE_PRINCIPAL_CHANGE_GROUP),
+  ADD (SERVER_ROLE_MEMBER_CHANGE_GROUP),  -- recommended: server and database role membership (DCL)
+  ADD (DATABASE_ROLE_MEMBER_CHANGE_GROUP),
   ADD (APPLICATION_ROLE_CHANGE_PASSWORD_GROUP),
   ADD (LOGIN_CHANGE_PASSWORD_GROUP),
   ADD (BACKUP_RESTORE_GROUP)              -- recommended: BACKUP DATABASE (signature.backup_database)
@@ -315,7 +317,7 @@ ALTER SERVER AUDIT databastion_audit WITH (STATE = ON);
 ```
 
 - **Required for Partial**: the audit enabled, with a `FILE` target and **no `WHERE` predicate** (`audit.server_audit_filtered` otherwise); `SCHEMA_OBJECT_ACCESS_GROUP` in an enabled server audit specification, or, per monitored database, an enabled database audit specification with `SCHEMA_OBJECT_ACCESS_GROUP` or `SELECT ON DATABASE::<db> BY public` (`audit.reads_not_logged` with the number of databases otherwise); `AUDIT_CHANGE_GROUP` in an enabled server audit specification (`audit.audit_changes_not_audited` otherwise).
-- **Recommended**: `FAILED_LOGIN_GROUP` (`audit.failed_logins_not_audited` otherwise, not required for Partial), the principal and password change groups (password-bearing DCL, reported by class only) and `BACKUP_RESTORE_GROUP`.
+- **Recommended**: `FAILED_LOGIN_GROUP` (`audit.failed_logins_not_audited` otherwise, not required for Partial), the principal and password change groups (password-bearing DCL, reported by class only), the role-membership change groups (`ALTER SERVER ROLE` / `ALTER ROLE … ADD MEMBER` and `DROP MEMBER`, reported as DCL naming the role) and `BACKUP_RESTORE_GROUP`.
 - **Name**: an audit name with `/` or `\` is refused. The agent builds the file pattern from the catalog (folder, name, GUID), never from `agent.yaml`.
 - **File sizes**: size `MAXSIZE` and `MAX_ROLLOVER_FILES` so that a file outlives a few poll intervals. A file lost to rollover before the agent read it is a gap.
 - **`ON_FAILURE = CONTINUE`**: records lost when the audit cannot write are counted in `sys.dm_server_audit_status`, which the agent's grants do not read, so `check()` reports `privilege.not_evaluated` with the label `on_failure_probe` (shown as `other` by a console that does not list the note-label revision `target_status.note_labels.2026_10_c`). `SHUTDOWN` and `FAIL_OPERATION` lose no record but stop the server or fail statements when the audit cannot write: your choice.

@@ -18,8 +18,13 @@ name: Engine matrix
 #     printed by the main test run), and the fresh-server test
 #     `xe_fresh_server_own_reads_raise_no_event` run first on the new data volume
 #     (DATABASTION_IT_SQLSERVER_FRESH=1: the `sysaudacts` and `sysguidrefs` builds, with the
-#     captured events of their activity, DATABASTION_IT_SQLSERVER_CAPTURE, fake data only). The
-#     fresh-server step never fails the job: it is a measurement on 2019 and 2025.
+#     captured events of their activity, DATABASTION_IT_SQLSERVER_CAPTURE, fake data only:
+#     fresh-capture.txt, the `sysaudacts` build's activity alone in fresh-capture-sysaudacts.txt,
+#     and every statistics build of the agent's login with its activity in
+#     fresh-capture-statistics.txt, the source of the fixtures statistics-<build>.xml). The
+#     fresh-server step never fails the job: it is a measurement on 2019 and 2025. The main run's
+#     `[it] tables:`, `[it] roles:`, `[it] server run:` and `[it] xe predicate change:` lines (the
+#     #293, #281, #303 and #280 follow-ups) are kept in follow-ups.txt.
 #   - MySQL / MariaDB (#256): the digests of the agent's performance_schema poll and stats texts as
 #     each service renders them, in the format of the connector's fixture poll_digests.tsv
 #     (dev/capture-poll-digests.sh, after the tests sent every text).
@@ -372,11 +377,18 @@ jobs:
               grep -oE '(M2 \| |\[it\] m2: ).*' "$RUNNER_TEMP/it.log" >"$d/m2.txt" 2>/dev/null || true
               # ADR-0055 name case facts (catalog_collation_type, ComparisonStyle, case-only duplicates).
               grep -oE '\[it\] name_case: .*' "$RUNNER_TEMP/it.log" >"$d/name_case.txt" 2>/dev/null || true
+              # Phase 9 follow-ups: Discovery's table list under SQL Server Audit (#293), role
+              # membership changes (#281 review L2), the streams' server run (#303).
+              grep -oE '\[it\] (tables|roles|server run|xe predicate change): .*' "$RUNNER_TEMP/it.log" >"$d/follow-ups.txt" 2>/dev/null || true
               grep -oE '(\[it\] xe fresh|panicked at|^test .* (ok|FAILED|ignored)$|test result: ).*' \
                 "$d/fresh.log" >"$d/fresh-summary.txt" 2>/dev/null || true
               echo "M2 drift table: $(grep -c '^M2 | ' "$d/m2.txt" || true) row(s) (m2.txt); fresh-server test: ${FRESH_OUTCOME:-not run}"
               echo '```'
               cat "$d/fresh-summary.txt" 2>/dev/null || true
+              echo '```'
+              echo "phase 9 follow-ups: $(grep -c '' "$d/follow-ups.txt" || true) line(s) (follow-ups.txt)"
+              echo '```'
+              cat "$d/follow-ups.txt" 2>/dev/null || true
               echo '```'
               echo "name case: $(grep -c 'name_case: ' "$d/name_case.txt" || true) line(s) (name_case.txt)"
               echo '```'
