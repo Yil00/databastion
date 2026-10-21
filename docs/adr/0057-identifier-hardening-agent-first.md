@@ -61,7 +61,7 @@ The `Identifier` schema, plus these `not` rules, applied to the name and to each
 2. no run of 9 or more characters made of digits, separators (`.`, `_`, `+`, `-`, spaces, any `\p{Pd}` dash, U+FF0E), that starts and ends with a digit (a phone or card number split across segments: `06.12.34.56.78`, `06_12_34_56_78`);
 3. no IPv4 address as whole segments (`host.10.0.0.1`, `10.0.0.1`), no MAC address in the dashed form (`00-1a-2b-3c-4d-5e`), and no dotted MAC form (`001a.2b3c.4d5e`: three segments of 4 hexadecimal characters, at least one of which holds a digit, so that a dotted name of hexadecimal-looking words such as `face.cafe.beef` is not refused);
 4. no percent-encoded byte (`%` and two hexadecimal digits) and no `%uXXXX` escape;
-5. the agent's gate, stated so that the contract says what a conforming agent sends: no run of more than 6 numeric characters, and no more than 8 numeric characters in the whole name.
+5. the agent's gate, stated so that the contract says what a conforming agent sends: no run of more than 6 numeric characters, and no more than 8 numeric characters in the whole name, a numeric character being any `\p{N}` character. The agent's `is_numeric_like` counts every `\p{N}` character and also the CJK numerals that are letters in Unicode (`零〇一二三四五六七八九`, `壹贰叁肆伍陆柒捌玖`), so the contract rule is looser than the agent on CJK numerals: the safe direction, since a conforming agent's names always pass it.
 
 The LDAP container DN form of `Identifier` gets the same rules on each RDN value.
 
