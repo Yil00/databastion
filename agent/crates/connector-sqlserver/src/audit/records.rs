@@ -792,6 +792,56 @@ pub(crate) mod tests {
         assert!(a.unwrap().credential);
     }
 
+    /// #281 review L2: role-membership changes, as
+    /// `SERVER_ROLE_MEMBER_CHANGE_GROUP` (server roles, class `SG`, no
+    /// database) and `DATABASE_ROLE_MEMBER_CHANGE_GROUP` (database roles,
+    /// class `RL`) record them (`APRL` add member, `DPRL` drop member,
+    /// also from `sp_addrolemember` / `sp_addsrvrolemember`): DCL naming
+    /// the role, never a read of the member.
+    #[test]
+    fn role_membership_changes_are_dcl() {
+        for (action, class, db, role, text) in [
+            (
+                "APRL",
+                "SG",
+                "",
+                "sysadmin",
+                "ALTER SERVER ROLE sysadmin ADD MEMBER jane",
+            ),
+            (
+                "DPRL",
+                "SG",
+                "",
+                "it_srv_role",
+                "ALTER SERVER ROLE it_srv_role DROP MEMBER jane",
+            ),
+            (
+                "APRL",
+                "RL",
+                "retail",
+                "db_owner",
+                "ALTER ROLE db_owner ADD MEMBER jane",
+            ),
+            (
+                "DPRL",
+                "RL",
+                "retail",
+                "it_db_role",
+                "EXEC sp_droprolemember N'it_db_role', N'jane'",
+            ),
+        ] {
+            let mut r = rec(action, class, "", role, text);
+            r.database = db.to_owned();
+            let (ev, a) = one(vec![r]);
+            assert_eq!(ev.action(), EventAction::Dcl, "{action} {class}");
+            assert!(a.is_none(), "the text is not analysed as a read");
+            let want = format!("{}.-.{role}", if db.is_empty() { "*" } else { db });
+            assert_eq!(names(&ev), [want], "{action} {class}");
+        }
+        assert_eq!(map("APRL", "SG"), Mapped::Event(EventAction::Dcl));
+        assert_eq!(map("DPRL", "RL"), Mapped::Event(EventAction::Dcl));
+    }
+
     #[test]
     fn long_statements_are_reassembled_or_cut() {
         let part1 = "x".repeat(4000);

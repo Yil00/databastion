@@ -66,7 +66,6 @@ pub(crate) struct Table {
     pub(crate) stretch: bool,
     pub(crate) memory_optimized: bool,
     pub(crate) estimated_rows: Option<u64>,
-    pub(crate) readable: bool,
 }
 
 /// One column as the catalog describes it.
@@ -133,7 +132,6 @@ fn parse_tables(rows: &[Vec<Value>]) -> Vec<Table> {
                 stretch: int(3) == Some(1),
                 memory_optimized: int(4) == Some(1),
                 estimated_rows: int(5).and_then(|n| u64::try_from(n).ok()),
-                readable: int(6) == Some(1),
             })
         })
         .collect()
@@ -424,9 +422,11 @@ pub(crate) async fn discover(
                 sink.add_coverage(cov(|c| c.row_level_security = 1));
                 continue;
             }
-            // `table.readable` is the table-level `SELECT`; column grants
-            // (SQL Server has column `DENY` and column `GRANT`) are read
-            // per column by `sample_table`.
+            // The table's `SELECT` is read per column by `sample_table`
+            // (SQL Server has column `DENY` and column `GRANT`), one table
+            // per statement: the table list checks no permission, since
+            // SQL Server Audit writes a record on each table a check names
+            // (`sql::TABLES`).
             let mut s = match current.take() {
                 Some(s) if !s.is_poisoned() && !s.is_stale() => s,
                 stale => {
@@ -489,7 +489,9 @@ pub(crate) async fn discover(
             }
             if sample.columns.is_empty() {
                 sink.add_coverage(cov(|c| {
-                    if sample.any_readable || table.readable {
+                    // No column the account can read: not readable (a
+                    // table `SELECT` with every column denied included).
+                    if sample.any_readable {
                         c.unsupported = 1;
                     } else {
                         c.not_readable = 1;
@@ -575,7 +577,7 @@ async fn read_catalog(
         .rows(
             &stmt,
             Stage::Introspection,
-            Shape::rows(7, limit as usize + 1),
+            Shape::rows(6, limit as usize + 1),
         )
         .await?;
     let mut tables = parse_tables(&rows);

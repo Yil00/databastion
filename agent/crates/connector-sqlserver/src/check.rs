@@ -48,6 +48,11 @@ pub(crate) struct CheckState {
     /// Per target: how names compare (ADR-0055), as last read, with its
     /// server run and `AUTO_CLOSE` memory.
     name_cases: Mutex<HashMap<String, crate::name_case::Memory>>,
+    /// Per target: the server run an Audit stream's session saw last, and
+    /// when (security review L5 of the #303 follow-up: a check that read on
+    /// an earlier run and ends after it does not reinstall that run's
+    /// value).
+    stream_runs: Mutex<HashMap<String, (crate::name_case::ServerRun, std::time::Instant)>>,
 }
 
 impl CheckState {
@@ -72,19 +77,73 @@ impl CheckState {
             .map(|m| m.report.clone())
     }
 
-    /// Evaluates a read against the target's memory and keeps the result.
+    /// Evaluates a read, started at `read_at`, against the target's memory
+    /// and keeps the result. When an Audit stream saw another server run
+    /// since `read_at`, the read is of an earlier run: `unknown` until the
+    /// next check (security review L5 of the #303 follow-up).
     fn observe_name_case(
         &self,
         target_id: &str,
         read: Option<&crate::name_case::Read>,
+        read_at: std::time::Instant,
     ) -> crate::name_case::Memory {
+        let seen = self
+            .stream_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .filter(|(_, at)| *at >= read_at)
+            .map(|(run, _)| run.clone());
         let mut map = self
             .name_cases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let m = crate::name_case::evaluate(read, map.get(target_id));
+        let mut m = crate::name_case::evaluate(read, map.get(target_id));
+        if let Some(run) = seen
+            && m.observe_run(&run)
+        {
+            tracing::info!(
+                target_id,
+                "SQL Server restarted during the check: name case unknown until the next one"
+            );
+        }
         map.insert(target_id.to_owned(), m.clone());
         m
+    }
+
+    /// The server run the kept name case was read on (tests only).
+    #[cfg(test)]
+    pub(crate) fn name_case_run(&self, target_id: &str) -> Option<crate::name_case::ServerRun> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .and_then(|m| m.run().cloned())
+    }
+
+    /// An Audit stream's session is on `run`: a name case kept from
+    /// another run of the server is reset to `unknown` (the #303
+    /// residual; [`crate::name_case::Memory::observe_run`]).
+    pub(crate) fn observe_server_run(&self, target_id: &str, run: &crate::name_case::ServerRun) {
+        self.stream_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                target_id.to_owned(),
+                (run.clone(), std::time::Instant::now()),
+            );
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = map.get_mut(target_id)
+            && m.observe_run(run)
+        {
+            tracing::info!(
+                target_id,
+                "SQL Server restarted since the last check: name case unknown until the next one"
+            );
+        }
     }
 
     fn set_version(&self, target_id: &str, version: Option<String>) {
@@ -1008,8 +1067,9 @@ async fn checked(
     )];
     // ADR-0055 decision 4: read first, so that a later stage failing keeps
     // this run's value (decision 2).
+    let read_at = std::time::Instant::now();
     let read = crate::name_case::read(s).await?;
-    let names = state.observe_name_case(&target.id, read.as_ref());
+    let names = state.observe_name_case(&target.id, read.as_ref(), read_at);
     detail.push(crate::name_case::summary(&names));
     let mut ev = evaluate(s, target).await?;
     // The Audit source (decision 6, option (a')): its two grants are
@@ -1213,6 +1273,53 @@ async fn checked(
 
 #[cfg(test)]
 mod tests {
+
+    /// Security review L5 of the #303 follow-up: a check that read on an
+    /// earlier server run and ends after a stream saw a later one does not
+    /// reinstall the earlier run's value; a stream run seen before the
+    /// check read does not change it.
+    #[test]
+    fn a_check_does_not_reinstall_an_earlier_run() {
+        use crate::name_case::{DbRow, Read, evaluate};
+        use databastion_core::name_case::NameCaseReport;
+        use std::time::Instant;
+        let row = |id: i64, name: &str, created: i64| DbRow {
+            id,
+            name: name.to_owned(),
+            created,
+            style: Some(196_609),
+            contained: false,
+            auto_close: false,
+            state: Some(0),
+            catalog: Some(0),
+        };
+        let on = |tempdb: i64| Read {
+            rows: vec![row(1, "master", 1), row(2, "tempdb", tempdb)],
+            server_style: Some(196_609),
+            view_any_database: true,
+            server: Some("mssql1".to_owned()),
+            catalog_column: true,
+        };
+        let run2 = evaluate(Some(&on(11)), None).run().cloned().unwrap();
+        let state = CheckState::default();
+        state.observe_name_case("t", Some(&on(10)), Instant::now());
+        let known = state.name_case("t").unwrap();
+        assert_ne!(known, NameCaseReport::unknown());
+        // A check reads on run 1, a stream then sees run 2, the check ends.
+        let read_at = Instant::now();
+        state.observe_server_run("t", &run2);
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.observe_name_case("t", Some(&on(10)), read_at);
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // The next check reads on run 2.
+        state.observe_name_case("t", Some(&on(11)), Instant::now());
+        assert_eq!(state.name_case("t").as_ref(), Some(&known));
+        // A stream run seen before the check read (a stream since stopped):
+        // the check's own run stands.
+        state.observe_name_case("t", Some(&on(12)), Instant::now());
+        assert_eq!(state.name_case("t").as_ref(), Some(&known));
+    }
+
     use super::*;
 
     fn cas_row(id: i64, table: &str, col: &str) -> Vec<Value> {
