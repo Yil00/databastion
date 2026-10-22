@@ -508,4 +508,66 @@ mod tests {
         assert!(judge(sock, parent, &[], redis).is_err());
         assert!(judge(None, parent, &[], agent).is_err());
     }
+
+    /// Security review M1: a peer whose uid is not the declared server's
+    /// never gets a byte, the password least of all. The listener runs in
+    /// a separate process (agent code never binds a socket, I1) as the
+    /// test's own user, so its uid is the agent's: declaring another uid
+    /// must refuse with `authentication_failed`, and the accepted
+    /// connection must read end of file at once (0 bytes), through the
+    /// whole `Session::open` path that would send `AUTH`.
+    #[test]
+    fn a_peer_with_another_uid_never_gets_the_password() {
+        use std::io::{BufRead, BufReader};
+        let dir = tmp();
+        let sock = dir.join("redis.sock");
+        // Binds, says `ready`, accepts one connection (10 s at most),
+        // reads it to end of file and prints the byte count.
+        let mut listener = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket, sys\n\
+                 s = socket.create_server(sys.argv[1], family=socket.AF_UNIX)\n\
+                 s.settimeout(10)\n\
+                 print('ready', flush=True)\n\
+                 c, _ = s.accept(); c.settimeout(10); n = 0\n\
+                 while True:\n    b = c.recv(4096)\n    if not b: break\n    n += len(b)\n\
+                 print(n, flush=True)\n",
+            ])
+            .arg(&sock)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is needed to make a test socket");
+        let mut out = BufReader::new(listener.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+
+        let own = rustix::process::geteuid().as_raw();
+        let endpoint = Endpoint::Unix {
+            path: sock.clone(),
+            server_uid: Some(own.wrapping_add(1)),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(crate::conn::Session::open(
+                &endpoint,
+                None,
+                "databastion",
+                "never-sent-password",
+                Duration::from_secs(5),
+            ))
+            .unwrap_err();
+        assert_eq!(err.code, FailureCode::AuthenticationFailed);
+        assert_eq!(err.stage, Stage::Connect);
+
+        line.clear();
+        out.read_line(&mut line).unwrap();
+        assert!(listener.wait().unwrap().success());
+        assert_eq!(line.trim(), "0", "bytes the peer received");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

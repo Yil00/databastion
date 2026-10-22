@@ -143,6 +143,18 @@ it_redis() {
   export DATABASTION_IT_REDIS_CA="$ROOT/dev/.state/tls/redis-ca.pem"
   # Clients on the Valkey server's Unix socket (inside the container): the socket attribution test.
   export DATABASTION_IT_REDIS_EXEC_VALKEY="timeout 120 docker compose -f $COMPOSE_FILE exec -T valkey"
+  # Unix-socket targets (#239 re-review N1): the sockets published to the host by the opt-in
+  # override redis/compose.socket.yml, when the services run with it; the socket target test is
+  # skipped otherwise (required in CI: DATABASTION_IT_REDIS_REQUIRE_SOCKET=1). The dev servers run
+  # as uid 999 (docker-compose.yml), the uid the agent checks on the socket.
+  local s dir
+  for s in valkey redis; do
+    dir="$(compose exec -T "$s" printenv DATABASTION_DEV_REDIS_SOCKET_DIR 2>/dev/null || true)"
+    if [ -n "$dir" ]; then
+      export "DATABASTION_IT_REDIS_SOCKET_${s^^}=$ROOT/dev/.state/redis-socket/$s/redis.sock"
+    fi
+  done
+  export DATABASTION_IT_REDIS_SERVER_UID=999
   cargo_it databastion-connector-redis --test-threads 1 "$@"
 }
 

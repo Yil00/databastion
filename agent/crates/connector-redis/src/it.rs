@@ -15,7 +15,12 @@
 //! - `DATABASTION_IT_REDIS_EXEC_VALKEY` (optional): a command prefix that
 //!   runs a command in the Valkey container (e.g. `docker compose -f
 //!   dev/docker-compose.yml exec -T valkey`), for the test with clients on
-//!   the server's Unix socket; skipped without it.
+//!   the server's Unix socket; skipped without it;
+//! - `DATABASTION_IT_REDIS_SOCKET_VALKEY` / `DATABASTION_IT_REDIS_SOCKET_REDIS`
+//!   (optional): the servers' Unix sockets published to the host
+//!   (`dev/redis/compose.socket.yml`), for the socket target test, with
+//!   `DATABASTION_IT_REDIS_SERVER_UID` (default 999); skipped without them
+//!   unless `DATABASTION_IT_REDIS_REQUIRE_SOCKET=1`.
 //!
 //! The tests read the server's `ACL LOG` through a test-only raw client
 //! with the agent's own user (`+acl|log` is part of the dev ACL); the
@@ -123,15 +128,18 @@ async fn raw(t: &TargetConfig, args: &[&[u8]]) -> Value {
     out.pop().unwrap()
 }
 
+/// A test-only raw connection to the target's node: TCP and TLS, or its
+/// Unix socket (peer credentials checked as the connector does).
+async fn open(t: &TargetConfig) -> crate::net::Transport {
+    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
+    let ep = crate::node::endpoint(t, crate::node::Which::Target).unwrap();
+    ep.open(tls).await.unwrap()
+}
+
 /// Test-only raw commands as `user`, on one connection; their replies.
 async fn raw_as(t: &TargetConfig, user: &str, password: &str, cmds: &[Vec<&[u8]>]) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
-    let ep = Endpoint::Tcp {
-        host: "127.0.0.1".to_owned(),
-        port: t.port.unwrap(),
-    };
-    let mut io = ep.open(tls).await.unwrap();
+    let mut io = open(t).await;
     let mut req = Vec::new();
     crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
     crate::resp::encode(&[b"HELLO", b"3"], &mut req);
@@ -758,12 +766,7 @@ async fn raw_held(
     after: std::time::Duration,
 ) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
-    let ep = Endpoint::Tcp {
-        host: "127.0.0.1".to_owned(),
-        port: t.port.unwrap(),
-    };
-    let mut io = ep.open(tls).await.unwrap();
+    let mut io = open(t).await;
     let mut req = Vec::new();
     crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
     crate::resp::encode(&[b"HELLO", b"3"], &mut req);
@@ -1514,13 +1517,30 @@ async fn socket_clients_are_never_attributed() {
     let socket_client = |user: &str, password: String, commands: &str| {
         let script = format!(
             "C=$(command -v valkey-cli || command -v redis-cli); \
-             (printf 'AUTH {user} {password}\\n'; sleep 3; printf '{commands}') \
-             | $C -s /tmp/databastion-dev.sock >/dev/null 2>&1"
+             S=/tmp/databastion-dev.sock; \
+             [ -z \"${{DATABASTION_DEV_REDIS_SOCKET_DIR:-}}\" ] || \
+             S=\"$DATABASTION_DEV_REDIS_SOCKET_DIR/redis.sock\"; \
+             read -r P; \
+             (printf 'AUTH %s %s\\n' {user} \"$P\"; sleep 3; printf '{commands}') \
+             | $C -s \"$S\" >/dev/null 2>&1"
         );
         let mut parts = exec.split_whitespace();
         let mut cmd = std::process::Command::new(parts.next().unwrap());
-        cmd.args(parts).args(["bash", "-c", &script]);
-        tokio::task::spawn_blocking(move || cmd.status().map(|s| s.success()))
+        cmd.args(parts)
+            .args(["bash", "-c", &script])
+            .stdin(std::process::Stdio::piped());
+        // The password goes through the CLI's standard input only (read
+        // by the shell's `read`, sent by its `printf` builtin), never on a
+        // command line of the host or the container (security review L4).
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = cmd.spawn()?;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin.write_all(password.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            drop(stdin);
+            child.wait().map(|s| s.success())
+        })
     };
     let a = socket_client(
         "admin",
@@ -1554,6 +1574,339 @@ async fn socket_clients_are_never_attributed() {
         assert_eq!(e["principal"]["account_not_recorded"], true, "{e}");
         assert!(e["principal"].get("db_user").is_none(), "{e}");
         assert_eq!(e["source"], "redis_slowlog", "{e}");
+    }
+}
+
+/// A Unix-socket target of the dev server (`dev/redis/compose.socket.yml`,
+/// published to the host): `tls: disable` and the declared server uid
+/// (ADR-0052 decision 3).
+fn socket_target(engine: &str, path: &str, server_uid: u32, extra: &str) -> TargetConfig {
+    let yaml = format!(
+        "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: it-socket, \
+         engine: {engine}, socket: \"{path}\", account: databastion, \
+         secret: {{env: DATABASTION_DB_PASSWORD}}, \
+         redis: {{tls: disable, server_uid: {server_uid}{extra}}}}}]}}",
+    );
+    databastion_core::AgentConfig::parse(&yaml).unwrap().targets[0].clone()
+}
+
+/// The newest slow-log id (as `admin`, over TCP: its own entries are never
+/// socket entries).
+async fn newest_slowlog_id(tcp: &TargetConfig) -> i64 {
+    let r = admin(tcp, &[vec![b"SLOWLOG", b"GET", b"1"]]).await;
+    let Value::Array(items) = &r[0] else {
+        panic!("SLOWLOG GET reply")
+    };
+    items
+        .first()
+        .and_then(|e| match e {
+            Value::Array(f) => match f.first() {
+                Some(Value::Int(id)) => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(-1)
+}
+
+/// #239 re-review N1 (ADR-0052 decision 8): on a Unix-socket target the
+/// agent's own entries cannot be told apart from other local clients',
+/// since every socket peer has the same address. The documented residual,
+/// and the fail-closed side of it, against the dev servers' published
+/// sockets with the Audit stream on the socket:
+/// - the agent's own Discovery reads over the socket, another local client
+///   (`admin`, connected well before its commands) and a client with the
+///   agent's own user from another socket connection all give events with
+///   `account_not_recorded` and client `local`, never an account;
+/// - nothing is hidden: every socket slow-log entry that gives an event
+///   (an independent read of the slow log, as `admin` over TCP) is
+///   reported, no own-read budget is charged (no entry was taken for the
+///   agent's), and no record is dropped;
+/// - I2: no ground-truth value nor raw key name in the events;
+/// - decision 3: with a server uid that is not the peer's, the password is
+///   never sent (`authentication_failed`, no `ACL LOG` entry).
+///
+/// Needs the sockets on the host (`DATABASTION_IT_REDIS_SOCKET_VALKEY` /
+/// `_REDIS`, set by `dev/agent-it.sh redis` when the override is up);
+/// skipped without them unless `DATABASTION_IT_REDIS_REQUIRE_SOCKET=1` (CI).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_target_reports_the_agents_own_reads_unattributed() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    let required = std::env::var("DATABASTION_IT_REDIS_REQUIRE_SOCKET").as_deref() == Ok("1");
+    let server_uid: u32 = std::env::var("DATABASTION_IT_REDIS_SERVER_UID")
+        .ok()
+        .and_then(|u| u.parse().ok())
+        .unwrap_or(999);
+    for (name, engine, var) in [
+        (
+            "valkey",
+            TargetEngine::Valkey,
+            "DATABASTION_IT_REDIS_SOCKET_VALKEY",
+        ),
+        (
+            "redis",
+            TargetEngine::Redis,
+            "DATABASTION_IT_REDIS_SOCKET_REDIS",
+        ),
+    ] {
+        let Ok(path) = std::env::var(var) else {
+            assert!(!required, "{var} unset: the socket target is not tested");
+            tracing::warn!("{var} unset: the socket target is not tested");
+            continue;
+        };
+        let tcp = tgt(name, engine, "databastion", "").await;
+        let extra = if legacy(engine).await {
+            ", unevaluated_acl: accept"
+        } else {
+            ""
+        };
+        let t = socket_target(name, &path, server_uid, extra);
+        let connector = Arc::new(RedisConnector::new());
+
+        // Decision 3: a peer that is not the declared server user never
+        // gets the password. A failed `AUTH` would leave an `ACL LOG`
+        // entry, but a regression that authenticated before comparing the
+        // peer's uid would succeed and leave none (security review M1): the
+        // server's `AUTH` and `HELLO` call counts must not move either.
+        // Each count is read on a new `admin` connection over TCP, which
+        // runs its own handshake: that cost is measured first (two reads in
+        // a row) and is the only change allowed across the check.
+        let failures = acl_log_count(&tcp, "databastion").await;
+        let calls0 = handshake_calls(&tcp).await;
+        let calls1 = handshake_calls(&tcp).await;
+        let wrong = socket_target(name, &path, server_uid + 1, extra);
+        let h = connector.check(&wrong).await;
+        let calls2 = handshake_calls(&tcp).await;
+        assert!(!h.reachable, "{name}: {h:?}");
+        assert_eq!(
+            h.failure,
+            Some(FailureCode::AuthenticationFailed),
+            "{name}: {h:?}"
+        );
+        let own = (calls1.0 - calls0.0, calls1.1 - calls0.1);
+        assert_eq!(
+            (calls2.0 - calls1.0 - own.0, calls2.1 - calls1.1 - own.1),
+            (0, 0),
+            "{name}: AUTH / HELLO calls during the wrong-uid check \
+             ({calls0:?}, {calls1:?}, {calls2:?})"
+        );
+        assert_eq!(acl_log_count(&tcp, "databastion").await, failures, "{name}");
+        let h = connector.check(&t).await;
+        assert!(h.reachable, "{name}: {h:?}");
+        assert_eq!(h.failure, None, "{name}: {:?}", codes(&h));
+
+        // A slow log that holds the whole run, for the independent count
+        // below (restored at the end).
+        let old_len = match &admin(&tcp, &[vec![b"CONFIG", b"GET", b"slowlog-max-len"]]).await[0] {
+            Value::Map(m) => m[0].1.as_bytes().unwrap().to_vec(),
+            Value::Array(a) => a[1].as_bytes().unwrap().to_vec(),
+            v => panic!("CONFIG GET reply: {v:?}"),
+        };
+        // Restored on a panic too (the guard's drop), not only at the end.
+        let restore = RestoreSlowlogLen {
+            tcp: tcp.clone(),
+            len: old_len,
+        };
+        admin(
+            &tcp,
+            &[vec![b"CONFIG", b"SET", b"slowlog-max-len", b"16384"]],
+        )
+        .await;
+
+        // The patterns the stream maps keys to, learned over the socket.
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-socket-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, mut rx) = databastion_core::EventSink::channel(65536);
+        let c2 = Arc::clone(&connector);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        let _abort = AbortOnDrop(stream.abort_handle());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+        // Past the stream's first poll (its start position).
+        let start = newest_slowlog_id(&tcp).await;
+
+        // Another local client, connected well before its reads, and a
+        // client with the agent's own user from another socket connection.
+        let (ta, pw) = (t.clone(), admin_password());
+        let other = tokio::spawn(async move {
+            raw_held(
+                &ta,
+                "admin",
+                &pw,
+                std::time::Duration::from_secs(3),
+                &[
+                    vec![b"HGETALL", b"session:jdupont"],
+                    vec![b"GET", b"customer:1000:email"],
+                    vec![b"GETRANGE", b"customer:1000:email", b"0", b"4095"],
+                ],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        let (tb, pw) = (t.clone(), t.secret.read().unwrap().to_string());
+        let own_user = tokio::spawn(async move {
+            raw_held(
+                &tb,
+                "databastion",
+                &pw,
+                std::time::Duration::from_secs(2),
+                &[vec![b"GETRANGE", b"customer:1000:email", b"0", b"4095"]],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        // The agent's own Discovery over the socket while the stream polls
+        // (paced, so it lasts several polls and no poll finds more new
+        // entries than one log read returns: a ring read past is counted in
+        // `audit.records_dropped`, asserted absent below).
+        let paced = Limits {
+            discovery_duty_cycle_percent: 5,
+            ..Limits::default()
+        };
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+        assert_eq!(other.await.unwrap().len(), 3, "{name}");
+        assert_eq!(own_user.await.unwrap().len(), 1, "{name}");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let end = newest_slowlog_id(&tcp).await;
+        // Polls past `end`.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let h = connector.check(&t).await;
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        // The independent count: socket entries in (start, end] that give
+        // an event, from the slow log as the server holds it.
+        let log = admin(&tcp, &[vec![b"SLOWLOG", b"GET", b"16384"]]).await;
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Value::Array(entries) = &log[0] else {
+            panic!("SLOWLOG GET reply")
+        };
+        let learned = databastion_classifiers::keys::LearnedPatterns::default();
+        let ctx = crate::audit::entries::Context {
+            learned: &learned,
+            stores: None,
+            dbs: &[],
+        };
+        let parsed: Vec<_> = entries
+            .iter()
+            .map(|v| crate::audit::entries::parse_log_entry(v, &ctx).unwrap())
+            .filter(|e| e.id > start && e.id <= end)
+            .collect();
+        // The ring held the whole window (not vacuous).
+        assert!(
+            parsed.iter().any(|e| e.id == start + 1),
+            "{name}: the slow log lost the window's first entries"
+        );
+        let socket_entries = parsed
+            .iter()
+            .filter(|e| {
+                e.peer.is_some_and(|p| p.socket().is_none()) && e.action.event_action().is_some()
+            })
+            .count();
+
+        let json = events_json(&events);
+        let text = serde_json::to_string(&json).unwrap();
+        // I2: no ground-truth value, no raw key name.
+        for v in ground_truth_values(name) {
+            assert!(
+                !text.contains(&v),
+                "{name}: a ground-truth value in an event"
+            );
+        }
+        for raw in ["jdupont", "customer:1000"] {
+            assert!(!text.contains(raw), "{name}: {raw} in an event");
+        }
+        // Every socket entry: no recorded account, client `local`.
+        let local: Vec<&serde_json::Value> = json
+            .iter()
+            .filter(|e| e["principal"]["client_addr"] == "local")
+            .collect();
+        for e in &local {
+            assert_eq!(e["principal"]["account_not_recorded"], true, "{name}: {e}");
+            assert!(e["principal"].get("db_user").is_none(), "{name}: {e}");
+            assert!(
+                e["principal"].get("db_user_fingerprint").is_none(),
+                "{name}: {e}"
+            );
+        }
+        // Nothing hidden: at least every socket entry of the window (the
+        // stream also reports the entries just outside it).
+        let local_slow = local
+            .iter()
+            .filter(|e| e["source"] == "redis_slowlog")
+            .count();
+        assert!(
+            local_slow >= socket_entries,
+            "{name}: {local_slow} socket events for {socket_entries} socket entries in \
+             ({start}, {end}]"
+        );
+        // The agent's own reads (its client name) are among them: the
+        // documented residual (N1), not left out.
+        let own = local
+            .iter()
+            .filter(|e| e["principal"]["application"] == crate::cmd::CLIENT_NAME)
+            .count();
+        assert!(own >= 20, "{name}: {own} own socket reads reported");
+        // The other socket clients (no client name): `admin`'s 3 reads and
+        // the agent's user from another connection.
+        let unnamed = local
+            .iter()
+            .filter(|e| {
+                e["principal"].get("application").is_none()
+                    && e["action"] == "read"
+                    && e["source"] == "redis_slowlog"
+            })
+            .count();
+        assert!(unnamed >= 4, "{name}: {json:#?}");
+        // No entry was taken for the agent's: no own-read budget charged.
+        let budgets = connector
+            .state
+            .audit
+            .own_usage(&t.id)
+            .lock()
+            .unwrap()
+            .budgeted_objects();
+        assert!(budgets.is_empty(), "{name}: {budgets:?}");
+        // Nothing dropped, and Limited (every socket entry is another
+        // client's to the stream).
+        assert!(
+            !codes(&h).contains(&NoteCode::AuditRecordsDropped),
+            "{name}: {:?}",
+            codes(&h)
+        );
+        assert_eq!(
+            h.audit_level,
+            databastion_core::AuditLevel::Limited,
+            "{name}: {:?}",
+            codes(&h)
+        );
     }
 }
 
@@ -1799,6 +2152,55 @@ async fn own_reads_of_merged_families_are_not_reported() {
             budgets.iter().any(|k| k == "db7\u{0}\u{0}*:*"),
             "{name}: {budgets:?}"
         );
+    }
+}
+
+/// The server's `AUTH` and `HELLO` call counts (`INFO commandstats`, as
+/// `admin` over TCP; 0 for a command never called), read on a connection
+/// of their own, whose handshake they include.
+async fn handshake_calls(tcp: &TargetConfig) -> (i64, i64) {
+    let r = admin(tcp, &[vec![b"INFO", b"commandstats"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .expect("INFO commandstats reply");
+    let calls = |cmd: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("cmdstat_{cmd}:calls=")))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |n| n.trim().parse().expect("cmdstat calls"))
+    };
+    (calls("auth"), calls("hello"))
+}
+
+/// Restores the server's `slowlog-max-len` when dropped, a panic included
+/// (security review, informational): a test that fails leaves the dev
+/// server's slow log as it found it. Drop cannot await, so the restore
+/// runs on a runtime of its own in another thread.
+struct RestoreSlowlogLen {
+    tcp: TargetConfig,
+    len: Vec<u8>,
+}
+
+impl Drop for RestoreSlowlogLen {
+    fn drop(&mut self) {
+        let (tcp, len) = (self.tcp.clone(), std::mem::take(&mut self.len));
+        let restored = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| {
+                    rt.block_on(admin(
+                        &tcp,
+                        &[vec![b"CONFIG", b"SET", b"slowlog-max-len", &len]],
+                    ))
+                })
+                .is_ok()
+        })
+        .join();
+        if !matches!(restored, Ok(true)) && !std::thread::panicking() {
+            panic!("slowlog-max-len not restored");
+        }
     }
 }
 
