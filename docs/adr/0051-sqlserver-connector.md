@@ -887,3 +887,7 @@ The maintainer accepted **option (b)** on 2026-10-22, with the proposed answer t
 7. Cancels and timeouts are a log line and the load harness's counters; a heartbeat metric only if the census needs it, as a compatible protocol change with its own review.
 
 Implementation (`agent-engineer`, with a `security-reviewer` review) follows the implementation obligations and the measurement and test plan above, step 1 first. Until it is merged, Extended Events reads stay at 500 events, as docs/08 states.
+
+## Implementation note (2026-10-22): the drain figures of plan item 4 are checks
+
+With PR #314 (ROADMAP item "#311 review R2"), the `load-sqlserver` harness checks the catch-up figures that item 4 of the [measurement and test plan](#measurement-and-test-plan) of the refinement above records for information: `db_cores_drain` at most 0.5 × the server's CPUs and at most the database cores with Audit on plus 0.25, and the drain latency probe p95 at most max(2 × the p95 before Audit, the p95 before Audit + 1 ms). The refinement's text, its decision and its gating (the 50 `SELECT`s/s run and the large-event run) are unchanged; the checks run in `load-sqlserver` itself. User-facing text: [docs/08](../08-engine-capabilities.md#load-and-database-impact-measured).
