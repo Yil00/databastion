@@ -1520,13 +1520,27 @@ async fn socket_clients_are_never_attributed() {
              S=/tmp/databastion-dev.sock; \
              [ -z \"${{DATABASTION_DEV_REDIS_SOCKET_DIR:-}}\" ] || \
              S=\"$DATABASTION_DEV_REDIS_SOCKET_DIR/redis.sock\"; \
-             (printf 'AUTH {user} {password}\\n'; sleep 3; printf '{commands}') \
+             read -r P; \
+             (printf 'AUTH %s %s\\n' {user} \"$P\"; sleep 3; printf '{commands}') \
              | $C -s \"$S\" >/dev/null 2>&1"
         );
         let mut parts = exec.split_whitespace();
         let mut cmd = std::process::Command::new(parts.next().unwrap());
-        cmd.args(parts).args(["bash", "-c", &script]);
-        tokio::task::spawn_blocking(move || cmd.status().map(|s| s.success()))
+        cmd.args(parts)
+            .args(["bash", "-c", &script])
+            .stdin(std::process::Stdio::piped());
+        // The password goes through the CLI's standard input only (read
+        // by the shell's `read`, sent by its `printf` builtin), never on a
+        // command line of the host or the container (security review L4).
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = cmd.spawn()?;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin.write_all(password.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            drop(stdin);
+            child.wait().map(|s| s.success())
+        })
     };
     let a = socket_client(
         "admin",
@@ -1653,15 +1667,31 @@ async fn a_socket_target_reports_the_agents_own_reads_unattributed() {
         let connector = Arc::new(RedisConnector::new());
 
         // Decision 3: a peer that is not the declared server user never
-        // gets the password.
+        // gets the password. A failed `AUTH` would leave an `ACL LOG`
+        // entry, but a regression that authenticated before comparing the
+        // peer's uid would succeed and leave none (security review M1): the
+        // server's `AUTH` and `HELLO` call counts must not move either.
+        // Each count is read on a new `admin` connection over TCP, which
+        // runs its own handshake: that cost is measured first (two reads in
+        // a row) and is the only change allowed across the check.
         let failures = acl_log_count(&tcp, "databastion").await;
+        let calls0 = handshake_calls(&tcp).await;
+        let calls1 = handshake_calls(&tcp).await;
         let wrong = socket_target(name, &path, server_uid + 1, extra);
         let h = connector.check(&wrong).await;
+        let calls2 = handshake_calls(&tcp).await;
         assert!(!h.reachable, "{name}: {h:?}");
         assert_eq!(
             h.failure,
             Some(FailureCode::AuthenticationFailed),
             "{name}: {h:?}"
+        );
+        let own = (calls1.0 - calls0.0, calls1.1 - calls0.1);
+        assert_eq!(
+            (calls2.0 - calls1.0 - own.0, calls2.1 - calls1.1 - own.1),
+            (0, 0),
+            "{name}: AUTH / HELLO calls during the wrong-uid check \
+             ({calls0:?}, {calls1:?}, {calls2:?})"
         );
         assert_eq!(acl_log_count(&tcp, "databastion").await, failures, "{name}");
         let h = connector.check(&t).await;
@@ -1674,6 +1704,11 @@ async fn a_socket_target_reports_the_agents_own_reads_unattributed() {
             Value::Map(m) => m[0].1.as_bytes().unwrap().to_vec(),
             Value::Array(a) => a[1].as_bytes().unwrap().to_vec(),
             v => panic!("CONFIG GET reply: {v:?}"),
+        };
+        // Restored on a panic too (the guard's drop), not only at the end.
+        let restore = RestoreSlowlogLen {
+            tcp: tcp.clone(),
+            len: old_len,
         };
         admin(
             &tcp,
@@ -1768,11 +1803,7 @@ async fn a_socket_target_reports_the_agents_own_reads_unattributed() {
         // The independent count: socket entries in (start, end] that give
         // an event, from the slow log as the server holds it.
         let log = admin(&tcp, &[vec![b"SLOWLOG", b"GET", b"16384"]]).await;
-        admin(
-            &tcp,
-            &[vec![b"CONFIG", b"SET", b"slowlog-max-len", &old_len]],
-        )
-        .await;
+        drop(restore);
         let _ = std::fs::remove_dir_all(&dir);
         let Value::Array(entries) = &log[0] else {
             panic!("SLOWLOG GET reply")
@@ -2121,6 +2152,55 @@ async fn own_reads_of_merged_families_are_not_reported() {
             budgets.iter().any(|k| k == "db7\u{0}\u{0}*:*"),
             "{name}: {budgets:?}"
         );
+    }
+}
+
+/// The server's `AUTH` and `HELLO` call counts (`INFO commandstats`, as
+/// `admin` over TCP; 0 for a command never called), read on a connection
+/// of their own, whose handshake they include.
+async fn handshake_calls(tcp: &TargetConfig) -> (i64, i64) {
+    let r = admin(tcp, &[vec![b"INFO", b"commandstats"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .expect("INFO commandstats reply");
+    let calls = |cmd: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("cmdstat_{cmd}:calls=")))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |n| n.trim().parse().expect("cmdstat calls"))
+    };
+    (calls("auth"), calls("hello"))
+}
+
+/// Restores the server's `slowlog-max-len` when dropped, a panic included
+/// (security review, informational): a test that fails leaves the dev
+/// server's slow log as it found it. Drop cannot await, so the restore
+/// runs on a runtime of its own in another thread.
+struct RestoreSlowlogLen {
+    tcp: TargetConfig,
+    len: Vec<u8>,
+}
+
+impl Drop for RestoreSlowlogLen {
+    fn drop(&mut self) {
+        let (tcp, len) = (self.tcp.clone(), std::mem::take(&mut self.len));
+        let restored = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| {
+                    rt.block_on(admin(
+                        &tcp,
+                        &[vec![b"CONFIG", b"SET", b"slowlog-max-len", &len]],
+                    ))
+                })
+                .is_ok()
+        })
+        .join();
+        if !matches!(restored, Ok(true)) && !std::thread::panicking() {
+            panic!("slowlog-max-len not restored");
+        }
     }
 }
 

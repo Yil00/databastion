@@ -2,12 +2,14 @@
 # publishes each dev Valkey / Redis server's Unix socket to the host, so the connector integration
 # tests can declare a `socket:` target (`tls: disable`, `redis.server_uid: 999`) and run the Audit
 # stream over it. Opt-in, not part of `make dev-redis`; the TLS port is unchanged. The server (uid
-# 999) gets the host user's group (DATABASTION_DEV_REDIS_SOCKET_GID, `id -g`) as a supplementary
-# group; the directories are the host user's, setgid and `2770`, so the socket (`770`) inherits that
-# group: only the host user (and root) can connect, no world-writable directory or socket.
+# 999) gets the group DATABASTION_DEV_REDIS_SOCKET_GID as a supplementary group; the directories
+# are the host user's, in that group, setgid and `2770`, so the socket (`770`) inherits it: whoever
+# is in that group can connect. The gid must come from redis/socket-group.sh, which accepts only a
+# group with the host user as its single user (a private primary group, or a dedicated group;
+# #317 review L2), never a shared one such as `users` or `docker`. Recipes: dev/README.md.
 #
+#   export DATABASTION_DEV_REDIS_SOCKET_GID="$(dev/redis/socket-group.sh)"   # or: ... <group>
 #   install -d -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
-#   export DATABASTION_DEV_REDIS_SOCKET_GID="$(id -g)"
 #   docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml --profile redis \
 #     up -d --wait valkey redis
 #
@@ -16,13 +18,13 @@
 # directory).
 services:
   valkey:
-    group_add: ["${DATABASTION_DEV_REDIS_SOCKET_GID:?set DATABASTION_DEV_REDIS_SOCKET_GID (id -g)}"]
+    group_add: ["${DATABASTION_DEV_REDIS_SOCKET_GID:?set DATABASTION_DEV_REDIS_SOCKET_GID (redis/socket-group.sh)}"]
     environment:
       DATABASTION_DEV_REDIS_SOCKET_DIR: /run/databastion-redis
     volumes:
       - ./.state/redis-socket/valkey:/run/databastion-redis
   redis:
-    group_add: ["${DATABASTION_DEV_REDIS_SOCKET_GID:?set DATABASTION_DEV_REDIS_SOCKET_GID (id -g)}"]
+    group_add: ["${DATABASTION_DEV_REDIS_SOCKET_GID:?set DATABASTION_DEV_REDIS_SOCKET_GID (redis/socket-group.sh)}"]
     environment:
       DATABASTION_DEV_REDIS_SOCKET_DIR: /run/databastion-redis
     volumes:

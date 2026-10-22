@@ -638,15 +638,24 @@ jobs:
         with:
           workspaces: agent
       # With the Unix sockets published to the runner (dev/redis/compose.socket.yml, #239 re-review
-      # N1): directories of the runner's user, setgid 2770, the servers in the runner's group, so
-      # only the runner's user connects; the TLS port is unchanged.
+      # N1): the runner's primary group may be shared (docker on hosted runners), so a dedicated
+      # group with the runner's user as its single member (checked by dev/redis/socket-group.sh,
+      # #317 review L2) owns the setgid 2770 directories and is added to the servers; only the
+      # runner's user (and root) connects. The tests run in that group through `sg`. The TLS port
+      # is unchanged.
       - name: Start the dev Valkey and Redis services
         run: |
           cp dev/.env.example dev/.env
           make dev-dirs
-          install -d -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
-          DATABASTION_DEV_REDIS_SOCKET_GID="$(id -g)"
+          sudo groupadd databastion-redis-socket
+          sudo usermod -aG databastion-redis-socket "$USER"
+          DATABASTION_DEV_REDIS_SOCKET_GID="$(dev/redis/socket-group.sh databastion-redis-socket)"
           export DATABASTION_DEV_REDIS_SOCKET_GID
+          install -d dev/.state/redis-socket
+          sudo install -d -o "$USER" -g databastion-redis-socket -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
+          for d in dev/.state/redis-socket/valkey dev/.state/redis-socket/redis; do
+            [ "$(stat -c %g:%a "$d")" = "$DATABASTION_DEV_REDIS_SOCKET_GID:2770" ] || { echo "$d: unexpected group or mode" >&2; exit 1; }
+          done
           timeout 900 docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml up -d --wait --wait-timeout 600 valkey redis
           timeout 60 docker compose -f dev/docker-compose.yml images valkey redis
       - name: Connector integration tests (dev images, Valkey and Redis over TLS and their sockets)
@@ -655,7 +664,9 @@ jobs:
           DATABASTION_IT_REDIS_REQUIRE_SOCKET: "1"
         run: |
           set -o pipefail
-          timeout 1200 dev/agent-it.sh redis 2>&1 | tee "$RUNNER_TEMP/it.log"
+          # In the dedicated socket group (the step above; `sg` keeps the environment and the
+          # runner's other groups).
+          sg databastion-redis-socket -c 'timeout 1200 dev/agent-it.sh redis' 2>&1 | tee "$RUNNER_TEMP/it.log"
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 redis-tls-init valkey redis
