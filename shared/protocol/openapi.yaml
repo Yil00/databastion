@@ -114,7 +114,9 @@ info:
     those fields removed (ADR-0022 decision 9): a heartbeat, a job status update, or the items
     pointed at in a result batch are resent, never dropped for the field alone. This holds for
     findings too: `Location.altered` (`location.altered`, ADR-0056) is the first gated field of
-    `POST /findings`. A console lists `location.altered` and `object_ref.altered` both or neither.
+    `POST /findings`. A console lists `location.altered` and `object_ref.altered` both or
+    neither, and only once every replica stores and applies them (ADR-0022 decision 8); a build
+    that accepts the fields without storing them does not count.
     Tokens are `Capability` values; unknown tokens are ignored. New enum values in a request
     (e.g. `TargetNoteLabel`) are negotiated the same way, with a revision token. A value form
     that a console -> agent field accepts only after protocol 0.1.0 is negotiated like a new
