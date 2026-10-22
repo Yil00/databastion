@@ -38,7 +38,8 @@ Subcommands (stdlib only; unit tests in test_loadlib.py):
              [--gap S] [--label TEXT] [--md FILE] [--json FILE]
       #282 review N3 (SQL Server Extended Events source under load): the agent's cut lines before
       unpaired statistics builds, grouped in runs (cuts at most S seconds apart), the runs that
-      reached the 60 s hold, the statistics builds and workload SELECTs the session's files hold
+      reached the 60 s hold, its reads cancelled above 12 MiB or at the statement timeout and read
+      again smaller (`XE-READS`, ADR-0051 refinement of 2026-10-22), the statistics builds and workload SELECTs the session's files hold
       per principal (--builds, read by sqlserver.sh), and the workload principals' events naming
       `*` without the overflow flag and their statements beyond those issued (--console). Prints
       `XE-CATCHUP` / `XE-BUILDS` / `XE-SELECTS` / `XE-NOISE` lines, and writes the Markdown section
@@ -565,6 +566,11 @@ class Limits:
     drain_db_cores_over_on: float = 0.25
     drain_probe_factor: float = 2.0
     drain_probe_slack_us: float = 1000.0
+    # The Extended Events read size (ADR-0051 refinement of 2026-10-22, load step 4; checked when the
+    # run read that source, sqlserver.sh's `xe_reads` fact): reads cancelled above 12 MiB at most this
+    # many in any 10 minutes, and no read at the statement timeout.
+    xe_cancels_per_10min: int = 1
+    xe_timeouts: int = 0
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "Limits":
@@ -656,6 +662,24 @@ def drain_checks(ck: Checks, target: str, a: dict, dr: dict, cap: float | None, 
     ck.add(names[2], None if dur is None or bound_p is None else dur <= bound_p, dur, f"<= {bound_p}",
            f"latency probe p95 (us per constant SELECT as sa) during the drain: at most max("
            f"{lim.drain_probe_factor} x, + {lim.drain_probe_slack_us} us) the p95 before Audit ({off} us)")
+
+
+def xe_read_checks(ck: Checks, target: str, a: dict, xr: dict, lim: Limits) -> None:
+    """The Extended Events read-size checks (ADR-0051 refinement of 2026-10-22, load step 4): from the
+    agent's "Extended Events read cancelled" lines (sqlserver.sh's `xe_reads` fact, xe-catchup), the
+    reads cancelled above 12 MiB in any 10 minutes and the reads at the statement timeout. "No data"
+    (failed) when the fact holds no counts (the agent's log could not be read)."""
+    for k in ("cancels", "timeouts", "max_cancels_per_10min", "large_bursts"):
+        a[f"xe_{k}"] = xr.get(k)
+    burst = xr.get("large_bursts") or 0
+    note = f"{burst} burst(s) of large events" if burst else "no large events"
+    most = xr.get("max_cancels_per_10min")
+    ck.add(f"audit.{target}.xe_cancels_per_10min", None if most is None else most <= lim.xe_cancels_per_10min,
+           most, f"<= {lim.xe_cancels_per_10min}",
+           f"Extended Events reads cancelled above 12 MiB in any 10 minutes ({xr.get('cancels')} in all; {note})")
+    t = xr.get("timeouts")
+    ck.add(f"audit.{target}.xe_timeouts", None if t is None else t <= lim.xe_timeouts, t, f"<= {lim.xe_timeouts}",
+           f"Extended Events reads at the client's statement timeout, retried at 500 ({note})")
 
 
 def discovery_impact(samples: list[dict], container: str, t0: float, t1: float,
@@ -795,6 +819,9 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
         if dr is not None:
             caps = [c for _, c in series(samples, cont, "cap")]
             drain_checks(ck, target, a, dr, caps[-1] if caps else None, lim)
+        xr = one_fact(facts, "xe_reads", target=target)
+        if xr is not None:
+            xe_read_checks(ck, target, a, xr, lim)
         audit[target] = a
         ok_wl = issued_on is not None and issued_on > 0 and not wl.get("failed")
         ck.add(f"audit.{target}.workload_ran", ok_wl, {"issued": issued_on, "failed": wl.get("failed")}, "> 0 issued, 0 failed")
@@ -1411,6 +1438,12 @@ def cmd_census_sql(args: argparse.Namespace) -> int:
 XE_CUT_MESSAGE = "Extended Events: a statistics build not paired yet: the read ends before it"
 # The hold of a stream behind deferrals is bounded to 60 s in a row (MAX_DEFERRAL, audit/xe/events.rs).
 XE_MAX_HOLD_S = 60.0
+# The agent's debug line of an Extended Events read cancelled above 12 MiB or at the client's statement
+# timeout and read again smaller (connector-sqlserver, audit/xe/size.rs, ADR-0051 refinement of
+# 2026-10-22), one per such read, with `reason`: "response above 12 MiB" or "statement timeout".
+XE_RETRY_MESSAGE = "Extended Events read cancelled: read again smaller"
+XE_RETRY_REASONS = {"response above 12 MiB": "cancels", "statement timeout": "timeouts"}
+XE_RETRY_WINDOW_S = 600.0
 
 
 def _log_time(rec: dict) -> float | None:
@@ -1447,6 +1480,39 @@ def xe_cut_times(lines: list[str], since: float | None = None) -> list[float]:
         if t is not None and (since is None or t >= since):
             out.append(t)
     return sorted(out)
+
+
+def xe_retries(lines: list[str], since: float | None = None) -> dict:
+    """The agent's retried reads (XE_RETRY_MESSAGE) at or after `since`: cancels above 12 MiB,
+    timeouts, and the most cancels in any XE_RETRY_WINDOW_S seconds."""
+    out = {"cancels": 0, "timeouts": 0}
+    cancels: list[float] = []
+    for line in lines:
+        if XE_RETRY_MESSAGE not in line:
+            continue
+        i = line.find("{")
+        try:
+            rec = json.loads(line[i:]) if i >= 0 else None
+        except ValueError:
+            continue
+        f = rec.get("fields") if isinstance(rec, dict) else None
+        if not isinstance(f, dict) or f.get("message") != XE_RETRY_MESSAGE:
+            continue
+        kind = XE_RETRY_REASONS.get(f.get("reason"))
+        t = _log_time(rec)
+        if kind is None or t is None or (since is not None and t < since):
+            continue
+        out[kind] += 1
+        if kind == "cancels":
+            cancels.append(t)
+    cancels.sort()
+    most, j = 0, 0
+    for i, t in enumerate(cancels):
+        while t - cancels[j] >= XE_RETRY_WINDOW_S:
+            j += 1
+        most = max(most, i - j + 1)
+    out["max_cancels_per_10min"] = most
+    return out
 
 
 def xe_episodes(times: list[float], gap: float) -> list[tuple[float, float, int]]:
@@ -1509,14 +1575,16 @@ def xe_catchup(lines: list[str], builds: dict, noise: list[dict], issued: dict[s
         rows.append({**r, "issued": n_issued,
                      "excess_statements": (r["read_statements"] - n_issued) if n_issued is not None else None})
     return {"cuts": len(times), "episodes": len(eps), "longest_episode_s": round(max(spans), 1) if spans else 0.0,
-            "episodes_at_cap": len(at_cap), "gap_s": gap,
+            "episodes_at_cap": len(at_cap), "gap_s": gap, "reads": xe_retries(lines, since),
             "source_builds": builds.get("build", {}), "source_selects": builds.get("select", {}),
             "principals": rows}
 
 
 def xe_catchup_lines(r: dict, label: str) -> list[str]:
     out = [f"XE-CATCHUP {label} cuts={r['cuts']} episodes={r['episodes']} longest_episode_s={r['longest_episode_s']} "
-           f"episodes_at_60s_cap={r['episodes_at_cap']} gap_s={r['gap_s']}"]
+           f"episodes_at_60s_cap={r['episodes_at_cap']} gap_s={r['gap_s']}",
+           f"XE-READS {label} cancels={r['reads']['cancels']} timeouts={r['reads']['timeouts']} "
+           f"max_cancels_per_10min={r['reads']['max_cancels_per_10min']}"]
     for p, n in sorted(r["source_builds"].items()):
         out.append(f"XE-BUILDS {label} principal={p} statistics_builds_in_session_files={n}")
     for p, n in sorted(r["source_selects"].items()):
@@ -1536,6 +1604,9 @@ def xe_catchup_markdown(r: dict, label: str) -> str:
            f"- Agent cut lines (a read ended before an unpaired statistics build: deferrals and full-read cuts): "
            f"**{r['cuts']}**, in {r['episodes']} runs (cuts at most {r['gap_s']} s apart); longest run "
            f"{r['longest_episode_s']} s; runs reaching the 60 s hold: **{r['episodes_at_cap']}**.",
+           f"- Reads cancelled above 12 MiB and read again smaller: **{r['reads']['cancels']}** (at most "
+           f"{r['reads']['max_cancels_per_10min']} in 10 minutes); reads at the statement timeout: "
+           f"**{r['reads']['timeouts']}** (ADR-0051 refinement of 2026-10-22).",
            "- Statistics builds in the session's files since Audit started, per principal: "
            + (", ".join(f"`{p}` {n}" for p, n in sorted(r["source_builds"].items())) or "none") + ".",
            "- Workload SELECTs in the session's files: "

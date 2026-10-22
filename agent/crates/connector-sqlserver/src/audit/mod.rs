@@ -15,7 +15,8 @@
 //!   parameter (M1); the file name, the buffer offset and the row bound
 //!   and the records of the next buffer already handled (skipped on the
 //!   server) are parameters. At most [`BATCH`] records per read (halved after a
-//!   response over [`POLL_BYTES`]), each turned into a record as its row
+//!   response over [`POLL_BYTES`]; the Extended Events source reads up to
+//!   [`xe::size::XE_MAX_ROWS`] after a full read), each turned into a record as its row
 //!   ends; a full read is followed by another, within [`cycle::CATCH_UP`] (and
 //!   less while the first start's history is walked), and a cycle that
 //!   ends while still behind is followed by the next one after a pause
@@ -82,11 +83,16 @@ use crate::tls;
 use crate::token::Value;
 use records::{Mapped, Record, Statement};
 
-/// Records read per poll (decision 6: at most 1 000). A record is at most
-/// about 9.3 KiB on the wire (an `nvarchar(4000)` statement, five
-/// `nvarchar(128)` names, a 260-character file name and the numbers), so a
-/// read of `BATCH` rows stays under [`POLL_BYTES`] (security review of
-/// P9-A lot 2, L5: the agent's measured peak RSS is 42 MiB).
+/// Records read per poll by SQL Server Audit (decision 6: at most 1 000),
+/// and the Extended Events source's base read size: its first read, and
+/// every read after one that was not full; after a full read, that source
+/// reads up to [`xe::size::XE_MAX_ROWS`] events, sized from the wire bytes
+/// per row (ADR-0051 refinement of 2026-10-22, option (b); [`xe::size`]).
+/// A SQL Server Audit record is at most about 9.3 KiB on the wire (an
+/// `nvarchar(4000)` statement, five `nvarchar(128)` names, a 260-character
+/// file name and the numbers), so a read of `BATCH` rows stays under
+/// [`POLL_BYTES`] (security review of P9-A lot 2, L5: the agent's measured
+/// peak RSS is 42 MiB).
 pub(crate) const BATCH: usize = 500;
 /// Records of one buffer handled across reads at most; beyond, the rest
 /// of that buffer is dropped (a gap). The handled records are skipped on
@@ -109,6 +115,20 @@ const REEVALUATE: Duration = Duration::from_secs(600);
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The level proofs last this long.
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
+
+/// The Extended Events reads of a target ([`Shared::xe_reads`]): reads
+/// whose response came, the events they returned, the largest read asked
+/// and returned, and the reads cancelled above [`POLL_BYTES`] or at the
+/// client's statement deadline and read again smaller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct XeReads {
+    pub(crate) reads: u64,
+    pub(crate) events: u64,
+    pub(crate) largest_asked: usize,
+    pub(crate) largest_returned: usize,
+    pub(crate) cancels: u64,
+    pub(crate) timeouts: u64,
+}
 
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
@@ -158,6 +178,9 @@ pub(crate) struct Shared {
     own_left_out: Mutex<HashMap<String, [u64; 4]>>,
     /// Reads out of file order, for the logs and the tests.
     out_of_order: Mutex<HashMap<String, u64>>,
+    /// Extended Events reads (ADR-0051 refinement of 2026-10-22), for the
+    /// logs and the tests: [`XeReads`].
+    xe_reads: Mutex<HashMap<String, XeReads>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -443,6 +466,35 @@ impl Shared {
             .get(target_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// An Extended Events read of `asked` rows that returned `returned`.
+    pub(crate) fn note_xe_read(&self, target_id: &str, asked: usize, returned: usize) {
+        let mut m = lock(&self.xe_reads);
+        let r = m.entry(target_id.to_owned()).or_default();
+        r.reads = r.reads.saturating_add(1);
+        r.events = r.events.saturating_add(returned as u64);
+        r.largest_asked = r.largest_asked.max(asked);
+        r.largest_returned = r.largest_returned.max(returned);
+    }
+
+    /// An Extended Events read retried smaller ([`xe::size::Retry`]).
+    pub(crate) fn note_xe_retry(&self, target_id: &str, retry: xe::size::Retry) {
+        let mut m = lock(&self.xe_reads);
+        let r = m.entry(target_id.to_owned()).or_default();
+        match retry {
+            xe::size::Retry::Bytes => r.cancels = r.cancels.saturating_add(1),
+            xe::size::Retry::Timeout => r.timeouts = r.timeouts.saturating_add(1),
+        }
+    }
+
+    /// The Extended Events reads of `target_id` since the agent started.
+    #[cfg(test)]
+    pub(crate) fn xe_reads(&self, target_id: &str) -> XeReads {
+        lock(&self.xe_reads)
+            .get(target_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Statements left out: exact texts, credited sampling, credited
@@ -1663,8 +1715,13 @@ async fn read(
             }
             return Ok(true);
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            // A response over the bound: smaller reads.
+        // A response over the bound on a session the cancel left usable
+        // (`SsError::new` marks every client-side bound fatal, so the
+        // session's state tells, not `e.fatal`; found with the Extended
+        // Events read-size change of 2026-10-22): smaller reads.
+        Err(e)
+            if e.code == FailureCode::ResourceLimit && !s.is_poisoned() && st.batch > MIN_BATCH =>
+        {
             st.batch = (st.batch / 2).max(MIN_BATCH);
             return Ok(true);
         }

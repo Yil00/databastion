@@ -4873,3 +4873,489 @@ async fn name_case_follows_the_collations_body() {
         .await;
     }
 }
+
+/// The read-cost measurement's own Extended Events session
+/// ([`measure_xe_read_cost`]).
+const READCOST_XE: &str = "it_readcost_xe";
+
+/// One timed poll of the measurement: `(ms, rows, largest row, bytes)`,
+/// or the error's failure code.
+async fn readcost_poll(
+    s: &mut Session,
+    text: &str,
+    file: &str,
+    offset: i64,
+    top: usize,
+    skip: u32,
+) -> Result<(f64, usize, usize, usize), databastion_core::FailureCode> {
+    let t = std::time::Instant::now();
+    let r = Box::pin(crate::audit::xe::poll_records(
+        s,
+        text,
+        crate::audit::own::PollKind::From,
+        file,
+        offset,
+        top,
+        skip,
+    ))
+    .await;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    match r {
+        Ok(p) => Ok((ms, p.returned, p.largest_row, p.bytes)),
+        Err(e) => {
+            eprintln!("[it] readcost: poll ({top}, skip {skip}) failed after {ms:.0} ms: {e:?}");
+            Err(e.code)
+        }
+    }
+}
+
+fn median_of(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`), ADR-0051
+/// refinement of 2026-10-22 (Extended Events reads within one buffer),
+/// measurement plan item 1: the cost of the agent's poll
+/// (`sql::XE_POLL_FROM`, through [`crate::audit::xe::poll_records`]) by
+/// the rows asked at a buffer start and by the rows skipped inside a
+/// buffer, the events per buffer and the wire bytes per event, for small
+/// events (statements of the load workload's T-SQL loop) and for large
+/// ones (statements near the 128 KiB `event_data` bound). Prints `READCOST`
+/// lines and the least-squares fit of `c + a·k + b·s` (ms). On its own
+/// session [`READCOST_XE`], read as `sa` with the exact poll text.
+#[tokio::test]
+#[ignore = "measurement: DATABASTION_IT_SQLSERVER_MEASURE=1, --ignored"]
+async fn measure_xe_read_cost() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{READCOST_XE}') \
+         DROP EVENT SESSION {READCOST_XE} ON SERVER"
+    );
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    let reps = 5usize;
+    let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (k, s, ms)
+    for (kind, iterations) in [("small", 2_500u32), ("large", 300u32)] {
+        let stem = format!("it_readcost_{kind}_{}", std::process::id());
+        Box::pin(exec_ok(&mut s, &drop)).await;
+        let session = backlog_session(&stem)
+            .replace(BACKLOG_XE, READCOST_XE)
+            .replace(
+                "max_file_size = 16, max_rollover_files = 2",
+                "max_file_size = 256, max_rollover_files = 4",
+            );
+        Box::pin(exec(&mut s, &session)).await;
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER EVENT SESSION {READCOST_XE} ON SERVER STATE = START"),
+        ))
+        .await;
+        let started = std::time::Instant::now();
+        let body = if kind == "small" {
+            // As the load workload's loop (seed.py tsql_workload): a
+            // schedule, a branch chain and a table variable insert.
+            let branches: String = (0..8)
+                .map(|k| {
+                    format!(
+                        "{} @k = {k} SELECT @n = COUNT(*) FROM crm.customers WHERE id = 1 + @r % 50; ",
+                        if k == 0 { "IF" } else { "ELSE IF" }
+                    )
+                })
+                .collect();
+            format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int, @k int, @r bigint, @w int; \
+                 DECLARE @lat TABLE (us bigint NOT NULL); \
+                 WHILE @i < {iterations} BEGIN \
+                 SET @w = DATEDIFF(millisecond, SYSUTCDATETIME(), SYSUTCDATETIME()); \
+                 IF @w > 0 SET @w = 0; ELSE IF @w < -1000 SET @w = 1; \
+                 SET @k = @i % 8; SET @r = ABS(CAST(CHECKSUM(NEWID()) AS bigint)); \
+                 {branches} INSERT @lat VALUES (@i); SET @i += 1; END"
+            )
+        } else {
+            // One statement of about 60 000 characters (a comment), built
+            // on the server (the client's batch bound): `event_data` near
+            // its 128 KiB bound, an `sp_statement_completed` each.
+            format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+                 DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+                 REPLICATE(CONVERT(nvarchar(max), N'x'), 60000) + N' */ FROM crm.customers WHERE id = @i'; \
+                 WHILE @i < {iterations} BEGIN \
+                 EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; END"
+            )
+        };
+        Box::pin(exec(&mut s, &in_db("retail", &body))).await;
+        eprintln!(
+            "[it] readcost ({kind}): {iterations} iterations written in {} ms",
+            started.elapsed().as_millis()
+        );
+        // The dispatch latency, then a stop flushes the buffers.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER EVENT SESSION {READCOST_XE} ON SERVER STATE = STOP"),
+        ))
+        .await;
+        let files = format!("N'/var/opt/mssql/xe/{stem}_0_*.xel'");
+        let layout = try_rows(
+            &mut s,
+            &format!(
+                "SELECT CONVERT(nvarchar(260), file_name), CONVERT(bigint, file_offset), \
+                 CONVERT(bigint, COUNT(*)) FROM sys.fn_xe_file_target_read_file({files}, NULL, NULL, NULL) \
+                 GROUP BY file_name, file_offset ORDER BY file_name, file_offset"
+            ),
+            3,
+        )
+        .await
+        .unwrap();
+        let buffers: Vec<(String, i64, i64)> = layout
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_text().unwrap().trim_end().to_owned(),
+                    r[1].as_int().unwrap(),
+                    r[2].as_int().unwrap(),
+                )
+            })
+            .collect();
+        let mut sizes: Vec<f64> = buffers.iter().map(|b| b.2 as f64).collect();
+        let total: f64 = sizes.iter().sum();
+        let max = sizes.iter().copied().fold(0.0, f64::max);
+        let min = sizes.iter().copied().fold(f64::MAX, f64::min);
+        eprintln!(
+            "READCOST | {kind} | buffers {} | events {total} | per buffer min {min} median {} max {max}",
+            buffers.len(),
+            median_of(&mut sizes)
+        );
+        let current = &buffers.last().unwrap().0;
+        let text = crate::sql::xe_poll(&crate::sql::xe_pattern(current).unwrap(), true).unwrap();
+        // Positions before buffers of the middle of the set, each followed
+        // by a buffer at least as large as the median.
+        let big: Vec<usize> = (1..buffers.len().saturating_sub(4))
+            .filter(|i| buffers[*i].2 as f64 >= max * 0.8)
+            .collect();
+        let starts: Vec<usize> = big.iter().map(|i| i - 1).take(reps).collect();
+        assert!(!starts.is_empty(), "{kind}: no buffer to start before");
+        let sizes_k: &[usize] = if kind == "small" {
+            &[100, 500, 1_000, 2_000, 3_000, 4_000]
+        } else {
+            &[16, 50, 100, 250, 500]
+        };
+        let mut per_event: Vec<f64> = Vec::new();
+        let mut largest = 0usize;
+        for &k in sizes_k {
+            let (mut ms, mut ok, mut failed) = (Vec::new(), 0usize, Vec::new());
+            for &i in &starts {
+                let (f, o, _) = &buffers[i];
+                match readcost_poll(&mut s, &text, f, *o, k, 0).await {
+                    Ok((t, rows, l, bytes)) => {
+                        ms.push(t);
+                        ok = rows;
+                        largest = largest.max(l);
+                        if rows > 0 {
+                            per_event.push(bytes as f64 / rows as f64);
+                        }
+                        if kind == "small" {
+                            samples.push((rows as f64, 0.0, t));
+                        }
+                    }
+                    Err(code) => failed.push(code),
+                }
+            }
+            eprintln!(
+                "READCOST | {kind} | rows {k} at skip 0 | returned {ok} | median {:.1} ms | failed {failed:?}",
+                median_of(&mut ms)
+            );
+        }
+        if kind == "small" {
+            for skip in [0u32, 500, 1_000, 2_000, 3_000, 4_000] {
+                let mut ms = Vec::new();
+                for &i in &starts {
+                    let (f, o, _) = &buffers[i];
+                    if let Ok((t, rows, _, _)) =
+                        readcost_poll(&mut s, &text, f, *o, 500, skip).await
+                    {
+                        ms.push(t);
+                        samples.push((rows as f64, f64::from(skip), t));
+                    }
+                }
+                eprintln!(
+                    "READCOST | {kind} | rows 500 at skip {skip} | median {:.1} ms",
+                    median_of(&mut ms)
+                );
+            }
+            // One buffer walked in reads of B (the quadratic re-skip): the
+            // time to read `max` events from the start of a large buffer.
+            for b in [500usize, 1_000, 2_000, 3_000] {
+                let mut times = Vec::new();
+                for &i in &starts {
+                    let (pf, po, _) = &buffers[i];
+                    let (mut done, mut sum) = (0usize, 0.0);
+                    while done < max as usize {
+                        let skip = u32::try_from(done).unwrap();
+                        match readcost_poll(&mut s, &text, pf, *po, b, skip).await {
+                            Ok((t, rows, _, _)) if rows > 0 => {
+                                sum += t;
+                                done += rows;
+                            }
+                            _ => break,
+                        }
+                    }
+                    times.push(sum / done.max(1) as f64 * 1000.0);
+                }
+                eprintln!(
+                    "READCOST | {kind} | {max} events walked from a buffer start in reads of {b} | median {:.1} ms per 1 000 events",
+                    median_of(&mut times)
+                );
+            }
+        }
+        eprintln!(
+            "READCOST | {kind} | wire bytes per event: median {:.0} | largest row {largest}",
+            median_of(&mut per_event)
+        );
+        Box::pin(exec_ok(&mut s, &drop)).await;
+    }
+    // Least squares of ms = c + a·k + b·s over the small-event samples.
+    let n = samples.len() as f64;
+    let (mut sk, mut ss, mut st, mut skk, mut sss, mut sks, mut skt, mut sst) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (k, s_, t) in &samples {
+        sk += k;
+        ss += s_;
+        st += t;
+        skk += k * k;
+        sss += s_ * s_;
+        sks += k * s_;
+        skt += k * t;
+        sst += s_ * t;
+    }
+    // Normal equations, 3x3, by Cramer's rule.
+    let m = [[n, sk, ss], [sk, skk, sks], [ss, sks, sss]];
+    let v = [st, skt, sst];
+    let det3 = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det3(m);
+    let col = |j: usize| {
+        let mut x = m;
+        for (i, row) in x.iter_mut().enumerate() {
+            row[j] = v[i];
+        }
+        det3(x) / d
+    };
+    eprintln!(
+        "READCOST | fit | c {:.1} ms | a {:.4} ms per event read | b {:.4} ms per event skipped | {} samples",
+        col(0),
+        col(1),
+        col(2),
+        samples.len()
+    );
+    Box::pin(exec_ok(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+}
+
+/// The large-event test's own Extended Events session
+/// ([`xe_large_events_are_read_by_halving`]).
+const LARGE_XE: &str = "it_large_xe";
+
+/// `n` reads of `retail.crm.customers` by `sa` in one tight batch, each
+/// statement `pad` characters longer (a comment; built on the server and
+/// run through `sp_executesql`, since the client sends batches of one
+/// packet only; 20 ms apart, so that the session's buffers keep up and
+/// drop none): one statement event each naming the table, and the `SET`,
+/// `WHILE` (and `EXEC`, `WAITFOR`) events.
+async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
+    let body = if pad == 0 {
+        format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
+             SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
+        )
+    } else {
+        format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
+             WHILE @i < {n} BEGIN \
+             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+             WAITFOR DELAY '00:00:00.020'; END"
+        )
+    };
+    Box::pin(exec(s, &body)).await;
+}
+
+/// ADR-0051 refinement of 2026-10-22, test plan item 3: a backlog of small
+/// events is read at the sized bound (more than `BATCH` rows a read); a
+/// run of large events (statements of about 60 000 characters, `event_data`
+/// near its 128 KiB bound) makes a read's response go above 12 MiB: it is
+/// cancelled and read again by halving, with no event lost or reported
+/// twice and no stream error; once the halving is forgotten (its 10
+/// minutes shortened to 20 s for the test), small events are read at the
+/// sized bound again, with no further cancel.
+#[tokio::test]
+async fn xe_large_events_are_read_by_halving() {
+    Box::pin(xe_large_scenario()).await;
+}
+
+async fn xe_large_scenario() {
+    use crate::audit::xe::size::{TEST_MEMORY_MS, XE_MAX_ROWS};
+    use std::sync::atomic::Ordering;
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let stem = format!("it_large_{}", std::process::id());
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
+         DROP EVENT SESSION {LARGE_XE} ON SERVER"
+    );
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    let session = backlog_session(&stem)
+        .replace(BACKLOG_XE, LARGE_XE)
+        .replace(
+            "max_file_size = 16, max_rollover_files = 2",
+            "max_file_size = 256, max_rollover_files = 4",
+        );
+    Box::pin(exec(&mut s, &session)).await;
+    // The dev session is stopped meanwhile (as in the backlog test), so
+    // that the other tests' first starts do not walk these events.
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {LARGE_XE} ON SERVER STATE = START"),
+    ))
+    .await;
+    TEST_MEMORY_MS.store(20_000, Ordering::Relaxed);
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {LARGE_XE}}}",
+        own_tls()
+    ));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-large-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(&c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "the stream started");
+    // Counts the stream's reads of `retail.crm.customers` by `sa` until
+    // `want` are counted or `wait` passes.
+    let mut seen = 0usize;
+    let other = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let mut count_until = async |want: usize, wait: Duration| {
+        let deadline = std::time::Instant::now() + wait;
+        while seen < want && std::time::Instant::now() < deadline {
+            assert!(!stream.is_finished(), "the stream ended");
+            if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                && e.principal().account_name().eq_ignore_ascii_case("sa")
+            {
+                let names = names_of(&e);
+                if names.contains(&"retail.crm.customers".to_owned()) {
+                    seen += usize::try_from(e.aggregated_count()).unwrap_or(1);
+                } else {
+                    *other
+                        .borrow_mut()
+                        .entry(format!("{:?} {names:?}", e.action()))
+                        .or_insert(0usize) += 1;
+                }
+            }
+        }
+        seen
+    };
+    // 1. Small events, written at once: read at the sized bound.
+    let small = 6_000u32;
+    Box::pin(customer_reads(&mut s, small, 0)).await;
+    let got = count_until(small as usize, Duration::from_secs(60)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: small backlog {got}/{small}, reads {r:?}");
+    assert_eq!(got, small as usize, "every small read reported once");
+    assert!(
+        r.largest_asked > crate::audit::BATCH && r.largest_asked <= XE_MAX_ROWS,
+        "{r:?}"
+    );
+    assert_eq!((r.cancels, r.timeouts), (0, 0), "{r:?}");
+    // 2. Large events: a response above 12 MiB, cancelled, read by halving.
+    let large = 300u32;
+    Box::pin(customer_reads(&mut s, large, 60_000)).await;
+    let want = (small + large) as usize;
+    let got = count_until(want, Duration::from_secs(120)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: {got}/{want} after the large ones, reads {r:?}");
+    eprintln!("[it] large events: other events of sa {:?}", other.borrow());
+    assert_eq!(got, want, "every large read reported once");
+    assert!(r.cancels >= 1, "a response above 12 MiB: {r:?}");
+    assert_eq!(r.timeouts, 0, "{r:?}");
+    let cancels = r.cancels;
+    // 3. After the (shortened) memory: small events at the sized bound
+    // again, with no further cancel.
+    tokio::time::sleep(Duration::from_secs(22)).await;
+    let before = c.state.audit.xe_reads(&t.id);
+    let more = 6_000u32;
+    Box::pin(customer_reads(&mut s, more, 0)).await;
+    let want = want + more as usize;
+    let got = count_until(want, Duration::from_secs(60)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: {got}/{want} after the memory, reads {r:?}");
+    assert_eq!(got, want, "every read reported once");
+    assert_eq!(r.cancels, cancels, "no further cancel: {r:?}");
+    assert!(r.largest_returned > crate::audit::BATCH, "{r:?}");
+    assert!(
+        r.reads - before.reads < u64::from(more) * 3 / 500,
+        "read at more than BATCH: {before:?} {r:?}"
+    );
+    // Nothing more arrives (none twice) and nothing was dropped.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let got = count_until(want + 1, Duration::from_secs(2)).await;
+    assert_eq!(got, want, "no read reported twice");
+    stream.abort();
+    let _ = stream.await;
+    TEST_MEMORY_MS.store(0, Ordering::Relaxed);
+    let dropped = c.state.audit.facts(&t.id).dropped;
+    assert_eq!(dropped, 0, "records dropped");
+    let _ = std::fs::remove_dir_all(&dir);
+    Box::pin(exec_ok(
+        &mut s,
+        &format!("ALTER EVENT SESSION {LARGE_XE} ON SERVER STATE = STOP"),
+    ))
+    .await;
+    Box::pin(exec_ok(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+}

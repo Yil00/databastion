@@ -434,6 +434,37 @@ redacted), never as a check:
 LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_SQLSERVER_STATS_RESET_S=10 e2e/load/sqlserver.sh
 ```
 
+### Extended Events source: read size and large events (ADR-0051 refinement of 2026-10-22)
+
+With the Extended Events source, the agent reads up to 2 000 events after a full read (sized from the
+wire bytes of the largest event of that read), 500 otherwise, and reads a response above 12 MiB again
+at half the size ([ADR-0051 refinement of 2026-10-22](../../docs/adr/0051-sqlserver-connector.md#refinement-2026-10-22-accepted-by-the-maintainer-on-2026-10-22-option-b-extended-events-reads-within-one-buffer),
+load step 4). `LOAD_SQLSERVER_LARGE_EVERY_S=N` (default 0, off; workflow input
+`sqlserver_large_every_s`; refused with `sqlserver_audit`) adds, every N seconds of the Audit run, a
+burst of `LOAD_SQLSERVER_LARGE_BURST` (default 60) reads of the first load table by the login
+`load_big` (created with the same password as `load_app`, `SELECT` on the load schema), each through
+`sp_executesql` with a statement holding a comment of about 60 000 characters: an Extended Events event
+of about 120 KiB, near the poll's 128 KiB bound. The statements of a burst are 20 ms apart (back to
+back, the session's 4 MB of buffers drop events, measured locally). A burst met by a read of 2 000
+events is above 12 MiB: that read is cancelled and read again smaller, and the reads then stay at 500
+or less for 10 minutes. `load_big`'s events are reported as reads of that table; they are not counted
+in the workload figures (`load_app`). The large-event session prints `large-event session (on): LARGE
+<statements run>`.
+
+In every Extended Events run, `xe-catchup` also prints `XE-READS load-sqlserver cancels=… timeouts=…
+max_cancels_per_10min=…`, from the agent's debug line "Extended Events read cancelled: read again
+smaller" (one per read cancelled above 12 MiB, `reason` "response above 12 MiB", or at the client's
+statement timeout, "statement timeout", since Audit started), and the run records an `xe_reads` fact
+that the report checks: `audit.mssql-load.xe_cancels_per_10min` (at most 1 in any 10 minutes,
+`LOAD_LIMIT_XE_CANCELS_PER_10MIN`) and `audit.mssql-load.xe_timeouts` (0, `LOAD_LIMIT_XE_TIMEOUTS`);
+"no data" (failed) when the agent's log could not be read.
+
+```sh
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents e2e/load/sqlserver.sh                                     # 50 SELECTs/s
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_MSSQL_RATE=100 e2e/load/sqlserver.sh                 # recorded only
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_SQLSERVER_LARGE_EVERY_S=60 e2e/load/sqlserver.sh     # large events
+```
+
 `LOAD_MSSQL_DIAG=1` (refused under GitHub Actions) writes the 15 statements that used the most CPU
 during the scan (their first 70 characters, which may name a value-bearing table) to
 `diag-top-statements.txt` in the log directory. Results go to `$LOAD_RESULTS_DIR` (default

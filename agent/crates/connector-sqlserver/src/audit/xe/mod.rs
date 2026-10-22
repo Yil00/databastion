@@ -11,11 +11,21 @@
 //!   text (M1), never from configuration.
 //! - **Polls**: one `sp_executesql` RPC each, text constant for a given
 //!   catalog state, the file name, the buffer offset and the row bound as
-//!   parameters; at most `BATCH` events per read, halved after a response
-//!   over `POLL_BYTES`; full reads follow one another within a cycle, and
-//!   a cycle that ends behind the session's files is followed by the next
-//!   one after a bounded pause (`super::cycle`); each poll gets a credit (its own events are left
-//!   out only for this session and this text). Each event's XML is read by
+//!   parameters. The row bound is stream state set inside `read`
+//!   ([`size`], ADR-0051 refinement of 2026-10-22, option (b)): `BATCH`
+//!   (500) first and after any read that is not full (a deferral, a clamp,
+//!   a restart at the oldest file, a re-probe that moved the cursor
+//!   included); after a full read, the sized bound: at most
+//!   [`size::XE_MAX_ROWS`] and at most 0.75 × `POLL_BYTES` over the largest
+//!   row of that read (in wire bytes), never below `BATCH`. A response
+//!   over `POLL_BYTES` is cancelled before any of it is handled and read
+//!   again at half the size, kept for 10 minutes; a cancel, or a retried
+//!   client statement timeout, of a read above `BATCH` caps the reads at
+//!   `BATCH` for 10 minutes. Full reads follow one another within a cycle,
+//!   and a cycle that ends behind the session's files is followed by the
+//!   next one after a bounded pause (`super::cycle`); each poll gets a
+//!   credit (its own events are left out only for this session and this
+//!   text). Each event's XML is read by
 //!   the bounded reader of [`xml`], under panic isolation, and is at most
 //!   `sql::XE_EVENT_BYTES` on the wire (the server sends larger ones
 //!   without their XML).
@@ -46,6 +56,9 @@
 
 pub(crate) mod events;
 pub(crate) mod probe;
+#[cfg(test)]
+mod sim_tests;
+pub(crate) mod size;
 pub(crate) mod xml;
 
 use std::time::{Duration, Instant};
@@ -58,8 +71,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, Batch, Below, Cursor, FLOOR_MAX, MIN_BATCH, OWN_FILE_BYTES, OWN_SESSIONS,
-    POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern, target_error,
+    APP, Batch, Below, Cursor, FLOOR_MAX, OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE,
+    REPROBE, on_bad_position, on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -101,7 +114,8 @@ struct Stream<'a> {
     poll_from: String,
     reprobe_at: Instant,
     evaluated_at: Option<Instant>,
-    batch: usize,
+    /// The size of the next read ([`size`]), set inside [`read`].
+    size: size::ReadSize,
     /// Time spent in poll statements, summed ([`super::cycle::Read::statements`]).
     poll_time: Duration,
     /// The statistics exclusion applies (an allow-listed build).
@@ -399,7 +413,7 @@ pub(crate) async fn stream(
         poll_from: String::new(),
         reprobe_at: Instant::now(),
         evaluated_at: None,
-        batch: BATCH,
+        size: size::ReadSize::default(),
         poll_time: Duration::ZERO,
         statman: false,
         major: 0,
@@ -627,15 +641,39 @@ pub(crate) fn xe_next(cursor: &Cursor, positions: &[(String, i64)], full: bool) 
 }
 
 /// What one poll returned.
-struct Polled {
-    records: Vec<XeRecord>,
-    returned: usize,
-    malformed: u64,
+pub(crate) struct Polled {
+    pub(crate) records: Vec<XeRecord>,
+    pub(crate) returned: usize,
+    pub(crate) malformed: u64,
+    /// The largest row of the response, in wire bytes ([`row_wire_bytes`]).
+    pub(crate) largest_row: usize,
+    /// Every row's wire bytes, summed.
+    pub(crate) bytes: usize,
+}
+
+/// The bytes a row took on the wire, as the client counts them: each
+/// value's bytes (UTF-16 for text, as sent) and its length prefix (2
+/// bytes, the widest of the poll's column types), and the row token. An
+/// estimate within a few bytes per column of the TDS framing, used to
+/// size the next read (refinement of 2026-10-22, M2).
+pub(crate) fn row_wire_bytes(row: &[Value]) -> usize {
+    1 + row
+        .iter()
+        .map(|v| {
+            2 + match v {
+                Value::Null => 0,
+                Value::Bit(_) => 1,
+                Value::Int(_) => 8,
+                Value::Text(t) => t.encode_utf16().count() * 2,
+                Value::Binary(b) | Value::DateTime2(b) => b.len(),
+            }
+        })
+        .sum::<usize>()
 }
 
 /// Sends one poll; each row becomes a record as it ends, alone under panic
 /// isolation.
-async fn poll_records(
+pub(crate) async fn poll_records(
     s: &mut Session,
     text: &str,
     kind: own::PollKind,
@@ -655,6 +693,8 @@ async fn poll_records(
         records: Vec::new(),
         returned: 0,
         malformed: 0,
+        largest_row: 0,
+        bytes: 0,
     };
     let mut row: Vec<Value> = Vec::with_capacity(sql::XE_POLL_COLUMNS);
     s.rpc(
@@ -673,6 +713,9 @@ async fn poll_records(
                 Cell::RowEnd => {
                     out.returned += 1;
                     let r = std::mem::take(&mut row);
+                    let wire = row_wire_bytes(&r);
+                    out.largest_row = out.largest_row.max(wire);
+                    out.bytes = out.bytes.saturating_add(wire);
                     match databastion_core::isolate(|| XeRecord::from_row(r)) {
                         Some(Ok(mut rec)) => {
                             rec.index = out.records.len();
@@ -689,7 +732,9 @@ async fn poll_records(
     Ok(out)
 }
 
-/// One read from the position; `true` when it was full (more to read).
+/// One read from the position; `true` when more is to be read at once (a
+/// full read, or a read retried smaller). Sets the size of the next read
+/// (`st.size`, ADR-0051 refinement of 2026-10-22, M1) on every path.
 async fn read(
     st: &mut Stream<'_>,
     s: &mut Session,
@@ -710,8 +755,10 @@ async fn read(
             ))
         });
     // The server skips the events of the next buffer already handled
-    // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
-    let top = st.batch;
+    // (`sql::XE_POLL_FROM`): a read returns at most `top` events, the size
+    // the last read set (`size`: `BATCH`, the sized bound up to
+    // `XE_MAX_ROWS` after a full read, less after a cancel).
+    let top = st.size.rows();
     let skip = st.cursor.skip;
     let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
@@ -742,10 +789,7 @@ async fn read(
     };
     st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
-        Ok(p) => {
-            st.batch = (st.batch * 2).min(BATCH);
-            p
-        }
+        Ok(p) => p,
         Err(e)
             if matches!(e.number, Some(ERR_BAD_OFFSET | ERR_FILE_GONE))
                 && st.cursor.file.is_some() =>
@@ -753,6 +797,7 @@ async fn read(
             // The position is no longer in the file set (rollover, a file
             // deleted): from the oldest file, leaving out what was read;
             // whatever was between is lost (M4).
+            st.size.restarted(Instant::now());
             let before = st.cursor.pattern.clone();
             Box::pin(reprobe(st, s)).await?;
             if st.cursor.pattern == before && st.cursor.file.is_some() {
@@ -763,12 +808,27 @@ async fn read(
             }
             return Ok(true);
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            st.batch = (st.batch / 2).max(MIN_BATCH);
-            return Ok(true);
+        Err(e) => {
+            // A response above `POLL_BYTES` (nothing of it handled), or the
+            // client's deadline on a read above `BATCH` rows, on a session
+            // the cancel left usable: read again smaller, from the same
+            // position (refinement of 2026-10-22, M2). Anything else fails
+            // the stream, as before.
+            let now = Instant::now();
+            return match st.size.failed(&e, s.is_poisoned(), now) {
+                Some(retry) => {
+                    st.state.audit.note_xe_retry(&target_id, retry);
+                    st.size.log(&target_id, retry, top, now);
+                    Ok(true)
+                }
+                None => Err(e.into_connector_error()),
+            };
         }
-        Err(e) => return Err(e.into_connector_error()),
     };
+    let largest_row = polled.largest_row;
+    st.state
+        .audit
+        .note_xe_read(&target_id, top, polled.returned);
     let positions: Vec<(String, i64)> = polled
         .records
         .iter()
@@ -794,6 +854,8 @@ async fn read(
         // re-probe left (the gap is already noted).
         if reprobe_moved(&before, &st.cursor) {
             tracing::info!(target_id = %target_id, "Extended Events: the session's file set or start changed during a read: reading again from the new position");
+            st.size
+                .received(largest_row, size::Path::Base, Instant::now());
             return Ok(true);
         }
     }
@@ -969,7 +1031,16 @@ async fn read(
     // A deferral ends the cycle: the next read waits a poll interval. A
     // full read cut before a build whose pair may be in the rows that
     // follow reads on (it moved the position by half the read at least).
-    Ok(b.full && !waits && clamped.is_none())
+    // That read, and a full read not cut, set the next one to the sized
+    // bound; any other read to `BATCH` (M1).
+    let more = b.full && !waits && clamped.is_none();
+    let path = if more {
+        size::Path::Sized
+    } else {
+        size::Path::Base
+    };
+    st.size.received(largest_row, path, Instant::now());
+    Ok(more)
 }
 
 /// Whether the re-probe inside a read changed what `before` (the cursor's

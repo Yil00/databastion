@@ -36,6 +36,10 @@ on:
         description: "load-sqlserver: drop the load schema's auto-created statistics every N seconds of the Audit run (0: never)"
         required: false
         default: "0"
+      sqlserver_large_every_s:
+        description: "load-sqlserver, sqlserver_xevents only: a burst of 60 statements near the 128 KiB event bound every N seconds of the Audit run (0: never; ADR-0051 refinement of 2026-10-22)"
+        required: false
+        default: "0"
   pull_request:
     branches: [main, dev]
     types: [opened, synchronize, reopened, labeled]
@@ -172,6 +176,7 @@ jobs:
       LOAD_SQLSERVER_AUDIT_SOURCE: ${{ inputs.sqlserver_audit_source || 'sqlserver_audit' }}
       LOAD_MSSQL_RATE: ${{ inputs.sqlserver_rate }}
       LOAD_SQLSERVER_STATS_RESET_S: ${{ inputs.sqlserver_stats_reset_s || '0' }}
+      LOAD_SQLSERVER_LARGE_EVERY_S: ${{ inputs.sqlserver_large_every_s || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

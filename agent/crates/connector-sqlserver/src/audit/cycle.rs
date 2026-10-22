@@ -3,7 +3,9 @@
 //! ([`End::pause`]).
 //!
 //! A cycle reads full pages back to back (each read bounded: at most
-//! `BATCH` rows, `POLL_BYTES`, the statement timeout) until a read is not
+//! `BATCH` rows on SQL Server Audit, at most `xe::size::XE_MAX_ROWS` on the
+//! Extended Events source after a full read, `POLL_BYTES`, the statement
+//! timeout) until a read is not
 //! full (or must wait: a deferred statistics build, a position kept before
 //! a file), or for [`CATCH_UP`] ([`HISTORY_CATCH_UP`] while the first
 //! start's history is walked). Then:
@@ -389,6 +391,12 @@ mod tests {
         max_lag_after_ms: u64,
         /// The reads' share of the time until the catch-up.
         busy_share: f64,
+        /// The first read that was not full after the writes stopped.
+        drained_ms: Option<u64>,
+        /// The longest read (ms).
+        longest_read_ms: u64,
+        /// The longest pause between two cycles (ms).
+        longest_pause_ms: u64,
     }
 
     /// A source writing `rate` events/s after a first start with `backlog`
@@ -399,6 +407,13 @@ mod tests {
         rate: u64,
         backlog: u64,
         read_ms: u64,
+        /// The cost model measured on 2026-10-22 instead of `read_ms`, in
+        /// buffers of this many events (ADR-0051 refinement of 2026-10-22).
+        buffer: Option<u64>,
+        /// Reads sized by the Extended Events read size (else `BATCH`).
+        size: Option<super::super::xe::size::ReadSize>,
+        /// Nothing is written after this time.
+        write_until_ms: u64,
         t0: Instant,
         t_ms: u64,
         pos: u64,
@@ -418,7 +433,7 @@ mod tests {
             )
         }
         fn available(&self, t: u64) -> u64 {
-            self.backlog + t * self.rate / 1000
+            self.backlog + t.min(self.write_until_ms) * self.rate / 1000
         }
     }
 
@@ -433,14 +448,21 @@ mod tests {
             self.cursor.walking_history()
         }
         async fn read_once(&mut self) -> Result<Read, ConnectorError> {
-            let batch = BATCH as u64;
+            let batch = self.size.as_ref().map_or(BATCH, |s| s.rows()) as u64;
             let n = self
                 .available(self.t_ms)
                 .saturating_sub(self.pos)
                 .min(batch);
-            self.t_ms += self.read_ms;
+            let read_ms = match self.buffer {
+                // Measured on 2022: about 37 ms, 0.43 ms per event read and
+                // 0.06 ms per event of the buffer skipped.
+                Some(buffer) => 37 + n * 43 / 100 + (self.pos % buffer) * 6 / 100,
+                None => self.read_ms,
+            };
+            self.out.longest_read_ms = self.out.longest_read_ms.max(read_ms);
+            self.t_ms += read_ms;
             if self.out.caught_up_ms.is_none() {
-                self.busy_ms += self.read_ms;
+                self.busy_ms += read_ms;
             }
             for i in self.pos..self.pos + n {
                 self.cursor.max_seen_us = Cursor::seen(self.cursor.max_seen_us, self.stamp(i));
@@ -450,13 +472,26 @@ mod tests {
             }
             self.pos += n;
             let full = n == batch;
+            let now = self.now();
+            if let Some(size) = self.size.as_mut() {
+                let path = if full {
+                    super::super::xe::size::Path::Sized
+                } else {
+                    super::super::xe::size::Path::Base
+                };
+                // The load workload's events: 3.6 KB on the wire at most.
+                size.received(3_603, path, now);
+            }
+            if !full && self.t_ms >= self.write_until_ms {
+                self.out.drained_ms.get_or_insert(self.t_ms);
+            }
             if !full {
                 self.cursor.history_us = None;
                 self.out.caught_up_ms.get_or_insert(self.t_ms);
             }
             Ok(Read {
                 full,
-                statements: Duration::from_millis(self.read_ms),
+                statements: Duration::from_millis(read_ms),
             })
         }
         async fn between(&mut self) -> Result<(), ConnectorError> {
@@ -468,12 +503,35 @@ mod tests {
     }
 
     fn model(rate: u64, backlog: u64, read_ms: u64, poll_ms: u64, end_ms: u64) -> Modelled {
+        model_with(
+            rate,
+            backlog,
+            read_ms,
+            (None, false),
+            u64::MAX,
+            poll_ms,
+            end_ms,
+        )
+    }
+
+    fn model_with(
+        rate: u64,
+        backlog: u64,
+        read_ms: u64,
+        (buffer, sized): (Option<u64>, bool),
+        write_until_ms: u64,
+        poll_ms: u64,
+        end_ms: u64,
+    ) -> Modelled {
         let mut cursor = Cursor::default();
         cursor.first_start(Some(0), 0);
         let mut m = Model {
             rate,
             backlog,
             read_ms,
+            buffer,
+            size: sized.then(super::super::xe::size::ReadSize::default),
+            write_until_ms,
             t0: Instant::now(),
             t_ms: 0,
             pos: 0,
@@ -483,6 +541,9 @@ mod tests {
                 behind: 0,
                 max_lag_after_ms: 0,
                 busy_share: 0.0,
+                drained_ms: None,
+                longest_read_ms: 0,
+                longest_pause_ms: 0,
             },
             busy_ms: 0,
         };
@@ -490,7 +551,9 @@ mod tests {
         while m.t_ms < end_ms {
             m.t_ms += 30; // the session's counters
             let e = block_on(run(&mut m, &mut log)).unwrap();
-            m.t_ms += u64::try_from(e.pause(Duration::from_millis(poll_ms)).as_millis()).unwrap();
+            let pause = u64::try_from(e.pause(Duration::from_millis(poll_ms)).as_millis()).unwrap();
+            m.out.longest_pause_ms = m.out.longest_pause_ms.max(pause);
+            m.t_ms += pause;
         }
         let until = m.out.caught_up_ms.unwrap_or(end_ms);
         m.out.busy_share = m.busy_ms as f64 / until as f64;
@@ -519,5 +582,43 @@ mod tests {
         // 80 %): still caught up.
         let m = model(rate, 0, 250, poll_ms, 1_200_000);
         assert!(m.behind <= rate * 12, "{m:?}");
+    }
+
+    /// ADR-0051 refinement of 2026-10-22, test plan item 2 (`cycle.rs`
+    /// with mixed read sizes), on the cost model measured on 2022 (37 ms,
+    /// plus 0.43 ms per event read and 0.06 ms per event skipped, in
+    /// buffers of 4 593 events): a stream reading 1 500 events/s written
+    /// for 600 s (the 50 SELECTs/s load run) falls behind with reads of
+    /// 500 (it drains minutes after the writes stop) and keeps up with
+    /// sized reads (`BATCH` after a read that is not full, the sized bound
+    /// after a full one); either way the reads take at most 80 % of the
+    /// time, each read at most a sixth of the statement timeout, and the
+    /// pauses stay under their cap.
+    #[test]
+    fn sized_reads_drain_sooner_within_the_same_bounds() {
+        let (rate, poll_ms, until) = (1_500, 10_000, 600_000);
+        let run =
+            |sized: bool| model_with(rate, 0, 0, (Some(4_593), sized), until, poll_ms, 1_800_000);
+        let fixed = run(false);
+        let sized = run(true);
+        let (f, d) = (
+            fixed.drained_ms.expect("drained with reads of 500"),
+            sized.drained_ms.expect("drained with sized reads"),
+        );
+        assert!(f > until + 60_000, "reads of 500 fall behind: {fixed:?}");
+        assert!(
+            d < f,
+            "sized reads drain sooner: {sized:?} against {fixed:?}"
+        );
+        for m in [&fixed, &sized] {
+            assert!(m.busy_share <= 0.8 + 1e-9, "{m:?}");
+            let timeout = u64::try_from(super::super::POLL_TIMEOUT.as_millis()).unwrap();
+            assert!(m.longest_read_ms * 6 <= timeout, "{m:?}");
+            assert!(
+                m.longest_pause_ms <= u64::try_from(PAUSE_CAP.as_millis()).unwrap(),
+                "{m:?}"
+            );
+        }
+        assert!(d < until + 30_000, "sized reads keep up: {sized:?}");
     }
 }
