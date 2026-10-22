@@ -1,6 +1,6 @@
 # ADR-0053 decision 6: flagged-event rate (load run with an ORM-style principal)
 
-Measurement for the precondition of acceptance of [ADR-0053](../adr/0053-overflowed-event-objects-flag.md#6-precondition-of-acceptance-measure-the-flagged-event-rate): how often an access event would carry `objects_overflowed` (its objects passed the bound of 15 named objects plus `*`, [08-engine-capabilities.md](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine)), next to how often an event names an unknown-object `*` without overflow (ADR-0053 open question 1). Recorded on 2026-10-20, with a second SQL Server run the same day after the CAS store guard fix of #293. The maintainer accepted ADR-0053 on 2026-10-20 on these figures, with no mitigation from decision 6.
+Measurement for the precondition of acceptance of [ADR-0053](../adr/0053-overflowed-event-objects-flag.md#6-precondition-of-acceptance-measure-the-flagged-event-rate): how often an access event would carry `objects_overflowed` (its objects passed the bound of 15 named objects plus `*`, [08-engine-capabilities.md](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine)), next to how often an event names an unknown-object `*` without overflow (ADR-0053 open question 1). Recorded on 2026-10-20, with a second SQL Server run the same day after the CAS store guard fix of #293. The maintainer accepted ADR-0053 on 2026-10-20 on these figures, with no mitigation from decision 6. The remainder of decision 6 (the end-to-end census, MongoDB Audit, the Valkey `*` events and an Extended Events load run) was recorded on 2026-10-22, from the census of #310 ([below](#remainder-2026-10-22-end-to-end-census-valkey-and-extended-events)).
 
 ## Runs
 
@@ -47,7 +47,7 @@ Notes on the figures:
 
 - **SQL Server, the agent's own account.** 74 of the 120 overflowed SQL Server events were the agent's own reads (`databastion`), every one with `*` and at most 16 objects. They came from the CAS store guard's `check()` read, which called a column-level `HAS_PERMS_BY_NAME` on every column of every user table: SQL Server Audit writes one `SL` record on each table such a call checks, so at every check the agent's statement reached more than 15 tables of the load database and overflowed. Own events whose objects overflowed are never left out under the own-read budget (ADR-0053 context, [08-engine-capabilities.md](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine)), so they were reported. Fixed in #293: the guard now checks column `SELECT` only on recognized CAS stores, one table per statement ([ADR-0041 implementation note of 2026-10-20](../adr/0041-cas-connector.md#implementation-note-2026-10-20-the-sql-server-guard-check-one-table-at-a-time)). Without them, 46 of 854 SQL Server events overflowed (5.4 %, derived from the table above); the second run below confirms the figure.
 - **MariaDB, statement texts cut at 1024 bytes.** A local replay of a real `server_audit` log of one ORM cycle gave overflowed events for the 16-, 20- and 24-table statements. The 15-table chain (1 239 bytes of text) was cut at `server_audit_query_log_limit` = 1024 and became an unknown-object `*`, not an overflow, although all 15 tables were in its `TABLE` records. This bears on ADR-0053 open question 1: on MariaDB a long ORM statement can produce an unknown `*` rather than a flagged event.
-- **Valkey.** All 10 events name `*`. Not yet checked: whether this is a real `*` key pattern (the load key space collapsed into one pattern by Discovery's normalization) or a key the agent could not attribute.
+- **Valkey.** All 10 events name `*`. Checked on 2026-10-22 ([below](#valkey-the--events)): not a real `*` key pattern but keys the agent did not attribute.
 - **CAS.** No event overflowed or named `*`: CAS events name one or two objects.
 
 ## Second SQL Server run (39476569869, after the CAS guard fix)
@@ -67,6 +67,40 @@ Per principal, as stored by the console:
 
 Every overflowed event came from the ORM-style principal; the agent's own account gave no event.
 
+## Remainder (2026-10-22): end-to-end census, Valkey and Extended Events
+
+The census of #310 reads the console database read-only when an end-to-end or load run ends and prints, per engine, the events, the statements, the overflowed events and the unknown-object `*` events, then the `*` events by source, action, principal kind and signals ([e2e/load/README.md](../../e2e/load/README.md#event-census-adr-0053-decision-6-informational)).
+
+### End-to-end runs
+
+CI run 39687126318, job `E2E`, on PR #310 (2026-10-21):
+
+| Engine | Events | Statements | Overflowed events | Unknown `*` events (no overflow) |
+|---|---|---|---|---|
+| MariaDB | 10 | 115 | 0 | 2 |
+| MongoDB (Audit) | 9 | 24 | 0 | 0 |
+| OpenLDAP | 4 | 5 | 0 | 0 |
+| PostgreSQL | 14 | 25 | 0 | 2 (the `pg_dump` full-table copies, and a read in `shop` over 7 statements) |
+
+The four `*` events are the dump signatures (`signature.mysqldump`, `signature.pg_dump`), a MariaDB write to a `mysql` system table and a read recorded by pgaudit. No end-to-end event overflowed, MongoDB Audit included.
+
+### Valkey: the `*` events
+
+- **Load**: run 39679876881, job `load-valkey` (2026-10-21): 120 000 `GET`s gave 10 events, every one naming only `*`, in the database `*` (the slow log records no database, and Discovery found keys in two databases), none overflowed. Discovery had learned 4 patterns in `db0` and 1 in `db1`.
+- **End to end**: the job `e2e-redis` gave 10 events, every one naming only `*`, in `db0`.
+- **Conclusion**: the Valkey `*` is never a real `*` key pattern (the learned set never holds `*`). It is a key the agent did not attribute: the database is `*` because the slow log records none, and the key matched no learned pattern and no learned literal prefix ([08-engine-capabilities.md](../08-engine-capabilities.md#redis--valkey-audit)). Why the load keys match no learned pattern is not explained yet, a [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups).
+
+### SQL Server, Extended Events source
+
+Load run 39695590686 at `527eb08` (#311, 2026-10-22), `load-sqlserver` with the Extended Events source (`sqlserver_xevents`), 50 `SELECT`s per second and a statistics reset every 10 s:
+
+| Principal | Events | Overflowed events |
+|---|---|---|
+| `load_orm` | 162 | 27 (16.7 %) |
+| `load_app` | 360 | 0 |
+
+As with SQL Server Audit, only the ORM-style principal overflowed (27 of its 162 events, against 43 of 401 in the second SQL Server Audit run, at a lower statement rate); the regular application traffic gave no overflowed event.
+
 ## Interpretation
 
 - The regular application traffic (`load_app`, about 180 000 statements per SQL engine) produced no overflowed event and no `*` event.
@@ -76,7 +110,6 @@ Every overflowed event came from the ORM-style principal; the agent's own accoun
 
 ## Limits
 
-- One run per engine (two on SQL Server), with a synthetic workload: the ORM-style cycle is a fixed mix written for this measurement, not traffic from a real application or ORM.
-- MongoDB Audit is not in the load run; there are no figures here for MySQL, Redis or OpenLDAP.
-- The end-to-end runs that decision 6 also names are not counted yet (their census lines are printed since #293, but not collected here); with MongoDB Audit, a ROADMAP [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups).
-- The Valkey `*` events are an open item, above.
+- One load run per engine (two on SQL Server Audit, one on Extended Events), with a synthetic workload: the ORM-style cycle is a fixed mix written for this measurement, not traffic from a real application or ORM.
+- MongoDB Audit and OpenLDAP are counted only in the end-to-end run, whose scenarios are small (at most 115 statements per engine) and have no ORM-style principal; there are no figures here for MySQL or for Redis load.
+- Why the Valkey load keys are not attributed to learned patterns is an open item, above.

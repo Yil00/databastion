@@ -204,6 +204,9 @@ resolution shows), and the agent account's own statement time from the engine's 
 | `audit.<target>.workload_ran` | issued > 0, 0 failed | pgbench `failed transactions`, sysbench `ignored errors` |
 | `audit.<target>.events_accounted` | 0.99 to 1.01 | sum of `aggregated_count` of `load_app`'s `read` events / statements issued during the Audit run: nothing lost, nothing counted twice |
 | `audit.<target>.drain_s` | ≤ 240 s | end of the workload → last of those events stored (`received_at`); includes the 60 s aggregation window by design |
+| `audit.<target>.db_cores_drain` | ≤ 0.5 × the server's CPUs (1.0 core of 2) | SQL Server runs only (a `drain` fact): the server's CPU over the drain, when no workload runs (the agent's catch-up reads, the probe, the server's own work). Skipped (reported, not failed) when every workload statement was stored when the workload ended |
+| `audit.<target>.db_cores_drain_vs_audit_on` | ≤ DB cores with Audit on + 0.25 | the same figure against the Audit-on run, which has the same reads plus the workload; skipped as above |
+| `audit.<target>.drain_probe_p95_us` | ≤ max(2 × p95 before Audit, p95 before Audit + 1000 µs) | the `sa` latency probe's p95 during the drain against the one before Audit; skipped as above |
 | `audit.<target>.p95_latency_ms` | ≤ 3 × p95 without Audit + 5 ms | p95 latency of the workload with Audit vs without (pgbench: per-transaction log, from the scheduled start; sysbench: its 95th percentile). Generous on purpose: shared CI runners are noisy |
 | `audit.mariadb-load.monitor_ran`, `.builtins_ran` | issued > 0, 0 failed | the side accounts ran in both phases (statements counted for the Audit run) |
 | `audit.mariadb-load.monitor_reported` | `threads` and `PROCESSLIST` named | the reader's reads of [statement-text tables](../../docs/08-engine-capabilities.md#statement-text-tables) are events naming them (ADR-0045 part (a); the digest summary has no statement text on MariaDB and stays quiet) |
@@ -391,7 +394,9 @@ workload statement, statements stored), `stored_at_workload_end` and `rate_per_s
 stored per second during the drain. `drain_s` (the check) is the time from the last workload
 statement to the last of them stored, `null` when the drain times out; the `drain` fact still shows
 how far behind the stream was and how fast it caught up. The catch-up's impact, in `results.json`
-under the target's Audit figures (informational): `db_cores_drain`, the SQL Server container's CPU
+under the target's Audit figures and checked since the #311 review R2 (`db_cores_drain`,
+`db_cores_drain_vs_audit_on`, `drain_probe_p95_us` in [2.](#2-audit-path-under-load); `drain_happened`
+says whether they applied): `db_cores_drain`, the SQL Server container's CPU
 over the drain (a `drain_<target>` window; no workload runs then), and `probe_p95_us_off` /
 `probe_p95_us_drain`, a latency probe as `sa` (blocks of 100 constant `SELECT`s every 5 s, which
 name no table and so produce no access event; one `PROBE <µs per statement>` line per block, the
