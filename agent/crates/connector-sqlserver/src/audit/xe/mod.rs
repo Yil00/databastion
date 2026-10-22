@@ -56,8 +56,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, MIN_BATCH,
-    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern,
+    APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, OWN_FILE_BYTES,
+    OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, halved, on_bad_position, on_pattern,
     target_error,
 };
 use crate::check::{self, CheckState};
@@ -690,11 +690,14 @@ async fn read(
             }
             return Ok(true);
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            st.batch = (st.batch / 2).max(MIN_BATCH);
-            return Ok(true);
+        Err(e) => {
+            if let Some(smaller) = halved(&e, s.is_poisoned(), st.batch) {
+                // A response over the bound: smaller reads, same position.
+                st.batch = smaller;
+                return Ok(true);
+            }
+            return Err(e.into_connector_error());
         }
-        Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
     let positions: Vec<(String, i64)> = polled
