@@ -637,13 +637,22 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: agent
+      # With the Unix sockets published to the runner (dev/redis/compose.socket.yml, #239 re-review
+      # N1): directories of the runner's user, setgid 2770, the servers in the runner's group, so
+      # only the runner's user connects; the TLS port is unchanged.
       - name: Start the dev Valkey and Redis services
         run: |
           cp dev/.env.example dev/.env
           make dev-dirs
-          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 valkey redis
+          install -d -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
+          DATABASTION_DEV_REDIS_SOCKET_GID="$(id -g)"
+          export DATABASTION_DEV_REDIS_SOCKET_GID
+          timeout 900 docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml up -d --wait --wait-timeout 600 valkey redis
           timeout 60 docker compose -f dev/docker-compose.yml images valkey redis
-      - name: Connector integration tests (dev images, Valkey and Redis over TLS)
+      - name: Connector integration tests (dev images, Valkey and Redis over TLS and their sockets)
+        env:
+          # The socket target test must run, never be skipped.
+          DATABASTION_IT_REDIS_REQUIRE_SOCKET: "1"
         run: |
           set -o pipefail
           timeout 1200 dev/agent-it.sh redis 2>&1 | tee "$RUNNER_TEMP/it.log"
