@@ -186,6 +186,10 @@ pub(crate) struct Shared {
     /// Extended Events reads (ADR-0051 refinement of 2026-10-22), for the
     /// logs and the tests: [`XeReads`].
     xe_reads: Mutex<HashMap<String, XeReads>>,
+    /// Integration tests only: the Extended Events read-size memory of
+    /// this connector's streams ([`xe::size::ReadSize::with_memory`]).
+    #[cfg(test)]
+    pub(crate) xe_size_memory: Mutex<Option<Duration>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -503,6 +507,19 @@ impl Shared {
         match retry {
             xe::size::Retry::Bytes => r.cancels = r.cancels.saturating_add(1),
             xe::size::Retry::Timeout => r.timeouts = r.timeouts.saturating_add(1),
+        }
+    }
+
+    /// The read-size memory of a new Extended Events stream (`None`: the
+    /// default; integration tests only otherwise).
+    pub(crate) fn xe_size_memory(&self) -> Option<Duration> {
+        #[cfg(test)]
+        {
+            *lock(&self.xe_size_memory)
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 

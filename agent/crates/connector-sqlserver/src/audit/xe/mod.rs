@@ -413,7 +413,7 @@ pub(crate) async fn stream(
         poll_from: String::new(),
         reprobe_at: Instant::now(),
         evaluated_at: None,
-        size: size::ReadSize::default(),
+        size: size::ReadSize::with_memory(state.audit.xe_size_memory()),
         poll_time: Duration::ZERO,
         statman: false,
         major: 0,
@@ -801,7 +801,6 @@ async fn read(
             // The position is no longer in the file set (rollover, a file
             // deleted): from the oldest file, leaving out what was read;
             // whatever was between is lost (M4).
-            st.size.restarted(Instant::now());
             let before = st.cursor.pattern.clone();
             Box::pin(reprobe(st, s)).await?;
             if st.cursor.pattern == before && st.cursor.file.is_some() {
@@ -810,7 +809,7 @@ async fn read(
                 st.state.audit.note_gap(&target_id);
                 st.state.audit.note_dropped(&target_id, 1);
             }
-            return Ok(true);
+            return Ok(st.size.ended(size::ReadEnd::Restarted, Instant::now()));
         }
         Err(e) => {
             // A response above `POLL_BYTES` (nothing of it handled), or the
@@ -858,9 +857,9 @@ async fn read(
         // re-probe left (the gap is already noted).
         if reprobe_moved(&before, &st.cursor) {
             tracing::info!(target_id = %target_id, "Extended Events: the session's file set or start changed during a read: reading again from the new position");
-            st.size
-                .received(largest_row, size::Path::Base, Instant::now());
-            return Ok(true);
+            return Ok(st
+                .size
+                .ended(size::ReadEnd::ReprobeMoved { largest_row }, Instant::now()));
         }
     }
     st.state.audit.note_dropped(&target_id, polled.malformed);
@@ -888,11 +887,7 @@ async fn read(
     // that may change an event session, found among every record of the
     // read, those the history, floor and skip filters then drop included;
     // its place and time cut the failed-login proof below.
-    let changed = records
-        .iter()
-        .rev()
-        .find(|r| r.may_change_event_session())
-        .map(|r| (r.index, r.time_us));
+    let changed = session_change(&records);
     // The agent's sessions on this source's clock: each read-back event
     // calibrates its session (own::calibrate), before any own rule.
     own::calibrate(&target_id, &readbacks(&records, &st.target.account));
@@ -1040,14 +1035,31 @@ async fn read(
     // follow reads on (it moved the position by half the read at least).
     // That read, and a full read not cut, set the next one to the sized
     // bound; any other read to `BATCH` (M1).
-    let more = b.full && !waits && clamped.is_none();
-    let path = if more {
-        size::Path::Sized
-    } else {
-        size::Path::Base
-    };
-    st.size.received(largest_row, path, Instant::now());
-    Ok(more)
+    Ok(st.size.ended(
+        size::ReadEnd::Handled {
+            largest_row,
+            full: b.full,
+            waits,
+            clamped: clamped.is_some(),
+        },
+        Instant::now(),
+    ))
+}
+
+/// The statements of a read that may change an event session (#280
+/// re-review L-b), as one change: the last one's place in the read and the
+/// latest event time of them all (security review L2 of the read-size
+/// change: with two changes in one read, a failed login must follow both,
+/// in the file and in time).
+pub(crate) fn session_change(records: &[XeRecord]) -> Option<(usize, i64)> {
+    records
+        .iter()
+        .filter(|r| r.may_change_event_session())
+        .fold(None, |acc: Option<(usize, i64)>, r| {
+            Some(acc.map_or((r.index, r.time_us), |(i, t)| {
+                (i.max(r.index), t.max(r.time_us))
+            }))
+        })
 }
 
 /// Whether the re-probe inside a read changed what `before` (the cursor's
@@ -1379,12 +1391,11 @@ mod failed_login_proof_tests {
             r.index = i;
         }
         recs[1].time_us = 35;
-        let changed = recs
-            .iter()
-            .rev()
-            .find(|r| r.may_change_event_session())
-            .map(|r| (r.index, r.time_us));
+        let changed = session_change(&recs);
         assert_eq!(changed, Some((1, 35)));
+        // Security review L2: two changes, the later in the file stamped
+        // earlier (another buffer): the last place and the latest time.
+        assert_eq!(session_change(&recs[2..3]), None);
         // After it in the file and in time: `ann` only (`bob` is later in
         // the file but stamped before it, another CPU's buffer).
         let after = recs
@@ -1396,6 +1407,19 @@ mod failed_login_proof_tests {
             .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
         assert_eq!(failed_login_proof(after, "databastion"), None);
         assert_eq!(failed_login_proof(&recs, "databastion"), Some(40));
+        // Security review L2: a second change later in the file but
+        // stamped earlier (another buffer): the last place and the latest
+        // time of both.
+        let mut second = stmt("DROP EVENT SESSION other ON SERVER");
+        second.index = 3;
+        second.time_us = 20;
+        recs[3] = second;
+        let changed = session_change(&recs);
+        assert_eq!(changed, Some((3, 35)));
+        let after = recs
+            .iter()
+            .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
+        assert_eq!(failed_login_proof(after, "databastion"), Some(40));
     }
 
     /// Security review L2: the last event facts live with the proof, per

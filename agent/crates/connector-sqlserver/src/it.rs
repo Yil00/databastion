@@ -5357,15 +5357,48 @@ async fn xe_large_events_are_read_by_halving() {
 }
 
 async fn xe_large_scenario() {
-    use crate::audit::xe::size::{TEST_MEMORY_MS, XE_MAX_ROWS};
-    use std::sync::atomic::Ordering;
     if !enabled() {
         return;
     }
     let _g = serial().await;
     let major = Box::pin(major()).await;
+    // The body in a task, so that the dev session is started again and
+    // the test's session dropped whatever happens (security review L4).
+    let result = tokio::spawn(xe_large_body(major)).await;
     let mut s = Box::pin(sa()).await;
-    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    Box::pin(exec_ok(
+        &mut s,
+        &format!(
+            "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
+             DROP EVENT SESSION {LARGE_XE} ON SERVER"
+        ),
+    ))
+    .await;
+    Box::pin(exec_ok(
+        &mut s,
+        "IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'databastion_xe') \
+         ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec_ok(
+            &mut s,
+            &in_db(
+                "master",
+                "REVOKE VIEW SERVER PERFORMANCE STATE FROM databastion",
+            ),
+        ))
+        .await;
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+async fn xe_large_body(major: u32) {
+    use crate::audit::xe::size::XE_MAX_ROWS;
+    let mut s = Box::pin(sa()).await;
+    let _ = Box::pin(xe_grant(&mut s, major)).await;
     let stem = format!("it_large_{}", std::process::id());
     let drop = format!(
         "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
@@ -5391,8 +5424,9 @@ async fn xe_large_scenario() {
         &format!("ALTER EVENT SESSION {LARGE_XE} ON SERVER STATE = START"),
     ))
     .await;
-    TEST_MEMORY_MS.store(20_000, Ordering::Relaxed);
     let c = Arc::new(SqlserverConnector::new());
+    // This connector's streams remember outcomes for 20 s, not 10 minutes.
+    *c.state.audit.xe_size_memory.lock().unwrap() = Some(Duration::from_secs(20));
     let t = agent(&format!(
         "{}, rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {LARGE_XE}}}",
         own_tls()
@@ -5416,20 +5450,32 @@ async fn xe_large_scenario() {
     // Counts the stream's reads of `retail.crm.customers` by `sa` until
     // `want` are counted or `wait` passes.
     let mut seen = 0usize;
-    let other = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let other = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    // Security review L6: the agent's own events (its polls, cancelled
+    // ones included, consumed by their credits) are never reported.
+    let own = std::sync::atomic::AtomicUsize::new(0);
     let mut count_until = async |want: usize, wait: Duration| {
         let deadline = std::time::Instant::now() + wait;
         while seen < want && std::time::Instant::now() < deadline {
             assert!(!stream.is_finished(), "the stream ended");
-            if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-                && e.principal().account_name().eq_ignore_ascii_case("sa")
+            let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            else {
+                continue;
+            };
+            if e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("databastion")
             {
+                own.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if e.principal().account_name().eq_ignore_ascii_case("sa") {
                 let names = names_of(&e);
                 if names.contains(&"retail.crm.customers".to_owned()) {
                     seen += usize::try_from(e.aggregated_count()).unwrap_or(1);
                 } else {
                     *other
-                        .borrow_mut()
+                        .lock()
+                        .unwrap()
                         .entry(format!("{:?} {names:?}", e.action()))
                         .or_insert(0usize) += 1;
                 }
@@ -5456,7 +5502,10 @@ async fn xe_large_scenario() {
     let got = count_until(want, Duration::from_secs(120)).await;
     let r = c.state.audit.xe_reads(&t.id);
     eprintln!("[it] large events: {got}/{want} after the large ones, reads {r:?}");
-    eprintln!("[it] large events: other events of sa {:?}", other.borrow());
+    eprintln!(
+        "[it] large events: other events of sa {:?}",
+        other.lock().unwrap()
+    );
     assert_eq!(got, want, "every large read reported once");
     assert!(r.cancels >= 1, "a response above 12 MiB: {r:?}");
     assert_eq!(r.timeouts, 0, "{r:?}");
@@ -5484,26 +5533,152 @@ async fn xe_large_scenario() {
     assert_eq!(got, want, "no read reported twice");
     stream.abort();
     let _ = stream.await;
-    TEST_MEMORY_MS.store(0, Ordering::Relaxed);
+    let left_out = c.state.audit.own_left_out(&t.id);
+    let own = own.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[it] large events: own statements left out {left_out:?} (credited polls {}), own events reported {own}, reads {:?}",
+        left_out[2],
+        c.state.audit.xe_reads(&t.id)
+    );
+    assert_eq!(own, 0, "none of the agent's own events reported");
     let dropped = c.state.audit.facts(&t.id).dropped;
     assert_eq!(dropped, 0, "records dropped");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`,
+/// `--ignored`), security review M1 of the read-size change (2026-10-22):
+/// the cost of the agent's poll over events above the poll's 128 KiB
+/// `event_data` bound (returned without their XML, but converted by the
+/// server: `DATALENGTH` and the `CASE`), statements of `pad` characters,
+/// against the 15 s statement timeout. Prints `OVERSIZED` lines.
+#[tokio::test]
+#[ignore = "measurement: DATABASTION_IT_SQLSERVER_MEASURE=1, --ignored"]
+async fn measure_xe_oversized_events() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    // `DATABASTION_IT_OVERSIZED_PAD`: the statements' length (default
+    // 200 000 characters; an event above a buffer, about 1.3 MB with the
+    // default `MAX_MEMORY`, is dropped by the session).
+    let pad: usize = std::env::var("DATABASTION_IT_OVERSIZED_PAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let name = "it_oversized_xe";
+    let stem = format!("it_oversized_{}", std::process::id());
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{name}') \
+         DROP EVENT SESSION {name} ON SERVER"
+    );
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    // `sp_statement_completed` only: the large statements alone, every
+    // event above the bound.
+    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
+    let session = format!(
+        "CREATE EVENT SESSION {name} ON SERVER ADD EVENT sqlserver.sp_statement_completed ({actions}) \
+         ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
+         max_file_size = 512, max_rollover_files = 2) WITH (MAX_DISPATCH_LATENCY = 5 SECONDS)"
+    );
+    Box::pin(exec(&mut s, &session)).await;
     Box::pin(exec_ok(
         &mut s,
-        &format!("ALTER EVENT SESSION {LARGE_XE} ON SERVER STATE = STOP"),
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
     ))
     .await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {name} ON SERVER STATE = START"),
+    ))
+    .await;
+    let n = 600u32;
+    let started = std::time::Instant::now();
+    for _ in 0..n / 100 {
+        let n = 100u32;
+        Box::pin(exec(
+        &mut s,
+        &format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
+             WHILE @i < {n} BEGIN \
+             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+             WAITFOR DELAY '00:00:00.050'; END"
+        ),
+    ))
+    .await;
+    }
+    let n = 600u32;
+    eprintln!(
+        "OVERSIZED | {n} statements of {pad} characters written in {} ms",
+        started.elapsed().as_millis()
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {name} ON SERVER STATE = STOP"),
+    ))
+    .await;
+    let files = format!("N'/var/opt/mssql/xe/{stem}_0_*.xel'");
+    let stats = try_rows(
+        &mut s,
+        &format!(
+            "SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, SUM(CASE WHEN DATALENGTH(event_data) > 131072 THEN 1 ELSE 0 END)), \
+             CONVERT(bigint, MAX(DATALENGTH(event_data))) FROM sys.fn_xe_file_target_read_file({files}, NULL, NULL, NULL)"
+        ),
+        3,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "OVERSIZED | events {:?}, above 128 KiB {:?}, largest {:?} bytes",
+        stats[0][0].as_int(),
+        stats[0][1].as_int(),
+        stats[0][2].as_int()
+    );
+    let current = format!("/var/opt/mssql/xe/{stem}_0_1.xel");
+    let text = crate::sql::xe_poll(&crate::sql::xe_pattern(&current).unwrap(), false).unwrap();
+    for top in [100usize, 250, 500, 1_000, 2_000] {
+        let mut ms = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let r = Box::pin(crate::audit::xe::poll_records(
+                &mut s,
+                &text,
+                crate::audit::own::PollKind::Start,
+                "",
+                0,
+                top,
+                0,
+            ))
+            .await;
+            let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+            match r {
+                Ok(p) => {
+                    ms.push(elapsed);
+                    eprintln!(
+                        "OVERSIZED | read of {top}: {} rows, {} bytes, {elapsed:.0} ms",
+                        p.returned, p.bytes
+                    );
+                }
+                Err(e) => eprintln!(
+                    "OVERSIZED | read of {top}: {:?} after {elapsed:.0} ms",
+                    e.code
+                ),
+            }
+        }
+        eprintln!(
+            "OVERSIZED | read of {top}: median {:.0} ms",
+            median_of(&mut ms)
+        );
+    }
+    Box::pin(exec_ok(&mut s, &drop)).await;
     Box::pin(exec_ok(
         &mut s,
         "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
     ))
     .await;
-    Box::pin(exec_ok(&mut s, &drop)).await;
-    if major >= 16 {
-        Box::pin(exec(
-            &mut s,
-            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
-        ))
-        .await;
-    }
 }

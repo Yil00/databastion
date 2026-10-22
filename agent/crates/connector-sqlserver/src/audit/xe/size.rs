@@ -61,6 +61,28 @@ pub(crate) enum Path {
     Base,
 }
 
+/// How a read whose response was taken ended (security review L3 of the
+/// read-size change: `read()`'s choice of "more to read" and of the next
+/// size, in one pure function, [`ReadSize::ended`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadEnd {
+    /// A position the server refused (errors 25722 / 25717): restarted at
+    /// the oldest file, nothing read.
+    Restarted,
+    /// Its response came, and a re-probe moved the cursor (new file set or
+    /// session start): not handled. `largest_row`: its largest row.
+    ReprobeMoved { largest_row: usize },
+    /// Handled: `full` it returned every row it asked, `waits` it ended
+    /// before a deferred statistics build, `clamped` its position was kept
+    /// before a file the session has not written yet.
+    Handled {
+        largest_row: usize,
+        full: bool,
+        waits: bool,
+        clamped: bool,
+    },
+}
+
 /// Why a read was retried rather than failing the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Retry {
@@ -87,6 +109,9 @@ pub(crate) struct ReadSize {
     /// The totals at the last `info` line, and when it was logged.
     logged: (u64, u64),
     logged_at: Option<Instant>,
+    /// How long outcomes are remembered: [`MEMORY`], shorter only in the
+    /// integration tests, per connector ([`ReadSize::with_memory`]).
+    memory: Duration,
 }
 
 impl Default for ReadSize {
@@ -100,32 +125,25 @@ impl Default for ReadSize {
             timeouts: 0,
             logged: (0, 0),
             logged_at: None,
+            memory: MEMORY,
         }
     }
 }
 
-/// Integration tests only: [`MEMORY`] shortened (ms, 0: unchanged), so
-/// that a test sees the reads grow back without waiting 10 minutes.
-#[cfg(test)]
-pub(crate) static TEST_MEMORY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn memory() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = TEST_MEMORY_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    MEMORY
-}
-
-fn active(at: Option<Instant>, now: Instant) -> bool {
-    at.is_some_and(|t| now.saturating_duration_since(t) < memory())
+fn active(at: Option<Instant>, now: Instant, memory: Duration) -> bool {
+    at.is_some_and(|t| now.saturating_duration_since(t) < memory)
 }
 
 impl ReadSize {
+    /// A stream's read size, its memory `memory` (`None`: [`MEMORY`]; set
+    /// only by the integration tests, per connector instance).
+    pub(crate) fn with_memory(memory: Option<Duration>) -> Self {
+        Self {
+            memory: memory.unwrap_or(MEMORY),
+            ..Self::default()
+        }
+    }
+
     /// The rows of the next read.
     pub(crate) fn rows(&self) -> usize {
         self.next
@@ -136,12 +154,38 @@ impl ReadSize {
         let by_bytes = (POLL_BYTES / 4 * 3)
             .checked_div(self.largest_row)
             .unwrap_or(XE_MAX_ROWS);
-        let cap = if active(self.capped, now) {
+        let cap = if active(self.capped, now, self.memory) {
             BATCH
         } else {
             XE_MAX_ROWS
         };
         XE_MAX_ROWS.min(cap).min(by_bytes).max(BATCH)
+    }
+
+    /// Sets the next size after a read that ended as `end`; `true` when
+    /// the next read follows at once (`read()`'s result).
+    pub(crate) fn ended(&mut self, end: ReadEnd, now: Instant) -> bool {
+        match end {
+            ReadEnd::Restarted => {
+                self.restarted(now);
+                true
+            }
+            ReadEnd::ReprobeMoved { largest_row } => {
+                self.received(largest_row, Path::Base, now);
+                true
+            }
+            ReadEnd::Handled {
+                largest_row,
+                full,
+                waits,
+                clamped,
+            } => {
+                let more = full && !waits && !clamped;
+                let path = if more { Path::Sized } else { Path::Base };
+                self.received(largest_row, path, now);
+                more
+            }
+        }
     }
 
     /// A read whose response was received, its largest row `largest_row`
@@ -164,7 +208,7 @@ impl ReadSize {
     fn settle(&mut self, base: usize, succeeded: bool, now: Instant) {
         let mut next = base;
         if let Some((size, at)) = self.halved {
-            if active(Some(at), now) || !succeeded {
+            if active(Some(at), now, self.memory) || !succeeded {
                 next = next.min(size);
             } else {
                 // Grows back by doubling after each read that succeeds, to
@@ -179,7 +223,7 @@ impl ReadSize {
                 }
             }
         }
-        if active(self.capped, now) {
+        if active(self.capped, now, self.memory) {
             next = next.min(BATCH);
         }
         self.next = next.max(MIN_BATCH);
@@ -241,7 +285,7 @@ impl ReadSize {
         );
         if self
             .logged_at
-            .is_some_and(|t| now.saturating_duration_since(t) < memory())
+            .is_some_and(|t| now.saturating_duration_since(t) < self.memory)
         {
             return false;
         }
@@ -301,6 +345,49 @@ mod tests {
         // No row (an empty read is never full; the bound alone).
         s.received(0, Path::Sized, t);
         assert_eq!(s.rows(), XE_MAX_ROWS);
+    }
+
+    /// Security review L3: every end of `read()` through the pure
+    /// function it calls: "more to read" and the next size.
+    #[test]
+    fn every_end_of_a_read_sets_more_and_the_size() {
+        let t = Instant::now();
+        let handled = |full, waits, clamped| ReadEnd::Handled {
+            largest_row: 1_000,
+            full,
+            waits,
+            clamped,
+        };
+        for (end, more, rows) in [
+            (handled(true, false, false), true, XE_MAX_ROWS),
+            // A clamp before a file not written yet.
+            (handled(true, false, true), false, BATCH),
+            // A deferral.
+            (handled(true, true, false), false, BATCH),
+            (handled(false, true, false), false, BATCH),
+            // Not full (caught up).
+            (handled(false, false, false), false, BATCH),
+            (ReadEnd::ReprobeMoved { largest_row: 1_000 }, true, BATCH),
+            (ReadEnd::Restarted, true, BATCH),
+        ] {
+            let mut s = ReadSize::default();
+            s.received(1_000, Path::Sized, t);
+            assert_eq!(s.rows(), XE_MAX_ROWS);
+            assert_eq!(s.ended(end, t), more, "{end:?}");
+            assert_eq!(s.rows(), rows, "{end:?}");
+        }
+        // A full read's largest row sizes the next one.
+        let mut s = ReadSize::default();
+        assert!(s.ended(
+            ReadEnd::Handled {
+                largest_row: 6_000,
+                full: true,
+                waits: false,
+                clamped: false
+            },
+            t
+        ));
+        assert_eq!(s.rows(), POLL_BYTES / 4 * 3 / 6_000);
     }
 
     /// The sized bound: the smaller of N, the cap and 0.75 × POLL_BYTES
