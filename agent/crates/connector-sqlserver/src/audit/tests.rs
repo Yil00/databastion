@@ -803,3 +803,120 @@ async fn a_response_over_the_byte_bound_leaves_the_session_usable() {
             .any(|m| m.first() == Some(&crate::tds::ptype::ATTENTION))
     );
 }
+
+/// A real `ResourceLimit` with the session poisoned: a response over the
+/// byte bound whose cancel is never acknowledged (the server closes).
+async fn poisoned_bound() -> SsError {
+    use crate::conn::{Flow, Shape, tests::scripted};
+    use crate::token::{done, tests::build, tok};
+
+    let mut big = build::colmeta_int(&["a"]);
+    for i in 0..4_000 {
+        big.extend(build::row_int(&[Some(i)]));
+    }
+    big.extend(build::done(tok::DONE, done::COUNT, 4_000));
+    let (mut s, _h) = scripted(vec![big, crate::fake::CLOSE.to_vec()]);
+    let shape = Shape {
+        columns: 1,
+        max_rows: 10_000,
+        max_bytes: 1024,
+        plp_cap: 0,
+    };
+    let e = s
+        .run("SELECT a", Stage::Introspection, shape, |_| Flow::Continue)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, FailureCode::ResourceLimit);
+    assert!(s.is_poisoned(), "attention not acknowledged");
+    e
+}
+
+/// Security review L1 of the 0.8.1 fix: a read over the bound whose
+/// cancel poisons the session ends the stream, and the restarted stream
+/// (which starts at `BATCH`) reads the halved size from the same
+/// position, so a poisoning that recurs there still walks down to
+/// `MIN_BATCH`; a successful read clears it. Both sources, each with its
+/// own key.
+#[tokio::test]
+async fn a_poisoned_oversized_read_keeps_its_halved_size_across_restarts() {
+    let e = poisoned_bound().await;
+    let audit = Cursor {
+        file: Some(f("/var/opt/mssql/audit/", 1)),
+        offset: 4096,
+        skip: 7,
+        pattern: Some(P1.to_owned()),
+        ..Cursor::default()
+    };
+    let xe = Cursor {
+        file: Some("/var/opt/mssql/xe/x_0_1.xel".to_owned()),
+        offset: 8192,
+        skip: 3,
+        pattern: Some("N'/var/opt/mssql/xe/x*.xel'".to_owned()),
+        ..Cursor::default()
+    };
+    for (source, cursor, other) in [
+        (Source::Audit, &audit, Source::Xevents),
+        (Source::Xevents, &xe, Source::Audit),
+    ] {
+        let shared = Shared::default();
+        let at = ReadAt::of(cursor);
+        // A first stream: the read fails poisoned, the stream ends.
+        let first = shared.read_size("t1", source, &at, BATCH);
+        assert_eq!(first, BATCH);
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &e, true, first),
+            None,
+            "{source:?}: a poisoned session ends the stream"
+        );
+        // Restarts at the same position read smaller each time, down to
+        // the floor, never below it.
+        let mut sizes = vec![first];
+        loop {
+            let n = shared.read_size("t1", source, &ReadAt::of(cursor), BATCH);
+            if n == *sizes.last().unwrap() {
+                break;
+            }
+            sizes.push(n);
+            assert_eq!(
+                shared.read_failed("t1", source, ReadAt::of(cursor), &e, true, n),
+                None
+            );
+        }
+        assert_eq!(sizes, [500, 250, 125, 62, 31, 16], "{source:?}");
+        // Only for this target, this source and this position.
+        assert_eq!(shared.read_size("t2", source, &at, BATCH), BATCH);
+        assert_eq!(shared.read_size("t1", other, &at, BATCH), BATCH);
+        let mut moved = cursor.clone();
+        moved.skip += 1;
+        assert_eq!(
+            shared.read_size("t1", source, &ReadAt::of(&moved), BATCH),
+            BATCH
+        );
+        let mut refiled = cursor.clone();
+        refiled.pattern = None;
+        assert_eq!(
+            shared.read_size("t1", source, &ReadAt::of(&refiled), BATCH),
+            BATCH
+        );
+        // A smaller in-stream size is never raised by it.
+        assert_eq!(shared.read_size("t1", source, &at, 8), 8);
+        // A successful read clears it: the next restart reads BATCH.
+        shared.read_succeeded("t1");
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH);
+        // A session still in step halves in the stream, and the size is
+        // kept for a restart too until a read succeeds.
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &e, false, BATCH),
+            Some(BATCH / 2)
+        );
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH / 2);
+        shared.read_succeeded("t1");
+        // Other failures keep nothing.
+        let timeout = SsError::new(FailureCode::Timeout, Stage::Introspection);
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &timeout, false, BATCH),
+            None
+        );
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH);
+    }
+}
