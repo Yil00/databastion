@@ -518,6 +518,27 @@ phase_done warmup
 run_workload off "$LOAD_BASELINE_S"
 phase_done workload-off
 
+# The latency probe (the catch-up impact, review M1 of the read-throughput fix): as `sa`, blocks of
+# 100 constant SELECTs (no table: no access event on either source; about 60 Extended Events events/s),
+# one `PROBE <µs per statement>` line per block every 5 s, for 30 s per call (server clock: a block's
+# mean, not a statement's latency). Run once before Audit (phase off) and during the drain, while the
+# stream may still catch up and no workload runs (phase drain); compared as the `probe` facts.
+PROBE_SQL="DECLARE @end datetime2 = DATEADD(second, 30, SYSUTCDATETIME()), @t0 datetime2, @i int, @v int;
+WHILE SYSUTCDATETIME() < @end BEGIN
+  SET @t0 = SYSUTCDATETIME(); SET @i = 0;
+  WHILE @i < 100 BEGIN SELECT @v = COUNT(*) FROM (VALUES (1), (2), (3)) AS v(x); SET @i += 1; END;
+  PRINT CONCAT('PROBE ', DATEDIFF_BIG(microsecond, @t0, SYSUTCDATETIME()) / 100);
+  WAITFOR DELAY '00:00:05';
+END"
+probe_chunk() { mssql_sa_q "$PROBE_SQL" >>"$1" 2>/dev/null || true; }
+# probe_loop OUT STOP_FILE: 30 s chunks until STOP_FILE exists.
+probe_loop() { while [ ! -e "$2" ]; do probe_chunk "$1"; done; }
+log "latency probe before Audit (30 s, as sa, constant SELECTs)"
+: >"$W/out/probe-off.txt"
+probe_chunk "$W/out/probe-off.txt"
+python3 "$LOADLIB" probe --out-file "$W/out/probe-off.txt" --target "$TARGET" --phase off >>"$FACTS"
+log "probe (off): $(tail -n 1 "$FACTS" | jq -c '{blocks, mean_us, p95_us}')"
+
 # ------------------------------------------------------------------------------ Audit on
 log "enabling Audit on ${TARGET} (${LOAD_SQLSERVER_AUDIT_SOURCE})"
 AUDIT_START="$(date +%s)"
@@ -538,16 +559,51 @@ events_sql() {
 want="$(grep '"kind":"workload"' "$FACTS" | jq -s 'map(select(.phase == "on"))[0].issued // 0')"
 log "waiting until every statement of the Audit run is stored (${want} expected, at most ${LOAD_DRAIN_TIMEOUT_S} s)"
 deadline=$(( $(date +%s) + LOAD_DRAIN_TIMEOUT_S ))
+# The stream lag: statements stored against the time since the last workload statement, sampled every
+# 5 s and logged every 30 s; the `drain` fact keeps the samples, the count stored when the workload
+# ended and the rate during the drain (statements/s), so a stream that falls behind its source shows
+# how far and how fast it catches up even when the drain times out (drain_s is then null).
+drain_samples=()
+last_log=0
+DRAIN_T0="$(now_s)"
+: >"$W/out/probe-drain.txt"
+rm -f -- "$W/out/probe-stop"
+probe_loop "$W/out/probe-drain.txt" "$W/out/probe-stop" &
+probe_pid=$!
+BG_PIDS+=("$probe_pid")
 while :; do
   got="$(console_sql "SELECT coalesce(sum(aggregated_count), 0) $(events_sql)")"
+  since="$(jq -n --argjson a "$SOAK_END" --argjson b "$(now_s)" '$b - $a | . * 10 | round / 10')"
+  drain_samples+=("[${since},${got}]")
   [ "$got" -ge "$want" ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
     log "WARNING: not every statement stored within ${LOAD_DRAIN_TIMEOUT_S} s: ${got}/${want}"
     break
   fi
+  if [ "$(date +%s)" -ge $(( last_log + 30 )) ]; then
+    log "drain: ${got}/${want} statements stored ${since} s after the workload"
+    last_log="$(date +%s)"
+  fi
   sleep 5
 done
 log "statements stored: ${got}/${want}"
+DRAIN_T1="$(now_s)"
+fact --arg name "drain_${TARGET}" --argjson t0 "$DRAIN_T0" --argjson t1 "$DRAIN_T1" '{kind: "window", name: $name, t0: $t0, t1: $t1}'
+# The probe's current chunk ends within 30 s.
+touch "$W/out/probe-stop"
+wait "$probe_pid" 2>/dev/null || true
+kept_pids=()
+for pid in "${BG_PIDS[@]}"; do [ "$pid" = "$probe_pid" ] || kept_pids+=("$pid"); done
+BG_PIDS=("${kept_pids[@]}")
+python3 "$LOADLIB" probe --out-file "$W/out/probe-drain.txt" --target "$TARGET" --phase drain >>"$FACTS"
+log "probe (drain): $(tail -n 1 "$FACTS" | jq -c '{blocks, mean_us, p95_us}')"
+fact --arg target "$TARGET" --argjson want "$want" --argjson got "$got" \
+  --argjson samples "[$(IFS=,; printf '%s' "${drain_samples[*]}")]" \
+  '{kind: "drain", target: $target, want: $want, stored: $got, samples: $samples,
+    stored_at_workload_end: $samples[0][1],
+    rate_per_s: (if ($samples | length) > 1 and ($samples[-1][0] - $samples[0][0]) > 0
+      then (($samples[-1][1] - $samples[0][1]) / ($samples[-1][0] - $samples[0][0]) | . * 10 | round / 10) else null end)}'
+log "drain: $(tail -n 1 "$FACTS" | jq -c '{want, stored, stored_at_workload_end, rate_per_s}')"
 console_sql "SELECT json_build_object('kind', 'events', 'target', '${TARGET}',
     'received', coalesce(sum(aggregated_count), 0), 'events', count(*),
     'lag_p95_s', round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from received_at - coalesce(ts_last, ts))::float8)::numeric, 1),

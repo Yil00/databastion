@@ -582,6 +582,19 @@ def facts_of(rows: list[dict], kind: str) -> list[dict]:
     return [r for r in rows if r.get("kind") == kind]
 
 
+def probe_fact(text: str, target: str, phase: str) -> dict:
+    """The `probe` fact of sqlserver.sh's latency probe output (`PROBE <µs per statement>` lines, one
+    per block): blocks, mean and nearest-rank p95 (µs)."""
+    vals = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "PROBE" and parts[1].isdigit():
+            vals.append(float(parts[1]))
+    return {"kind": "probe", "target": target, "phase": phase, "blocks": len(vals),
+            "mean_us": _r(sum(vals) / len(vals), 1) if vals else None,
+            "p95_us": percentile(vals, 95.0) if vals else None}
+
+
 def one_fact(rows: list[dict], kind: str, **match: object) -> dict | None:
     for r in rows:
         if r.get("kind") == kind and all(r.get(k) == v for k, v in match.items()):
@@ -707,6 +720,21 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
             a["db_cores_audit_off"] = _r(rate(cpu, w_off["t0"], w_off["t1"], 1e6), 4)
         if w_on:
             a["db_cores_audit_on"] = _r(rate(cpu, w_on["t0"], w_on["t1"], 1e6), 4)
+        # The stream's catch-up after the workload (informational, sqlserver.sh): the DB server's CPU
+        # over the drain (no workload runs then: the agent's reads, the probe and the server's own
+        # work), the drain progress, and the latency probe before Audit and during the drain.
+        w_drain = one_fact(facts, "window", name=f"drain_{target}")
+        if w_drain:
+            a["db_cores_drain"] = _r(rate(cpu, w_drain["t0"], w_drain["t1"], 1e6), 4)
+        dr = one_fact(facts, "drain", target=target)
+        if dr:
+            a["stored_at_workload_end"] = dr.get("stored_at_workload_end")
+            a["drain_rate_per_s"] = dr.get("rate_per_s")
+        for ph in ("off", "drain"):
+            pr = one_fact(facts, "probe", target=target, phase=ph)
+            if pr:
+                a[f"probe_p95_us_{ph}"] = pr.get("p95_us")
+                a[f"probe_blocks_{ph}"] = pr.get("blocks")
         audit[target] = a
         ok_wl = issued_on is not None and issued_on > 0 and not wl.get("failed")
         ck.add(f"audit.{target}.workload_ran", ok_wl, {"issued": issued_on, "failed": wl.get("failed")}, "> 0 issued, 0 failed")
@@ -1487,6 +1515,11 @@ def cmd_xe_catchup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe(args: argparse.Namespace) -> int:
+    print(json.dumps(probe_fact(_read(args.out_file) or "", args.target, args.phase), separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1524,6 +1557,10 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--label", default="run")
     x.add_argument("--md")
     x.add_argument("--json")
+    pr = sub.add_parser("probe", help="the probe fact of sqlserver.sh's latency probe output")
+    pr.add_argument("--out-file", dest="out_file", required=True)
+    pr.add_argument("--target", required=True)
+    pr.add_argument("--phase", required=True, choices=["off", "drain"])
     r = sub.add_parser("report")
     r.add_argument("--facts", required=True)
     r.add_argument("--samples", nargs="+", required=True)
@@ -1532,7 +1569,7 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     return {"sample": cmd_sample, "pgbench": cmd_pgbench, "sysbench": cmd_sysbench, "quiet": cmd_quiet,
             "report": cmd_report, "census": cmd_census, "census-sql": cmd_census_sql,
-            "xe-catchup": cmd_xe_catchup}[a.cmd](a)
+            "xe-catchup": cmd_xe_catchup, "probe": cmd_probe}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -384,6 +384,25 @@ session's next reporting queries (`GROUP BY a0.status`) build them again in `loa
 statistics builds under load, which the stream may defer (ADR-0051 refinement of 2026-10-18). The
 `sa` drops are DDL events of `sa`, always reported; they are not in the figures below.
 
+The stream lag (both sources): while it waits for the drain, the run samples the statements stored
+every 5 s, logs `drain: <stored>/<expected> statements stored <s> s after the workload` every 30 s,
+and records a `drain` fact (`facts.jsonl`, not a check): the samples (seconds since the last
+workload statement, statements stored), `stored_at_workload_end` and `rate_per_s`, the statements
+stored per second during the drain. `drain_s` (the check) is the time from the last workload
+statement to the last of them stored, `null` when the drain times out; the `drain` fact still shows
+how far behind the stream was and how fast it caught up. The catch-up's impact, in `results.json`
+under the target's Audit figures (informational): `db_cores_drain`, the SQL Server container's CPU
+over the drain (a `drain_<target>` window; no workload runs then), and `probe_p95_us_off` /
+`probe_p95_us_drain`, a latency probe as `sa` (blocks of 100 constant `SELECT`s every 5 s, which
+name no table and so produce no access event; one `PROBE <µs per statement>` line per block, the
+p95 over the blocks) run for 30 s before Audit and throughout the drain. The agent logs an `info`
+line at most once a minute while a stream is behind its source ("Audit stream behind its source",
+with `cycles`, `reads`, `busy_ms` and `window_ms`; the read rate is about
+`reads × 500 / busy_ms × 1000` events per second at most) and one when it caught up. Load run
+39687119269 (Extended Events, 50 `SELECT`s/s, before the fix) stored 15 028 of 30 000 `SELECT`s
+300 s after the workload: a stream still in its first start's history phase waited the poll
+interval after every 20 reads, about 700 events/s against 1 500 written.
+
 After the drain, the run prints (and writes to `$LOAD_RESULTS_DIR/xe-catchup.json` and
 `xe-catchup.md`, the latter added to the job summary on exit, once the results directory is
 redacted), never as a check:

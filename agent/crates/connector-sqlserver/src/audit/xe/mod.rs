@@ -12,7 +12,9 @@
 //! - **Polls**: one `sp_executesql` RPC each, text constant for a given
 //!   catalog state, the file name, the buffer offset and the row bound as
 //!   parameters; at most `BATCH` events per read, halved after a response
-//!   over `POLL_BYTES`; each poll gets a credit (its own events are left
+//!   over `POLL_BYTES`; full reads follow one another within a cycle, and
+//!   a cycle that ends behind the session's files is followed by the next
+//!   one after a bounded pause (`super::cycle`); each poll gets a credit (its own events are left
 //!   out only for this session and this text). Each event's XML is read by
 //!   the bounded reader of [`xml`], under panic isolation, and is at most
 //!   `sql::XE_EVENT_BYTES` on the wire (the server sends larger ones
@@ -46,7 +48,7 @@ pub(crate) mod events;
 pub(crate) mod probe;
 pub(crate) mod xml;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use databastion_classifiers::masking::{EventAction, MaskedEvent};
 use databastion_core::audit::CursorStore;
@@ -56,9 +58,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, MIN_BATCH,
-    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern,
-    target_error,
+    APP, BATCH, Batch, Below, Cursor, FLOOR_MAX, MIN_BATCH, OWN_FILE_BYTES, OWN_SESSIONS,
+    POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -101,6 +102,8 @@ struct Stream<'a> {
     reprobe_at: Instant,
     evaluated_at: Option<Instant>,
     batch: usize,
+    /// Time spent in poll statements, summed ([`super::cycle::Read::statements`]).
+    poll_time: Duration,
     /// The statistics exclusion applies (an allow-listed build).
     statman: bool,
     /// The server's major version and the account's server permissions at
@@ -397,6 +400,7 @@ pub(crate) async fn stream(
         reprobe_at: Instant::now(),
         evaluated_at: None,
         batch: BATCH,
+        poll_time: Duration::ZERO,
         statman: false,
         major: 0,
         perms: std::collections::BTreeSet::new(),
@@ -405,6 +409,7 @@ pub(crate) async fn stream(
     };
     let tls = crate::tls::configs(target.sqlserver_settings().ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
+    let mut log = super::cycle::BehindLog::default();
     loop {
         if session.is_poisoned() || session.is_stale() {
             let old = std::mem::replace(
@@ -416,14 +421,16 @@ pub(crate) async fn stream(
             old.close().await;
             Box::pin(super::observe_server_run(state, &target.id, &mut session)).await;
         }
-        let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
-        if let Err(e) = r {
-            st.save();
-            session.close().await;
-            return Err(e);
-        }
+        let end = match Box::pin(cycle(&mut st, &mut session, sink, &mut log)).await {
+            Ok(end) => end,
+            Err(e) => {
+                st.save();
+                session.close().await;
+                return Err(e);
+            }
+        };
         st.save();
-        tokio::time::sleep(cfg.poll_interval()).await;
+        tokio::time::sleep(end.pause(cfg.poll_interval())).await;
     }
 }
 
@@ -433,7 +440,8 @@ async fn cycle(
     st: &mut Stream<'_>,
     s: &mut Session,
     sink: &EventSink,
-) -> Result<(), ConnectorError> {
+    log: &mut super::cycle::BehindLog,
+) -> Result<super::cycle::End, ConnectorError> {
     let target = st.target;
     if st.evaluated_at.is_none_or(|t| t.elapsed() >= REEVALUATE) {
         let v = check::version(s)
@@ -472,21 +480,48 @@ async fn cycle(
         observe(st, &p);
         st.probe = Some(p);
     }
-    let started = Instant::now();
-    let mut history_reads = 0usize;
-    loop {
-        let in_history = st.cursor.history_us.is_some();
-        let full = Box::pin(read(st, s, sink)).await?;
-        st.save();
-        history_reads += usize::from(in_history);
-        if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
-            break;
-        }
-        if st.probe.is_none() {
-            Box::pin(reprobe(st, s)).await?;
-        }
+    // A deferral or a clamped position ends the cycle as a read that
+    // reached the end (`read` returns `false`): the poll interval.
+    let mut reads = Reads { st, s, sink };
+    Box::pin(super::cycle::run(&mut reads, log)).await
+}
+
+/// One cycle's reads ([`super::cycle::run`]).
+struct Reads<'r, 's> {
+    st: &'r mut Stream<'s>,
+    s: &'r mut Session,
+    sink: &'r EventSink,
+}
+
+impl super::cycle::Reads for Reads<'_, '_> {
+    fn target_id(&self) -> &str {
+        &self.st.target.id
     }
-    Ok(())
+
+    fn source(&self) -> &'static str {
+        "Extended Events"
+    }
+
+    fn walking_history(&self) -> bool {
+        self.st.cursor.walking_history()
+    }
+
+    async fn read_once(&mut self) -> Result<super::cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
+        let full = Box::pin(read(self.st, self.s, self.sink)).await?;
+        self.st.save();
+        Ok(super::cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
+    }
+
+    async fn between(&mut self) -> Result<(), ConnectorError> {
+        if self.st.probe.is_none() {
+            Box::pin(reprobe(self.st, self.s)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// A restart of the session or grown drop counters: a gap.
@@ -678,6 +713,7 @@ async fn read(
     // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
     let top = st.batch;
     let skip = st.cursor.skip;
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         None => {
             Box::pin(poll_records(
@@ -704,6 +740,7 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
             st.batch = (st.batch * 2).min(BATCH);

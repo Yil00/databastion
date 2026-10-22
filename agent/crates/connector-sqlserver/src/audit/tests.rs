@@ -1135,3 +1135,31 @@ fn read_faults_are_gaps_on_both_sources() {
         assert!(state.audit.facts(t).gap, "{source:?}");
     }
 }
+
+/// Only reads of the history itself are paced as a history walk: once a
+/// record of after the first start was handled, the stream is behind live
+/// records, though the history phase lasts until a read that is not full.
+#[test]
+fn the_history_walk_ends_at_the_first_live_record() {
+    let mut c = Cursor::default();
+    assert!(!c.walking_history(), "no first start");
+    c.first_start(Some(1_000_000), 20_000);
+    assert!(c.walking_history(), "nothing read yet");
+    c.max_seen_us = Some(999_999);
+    assert!(c.walking_history(), "history only");
+    // Review L2: the threshold of `below` (the floor, the start plus the
+    // clock skew): a record within the skew is still history.
+    c.max_seen_us = Some(1_019_999);
+    assert!(c.walking_history(), "within the skew");
+    assert_eq!(
+        c.below(1_019_999, None, Duration::ZERO),
+        Some(Below::History)
+    );
+    c.max_seen_us = Some(1_020_000);
+    assert_eq!(c.below(1_020_000, None, Duration::ZERO), None);
+    assert!(!c.walking_history(), "a record at the floor");
+    assert!(c.history_us.is_some(), "the history phase goes on");
+    c.max_seen_us = Some(5);
+    c.history_us = None;
+    assert!(!c.walking_history(), "after the history phase");
+}

@@ -3552,6 +3552,201 @@ async fn first_start_scenario() {
     }
 }
 
+/// Iterations of [`backlog_scenario`]'s tight batch for the Extended
+/// Events stream: three statement events each (the `SELECT`, the `SET`,
+/// the `WHILE` test), 12 000 events.
+const BACKLOG_XE_READS: u32 = 4_000;
+/// The same for the SQL Server Audit stream: one `SL` record each.
+const BACKLOG_AUDIT_READS: u32 = 10_500;
+/// The poll intervals (of 1 s) a first start behind a backlog of more
+/// than 10 000 records may take to reach the end of its source.
+const BACKLOG_POLLS: u32 = 60;
+/// The test's own Extended Events session ([`backlog_scenario`]).
+const BACKLOG_XE: &str = "it_backlog_xe";
+
+/// The Extended Events session [`BACKLOG_XE`] as the dev session is
+/// defined (dev/sqlserver/initdb/30-audit.sql), writing to `stem` files.
+fn backlog_session(stem: &str) -> String {
+    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
+    format!(
+        "CREATE EVENT SESSION {BACKLOG_XE} ON SERVER \
+         ADD EVENT sqlserver.sql_statement_completed ({actions}), \
+         ADD EVENT sqlserver.sp_statement_completed ({actions}), \
+         ADD EVENT sqlserver.rpc_completed ({actions}), \
+         ADD EVENT sqlserver.error_reported ({actions} WHERE ([error_number] = (18456))) \
+         ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
+         max_file_size = 16, max_rollover_files = 2) \
+         WITH (TRACK_CAUSALITY = ON, MAX_DISPATCH_LATENCY = 5 SECONDS)"
+    )
+}
+
+/// `reads` reads of `crm.customers` in one tight batch (`sa`).
+async fn backlog_reads(s: &mut Session, label: &str, reads: u32) {
+    let started = std::time::Instant::now();
+    Box::pin(exec(
+        s,
+        &in_db(
+            "retail",
+            &format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+                 WHILE @i < {reads} BEGIN \
+                 SELECT @n = COUNT(*) FROM crm.customers WHERE id = @i; SET @i += 1; END"
+            ),
+        ),
+    ))
+    .await;
+    eprintln!(
+        "[it] backlog ({label}): {reads} reads written in {} ms",
+        started.elapsed().as_millis()
+    );
+}
+
+/// Records in a source's files (`sa`).
+async fn source_records(s: &mut Session, files: &str) -> i64 {
+    try_rows(
+        s,
+        &format!("SELECT CONVERT(bigint, COUNT(*)) FROM {files}"),
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r.first().and_then(Value::as_int)))
+    .unwrap_or(-1)
+}
+
+/// Security review R3 of 527eb08 (the catch-up pacing of
+/// [`crate::audit::cycle`]): a fresh first start behind a backlog of more
+/// than 10 000 records (a tight batch of reads written before the stream
+/// starts, all history) reaches the end of its source within
+/// [`BACKLOG_POLLS`] poll intervals: a read by `sa` made just after the
+/// start is reported. No `audit.records_dropped`. Extended Events on its
+/// own session [`BACKLOG_XE`], and SQL Server Audit on 2022 and later.
+/// The dev session is stopped while the backlog is written, so that the
+/// other tests' first starts do not walk it.
+#[tokio::test]
+async fn a_backlog_is_caught_up_within_poll_intervals() {
+    Box::pin(backlog_scenario()).await;
+}
+
+async fn backlog_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let stem = format!("it_backlog_{}", std::process::id());
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{BACKLOG_XE}') \
+         DROP EVENT SESSION {BACKLOG_XE} ON SERVER"
+    );
+    let state = |name: &str, on: bool| {
+        format!(
+            "ALTER EVENT SESSION {name} ON SERVER STATE = {}",
+            if on { "START" } else { "STOP" }
+        )
+    };
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    Box::pin(exec(&mut s, &backlog_session(&stem))).await;
+    Box::pin(exec(&mut s, &state("databastion_xe", false))).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, true))).await;
+    Box::pin(backlog_reads(&mut s, "xevents", BACKLOG_XE_READS)).await;
+    // Its dispatch latency, then the SQL Server Audit backlog alone.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, false))).await;
+    if major >= 16 {
+        Box::pin(backlog_reads(&mut s, "audit", BACKLOG_AUDIT_READS)).await;
+    }
+    Box::pin(exec(&mut s, &state("databastion_xe", true))).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, true))).await;
+    // The audit's QUEUE_DELAY.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let xe = format!(
+        "rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {BACKLOG_XE}}}"
+    );
+    let xe_files = format!(
+        "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/{stem}_0_*.xel', NULL, NULL, NULL)"
+    );
+    let audit_files =
+        "sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL)".to_owned();
+    let mut sources = vec![(xe, "xevents", xe_files)];
+    if major >= 16 {
+        sources.push((AUDIT.to_owned(), "audit", audit_files));
+    }
+    for (settings, label, files) in sources {
+        let records = Box::pin(source_records(&mut s, &files)).await;
+        eprintln!("[it] backlog ({label}): {records} records in the source");
+        assert!(
+            records > 10_000,
+            "{label}: a backlog of more than 10 000 records"
+        );
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {settings}", own_tls()));
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-backlog-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let poll = cfg.poll_interval();
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let started = std::time::Instant::now();
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // After the first start: live, reported once the history is read.
+        Box::pin(exec(
+            &mut s,
+            &in_db(
+                "retail",
+                "DECLARE @n int; SELECT @n = COUNT(*) FROM finance.payment_cards",
+            ),
+        ))
+        .await;
+        let deadline = started + poll * BACKLOG_POLLS;
+        let mut reached = None;
+        while reached.is_none() && std::time::Instant::now() < deadline {
+            assert!(!stream.is_finished(), "{label}: the stream ended");
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(e)) => {
+                    if names_of(&e).contains(&"retail.finance.payment_cards".to_owned()) {
+                        reached = Some(started.elapsed());
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        stream.abort();
+        let _ = stream.await;
+        let dropped = c.state.audit.facts(&t.id).dropped;
+        eprintln!(
+            "[it] backlog ({label}): end of the source reached after {reached:?} (poll interval {poll:?}), records dropped {dropped}"
+        );
+        let reached = reached.unwrap_or_else(|| {
+            panic!("{label}: the end of the source within {BACKLOG_POLLS} poll intervals")
+        });
+        assert!(reached <= poll * BACKLOG_POLLS, "{label}");
+        assert_eq!(dropped, 0, "{label}: a backlog read drops nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(exec_ok(&mut s, &state(BACKLOG_XE, false))).await;
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+}
+
 /// End-of-phase-9 review of G7 / N1, H1: SQL Server ignores trailing
 /// spaces in identifiers, so `[sys].[sql_logins ]` and `[sys ].[...]`
 /// resolve to the catalog views (an unknown name fails with error 208),

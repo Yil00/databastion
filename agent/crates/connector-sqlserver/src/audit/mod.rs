@@ -16,8 +16,11 @@
 //!   and the records of the next buffer already handled (skipped on the
 //!   server) are parameters. At most [`BATCH`] records per read (halved after a
 //!   response over [`POLL_BYTES`]), each turned into a record as its row
-//!   ends; a full read is followed by another, within [`CATCH_UP`] (and
-//!   [`HISTORY_READS`] reads while the first start skips the history). Each poll gets a credit
+//!   ends; a full read is followed by another, within [`cycle::CATCH_UP`] (and
+//!   less while the first start's history is walked), and a cycle that
+//!   ends while still behind is followed by the next one after a pause
+//!   bounding the reads' share of the time, not after the poll interval
+//!   ([`cycle`]). Each poll gets a credit
 //!   (its own record is left out only for this session and this text).
 //! - **Position** (M4), persisted through the core: the file and the
 //!   offset of the last buffer read whole (a read starts after it,
@@ -53,6 +56,7 @@
 //!   rule shared by `check()` and the stream, re-evaluated every 5
 //!   minutes: a stream whose choice changes ends and is restarted).
 
+pub(crate) mod cycle;
 pub(crate) mod objects;
 pub(crate) mod own;
 pub(crate) mod probe;
@@ -95,11 +99,6 @@ pub(crate) const BATCH: usize = 500;
 pub(crate) const MAX_SKIP: u32 = 1_000_000;
 /// Smallest read after responses over [`POLL_BYTES`] (the read halves).
 const MIN_BATCH: usize = 16;
-/// Time spent catching up (full reads one after the other) per cycle.
-const CATCH_UP: Duration = Duration::from_secs(20);
-/// Reads of the audit's history (first start) per cycle: the scan to the
-/// end of the file set is spread over cycles.
-const HISTORY_READS: usize = 20;
 /// Bound of one poll's response.
 const POLL_BYTES: usize = 12 * 1024 * 1024;
 /// The catalog proofs are read again this often (decision 6).
@@ -744,6 +743,25 @@ impl Cursor {
         }
     }
 
+    /// Whether a read from this position walks the first start's history:
+    /// the history phase is on and no record handled so far is stamped at
+    /// or after its start. The history phase itself lasts until a read
+    /// that is not full ([`Self::settle`]), however far past the history
+    /// the stream is: a stream behind live records stays in it, and must
+    /// not be paced as a history walk ([`cycle::HISTORY_CATCH_UP`]).
+    ///
+    /// "Stamped at or after its start" uses the threshold of
+    /// [`Self::below`] (the later of the start and the floor, which adds
+    /// the source's clock skew): a record [`Self::below`] still classes as
+    /// history keeps the walk on (review L2).
+    pub(crate) fn walking_history(&self) -> bool {
+        let Some(h) = self.history_us else {
+            return false;
+        };
+        let threshold = self.floor.map_or(h, |f| f.max(h));
+        self.max_seen_us.is_none_or(|m| m < threshold)
+    }
+
     /// `seen` with a record handled at `time_us`.
     pub(crate) fn seen(seen: Option<i64>, time_us: i64) -> Option<i64> {
         Some(seen.map_or(time_us, |m| m.max(time_us)))
@@ -1100,6 +1118,8 @@ struct Stream<'a> {
     evaluated_at: Option<Instant>,
     /// Records asked per read (halved after an oversized response).
     batch: usize,
+    /// Time spent in poll statements, summed ([`cycle::Read::statements`]).
+    poll_time: Duration,
 }
 
 impl Stream<'_> {
@@ -1375,7 +1395,9 @@ pub(crate) async fn audit_stream(
         reprobe_at: Instant::now(),
         evaluated_at: None,
         batch: BATCH,
+        poll_time: Duration::ZERO,
     };
+    let mut log = cycle::BehindLog::default();
     loop {
         if session.is_poisoned() || session.is_stale() {
             let old = std::mem::replace(
@@ -1387,14 +1409,16 @@ pub(crate) async fn audit_stream(
             old.close().await;
             Box::pin(observe_server_run(state, &target.id, &mut session)).await;
         }
-        let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
-        if let Err(e) = r {
-            st.save();
-            session.close().await;
-            return Err(e);
-        }
+        let end = match Box::pin(cycle(&mut st, &mut session, sink, &mut log)).await {
+            Ok(end) => end,
+            Err(e) => {
+                st.save();
+                session.close().await;
+                return Err(e);
+            }
+        };
         st.save();
-        tokio::time::sleep(cfg.poll_interval()).await;
+        tokio::time::sleep(end.pause(cfg.poll_interval())).await;
     }
 }
 
@@ -1403,7 +1427,8 @@ async fn cycle(
     st: &mut Stream<'_>,
     s: &mut Session,
     sink: &EventSink,
-) -> Result<(), ConnectorError> {
+    log: &mut cycle::BehindLog,
+) -> Result<cycle::End, ConnectorError> {
     let target = st.target;
     if st.evaluated_at.is_none_or(|t| t.elapsed() >= REEVALUATE) {
         let v = check::version(s)
@@ -1433,21 +1458,46 @@ async fn cycle(
     if st.probe.is_none() || st.reprobe_at.elapsed() >= REPROBE {
         Box::pin(reprobe(st, s)).await?;
     }
-    let started = Instant::now();
-    let mut history_reads = 0usize;
-    loop {
-        let in_history = st.cursor.history_us.is_some();
-        let full = Box::pin(read(st, s, sink)).await?;
-        st.save();
-        history_reads += usize::from(in_history);
-        if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
-            break;
-        }
-        if st.probe.is_none() {
-            Box::pin(reprobe(st, s)).await?;
-        }
+    let mut reads = Reads { st, s, sink };
+    Box::pin(cycle::run(&mut reads, log)).await
+}
+
+/// One cycle's reads ([`cycle::run`]).
+struct Reads<'r, 's> {
+    st: &'r mut Stream<'s>,
+    s: &'r mut Session,
+    sink: &'r EventSink,
+}
+
+impl cycle::Reads for Reads<'_, '_> {
+    fn target_id(&self) -> &str {
+        &self.st.target.id
     }
-    Ok(())
+
+    fn source(&self) -> &'static str {
+        "SQL Server Audit"
+    }
+
+    fn walking_history(&self) -> bool {
+        self.st.cursor.walking_history()
+    }
+
+    async fn read_once(&mut self) -> Result<cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
+        let full = Box::pin(read(self.st, self.s, self.sink)).await?;
+        self.st.save();
+        Ok(cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
+    }
+
+    async fn between(&mut self) -> Result<(), ConnectorError> {
+        if self.st.probe.is_none() {
+            Box::pin(reprobe(self.st, self.s)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Reads the catalog proofs and rebuilds the poll texts.
@@ -1563,6 +1613,7 @@ async fn read(
     let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
     // The server skips the records of the next buffer already handled.
     let (top, skip) = request(&st.cursor, st.batch);
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
         None => {
@@ -1590,6 +1641,7 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
             st.batch = (st.batch * 2).min(BATCH);

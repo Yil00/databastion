@@ -3384,8 +3384,8 @@ mod statistics_tests {
     /// The stream over `file` (sorted by `at_ms`) as `read` and `cycle`
     /// run it: reads of at most `batch` rows from the position; a full read
     /// that is not a deferral reads on at once (5 ms), at most 20 s in a
-    /// cycle (`CATCH_UP`); a deferral or a read that reached the end waits
-    /// `poll_ms`. Returns, per event id, when it was handled and whether it
+    /// cycle (`CATCH_UP`), and the next cycle follows its pause; a deferral
+    /// or a read that reached the end waits `poll_ms`. Returns, per event id, when it was handled and whether it
     /// was left out; asserts that none is handled twice.
     fn simulate(
         file: &[Spec],
@@ -3427,9 +3427,14 @@ mod statistics_tests {
                     r.time_us
                 );
             }
-            let waits = cut.is_some_and(|c| c.wait) || !full || t - cycle >= 20_000;
-            if waits {
-                t += poll_ms;
+            // As `read` and `cycle`: a deferral reads as a read that
+            // reached the end; a cycle that ends behind is followed by the
+            // next one after its pause (`cycle::End::pause`).
+            let reads_on = full && !cut.is_some_and(|c| c.wait);
+            let elapsed = Duration::from_millis(t - cycle);
+            if let Some(end) = crate::audit::cycle::end(reads_on, false, elapsed) {
+                let pause = end.pause(Duration::from_millis(poll_ms));
+                t += u64::try_from(pause.as_millis()).unwrap();
                 cycle = t;
             } else {
                 t += 5;

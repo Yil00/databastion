@@ -110,7 +110,7 @@ Deploy the agent on the host or network of the databases it monitors, not next t
 **`agent.yaml`**: start from [agent/agent.example.yaml](../agent/agent.example.yaml). Unknown keys are rejected. The main settings:
 - `console.url`: the console's public HTTPS URL. `console.ca_file` pins a private CA (it then is the only trusted root). TLS 1.3 minimum. `HTTPS_PROXY` / `NO_PROXY` are honored.
 - `state_dir`: a directory owned by the agent user, not group- or world-writable.
-- `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval), and `discovery_duty_cycle_percent`, the Discovery pacing (see [section 9](#9-discovery-scans-and-findings)).
+- `limits`: local caps that console jobs cannot exceed (rows sampled per object, statement timeout, scan duration, audit poll interval; a polled Audit source that is behind its source reads on in bounded catch-up cycles, which still start at most once per poll interval, see [docs/08](08-engine-capabilities.md#extended-events-polls-and-position)), and `discovery_duty_cycle_percent`, the Discovery pacing (see [section 9](#9-discovery-scans-and-findings)).
 - `spool`: bounded disk buffer for results while the console is unreachable. When it is full, batches are dropped by priority: findings and events can each grow to 3/4 of the bounds, so each keeps at least 1/4 (an events flood can evict findings down to that quarter); batches with a `signature.*` signal go last; otherwise the oldest first; the console raises an `agent.batches_dropped` alert.
 - `targets`: see [section 6](#6-declare-targets).
 
