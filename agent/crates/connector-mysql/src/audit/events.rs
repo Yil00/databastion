@@ -155,7 +155,21 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
-        .any(|s| s.eq_ignore_ascii_case(db))
+        .any(|s| wide_eq(s, db))
+}
+
+/// Whether `name` is the listed ASCII name `listed` in ASCII case, or once
+/// its Unicode uppercase or lowercase is taken: the wider match the
+/// always-reported lists use (the PR #308 CI run on MariaDB 11.8: the
+/// servers fold schema names with `utf8mb3_general_ci`, where
+/// `performance_ſchema`, U+017F, reads the system schema, so its
+/// statement-text tables must stay always reported under that spelling;
+/// matching more only reports more).
+pub(crate) fn wide_eq(listed: &str, name: &str) -> bool {
+    listed.eq_ignore_ascii_case(name)
+        || (!name.is_ascii()
+            && (listed.eq_ignore_ascii_case(&name.to_uppercase())
+                || listed.eq_ignore_ascii_case(&name.to_lowercase())))
 }
 
 /// [`is_system_schema`] for what is left out of reads: `information_schema`
@@ -305,7 +319,7 @@ pub(crate) fn statement_text_table(
                 (TextOn::Both, _) | (_, None) => true,
                 (TextOn::Mysql, Some(f)) => f == Flavor::Mysql,
             };
-            here && d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table)
+            here && wide_eq(d, db) && wide_eq(t, table)
         })
         .map(|(d, t, _)| (*d, *t))
 }
@@ -326,12 +340,12 @@ pub(crate) const STATISTICS_TABLES: &[(&str, &str)] = &[
     ("mysql", "column_stats"),
 ];
 
-/// The statistics table `db`.`table` is, as listed (compared
-/// ASCII-case-insensitively).
+/// The statistics table `db`.`table` is, as listed (compared with
+/// [`wide_eq`]).
 pub(crate) fn statistics_table(db: &str, table: &str) -> Option<(&'static str, &'static str)> {
     STATISTICS_TABLES
         .iter()
-        .find(|(d, t)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
+        .find(|(d, t)| wide_eq(d, db) && wide_eq(t, table))
         .map(|(d, t)| (*d, *t))
 }
 
@@ -418,10 +432,10 @@ fn shows_session_text(p: &StatementInfo) -> bool {
 /// `mysql.audit_log_filter` and `mysql.audit_log_user`. Writing them
 /// changes what the audit log records.
 fn is_audit_table(db: &str, table: &str) -> bool {
-    db.eq_ignore_ascii_case("mysql")
+    wide_eq("mysql", db)
         && ["audit_log_filter", "audit_log_user"]
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(table))
+            .any(|t| wide_eq(t, table))
 }
 
 /// The closed allow-list of statements of no known kind that produce no
@@ -7075,6 +7089,39 @@ mod tests {
 
     /// `events_statements_summary_by_digest` holds statement texts with
     /// literals on MySQL (`QUERY_SAMPLE_TEXT`), digests only on MariaDB.
+    /// The PR #308 CI run on MariaDB 11.8: a statement-text table read
+    /// through a schema spelling the servers fold to `performance_schema`
+    /// (`performance_ſchema`, U+017F) is named as listed and always
+    /// reported, on every source; the always-reported lists match such
+    /// spellings, the read-skip rule does not.
+    #[test]
+    fn statement_text_tables_through_a_folded_spelling_are_always_reported() {
+        assert!(wide_eq("performance_schema", "performance_\u{17F}chema"));
+        assert!(wide_eq(
+            "information_schema",
+            "\u{131}nformation_\u{17F}chema"
+        ));
+        assert!(wide_eq("mysql", "MY\u{17F}QL"));
+        assert!(!wide_eq("performance_schema", "performance_schemas"));
+        assert!(!is_skipped_system_schema("performance_\u{17F}chema"));
+        for text in [
+            "SELECT SQL_TEXT FROM performance_\u{17F}chema.events_statements_current LIMIT 1",
+            "SELECT * FROM `PERFORMANCE_\u{17F}CHEMA`.`EVENTS_STATEMENTS_HISTORY`",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                let ev = ev.unwrap_or_else(|| panic!("{source:?}: {text}"));
+                assert!(ev.always_report(), "{source:?}: {text}");
+                assert!(
+                    ev.objects()
+                        .iter()
+                        .all(|o| o.database().as_str() == "performance_schema"),
+                    "{source:?}: {text}: {}",
+                    shown(&ev)
+                );
+            }
+        }
+    }
+
     #[test]
     fn statement_text_tables_follow_the_flavor() {
         let text = "SELECT * FROM performance_schema.events_statements_summary_by_digest";
