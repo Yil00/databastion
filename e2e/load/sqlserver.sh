@@ -743,7 +743,11 @@ else
   # ADR-0051 refinement of 2026-10-22: the reads cancelled above 12 MiB and at the statement timeout
   # (from the agent's log, xe-catchup), checked by loadlib.py report (`xe_cancels_per_10min`,
   # `xe_timeouts`); null counts when the log could not be read (no data: failed).
-  large_done="$(sed -n 's/^LARGE \([0-9][0-9]*\)$/\1/p' "$W/out/large-on.out" 2>/dev/null | tail -n 1)"
+  # No large-event workload: no file (and, under pipefail, no failing sed).
+  large_done=""
+  if [ -f "$W/out/large-on.out" ]; then
+    large_done="$(sed -n 's/^LARGE \([0-9][0-9]*\)$/\1/p' "$W/out/large-on.out" | tail -n 1)"
+  fi
   large_bursts=$(( ${large_done:-0} / LOAD_SQLSERVER_LARGE_BURST ))
   if ! jq -c --arg t "$TARGET" --argjson b "$large_bursts" \
       '{kind: "xe_reads", target: $t, cancels: .reads.cancels, timeouts: .reads.timeouts,
