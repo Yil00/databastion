@@ -76,10 +76,12 @@ LOAD_SQLSERVER_STATS_RESET_S="${LOAD_SQLSERVER_STATS_RESET_S:-0}"
 # and reads stay at 500 or less for 10 minutes. Extended Events source only.
 LOAD_SQLSERVER_LARGE_EVERY_S="${LOAD_SQLSERVER_LARGE_EVERY_S:-0}"
 LOAD_SQLSERVER_LARGE_BURST="${LOAD_SQLSERVER_LARGE_BURST:-60}"
-[[ "$LOAD_SQLSERVER_LARGE_EVERY_S" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$LOAD_SQLSERVER_LARGE_EVERY_S" -le 600 ] \
-  || { echo "LOAD_SQLSERVER_LARGE_EVERY_S must be 0 or a number of seconds (at most 600)" >&2; exit 2; }
-[[ "$LOAD_SQLSERVER_LARGE_BURST" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$LOAD_SQLSERVER_LARGE_BURST" -le 200 ] \
-  || { echo "LOAD_SQLSERVER_LARGE_BURST must be between 1 and 200 statements" >&2; exit 2; }
+if ! [[ "$LOAD_SQLSERVER_LARGE_EVERY_S" =~ ^(0|[1-9][0-9]{0,2})$ ]] || [ "$LOAD_SQLSERVER_LARGE_EVERY_S" -gt 600 ]; then
+  echo "LOAD_SQLSERVER_LARGE_EVERY_S must be 0 or a number of seconds (at most 600)" >&2; exit 2
+fi
+if ! [[ "$LOAD_SQLSERVER_LARGE_BURST" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$LOAD_SQLSERVER_LARGE_BURST" -gt 200 ]; then
+  echo "LOAD_SQLSERVER_LARGE_BURST must be between 1 and 200 statements" >&2; exit 2
+fi
 if [ "$LOAD_SQLSERVER_LARGE_EVERY_S" -gt 0 ] && [ "$LOAD_SQLSERVER_AUDIT_SOURCE" != sqlserver_xevents ]; then
   echo "LOAD_SQLSERVER_LARGE_EVERY_S needs LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents" >&2; exit 2
 fi
