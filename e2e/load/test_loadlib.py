@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -341,7 +343,8 @@ class WorkloadParseTest(unittest.TestCase):
 
 
 def scenario(impact_cores: float = 0.005, received_ratio: float = 1.0, dropped: int = 0,
-             leak_mb_per_s: float = 0.0, p95_on: float = 1.2, missing_idle: bool = False) -> tuple[list, list, list]:
+             leak_mb_per_s: float = 0.0, p95_on: float = 1.2, missing_idle: bool = False,
+             drain_cores: float = 0.0) -> tuple[list, list, list]:
     """A whole run: idle 0-60 (no agent), idle 60-120 (agent), scan 130-160, workload off 200-320,
     workload on 340-940, drain done at 1000."""
     facts = [
@@ -367,7 +370,8 @@ def scenario(impact_cores: float = 0.005, received_ratio: float = 1.0, dropped: 
     if not missing_idle:
         facts.append({"kind": "window", "name": "idle_no_agent", "t0": 0, "t1": 60})
     db = samples_linear("target-pg", 0, 1000, 0.5, 0.01,
-                        bursts=[(60, 1000, 0.002), (130, 160, impact_cores * 1), (200, 940, 0.3)])
+                        bursts=[(60, 1000, 0.002), (130, 160, impact_cores * 1), (200, 940, 0.3),
+                                (940, 1000, drain_cores)])
     agent = samples_linear("agent", 60, 1000, 1.0, 0.0, cap=4.0, bursts=[(340, 940, 0.05)],
                            rss=lambda t: (40 + max(0.0, t - 340) * leak_mb_per_s) * 2**20)
     for s in agent:
@@ -651,6 +655,120 @@ class ReportTest(unittest.TestCase):
             with open(f"{d}/out/results.json") as f:
                 self.assertTrue(json.load(f)["pass"])
             self.assertTrue(os.path.exists(f"{d}/out/results.md"))
+
+
+def with_drain(facts: list, at_end: int | None = 20000, want: int = 180000, p95_off: float | None = 44.0,
+               p95_drain: float | None = 41.0, window: bool = True) -> list:
+    """The scenario's facts plus sqlserver.sh's catch-up facts: the drain window (940-1000, after the
+    workload), the `drain` fact and the latency probes before Audit and during the drain."""
+    out = list(facts)
+    if window:
+        out.append({"kind": "window", "name": "drain_pg-load", "t0": 940, "t1": 1000})
+    samples = [[0.0, at_end], [60.0, want]]
+    out.append({"kind": "drain", "target": "pg-load", "want": want, "stored": want, "samples": samples,
+                "stored_at_workload_end": at_end, "rate_per_s": 2666.7})
+    for ph, v in (("off", p95_off), ("drain", p95_drain)):
+        out.append({"kind": "probe", "target": "pg-load", "phase": ph, "blocks": 0 if v is None else 6,
+                    "mean_us": v, "p95_us": v})
+    return out
+
+
+class DrainChecksTest(unittest.TestCase):
+    NAMES = {"audit.pg-load.db_cores_drain", "audit.pg-load.db_cores_drain_vs_audit_on",
+             "audit.pg-load.drain_probe_p95_us"}
+
+    def checks(self, ck: L.Checks) -> dict[str, dict]:
+        return {c["name"]: c for c in ck.items if c["name"] in self.NAMES}
+
+    def test_no_drain_fact_no_check(self) -> None:
+        # run.sh, cas.sh and redis.sh record no `drain` fact: no catch-up check at all.
+        rep, ck = L.build_report(*scenario(), L.Limits())
+        self.assertEqual(self.checks(ck), {})
+        self.assertNotIn("drain_happened", rep["audit"]["pg-load"])
+        self.assertNotIn("Catch-up after the workload", L.render_markdown(rep))
+
+    def test_pass_as_run_39695590686(self) -> None:
+        facts, samples, hbs = scenario(drain_cores=0.2)
+        rep, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True])
+        got = self.checks(ck)
+        self.assertEqual(set(got), self.NAMES)
+        self.assertTrue(all(c["pass"] is True for c in got.values()))
+        a = rep["audit"]["pg-load"]
+        self.assertTrue(a["drain_happened"])
+        self.assertAlmostEqual(a["db_cores_drain"], 0.212, delta=0.01)
+        self.assertEqual(got["audit.pg-load.db_cores_drain"]["limit"], "<= 1.0")
+        self.assertAlmostEqual(a["db_cores_audit_on"], 0.312, delta=0.01)
+        # 44 us before Audit: max(88, 1044).
+        self.assertEqual(got["audit.pg-load.drain_probe_p95_us"]["limit"], "<= 1044.0")
+        md = L.render_markdown(rep)
+        self.assertIn("Catch-up after the workload", md)
+        self.assertIn("| `audit.pg-load.drain_probe_p95_us` | pass |", md)
+
+    def test_failures(self) -> None:
+        # More than half the 2-CPU capacity during the drain: both CPU checks fail.
+        facts, samples, hbs = scenario(drain_cores=1.2)
+        rep, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertFalse(rep["pass"])
+        failed = {c["name"] for c in ck.items if c["pass"] is False}
+        self.assertEqual(failed, {"audit.pg-load.db_cores_drain", "audit.pg-load.db_cores_drain_vs_audit_on"})
+        # Above the Audit-on run's 0.312 + 0.25, below 1 core: only the relative check fails.
+        facts, samples, hbs = scenario(drain_cores=0.7)
+        _, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertEqual({c["name"] for c in ck.items if c["pass"] is False},
+                         {"audit.pg-load.db_cores_drain_vs_audit_on"})
+        # The probe 1.1 ms slower during the drain (off + 1 ms is the larger bound below 1 ms).
+        facts, samples, hbs = scenario()
+        _, ck = L.build_report(with_drain(facts, p95_drain=1145.0), samples, hbs, L.Limits())
+        self.assertEqual({c["name"] for c in ck.items if c["pass"] is False}, {"audit.pg-load.drain_probe_p95_us"})
+        # Above 1 ms before Audit, the factor is the larger bound: 2 x 1500 = 3000.
+        _, ck = L.build_report(with_drain(facts, p95_off=1500.0, p95_drain=2900.0), samples, hbs, L.Limits())
+        self.assertTrue(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["pass"])
+        self.assertEqual(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["limit"], "<= 3000.0")
+        _, ck = L.build_report(with_drain(facts, p95_off=1500.0, p95_drain=3100.0), samples, hbs, L.Limits())
+        self.assertIs(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["pass"], False)
+        # Limits from the environment.
+        lim = L.Limits.from_env({"LOAD_LIMIT_DRAIN_DB_CPU_SHARE": "0.005"})
+        _, ck = L.build_report(with_drain(facts), samples, hbs, lim)
+        self.assertIs(self.checks(ck)["audit.pg-load.db_cores_drain"]["pass"], False)
+
+    def test_skipped_when_no_drain(self) -> None:
+        # Every statement stored when the workload ended: reported as skipped, the run still passes,
+        # even with figures that would fail.
+        facts, samples, hbs = scenario(drain_cores=1.5)
+        for kw in ({"at_end": 180000}, {"at_end": 0, "want": 0}):
+            rep, ck = L.build_report(with_drain(facts, p95_drain=None, **kw), samples, hbs, L.Limits())
+            got = self.checks(ck)
+            self.assertEqual(set(got), self.NAMES)
+            self.assertTrue(all(c.get("skipped") and c["pass"] is None for c in got.values()), got)
+            self.assertNotIn("audit.pg-load.db_cores_drain", {c["name"] for c in ck.items if c["pass"] is False})
+            self.assertIn("| `audit.pg-load.db_cores_drain` | skipped |", L.render_markdown(rep))
+        rep, ck = L.build_report(with_drain(facts, p95_drain=None, at_end=180000), samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True and not c.get("skipped")])
+        self.assertFalse(rep["audit"]["pg-load"]["drain_happened"])
+
+    def test_no_data_fails_when_a_drain_happened(self) -> None:
+        facts, samples, hbs = scenario()
+        rep, ck = L.build_report(with_drain(facts, p95_drain=None, window=False), samples, hbs, L.Limits())
+        self.assertFalse(rep["pass"])
+        got = self.checks(ck)
+        self.assertTrue(all(c["pass"] is None and not c.get("skipped") for c in got.values()), got)
+
+    def test_cli_prints_skipped(self) -> None:
+        facts, samples, hbs = scenario()
+        facts = with_drain(facts, at_end=180000)
+        with tempfile.TemporaryDirectory() as d:
+            for name, rows in (("facts", facts), ("samples", samples), ("hb", hbs)):
+                with open(f"{d}/{name}.jsonl", "w") as f:
+                    f.write("".join(json.dumps(r) + "\n" for r in rows))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = L.main(["report", "--facts", f"{d}/facts.jsonl", "--samples", f"{d}/samples.jsonl",
+                             "--heartbeats", f"{d}/hb.jsonl", "--out", f"{d}/out"])
+            self.assertEqual(rc, 0)
+            self.assertIn("loadlib: check audit.pg-load.db_cores_drain: skipped (no drain:", err.getvalue())
+            with open(f"{d}/out/results.json") as f:
+                self.assertTrue(json.load(f)["pass"])
 
 
 class CensusTest(unittest.TestCase):

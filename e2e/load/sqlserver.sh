@@ -522,7 +522,8 @@ phase_done workload-off
 # 100 constant SELECTs (no table: no access event on either source; about 60 Extended Events events/s),
 # one `PROBE <µs per statement>` line per block every 5 s, for 30 s per call (server clock: a block's
 # mean, not a statement's latency). Run once before Audit (phase off) and during the drain, while the
-# stream may still catch up and no workload runs (phase drain); compared as the `probe` facts.
+# stream may still catch up and no workload runs (phase drain); compared as the `probe` facts and
+# checked by loadlib.py (`drain_probe_p95_us`, with `db_cores_drain`) when the stream was behind.
 PROBE_SQL="DECLARE @end datetime2 = DATEADD(second, 30, SYSUTCDATETIME()), @t0 datetime2, @i int, @v int;
 WHILE SYSUTCDATETIME() < @end BEGIN
   SET @t0 = SYSUTCDATETIME(); SET @i = 0;
