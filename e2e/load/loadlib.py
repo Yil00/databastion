@@ -550,6 +550,21 @@ class Limits:
     agent_ref_rss_mb: float = 42.0
     agent_ref_rss_abs_mb: float = 16.0
     agent_ref_rss_rel: float = 0.25
+    # The stream's catch-up after the workload (sqlserver.sh, #311 review R2), checked only when the
+    # stream was behind when the workload ended (otherwise skipped). Load run 39695590686 (Extended
+    # Events, 50 SELECTs/s, drain about 88 s) measured the probe p95 at 41 us during the drain against
+    # 44 us before Audit. The limits leave a wide margin for the shared CI runners:
+    # - the database CPU over the drain (no workload runs then) at most this share of the server's
+    #   CPU capacity (1.0 core of 2): the agent's reads are paced to at most 80 % of the time on one
+    #   scheduler (MAXDOP 1), so a catch-up that takes more than one core is not the agent's pacing;
+    # - and at most the database CPU of the Audit-on run (the same reads plus the workload) plus
+    #   this slack (cores), for the server's own background work;
+    # - the probe p95 during the drain at most max(factor x p95 before Audit, p95 before Audit +
+    #   slack): a catch-up that delays other sessions' statements by a millisecond or doubles them.
+    drain_db_cpu_share: float = 0.5
+    drain_db_cores_over_on: float = 0.25
+    drain_probe_factor: float = 2.0
+    drain_probe_slack_us: float = 1000.0
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "Limits":
@@ -569,9 +584,15 @@ class Checks:
     def add(self, name: str, ok: bool | None, value: object, limit: object, note: str = "") -> None:
         self.items.append({"name": name, "pass": ok, "value": value, "limit": limit, "note": note})
 
+    def skip(self, name: str, value: object, limit: object, note: str) -> None:
+        """A check that does not apply to this run (e.g. no drain happened): reported, not failed.
+        A check that applies but lacks data is `add(..., None, ...)` ("no data"), which fails."""
+        self.items.append({"name": name, "pass": None, "skipped": True, "value": value, "limit": limit,
+                           "note": note})
+
     @property
     def passed(self) -> bool:
-        return all(c["pass"] is True for c in self.items)
+        return all(c["pass"] is True or c.get("skipped") is True for c in self.items)
 
 
 def _r(x: float | None, nd: int = 3) -> float | None:
@@ -600,6 +621,41 @@ def one_fact(rows: list[dict], kind: str, **match: object) -> dict | None:
         if r.get("kind") == kind and all(r.get(k) == v for k, v in match.items()):
             return r
     return None
+
+
+def drain_checks(ck: Checks, target: str, a: dict, dr: dict, cap: float | None, lim: Limits) -> None:
+    """The catch-up checks of a target with a `drain` fact (sqlserver.sh; #311 review R2): the
+    database CPU over the drain against the server's capacity and against the Audit-on run, and the
+    latency probe's p95 during the drain against the one before Audit. Skipped (reported, not
+    failed) when no drain happened: every workload statement was stored when the workload ended, or
+    there was no statement to wait for (`workload_ran` fails then). "No data" (failed) when a drain
+    happened but a figure is missing."""
+    names = (f"audit.{target}.db_cores_drain", f"audit.{target}.db_cores_drain_vs_audit_on",
+             f"audit.{target}.drain_probe_p95_us")
+    want, at_end = dr.get("want"), dr.get("stored_at_workload_end")
+    a["drain_happened"] = None if not want or at_end is None else at_end < want
+    if not want or (at_end is not None and at_end >= want):
+        why = ("no drain: every workload statement was stored when the workload ended" if want
+               else "no drain: no workload statement to wait for")
+        for n in names:
+            ck.skip(n, {"want": want, "stored_at_workload_end": at_end}, "drain happened", why)
+        return
+    drain_s = (dr.get("samples") or [[None]])[-1][0]
+    over = f"over the drain ({drain_s} s after the workload; no workload runs then)"
+    cores = a.get("db_cores_drain")
+    bound = None if cap is None else _r(lim.drain_db_cpu_share * cap, 4)
+    ck.add(names[0], None if cores is None or bound is None else cores <= bound, cores, f"<= {bound}",
+           f"DB server cores {over}: at most {lim.drain_db_cpu_share} x its {cap} CPUs")
+    on = a.get("db_cores_audit_on")
+    bound_on = None if on is None else _r(on + lim.drain_db_cores_over_on, 4)
+    ck.add(names[1], None if cores is None or bound_on is None else cores <= bound_on, cores, f"<= {bound_on}",
+           f"DB server cores {over}: at most the Audit-on run's ({on}, the same reads plus the workload) "
+           f"+ {lim.drain_db_cores_over_on}")
+    off, dur = a.get("probe_p95_us_off"), a.get("probe_p95_us_drain")
+    bound_p = None if off is None else _r(max(lim.drain_probe_factor * off, off + lim.drain_probe_slack_us), 1)
+    ck.add(names[2], None if dur is None or bound_p is None else dur <= bound_p, dur, f"<= {bound_p}",
+           f"latency probe p95 (us per constant SELECT as sa) during the drain: at most max("
+           f"{lim.drain_probe_factor} x, + {lim.drain_probe_slack_us} us) the p95 before Audit ({off} us)")
 
 
 def discovery_impact(samples: list[dict], container: str, t0: float, t1: float,
@@ -720,9 +776,10 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
             a["db_cores_audit_off"] = _r(rate(cpu, w_off["t0"], w_off["t1"], 1e6), 4)
         if w_on:
             a["db_cores_audit_on"] = _r(rate(cpu, w_on["t0"], w_on["t1"], 1e6), 4)
-        # The stream's catch-up after the workload (informational, sqlserver.sh): the DB server's CPU
-        # over the drain (no workload runs then: the agent's reads, the probe and the server's own
-        # work), the drain progress, and the latency probe before Audit and during the drain.
+        # The stream's catch-up after the workload (sqlserver.sh): the DB server's CPU over the drain
+        # (no workload runs then: the agent's reads, the probe and the server's own work), the drain
+        # progress, and the latency probe before Audit and during the drain; checked by drain_checks
+        # (#311 review R2) when a drain happened.
         w_drain = one_fact(facts, "window", name=f"drain_{target}")
         if w_drain:
             a["db_cores_drain"] = _r(rate(cpu, w_drain["t0"], w_drain["t1"], 1e6), 4)
@@ -735,6 +792,9 @@ def build_report(facts: list[dict], samples: list[dict], heartbeats: list[dict],
             if pr:
                 a[f"probe_p95_us_{ph}"] = pr.get("p95_us")
                 a[f"probe_blocks_{ph}"] = pr.get("blocks")
+        if dr is not None:
+            caps = [c for _, c in series(samples, cont, "cap")]
+            drain_checks(ck, target, a, dr, caps[-1] if caps else None, lim)
         audit[target] = a
         ok_wl = issued_on is not None and issued_on > 0 and not wl.get("failed")
         ck.add(f"audit.{target}.workload_ran", ok_wl, {"issued": issued_on, "failed": wl.get("failed")}, "> 0 issued, 0 failed")
@@ -960,6 +1020,15 @@ def render_markdown(rep: dict) -> str:
                    f"{fmt(a.get('source_statements'))} | {fmt(a.get('events_received'))} | {fmt(a.get('events_ratio'))} | {fmt(a.get('drain_s'))} | "
                    f"{fmt(a.get('lag_p95_s'))} | {fmt(a.get('p95_ms_audit_off'))} | {fmt(a.get('p95_ms_audit_on'))} | "
                    f"{fmt(a.get('p95_added_ms'))} | {fmt(a.get('db_cores_audit_off'))} / {fmt(a.get('db_cores_audit_on'))} |")
+    drains = {t: a for t, a in (rep.get("audit") or {}).items() if "drain_happened" in a}
+    if drains:
+        out += ["", "Catch-up after the workload (checked only when the stream was behind when the workload ended).", "",
+                "| Target | Drain happened | Stored at workload end | Drain rate (/s) | DB cores drain | Probe p95 off (µs) | Probe p95 drain (µs) |",
+                "|---|---|---|---|---|---|---|"]
+        for t, a in sorted(drains.items()):
+            out.append(f"| {t} | {fmt(a.get('drain_happened'))} | {fmt(a.get('stored_at_workload_end'))} | "
+                       f"{fmt(a.get('drain_rate_per_s'))} | {fmt(a.get('db_cores_drain'))} | "
+                       f"{fmt(a.get('probe_p95_us_off'))} | {fmt(a.get('probe_p95_us_drain'))} |")
     if rep.get("side"):
         out += ["", "Side accounts of the Audit run (not in the workload counts): a monitoring-like reader, a "
                 "table-less built-in mix and the statistics readers (ADR-0048).", "",
@@ -986,7 +1055,7 @@ def render_markdown(rep: dict) -> str:
         out.append(f"- `{k}`: {fmt(ag.get(k))}")
     out += ["", "## Checks", "", "| Check | Result | Value | Limit | Note |", "|---|---|---|---|---|"]
     for c in rep.get("checks") or []:
-        res = {True: "pass", False: "**FAIL**", None: "**no data**"}[c["pass"]]
+        res = "skipped" if c.get("skipped") else {True: "pass", False: "**FAIL**", None: "**no data**"}[c["pass"]]
         out.append(f"| `{c['name']}` | {res} | {fmt(c['value'])} | {fmt(c['limit'])} | {c.get('note', '')} |")
     return "\n".join(out) + "\n"
 
@@ -1006,7 +1075,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     with open(os.path.join(args.out, "results.md"), "w", encoding="utf-8") as f:
         f.write(md)
     for c in ck.items:
-        if c["pass"] is not True:
+        if c.get("skipped"):
+            print(f"loadlib: check {c['name']}: skipped ({c['note']})", file=sys.stderr)
+        elif c["pass"] is not True:
             print(f"loadlib: check {c['name']}: {'failed' if c['pass'] is False else 'no data'} "
                   f"(value {c['value']}, limit {c['limit']})", file=sys.stderr)
     return 0 if ck.passed else 1
