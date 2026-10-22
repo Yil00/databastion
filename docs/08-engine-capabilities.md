@@ -120,6 +120,20 @@ The same job with the Extended Events source (`sqlserver_audit_source=sqlserver_
 
 Before #311, a stream still in its history phase slept a whole poll interval after every 20 reads and read about 700 events/s against 1 500 written ([Extended Events: polls and position](#extended-events-polls-and-position)). Each read is still at most 500 events, and such a read costs about 250 to 700 ms on the server, which skips the events of the buffer already read at every read; larger reads within a buffer would change the "up to 500 rows" of the [ADR-0051](adr/0051-sqlserver-connector.md) refinement of 2026-10-18, a maintainer decision (a [phase 9 follow-up](ROADMAP.md#phase-9-follow-ups)). With PR #314 the harness checks the catch-up's impact: the database CPU during the drain (`db_cores_drain`) at most half the server's CPUs and at most the database cores measured with Audit on plus 0.25 core, and the probe as in the table; both runs above predate these checks. In run 39695590686 the statistics builds held for pairing (#282) gave 2 read cuts, the longest 0 s, none at the 60 s hold, no read statement reported beyond those issued (`load_app` 30 000 of 30 000, `load_orm` 5 130 of 5 130) and no event naming only `*`.
 
+With reads of up to 2 000 events after a full read ([ADR-0051 refinement of 2026-10-22](adr/0051-sqlserver-connector.md#refinement-2026-10-22-accepted-by-the-maintainer-on-2026-10-22-option-b-extended-events-reads-within-one-buffer)), the same job on the branch of that change, at `5ccefef` and `1b84feb` (2026-10-22, 600 s soak, no statistics reset):
+
+| Measurement | Run 39860900313 (50/s) | Run 39849430024 (50/s, large events) | Run 39865634673 (100/s, recorded only) |
+|-------------|------------------------|--------------------------------------|----------------------------------------|
+| Workload `SELECT`s stored / issued | 30 000 / 30 000 | 30 000 / 30 000 | 56 216 / 60 000 at the end of the drain window (300 s); 59 548 reported by the end of the run |
+| Stored when the workload ended | 27 237 | 29 948 | 56 216 |
+| Drain | about 16 s (88 s in run 39695590686) | about 72 s (the last large-event burst) | not reached |
+| Reads cancelled at 12 MiB / client timeouts | 0 / 0 | at most 1 cancel per 10 minutes / 0 | 0 / 0 |
+| Database cores during the drain; probe p95 before Audit / drain | 0.19; 40 / 40 µs | 0.04; 51 / 41 µs | 0.73; 40 / 40 µs |
+| Agent CPU with Audit on; peak RSS | 0.12 core; 20.9 MiB | 0.12 core; 21.5 MiB | 0.17 core; 20.8 MiB |
+| Losses, spool drops, panics, stream failures | 0 | 0 | 0 on the agent's side |
+
+The large-event run adds a burst of statements near the 128 KiB event bound every 60 s (`sqlserver_large_every_s=60`, login `load_big`); each burst is read by halving after at most one cancelled read, and its events are reported as reads of `*` (their text is left out of the poll above 128 KiB, [below](#extended-events-polls-and-position)). At 100 `SELECT`s/s (about 3 000 events/s written, on a 2-CPU server), the stream stayed behind and the session's file rollover (the load session's `max_file_size` and `max_rollover_files`) removed files before the agent read them: the agent reported that gap (`audit.records_dropped`) and lost nothing on its side; when the run ended, the session's files held 48 697 of the workload's `SELECT`s. That is the measured limit of the Extended Events source on this server: a workload that writes events faster than about 2 000 a second for minutes needs larger or more rollover files, or loses events at the source, reported as a gap.
+
 The same harness against Redis 8.10.2 (`LOAD_REDIS_ENGINE=redis`, target `redis-load`, CI job "Load / Redis target" of `load-redis`), with the same settings: run 39037884737 (`workflow_dispatch`, 600 s soak) on `dev` at `ab27504`, 2026-10-17, every check passed:
 
 | Measurement | Redis 8.10.2 (`redis-load`) | Criterion |
