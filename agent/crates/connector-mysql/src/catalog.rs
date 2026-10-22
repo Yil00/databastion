@@ -146,14 +146,13 @@ pub(crate) async fn introspect(tx: &mut ReadTx<'_>) -> Result<Vec<Table>, MyErro
         else {
             continue;
         };
-        // Case-insensitive system schema check again, in Rust.
-        if sql::SYSTEM_SCHEMAS
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(&schema))
+        // The system schema and object rules again, in Rust.
+        let engine = it.next().flatten();
+        if sql::is_system_schema(&schema)
+            || sql::is_system_object(kind.as_deref(), engine.as_deref())
         {
             continue;
         }
-        let engine = it.next().flatten();
         out.push(Table {
             schema,
             name,

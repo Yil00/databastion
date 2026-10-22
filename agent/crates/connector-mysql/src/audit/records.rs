@@ -617,6 +617,35 @@ pub(crate) fn parse_json(record: &[u8]) -> Option<FileRecord> {
     Some(parsed)
 }
 
+/// A server start recorded by a JSON audit log: the Percona `audit_log`
+/// header record (`{"audit_record": {"name": "Audit", …}}`, written when
+/// the plugin opens its log at server start, and on some versions at each
+/// new log file), or an `audit_log_filter` / Enterprise `startup` event
+/// (`"class": "audit", "event": "startup"`). `Some(time)` for such a
+/// record, its time `None` when it does not parse; `None` for any other
+/// record. Only the kind and the time are read (the startup options and
+/// arguments the record holds are not).
+pub(crate) fn json_server_start(record: &[u8]) -> Option<Option<SystemTime>> {
+    let json = std::str::from_utf8(record).ok()?;
+    let fields = jtext::object(json, &LINE_KEYS).ok()??;
+    if let Some(audit_record) = fields[0] {
+        let [name, timestamp] = opt_obj(Some(audit_record), &["name", "timestamp"]).ok()??;
+        let name = opt_str(name).ok()??;
+        if name.as_str() != "Audit" {
+            return None;
+        }
+        let ts = opt_str(timestamp).ok().flatten();
+        return Some(ts.as_deref().and_then(|t| json_time(t)));
+    }
+    let class = opt_str(fields[2]).ok()??;
+    let event = opt_str(fields[3]).ok()??;
+    if (class.as_str(), event.as_str()) != ("audit", "startup") {
+        return None;
+    }
+    let ts = opt_str(fields[1]).ok().flatten();
+    Some(ts.as_deref().and_then(|t| json_time(t)))
+}
+
 /// The login user of a legacy `Query` record: `user[priv_user] @ host
 /// [ip]`.
 fn legacy_user(raw: &str) -> Option<String> {
@@ -913,6 +942,30 @@ mod tests {
         let c = parse_json(c).unwrap();
         assert_eq!((c.op, c.user.as_str()), (Op::FailedConnect, "wrong"));
         assert!(parse_json(br#"{"audit_record":{"name":"Audit","timestamp":"x"}}"#).is_none());
+    }
+
+    /// The #303 residual follow-up: the server starts the JSON logs
+    /// record, with their time (`None` when it does not parse); every
+    /// other record, and the closing records, are not starts.
+    #[test]
+    fn json_server_starts_are_recognized() {
+        let legacy = br#"{"audit_record":{"name":"Audit","record":"1_2026-10-21T08:00:00","timestamp":"2026-10-21T08:00:05Z","mysql_version":"8.0.40-31","startup_optionsi":"--lower-case-table-names=1","os_version":"x86_64-Linux"}}"#;
+        assert_eq!(json_server_start(legacy), Some(at(1_792_569_605)));
+        let old_time = br#"{"audit_record":{"name":"Audit","record":"1_x","timestamp":"2026-10-21T08:00:05 UTC"}}"#;
+        assert_eq!(json_server_start(old_time), Some(None), "unparsed time");
+        let filter = br#"{"timestamp": "2026-10-21 08:00:05", "id": 0, "class": "audit", "event": "startup", "connection_id": 0,
+            "startup_data": { "server_id": 1, "os_version": "x86_64-Linux", "mysql_version": "8.4.4-4", "args": ["/usr/sbin/mysqld"] } }"#;
+        assert_eq!(json_server_start(filter), Some(at(1_792_569_605)));
+        for other in [
+            &br#"{"audit_record":{"name":"NoAudit","record":"9_x","timestamp":"2026-10-21T08:00:05Z"}}"#[..],
+            br#"{"audit_record":{"name":"Query","record":"2_x","timestamp":"2026-10-21T08:00:05Z","connection_id":"1","sqltext":"select 1","user":"a[a] @ h [1.2.3.4]"}}"#,
+            br#"{"timestamp": "2026-10-21 08:00:05", "id": 1, "class": "audit", "event": "shutdown", "connection_id": 0}"#,
+            br#"{"timestamp": "2026-10-21 08:00:05", "id": 2, "class": "connection", "event": "connect", "connection_id": 3}"#,
+            b"not json",
+            b"{}",
+        ] {
+            assert_eq!(json_server_start(other), None, "{}", String::from_utf8_lossy(other));
+        }
     }
 
     #[test]

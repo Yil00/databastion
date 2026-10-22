@@ -35,9 +35,8 @@
 //! statement's current database. Names keep the case the records give or
 //! the text is written in, quoted or not (ADR-0055 decision 3: with
 //! `lower_case_table_names = 0`, the Linux default, `Customers` and
-//! `customers` are two tables), but `information_schema` and
-//! `performance_schema`, which the servers compare without case, named in
-//! lower case. Residual (security review of ADR-0055 decision 3, L1): the
+//! `customers` are two tables), but `information_schema`, which the
+//! servers compare without case, named in lower case. Residual (security review of ADR-0055 decision 3, L1): the
 //! core's pre-aggregation groups key on the objects as written, so reads
 //! of one table spelled in two cases are two groups, and under
 //! `lower_case_table_names = 1` or `2` (where they are one table) each
@@ -46,11 +45,11 @@
 //! before; groups keyed on folded names for `mysql` / `mariadb` are
 //! planned with ADR-0055 decision 4 (the agent reading
 //! `lower_case_table_names`).
-//! `information_schema`,
-//! `performance_schema` (in any case), `sys`, `DUAL` and the internal
-//! statistics tables (`mysql.*_stats`; `sys` and `mysql` as stored, since
-//! `SYS` or `MySQL` may be another database) are skipped from the objects
-//! of reads only: a write
+//! `information_schema` (in any case), `performance_schema`, `sys`,
+//! `DUAL` and the internal statistics tables (`mysql.*_stats`;
+//! `performance_schema`, `sys` and `mysql` as stored, since
+//! `Performance_Schema` (MariaDB), `SYS` or `MySQL` may be another
+//! database) are skipped from the objects of reads only: a write
 //! names them (`UPDATE performance_schema.setup_consumers …` turns the
 //! `performance_schema` source off), and so does a table record that
 //! writes a system schema table, whatever the statement's action. The
@@ -156,21 +155,38 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
-        .any(|s| s.eq_ignore_ascii_case(db))
+        .any(|s| wide_eq(s, db))
+}
+
+/// Whether `name` is the listed ASCII name `listed` in ASCII case, or once
+/// its Unicode uppercase or lowercase is taken: the wider match the
+/// always-reported lists use (the PR #308 CI run on MariaDB 11.8: the
+/// servers fold schema names with `utf8mb3_general_ci`, where
+/// `performance_ſchema`, U+017F, reads the system schema, so its
+/// statement-text tables must stay always reported under that spelling;
+/// matching more only reports more).
+pub(crate) fn wide_eq(listed: &str, name: &str) -> bool {
+    listed.eq_ignore_ascii_case(name)
+        || (!name.is_ascii()
+            && (listed.eq_ignore_ascii_case(&name.to_uppercase())
+                || listed.eq_ignore_ascii_case(&name.to_lowercase())))
 }
 
 /// [`is_system_schema`] for what is left out of reads: `information_schema`
-/// and `performance_schema` in any case (the servers compare them without
-/// case whatever `lower_case_table_names`), `sys` only as stored. `sys` is
-/// an ordinary database for name resolution: with
+/// in any case (both servers compare it without case whatever
+/// `lower_case_table_names` and refuse a database of that name in another
+/// case), `performance_schema` and `sys` only as stored. `sys` is an
+/// ordinary database for name resolution: with
 /// `lower_case_table_names = 0` (the Linux default) `SYS` or `Sys` is
 /// another database, whose reads are application reads (ADR-0055
-/// decision 3; with 1 or 2 such a read is reported, failing closed).
-fn is_skipped_system_schema(db: &str) -> bool {
-    ["information_schema", "performance_schema"]
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(db))
-        || db == "sys"
+/// decision 3; with 1 or 2 such a read is reported, failing closed). So is
+/// `Performance_Schema` on MariaDB, which lets a user create it next to
+/// the system schema (measured in CI, PR #308); MySQL refuses it and reads
+/// `PERFORMANCE_SCHEMA.t` as the system schema, but the flavor comes from
+/// a version string a proxy can rewrite, so the stricter rule applies to
+/// both (such a read on MySQL is reported, named as written).
+pub(crate) fn is_skipped_system_schema(db: &str) -> bool {
+    db.eq_ignore_ascii_case("information_schema") || db == "performance_schema" || db == "sys"
 }
 
 /// MariaDB's engine-independent statistics, read by the server itself for
@@ -303,7 +319,7 @@ pub(crate) fn statement_text_table(
                 (TextOn::Both, _) | (_, None) => true,
                 (TextOn::Mysql, Some(f)) => f == Flavor::Mysql,
             };
-            here && d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table)
+            here && wide_eq(d, db) && wide_eq(t, table)
         })
         .map(|(d, t, _)| (*d, *t))
 }
@@ -324,12 +340,12 @@ pub(crate) const STATISTICS_TABLES: &[(&str, &str)] = &[
     ("mysql", "column_stats"),
 ];
 
-/// The statistics table `db`.`table` is, as listed (compared
-/// ASCII-case-insensitively).
+/// The statistics table `db`.`table` is, as listed (compared with
+/// [`wide_eq`]).
 pub(crate) fn statistics_table(db: &str, table: &str) -> Option<(&'static str, &'static str)> {
     STATISTICS_TABLES
         .iter()
-        .find(|(d, t)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
+        .find(|(d, t)| wide_eq(d, db) && wide_eq(t, table))
         .map(|(d, t)| (*d, *t))
 }
 
@@ -416,10 +432,10 @@ fn shows_session_text(p: &StatementInfo) -> bool {
 /// `mysql.audit_log_filter` and `mysql.audit_log_user`. Writing them
 /// changes what the audit log records.
 fn is_audit_table(db: &str, table: &str) -> bool {
-    db.eq_ignore_ascii_case("mysql")
+    wide_eq("mysql", db)
         && ["audit_log_filter", "audit_log_user"]
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(table))
+            .any(|t| wide_eq(t, table))
 }
 
 /// The closed allow-list of statements of no known kind that produce no
@@ -1228,17 +1244,14 @@ pub(crate) fn text_shape(text: &[u8]) -> Option<Vec<String>> {
 }
 
 /// The database of an object: as written or recorded (ADR-0055 decision
-/// 3), but `information_schema` and `performance_schema` in the case the
-/// servers store them, since they compare them without case whatever
-/// `lower_case_table_names`.
+/// 3), but `information_schema` in the case the servers store it, since
+/// they compare it without case whatever `lower_case_table_names`
+/// (`performance_schema` as written: see [`is_skipped_system_schema`]).
 fn object_database(database: &str) -> NormalizedName {
     if database.is_empty() {
         NormalizedName::wildcard()
-    } else if let Some(s) = ["information_schema", "performance_schema"]
-        .into_iter()
-        .find(|s| s.eq_ignore_ascii_case(database))
-    {
-        normalize(s)
+    } else if database.eq_ignore_ascii_case("information_schema") {
+        normalize("information_schema")
     } else {
         normalize(database)
     }
@@ -1480,7 +1493,7 @@ impl EventBuilder {
             text == t.as_slice()
                 && a.tables.iter().all(|(db, table, op)| {
                     *op == TableOp::Read
-                        && db.eq_ignore_ascii_case("performance_schema")
+                        && *db == "performance_schema"
                         && tables.iter().any(|x| x.eq_ignore_ascii_case(table))
                 })
         })
@@ -7076,6 +7089,39 @@ mod tests {
 
     /// `events_statements_summary_by_digest` holds statement texts with
     /// literals on MySQL (`QUERY_SAMPLE_TEXT`), digests only on MariaDB.
+    /// The PR #308 CI run on MariaDB 11.8: a statement-text table read
+    /// through a schema spelling the servers fold to `performance_schema`
+    /// (`performance_ſchema`, U+017F) is named as listed and always
+    /// reported, on every source; the always-reported lists match such
+    /// spellings, the read-skip rule does not.
+    #[test]
+    fn statement_text_tables_through_a_folded_spelling_are_always_reported() {
+        assert!(wide_eq("performance_schema", "performance_\u{17F}chema"));
+        assert!(wide_eq(
+            "information_schema",
+            "\u{131}nformation_\u{17F}chema"
+        ));
+        assert!(wide_eq("mysql", "MY\u{17F}QL"));
+        assert!(!wide_eq("performance_schema", "performance_schemas"));
+        assert!(!is_skipped_system_schema("performance_\u{17F}chema"));
+        for text in [
+            "SELECT SQL_TEXT FROM performance_\u{17F}chema.events_statements_current LIMIT 1",
+            "SELECT * FROM `PERFORMANCE_\u{17F}CHEMA`.`EVENTS_STATEMENTS_HISTORY`",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                let ev = ev.unwrap_or_else(|| panic!("{source:?}: {text}"));
+                assert!(ev.always_report(), "{source:?}: {text}");
+                assert!(
+                    ev.objects()
+                        .iter()
+                        .all(|o| o.database().as_str() == "performance_schema"),
+                    "{source:?}: {text}: {}",
+                    shown(&ev)
+                );
+            }
+        }
+    }
+
     #[test]
     fn statement_text_tables_follow_the_flavor() {
         let text = "SELECT * FROM performance_schema.events_statements_summary_by_digest";
@@ -7867,18 +7913,18 @@ mod tests {
     }
 
     /// ADR-0055 decision 3: the system schemas stay matched without case
-    /// where the servers compare them so (`information_schema`,
-    /// `performance_schema`) and wherever the match reports more (the
-    /// statement-text and statistics tables, named as listed and always
-    /// reported); a read is left out as a system read only for `sys` and
-    /// `mysql` as stored, since with `lower_case_table_names = 0` `SYS` or
-    /// `MySQL` is another database.
+    /// where both servers compare them so (`information_schema`) and
+    /// wherever the match reports more (the statement-text and statistics
+    /// tables, named as listed and always reported); a read is left out as
+    /// a system read only for `performance_schema`, `sys` and `mysql` as
+    /// stored, since with `lower_case_table_names = 0` `SYS`, `MySQL` or
+    /// (MariaDB, PR #308) `Performance_Schema` is another database.
     #[test]
     fn system_schema_matching_follows_the_server_rules() {
         for text in [
             "SELECT * FROM INFORMATION_SCHEMA.STATISTICS",
             "select * from Information_Schema.Columns",
-            "SELECT * FROM PERFORMANCE_SCHEMA.setup_instruments",
+            "SELECT * FROM performance_schema.setup_instruments",
             "SELECT * FROM sys.statement_analysis",
             "SELECT * FROM mysql.table_stats",
             "SELECT * FROM dual",
@@ -7892,6 +7938,14 @@ mod tests {
             (
                 "SELECT * FROM SYS.statement_analysis",
                 &["SYS.statement_analysis"][..],
+            ),
+            (
+                "SELECT * FROM PERFORMANCE_SCHEMA.setup_instruments",
+                &["PERFORMANCE_SCHEMA.setup_instruments"][..],
+            ),
+            (
+                "SELECT * FROM `Performance_Schema`.people",
+                &["Performance_Schema.people"][..],
             ),
             (
                 "SELECT * FROM `Sys`.`statement_analysis`",
@@ -7939,11 +7993,12 @@ mod tests {
                 }
             }
         }
-        // A write of a system schema in any case is always reported, the
-        // schema named as stored.
+        // A write of a system schema in any case is always reported, named
+        // as written (`Performance_Schema` may be a user database on
+        // MariaDB).
         expect_everywhere(
             "UPDATE Performance_Schema.Setup_Consumers SET ENABLED = 'NO'",
-            |_| "write [\"performance_schema.Setup_Consumers\"] always".to_owned(),
+            |_| "write [\"Performance_Schema.Setup_Consumers\"] always".to_owned(),
         );
     }
 
@@ -8420,8 +8475,8 @@ mod tests {
             let text = format!("SELECT * FROM {}.{}", q(&s, quote[0]), q(&t, quote[1]));
             let may_skip = s == "sys"
                 || s == "mysql"
-                || s.eq_ignore_ascii_case("information_schema")
-                || s.eq_ignore_ascii_case("performance_schema");
+                || s == "performance_schema"
+                || s.eq_ignore_ascii_case("information_schema");
             for (source, ev) in on_every_source("app", &text) {
                 if ev.is_none() {
                     proptest::prop_assert!(may_skip && !listed, "{:?}: {}", source, text);
