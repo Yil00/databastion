@@ -902,7 +902,8 @@ export interface components {
             /**
              * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
              *     `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
-             *     `access_event.objects_overflowed`, `job_progress.coverage`, and the engines
+             *     `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
+             *     `job_progress.coverage`, and the engines
              *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
@@ -1230,7 +1231,32 @@ export interface components {
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
             field: components["schemas"]["Identifier"];
+            /**
+             * @description Parts of this location whose name was altered: the agent's name
+             *     normalization (ADR-0009: control and format characters stripped, NFKC; on
+             *     Redis / Valkey the same steps of the key-pattern normalizer; on CAS,
+             *     definition keys converted to snake_case) changed these parts, so another
+             *     object of the engine may be sent under the same name. Never set for a part
+             *     sent as `*`. It carries no value, no character and no count (I2). Unique
+             *     parts, at least one; absent when no part was altered. Sent only when the
+             *     latest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,
+             *     ADR-0056); a `400` reporting it as an unknown field clears the agent's
+             *     capability list, and the findings are resent once without it (ADR-0022
+             *     decision 9).
+             */
+            altered?: components["schemas"]["LocationPart"][];
         };
+        /**
+         * @description A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
+         * @enum {string}
+         */
+        LocationPart: "database" | "schema" | "object" | "field";
+        /**
+         * @description A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event
+         *     object names no field).
+         * @enum {string}
+         */
+        ObjectRefPart: "database" | "schema" | "object";
         /** @description Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`). */
         EventsBatch: {
             batch_id: components["schemas"]["UuidV7"];
@@ -1382,6 +1408,21 @@ export interface components {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
+            /**
+             * @description Parts of this object whose name was altered: the agent's name normalization
+             *     (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+             *     the same steps of the key-pattern normalizer; on CAS, definition keys
+             *     converted to snake_case) changed these parts, so another object of the
+             *     engine may be sent under the same name. Never set for a part sent as `*`. It
+             *     carries no value, no character and no count (I2). Unique parts, at least
+             *     one; absent when no part was altered; an event object names no field. Sent
+             *     only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+             *     (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+             *     agent's capability list, and the events are resent once without it (ADR-0022
+             *     decision 9). Keep in step with the inline copies of `ObjectRef` in
+             *     `AccessEvent`.
+             */
+            altered?: components["schemas"]["ObjectRefPart"][];
         };
     };
     responses: {

@@ -347,6 +347,8 @@ fn keep_overflow_wildcard(e: &mut AccessEvent, left_out: &[Identifier]) {
         database,
         schema: None,
         object: ObjectName::Variant0(star),
+        // ADR-0056: no marker is produced yet (agent lot, decision 2).
+        altered: None,
     });
 }
 

@@ -184,6 +184,18 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "EventsBatch.objects-overflowed-without-star.json",
         "contains (via if/then, removed before generation)",
     ),
+    // ADR-0056: `Location.altered` and `ObjectRef.altered` are generated as
+    // `Option<Vec<_>>`; the agent does not send them yet.
+    (
+        "EventsBatch.altered-empty.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    ("EventsBatch.altered-repeated-part.json", "uniqueItems"),
+    (
+        "FindingsBatch.altered-empty.json",
+        "minItems (Some([]), distinct from absent)",
+    ),
+    ("FindingsBatch.altered-repeated-part.json", "uniqueItems"),
     (
         "EventsBatch.account-not-recorded-on-auth-failure.json",
         "not (via if/then, removed before generation)",
