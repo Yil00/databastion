@@ -19,6 +19,13 @@
 //!   the same, with the reads at most two thirds of the time (a pause of
 //!   half the reading time, at least 1 s).
 //!
+//! The reading time is the time spent in the poll statements only (review
+//! R1 of 527eb08): a read that waits for the core's event queue (the
+//! sink's back-pressure) or parses locally does not lengthen the pause.
+//! The pause is also capped at the larger of the poll interval and
+//! [`CATCH_UP`] / 4 plus the statement timeout (what the last statement of
+//! a cycle can add), whatever a source reports.
+//!
 //! Before load run 39687119269, every cycle waited the poll interval: a
 //! stream in its history phase (which only a read that is not full ends)
 //! read at most 20 reads of 500 records per poll interval, under 1 000
@@ -45,6 +52,11 @@ pub(crate) const HISTORY_PAUSE: Duration = Duration::from_secs(1);
 const BEHIND_DIVISOR: u32 = 4;
 /// The same for the history walk: reads at most two thirds of the time.
 const HISTORY_DIVISOR: u32 = 2;
+/// The longest pause after a cycle behind or of the history walk, the poll
+/// interval aside: what [`CATCH_UP`] plus one statement at its timeout
+/// asks.
+const PAUSE_CAP: Duration =
+    Duration::from_secs(CATCH_UP.as_secs() / BEHIND_DIVISOR as u64 + super::POLL_TIMEOUT.as_secs());
 /// The "behind" log line, once per this per target at most.
 const LOG_EVERY: Duration = Duration::from_secs(60);
 
@@ -62,14 +74,18 @@ pub(crate) enum End {
 impl End {
     /// The wait before the next cycle, `poll` the poll interval: the poll
     /// interval when caught up; else at least the reads' share bound and
-    /// the rest of the poll interval since the cycle started.
+    /// the rest of the poll interval since the cycle started, at most
+    /// [`PAUSE_CAP`] or the poll interval.
     pub(crate) fn pause(self, poll: Duration) -> Duration {
         let (busy, divisor, least) = match self {
             Self::CaughtUp => return poll,
             Self::Behind(b) => (b, BEHIND_DIVISOR, BEHIND_PAUSE),
             Self::History(b) => (b, HISTORY_DIVISOR, HISTORY_PAUSE),
         };
-        (busy / divisor).max(poll.saturating_sub(busy)).max(least)
+        (busy / divisor)
+            .max(poll.saturating_sub(busy))
+            .max(least)
+            .min(poll.max(PAUSE_CAP))
     }
 }
 
@@ -88,15 +104,24 @@ pub(crate) fn end(full: bool, history: bool, busy: Duration) -> Option<End> {
     }
 }
 
+/// One read's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Read {
+    /// The read was full: the next one should follow at once.
+    pub(crate) full: bool,
+    /// The time spent in its poll statement (not in the sink's
+    /// back-pressure, nor in local parsing).
+    pub(crate) statements: Duration,
+}
+
 /// What a source gives a cycle.
 pub(crate) trait Reads {
     fn target_id(&self) -> &str;
     fn source(&self) -> &'static str;
     /// Whether the next read walks the first start's history.
     fn walking_history(&self) -> bool;
-    /// One read from the position (saved after it); `true` when it was
-    /// full and the next read should follow at once.
-    fn read_once(&mut self) -> impl Future<Output = Result<bool, ConnectorError>> + Send;
+    /// One read from the position (saved after it).
+    fn read_once(&mut self) -> impl Future<Output = Result<Read, ConnectorError>> + Send;
     /// Between two reads of a cycle (the proofs, when a read asked).
     fn between(&mut self) -> impl Future<Output = Result<(), ConnectorError>> + Send;
     fn now(&self) -> Instant {
@@ -104,20 +129,20 @@ pub(crate) trait Reads {
     }
 }
 
-/// One cycle: reads until [`end`] says it ends; the stream then waits
-/// [`End::pause`].
+/// One cycle: reads until [`end`] says it ends, on the time spent in the
+/// poll statements; the stream then waits [`End::pause`].
 pub(crate) async fn run<R: Reads + Send>(
     r: &mut R,
     log: &mut BehindLog,
 ) -> Result<End, ConnectorError> {
-    let started = r.now();
+    let mut busy = Duration::ZERO;
     let mut reads = 0usize;
     loop {
         let history = r.walking_history();
-        let full = r.read_once().await?;
+        let read = r.read_once().await?;
         reads += 1;
-        let busy = r.now().saturating_duration_since(started);
-        if let Some(e) = end(full, history, busy) {
+        busy = busy.saturating_add(read.statements);
+        if let Some(e) = end(read.full, history, busy) {
             log.note(r.target_id(), r.source(), e, reads, r.now());
             return Ok(e);
         }
@@ -200,6 +225,8 @@ mod tests {
         t0: Instant,
         t_ms: u64,
         read_ms: u64,
+        /// Wall time a read waits beyond its statement (back-pressure).
+        wait_ms: u64,
         fulls: Vec<bool>,
         history: usize,
         reads: usize,
@@ -212,6 +239,7 @@ mod tests {
                 t0: Instant::now(),
                 t_ms: 0,
                 read_ms,
+                wait_ms: 0,
                 fulls: fulls.to_vec(),
                 history,
                 reads: 0,
@@ -230,11 +258,14 @@ mod tests {
         fn walking_history(&self) -> bool {
             self.reads < self.history
         }
-        async fn read_once(&mut self) -> Result<bool, ConnectorError> {
-            self.t_ms += self.read_ms;
+        async fn read_once(&mut self) -> Result<Read, ConnectorError> {
+            self.t_ms += self.read_ms + self.wait_ms;
             let full = self.fulls.get(self.reads).copied().unwrap_or(true);
             self.reads += 1;
-            Ok(full)
+            Ok(Read {
+                full,
+                statements: Duration::from_millis(self.read_ms),
+            })
         }
         async fn between(&mut self) -> Result<(), ConnectorError> {
             self.betweens += 1;
@@ -269,6 +300,35 @@ mod tests {
         let mut s = Script::new(500, &[], 5);
         let e = block_on(run(&mut s, &mut log)).unwrap();
         assert_eq!(e, End::Behind(Duration::from_secs(20)));
+    }
+
+    /// Review R1 of 527eb08: the sink's back-pressure (a read that waits
+    /// a minute for the core's queue after a 500 ms statement) counts
+    /// neither towards the cycle's reading time nor towards the pause.
+    #[test]
+    fn back_pressure_is_not_reading_time() {
+        let mut log = BehindLog::default();
+        let mut s = Script::new(500, &[], 0);
+        s.wait_ms = 60_000;
+        let e = block_on(run(&mut s, &mut log)).unwrap();
+        assert_eq!(e, End::Behind(Duration::from_secs(20)));
+        assert_eq!(s.reads, 40);
+        assert_eq!(e.pause(Duration::from_secs(10)), Duration::from_secs(5));
+        // Caught up after a wait: the poll interval, as always.
+        let mut s = Script::new(100, &[false], 0);
+        s.wait_ms = 3_600_000;
+        let e = block_on(run(&mut s, &mut log)).unwrap();
+        assert_eq!(e, End::CaughtUp);
+        // Whatever a source reports, the pause is capped.
+        let poll = Duration::from_secs(10);
+        for e in [
+            End::Behind(Duration::from_secs(3600)),
+            End::History(Duration::from_secs(3600)),
+        ] {
+            assert_eq!(e.pause(poll), PAUSE_CAP);
+            assert_eq!(e.pause(Duration::from_secs(600)), Duration::from_secs(600));
+        }
+        assert_eq!(PAUSE_CAP, CATCH_UP / 4 + super::super::POLL_TIMEOUT);
     }
 
     /// Review M1: the reads take at most 80 % of the time behind and two
@@ -372,7 +432,7 @@ mod tests {
         fn walking_history(&self) -> bool {
             self.cursor.walking_history()
         }
-        async fn read_once(&mut self) -> Result<bool, ConnectorError> {
+        async fn read_once(&mut self) -> Result<Read, ConnectorError> {
             let batch = BATCH as u64;
             let n = self
                 .available(self.t_ms)
@@ -394,7 +454,10 @@ mod tests {
                 self.cursor.history_us = None;
                 self.out.caught_up_ms.get_or_insert(self.t_ms);
             }
-            Ok(full)
+            Ok(Read {
+                full,
+                statements: Duration::from_millis(self.read_ms),
+            })
         }
         async fn between(&mut self) -> Result<(), ConnectorError> {
             Ok(())

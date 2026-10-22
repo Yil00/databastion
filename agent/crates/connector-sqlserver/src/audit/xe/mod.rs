@@ -48,7 +48,7 @@ pub(crate) mod events;
 pub(crate) mod probe;
 pub(crate) mod xml;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use databastion_classifiers::masking::{EventAction, MaskedEvent};
 use databastion_core::audit::CursorStore;
@@ -102,6 +102,8 @@ struct Stream<'a> {
     reprobe_at: Instant,
     evaluated_at: Option<Instant>,
     batch: usize,
+    /// Time spent in poll statements, summed ([`super::cycle::Read::statements`]).
+    poll_time: Duration,
     /// The statistics exclusion applies (an allow-listed build).
     statman: bool,
     /// The server's major version and the account's server permissions at
@@ -398,6 +400,7 @@ pub(crate) async fn stream(
         reprobe_at: Instant::now(),
         evaluated_at: None,
         batch: BATCH,
+        poll_time: Duration::ZERO,
         statman: false,
         major: 0,
         perms: std::collections::BTreeSet::new(),
@@ -503,10 +506,14 @@ impl super::cycle::Reads for Reads<'_, '_> {
         self.st.cursor.walking_history()
     }
 
-    async fn read_once(&mut self) -> Result<bool, ConnectorError> {
+    async fn read_once(&mut self) -> Result<super::cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
         let full = Box::pin(read(self.st, self.s, self.sink)).await?;
         self.st.save();
-        Ok(full)
+        Ok(super::cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
     }
 
     async fn between(&mut self) -> Result<(), ConnectorError> {
@@ -706,6 +713,7 @@ async fn read(
     // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
     let top = st.batch;
     let skip = st.cursor.skip;
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         None => {
             Box::pin(poll_records(
@@ -732,6 +740,7 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
             st.batch = (st.batch * 2).min(BATCH);

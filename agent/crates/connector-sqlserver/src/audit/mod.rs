@@ -1118,6 +1118,8 @@ struct Stream<'a> {
     evaluated_at: Option<Instant>,
     /// Records asked per read (halved after an oversized response).
     batch: usize,
+    /// Time spent in poll statements, summed ([`cycle::Read::statements`]).
+    poll_time: Duration,
 }
 
 impl Stream<'_> {
@@ -1393,6 +1395,7 @@ pub(crate) async fn audit_stream(
         reprobe_at: Instant::now(),
         evaluated_at: None,
         batch: BATCH,
+        poll_time: Duration::ZERO,
     };
     let mut log = cycle::BehindLog::default();
     loop {
@@ -1479,10 +1482,14 @@ impl cycle::Reads for Reads<'_, '_> {
         self.st.cursor.walking_history()
     }
 
-    async fn read_once(&mut self) -> Result<bool, ConnectorError> {
+    async fn read_once(&mut self) -> Result<cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
         let full = Box::pin(read(self.st, self.s, self.sink)).await?;
         self.st.save();
-        Ok(full)
+        Ok(cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
     }
 
     async fn between(&mut self) -> Result<(), ConnectorError> {
@@ -1606,6 +1613,7 @@ async fn read(
     let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
     // The server skips the records of the next buffer already handled.
     let (top, skip) = request(&st.cursor, st.batch);
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
         None => {
@@ -1633,6 +1641,7 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
             st.batch = (st.batch * 2).min(BATCH);
