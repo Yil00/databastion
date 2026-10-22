@@ -88,7 +88,7 @@ The four `*` events are the dump signatures (`signature.mysqldump`, `signature.p
 
 - **Load**: run 39679876881, job `load-valkey` (2026-10-21): 120 000 `GET`s gave 10 events, every one naming only `*`, in the database `*` (the slow log records no database, and Discovery found keys in two databases), none overflowed. Discovery had learned 4 patterns in `db0` and 1 in `db1`.
 - **End to end**: the job `e2e-redis` gave 10 events, every one naming only `*`, in `db0`.
-- **Conclusion**: the Valkey `*` is never a real `*` key pattern (the learned set never holds `*`). It is a key the agent did not attribute: the database is `*` because the slow log records none, and the key matched no learned pattern and no learned literal prefix ([08-engine-capabilities.md](../08-engine-capabilities.md#redis--valkey-audit)). Why the load keys match no learned pattern is not explained yet, a [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups).
+- **Conclusion**: the Valkey `*` is never a real `*` key pattern (the learned set never holds `*`). It is a key the agent did not attribute: the database is `*` because the slow log records none, and the key matched no learned pattern and no learned literal prefix ([08-engine-capabilities.md](../08-engine-capabilities.md#redis--valkey-audit)). Why the load keys match no usable pattern was found on 2026-10-22 (phase 9 follow-up): by design, not a bug. The load keys (`load:s:<n>`) are learned as `load:*:*` in `db0`, but the dev keyspace also holds keys in `db1` (`session:*` only), and a slow-log entry, which records no database, is matched only against the patterns learned in every database with keys (ADR-0052 decision 8): none here, so `*` in `*`. Attributing a pattern learned in one database only would narrow the object of a key that may live, unlearned, in the other database ([08-engine-capabilities.md](../08-engine-capabilities.md#redis--valkey-audit)).
 
 ### SQL Server, Extended Events source
 
@@ -112,4 +112,4 @@ As with SQL Server Audit, only the ORM-style principal overflowed (27 of its 162
 
 - One load run per engine (two on SQL Server Audit, one on Extended Events), with a synthetic workload: the ORM-style cycle is a fixed mix written for this measurement, not traffic from a real application or ORM.
 - MongoDB Audit and OpenLDAP are counted only in the end-to-end run, whose scenarios are small (at most 115 statements per engine) and have no ORM-style principal; there are no figures here for MySQL or for Redis load.
-- Why the Valkey load keys are not attributed to learned patterns is an open item, above.
+- The Valkey load keys are not attributed because their pattern is learned in one of the two databases with keys (above).

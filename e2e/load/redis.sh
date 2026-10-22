@@ -228,6 +228,13 @@ done
 admin_cli BGSAVE >/dev/null || true
 DBSIZE="$(admin_cli DBSIZE | tr -d '\r')"
 log "seeded in $(( $(date +%s) - t0 )) s: dbsize ${DBSIZE}, used_memory $(info_field memory used_memory_human)"
+# The databases holding keys (the dev keyspace's db0 and db1 next to the load keys of db0). Slow-log
+# entries record no database, so with more than one, a key's object is a pattern learned in every
+# one of them, else `*` (docs/08-engine-capabilities.md, "Redis / Valkey Audit"): the load GETs are
+# reads of `*` in `*` here, `load:*:*` being learned in db0 only.
+KEYSPACE_DBS="$(admin_cli INFO keyspace | tr -d '\r' | sed -n 's/^\(db[0-9]*\):keys=\([0-9]*\),.*/\1=\2/p' | paste -sd ' ' -)"
+log "databases with keys: ${KEYSPACE_DBS:-none}"
+fact --arg t "$TARGET" --arg dbs "$KEYSPACE_DBS" '{kind: "keyspace", target: $t, databases: ($dbs | split(" ") | map(select(. != "")))}'
 if r="$(python3 "$LOADLIB" quiet --samples "$SAMPLES_DB" --names "$SVC" --below 0.02 --window 10 --timeout 180)"; then
   log "target quiet: $r"
 else

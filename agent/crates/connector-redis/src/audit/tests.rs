@@ -143,6 +143,55 @@ fn replicas_and_databases() {
     assert!(set.is_empty());
 }
 
+/// ROADMAP phase 9 follow-up (load run 39679876881): the load keys
+/// (`load:s:<n>`) match `load:*:*`, learned in `db0` only; slow-log
+/// entries carry no database, so with keys in `db0` and `db1` the `GET` is
+/// a read of `*` in `*` (ADR-0052 decision 8), and of the pattern once it
+/// is learned in every database with keys, or when `db0` alone holds keys.
+#[test]
+fn load_keys_need_their_pattern_in_every_database_with_keys() {
+    let get = |set: &LearnedPatterns| {
+        let ctx = Context {
+            learned: set,
+            stores: None,
+            dbs: &[],
+        };
+        let raw = resp_entry(1, 1, &[b"GET", b"load:s:7"], "10.0.0.9:5000");
+        let e = entries::parse_log_entry(&decode(&raw), &ctx).unwrap();
+        e.objects
+            .iter()
+            .map(|o| o.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut l = state::Learned::default();
+    l.dbs.insert(
+        0,
+        Arc::new(LearnedPatterns::new([
+            "*:*",
+            "customer:*:email",
+            "load:*:*",
+            "user:*:profile",
+        ])),
+    );
+    l.dbs
+        .insert(1, Arc::new(LearnedPatterns::new(["session:*"])));
+    // The load run: learned in db0, not usable without a database.
+    let (db, set) = log_database(&l, &[0, 1]);
+    assert_eq!(db.as_str(), "*");
+    assert!(set.is_empty());
+    assert_eq!(get(&set), ["*"]);
+    // db0 alone holds keys: its patterns apply.
+    let (db, set) = log_database(&l, &[0]);
+    assert_eq!(db.as_str(), "db0");
+    assert_eq!(get(&set), ["load:*:*"]);
+    // Learned in both databases: the pattern, in `*`.
+    l.dbs
+        .insert(1, Arc::new(LearnedPatterns::new(["load:*:*", "session:*"])));
+    let (db, set) = log_database(&l, &[0, 1]);
+    assert_eq!(db.as_str(), "*");
+    assert_eq!(get(&set), ["load:*:*"]);
+}
+
 #[test]
 fn levels() {
     use databastion_core::{AuditLevel, NoteCode};

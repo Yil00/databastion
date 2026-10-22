@@ -2204,6 +2204,180 @@ impl Drop for RestoreSlowlogLen {
     }
 }
 
+/// Keys of the load run's shape (`load:s:<n>` strings, every tenth
+/// `load:h:<n>` a hash; e2e/load/seed.py), written by `admin` into `db`
+/// (the commands; `del` gives their deletion instead).
+fn load_keys(db: &'static [u8], del: bool) -> Vec<Vec<Vec<u8>>> {
+    let mut cmds: Vec<Vec<Vec<u8>>> = vec![vec![b"SELECT".to_vec(), db.to_vec()]];
+    for n in 1..=LOAD_KEYS {
+        let key = if n % 10 == 0 {
+            format!("load:h:{n}")
+        } else {
+            format!("load:s:{n}")
+        };
+        cmds.push(match (del, n % 10 == 0) {
+            (true, _) => vec![b"DEL".to_vec(), key.into_bytes()],
+            (false, true) => vec![
+                b"HSET".to_vec(),
+                key.into_bytes(),
+                b"status".to_vec(),
+                b"active".to_vec(),
+            ],
+            (false, false) => vec![b"SET".to_vec(), key.into_bytes(), b"v".to_vec()],
+        });
+    }
+    cmds
+}
+
+/// Keys of the load shape per database.
+const LOAD_KEYS: u32 = 300;
+
+async fn admin_owned(t: &TargetConfig, cmds: &[Vec<Vec<u8>>]) {
+    let borrowed: Vec<Vec<&[u8]>> = cmds
+        .iter()
+        .map(|c| c.iter().map(Vec::as_slice).collect())
+        .collect();
+    admin(t, &borrowed).await;
+}
+
+/// The objects (object, database) of `admin`'s slow-log `GET`s.
+fn admin_get_objects(json: &[serde_json::Value]) -> Vec<(String, String)> {
+    json.iter()
+        .filter(|e| {
+            e["principal"]["db_user"] == "admin"
+                && e["action"] == "read"
+                && e["source"] == "redis_slowlog"
+        })
+        .flat_map(|e| e["objects"].as_array().cloned().unwrap_or_default())
+        .map(|o| {
+            (
+                o["object"].as_str().unwrap_or_default().to_owned(),
+                o["database"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// One Discovery scan, then an Audit stream during which `admin` reads
+/// `load:s:7` (database 0) from a connection older than the read; the
+/// learned patterns of `db0` and the events' JSON.
+async fn scan_then_load_get(
+    t: &TargetConfig,
+    dir: &std::path::Path,
+) -> (Vec<String>, Vec<serde_json::Value>) {
+    let connector = Arc::new(RedisConnector::new());
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
+    let (fs, mut frx) = FindingSink::channel(4096);
+    let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+    connector.discover(&job, &fs).await.unwrap();
+    drop(fs);
+    drain.await.unwrap();
+    let db0: Vec<String> = connector
+        .state
+        .audit
+        .learned(&t.id)
+        .dbs
+        .get(&0)
+        .map(|s| s.patterns().to_vec())
+        .unwrap_or_default();
+
+    std::fs::create_dir_all(dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&connector);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    let _stop = AbortOnDrop(stream.abort_handle());
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    let pw = admin_password();
+    raw_held(
+        t,
+        "admin",
+        &pw,
+        std::time::Duration::from_secs(3),
+        &[vec![b"GET", b"load:s:7"]],
+        std::time::Duration::from_secs(4),
+    )
+    .await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    (db0, events_json(&events))
+}
+
+/// ROADMAP phase 9 follow-up "why the Valkey load keys are not attributed
+/// to learned patterns" (load run 39679876881): the load keys
+/// (`load:s:<n>`, database 0) are learned in `db0` (`load:*:*` here), but a
+/// slow-log entry carries no database, and with keys in `db0` and `db1`
+/// (the dev and load keyspace) only patterns learned in **every**
+/// database with keys apply (ADR-0052 decision 8): the `GET` is a read of
+/// `*` in `*`. Once `db1` holds keys of the same shape too, the pattern is
+/// learned in both and the same `GET` is a read of that pattern in `*`.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_keys_are_attributed_only_when_learned_in_every_database() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-load-attr-{}-{name}",
+            std::process::id()
+        ));
+        admin_owned(&t, &load_keys(b"0", false)).await;
+        // The scans and streams in a task of their own, so the keys are
+        // removed even when an assertion fails.
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            // Load keys in db0 only: learned there, not usable.
+            let (db0, json) = scan_then_load_get(&t, &dir).await;
+            // `load:*:*` on the dev keyspace (the `s` / `h` segment has
+            // too few keys per value to stay literal next to the others).
+            let learned =
+                databastion_classifiers::keys::LearnedPatterns::new(db0.iter().map(String::as_str));
+            let pattern = learned
+                .pattern_of(b"load:s:7")
+                .unwrap_or_else(|| panic!("{name}: load:s:7 matches none of {db0:?}"));
+            assert!(pattern.as_str().starts_with("load:"), "{name}: {db0:?}");
+            let only_db0 = admin_get_objects(&json);
+            assert_eq!(
+                only_db0,
+                vec![("*".to_owned(), "*".to_owned())],
+                "{name}: {json:#?}"
+            );
+            // Load keys in db1 too: `load:s:*` learned in both databases.
+            admin_owned(&t, &load_keys(b"1", false)).await;
+            let (_, json) = scan_then_load_get(&t, &dir).await;
+            let both = admin_get_objects(&json);
+            assert_eq!(
+                both,
+                vec![(pattern.as_str().to_owned(), "*".to_owned())],
+                "{name}: {json:#?}"
+            );
+        })
+        .await;
+        admin_owned(&t, &load_keys(b"0", true)).await;
+        admin_owned(&t, &load_keys(b"1", true)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = run {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+}
+
 /// Aborts a task when dropped (a test that fails leaves no stream polling).
 struct AbortOnDrop(tokio::task::AbortHandle);
 
