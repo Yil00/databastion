@@ -7,7 +7,9 @@
 #    `databastion_scoped`, the same rights on the patterns of DATABASTION_DEV_REDIS_SCOPED_PATTERNS
 #    only (declared in agent.yaml as `redis.key_patterns`). Passwords are stored as `#<sha256>`.
 # 2. TLS only on TCP (`--port 0`), with the dev CA of the one-shot `redis-tls-init`; client
-#    certificates optional. A Unix socket in /tmp (0700) serves the seeding below.
+#    certificates optional. A Unix socket in /tmp (0700) serves the seeding below; with
+#    DATABASTION_DEV_REDIS_SOCKET_DIR (set by the opt-in override redis/compose.socket.yml), the
+#    socket is <dir>/redis.sock (0770, the directory's group), published to the host instead.
 #    DATABASTION_DEV_REDIS_EXTRA_ACL names a file of further users (the e2e and load test clients),
 #    appended once every line passed extra_acl_check: `user <name> on #<sha256> <rules>`, no
 #    reserved name, no clear-text or missing password, no all-commands grant.
@@ -90,10 +92,17 @@ ACL=/tmp/databastion-users.acl
   } > "$ACL"
 )
 
-SOCK=/tmp/databastion-dev.sock
+SOCK=/tmp/databastion-dev.sock SOCK_PERM=700
+if [ -n "${DATABASTION_DEV_REDIS_SOCKET_DIR:-}" ]; then
+  SOCK="$DATABASTION_DEV_REDIS_SOCKET_DIR/redis.sock" SOCK_PERM=770
+  [ -w "$DATABASTION_DEV_REDIS_SOCKET_DIR" ] || {
+    echo "databastion: $DATABASTION_DEV_REDIS_SOCKET_DIR is not writable (redis/compose.socket.yml)" >&2
+    exit 1
+  }
+fi
 "$SERVER" --aclfile "$ACL" --port 0 --tls-port 6379 \
   --tls-cert-file /tls/server.pem --tls-key-file /tls/server.key --tls-ca-cert-file /tls/ca.pem \
-  --tls-auth-clients optional --unixsocket "$SOCK" --unixsocketperm 700 \
+  --tls-auth-clients optional --unixsocket "$SOCK" --unixsocketperm "$SOCK_PERM" \
   --save 60 1 --appendonly no --slowlog-log-slower-than -1 --slowlog-max-len "${DATABASTION_DEV_REDIS_SLOWLOG_MAX_LEN:-128}" &
 pid=$!
 trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"' TERM INT

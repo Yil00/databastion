@@ -3398,8 +3398,8 @@ async fn xe_fresh_sysguidrefs(
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;
     };
-    // The `sysaudacts` build's activity alone too (the 2025 fixture
-    // `sysaudacts-17.0.5015.4.xml`, ROADMAP follow-up of #287).
+    // The `sysaudacts` build's activity alone too (the source of the
+    // fixtures `sysaudacts-<build>.xml`).
     let (only, cut) = Box::pin(activity_events(s, &audacts)).await;
     eprintln!(
         "[it] xe fresh capture: sysaudacts {} event(s), {cut} above 4000 characters",
@@ -3477,10 +3477,9 @@ async fn activity_events(s: &mut Session, builds: &[String]) -> (Vec<String>, us
 /// Every statistics build of the agent's login in the fresh run with the
 /// events of its activity, to `<capture>-statistics.txt`: the source of
 /// the drift fixtures `statistics-<build>.xml` (the agent's own builds on
-/// a fresh server; ROADMAP follow-up of #293: the re-capture of
-/// `statistics-16.0.4305.5.xml`, whose CAS guard partner text was
-/// synthesized). Prints whether the CAS guard's current text
-/// (`sql::CAS_COLUMNS` on `retail`) is among them.
+/// a fresh server; `statistics-16.0.4305.5.xml`'s own part was re-captured
+/// from it on 2026-10-22, ROADMAP follow-up of #293). Prints whether the
+/// CAS guard's current text (`sql::CAS_COLUMNS` on `retail`) is among them.
 async fn xe_fresh_capture_statistics(s: &mut Session, major: u32) {
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;

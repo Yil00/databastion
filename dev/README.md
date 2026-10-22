@@ -233,6 +233,25 @@ The targets of the Redis / Valkey connector ([ADR-0052](../docs/adr/0052-redis-v
 - **TLS only on TCP**: the one-shot `redis-tls-init` ([redis/tls-init.sh](redis/tls-init.sh), in the pinned PostgreSQL image for its `openssl`) makes a dev CA (key deleted) and a certificate for `localhost`, `valkey`, `redis`, `127.0.0.1`, `::1`, shared by both servers; client certificates optional. Export the CA with `docker compose -f dev/docker-compose.yml --profile redis exec -T valkey cat /tls/ca.pem`.
 - **ACL** (generated at each start into `/tmp`, `0600`; passwords as `#<sha256>`): `default` off; `databastion` (password `DATABASTION_DB_PASSWORD`), the exact allow-list of ADR-0052 decision 4 on `%R~*` with the Audit reads (`slowlog|get`, `acl|log`, `client|list`; Valkey 8.1+: `commandlog|get`) and `client|no-touch` (not on Redis 6.2, where `~*` replaces `%R~*` and `acl|dryrun` is absent); `databastion_scoped`, the same rights on the declared patterns `customer:*` and `user:*` only (`redis.key_patterns`, also in `ground-truth.json`); `admin` (`REDIS_ADMIN_PASSWORD`, passed to the CLI through `REDISCLI_AUTH`, never its command line) seeds and inspects only. `DATABASTION_DEV_REDIS_EXTRA_ACL` (unset in dev) names a file of further users, appended once every line passed the entrypoint's check (`user <name> on #<sha256> <rules>`, no reserved name, no `nopass` or clear-text `>` / `<` password, no `allcommands` / `+@all`): the e2e and load test clients ([e2e/README.md](../e2e/README.md#valkey-and-redis-targets)).
 - **Connector integration tests**: `make dev-redis`, then `make agent-it ENGINE=redis` ([agent-it.sh](agent-it.sh): `DATABASTION_IT_REDIS=1`, the CA exported to `.state/tls/redis-ca.pem`, one test thread), as the CI job `agent-redis` does on every change; the weekly engine matrix runs them on every maintained line (Redis 6.2, 7.2, 7.4, 8.2 to 8.10; Valkey 7.2, 8.0, 8.1, 9.0, 9.1) through the image variables above. `ENGINE=all` leaves this opt-in profile out.
+- **Unix sockets on the host** (opt-in, for the socket target test of #239 re-review N1): by default each server's socket stays inside its container (`/tmp/databastion-dev.sock`, `0700`). The override [redis/compose.socket.yml](redis/compose.socket.yml) moves it to `.state/redis-socket/<service>/redis.sock` (`0770`), in a directory of the host user (setgid, `2770`) whose group is added to the server's (uid 999); the TLS port is unchanged. Whoever is in that group can connect, so its gid comes from [redis/socket-group.sh](redis/socket-group.sh), which refuses gid 0 and any group with another user in it (as member or as primary group). `agent-it.sh redis` then declares `socket:` targets (`tls: disable`, `redis.server_uid: 999`) and runs the Audit stream over them; without the override that test is skipped (CI requires it with `DATABASTION_IT_REDIS_REQUIRE_SOCKET=1`). With a private primary group (named after the user, the usual Debian, Ubuntu and Fedora scheme):
+
+  ```sh
+  export DATABASTION_DEV_REDIS_SOCKET_GID="$(dev/redis/socket-group.sh)"
+  install -d -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
+  docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml --profile redis up -d --wait valkey redis
+  make agent-it ENGINE=redis
+  ```
+
+  When the script refuses the primary group (shared, such as `users`), use a dedicated group, as the CI job `agent-redis` does, and run the tests in it with `sg` (or after a new login):
+
+  ```sh
+  sudo groupadd databastion-redis-socket && sudo usermod -aG databastion-redis-socket "$USER"
+  export DATABASTION_DEV_REDIS_SOCKET_GID="$(dev/redis/socket-group.sh databastion-redis-socket)"
+  install -d dev/.state/redis-socket
+  sudo install -d -o "$USER" -g databastion-redis-socket -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
+  docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml --profile redis up -d --wait valkey redis
+  sg databastion-redis-socket -c 'make agent-it ENGINE=redis'
+  ```
 - **Seed** ([seed/out/redis.txt](seed/out/redis.txt), generated, one command per line): strings, hashes, sets, sorted sets, lists and streams with fake PII in `db0` and session hashes in `db1`; key names that embed ground-truth values (`user:<e-mail>:profile`, `phone:<number>`), hash fields named by e-mail address, 17 fixed names under `cache:page:` (cardinality collapse), and keys with a CAS ticket-id shape (`sso:TGT-…`) for the guard. It is loaded with the slow log off; then `slowlog-log-slower-than` is `DATABASTION_DEV_REDIS_SLOWLOG_US` (default 0: every command) and the logs are reset. The slow log keeps `DATABASTION_DEV_REDIS_SLOWLOG_MAX_LEN` entries (default 128; 1024 in e2e). The healthcheck sends no command.
 
 ```sh

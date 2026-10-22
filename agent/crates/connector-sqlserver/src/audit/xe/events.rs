@@ -794,7 +794,8 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// 2022 and 2025) joined the list on 2026-10-16 (ADR-0051, addendum to the
 /// refinement of 2026-10-16), under the same conditions as the others.
 /// `sysaudacts` (in `master`, a build on `audit_spec_id` at `nest_level`
-/// 2 paired with the `audit_specifications` proof, measured on 2022)
+/// 2 paired with the `audit_specifications` proof, measured on 2022 and
+/// 2025)
 /// joined it on 2026-10-18 (ADR-0051 note of that day, accepted by the
 /// maintainer), under the same conditions.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
@@ -1982,6 +1983,7 @@ mod statistics_tests {
             "statistics-16.0.4305.5.xml",
             "statistics-17.0.5015.4.xml",
             "sysaudacts-16.0.4305.5.xml",
+            "sysaudacts-17.0.5015.4.xml",
             "sysguidrefs-16.0.4305.5.xml",
             "sysguidrefs-17.0.5015.4.xml",
         ] {
@@ -2020,35 +2022,78 @@ mod statistics_tests {
             .collect()
     }
 
-    /// Security review L2 of bbfcab7: the 2022 drift fixture's CAS guard
-    /// partner text was substituted by hand (`sql::CAS_COLUMNS` lost its
-    /// `HAS_PERMS_BY_NAME` column). The file says so in a comment right
-    /// before that event, and the substituted text is exactly the current
-    /// statement (a re-capture replaces both).
+    /// Security review L2 of bbfcab7, closed by the re-capture of
+    /// 2026-10-22: the 2022 drift fixture's own part (the agent's builds on
+    /// `sysschobjs` and `sysclsobjs` and the CAS guard statement that made
+    /// them) was captured from a new 16.0.4305.5 data volume with the
+    /// current `sql::CAS_COLUMNS` text as the agent sent it. Nothing in the
+    /// file is synthesized, the current text is there once, it is the
+    /// partner of the two builds (their activity, after them), and the
+    /// guard's earlier text (with its `HAS_PERMS_BY_NAME` column) is gone.
     #[test]
-    fn synthesized_fixture_text_is_marked_and_current() {
-        let raw = std::fs::read_to_string(format!(
-            "{}/fixtures/xe/statistics-16.0.4305.5.xml",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
-        let lines: Vec<&str> = raw.lines().collect();
-        let marked: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.starts_with("<!-- SYNTHESIZED"))
-            .map(|(i, _)| i)
-            .collect();
-        let current = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
-        let with_text: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.contains(&format!("<![CDATA[{current}]]>")))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(marked.len(), 1);
-        assert_eq!(with_text, [marked[0] + 1]);
+    fn statistics_fixture_of_2022_holds_the_current_cas_text_as_captured() {
+        let file = "statistics-16.0.4305.5.xml";
+        let raw =
+            std::fs::read_to_string(format!("{}/fixtures/xe/{file}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        assert!(!raw.contains("SYNTHESIZED"), "{file}");
+        assert!(
+            raw.lines().all(|l| l.starts_with("<event")),
+            "{file}: one captured event per line, no comment"
+        );
         assert!(!raw.contains("N'SELECT', c.name, N'COLUMN')) FROM [retail].sys.tables"));
+        let current = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
+        let recs = fixture(file);
+        let partners: Vec<usize> = recs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| statement(r) == Some(current.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(partners.len(), 1, "{file}: {partners:?}");
+        let partner = &recs[partners[0]];
+        assert_eq!(partner.login(), "databastion");
+        assert_eq!(partner.kind(), Kind::SqlStatementCompleted);
+        let guid = |r: &XeRecord| r.event.as_ref().and_then(|e| e.activity.clone());
+        let (g, seq) = guid(partner).unwrap();
+        let builds: Vec<&XeRecord> = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(|t| t.contains("StatMan")))
+            .filter(|r| r.login() == "databastion")
+            .collect();
+        assert_eq!(builds.len(), 2, "{file}");
+        for (b, table) in builds
+            .iter()
+            .zip(["[sys].[sysschobjs]", "[sys].[sysclsobjs]"])
+        {
+            assert!(statement(b).is_some_and(|t| t.contains(table)), "{table}");
+            let (h, s) = guid(b).unwrap();
+            assert!(
+                h == g && s < seq,
+                "{table}: a build of the partner's activity"
+            );
+        }
+        // Both sides: the builds and their internal statements are left
+        // out with the captured partner, the partner itself stays; from a
+        // foreign session, everything stays.
+        let mut left = fixture(file);
+        context(&mut left, true, &own);
+        for (i, r) in left
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.login() == "databastion")
+        {
+            assert_eq!(r.skip, i != partners[0], "{file} {i}");
+        }
+        let mut foreign = fixture(file);
+        context(&mut foreign, true, &|_| false);
+        assert!(
+            foreign
+                .iter()
+                .filter(|r| r.login() == "databastion")
+                .all(|r| !r.skip),
+            "{file}"
+        );
     }
 
     /// The drift fixtures, one per matrix image (captured on 2026-10-16:
@@ -2528,49 +2573,82 @@ mod statistics_tests {
         }
     }
 
-    /// The `audit_specifications` proof's build on a fresh 2022 server
-    /// (captured on 2026-10-18 from a new data volume by the fresh-server
-    /// integration test, the dev service's audit named): the build on
-    /// `sysaudacts` at nest level 2 and its internal statement at 1, in the
-    /// proof's activity, left out; the proof itself is not touched. Each is
+    /// The `audit_specifications` proof's build on a fresh server, one
+    /// fixture per image with a SQL Server Audit source (captured from a
+    /// new data volume by the fresh-server integration test, the dev
+    /// service's audit named: 2022 on 2026-10-18, 2025 with strict TLS on
+    /// 2026-10-22, the same shape): the build on `sysaudacts` at nest
+    /// level 2 in `master` and its internal statement at 1, in the proof's
+    /// activity, left out; the proof itself is not touched. Each is
     /// reported without causality, from a foreign session, or off the
     /// allow-listed builds (ADR-0051 note of 2026-10-18).
     #[test]
-    fn sysaudacts_fixture_of_2022() {
-        let file = "sysaudacts-16.0.4305.5.xml";
-        let recs = fixture(file);
-        assert_eq!(recs.len(), 3, "{file}");
-        let builds: Vec<&XeRecord> = recs
-            .iter()
-            .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
-            .collect();
-        assert_eq!(builds.len(), 1, "{file}");
-        assert_eq!(builds[0].event.as_ref().and_then(|e| e.nest_level), Some(2));
-        let proof = recs
-            .iter()
-            .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
-            .count();
-        assert_eq!(proof, 1, "{file}: the audit_specifications proof");
-        let mut left = fixture(file);
-        assert_eq!(context(&mut left, true, &own), 2, "{file}");
-        for r in &left {
-            assert_eq!(
-                r.skip,
-                !statement(r).is_some_and(crate::sql::catalog_text),
-                "{file}"
+    fn sysaudacts_fixtures_of_the_audit_images() {
+        for file in ["sysaudacts-16.0.4305.5.xml", "sysaudacts-17.0.5015.4.xml"] {
+            let recs = fixture(file);
+            assert_eq!(recs.len(), 3, "{file}");
+            let builds: Vec<&XeRecord> = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
+                .collect();
+            assert_eq!(builds.len(), 1, "{file}");
+            let build = builds[0].event.as_ref().unwrap();
+            assert_eq!(build.nest_level, Some(2), "{file}");
+            assert_eq!(build.database.as_deref(), Some("master"), "{file}");
+            assert!(
+                recs.iter().all(|r| r.login() == "databastion"),
+                "{file}: the agent's login"
             );
-        }
-        let mut off = fixture(file);
-        assert_eq!(context(&mut off, false, &own), 0, "{file}");
-        let mut foreign = fixture(file);
-        assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
-        let mut no_causality = fixture(file);
-        for r in &mut no_causality {
-            if let Some(e) = r.event.as_mut() {
-                e.activity = None;
+            let activities: std::collections::BTreeSet<String> = recs
+                .iter()
+                .filter_map(|r| r.event.as_ref().and_then(|e| e.activity.as_ref()))
+                .map(|(g, _)| g.clone())
+                .collect();
+            assert_eq!(activities.len(), 1, "{file}: one activity");
+            let proof = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
+                .count();
+            assert_eq!(proof, 1, "{file}: the audit_specifications proof");
+            let mut left = fixture(file);
+            assert_eq!(context(&mut left, true, &own), 2, "{file}");
+            for r in &left {
+                assert_eq!(
+                    r.skip,
+                    !statement(r).is_some_and(crate::sql::catalog_text),
+                    "{file}"
+                );
+            }
+            let mut off = fixture(file);
+            assert_eq!(context(&mut off, false, &own), 0, "{file}");
+            let mut foreign = fixture(file);
+            assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
+            let mut no_causality = fixture(file);
+            for r in &mut no_causality {
+                if let Some(e) = r.event.as_mut() {
+                    e.activity = None;
+                }
+            }
+            assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
+            // The proof in another activity than the build: reported.
+            let mut apart = fixture(file);
+            for r in &mut apart {
+                if statement(r).is_some_and(crate::sql::catalog_text)
+                    && let Some((g, _)) = r.event.as_mut().and_then(|e| e.activity.as_mut())
+                {
+                    *g = GUID2.to_owned();
+                }
+            }
+            assert_eq!(context(&mut apart, true, &own), 0, "{file}");
+            for r in off
+                .iter()
+                .chain(&foreign)
+                .chain(&no_causality)
+                .chain(&apart)
+            {
+                assert!(!r.skip, "{file}");
             }
         }
-        assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
     }
 
     /// The credential-bearing tables stay reported next to a `sysguidrefs`
@@ -3200,6 +3278,7 @@ mod statistics_tests {
             "sysguidrefs-16.0.4305.5.xml",
             "sysguidrefs-17.0.5015.4.xml",
             "sysaudacts-16.0.4305.5.xml",
+            "sysaudacts-17.0.5015.4.xml",
         ] {
             let mut whole = fixture(file);
             context(&mut whole, true, &own);
