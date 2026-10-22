@@ -1718,24 +1718,59 @@ async fn xe_predicate_proof_scenario() {
         }
     };
     let notes = std::sync::Mutex::new(Vec::new());
-    let _ = Box::pin(xe_stream_around(&c, &t, &dir, async {
-        for (i, via) in ["plain", "exec", "sp_executesql"].into_iter().enumerate() {
-            Box::pin(failed_login(&format!("it_no_such_plogin{i}"))).await;
-            tokio::time::sleep(Duration::from_secs(8)).await;
+    // Whether `check()` reports the note `want` (or not) within `wait`,
+    // asked every second: what the agent guarantees is the eventual
+    // outcome, within the session's dispatch latency (5 s) and the poll
+    // interval; the time it takes is printed (CI runners are slower).
+    let note_within = async |want: bool, wait: Duration| -> Option<Duration> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < wait {
             let h = Box::pin(c.check(&t)).await;
-            let proven = !has(&h, NoteCode::AuditFailedLoginsNotAudited);
-            let sent = Box::pin(exec_try(&mut s, &drop_add(via))).await;
-            tokio::time::sleep(Duration::from_secs(8)).await;
-            let h = Box::pin(c.check(&t)).await;
-            let back = has(&h, NoteCode::AuditFailedLoginsNotAudited);
-            eprintln!(
-                "[it] xe predicate change: {via}: proven by a failed login {proven}, ALTER sent \
-                 {sent}, note back after it {back}"
-            );
-            notes.lock().unwrap().push((via, proven, sent, back));
+            if has(&h, NoteCode::AuditFailedLoginsNotAudited) == want {
+                return Some(started.elapsed());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    }))
+        None
+    };
+    let mut marker = Box::pin(sa()).await;
+    let (stream, _rx) = Box::pin(xe_stream_caught_up(
+        &c,
+        &t,
+        &dir,
+        &mut marker,
+        Duration::from_secs(300),
+    ))
     .await;
+    marker.close().await;
+    {
+        for (i, via) in ["plain", "exec", "sp_executesql"].into_iter().enumerate() {
+            // A failed login proves the filtered error_reported: up to
+            // three, each given 20 s.
+            let mut proven = None;
+            for k in 0..3 {
+                Box::pin(failed_login(&format!("it_no_such_plogin{i}_{k}"))).await;
+                proven = note_within(false, Duration::from_secs(20)).await;
+                if proven.is_some() {
+                    break;
+                }
+            }
+            let sent = Box::pin(exec_try(&mut s, &drop_add(via))).await;
+            // The change clears it: within 30 s, with no failed login.
+            let back = note_within(true, Duration::from_secs(30)).await;
+            eprintln!(
+                "[it] xe predicate change: {via}: proven by a failed login {proven:?}, ALTER sent \
+                 {sent}, note back after it {back:?}"
+            );
+            notes
+                .lock()
+                .unwrap()
+                .push((via, proven.is_some(), sent, back.is_some()));
+            assert!(!stream.is_finished(), "the stream ended");
+        }
+    }
+    stream.abort();
+    let _ = stream.await;
     // The dev session as it was, whatever happened above.
     Box::pin(exec_ok(
         &mut s,
@@ -2866,6 +2901,111 @@ async fn xe_stream_around<F: std::future::Future<Output = ()>>(
     events
 }
 
+/// Starts an Extended Events stream of `t` (state in `dir`) and returns
+/// once it has read past its first start's history: a read of
+/// `retail.crm.customers` by `sa` on `marker`, sent after the start, is
+/// received (at most `wait`). The engine matrix runs every test on one
+/// server, so the dev session's history a first start walks grows with
+/// the run (reproduced locally: with 90 000 events of history, the fixed
+/// waits of the predicate and statistics tests saw none of their events).
+async fn xe_stream_caught_up(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    marker: &mut Session,
+    wait: Duration,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectorError>>,
+    tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
+) {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!stream.is_finished(), "the stream started");
+    Box::pin(exec(
+        marker,
+        "DECLARE @n int; SELECT @n = COUNT(*) FROM retail.crm.customers",
+    ))
+    .await;
+    let started = std::time::Instant::now();
+    while started.elapsed() < wait {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            && e.principal().account_name().eq_ignore_ascii_case("sa")
+            && names_of(&e).contains(&"retail.crm.customers".to_owned())
+        {
+            eprintln!("[it] stream caught up after {:?}", started.elapsed());
+            return (stream, rx);
+        }
+    }
+    panic!("the stream did not read past its history within {wait:?}");
+}
+
+/// As [`xe_stream_around`], but after `work` waits until the stream has
+/// read past it: a read of `retail.crm.customers` by `sa` on `marker`,
+/// sent after `work`, is received (at most `wait`), then 2 s more. A first
+/// start behind a long history of the dev session (the engine matrix runs
+/// every test on one server) walks it before it reaches `work`'s events;
+/// a fixed wait made `xe_statistics_builds_match_the_fixture` see none of
+/// them on 2019 (PR #318's engine matrix).
+async fn xe_stream_until_read<F: std::future::Future<Output = ()>>(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    marker: &mut Session,
+    wait: Duration,
+    work: F,
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    work.await;
+    Box::pin(exec(
+        marker,
+        "DECLARE @n int; SELECT @n = COUNT(*) FROM retail.crm.customers",
+    ))
+    .await;
+    let marked = |e: &databastion_classifiers::masking::MaskedEvent| {
+        e.principal().account_name().eq_ignore_ascii_case("sa")
+            && names_of(e).contains(&"retail.crm.customers".to_owned())
+    };
+    let mut events = Vec::new();
+    let deadline = std::time::Instant::now() + wait;
+    let mut seen = None;
+    while std::time::Instant::now() < deadline
+        && seen.is_none_or(|at: std::time::Instant| at.elapsed() < Duration::from_secs(2))
+    {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+            if marked(&e) {
+                seen.get_or_insert_with(std::time::Instant::now);
+            }
+            events.push(e);
+        }
+    }
+    stream.abort();
+    let _ = stream.await;
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    assert!(
+        seen.is_some(),
+        "the stream read past the work within {wait:?}"
+    );
+    events
+}
+
 /// The Extended Events grant of the server's version, granted to the dev
 /// account for a test (2019: held already).
 async fn xe_grant(s: &mut Session, major: u32) -> &'static str {
@@ -2936,17 +3076,26 @@ async fn xe_statistics_scenario() {
     // then of another column inside `sp_executesql` (nest level 3).
     let q = format!("SELECT TOP (5) id FROM retail.crm.{table} WHERE v = 3");
     let q3 = format!("EXEC sp_executesql N'SELECT TOP (5) v FROM retail.crm.{table} WHERE id = 3'");
-    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
-        let mut d = Box::pin(foreign_session(
-            "it_xstats",
-            "DATABASTION_IT_SQLSERVER_THROWAWAY",
-        ))
-        .await;
-        Box::pin(try_rows(&mut d, &q, 1)).await;
-        Box::pin(try_rows(&mut d, &q3, 1)).await;
-        d.close().await;
-    }))
+    let mut marker = Box::pin(sa()).await;
+    let events = Box::pin(xe_stream_until_read(
+        &c,
+        &t,
+        &dir,
+        &mut marker,
+        Duration::from_secs(300),
+        async {
+            let mut d = Box::pin(foreign_session(
+                "it_xstats",
+                "DATABASTION_IT_SQLSERVER_THROWAWAY",
+            ))
+            .await;
+            Box::pin(try_rows(&mut d, &q, 1)).await;
+            Box::pin(try_rows(&mut d, &q3, 1)).await;
+            d.close().await;
+        },
+    ))
     .await;
+    marker.close().await;
     let mine: Vec<_> = events
         .iter()
         .filter(|e| {

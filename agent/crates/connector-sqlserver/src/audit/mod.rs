@@ -160,6 +160,11 @@ pub(crate) struct Shared {
     /// Extended Events session happened, on the agent's monotonic clock
     /// ([`Shared::note_failed_login`]).
     failed_login: Mutex<HashMap<String, Instant>>,
+    /// The server time (µs) of the latest change the failed-login proof
+    /// was cleared for, per target: a failed login stamped at or before it
+    /// proves nothing, whichever read it comes in (a later read can hold
+    /// an earlier event, file order following the session's buffers).
+    failed_login_floor: Mutex<HashMap<String, i64>>,
     /// The Extended Events session's event facts at the last probe of a
     /// stream ([`xe::probe::Probe::event_facts`]): a change clears the
     /// failed-login proof (#280 re-review L-b).
@@ -245,6 +250,12 @@ impl Shared {
         let Some(now) = server_now_us else {
             return;
         };
+        if lock(&self.failed_login_floor)
+            .get(target_id)
+            .is_some_and(|floor| at_us <= *floor)
+        {
+            return;
+        }
         let age = Duration::from_micros(u64::try_from(now.saturating_sub(at_us)).unwrap_or(0));
         if age >= FRESHNESS {
             return;
@@ -259,9 +270,16 @@ impl Shared {
 
     /// The session was restarted, its file set or its events changed, or
     /// a statement that may change an event session was read: the proof
-    /// is taken again.
-    pub(crate) fn clear_failed_login(&self, target_id: &str) {
+    /// is taken again, and only from a failed login stamped after `since_us`
+    /// (the server time of the change, or the server's time when the change
+    /// was seen; `None`: the floor is kept as it is).
+    pub(crate) fn clear_failed_login(&self, target_id: &str, since_us: Option<i64>) {
         lock(&self.failed_login).remove(target_id);
+        if let Some(since) = since_us {
+            let mut m = lock(&self.failed_login_floor);
+            let f = m.entry(target_id.to_owned()).or_insert(since);
+            *f = (*f).max(since);
+        }
     }
 
     /// Keeps `facts` as the target's last event facts; the previous ones.

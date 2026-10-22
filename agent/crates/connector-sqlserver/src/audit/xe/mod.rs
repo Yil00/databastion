@@ -491,7 +491,7 @@ async fn cycle(
             tracing::warn!(target_id = %target.id, "Extended Events: the session is not running");
             return Err(target_error(FailureCode::Unsupported));
         }
-        observe(st, &p);
+        observe(st, &p, s.own.as_ref().map(own::Handle::server_now));
         st.probe = Some(p);
     }
     // A deferral or a clamped position ends the cycle as a read that
@@ -539,7 +539,9 @@ impl super::cycle::Reads for Reads<'_, '_> {
 }
 
 /// A restart of the session or grown drop counters: a gap.
-fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
+/// `server_now`: the server's time on the stream's session (the floor of
+/// the failed-login proof when it is cleared here).
+fn observe(st: &mut Stream<'_>, p: &probe::Probe, server_now: Option<i64>) {
     let target_id = &st.target.id;
     if st
         .cursor
@@ -549,7 +551,7 @@ fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
         tracing::warn!(target_id = %target_id, "Extended Events: the session was stopped and started (create_time changed): what happened in between was not recorded");
         st.state.audit.note_gap(target_id);
         // Its events may have changed: the failed-login proof starts over.
-        st.state.audit.clear_failed_login(target_id);
+        st.state.audit.clear_failed_login(target_id, server_now);
         st.state.audit.note_dropped(target_id, 1);
     }
     st.cursor.session = Some(p.create_us);
@@ -563,9 +565,9 @@ fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
         Some(prev) if prev == p.event_facts() => {}
         Some(_) => {
             tracing::info!(target_id = %target_id, "Extended Events: the session's events changed: the failed-login proof is taken again");
-            st.state.audit.clear_failed_login(target_id);
+            st.state.audit.clear_failed_login(target_id, server_now);
         }
-        None => st.state.audit.clear_failed_login(target_id),
+        None => st.state.audit.clear_failed_login(target_id, server_now),
     }
     if st.state.audit.observe_xe(target_id, p.counters()) {
         tracing::warn!(target_id = %target_id, "Extended Events: the session dropped events or was restarted");
@@ -603,10 +605,12 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     if on_pattern(&mut st.cursor, &pattern) {
         tracing::warn!(target_id = %target.id, "Extended Events: the session's file set changed (folder or file name): reading the new set from its start");
         st.state.audit.note_gap(&target.id);
-        st.state.audit.clear_failed_login(&target.id);
+        st.state
+            .audit
+            .clear_failed_login(&target.id, s.own.as_ref().map(own::Handle::server_now));
         st.state.audit.note_dropped(&target.id, 1);
     }
-    observe(st, &p);
+    observe(st, &p, s.own.as_ref().map(own::Handle::server_now));
     st.poll_start = start;
     st.poll_from = from;
     st.probe = Some(p);
@@ -923,9 +927,12 @@ async fn read(
     // Only a failed login after it, in the file and in time (file order
     // follows the session's per-CPU buffers, security review L4), proves
     // it again.
-    if changed.is_some() {
+    // Across reads too: the proof is then taken only from a failed login
+    // stamped after the change, whichever read it comes in (a later read
+    // can hold an earlier event: fail closed).
+    if let Some((_, t)) = changed {
         tracing::info!(target_id = %target_id, "Extended Events: a statement that may change an event session was read: the failed-login proof is taken again");
-        st.state.audit.clear_failed_login(&target_id);
+        st.state.audit.clear_failed_login(&target_id, Some(t));
     }
     let after = records
         .iter()
@@ -1300,7 +1307,7 @@ mod failed_login_proof_tests {
             assert!(shared.facts("t").failed_login_seen, "skew {skew}");
             // A session restart, a new file set or changed events: taken
             // again.
-            shared.clear_failed_login("t");
+            shared.clear_failed_login("t", None);
             assert!(!shared.facts("t").failed_login_seen);
             assert!(!shared.facts("other").failed_login_seen);
             // Stamped ahead of the read-back (the event clock's lead): fresh.
@@ -1311,6 +1318,39 @@ mod failed_login_proof_tests {
             none.note_failed_login("t", server_now, None);
             assert!(!none.facts("t").failed_login_seen);
         }
+    }
+
+    /// Engine-matrix failures of the predicate test on PR #316: a change
+    /// read in one read sets a floor, and a failed login stamped at or
+    /// before it proves nothing in any later read (a later read can hold an
+    /// earlier event); one stamped after it does. A clear without a time
+    /// keeps the floor.
+    #[test]
+    fn a_failed_login_before_the_change_proves_nothing_in_a_later_read() {
+        let now = 1_800_000_000_000_000i64;
+        let shared = crate::audit::Shared::default();
+        shared.note_failed_login("t", now - 10_000_000, Some(now));
+        assert!(shared.facts("t").failed_login_seen);
+        // The ALTER EVENT SESSION, stamped 5 s ago, read now.
+        shared.clear_failed_login("t", Some(now - 5_000_000));
+        assert!(!shared.facts("t").failed_login_seen);
+        // A later read holds a failed login stamped before it, or at it.
+        shared.note_failed_login("t", now - 6_000_000, Some(now));
+        shared.note_failed_login("t", now - 5_000_000, Some(now));
+        assert!(
+            !shared.facts("t").failed_login_seen,
+            "stamped before the change"
+        );
+        // A plain clear keeps the floor; an earlier floor does not lower it.
+        shared.clear_failed_login("t", None);
+        shared.clear_failed_login("t", Some(now - 9_000_000));
+        shared.note_failed_login("t", now - 5_500_000, Some(now));
+        assert!(!shared.facts("t").failed_login_seen);
+        // One stamped after it proves again; another target is apart.
+        shared.note_failed_login("t", now - 4_000_000, Some(now));
+        assert!(shared.facts("t").failed_login_seen);
+        shared.note_failed_login("u", now - 6_000_000, Some(now));
+        assert!(shared.facts("u").failed_login_seen);
     }
 
     /// #280 re-review L-b: a statement that may change an event session
