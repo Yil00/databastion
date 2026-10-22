@@ -735,9 +735,9 @@ Records #293 (decision 5, the CAS store guard of ADR-0041 decisions 5 and 6); de
 - **Residuals.** The Extended Events fixture `xe/statistics-16.0.4305.5.xml` holds the guard's earlier text as captured; its partner statement text was replaced by the current `CAS_COLUMNS` text and marked `SYNTHESIZED` (re-capture on 16.0.4305.5 is a ROADMAP follow-up). Whether Discovery's `TABLES` statement (an object-level `HAS_PERMS_BY_NAME` per table) also writes one `SL` record per table, which would make a scan under Audit of a database of more than 15 tables an own overflowed read, is not measured yet (ROADMAP follow-up).
 - **Disclosure.** Maintainer decision of 2026-10-20: the release notes only, no SECURITY.md entry and no advisory.
 
-## Proposed refinement (2026-10-21, for the maintainer's decision): an exact own text whose only always-report reason is the core overflow
+## Refinement (2026-10-21, decided by the maintainer on 2026-10-22: option (a)): an exact own text whose only always-report reason is the core overflow
 
-Status: **Proposed**, not accepted. Security review (2026-10-21): sound after changes, revised (L1: the unit of the mark is the statement group; L2: `SERVER_INTERNAL` texts not eligible). It would refine decision 6 ("The agent's own statements and the always-reported rules") and the implementation note of 2026-10-17 (at most 15 named objects per event). ROADMAP: [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "possible ADR-0051 refinement: let an exact own text through when the core overflow is its only always-report reason".
+Status: **Decided by the maintainer on 2026-10-22: option (a) accepted, option (b) not adopted** ([decision](#decision-2026-10-22)). Proposed on 2026-10-21. Security review (2026-10-21): sound after changes, revised (L1: the unit of the mark is the statement group; L2: `SERVER_INTERNAL` texts not eligible). It would refine decision 6 ("The agent's own statements and the always-reported rules") and the implementation note of 2026-10-17 (at most 15 named objects per event). ROADMAP: [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "possible ADR-0051 refinement: let an exact own text through when the core overflow is its only always-report reason".
 
 ### Context
 
@@ -774,6 +774,14 @@ Option (a) now, with option (b) kept as the fallback: implement (b), under its f
 
 1. (a) with (b) as a fallback (recommended), or (b) now as a general guard against future catalog statements? Proposed answer: (a); (b) adds a second always-report mark that every later change to the connector's always-report rules must keep in step.
 2. If (b) is taken, should an eligible record still count in the heartbeat metrics of own events (as the other exact texts do) or in a metric of its own? Proposed answer: a metric of its own, so a census can tell how often the exception applies.
+
+### Decision (2026-10-22)
+
+The maintainer accepted **option (a)** on 2026-10-22: the rule stays as it is (an exact own text whose event is always reported, the core overflow included, is not the agent's own), and each own statement found to overflow is reshaped, as #293 (the CAS store guard's `check()`) and #309 (Discovery's `TABLES` statement, measured: 20 `SL` records on 20 tables before, none after, on 2022) did. **Option (b) is not adopted**; open question 2 falls with it. The census of the end-to-end and load runs (#310) remains the way to find such a statement.
+
+## Note (2026-10-22): the plan cache source dropped (open question 11)
+
+Open question 11 made the plan cache statistics source (`sqlserver_query_stats`, Limited, no principal) depend on the end-to-end scenario showing an incident on an export by volume. That criterion could not be met without implementing the source first: the end-to-end entries test the two other sources. The maintainer **dropped the source on 2026-10-22**, which replaces that criterion: SQL Server Audit and Extended Events cover every supported version (Extended Events on 2019; SQL Server Audit or Extended Events on 2022 and 2025), green end to end on each (engine matrix run 39586886633, 2026-10-21), and the plan cache source has no principal and would be Limited at best. A server where neither SQL Server Audit nor an Extended Events session is usable reports None (`audit.source_not_configured`), as today. The preference order of decision 6 is read without its plan cache step; the source's description in decision 6 is kept as the record of what was considered.
 
 ## Implementation note (2026-10-22): catch-up pacing of the Audit streams
 

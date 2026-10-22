@@ -1,6 +1,6 @@
 # ADR-0057: `Identifier` hardening, agent first: the `KeyPattern` digit-run, address and escape rules for every normalized name
 
-- **Status**: Proposed (2026-10-21), for the maintainer's decision
+- **Status**: Accepted (2026-10-22). **Accepted by the maintainer on 2026-10-22, option (B), agent first**, as revised after its security review of 2026-10-21 (open question 1 answered by that choice; questions 2 and 3 answered the same day with their proposed answers; see [Open questions](#open-questions-for-the-maintainer)). History: proposed on 2026-10-21. Implementation: the agent first, then the console mask in a later release; the narrowing of `Identifier` later, in `/api/agent/v2` only (ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups))
 - **Security review (2026-10-21)**: sound after changes, revised (M1: the agent's current masking stated from the code; L1 to L6)
 - **Date**: 2026-10-21
 - **Refines** (on acceptance): [ADR-0009](0009-name-normalization-and-item-sanitization.md) (which stays Accepted), its normalized names, with stricter producer rules; uses [ADR-0013](0013-frozen-error-codes.md) and [ADR-0022](0022-protocol-capability-negotiation.md) decision 6 (narrowing a pattern is incompatible) without changing them
@@ -49,9 +49,9 @@ Folded into the next incompatible protocol version, whenever one is needed for o
 
 Incompatible (ADR-0022 decision 6): items of older agents refused and dropped, jobs of older consoles lost.
 
-## Decision (proposed)
+## Decision
 
-Option (B), in this order: the agent first (A), then the console mask in a later release; (D) recorded as the target for a future `/api/agent/v2`.
+Accepted by the maintainer on 2026-10-22. Option (B), in this order: the agent first (A), then the console mask in a later release; (D) recorded as the target for a future `/api/agent/v2`.
 
 ### 1. Rules (`IdentifierProduced`)
 
@@ -115,3 +115,9 @@ When `/api/agent/v2` is introduced for any reason, `Identifier` in v2 is `Identi
 1. (B) in two releases, agent first (proposed), or (A) only, leaving the console's check to v2? Proposed answer: (B); the console part costs one check per name and turns an older agent's value-bearing names into `*` before storage.
 2. Rule 2 counts `_` as a separator, as `KeyPattern` does (`06_12_34_56_78` is a phone number). Keep it (proposed), or leave `_` out of rule 2 for `Identifier`, where `_` is the usual word separator of table and column names? Proposed answer: keep it, unless the measurement of section 2 item 4 shows names masked that today's agent keeps and that are not values.
 3. Should the console part also mask names in `Location.schema` for OpenLDAP containers (RDN values), or only plain names? Proposed answer: every `Identifier`, the container form included.
+
+**Answered by the maintainer on 2026-10-22**, each with its proposed answer:
+
+1. (B) in two releases, agent first, with the acceptance.
+2. Rule 2 keeps `_` as a separator, unless the measurement of section 2 item 4 shows names masked that today's agent keeps and that are not values.
+3. The console masks every `Identifier`, the OpenLDAP container form (RDN values in `Location.schema`) included.

@@ -1,6 +1,6 @@
 # ADR-0056: A marker on names altered by ADR-0009 normalization, which location exceptions refuse to cover
 
-- **Status**: Proposed (2026-10-21), for the maintainer's decision
+- **Status**: Accepted (2026-10-22). **Accepted by the maintainer on 2026-10-22, option (B)**, as revised after its security review of 2026-10-21 (open question 1 answered by that choice; questions 2 to 4 answered the same day with their proposed answers; see [Open questions](#open-questions-for-the-maintainer)). History: proposed on 2026-10-21. Implementation: the contract, agent and console lots, each with a `security-reviewer` review (ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups))
 - **Security review (2026-10-21)**: sound after changes, revised (H1: findings stored per location; H2: the inline `ObjectRef` copies of `AccessEvent`; M1: the first gated field on findings; L1 to L4)
 - **Date**: 2026-10-21
 - **Refines** (on acceptance): [ADR-0009](0009-name-normalization-and-item-sanitization.md) (which stays Accepted), its normalized names, which would carry a negotiated marker when normalization changed them; [ADR-0054](0054-case-sensitive-location-exceptions.md) (which stays Accepted), decision 4 and its residual risk "Normalization merges names"; [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decision 5 (exceptions on access events), and [ADR-0014](0014-policy-and-incident-model.md) (which stays Accepted), decision 1, for location exceptions only. Uses [ADR-0022](0022-protocol-capability-negotiation.md) (capability negotiation) and the send-time stripping of [ADR-0053](0053-overflowed-event-objects-flag.md) decision 2 without changing them; interacts with [ADR-0025](0025-mysql-mariadb-role-privileges-and-heartbeat-checks.md) (a scan's terminal status waits up to 120 s for its findings batches)
@@ -66,9 +66,9 @@ A registered note code (`coverage.names_altered`) needs no negotiation (ADR-0022
 
 The residual is documented in docs/08 and the user guide since ADR-0054. No change; exceptions keep covering look-alikes.
 
-## Decision (proposed)
+## Decision
 
-Option (B).
+Option (B) (accepted by the maintainer on 2026-10-22).
 
 ### 1. Contract (`shared/protocol/`, `security-reviewer` review)
 
@@ -151,3 +151,10 @@ When implemented: docs/08 "Objects per event and sensitive objects" and the user
 2. CAS `field` keys converted to snake_case: marked (proposed, the rule is the same: two keys may arrive as one), or left out because CAS definitions are written by administrators? Proposed answer: marked; measure on the dev registry how many findings it affects before the implementation.
 3. Should the console offer an inventory of the exceptions whose effect changes, as ADR-0054 decision 6 did? Proposed answer: no. Stored rows have no marker, so there is nothing to compare at upgrade; the change shows only as agents are upgraded, and the upgrade notes say so.
 4. Findings: the per-job merge on one row (proposed) or the marker in the location key (B')? Proposed answer: the per-job merge; it keeps the location key a tuple of names.
+
+**Answered by the maintainer on 2026-10-22**, each with its proposed answer:
+
+1. Option (B), per part, with the acceptance.
+2. CAS `field` keys converted to snake_case are marked; how many findings this affects is measured on the dev registry before the agent lot.
+3. No console inventory of the exceptions whose effect changes; the upgrade notes suffice.
+4. The per-job merge on one row; no marker in the location key (option (B') not taken).
