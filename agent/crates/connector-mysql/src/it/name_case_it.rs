@@ -927,3 +927,244 @@ async fn user_databases_named_like_system_schemas_are_sampled() {
         .await;
     }
 }
+
+/// Test account of [`folded_system_spellings_are_user_databases`].
+const FOLDED_USER: &str = "databastion_it_case_fold";
+/// Fake e-mail rows of its user databases.
+const FOLDED_ROWS: u32 = 30;
+
+/// #308 final review N7: databases spelled like `mysql` and `sys` through
+/// the Unicode case fold the servers use to compare names (`MYſQL`,
+/// `ſys`, U+017F; `'mysql' = 'MYſQL'` holds on both servers), each with
+/// the system table that proves an alias (`user`, `version`) and the
+/// listed table a user may create there (`column_stats`, ADR-0048;
+/// `processlist`, ADR-0045). Measured with `lower_case_table_names = 0`
+/// (a server with another setting is skipped): whether the server accepts
+/// the database, and whether `SELECT 1 FROM <spelling>.<system table>`
+/// reads the system schema. An alias fails the test, closed: Discovery
+/// would sample the system tables listed under that spelling, and Audit
+/// would leave out none of their reads but name them as a user location.
+/// Otherwise the database is a user database: Discovery samples it under
+/// its own name, and a read of its tables is reported under that name on
+/// the `performance_schema` source (and on MariaDB's `server_audit` log),
+/// its listed table both as written and under the listed name, always
+/// reported (#308 final review L10).
+#[tokio::test]
+async fn folded_system_spellings_are_user_databases() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let label = server.name;
+        let mut a = admin_session(&server, &admin).await;
+        if !compares_with_case(label, &mut a).await {
+            continue;
+        }
+        let u = format!("'{FOLDED_USER}'@'%'");
+        exec(&mut a, &format!("DROP USER IF EXISTS {u}")).await;
+        let plugin = match server.flavor() {
+            Flavor::Mysql => "IDENTIFIED WITH caching_sha2_password BY",
+            Flavor::Mariadb => "IDENTIFIED BY",
+        };
+        exec(
+            &mut a,
+            &format!("CREATE USER {u} {plugin} '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        let mut made: Vec<(&str, &str, &str)> = Vec::new();
+        for (name, system, proof, listed) in [
+            ("MY\u{17F}QL", "mysql", "user", "column_stats"),
+            ("\u{17F}ys", "sys", "version", "processlist"),
+        ] {
+            let _ = a
+                .exec(Stage::Check, &format!("DROP DATABASE IF EXISTS `{name}`"))
+                .await;
+            let created = a
+                .exec(Stage::Check, &format!("CREATE DATABASE `{name}`"))
+                .await;
+            eprintln!(
+                "[it] name_case: {label}: CREATE DATABASE `{name}`: {}",
+                match &created {
+                    Ok(_) => "accepted".to_owned(),
+                    Err(e) => format!("refused (errno {:?})", e.errno),
+                }
+            );
+            if created.is_err() {
+                continue;
+            }
+            let listed_n = count(
+                &mut a,
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.TABLES \
+                     WHERE CAST(TABLE_SCHEMA AS BINARY) = '{name}'"
+                ),
+            )
+            .await;
+            let probe = format!("SELECT 1 FROM `{name}`.`{proof}` LIMIT 1");
+            let alias = a.query(Stage::Check, &probe).await;
+            eprintln!(
+                "[it] name_case: {label}: empty `{name}`: {listed_n} table(s) listed; `{probe}`: {}",
+                match &alias {
+                    Ok(rows) => format!("answered ({} row(s)): an alias of `{system}`", rows.len()),
+                    Err(e) => format!("refused (errno {:?}): not an alias of `{system}`", e.errno),
+                }
+            );
+            if alias.is_ok() || listed_n != 0 {
+                let _ = a
+                    .exec(Stage::Check, &format!("DROP DATABASE `{name}`"))
+                    .await;
+                let _ = a
+                    .exec(Stage::Check, &format!("DROP USER IF EXISTS {u}"))
+                    .await;
+                panic!(
+                    "{label}: `{name}` reads or lists the system schema `{system}`: Discovery and \
+                     Audit must treat that spelling as `{system}` (#308 final review N7)"
+                );
+            }
+            for statement in [
+                format!("CREATE TABLE `{name}`.people (id INT PRIMARY KEY, email VARCHAR(120))"),
+                format!(
+                    "CREATE TABLE `{name}`.`{listed}` (id INT PRIMARY KEY, email VARCHAR(120))"
+                ),
+                format!("GRANT SELECT ON `{name}`.* TO {u}"),
+            ] {
+                exec(&mut a, &statement).await;
+            }
+            for table in ["people", listed] {
+                exec(
+                    &mut a,
+                    &format!(
+                        "INSERT INTO `{name}`.`{table}` (id, email) \
+                         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                         WHERE i < {FOLDED_ROWS}) \
+                         SELECT i, CONCAT('fold.user', i, '@example.com') FROM n"
+                    ),
+                )
+                .await;
+            }
+            made.push((name, system, listed));
+        }
+        // Discovery as the test account: both tables of each database,
+        // under its own name, nothing under a system schema's.
+        let (_dir, t) = target(&server, FOLDED_USER, IT_PASSWORD);
+        let (r, findings) = scan(&t).await;
+        r.unwrap();
+        let found = located(&findings);
+        eprintln!(
+            "[it] name_case: {label}: user databases {:?}: findings {found:?}",
+            made.iter().map(|m| m.0).collect::<Vec<_>>()
+        );
+        for (name, _, listed) in &made {
+            for table in ["people", listed] {
+                let want = key_of(normalize(name).as_str(), table, "email", "pii.email");
+                assert!(found.contains(&want), "{label}: {name}.{table}: {found:?}");
+            }
+        }
+        // ADR-0009 NFKC: `ſys` reaches the console as `sys` (measured; the
+        // ADR-0056 marker on names altered by normalization, #308 final
+        // review N8); only the user database's own tables may carry a
+        // system schema's name here.
+        for k in &found {
+            assert!(
+                made.iter()
+                    .any(|(name, _, listed)| k.0 == normalize(name).as_str()
+                        && (k.1 == "people" || k.1 == *listed))
+                    || !["mysql", "sys", "information_schema", "performance_schema"]
+                        .contains(&k.0.as_str()),
+                "{label}: a system schema sampled: {k:?}"
+            );
+        }
+        // Audit: the `performance_schema` source as the test account, then
+        // MariaDB's `server_audit` log.
+        exec(
+            &mut a,
+            &format!("GRANT SELECT ON performance_schema.* TO {u}"),
+        )
+        .await;
+        let admin_user = admin.user.clone();
+        let mut sources = vec![(
+            audit_target(&server, FOLDED_USER, IT_PASSWORD, None),
+            EventSource::PerformanceSchema,
+        )];
+        if server.flavor() == Flavor::Mariadb
+            && let Some(log) = env_path("DATABASTION_TEST_MARIADB_AUDIT_LOG", "mariadb-audit")
+        {
+            sources.push((
+                audit_target(
+                    &server,
+                    &server.url.user,
+                    &server.url.password,
+                    Some((&log, "server_audit")),
+                ),
+                EventSource::MariadbServerAudit,
+            ));
+        }
+        for ((_d, t), source) in sources {
+            folded_reads_are_named_as_written(label, &mut a, &admin_user, &t, source, &made).await;
+        }
+        for (name, _, _) in &made {
+            exec(&mut a, &format!("DROP DATABASE IF EXISTS `{name}`")).await;
+        }
+        exec(&mut a, &format!("DROP USER IF EXISTS {u}")).await;
+    }
+}
+
+/// The administrator reads each table of the [`made`] user databases;
+/// `source` reports `people` under the database's name, and the listed
+/// table as written and under the listed name, always reported (#308
+/// final review L10).
+async fn folded_reads_are_named_as_written(
+    label: &str,
+    a: &mut Session,
+    admin_user: &str,
+    t: &TargetConfig,
+    source: EventSource,
+    made: &[(&str, &str, &str)],
+) {
+    let connector = Arc::new(MysqlConnector::new());
+    let health = connector.check(t).await;
+    assert!(health.reachable, "{label}: {health:?}");
+    assert_eq!(connector.audit_source(t), Some(source), "{label}");
+    let state = TempDir::new();
+    let (task, mut rx) = start_audit(Arc::clone(&connector), t, &state.0);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    for (name, _, listed) in made {
+        for table in ["people", listed] {
+            a.query(Stage::Check, &format!("SELECT * FROM `{name}`.`{table}`"))
+                .await
+                .unwrap();
+        }
+    }
+    let names = |e: &MaskedEvent, db: &str, table: &str| {
+        e.objects()
+            .iter()
+            .any(|o| o.database().as_str() == db && o.object().as_str() == table)
+    };
+    let done = |ev: &[MaskedEvent]| {
+        made.iter().all(|(name, system, listed)| {
+            let db = normalize(name);
+            let by_admin = |e: &&MaskedEvent| {
+                e.action() == EventAction::Read && e.principal().account_name() == admin_user
+            };
+            ev.iter()
+                .filter(by_admin)
+                .any(|e| names(e, db.as_str(), "people"))
+                && ev.iter().filter(by_admin).any(|e| {
+                    e.always_report() && names(e, db.as_str(), listed) && names(e, system, listed)
+                })
+        })
+    };
+    let mut events: Vec<MaskedEvent> = Vec::new();
+    collect_until(&mut rx, &mut events, Duration::from_secs(30), done).await;
+    task.abort();
+    let all: Vec<String> = events.iter().map(describe).collect();
+    eprintln!(
+        "[it] name_case: {label}: {} reads of {:?} ({} events):\n{}",
+        source.as_str(),
+        made.iter().map(|m| m.0).collect::<Vec<_>>(),
+        all.len(),
+        all.join("\n")
+    );
+    assert!(done(&events), "{label}: {}: {all:#?}", source.as_str());
+}
