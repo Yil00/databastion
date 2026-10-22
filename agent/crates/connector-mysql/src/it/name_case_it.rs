@@ -1010,6 +1010,15 @@ async fn folded_system_spellings_are_user_databases() {
                     Err(e) => format!("refused (errno {:?}): not an alias of `{system}`", e.errno),
                 }
             );
+            // Only "unknown table" proves the spelling is not an alias; any
+            // other refusal could hide one (#318 review L2).
+            if let Err(e) = &alias {
+                assert_eq!(
+                    e.errno,
+                    Some(1146),
+                    "{label}: `{probe}` refused for another reason than an unknown table"
+                );
+            }
             if alias.is_ok() || listed_n != 0 {
                 let _ = a
                     .exec(Stage::Check, &format!("DROP DATABASE `{name}`"))
