@@ -57,7 +57,7 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 use super::own;
 use super::{
     APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, OWN_FILE_BYTES,
-    OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, halved, on_bad_position, on_pattern,
+    OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, ReadAt, on_bad_position, on_pattern,
     target_error,
 };
 use crate::check::{self, CheckState};
@@ -640,6 +640,12 @@ async fn read(
         });
     // The server skips the events of the next buffer already handled
     // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
+    // The size an earlier stream halved to at this position, if any.
+    let at = ReadAt::of(&st.cursor);
+    st.batch = st
+        .state
+        .audit
+        .read_size(&target_id, super::Source::Xevents, &at, st.batch);
     let top = st.batch;
     let skip = st.cursor.skip;
     let polled = match st.cursor.file.clone() {
@@ -670,6 +676,7 @@ async fn read(
     };
     let polled = match polled {
         Ok(p) => {
+            st.state.audit.read_succeeded(&target_id);
             st.batch = (st.batch * 2).min(BATCH);
             p
         }
@@ -691,7 +698,14 @@ async fn read(
             return Ok(true);
         }
         Err(e) => {
-            if let Some(smaller) = halved(&e, s.is_poisoned(), st.batch) {
+            if let Some(smaller) = st.state.audit.read_failed(
+                &target_id,
+                super::Source::Xevents,
+                at,
+                &e,
+                s.is_poisoned(),
+                st.batch,
+            ) {
                 // A response over the bound: smaller reads, same position.
                 st.batch = smaller;
                 return Ok(true);

@@ -146,6 +146,10 @@ pub(crate) struct Shared {
     /// sampling, credited polls, statistics builds and their internal
     /// statements), for the logs and the tests.
     own_left_out: Mutex<HashMap<String, [u64; 4]>>,
+    /// The read size halved at a position, kept across stream restarts
+    /// ([`Shared::read_failed`]): at most one per target, cleared by the
+    /// next successful read.
+    halved: Mutex<HashMap<String, (Source, ReadAt, usize)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -280,6 +284,59 @@ impl Shared {
         {
             *n += 1;
         }
+    }
+
+    /// The size of a read at `at`: `batch`, or the smaller size an
+    /// earlier failed read of this source at this very position left
+    /// ([`Shared::read_failed`]), so a restarted stream does not start
+    /// again at [`BATCH`] where a read over the bound poisoned the session
+    /// (security review L1 of the 0.8.1 fix).
+    pub(crate) fn read_size(
+        &self,
+        target_id: &str,
+        source: Source,
+        at: &ReadAt,
+        batch: usize,
+    ) -> usize {
+        match lock(&self.halved).get(target_id) {
+            Some((s, a, n)) if *s == source && a == at => batch.min(*n),
+            _ => batch,
+        }
+    }
+
+    /// After a failed read at `at`: the size of the next read from the
+    /// same position in this stream, or `None` (the error ends the
+    /// stream). A read over the bound ([`halved`]) is kept at its halved
+    /// size for the target even when the cancel was not acknowledged (the
+    /// session poisoned, the stream ends): the next stream reads that size
+    /// from the same position (fail closed: the position unchanged,
+    /// nothing skipped), so a poisoning that recurs there still walks
+    /// down to [`MIN_BATCH`].
+    pub(crate) fn read_failed(
+        &self,
+        target_id: &str,
+        source: Source,
+        at: ReadAt,
+        e: &SsError,
+        poisoned: bool,
+        batch: usize,
+    ) -> Option<usize> {
+        let smaller = halved(e, false, batch)?;
+        lock(&self.halved).insert(target_id.to_owned(), (source, at, smaller));
+        if poisoned {
+            tracing::warn!(
+                target_id = %target_id,
+                batch = smaller,
+                "SQL Server Audit: an oversized read was not cancelled in step: the next stream reads fewer records from the same position"
+            );
+            return None;
+        }
+        Some(smaller)
+    }
+
+    /// A read succeeded: the size kept by [`Shared::read_failed`] ends.
+    pub(crate) fn read_succeeded(&self, target_id: &str) {
+        lock(&self.halved).remove(target_id);
     }
 
     /// Statistics statements left out (item 4, refinement of 2026-10-15).
@@ -691,6 +748,27 @@ pub(crate) fn request(cursor: &Cursor, batch: usize) -> (usize, u32) {
 pub(crate) fn halved(e: &SsError, poisoned: bool, batch: usize) -> Option<usize> {
     (e.code == FailureCode::ResourceLimit && !poisoned && batch > MIN_BATCH)
         .then(|| (batch / 2).max(MIN_BATCH))
+}
+
+/// Where a read starts (file set, buffer, records of it skipped on the
+/// server): the key of a read size kept across stream restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    pattern: Option<String>,
+    file: Option<String>,
+    offset: i64,
+    skip: u32,
+}
+
+impl ReadAt {
+    pub(crate) fn of(c: &Cursor) -> Self {
+        Self {
+            pattern: c.pattern.clone(),
+            file: c.file.clone(),
+            offset: c.offset,
+            skip: c.skip,
+        }
+    }
 }
 
 /// The order key of an audit file of one file set, (timestamp,
@@ -1243,6 +1321,12 @@ async fn read(
     // The audit's delivery delay (`QUEUE_DELAY`): the history and floor
     // bound.
     let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
+    // The size an earlier stream halved to at this position, if any.
+    let at = ReadAt::of(&st.cursor);
+    st.batch = st
+        .state
+        .audit
+        .read_size(&target_id, Source::Audit, &at, st.batch);
     // The server skips the records of the next buffer already handled.
     let (top, skip) = request(&st.cursor, st.batch);
     let polled = match st.cursor.file.clone() {
@@ -1274,6 +1358,7 @@ async fn read(
     };
     let polled = match polled {
         Ok(p) => {
+            st.state.audit.read_succeeded(&target_id);
             st.batch = (st.batch * 2).min(BATCH);
             p
         }
@@ -1294,7 +1379,14 @@ async fn read(
             return Ok(true);
         }
         Err(e) => {
-            if let Some(smaller) = halved(&e, s.is_poisoned(), st.batch) {
+            if let Some(smaller) = st.state.audit.read_failed(
+                &target_id,
+                Source::Audit,
+                at,
+                &e,
+                s.is_poisoned(),
+                st.batch,
+            ) {
                 // A response over the bound: smaller reads, same position.
                 st.batch = smaller;
                 return Ok(true);
