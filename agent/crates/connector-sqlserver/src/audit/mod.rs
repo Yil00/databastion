@@ -678,6 +678,21 @@ pub(crate) fn request(cursor: &Cursor, batch: usize) -> (usize, u32) {
     (batch, cursor.skip)
 }
 
+/// The size of the next read after a failed one, asked again from the
+/// same position, or `None` (the error ends the stream): a response over
+/// [`POLL_BYTES`] (or more rows than asked) was cancelled with the session
+/// still in step, and the read halves, never below [`MIN_BATCH`]; a
+/// successful read doubles it back up to [`BATCH`]. Used by both sources.
+///
+/// The session tells, not [`SsError::fatal`]: every client-side bound
+/// sets `fatal`, so the check `!e.fatal` of 0.8.0 never halved, and a run
+/// of large Extended Events events failed every read from the same
+/// position until the files rolled over (fixed in 0.8.1).
+pub(crate) fn halved(e: &SsError, poisoned: bool, batch: usize) -> Option<usize> {
+    (e.code == FailureCode::ResourceLimit && !poisoned && batch > MIN_BATCH)
+        .then(|| (batch / 2).max(MIN_BATCH))
+}
+
 /// The order key of an audit file of one file set, (timestamp,
 /// partition), from `…_<partition>_<timestamp>.sqlaudit` (measured: the
 /// name of the audit and its GUID, then the partition and an 18-digit
@@ -1278,12 +1293,14 @@ async fn read(
             }
             return Ok(true);
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            // A response over the bound: smaller reads.
-            st.batch = (st.batch / 2).max(MIN_BATCH);
-            return Ok(true);
+        Err(e) => {
+            if let Some(smaller) = halved(&e, s.is_poisoned(), st.batch) {
+                // A response over the bound: smaller reads, same position.
+                st.batch = smaller;
+                return Ok(true);
+            }
+            return Err(e.into_connector_error());
         }
-        Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
     let b = batch(&st.cursor, polled.records, polled.returned, top, file_key);

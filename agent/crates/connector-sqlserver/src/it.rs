@@ -2737,3 +2737,221 @@ async fn trailing_spaces_in_bracketed_names_resolve_to_the_listed_views() {
         assert!(a.listed.contains(&listed), "{text}: {:?}", a.listed);
     }
 }
+
+/// The large-event test's own Extended Events session
+/// ([`xe_large_events_are_read_by_halving`]).
+const LARGE_XE: &str = "it_large_xe";
+
+/// `n` reads of `retail.crm.customers` by `sa` in one batch, each
+/// statement `pad` characters longer (a comment; built on the server and
+/// run through `sp_executesql`, since the client sends batches of one
+/// packet only; 20 ms apart, so that the session's buffers keep up and
+/// drop none): one statement event each naming the table, and the `SET`,
+/// `WHILE` (and `EXEC`, `WAITFOR`) events.
+async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
+    let body = if pad == 0 {
+        format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
+             SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
+        )
+    } else {
+        format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
+             WHILE @i < {n} BEGIN \
+             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+             WAITFOR DELAY '00:00:00.020'; END"
+        )
+    };
+    Box::pin(exec(s, &body)).await;
+}
+
+/// 0.8.1 hotfix: a run of large events (statements of 60 000 characters,
+/// `event_data` near the poll's 128 KiB bound) makes a read of `BATCH`
+/// events go above the 12 MiB response bound. The read is cancelled and
+/// asked again smaller from the same position (halved down to
+/// `MIN_BATCH`), then back up: the stream moves past them with no stream
+/// error, no event lost or reported twice and nothing dropped. In 0.8.0
+/// the halving never ran (its guard tested `SsError::fatal`, which every
+/// client-side bound sets): every read failed, and the stream restarted
+/// at the same position until the files rolled over.
+#[tokio::test]
+async fn xe_large_events_are_read_by_halving() {
+    Box::pin(xe_large_scenario()).await;
+}
+
+async fn xe_large_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    // The body in a task, so that the dev session is started again, the
+    // test's session dropped and the grant revoked whatever happens.
+    let result = tokio::spawn(xe_large_body(major)).await;
+    let mut s = Box::pin(sa()).await;
+    Box::pin(exec_ok(
+        &mut s,
+        &format!(
+            "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
+             DROP EVENT SESSION {LARGE_XE} ON SERVER"
+        ),
+    ))
+    .await;
+    Box::pin(exec_ok(
+        &mut s,
+        "IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'databastion_xe') \
+         ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec_ok(
+            &mut s,
+            &in_db(
+                "master",
+                "REVOKE VIEW SERVER PERFORMANCE STATE FROM databastion",
+            ),
+        ))
+        .await;
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn xe_large_body(major: u32) {
+    let mut s = Box::pin(sa()).await;
+    let _ = Box::pin(xe_grant(&mut s, major)).await;
+    let stem = format!("it_large_{}", std::process::id());
+    Box::pin(exec_ok(
+        &mut s,
+        &format!(
+            "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
+             DROP EVENT SESSION {LARGE_XE} ON SERVER"
+        ),
+    ))
+    .await;
+    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
+    Box::pin(exec(
+        &mut s,
+        &format!(
+            "CREATE EVENT SESSION {LARGE_XE} ON SERVER \
+             ADD EVENT sqlserver.sql_statement_completed ({actions}), \
+             ADD EVENT sqlserver.sp_statement_completed ({actions}), \
+             ADD EVENT sqlserver.rpc_completed ({actions}), \
+             ADD EVENT sqlserver.error_reported ({actions} WHERE ([error_number] = (18456))) \
+             ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
+             max_file_size = 256, max_rollover_files = 4) \
+             WITH (TRACK_CAUSALITY = ON, MAX_DISPATCH_LATENCY = 5 SECONDS)"
+        ),
+    ))
+    .await;
+    // The dev session is stopped meanwhile, so that the other tests'
+    // first starts do not walk these events.
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {LARGE_XE} ON SERVER STATE = START"),
+    ))
+    .await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {LARGE_XE}}}",
+        own_tls()
+    ));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-large-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(&c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "the stream started");
+    // Counts the stream's reads of `retail.crm.customers` by `sa` until
+    // `want` are counted, `wait` passes or the stream ends (a read error
+    // ends it).
+    let mut seen = 0usize;
+    let mut own = 0usize;
+    let mut count_until = async |stream: &tokio::task::JoinHandle<Result<(), ConnectorError>>,
+                                 want: usize,
+                                 wait: Duration| {
+        let deadline = std::time::Instant::now() + wait;
+        while seen < want && std::time::Instant::now() < deadline && !stream.is_finished() {
+            let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            else {
+                continue;
+            };
+            let who = e.principal().account_name();
+            if who.eq_ignore_ascii_case("databastion") {
+                own += 1;
+            }
+            if who.eq_ignore_ascii_case("sa")
+                && names_of(&e).contains(&"retail.crm.customers".to_owned())
+            {
+                seen += usize::try_from(e.aggregated_count()).unwrap_or(1);
+            }
+        }
+        seen
+    };
+    // 1. Small events: read as before.
+    let small = 200u32;
+    Box::pin(customer_reads(&mut s, small, 0)).await;
+    let got = count_until(&stream, small as usize, Duration::from_secs(60)).await;
+    if stream.is_finished() {
+        panic!("the stream ended: {:?}", stream.await);
+    }
+    eprintln!("[it] large events: small reads {got}/{small}");
+    assert_eq!(got, small as usize, "every small read reported once");
+    // 2. About 300 events near 128 KiB within `BATCH` rows: a read of
+    // `BATCH` events is above 12 MiB, cancelled and asked again smaller.
+    let large = 300u32;
+    Box::pin(customer_reads(&mut s, large, 60_000)).await;
+    let want = (small + large) as usize;
+    let got = count_until(&stream, want, Duration::from_secs(180)).await;
+    if stream.is_finished() {
+        panic!("the stream ended after {got}/{want}: {:?}", stream.await);
+    }
+    eprintln!("[it] large events: {got}/{want} after the large reads");
+    assert_eq!(got, want, "every large read reported once");
+    // 3. Small events again: the stream goes on past the large ones.
+    let more = 2_000u32;
+    Box::pin(customer_reads(&mut s, more, 0)).await;
+    let want = want + more as usize;
+    let got = count_until(&stream, want, Duration::from_secs(90)).await;
+    if stream.is_finished() {
+        panic!("the stream ended after {got}/{want}: {:?}", stream.await);
+    }
+    eprintln!("[it] large events: {got}/{want} after the large ones");
+    assert_eq!(got, want, "every read after the large ones reported once");
+    // Nothing more arrives (none twice).
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let got = count_until(&stream, want + 1, Duration::from_secs(2)).await;
+    assert_eq!(got, want, "no read reported twice");
+    assert!(!stream.is_finished(), "the stream ended");
+    stream.abort();
+    let _ = stream.await;
+    let facts = c.state.audit.facts(&t.id);
+    eprintln!(
+        "[it] large events: own events reported {own}, dropped {}, gap {}",
+        facts.dropped, facts.gap
+    );
+    assert_eq!(own, 0, "none of the agent's own events reported");
+    assert_eq!(facts.dropped, 0, "records dropped");
+    assert!(!facts.gap, "no gap");
+    let _ = std::fs::remove_dir_all(&dir);
+}
