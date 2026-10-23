@@ -121,3 +121,25 @@ When `/api/agent/v2` is introduced for any reason, `Identifier` in v2 is `Identi
 1. (B) in two releases, agent first, with the acceptance.
 2. Rule 2 keeps `_` as a separator, unless the measurement of section 2 item 4 shows names masked that today's agent keeps and that are not values.
 3. The console masks every `Identifier`, the OpenLDAP container form (RDN values in `Location.schema`) included.
+
+## Implementation note (2026-10-23): agent lot
+
+Section 2, implemented on branch `feat/p9-adr0057-agent` (`agent-engineer`; `security-reviewer` review of the contract file and the normalizer to follow). The console masking (section 3) is for a later release.
+
+- **Measurement first (section 2 item 4).** Commit `6e0310c` added the rules and a measurement test (`agent/crates/classifiers/tests/identifier_produced.rs`, `measurement_over_the_dev_corpus`) before the normalizer applied them. It runs the rules over the name each normalizer emitted then, for the distinct raw names of: the dev ground truth (locations and target databases, Redis / Valkey key patterns left out), the dev seeds (`dev/seed/out`: SQL tables and columns, MongoDB collections and field paths with their real keys, LDIF entry DNs, attributes and object classes), the dev, end-to-end and load init scripts, the tables the connectors' integration tests create (which the engine matrix runs), the CAS service registry and audit fixtures, and the `load` seed's schema, table and column names (999 tables, `e2e/load/seed.py`). The end-to-end runs discover the dev seeds; no Discovery finding of a `load` or end-to-end run is committed, so the `load` seed's names stand for them. Result (counts only, I2):
+
+  | Source | Names | Kept (not `*`) | Refused by a rule |
+  |--------|------:|---------------:|------------------:|
+  | Ground truth | 160 | 148 | 0 |
+  | Dev seeds | 794 | 786 | 0 |
+  | Init scripts | 1 | 1 | 0 |
+  | Connector integration tests | 70 | 69 | 0 |
+  | CAS fixtures | 123 | 121 | 0 |
+  | `load` seed | 3 015 | 3 015 | 0 |
+  | **Total** | **4 163** | **4 140** | **0** (every rule: 0) |
+
+  No name the agent kept is masked by the rules, so open question 2's condition is not met: rule 2 keeps `_` as a separator. The test now asserts that no kept name violates a rule.
+- **Normalizer (item 1).** `classifiers::names` applies the rules after its existing gate (the agent's output is unchanged for every name that passes them): on a plain name, every `.`-separated segment a match of rules 1 to 4 touches becomes `*`, consecutive such segments collapse into one `*`, repeated until no rule matches (`device.001a.2b3c.4d5e.port` -> `device.*.port`, `crm.v1_2_3_4_5.orders` -> `crm.*.orders`); on an LDAP container DN, an RDN value that violates a rule becomes `*` (`ou=10.0.0.1,dc=x` -> `ou=*,dc=x`); a name that still violates one (rule 5 bounds the whole name) is `*`. A name turned into `*` is never marked altered (ADR-0056). One agent-only rule beyond the contract: a code point unassigned in the agent's Unicode tables (`\p{Cn}`) makes its segment `*`, as `KeyPattern`'s gate refuses it, since the console's engine may know it as a digit or a space (Unicode version drift).
+- **Contract (item 2).** `IdentifierProduced` is held in a separate file, `shared/protocol/identifier-produced.schema.json` (the preferred option): `allOf` one `$ref` to `Identifier` and a `not.anyOf` of the rules, each titled with its id (`1`, `2`, `3-ipv4`, `3-mac-dashed`, `3-mac-dotted`, `4`, `5-run`, `5-total`). Nothing in `openapi.yaml` refers to it, no generator reads it, and the Redocly lint is unchanged. Its patterns are the agent's (`names::IDENTIFIER_PRODUCED_RULES`), checked verbatim. The rules apply at `[.,=]` boundaries, so the container DN form gets them on each RDN value. Rule 3's dashed MAC form is `KeyPattern`'s (six 2-character hexadecimal groups, no digit required); its dotted form requires a digit in one of the three segments.
+- **Oracles.** The agent's check agrees with the contract compiled with `regress` (ECMAScript `u` mode, as Ajv), rule by rule, in a property test, and on every code point in a release-mode sweep (`no_drift_on_any_code_point`); every name the four normalizers emit matches it in property tests (a targeted alphabet, any text, any bytes), in `names_props.rs`, in the new fuzz target `classifiers_names` (also in the nightly campaign) and in the SQL Server Audit and Extended Events fuzz oracles. `npm test` in `shared/protocol` runs the schema's own self-test (`scripts/identifier-produced.test.mjs`).
+- **Item 3.** The agent's decoding of `SensitiveObject.object` is unchanged.
