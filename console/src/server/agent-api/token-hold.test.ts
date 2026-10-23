@@ -1,0 +1,232 @@
+import { and, eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { getDb } from "@/db/client";
+import { accessEvents, agentTargets, findings } from "@/db/schema";
+import { validateSchema } from "@/lib/protocol/validate";
+import { enqueueJob } from "@/server/jobs";
+import { agentTokensHoldWarning, startupFatal, startupWarnings } from "@/server/startup-checks";
+import { hasDb, setupTestDatabase } from "@/test/db";
+import { adminUser, agentRequest, enroll, fixtures } from "@/test/helpers";
+
+import { CONSOLE_ACCEPTS, heldAccepts, listedAccepts, RELEASE_ACCEPTS } from "./capabilities";
+import { handleEvents, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+
+/**
+ * DATABASTION_AGENT_TOKENS_HOLD (ADR-0022 decision 8, end-of-phase-9 review L1): a held console lists
+ * the tokens of the older release line and still accepts every field it knows.
+ */
+
+/** The tokens listed by 0.8.0, 0.8.1 and 0.8.2 (`git show 0.8.2:console/src/server/agent-api/capabilities.ts`). */
+const LISTED_BY_0_8 = [
+  "access_event.bytes",
+  "engine.cas",
+  "engine.redis",
+  "engine.sqlserver",
+  "engine.valkey",
+  "job_progress.coverage",
+  "target_status.note_labels.2026_10",
+  "target_status.note_labels.2026_10_b",
+  "target_status.notes",
+];
+
+/** Tokens added after 0.8.2, held by `0.8`. */
+const ADDED_AFTER_0_8 = [
+  "access_event.objects_overflowed",
+  "location.altered",
+  "object_ref.altered",
+  "target_status.name_case",
+  "target_status.note_labels.2026_10_c",
+];
+
+const held = { DATABASTION_AGENT_TOKENS_HOLD: "0.8" };
+
+describe("token hold: listing (unit)", () => {
+  it("lists every token when unset or empty (today's behaviour)", () => {
+    expect(listedAccepts({})).toEqual([...CONSOLE_ACCEPTS]);
+    expect(listedAccepts({ DATABASTION_AGENT_TOKENS_HOLD: "" })).toEqual([...CONSOLE_ACCEPTS]);
+    expect(heldAccepts({})).toEqual([]);
+  });
+
+  it("0.8 lists exactly the 0.8.x list and holds the tokens added since", () => {
+    expect(listedAccepts(held)).toEqual(LISTED_BY_0_8);
+    expect(heldAccepts(held)).toEqual(ADDED_AFTER_0_8);
+    expect([...listedAccepts(held), ...heldAccepts(held)].sort()).toEqual([...CONSOLE_ACCEPTS]);
+  });
+
+  it("never holds an engine token nor a token of 0.8 or earlier", () => {
+    for (const t of CONSOLE_ACCEPTS.filter((t) => t.startsWith("engine."))) expect(listedAccepts(held)).toContain(t);
+    expect(heldAccepts(held).filter((t) => LISTED_BY_0_8.includes(t))).toEqual([]);
+  });
+
+  it("every release list is a sorted, duplicate-free subset of CONSOLE_ACCEPTS and a valid CapabilityList", () => {
+    for (const [release, list] of Object.entries(RELEASE_ACCEPTS)) {
+      expect([...list], release).toEqual([...new Set(list)].sort());
+      for (const t of list) expect(CONSOLE_ACCEPTS as readonly string[], `${release} ${t}`).toContain(t);
+      expect(validateSchema("CapabilityList", [...list]).ok).toBe(true);
+    }
+  });
+
+  it("an invalid value seen at run time lists the oldest known set (fail closed)", () => {
+    expect(listedAccepts({ DATABASTION_AGENT_TOKENS_HOLD: "0.9" })).toEqual(LISTED_BY_0_8);
+  });
+});
+
+describe("token hold: startup checks (unit)", () => {
+  const env = (e: Record<string, string>) => e as unknown as NodeJS.ProcessEnv;
+
+  it("refuses to start on an unknown value, in every environment, without echoing it", () => {
+    for (const NODE_ENV of ["production", "development", "test"]) {
+      const fatal = startupFatal(env({ NODE_ENV, DATABASTION_AGENT_TOKENS_HOLD: "0.8.2", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) }));
+      expect(fatal).toContain("DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8");
+      expect(fatal).toContain("Refusing to start");
+      expect(fatal).not.toContain("0.8.2");
+    }
+  });
+
+  it("starts with the hold unset or valid, and warns while it is set", () => {
+    const base = { NODE_ENV: "production", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) };
+    expect(startupFatal(env({ ...base, ...held }))).toBeNull();
+    expect(startupFatal(env(base))).toBeNull();
+    expect(agentTokensHoldWarning(env(base))).toBeNull();
+    const warning = agentTokensHoldWarning(env({ ...base, ...held }));
+    expect(warning).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.8");
+    for (const t of ADDED_AFTER_0_8) expect(warning).toContain(t);
+    expect(startupWarnings(env({ ...base, ...held }))).toContain(warning);
+  });
+});
+
+// ------------------------------------------------------------------------------------- DB
+
+type Auth = { agentId: string; secret: string };
+
+function fixture<T>(name: string): T {
+  const kind = name.split(".")[0] as string;
+  const found = fixtures("valid", kind).find(([f]) => f === name);
+  if (!found) throw new Error(`no fixture ${name}`);
+  return structuredClone(found[1]) as T;
+}
+
+type Hb = { targets: { target_id: string; name_case?: unknown }[] };
+type Events = { batch_id: string; events: { target_id: string; objects_overflowed?: boolean; objects: unknown[] }[] };
+type Findings = { batch_id: string; job_id: string; findings: { target_id: string; location: { altered?: string[] } }[] };
+
+describe.skipIf(!hasDb)("token hold: a held console still accepts and stores every field (PostgreSQL)", () => {
+  let teardown: () => Promise<void>;
+
+  beforeAll(async () => {
+    teardown = await setupTestDatabase();
+    await adminUser();
+  });
+  afterAll(async () => teardown?.());
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const heartbeat = (auth: Auth, body: unknown) => handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+
+  it("answers a heartbeat with the 0.8 list, and with the full list once the hold is removed", async () => {
+    const auth = await enroll();
+    const body = fixture<Hb>("HeartbeatRequest.name-case-sqlserver.json");
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.8");
+    let res = await heartbeat(auth, body);
+    expect(res.status).toBe(200);
+    let out = (await res.json()) as { accepts: string[] };
+    expect(validateSchema("HeartbeatResponse", out).ok).toBe(true);
+    expect(out.accepts).toEqual(LISTED_BY_0_8);
+    // The held field is still accepted and stored.
+    for (const t of body.targets) {
+      const [row] = await getDb()
+        .select()
+        .from(agentTargets)
+        .where(and(eq(agentTargets.agentId, auth.agentId), eq(agentTargets.targetId, t.target_id)));
+      expect(row?.nameCase, t.target_id).toEqual(t.name_case);
+    }
+    vi.unstubAllEnvs();
+    res = await heartbeat(auth, body);
+    out = (await res.json()) as { accepts: string[] };
+    expect(out.accepts).toEqual([...CONSOLE_ACCEPTS]);
+  });
+
+  it("accepts the 2026_10_c note label while holding its token", async () => {
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.8");
+    const auth = await enroll();
+    const res = await heartbeat(auth, fixture("HeartbeatRequest.sqlserver-labels-2026-10-c.json"));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { accepts: string[] }).accepts).not.toContain("target_status.note_labels.2026_10_c");
+  });
+
+  it("stores objects_overflowed and ObjectRef.altered of an events batch", async () => {
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.8");
+    const auth = await enroll();
+    const batch = fixture<Events>("EventsBatch.objects-overflowed-altered.json");
+    const targets = [...new Set(batch.events.map((e) => e.target_id))].map((target_id) => ({
+      target_id,
+      engine: "postgres",
+      reachable: true,
+      audit_level: "full",
+      audit_source: "pgaudit",
+    }));
+    const hb = {
+      ts: new Date().toISOString(),
+      agent_version: "0.9.0",
+      uptime_s: 1,
+      classifiers_version: "2026.09.1",
+      connectors: ["postgres"],
+      targets,
+      detected_targets: [],
+      spool: { bytes: 0, max_bytes: 1024, batches: 0 },
+    };
+    expect((await heartbeat(auth, hb)).status).toBe(200);
+    // Recent timestamps: the fixture's fixed dates may be past the retention.
+    const now = new Date().toISOString();
+    for (const e of batch.events as Record<string, unknown>[]) {
+      e.ts = now;
+      delete e.ts_last;
+    }
+    const res = await handleEvents(agentRequest("POST", "/events", { auth, body: batch }));
+    expect(res.status).toBe(202);
+    const rows = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId)).orderBy(accessEvents.itemIndex);
+    expect(rows).toHaveLength(batch.events.length);
+    rows.forEach((r, i) => {
+      const e = batch.events[i] as Events["events"][number];
+      expect(r.objects).toEqual(e.objects);
+      expect(r.objectsOverflowed).toBe(e.objects_overflowed === true ? true : null);
+    });
+    expect(rows.some((r) => r.objectsOverflowed === true)).toBe(true);
+    expect(JSON.stringify(rows.map((r) => r.objects))).toContain('"altered"');
+  });
+
+  it("stores Location.altered of a findings batch", async () => {
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.8");
+    const auth = await enroll();
+    const body = fixture<Findings>("FindingsBatch.postgres-altered.json");
+    const targetIds = [...new Set(body.findings.map((f) => f.target_id))];
+    const hb = {
+      ts: new Date().toISOString(),
+      agent_version: "0.9.0",
+      uptime_s: 1,
+      classifiers_version: "2026.09.1",
+      connectors: ["postgres"],
+      targets: targetIds.map((target_id) => ({ target_id, engine: "postgres", reachable: true, audit_level: "limited" })),
+      detected_targets: [],
+      spool: { bytes: 0, max_bytes: 1024, batches: 0 },
+    };
+    expect((await heartbeat(auth, hb)).status).toBe(200);
+    expect(targetIds).toHaveLength(1);
+    const jobId = await enqueueJob(getDb(), {
+      agentId: auth.agentId,
+      type: "discovery.scan",
+      targetId: targetIds[0] as string,
+      classifiersVersion: "2026.09.1",
+      params: { sample_rows: 200, max_duration_s: 900 },
+    });
+    expect((await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).status).toBe(200);
+    body.job_id = jobId;
+    const res = await handleFindings(agentRequest("POST", "/findings", { auth, body }));
+    expect(res.status).toBe(202);
+    const rows = await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.some((r) => Array.isArray(r.altered) && r.altered.length > 0)).toBe(true);
+  });
+});

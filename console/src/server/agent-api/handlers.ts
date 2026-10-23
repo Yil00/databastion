@@ -23,7 +23,7 @@ import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
 import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
 import { authenticateAgent, authPrecheck, countTimedOutBody, type AuthOptions, type AuthResult } from "./auth";
-import { CONSOLE_ACCEPTS, unlistedEngineDetails } from "./capabilities";
+import { listedAccepts, unlistedEngineDetails } from "./capabilities";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -141,8 +141,9 @@ export function handleHeartbeat(req: Request): Promise<Response> {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,
       server_time: new Date().toISOString(),
-      // ADR-0022: the optional request fields this console accepts.
-      accepts: [...CONSOLE_ACCEPTS],
+      // ADR-0022: the optional request fields this console accepts, less those that
+      // DATABASTION_AGENT_TOKENS_HOLD holds back during a rolling upgrade (decision 8).
+      accepts: listedAccepts(),
     });
   });
 }

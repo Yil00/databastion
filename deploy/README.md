@@ -261,7 +261,8 @@ process names (never command lines) and `/proc/net/tcp` ([ADR-0006](../docs/adr/
 
 **Upgrade.** Console first, then the agents ([RELEASE.md](../RELEASE.md#compatibility)). Console:
 set the new `DATABASTION_CONSOLE_IMAGE` in `.env`, then `docker compose --profile proxy up -d`
-(migrations run first). Agent: `sudo apt-get install ./databastion-agent_<new>_<arch>.deb`; a
+(migrations run first); with several web replicas, see
+[Rolling upgrade of several console replicas](#rolling-upgrade-of-several-console-replicas). Agent: `sudo apt-get install ./databastion-agent_<new>_<arch>.deb`; a
 running service is restarted, the identity and a modified `agent.yaml` are kept.
 
 **Removal.** Revoke the agent in the console, then `sudo apt-get remove databastion-agent` (stops
@@ -270,6 +271,37 @@ and disables the service, keeps configuration and state) or `sudo apt-get purge 
 The `databastion` user and your files under `/etc/databastion/secrets` are kept: after a purge,
 delete the target passwords yourself (`sudo rm -rf /etc/databastion/secrets /etc/databastion`) and
 rotate them on the databases if the host is being decommissioned.
+
+## Rolling upgrade of several console replicas
+The bundled Compose file runs one web process: `docker compose up -d` replaces it, and the upgrade
+above needs nothing more. With **several web replicas** behind your own load balancer, replicas of
+two releases answer the same agents for a while. Each heartbeat answer lists the optional fields
+that replica accepts (capability tokens, [ADR-0022](../docs/adr/0022-protocol-capability-negotiation.md)
+decision 8); an agent that learned a new token from an upgraded replica sends the field to every
+replica, an older replica answers `400`, and the agent resends those items without the field, so
+they lose it (for example the overflowed-objects flag of an event, the name case of a target, the
+"altered by normalization" marker of a finding). To avoid that, hold the new tokens back with
+`DATABASTION_AGENT_TOKENS_HOLD` ([console/README.md](../console/README.md#configuration)) until no
+older replica remains:
+
+1. Set `DATABASTION_AGENT_TOKENS_HOLD` to the release line the replicas run now (`0.8` for 0.8.0,
+   0.8.1 or 0.8.2, the only value today) in the environment of every web process of the new build
+   (in `compose.yaml`, the `environment` of the `console` service; the worker answers no agent and
+   only checks the value). An older build ignores the variable; a value the new build does not
+   know stops it at startup.
+2. Run the migrations once, then roll the new image out replica by replica. The upgraded replicas
+   accept and store every field of the new release, but list only the tokens of the held release
+   (each logs a warning at startup naming the tokens it holds back), so the agents keep sending
+   what the older replicas accept.
+3. Once **every** replica runs the new build, remove the variable and restart the replicas, one
+   by one if you like: every replica now accepts the new fields, so a replica that already lists
+   them and one that does not yet can answer side by side.
+4. Upgrade the agents. They send the new fields once a heartbeat answer lists their tokens.
+
+Upgrading from a release older than 0.8.0 this way is not covered by `0.8` (those releases do not
+accept every field 0.8 lists, such as the SQL Server, Redis and Valkey engines): stop every older
+replica before starting the new ones, or upgrade to 0.8.x first. To roll a replica back to an
+older release, set the hold on the remaining replicas first, the same way.
 
 ## Building the `.deb`
 ```bash

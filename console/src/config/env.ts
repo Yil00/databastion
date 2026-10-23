@@ -96,3 +96,31 @@ export function getDatabaseUrl(
   }
   return value;
 }
+
+/**
+ * `DATABASTION_AGENT_TOKENS_HOLD` (ADR-0022 decision 8, multi-replica rollout; end-of-phase-9
+ * review L1): the console release line (`X.Y`) whose capability tokens the heartbeat answer lists,
+ * set on every replica during a rolling upgrade from that release line. Only the listing changes;
+ * the console accepts every field it knows (src/server/agent-api/capabilities.ts). The values are
+ * the release lines whose token set the console knows.
+ */
+export const AGENT_TOKENS_HOLD_VAR = "DATABASTION_AGENT_TOKENS_HOLD";
+export const AGENT_TOKENS_HOLD_RELEASES = ["0.8"] as const;
+export type AgentTokensHold = (typeof AGENT_TOKENS_HOLD_RELEASES)[number];
+
+/**
+ * The release line of `DATABASTION_AGENT_TOKENS_HOLD`, or `null` when it is unset or empty (no
+ * hold: every token is listed). Any other value is a {@link ConfigError}: the web and worker
+ * processes refuse to start (`startupFatal`). Exact match after trimming, no patch level.
+ */
+export function agentTokensHold(env: Env = process.env): AgentTokensHold | null {
+  const raw = env[AGENT_TOKENS_HOLD_VAR]?.trim();
+  if (raw === undefined || raw === "") return null;
+  const release = AGENT_TOKENS_HOLD_RELEASES.find((r) => r === raw);
+  if (release === undefined) {
+    throw new ConfigError(
+      `${AGENT_TOKENS_HOLD_VAR} must be unset or one of: ${AGENT_TOKENS_HOLD_RELEASES.join(", ")} (the release line of the oldest console replica).`,
+    );
+  }
+  return release;
+}

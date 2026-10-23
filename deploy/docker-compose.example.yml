@@ -58,6 +58,9 @@ services:
       # System alerts per notification channel and hour, all agents together (default 20).
       # Heartbeats and integrity events raise them here too: keep the worker's value.
       # DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR: "20"
+      # Rolling upgrade of several web replicas only (deploy/README.md): list the capability
+      # tokens of the release line still running until every replica is upgraded, then remove it.
+      # DATABASTION_AGENT_TOKENS_HOLD: "0.8"
       # Single sign-on with OpenID Connect (ADR-0038; every variable: console/README.md, "Single
       # sign-on (OIDC)"). Register the redirect URI https://<DATABASTION_DOMAIN>/api/auth/oidc/callback
       # and the post-logout URI https://<DATABASTION_DOMAIN>/login at the provider, then uncomment,
