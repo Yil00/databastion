@@ -2403,6 +2403,10 @@ async fn a_fullwidth_key_segment_is_marked_altered_in_discovery_and_audit() {
     const ALTERED: &str = "fwtest/\u{FF43}\u{FF4F}\u{FF4C}\u{FF4F}\u{FF52}|theme";
     const PLAIN_SPELLING: &[u8] = b"fwtest/color|theme";
     const PLAIN: &str = "fwplain.color|theme/main";
+    // A hash whose field name holds a fullwidth `ｅ` and a U+200B
+    // (security review M1): the finding's `field` is `email`, altered.
+    const HASH: &str = "fwhash|profile/main.card";
+    const HASH_FIELD: &str = "\u{FF45}ma\u{200B}il";
     const MARK: &str = "fwqzxk";
     for (name, engine) in [
         ("valkey", TargetEngine::Valkey),
@@ -2426,6 +2430,15 @@ async fn a_fullwidth_key_segment_is_marked_altered_in_discovery_and_audit() {
                 ]);
                 del.push(vec![b"DEL".to_vec(), k.as_bytes().to_vec()]);
             }
+            set.push(vec![
+                b"HSET".to_vec(),
+                HASH.as_bytes().to_vec(),
+                HASH_FIELD.as_bytes().to_vec(),
+                value.clone().into_bytes(),
+                b"city".to_vec(),
+                b"Lyon".to_vec(),
+            ]);
+            del.push(vec![b"DEL".to_vec(), HASH.as_bytes().to_vec()]);
         }
         admin_owned(&t, &set).await;
         let dir = std::env::temp_dir().join(format!(
@@ -2461,6 +2474,19 @@ async fn a_fullwidth_key_segment_is_marked_altered_in_discovery_and_audit() {
                 assert_eq!(
                     f["location"]["altered"],
                     serde_json::json!(["object"]),
+                    "{name}: {f:#}"
+                );
+            }
+            // The hash field: `email`, altered, on every finding there.
+            let email: Vec<serde_json::Value> = at(HASH)
+                .into_iter()
+                .filter(|f| f["location"]["field"] == "email")
+                .collect();
+            assert!(!email.is_empty(), "{name}: {json:#?}");
+            for f in &email {
+                assert_eq!(
+                    f["location"]["altered"],
+                    serde_json::json!(["field"]),
                     "{name}: {f:#}"
                 );
             }

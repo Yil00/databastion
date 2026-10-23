@@ -231,6 +231,10 @@ struct Accepted {
     /// became unknown: the console is reachable, so unanswered heartbeats
     /// no longer restart the hold (re-review N1).
     results_answered: bool,
+    /// The set is empty because of a [`clear`](ConsoleCapabilities::clear)
+    /// that no heartbeat response has replaced yet, whether that clear
+    /// started a hold or not (ADR-0056 security review L1).
+    cleared: bool,
 }
 
 /// The capability set read once (security review I-2): the tokens and
@@ -253,11 +257,15 @@ impl Snapshot {
         self.settled
     }
 
-    /// Whether a heartbeat response recorded the set (it is not known from
-    /// the start of the agent, and from a clear that held, until the next
-    /// response). Findings are never held for it (ADR-0056 decision 2 item
-    /// 3): a findings batch sent while it is not known is stripped, and
-    /// counted apart.
+    /// Whether a heartbeat response recorded the set and no clear came
+    /// since: false from the start of the agent until the first response,
+    /// and from any clear (one that started a hold, or one within
+    /// [`UNKNOWN_HOLD`] of the last hold, which leaves the set empty
+    /// without holding) until the next response. Findings are never held
+    /// (ADR-0056 decision 2 item 3): a findings batch stripped while the
+    /// set is not known is counted per finding
+    /// (`findings_stripped_capabilities_unknown_total`), apart from the
+    /// batches stripped because a known set does not list a token.
     pub(crate) fn known(&self) -> bool {
         self.known
     }
@@ -289,6 +297,7 @@ impl Default for ConsoleCapabilities {
                 hold_from: Some(now),
                 last_hold: None,
                 results_answered: false,
+                cleared: false,
             }),
         }
     }
@@ -314,6 +323,7 @@ impl ConsoleCapabilities {
         accepted.tokens = set;
         accepted.unknown_since = None;
         accepted.hold_from = None;
+        accepted.cleared = false;
         changed
     }
 
@@ -331,6 +341,7 @@ impl ConsoleCapabilities {
     pub(crate) fn clear_at(&self, now: Instant) {
         let mut accepted = self.write();
         accepted.tokens.clear();
+        accepted.cleared = true;
         if accepted.unknown_since.is_some() {
             return;
         }
@@ -396,7 +407,7 @@ impl ConsoleCapabilities {
         Snapshot {
             tokens: a.tokens.clone(),
             settled: Self::settled_in(&a, now),
-            known: a.unknown_since.is_none(),
+            known: a.unknown_since.is_none() && !a.cleared,
         }
     }
 
@@ -523,6 +534,29 @@ mod tests {
 
     fn list(tokens: &[&str]) -> CapabilityList {
         serde_json::from_value(serde_json::json!(tokens)).unwrap()
+    }
+
+    /// ADR-0056 security review L1: the set is known only once a heartbeat
+    /// response recorded it with no clear since, including a clear within
+    /// the hold window that leaves the set known and empty without holding.
+    #[test]
+    fn a_clear_makes_the_set_unknown_for_findings_until_the_next_answer() {
+        let caps = ConsoleCapabilities::default();
+        let now = Instant::now();
+        assert!(!caps.snapshot(now).known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
+        caps.clear_at(now);
+        assert!(!caps.snapshot(now).known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
+        // A second clear within the hold window: no hold, settled, but not
+        // known.
+        caps.clear_at(now + std::time::Duration::from_secs(1));
+        let snap = caps.snapshot(now + std::time::Duration::from_secs(1));
+        assert!(snap.settled() && !snap.known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
     }
 
     #[test]

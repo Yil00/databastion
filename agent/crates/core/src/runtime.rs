@@ -318,15 +318,17 @@ struct Counters {
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
-    /// Batches whose gated fields the console does not list, stripped at
-    /// send time (ADR-0053 decision 2).
+    /// Batches (counted per **batch**) whose gated fields a known console
+    /// set does not list, stripped at send time (ADR-0053 decision 2).
     gated_fields_stripped_at_send: AtomicU64,
-    /// Findings whose `Location.altered` was stripped at send time because
-    /// the console's capabilities were not known (no heartbeat answer yet,
-    /// or since a clear): findings are never held for them (ADR-0056
-    /// decision 2 item 3). Counted per finding, apart from
-    /// `gated_fields_stripped_at_send` (batches, the console known not to
-    /// list the token), so the size of that residual is visible.
+    /// Findings (counted per **finding**, not per batch) whose
+    /// `Location.altered` was stripped at send time because the console's
+    /// capabilities were not known: no heartbeat answer yet, or any clear
+    /// since the last answer, a clear that did not start a hold included
+    /// (`Snapshot::known`). Findings are never held for them (ADR-0056
+    /// decision 2 item 3); counted apart from
+    /// `gated_fields_stripped_at_send` so the size of that residual is
+    /// visible.
     findings_stripped_capabilities_unknown: AtomicU64,
     /// Batches resent without `objects_overflowed` after the console found
     /// a flagged event naming no `*` (ADR-0053; never expected).
