@@ -95,7 +95,16 @@ pub(crate) struct SsError {
     /// The server's error number, if the server reported one.
     pub(crate) number: Option<i32>,
     pub(crate) stage: Stage,
-    /// The connection is unusable.
+    /// `false` only for a server error (an `ERROR` token of class 11 to 19,
+    /// outside the TLS, connect and login stages) after which the session
+    /// stays usable: the callers that go on with the same session test
+    /// `!fatal` (fail closed). `true` for every client-side failure
+    /// ([`SsError::new`]: I/O, protocol, the client's statement deadline
+    /// and its response bounds) and for a server error of class 20 or more
+    /// or at those stages. After a client-side deadline or bound the
+    /// session may still be usable, once the client's `ATTENTION` was
+    /// acknowledged: `Session::is_poisoned` tells (the Audit streams' read
+    /// retries test it, ADR-0051 refinement of 2026-10-22), not this flag.
     pub(crate) fatal: bool,
     pub(crate) detail: Option<Detail>,
 }
@@ -104,7 +113,7 @@ impl SsError {
     /// A local, transport or protocol failure: the connection is unusable.
     pub(crate) fn new(code: FailureCode, stage: Stage) -> Self {
         Self {
-            code,
+            code: at_stage(code, stage),
             number: None,
             stage,
             fatal: true,
@@ -125,7 +134,7 @@ impl SsError {
     /// An `ERROR` token (class 11 and above). Class 20 and above closes the
     /// connection on the server side.
     pub(crate) fn server(number: i32, class: u8, stage: Stage) -> Self {
-        let code = failure_of(number);
+        let code = at_stage(failure_of(number), stage);
         Self {
             code,
             number: Some(number),
@@ -169,6 +178,16 @@ pub(crate) fn failure_of(number: i32) -> FailureCode {
         // Invalid object or column name.
         207 | 208 => FailureCode::UnknownTarget,
         _ => FailureCode::Internal,
+    }
+}
+
+/// The code of a failure at `stage`: at the TLS stage, the same mapping on
+/// every engine ([`databastion_core::connector::tls_stage_failure`]).
+fn at_stage(code: FailureCode, stage: Stage) -> FailureCode {
+    if stage == Stage::Tls {
+        databastion_core::connector::tls_stage_failure(code)
+    } else {
+        code
     }
 }
 

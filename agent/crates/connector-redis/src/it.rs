@@ -15,7 +15,12 @@
 //! - `DATABASTION_IT_REDIS_EXEC_VALKEY` (optional): a command prefix that
 //!   runs a command in the Valkey container (e.g. `docker compose -f
 //!   dev/docker-compose.yml exec -T valkey`), for the test with clients on
-//!   the server's Unix socket; skipped without it.
+//!   the server's Unix socket; skipped without it;
+//! - `DATABASTION_IT_REDIS_SOCKET_VALKEY` / `DATABASTION_IT_REDIS_SOCKET_REDIS`
+//!   (optional): the servers' Unix sockets published to the host
+//!   (`dev/redis/compose.socket.yml`), for the socket target test, with
+//!   `DATABASTION_IT_REDIS_SERVER_UID` (default 999); skipped without them
+//!   unless `DATABASTION_IT_REDIS_REQUIRE_SOCKET=1`.
 //!
 //! The tests read the server's `ACL LOG` through a test-only raw client
 //! with the agent's own user (`+acl|log` is part of the dev ACL); the
@@ -123,15 +128,18 @@ async fn raw(t: &TargetConfig, args: &[&[u8]]) -> Value {
     out.pop().unwrap()
 }
 
+/// A test-only raw connection to the target's node: TCP and TLS, or its
+/// Unix socket (peer credentials checked as the connector does).
+async fn open(t: &TargetConfig) -> crate::net::Transport {
+    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
+    let ep = crate::node::endpoint(t, crate::node::Which::Target).unwrap();
+    ep.open(tls).await.unwrap()
+}
+
 /// Test-only raw commands as `user`, on one connection; their replies.
 async fn raw_as(t: &TargetConfig, user: &str, password: &str, cmds: &[Vec<&[u8]>]) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
-    let ep = Endpoint::Tcp {
-        host: "127.0.0.1".to_owned(),
-        port: t.port.unwrap(),
-    };
-    let mut io = ep.open(tls).await.unwrap();
+    let mut io = open(t).await;
     let mut req = Vec::new();
     crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
     crate::resp::encode(&[b"HELLO", b"3"], &mut req);
@@ -352,6 +360,56 @@ async fn declared_patterns_are_confirmed_and_opt_in_is_refused_on_dryrun_servers
     } else {
         assert_eq!(h.failure, Some(FailureCode::Unsupported));
     }
+}
+
+/// #237: a declared Discovery node that is down does not make the target
+/// unreachable: the target's node answers, so `check()` reports it
+/// reachable, with the Discovery node's failure as a `check.stage_failed`
+/// note and as the target's failure; the scan fails.
+#[tokio::test]
+async fn a_discovery_node_down_is_a_note_not_an_unreachable_target() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // Nothing listens on port 1.
+    let t = target(
+        "valkey",
+        TargetEngine::Valkey,
+        "databastion",
+        "discovery_node: {host: 127.0.0.1, port: 1}",
+    );
+    let h = RedisConnector::new().check(&t).await;
+    let c = codes(&h);
+    assert!(h.reachable, "{h:?}");
+    assert_eq!(h.failure, Some(FailureCode::TargetUnreachable), "{c:?}");
+    let stage = databastion_core::NoteLabel::stage(crate::error::Stage::Connect.as_str());
+    assert!(
+        h.notes
+            .iter()
+            .any(|n| n.code() == NoteCode::CheckStageFailed && n.labels().contains(&stage)),
+        "{c:?}"
+    );
+    // The target's node was evaluated: its notes are there.
+    assert!(c.contains(&NoteCode::AuditStreamNotAvailable), "{c:?}");
+    assert!(
+        c.contains(&NoteCode::PrivilegeTicketCredentialsReadable),
+        "{c:?}"
+    );
+    // Discovery reads the Discovery node: it cannot run.
+    let s = scan(&t).await;
+    assert!(
+        matches!(
+            s.result,
+            Err(ConnectorError::Target {
+                code: FailureCode::TargetUnreachable,
+                ..
+            })
+        ),
+        "{:?}",
+        s.result
+    );
+    assert!(s.findings.is_empty());
 }
 
 /// The contract findings, as the core would send them.
@@ -708,12 +766,7 @@ async fn raw_held(
     after: std::time::Duration,
 ) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tls = crate::node::tls_of(&t.redis_settings()).unwrap();
-    let ep = Endpoint::Tcp {
-        host: "127.0.0.1".to_owned(),
-        port: t.port.unwrap(),
-    };
-    let mut io = ep.open(tls).await.unwrap();
+    let mut io = open(t).await;
     let mut req = Vec::new();
     crate::resp::encode(&[b"AUTH", user.as_bytes(), password.as_bytes()], &mut req);
     crate::resp::encode(&[b"HELLO", b"3"], &mut req);
@@ -1464,13 +1517,30 @@ async fn socket_clients_are_never_attributed() {
     let socket_client = |user: &str, password: String, commands: &str| {
         let script = format!(
             "C=$(command -v valkey-cli || command -v redis-cli); \
-             (printf 'AUTH {user} {password}\\n'; sleep 3; printf '{commands}') \
-             | $C -s /tmp/databastion-dev.sock >/dev/null 2>&1"
+             S=/tmp/databastion-dev.sock; \
+             [ -z \"${{DATABASTION_DEV_REDIS_SOCKET_DIR:-}}\" ] || \
+             S=\"$DATABASTION_DEV_REDIS_SOCKET_DIR/redis.sock\"; \
+             read -r P; \
+             (printf 'AUTH %s %s\\n' {user} \"$P\"; sleep 3; printf '{commands}') \
+             | $C -s \"$S\" >/dev/null 2>&1"
         );
         let mut parts = exec.split_whitespace();
         let mut cmd = std::process::Command::new(parts.next().unwrap());
-        cmd.args(parts).args(["bash", "-c", &script]);
-        tokio::task::spawn_blocking(move || cmd.status().map(|s| s.success()))
+        cmd.args(parts)
+            .args(["bash", "-c", &script])
+            .stdin(std::process::Stdio::piped());
+        // The password goes through the CLI's standard input only (read
+        // by the shell's `read`, sent by its `printf` builtin), never on a
+        // command line of the host or the container (security review L4).
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = cmd.spawn()?;
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin.write_all(password.as_bytes())?;
+            stdin.write_all(b"\n")?;
+            drop(stdin);
+            child.wait().map(|s| s.success())
+        })
     };
     let a = socket_client(
         "admin",
@@ -1504,6 +1574,339 @@ async fn socket_clients_are_never_attributed() {
         assert_eq!(e["principal"]["account_not_recorded"], true, "{e}");
         assert!(e["principal"].get("db_user").is_none(), "{e}");
         assert_eq!(e["source"], "redis_slowlog", "{e}");
+    }
+}
+
+/// A Unix-socket target of the dev server (`dev/redis/compose.socket.yml`,
+/// published to the host): `tls: disable` and the declared server uid
+/// (ADR-0052 decision 3).
+fn socket_target(engine: &str, path: &str, server_uid: u32, extra: &str) -> TargetConfig {
+    let yaml = format!(
+        "{{console: {{url: \"https://c.example\"}}, state_dir: /s, targets: [{{id: it-socket, \
+         engine: {engine}, socket: \"{path}\", account: databastion, \
+         secret: {{env: DATABASTION_DB_PASSWORD}}, \
+         redis: {{tls: disable, server_uid: {server_uid}{extra}}}}}]}}",
+    );
+    databastion_core::AgentConfig::parse(&yaml).unwrap().targets[0].clone()
+}
+
+/// The newest slow-log id (as `admin`, over TCP: its own entries are never
+/// socket entries).
+async fn newest_slowlog_id(tcp: &TargetConfig) -> i64 {
+    let r = admin(tcp, &[vec![b"SLOWLOG", b"GET", b"1"]]).await;
+    let Value::Array(items) = &r[0] else {
+        panic!("SLOWLOG GET reply")
+    };
+    items
+        .first()
+        .and_then(|e| match e {
+            Value::Array(f) => match f.first() {
+                Some(Value::Int(id)) => Some(*id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(-1)
+}
+
+/// #239 re-review N1 (ADR-0052 decision 8): on a Unix-socket target the
+/// agent's own entries cannot be told apart from other local clients',
+/// since every socket peer has the same address. The documented residual,
+/// and the fail-closed side of it, against the dev servers' published
+/// sockets with the Audit stream on the socket:
+/// - the agent's own Discovery reads over the socket, another local client
+///   (`admin`, connected well before its commands) and a client with the
+///   agent's own user from another socket connection all give events with
+///   `account_not_recorded` and client `local`, never an account;
+/// - nothing is hidden: every socket slow-log entry that gives an event
+///   (an independent read of the slow log, as `admin` over TCP) is
+///   reported, no own-read budget is charged (no entry was taken for the
+///   agent's), and no record is dropped;
+/// - I2: no ground-truth value nor raw key name in the events;
+/// - decision 3: with a server uid that is not the peer's, the password is
+///   never sent (`authentication_failed`, no `ACL LOG` entry).
+///
+/// Needs the sockets on the host (`DATABASTION_IT_REDIS_SOCKET_VALKEY` /
+/// `_REDIS`, set by `dev/agent-it.sh redis` when the override is up);
+/// skipped without them unless `DATABASTION_IT_REDIS_REQUIRE_SOCKET=1` (CI).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_target_reports_the_agents_own_reads_unattributed() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    let required = std::env::var("DATABASTION_IT_REDIS_REQUIRE_SOCKET").as_deref() == Ok("1");
+    let server_uid: u32 = std::env::var("DATABASTION_IT_REDIS_SERVER_UID")
+        .ok()
+        .and_then(|u| u.parse().ok())
+        .unwrap_or(999);
+    for (name, engine, var) in [
+        (
+            "valkey",
+            TargetEngine::Valkey,
+            "DATABASTION_IT_REDIS_SOCKET_VALKEY",
+        ),
+        (
+            "redis",
+            TargetEngine::Redis,
+            "DATABASTION_IT_REDIS_SOCKET_REDIS",
+        ),
+    ] {
+        let Ok(path) = std::env::var(var) else {
+            assert!(!required, "{var} unset: the socket target is not tested");
+            tracing::warn!("{var} unset: the socket target is not tested");
+            continue;
+        };
+        let tcp = tgt(name, engine, "databastion", "").await;
+        let extra = if legacy(engine).await {
+            ", unevaluated_acl: accept"
+        } else {
+            ""
+        };
+        let t = socket_target(name, &path, server_uid, extra);
+        let connector = Arc::new(RedisConnector::new());
+
+        // Decision 3: a peer that is not the declared server user never
+        // gets the password. A failed `AUTH` would leave an `ACL LOG`
+        // entry, but a regression that authenticated before comparing the
+        // peer's uid would succeed and leave none (security review M1): the
+        // server's `AUTH` and `HELLO` call counts must not move either.
+        // Each count is read on a new `admin` connection over TCP, which
+        // runs its own handshake: that cost is measured first (two reads in
+        // a row) and is the only change allowed across the check.
+        let failures = acl_log_count(&tcp, "databastion").await;
+        let calls0 = handshake_calls(&tcp).await;
+        let calls1 = handshake_calls(&tcp).await;
+        let wrong = socket_target(name, &path, server_uid + 1, extra);
+        let h = connector.check(&wrong).await;
+        let calls2 = handshake_calls(&tcp).await;
+        assert!(!h.reachable, "{name}: {h:?}");
+        assert_eq!(
+            h.failure,
+            Some(FailureCode::AuthenticationFailed),
+            "{name}: {h:?}"
+        );
+        let own = (calls1.0 - calls0.0, calls1.1 - calls0.1);
+        assert_eq!(
+            (calls2.0 - calls1.0 - own.0, calls2.1 - calls1.1 - own.1),
+            (0, 0),
+            "{name}: AUTH / HELLO calls during the wrong-uid check \
+             ({calls0:?}, {calls1:?}, {calls2:?})"
+        );
+        assert_eq!(acl_log_count(&tcp, "databastion").await, failures, "{name}");
+        let h = connector.check(&t).await;
+        assert!(h.reachable, "{name}: {h:?}");
+        assert_eq!(h.failure, None, "{name}: {:?}", codes(&h));
+
+        // A slow log that holds the whole run, for the independent count
+        // below (restored at the end).
+        let old_len = match &admin(&tcp, &[vec![b"CONFIG", b"GET", b"slowlog-max-len"]]).await[0] {
+            Value::Map(m) => m[0].1.as_bytes().unwrap().to_vec(),
+            Value::Array(a) => a[1].as_bytes().unwrap().to_vec(),
+            v => panic!("CONFIG GET reply: {v:?}"),
+        };
+        // Restored on a panic too (the guard's drop), not only at the end.
+        let restore = RestoreSlowlogLen {
+            tcp: tcp.clone(),
+            len: old_len,
+        };
+        admin(
+            &tcp,
+            &[vec![b"CONFIG", b"SET", b"slowlog-max-len", b"16384"]],
+        )
+        .await;
+
+        // The patterns the stream maps keys to, learned over the socket.
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-socket-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, mut rx) = databastion_core::EventSink::channel(65536);
+        let c2 = Arc::clone(&connector);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        let _abort = AbortOnDrop(stream.abort_handle());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!stream.is_finished(), "{name}: {:?}", stream.await);
+        // Past the stream's first poll (its start position).
+        let start = newest_slowlog_id(&tcp).await;
+
+        // Another local client, connected well before its reads, and a
+        // client with the agent's own user from another socket connection.
+        let (ta, pw) = (t.clone(), admin_password());
+        let other = tokio::spawn(async move {
+            raw_held(
+                &ta,
+                "admin",
+                &pw,
+                std::time::Duration::from_secs(3),
+                &[
+                    vec![b"HGETALL", b"session:jdupont"],
+                    vec![b"GET", b"customer:1000:email"],
+                    vec![b"GETRANGE", b"customer:1000:email", b"0", b"4095"],
+                ],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        let (tb, pw) = (t.clone(), t.secret.read().unwrap().to_string());
+        let own_user = tokio::spawn(async move {
+            raw_held(
+                &tb,
+                "databastion",
+                &pw,
+                std::time::Duration::from_secs(2),
+                &[vec![b"GETRANGE", b"customer:1000:email", b"0", b"4095"]],
+                std::time::Duration::from_secs(2),
+            )
+            .await
+        });
+        // The agent's own Discovery over the socket while the stream polls
+        // (paced, so it lasts several polls and no poll finds more new
+        // entries than one log read returns: a ring read past is counted in
+        // `audit.records_dropped`, asserted absent below).
+        let paced = Limits {
+            discovery_duty_cycle_percent: 5,
+            ..Limits::default()
+        };
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &paced, key());
+        let (fs, mut frx) = FindingSink::channel(4096);
+        let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+        connector.discover(&job, &fs).await.unwrap();
+        drop(fs);
+        drain.await.unwrap();
+        assert_eq!(other.await.unwrap().len(), 3, "{name}");
+        assert_eq!(own_user.await.unwrap().len(), 1, "{name}");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let end = newest_slowlog_id(&tcp).await;
+        // Polls past `end`.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let h = connector.check(&t).await;
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        // The independent count: socket entries in (start, end] that give
+        // an event, from the slow log as the server holds it.
+        let log = admin(&tcp, &[vec![b"SLOWLOG", b"GET", b"16384"]]).await;
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Value::Array(entries) = &log[0] else {
+            panic!("SLOWLOG GET reply")
+        };
+        let learned = databastion_classifiers::keys::LearnedPatterns::default();
+        let ctx = crate::audit::entries::Context {
+            learned: &learned,
+            stores: None,
+            dbs: &[],
+        };
+        let parsed: Vec<_> = entries
+            .iter()
+            .map(|v| crate::audit::entries::parse_log_entry(v, &ctx).unwrap())
+            .filter(|e| e.id > start && e.id <= end)
+            .collect();
+        // The ring held the whole window (not vacuous).
+        assert!(
+            parsed.iter().any(|e| e.id == start + 1),
+            "{name}: the slow log lost the window's first entries"
+        );
+        let socket_entries = parsed
+            .iter()
+            .filter(|e| {
+                e.peer.is_some_and(|p| p.socket().is_none()) && e.action.event_action().is_some()
+            })
+            .count();
+
+        let json = events_json(&events);
+        let text = serde_json::to_string(&json).unwrap();
+        // I2: no ground-truth value, no raw key name.
+        for v in ground_truth_values(name) {
+            assert!(
+                !text.contains(&v),
+                "{name}: a ground-truth value in an event"
+            );
+        }
+        for raw in ["jdupont", "customer:1000"] {
+            assert!(!text.contains(raw), "{name}: {raw} in an event");
+        }
+        // Every socket entry: no recorded account, client `local`.
+        let local: Vec<&serde_json::Value> = json
+            .iter()
+            .filter(|e| e["principal"]["client_addr"] == "local")
+            .collect();
+        for e in &local {
+            assert_eq!(e["principal"]["account_not_recorded"], true, "{name}: {e}");
+            assert!(e["principal"].get("db_user").is_none(), "{name}: {e}");
+            assert!(
+                e["principal"].get("db_user_fingerprint").is_none(),
+                "{name}: {e}"
+            );
+        }
+        // Nothing hidden: at least every socket entry of the window (the
+        // stream also reports the entries just outside it).
+        let local_slow = local
+            .iter()
+            .filter(|e| e["source"] == "redis_slowlog")
+            .count();
+        assert!(
+            local_slow >= socket_entries,
+            "{name}: {local_slow} socket events for {socket_entries} socket entries in \
+             ({start}, {end}]"
+        );
+        // The agent's own reads (its client name) are among them: the
+        // documented residual (N1), not left out.
+        let own = local
+            .iter()
+            .filter(|e| e["principal"]["application"] == crate::cmd::CLIENT_NAME)
+            .count();
+        assert!(own >= 20, "{name}: {own} own socket reads reported");
+        // The other socket clients (no client name): `admin`'s 3 reads and
+        // the agent's user from another connection.
+        let unnamed = local
+            .iter()
+            .filter(|e| {
+                e["principal"].get("application").is_none()
+                    && e["action"] == "read"
+                    && e["source"] == "redis_slowlog"
+            })
+            .count();
+        assert!(unnamed >= 4, "{name}: {json:#?}");
+        // No entry was taken for the agent's: no own-read budget charged.
+        let budgets = connector
+            .state
+            .audit
+            .own_usage(&t.id)
+            .lock()
+            .unwrap()
+            .budgeted_objects();
+        assert!(budgets.is_empty(), "{name}: {budgets:?}");
+        // Nothing dropped, and Limited (every socket entry is another
+        // client's to the stream).
+        assert!(
+            !codes(&h).contains(&NoteCode::AuditRecordsDropped),
+            "{name}: {:?}",
+            codes(&h)
+        );
+        assert_eq!(
+            h.audit_level,
+            databastion_core::AuditLevel::Limited,
+            "{name}: {:?}",
+            codes(&h)
+        );
     }
 }
 
@@ -1640,11 +2043,544 @@ async fn own_scan_reads_across_databases_stay_within_the_pattern_budgets() {
     }
 }
 
+/// #275 review L6: with merged `*:*` families (`phone:<n>` first, then
+/// `addressbook:<n>`, so the late family is sampled only through the
+/// round-robin), the scan's own reads under Audit are never reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_reads_of_merged_families_are_not_reported() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    // Few sample keys per pattern, so the round-robin decides which keys
+    // are read.
+    const MAX_ROWS: u32 = 4;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "databases: [7]").await;
+        let mut seed: Vec<Vec<Vec<u8>>> = vec![vec![b"SELECT".to_vec(), b"7".to_vec()]];
+        seed.push(vec![b"FLUSHDB".to_vec()]);
+        for i in 1..=40 {
+            seed.push(vec![
+                b"SET".to_vec(),
+                format!("phone:{i}").into_bytes(),
+                b"v".to_vec(),
+            ]);
+        }
+        for i in 1..=3 {
+            seed.push(vec![
+                b"SET".to_vec(),
+                format!("addressbook:{i}").into_bytes(),
+                b"v".to_vec(),
+            ]);
+        }
+        let cmds: Vec<Vec<&[u8]>> = seed
+            .iter()
+            .map(|c| c.iter().map(Vec::as_slice).collect())
+            .collect();
+        admin(&t, &cmds).await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-merged-{}-{name}",
+            std::process::id()
+        ));
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            let limits = Limits {
+                max_sample_rows: MAX_ROWS,
+                ..unpaced()
+            };
+            // The patterns the stream maps keys to.
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &limits, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+
+            std::fs::create_dir_all(&dir).unwrap();
+            let audit_limits = Limits {
+                min_audit_poll_interval_s: 1,
+                max_sample_rows: MAX_ROWS,
+                ..Limits::default()
+            };
+            let cfg = databastion_core::AuditConfig::local(&t, 1, &audit_limits)
+                .with_state_dir(dir.clone());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{:?}", stream.await);
+            // The agent's own scan while the stream polls.
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &limits, key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            drain.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            (connector, events)
+        })
+        .await;
+        admin(&t, &[vec![b"SELECT", b"7"], vec![b"FLUSHDB"]]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let (connector, events) = match run {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
+        let json = events_json(&events);
+        assert!(json.is_empty(), "{name}: {json:#?}");
+        // Not vacuous: the scan's reads were charged to the merged pattern.
+        let budgets = connector
+            .state
+            .audit
+            .own_usage(&t.id)
+            .lock()
+            .unwrap()
+            .budgeted_objects();
+        assert!(
+            budgets.iter().any(|k| k == "db7\u{0}\u{0}*:*"),
+            "{name}: {budgets:?}"
+        );
+    }
+}
+
+/// The server's `AUTH` and `HELLO` call counts (`INFO commandstats`, as
+/// `admin` over TCP; 0 for a command never called), read on a connection
+/// of their own, whose handshake they include.
+async fn handshake_calls(tcp: &TargetConfig) -> (i64, i64) {
+    let r = admin(tcp, &[vec![b"INFO", b"commandstats"]]).await;
+    let text = r[0]
+        .as_bytes()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .expect("INFO commandstats reply");
+    let calls = |cmd: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("cmdstat_{cmd}:calls=")))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |n| n.trim().parse().expect("cmdstat calls"))
+    };
+    (calls("auth"), calls("hello"))
+}
+
+/// Restores the server's `slowlog-max-len` when dropped, a panic included
+/// (security review, informational): a test that fails leaves the dev
+/// server's slow log as it found it. Drop cannot await, so the restore
+/// runs on a runtime of its own in another thread.
+struct RestoreSlowlogLen {
+    tcp: TargetConfig,
+    len: Vec<u8>,
+}
+
+impl Drop for RestoreSlowlogLen {
+    fn drop(&mut self) {
+        let (tcp, len) = (self.tcp.clone(), std::mem::take(&mut self.len));
+        let restored = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| {
+                    rt.block_on(admin(
+                        &tcp,
+                        &[vec![b"CONFIG", b"SET", b"slowlog-max-len", &len]],
+                    ))
+                })
+                .is_ok()
+        })
+        .join();
+        if !matches!(restored, Ok(true)) && !std::thread::panicking() {
+            panic!("slowlog-max-len not restored");
+        }
+    }
+}
+
+/// Keys of the load run's shape (`load:s:<n>` strings, every tenth
+/// `load:h:<n>` a hash; e2e/load/seed.py), written by `admin` into `db`
+/// (the commands; `del` gives their deletion instead).
+fn load_keys(db: &'static [u8], del: bool) -> Vec<Vec<Vec<u8>>> {
+    let mut cmds: Vec<Vec<Vec<u8>>> = vec![vec![b"SELECT".to_vec(), db.to_vec()]];
+    for n in 1..=LOAD_KEYS {
+        let key = if n % 10 == 0 {
+            format!("load:h:{n}")
+        } else {
+            format!("load:s:{n}")
+        };
+        cmds.push(match (del, n % 10 == 0) {
+            (true, _) => vec![b"DEL".to_vec(), key.into_bytes()],
+            (false, true) => vec![
+                b"HSET".to_vec(),
+                key.into_bytes(),
+                b"status".to_vec(),
+                b"active".to_vec(),
+            ],
+            (false, false) => vec![b"SET".to_vec(), key.into_bytes(), b"v".to_vec()],
+        });
+    }
+    cmds
+}
+
+/// Keys of the load shape per database.
+const LOAD_KEYS: u32 = 300;
+
+async fn admin_owned(t: &TargetConfig, cmds: &[Vec<Vec<u8>>]) {
+    let borrowed: Vec<Vec<&[u8]>> = cmds
+        .iter()
+        .map(|c| c.iter().map(Vec::as_slice).collect())
+        .collect();
+    admin(t, &borrowed).await;
+}
+
+/// The objects (object, database) of `admin`'s slow-log `GET`s.
+fn admin_get_objects(json: &[serde_json::Value]) -> Vec<(String, String)> {
+    json.iter()
+        .filter(|e| {
+            e["principal"]["db_user"] == "admin"
+                && e["action"] == "read"
+                && e["source"] == "redis_slowlog"
+        })
+        .flat_map(|e| e["objects"].as_array().cloned().unwrap_or_default())
+        .map(|o| {
+            (
+                o["object"].as_str().unwrap_or_default().to_owned(),
+                o["database"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// One Discovery scan, then an Audit stream during which `admin` reads
+/// `load:s:7` (database 0) from a connection older than the read; the
+/// learned patterns of `db0` and the events' JSON.
+async fn scan_then_load_get(
+    t: &TargetConfig,
+    dir: &std::path::Path,
+) -> (Vec<String>, Vec<serde_json::Value>) {
+    let connector = Arc::new(RedisConnector::new());
+    let job = ScanJob::new(ScanParams::contract_defaults(), t, &unpaced(), key());
+    let (fs, mut frx) = FindingSink::channel(4096);
+    let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+    connector.discover(&job, &fs).await.unwrap();
+    drop(fs);
+    drain.await.unwrap();
+    let db0: Vec<String> = connector
+        .state
+        .audit
+        .learned(&t.id)
+        .dbs
+        .get(&0)
+        .map(|s| s.patterns().to_vec())
+        .unwrap_or_default();
+
+    std::fs::create_dir_all(dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&connector);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    let _stop = AbortOnDrop(stream.abort_handle());
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    let pw = admin_password();
+    raw_held(
+        t,
+        "admin",
+        &pw,
+        std::time::Duration::from_secs(3),
+        &[vec![b"GET", b"load:s:7"]],
+        std::time::Duration::from_secs(4),
+    )
+    .await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    (db0, events_json(&events))
+}
+
+/// ROADMAP phase 9 follow-up "why the Valkey load keys are not attributed
+/// to learned patterns" (load run 39679876881): the load keys
+/// (`load:s:<n>`, database 0) are learned in `db0` (`load:*:*` here), but a
+/// slow-log entry carries no database, and with keys in `db0` and `db1`
+/// (the dev and load keyspace) only patterns learned in **every**
+/// database with keys apply (ADR-0052 decision 8): the `GET` is a read of
+/// `*` in `*`. Once `db1` holds keys of the same shape too, the pattern is
+/// learned in both and the same `GET` is a read of that pattern in `*`.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_keys_are_attributed_only_when_learned_in_every_database() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-load-attr-{}-{name}",
+            std::process::id()
+        ));
+        admin_owned(&t, &load_keys(b"0", false)).await;
+        // The scans and streams in a task of their own, so the keys are
+        // removed even when an assertion fails.
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            // Load keys in db0 only: learned there, not usable.
+            let (db0, json) = scan_then_load_get(&t, &dir).await;
+            // `load:*:*` on the dev keyspace (the `s` / `h` segment has
+            // too few keys per value to stay literal next to the others).
+            let learned =
+                databastion_classifiers::keys::LearnedPatterns::new(db0.iter().map(String::as_str));
+            let pattern = learned
+                .pattern_of(b"load:s:7")
+                .unwrap_or_else(|| panic!("{name}: load:s:7 matches none of {db0:?}"));
+            assert!(pattern.as_str().starts_with("load:"), "{name}: {db0:?}");
+            let only_db0 = admin_get_objects(&json);
+            assert_eq!(
+                only_db0,
+                vec![("*".to_owned(), "*".to_owned())],
+                "{name}: {json:#?}"
+            );
+            // Load keys in db1 too: `load:s:*` learned in both databases.
+            admin_owned(&t, &load_keys(b"1", false)).await;
+            let (_, json) = scan_then_load_get(&t, &dir).await;
+            let both = admin_get_objects(&json);
+            assert_eq!(
+                both,
+                vec![(pattern.as_str().to_owned(), "*".to_owned())],
+                "{name}: {json:#?}"
+            );
+        })
+        .await;
+        admin_owned(&t, &load_keys(b"0", true)).await;
+        admin_owned(&t, &load_keys(b"1", true)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = run {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+}
+
 /// Aborts a task when dropped (a test that fails leaves no stream polling).
 struct AbortOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// ADR-0056 decision 2 item 5: a key with a fullwidth segment (`ｃｏｌｏｒ`,
+/// U+FF43 …, which NFKC maps to `color`) is marked altered in Discovery
+/// (the finding's `location.altered` names `object`) and in Audit (the
+/// event object read through the fullwidth spelling, and through the plain
+/// spelling mapped to the pattern learned from it, carry `object` in
+/// `altered`); a plain key of another shape is never marked. The contract
+/// JSON is the spooled form (before the send-time strip).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fullwidth_key_segment_is_marked_altered_in_discovery_and_audit() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    const ALTERED: &str = "fwtest/\u{FF43}\u{FF4F}\u{FF4C}\u{FF4F}\u{FF52}|theme";
+    const PLAIN_SPELLING: &[u8] = b"fwtest/color|theme";
+    const PLAIN: &str = "fwplain.color|theme/main";
+    // A hash whose field name holds a fullwidth `ｅ` and a U+200B
+    // (security review M1): the finding's `field` is `email`, altered.
+    const HASH: &str = "fwhash|profile/main.card";
+    const HASH_FIELD: &str = "\u{FF45}ma\u{200B}il";
+    const MARK: &str = "fwqzxk";
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let value = format!("jane.{MARK}@example.com");
+        // In both databases of the dev keyspace: a slow-log entry names no
+        // database, so only patterns learned in every database with keys
+        // apply (ADR-0052 decision 8).
+        let mut set: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut del: Vec<Vec<Vec<u8>>> = Vec::new();
+        for db in [b"0", b"1"] {
+            set.push(vec![b"SELECT".to_vec(), db.to_vec()]);
+            del.push(vec![b"SELECT".to_vec(), db.to_vec()]);
+            for k in [ALTERED, PLAIN] {
+                set.push(vec![
+                    b"SET".to_vec(),
+                    k.as_bytes().to_vec(),
+                    value.clone().into_bytes(),
+                ]);
+                del.push(vec![b"DEL".to_vec(), k.as_bytes().to_vec()]);
+            }
+            set.push(vec![
+                b"HSET".to_vec(),
+                HASH.as_bytes().to_vec(),
+                HASH_FIELD.as_bytes().to_vec(),
+                value.clone().into_bytes(),
+                b"city".to_vec(),
+                b"Lyon".to_vec(),
+            ]);
+            del.push(vec![b"DEL".to_vec(), HASH.as_bytes().to_vec()]);
+        }
+        admin_owned(&t, &set).await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-altered-{}-{name}",
+            std::process::id()
+        ));
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let collect = tokio::spawn(async move {
+                let mut out = Vec::new();
+                while let Some(f) = frx.recv().await {
+                    out.push(f);
+                }
+                out
+            });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            let findings = collect.await.unwrap();
+            let json = findings_json(&findings, engine);
+            let at = |object: &str| -> Vec<serde_json::Value> {
+                json.iter()
+                    .filter(|f| f["location"]["object"] == object)
+                    .cloned()
+                    .collect()
+            };
+            let altered = at("fwtest/color|theme");
+            assert!(!altered.is_empty(), "{name}: {json:#?}");
+            for f in &altered {
+                assert_eq!(
+                    f["location"]["altered"],
+                    serde_json::json!(["object"]),
+                    "{name}: {f:#}"
+                );
+            }
+            // The hash field: `email`, altered, on every finding there.
+            let email: Vec<serde_json::Value> = at(HASH)
+                .into_iter()
+                .filter(|f| f["location"]["field"] == "email")
+                .collect();
+            assert!(!email.is_empty(), "{name}: {json:#?}");
+            for f in &email {
+                assert_eq!(
+                    f["location"]["altered"],
+                    serde_json::json!(["field"]),
+                    "{name}: {f:#}"
+                );
+            }
+            let plain = at(PLAIN);
+            assert!(!plain.is_empty(), "{name}: {json:#?}");
+            for f in &plain {
+                assert!(f["location"].get("altered").is_none(), "{name}: {f:#}");
+            }
+            // The learned pattern keeps its marker for Audit.
+            let learned = connector.state.audit.learned(&t.id);
+            let db0: Vec<(String, bool)> = learned.dbs[&0]
+                .marked()
+                .map(|(p, a)| (p.to_owned(), a))
+                .collect();
+            assert!(
+                db0.contains(&("fwtest/color|theme".to_owned(), true)),
+                "{name}: {db0:?}"
+            );
+            assert!(db0.contains(&(PLAIN.to_owned(), false)), "{name}: {db0:?}");
+
+            std::fs::create_dir_all(&dir).unwrap();
+            let limits = Limits {
+                min_audit_poll_interval_s: 1,
+                ..Limits::default()
+            };
+            let cfg = databastion_core::AuditConfig::local(&t, 1, &limits)
+                .with_state_dir(dir.to_path_buf());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{:?}", stream.await);
+            let pw = admin_password();
+            raw_held(
+                &t,
+                "admin",
+                &pw,
+                std::time::Duration::from_secs(3),
+                &[
+                    vec![b"GET", ALTERED.as_bytes()],
+                    vec![b"GET", PLAIN_SPELLING],
+                    vec![b"GET", PLAIN.as_bytes()],
+                ],
+                std::time::Duration::from_secs(4),
+            )
+            .await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            let json = events_json(&events);
+            let reads: Vec<(String, Option<serde_json::Value>)> = json
+                .iter()
+                .filter(|e| {
+                    e["principal"]["db_user"] == "admin"
+                        && e["action"] == "read"
+                        && e["source"] == "redis_slowlog"
+                })
+                .flat_map(|e| e["objects"].as_array().cloned().unwrap_or_default())
+                .map(|o| {
+                    (
+                        o["object"].as_str().unwrap_or_default().to_owned(),
+                        o.get("altered").cloned(),
+                    )
+                })
+                .collect();
+            let object = Some(serde_json::json!(["object"]));
+            // The two `fwtest` reads (fullwidth and plain spelling) are one
+            // object, aggregated or not; the plain key apart, unmarked.
+            assert!(
+                reads.contains(&("fwtest/color|theme".to_owned(), object.clone())),
+                "{name}: {json:#?}"
+            );
+            assert!(
+                !reads.contains(&("fwtest/color|theme".to_owned(), None)),
+                "{name}: {json:#?}"
+            );
+            assert!(
+                reads.contains(&(PLAIN.to_owned(), None)),
+                "{name}: {json:#?}"
+            );
+            // No raw spelling and no value reaches the contract JSON (I2).
+            for text in [format!("{json:?}"), format!("{findings:?}")] {
+                assert!(!text.contains('\u{FF43}') && !text.contains(MARK), "{name}");
+            }
+        })
+        .await;
+        admin_owned(&t, &del).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = run {
+            std::panic::resume_unwind(e.into_panic());
+        }
     }
 }

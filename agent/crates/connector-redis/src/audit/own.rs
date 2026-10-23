@@ -30,12 +30,16 @@
 //! ([`note_client_list`]: a refusal of a real call wins for the server
 //! run), and records the address from it ([`seen`]); a closed connection
 //! keeps that address for its whole lifetime (plus [`MARGIN`]) and
-//! [`KEEP`] after.
+//! [`KEEP`] after. A timeout or a transport failure of that request backs
+//! off for a bounded time ([`BACKOFF_BASE`] doubling up to [`BACKOFF_MAX`]
+//! on the server run, #244 re-review L1) rather than stopping it for the
+//! whole run; an error reply other than `NOPERM`, or a reply without a TCP
+//! address, still stops it for the run.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Connections remembered per target.
 const MAX_CONNS: usize = 1024;
@@ -44,6 +48,28 @@ const KEEP: Duration = Duration::from_secs(24 * 3600);
 /// Margin around a connection's lifetime when matching an entry's time
 /// (entry timestamps have a one-second granularity).
 const MARGIN: Duration = Duration::from_secs(2);
+/// First pause of `CLIENT LIST ID` after a timeout or a transport failure.
+pub(crate) const BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Longest pause: the request is tried again at least this often while the
+/// server run lasts.
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// A pause of `CLIENT LIST ID` on one server run.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    run: u64,
+    /// Consecutive transient failures on the run.
+    failures: u32,
+    until: Instant,
+}
+
+/// The pause after `failures` consecutive transient failures (1 or more).
+fn backoff_for(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(BACKOFF_MAX)
+}
 
 /// One of the agent's connections.
 #[derive(Debug, Clone)]
@@ -79,9 +105,13 @@ struct Target {
     /// for this account: wins over `ACL DRYRUN` until another run or
     /// another account (a configuration change).
     refused: Option<(u64, String)>,
-    /// `CLIENT LIST ID` failed otherwise (a renamed or disabled command, a
-    /// timeout) on this server run: not sent again during it.
+    /// `CLIENT LIST ID` was answered with an error other than `NOPERM` (a
+    /// renamed or disabled command) or without a TCP address on this
+    /// server run: not sent again during it.
     unsupported: Option<u64>,
+    /// `CLIENT LIST ID` timed out or its transport failed on this server
+    /// run: not sent again until the pause ends (review L1).
+    backoff: Option<Backoff>,
     /// Audit streams running for the target: sessions learn their address
     /// only while one reads the target's logs (ADR-0052 decision 4:
     /// `+client|list` is an Audit read).
@@ -221,15 +251,29 @@ pub(crate) enum ClientList {
     /// A real call was refused (`NOPERM`): sticky for the server run and
     /// the account, whatever `ACL DRYRUN` says later.
     Refused,
-    /// `CLIENT LIST ID` failed otherwise (an error other than `NOPERM`, a
-    /// timeout, an unreadable reply): not sent again during the run.
+    /// `CLIENT LIST ID` was answered otherwise (an error other than
+    /// `NOPERM`, a reply without a TCP address, an unreadable reply): not
+    /// sent again during the run.
     Unsupported,
+    /// `CLIENT LIST ID` timed out or its transport failed: not sent again
+    /// for a bounded pause on the run, longer at each failure in a row.
+    Failed,
 }
 
 /// Records what the agent learned about `CLIENT LIST` on the node of
 /// `target_id` (the target's node, the one Audit reads), on the server run
 /// `run`, for `account`.
 pub(crate) fn note_client_list(target_id: &str, run: Option<u64>, account: &str, what: ClientList) {
+    note_client_list_at(target_id, run, account, what, Instant::now());
+}
+
+fn note_client_list_at(
+    target_id: &str,
+    run: Option<u64>,
+    account: &str,
+    what: ClientList,
+    now: Instant,
+) {
     let mut map = lock();
     let t = map.entry(target_id.to_owned()).or_default();
     match what {
@@ -246,20 +290,39 @@ pub(crate) fn note_client_list(target_id: &str, run: Option<u64>, account: &str,
                 t.unsupported = Some(r);
             }
         }
+        ClientList::Failed => {
+            if let Some(r) = run {
+                let failures = match t.backoff {
+                    Some(b) if b.run == r => b.failures.saturating_add(1),
+                    _ => 1,
+                };
+                t.backoff = Some(Backoff {
+                    run: r,
+                    failures,
+                    until: now + backoff_for(failures),
+                });
+            }
+        }
     }
 }
 
 /// Whether a session of `account` to `target_id`, on the server run `run`,
 /// asks the server for its own line (`CLIENT LIST ID`): only while an
 /// Audit stream reads the target's logs, with `+client|list` known to be
-/// held, no refusal of a real call nor failure on this run, and a known
-/// run (a registration without one never matches).
+/// held, no refusal of a real call nor lasting failure on this run, no
+/// pause after a transient failure running, and a known run (a
+/// registration without one never matches).
 pub(crate) fn learns_addresses(target_id: &str, run: Option<u64>, account: &str) -> bool {
+    learns_addresses_at(target_id, run, account, Instant::now())
+}
+
+fn learns_addresses_at(target_id: &str, run: Option<u64>, account: &str, now: Instant) -> bool {
     let Some(r) = run else { return false };
     lock().get(target_id).is_some_and(|t| {
         t.streams > 0
             && t.client_list
             && t.unsupported != Some(r)
+            && t.backoff.is_none_or(|b| b.run != r || now >= b.until)
             && t.refused
                 .as_ref()
                 .is_none_or(|(rr, a)| *rr != r || a != account)
@@ -294,7 +357,15 @@ pub(crate) fn record_own_line(
         }
         Some(_) => note_client_list(target_id, run, account, ClientList::Unsupported),
         None => match super::entries::own_address(reply, id) {
-            Some(addr) => seen(target_id, id, run, addr),
+            Some(addr) => {
+                seen(target_id, id, run, addr);
+                // Answered: the next failure starts a new pause series.
+                if let Some(t) = lock().get_mut(target_id)
+                    && t.backoff.is_some_and(|b| Some(b.run) == run)
+                {
+                    t.backoff = None;
+                }
+            }
             // No TCP address in the reply (a Unix socket, whose peers are
             // never attributed, or a reply without the session's line):
             // nothing to learn on this run, not asked again.
@@ -482,5 +553,71 @@ mod tests {
         record_own_line(t, 30, r5, acct, &crate::resp::Value::Null);
         assert!(!is_seen(t, 30, r5));
         assert!(!learns_addresses(t, r5, acct));
+    }
+
+    /// #244 re-review L1: a timeout or a transport failure pauses the
+    /// request for a bounded, growing time on the run, never for the whole
+    /// run; an answer ends the series.
+    #[test]
+    fn transient_failures_back_off_for_a_bounded_time() {
+        let t = "own-backoff-t";
+        let acct = "databastion";
+        let (r1, r2) = (Some(1), Some(2));
+        let _stream = audit_started(t);
+        note_client_list(t, None, acct, ClientList::Granted);
+        let now = Instant::now();
+        assert!(learns_addresses_at(t, r1, acct, now));
+        note_client_list_at(t, r1, acct, ClientList::Failed, now);
+        assert!(!learns_addresses_at(t, r1, acct, now));
+        assert!(!learns_addresses_at(
+            t,
+            r1,
+            acct,
+            now + BACKOFF_BASE - Duration::from_secs(1)
+        ));
+        assert!(learns_addresses_at(t, r1, acct, now + BACKOFF_BASE));
+        // Another run is not paused.
+        assert!(learns_addresses_at(t, r2, acct, now));
+        // In a row: doubled, up to the bound.
+        let later = now + BACKOFF_BASE;
+        note_client_list_at(t, r1, acct, ClientList::Failed, later);
+        assert!(!learns_addresses_at(t, r1, acct, later + BACKOFF_BASE));
+        assert!(learns_addresses_at(t, r1, acct, later + 2 * BACKOFF_BASE));
+        let mut at = later;
+        for _ in 0..40 {
+            note_client_list_at(t, r1, acct, ClientList::Failed, at);
+            at += BACKOFF_MAX;
+        }
+        assert!(learns_addresses_at(t, r1, acct, at));
+        assert_eq!(backoff_for(1), BACKOFF_BASE);
+        assert_eq!(backoff_for(2), 2 * BACKOFF_BASE);
+        assert_eq!(backoff_for(u32::MAX), BACKOFF_MAX);
+        // An answer with the session's address ends the series.
+        let _c = register(t, 5, None, r1, SystemTime::now());
+        let line = "id=5 addr=172.18.0.1:4001 user=databastion\n";
+        let reply = crate::resp::decode_all(
+            format!("${}\r\n{line}\r\n", line.len()).as_bytes(),
+            crate::resp::Limits {
+                bulk: 4096,
+                items: 0,
+                skip_oversized: true,
+                reply: 8192,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        record_own_line(t, 5, r1, acct, &reply);
+        assert!(is_seen(t, 5, r1));
+        note_client_list_at(t, r1, acct, ClientList::Failed, at);
+        assert!(learns_addresses_at(t, r1, acct, at + BACKOFF_BASE));
+        // A lasting failure (an error reply) still stops the run.
+        record_own_line(
+            t,
+            5,
+            r1,
+            acct,
+            &crate::resp::Value::Error(crate::resp::ErrorWord::Err),
+        );
+        assert!(!learns_addresses_at(t, r1, acct, at + BACKOFF_MAX));
     }
 }

@@ -4,7 +4,8 @@
 # and the agent (the e2e images) with the dev Valkey 9.0 and Redis 8.10 services (dev/redis: the
 # committed keyspace, the agent's ACL user with the decision 4 allow-list, `default` off, TLS only,
 # the slow log at every command). Compose: docker-compose.yml merged with docker-compose.redis.yml
-# (project databastion-e2e-redis); the client traffic comes from e2e/redis_scenario.py on the host.
+# (project databastion-e2e-redis); the client traffic comes from e2e/redis_scenario.py in the one-shot
+# redis-client container on the internal agent-net (the targets publish nothing: #254 review L5).
 # For each of valkey-e2e (engine valkey) and redis-e2e (engine redis):
 #   - enrollment; the console lists `engine.redis` and `engine.valkey`: the target is reported,
 #     reachable over verified TLS, as the engine it is (no check.server_is_* note), with the honest
@@ -33,13 +34,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export E2E_HTTPS_PORT="${E2E_HTTPS_PORT:-8443}"
-export E2E_VALKEY_PORT="${E2E_VALKEY_PORT:-16379}"
-export E2E_REDIS_PORT="${E2E_REDIS_PORT:-16389}"
 E2E_LOG_DIR="${E2E_LOG_DIR:-$HERE/.logs-redis}"
 PROJECT="databastion-e2e-redis"
 LOG_TAG="e2e-redis"  # read by lib.sh
 I2_CHECK="$HERE/i2_check.py"
-SCENARIO="$HERE/redis_scenario.py"
 GROUND_TRUTH="$HERE/../dev/ground-truth.json"
 BADCA="valkey-e2e-wrong-ca"   # the negative TLS control (the console test CA as ca_file)
 POLICY_DUMP="e2e redis export"
@@ -47,9 +45,10 @@ POLICY_READS="e2e redis reads"
 DUMP_INCIDENT_LIMIT_S=120
 SCAN_TIMEOUT_S=600
 EVENTS_TIMEOUT_S=240
-# target id, engine (ground truth and agent.yaml), compose service, host port, network alias, CLI
-TARGETS=("valkey-e2e valkey target-valkey ${E2E_VALKEY_PORT} valkey valkey-cli"
-  "redis-e2e redis target-redis ${E2E_REDIS_PORT} redis redis-cli")
+# target id, engine (ground truth and agent.yaml), compose service, TLS port on agent-net, network
+# alias, CLI
+TARGETS=("valkey-e2e valkey target-valkey 6379 valkey valkey-cli"
+  "redis-e2e redis target-redis 6379 redis redis-cli")
 
 # The images are the dev services' (dev/docker-compose.yml): the same pins.
 for name in VALKEY REDIS; do
@@ -80,7 +79,10 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs "${SERVICES[@]}"
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  print_census e2e-redis
   redact_dir "$E2E_LOG_DIR" "$P"
+  # The census Markdown, redacted above, into the job summary (never written there before).
+  summary_append "$E2E_LOG_DIR"/census/*.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$E2E_WORK_DIR"
@@ -169,12 +171,15 @@ admin_cli() {
     'REDISCLI_AUTH="$(cat /run/secrets/target_redis_admin_password)" exec "$0" -s /tmp/databastion-dev.sock --user admin --no-auth-warning "$@"' \
     "$cli" "$@"
 }
-# client SUBCOMMAND PORT USER ARGS...: e2e/redis_scenario.py from the host (the published TLS port).
+# client SUBCOMMAND HOST PORT USER ARGS...: e2e/redis_scenario.py in the one-shot redis-client
+# container on agent-net (HOST: the target's network alias, the name in its certificate); stdin
+# passed through (the key lists), the JSON counts on stdout.
 client() {
-  local sub="$1" port="$2" user="$3"
-  shift 3
-  timeout 300 python3 "$SCENARIO" "$sub" --port "$port" --ca "$T/redis-ca.pem" --user "$user" \
-    --password-file "$S/target_client_password" "$@"
+  local sub="$1" host="$2" port="$3" user="$4"
+  shift 4
+  timeout 300 docker compose "${COMPOSE_ARGS[@]}" --profile tools run --rm -T --no-deps redis-client \
+    "$sub" --host "$host" --port "$port" --ca /etc/e2e/redis-ca.pem --user "$user" \
+    --password-file /run/secrets/target_client_password "$@"
 }
 
 # --------------------------------------------------------------------------- build + start
@@ -188,6 +193,8 @@ else
   log "building images (web, agent)"
   timeout 1800 docker compose "${COMPOSE_ARGS[@]}" build web agent
 fi
+# The scenario client's pinned Python image, pulled before the timed traffic.
+timeout 600 docker compose "${COMPOSE_ARGS[@]}" --profile tools pull --quiet redis-client
 phase_done build
 
 log "starting the console, Valkey and Redis"
@@ -373,16 +380,16 @@ PY
 done
 T0_MS="$(date +%s%3N)"
 for spec in "${TARGETS[@]}"; do
-  read -r id engine svc port _ <<<"$spec"
+  read -r id engine svc port alias _ <<<"$spec"
   log "Audit ($id): sweep as e2e_exporter (KEYS * on db0 and db1, every key read), held open past a poll"
-  out="$(client sweep "$port" e2e_exporter --db 0 --db 1 --linger 15)" || fail "the sweep of $id failed (see above)"
+  out="$(client sweep "$alias" "$port" e2e_exporter --db 0 --db 1 --linger 15)" || fail "the sweep of $id failed (see above)"
   log "Audit ($id): sweep $out"
   log "Audit ($id): reads of value-bearing key names as e2e_analyst (${ENGINE_IDS[$engine]})"
-  out="$(client queries "$port" e2e_analyst --keys-file "$E2E_WORK_DIR/analyst.keys" --linger 15)" \
+  out="$(client queries "$alias" "$port" e2e_analyst --keys-file /dev/stdin --linger 15 <"$E2E_WORK_DIR/analyst.keys")" \
     || fail "the analyst's reads on $id failed (see above)"
   log "Audit ($id): queries $out"
   sync_before="$(admin_cli "$svc" "$(awk '{print $6}' <<<"$spec")" INFO stats | tr -d '\r' | sed -n 's/^sync_full://p')"
-  out="$(client sync "$port" e2e_exporter --settle 0)" || fail "the full synchronization of $id failed (see above)"
+  out="$(client sync "$alias" "$port" e2e_exporter --settle 0)" || fail "the full synchronization of $id failed (see above)"
   sync_after="$(admin_cli "$svc" "$(awk '{print $6}' <<<"$spec")" INFO stats | tr -d '\r' | sed -n 's/^sync_full://p')"
   log "Audit ($id): SYNC $out; INFO sync_full ${sync_before} -> ${sync_after}"
   [ "$sync_after" -gt "$sync_before" ] || fail "$id: SYNC did not increase sync_full"

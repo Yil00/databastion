@@ -63,6 +63,34 @@ SPOOL_TIMEOUT_S=90
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
 log() { printf '[e2e-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
+# (counts only) per engine from the collected agent log, the console's per-principal counts and its
+# events naming `*` by kind (console_sql, once defined; nothing when the console database is down),
+# to the log and $E2E_LOG_DIR/census/census-LABEL.json / .md (added to the job summary by
+# summary_append once redacted). Never fails.
+print_census() {
+  local line lib="$HERE/load/loadlib.py" con="$E2E_WORK_DIR/census-console.json" star="$E2E_WORK_DIR/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$lib" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$lib" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$lib" census --log "$E2E_LOG_DIR/agent.log" --label "$1" --console "$con" --star "$star" \
+    --out-dir "$E2E_LOG_DIR/census" 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
+}
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
+}
 fail() { log "FAIL: $*"; exit 1; }
 
 T_RUN="$(date +%s)"
@@ -195,12 +223,15 @@ cleanup() {
   log "collecting logs into $E2E_LOG_DIR"
   dump_logs
   compose ps -a >"$E2E_LOG_DIR/ps.txt" 2>&1
+  print_census e2e-cas
   redact_dir "$E2E_LOG_DIR" "$P"
   redact_dir "$E2E_LOG_DIR" "$TP"
   redact_dir "$E2E_LOG_DIR" "$NP"
   # CAS prints the ticket, cookie and webflow keys it generates at each start (no key is configured:
   # dev only); they die with the container, but are not kept in the logs either.
   redact_cas_keys "$E2E_LOG_DIR"
+  # The census Markdown, redacted above, into the job summary (never written there before).
+  summary_append "$E2E_LOG_DIR"/census/*.md
   log "tearing down"
   timeout 120 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$E2E_WORK_DIR"

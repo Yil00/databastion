@@ -28,9 +28,10 @@
 //! 5. a record parsed in the last 24 h (`audit.partial_pending_first_record`).
 //!
 //! Failed logins are seen only when the session has `error_reported`
-//! (error 18456); without it, a local detail says so (the
-//! `audit.failed_logins_not_audited` text names SQL Server Audit's group:
-//! not sent for this source).
+//! (error 18456); without it, `check()` notes
+//! `audit.failed_logins_not_audited` (its registry text names both
+//! sources since the phase 9 follow-ups) and a local detail says so. Not
+//! required for Partial, as on the SQL Server Audit source.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -114,11 +115,35 @@ pub(crate) struct Probe {
     pub(crate) filtered: bool,
     /// `error_reported` is in the session (failed logins).
     pub(crate) failed_logins: bool,
+    /// That `error_reported` has a predicate. The agent never reads a
+    /// predicate (it can hold literals), so a filtered `error_reported` is
+    /// proven to admit failed logins only by one read in the last 24 h
+    /// (`StreamFacts::failed_login_seen`).
+    pub(crate) failed_logins_filtered: bool,
     /// A catalog read failed or was cut.
     pub(crate) incomplete: bool,
 }
 
+/// What the agent sees of a session's events ([`Probe::event_facts`]):
+/// `error_reported` present, with a predicate; a predicate on a required
+/// event; required events, actions or statement collection missing; a
+/// catalog read that failed or was cut.
+pub(crate) type EventFacts = (bool, bool, bool, u64, bool);
+
 impl Probe {
+    /// The session's event facts: two probes that differ mean its events
+    /// changed (#280 re-review L-b; the predicates themselves are never
+    /// read).
+    pub(crate) fn event_facts(&self) -> EventFacts {
+        (
+            self.failed_logins,
+            self.failed_logins_filtered,
+            self.filtered,
+            self.missing,
+            self.incomplete,
+        )
+    }
+
     /// The quoted file pattern of the poll (`sql::xe_pattern`).
     pub(crate) fn pattern(&self) -> Option<String> {
         sql::xe_pattern(&self.current_file)
@@ -191,6 +216,7 @@ pub(crate) async fn probe(s: &mut Session, name: &str, stage: Stage) -> Result<P
                 let no_statement = r.get(3).and_then(Value::as_int).unwrap_or(0) > 0;
                 if name == "error_reported" {
                     p.failed_logins = true;
+                    p.failed_logins_filtered = !no_predicate;
                 }
                 if !REQUIRED_EVENTS.contains(&name) {
                     continue;
@@ -272,6 +298,12 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         );
     }
     out.source = true;
+    // Decision 6 measurement obligation (M2): what this source cannot see.
+    out.details.push(crate::audit::probe::XE_INVISIBLE_DETAIL);
+    if !crate::audit::probe::invisible_measured(i.major) {
+        out.details
+            .push(crate::audit::probe::INVISIBLE_NOT_MEASURED);
+    }
     let mut proofs = !p.incomplete;
     if p.missing > 0 {
         proofs = false;
@@ -287,10 +319,23 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
         out.notes
             .push(TargetNote::new(NoteCode::AuditXeCausalityOff));
     }
+    // Security review of #280, L2: a predicate on `error_reported` may
+    // keep 18456 out; without reading it, only a failed login read in the
+    // last 24 h proves it admits them.
     if !p.failed_logins {
+        out.notes
+            .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
         out.details.push(
             "Extended Events: the session has no error_reported event (error 18456): failed \
              logins are not seen",
+        );
+    } else if p.failed_logins_filtered && !i.stream.failed_login_seen {
+        out.notes
+            .push(TargetNote::new(NoteCode::AuditFailedLoginsNotAudited));
+        out.details.push(
+            "Extended Events: error_reported has a predicate, which the agent does not read, \
+             and no 18456 was recorded in the last 24 h: failed logins are not proven to be \
+             recorded",
         );
     }
     out.details.push(match p.retention_mode() {
@@ -357,6 +402,7 @@ mod tests {
             missing: 0,
             filtered: false,
             failed_logins: true,
+            failed_logins_filtered: false,
             incomplete: false,
         }
     }
@@ -383,6 +429,7 @@ mod tests {
         fresh: true,
         gap: false,
         dropped: 0,
+        failed_login_seen: false,
     };
 
     #[test]
@@ -391,6 +438,32 @@ mod tests {
         let l = at(&p, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
+        // Review of #276, L1: 2019, 2022 and 2025 are measured (2019 and
+        // 2025 by engine-matrix run 39139682239); a later major is not.
+        assert!(
+            !l.details
+                .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+        );
+        for major in [16, 17] {
+            assert!(
+                !at(&p, major, &[GRANT_2022], LIVE)
+                    .details
+                    .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+            );
+        }
+        assert!(
+            at(&p, 18, &[GRANT_2022], LIVE)
+                .details
+                .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+        );
+        // Decision 6 measurement obligation (M2): the reads this source
+        // cannot see are named in the local detail.
+        assert!(
+            l.details
+                .contains(&crate::audit::probe::XE_INVISIBLE_DETAIL),
+            "{:?}",
+            l.details
+        );
         assert!(!codes(&l).contains(&"audit.log_without_row_counts"));
         // 2022 needs VIEW SERVER PERFORMANCE STATE.
         assert_eq!(at(&p, 16, &[GRANT_2019], LIVE).level, AuditLevel::None);
@@ -465,6 +538,39 @@ mod tests {
         let l = at(&q, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial);
         assert!(codes(&l).contains(&"audit.xe_causality_off"));
+        // No error_reported (phase 9 follow-ups): the source-neutral note,
+        // no effect on the level, as on SQL Server Audit.
+        assert!(
+            !codes(&at(&p, 15, &[GRANT_2019], LIVE)).contains(&"audit.failed_logins_not_audited")
+        );
+        let mut q = full_probe();
+        q.failed_logins = false;
+        let l = at(&q, 15, &[GRANT_2019], LIVE);
+        assert_eq!(l.level, AuditLevel::Partial);
+        assert!(codes(&l).contains(&"audit.failed_logins_not_audited"));
+        // Security review of #280, L2: `error_reported` with a predicate
+        // (never read) is proven only by a failed login read in 24 h.
+        let mut q = full_probe();
+        q.failed_logins_filtered = true;
+        let l = at(&q, 15, &[GRANT_2019], LIVE);
+        assert_eq!(l.level, AuditLevel::Partial);
+        assert!(codes(&l).contains(&"audit.failed_logins_not_audited"));
+        assert!(
+            l.details
+                .iter()
+                .any(|d| d.contains("error_reported has a predicate"))
+        );
+        let seen = StreamFacts {
+            failed_login_seen: true,
+            ..LIVE
+        };
+        let l = at(&q, 15, &[GRANT_2019], seen);
+        assert!(!codes(&l).contains(&"audit.failed_logins_not_audited"));
+        // Without a predicate, the event alone is the proof.
+        assert!(
+            !codes(&at(&full_probe(), 15, &[GRANT_2019], LIVE))
+                .contains(&"audit.failed_logins_not_audited")
+        );
     }
 
     #[test]

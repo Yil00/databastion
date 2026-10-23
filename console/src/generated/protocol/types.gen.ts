@@ -424,12 +424,15 @@ export interface components {
          */
         KeyPattern: string;
         /**
-         * @description Name of an object (`Location.object`, `ObjectRef.object`): an `Identifier`, or, for the
-         *     `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
+         * @description Name of an object (`Location.object`, `ObjectRef.object`, `SensitiveObject.object`): an
+         *     `Identifier`, or, for the `redis` and `valkey` engines only, a `KeyPattern`. `Location` selects the schema from its
          *     `engine` (`if` / `then` / `else`), and `AccessEvent` from its `source` (the `redis_*` audit
          *     sources serve only Redis and Valkey). `ObjectRef` itself names no engine: the console also
          *     checks each event's objects against the schema of the **target's** engine (a `KeyPattern`
          *     that is not an `Identifier`, such as `user:*:email`, is rejected on any other engine).
+         *     `SensitiveObject` names no engine either: the console checks it against the target's
+         *     engine before it queues the job, and the agent against its declared target's engine
+         *     (see `SensitiveObject` for the negotiation).
          *
          *     Written as "exactly one of `Identifier`, or `KeyPattern` but not `Identifier`", which
          *     accepts exactly the union of the two (a name valid under both, such as `orders` or `*`,
@@ -540,11 +543,13 @@ export interface components {
          * @description Closed set of failure causes. Driver or engine messages are never sent (they can contain values
          *     or query text); `engine_code` may carry the engine's numeric / SQLSTATE code. There is no
          *     TLS-specific code. The reliable sign of a TLS problem is the `stage_tls` label of the
-         *     target's `check.stage_failed` note; the code depends on the cause and the engine: usually
-         *     `target_unreachable` (a failed handshake or certificate verification) or `timeout`;
-         *     `internal` for a TLS setup error on some engines and for an OpenLDAP StartTLS anomaly;
-         *     `unsupported` for a SQL Server server that refuses encryption or sends a malformed
-         *     PRELOGIN.
+         *     target's `check.stage_failed` note. A failure at the TLS stage has the same code on every
+         *     engine: `timeout` (or `cancelled`) when the handshake was cut, otherwise
+         *     `target_unreachable` (a failed handshake or certificate verification, a server that refuses
+         *     or does not offer TLS, an anomaly around the negotiation such as bytes after an OpenLDAP
+         *     StartTLS response or a malformed SQL Server PRELOGIN, a local TLS setup error). Agents up
+         *     to 0.8.0 sent `internal` for some of these and `unsupported` for a SQL Server server that
+         *     refuses encryption or sends a malformed PRELOGIN.
          * @enum {string}
          */
         FailureCode: "target_unreachable" | "authentication_failed" | "permission_denied" | "timeout" | "cancelled" | "expired" | "unknown_target" | "unsupported" | "invalid_params" | "resource_limit" | "internal";
@@ -693,9 +698,11 @@ export interface components {
             /**
              * @description Optional **response and job** fields and features this agent build accepts
              *     (ADR-0022). Agents reject unknown fields in every console -> agent body, so the
-             *     console sends a console -> agent field introduced after protocol 0.1.0 (in a response
-             *     or in a job) only when the agent's latest heartbeat listed it. None exists yet: the
-             *     agent omits the list. Unknown tokens are ignored by the console.
+             *     console sends a console -> agent field or value form introduced after protocol 0.1.0
+             *     (in a response or in a job) only when the agent's latest heartbeat listed it. Tokens:
+             *     `sensitive_object.key_pattern` (a `KeyPattern` as `SensitiveObject.object` in
+             *     `audit.configure` jobs for Redis / Valkey targets). An agent built before it omits the
+             *     list. Unknown tokens are ignored by the console.
              */
             accepts?: components["schemas"]["CapabilityList"];
         };
@@ -723,7 +730,63 @@ export interface components {
              *     Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
              */
             notes?: components["schemas"]["TargetNote"][];
+            /**
+             * @description How the target compares names that differ only by case, from the last `check()`
+             *     (ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this
+             *     schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+             *     `target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055
+             *     sends it in every `TargetStatus` of those engines, also when `check()` fails or
+             *     times out (then the last value read on the same server run, else `unknown` for both
+             *     parts). Absent, the console keeps comparing these engines' names without case.
+             */
+            name_case?: components["schemas"]["TargetNameCase"];
             metrics?: components["schemas"]["MetricsMap"];
+        };
+        /**
+         * @description How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
+         *     `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
+         *     as `sensitive`, the stricter rule). A closed value: never a collation name, a setting value
+         *     or free text.
+         * @enum {string}
+         */
+        NameCase: "sensitive" | "insensitive" | "unknown";
+        /**
+         * @description Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the
+         *     server's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL
+         *     Server). Three closed values and normalized database names only (invariant I2).
+         */
+        TargetNameCase: {
+            /** @description How database names compare. */
+            databases: components["schemas"]["NameCase"];
+            /** @description How schema, object and column names compare in every database not listed in `except`. */
+            objects: components["schemas"]["NameCase"];
+            /**
+             * @description Databases whose schema, object and column names compare otherwise than `objects`
+             *     (SQL Server catalog collations; MySQL / MariaDB send none, their setting is
+             *     server-wide). Database names are `Identifier`s, normalized and sanitized like every
+             *     location (ADR-0009): two databases whose names reach the console as one name (`*`,
+             *     stripped characters) are one entry with the stricter value (`sensitive`, then
+             *     `unknown`, then `insensitive`). It may name databases the agent never sends in a
+             *     finding or an event (outside the scan's scope, snapshots, databases its login cannot
+             *     enter; ADR-0055 decision 9).
+             *
+             *     One entry per `database` name, and entries sorted by `database` in the byte order of
+             *     its UTF-8 form (after normalization): a conforming agent merges the entries of one
+             *     name into one, with the stricter value. Not checked by this schema (`uniqueItems`
+             *     compares whole entries, not names); the console reads several entries of one name as
+             *     the stricter of their values (ADR-0055 decision 6).
+             *
+             *     At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
+             *     JSON: an agent-side bound, which the console does not check (its request size limit
+             *     applies). A conforming agent that would pass either bound, or that cannot list every
+             *     database, sends `objects: unknown` without `except`.
+             */
+            except?: components["schemas"]["TargetNameCaseException"][];
+        };
+        /** @description One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`. */
+        TargetNameCaseException: {
+            database: components["schemas"]["Identifier"];
+            objects: components["schemas"]["NameCase"];
         };
         /**
          * @description One explanation of a target's status: a registered `code`, an optional `count` and
@@ -783,11 +846,18 @@ export interface components {
          *       cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the
          *       minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,
          *       so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's
-         *       column read cut or failed). Each revision is negotiated on its own: a value is sent
-         *       only when the token of its own revision is listed.
+         *       column read cut or failed).
+         *     - `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9
+         *       follow-ups): the SQL Server label below `cas_store_guard_probe`, `on_failure_probe`
+         *       for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
+         *       whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
+         *       read, so records lost to a failing audit target are not counted.
+         *
+         *     Each revision is negotiated on its own: a value is sent only when the token of its own
+         *     revision is listed.
          * @enum {string}
          */
-        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe";
+        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe" | "on_failure_probe";
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
@@ -831,7 +901,9 @@ export interface components {
             server_time: components["schemas"]["Timestamp"];
             /**
              * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
-             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines
+             *     `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
+             *     `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
+             *     `job_progress.coverage`, and the engines
              *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
@@ -961,10 +1033,31 @@ export interface components {
              */
             sensitive_objects?: components["schemas"]["SensitiveObject"][];
         };
+        /**
+         * @description An object whose accesses are always reported, named as Discovery names it in a finding's
+         *     `Location` (`database`, `schema`, `object`).
+         *
+         *     **Redis / Valkey key patterns** (`sensitive_object.key_pattern`, ADR-0022 decision 3).
+         *     `object` is an `ObjectName`: an `Identifier`, or, on a `redis` or `valkey` target only, a
+         *     `KeyPattern` (e.g. `user:*:email`). An agent built before this change decodes `object` as
+         *     an `Identifier` and cannot decode a job carrying a key pattern that is not one, so the
+         *     console sends such an object only when the agent's latest `HeartbeatRequest.accepts` lists
+         *     `sensitive_object.key_pattern`, and never to an agent that does not (it leaves the object
+         *     out, and counts it). The console checks the object against the schema of the **target's**
+         *     engine, as for `ObjectRef`, and the agent refuses an `audit.configure` job whose key
+         *     pattern names a target of any other engine (`invalid_params`). On a Redis / Valkey target
+         *     the agent keeps an event whose key pattern overlaps a listed one: some key name matches
+         *     both, each read as a Redis glob in which `*` is the only wildcard (any run of
+         *     characters, separators included). So a listed `user:*:email` covers the event objects
+         *     `user:*:email`, `user:*` and `*:email`, and the event object `*` (a key no learned
+         *     pattern names) matches every listed pattern of its database; the database `*` (a
+         *     source that does not tell the database) matches any database. The match ignores case,
+         *     and compares names with and without their trailing spaces, as on every engine.
+         */
         SensitiveObject: {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
-            object: components["schemas"]["Identifier"];
+            object: components["schemas"]["ObjectName"];
             classifiers: components["schemas"]["ClassifierId"][];
         };
         /**
@@ -1138,7 +1231,32 @@ export interface components {
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
             field: components["schemas"]["Identifier"];
+            /**
+             * @description Parts of this location whose name was altered: the agent's name
+             *     normalization (ADR-0009: control and format characters stripped, NFKC; on
+             *     Redis / Valkey the same steps of the key-pattern normalizer; on CAS,
+             *     definition keys converted to snake_case) changed these parts, so another
+             *     object of the engine may be sent under the same name. Never set for a part
+             *     sent as `*`. It carries no value, no character and no count (I2). Unique
+             *     parts, at least one; absent when no part was altered. Sent only when the
+             *     latest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,
+             *     ADR-0056); a `400` reporting it as an unknown field clears the agent's
+             *     capability list, and the findings are resent once without it (ADR-0022
+             *     decision 9).
+             */
+            altered?: components["schemas"]["LocationPart"][];
         };
+        /**
+         * @description A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
+         * @enum {string}
+         */
+        LocationPart: "database" | "schema" | "object" | "field";
+        /**
+         * @description A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event
+         *     object names no field).
+         * @enum {string}
+         */
+        ObjectRefPart: "database" | "schema" | "object";
         /** @description Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`). */
         EventsBatch: {
             batch_id: components["schemas"]["UuidV7"];
@@ -1174,12 +1292,22 @@ export interface components {
              *     latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
              */
             bytes?: components["schemas"]["Count"];
+            /**
+             * @description Objects of this event were left out under a bound (the agent core's 15 named objects,
+             *     or a connector's own bound); the event's `*` objects stand for them (see `ObjectRef`,
+             *     the name `*`). Carries no value, no name and no count. Only `true` is valid; absent
+             *     otherwise. An event that carries it names at least one object `*` (checked by this
+             *     schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+             *     `access_event.objects_overflowed` (ADR-0022, ADR-0053).
+             * @constant
+             */
+            objects_overflowed?: true;
             /** @description Signal ids of the registry `signals.json` (see `Signal`). */
             signals?: components["schemas"]["Signal"][];
             source: components["schemas"]["AuditSource"];
             /** @description Number of raw events merged into this one. */
             aggregated_count: number;
-        } & (unknown & unknown);
+        } & (unknown & unknown & unknown);
         /**
          * @description Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
          *     an account that does not exist on the target (the attempted name may be a mistyped password), and
@@ -1240,7 +1368,7 @@ export interface components {
          * @description Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
          *
          *     **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
-         *     one of two reasons:
+         *     one of three reasons:
          *     - **unknown object**: the source does not say which objects were reached and the agent
          *       cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
          *       it cannot parse). `database` is the session's database and `schema` is absent. Such a
@@ -1248,9 +1376,17 @@ export interface components {
          *       `*`, the objects the agent could tell;
          *     - **masked name**: normalization replaced the name (a name matched by a classifier, or
          *       one that does not conform to `Identifier`). This also applies to `database` and
-         *       `schema`.
+         *       `schema`;
+         *     - **overflowed objects**: the event reached more objects than it may list (the agent
+         *       core keeps at most 15 named objects, and a connector may drop objects under a bound of
+         *       its own), and the `*` stands for the objects left out. It is `(<database>, -, *)` when
+         *       they share a database, `(*, -, *)` once objects of another database are left out too,
+         *       and none is added when a `*` already in the event covers them. Such an event is always
+         *       reported, and carries `AccessEvent.objects_overflowed` when the console lists
+         *       `access_event.objects_overflowed` (ADR-0053); without the field, the overflow is not
+         *       known to the console.
          *
-         *     In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+         *     In every case `*` is a **literal name, not a wildcard**: it never means "every object".
          *     The console compares it as the string `*` (ADR-0021): an `objects` condition or a
          *     location exception selects it only when its glob matches the string `*` (the glob `*`,
          *     or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its
@@ -1259,6 +1395,14 @@ export interface components {
          *     still matches conditions that do not depend on objects (signals, principals, rows,
          *     anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
          *     therefore does not see such accesses: signal, volume and anomaly conditions do.
+         *
+         *     **Except for a flagged event** (ADR-0053 decision 3): when the event carries
+         *     `objects_overflowed`, every `*` of it (on Redis / Valkey, a real `*` key pattern too)
+         *     stands for one or more objects of its database that the event does not name (of the
+         *     target, for the database `*`): an `objects` condition retains it when its `database`
+         *     glob, if any, matches; `min_sensitivity`, `min_score` and the incident's database count
+         *     it as the database's most sensitive object; a location exception covers it only when it
+         *     covers the whole database. Without the field, the literal rule above applies.
          *
          *     **Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log
          *     entry is reported under the pattern learned by the last scan, its longest learned literal
@@ -1272,6 +1416,21 @@ export interface components {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
+            /**
+             * @description Parts of this object whose name was altered: the agent's name normalization
+             *     (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+             *     the same steps of the key-pattern normalizer; on CAS, definition keys
+             *     converted to snake_case) changed these parts, so another object of the
+             *     engine may be sent under the same name. Never set for a part sent as `*`. It
+             *     carries no value, no character and no count (I2). Unique parts, at least
+             *     one; absent when no part was altered; an event object names no field. Sent
+             *     only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+             *     (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+             *     agent's capability list, and the events are resent once without it (ADR-0022
+             *     decision 9). Keep in step with the inline copies of `ObjectRef` in
+             *     `AccessEvent`.
+             */
+            altered?: components["schemas"]["ObjectRefPart"][];
         };
     };
     responses: {

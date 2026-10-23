@@ -7,10 +7,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 import { getDb, getPool } from "@/db/client";
 import { agents, agentTargets, auditLog, enrollmentTokens, jobs, securityEvents } from "@/db/schema";
-import { validateSchema } from "@/lib/protocol/validate";
+import { MAX_VALIDATION_DETAILS, validateSchema } from "@/lib/protocol/validate";
 import schemasBundle from "@/generated/protocol/schemas.gen.json";
 import { MAX_TARGET_NOTES_BYTES } from "@/lib/target-notes";
-import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceDetails } from "@/server/agents";
+import { enrollFailureAuditBudget, getAgentDetail, listAgents, revokeAgent, targetSourceMismatches } from "@/server/agents";
 import {
   agentArgon2Gate,
   argon2Stats,
@@ -32,6 +32,7 @@ import {
   sweepDeadScans,
 } from "@/server/scans";
 import { lockAgentForConflict } from "@/server/rotation";
+import { integrityStats, integrityWriteBudget, recordIntegrityEvent, targetMismatchChangeBudget, targetMismatchWriteBudget } from "@/server/integrity";
 import { createRuntimeRole, hasDb, setupTestDatabase } from "@/test/db";
 import { runtimeRoleWarnings } from "@/server/db-role-check";
 import { pgBossOptions } from "@/worker/queues";
@@ -99,6 +100,9 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
     enrollPerIp.clear();
     pollClock.msPerSecond = 1000;
     jobsPollsPerAgent.clear();
+    integrityWriteBudget.clear();
+    targetMismatchWriteBudget.clear();
+    targetMismatchChangeBudget.clear();
   });
 
   describe("POST /enroll", () => {
@@ -781,11 +785,14 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         ],
       };
       expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
-      expect(targetSourceDetails(body as never)).toEqual([
-        { pointer: "/targets/1/audit_source", keyword: "const" },
-        { pointer: "/targets/4/audit_source", keyword: "const" },
-        { pointer: "/targets/5/audit_source", keyword: "const" },
-      ]);
+      expect(targetSourceMismatches(body as never)).toEqual({
+        indices: [1, 4, 5],
+        details: [
+          { pointer: "/targets/1/audit_source", keyword: "const" },
+          { pointer: "/targets/4/audit_source", keyword: "const" },
+          { pointer: "/targets/5/audit_source", keyword: "const" },
+        ],
+      });
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);
       const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
@@ -802,7 +809,14 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
         .from(securityEvents)
         .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
       expect(events).toHaveLength(1);
-      expect(events[0]?.details).toMatchObject({ endpoint: "heartbeat", status: 200, details_count: 3, pointer: "/targets/1/audit_source", keyword: "const" });
+      expect(events[0]?.details).toMatchObject({
+        endpoint: "heartbeat",
+        status: 200,
+        details_count: 3,
+        pointer: "/targets/1/audit_source",
+        keyword: "const",
+        target_ids: "cache-2,pg-odd,sales",
+      });
       // A conforming heartbeat records no integrity event.
       const ok = { ...body, targets: body.targets.filter((_t, i) => ![1, 4, 5].includes(i)) };
       expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: ok }))).status).toBe(200);
@@ -812,6 +826,128 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
           .from(securityEvents)
           .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch"))),
       ).toHaveLength(1);
+    });
+
+    it("#274 review L5 and #277: with 25 mismatched targets, every one is stored without its source, listed and counted; only the details are capped", async () => {
+      const auth = await enroll();
+      const bad = Array.from({ length: 25 }, (_v, i) => ({
+        target_id: `pg-${String(i).padStart(2, "0")}`,
+        engine: "postgres",
+        reachable: true,
+        audit_level: "limited",
+        audit_source: "redis_slowlog",
+      }));
+      const good = [
+        { target_id: "pg-ok-a", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "pg_stat_statements" },
+        { target_id: "pg-ok-b", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "pg_stat_statements" },
+      ];
+      // A conforming target first, one in the middle, so the indices are not just 0..24.
+      const targets = [good[0], ...bad.slice(0, 12), good[1], ...bad.slice(12)];
+      const body = { ...MINIMAL_HEARTBEAT, connectors: ["postgres"], targets };
+      expect(validateSchema("HeartbeatRequest", body).ok).toBe(true);
+      const found = targetSourceMismatches(body as never);
+      expect(found.indices).toHaveLength(25);
+      expect(found.details).toHaveLength(MAX_VALIDATION_DETAILS);
+      expect(found.details[0]).toEqual({ pointer: "/targets/1/audit_source", keyword: "const" });
+      // The 20th mismatch: positions 1..12, then 14 onwards (position 13 conforms).
+      expect(found.details[MAX_VALIDATION_DETAILS - 1]).toEqual({ pointer: "/targets/21/audit_source", keyword: "const" });
+      expect(found.indices).toEqual([...Array.from({ length: 12 }, (_v, i) => i + 1), ...Array.from({ length: 13 }, (_v, i) => i + 14)]);
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+      expect(res.status).toBe(200);
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(Object.fromEntries(stored.map((t) => [t.targetId, t.auditSource]))).toEqual({
+        ...Object.fromEntries(bad.map((t) => [t.target_id, null])),
+        "pg-ok-a": "pg_stat_statements",
+        "pg-ok-b": "pg_stat_statements",
+      });
+      const events = await getDb()
+        .select()
+        .from(securityEvents)
+        .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
+      expect(events).toHaveLength(1);
+      expect(events[0]?.details).toMatchObject({
+        endpoint: "heartbeat",
+        status: 200,
+        // #277: the true count; the first pointer comes from the capped details.
+        details_count: 25,
+        pointer: "/targets/1/audit_source",
+        keyword: "const",
+        target_ids: bad.map((t) => t.target_id).sort().join(","),
+      });
+    });
+
+    it("#235 review N1: a persistent target_mismatch is recorded once an hour, in its own budget; other integrity events keep theirs", async () => {
+      const auth = await enroll();
+      const body = {
+        ...MINIMAL_HEARTBEAT,
+        connectors: ["postgres", "redis"],
+        targets: [{ target_id: "pg-odd", engine: "postgres", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+      };
+      const mismatchRows = () =>
+        getDb()
+          .select()
+          .from(securityEvents)
+          .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")));
+      const before = integrityStats.suppressed;
+      for (let i = 0; i < integrityWriteBudget.limit + 5; i++) {
+        expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+      }
+      expect(await mismatchRows()).toHaveLength(1);
+      expect(integrityStats.suppressed - before).toBe(integrityWriteBudget.limit + 4);
+      // The target is still stored without its source at every heartbeat.
+      const [stored] = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+      expect(stored?.auditSource).toBeNull();
+      // The shared budget of the other kinds is untouched: a whole budget of them is still recorded,
+      // and their suppression count does not include the mismatches.
+      for (let i = 0; i < integrityWriteBudget.limit; i++) {
+        expect(
+          await recordIntegrityEvent(getDb(), { agentId: auth.agentId, kind: "batch_rejected", endpoint: "findings", status: 400, ip: null }),
+        ).toBe(true);
+      }
+      const rejected = await getDb()
+        .select()
+        .from(securityEvents)
+        .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.batch_rejected")));
+      expect(rejected).toHaveLength(integrityWriteBudget.limit);
+      expect(rejected.every((r) => (r.details as { suppressed_before: number }).suppressed_before === 0)).toBe(true);
+      // Next window: the next mismatch row carries the heartbeats counted in between.
+      targetMismatchWriteBudget.clear();
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+      const rows = (await mismatchRows()).sort((a, b) => b.at.getTime() - a.at.getTime());
+      expect(rows).toHaveLength(2);
+      expect(rows[0]?.details).toMatchObject({ suppressed_before: integrityWriteBudget.limit + 4 });
+    });
+
+    it("PR #274 review L1: a mismatch that starts on another target within the hour is recorded at once, with the target ids", async () => {
+      const auth = await enroll();
+      const t = (target_id: string, audit_source: string) => ({ target_id, engine: "postgres", reachable: true, audit_level: "limited", audit_source });
+      const hb = (targets: ReturnType<typeof t>[]) => ({ ...MINIMAL_HEARTBEAT, connectors: ["postgres", "redis"], targets });
+      const rows = async () =>
+        (
+          await getDb()
+            .select()
+            .from(securityEvents)
+            .where(and(eq(securityEvents.agentId, auth.agentId), eq(securityEvents.kind, "agent.target_mismatch")))
+        )
+          .sort((a, b) => a.at.getTime() - b.at.getTime())
+          .map((r) => (r.details as { target_ids: string }).target_ids);
+      const send = async (targets: ReturnType<typeof t>[]) =>
+        expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb(targets) }))).status).toBe(200);
+      const a = [t("pg-a", "redis_slowlog"), t("pg-b", "pg_stat_statements")];
+      const ab = [t("pg-a", "redis_slowlog"), t("pg-b", "redis_slowlog")];
+      await send(a);
+      await send(a);
+      expect(await rows()).toEqual(["pg-a"]);
+      // The second target starts mismatching within the hour: recorded at once.
+      await send(ab);
+      await send(ab);
+      expect(await rows()).toEqual(["pg-a", "pg-a,pg-b"]);
+      // Back to the first set: a change again.
+      await send(a);
+      expect(await rows()).toEqual(["pg-a", "pg-a,pg-b", "pg-a"]);
+      // An agent alternating at every heartbeat is bounded by the change budget (3 used above).
+      for (let i = 0; i < targetMismatchChangeBudget.limit + 4; i++) await send(i % 2 === 0 ? ab : a);
+      expect(await rows()).toHaveLength(targetMismatchChangeBudget.limit);
     });
 
     it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {

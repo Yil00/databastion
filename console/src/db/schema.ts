@@ -19,6 +19,9 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
+import type { NameCaseRule } from "../lib/name-case";
+import type { LocationPart } from "../lib/policy-model";
+
 /**
  * Console internal schema. Changes go through `pnpm db:generate`, which
  * writes a versioned SQL migration under drizzle/ (never edit the DB by hand).
@@ -215,6 +218,20 @@ export const agents = pgTable(
     spool: jsonb("spool").$type<Record<string, number>>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
     detectedTargets: jsonb("detected_targets").$type<unknown[]>(),
+    /**
+     * The console -> agent capability tokens the agent's latest heartbeat listed in `accepts`
+     * (ADR-0022 decision 3), restricted to the ones this console knows (`AGENT_TOKENS`,
+     * src/server/agent-api/capabilities.ts). A console -> agent field or value form added after
+     * protocol 0.1.0 is sent only when its token is here.
+     */
+    accepts: jsonb("accepts").$type<string[]>().notNull().default([]),
+    /**
+     * Set when a change of `accepts` could not be acted on (#280 re-review L-a): the requeue
+     * budget (`audit.requeue_per_agent`) was spent, or the requeue failed. The Audit settings of the
+     * agent's Redis / Valkey targets are then queued again from a later heartbeat, once the budget
+     * allows, and this is cleared. Millisecond precision, so the clearing compare-and-set is exact.
+     */
+    auditRequeueDueAt: tsz("audit_requeue_due_at"),
     /** argon2id PHC string of the current secret; NULL once revoked or locked. */
     currentSecretHash: text("current_secret_hash"),
     /** argon2id PHC string of the pending secret during a rotation (ADR-0008, `/rotate`). */
@@ -300,6 +317,23 @@ export const agentTargets = pgTable(
      */
     notes: jsonb("notes").$type<{ code: string; count?: number; labels?: string[] }[]>(),
     metrics: jsonb("metrics").$type<Record<string, number>>(),
+    /**
+     * Contract `TargetStatus.name_case` of the latest heartbeat (ADR-0055), in its canonical form
+     * (`canonicalNameCase` in src/lib/name-case.ts: `except` sorted and merged, past its bounds the
+     * strict form); null when that heartbeat carried none (today's rule). Three closed values and
+     * normalized database names only (I2). Written by a compare-and-set in the heartbeat's
+     * transaction (`storeNameCase`, decision 7, L8).
+     */
+    nameCase: jsonb("name_case").$type<NameCaseRule>(),
+    /** When `name_case` last changed (its first value, any value, or its loss). */
+    nameCaseChangedAt: tsz("name_case_changed_at"),
+    /**
+     * Set when the effective rule changed and the ADR-0054 inventory of this target is due (the
+     * earliest pending change); cleared by the worker run that takes it (decision 7, M2).
+     */
+    nameCaseInventoryDueAt: tsz("name_case_inventory_due_at"),
+    /** When the worker last ran this target's inventory: at most one run per target and hour (M2). */
+    nameCaseInventoryAt: tsz("name_case_inventory_at"),
     /** false when the target was absent from the last heartbeat (removed from agent.yaml). */
     present: boolean("present").notNull().default(true),
     firstSeenAt: tsz("first_seen_at").notNull().defaultNow(),
@@ -310,6 +344,10 @@ export const agentTargets = pgTable(
     check(
       "agent_targets_notes_bounded",
       sql`${t.notes} is null or (jsonb_typeof(${t.notes}) = 'array' and jsonb_array_length(${t.notes}) <= 16 and octet_length(${t.notes}::text) <= 16384)`,
+    ),
+    check(
+      "agent_targets_name_case_bounded",
+      sql`${t.nameCase} is null or (jsonb_typeof(${t.nameCase}) = 'object' and octet_length(${t.nameCase}::text) <= 16384)`,
     ),
   ],
 );
@@ -377,6 +415,12 @@ export const jobs = pgTable(
     error: jsonb("error").$type<{ code: string; engine_code?: string }>(),
     finishedAt: tsz("finished_at"),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * `audit.configure` only: the key-pattern sensitive objects left out of the last delivery
+     * because the agent no longer listed `sensitive_object.key_pattern` (src/server/jobs.ts,
+     * security review of #280, M2); null when nothing was left out. `params` is unchanged.
+     */
+    deliveredWithoutKeyPatterns: integer("delivered_without_key_patterns"),
   },
   (t) => [index("jobs_agent_status_idx").on(t.agentId, t.status, t.createdAt)],
 );
@@ -500,6 +544,30 @@ export const findings = pgTable(
      */
     falsePositiveMatched: integer("false_positive_matched"),
     falsePositiveClassifiersVersion: text("false_positive_classifiers_version"),
+    /**
+     * ADR-0056 decision 3 item 3: the row's `altered` parts when the false positive was marked
+     * (`{}` when it was not altered), cleared with the mark; null without a mark, or for a mark set
+     * before this column (then read as "not altered"). A later revision altered in a part not in
+     * this list resets the mark (audited, reason `names_altered`).
+     */
+    falsePositiveAltered: text("false_positive_altered").array().$type<LocationPart[]>(),
+    /**
+     * Contract `Location.altered` (ADR-0056 decision 3 item 2): the union of the altered parts of
+     * every item of this location within one scan job, within a batch and across that job's
+     * batches; the first batch of a new job for the location replaces it. Null: no item of that
+     * job reported an altered part (or an older agent, or a console that did not list
+     * `location.altered`). Kept in `LOCATION_PARTS` order. The one agent-reported column that
+     * changes under a merge rule rather than "as sent" (written only by the findings upsert).
+     */
+    altered: text("altered").array().$type<LocationPart[]>(),
+    /**
+     * ADR-0056 (security review L1 of the console lot): the scan job whose items `altered` holds.
+     * A batch of that job adds to it, a batch of a newer job (by `jobs.created_at`, then id)
+     * replaces it, and a late batch of an older job only adds to it, so it never clears what a
+     * newer job reported (fail closed). Separate from `last_job_id`, which every batch still sets.
+     * No foreign key (none to validate on a large table): a job that is gone counts as older.
+     */
+    alteredJobId: uuid("altered_job_id"),
     /**
      * `last_seen_at` of the revision last evaluated by the policy engine (P3-A). The finding is
      * pending evaluation while it differs from `last_seen_at` (set by the worker with a
@@ -665,6 +733,19 @@ export const incidents = pgTable(
      * further matches of that hour are counted here (P4-C security review H1).
      */
     eventOverflow: boolean("event_overflow").notNull().default(false),
+    /**
+     * ADR-0053 decision 3 item 4: an event that joined this incident was flagged
+     * `objects_overflowed` (objects left out under a bound); null before the first such event or
+     * on rows written before ADR-0053. Display only, never compared with later events.
+     */
+    eventObjectsOverflowed: boolean("event_objects_overflowed"),
+    /**
+     * ADR-0053 decision 3 item 4: highest bound score of the events that joined this incident
+     * (equal to `event_score` while none was flagged). Display only ("up to ..."): the
+     * comparisons with later events (`worseThanClosed`, the cap bypass) use `event_score`, the
+     * named score (review H1 of ADR-0053).
+     */
+    eventBoundScore: doublePrecision("event_bound_score"),
   },
   (t) => [
     uniqueIndex("incidents_active_dedup_key")
@@ -862,7 +943,8 @@ export const eventsBatches = pgTable(
  * migration 0040, validated outside the migration transaction).
  *
  * The runtime role may only INSERT and SELECT, plus UPDATE of the evaluation columns
- * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`) written by the worker:
+ * (`evaluated_at`, `sensitivity`, `score`, `anomaly`, `baseline_rows`, and since ADR-0053
+ * `bound_sensitivity`, `bound_score`) written by the worker:
  * what the agent reported can never be rewritten nor deleted by the console process (migration
  * 0022). Rows older than the retention bound are deleted by `databastion_purge_access_events`.
  */
@@ -891,8 +973,15 @@ export const accessEvents = pgTable(
     clientAddr: text("client_addr"),
     application: text("application"),
     action: text("action").notNull(),
-    /** Contract `ObjectRef[]` (normalized names), at most 16. */
-    objects: jsonb("objects").$type<{ database: string; schema?: string; object: string }[]>().notNull(),
+    /**
+     * Contract `ObjectRef[]` (normalized names), at most 16. `altered` (ADR-0056 decision 3 item
+     * 1): the parts the agent's name normalization altered, as sent; absent when not reported (an
+     * older agent, or a console that did not list `object_ref.altered`). Not updatable by the
+     * runtime role, like the rest of the column (migration 0022).
+     */
+    objects: jsonb("objects")
+      .$type<{ database: string; schema?: string; object: string; altered?: ("database" | "schema" | "object")[] }[]>()
+      .notNull(),
     rows: bigint("rows", { mode: "number" }),
     /**
      * Contract `AccessEvent.bytes` (P4-D): size of the result returned or of the data affected, when
@@ -900,6 +989,13 @@ export const accessEvents = pgTable(
      * shown, not used by the score (ADR-0021: volume is rows only).
      */
     bytes: bigint("bytes", { mode: "number" }),
+    /**
+     * Contract `AccessEvent.objects_overflowed` (ADR-0053): true when the agent sent the field
+     * (objects of the event were left out under a bound; its `*` objects stand for them), null
+     * otherwise (absent means "not known": an agent up to 0.8.0, or a console that did not list
+     * the token). No constraint: the contract allows `true` only.
+     */
+    objectsOverflowed: boolean("objects_overflowed"),
     signals: jsonb("signals").$type<string[]>().notNull().default([]),
     source: text("source").notNull(),
     aggregatedCount: integer("aggregated_count").notNull(),
@@ -913,8 +1009,16 @@ export const accessEvents = pgTable(
     evaluatedAt: tsz("evaluated_at"),
     /** Sensitivity of the most sensitive object reached (see src/lib/event-model.ts). */
     sensitivity: doublePrecision("sensitivity"),
-    /** Volume x sensitivity score. */
+    /** Volume x sensitivity score (the named score of ADR-0053: from the named objects only). */
     score: doublePrecision("score"),
+    /**
+     * ADR-0053 decision 3 item 3: the bound sensitivity and score, where every `*` object of a
+     * flagged event takes the highest object sensitivity of its database (of the target, for the
+     * database `*`). Equal to `sensitivity` / `score` for an event without the flag; null on rows
+     * evaluated before ADR-0053.
+     */
+    boundSensitivity: doublePrecision("bound_sensitivity"),
+    boundScore: doublePrecision("bound_score"),
     /** Volume above the principal's baseline (after its warm-up). */
     anomaly: boolean("anomaly"),
     /** Baseline volume (rows) of the principal when the event was evaluated; null during warm-up. */

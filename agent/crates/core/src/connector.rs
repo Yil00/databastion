@@ -8,6 +8,28 @@ use crate::engine::{Engine, FailureCode, TargetHealth};
 pub use crate::job::{AuditConfig, ScanJob};
 use crate::sink::{EventSink, FindingSink, SinkClosed};
 
+/// The [`FailureCode`] of a failure at the TLS stage of a connection, the
+/// same on every engine (P9-A lot 1 contract review L2): `timeout` and
+/// `cancelled` are kept; every other cause is `target_unreachable`: the
+/// target cannot be reached over a verified channel. That covers a failed
+/// or refused handshake, a certificate or name not verified, a server that
+/// refuses or does not offer TLS (PostgreSQL `SSLRequest`, MySQL
+/// `CLIENT_SSL`, OpenLDAP StartTLS, SQL Server `PRELOGIN` encryption), an
+/// anomaly around the negotiation (a malformed SQL Server `PRELOGIN`, an
+/// unexpected StartTLS response, bytes received after it: a StartTLS
+/// injection indicator, not an agent bug) and a local TLS setup error (a
+/// CA or client certificate file that cannot be used, a host that is not a
+/// TLS server name, TLS asked on a Unix socket). The `stage_tls` label of
+/// the `check.stage_failed` note tells a TLS problem apart; the cause is in
+/// the agent's log (and the engine code, when the server sent one).
+#[must_use]
+pub fn tls_stage_failure(code: FailureCode) -> FailureCode {
+    match code {
+        FailureCode::Timeout | FailureCode::Cancelled => code,
+        _ => FailureCode::TargetUnreachable,
+    }
+}
+
 /// Errors returned by connectors.
 ///
 /// Messages must never contain a sampled value or a credential.
@@ -120,12 +142,46 @@ pub trait Connector: Send + Sync {
     fn server_version(&self, _target: &TargetConfig) -> Option<String> {
         None
     }
+
+    /// How `target` compares names that differ only by case (ADR-0055):
+    /// the last value a [`check`](Self::check) read on the same server
+    /// run, kept when a later check fails, times out or cannot reach the
+    /// server (decision 2). `None` (the default) when the connector reports
+    /// none or read nothing yet: for a `mysql`, `mariadb` or `sqlserver`
+    /// target the core then sends `unknown` for both parts. Database names
+    /// in it are normalized like the connector's locations (ADR-0009).
+    fn name_case(&self, _target: &TargetConfig) -> Option<crate::name_case::NameCaseReport> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::AuditLevel;
+
+    /// One mapping of TLS-stage failures on every engine (P9-A lot 1
+    /// contract review L2).
+    #[test]
+    fn tls_stage_failures_have_one_mapping() {
+        use FailureCode as F;
+        for code in [F::Timeout, F::Cancelled] {
+            assert_eq!(tls_stage_failure(code), code);
+        }
+        for code in [
+            F::TargetUnreachable,
+            F::AuthenticationFailed,
+            F::PermissionDenied,
+            F::Expired,
+            F::UnknownTarget,
+            F::Unsupported,
+            F::InvalidParams,
+            F::ResourceLimit,
+            F::Internal,
+        ] {
+            assert_eq!(tls_stage_failure(code), F::TargetUnreachable, "{code}");
+        }
+    }
 
     struct Dummy;
 

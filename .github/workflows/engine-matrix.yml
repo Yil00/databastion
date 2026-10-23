@@ -12,6 +12,25 @@ name: Engine matrix
 # ci.yml (agent-sqlserver); the service is in the opt-in Compose profile `sqlserver`. The TLS mode
 # each version reaches is asserted by the tests (tls_modes_by_version): `mandatory` and the `auto`
 # fallback on 2019 and 2022, `strict` on 2025 with DATABASTION_DEV_SQLSERVER_FORCE_STRICT=1.
+# Measurements (ROADMAP phase 9 follow-ups), uploaded as the artifact `measure-<engine>-<version>`:
+#   - SQL Server (#276 review L1): the M2 drift table of
+#     `listed_object_reads_are_recorded_or_named_invisible` (`M2 | major | object | account | …`,
+#     printed by the main test run), and the fresh-server test
+#     `xe_fresh_server_own_reads_raise_no_event` run first on the new data volume
+#     (DATABASTION_IT_SQLSERVER_FRESH=1: the `sysaudacts` and `sysguidrefs` builds, with the
+#     captured events of their activity, DATABASTION_IT_SQLSERVER_CAPTURE, fake data only:
+#     fresh-capture.txt, the `sysaudacts` build's activity alone in fresh-capture-sysaudacts.txt,
+#     and every statistics build of the agent's login with its activity in
+#     fresh-capture-statistics.txt, the source of the fixtures statistics-<build>.xml). The
+#     fresh-server step never fails the job: it is a measurement on 2019 and 2025. The main run's
+#     `[it] tables:`, `[it] roles:`, `[it] server run:` and `[it] xe predicate change:` lines (the
+#     #293, #281, #303 and #280 follow-ups) are kept in follow-ups.txt.
+#   - MySQL / MariaDB (#256): the digests of the agent's performance_schema poll and stats texts as
+#     each service renders them, in the format of the connector's fixture poll_digests.tsv
+#     (dev/capture-poll-digests.sh, after the tests sent every text).
+# Job e2e-sqlserver (ROADMAP phase 9 follow-up P9-D): e2e/sqlserver.sh on the versions and Audit
+# sources the required ci.yml job (2022, SQL Server Audit) does not run: 2022 with Extended Events,
+# 2019 (Extended Events only) and 2025 with each source, the I2 check and incidents included.
 # Not a required check: not part of the "CI result" gate of ci.yml.
 # Every image is pinned by tag AND index digest (multi-arch), like the rest of the repository.
 on:
@@ -30,6 +49,9 @@ on:
       - "dev/mongo/**"
       - "dev/redis/**"
       - "dev/sqlserver/**"
+      - "dev/capture-poll-digests.sh"
+      - "e2e/sqlserver.sh"
+      - "e2e/docker-compose.sqlserver.yml"
       - "agent/crates/core/**"
       - "agent/crates/connector-postgres/**"
       - "agent/crates/connector-mysql/**"
@@ -48,7 +70,8 @@ jobs:
   engine:
     name: ${{ matrix.engine }} ${{ matrix.version }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60: the SQL Server entries also run the fresh-server measurement before the tests.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +140,21 @@ jobs:
             it: mysql
             services: mysql mariadb percona
             mariadb_image: mariadb:11.8.9@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+          # ADR-0055 decision 10: a MySQL and a MariaDB server started with lower_case_table_names =
+          # 1 (names stored in lowercase, compared without case), at their default versions: check()
+          # reports `insensitive` (name_case_it asserts the setting through dev/agent-it.sh); the
+          # tests that need 0 (names as written, the CTE rule, `SYS` / `MySQL` user databases) skip
+          # with a message.
+          - engine: MySQL
+            version: "8.4.11 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mysql_lower_case_table_names: "1"
+          - engine: MariaDB
+            version: "11.4.13 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mariadb_lower_case_table_names: "1"
           # MongoDB Community (5.0+ is enforced by the connector).
           - engine: MongoDB
             version: "6.0.28"
@@ -253,6 +291,8 @@ jobs:
       DATABASTION_DEV_POSTGRES_LOG_FORMAT: ${{ matrix.postgres_log_format }}
       DATABASTION_DEV_MYSQL_IMAGE: ${{ matrix.mysql_image }}
       DATABASTION_DEV_MARIADB_IMAGE: ${{ matrix.mariadb_image }}
+      DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES: ${{ matrix.mysql_lower_case_table_names }}
+      DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES: ${{ matrix.mariadb_lower_case_table_names }}
       DATABASTION_DEV_MONGO_IMAGE: ${{ matrix.mongo_image }}
       DATABASTION_DEV_REDIS_IMAGE: ${{ matrix.redis_image }}
       DATABASTION_DEV_VALKEY_IMAGE: ${{ matrix.valkey_image }}
@@ -282,12 +322,119 @@ jobs:
           # shellcheck disable=SC2086 # SERVICES is a space-separated list of service names
           timeout 900 docker compose -f dev/docker-compose.yml up -d --build --wait --wait-timeout 600 $SERVICES
           timeout 60 docker compose -f dev/docker-compose.yml images
+          mkdir -p "$RUNNER_TEMP/measure"
+      # SQL Server, first on the new data volume (#276 review L1): the fresh-server test alone, which
+      # the main run skips (it needs DATABASTION_IT_SQLSERVER_FRESH=1). A measurement: its result
+      # does not fail the job (the step's outcome is in the summary).
+      - name: SQL Server fresh-server measurement
+        id: fresh
+        if: matrix.it == 'sqlserver'
+        continue-on-error: true
+        env:
+          DATABASTION_IT_SQLSERVER_FRESH: "1"
+        run: |
+          set -o pipefail
+          status=0
+          DATABASTION_IT_SQLSERVER_CAPTURE="$RUNNER_TEMP/measure/fresh-capture.txt" \
+            timeout 1500 dev/agent-it.sh sqlserver xe_fresh_server_own_reads_raise_no_event 2>&1 \
+            | tee "$RUNNER_TEMP/measure/fresh.log" || status=$?
+          # A test that stopped midway keeps the Extended Events grant it gave the agent login
+          # (2022+): taken back as `sa`, so that the main run starts from the dev grants.
+          if [ "$status" -ne 0 ] && [ "${DATABASTION_IT_SQLSERVER_MAJOR:-16}" -ge 16 ]; then
+            # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+            timeout 120 docker compose -f dev/docker-compose.yml exec -T sqlserver bash -c '
+              enc=(-C)
+              if [ "${DATABASTION_DEV_SQLSERVER_FORCE_STRICT:-0}" = 1 ]; then enc=(-N s -J /var/opt/mssql/databastion-tls/server.pem); fi
+              SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa "${enc[@]}" -b \
+                -Q "REVOKE VIEW SERVER PERFORMANCE STATE FROM databastion"' || true
+          fi
+          exit "$status"
+      # Not continue-on-error: the main run must never start with the fresh-server test's
+      # Extended Events grant still held by the agent login (2022+; on 2019 the grant is the dev
+      # script's own). Fails the job when the grant is still there or cannot be read.
+      - name: SQL Server grants after the measurement
+        if: matrix.it == 'sqlserver' && matrix.sqlserver_major != '15'
+        run: |
+          # shellcheck disable=SC2016 # expanded by the container shell, on purpose
+          n="$(timeout 120 docker compose -f dev/docker-compose.yml exec -T sqlserver bash -c '
+            enc=(-C)
+            if [ "${DATABASTION_DEV_SQLSERVER_FORCE_STRICT:-0}" = 1 ]; then enc=(-N s -J /var/opt/mssql/databastion-tls/server.pem); fi
+            SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa "${enc[@]}" -b -h -1 -W \
+              -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.server_permissions p JOIN sys.server_principals s
+                  ON s.principal_id = p.grantee_principal_id WHERE s.name = N'"'"'databastion'"'"'
+                  AND p.permission_name = N'"'"'VIEW SERVER PERFORMANCE STATE'"'"' AND p.state IN ('"'"'G'"'"', '"'"'W'"'"')"' \
+            | tr -d '[:space:]')"
+          if [ "$n" != 0 ]; then
+            echo "::error title=Extended Events grant left::the agent login still holds VIEW SERVER PERFORMANCE STATE after the fresh-server measurement (count '${n}'): the main run would start with an extra grant"
+            exit 1
+          fi
+          echo "the agent login holds no VIEW SERVER PERFORMANCE STATE: the main run starts from the dev grants"
       # Same commands, variables and DATABASTION_TEST_REQUIRE as the "dev image" step of the ci.yml
       # job of this engine (dev/agent-it.sh); every probe is required.
       - name: Connector integration tests
         run: |
           set -o pipefail
           timeout 1800 dev/agent-it.sh "$IT_ENGINE" 2>&1 | tee "$RUNNER_TEMP/it.log"
+      # The measurement tables, whatever the tests' result. Every line comes from the dev fixtures
+      # (fake data) or from the agent's constant texts; nothing secret is printed by these tests.
+      - name: Measurement tables
+        id: measure
+        if: always() && (matrix.it == 'sqlserver' || matrix.it == 'mysql')
+        env:
+          ENTRY: ${{ matrix.engine }} ${{ matrix.version }}
+          FRESH_OUTCOME: ${{ steps.fresh.outcome }}
+        run: |
+          d="$RUNNER_TEMP/measure"
+          mkdir -p "$d"
+          printf '%s\n' "$ENTRY" >"$d/entry.txt"
+          {
+            echo "### Measurements: $ENTRY"
+            if [ "$IT_ENGINE" = sqlserver ]; then
+              # With --nocapture the first line of a test can follow its `test … ...` prefix.
+              grep -oE '(M2 \| |\[it\] m2: ).*' "$RUNNER_TEMP/it.log" >"$d/m2.txt" 2>/dev/null || true
+              # ADR-0055 name case facts (catalog_collation_type, ComparisonStyle, case-only duplicates).
+              grep -oE '\[it\] name_case: .*' "$RUNNER_TEMP/it.log" >"$d/name_case.txt" 2>/dev/null || true
+              # Phase 9 follow-ups: Discovery's table list under SQL Server Audit (#293), role
+              # membership changes (#281 review L2), the streams' server run (#303).
+              grep -oE '\[it\] (tables|roles|server run|xe predicate change): .*' "$RUNNER_TEMP/it.log" >"$d/follow-ups.txt" 2>/dev/null || true
+              grep -oE '(\[it\] xe fresh|panicked at|^test .* (ok|FAILED|ignored)$|test result: ).*' \
+                "$d/fresh.log" >"$d/fresh-summary.txt" 2>/dev/null || true
+              echo "M2 drift table: $(grep -c '^M2 | ' "$d/m2.txt" || true) row(s) (m2.txt); fresh-server test: ${FRESH_OUTCOME:-not run}"
+              echo '```'
+              cat "$d/fresh-summary.txt" 2>/dev/null || true
+              echo '```'
+              echo "phase 9 follow-ups: $(grep -c '' "$d/follow-ups.txt" || true) line(s) (follow-ups.txt)"
+              echo '```'
+              cat "$d/follow-ups.txt" 2>/dev/null || true
+              echo '```'
+              echo "name case: $(grep -c 'name_case: ' "$d/name_case.txt" || true) line(s) (name_case.txt)"
+              echo '```'
+              cat "$d/name_case.txt" 2>/dev/null || true
+              echo '```'
+            else
+              timeout 300 dev/capture-poll-digests.sh >"$d/poll_digests.tsv" || echo "capture incomplete (see poll_digests.tsv)"
+              echo "poll and stats digests: $(grep -vc '^#' "$d/poll_digests.tsv" || true) row(s) (poll_digests.tsv)"
+              echo '```'
+              grep '^#' "$d/poll_digests.tsv" || true
+              cut -f1-4 "$d/poll_digests.tsv" | grep -v '^#' || true
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+          # The full rows in the job log too (readable without the artifact): `sed -n l` shows
+          # tabs as \t and ends each row with `$`, so the MariaDB digests' trailing space stays visible.
+          if [ -f "$d/poll_digests.tsv" ]; then
+            echo "poll_digests.tsv of $ENTRY:"
+            sed -n l "$d/poll_digests.tsv"
+          fi
+      - name: Upload the measurements
+        if: always() && steps.measure.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # entry.txt names the entry (engine and version).
+          name: measure-${{ matrix.it }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/measure/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Service logs
         if: failure()
         run: |
@@ -303,3 +450,88 @@ jobs:
       - name: Stop
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
+
+  # e2e/sqlserver.sh (e2e/README.md "SQL Server target", "Other versions and the Extended Events
+  # source") on what the required ci.yml job e2e-sqlserver (2022, SQL Server Audit) does not run:
+  # the Extended Events source on 2022, SQL Server 2019 (Extended Events, its only source) and 2025
+  # (each source; without forced strict, the TLS mode `auto` reaches is printed). Each entry: the
+  # console and agent images built, enrollment, the honest level, Discovery against the ground
+  # truth, no own event, a bcp export raising a critical incident, reads and DCL incidents, and the
+  # I2 check. The images of 2019 and 2025 are the engine matrix pins above (sqlserver.sh checks).
+  e2e-sqlserver:
+    name: E2E SQL Server ${{ matrix.version }} (${{ matrix.source }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "2022"
+            source: sqlserver_xevents
+          - version: "2019"
+            source: sqlserver_xevents
+          - version: "2025"
+            source: sqlserver_audit
+          - version: "2025"
+            source: sqlserver_xevents
+    env:
+      E2E_LOG_DIR: ${{ github.workspace }}/e2e-sqlserver-logs
+      E2E_SQLSERVER_VERSION: ${{ matrix.version }}
+      E2E_SQLSERVER_AUDIT_SOURCE: ${{ matrix.source }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          openssl version
+          python3 --version
+      - name: shellcheck
+        run: timeout 60 shellcheck -x e2e/sqlserver.sh e2e/lib.sh
+      - name: Run e2e/sqlserver.sh
+        # Within the job budget (45 min): cleanup always completes. Every line goes to the job log
+        # unchanged (the runner reads the `::add-mask::` commands there); the copy kept for the
+        # summary leaves those commands out, since each one holds a secret in clear text. A plain
+        # loop rather than `tee >(…)`: it ends with the pipeline, so the copy is complete when the
+        # step ends, and pipefail keeps sqlserver.sh's exit status.
+        run: |
+          set -o pipefail
+          : >"$RUNNER_TEMP/e2e.log"
+          timeout 2280 e2e/sqlserver.sh 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+            printf '%s\n' "$line"
+            case "$line" in
+              ::add-mask::*) ;;
+              *) printf '%s\n' "$line" >>"$RUNNER_TEMP/e2e.log" ;;
+            esac
+          done
+      - name: Summary
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/e2e.log" ] || exit 0
+          {
+            echo "### E2E SQL Server $E2E_SQLSERVER_VERSION ($E2E_SQLSERVER_AUDIT_SOURCE)"
+            echo '```'
+            grep -E '\] (target-mssql: |mssql-e2e: (checked|SQL Server|audit level)|Audit: (bcp start|exporter events|.* hold .* statement)|(CENSUS|XE-CATCHUP) |all checks passed|PASS$|FAIL: |timings: )' \
+              "$RUNNER_TEMP/e2e.log" || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      # ADR-0053 decision 6 and #282 review N3: the event census (counts, target ids, principals as
+      # stored, the `*` events by kind; no value), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-census-${{ matrix.version }}-${{ matrix.source }}
+          path: e2e-sqlserver-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-logs-${{ matrix.version }}-${{ matrix.source }}
+          path: e2e-sqlserver-logs/
+          retention-days: 7
+          if-no-files-found: ignore

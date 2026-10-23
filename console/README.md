@@ -40,6 +40,7 @@ database (also used as the job queue: no Redis). See
 | `DATABASTION_BASELINES_PER_TARGET` | Worker: principal baselines kept per target, 10 to 1000000, default 10000; the least recently updated are evicted beyond. See "Audit correlation" |
 | `DATABASTION_NOTIFY_MAX_PER_HOUR` | Worker: incident notifications per channel and clock hour, 1 to 10000, default 30; beyond, they are skipped (`rate_limited`) and one digest per channel and hour reports the count. See "Alerting" |
 | `DATABASTION_SYSTEM_ALERTS_MAX_PER_HOUR` | Web and worker: system alerts (silent agents and recoveries, agent-integrity events, dropped batches, stopped Audit streams, break-glass local administrator logins) per channel and UTC clock hour, all agents together, 1 to 10000, default 20 (other values: the default, with a startup warning); beyond, they are skipped (`rate_limited`) and one `system_alerts.suppressed` digest per channel and hour reports them. Set the same value in every console process. See "Alerting" |
+| `DATABASTION_AGENT_TOKENS_HOLD` | Web (the worker only checks the value): rolling upgrade of several console replicas ([ADR-0022](../docs/adr/0022-protocol-capability-negotiation.md) decision 8). Set to the release line of the oldest replica (`0.8`, the only value today) on **every** replica during the upgrade: heartbeat answers then list only the capability tokens that release lists (for `0.8`: not `access_event.objects_overflowed`, `target_status.name_case`, `location.altered`, `object_ref.altered` nor `target_status.note_labels.2026_10_c`), so no agent sends a field an older replica rejects; every field is still accepted and stored. Remove it once every replica runs the new build. Unset or empty: every token is listed. Any other value: the processes **refuse to start**. While set, the ADR-0053, ADR-0055 and ADR-0056 detection rules do not apply to new items, and the web process reports it: a warning at startup, then at most once an hour from the heartbeat path, and the `/metrics` gauge `databastion_console_agent_tokens_hold` (`1` with label `release`, `0` when unset). Procedure: [deploy/README.md](../deploy/README.md#rolling-upgrade-of-several-console-replicas) |
 | `DATABASTION_ALERTING_INSECURE_DEV=1` | **Development only**: allows `http://` webhooks, webhooks to private / loopback addresses and plain-text SMTP to a non-loopback relay (link-local and metadata addresses stay refused). In production the web and worker processes **refuse to start** when it is set (any value), unless `DATABASTION_ALERTING_INSECURE_DEV_I_UNDERSTAND=1` is also set (then a warning is logged) |
 | `DATABASTION_TRUST_PROXY=1` | One trusted reverse proxy: the last `X-Forwarded-For` entry is the client IP used for per-IP rate limits. **Set it only behind a reverse proxy that sets or overwrites `X-Forwarded-For`** (otherwise clients choose their IP). Unset: the client IP is unknown, per-IP limits are off (per-user / per-agent limits and the argon2 concurrency cap remain), and a warning is logged at startup in production |
 | `DATABASTION_TRUSTED_PROXY_HOPS=N` | Same, for N (1 to 10) chained trusted proxies: the N-th `X-Forwarded-For` entry from the right is used. Takes precedence over `DATABASTION_TRUST_PROXY`. When the selected entry is missing or not an IP, a warning is logged (at most once a minute) |
@@ -445,8 +446,8 @@ The CI runs `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm test` and
 | `POST /api/agents/{id}/revoke` | Revoke an agent (admin): secrets unusable immediately, held long-polls closed, pending jobs cancelled |
 | `POST /api/agents/{id}/rotate` | Queue an `agent.rotate_secret` job (admin, `202 {job_id}`); `409` while a secret is pending, within 60 s of a promotion, or while another rotate job is open (ADR-0010) |
 | `POST /api/agents/{id}/targets/{target_id}/scan` | Queue a `discovery.scan` job (admin, `202 {job_id}`, audited `discovery.scan_request`). Body: contract `DiscoveryScanParams`, every key optional (defaults `sample_rows` 200, `max_duration_s` 3600, `statement_timeout_ms` 30000; 3600 rather than the contract's 900 because Discovery is paced by the agent, a scan lasting about 100 times its query time at the default 1 % duty cycle; the agent clamps the budget to its `limits.max_scan_duration_s`, 3600 s by default. This default assumes agents that pace Discovery: every released agent does, since 0.1.0, the first release, ships console and agents together and no unpaced agent was ever released; upgrade consoles and agents together. A pre-release agent without pacing would hold a target for up to that budget); unknown keys, out-of-range values and empty include filters: `400 invalid_params`. `404` unknown / inactive agent or target not currently reported; `409 agent_not_ready` (the agent's latest heartbeat carries no `classifiers_version`), `409 classifiers_version_unregistered` (that version is not in the contract classifier registry `classifiers.json`: no job is issued), `422 unknown_classifiers` (`classifiers` holds ids that are not classifiers of that version); each refusal is audited (`discovery.scan_request`, `failure`, with the reason and the version). The job carries the version of the agent's latest heartbeat. `409 scan_in_progress` (a scan of the target is pending, delivered or running). Expires after 6 h. **One scan per agent at a time** (security review M1): `GET /jobs` delivers a pending `discovery.scan` only when the agent has no other `discovery.scan` delivered or running and no older pending one, so the next scan of the agent goes out after the previous one ends (`succeeded`, `failed`, `cancelled`, or given up / timed out by the console; a scan ending wakes the agent's held poll). The agent counts a scan's window from its reception, so queue time no longer eats the budget of a scan requested together with others. Other job types are never held. Claims of one agent are serialized (transaction-scoped advisory lock `jobs.claim:<agent id>`, `src/server/job-lock.ts`), so concurrent polls never deliver two scans; revocation, the rotation-conflict lock, scan requests and Audit settings take the same lock after the agent row and before the agent's jobs (one lock order, so a revocation concurrent with polls never deadlocks). `GET /jobs` is limited to 20 requests per agent per 20 s (`429` + `Retry-After`). A held scan is shown as "pending (waiting for the previous scan of this agent)" on the agent page. While it is held and the agent is online (and neither revoked nor locked), its `expires_at` is kept at least 30 min ahead (refreshed to now + 1 h), so waiting behind long scans never expires it, but never past 24 h after the request (about 20 scans of the default 3600 s budget queued on one agent; an older order is stale: request it again); a held scan of an offline agent, one past that bound, or one whose `expires_at` already passed, expires as before. When a pending scan is delivered, its `expires_at` is raised, if lower, to now + 1 h (same 24 h bound), so a scan that waited does not reach the agent with only minutes left. Before the busy check and before each job claim, the agent's dead scans are swept: delivered / running past `first_delivered_at + max_duration_s + 1 h` (the first delivery: neither a redelivery nor a late `running` acknowledgement extends it; the `/findings` window of the scan uses the same deadline) → `failed` (`timeout`, audited `job.timeout`, `finished_at` = that deadline), then pending past `expires_at` → `expired`. The agent acknowledges a scan (`running`) only when it starts it: a delivered job without a status is delivered again every 120 s and given up (`failed`, `timeout`) after 5 deliveries, except a `discovery.scan` of an online agent (heartbeat within the last 90 s) before `first_delivered_at + max_duration_s + 600 s` (a malformed stored `max_duration_s` counts as the contract's 900 s): a delivered scan that still waits in the agent's queue (scans delivered by an older console before an upgrade) stays delivered (and redelivered, which the agent ignores while it holds the job) until it starts or its window is over. A scan job that fails the contract check when served is marked `failed` (`internal`) and the next pending scan is served in the same response |
-| `POST /api/agents/{id}/targets/{target_id}/audit` | Audit settings of a target, queued as an `audit.configure` job (admin, CSRF; P4-C). Body `{enabled, aggregation_window_s?, poll_interval_s?, min_rows?, derive_from_findings?, manual_objects?, confirm?}` (defaults 60, 10, none, `true`, `[]`; `manual_objects`: contract `SensitiveObject[]`); unknown keys and non-conforming objects: `400 {"error": "invalid_audit_settings", "field"}`; `404` unknown / inactive agent or target not currently reported. `202 {job_id, warning, previous_objects, next_objects, added_objects, removed_objects, truncated_objects, skipped_key_patterns}`. A change that disables Audit, empties `sensitive_objects` or removes many objects answers `409 {"error": "confirmation_required", warning, ...counts, digest}` and queues nothing: post the same settings again with `confirm: digest`. Audited `audit.configure` (counts, flags, warning, `confirmed`; refusals as failures). See "Audit correlation" |
-| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor). Marking closes the finding's open / acknowledged incidents as `false_positive` (audited `incident.transition`); unmarking makes the policies apply to it again |
+| `POST /api/agents/{id}/targets/{target_id}/audit` | Audit settings of a target, queued as an `audit.configure` job (admin, CSRF; P4-C). Body `{enabled, aggregation_window_s?, poll_interval_s?, min_rows?, derive_from_findings?, manual_objects?, confirm?}` (defaults 60, 10, none, `true`, `[]`; `manual_objects`: contract `SensitiveObject[]`); unknown keys and non-conforming objects: `400 {"error": "invalid_audit_settings", "field"}`; `404` unknown / inactive agent or target not currently reported. `202 {job_id, warning, previous_objects, next_objects, added_objects, removed_objects, truncated_objects, skipped_key_patterns, min_rows_warning}` (`min_rows_warning`: `"no_row_counts"` when `min_rows` is set on a Redis / Valkey target, whose events carry no row count, #235 review N2; a warning shown on the settings page, never a refusal; otherwise `null`). A change that disables Audit, empties `sensitive_objects` or removes many objects answers `409 {"error": "confirmation_required", warning, ...counts, digest}` and queues nothing: post the same settings again with `confirm: digest`. Audited `audit.configure` (counts, flags, warning, `confirmed`; refusals as failures). See "Audit correlation" |
+| `POST /api/findings/{id}/false-positive` | `{"false_positive": true\|false}` (admin, CSRF, audited `finding.false_positive` with agent, target and classifier); `204`, `404` unknown finding. The mark stores `matched` and `classifiers_version`; a rescan that matches more values or uses another classifier set clears it (audited `finding.false_positive_reset`, system actor, reasons `matched_increased` and `classifiers_version`); it also stores the row's altered parts (ADR-0056), and a revision altered in a part it was not altered in when marked clears it too (reason `names_altered`). A mark taken while a part was already altered carries over to a different look-alike in that same part: the console cannot tell look-alikes apart, as the agent sends no original spelling. Marking closes the finding's open / acknowledged incidents as `false_positive` (audited `incident.transition`); unmarking makes the policies apply to it again |
 | `POST /api/policies` | Create a policy (admin, CSRF): `{name, description?, enabled?, source?, conditions, actions}`, strictly validated (see "Policies and incidents"); `201 {id}`, `400 {"error": "invalid_policy", "field"}`, `409 name_taken` (case-insensitive). Audited `policy.create` (identifiers, flags and counts only: never the name or description) |
 | `PATCH` / `DELETE /api/policies/{id}` | Update any subset of the create keys (`source` is fixed) / delete (admin, CSRF); `204`, `404`. A deleted policy's exceptions go with it, its incidents are kept. Audited `policy.update` (with the changed keys) / `policy.delete` |
 | `POST /api/policy-exceptions` | Create an exception (admin, CSRF): `{policy_id?, agent_id?, target_id?, classifier?, location?, reason, expires_at?}`, at least one of agent / target / classifier / location; `201 {id}`, `400 {"error": "invalid_exception", "field"}`, `404` unknown policy or agent. Audited `policy_exception.create` (never the reason) |
@@ -650,7 +651,15 @@ heartbeat is processed, contract "Heartbeat target checks"); since P3-C also
 endpoint, the status and the first error `{pointer, keyword}` only. At most 20 are written per agent
 per 10 minutes; beyond, they are counted, logged once per window, and the next recorded event of the
 agent carries the count (`suppressed_before`). The budget is shared by all console processes (see "Shared
-rate limits"; per-process fallback if the shared store fails).
+rate limits"; per-process fallback if the shared store fails). `agent.target_mismatch` has a budget
+of its own (#235 review N1), since it is detected at every heartbeat for as long as the mismatch
+lasts: one row per agent and hour while the set of mismatched targets stays the same, and a row at
+once when it differs from the last recorded one (at most 12 such rows per agent and hour, PR #274
+review L1); the heartbeats in between are counted in the next row's `suppressed_before`, and its
+details carry `target_ids` (the sorted, comma-separated ids of every mismatched target, up to the
+contract's 64, #274 review L5); its `details_count` counts every mismatched target too (#277;
+rows written before count at most 20), while the stored error details stay capped at 20. It never
+uses the 20 rows of the other kinds.
 
 ## Metrics
 `GET /metrics` (Prometheus text format 0.0.4, [ADR-0004](../docs/adr/0004-observability-via-console.md)):
@@ -696,6 +705,7 @@ Frozen names (renaming one is a breaking change; the provisional Grafana dashboa
 | `databastion_console_rate_limit_store_errors_total` | | shared rate-limit store operations of this process that failed or timed out |
 | `databastion_console_rate_limit_store_short_circuits_total` | | shared rate-limit operations of this process answered by the failure mode during the circuit breaker, without calling the store |
 | `databastion_console_rate_limit_counters_rows` | | rows of `rate_limit_counters`, expired ones included, counted up to 1 000 000: alarm when it grows far beyond the number of active clients (floods of distinct keys between two prunes) |
+| `databastion_console_agent_tokens_hold` | `release` (only while held) | `1` while `DATABASTION_AGENT_TOKENS_HOLD` is set in this process, `0` when unset: alarm when it stays `1` after a rolling upgrade, or when replicas disagree during one |
 | `databastion_metrics_series_dropped` | | series dropped by the caps in the last scrape |
 
 Per-agent series cover enrolled / online agents (not revoked or locked). Agent-provided metric
@@ -716,8 +726,9 @@ integer (`?` when absent) and `{labels}` by the labels' display names (PostgreSQ
 and MySQL / MariaDB privileges in upper case, SQL Server permissions in upper case with spaces,
 SQL Server fixed roles as SQL Server names them, `##MS_…##` for the SQL Server 2022 roles, the
 other labels, the `check()` probes such as `logon_trigger_probe` included, as sent; the SQL Server
-labels are those of revisions `target_status.note_labels.2026_10` and
-`target_status.note_labels.2026_10_b`, both listed by the console in `accepts`), in one
+labels are those of revisions `target_status.note_labels.2026_10`,
+`target_status.note_labels.2026_10_b` and `target_status.note_labels.2026_10_c`
+(`on_failure_probe`), all listed by the console in `accepts`), in one
 non-recursive pass;
 a code this console does not know is shown raw with its count and labels. Everything is rendered as
 text (escaped). The console never derives a decision from notes.
@@ -882,7 +893,14 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   opens no incident; expired exceptions are listed as expired and ignored. An exception without a
   policy is global: scoped to a classifier family (e.g. `pii.*`) alone, it silences that family for
   every policy and every target. Only administrators create one, and it is audited
-  (`policy_exception.create`).
+  (`policy_exception.create`). A location part the agent reported altered by its name
+  normalization (contract `Location.altered` / `ObjectRef.altered`, ADR-0056: invisible or
+  formatting characters removed, compatibility forms folded, CAS keys converted to snake_case) is
+  covered only by an absent glob or exactly `*` for that part (`\*` does not cover it); the other
+  parts keep their rules. A finding row holds the union of the altered parts of every item of its
+  location within one scan job (`findings.altered`, within a batch and across that job's batches;
+  the first batch of a new job replaces it), and the finding and event views say the name was
+  altered. Without the marker (an older agent), nothing changes.
 - **Execution** (worker, pg-boss queue `policies.evaluate`, `stately`, no payload): the web process
   sends a wake-up after the commit of an accepted findings batch and after a policy or exception
   change (through a send-only pg-boss instance installed at startup and kept process-wide on
@@ -1033,6 +1051,13 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   not. An incident keeps at most 16 signals, `signature.*` ids first, so truncation never drops
   them.
 - **Dedup**: `dedup_key = policy:<id>|agent:<id>|target:<id>|principal:<key>|database:<sha256 of the name, or ->|hour:<UTC hour of the event ts>`.
+  The name keeps its case on every engine (case can tell databases apart), and drops trailing
+  spaces only on `sqlserver`, `mysql` and `mariadb`, as location exceptions (`dedupDatabaseName`,
+  ADR-0021 implementation note of 2026-10-18): on MySQL `crm ` and `crm` share one incident, on
+  PostgreSQL they do not, and `CRM` and `crm` never do. Consoles before it hashed the name as
+  sent: for a name with trailing spaces on these engines the key of the name as sent is also
+  looked up (one query for both keys, an active incident first), so an incident opened before the
+  upgrade keeps its events of that hour.
   For every `auth_failure`, the principal part is `unknown:<sha256 of the client network>`: IPv4
   /24, IPv6 /64 (canonical form), IPv4-mapped IPv6 as its IPv4 /24, `local` kept. All such events
   from one network count as one principal, so random account names or rotating addresses cannot
@@ -1092,12 +1117,33 @@ engine: `src/server/incidents.ts`; CRUD: `src/server/policies.ts`.*
   of those sent last time needs a confirmation of the exact settings (a digest: if the findings
   change in between, confirm again), is audited, and leaves a warning on the target until a later
   change that does not narrow Audit. The first configuration of a target never warns.
-  Redis / Valkey targets (P9-E review M3): the contract's `SensitiveObject.object` is an
-  `Identifier`, so derived objects named by a key pattern are left out of the settings sent
-  (counted in `skipped_key_patterns` of the answer and in the audit entry; the save never fails
-  because of them, and turning Audit off always works), the Audit page says so, and manual
-  objects are typed `database; object; classifier, …` (split on `;` only, never on `/` or `:`).
-  Key patterns typed by hand are refused until the contract carries them.
+  Redis / Valkey targets (P9-E review M3, phase 9 follow-ups): the contract's
+  `SensitiveObject.object` is an `ObjectName`, so a key pattern (`user:*:email`) can be a
+  sensitive object of a Redis / Valkey target, but it is sent only to an agent whose latest
+  heartbeat listed `sensitive_object.key_pattern` in `HeartbeatRequest.accepts` (ADR-0022
+  decision 3; the console stores the known tokens in `agents.accepts`, migration `0041`, and
+  lists them in `AGENT_TOKENS`, `src/server/agent-api/capabilities.ts`). For an older agent,
+  derived and manual objects named by a key pattern are left out of the settings sent (counted
+  in `skipped_key_patterns` of the answer and in the audit entry; the save never fails because
+  of them, and turning Audit off always works), and the Audit page says so. The check is made
+  again at delivery (`src/server/jobs.ts`): a job queued for an agent that no longer lists the
+  token goes out without its key patterns (logged with their count, recorded in
+  `jobs.delivered_without_key_patterns` and shown on the Audit settings page). A heartbeat that
+  changes the agent's stored list queues the enabled Redis / Valkey settings again from the
+  objects sent last time (`requeueAuditSettingsOnAcceptsChange`, a system `audit.configure`, no
+  confirmation): the plain names are kept as sent, only the key patterns are added or removed
+  (within what the 1000 cap leaves), nothing is queued when that changes nothing, and the stored
+  warning is replaced only when the requeue removes objects. At most 4 such changes per agent and
+  hour (`audit.requeue_per_agent`); past it, one `agent.accepts_flapping` integrity event an hour
+  (`audit.requeue_flapping_alerts`) and no requeue then, but the change is not dropped (#280
+  re-review L-a): the agent is marked (`agents.audit_requeue_due_at`, audited once as a system
+  `audit.requeue_deferred`, `reason: "budget_spent"`, only for an agent with enabled Redis /
+  Valkey settings), and the first heartbeat after the window queues the settings from the agent's
+  latest tokens (`deferred: true` in the `audit.configure` entry) and clears the mark, unless it
+  moved meanwhile (the mark only moves forward, under the agent's row lock). A requeue
+  that fails marks the agent the same way (`reason: "requeue_failed"`). Manual objects are typed
+  `database; object; classifier, …` (split on `;` only, never on `/` or `:`). A key pattern
+  typed by hand for a target of any other engine is refused (`400 invalid_params`).
 
 ## Alerting
 *P3-C. Channels: `src/server/channels.ts`, `src/server/channel-secrets.ts`; outbox and delivery:
@@ -1135,7 +1181,11 @@ dropped batches (P7): `src/server/dropped-batches.ts`; contents: `src/lib/notifi
   receivers must read `overflow`, never infer it from an empty `principal`), `database`,
   `hour` and `access` (the first event's `ts`, action,
   source, rows, score, sensitivity, anomaly flag, signals, `unregistered_signals` (the signal ids
-  missing from the console's registry; absent in rows written before P4-D) and objects); receivers should switch on
+  missing from the console's registry; absent in rows written before P4-D), objects and
+  `objects_overflowed` (ADR-0053: a boolean, always present in rows written since ADR-0053,
+  `true` when the agent left objects of the event out under a bound and its `*` objects stand for
+  them, `false` when not flagged or not known; receivers that reject unknown keys must be updated
+  before the console)); receivers should switch on
   `source`. **Never a sampled value, masked or not** (I2); the masked samples stay encrypted on the
   finding, and access events carry none.
 - **Webhook**: `POST` of `{"version": 1, "delivery_id", ...payload}` with `Content-Type:

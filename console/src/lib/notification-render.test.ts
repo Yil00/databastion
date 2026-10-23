@@ -71,6 +71,14 @@ describe("notification contents", () => {
     expect(body.access.unregistered_signals).toEqual(["signature.unregistered_example"]);
   });
 
+  it("access incident: says when the event reached more objects than it lists (ADR-0053), and the webhook carries the key", () => {
+    const flagged = { ...ACCESS, access: { ...ACCESS.access, objects: [{ database: "crm", schema: null, object: "*" }], objects_overflowed: true } };
+    expect(renderEmail(flagged).text).toContain("Objects:    crm.* (and objects the event does not list: left out by the agent under a bound)");
+    expect(renderEmail({ ...flagged, access: { ...flagged.access, objects_overflowed: false } }).text).not.toContain("left out");
+    expect(renderEmail(ACCESS).text).not.toContain("left out");
+    expect((JSON.parse(webhookBody("d-2", flagged)) as { access: Record<string, unknown> }).access.objects_overflowed).toBe(true);
+  });
+
   it("access incident: db_user stays on one line in the subject and body (P1-A)", () => {
     const { subject, text } = renderEmail(ACCESS);
     expect(subject).not.toMatch(/[\r\n\u202e]/);

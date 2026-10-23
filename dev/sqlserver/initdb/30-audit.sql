@@ -2,7 +2,8 @@
 -- time), never by the agent. Applied after the seed and the agent account, so neither is recorded.
 -- SQL Server Audit: a FILE target, no WHERE predicate, ON_FAILURE = CONTINUE; one server audit
 -- specification with read coverage for every database (SCHEMA_OBJECT_ACCESS_GROUP), the required
--- AUDIT_CHANGE_GROUP, failed logins, principal changes (password-bearing DCL) and backups.
+-- AUDIT_CHANGE_GROUP, failed logins, principal changes (password-bearing DCL), role-membership
+-- changes of server and database roles (ROADMAP phase 9 follow-up, #281 review L2) and backups.
 -- Extended Events: the statement-level events and rpc_completed with the five actions of the
 -- Partial proof, failed logins (error_reported, error 18456 only: a bare TCP connect such as the
 -- healthcheck's gives error 17830, left out by the predicate), an event_file target,
@@ -19,6 +20,8 @@ CREATE SERVER AUDIT SPECIFICATION databastion_audit_spec FOR SERVER AUDIT databa
   ADD (FAILED_LOGIN_GROUP),
   ADD (SERVER_PRINCIPAL_CHANGE_GROUP),
   ADD (DATABASE_PRINCIPAL_CHANGE_GROUP),
+  ADD (SERVER_ROLE_MEMBER_CHANGE_GROUP),
+  ADD (DATABASE_ROLE_MEMBER_CHANGE_GROUP),
   ADD (APPLICATION_ROLE_CHANGE_PASSWORD_GROUP),
   ADD (LOGIN_CHANGE_PASSWORD_GROUP),
   ADD (BACKUP_RESTORE_GROUP)

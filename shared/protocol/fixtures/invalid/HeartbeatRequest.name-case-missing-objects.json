@@ -1,0 +1,26 @@
+{
+  "ts": "2026-10-21T09:00:00Z",
+  "agent_version": "0.9.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "mysql"
+  ],
+  "targets": [
+    {
+      "target_id": "mysql-prod",
+      "engine": "mysql",
+      "reachable": true,
+      "audit_level": "partial",
+      "name_case": {
+        "databases": "insensitive"
+      }
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

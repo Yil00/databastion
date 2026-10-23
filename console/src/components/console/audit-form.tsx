@@ -5,6 +5,7 @@ import { useState, type FormEvent } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
+import { MIN_ROWS_WARNING_TEXT } from "@/lib/audit-warning";
 
 import { userApi } from "./client-api";
 
@@ -157,9 +158,11 @@ export function AuditForm({
     const truncated = typeof json?.truncated_objects === "number" && json.truncated_objects > 0 ? ` ${json.truncated_objects} objects over the limit of 1000 were left out.` : "";
     const skipped =
       typeof json?.skipped_key_patterns === "number" && json.skipped_key_patterns > 0
-        ? ` ${json.skipped_key_patterns} key-pattern objects with findings cannot be listed as sensitive objects yet and were left out.`
+        ? ` ${json.skipped_key_patterns} key-pattern objects were left out: this agent cannot receive key patterns as sensitive objects (upgrade it, then save again).`
         : "";
-    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}${skipped}`);
+    // #235 review N2: saved, with a warning (min_rows on a Redis / Valkey target).
+    const rows = json?.min_rows_warning === "no_row_counts" ? ` Warning: ${MIN_ROWS_WARNING_TEXT.no_row_counts}` : "";
+    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}${skipped}${rows}`);
     router.refresh();
   }
 
@@ -199,7 +202,19 @@ export function AuditForm({
         </div>
         <div className="flex flex-col gap-1">
           <Label htmlFor={id("min-rows")}>Report other accesses from (rows)</Label>
-          <Input id={id("min-rows")} name="min_rows" type="number" min={0} defaultValue={initial.minRows ?? ""} />
+          <Input
+            id={id("min-rows")}
+            name="min_rows"
+            type="number"
+            min={0}
+            defaultValue={initial.minRows ?? ""}
+            aria-describedby={keyPatterns ? id("min-rows-hint") : undefined}
+          />
+          {keyPatterns && (
+            <p id={id("min-rows-hint")} className="text-xs text-muted-foreground">
+              Leave empty: events of this engine carry no row count, so a threshold drops those without a signal.
+            </p>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-2">

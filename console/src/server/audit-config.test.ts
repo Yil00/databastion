@@ -1,8 +1,9 @@
 import { and, desc, eq } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { auditConfigs, auditLog, jobs, users } from "@/db/schema";
+import { agents, auditConfigs, auditLog, jobs, securityEvents, users } from "@/db/schema";
+import { minRowsWarning } from "@/lib/audit-warning";
 import { validateSchema } from "@/lib/protocol/validate";
 import { failuresPerAgent } from "@/server/agent-api/auth";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
@@ -14,7 +15,10 @@ import { adminUser, agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
 import {
   assessAuditChange,
+  auditRequeueBudget,
+  auditRequeueTestHooks,
   auditSummaries,
+  deferAuditRequeue,
   getAuditConfig,
   MAX_SENSITIVE_OBJECTS,
   mergeSensitiveObjects,
@@ -36,6 +40,13 @@ const obj = (object: string, classifiers = ["pii.email"], schema: string | null 
 const objs = (n: number, prefix = "t") => Array.from({ length: n }, (_, i) => obj(`${prefix}${i}`));
 
 describe("audit settings model", () => {
+  it("#235 review N2: warns on min_rows only on a key-pattern engine, 0 included", () => {
+    expect(minRowsWarning(true, 0)).toBe("no_row_counts");
+    expect(minRowsWarning(true, 1000)).toBe("no_row_counts");
+    expect(minRowsWarning(true, null)).toBeNull();
+    expect(minRowsWarning(false, 1000)).toBeNull();
+  });
+
   it("parses a request with the contract defaults made explicit", () => {
     expect(parseAuditConfigInput({ enabled: true })).toEqual({
       ok: true,
@@ -228,7 +239,7 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     const res = await configure(auth, { enabled: true, min_rows: 10_000 });
     expect(res.status).toBe(202);
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toMatchObject({ warning: null, previous_objects: 0, next_objects: 2, added_objects: 2, removed_objects: 0 });
+    expect(body).toMatchObject({ warning: null, previous_objects: 0, next_objects: 2, added_objects: 2, removed_objects: 0, min_rows_warning: null });
     const [job] = await auditJobs(auth.agentId);
     expect(job).toMatchObject({ id: body.job_id, status: "pending", targetId: "pg-prod-1", createdBy: adminId });
     expect(job?.params).toEqual({
@@ -298,12 +309,14 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(row).toMatchObject({ enabled: false, warning: "disabled" });
   });
 
-  it("P9-E review M3: on a Redis target, key-pattern findings are left out of the settings, never failing the save; turning Audit off works", async () => {
+  /** An agent with a Redis target and two findings there: a key pattern and a plain name. */
+  async function redisAgentWithFindings(accepts?: string[]): Promise<Auth> {
     const auth = await enroll();
     const hb = {
       ...HEARTBEAT,
       connectors: ["postgres", "redis"],
       targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+      ...(accepts ? { accepts } : {}),
     };
     expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
     await enqueueJob(getDb(), {
@@ -324,6 +337,11 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     });
     const body = { batch_id: uuidv7(), job_id: list[0]?.job_id, classifiers_version: "2026.09.1", findings: [redisFinding("user:*:profile"), redisFinding("profiles")] };
     expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+    return auth;
+  }
+
+  it("P9-E review M3: on a Redis target of an agent without sensitive_object.key_pattern, key patterns are left out, never failing the save; turning Audit off works", async () => {
+    const auth = await redisAgentWithFindings();
     const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
     expect(on.status).toBe(202);
     expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
@@ -331,6 +349,7 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(job?.params).toMatchObject({ enabled: true, sensitive_objects: [{ database: "db0", schema: "hash", object: "profiles", classifiers: ["pii.email"] }] });
     const [audit] = await audits(auth.agentId);
     expect(audit?.details).toMatchObject({ derived_objects: 1, skipped_key_patterns: 1 });
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.agentAcceptsKeyPatterns).toBe(false);
     // Turning Audit off: confirmation, then queued.
     const off = await configure(auth, { enabled: false }, { target: "cache-redis" });
     expect(off.status).toBe(409);
@@ -338,9 +357,299 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect((await configure(auth, { enabled: false, confirm: d.digest }, { target: "cache-redis" })).status).toBe(202);
     const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
     expect(row).toMatchObject({ enabled: false });
-    // A key pattern typed by hand is still refused (not a SensitiveObject yet).
-    const manual = await configure(auth, { enabled: true, manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }] }, { target: "cache-redis" });
-    expect(manual.status).toBe(400);
+    // A key pattern typed by hand is kept in the settings but left out of the job, and counted
+    // (here the change empties the objects sent: a confirmation first).
+    const settings = {
+      enabled: true,
+      derive_from_findings: false,
+      manual_objects: [{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }],
+    };
+    const emptied = await configure(auth, settings, { target: "cache-redis" });
+    expect(emptied.status).toBe(409);
+    const e = (await emptied.json()) as { digest: string; skipped_key_patterns: number; warning: string };
+    expect(e).toMatchObject({ warning: "emptied", skipped_key_patterns: 1 });
+    const manual = await configure(auth, { ...settings, confirm: e.digest }, { target: "cache-redis" });
+    expect(manual.status).toBe(202);
+    expect(await manual.json()).toMatchObject({ next_objects: 0, skipped_key_patterns: 1 });
+    const [latest] = await auditJobs(auth.agentId);
+    expect(latest?.params).toMatchObject({ enabled: true, sensitive_objects: [] });
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.manualObjects).toEqual([{ database: "db0", object: "user:*:email", classifiers: ["pii.email"] }]);
+  });
+
+  it("phase 9 follow-ups: an agent that lists sensitive_object.key_pattern receives the key patterns, from findings and typed by hand", async () => {
+    const auth = await redisAgentWithFindings(["future.feature", "sensitive_object.key_pattern"]);
+    const [stored] = await getDb().select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, auth.agentId));
+    // Only the tokens this console knows are stored.
+    expect(stored?.accepts).toEqual(["sensitive_object.key_pattern"]);
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.agentAcceptsKeyPatterns).toBe(true);
+    const on = await configure(
+      auth,
+      { enabled: true, manual_objects: [{ database: "db1", object: "session:*:token", classifiers: ["pii.phone"] }] },
+      { target: "cache-redis" },
+    );
+    expect(on.status).toBe(202);
+    expect(await on.json()).toMatchObject({ next_objects: 3, skipped_key_patterns: 0 });
+    const [job] = await auditJobs(auth.agentId);
+    const sent = (job?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    expect(sent).toEqual(["profiles", "session:*:token", "user:*:profile"]);
+    // Delivered as such, and a conforming JobList.
+    const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+    const { jobs: list } = (await polled.json()) as { jobs: { type: string; params: { sensitive_objects: SensitiveObject[] } }[] };
+    const delivered = list.find((j) => j.type === "audit.configure");
+    expect(delivered?.params.sensitive_objects.map((o) => o.object).sort()).toEqual(sent);
+    expect(validateSchema("JobList", { jobs: list }).ok).toBe(true);
+  });
+
+  const REDIS_HB = {
+    ...HEARTBEAT,
+    connectors: ["postgres", "redis"],
+    targets: [{ target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" }],
+  };
+
+  it("#280 review M2: a downgraded agent's settings are queued again without key patterns, with a warning, by the system", async () => {
+    const auth = await redisAgentWithFindings(["sensitive_object.key_pattern"]);
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    // A rolled-back agent: its next heartbeat lists nothing.
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HB }))).status).toBe(200);
+    const [latest, first] = await auditJobs(auth.agentId);
+    expect(first?.status).toBe("cancelled");
+    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object)).toEqual(["profiles"]);
+    expect(latest?.createdBy).toBeNull();
+    const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
+    expect(row).toMatchObject({ warning: "shrunk", warningRemoved: 1 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit).toMatchObject({ actorType: "system", actorId: null });
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", key_patterns: 0, removed_objects: 1, warning: "shrunk" });
+    // The same heartbeat again changes nothing: no new job.
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: REDIS_HB }))).status).toBe(200);
+    expect(await auditJobs(auth.agentId)).toHaveLength(2);
+  });
+
+  it("#280 review M2 and re-review N2: an upgraded agent gets the key patterns left out before; plain names and the stored warning are kept", async () => {
+    const auth = await redisAgentWithFindings();
+    const on = await configure(auth, { enabled: true }, { target: "cache-redis" });
+    expect(await on.json()).toMatchObject({ next_objects: 1, skipped_key_patterns: 1 });
+    expect((await auditJobs(auth.agentId))[0]?.params).toMatchObject({ sensitive_objects: [{ object: "profiles" }] });
+    // What was sent last is the base, never today's findings: a plain name sent before stays, one
+    // that was not sent is not added (here, `profiles` taken out of the record of what was sent),
+    // and an earlier warning on the target stays.
+    await getDb()
+      .update(auditConfigs)
+      .set({ sentObjects: [{ database: "db0", object: "kept_plain", classifiers: ["pii.email"] }], warning: "shrunk", warningRemoved: 7 })
+      .where(eq(auditConfigs.agentId, auth.agentId));
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } }))).status).toBe(200);
+    const [latest] = await auditJobs(auth.agentId);
+    expect((latest?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object)).toEqual(["kept_plain", "user:*:profile"]);
+    const [row] = await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId));
+    expect(row).toMatchObject({ warning: "shrunk", warningRemoved: 7 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", added_objects: 1, removed_objects: 0, key_patterns: 1, warning: null });
+  });
+
+  it("#280 re-review N1: an agent flipping its tokens gets at most 4 requeues an hour, then one accepts_flapping integrity event", async () => {
+    const auth = await redisAgentWithFindings();
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    for (let i = 0; i < 8; i++) {
+      const body = i % 2 === 0 ? { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } : REDIS_HB;
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    }
+    // 8 changes: the first 4 are requeued (each one changes the key patterns sent), then none.
+    expect(await auditJobs(auth.agentId)).toHaveLength(1 + 4);
+    const events = await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, auth.agentId));
+    expect(events.filter((e) => e.kind === "agent.accepts_flapping")).toHaveLength(1);
+  });
+
+  it("#280 re-review L-a: a change past the requeue budget is deferred, audited once, and acted on from a later heartbeat", async () => {
+    const auth = await redisAgentWithFindings();
+    expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+    const withToken = { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] };
+    const hb = async (body: unknown) => expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    const sentObjects = async () => ((await auditJobs(auth.agentId))[0]?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    const mark = async () => (await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, auth.agentId)))[0]?.dueAt;
+    const deferrals = async () =>
+      (await getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, auth.agentId))));
+    // Four changes spend the budget (each one requeued), ending without the token.
+    for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+    expect(await auditJobs(auth.agentId)).toHaveLength(1 + 4);
+    expect(await mark()).toBeNull();
+    // The fifth change (an upgrade) is stored but not requeued: the agent is marked, audited once.
+    await hb(withToken);
+    expect((await getDb().select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, auth.agentId)))[0]?.accepts).toEqual(["sensitive_object.key_pattern"]);
+    expect(await auditJobs(auth.agentId)).toHaveLength(5);
+    expect(await sentObjects()).toEqual(["profiles"]);
+    expect(await mark()).toBeInstanceOf(Date);
+    const [deferred] = await deferrals();
+    expect(deferred).toMatchObject({ actorType: "system", outcome: "failure", targetType: "agent" });
+    expect(deferred?.details).toEqual({ agent_id: auth.agentId, reason: "budget_spent" });
+    // Later heartbeats in the same window: nothing queued, no second audit entry or integrity event.
+    await hb(withToken);
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(5);
+    expect(await deferrals()).toHaveLength(1);
+    const flapping = async () => (await getDb().select().from(securityEvents).where(eq(securityEvents.agentId, auth.agentId))).filter((e) => e.kind === "agent.accepts_flapping");
+    expect(await flapping()).toHaveLength(1);
+    // The window is over: the next heartbeat, with no change, queues the settings from the latest
+    // tokens and clears the mark.
+    auditRequeueBudget.clear();
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(6);
+    expect(await sentObjects()).toEqual(["profiles", "user:*:profile"]);
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ reason: "agent_accepts_changed", added_objects: 1, deferred: true });
+    expect(await mark()).toBeNull();
+    await hb(withToken);
+    expect(await auditJobs(auth.agentId)).toHaveLength(6);
+    expect(await flapping()).toHaveLength(1);
+  });
+
+  describe("#280 re-review L-a, security review of 34db5b8", () => {
+    const withToken = { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] };
+    const hbOf = (auth: Auth) => async (body: unknown) =>
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    const markOf = async (agentId: string) => (await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, agentId)))[0]?.dueAt ?? null;
+    const deferralsOf = async (agentId: string) =>
+      getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, agentId)));
+    const sentOf = async (agentId: string) =>
+      ((await auditJobs(agentId))[0]?.params as { sensitive_objects: SensitiveObject[] }).sensitive_objects.map((o) => o.object).sort();
+    afterEach(() => {
+      auditRequeueTestHooks.beforeTarget = null;
+    });
+
+    it("L3: a requeue that fails marks the agent once; a later heartbeat queues the settings and clears the mark", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      auditRequeueTestHooks.beforeTarget = async () => {
+        throw new Error("injected");
+      };
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(1);
+      expect(await markOf(auth.agentId)).toBeInstanceOf(Date);
+      const [entry] = await deferralsOf(auth.agentId);
+      expect(entry?.details).toEqual({ agent_id: auth.agentId, reason: "requeue_failed" });
+      // Still failing: the mark stays, no second entry.
+      await hb(withToken);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      auditRequeueTestHooks.beforeTarget = null;
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(2);
+      expect(await sentOf(auth.agentId)).toEqual(["profiles", "user:*:profile"]);
+      expect(await markOf(auth.agentId)).toBeNull();
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+    });
+
+    it("L3: a deferred change reverted before the window ends queues nothing and clears the mark", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+      expect(await auditJobs(auth.agentId)).toHaveLength(5);
+      await hb(withToken);
+      const first = await markOf(auth.agentId);
+      expect(first).toBeInstanceOf(Date);
+      // Reverted: the mark moves forward, still one audit entry.
+      await hb(REDIS_HB);
+      const moved = await markOf(auth.agentId);
+      expect(moved?.getTime()).toBeGreaterThan(first?.getTime() ?? Infinity);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      auditRequeueBudget.clear();
+      await hb(REDIS_HB);
+      expect(await auditJobs(auth.agentId)).toHaveLength(5);
+      expect(await sentOf(auth.agentId)).toEqual(["profiles"]);
+      expect(await markOf(auth.agentId)).toBeNull();
+    });
+
+    it("L1: a mark moved during a requeue (another replica deferring a change) stays set", async () => {
+      const auth = await redisAgentWithFindings();
+      const hb = hbOf(auth);
+      expect((await configure(auth, { enabled: true }, { target: "cache-redis" })).status).toBe(202);
+      for (let i = 0; i < 4; i++) await hb(i % 2 === 0 ? withToken : REDIS_HB);
+      await hb(withToken);
+      const before = await markOf(auth.agentId);
+      expect(before).toBeInstanceOf(Date);
+      auditRequeueBudget.clear();
+      auditRequeueTestHooks.beforeTarget = async (agentId) => {
+        expect(await deferAuditRequeue(getDb(), agentId, "budget_spent")).toBe(false);
+      };
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(6);
+      const after = await markOf(auth.agentId);
+      expect(after?.getTime()).toBeGreaterThan(before?.getTime() ?? Infinity);
+      expect(await deferralsOf(auth.agentId)).toHaveLength(1);
+      // The next heartbeat acts on it (nothing left to change) and clears it.
+      auditRequeueTestHooks.beforeTarget = null;
+      await hb(withToken);
+      expect(await auditJobs(auth.agentId)).toHaveLength(6);
+      expect(await markOf(auth.agentId)).toBeNull();
+    });
+  });
+
+  it("#280 re-review L-a: an agent without Redis / Valkey Audit settings is not marked past the budget", async () => {
+    const auth = await enroll();
+    for (let i = 0; i < 6; i++) {
+      const body = i % 2 === 0 ? { ...REDIS_HB, accepts: ["sensitive_object.key_pattern"] } : REDIS_HB;
+      expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }))).status).toBe(200);
+    }
+    const [row] = await getDb().select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, auth.agentId));
+    expect(row?.dueAt).toBeNull();
+    expect((await getDb().select().from(auditLog).where(and(eq(auditLog.action, "audit.requeue_deferred"), eq(auditLog.targetId, auth.agentId))))).toHaveLength(0);
+  });
+
+  it("#280 review M2 and L4: a job carrying key patterns is delivered without them to an agent that never listed the token, recorded on the job", async () => {
+    const auth = await redisAgentWithFindings();
+    const params = {
+      enabled: true,
+      sensitive_objects: [
+        { database: "db0", object: "user:*:email", classifiers: ["pii.email"] },
+        { database: "db0", object: "profiles", classifiers: ["pii.email"] },
+      ],
+    };
+    const id = await enqueueJob(getDb(), { agentId: auth.agentId, type: "audit.configure", targetId: "cache-redis", params });
+    const polled = await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }));
+    const { jobs: list } = (await polled.json()) as { jobs: { job_id: string; params: { sensitive_objects: SensitiveObject[] } }[] };
+    const delivered = list.find((j) => j.job_id === id);
+    expect(delivered?.params.sensitive_objects.map((o) => o.object)).toEqual(["profiles"]);
+    const [job] = await getDb().select().from(jobs).where(eq(jobs.id, id));
+    expect(job?.deliveredWithoutKeyPatterns).toBe(1);
+    expect((job?.params as typeof params).sensitive_objects).toHaveLength(2);
+    expect((await getAuditConfig(getDb(), auth.agentId, "cache-redis"))?.lastJob?.deliveredWithoutKeyPatterns).toBe(1);
+  });
+
+  it("phase 9 follow-ups: a key pattern typed by hand for a target of another engine is refused", async () => {
+    const auth = await agentWithFindings([]);
+    const r = await configure(auth, { enabled: true, manual_objects: [{ database: "crm", object: "user:*:email", classifiers: ["pii.email"] }] });
+    expect(r.status).toBe(400);
+    expect(await auditJobs(auth.agentId)).toHaveLength(0);
+  });
+
+  it("#235 review N2: min_rows on a Redis / Valkey target is saved with a warning, in the answer and the audit entry", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "redis"],
+      targets: [
+        ...HEARTBEAT.targets,
+        { target_id: "cache-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+      ],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const withRows = await configure(auth, { enabled: true, min_rows: 100 }, { target: "cache-valkey" });
+    expect(withRows.status).toBe(202);
+    expect(await withRows.json()).toMatchObject({ min_rows_warning: "no_row_counts" });
+    const [job] = await auditJobs(auth.agentId);
+    expect(job?.params).toMatchObject({ enabled: true, min_rows: 100 });
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.details).toMatchObject({ target_id: "cache-valkey", min_rows: 100, min_rows_warning: "no_row_counts" });
+    // Without min_rows: no warning; on a SQL target, min_rows carries none either.
+    const without = await configure(auth, { enabled: true }, { target: "cache-valkey" });
+    expect(await without.json()).toMatchObject({ min_rows_warning: null });
+    const sql = await configure(auth, { enabled: true, min_rows: 100 });
+    expect(sql.status).toBe(202);
+    expect(await sql.json()).toMatchObject({ min_rows_warning: null });
+    // The warning rides along with a confirmation request too.
+    const off = await configure(auth, { enabled: false, min_rows: 5 }, { target: "cache-valkey" });
+    expect(off.status).toBe(409);
+    expect(await off.json()).toMatchObject({ error: "confirmation_required", min_rows_warning: "no_row_counts" });
   });
 
   it("supersedes the settings jobs not delivered yet", async () => {

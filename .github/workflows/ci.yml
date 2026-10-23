@@ -637,16 +637,36 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: agent
+      # With the Unix sockets published to the runner (dev/redis/compose.socket.yml, #239 re-review
+      # N1): the runner's primary group may be shared (docker on hosted runners), so a dedicated
+      # group with the runner's user as its single member (checked by dev/redis/socket-group.sh,
+      # #317 review L2) owns the setgid 2770 directories and is added to the servers; only the
+      # runner's user (and root) connects. The tests run in that group through `sg`. The TLS port
+      # is unchanged.
       - name: Start the dev Valkey and Redis services
         run: |
           cp dev/.env.example dev/.env
           make dev-dirs
-          timeout 900 docker compose -f dev/docker-compose.yml up -d --wait --wait-timeout 600 valkey redis
+          sudo groupadd databastion-redis-socket
+          sudo usermod -aG databastion-redis-socket "$USER"
+          DATABASTION_DEV_REDIS_SOCKET_GID="$(dev/redis/socket-group.sh databastion-redis-socket)"
+          export DATABASTION_DEV_REDIS_SOCKET_GID
+          install -d dev/.state/redis-socket
+          sudo install -d -o "$USER" -g databastion-redis-socket -m 2770 dev/.state/redis-socket/valkey dev/.state/redis-socket/redis
+          for d in dev/.state/redis-socket/valkey dev/.state/redis-socket/redis; do
+            [ "$(stat -c %g:%a "$d")" = "$DATABASTION_DEV_REDIS_SOCKET_GID:2770" ] || { echo "$d: unexpected group or mode" >&2; exit 1; }
+          done
+          timeout 900 docker compose -f dev/docker-compose.yml -f dev/redis/compose.socket.yml up -d --wait --wait-timeout 600 valkey redis
           timeout 60 docker compose -f dev/docker-compose.yml images valkey redis
-      - name: Connector integration tests (dev images, Valkey and Redis over TLS)
+      - name: Connector integration tests (dev images, Valkey and Redis over TLS and their sockets)
+        env:
+          # The socket target test must run, never be skipped.
+          DATABASTION_IT_REDIS_REQUIRE_SOCKET: "1"
         run: |
           set -o pipefail
-          timeout 1200 dev/agent-it.sh redis 2>&1 | tee "$RUNNER_TEMP/it.log"
+          # In the dedicated socket group (the step above; `sg` keeps the environment and the
+          # runner's other groups).
+          sg databastion-redis-socket -c 'timeout 1200 dev/agent-it.sh redis' 2>&1 | tee "$RUNNER_TEMP/it.log"
       - name: Service logs
         if: failure()
         run: timeout 120 docker compose -f dev/docker-compose.yml logs --no-color --tail=300 redis-tls-init valkey redis
@@ -716,14 +736,15 @@ jobs:
   # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
   # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
   # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
-  # up. Ignored in debug builds (5 to 11 minutes there), about 20 s in release. A job of its own so
+  # up. Ignored in debug builds (5 to 11 minutes there), about 20 s in release. Also the normalized
+  # names' IdentifierProduced sweep (ADR-0057). A job of its own so
   # that the release build neither shares the debug cache nor eats the Agent job's time budget.
   agent-keys-sweep:
     name: Agent key-pattern code-point sweep (release)
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: agent
@@ -740,6 +761,10 @@ jobs:
           key: release-sweep
       - name: Code-point sweep (keys_contract, release)
         run: timeout 600 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test --release --locked -p databastion-classifiers --test keys_contract -- --include-ignored
+      # The same sweep for the normalized names against the contract's IdentifierProduced rule
+      # (ADR-0057, classifiers test identifier_produced): about 3 minutes in release.
+      - name: Code-point sweep (identifier_produced, release)
+        run: timeout 600 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test --release --locked -p databastion-classifiers --test identifier_produced -- --include-ignored
 
   # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
   # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,
@@ -801,6 +826,16 @@ jobs:
       # with the containers. If the invariant I2 check fails, the logs may hold seeded values:
       # they are fake (dev/seed/generate.py) and already public in the repository; the job log
       # itself only holds needle ids and file names.
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-census
+          path: e2e-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -890,6 +925,16 @@ jobs:
         run: timeout 2280 e2e/cas.sh
       # cas.sh redacts every generated secret, every ticket of the run and every typed name of a
       # failed login from the logs on exit, whatever the result (and masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-cas-census
+          path: e2e-cas-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -937,6 +982,16 @@ jobs:
         run: timeout 2280 e2e/sqlserver.sh
       # sqlserver.sh redacts every generated secret and the DCL marker passwords from the logs on
       # exit, whatever the result (and masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-census
+          path: e2e-sqlserver-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -985,6 +1040,16 @@ jobs:
         run: timeout 1980 e2e/redis.sh
       # redis.sh redacts every generated secret from the logs on exit, whatever the result (and
       # masks them in the job log).
+      # ADR-0053 decision 6: the event census (counts, target ids, principals as stored, the `*`
+      # events by kind; no value, redacted with the logs), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-redis-census
+          path: e2e-redis-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

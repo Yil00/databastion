@@ -173,16 +173,20 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
                 .iter()
                 .filter(|f| {
                     let l = f.location().unwrap();
+                    // Without case: under `lower_case_table_names` 1
+                    // the server stores the tables in lowercase (no two
+                    // fixture tables differ by case only).
                     l.database.as_str() == GUARD_DB
-                        && l.object.as_str() == object
-                        && l.field.as_str() == field
+                        && l.object.as_str().eq_ignore_ascii_case(object)
+                        && l.field.as_str().eq_ignore_ascii_case(field)
                 })
                 .collect::<Vec<_>>()
         };
         for f in &findings {
             let o = f.location().unwrap().object.as_str();
             assert!(
-                o != "sso_sessions_v2" && o != "cas_tickets",
+                !o.eq_ignore_ascii_case("sso_sessions_v2")
+                    && !o.eq_ignore_ascii_case("cas_tickets"),
                 "{name}: {f:?}"
             );
         }
@@ -303,6 +307,123 @@ async fn cas_store_guard_on_mysql_and_mariadb() {
         drop_fixtures(&mut a).await;
         assert_eq!(through_role, Some(1), "{name}");
         assert_eq!(with_audit, Some(2), "{name}");
+    }
+}
+
+/// Test account of [`ticket_tables_in_user_databases_named_like_system_schemas`].
+const CAS_SYS_USER: &str = "databastion_it_cas_sys";
+
+/// Security review L4 of the #300 follow-up: under
+/// `lower_case_table_names = 0` the user databases `SYS` and `MySQL` are
+/// not system schemas, and a CAS ticket table in one of them is counted by
+/// Discovery, never sampled, and reported by `check()` when readable (the
+/// guard's table list compares `mysql` and `sys` as the server does). A
+/// database the server refuses to create is left out with a message; a
+/// server with another setting is skipped.
+#[tokio::test]
+async fn ticket_tables_in_user_databases_named_like_system_schemas() {
+    let _serial = SERIAL.lock().await;
+    for server in servers() {
+        let Some(admin) = server.admin() else {
+            continue;
+        };
+        let name = server.name;
+        let mut a = admin_session(&server, &admin).await;
+        let lctn = scalar(&mut a, "SELECT @@GLOBAL.lower_case_table_names").await;
+        if lctn.as_deref() != Some("0") {
+            eprintln!("skipped: {name}: lower_case_table_names is {lctn:?}, not 0");
+            continue;
+        }
+        let u = format!("'{CAS_SYS_USER}'@'%'");
+        exec(&mut a, &format!("DROP USER IF EXISTS {u}")).await;
+        exec(
+            &mut a,
+            &format!("CREATE USER {u} IDENTIFIED BY '{IT_PASSWORD}' REQUIRE SSL"),
+        )
+        .await;
+        let [t0, t1, ..] = TICKETS;
+        let [p0, _] = TICKET_PRINCIPALS;
+        let mut made = Vec::new();
+        for db in ["SYS", "MySQL"] {
+            let _ = a
+                .exec(Stage::Check, &format!("DROP DATABASE IF EXISTS `{db}`"))
+                .await;
+            if let Err(e) = a
+                .exec(Stage::Check, &format!("CREATE DATABASE `{db}`"))
+                .await
+            {
+                eprintln!(
+                    "[it] name_case: {name}: CREATE DATABASE `{db}` refused (errno {:?}): \
+                     not tested",
+                    e.errno
+                );
+                continue;
+            }
+            for statement in [
+                format!(
+                    "CREATE TABLE `{db}`.cas_tickets (id varchar(255), parent_id varchar(255), \
+                     body text, type varchar(255), principal_id varchar(255))"
+                ),
+                format!(
+                    "INSERT INTO `{db}`.cas_tickets VALUES \
+                     ('{t0}', NULL, '{{\"id\":\"{t0}\",\"principal\":\"{p0}\"}}', \
+                      'org.apereo.cas.ticket.TicketGrantingTicketImpl', '{p0}'), \
+                     ('{t1}', '{t0}', '{{\"id\":\"{t1}\"}}', \
+                      'org.apereo.cas.ticket.ServiceTicketImpl', '{p0}')"
+                ),
+                format!("GRANT SELECT ON `{db}`.cas_tickets TO {u}"),
+            ] {
+                exec(&mut a, &statement).await;
+            }
+            made.push(db);
+        }
+        let (_dir, t) = target(&server, CAS_SYS_USER, IT_PASSWORD);
+        let logs = Logs::default();
+        let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+        let findings = {
+            let _guard = logs.capture();
+            let (sink, mut rx) = FindingSink::channel(100_000);
+            MysqlConnector::new().discover(&job, &sink).await.unwrap();
+            drop(sink);
+            let mut out = Vec::new();
+            while let Some(f) = rx.recv().await {
+                out.push(f);
+            }
+            out
+        };
+        eprintln!(
+            "[it] name_case: {name}: ticket tables in {made:?}: {} registries, {} findings",
+            job.cas_guard().registries(),
+            findings.len()
+        );
+        assert_eq!(job.cas_guard().registries(), made.len() as u64, "{name}");
+        assert_eq!(
+            job.cas_guard().unencrypted(),
+            2 * made.len() as u64,
+            "{name}"
+        );
+        for f in &findings {
+            assert_ne!(
+                f.location().unwrap().object.as_str(),
+                "cas_tickets",
+                "{name}: {f:?}"
+            );
+        }
+        let text = format!("{findings:?}{}", logs.text());
+        for v in TICKETS.iter().chain(&TICKET_PRINCIPALS) {
+            assert!(!text.contains(v), "{name}: {v} leaked");
+        }
+        let notes = guard_check(&t).await;
+        let readable = ticket_note(&notes);
+        for db in &made {
+            exec(&mut a, &format!("DROP DATABASE IF EXISTS `{db}`")).await;
+        }
+        exec(&mut a, &format!("DROP USER IF EXISTS {u}")).await;
+        if made.is_empty() {
+            assert_eq!(readable, None, "{name}: {notes:?}");
+        } else {
+            assert_eq!(readable, Some(made.len() as u64), "{name}: {notes:?}");
+        }
     }
 }
 

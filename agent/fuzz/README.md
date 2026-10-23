@@ -6,6 +6,8 @@ tests of each connector (`src/proptests.rs`).
 
 | Target | Entry point | Input |
 |--------|-------------|-------|
+| `classifiers_names` | `databastion_classifiers::names::fuzz_normalize` | A name (lossy UTF-8; `/` separates field-path keys, a `*` part is an array level): `normalize_path`, `normalize_field_path`, `normalize_ldap_dn` and `normalize_ldap_attribute`; every emitted name must be `*` or match the contract `IdentifierProduced` ([ADR-0057](../../docs/adr/0057-identifier-hardening-agent-first.md) decision 1), else it panics |
+| `core_csv_splitter` | `databastion_core::audit::tail::fuzz::splitter` | Selector bytes (chunk size, start offset, damage position, record bound), then statement texts: csvlog records quoted as PostgreSQL writes them (pgaudit and `log_statement`) fed to the CSV splitter; oracles: aligned input gives exactly the records with no realignment, a first start anywhere in the first record exactly the records after it, a record cut inside a quoted field only that record lost (one damaged count), a record bound never a forged record (#267 review L3) |
 | `mongodb_bson` | `databastion_connector_mongodb::fuzz::bson` | A BSON document, every element walked |
 | `mongodb_op_msg` | `…::fuzz::op_msg` | An `OP_MSG` reply: header, flags, body section |
 | `mongodb_audit_log` | `…::fuzz::audit_log` | One `auditLog` JSON line |
@@ -34,7 +36,7 @@ tests of each connector (`src/proptests.rs`).
 | `cas_registry_yaml_diff` | `…::fuzz::registry_yaml_diff` | Differential ([ADR-0046](../../docs/adr/0046-cas-yaml-registry-parser-without-unsafe-libyaml.md)): on every file the pre-scan accepts, the crate's YAML parser and `serde_yaml_ng` (the oracle, a dependency of this harness only) must read the same values and the same definition, or both fail; a disagreement panics |
 | `cas_audit_log` | `…::fuzz::audit_log` | A short CAS JSON audit log excerpt (at most 64 lines, in order): each line parsed, `what` reducer, time parser, event builder with the token request / response correlation state ([ADR-0044](../../docs/adr/0044-cas-token-only-grants-client-naming.md)) |
 
-The connectors expose these entry points only with their `fuzzing` feature, which the agent binary
+The core and the connectors expose these entry points only with their `fuzzing` feature, which the agent binary
 never enables. This directory is its own Cargo workspace: `cargo test` and `cargo clippy` in
 `agent/` never build it, and nothing here needs a nightly toolchain to compile.
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -340,7 +343,8 @@ class WorkloadParseTest(unittest.TestCase):
 
 
 def scenario(impact_cores: float = 0.005, received_ratio: float = 1.0, dropped: int = 0,
-             leak_mb_per_s: float = 0.0, p95_on: float = 1.2, missing_idle: bool = False) -> tuple[list, list, list]:
+             leak_mb_per_s: float = 0.0, p95_on: float = 1.2, missing_idle: bool = False,
+             drain_cores: float = 0.0) -> tuple[list, list, list]:
     """A whole run: idle 0-60 (no agent), idle 60-120 (agent), scan 130-160, workload off 200-320,
     workload on 340-940, drain done at 1000."""
     facts = [
@@ -366,7 +370,8 @@ def scenario(impact_cores: float = 0.005, received_ratio: float = 1.0, dropped: 
     if not missing_idle:
         facts.append({"kind": "window", "name": "idle_no_agent", "t0": 0, "t1": 60})
     db = samples_linear("target-pg", 0, 1000, 0.5, 0.01,
-                        bursts=[(60, 1000, 0.002), (130, 160, impact_cores * 1), (200, 940, 0.3)])
+                        bursts=[(60, 1000, 0.002), (130, 160, impact_cores * 1), (200, 940, 0.3),
+                                (940, 1000, drain_cores)])
     agent = samples_linear("agent", 60, 1000, 1.0, 0.0, cap=4.0, bursts=[(340, 940, 0.05)],
                            rss=lambda t: (40 + max(0.0, t - 340) * leak_mb_per_s) * 2**20)
     for s in agent:
@@ -652,5 +657,370 @@ class ReportTest(unittest.TestCase):
             self.assertTrue(os.path.exists(f"{d}/out/results.md"))
 
 
+def with_drain(facts: list, at_end: int | None = 20000, want: int = 180000, p95_off: float | None = 44.0,
+               p95_drain: float | None = 41.0, window: bool = True) -> list:
+    """The scenario's facts plus sqlserver.sh's catch-up facts: the drain window (940-1000, after the
+    workload), the `drain` fact and the latency probes before Audit and during the drain."""
+    out = list(facts)
+    if window:
+        out.append({"kind": "window", "name": "drain_pg-load", "t0": 940, "t1": 1000})
+    samples = [[0.0, at_end], [60.0, want]]
+    out.append({"kind": "drain", "target": "pg-load", "want": want, "stored": want, "samples": samples,
+                "stored_at_workload_end": at_end, "rate_per_s": 2666.7})
+    for ph, v in (("off", p95_off), ("drain", p95_drain)):
+        out.append({"kind": "probe", "target": "pg-load", "phase": ph, "blocks": 0 if v is None else 6,
+                    "mean_us": v, "p95_us": v})
+    return out
+
+
+class DrainChecksTest(unittest.TestCase):
+    NAMES = {"audit.pg-load.db_cores_drain", "audit.pg-load.db_cores_drain_vs_audit_on",
+             "audit.pg-load.drain_probe_p95_us"}
+
+    def checks(self, ck: L.Checks) -> dict[str, dict]:
+        return {c["name"]: c for c in ck.items if c["name"] in self.NAMES}
+
+    def test_no_drain_fact_no_check(self) -> None:
+        # run.sh, cas.sh and redis.sh record no `drain` fact: no catch-up check at all.
+        rep, ck = L.build_report(*scenario(), L.Limits())
+        self.assertEqual(self.checks(ck), {})
+        self.assertNotIn("drain_happened", rep["audit"]["pg-load"])
+        self.assertNotIn("Catch-up after the workload", L.render_markdown(rep))
+
+    def test_pass_as_run_39695590686(self) -> None:
+        facts, samples, hbs = scenario(drain_cores=0.2)
+        rep, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True])
+        got = self.checks(ck)
+        self.assertEqual(set(got), self.NAMES)
+        self.assertTrue(all(c["pass"] is True for c in got.values()))
+        a = rep["audit"]["pg-load"]
+        self.assertTrue(a["drain_happened"])
+        self.assertAlmostEqual(a["db_cores_drain"], 0.212, delta=0.01)
+        self.assertEqual(got["audit.pg-load.db_cores_drain"]["limit"], "<= 1.0")
+        self.assertAlmostEqual(a["db_cores_audit_on"], 0.312, delta=0.01)
+        # 44 us before Audit: max(88, 1044).
+        self.assertEqual(got["audit.pg-load.drain_probe_p95_us"]["limit"], "<= 1044.0")
+        md = L.render_markdown(rep)
+        self.assertIn("Catch-up after the workload", md)
+        self.assertIn("| `audit.pg-load.drain_probe_p95_us` | pass |", md)
+
+    def test_failures(self) -> None:
+        # More than half the 2-CPU capacity during the drain: both CPU checks fail.
+        facts, samples, hbs = scenario(drain_cores=1.2)
+        rep, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertFalse(rep["pass"])
+        failed = {c["name"] for c in ck.items if c["pass"] is False}
+        self.assertEqual(failed, {"audit.pg-load.db_cores_drain", "audit.pg-load.db_cores_drain_vs_audit_on"})
+        # Above the Audit-on run's 0.312 + 0.25, below 1 core: only the relative check fails.
+        facts, samples, hbs = scenario(drain_cores=0.7)
+        _, ck = L.build_report(with_drain(facts), samples, hbs, L.Limits())
+        self.assertEqual({c["name"] for c in ck.items if c["pass"] is False},
+                         {"audit.pg-load.db_cores_drain_vs_audit_on"})
+        # The probe 1.1 ms slower during the drain (off + 1 ms is the larger bound below 1 ms).
+        facts, samples, hbs = scenario()
+        _, ck = L.build_report(with_drain(facts, p95_drain=1145.0), samples, hbs, L.Limits())
+        self.assertEqual({c["name"] for c in ck.items if c["pass"] is False}, {"audit.pg-load.drain_probe_p95_us"})
+        # Above 1 ms before Audit, the factor is the larger bound: 2 x 1500 = 3000.
+        _, ck = L.build_report(with_drain(facts, p95_off=1500.0, p95_drain=2900.0), samples, hbs, L.Limits())
+        self.assertTrue(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["pass"])
+        self.assertEqual(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["limit"], "<= 3000.0")
+        _, ck = L.build_report(with_drain(facts, p95_off=1500.0, p95_drain=3100.0), samples, hbs, L.Limits())
+        self.assertIs(self.checks(ck)["audit.pg-load.drain_probe_p95_us"]["pass"], False)
+        # Limits from the environment.
+        lim = L.Limits.from_env({"LOAD_LIMIT_DRAIN_DB_CPU_SHARE": "0.005"})
+        _, ck = L.build_report(with_drain(facts), samples, hbs, lim)
+        self.assertIs(self.checks(ck)["audit.pg-load.db_cores_drain"]["pass"], False)
+
+    def test_skipped_when_no_drain(self) -> None:
+        # Every statement stored when the workload ended: reported as skipped, the run still passes,
+        # even with figures that would fail.
+        facts, samples, hbs = scenario(drain_cores=1.5)
+        for kw in ({"at_end": 180000}, {"at_end": 0, "want": 0}):
+            rep, ck = L.build_report(with_drain(facts, p95_drain=None, **kw), samples, hbs, L.Limits())
+            got = self.checks(ck)
+            self.assertEqual(set(got), self.NAMES)
+            self.assertTrue(all(c.get("skipped") and c["pass"] is None for c in got.values()), got)
+            self.assertNotIn("audit.pg-load.db_cores_drain", {c["name"] for c in ck.items if c["pass"] is False})
+            self.assertIn("| `audit.pg-load.db_cores_drain` | skipped |", L.render_markdown(rep))
+        rep, ck = L.build_report(with_drain(facts, p95_drain=None, at_end=180000), samples, hbs, L.Limits())
+        self.assertTrue(rep["pass"], [c for c in ck.items if c["pass"] is not True and not c.get("skipped")])
+        self.assertFalse(rep["audit"]["pg-load"]["drain_happened"])
+
+    def test_no_data_fails_when_a_drain_happened(self) -> None:
+        facts, samples, hbs = scenario()
+        rep, ck = L.build_report(with_drain(facts, p95_drain=None, window=False), samples, hbs, L.Limits())
+        self.assertFalse(rep["pass"])
+        got = self.checks(ck)
+        self.assertTrue(all(c["pass"] is None and not c.get("skipped") for c in got.values()), got)
+
+    def test_cli_prints_skipped(self) -> None:
+        facts, samples, hbs = scenario()
+        facts = with_drain(facts, at_end=180000)
+        with tempfile.TemporaryDirectory() as d:
+            for name, rows in (("facts", facts), ("samples", samples), ("hb", hbs)):
+                with open(f"{d}/{name}.jsonl", "w") as f:
+                    f.write("".join(json.dumps(r) + "\n" for r in rows))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = L.main(["report", "--facts", f"{d}/facts.jsonl", "--samples", f"{d}/samples.jsonl",
+                             "--heartbeats", f"{d}/hb.jsonl", "--out", f"{d}/out"])
+            self.assertEqual(rc, 0)
+            self.assertIn("loadlib: check audit.pg-load.db_cores_drain: skipped (no drain:", err.getvalue())
+            with open(f"{d}/out/results.json") as f:
+                self.assertTrue(json.load(f)["pass"])
+
+
+class CensusTest(unittest.TestCase):
+    @staticmethod
+    def line(engine: str, events: int, **kw: int) -> str:
+        fields = {"message": "audit event census", "engine": engine, "events": events,
+                  "statements": events, "overflowed": 0, "overflowed_statements": 0, "unknown_star": 0,
+                  "unknown_star_statements": 0, "filtered": 0}
+        fields.update(kw)
+        rec = {"timestamp": "2026-10-20T10:00:00Z", "level": "INFO", "fields": fields,
+               "target": "databastion_core::audit::census"}
+        return "agent-1  | 2026-10-20T10:00:00.000000000Z " + json.dumps(rec)
+
+    def test_last_line_per_engine_wins(self) -> None:
+        lines = [
+            self.line("postgres", 10, overflowed=1),
+            "agent-1  | not json at all audit event census",
+            self.line("mariadb", 5, unknown_star=2),
+            self.line("postgres", 20, overflowed=3, overflowed_statements=7),
+            '{"fields": {"message": "audit stream started", "engine": "postgres", "events": 99}}',
+            self.line("BAD ENGINE", 1),
+            self.line("redis", -1),
+        ]
+        c = L.census_from_log(lines)
+        self.assertEqual(sorted(c), ["mariadb", "postgres"])
+        self.assertEqual(c["postgres"]["events"], 20)
+        self.assertEqual(c["postgres"]["overflowed_statements"], 7)
+        self.assertEqual(c["mariadb"]["unknown_star"], 2)
+        out = L.census_lines(c, "load")
+        self.assertIn("CENSUS load engine=postgres events=20", out[1])
+        self.assertIn("overflowed_rate=15.000%", out[1])
+        md = L.census_markdown(c, [], "load")
+        self.assertIn("| postgres | 20 | 20 | 3 | 7 |", md)
+
+    def test_cmd_census_never_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "agent.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(self.line("sqlserver", 4, overflowed=1) + "\n")
+            con = os.path.join(d, "console.json")
+            with open(con, "w", encoding="utf-8") as f:
+                json.dump([{"target": "mssql-load", "db_user": "load_orm", "events": 4, "statements": 9,
+                            "star_events": 1, "star_statements": 3, "max_objects": 16}, {"bad": 1}], f)
+            args = argparse.Namespace(log=log, console=con, label="t", out_dir=d)
+            self.assertEqual(L.cmd_census(args), 0)
+            with open(os.path.join(d, "census-t.md"), encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("| sqlserver | 4 |", text)
+            self.assertIn("| mssql-load | load_orm | 4 | 9 | 1 | 3 | - | - | 16 |", text)
+            args = argparse.Namespace(log=os.path.join(d, "missing"), console=None, label="t", out_dir=None)
+            self.assertEqual(L.cmd_census(args), 0)
+
+
+    def test_console_names_carry_no_markup(self) -> None:
+        self.assertEqual(L._console_name("<img src=x onerror=a()>&amp;"), "?img?src=x?onerror=a()??amp;")
+        row = {"target": "<b>t</b>", "db_user": "a&b", "events": 1, "statements": 1, "star_events": 0,
+               "star_statements": 0, "max_objects": 1}
+        md = L.census_markdown({}, L.console_rows([row]), "t")
+        for c in "<>&":
+            self.assertNotIn(c, md.split("| Target |")[1])
+        events, findings = L.star_rows({"events": [{"target": "<t>", "source": "s&", "action": "read",
+                                                    "principal_kind": "account", "signals": "-",
+                                                    "star_databases": ">db", "only_star": True, "overflowed": False,
+                                                    "events": 1, "statements": 1, "rows_sum": 0}],
+                                        "findings": [{"target": "t", "engine": "valkey", "database": "<d>",
+                                                      "objects": 1, "star_object": False}]})
+        self.assertEqual((events[0]["target"], events[0]["source"], events[0]["star_databases"]), ("?t?", "s?", "?db"))
+        self.assertEqual(findings[0]["database"], "?d?")
+        self.assertEqual(L.xe_builds("build <x>&y 2\n"), {"build": {"?x??y": 2}})
+
+    def test_console_rows_are_safe_to_print(self) -> None:
+        good = {"target": "mssql-load", "db_user": "\\fb45bc05628d$", "events": 4, "statements": 4,
+                "star_events": 0, "star_statements": 0, "max_objects": 2}
+        bad_name = dict(good, db_user="a|b`c d\n::error::x\r\u0007")
+        rows = L.console_rows([good, bad_name, dict(good, target=7), dict(good, events=-1),
+                               dict(good, events=True), dict(good, events="4"), {"target": "t"}, 3])
+        self.assertEqual([r["db_user"] for r in rows], ["\\fb45bc05628d$", "a?b?c?d?::error::x??"])
+        self.assertEqual(L.console_rows({"x": 1}), [])
+        self.assertEqual(len(L.console_rows([dict(good, db_user="u" * 500)])[0]["db_user"]),
+                         L.CONSOLE_NAME_MAX)
+        md = L.census_markdown({}, rows, "load")
+        for line in md.splitlines():
+            if line.startswith("| mssql-load"):
+                self.assertEqual(line.count("|"), 10)
+
+
+    def test_census_sql_filters_on_a_uuid_only(self) -> None:
+        q = L.census_sql("0f8e2c3a-1b2c-4d5e-8f90-123456789abc")
+        self.assertIn("agent_id = '0f8e2c3a-1b2c-4d5e-8f90-123456789abc'", q)
+        self.assertIn("objects_overflowed IS TRUE", q)
+        self.assertIn("WHERE TRUE GROUP BY", L.census_sql())
+        with self.assertRaises(ValueError):
+            L.census_sql("x' OR '1'='1")
+        self.assertIn("FROM findings WHERE TRUE", L.star_sql())
+        args = argparse.Namespace(agent_id="bad", star=True)
+        self.assertEqual(L.cmd_census_sql(args), 2)
+
+    def test_console_rows_keep_the_overflow_flag_counts(self) -> None:
+        row = {"target": "pg", "db_user": "fp:0123abcd", "events": 3, "statements": 5, "star_events": 1,
+               "star_statements": 1, "overflowed_events": 1, "overflowed_statements": 2, "max_objects": 16}
+        rows = L.console_rows([row, dict(row, overflowed_events=-2)])
+        self.assertEqual(rows[0]["overflowed_statements"], 2)
+        self.assertIsNone(rows[1]["overflowed_events"])
+
+    def test_star_rows_and_out_dir(self) -> None:
+        ev = {"target": "valkey-e2e", "source": "redis_slowlog", "action": "read", "principal_kind": "account",
+              "signals": "-", "star_databases": "db0", "only_star": True, "overflowed": False, "events": 10,
+              "statements": 120, "rows_sum": 0}
+        data = {"events": [ev, dict(ev, events=-1), dict(ev, only_star="yes"), dict(ev, source="a\nb c"), 7],
+                "findings": [{"target": "valkey-e2e", "engine": "valkey", "database": "db0", "objects": 4,
+                              "star_object": False}, {"target": 1}]}
+        events, findings = L.star_rows(data)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1]["source"], "a?b?c")
+        self.assertEqual(len(findings), 1)
+        out = L.star_lines(events, findings, "e2e-redis")
+        self.assertIn("STAR-EVENTS e2e-redis target=valkey-e2e source=redis_slowlog action=read principal=account "
+                      "signals=- star_databases=db0 only_star=true overflowed=false events=10", out[0])
+        self.assertIn("STAR-FINDINGS e2e-redis target=valkey-e2e engine=valkey database=db0 finding_objects=4 "
+                      "star_object=false", out[2])
+        self.assertEqual(L.star_rows([1]), ([], []))
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "agent.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(self.line("valkey", 10, unknown_star=10) + "\n")
+            star = os.path.join(d, "star.json")
+            with open(star, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            out_dir = os.path.join(d, "census")
+            args = argparse.Namespace(log=log, console=None, star=star, label="e2e redis/x", out_dir=out_dir)
+            self.assertEqual(L.cmd_census(args), 0)
+            with open(os.path.join(out_dir, "census-e2e_redis_x.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["agent"]["valkey"]["unknown_star"], 10)
+            self.assertEqual(len(doc["star_events"]), 2)
+            with open(os.path.join(out_dir, "census-e2e_redis_x.md"), encoding="utf-8") as f:
+                md = f.read()
+            self.assertIn("| valkey-e2e | redis_slowlog | read | account | - | db0 | yes | no | 10 | 120 | 0 |", md)
+
+
+class XeCatchupTest(unittest.TestCase):
+    @staticmethod
+    def cut(ts: str) -> str:
+        rec = {"timestamp": ts, "level": "DEBUG", "target": "databastion_connector_sqlserver::audit::xe",
+               "fields": {"message": L.XE_CUT_MESSAGE, "target_id": "mssql-load"}}
+        return "agent-1  | " + json.dumps(rec)
+
+    def test_runs_of_cuts_and_the_cap(self) -> None:
+        lines = [self.cut(f"2026-10-21T10:00:{s:02d}.123456Z") for s in range(0, 60, 5)]
+        lines += [self.cut("2026-10-21T10:01:00.5Z"), "agent-1  | not json " + L.XE_CUT_MESSAGE]
+        lines += [self.cut("2026-10-21T10:05:00Z"), self.cut("2026-10-21T10:05:10+00:00")]
+        lines += [self.cut("2026-10-21T09:00:00Z"), self.cut("bad time")]
+        since = L._log_time({"timestamp": "2026-10-21T09:30:00Z"})
+        times = L.xe_cut_times(lines, since)
+        self.assertEqual(len(times), 15)
+        r = L.xe_catchup(lines, {"build": {"load_orm": 7}}, [], {}, since, 30.0)
+        self.assertEqual((r["cuts"], r["episodes"], r["episodes_at_cap"]), (15, 2, 1))
+        self.assertEqual(r["longest_episode_s"], 60.4)
+
+    def test_builds_noise_and_command(self) -> None:
+        b = L.xe_builds("build load_orm 4\nbuild load_orm 1\nselect load_app 900\nbuild a|b 2\njunk\nbuild x y\n")
+        self.assertEqual(b, {"build": {"load_orm": 5, "a?b": 2}, "select": {"load_app": 900}})
+        noise = L.xe_noise_rows([{"db_user": "load_orm", "events": 5, "statements": 41, "read_statements": 40,
+                                  "unknown_star_events": 2,
+                                  "unknown_star_statements": 3, "star_only_events": 1, "star_only_statements": 2,
+                                  "overflowed_events": 1}, {"db_user": "x"}])
+        r = L.xe_catchup([], b, noise, {"load_orm": 36}, None, 30.0)
+        self.assertEqual(r["principals"][0]["excess_statements"], 4)
+        out = L.xe_catchup_lines(r, "load-sqlserver")
+        self.assertIn("XE-CATCHUP load-sqlserver cuts=0 episodes=0", out[0])
+        self.assertIn("XE-NOISE load-sqlserver principal=load_orm events=5 statements=41 read_statements=40 issued=36 "
+                      "excess_read_statements=4",
+                      out[-1])
+        with tempfile.TemporaryDirectory() as d:
+            con = os.path.join(d, "noise.json")
+            with open(con, "w", encoding="utf-8") as f:
+                json.dump([{"db_user": "load_app", "events": 1, "statements": 9, "read_statements": 9, "unknown_star_events": 0,
+                            "unknown_star_statements": 0, "star_only_events": 0, "star_only_statements": 0,
+                            "overflowed_events": 0}], f)
+            summary, js = os.path.join(d, "s.md"), os.path.join(d, "x.json")
+            args = argparse.Namespace(log=os.path.join(d, "missing.log"), builds=None, console=con,
+                                      issued=["load_app=9", "bad", "x=y"], since=None, gap=30.0, label="t",
+                                      md=summary, json=js)
+            self.assertEqual(L.cmd_xe_catchup(args), 0)
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["principals"][0]["excess_statements"], 0)
+            with open(summary, encoding="utf-8") as f:
+                self.assertIn("| load_app | 1 | 9 | 9 | 9 | 0 |", f.read())
+
+    @staticmethod
+    def retry(ts: str, reason: str) -> str:
+        rec = {"timestamp": ts, "level": "DEBUG", "target": "databastion_connector_sqlserver::audit::xe::size",
+               "fields": {"message": L.XE_RETRY_MESSAGE, "target_id": "mssql-load", "reason": reason,
+                          "asked": 2000, "next": 500, "cancels_total": 1, "timeouts_total": 0}}
+        return "agent-1  | " + json.dumps(rec)
+
+    def test_retried_reads(self) -> None:
+        # ADR-0051 refinement of 2026-10-22: cancels above 12 MiB (two within 10 minutes, one 10 minutes
+        # later), a timeout, and lines before `since`, of another reason or not JSON, left out.
+        lines = [self.retry("2026-10-22T10:00:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:09:59Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:20:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:21:00Z", "statement timeout"),
+                 self.retry("2026-10-22T09:00:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:22:00Z", "something else"),
+                 "agent-1  | not json " + L.XE_RETRY_MESSAGE]
+        since = L._log_time({"timestamp": "2026-10-22T09:30:00Z"})
+        self.assertEqual(L.xe_retries(lines, since), {"cancels": 3, "timeouts": 1, "max_cancels_per_10min": 2})
+        self.assertEqual(L.xe_retries(lines[2:3], since)["max_cancels_per_10min"], 1)
+        self.assertEqual(L.xe_retries([], None), {"cancels": 0, "timeouts": 0, "max_cancels_per_10min": 0})
+        r = L.xe_catchup(lines, {}, [], {}, since, 30.0)
+        self.assertEqual(r["reads"]["cancels"], 3)
+        out = L.xe_catchup_lines(r, "load-sqlserver")
+        self.assertIn("XE-READS load-sqlserver cancels=3 timeouts=1 max_cancels_per_10min=2", out)
+        self.assertIn("Reads cancelled above 12 MiB and read again smaller: **3**", L.xe_catchup_markdown(r, "x"))
+
+
+class XeReadChecksTest(unittest.TestCase):
+    NAMES = {"audit.pg-load.xe_cancels_per_10min", "audit.pg-load.xe_timeouts"}
+
+    def run_with(self, fact: dict | None) -> tuple[dict, dict[str, dict]]:
+        facts, samples, hbs = scenario()
+        if fact is not None:
+            facts = facts + [{"kind": "xe_reads", "target": "pg-load", **fact}]
+        rep, ck = L.build_report(facts, samples, hbs, L.Limits())
+        return rep, {c["name"]: c for c in ck.items if c["name"] in self.NAMES}
+
+    def test_checks(self) -> None:
+        # No fact (SQL Server Audit, the other harnesses): no check.
+        self.assertEqual(self.run_with(None)[1], {})
+        rep, got = self.run_with({"cancels": 1, "timeouts": 0, "max_cancels_per_10min": 1, "large_bursts": 10})
+        self.assertEqual(set(got), self.NAMES)
+        self.assertTrue(all(c["pass"] is True for c in got.values()), got)
+        self.assertTrue(rep["pass"])
+        self.assertEqual(rep["audit"]["pg-load"]["xe_large_bursts"], 10)
+        _, got = self.run_with({"cancels": 2, "timeouts": 0, "max_cancels_per_10min": 2, "large_bursts": 10})
+        self.assertIs(got["audit.pg-load.xe_cancels_per_10min"]["pass"], False)
+        _, got = self.run_with({"cancels": 0, "timeouts": 1, "max_cancels_per_10min": 0, "large_bursts": 0})
+        self.assertIs(got["audit.pg-load.xe_timeouts"]["pass"], False)
+        # The agent's log not read: no data, failed.
+        rep, got = self.run_with({"cancels": None, "timeouts": None, "max_cancels_per_10min": None})
+        self.assertFalse(rep["pass"])
+        self.assertTrue(all(c["pass"] is None for c in got.values()))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeFactTest(unittest.TestCase):
+    def test_probe_lines(self) -> None:
+        text = "PROBE 40\nPROBE 60\nnoise\nPROBE x\nPROBE 50\n"
+        f = L.probe_fact(text, "t", "drain")
+        self.assertEqual((f["blocks"], f["mean_us"], f["p95_us"]), (3, 50.0, 60.0))
+        self.assertIsNone(L.probe_fact("", "t", "off")["p95_us"])

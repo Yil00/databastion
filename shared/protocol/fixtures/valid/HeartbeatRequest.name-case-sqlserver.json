@@ -1,0 +1,77 @@
+{
+  "ts": "2026-10-21T09:00:00Z",
+  "agent_version": "0.9.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "sqlserver"
+  ],
+  "targets": [
+    {
+      "target_id": "mssql-prod",
+      "engine": "sqlserver",
+      "reachable": true,
+      "audit_level": "partial",
+      "server_version": "16.0.4305.5",
+      "audit_source": "sqlserver_audit",
+      "name_case": {
+        "databases": "insensitive",
+        "objects": "insensitive",
+        "except": [
+          {
+            "database": "*",
+            "objects": "sensitive"
+          },
+          {
+            "database": "archive_offline",
+            "objects": "unknown"
+          },
+          {
+            "database": "crm_cs",
+            "objects": "sensitive"
+          },
+          {
+            "database": "ledger_bin2",
+            "objects": "sensitive"
+          }
+        ]
+      }
+    },
+    {
+      "target_id": "mssql-cs",
+      "engine": "sqlserver",
+      "reachable": true,
+      "audit_level": "partial",
+      "server_version": "16.0.4305.5",
+      "name_case": {
+        "databases": "sensitive",
+        "objects": "sensitive",
+        "except": [
+          {
+            "database": "contained_app",
+            "objects": "insensitive"
+          }
+        ]
+      }
+    },
+    {
+      "target_id": "mssql-many",
+      "engine": "sqlserver",
+      "reachable": true,
+      "audit_level": "partial",
+      "server_version": "15.0.4385.2",
+      "name_case": {
+        "databases": "insensitive",
+        "objects": "unknown"
+      }
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

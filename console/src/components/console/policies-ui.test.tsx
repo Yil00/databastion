@@ -8,8 +8,8 @@ import type { ExceptionView, PolicyView } from "@/server/policies";
 
 import { availableTransitions } from "./incident-actions";
 import { IncidentsTable } from "./incidents-table";
-import { conditionLines, ExceptionsTable, PoliciesTable, policyFormValues } from "./policies-table";
-import { exceptionRequestBody } from "./policy-actions";
+import { CaseInventoryView, conditionLines, ExceptionsTable, PoliciesTable, policyFormValues } from "./policies-table";
+import { EXCEPTION_MATCHING_NOTE, ExceptionForm, exceptionRequestBody } from "./policy-actions";
 import { policyErrorMessage, policyRequestBody } from "./policy-form";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: () => undefined, push: () => undefined }) }));
@@ -196,5 +196,74 @@ describe("policies view", () => {
     expect(Number.isNaN(Date.parse(String(body.expires_at)))).toBe(false);
     expect(body).not.toHaveProperty("classifier");
     expect(body).not.toHaveProperty("policy_id");
+  });
+});
+
+describe("case-sensitive exceptions (ADR-0054)", () => {
+  const ex: ExceptionView = {
+    id: "01890a5d-ac96-774b-bcce-b302099a8061",
+    policyId: null,
+    policyName: null,
+    agentId: null,
+    agentName: null,
+    targetId: null,
+    classifier: null,
+    location: { object: HOSTILE },
+    reason: "r",
+    expiresAt: null,
+    createdAt: new Date(NOW - 10),
+  };
+  const gone = "01890a5d-ac96-774b-bcce-b302099a8062";
+
+  it("the exception form says where names compare with case", () => {
+    const html = renderToStaticMarkup(<ExceptionForm csrfToken="c" />);
+    expect(html).toContain((EXCEPTION_MATCHING_NOTE.split(" (")[0] ?? "").replaceAll("'", "&#x27;"));
+    expect(EXCEPTION_MATCHING_NOTE).toContain("with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS");
+    expect(EXCEPTION_MATCHING_NOTE).toContain("without case on OpenLDAP");
+    // ADR-0055 decision 7: these engines follow the server's settings.
+    expect(EXCEPTION_MATCHING_NOTE).toContain("on SQL Server, MySQL and MariaDB targets according to the server's settings");
+    expect(EXCEPTION_MATCHING_NOTE).toContain("unknown: with case");
+  });
+
+  it("lists the affected exceptions with their counts, escaped; a deleted one by id; the bound when reached", () => {
+    const inventory = {
+      at: new Date(NOW),
+      trigger: "startup",
+      entries: [
+        { exceptionId: ex.id, findings: 12, events: 3 },
+        { exceptionId: gone, findings: 0, events: 1 },
+      ],
+      exceptionsListed: 2,
+      truncated: false,
+      findingNamesCompared: 40,
+      eventNamesCompared: 7,
+      exceptionsCompared: 4,
+      exceptionsTotal: 6,
+      boundReached: true,
+    };
+    const html = renderToStaticMarkup(<CaseInventoryView status={{ latest: inventory, failure: null }} exceptions={[ex]} isAdmin csrfToken="c" />);
+    expect(html).not.toContain("<img");
+    expect(html).toContain(ESCAPED);
+    expect(html).toContain(">12<");
+    expect(html).toContain(`deleted exception ${gone}`);
+    expect(html).toContain("reached its bound");
+    expect(html).toContain("4 of 6 active location exceptions compared");
+    expect(html).toContain("The 2 most recently created exceptions were not compared.");
+    expect(html).toContain("upper bounds");
+    expect(html).toContain("(up to)");
+    expect(html).not.toContain("failed");
+    expect(html).toContain("Run the inventory again");
+    const analyst = renderToStaticMarkup(
+      <CaseInventoryView
+        status={{ latest: null, failure: { at: new Date(NOW), trigger: "startup", errorCode: "57014" } }}
+        exceptions={[]}
+        isAdmin={false}
+        csrfToken="c"
+      />,
+    );
+    expect(analyst).toContain("No inventory has run yet");
+    expect(analyst).toContain("failed");
+    expect(analyst).toContain("error 57014");
+    expect(analyst).not.toContain("Run the inventory again");
   });
 });

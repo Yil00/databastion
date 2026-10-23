@@ -85,8 +85,88 @@ export function foldName(s: string): string {
  */
 export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb"];
 
+/**
+ * Database name as hashed in the access-event incident dedup key (ADR-0021 decision 6,
+ * implementation note of 2026-10-18, review M1 of PR #274): the case as sent on every engine,
+ * since case can tell two databases apart (PostgreSQL quoted names, SQL Server under a
+ * case-sensitive collation, MySQL / MariaDB with `lower_case_table_names=0`), and trailing spaces
+ * dropped only on {@link TRAILING_SPACE_BLIND_ENGINES}, as location exceptions. A merged key would
+ * link a later dump of another database to a closed incident; a null or unknown engine is never
+ * loosened.
+ */
+export function dedupDatabaseName(name: string, engine: string | null): string {
+  return engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) ? trimTrailingSpaces(name) : name;
+}
+
+/**
+ * Engines whose object names a location exception compares without case (ADR-0054 decision 1):
+ * SQL Server (case-insensitive under the default collation) and MySQL / MariaDB (with
+ * `lower_case_table_names` other than 0) while their agent reports no case semantics (ADR-0054
+ * decision 3; with a `TargetStatus.name_case`, ADR-0055 decision 6 compares them per part,
+ * `exceptionPartOptions` in src/lib/name-case.ts), and OpenLDAP (case-insensitive matching rules
+ * of the naming attributes).
+ * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
+ * Redis, Valkey and Apereo CAS by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES}), and an
+ * engine added later is never loosened before its connector ADR decides. Policy conditions,
+ * per-object sensitivity and scores stay case-insensitive on every engine (looser matching only
+ * reports more).
+ */
+export const CASE_BLIND_EXCEPTION_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "openldap"];
+
+/** The contract engines on which location exceptions compare names with case (ADR-0054). */
+export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas"];
+
+/** Whether location exceptions compare names with case on `engine` (ADR-0054 decision 1). */
+export function exceptionMatchesCase(engine: string | null): boolean {
+  return engine === null || !CASE_BLIND_EXCEPTION_ENGINES.includes(engine);
+}
+
+/**
+ * Glob options of location exceptions on an item of `engine`: trailing spaces ignored only on
+ * {@link TRAILING_SPACE_BLIND_ENGINES} (N1), case compared everywhere but on
+ * {@link CASE_BLIND_EXCEPTION_ENGINES} (ADR-0054). A null (unknown) engine gets neither loosening.
+ */
 export function exceptionGlobOptions(engine: string | null): GlobOptions {
-  return { ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine) };
+  return {
+    ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine),
+    matchCase: exceptionMatchesCase(engine),
+  };
+}
+
+/** The parts of a location (finding) or an event object (no `field`). */
+export type NamePart = "database" | "schema" | "object" | "field";
+
+/**
+ * Glob options per location part (ADR-0055 decision 6): a target's `name_case` can compare its
+ * database names and its object names differently. Built by `exceptionPartOptions`
+ * (src/lib/name-case.ts).
+ */
+export type PartGlobOptions = { readonly perPart: Readonly<Record<NamePart, GlobOptions>> };
+
+/**
+ * ADR-0056 decision 3 item 4: whether location exception globs may cover the parts the agent
+ * reported altered by its name normalization (contract `Location.altered` / `ObjectRef.altered`).
+ * An altered part is covered only by a glob that is absent or exactly `*` (the glob `\*`, which
+ * selects the literal name only, does not): another object of the engine may have been sent under
+ * the same name. The parts not altered are left to the caller's usual match (ADR-0054 / ADR-0055
+ * case rules). No list (an older agent, or a console that did not list the tokens): nothing is
+ * restricted, the console never guesses an alteration from the name. A part sent as `*` that also
+ * carries the marker (the contract says it never should) gets the same rule: stricter only.
+ */
+export function alteredPartsCoverable(
+  globs: Readonly<Partial<Record<NamePart, string>>>,
+  altered: readonly string[] | null | undefined,
+): boolean {
+  if (!altered || altered.length === 0) return true;
+  return altered.every((part) => {
+    const g = globs[part as NamePart];
+    return g === undefined || g === "*";
+  });
+}
+
+/** The options of `part`: the same for every part when `opts` is a plain {@link GlobOptions}. */
+export function optionsFor(opts: GlobOptions | PartGlobOptions, part: NamePart): GlobOptions {
+  return "perPart" in opts ? opts.perPart[part] : opts;
 }
 
 export interface GlobOptions {
@@ -95,6 +175,14 @@ export interface GlobOptions {
    * the pattern (N1). Strictly looser: a match without it is still a match.
    */
   ignoreTrailingSpaces?: boolean;
+  /**
+   * Also require the match of the pattern and the value as written, without the case fold (same
+   * matcher, same trailing-space handling), on top of the folded match (ADR-0054 decision 1).
+   * Strictly stricter: thanks to the conjunction, a match with it is a match without it, although
+   * `?` and case mappings that change a string's length (`İ`) make the folded and the exact match
+   * differ in both directions.
+   */
+  matchCase?: boolean;
 }
 
 /**
@@ -107,8 +195,12 @@ export interface GlobOptions {
  * patterns are cached (policies reuse the same few patterns for every event or finding).
  */
 export function globMatch(pattern: string, value: string, opts: GlobOptions = {}): boolean {
-  const p = compiled(pattern);
-  const s = [...foldCase(value)];
+  if (!matchWith(compiled(pattern, true), [...foldCase(value)], opts)) return false;
+  // ADR-0054: the exact match is a second pass of the same linear matcher, never a replacement.
+  return !opts.matchCase || matchWith(compiled(pattern, false), [...value], opts);
+}
+
+function matchWith(p: readonly GlobToken[], s: readonly string[], opts: GlobOptions): boolean {
   if (matchTokens(p, s)) return true;
   if (!opts.ignoreTrailingSpaces) return false;
   let pe = p.length;
@@ -147,14 +239,17 @@ function matchTokens(p: readonly GlobToken[], s: readonly string[]): boolean {
 type GlobToken = { kind: "star" } | { kind: "any" } | { kind: "char"; ch: string };
 
 const GLOB_CACHE_MAX = 1000;
-const globCache = new Map<string, GlobToken[]>();
+const foldedGlobCache = new Map<string, GlobToken[]>();
+const exactGlobCache = new Map<string, GlobToken[]>();
 
-function compiled(pattern: string): GlobToken[] {
-  let t = globCache.get(pattern);
+/** Tokens of `pattern`, folded with {@link foldCase} or as written (`matchCase`, ADR-0054). */
+function compiled(pattern: string, fold: boolean): GlobToken[] {
+  const cache = fold ? foldedGlobCache : exactGlobCache;
+  let t = cache.get(pattern);
   if (!t) {
-    if (globCache.size >= GLOB_CACHE_MAX) globCache.clear();
-    t = tokens(foldCase(pattern));
-    globCache.set(pattern, t);
+    if (cache.size >= GLOB_CACHE_MAX) cache.clear();
+    t = tokens(fold ? foldCase(pattern) : pattern);
+    cache.set(pattern, t);
   }
   return t;
 }

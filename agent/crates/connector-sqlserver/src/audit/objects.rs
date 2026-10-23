@@ -21,10 +21,12 @@ pub(crate) struct Objects {
 }
 
 impl Objects {
-    /// Adds an object (duplicates ignored).
+    /// Adds an object (a duplicate unites its ADR-0056 markers into the
+    /// one kept).
     pub(crate) fn push(&mut self, o: EventObject) {
-        if !self.list.contains(&o) {
-            self.list.push(o);
+        match self.list.iter_mut().find(|x| **x == o) {
+            Some(kept) => kept.absorb_markers(&o),
+            None => self.list.push(o),
         }
     }
 
@@ -32,8 +34,9 @@ impl Objects {
     /// lost before they reached this list (a bound upstream): the event
     /// gets the core's overflow ([`MaskedEvent::with_unlisted_objects`]).
     pub(crate) fn mark_unlisted(&mut self, database: NormalizedName) {
-        if !self.unlisted.contains(&database) {
-            self.unlisted.push(database);
+        match self.unlisted.iter_mut().find(|d| **d == database) {
+            Some(kept) => kept.absorb_marker(&database),
+            None => self.unlisted.push(database),
         }
     }
 

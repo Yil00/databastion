@@ -32,9 +32,24 @@
 //! (`server_audit` `TABLE` events, `audit_log_filter` `table_access`),
 //! otherwise from the statement text (reads and writes only: DDL and DCL
 //! events take no name from text); an unqualified name is in the
-//! statement's current database. `information_schema`,
-//! `performance_schema`, `sys`, `DUAL` and the internal statistics tables
-//! (`mysql.*_stats`) are skipped from the objects of reads only: a write
+//! statement's current database. Names keep the case the records give or
+//! the text is written in, quoted or not (ADR-0055 decision 3: with
+//! `lower_case_table_names = 0`, the Linux default, `Customers` and
+//! `customers` are two tables), but `information_schema`, which the
+//! servers compare without case, named in lower case. Residual (security review of ADR-0055 decision 3, L1): the
+//! core's pre-aggregation groups key on the objects as written, so reads
+//! of one table spelled in two cases are two groups, and under
+//! `lower_case_table_names = 1` or `2` (where they are one table) each
+//! group is compared with `min_rows` on its own and may be dropped where
+//! the sum would pass, as backquoted names in another case already were
+//! before; groups keyed on folded names for `mysql` / `mariadb` are
+//! planned with ADR-0055 decision 4 (the agent reading
+//! `lower_case_table_names`).
+//! `information_schema` (in any case), `performance_schema`, `sys`,
+//! `DUAL` and the internal statistics tables (`mysql.*_stats`;
+//! `performance_schema`, `sys` and `mysql` as stored, since
+//! `Performance_Schema` (MariaDB), `SYS` or `MySQL` may be another
+//! database) are skipped from the objects of reads only: a write
 //! names them (`UPDATE performance_schema.setup_consumers …` turns the
 //! `performance_schema` source off), and so does a table record that
 //! writes a system schema table, whatever the statement's action. The
@@ -133,16 +148,59 @@ fn analyze_opts(truncated: bool) -> AnalyzeOptions {
 /// included on `SQL_TEXT`, clear-text passwords on MariaDB) and its setup
 /// tables drive the `performance_schema` Audit source. Reads of them are
 /// not reported; writes are (see [`EventBuilder::statement`]).
+///
+/// Compared ASCII-case-insensitively: for what is always reported (a
+/// change that touches a system schema), the wider match fails closed.
+/// What is left out of reads uses [`is_skipped_system_schema`].
 pub(crate) fn is_system_schema(db: &str) -> bool {
     ["information_schema", "performance_schema", "sys"]
         .iter()
-        .any(|s| s.eq_ignore_ascii_case(db))
+        .any(|s| wide_eq(s, db))
+}
+
+/// Whether `name` is the listed ASCII name `listed` in ASCII case, or once
+/// its Unicode uppercase or lowercase is taken: the wider match the
+/// always-reported lists use (the PR #308 CI run on MariaDB 11.8: the
+/// servers fold schema names with `utf8mb3_general_ci`, where
+/// `performance_ſchema`, U+017F, reads the system schema, so its
+/// statement-text tables must stay always reported under that spelling;
+/// matching more only reports more). Measured on MySQL 8.4.11 and MariaDB
+/// 11.4.13 / 11.8.9 (#308 final review N7, `it::name_case_it`): `MYſQL`
+/// and `ſys` are user databases, not aliases of `mysql` and `sys`, so an
+/// object matched through this fold keeps its name as written next to the
+/// listed one ([`push_named`], L10).
+pub(crate) fn wide_eq(listed: &str, name: &str) -> bool {
+    listed.eq_ignore_ascii_case(name)
+        || (!name.is_ascii()
+            && (listed.eq_ignore_ascii_case(&name.to_uppercase())
+                || listed.eq_ignore_ascii_case(&name.to_lowercase())))
+}
+
+/// [`is_system_schema`] for what is left out of reads: `information_schema`
+/// in any case (both servers compare it without case whatever
+/// `lower_case_table_names` and refuse a database of that name in another
+/// case), `performance_schema` and `sys` only as stored. `sys` is an
+/// ordinary database for name resolution: with
+/// `lower_case_table_names = 0` (the Linux default) `SYS` or `Sys` is
+/// another database, whose reads are application reads (ADR-0055
+/// decision 3; with 1 or 2 such a read is reported, failing closed). So is
+/// `Performance_Schema` on MariaDB, which lets a user create it next to
+/// the system schema (measured in CI, PR #308); MySQL refuses it and reads
+/// `PERFORMANCE_SCHEMA.t` as the system schema, but the flavor comes from
+/// a version string a proxy can rewrite, so the stricter rule applies to
+/// both (such a read on MySQL is reported, named as written).
+pub(crate) fn is_skipped_system_schema(db: &str) -> bool {
+    db.eq_ignore_ascii_case("information_schema") || db == "performance_schema" || db == "sys"
 }
 
 /// MariaDB's engine-independent statistics, read by the server itself for
-/// many statements, and InnoDB's persistent statistics.
+/// many statements, and InnoDB's persistent statistics. Compared as
+/// stored (the servers' records name them in lower case): it decides what
+/// is left out, and with `lower_case_table_names = 0` `MySQL.Table_stats`
+/// is another table (ADR-0055 decision 3; with 1 or 2 a text that names
+/// one in another case is reported, failing closed).
 fn is_internal_table(db: &str, table: &str) -> bool {
-    db.eq_ignore_ascii_case("mysql")
+    db == "mysql"
         && [
             "table_stats",
             "column_stats",
@@ -150,8 +208,7 @@ fn is_internal_table(db: &str, table: &str) -> bool {
             "innodb_table_stats",
             "innodb_index_stats",
         ]
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(table))
+        .contains(&table)
 }
 
 /// A relation named by a statement (unqualified: in `database`) that holds
@@ -159,7 +216,7 @@ fn is_internal_table(db: &str, table: &str) -> bool {
 /// `DUAL`. Skipped from the objects of reads only.
 fn is_system_relation(r: &RelationName, database: &str) -> bool {
     let db = r.schema.as_deref().unwrap_or(database);
-    is_system_schema(db)
+    is_skipped_system_schema(db)
         || is_internal_table(db, &r.name)
         || (r.schema.is_none() && r.name.eq_ignore_ascii_case("dual"))
 }
@@ -266,7 +323,7 @@ pub(crate) fn statement_text_table(
                 (TextOn::Both, _) | (_, None) => true,
                 (TextOn::Mysql, Some(f)) => f == Flavor::Mysql,
             };
-            here && d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table)
+            here && wide_eq(d, db) && wide_eq(t, table)
         })
         .map(|(d, t, _)| (*d, *t))
 }
@@ -287,12 +344,12 @@ pub(crate) const STATISTICS_TABLES: &[(&str, &str)] = &[
     ("mysql", "column_stats"),
 ];
 
-/// The statistics table `db`.`table` is, as listed (compared
-/// ASCII-case-insensitively).
+/// The statistics table `db`.`table` is, as listed (compared with
+/// [`wide_eq`]).
 pub(crate) fn statistics_table(db: &str, table: &str) -> Option<(&'static str, &'static str)> {
     STATISTICS_TABLES
         .iter()
-        .find(|(d, t)| d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table))
+        .find(|(d, t)| wide_eq(d, db) && wide_eq(t, table))
         .map(|(d, t)| (*d, *t))
 }
 
@@ -305,6 +362,50 @@ pub(crate) fn listed_table(
     table: &str,
 ) -> Option<(&'static str, &'static str)> {
     statement_text_table(flavor, db, table).or_else(|| statistics_table(db, table))
+}
+
+/// Whether `db`.`table`, matched to the listed table `listed` by
+/// [`listed_table`], is that table under every server rule, so that it is
+/// named as listed only: its names equal the listed ones in ASCII case,
+/// and a listed `mysql` or `sys` table (which the servers compare as
+/// written under `lower_case_table_names = 0`) is written exactly as
+/// listed. Otherwise (#308 final review L10) the name may be a user
+/// location the server does not fold to the system table: MySQL lets a
+/// user create `performance_ſchema` (U+017F) and `MYſQL`, and both servers
+/// let one create `MySQL` and `SYS` (measured, `it::name_case_it`).
+fn names_listed_table(listed: (&str, &str), db: &str, table: &str) -> bool {
+    let (d, t) = listed;
+    if crate::sql::SYSTEM_SCHEMAS_AS_WRITTEN.contains(&d) {
+        d == db && t == table
+    } else {
+        d.eq_ignore_ascii_case(db) && t.eq_ignore_ascii_case(table)
+    }
+}
+
+/// Adds the objects that name `db`.`table` (`listed`: the listed table it
+/// matched, if any) to `objects`, once each. A listed table is named as
+/// listed (ADR-0045 decision 1, ADR-0048); when it matched only through a
+/// wider rule than the server's ([`wide_eq`]'s Unicode case fold, or
+/// another case of `mysql` / `sys`), the object as written is kept next
+/// to it, both always reported, so that policies and exceptions on the
+/// user location still match it (#308 final review L10).
+fn push_named(
+    objects: &mut Vec<(String, String)>,
+    listed: Option<(&str, &str)>,
+    db: &str,
+    table: &str,
+) {
+    let as_written = (db.to_owned(), table.to_owned());
+    let named = match listed {
+        None => vec![as_written],
+        Some(l) if names_listed_table(l, db, table) => vec![(l.0.to_owned(), l.1.to_owned())],
+        Some(l) => vec![(l.0.to_owned(), l.1.to_owned()), as_written],
+    };
+    for o in named {
+        if !objects.contains(&o) {
+            objects.push(o);
+        }
+    }
 }
 
 /// A `USE` with another statement in one text, in either order (security
@@ -379,10 +480,10 @@ fn shows_session_text(p: &StatementInfo) -> bool {
 /// `mysql.audit_log_filter` and `mysql.audit_log_user`. Writing them
 /// changes what the audit log records.
 fn is_audit_table(db: &str, table: &str) -> bool {
-    db.eq_ignore_ascii_case("mysql")
+    wide_eq("mysql", db)
         && ["audit_log_filter", "audit_log_user"]
             .iter()
-            .any(|t| t.eq_ignore_ascii_case(table))
+            .any(|t| wide_eq(t, table))
 }
 
 /// The closed allow-list of statements of no known kind that produce no
@@ -552,7 +653,7 @@ pub(crate) fn is_dump_program(program: &str) -> bool {
 struct SessionState {
     /// Consistent snapshot, global read lock or `LOCK TABLES` taken.
     snapshot: bool,
-    /// Tables `SHOW CREATE TABLE` ran on.
+    /// Tables `SHOW CREATE TABLE` ran on ([`folded`]).
     shown: HashSet<RelationName>,
     /// `program_name` from the connect record.
     program: Option<String>,
@@ -1190,33 +1291,38 @@ pub(crate) fn text_shape(text: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Whether `text` holds `name` written in another ASCII case than `name`
-/// (anywhere: a name, a literal or a comment; fails closed).
-fn case_variant_in(text: &[u8], name: &str) -> bool {
-    let n = name.as_bytes();
-    !n.is_empty()
-        && text
-            .windows(n.len())
-            .any(|w| w.eq_ignore_ascii_case(n) && w != n)
+/// The database of an object: as written or recorded (ADR-0055 decision
+/// 3), but `information_schema` in the case the servers store it, since
+/// they compare it without case whatever `lower_case_table_names`
+/// (`performance_schema` as written: see [`is_skipped_system_schema`]).
+fn object_database(database: &str) -> NormalizedName {
+    if database.is_empty() {
+        NormalizedName::wildcard()
+    } else if database.eq_ignore_ascii_case("information_schema") {
+        normalize("information_schema")
+    } else {
+        normalize(database)
+    }
 }
 
 fn object(database: &str, name: &str) -> EventObject {
-    let db = if database.is_empty() {
-        NormalizedName::wildcard()
-    } else {
-        normalize(database)
-    };
-    EventObject::new(db, None, normalize(name))
+    EventObject::new(object_database(database), None, normalize(name))
 }
 
 /// An object the source does not name: the database, and `*`.
 fn unknown_object(database: &str) -> EventObject {
-    let db = if database.is_empty() {
-        NormalizedName::wildcard()
-    } else {
-        normalize(database)
-    };
+    let db = object_database(database);
     EventObject::new(db, None, NormalizedName::wildcard())
+}
+
+/// A relation ASCII-lowercased: the dump pattern matches tables without
+/// case (a signal: matching more fails closed), while objects keep the
+/// names as written (ADR-0055 decision 3).
+fn folded(r: &RelationName) -> RelationName {
+    RelationName {
+        schema: r.schema.as_deref().map(str::to_ascii_lowercase),
+        name: r.name.to_ascii_lowercase(),
+    }
 }
 
 /// Updates the session's dump state from its utility statements.
@@ -1238,7 +1344,7 @@ fn note_utility(s: &mut SessionState, parts: &[StatementInfo]) {
                             .as_deref()
                             .is_none_or(|s| s.chars().count() <= MAX_SHOWN_NAME_CHARS);
                     if short && s.shown.len() < MAX_SESSION_RELATIONS {
-                        s.shown.insert(r.clone());
+                        s.shown.insert(folded(r));
                     }
                 }
             }
@@ -1435,7 +1541,7 @@ impl EventBuilder {
             text == t.as_slice()
                 && a.tables.iter().all(|(db, table, op)| {
                     *op == TableOp::Read
-                        && db.eq_ignore_ascii_case("performance_schema")
+                        && *db == "performance_schema"
                         && tables.iter().any(|x| x.eq_ignore_ascii_case(table))
                 })
         })
@@ -1828,13 +1934,7 @@ impl EventBuilder {
                     {
                         continue;
                     }
-                    let o = text_table.map_or_else(
-                        || (db.to_owned(), r.name.clone()),
-                        |(d, t)| (d.to_owned(), t.to_owned()),
-                    );
-                    if !objects.contains(&o) {
-                        objects.push(o);
-                    }
+                    push_named(&mut objects, text_table, db, &r.name);
                 }
             }
             // Unknown objects: a text that cannot be read, code that runs
@@ -1898,19 +1998,10 @@ impl EventBuilder {
                         if is_dual(r) || is_system_relation(r, a.database) {
                             continue;
                         }
-                        // The analyzer folds unquoted names to lower case:
-                        // a name written in another case anywhere in the
-                        // text (`hr.V_stats`, `HR.v_stats`) may be another
-                        // relation than the record's.
-                        let variant = |n: &str| {
-                            [a.text, a.alt_text]
-                                .into_iter()
-                                .flatten()
-                                .any(|t| case_variant_in(t, n))
-                        };
+                        // The analyzer keeps names as written, quoted or
+                        // not (ADR-0055 decision 3): `hr.V_stats` and
+                        // `HR.v_stats` are not recorded by `hr.v_stats`.
                         let recorded = !temporary
-                            && !variant(&r.name)
-                            && r.schema.as_deref().is_none_or(|s| !variant(s))
                             && a.tables
                                 .iter()
                                 .any(|(d, t, _)| *d == db && *t == r.name.as_str());
@@ -1931,12 +2022,9 @@ impl EventBuilder {
             for (db, table, op) in &a.tables {
                 if *op == TableOp::Read
                     && stats_record_kept
-                    && let Some((d, t)) = statistics_table(db, table)
+                    && let Some(listed) = statistics_table(db, table)
                 {
-                    let o = (d.to_owned(), t.to_owned());
-                    if !objects.contains(&o) {
-                        objects.push(o);
-                    }
+                    push_named(&mut objects, Some(listed), db, table);
                     continue;
                 }
                 // System tables are skipped from reads only: a write
@@ -1950,18 +2038,14 @@ impl EventBuilder {
                 // loads a table's statistics (ADR-0048 decision 2). A
                 // statistics table the text names is added below.
                 let text_table = statement_text_table(self.flavor, db, table);
-                let system = (is_system_schema(db)
+                let system = (is_skipped_system_schema(db)
                     && !write
                     && *op == TableOp::Read
                     && text_table.is_none())
                     || (is_internal_table(db, table) && (!write || *op == TableOp::Read))
-                    || (!rw && db.eq_ignore_ascii_case("mysql"));
-                let o = text_table.map_or_else(
-                    || ((*db).to_owned(), (*table).to_owned()),
-                    |(d, t)| (d.to_owned(), t.to_owned()),
-                );
-                if !system && !objects.contains(&o) {
-                    objects.push(o);
+                    || (!rw && *db == "mysql");
+                if !system {
+                    push_named(&mut objects, text_table, db, table);
                 }
             }
             for o in unrecorded {
@@ -1987,13 +2071,7 @@ impl EventBuilder {
                         {
                             continue;
                         }
-                        let o = text_table.map_or_else(
-                            || (db.to_owned(), r.name.clone()),
-                            |(d, t)| (d.to_owned(), t.to_owned()),
-                        );
-                        if !objects.contains(&o) {
-                            objects.push(o);
-                        }
+                        push_named(&mut objects, text_table, db, &r.name);
                     }
                 }
             }
@@ -2007,11 +2085,8 @@ impl EventBuilder {
                 for p in parts {
                     for r in &p.relations {
                         let db = r.schema.as_deref().unwrap_or(a.database);
-                        if let Some((d, t)) = listed_table(self.flavor, db, &r.name) {
-                            let o = (d.to_owned(), t.to_owned());
-                            if !objects.contains(&o) {
-                                objects.push(o);
-                            }
+                        if let Some(listed) = listed_table(self.flavor, db, &r.name) {
+                            push_named(&mut objects, Some(listed), db, &r.name);
                         }
                     }
                 }
@@ -2051,13 +2126,7 @@ impl EventBuilder {
                     if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
                         continue;
                     }
-                    let o = text_table.map_or_else(
-                        || (db.to_owned(), r.name.clone()),
-                        |(d, t)| (d.to_owned(), t.to_owned()),
-                    );
-                    if !objects.contains(&o) {
-                        objects.push(o);
-                    }
+                    push_named(&mut objects, text_table, db, &r.name);
                 }
             }
             unknown = unknown
@@ -2088,13 +2157,7 @@ impl EventBuilder {
                     if is_dual(r) || (text_table.is_none() && is_system_relation(r, a.database)) {
                         continue;
                     }
-                    let o = text_table.map_or_else(
-                        || (db.to_owned(), r.name.clone()),
-                        |(d, t)| (d.to_owned(), t.to_owned()),
-                    );
-                    if !objects.contains(&o) {
-                        objects.push(o);
-                    }
+                    push_named(&mut objects, text_table, db, &r.name);
                 }
             }
         }
@@ -2248,7 +2311,7 @@ impl EventBuilder {
                     e = e.with_signal(Signal::FullTableRead);
                     let no_cache = p.lead.iter().skip(1).any(|w| w == "sql_no_cache");
                     let pattern = session.is_some_and(|s| {
-                        s.snapshot || user_relations.iter().any(|r| s.shown.contains(*r))
+                        s.snapshot || user_relations.iter().any(|r| s.shown.contains(&folded(r)))
                     });
                     if no_cache || dumper || pattern {
                         e = e.with_signal(Signal::Mysqldump);
@@ -3720,7 +3783,9 @@ mod tests {
 
     /// Names that differ only in case share one budget (security review
     /// of #197, M2): with `lower_case_table_names` 1 or 2 they are the
-    /// same table.
+    /// same table; with 0 they are two, and the shared budget only reports
+    /// the agent's own reads sooner (fails closed). The reported event
+    /// keeps the name as written (ADR-0055 decision 3).
     #[test]
     fn own_budget_ignores_the_case_of_names() {
         let usage = SharedOwnUsage::default();
@@ -3731,7 +3796,7 @@ mod tests {
             2,
             usage.clone(),
         ));
-        let reported: Vec<bool> = [
+        let reported: Vec<Option<String>> = [
             "SELECT 1 FROM hr.customers WHERE id = 1",
             "SELECT 1 FROM `HR`.`Customers` WHERE id = 2",
             "SELECT 1 FROM Hr.CUSTOMERS WHERE id = 3",
@@ -3740,10 +3805,13 @@ mod tests {
         .map(|t| {
             let mut access = pfs_access(t.as_bytes(), false, Vec::new());
             access.rows = Some(0);
-            b.statement(access, SystemTime::now()).is_some()
+            b.statement(access, SystemTime::now()).map(|e| shown(&e))
         })
         .collect();
-        assert_eq!(reported, [false, false, true]);
+        assert_eq!(
+            reported,
+            [None, None, Some("read [\"Hr.CUSTOMERS\"]".to_owned())]
+        );
         assert_eq!(usage.lock().unwrap().budgeted_objects().len(), 1);
     }
 
@@ -6905,6 +6973,16 @@ mod tests {
                 format!("SET @x = (SELECT COUNT(*) FROM {db}.{table})"),
                 format!("DO (SELECT 1 FROM {db}.{table} LIMIT 1)"),
             ] {
+                // `MYSQL` and `SYS` may be user databases (#308 final
+                // review L10): kept as written next to the listed name.
+                let upper = format!("{}.{}", db.to_ascii_uppercase(), table.to_ascii_uppercase());
+                let want = if text.contains(&upper)
+                    && crate::sql::SYSTEM_SCHEMAS_AS_WRITTEN.contains(db)
+                {
+                    read_of(&[&named, &upper], true)
+                } else {
+                    want.clone()
+                };
                 expect_everywhere(&text, |_| want.clone());
             }
             // In a `JOIN` with an application table: both.
@@ -7035,6 +7113,188 @@ mod tests {
 
     /// `events_statements_summary_by_digest` holds statement texts with
     /// literals on MySQL (`QUERY_SAMPLE_TEXT`), digests only on MariaDB.
+    /// The PR #308 CI run on MariaDB 11.8: a statement-text table read
+    /// through a schema spelling the servers fold to `performance_schema`
+    /// (`performance_ſchema`, U+017F) is named as listed and always
+    /// reported, on every source; the always-reported lists match such
+    /// spellings, the read-skip rule does not. #308 final review L10: MySQL
+    /// lets a user create that database (and `MYſQL`, measured on 8.4.11),
+    /// so the object as written is kept next to the listed name, both
+    /// always reported: a policy or exception on the user location still
+    /// matches it.
+    #[test]
+    fn statement_text_tables_through_a_folded_spelling_are_always_reported() {
+        assert!(wide_eq("performance_schema", "performance_\u{17F}chema"));
+        assert!(wide_eq(
+            "information_schema",
+            "\u{131}nformation_\u{17F}chema"
+        ));
+        assert!(wide_eq("mysql", "MY\u{17F}QL"));
+        assert!(!wide_eq("performance_schema", "performance_schemas"));
+        assert!(!is_skipped_system_schema("performance_\u{17F}chema"));
+        let named =
+            |db: &str, t: &str| format!("{}.{}", normalize(db).as_str(), normalize(t).as_str());
+        for (text, db, table, listed) in [
+            (
+                "SELECT SQL_TEXT FROM performance_\u{17F}chema.events_statements_current LIMIT 1",
+                "performance_\u{17F}chema",
+                "events_statements_current",
+                "performance_schema.events_statements_current",
+            ),
+            (
+                "SELECT * FROM `PERFORMANCE_\u{17F}CHEMA`.`EVENTS_STATEMENTS_HISTORY`",
+                "PERFORMANCE_\u{17F}CHEMA",
+                "EVENTS_STATEMENTS_HISTORY",
+                "performance_schema.events_statements_history",
+            ),
+            (
+                "SELECT min_value FROM MY\u{17F}QL.column_stats",
+                "MY\u{17F}QL",
+                "column_stats",
+                "mysql.column_stats",
+            ),
+            (
+                "SELECT * FROM `\u{17F}ys`.`processlist`",
+                "\u{17F}ys",
+                "processlist",
+                "sys.processlist",
+            ),
+        ] {
+            let mut want = vec![listed.to_owned(), named(db, table)];
+            want.sort();
+            want.dedup();
+            let want = format!("read {want:?} always");
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let ev = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert_eq!(shown(&ev), want, "{user} {source:?}: {text}");
+                }
+            }
+        }
+        // `MYſQL` holds no system table on either server (measured): the
+        // user tables keep their names.
+        assert_eq!(
+            on_every_source("app", "SELECT * FROM MY\u{17F}QL.people")
+                .into_iter()
+                .map(|(_, ev)| ev.as_ref().map(shown))
+                .collect::<Vec<_>>(),
+            vec![Some(format!("read [{:?}]", named("MY\u{17F}QL", "people"))); 3]
+        );
+    }
+
+    /// #308 final review L10, with `server_audit` table records: a read
+    /// record of the user table `MYſQL`.`column_stats` or of
+    /// `performance_ſchema`.`events_statements_current` (the record names
+    /// the table as the server stored it), with or without the server's
+    /// own statistics load records next to it, names the table as written
+    /// and the listed one, always reported.
+    #[test]
+    fn listed_tables_through_a_folded_spelling_keep_the_record_name() {
+        let named =
+            |db: &str, t: &str| format!("{}.{}", normalize(db).as_str(), normalize(t).as_str());
+        for (db, table, listed) in [
+            ("MY\u{17F}QL", "column_stats", "mysql.column_stats"),
+            (
+                "performance_\u{17F}chema",
+                "events_statements_current",
+                "performance_schema.events_statements_current",
+            ),
+            ("MY\u{17F}QL", "Column_Stats", "mysql.column_stats"),
+        ] {
+            let mut want = vec![listed.to_owned(), named(db, table)];
+            want.sort();
+            want.dedup();
+            let want = format!("read {want:?} always");
+            for (q, loads) in [(1, false), (2, true)] {
+                let mut lines = vec![format!(
+                    "20260929 09:40:35,h,app,10.0.0.5,30,{q},READ,{db},{table},"
+                )];
+                if loads {
+                    for t in ["table_stats", "column_stats"] {
+                        lines.push(format!(
+                            "20260929 09:40:35,h,app,10.0.0.5,30,{q},READ,mysql,{t},"
+                        ));
+                    }
+                }
+                lines.push(sa_line(
+                    "app",
+                    "10.0.0.5",
+                    q,
+                    &format!("SELECT * FROM `{db}`.`{table}`"),
+                ));
+                let mut b = EventBuilder::new(own());
+                let ev = b.convert_file(
+                    sa_at(&lines, 1024),
+                    EventSource::MariadbServerAudit,
+                    SystemTime::now(),
+                );
+                assert_eq!(
+                    ev.iter().map(shown).collect::<Vec<_>>(),
+                    [want.as_str()],
+                    "{db}.{table} loads {loads}"
+                );
+            }
+        }
+    }
+
+    /// #308 final review N8, the agent part (ADR-0056 decision 2): a user
+    /// database whose name NFKC folds onto a system schema's spelling
+    /// (`performance_ſchema`, `ſys`) or changes (`MYſQL` gives `MYsQL`)
+    /// reaches the console with `database` in `altered`: the folded name
+    /// is not the server's, and the console's exceptions refuse to cover
+    /// it by name. Where the as-written object and the listed one are the
+    /// same name, they are one object, altered (the markers are united);
+    /// a listed name that differs (`mysql`) and a plain system read are
+    /// not altered.
+    #[test]
+    fn folded_system_spellings_are_marked_altered() {
+        let marks = |e: &MaskedEvent| -> Vec<(String, bool, bool)> {
+            e.objects()
+                .iter()
+                .map(|o| {
+                    (
+                        format!("{}.{}", o.database().as_str(), o.object().as_str()),
+                        o.database().altered(),
+                        o.object().altered(),
+                    )
+                })
+                .collect()
+        };
+        let m = |n: &str, db: bool| (n.to_owned(), db, false);
+        for (text, want) in [
+            (
+                "SELECT SQL_TEXT FROM performance_\u{17F}chema.events_statements_current LIMIT 1",
+                vec![m("performance_schema.events_statements_current", true)],
+            ),
+            (
+                "SELECT * FROM `\u{17F}ys`.`processlist`",
+                vec![m("sys.processlist", true)],
+            ),
+            (
+                "SELECT min_value FROM MY\u{17F}QL.column_stats",
+                vec![
+                    m("MYsQL.column_stats", true),
+                    m("mysql.column_stats", false),
+                ],
+            ),
+            (
+                "SELECT * FROM MY\u{17F}QL.people",
+                vec![m("MYsQL.people", true)],
+            ),
+            (
+                "SELECT SQL_TEXT FROM performance_schema.events_statements_current LIMIT 1",
+                vec![m("performance_schema.events_statements_current", false)],
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let ev = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert_eq!(marks(&ev), want, "{user} {source:?}: {text}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn statement_text_tables_follow_the_flavor() {
         let text = "SELECT * FROM performance_schema.events_statements_summary_by_digest";
@@ -7375,6 +7635,38 @@ mod tests {
         }
     }
 
+    /// ADR-0055 decision 4 (security review L7): the name-case read of
+    /// `check()` is one of the agent's own exact texts, for both flavors,
+    /// reads no table and raises no event, from the agent or any account;
+    /// a near copy is not an own text.
+    #[test]
+    fn the_name_case_read_is_an_own_exact_text_and_quiet() {
+        let target: databastion_core::config::TargetConfig = databastion_core::AgentConfig::parse(
+            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+                 engine: mariadb, host: db, account: databastion, secret: {env: X}}]}",
+        )
+        .unwrap()
+        .targets[0]
+            .clone();
+        let texts = crate::audit::own_statements(&target);
+        for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            let text = crate::sql::name_case_settings(flavor);
+            assert!(texts.iter().any(|t| t == text.as_bytes()), "{text}");
+            let b = EventBuilder::new(own()).with_own_statements(texts.clone());
+            assert!(b.own_statement(text.as_bytes(), false, false));
+            assert!(!b.own_statement(text.as_bytes(), true, false), "cut");
+            assert!(!b.own_statement(format!("{text} ").as_bytes(), false, false));
+            for user in ["databastion", "app"] {
+                let mut b = EventBuilder::new(own()).with_own_statements(texts.clone());
+                let out = file(
+                    &mut b,
+                    sa_at(&[sa_line(user, "172.18.0.1", 1, &text)], 1024),
+                );
+                assert!(out.is_empty(), "{user}: {out:?}");
+            }
+        }
+    }
+
     #[test]
     fn dump_programs() {
         for p in [
@@ -7421,6 +7713,16 @@ mod tests {
                 format!("SELECT 1 FROM DUAL WHERE EXISTS (SELECT 1 FROM {db}.{table})"),
                 format!("SELECT * FROM (SELECT * FROM {db}.{table}) AS d"),
             ] {
+                // `MYSQL` and `SYS` may be user databases (#308 final
+                // review L10): kept as written next to the listed name.
+                let upper = format!("{}.{}", db.to_ascii_uppercase(), table.to_ascii_uppercase());
+                let want = if text.contains(&upper)
+                    && crate::sql::SYSTEM_SCHEMAS_AS_WRITTEN.contains(db)
+                {
+                    read_of(&[&named, &upper], true)
+                } else {
+                    want.clone()
+                };
                 expect_everywhere(&text, |_| want.clone());
             }
             // With an application table: both, in a `JOIN` or a subquery.
@@ -7470,7 +7772,8 @@ mod tests {
                 assert_eq!(ev.len(), 1, "{user}");
                 assert!(ev[0].always_report(), "{user}");
             }
-            // The same name in another schema is an ordinary table.
+            // The same name in another schema is an ordinary table, named
+            // as written (ADR-0055 decision 3).
             let mut b = EventBuilder::new(own());
             let ev = b.convert_file(
                 sa_at(
@@ -7487,7 +7790,7 @@ mod tests {
             );
             assert_eq!(
                 ev.iter().map(shown).collect::<Vec<_>>(),
-                [format!("read [\"hr.{}\"]", table.to_ascii_lowercase())]
+                [format!("read [\"hr.{table}\"]")]
             );
         }
         // Writes name them too, always reported.
@@ -7682,6 +7985,209 @@ mod tests {
         assert!(statistics_table("hr", "column_stats").is_none());
     }
 
+    /// The [`shown`] form of a read of `objects` (sorted, as events keep
+    /// them).
+    fn read_of(objects: &[&str], always: bool) -> String {
+        let mut o: Vec<&str> = objects.to_vec();
+        o.sort_unstable();
+        format!("read {o:?}{}", if always { " always" } else { "" })
+    }
+
+    /// ADR-0055 decision 3 (security review H1): with
+    /// `lower_case_table_names = 0` `Customers` and `customers` are two
+    /// tables, so on every source the objects taken from the statement
+    /// text (`server_audit` `QUERY` records, the `audit_log` JSON text,
+    /// `performance_schema` texts and digests) keep the names as written,
+    /// backquoted or not, and so do the objects taken from table records.
+    #[test]
+    fn names_reach_the_objects_as_written() {
+        for (text, objects) in [
+            ("SELECT * FROM hr.Customers", &["hr.Customers"][..]),
+            ("select * from hr.customers", &["hr.customers"][..]),
+            ("SELECT * FROM `hr`.`Customers`", &["hr.Customers"][..]),
+            ("SELECT * FROM `hr`.`customers`", &["hr.customers"][..]),
+            ("SELECT * FROM Hr.CUSTOMERS", &["Hr.CUSTOMERS"][..]),
+            (
+                "SELECT * FROM hr.Customers JOIN hr.customers USING (id)",
+                &["hr.Customers", "hr.customers"][..],
+            ),
+            (
+                "SELECT * FROM hr.Customers WHERE id IN (SELECT id FROM `hr`.`customers`)",
+                &["hr.Customers", "hr.customers"][..],
+            ),
+            // Keywords still match in any case.
+            ("SeLeCt * FrOm hr.Customers LiMiT 5", &["hr.Customers"][..]),
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(read_of(objects, false).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        // Writes too.
+        expect_everywhere("UPDATE hr.Customers SET a = 1", |_| {
+            "write [\"hr.Customers\"]".to_owned()
+        });
+        expect_everywhere("INSERT INTO `hr`.`customers` VALUES (1)", |_| {
+            "write [\"hr.customers\"]".to_owned()
+        });
+        // A `performance_schema` digest (identifiers backquoted, in the
+        // case written: `poll_digests.tsv`).
+        for (digest, objects) in [
+            ("SELECT * FROM `hr` . `Customers` ", &["hr.Customers"][..]),
+            ("SELECT * FROM `hr` . `customers` ", &["hr.customers"][..]),
+        ] {
+            let mut b = EventBuilder::new(own());
+            let mut access = pfs_access(digest.as_bytes(), false, Vec::new());
+            access.user = "app";
+            access.principal = EventPrincipal::account("app");
+            access.digest = true;
+            access.rows = Some(1);
+            let e = b.statement(access, SystemTime::now()).expect(digest);
+            assert_eq!(shown(&e), read_of(objects, false), "{digest}");
+        }
+        // Unqualified, in the current database as the source logs it.
+        let mut b = EventBuilder::new(own());
+        let out = file(
+            &mut b,
+            sa_at(
+                &[sa_in("app", "10.0.0.5", 1, "Hr", "SELECT * FROM Customers")],
+                1024,
+            ),
+        );
+        assert_eq!(
+            out,
+            ["read [\"Hr.Customers\"] None [\"shape.full_table_read\"]"]
+        );
+        // Table records: the server's names, as the records give them.
+        for table in ["Customers", "customers"] {
+            let lines = vec![
+                format!("20260929 09:40:35,h,app,10.0.0.5,30,7,READ,hr,{table},"),
+                sa_line("app", "10.0.0.5", 7, &format!("SELECT * FROM hr.{table}")),
+            ];
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 1024),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [read_of(&[&format!("hr.{table}")], false)],
+                "{table}"
+            );
+            let recs = filter_json(
+                "app",
+                "10.0.0.5",
+                9,
+                &[("hr", table)],
+                &format!("SELECT * FROM `hr`.`{table}`"),
+            );
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(recs, EventSource::MysqlAuditLog, SystemTime::now());
+            assert_eq!(
+                ev.iter().map(shown).collect::<Vec<_>>(),
+                [read_of(&[&format!("hr.{table}")], false)],
+                "{table}"
+            );
+        }
+    }
+
+    /// ADR-0055 decision 3: the system schemas stay matched without case
+    /// where both servers compare them so (`information_schema`) and
+    /// wherever the match reports more (the statement-text and statistics
+    /// tables, named as listed and always reported); a read is left out as
+    /// a system read only for `performance_schema`, `sys` and `mysql` as
+    /// stored, since with `lower_case_table_names = 0` `SYS`, `MySQL` or
+    /// (MariaDB, PR #308) `Performance_Schema` is another database.
+    #[test]
+    fn system_schema_matching_follows_the_server_rules() {
+        for text in [
+            "SELECT * FROM INFORMATION_SCHEMA.STATISTICS",
+            "select * from Information_Schema.Columns",
+            "SELECT * FROM performance_schema.setup_instruments",
+            "SELECT * FROM sys.statement_analysis",
+            "SELECT * FROM mysql.table_stats",
+            "SELECT * FROM dual",
+            "SELECT 1 FROM DUAL",
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert!(ev.is_none(), "{source:?}: {text}");
+            }
+        }
+        for (text, objects) in [
+            (
+                "SELECT * FROM SYS.statement_analysis",
+                &["SYS.statement_analysis"][..],
+            ),
+            (
+                "SELECT * FROM PERFORMANCE_SCHEMA.setup_instruments",
+                &["PERFORMANCE_SCHEMA.setup_instruments"][..],
+            ),
+            (
+                "SELECT * FROM `Performance_Schema`.people",
+                &["Performance_Schema.people"][..],
+            ),
+            (
+                "SELECT * FROM `Sys`.`statement_analysis`",
+                &["Sys.statement_analysis"][..],
+            ),
+            (
+                "SELECT * FROM MySQL.table_stats",
+                &["MySQL.table_stats"][..],
+            ),
+            (
+                "SELECT * FROM mysql.Table_Stats",
+                &["mysql.Table_Stats"][..],
+            ),
+        ] {
+            for (source, ev) in on_every_source("app", text) {
+                assert_eq!(
+                    ev.as_ref().map(shown).as_deref(),
+                    Some(read_of(objects, false).as_str()),
+                    "{source:?}: {text}"
+                );
+            }
+        }
+        for (text, objects) in [
+            (
+                "SELECT * FROM PERFORMANCE_SCHEMA.EVENTS_STATEMENTS_HISTORY",
+                &["performance_schema.events_statements_history"][..],
+            ),
+            (
+                "SELECT * FROM SYS.PROCESSLIST",
+                &["SYS.PROCESSLIST", "sys.processlist"][..],
+            ),
+            (
+                "SELECT * FROM information_schema.processlist",
+                &["information_schema.PROCESSLIST"][..],
+            ),
+            (
+                "SELECT * FROM MYSQL.COLUMN_STATS",
+                &["MYSQL.COLUMN_STATS", "mysql.column_stats"][..],
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    assert_eq!(
+                        ev.as_ref().map(shown).as_deref(),
+                        Some(read_of(objects, true).as_str()),
+                        "{user} {source:?}: {text}"
+                    );
+                }
+            }
+        }
+        // A write of a system schema in any case is always reported, named
+        // as written (`Performance_Schema` may be a user database on
+        // MariaDB).
+        expect_everywhere(
+            "UPDATE Performance_Schema.Setup_Consumers SET ENABLED = 'NO'",
+            |_| "write [\"Performance_Schema.Setup_Consumers\"] always".to_owned(),
+        );
+    }
+
     /// Security review of #199, H2: a `READ,mysql,column_stats` record
     /// with a text that cannot be read whole, that runs code out of sight,
     /// that is a `HANDLER` read, or without the `table_stats` record of a
@@ -7851,11 +8357,10 @@ mod tests {
     }
 
     /// Security review of #199, R3-M1 and R3-L2: a relation is recorded
-    /// only by a record of exactly its name, in a text that writes it in
-    /// no other case (`lower_case_table_names = 0`: `hr.V_stats` is not
-    /// `hr.v_stats`; unquoted names are folded by the analyzer, so named
-    /// in lower case), and not at all in a text that creates or drops a
-    /// temporary table.
+    /// only by a record of exactly its name (`lower_case_table_names = 0`:
+    /// `hr.V_stats` is not `hr.v_stats`; names are kept as written, quoted
+    /// or not, ADR-0055 decision 3), and not at all in a text that creates
+    /// or drops a temporary table.
     #[test]
     fn statistics_records_next_to_case_variants_and_temporary_tables() {
         let rec = |q: u64, db: &str, t: &str| {
@@ -7865,7 +8370,7 @@ mod tests {
             (
                 21,
                 "SELECT * FROM hr.V_stats JOIN hr.v_stats ON 1=1",
-                &["hr.v_stats", "mysql.column_stats"][..],
+                &["hr.V_stats", "hr.v_stats", "mysql.column_stats"][..],
             ),
             (
                 22,
@@ -7875,7 +8380,7 @@ mod tests {
             (
                 23,
                 "SELECT * FROM HR.v_stats",
-                &["hr.v_stats", "mysql.column_stats"][..],
+                &["HR.v_stats", "hr.v_stats", "mysql.column_stats"][..],
             ),
         ] {
             let lines = vec![
@@ -8036,6 +8541,195 @@ mod tests {
             b"SELECT \xff",
         ] {
             assert!(text_shape(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// Each ASCII letter of `text` uppercased where `mask` says so.
+    fn recased(text: &str, mask: &[bool]) -> String {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if mask.get(i % mask.len().max(1)).copied().unwrap_or(false) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// An event as compared across spellings: action, objects folded to
+    /// ASCII lowercase (sorted, deduplicated), signals, always-reported
+    /// mark.
+    fn folded_view(e: &MaskedEvent) -> String {
+        let mut o: Vec<String> = e
+            .objects()
+            .iter()
+            .map(|o| {
+                format!("{}.{}", o.database().as_str(), o.object().as_str()).to_ascii_lowercase()
+            })
+            .collect();
+        // Two spellings of one name are two objects: one folded name.
+        o.sort_unstable();
+        o.dedup();
+        format!(
+            "{} {o:?} {:?} {}",
+            e.action().as_str(),
+            e.signals(),
+            e.always_report()
+        )
+    }
+
+    /// Statements naming one relation `{}` (review of ADR-0055 decision 3).
+    const ONE_RELATION: &[&str] = &[
+        "SELECT * FROM {}",
+        "SELECT a FROM {} WHERE b = 1 LIMIT 5",
+        "SELECT COUNT(*) FROM {}",
+        "SELECT * FROM {} JOIN hr.orders USING (id)",
+        "SELECT * FROM {} INTO OUTFILE '/tmp/x'",
+        "SELECT * FROM {} INTO @x",
+        "UPDATE {} SET a = 1",
+        "INSERT INTO {} VALUES (1)",
+        "DELETE FROM {}",
+        "SHOW CREATE TABLE {}",
+        "EXPLAIN SELECT * FROM {}",
+        "DROP TABLE {}",
+        "GRANT SELECT ON {} TO u",
+        "CREATE TABLE hr.copy AS SELECT * FROM {}",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256,
+            failure_persistence: None,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// Review of ADR-0055 decision 3 (a): for an account that is not
+        /// the agent's, writing a name in another case never removes an
+        /// event, nor changes its action, signals, always-reported mark or
+        /// objects (folded), on any of the three sources.
+        #[test]
+        fn recasing_identifiers_keeps_every_event(
+            template in proptest::sample::select(ONE_RELATION.to_vec()),
+            schema in proptest::sample::select(vec!["hr", "crm", "app_db"]),
+            table in proptest::sample::select(vec!["customers", "orders", "user", "status", "data"]),
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 2),
+            mask in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..12),
+        ) {
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let lower = template.replacen("{}", &format!("{}.{}", q(schema, quote[0]), q(table, quote[1])), 1);
+            let written = template.replacen(
+                "{}",
+                &format!("{}.{}", q(&recased(schema, &mask), quote[0]), q(&recased(table, &mask[1..].iter().chain(&mask[..1]).copied().collect::<Vec<_>>()), quote[1])),
+                1,
+            );
+            let base = on_every_source("app", &lower);
+            let other = on_every_source("app", &written);
+            for ((source, a), (_, b)) in base.iter().zip(&other) {
+                proptest::prop_assert_eq!(
+                    a.as_ref().map(folded_view),
+                    b.as_ref().map(folded_view),
+                    "{:?}: {} / {}", source, lower, written
+                );
+            }
+        }
+
+        /// Review of ADR-0055 decision 3 (b): a read of a system schema is
+        /// left out only when written exactly `sys` or `mysql`, or as
+        /// `information_schema` / `performance_schema` in any case; a
+        /// statement-text or statistics table is reported in any case.
+        #[test]
+        fn recasing_system_schemas_leaves_out_only_server_equal_names(
+            relation in proptest::sample::select(vec![
+                ("sys", "statement_analysis", false),
+                ("sys", "processlist", true),
+                ("mysql", "table_stats", false),
+                ("mysql", "column_stats", true),
+                ("information_schema", "columns", false),
+                ("information_schema", "processlist", true),
+                ("performance_schema", "setup_instruments", false),
+                ("performance_schema", "events_statements_history", true),
+            ]),
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 2),
+            mask in proptest::collection::vec(proptest::prelude::any::<bool>(), 1..12),
+        ) {
+            let (schema, table, listed) = relation;
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let s = recased(schema, &mask);
+            let t = recased(table, &mask[1..].iter().chain(&mask[..1]).copied().collect::<Vec<_>>());
+            let text = format!("SELECT * FROM {}.{}", q(&s, quote[0]), q(&t, quote[1]));
+            let may_skip = s == "sys"
+                || s == "mysql"
+                || s == "performance_schema"
+                || s.eq_ignore_ascii_case("information_schema");
+            for (source, ev) in on_every_source("app", &text) {
+                if ev.is_none() {
+                    proptest::prop_assert!(may_skip && !listed, "{:?}: {}", source, text);
+                }
+                if !may_skip || listed {
+                    proptest::prop_assert!(ev.is_some(), "{:?}: {}", source, text);
+                }
+                if listed {
+                    proptest::prop_assert!(
+                        ev.as_ref().is_some_and(MaskedEvent::always_report),
+                        "{:?}: {}", source, text
+                    );
+                }
+            }
+        }
+
+        /// Review of ADR-0055 decision 3 (c): a `server_audit` statistics
+        /// load (`READ,mysql,table_stats` and `READ,mysql,column_stats`
+        /// next to the read tables' records, as stored in lower case) is
+        /// dropped only when every relation of the text, as written,
+        /// equals a record exactly; otherwise `mysql.column_stats` is
+        /// named and the event always reported.
+        #[test]
+        fn statistics_loads_drop_only_on_exact_records(
+            quote in proptest::collection::vec(proptest::prelude::any::<bool>(), 4),
+            masks in proptest::collection::vec(proptest::collection::vec(proptest::prelude::any::<bool>(), 1..10), 4),
+        ) {
+            let q = |n: &str, quoted: bool| if quoted { format!("`{n}`") } else { n.to_owned() };
+            let names: Vec<String> = ["hr", "customers", "hr", "orders"]
+                .iter()
+                .zip(&masks)
+                .map(|(n, m)| recased(n, m))
+                .collect();
+            let text = format!(
+                "SELECT * FROM {}.{} c JOIN {}.{} o ON 1 = 1",
+                q(&names[0], quote[0]),
+                q(&names[1], quote[1]),
+                q(&names[2], quote[2]),
+                q(&names[3], quote[3]),
+            );
+            let rec = |db: &str, t: &str| {
+                format!("20260929 09:40:35,h,app,10.0.0.5,30,12,READ,{db},{t},")
+            };
+            let mut lines = vec![
+                rec("hr", "customers"),
+                rec("hr", "orders"),
+                rec("mysql", "table_stats"),
+                rec("mysql", "column_stats"),
+            ];
+            lines.push(sa_line("app", "10.0.0.5", 12, &text));
+            let mut b = EventBuilder::new(own());
+            let ev = b.convert_file(
+                sa_at(&lines, 4096),
+                EventSource::MariadbServerAudit,
+                SystemTime::now(),
+            );
+            let exact = names.iter().zip(["hr", "customers", "hr", "orders"]).all(|(n, l)| n == l);
+            let named: Vec<String> = ev
+                .iter()
+                .flat_map(|e| e.objects().iter())
+                .map(|o| format!("{}.{}", o.database().as_str(), o.object().as_str()))
+                .collect();
+            let kept = named.iter().any(|n| n == "mysql.column_stats");
+            proptest::prop_assert_eq!(kept, !exact, "{}: {:?}", text, named);
+            if kept {
+                proptest::prop_assert!(ev.iter().any(MaskedEvent::always_report), "{}", text);
+            }
         }
     }
 }

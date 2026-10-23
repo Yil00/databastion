@@ -40,6 +40,9 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # test's own user owns, and the masked -> contract conversion as JSON for
 # the interim I2 checks.
 test-support = []
+# Public entry points for the fuzz targets (`agent/fuzz`, cargo-fuzz): the
+# CSV splitter oracles. Never enabled by the agent binary.
+fuzzing = []
 
 [dev-dependencies]
 # sanitize.rs tests: the sanitizer's KeyPattern rules against the

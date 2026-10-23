@@ -222,8 +222,11 @@ fn stored_bytes_are_sent_verbatim() {
     assert_eq!(front.batch_id(), b[0].batch_id());
 }
 
+/// Security review L3: a crash after writing part of (or every)
+/// replacement but before the marker keeps the old batch and removes the
+/// replacements at the next start; a batch is never sent both ways.
 #[test]
-fn replacement_keys_never_collide_with_crash_leftovers() {
+fn a_replacement_cut_before_its_marker_is_rolled_back_at_start() {
     let dir = TempDir::new();
     let b = batches(2 * 200);
     let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
@@ -231,19 +234,77 @@ fn replacement_keys_never_collide_with_crash_leftovers() {
     spool.push(&b[1]).unwrap();
     let (key, front) = spool.front().unwrap();
     let (h1, h2) = front.halves().unwrap().unwrap();
-    // Crash after writing the children but before removing the parent.
+    // Crash after writing the children but before the marker.
     let sdir = dir.path().join("spool");
     crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 0], true)), h1.bytes()).unwrap();
+    crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 1], true)), h2.bytes()).unwrap();
     drop(spool);
     let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
-    assert_eq!(spool.len(), 3);
+    assert_eq!(spool.len(), 2);
+    assert!(!sdir.join(file_name(&[0, 0], true)).exists());
+    assert_eq!(spool.front().unwrap().1.batch_id(), front.batch_id());
+    // The replacement then goes through, and leaves no marker behind.
     spool.replace(&key, &[h1.clone(), h2.clone()], 7).unwrap();
     assert_eq!(spool.counters.dropped_items, 7);
     let keys: Vec<_> = spool.entries.iter().map(|e| e.key.clone()).collect();
-    assert_eq!(keys, vec![vec![0, 0], vec![0, 1], vec![0, 2], vec![1]]);
+    assert_eq!(keys, vec![vec![0, 0], vec![0, 1], vec![1]]);
+    assert!(std::fs::read_dir(&sdir).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(REPLACED_SUFFIX)
+    }));
     drop(spool);
     let spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
-    assert_eq!(spool.len(), 4);
+    assert_eq!(spool.len(), 3);
+}
+
+/// Security review L3: a crash after the marker keeps the replacements and
+/// removes the old batch (and the marker) at the next start.
+#[test]
+fn a_replacement_cut_after_its_marker_is_finished_at_start() {
+    let dir = TempDir::new();
+    let b = batches(2 * 200);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    spool.push(&b[0]).unwrap();
+    spool.push(&b[1]).unwrap();
+    let (_, front) = spool.front().unwrap();
+    let (h1, h2) = front.halves().unwrap().unwrap();
+    let sdir = dir.path().join("spool");
+    crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 0], true)), h1.bytes()).unwrap();
+    crate::fsutil::write_private_atomic(&sdir.join(file_name(&[0, 1], true)), h2.bytes()).unwrap();
+    let marker = sdir.join(format!("{}{REPLACED_SUFFIX}", file_name(&[0], true)));
+    crate::fsutil::write_private_atomic(&marker, b"").unwrap();
+    drop(spool);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    let order: Vec<_> = std::iter::from_fn(|| {
+        let (k, x) = spool.front()?;
+        spool.remove(&k);
+        Some(x.batch_id())
+    })
+    .collect();
+    assert_eq!(order, [h1.batch_id(), h2.batch_id(), b[1].batch_id()]);
+    assert!(!marker.exists());
+    assert!(!sdir.join(file_name(&[0], true)).exists());
+    assert_eq!(spool.counters.quarantined, 0);
+}
+
+/// Security review L2: the mark survives in memory only, and a
+/// replacement starts unmarked.
+#[test]
+fn a_sent_batch_is_marked_attempted() {
+    let dir = TempDir::new();
+    let b = batches(2 * 200);
+    let mut spool = Spool::open(dir.path(), &config(8 << 20, 100)).unwrap();
+    spool.push(&b[0]).unwrap();
+    let (key, front) = spool.front().unwrap();
+    assert!(!front.attempted());
+    spool.mark_attempted(&key);
+    let (_, front) = spool.front().unwrap();
+    assert!(front.attempted());
+    let (h1, h2) = front.halves().unwrap().unwrap();
+    spool.replace(&key, &[h1, h2], 0).unwrap();
+    assert!(!spool.front().unwrap().1.attempted());
 }
 
 #[test]
@@ -455,7 +516,6 @@ fn signature_events_are_packed_in_batches_of_their_own() {
         target_id: &target,
         events: &events,
         fingerprints: &fp,
-        accept_bytes: true,
     });
     let shape: Vec<(bool, usize)> = built
         .batches
@@ -509,7 +569,11 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
         spool.push(&cas_batch()).unwrap();
     }
     assert_eq!(spool.held_batches(held), 3);
-    assert!(spool.front_sendable(|_| true, held).is_none());
+    assert!(
+        spool
+            .front_sendable(|_| true, held, |_, _, _| false)
+            .is_none()
+    );
     // The bound applies to held batches like any other: a new batch
     // evicts the oldest (counted).
     let pg = batches(1).remove(0);
@@ -520,7 +584,11 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
     assert_eq!(spool.held_batches(held), 2);
     // The sendable batch is found behind the held ones.
     assert_eq!(
-        spool.front_sendable(|_| true, held).unwrap().1.batch_id(),
+        spool
+            .front_sendable(|_| true, held, |_, _, _| false)
+            .unwrap()
+            .1
+            .batch_id(),
         pg.batch_id()
     );
     // A held file is never read: removing them from disk is not noticed
@@ -531,7 +599,7 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
             fs::write(&p, b"not a batch").unwrap();
         }
     }
-    let _ = spool.front_sendable(|_| false, held);
+    let _ = spool.front_sendable(|_| false, held, |_, _, _| false);
     assert_eq!(spool.counters.quarantined, 0);
     // Reloaded (agent restart): the tokens come from the files again.
     let dir2 = TempDir::new();
@@ -540,6 +608,14 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
     drop(again);
     let mut again = Spool::open(dir2.path(), &config(1 << 20, 8)).unwrap();
     assert_eq!(again.held_batches(held), 1);
-    assert!(again.front_sendable(|_| true, held).is_none());
-    assert!(again.front_sendable(|_| true, |_| false).is_some());
+    assert!(
+        again
+            .front_sendable(|_| true, held, |_, _, _| false)
+            .is_none()
+    );
+    assert!(
+        again
+            .front_sendable(|_| true, |_| false, |_, _, _| false)
+            .is_some()
+    );
 }

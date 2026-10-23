@@ -1,8 +1,9 @@
 # Coverage-guided fuzz targets (cargo-fuzz, libFuzzer) for the parsers a hostile
-# server or log writer feeds: MongoDB BSON, OP_MSG, auditLog / server log lines and
+# server or log writer feeds: the core's CSV log splitter; MongoDB BSON, OP_MSG, auditLog / server log lines and
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
 # cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
-# serde_yaml_ng as a differential oracle) and JSON audit log lines. See
+# serde_yaml_ng as a differential oracle) and JSON audit log lines; and the name normalizers
+# (classifiers, ADR-0057). See
 # README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
@@ -20,6 +21,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# The name normalizers (target classifiers_names, ADR-0057): no feature needed.
+databastion-classifiers = { path = "../crates/classifiers" }
+databastion-core = { path = "../crates/core", features = ["fuzzing"] }
 databastion-connector-mongodb = { path = "../crates/connector-mongodb", features = ["fuzzing"] }
 databastion-connector-openldap = { path = "../crates/connector-openldap", features = ["fuzzing"] }
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
@@ -220,6 +224,20 @@ bench = false
 [[bin]]
 name = "sqlserver_xe_records"
 path = "fuzz_targets/sqlserver_xe_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_csv_splitter"
+path = "fuzz_targets/core_csv_splitter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classifiers_names"
+path = "fuzz_targets/classifiers_names.rs"
 test = false
 doc = false
 bench = false

@@ -26,6 +26,16 @@ use crate::tds::{self, ptype};
 use crate::tls::{self, PreloginWrap};
 use crate::token::{Decoder, Event, Limits, TokenError, Value, done};
 
+/// Bound of the TLS / TCP shutdown of a close.
+const CLOSE_SHUTDOWN: Duration = Duration::from_secs(1);
+/// What a clean close may take at most (its settle, then its shutdown): a
+/// caller bounding a session's work by a deadline stops that work this
+/// long before it, so that the close itself is not cancelled (#264 review
+/// L1).
+pub(crate) const CLOSE_ROOM: Duration = crate::audit::own::CLEAN_CLOSE_SETTLE
+    .saturating_add(CLOSE_SHUTDOWN)
+    .saturating_add(Duration::from_millis(100));
+
 /// TCP connect, TLS handshake and login timeout.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the `ATTENTION` acknowledgement is waited for (decision 5).
@@ -306,6 +316,14 @@ pub(crate) struct Session {
     pub(crate) own: Option<crate::audit::own::Handle>,
     /// A request is in flight (a drop then loses the session).
     in_flight: bool,
+    /// Tests only: the session may send texts off the allow-list.
+    #[cfg(test)]
+    pub(crate) any_text: bool,
+    /// Tests only: the session may send texts the deny-list refuses too
+    /// (the measurement of the listed objects' reads, as `sa` and a
+    /// throwaway login).
+    #[cfg(test)]
+    pub(crate) raw_text: bool,
 }
 
 impl Drop for Session {
@@ -536,6 +554,10 @@ impl Session {
             statement_timeout,
             own: None,
             in_flight: false,
+            #[cfg(test)]
+            any_text: false,
+            #[cfg(test)]
+            raw_text: false,
         }
     }
 
@@ -551,22 +573,39 @@ impl Session {
     /// session with nothing in flight and not poisoned ends cleanly (no
     /// grace, decision 6, re-review N4); otherwise it is lost. A clean
     /// close first waits, idle, until
-    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer, so
-    /// that no record of a statement it sent is stamped after its end.
+    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer
+    /// (`last_used`: the end of the last response read, or of the
+    /// `ATTENTION` acknowledgement of a cancelled statement), so that no
+    /// record of a statement it sent is stamped after its end.
+    ///
+    /// The future must run to its end for the close to be clean: dropped
+    /// during the settle or the shutdown (a caller's deadline), the
+    /// session is dropped, hence recorded as lost with the lost
+    /// connection's grace (fail closed, #264 review L1). A caller with a
+    /// deadline leaves [`CLOSE_ROOM`] for it (`check::check`).
     pub(crate) async fn close(mut self) {
         let lost = self.poisoned || self.in_flight;
         let grace = self.statement_timeout + crate::audit::own::LOST_GRACE;
-        if !lost && self.own.is_some() {
-            let wait =
-                crate::audit::own::CLEAN_CLOSE_SETTLE.saturating_sub(self.last_used.elapsed());
-            if !wait.is_zero() {
-                ::tokio::time::sleep(wait).await;
-            }
+        let wait = self.settle_wait();
+        if !wait.is_zero() {
+            ::tokio::time::sleep(wait).await;
         }
-        let _ = ::tokio::time::timeout(Duration::from_secs(1), self.io.shutdown()).await;
+        let _ = ::tokio::time::timeout(CLOSE_SHUTDOWN, self.io.shutdown()).await;
         if let Some(h) = self.own.as_mut() {
             h.end(lost, grace);
         }
+    }
+
+    /// How long a close waits before it shuts the connection down: until
+    /// [`crate::audit::own::CLEAN_CLOSE_SETTLE`] after the last answer for
+    /// a clean close of one of the agent's own sessions; nothing for a
+    /// lost one (poisoned or in flight: it keeps its grace instead) or for
+    /// a session idle for longer than that already.
+    fn settle_wait(&self) -> Duration {
+        if self.poisoned || self.in_flight || self.own.is_none() {
+            return Duration::ZERO;
+        }
+        crate::audit::own::CLEAN_CLOSE_SETTLE.saturating_sub(self.last_used.elapsed())
     }
 
     /// Grants an Audit credit for `text` on this session (decision 6, L5):
@@ -883,6 +922,35 @@ impl Session {
         Ok(rows)
     }
 
+    /// The run-time checks of a text before it is sent: the deny-list of
+    /// refinement item 7 (M4), then the reviewed allow-list
+    /// (`sql::STATEMENTS`, end-of-phase-9 review L1). Either refusal is an
+    /// agent bug: nothing is sent, `internal` (fail closed). Only a test
+    /// session (`any_text`, the integration tests' `sa` and foreign
+    /// sessions, the unit tests' scripted servers) skips the allow-list.
+    fn vet(&self, text: &str, stage: Stage) -> Result<(), SsError> {
+        #[cfg(test)]
+        if self.raw_text {
+            return Ok(());
+        }
+        if !crate::sql::checked(text) {
+            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
+            return Err(SsError::new(FailureCode::Internal, stage));
+        }
+        #[cfg(test)]
+        let any = self.any_text;
+        #[cfg(not(test))]
+        let any = false;
+        if !any && !crate::sql::allowed(text) {
+            tracing::error!(
+                stage = stage.as_str(),
+                "statement refused: not on the allow-list"
+            );
+            return Err(SsError::new(FailureCode::Internal, stage));
+        }
+        Ok(())
+    }
+
     /// Runs one statement of the closed set as a `SQLBatch`, handing each
     /// value to `on_cell`. Exactly one result of `shape.columns` columns
     /// (none for `columns: 0`), at most `shape.max_rows` rows.
@@ -893,11 +961,9 @@ impl Session {
         shape: Shape,
         on_cell: impl FnMut(Cell) -> Flow,
     ) -> Result<Ended, SsError> {
-        // The deny-list of refinement item 7 (M4), at run time too.
-        if !crate::sql::checked(sql) {
-            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
-            return Err(SsError::new(FailureCode::Internal, stage));
-        }
+        // The deny-list of refinement item 7 (M4) and the allow-list, at
+        // run time too.
+        self.vet(sql, stage)?;
         let payload =
             tds::sql_batch(sql).map_err(|_| SsError::new(FailureCode::Internal, stage))?;
         if let Some(h) = self.own.as_mut() {
@@ -916,10 +982,7 @@ impl Session {
         shape: Shape,
         on_cell: impl FnMut(Cell) -> Flow,
     ) -> Result<Ended, SsError> {
-        if !crate::sql::checked(text) {
-            tracing::error!(stage = stage.as_str(), "statement refused by the deny-list");
-            return Err(SsError::new(FailureCode::Internal, stage));
-        }
+        self.vet(text, stage)?;
         let payload = tds::rpc_executesql(text, params)
             .map_err(|_| SsError::new(FailureCode::Internal, stage))?;
         if let Some(h) = self.own.as_mut() {
@@ -1023,6 +1086,9 @@ impl Session {
         if let Some(outcome) = stop {
             self.cancel(stage).await;
             self.in_flight = self.poisoned;
+            // The acknowledgement is the statement's last answer: a clean
+            // close settles from it, not from the send (#264 review L2).
+            self.last_used = Instant::now();
             return outcome;
         }
         self.in_flight = false;
@@ -1104,6 +1170,9 @@ pub(crate) mod tests {
         let handle = ::tokio::spawn(crate::fake::serve(server, responses));
         let mut s = Session::new(Box::new(client), Mode::Mandatory, Duration::from_secs(2));
         s.info.tds_version = tds::TDS_74;
+        // Scripted servers answer any text (the allow-list has its own
+        // test, `texts_off_the_allow_list_are_never_sent`).
+        s.any_text = true;
         (s, handle)
     }
 
@@ -1245,6 +1314,7 @@ pub(crate) mod tests {
         });
         let e = s.prelogin().await.unwrap_err();
         assert_eq!(e.stage, Stage::Tls);
+        assert_eq!(e.code, FailureCode::TargetUnreachable);
         assert!(s.is_poisoned());
         drop(srv.await.unwrap());
         // Without trailing bytes the response is accepted and nothing is
@@ -1492,5 +1562,139 @@ pub(crate) mod tests {
         assert!(own::session_at(target, 65, end + 1, &columns).is_none());
         assert!(own::session_at(target, 65, end + 1, &sample).is_some());
         assert!(own::session_at(target, 65, end + own::CLOCK_TOLERANCE_US + 1, &sample).is_none());
+    }
+
+    /// #264 review L3: a lost close (poisoned, or a request in flight)
+    /// does not wait and keeps its grace; a session idle for longer than
+    /// the settle closes at once, cleanly; a session that is not one of
+    /// the agent's own never waits.
+    #[::tokio::test]
+    async fn lost_and_idle_closes_do_not_wait() {
+        use crate::audit::own;
+        let target = "conn-test-close-no-wait";
+        own::reset(target);
+        let server_us = 1_800_000_000_000_000;
+        let grace = i64::try_from((Duration::from_secs(30) + own::LOST_GRACE).as_micros()).unwrap();
+        for (spid, poisoned, in_flight) in [(70, true, false), (71, false, true)] {
+            let (mut s, _srv) = scripted(vec![]);
+            let at = Instant::now();
+            s.own = Some(own::opened(target, spid, server_us, 0, None, at));
+            s.statement_timeout = Duration::from_secs(30);
+            s.poisoned = poisoned;
+            s.in_flight = in_flight;
+            s.last_used = Instant::now();
+            assert!(s.settle_wait().is_zero(), "spid {spid}");
+            let t0 = Instant::now();
+            s.close().await;
+            assert!(
+                t0.elapsed() < own::CLEAN_CLOSE_SETTLE,
+                "spid {spid}: a lost close waited"
+            );
+            let end = own::session_at(target, spid, server_us, "")
+                .unwrap()
+                .end_us
+                .unwrap();
+            assert!(end >= server_us + grace, "spid {spid}: the grace is kept");
+        }
+        // Idle for longer than the settle: clean, at once.
+        let (mut s, _srv) = scripted(vec![]);
+        let at = Instant::now();
+        s.own = Some(own::opened(target, 72, server_us, 0, None, at));
+        s.last_used = Instant::now()
+            .checked_sub(own::CLEAN_CLOSE_SETTLE * 3)
+            .unwrap();
+        assert!(s.settle_wait().is_zero());
+        let t0 = Instant::now();
+        s.close().await;
+        assert!(
+            t0.elapsed() < own::CLEAN_CLOSE_SETTLE,
+            "an idle session waited"
+        );
+        let end = own::session_at(target, 72, server_us, "")
+            .unwrap()
+            .end_us
+            .unwrap();
+        assert!(end < server_us + grace, "a clean end: no grace");
+        // Just answered: the wait is the rest of the settle.
+        let (mut s, _srv) = scripted(vec![]);
+        s.own = Some(own::opened(target, 73, server_us, 0, None, Instant::now()));
+        s.last_used = Instant::now();
+        let w = s.settle_wait();
+        assert!(!w.is_zero() && w <= own::CLEAN_CLOSE_SETTLE);
+        // Not an own session: no wait.
+        s.own = None;
+        assert!(s.settle_wait().is_zero());
+    }
+
+    /// #264 review L2: after a statement stopped early and cancelled, the
+    /// settle counts from the `ATTENTION` acknowledgement (the last
+    /// answer), not from the send.
+    #[::tokio::test]
+    async fn a_cancelled_statement_settles_from_its_acknowledgement() {
+        // The statement times out (no answer for 200 ms), then the
+        // `ATTENTION` is acknowledged: the last answer is that
+        // acknowledgement, 200 ms or more after the send.
+        let (mut s, _h) = scripted(vec![
+            crate::fake::SILENT.to_vec(),
+            build::done(tok::DONE, done::ATTN, 0),
+        ]);
+        s.statement_timeout = Duration::from_millis(200);
+        let sent = Instant::now();
+        let e = s
+            .rows("SELECT 1", Stage::Check, Shape::rows(1, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Timeout);
+        assert!(
+            !s.is_poisoned() && !s.in_flight,
+            "acknowledged: a clean close"
+        );
+        assert!(
+            s.last_used.duration_since(sent) >= Duration::from_millis(200),
+            "the settle counts from the acknowledgement"
+        );
+    }
+
+    /// End-of-phase-9 review L1: a text off the allow-list is refused
+    /// before anything is sent (`internal`), the session staying usable;
+    /// an allow-listed text is sent.
+    #[::tokio::test]
+    async fn texts_off_the_allow_list_are_never_sent() {
+        let mut ok = build::colmeta_int(&["a"]);
+        ok.extend(build::row_int(&[Some(7)]));
+        ok.extend(build::done(tok::DONE, done::COUNT, 1));
+        let (mut s, h) = scripted(vec![ok]);
+        s.any_text = false;
+        for text in [
+            "SELECT 7",
+            "SELECT name FROM sys.databases",
+            // A near copy of an allow-listed constant.
+            &format!("{} ", crate::sql::VERSION),
+        ] {
+            let e = s
+                .rows(text, Stage::Check, Shape::rows(1, 1))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, FailureCode::Internal, "{text}");
+            assert!(!s.is_poisoned(), "{text}");
+        }
+        let e = s
+            .rpc(
+                "SELECT 7",
+                &[],
+                Stage::Introspection,
+                Shape::rows(1, 1),
+                |_| Flow::Continue,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Internal);
+        // Not a column count: only the parsing of the answer matters here.
+        let _ = s
+            .rows(crate::sql::VERSION, Stage::Check, Shape::rows(1, 1))
+            .await;
+        drop(s);
+        let sent = h.await.unwrap();
+        assert_eq!(sent.len(), 1, "only the allow-listed text was sent");
     }
 }

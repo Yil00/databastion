@@ -9,7 +9,9 @@
 #                 CA and a server certificate naming `sqlserver`, forced encryption, the committed
 #                 seed dev/seed/out/sqlserver.sql, the agent login of the minimal variant with the
 #                 2022 SQL Server Audit grants and the RLS opt-in, the server audit `databastion_audit`
-#                 and the Extended Events session `databastion_xe`). Express (MSSQL_PID=Express):
+#                 and the Extended Events session `databastion_xe`); sqlserver.sh sets E2E_MSSQL_IMAGE
+#                 to the engine matrix's 2019 or 2025 pin for E2E_SQLSERVER_VERSION=2019 / 2025
+#                 (the same setup: dev/sqlserver adapts to the version). Express (MSSQL_PID=Express):
 #                 ADR-0051 open question 13, CI on Express until the Developer license terms are
 #                 confirmed. The passwords come from Docker secrets, exported by the wrapper below for
 #                 the SQL Server process and the dev entrypoint only (never in the container's

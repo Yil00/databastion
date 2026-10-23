@@ -8,6 +8,7 @@ import { ConfigError, readEnvOrFile, type Env } from "@/config/env";
 import { getDb, type Database } from "@/db/client";
 import { errorSummary, logger } from "@/lib/logger";
 
+import { tokensHoldMetric } from "./agent-api/token-hold";
 import { argon2Stats } from "./crypto";
 import { eventStats } from "./events";
 import { rateLimitStoreStats } from "./rate-limit";
@@ -247,6 +248,9 @@ export async function collectMetrics(db: Database): Promise<string> {
   x.add("databastion_console_argon2_operations_total", "counter", "argon2id operations started by this process.", argon2Stats.started);
   x.add("databastion_console_rate_limit_store_errors_total", "counter", "Shared rate-limit store operations that failed or timed out (this process); each one applied the limiter's failure mode.", rateLimitStoreStats.errors);
   x.add("databastion_console_rate_limit_store_short_circuits_total", "counter", "Shared rate-limit operations of this process answered by the failure mode without calling the store, during the circuit breaker after a store failure.", rateLimitStoreStats.shortCircuited);
+  // ADR-0022 decision 8 (token hold review L1): per process, so each replica's /metrics shows its own hold.
+  const hold = tokensHoldMetric();
+  x.add("databastion_console_agent_tokens_hold", "gauge", "1 while DATABASTION_AGENT_TOKENS_HOLD holds back capability tokens in this process (label: the release line listed), 0 when unset.", hold.value, hold.labels);
   x.add("databastion_metrics_series_dropped", "gauge", "Series dropped by the cardinality caps in this scrape.", dropped);
   return x.render();
 }

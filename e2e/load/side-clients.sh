@@ -7,6 +7,9 @@
 #     second;
 #   - load_colstats, a reader of the engine-independent column statistics (`mysql.column_stats`, which
 #     hold column values: ADR-0048), every 10 seconds, as a scheduled tuning or monitoring check.
+#   - load_orm, an ORM-style application (ADR-0053 decision 6): the cycle of /orm/mariadb.sql (seed.py
+#     orm: lazy loads, eager-loading joins, select_related chains, reporting queries over 16 to 24
+#     tables) every 2 seconds, when run.sh mounts it.
 # One session per account, kept for the whole run, as those tools do. The statements are written to
 # the client one period at a time, so it runs them as they come. Prints one line per account:
 #   side <account> <statements issued> <0 | 1: the client failed>
@@ -68,6 +71,12 @@ run load_builtins 1 "${BUILTINS[@]}" &
 builtins_pid=$!
 run load_colstats 10 "${COLSTATS[@]}" &
 colstats_pid=$!
+if [ -s /orm/mariadb.sql ]; then
+  mapfile -t ORM </orm/mariadb.sql
+  run load_orm 2 "${ORM[@]}" &
+  orm_pid=$!
+fi
 wait "$monitor_pid"
 wait "$builtins_pid"
 wait "$colstats_pid"
+if [ -n "${orm_pid:-}" ]; then wait "$orm_pid"; fi

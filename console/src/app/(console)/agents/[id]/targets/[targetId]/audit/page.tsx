@@ -9,7 +9,7 @@ import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
 import { validateSchema } from "@/lib/protocol/validate";
 import { getAgentDetail } from "@/server/agents";
-import { auditWarningText } from "@/lib/audit-warning";
+import { auditWarningText, MIN_ROWS_WARNING_TEXT, minRowsWarning } from "@/lib/audit-warning";
 import { engineDisplayName, isKeyPatternEngine } from "@/lib/location-labels";
 import { deriveSensitiveObjects, getAuditConfig, sendableDerivedObjects, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
 import { requestTime, requirePageSession } from "@/server/ui-session";
@@ -30,8 +30,11 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   const derived = await deriveSensitiveObjects(db, id, targetId);
   derived.sort((a, b) => b.sensitivity - a.sensitivity);
   const keyPatterns = isKeyPatternEngine(config.engine);
-  // Key-pattern objects (Redis / Valkey) are not `SensitiveObject`s yet (P9-E review M3).
-  const notSendable = sendableDerivedObjects(derived).skipped;
+  // Key-pattern objects (Redis / Valkey) are sent only to an agent that lists
+  // `sensitive_object.key_pattern` (P9-E review M3, phase 9 follow-ups).
+  const notSendable = sendableDerivedObjects(derived, keyPatterns && config.agentAcceptsKeyPatterns).skipped;
+  // #235 review N2: a row threshold drops the events of a key-pattern target (no row counts).
+  const rowsWarning = config.configured ? minRowsWarning(keyPatterns, config.minRows) : null;
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const active = agent.revokedAt === null && agent.lockedAt === null && config.present;
@@ -59,12 +62,32 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
           {auditWarningText(config.warning, config.warningRemoved)}
         </p>
       )}
-      {keyPatterns && (
+      {rowsWarning && (
+        <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
+          {MIN_ROWS_WARNING_TEXT[rowsWarning]}
+        </p>
+      )}
+      {config.lastJob?.deliveredWithoutKeyPatterns ? (
+        <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
+          The last settings job was delivered without its {config.lastJob.deliveredWithoutKeyPatterns} key-pattern sensitive
+          objects: the agent no longer accepted key patterns when it fetched the job (an agent downgraded or rolled back). Accesses
+          to them are only reported with a signal or above the row threshold until the agent is upgraded again.
+        </p>
+      ) : null}
+      {keyPatterns && !config.agentAcceptsKeyPatterns && (
         <p role="note" className="rounded-md border p-3 text-sm text-muted-foreground">
-          Key-pattern objects cannot be listed as sensitive objects yet: the Audit settings sent to the agent only carry plain names, so
-          the {engineDisplayName(config.engine)} findings named by a key pattern
-          {notSendable > 0 ? ` (${notSendable} here)` : ""} are left out of the settings sent. Accesses are still reported
-          when they carry a signal or reach the row threshold, and turning Audit off always works.
+          This agent cannot receive key patterns as sensitive objects (its version does not list them): the Audit settings sent to it
+          only carry plain names, so the {engineDisplayName(config.engine)} objects named by a key pattern
+          {notSendable > 0 ? ` (${notSendable} here)` : ""} are left out of the settings sent. Accesses are still reported when they
+          carry a signal or reach the row threshold, and turning Audit off always works. Upgrade the agent, then save the settings
+          again.
+        </p>
+      )}
+      {keyPatterns && config.agentAcceptsKeyPatterns && (
+        <p role="note" className="rounded-md border p-3 text-sm text-muted-foreground">
+          Key patterns are sent as sensitive objects: the agent reports every access whose key pattern overlaps a listed one, read as a
+          glob where <code>*</code> spans any characters (a listed <code>user:*:email</code> covers the accesses named{" "}
+          <code>user:*:email</code>, <code>user:*</code> and <code>*</code>).
         </p>
       )}
       <Card>

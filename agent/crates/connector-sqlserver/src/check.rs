@@ -45,6 +45,14 @@ pub(crate) struct CheckState {
     versions: Mutex<HashMap<String, String>>,
     /// Audit facts shared with the stream.
     pub(crate) audit: crate::audit::Shared,
+    /// Per target: how names compare (ADR-0055), as last read, with its
+    /// server run and `AUTO_CLOSE` memory.
+    name_cases: Mutex<HashMap<String, crate::name_case::Memory>>,
+    /// Per target: the server run an Audit stream's session saw last, and
+    /// when (security review L5 of the #303 follow-up: a check that read on
+    /// an earlier run and ends after it does not reinstall that run's
+    /// value).
+    stream_runs: Mutex<HashMap<String, (crate::name_case::ServerRun, std::time::Instant)>>,
 }
 
 impl CheckState {
@@ -54,6 +62,88 @@ impl CheckState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(target_id)
             .cloned()
+    }
+
+    /// How `target_id`'s names compare, as last read (ADR-0055): kept
+    /// when a later check fails (decision 2).
+    pub(crate) fn name_case(
+        &self,
+        target_id: &str,
+    ) -> Option<databastion_core::name_case::NameCaseReport> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .map(|m| m.report.clone())
+    }
+
+    /// Evaluates a read, started at `read_at`, against the target's memory
+    /// and keeps the result. When an Audit stream saw another server run
+    /// since `read_at`, the read is of an earlier run: `unknown` until the
+    /// next check (security review L5 of the #303 follow-up).
+    fn observe_name_case(
+        &self,
+        target_id: &str,
+        read: Option<&crate::name_case::Read>,
+        read_at: std::time::Instant,
+    ) -> crate::name_case::Memory {
+        let seen = self
+            .stream_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .filter(|(_, at)| *at >= read_at)
+            .map(|(run, _)| run.clone());
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut m = crate::name_case::evaluate(read, map.get(target_id));
+        if let Some(run) = seen
+            && m.observe_run(&run)
+        {
+            tracing::info!(
+                target_id,
+                "SQL Server restarted during the check: name case unknown until the next one"
+            );
+        }
+        map.insert(target_id.to_owned(), m.clone());
+        m
+    }
+
+    /// The server run the kept name case was read on (tests only).
+    #[cfg(test)]
+    pub(crate) fn name_case_run(&self, target_id: &str) -> Option<crate::name_case::ServerRun> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .and_then(|m| m.run().cloned())
+    }
+
+    /// An Audit stream's session is on `run`: a name case kept from
+    /// another run of the server is reset to `unknown` (the #303
+    /// residual; [`crate::name_case::Memory::observe_run`]).
+    pub(crate) fn observe_server_run(&self, target_id: &str, run: &crate::name_case::ServerRun) {
+        self.stream_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                target_id.to_owned(),
+                (run.clone(), std::time::Instant::now()),
+            );
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = map.get_mut(target_id)
+            && m.observe_run(run)
+        {
+            tracing::info!(
+                target_id,
+                "SQL Server restarted since the last check: name case unknown until the next one"
+            );
+        }
     }
 
     fn set_version(&self, target_id: &str, version: Option<String>) {
@@ -668,11 +758,95 @@ pub(crate) async fn monitored_databases(
     Ok((dbs, cut))
 }
 
-/// A table of the CAS guard's read: id, name, columns with their `SELECT`.
-type CasTable = (i64, String, Vec<(String, bool)>);
+/// Tables of a database whose column `SELECT` the CAS guard checks, at
+/// most (one statement each); beyond, the check is incomplete.
+const CAS_CHECKED_TABLES: usize = 64;
+
+/// The tables of the CAS guard's catalog read ([`sql::CAS_COLUMNS`]) that
+/// it recognizes as a store with a credential column (by name or shape,
+/// over every column, as before), with their kind, at most
+/// [`CAS_CHECKED_TABLES`] (`true`: more were recognized). Only these get
+/// the column-level permission check: every `HAS_PERMS_BY_NAME` of a table
+/// writes an audit record on it.
+fn cas_candidates(
+    stores: Option<&cas_guard::CasStores>,
+    rows: &[Vec<Value>],
+) -> (Vec<(i64, cas_guard::StoreKind)>, bool) {
+    // Group per table: (id, name, columns); the rows come by object id.
+    let mut tables: Vec<(i64, &str, Vec<&str>)> = Vec::new();
+    for row in rows {
+        let id = row.first().and_then(Value::as_int).unwrap_or(-1);
+        let name = row.get(1).and_then(Value::as_text).unwrap_or_default();
+        let col = row.get(2).and_then(Value::as_text).unwrap_or_default();
+        match tables.last_mut() {
+            Some((last, _, cols)) if *last == id => cols.push(col),
+            _ => tables.push((id, name, vec![col])),
+        }
+    }
+    let mut out = Vec::new();
+    let mut cut = false;
+    for (id, name, cols) in &tables {
+        let Some(kind) = cas_guard::recognize(stores, [*name], cols.iter().copied()) else {
+            continue;
+        };
+        if !cols
+            .iter()
+            .any(|c| cas_guard::is_credential_column(kind, c))
+        {
+            continue;
+        }
+        if out.len() == CAS_CHECKED_TABLES {
+            cut = true;
+            break;
+        }
+        out.push((*id, kind));
+    }
+    (out, cut)
+}
+
+/// What a column read of one recognized table ([`sql::COLUMNS`]) shows of
+/// its credential columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CasColumns {
+    /// A credential column of the store's kind the account can read.
+    Readable,
+    /// Credential columns, none readable, each with a permission answer.
+    NotReadable,
+    /// No row, no credential column of that kind (the table changed since
+    /// the catalog read), or a credential column whose permission cell is
+    /// not an integer (`NULL`): not evaluated, fail closed (security
+    /// review L1).
+    Unknown,
+}
+
+fn cas_credential_readable(kind: cas_guard::StoreKind, rows: &[Vec<Value>]) -> CasColumns {
+    let mut seen = false;
+    let mut unknown = false;
+    for r in rows {
+        let Some(name) = r.first().and_then(Value::as_text) else {
+            continue;
+        };
+        if !cas_guard::is_credential_column(kind, name) {
+            continue;
+        }
+        seen = true;
+        match r.get(8).and_then(Value::as_int) {
+            Some(1) => return CasColumns::Readable,
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    if seen && !unknown {
+        CasColumns::NotReadable
+    } else {
+        CasColumns::Unknown
+    }
+}
 
 /// The CAS guard's credential columns readable by the account in the
-/// monitored databases (ADR-0041 decision 6).
+/// monitored databases (ADR-0041 decision 6): the catalog read of every
+/// user table's columns, then the column `SELECT` of the recognized
+/// tables only, one table per statement.
 async fn cas_readable(
     s: &mut Session,
     dbs: &[String],
@@ -688,7 +862,7 @@ async fn cas_readable(
             out.complete = false;
             continue;
         };
-        let rows = match s.rows(&stmt, Stage::Check, Shape::rows(4, 20_001)).await {
+        let rows = match s.rows(&stmt, Stage::Check, Shape::rows(3, 20_001)).await {
             Ok(r) => r,
             Err(e) if !e.fatal => {
                 out.complete = false;
@@ -699,30 +873,23 @@ async fn cas_readable(
         if rows.len() > 20_000 {
             out.complete = false;
         }
-        // Group per table: (name, [(column, readable)]).
-        let mut tables: Vec<CasTable> = Vec::new();
-        for row in rows.iter().take(20_000) {
-            let id = row.first().and_then(Value::as_int).unwrap_or(-1);
-            let name = row.get(1).and_then(Value::as_text).unwrap_or_default();
-            let col = row.get(2).and_then(Value::as_text).unwrap_or_default();
-            let readable = row.get(3).and_then(Value::as_int) == Some(1);
-            match tables.last_mut() {
-                Some((last, _, cols)) if *last == id => cols.push((col.to_owned(), readable)),
-                _ => tables.push((id, name.to_owned(), vec![(col.to_owned(), readable)])),
-            }
+        let (candidates, cut) = cas_candidates(stores, rows.get(..20_000).unwrap_or(&rows));
+        if cut {
+            out.complete = false;
         }
-        for (_, name, cols) in &tables {
-            let kind = cas_guard::recognize(
-                stores,
-                [name.as_str()],
-                cols.iter().map(|(c, _)| c.as_str()),
-            );
-            if let Some(kind) = kind
-                && cols
-                    .iter()
-                    .any(|(c, r)| *r && cas_guard::is_credential_column(kind, c))
-            {
-                out.readable += 1;
+        for (id, kind) in candidates {
+            let Some(stmt) = sql::columns(db, id) else {
+                out.complete = false;
+                continue;
+            };
+            match s.rows(&stmt, Stage::Check, Shape::rows(9, 4096)).await {
+                Ok(cols) => match cas_credential_readable(kind, &cols) {
+                    CasColumns::Readable => out.readable += 1,
+                    CasColumns::NotReadable => {}
+                    CasColumns::Unknown => out.complete = false,
+                },
+                Err(e) if !e.fatal => out.complete = false,
+                Err(e) => return Err(e),
             }
         }
     }
@@ -843,7 +1010,8 @@ fn failed(e: SsError, target: &TargetConfig) -> TargetHealth {
 
 /// `check()` of one target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
-    match tokio::time::timeout(CHECK_TOTAL, run(state, target)).await {
+    let deadline = tokio::time::Instant::now() + CHECK_TOTAL;
+    match tokio::time::timeout_at(deadline, run(state, target, deadline)).await {
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             state.set_version(&target.id, None);
@@ -853,12 +1021,29 @@ pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHe
     }
 }
 
-async fn run(state: &CheckState, target: &TargetConfig) -> Result<TargetHealth, SsError> {
+/// Connects, checks, then closes; the checks stop [`conn::CLOSE_ROOM`]
+/// before `deadline`, so that a clean close (its settle and shutdown) is
+/// not cancelled by [`CHECK_TOTAL`] and recorded as lost (#264 review
+/// L1). Checks cut by that bound leave a statement in flight: the close is
+/// then lost, as it should be.
+async fn run(
+    state: &CheckState,
+    target: &TargetConfig,
+    deadline: tokio::time::Instant,
+) -> Result<TargetHealth, SsError> {
     let settings = target.sqlserver_settings();
     let tls = tls::configs(settings.ca_file.as_deref())
         .ok_or(SsError::new(FailureCode::Internal, Stage::Tls))?;
     let mut s = conn::connect(target, &tls, &state.choice, CHECK_STATEMENT).await?;
-    let result = checked(state, target, &mut s).await;
+    let result = match tokio::time::timeout_at(
+        deadline.checked_sub(conn::CLOSE_ROOM).unwrap_or(deadline),
+        checked(state, target, &mut s),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(SsError::new(FailureCode::Timeout, Stage::Check)),
+    };
     s.close().await;
     result
 }
@@ -880,6 +1065,12 @@ async fn checked(
             conn::Mode::Mandatory => "mandatory",
         }
     )];
+    // ADR-0055 decision 4: read first, so that a later stage failing keeps
+    // this run's value (decision 2).
+    let read_at = std::time::Instant::now();
+    let read = crate::name_case::read(s).await?;
+    let names = state.observe_name_case(&target.id, read.as_ref(), read_at);
+    detail.push(crate::name_case::summary(&names));
     let mut ev = evaluate(s, target).await?;
     // The Audit source (decision 6, option (a')): its two grants are
     // expected while a stream uses them.
@@ -1082,7 +1273,150 @@ async fn checked(
 
 #[cfg(test)]
 mod tests {
+
+    /// Security review L5 of the #303 follow-up: a check that read on an
+    /// earlier server run and ends after a stream saw a later one does not
+    /// reinstall the earlier run's value; a stream run seen before the
+    /// check read does not change it.
+    #[test]
+    fn a_check_does_not_reinstall_an_earlier_run() {
+        use crate::name_case::{DbRow, Read, evaluate};
+        use databastion_core::name_case::NameCaseReport;
+        use std::time::Instant;
+        let row = |id: i64, name: &str, created: i64| DbRow {
+            id,
+            name: name.to_owned(),
+            created,
+            style: Some(196_609),
+            contained: false,
+            auto_close: false,
+            state: Some(0),
+            catalog: Some(0),
+        };
+        let on = |tempdb: i64| Read {
+            rows: vec![row(1, "master", 1), row(2, "tempdb", tempdb)],
+            server_style: Some(196_609),
+            view_any_database: true,
+            server: Some("mssql1".to_owned()),
+            catalog_column: true,
+        };
+        let run2 = evaluate(Some(&on(11)), None).run().cloned().unwrap();
+        let state = CheckState::default();
+        state.observe_name_case("t", Some(&on(10)), Instant::now());
+        let known = state.name_case("t").unwrap();
+        assert_ne!(known, NameCaseReport::unknown());
+        // A check reads on run 1, a stream then sees run 2, the check ends.
+        let read_at = Instant::now();
+        state.observe_server_run("t", &run2);
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.observe_name_case("t", Some(&on(10)), read_at);
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // The next check reads on run 2.
+        state.observe_name_case("t", Some(&on(11)), Instant::now());
+        assert_eq!(state.name_case("t").as_ref(), Some(&known));
+        // A stream run seen before the check read (a stream since stopped):
+        // the check's own run stands.
+        state.observe_name_case("t", Some(&on(12)), Instant::now());
+        assert_eq!(state.name_case("t").as_ref(), Some(&known));
+    }
+
     use super::*;
+
+    fn cas_row(id: i64, table: &str, col: &str) -> Vec<Value> {
+        vec![
+            Value::Int(id),
+            Value::Text(table.into()),
+            Value::Text(col.into()),
+        ]
+    }
+
+    /// Load run 39453966277: the guard's permission check runs on the
+    /// recognized stores only, so that 100 plain user tables write no
+    /// audit record (a statement over more than 15 of them was always
+    /// reported as the agent's read of `*`).
+    #[test]
+    fn cas_guard_checks_only_the_recognized_tables() {
+        let mut rows = Vec::new();
+        for i in 0..100 {
+            rows.push(cas_row(i, &format!("t{i}"), "id"));
+            rows.push(cas_row(i, &format!("t{i}"), "body"));
+        }
+        // A ticket registry by name, one by shape, a service registry
+        // (no credential column), and a store with metadata columns only.
+        for c in ["id", "type", "body"] {
+            rows.push(cas_row(200, "cas_tickets", c));
+        }
+        for c in ["id", "type", "body", "principal_id", "expiration_time"] {
+            rows.push(cas_row(201, "tgt", c));
+        }
+        for c in ["id", "body"] {
+            rows.push(cas_row(202, "registered_services", c));
+        }
+        for c in ["type", "creation_time"] {
+            rows.push(cas_row(203, "CasTickets", c));
+        }
+        let (got, cut) = cas_candidates(None, &rows);
+        assert!(!cut);
+        assert_eq!(
+            got,
+            [
+                (200, cas_guard::StoreKind::TicketRegistry),
+                (201, cas_guard::StoreKind::TicketRegistry)
+            ]
+        );
+        // A configured name.
+        let stores = cas_guard::CasStores {
+            ticket_registry: vec!["t7".into()],
+            ..Default::default()
+        };
+        let (got, _) = cas_candidates(Some(&stores), &rows);
+        assert_eq!(
+            got.first(),
+            Some(&(7, cas_guard::StoreKind::TicketRegistry))
+        );
+        // Past the bound: incomplete, never more statements.
+        let many: Vec<Vec<Value>> = (0..=i64::try_from(CAS_CHECKED_TABLES).unwrap())
+            .map(|i| cas_row(i, "cas_tickets", "body"))
+            .collect();
+        let (got, cut) = cas_candidates(None, &many);
+        assert!(cut);
+        assert_eq!(got.len(), CAS_CHECKED_TABLES);
+    }
+
+    #[test]
+    fn cas_credential_readable_reads_the_column_select() {
+        let col = |name: &str, readable: i64| {
+            let mut r = vec![Value::Text(name.into())];
+            r.extend((1..8).map(|_| Value::Int(0)));
+            r.push(Value::Int(readable));
+            r
+        };
+        let k = cas_guard::StoreKind::TicketRegistry;
+        let r = |rows: &[Vec<Value>]| cas_credential_readable(k, rows);
+        assert_eq!(
+            r(&[col("type", 1), col("body", 0)]),
+            CasColumns::NotReadable
+        );
+        assert_eq!(r(&[col("type", 1), col("body", 1)]), CasColumns::Readable);
+        // Security review L1: nothing to decide on is never "not readable".
+        // No row (the table is gone or hidden):
+        assert_eq!(r(&[]), CasColumns::Unknown);
+        // No credential column of the kind (metadata columns only):
+        assert_eq!(
+            r(&[col("type", 1), col("creation_time", 1)]),
+            CasColumns::Unknown
+        );
+        // A permission cell that is not an integer (NULL):
+        let mut null = col("body", 0);
+        null[8] = Value::Null;
+        assert_eq!(r(&[col("type", 1), null.clone()]), CasColumns::Unknown);
+        assert_eq!(r(&[col("id", 0), null.clone()]), CasColumns::Unknown);
+        // A readable credential column still decides.
+        assert_eq!(r(&[null, col("id", 1)]), CasColumns::Readable);
+        // The statement holds no `HAS_PERMS_BY_NAME`: no record per table.
+        let stmt = sql::in_database(sql::CAS_COLUMNS, "retail").unwrap();
+        assert!(!stmt.to_uppercase().contains("HAS_PERMS_BY_NAME"));
+    }
 
     #[test]
     fn contract_versions() {

@@ -1,13 +1,15 @@
 import { eq } from "drizzle-orm";
 
 import { getDb } from "@/db/client";
+import { logger } from "@/lib/logger";
 import { agents } from "@/db/schema";
 import { validateSchema, type ValidationDetail } from "@/lib/protocol/validate";
-import { enrollAgent, recordHeartbeat, targetSourceDetails, withoutMismatchedSources } from "@/server/agents";
+import { enrollAgent, mismatchedTargetIds, recordHeartbeat, targetSourceMismatches, withoutMismatchedSources } from "@/server/agents";
 import { BACKPRESSURE_RETRY_AFTER_S, eventStats, ingestEvents, pendingEventsOver } from "@/server/events";
 import { ingestFindings } from "@/server/findings";
 import { recordIntegrityEvent } from "@/server/integrity";
 import { requestPolicyEvaluation } from "@/server/policy-queue";
+import { requeueAuditSettingsOnAcceptsChange } from "@/server/audit-config";
 import { applyJobStatus, claimJobs } from "@/server/jobs";
 import { RateLimiter } from "@/server/rate-limit";
 import {
@@ -21,7 +23,8 @@ import { AGENT_SECRET_FORMAT, isLowEntropySecret } from "@/server/crypto";
 import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResult } from "@/server/request";
 
 import { authenticateAgent, authPrecheck, countTimedOutBody, type AuthOptions, type AuthResult } from "./auth";
-import { CONSOLE_ACCEPTS, unlistedEngineDetails } from "./capabilities";
+import { listedAccepts, unlistedEngineDetails } from "./capabilities";
+import { tokensHoldWarningDue } from "./token-hold";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -106,25 +109,45 @@ export function handleHeartbeat(req: Request): Promise<Response> {
     if (unlisted.length > 0) return invalidRequest(unlisted);
     // P9-E (review M2, contract "Heartbeat target checks"): a target whose audit source does not
     // serve its engine is stored without `audit_source`, as an agent-integrity event; the rest of
-    // the heartbeat is processed (no `400`).
-    const mismatched = targetSourceDetails(body.value);
-    if (mismatched.length > 0) {
+    // the heartbeat is processed (no `400`). Every mismatched target loses its source and is
+    // listed in `target_ids`; only the stored details are capped (#274 review L5).
+    const mismatched = targetSourceMismatches(body.value);
+    if (mismatched.indices.length > 0) {
       await recordIntegrityEvent(getDb(), {
         agentId: auth.agent.id,
         kind: "target_mismatch",
         endpoint: "heartbeat",
         status: 200,
-        details: mismatched,
+        details: mismatched.details,
+        // #277: the count of every mismatched target, not of the (capped) stored details.
+        detailsCount: mismatched.indices.length,
+        targetIds: mismatchedTargetIds(body.value, mismatched.indices),
         ip: clientIp(req),
       });
     }
-    await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched));
+    const recorded = await recordHeartbeat(getDb(), auth.agent.id, withoutMismatchedSources(body.value, mismatched.indices));
+    // Security review of #280, M2: the agent's capabilities changed (an upgrade or a downgrade):
+    // its Redis / Valkey Audit settings are queued again with what it can now receive. A failure
+    // here never fails the heartbeat (logged; the agent is marked and a later heartbeat queues
+    // them). #280 re-review L-a: a change the requeue budget deferred is acted on from a later
+    // heartbeat, once the budget allows.
+    if (recorded.acceptsChanged || recorded.auditRequeueDue) {
+      try {
+        await requeueAuditSettingsOnAcceptsChange(getDb(), auth.agent.id, recorded.acceptsChanged ? "accepts_changed" : "due");
+      } catch (e) {
+        logger.error({ agentId: auth.agent.id, err: e instanceof Error ? e.name : "error" }, "audit settings not queued again after a capability change");
+      }
+    }
+    // Security review of the token hold, L1: a hold left set is reported at most once an hour.
+    const holdWarning = tokensHoldWarningDue();
+    if (holdWarning !== null) logger.warn(holdWarning);
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,
       server_time: new Date().toISOString(),
-      // ADR-0022: the optional request fields this console accepts.
-      accepts: [...CONSOLE_ACCEPTS],
+      // ADR-0022: the optional request fields this console accepts, less those that
+      // DATABASTION_AGENT_TOKENS_HOLD holds back during a rolling upgrade (decision 8).
+      accepts: listedAccepts(),
     });
   });
 }

@@ -1,0 +1,28 @@
+{
+  "batch_id": "01925f40-2b3c-7d4e-8f50-6a7b8c9d0e12",
+  "job_id": "01925f40-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "cas-prod",
+      "location": {
+        "engine": "cas",
+        "database": "service_registry",
+        "schema": "oidc",
+        "object": "HR_Portal",
+        "field": "contacts[].user_name",
+        "altered": [
+          "field"
+        ]
+      },
+      "classifier": "pii.email",
+      "confidence": 0.98,
+      "sampled": 12,
+      "matched": 12,
+      "estimated_rows": 40,
+      "masked_samples": [
+        "j*******@e******.com"
+      ]
+    }
+  ]
+}

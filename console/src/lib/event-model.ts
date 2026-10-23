@@ -1,18 +1,21 @@
 import { EVENT_ACTIONS } from "@/lib/protocol/enums";
 import { validateSchema } from "@/lib/protocol/validate";
 
+import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
+  alteredPartsCoverable,
   ENGINES,
-  exceptionGlobOptions,
   fail,
   globMatch,
   isGlob,
   isPlainObject,
   onlyKeys,
+  optionsFor,
   stringList,
   UUID,
   type GlobOptions,
   type Parsed,
+  type PartGlobOptions,
 } from "./policy-common";
 
 /**
@@ -50,6 +53,28 @@ import {
  * uses the baseline before the event; the event then updates it with `x` capped at that threshold
  * (so one dump cannot inflate the baseline, while a lasting increase still raises it gradually).
  * The same statistics are kept on `ln(1 + score)` for display. Only these aggregates are stored.
+ *
+ * ## Overflowed objects (ADR-0053 decision 3)
+ * An event the agent flags `objects_overflowed` left objects out under a bound (the core's 15
+ * named objects, or a connector's own); every object named `*` of such an event is an **overflow
+ * `*`** (`isOverflowStar`), whatever its shape (`(<db>, -, *)`, `(*, -, *)`, or a `*` with a
+ * schema; on Redis / Valkey a real `*` key pattern too, fail closed): "one or more objects of this
+ * database (of the target, for the database `*`) that the event does not name". Fail closed for
+ * selection, never for comparison between incidents:
+ * - the **named score** (`score`, `sensitivity`) is the one above, from the named objects only
+ *   (a `*` keeps its literal-name sensitivity); it is the only one compared with incidents
+ *   (`worseThanClosed`, `severeEvent`, the incidents' highest score, the baselines);
+ * - the **bound score** (`boundScore`, `boundSensitivity`) gives each overflow `*` the highest
+ *   object sensitivity of its database (of the target for the database `*`), and is used by
+ *   `min_score` / `min_sensitivity` and for the choice of the dedup object, and shown as an upper
+ *   bound;
+ * - an `objects` condition retains an overflow `*` when its `database` glob, if any, matches its
+ *   database (always for the database `*`); its `schema` and `object` globs are not applied;
+ * - a location exception covers an overflow `*` only when it covers every object of its database
+ *   (`schema` and `object` absent or exactly `*`, `database` absent or matching it; for the
+ *   database `*`: absent or exactly `*`).
+ * Without the flag (an agent up to 0.8.0, or a console that did not list the token) every `*` is
+ * a literal name, as before, and both scores are the same.
  */
 
 // ---------------------------------------------------------------------------- scoring
@@ -339,14 +364,26 @@ export interface EventObject {
   database: string;
   schema?: string | null;
   object: string;
+  /**
+   * Contract `ObjectRef.altered` (ADR-0056), stored as sent: the parts whose names the agent's
+   * normalization altered. Absent: not reported, today's rule. Used by location exceptions only
+   * (decision 3 items 4 and 5); conditions, sensitivity, scores and the dedup key ignore it.
+   */
+  altered?: readonly ObjectPart[];
 }
 
 /** The event fields a policy may look at (no value: events carry none). */
 export interface EventFacts {
   agentId: string;
   targetId: string;
-  /** Engine last reported for the target. */
+  /** Engine the event's source tells, else the one last reported for the target. */
   engine: string | null;
+  /**
+   * The target's `name_case` (ADR-0055), canonical (`canonicalNameCase`); absent or null: not
+   * reported, today's rule. Used by location exceptions only, and only when `engine` is `mysql`,
+   * `mariadb` or `sqlserver`.
+   */
+  nameCase?: NameCaseRule | null;
   /** `db_user`, or the `hmac-sha256:` fingerprint sent in its place; empty when not recorded. */
   principal: string;
   /**
@@ -359,9 +396,59 @@ export interface EventFacts {
   objects: readonly EventObject[];
   rows: number | null;
   signals: readonly string[];
+  /** Named sensitivity and score (ADR-0053: from the named objects only). */
   sensitivity: number;
   score: number;
+  /**
+   * Contract `AccessEvent.objects_overflowed` (ADR-0053): every `*` object of the event is an
+   * overflow `*` (`isOverflowStar`). Absent or false: "not known", every `*` is a literal name.
+   */
+  objectsOverflowed?: boolean;
+  /**
+   * Bound sensitivity and score (ADR-0053 decision 3 item 3), used by `min_sensitivity` and
+   * `min_score`; the named ones when absent (an event without the flag has the same values).
+   */
+  boundSensitivity?: number;
+  boundScore?: number;
   anomaly: boolean;
+}
+
+/** The literal object name the agent uses for an unknown, masked or overflowed object. */
+export const STAR_OBJECT = "*";
+
+/**
+ * Whether `o` is an overflow `*` of the event (ADR-0053 decision 3 item 1): the event is flagged
+ * `objects_overflowed` and the object is named `*`, whatever its database and schema. The console
+ * does not infer the bound from the shape, and never guesses an overflow without the flag.
+ */
+export function isOverflowStar(e: { objectsOverflowed?: boolean | null }, o: Pick<EventObject, "object">): boolean {
+  return e.objectsOverflowed === true && o.object === STAR_OBJECT;
+}
+
+/**
+ * Whether an `objects` condition retains an overflow `*` (ADR-0053 decision 3 item 5): it may be
+ * any object of its database, so only the pattern's `database` glob applies (policy globs: without
+ * case, trailing spaces ignored); with the database `*` (objects of several databases left out) it
+ * may be any object of the target, and every pattern retains it.
+ */
+export function overflowStarMatches(pattern: ObjectPattern, o: EventObject): boolean {
+  if (o.database === STAR_OBJECT) return true;
+  return pattern.database === undefined || globMatch(pattern.database, o.database, { ignoreTrailingSpaces: true });
+}
+
+/**
+ * Whether a location exception's globs cover an overflow `*` (ADR-0053 decision 3 item 6): only
+ * when they would cover every object of its database. `schema` and `object` absent or exactly `*`
+ * (the glob `\*`, which selects the literal name only, does not), and `database` absent or
+ * matching the database with the exception's options (`exceptionGlobOptions`, ADR-0054); for the
+ * database `*`: absent or exactly `*`.
+ */
+export function exceptionCoversOverflowStar(parts: ObjectPattern, o: EventObject, opts: GlobOptions): boolean {
+  if (parts.schema !== undefined && parts.schema !== STAR_OBJECT) return false;
+  if (parts.object !== undefined && parts.object !== STAR_OBJECT) return false;
+  if (parts.database === undefined) return true;
+  if (o.database === STAR_OBJECT) return parts.database === STAR_OBJECT;
+  return globMatch(parts.database, o.database, opts);
 }
 
 export function signalSelected(selectors: readonly string[], signal: string): boolean {
@@ -369,16 +456,17 @@ export function signalSelected(selectors: readonly string[], signal: string): bo
 }
 
 /**
- * An object without schema only matches a schema glob of `*` (as for finding locations). Globs are
- * case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces (the
- * default, N1), location exceptions only on `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ * An object without schema only matches a schema glob of `*` (as for finding locations). Globs in
+ * policy conditions are case-insensitive (ADR-0014 decision 1) and ignore trailing spaces (the
+ * default, N1); location exceptions pass `exceptionPartOptions` (src/lib/name-case.ts, ADR-0055;
+ * N1 and ADR-0054).
  */
-export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
+export function objectMatches(pattern: ObjectPattern, o: EventObject, opts: GlobOptions | PartGlobOptions = { ignoreTrailingSpaces: true }): boolean {
   return OBJECT_PARTS.every((part) => {
     const g = pattern[part];
     if (g === undefined) return true;
     const name = part === "schema" ? (o.schema ?? null) : o[part];
-    return name === null ? g === "*" : globMatch(g, name, opts);
+    return name === null ? g === "*" : globMatch(g, name, optionsFor(opts, part));
   });
 }
 
@@ -396,13 +484,17 @@ export function eventMatches(c: EventConditions, e: EventFacts): number[] | null
   if (c.principals && !c.principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.exclude_principals && e.accountNotRecorded !== true && c.exclude_principals.some((g) => globMatch(g, e.principal))) return null;
   if (c.min_rows !== undefined && (e.rows === null || e.rows < c.min_rows)) return null;
-  if (c.min_score !== undefined && e.score < c.min_score) return null;
-  if (c.min_sensitivity !== undefined && e.sensitivity < c.min_sensitivity) return null;
+  // ADR-0053 decision 3 item 4: thresholds on the bound (the named values without the flag).
+  if (c.min_score !== undefined && (e.boundScore ?? e.score) < c.min_score) return null;
+  if (c.min_sensitivity !== undefined && (e.boundSensitivity ?? e.sensitivity) < c.min_sensitivity) return null;
   if (c.anomaly && !e.anomaly) return null;
   const all = e.objects.map((_, i) => i);
   if (!c.objects) return all;
   const pattern = c.objects;
-  const kept = all.filter((i) => objectMatches(pattern, e.objects[i] as EventObject));
+  const kept = all.filter((i) => {
+    const o = e.objects[i] as EventObject;
+    return isOverflowStar(e, o) ? overflowStarMatches(pattern, o) : objectMatches(pattern, o);
+  });
   return kept.length > 0 ? kept : null;
 }
 
@@ -419,9 +511,17 @@ export interface EventExceptionScope {
  * Policy exceptions applied to an event (every set scope must hold): agent, target, and a location
  * whose `database` / `schema` / `object` globs cover every retained object (a `field` glob other
  * than `*` never covers an event, which names no field). A classifier-scoped exception concerns
- * findings only and never covers an event. The globs are case-insensitive on every engine
- * (ADR-0014 decision 1) and ignore trailing spaces only on the target's engine of
- * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts) (N1; an unknown engine: never).
+ * findings only and never covers an event. The globs compare with case unless the event's engine
+ * is in `CASE_BLIND_EXCEPTION_ENGINES` (ADR-0054; an unknown engine: always with case), on SQL
+ * Server, MySQL and MariaDB per part as the target's `name_case` says when it reports one
+ * (ADR-0055 decision 6, `exceptionPartOptions`; an object of the database `*` takes the strictest
+ * value, L1), and ignore
+ * trailing spaces only on the target's engine of `TRAILING_SPACE_BLIND_ENGINES`
+ * (src/lib/policy-common.ts) (N1; an unknown engine: never). An overflow `*` of a flagged event
+ * (ADR-0053) is covered only by an exception that covers every object of its database
+ * (`exceptionCoversOverflowStar`). A part of an object that the agent reported altered by its name
+ * normalization is covered only by an absent glob or exactly `*` (ADR-0056 decision 3 item 4,
+ * `alteredPartsCoverable`), per object: the other objects of the event keep their own result.
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,
@@ -439,8 +539,14 @@ export function exceptionCoversEvent(
     const { field, ...parts } = x.location;
     if (field !== undefined && field !== "*") return false;
     if (objectIdx.length === 0) return false;
-    const opts = exceptionGlobOptions(e.engine);
-    return objectIdx.every((i) => objectMatches(parts, e.objects[i] as EventObject, opts));
+    return objectIdx.every((i) => {
+      const o = e.objects[i] as EventObject;
+      // ADR-0056 decision 3 item 4: an altered part only under an absent glob or exactly `*`.
+      if (!alteredPartsCoverable(parts, o.altered)) return false;
+      // ADR-0055 decision 6: per part, from the target's `name_case` and the object's database.
+      const opts = exceptionPartOptions(e.engine, e.nameCase, o.database);
+      return isOverflowStar(e, o) ? exceptionCoversOverflowStar(parts, o, opts.perPart.database) : objectMatches(parts, o, opts);
+    });
   }
   return true;
 }
@@ -605,7 +711,11 @@ export function worseThanClosed(
   return false;
 }
 
-/** Index of the retained object that sets the dedup database: the most sensitive, first on a tie. */
+/**
+ * Index of the retained object that sets the dedup database: the most sensitive, first on a tie.
+ * The caller passes the bound sensitivities (ADR-0053 decision 3 item 4), so an overflow `*` and
+ * its database (or `*`) can be the one; for an event without the flag they are the named ones.
+ */
 export function dedupObject(objectIdx: readonly number[], sensitivities: readonly number[]): number | null {
   let best: number | null = null;
   for (const i of objectIdx) {

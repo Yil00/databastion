@@ -5,6 +5,7 @@ import { agents, agentTargets, enrollmentTokens, jobs, securityEvents } from "@/
 import { auditSourceEngines } from "@/lib/location-labels";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 import { parseDetectedTargets } from "@/lib/detected-targets";
+import { canonicalNameCase } from "@/lib/name-case";
 import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
@@ -12,10 +13,12 @@ import { raiseAuditStreamStoppedAlert, recordAuditStreamStops, stoppedStreams } 
 import { addDroppedBatches, droppedBatchesDelta, raiseDroppedBatchesAlert } from "./dropped-batches";
 import { requestNotificationDelivery } from "./notification-queue";
 import { purgeSecretCache } from "./agent-api/auth";
+import { agentAcceptsToStore } from "./agent-api/capabilities";
 import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
 import { lockAgentJobs } from "./job-lock";
+import { storeNameCase } from "./name-case-inventory";
 
 /**
  * Consumes an enrollment token and creates the agent.
@@ -128,27 +131,41 @@ async function auditEnrollFailure(db: Database, ip: string | null): Promise<void
  * agent-integrity event; per target (P9-E review M2): the target is stored **without**
  * `audit_source` ({@link withoutMismatchedSources}) and the rest of the heartbeat is processed
  * (no `400`, so a non-conforming target never makes the agent look silent).
+ *
+ * `indices` is the full set of mismatched targets (up to the contract's 64 targets, #274 review
+ * L5): every one of them loses its source and is listed in the event's `target_ids`. Only the
+ * `{pointer, keyword}` `details` are capped at `MAX_VALIDATION_DETAILS`, like every other
+ * validation detail list.
  */
-export function targetSourceDetails(hb: Pick<Schemas["HeartbeatRequest"], "targets">): ValidationDetail[] {
-  const details: ValidationDetail[] = [];
-  hb.targets.forEach((t, i) => {
-    if (details.length >= MAX_VALIDATION_DETAILS || t.audit_source === undefined) return;
-    if (!(auditSourceEngines(t.audit_source) as readonly string[]).includes(t.engine)) {
-      details.push({ pointer: `/targets/${i}/audit_source`, keyword: "const" });
-    }
-  });
-  return details;
+export interface TargetSourceMismatches {
+  /** Indices (in `hb.targets`) of every mismatched target, ascending. */
+  indices: number[];
+  /** The first `MAX_VALIDATION_DETAILS` of them as validation details. */
+  details: ValidationDetail[];
 }
 
-/**
- * Stores a (validated) heartbeat: agent status, targets, detections, spool and metrics. A rise of
- * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
- * `dropped-batches.ts`), in the same transaction.
- */
-/** The heartbeat with `audit_source` removed from the targets pointed at by `details`. */
-export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], details: readonly ValidationDetail[]): Schemas["HeartbeatRequest"] {
-  if (details.length === 0) return hb;
-  const drop = new Set(details.map((d) => Number(/^\/targets\/(\d+)\/audit_source$/.exec(d.pointer)?.[1] ?? -1)));
+export function targetSourceMismatches(hb: Pick<Schemas["HeartbeatRequest"], "targets">): TargetSourceMismatches {
+  const indices: number[] = [];
+  hb.targets.forEach((t, i) => {
+    if (t.audit_source === undefined) return;
+    if (!(auditSourceEngines(t.audit_source) as readonly string[]).includes(t.engine)) indices.push(i);
+  });
+  const details = indices
+    .slice(0, MAX_VALIDATION_DETAILS)
+    .map((i): ValidationDetail => ({ pointer: `/targets/${i}/audit_source`, keyword: "const" }));
+  return { indices, details };
+}
+
+/** The ids (contract `TargetId`) of the targets at `indices`, all of them (#274 review L1, L5). */
+export function mismatchedTargetIds(hb: Pick<Schemas["HeartbeatRequest"], "targets">, indices: readonly number[]): string[] {
+  const at = new Set(indices);
+  return hb.targets.filter((_t, i) => at.has(i)).map((t) => t.target_id);
+}
+
+/** The heartbeat with `audit_source` removed from every target at `indices`. */
+export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], indices: readonly number[]): Schemas["HeartbeatRequest"] {
+  if (indices.length === 0) return hb;
+  const drop = new Set(indices);
   return {
     ...hb,
     targets: hb.targets.map((t, i) => {
@@ -159,12 +176,20 @@ export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], detail
   };
 }
 
+/**
+ * Stores a (validated) heartbeat: agent status, targets, detections, spool, metrics and the agent's
+ * capability tokens (`acceptsChanged` when they differ from the stored ones; `auditRequeueDue` when
+ * an earlier change is still to be acted on, #280 re-review L-a). A rise of
+ * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
+ * `dropped-batches.ts`), in the same transaction.
+ */
 export async function recordHeartbeat(
   db: Database,
   agentId: string,
   hb: Schemas["HeartbeatRequest"],
-): Promise<void> {
+): Promise<{ acceptsChanged: boolean; auditRequeueDue: boolean }> {
   const skew = Date.parse(hb.ts) - Date.now();
+  const accepts = agentAcceptsToStore(hb.accepts);
   const clockSkewMs = Math.max(-2_000_000_000, Math.min(2_000_000_000, Math.round(skew)));
   const alerted = await db.transaction(async (tx) => {
     // The previous spool counters, under the row lock (concurrent heartbeats count a rise once).
@@ -174,6 +199,8 @@ export async function recordHeartbeat(
         uptimeS: agents.uptimeS,
         unalerted: agents.droppedBatchesUnalerted,
         stopsUnalerted: agents.auditStreamStopsUnalerted,
+        accepts: agents.accepts,
+        auditRequeueDueAt: agents.auditRequeueDueAt,
       })
       .from(agents)
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
@@ -186,6 +213,8 @@ export async function recordHeartbeat(
         classifiersVersion: hb.classifiers_version ?? null,
         connectors: hb.connectors,
         detectedTargets: hb.detected_targets,
+        // ADR-0022 decision 3: what the agent decodes, from its latest heartbeat only.
+        accepts,
         spool: { ...hb.spool },
         metrics: hb.metrics ?? null,
         clockSkewMs,
@@ -213,6 +242,10 @@ export async function recordHeartbeat(
         .insert(agentTargets)
         .values({ agentId, targetId: t.target_id, ...values })
         .onConflictDoUpdate({ target: [agentTargets.agentId, agentTargets.targetId], set: values });
+      // ADR-0055 decision 7 (L8): compare-and-set of the canonical `name_case` in this transaction,
+      // so one replica sees each change and marks the target's inventory due. Absent -> cleared
+      // (today's rule), whatever the agent's version.
+      await storeNameCase(tx, agentId, t.target_id, t.engine, t.name_case);
     }
     await tx
       .update(agentTargets)
@@ -222,7 +255,9 @@ export async function recordHeartbeat(
           ? and(eq(agentTargets.agentId, agentId), notInArray(agentTargets.targetId, ids))
           : eq(agentTargets.agentId, agentId),
       );
-    if (!previous) return false;
+    if (!previous) return { raised: false, acceptsChanged: false, auditRequeueDue: false };
+    // Security review of #280, M2: the caller queues the settings again when this changes.
+    const acceptsChanged = JSON.stringify(previous.accepts ?? []) !== JSON.stringify(accepts);
     const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
     await addDroppedBatches(tx, agentId, delta);
     const stops = stoppedStreams(hb.targets);
@@ -230,9 +265,10 @@ export async function recordHeartbeat(
     let raised = false;
     if (previous.unalerted + delta > 0) raised = (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
     if (previous.stopsUnalerted + stops > 0) raised = (await raiseAuditStreamStoppedAlert(tx, agentId)) !== null || raised;
-    return raised;
+    return { raised, acceptsChanged, auditRequeueDue: previous.auditRequeueDueAt !== null };
   });
-  if (alerted) void requestNotificationDelivery();
+  if (alerted.raised) void requestNotificationDelivery();
+  return { acceptsChanged: alerted.acceptsChanged, auditRequeueDue: alerted.auditRequeueDue };
 }
 
 /**
@@ -414,6 +450,7 @@ export async function getAgentDetail(db: Database, agentId: string) {
       auditSource: agentTargets.auditSource,
       lastError: agentTargets.lastError,
       notes: agentTargets.notes,
+      nameCase: agentTargets.nameCase,
       present: agentTargets.present,
       lastReportedAt: agentTargets.lastReportedAt,
     })
@@ -426,6 +463,7 @@ export async function getAgentDetail(db: Database, agentId: string) {
     detectedTargets: parseDetectedTargets(agent.detectedTargets),
     droppedAlerts,
     streamStopAlerts,
-    targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })),
+    // ADR-0055: re-read in canonical form (a corrupt stored value reads as the strict form).
+    targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes), nameCase: canonicalNameCase(t.nameCase) })),
   };
 }

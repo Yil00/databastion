@@ -2,10 +2,15 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import type { Database } from "@/db/client";
 import { agents, agentTargets, auditConfigs, findings, jobs } from "@/db/schema";
-import type { AuditWarning } from "@/lib/audit-warning";
+import { minRowsWarning, type AuditWarning, type MinRowsWarning } from "@/lib/audit-warning";
 import { objectSensitivity } from "@/lib/event-model";
+import { isKeyPatternEngine } from "@/lib/location-labels";
+import { logger } from "@/lib/logger";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
+import { agentAccepts } from "./agent-api/capabilities";
+import { recordIntegrityEvent } from "./integrity";
+import { RateLimiter } from "./rate-limit";
 import { JOBS_CHANNEL } from "./agent-api/job-hub";
 import { writeAudit } from "./audit";
 import { sha256Hex } from "./crypto";
@@ -31,6 +36,18 @@ import { lockAgentJobs } from "./job-lock";
  *   `SHRINK_RATIO` (50 %) of the objects sent last time.
  * The confirmation is the digest of the exact settings shown to the administrator: if the findings
  * change in between, the digest no longer matches and the change must be confirmed again.
+ *
+ * `min_rows` on a key-pattern (Redis / Valkey) target is saved, with a `minRowsWarning` in the
+ * answer and the audit entry (#235 review N2): it is not a narrowing of the sensitive objects,
+ * but it drops the target's events that carry no signal and name no listed key pattern, since
+ * they have no row count.
+ *
+ * Key patterns as sensitive objects (phase 9 follow-ups, contract `SensitiveObject`,
+ * `sensitive_object.key_pattern`, ADR-0022 decision 3): on a Redis / Valkey target, objects named
+ * by a key pattern (`user:*:email`, from findings or typed by hand) are sent only when the agent's
+ * latest heartbeat listed the token (`agents.accepts`); otherwise they are left out and counted
+ * (`skippedKeyPatterns`), since an older agent cannot decode them and would lose the whole job.
+ * On any other target, a hand-typed object that is not an `Identifier` is refused (`invalid`).
  */
 
 export const SHRINK_MIN_REMOVED = 20;
@@ -141,16 +158,28 @@ export async function deriveSensitiveObjects(db: Database | Tx, agentId: string,
   }));
 }
 
+/** The capability token of key patterns as `SensitiveObject.object` (contract `HeartbeatRequest.accepts`). */
+export const KEY_PATTERN_TOKEN = "sensitive_object.key_pattern" as const;
+
+/** Whether `object` is a contract `KeyPattern` that is not an `Identifier` (the `ObjectName` second branch). */
+export function isKeyPatternObject(object: string): boolean {
+  return !validateSchema("Identifier", object).ok && validateSchema("KeyPattern", object).ok;
+}
+
 /**
- * Derived objects the contract can carry as `SensitiveObject`s (P9-E review M3): `object` must be
- * an `Identifier`. A Redis / Valkey finding names a key pattern (`user:*:email`), which is not
- * one: such objects are left out (counted in `skipped`), so the save never fails and Audit can
- * always be turned off. Follow-up: a contract change making `SensitiveObject.object` an
- * `ObjectName` checked against the target's engine (as `ObjectRef`).
+ * Objects the agent can receive as `SensitiveObject`s (P9-E review M3, phase 9 follow-ups): an
+ * `Identifier` always; a key pattern (`user:*:email`, a Redis / Valkey finding) only when
+ * `keyPatterns` (a Redis / Valkey target whose agent listed {@link KEY_PATTERN_TOKEN}). The others
+ * are left out (counted in `skipped`), so the save never fails and Audit can always be turned off.
  */
-export function sendableDerivedObjects<T extends SensitiveObject>(derived: readonly T[]): { objects: T[]; skipped: number } {
-  const objects = derived.filter((o) => validateSchema("Identifier", o.object).ok);
+export function sendableDerivedObjects<T extends SensitiveObject>(derived: readonly T[], keyPatterns = false): { objects: T[]; skipped: number } {
+  const objects = derived.filter((o) => validateSchema("Identifier", o.object).ok || (keyPatterns && isKeyPatternObject(o.object)));
   return { objects, skipped: derived.length - objects.length };
+}
+
+/** Whether the agent's stored capability list (`agents.accepts`) names {@link KEY_PATTERN_TOKEN}. */
+export function agentAcceptsKeyPatterns(accepts: unknown): boolean {
+  return agentAccepts(accepts, KEY_PATTERN_TOKEN);
 }
 
 /**
@@ -242,10 +271,16 @@ export interface AuditConfigView {
   deriveFromFindings: boolean;
   manualObjects: SensitiveObject[];
   sentObjects: SensitiveObject[];
+  /** The agent's latest heartbeat listed {@link KEY_PATTERN_TOKEN} (key patterns can be sent). */
+  agentAcceptsKeyPatterns: boolean;
   warning: AuditWarning | null;
   warningRemoved: number | null;
   updatedAt: Date | null;
-  lastJob: { id: string; status: string; errorCode: string | null; createdAt: Date } | null;
+  /**
+   * `deliveredWithoutKeyPatterns`: key patterns left out of its last delivery, the agent no longer
+   * listing `sensitive_object.key_pattern` (security review of #280, M2); null when none.
+   */
+  lastJob: { id: string; status: string; errorCode: string | null; createdAt: Date; deliveredWithoutKeyPatterns: number | null } | null;
 }
 
 /** Audit settings of a target (defaults when never configured), or null for an unknown target. */
@@ -256,13 +291,14 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
     .limit(1);
   if (!t) return null;
+  const [agent] = await db.select({ accepts: agents.accepts }).from(agents).where(eq(agents.id, agentId)).limit(1);
   const [c] = await db
     .select()
     .from(auditConfigs)
     .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
     .limit(1);
   const [job] = await db
-    .select({ id: jobs.id, status: jobs.status, error: jobs.error, createdAt: jobs.createdAt })
+    .select({ id: jobs.id, status: jobs.status, error: jobs.error, createdAt: jobs.createdAt, withoutKeys: jobs.deliveredWithoutKeyPatterns })
     .from(jobs)
     .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure")))
     .orderBy(desc(jobs.createdAt))
@@ -281,10 +317,13 @@ export async function getAuditConfig(db: Database, agentId: string, targetId: st
     deriveFromFindings: c?.deriveFromFindings ?? true,
     manualObjects: (c?.manualObjects ?? []) as unknown as SensitiveObject[],
     sentObjects: (c?.sentObjects ?? []) as unknown as SensitiveObject[],
+    agentAcceptsKeyPatterns: agentAcceptsKeyPatterns(agent?.accepts),
     warning: (c?.warning as AuditWarning | null | undefined) ?? null,
     warningRemoved: c?.warningRemoved ?? null,
     updatedAt: c?.updatedAt ?? null,
-    lastJob: job ? { id: job.id, status: job.status, errorCode: job.error?.code ?? null, createdAt: job.createdAt } : null,
+    lastJob: job
+      ? { id: job.id, status: job.status, errorCode: job.error?.code ?? null, createdAt: job.createdAt, deliveredWithoutKeyPatterns: job.withoutKeys ?? null }
+      : null,
   };
 }
 
@@ -304,9 +343,16 @@ export async function auditSummaries(db: Database, agentId: string): Promise<Map
 }
 
 export type AuditConfigureOutcome =
-  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number }
+  | { outcome: "queued"; jobId: string; change: AuditChange; truncated: number; skippedKeyPatterns: number; minRowsWarning: MinRowsWarning | null }
   /** A narrowing change without (or with an outdated) confirmation: nothing is queued. */
-  | { outcome: "confirmation_required"; change: AuditChange; digest: string; truncated: number; skippedKeyPatterns: number }
+  | {
+      outcome: "confirmation_required";
+      change: AuditChange;
+      digest: string;
+      truncated: number;
+      skippedKeyPatterns: number;
+      minRowsWarning: MinRowsWarning | null;
+    }
   | { outcome: "not_found" }
   | { outcome: "invalid" };
 
@@ -323,9 +369,46 @@ export async function configureAudit(
   actor: { userId: string; ip: string | null },
 ): Promise<AuditConfigureOutcome> {
   const result = await db.transaction(async (tx): Promise<AuditConfigureOutcome> => {
+    return queueAuditSettings(tx, agentId, targetId, input, actor);
+  });
+  if (result.outcome !== "queued") {
+    await writeAudit(db, {
+      actorType: "user",
+      actorId: actor.userId,
+      action: "audit.configure",
+      outcome: "failure",
+      targetType: "agent",
+      targetId: agentId,
+      sourceIp: actor.ip,
+      details: {
+        target_id: targetId,
+        reason: result.outcome,
+        ...(result.outcome === "confirmation_required"
+          ? {
+              warning: result.change.warning,
+              previous_objects: result.change.previousCount,
+              next_objects: result.change.nextCount,
+              removed_objects: result.change.removed,
+              min_rows_warning: result.minRowsWarning,
+            }
+          : {}),
+      },
+    });
+  }
+  return result;
+}
+
+/** The settings computation and queueing of {@link configureAudit}, inside its transaction. */
+async function queueAuditSettings(
+  tx: Tx,
+  agentId: string,
+  targetId: string,
+  input: AuditConfigInput,
+  actor: { userId: string; ip: string | null },
+): Promise<AuditConfigureOutcome> {
     // Serializes the changes of the agent's settings (and its jobs), as for scan requests.
     const [agent] = await tx
-      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt })
+      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
       .from(agents)
       .where(eq(agents.id, agentId))
       .for("update")
@@ -333,16 +416,25 @@ export async function configureAudit(
     if (!agent || agent.revokedAt || agent.lockedAt) return { outcome: "not_found" };
     await lockAgentJobs(tx, agentId);
     const [target] = await tx
-      .select({ present: agentTargets.present })
+      .select({ present: agentTargets.present, engine: agentTargets.engine })
       .from(agentTargets)
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
-    // Key-pattern objects (Redis / Valkey findings) are not `SensitiveObject`s yet: left out (M3).
-    const { objects: derived, skipped: skippedKeyPatterns } = sendableDerivedObjects(
+    const keyPatternTarget = isKeyPatternEngine(target.engine);
+    const rowsWarning = minRowsWarning(keyPatternTarget, input.minRows);
+    // A key pattern names a Redis / Valkey object only (contract `SensitiveObject`, as `ObjectRef`).
+    if (!keyPatternTarget && input.manualObjects.some((o) => !validateSchema("Identifier", o.object).ok)) return { outcome: "invalid" };
+    // Key patterns go only to an agent that listed the token (ADR-0022 decision 3); otherwise
+    // they are left out and counted (M3), from the findings and from the manual objects alike.
+    const keyPatterns = keyPatternTarget && agentAcceptsKeyPatterns(agent.accepts);
+    const { objects: derived, skipped: skippedDerived } = sendableDerivedObjects(
       input.deriveFromFindings ? await deriveSensitiveObjects(tx, agentId, targetId) : [],
+      keyPatterns,
     );
-    const { objects, truncated } = mergeSensitiveObjects(derived, input.manualObjects);
+    const { objects: manual, skipped: skippedManual } = sendableDerivedObjects(input.manualObjects, keyPatterns);
+    const skippedKeyPatterns = skippedDerived + skippedManual;
+    const { objects, truncated } = mergeSensitiveObjects(derived, manual);
     // Turning Audit off always works (M3): the objects are only a hint while it is off.
     const params = buildAuditParams(input, objects) ?? (input.enabled ? null : buildAuditParams(input, []));
     if (!params) return { outcome: "invalid" };
@@ -357,7 +449,7 @@ export async function configureAudit(
     );
     const digest = settingsDigest(params);
     if (change.warning !== null && input.confirm !== digest) {
-      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns };
+      return { outcome: "confirmation_required", change, digest, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
     }
     // The settings replace the previous ones as a whole: jobs not delivered yet are superseded.
     await tx
@@ -394,35 +486,239 @@ export async function configureAudit(
       targetType: "job",
       targetId: job.id,
       sourceIp: actor.ip,
-      details: { ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true), skipped_key_patterns: skippedKeyPatterns },
+      details: {
+        ...auditDetails(agentId, targetId, params, input, change, derived.length, truncated, true),
+        skipped_key_patterns: skippedKeyPatterns,
+        min_rows_warning: rowsWarning,
+      },
     });
     await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
-    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns };
-  });
-  if (result.outcome !== "queued") {
-    await writeAudit(db, {
-      actorType: "user",
-      actorId: actor.userId,
+    return { outcome: "queued", jobId: job.id, change, truncated, skippedKeyPatterns, minRowsWarning: rowsWarning };
+}
+
+/**
+ * Requeues of an agent's Audit settings after a capability change, per agent and hour (re-review
+ * N1), shared by the console processes with the per-process fallback (an audit budget, as the
+ * integrity limiters, ADR-0024 decision 4). An upgrade or a downgrade needs one; 4 leave room for a
+ * rollback and a retry.
+ */
+export const auditRequeueBudget = RateLimiter.shared("audit.requeue_per_agent", 4, 60 * 60_000, "local");
+/** The `accepts_flapping` integrity events of an agent past {@link auditRequeueBudget}: one per hour. */
+export const acceptsFlappingAlertBudget = RateLimiter.shared("audit.requeue_flapping_alerts", 1, 60 * 60_000, "local");
+
+/**
+ * One target of {@link requeueAuditSettingsOnAcceptsChange} (re-review N2): the objects sent last
+ * time keep their plain names (`Identifier`s, never derived again from today's findings); only the
+ * key patterns are added (from the findings, if derived, and the manual objects, most sensitive
+ * first, within what the 1000 cap leaves after the plain names) or removed, as the agent can now
+ * receive them. Nothing is queued when that changes nothing. The stored warning is kept unless this
+ * requeue removes objects, which records its own (`shrunk` or `emptied`). Whether the job was queued.
+ */
+async function requeueKeyPatterns(db: Database, agentId: string, targetId: string, deferred: boolean): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const [agent] = await tx
+      .select({ revokedAt: agents.revokedAt, lockedAt: agents.lockedAt, accepts: agents.accepts })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .for("update")
+      .limit(1);
+    if (!agent || agent.revokedAt || agent.lockedAt) return false;
+    await lockAgentJobs(tx, agentId);
+    const [c] = await tx
+      .select()
+      .from(auditConfigs)
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)))
+      .limit(1);
+    if (!c?.enabled) return false;
+    const sent = c.sentObjects as unknown as SensitiveObject[];
+    const plain = sent.filter((o) => validateSchema("Identifier", o.object).ok);
+    let keys: SensitiveObject[] = [];
+    if (agentAcceptsKeyPatterns(agent.accepts)) {
+      const derived = c.deriveFromFindings ? (await deriveSensitiveObjects(tx, agentId, targetId)).filter((o) => isKeyPatternObject(o.object)) : [];
+      const manual = (c.manualObjects as unknown as SensitiveObject[]).filter((o) => isKeyPatternObject(o.object));
+      keys = mergeSensitiveObjects(derived, manual).objects.slice(0, Math.max(0, MAX_SENSITIVE_OBJECTS - plain.length));
+    }
+    const next = [...plain, ...keys];
+    const change = assessAuditChange({ enabled: true, objects: sent }, { enabled: true, objects: next });
+    if (change.added === 0 && change.removed === 0) return false;
+    const input: AuditConfigInput = {
+      enabled: true,
+      aggregationWindowS: c.aggregationWindowS,
+      pollIntervalS: c.pollIntervalS,
+      minRows: c.minRows ?? null,
+      deriveFromFindings: c.deriveFromFindings,
+      manualObjects: c.manualObjects as unknown as SensitiveObject[],
+      confirm: null,
+    };
+    const params = buildAuditParams(input, next);
+    if (!params) return false;
+    await tx
+      .update(jobs)
+      .set({ status: "cancelled", finishedAt: sql`now()` })
+      .where(and(eq(jobs.agentId, agentId), eq(jobs.targetId, targetId), eq(jobs.type, "audit.configure"), eq(jobs.status, "pending")));
+    const [job] = await tx.insert(jobs).values({ agentId, type: "audit.configure", targetId, params: { ...params }, createdBy: null }).returning({ id: jobs.id });
+    if (!job) throw new Error("job insert returned no row");
+    // Only a requeue that removes objects records a warning; otherwise the stored one stays.
+    const narrows = change.removed > 0;
+    await tx
+      .update(auditConfigs)
+      .set({
+        sentObjects: next as unknown as Record<string, unknown>[],
+        lastJobId: job.id,
+        ...(narrows ? { warning: change.warning ?? "shrunk", warningRemoved: change.removed } : {}),
+        updatedAt: sql`now()`,
+      })
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.targetId, targetId)));
+    await writeAudit(tx, {
+      actorType: "system",
       action: "audit.configure",
+      targetType: "job",
+      targetId: job.id,
+      details: {
+        agent_id: agentId,
+        target_id: targetId,
+        reason: "agent_accepts_changed",
+        previous_objects: change.previousCount,
+        next_objects: change.nextCount,
+        added_objects: change.added,
+        removed_objects: change.removed,
+        key_patterns: keys.length,
+        warning: narrows ? (change.warning ?? "shrunk") : null,
+        // #280 re-review L-a: queued from a heartbeat after a change the budget had deferred.
+        deferred,
+      },
+    });
+    await tx.execute(sql`select pg_notify(${JOBS_CHANNEL}, ${agentId})`);
+    return true;
+  });
+}
+
+/**
+ * Marks the agent's Audit settings requeue as due (#280 re-review L-a): the heartbeat that changed
+ * its capability tokens was stored (delivery reads `agents.accepts`, so it must follow the latest
+ * heartbeat, ADR-0022 decision 3), but its settings were not queued again, because the requeue
+ * budget was spent or the requeue failed. Fail closed: the change is never dropped; a later
+ * heartbeat queues the settings from the agent's latest tokens once the budget allows. Only for an
+ * agent with enabled Audit settings on a present Redis / Valkey target (nothing to requeue
+ * otherwise).
+ *
+ * The mark always moves forward, under the agent's row lock (security review of 34db5b8, L1): a
+ * requeue running meanwhile (another replica) clears the mark only if it still holds the value
+ * that requeue read before it started, so a change marked during that requeue keeps its mark and
+ * is acted on later. The new value is strictly later than the old one, even within a millisecond.
+ * The audit entry `audit.requeue_deferred` is written only when the mark was not set, not at every
+ * heartbeat while it stays set, so at most once more per hour than the budget's requeues. Whether
+ * the entry was written by this call.
+ */
+export async function deferAuditRequeue(db: Database, agentId: string, reason: "budget_spent" | "requeue_failed"): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const [agent] = await tx
+      .select({ dueAt: agents.auditRequeueDueAt })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
+      .for("update")
+      .limit(1);
+    if (!agent) return false;
+    const configs = await tx
+      .select({ engine: agentTargets.engine })
+      .from(auditConfigs)
+      .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
+    if (!configs.some((c) => isKeyPatternEngine(c.engine))) return false;
+    await tx
+      .update(agents)
+      .set({
+        auditRequeueDueAt: sql`greatest(date_trunc('milliseconds', now()), ${agents.auditRequeueDueAt} + interval '1 millisecond')`,
+      })
+      .where(eq(agents.id, agentId));
+    if (agent.dueAt !== null) return false;
+    await writeAudit(tx, {
+      actorType: "system",
+      action: "audit.requeue_deferred",
       outcome: "failure",
       targetType: "agent",
       targetId: agentId,
-      sourceIp: actor.ip,
-      details: {
-        target_id: targetId,
-        reason: result.outcome,
-        ...(result.outcome === "confirmation_required"
-          ? {
-              warning: result.change.warning,
-              previous_objects: result.change.previousCount,
-              next_objects: result.change.nextCount,
-              removed_objects: result.change.removed,
-            }
-          : {}),
-      },
+      details: { agent_id: agentId, reason },
     });
+    return true;
+  });
+}
+
+/** {@link deferAuditRequeue}, never throwing (logged): the caller's other steps still run (L2). */
+async function deferAuditRequeueLogged(db: Database, agentId: string, reason: "budget_spent" | "requeue_failed"): Promise<void> {
+  try {
+    await deferAuditRequeue(db, agentId, reason);
+  } catch (e) {
+    logger.error({ agentId, reason, err: e instanceof Error ? e.name : "error" }, "audit settings requeue not marked as due");
   }
-  return result;
+}
+
+/**
+ * Test hook only (never set outside tests): called before each target's requeue, so a test can
+ * make it fail or move the agent's mark meanwhile. A plain module object, like `pollClock`.
+ */
+export const auditRequeueTestHooks: { beforeTarget: ((agentId: string, targetId: string) => Promise<void>) | null } = { beforeTarget: null };
+
+/** What made the heartbeat handler call {@link requeueAuditSettingsOnAcceptsChange}. */
+export type AuditRequeueCause = "accepts_changed" | "due";
+
+/**
+ * Security review of #280, M2: when a heartbeat changes the agent's stored capability list
+ * (`agents.accepts`: an upgrade that starts listing `sensitive_object.key_pattern`, or a downgrade
+ * that stops), the enabled Audit settings of its Redis / Valkey targets are computed again from the
+ * stored settings and queued when their objects change, so key patterns are neither withheld from
+ * an upgraded agent nor silently lost by a downgraded one. Audited as `audit.configure` by the
+ * system, with `reason: "agent_accepts_changed"`. At most `auditRequeueBudget` per agent and
+ * hour (re-review N1). Returns the number of jobs queued.
+ *
+ * #280 re-review L-a: past the budget, the change is not acted on but it is not dropped either:
+ * the agent is marked (`agents.audit_requeue_due_at`, audited as `audit.requeue_deferred`) and
+ * every later heartbeat calls this again (`cause: "due"`, refused locally at no store cost while the
+ * window lasts) until the budget allows a requeue, which starts from the agent's latest tokens and
+ * clears the mark if it has not moved since the requeue read it. A requeue that throws marks the
+ * agent the same way. A due call past the budget raises no `accepts_flapping` event: only a change
+ * does, even when marking fails (L2).
+ */
+export async function requeueAuditSettingsOnAcceptsChange(db: Database, agentId: string, cause: AuditRequeueCause = "accepts_changed"): Promise<number> {
+  // Re-review N1: an agent that flips its tokens at every heartbeat must not write jobs, settings
+  // and audit entries without bound. Past the budget, one integrity event an hour, no requeue.
+  if (!(await auditRequeueBudget.reserveShared(agentId)).ok) {
+    if (cause === "accepts_changed") {
+      await deferAuditRequeueLogged(db, agentId, "budget_spent");
+      if ((await acceptsFlappingAlertBudget.reserveShared(agentId)).ok) {
+        await recordIntegrityEvent(db, { agentId, kind: "accepts_flapping", endpoint: "heartbeat", status: 200, ip: null });
+      }
+    }
+    return 0;
+  }
+  try {
+    // Read before the requeue: a mark moved meanwhile (by a concurrent heartbeat) is a later value
+    // and stays, so its change is acted on too (L1).
+    const [mark] = await db.select({ dueAt: agents.auditRequeueDueAt }).from(agents).where(eq(agents.id, agentId)).limit(1);
+    const rows = await db
+      .select({ targetId: auditConfigs.targetId, engine: agentTargets.engine })
+      .from(auditConfigs)
+      .innerJoin(agentTargets, and(eq(agentTargets.agentId, auditConfigs.agentId), eq(agentTargets.targetId, auditConfigs.targetId)))
+      .where(and(eq(auditConfigs.agentId, agentId), eq(auditConfigs.enabled, true), eq(agentTargets.present, true)));
+    let queued = 0;
+    for (const { targetId, engine } of rows) {
+      if (!isKeyPatternEngine(engine)) continue;
+      if (auditRequeueTestHooks.beforeTarget) await auditRequeueTestHooks.beforeTarget(agentId, targetId);
+      if (await requeueKeyPatterns(db, agentId, targetId, cause === "due")) queued++;
+    }
+    if (mark?.dueAt) {
+      await db
+        .update(agents)
+        .set({ auditRequeueDueAt: null })
+        .where(and(eq(agents.id, agentId), eq(agents.auditRequeueDueAt, mark.dueAt)));
+    }
+    return queued;
+  } catch (e) {
+    // Fail closed: the settings are queued again from a later heartbeat (best effort here: the
+    // database may be what failed, and the caller logs the original error).
+    await deferAuditRequeueLogged(db, agentId, "requeue_failed");
+    throw e;
+  }
 }
 
 function auditDetails(

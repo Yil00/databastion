@@ -49,3 +49,20 @@ Until P4-D every console rate limiter kept its counters in memory, per web proce
 - **Storing the keys in clear**: the table would record IPs, usernames as typed (possibly a password), device nonces and agent ids.
 - **Failing open on store failure**: a database outage or saturation would remove every bound on password and secret guessing.
 - **Failing closed everywhere**: a limiter hiccup would make every agent back off on ingest, and the stale-retry limiter would lock agents irreversibly.
+
+## Implementation note (2026-10-18): `target_mismatch` limiters
+Recorded with the #274 review L5 follow-up; it changes no decision above. Two limiters bound the `target_mismatch` agent-integrity rows (a heartbeat target whose `audit_source` does not serve its `engine`, recorded at every heartbeat while it lasts), separately from `integrity.writes_per_agent` so that a persistent mismatch does not use the slots of the other integrity kinds (#235 review N1, #274 review L1):
+- `integrity.target_mismatch_per_agent`: 1 row per agent and hour while the set of mismatched targets stays the same.
+- `integrity.target_mismatch_changes`: up to 12 more rows per agent and hour when the set of mismatched targets differs from the last recorded row's.
+
+Both are audit budgets with the **per-process fallback** of decision 4, like `integrity.writes_per_agent`: the rows go to the same database, and failing closed would hide integrity events. Neither decides what is stored for the targets: every mismatched target is stored without its `audit_source` at every heartbeat.
+
+## Implementation note (2026-10-18): Audit settings requeue limiters
+Recorded with the re-review of #280 (N1); it changes no decision above. When a heartbeat changes an agent's console -> agent capability tokens (`agents.accepts`, [ADR-0022](0022-protocol-capability-negotiation.md) decision 3), the console queues the Audit settings of its Redis / Valkey targets again. An agent that flips its tokens at every heartbeat would otherwise write jobs, settings and audit entries without bound. Two limiters:
+- `audit.requeue_per_agent`: 4 capability changes acted on per agent and hour (an upgrade, a rollback and a retry fit); past it, nothing is requeued;
+- `audit.requeue_flapping_alerts`: 1 `agent.accepts_flapping` agent-integrity event per agent and hour past that budget, written within `integrity.writes_per_agent`.
+
+Both use the **per-process fallback** of decision 4: they bound writes to the same database, and failing closed would only drop a requeue or an integrity event a single process can still bound.
+
+## Implementation note (2026-10-21): requeues past the budget deferred, not dropped
+Recorded with the #280 re-review L-a follow-up; it changes no decision above and refines the note of 2026-10-18, whose "past it, nothing is requeued" now means "nothing is requeued in that window". A capability change that `audit.requeue_per_agent` refuses, or whose requeue fails, is still stored in `agents.accepts` (delivery reads it, ADR-0022 decision 3), and the agent is marked (`agents.audit_requeue_due_at`, console migration `0045`) when it has enabled Audit settings on a Redis / Valkey target. Every later heartbeat tries again; the first one the budget allows queues the settings from the agent's latest tokens and clears the mark. The budget is unchanged: these requeues count in it, and the refusals within the window are counted in the process with no store statement. The mark always moves forward under the agent's row lock, and the clear is a compare-and-set on the value read before the requeue, so a change marked by another replica during a requeue keeps its mark (security review of the follow-up, L1). Setting the mark writes one system `audit.requeue_deferred` audit-log entry (`reason` `budget_spent` or `requeue_failed`); while it stays set, no further entry and no `agent.accepts_flapping` event are written for heartbeats that change nothing.

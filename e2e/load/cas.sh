@@ -63,7 +63,51 @@ UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SPOOL_TIMEOUT_S=120
 
 log() { printf '[load-cas %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+
+# print_census LABEL: ADR-0053 decision 6 measurement (as e2e/lib.sh): the agent's event census
+# (counts only) per engine from the collected agent log, the console's per-principal counts and its
+# events naming `*` by kind (console_sql, once defined), to the log and
+# $LOAD_RESULTS_DIR/census-LABEL.json / .md (the results artifact; added to the job summary by
+# summary_append once redacted). Never fails.
+print_census() {
+  local line lib="$HERE/loadlib.py" con="$W/out/census-console.json" star="$W/out/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$lib" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$lib" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$lib" census --log "$LOAD_LOG_DIR/agent.log" --label "$1" --console "$con" --star "$star" \
+    --out-dir "$LOAD_RESULTS_DIR" 2>&1 \
+    | while IFS= read -r line; do log "$line"; done || true
+}
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
+}
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 T_RUN="$(date +%s)"
 T_PHASE="$T_RUN"
@@ -169,6 +213,7 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census load-cas
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   # Leak scan before redaction (as run.sh): canary first, then the registry.
   mkdir -p "$canary_dir"
@@ -194,6 +239,8 @@ cleanup() {
   # CAS prints the ticket, cookie and webflow keys it generates at each start (no key is configured:
   # dev only); they die with the container, but are not kept in the logs either.
   redact_cas_keys "$LOAD_LOG_DIR"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"

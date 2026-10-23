@@ -36,6 +36,7 @@ const finding = (over: Partial<FindingView> = {}): FindingView => ({
   firstSeenAt: new Date(NOW - 60_000),
   lastSeenAt: new Date(NOW - 60_000),
   falsePositiveAt: null,
+  altered: null,
   ...over,
 });
 
@@ -53,6 +54,21 @@ describe("FindingsTable", () => {
     expect(html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
     // The CSRF token is only a prop of the client button, not rendered.
     expect(html).toContain("False positive");
+  });
+
+  it("ADR-0056: says the location's names were altered by normalization, with the engine's part labels", () => {
+    const html = renderToStaticMarkup(
+      <FindingsTable findings={[finding({ altered: ["object", "field"] })]} csrfToken="csrf" now={NOW} canMark />,
+    );
+    expect(html).toContain("data-names-altered");
+    expect(html).toContain("object and field names altered by normalization: check for look-alike names");
+    const mssql = renderToStaticMarkup(
+      <FindingsTable findings={[finding({ engine: "sqlserver", altered: ["schema", "object", "field"] })]} csrfToken="csrf" now={NOW} canMark />,
+    );
+    expect(mssql).toContain("schema, table and column names altered by normalization");
+    const one = renderToStaticMarkup(<FindingsTable findings={[finding({ altered: ["field"] })]} csrfToken="csrf" now={NOW} canMark />);
+    expect(one).toContain("field name altered by normalization");
+    expect(renderToStaticMarkup(<FindingsTable findings={[finding()]} csrfToken="csrf" now={NOW} canMark />)).not.toContain("altered by normalization");
   });
 
   it("shows sample states, false positives and the location without a missing schema", () => {

@@ -1,14 +1,16 @@
+import { createHash, randomUUID } from "node:crypto";
+
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { getDb } from "@/db/client";
-import { accessEvents } from "@/db/schema";
+import { accessEvents, findings as findingsTable } from "@/db/schema";
 import { handleEvents, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
 import { enqueueJob } from "@/server/jobs";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { agentRequest, enroll, uuidv7 } from "@/test/helpers";
 
-import { prefilterNames } from "./event-engine";
+import { boundedWholeTargetCache, loadDatabaseBounds, loadObjectHits, prefilterNames } from "./event-engine";
 import { drainPolicyWork } from "./incidents";
 
 /**
@@ -17,11 +19,13 @@ import { drainPolicyWork } from "./incidents";
  * character and lets `objectKey` (JavaScript `foldName`) decide.
  */
 describe("sensitivity name pre-filter (pure)", () => {
-  it("keeps every name and its fold; none under an ASCII-only `lower` with a non-ASCII name", () => {
-    expect(prefilterNames(["CLIENTS ", "orders"], true)).toEqual(["CLIENTS ", "clients", "orders"]);
-    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual(["CLIENTS ", "clients", "orders"]);
-    expect(prefilterNames(["ΠΕΛΑΤΕΣ"], true)).toEqual(["ΠΕΛΑΤΕΣ", "πελατεσ"]);
-    expect(prefilterNames(["clients", "CLIENTÈLE"], false)).toBeNull();
+  it("keeps every name and its fold; the ASCII form under an ASCII-only `lower`", () => {
+    expect(prefilterNames(["CLIENTS ", "orders"], true)).toEqual({ kind: "fold", names: ["CLIENTS ", "clients", "orders"] });
+    // PR #274 review L2: under an ASCII-only `lower`, the ASCII form for every chunk.
+    expect(prefilterNames(["CLIENTS ", "orders"], false)).toEqual({ kind: "ascii", folded: ["clients", "orders"] });
+    expect(prefilterNames(["ΠΕΛΑΤΕΣ"], true)).toEqual({ kind: "fold", names: ["ΠΕΛΑΤΕΣ", "πελατεσ"] });
+    // Phase 9 follow-up after N1: the JavaScript folds, compared with the SQL fold of ASCII names.
+    expect(prefilterNames(["clients", "CLIENTÈLE", "Clients "], false)).toEqual({ kind: "ascii", folded: ["clients", "clientèle"] });
   });
 });
 
@@ -83,5 +87,137 @@ describe.skipIf(!hasDb)("sensitivity on a console database with the C character 
     await drainPolicyWork(getDb());
     const rows = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId)).orderBy(accessEvents.ts);
     expect(rows.map((r) => r.sensitivity)).toEqual([3, 3, 2, 0, 0]);
+  });
+  it("phase 9 follow-up after N1: the fallback reads the chunk's targets only, and of their ASCII names the matching ones", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      targets: [...HEARTBEAT.targets, { target_id: "pg-prod-2", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const row = (targetId: string, object: string) => ({
+      id: randomUUID(),
+      agentId: auth.agentId,
+      targetId,
+      locationKey: createHash("sha256").update(`${targetId}/crm/public/${object}/c`).digest("hex"),
+      engine: "postgres",
+      databaseName: "crm",
+      schemaName: "public",
+      objectName: object,
+      fieldName: "c",
+      classifier: "pii.email",
+      classifiersVersion: "2026.09.1",
+      confidence: 1,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    await getDb()
+      .insert(findingsTable)
+      .values([row("pg-prod-1", "CLIENTÈLE"), row("pg-prod-1", "CLIENTS"), row("pg-prod-1", "invoices"), row("pg-prod-2", "CLIENTÈLE"), row("pg-prod-2", "clients")]);
+    const hits = await getDb().transaction((tx) =>
+      loadObjectHits(tx, [
+        { agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database: "crm", schema: "public", object: "clientèle" }] },
+        { agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database: "crm", schema: "public", object: "clients " }] },
+      ]),
+    );
+    const read = [...hits.keys()].filter((k) => k.includes("\u0000=public\u0000")).map((k) => k.split("\u0000").filter((_p, i) => i === 1 || i === 4).join("/"));
+    // Non-ASCII names of the chunk's targets are all read (JavaScript decides); ASCII ones only
+    // when they fold to an event name; nothing of the other target of the same agent.
+    expect(read.sort()).toEqual(["pg-prod-1/clients", "pg-prod-1/clientèle"]);
+  });
+  it("PR #274 review L2: an ASCII event name gets the sensitivity of a finding spelled with the Kelvin sign", async () => {
+    const auth = await enroll();
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: HEARTBEAT }))).status).toBe(200);
+    await enqueueJob(getDb(), {
+      agentId: auth.agentId,
+      type: "discovery.scan",
+      targetId: "pg-prod-1",
+      classifiersVersion: "2026.09.1",
+      params: { sample_rows: 200, max_duration_s: 900 },
+    });
+    const { jobs } = (await (await handlePollJobs(agentRequest("GET", "/jobs?wait=0", { auth }))).json()) as { jobs: { job_id: string }[] };
+    // `\u212a` is the Kelvin sign: JavaScript lowercases it to an ASCII `k`, `C`-ctype `lower` does not.
+    const kunden = {
+      target_id: "pg-prod-1",
+      location: { engine: "postgres", database: "crm", schema: "public", object: "\u212aunden", field: "email" },
+      classifier: "pii.email",
+      confidence: 1,
+      sampled: 200,
+      matched: 150,
+    };
+    const body = { batch_id: uuidv7(), job_id: jobs[0]?.job_id, classifiers_version: "2026.09.1", findings: [kunden] };
+    expect((await handleFindings(agentRequest("POST", "/findings", { auth, body }))).status).toBe(202);
+    const event = {
+      target_id: "pg-prod-1",
+      ts: "2026-09-27T11:05:00.000Z",
+      principal: { db_user: "backup" },
+      action: "read",
+      objects: [{ database: "crm", schema: "public", object: "kunden" }],
+      rows: 99,
+      signals: [],
+      source: "pgaudit",
+      aggregated_count: 1,
+    };
+    expect((await handleEvents(agentRequest("POST", "/events", { auth, body: { batch_id: uuidv7(), events: [event] } }))).status).toBe(202);
+    await drainPolicyWork(getDb());
+    const [row] = await getDb().select().from(accessEvents).where(eq(accessEvents.agentId, auth.agentId));
+    expect(row?.sensitivity).toBe(3);
+  });
+  it("ADR-0053 test obligation 3: the per-database bound folds names and reads only the event's target through the fallback", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      targets: [...HEARTBEAT.targets, { target_id: "pg-prod-2", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const row = (targetId: string, database: string, object: string, classifier: string) => ({
+      id: randomUUID(),
+      agentId: auth.agentId,
+      targetId,
+      locationKey: createHash("sha256").update(`${targetId}/${database}/public/${object}/${classifier}`).digest("hex"),
+      engine: "postgres",
+      databaseName: database,
+      schemaName: "public",
+      objectName: object,
+      fieldName: "c",
+      classifier,
+      classifiersVersion: "2026.09.1",
+      confidence: 1,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    // The same rows as the UTF-8 test of event-engine.test.ts, with the same expected bounds.
+    await getDb()
+      .insert(findingsTable)
+      .values([
+        row("pg-prod-1", "Crm", "a", "pii.email"),
+        row("pg-prod-1", "ΒΆΣΗ", "b", "pii.iban"),
+        row("pg-prod-1", "\u212arm", "c", "pii.phone"),
+        row("pg-prod-2", "crm", "z", "secret.aws_key"),
+        row("pg-prod-2", "βάση", "z", "secret.aws_key"),
+      ]);
+    const star = (database: string) => ({ agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database, object: "*" }], objectsOverflowed: true });
+    // Probed (the C ctype: the ASCII form) and forced: the same result. Without the database `*`
+    // (which reads the whole target), the per-database pre-filter alone.
+    for (const unicodeLower of [undefined, false]) {
+      const only = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none")], unicodeLower));
+      expect([only.get(auth.agentId, "pg-prod-1", "crm"), only.get(auth.agentId, "pg-prod-1", "ΒΆΣΗ"), only.get(auth.agentId, "pg-prod-1", "krm")]).toEqual([3, 7, 3]);
+      expect(only.get(auth.agentId, "pg-prod-1", "*")).toBe(0);
+      const bounds = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none"), star("*")], unicodeLower));
+      expect(bounds.get(auth.agentId, "pg-prod-1", "crm  "), String(unicodeLower)).toBe(3);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "Βάση"), String(unicodeLower)).toBe(7);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "KRM"), String(unicodeLower)).toBe(3);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "none")).toBe(0);
+      expect(bounds.get(auth.agentId, "pg-prod-1", "*")).toBe(7);
+      expect(bounds.get(auth.agentId, "pg-prod-2", "crm")).toBe(0);
+      // Security review L1: the per-process whole-target cache gives the same values, read or reused.
+      const cache = boundedWholeTargetCache();
+      for (let round = 0; round < 2; round++) {
+        const cached = await getDb().transaction((tx) => loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("*")], unicodeLower, cache));
+        for (const db of ["crm", "ΒΆΣΗ", "krm", "none", "*"]) expect(cached.get(auth.agentId, "pg-prod-1", db), db).toBe(bounds.get(auth.agentId, "pg-prod-1", db));
+      }
+    }
   });
 });

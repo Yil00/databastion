@@ -347,6 +347,9 @@ pub(crate) struct OwnSessions {
     /// The stream's statement timeout (an interrupted poll ends within it
     /// after its session ended: ADR-0045 refinement of 2026-10-16).
     pub(crate) statement_timeout: Duration,
+    /// The target's kept name-case value, reset when the poll session is
+    /// on another server run than the one it was read on (ADR-0055).
+    pub(crate) name_case: Option<crate::check::NameCaseRuns>,
 }
 
 /// How a statement row's session is seen (see [`PsPoller::identify`]).
@@ -693,6 +696,11 @@ impl PsPoller {
         // probes recognized by the other streams on the server.
         let attached = own_thread(session).await?;
         let noted = NotedPollThread::note(&own.poll_threads, &attached, own.statement_timeout);
+        // A kept name-case value of another server run is reset at once
+        // (ADR-0055, security review L1 and L5), as in `note_own`.
+        if let (Some(nc), Some(run)) = (&own.name_case, attached.run.as_ref()) {
+            nc.observe(run);
+        }
         let limit = parse_limit;
         let text_limit = limit(scalar(session, sql::PS_TEXT_LIMIT).await?);
         if text_limit_low(text_limit) {
@@ -758,6 +766,9 @@ impl PsPoller {
             self.end_attached();
         }
         note_poll_thread(&self.own.poll_threads, &own, self.own.statement_timeout);
+        if let (Some(nc), Some(run)) = (&self.own.name_case, own.run.as_ref()) {
+            nc.observe(run);
+        }
         self.attached = next;
         self.run = own.run;
     }
@@ -1576,6 +1587,7 @@ mod tests {
                     poll_threads: Arc::clone(&polls),
                     pins: Arc::clone(&pins),
                     statement_timeout: Duration::from_secs(30),
+                    name_case: None,
                 },
                 attached: None,
                 run: poller_run,
@@ -1999,7 +2011,10 @@ mod tests {
         /// connection at the text-limit read (`start` returns an error),
         /// else leaves it unanswered and drops `start`. The poll threads
         /// and the server run.
-        async fn scripted_start(close: bool) -> (SharedPollThreads, ServerRun) {
+        async fn scripted_start(
+            close: bool,
+            name_case: Option<crate::check::NameCaseRuns>,
+        ) -> (SharedPollThreads, ServerRun) {
             use crate::conn::Flavor;
             use crate::fake::{EOF, column_def};
             use crate::proto::{PacketIo, put_lenenc};
@@ -2050,6 +2065,7 @@ mod tests {
                 poll_threads: Arc::clone(&polls),
                 pins: Arc::new(Mutex::new(DiscoveryPins::default())),
                 statement_timeout: Duration::from_secs(30),
+                name_case,
             };
             let builder = EventBuilder::new(OwnAccount::new(
                 AGENT,
@@ -2080,9 +2096,37 @@ mod tests {
             (polls, run)
         }
 
+        /// Security review L5 of the ADR-0055 agent lot: a stream that
+        /// starts on another server run than the kept name-case value's
+        /// resets it to `unknown` at once; on the same run it is kept.
+        #[tokio::test]
+        async fn a_start_on_another_server_run_resets_the_name_case() {
+            use databastion_core::name_case::{NameCase, NameCaseReport};
+            let run = |boot: u64| {
+                ServerRun::new(
+                    &["db1", "3306", "1", "uuid-a"].map(|c| Some(c.to_owned())),
+                    boot,
+                )
+                .unwrap()
+            };
+            for (boot, want) in [
+                (1_000_000, NameCaseReport::uniform(NameCase::Sensitive)),
+                (500_000, NameCaseReport::unknown()),
+            ] {
+                let state = crate::check::CheckState::default();
+                state.set_name_case(
+                    "t",
+                    Some(run(boot)),
+                    NameCaseReport::uniform(NameCase::Sensitive),
+                );
+                let _ = scripted_start(false, Some(state.name_case_runs("t"))).await;
+                assert_eq!(state.name_case("t"), Some(want), "{boot}");
+            }
+        }
+
         #[tokio::test]
         async fn the_poll_thread_is_noted_before_the_next_statement() {
-            let (polls, run) = scripted_start(false).await;
+            let (polls, run) = scripted_start(false, None).await;
             assert!(polls.lock().unwrap().contains(&run, 90));
         }
 
@@ -2095,7 +2139,7 @@ mod tests {
         async fn a_start_dropped_or_failed_after_the_note_ends_the_life() {
             let slack = crate::audit::own_threads::INTERRUPTED_SLACK;
             for close in [false, true] {
-                let (polls, run) = scripted_start(close).await;
+                let (polls, run) = scripted_start(close, None).await;
                 let p = polls.lock().unwrap();
                 assert!(p.contains(&run, 90), "{close}");
                 let now = SystemTime::now();
@@ -2130,7 +2174,24 @@ mod tests {
         fn interrupted_poll_digests_are_prefixes_of_the_poll_texts() {
             use crate::audit::events::own_poll_prefix;
             let all = poll_digests();
-            assert_eq!(all.len(), 18);
+            // 9 rows per server: MySQL 8.0.46, 8.4.11 and 9.7.2, MariaDB
+            // 10.11.19, 11.4.13 and 11.8.9 (engine-matrix run 39280421842
+            // for the versions other than the defaults).
+            assert_eq!(all.len(), 54);
+            for server in [
+                "mysql-8.0.46",
+                "mysql-8.4.11",
+                "mysql-9.7.2",
+                "mariadb-10.11.19",
+                "mariadb-11.4.13",
+                "mariadb-11.8.9",
+            ] {
+                assert_eq!(
+                    all.iter().filter(|(s, ..)| s == server).count(),
+                    9,
+                    "{server}"
+                );
+            }
             for (server, table, digest) in &all {
                 assert!(own_poll_prefix(digest.as_bytes()), "{server} {table}");
                 let main = format!("FROM `performance_schema` . `{table}`");

@@ -2,13 +2,13 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { PgBoss } from "pg-boss";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getDb } from "@/db/client";
 import * as schema from "@/db/schema";
-import { accessEvents, auditLog, incidentEvents, incidents, notificationDeliveries, policies, principalBaselines } from "@/db/schema";
+import { accessEvents, agentTargets, auditLog, incidentEvents, incidents, notificationDeliveries, policies, principalBaselines } from "@/db/schema";
 import { BASELINE_WARMUP, eventScore, objectSensitivity } from "@/lib/event-model";
 import { failuresPerAgent } from "@/server/agent-api/auth";
 import {
@@ -322,6 +322,78 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(list[3]?.eventBucket?.toISOString()).toBe("2026-09-27T11:00:00.000Z");
     });
 
+    it("PR #274 review M1: a false positive on `CRM` does not swallow a later dump of `crm` on PostgreSQL; a new incident opens", async () => {
+      const auth = await agentWithTargets();
+      await policy({ signals: ["signature.pg_dump"] });
+      const db = (database: string, ms: number) => dumpEvent({ ts: at(ms), objects: [{ database, schema: "public", object: "clients" }] });
+      await send(auth, [db("CRM", 0)]);
+      await drainPolicyWork(getDb());
+      const [first] = await incidentsOf(auth.agentId);
+      expect(first?.dedupKey).toContain(`|database:${sha256Hex("CRM")}|`);
+      expect((await transitionIncident(getDb(), String(first?.id), "false_positive", actor())).outcome).toBe("ok");
+      await send(auth, [db("crm", 1000)]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list.map((i) => [i.eventDatabase, i.status])).toEqual([
+        ["CRM", "false_positive"],
+        ["crm", "open"],
+      ]);
+      expect(await incidentEventCount(getDb(), String(first?.id))).toBe(1);
+    });
+
+    it("ADR-0021 decision 6 note of 2026-10-18: `crm ` and `crm` share a key on MySQL, not on PostgreSQL; case is kept on both", async () => {
+      const auth = await agentWithTargets();
+      await policy({ signals: ["signature.pg_dump"] });
+      const ev = (target: string, database: string, ms: number) =>
+        dumpEvent({
+          ts: at(ms),
+          target_id: target,
+          objects: target === "mysql-crm" ? [{ database, object: "clients" }] : [{ database, schema: "public", object: "clients" }],
+          ...(target === "mysql-crm" ? { source: "performance_schema" } : {}),
+        });
+      await send(auth, [ev("mysql-crm", "crm ", 0), ev("mysql-crm", "crm", 1000), ev("mysql-crm", "CRM", 2000), ev("pg-prod-1", "crm ", 3000), ev("pg-prod-1", "crm", 4000)]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      const of = (t: string) => list.filter((i) => i.targetId === t).map((i) => [i.eventDatabase, i.matchCount]);
+      expect(of("mysql-crm")).toEqual([
+        ["crm ", 2],
+        ["CRM", 1],
+      ]);
+      expect(list.find((i) => i.eventDatabase === "crm " && i.targetId === "mysql-crm")?.dedupKey).toContain(`|database:${sha256Hex("crm")}|`);
+      expect(of("pg-prod-1")).toEqual([
+        ["crm ", 1],
+        ["crm", 1],
+      ]);
+    });
+
+    it("ADR-0021 note of 2026-10-18: on MySQL, an incident opened under the name as sent (`crm `) keeps its events; an active one comes before a closed one of the new key", async () => {
+      const auth = await agentWithTargets();
+      await policy({ signals: ["signature.pg_dump"] });
+      const ev = (database: string, ms: number) => dumpEvent({ ts: at(ms), target_id: "mysql-crm", objects: [{ database, object: "clients" }], source: "performance_schema" });
+      // A: the new key of `crm`, then resolved. B: another database, turned into a legacy-key
+      // incident of `crm ` (as an earlier console would have keyed it), still open.
+      await send(auth, [ev("crm", 0), ev("billing", 1000)]);
+      await drainPolicyWork(getDb());
+      const [a, b] = await incidentsOf(auth.agentId);
+      expect(a?.eventDatabase).toBe("crm");
+      expect((await transitionIncident(getDb(), String(a?.id), "resolved", actor())).outcome).toBe("ok");
+      const legacy = String(a?.dedupKey).replace(`|database:${sha256Hex("crm")}|`, `|database:${sha256Hex("crm ")}|`);
+      expect(legacy).not.toBe(a?.dedupKey);
+      await getDb().update(incidents).set({ dedupKey: legacy, eventDatabase: "crm " }).where(eq(incidents.id, String(b?.id)));
+      // `crm ` after the upgrade: added to the active legacy incident, not linked to the resolved one.
+      await send(auth, [ev("crm ", 2000)]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(2);
+      expect(list.find((i) => i.id === b?.id)?.matchCount).toBe(2);
+      expect(await incidentEventCount(getDb(), String(a?.id))).toBe(1);
+      // Plain `crm` has no other key: it goes to the resolved new-key incident (M1 rule: linked).
+      await send(auth, [ev("crm", 3000)]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(2);
+      expect(await incidentEventCount(getDb(), String(a?.id))).toBe(2);
+    });
+
     it("every enabled access_event policy applies; exclusions, exceptions and finding policies do not", async () => {
       const auth = await agentWithTargets();
       await policy({ signals: ["signature.*"], exclude_principals: ["back*"] });
@@ -344,11 +416,12 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(list.every((i) => i.policyId !== disabled)).toBe(true);
     });
 
-    it("`objects` conditions ignore case and trailing spaces; exceptions ignore trailing spaces on MySQL only (N1)", async () => {
+    it("`objects` conditions ignore case and trailing spaces; exceptions compare with case on PostgreSQL (ADR-0054) and ignore trailing spaces on MySQL only (N1)", async () => {
       const auth = await agentWithTargets();
       const pid = await policy({ objects: { database: "crm", object: "clients" } });
-      // Exception of a second policy, scoped to the location only: case-insensitive on every
-      // engine (ADR-0014), blind to trailing spaces on SQL Server and MySQL / MariaDB only.
+      // Exception of a second policy, scoped to the location only: with case on PostgreSQL,
+      // without case on MySQL (ADR-0054), blind to trailing spaces on SQL Server and MySQL /
+      // MariaDB only (N1).
       const xp = await policy({ objects: { object: "clients" } });
       await createException(
         getDb(),
@@ -364,7 +437,14 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         dumpEvent({ objects: [{ database: "crm", schema: "public", object: "client" }], principal: { db_user: "d" } }),
         mysql("Clients ", at(1000)),
         mysql("CLIENT", at(2000)),
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients" }], principal: { db_user: "e" }, ts: at(3000) }),
       ]);
+      // The target's engine changes after ingest: the events keep the engine their source tells
+      // (pgaudit: PostgreSQL), not the target's current one (ADR-0054 review L1).
+      await getDb()
+        .update(agentTargets)
+        .set({ engine: "mysql" })
+        .where(and(eq(agentTargets.agentId, auth.agentId), eq(agentTargets.targetId, "pg-prod-1")));
       await drainPolicyWork(getDb());
       const evs = await eventsOf(auth.agentId);
       const linked = async (policyId: string) => {
@@ -373,10 +453,42 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
         return evs.flatMap((e, i) => (links.some((l) => l.eventId === e.id) ? [i] : []));
       };
       // Policy: every spelling of crm.clients, never `client`.
-      expect(await linked(pid)).toEqual([0, 1, 2, 4]);
-      // Exception: `Clients` excepted on PostgreSQL, `CLIENTS ` / `clients ` not (a distinct quoted
-      // name there), `Clients ` excepted on MySQL.
-      expect(await linked(xp)).toEqual([0, 2]);
+      expect(await linked(pid)).toEqual([0, 1, 2, 4, 6]);
+      // Exception: on PostgreSQL only the exact `crm.clients` is excepted; `Clients`, `CLIENTS `
+      // and `clients ` are distinct (quoted) names there. `Clients ` is excepted on MySQL.
+      expect(await linked(xp)).toEqual([0, 1, 2]);
+    });
+
+    it("ADR-0056: an object reported altered by normalization is covered only by an absent glob or `*` for that part; the plain object as today", async () => {
+      const auth = await agentWithTargets();
+      const exception = async (location: Record<string, string>) => {
+        const policyId = await policy({ objects: { object: "clients" } });
+        await createException(
+          getDb(),
+          { policyId, agentId: null, targetId: null, classifier: null, location, reason: "x", expiresAt: null },
+          actor(),
+        );
+        return policyId;
+      };
+      const named = await exception({ database: "crm", object: "clients" });
+      const star = await exception({ database: "crm", object: "*" });
+      const literal = await exception({ database: "crm", object: "\\*" });
+      const database = await exception({ database: "crm" });
+      const twin = { database: "crm", schema: "public", object: "clients", altered: ["object"] };
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients" }], principal: { db_user: "plain" } }),
+        dumpEvent({ objects: [twin], principal: { db_user: "twin" } }),
+      ]);
+      await drainPolicyWork(getDb());
+      const evs = await eventsOf(auth.agentId);
+      // Stored as sent, `altered` included.
+      expect(evs.map((e) => e.objects)).toEqual([[{ database: "crm", schema: "public", object: "clients" }], [twin]]);
+      const principals = async (policyId: string) =>
+        (await incidentsOf(auth.agentId)).filter((i) => i.policyId === policyId).map((i) => i.principal).sort();
+      expect(await principals(named)).toEqual(["twin"]);
+      expect(await principals(literal)).toEqual(["plain", "twin"]);
+      expect(await principals(star)).toEqual([]);
+      expect(await principals(database)).toEqual([]);
     });
 
     it("a policy change applies to the events evaluated after it, never to past ones", async () => {
@@ -904,6 +1016,335 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
     });
   });
 
+  describe("objects left out under a bound (ADR-0053 decision 3)", () => {
+    /** A finding row of any target, written directly (the scan path serves one target per job). */
+    const findingRow = (agentId: string, targetId: string, database: string, object: string, classifier: string) => ({
+      id: randomUUID(),
+      agentId,
+      targetId,
+      locationKey: sha256Hex(`${targetId}/${database}/public/${object}/${classifier}`),
+      engine: "postgres",
+      databaseName: database,
+      schemaName: "public",
+      objectName: object,
+      fieldName: classifier.replace(/\W/g, "_"),
+      classifier,
+      classifiersVersion: "2026.09.1",
+      confidence: 1,
+      sampled: 10,
+      matched: 5,
+      lastBatchId: randomUUID(),
+    });
+    const quiet = (over: Record<string, unknown> = {}) => dumpEvent({ principal: { db_user: "app" }, rows: 99, signals: [], ...over });
+    const named = { database: "crm", schema: "public", object: "audit_log" };
+    const clients = { database: "crm", schema: "public", object: "clients" };
+    const crmStar = { database: "crm", object: "*" };
+    /** crm.clients 10 (email + IBAN), crm.orders 3, hr.staff 15 (card + NIR); others out of reach. */
+    async function seed(auth: Auth): Promise<void> {
+      await scanWith(auth, [finding("email", "pii.email", 1), finding("iban", "pii.iban", 1), finding("phone", "pii.phone", 1, "orders")]);
+      await getDb()
+        .insert(schema.findings)
+        .values([
+          findingRow(auth.agentId, "pg-prod-1", "hr", "staff", "pii.card_number"),
+          findingRow(auth.agentId, "pg-prod-1", "hr", "staff", "pii.nir"),
+          // Another target of the same agent: never read for pg-prod-1.
+          findingRow(auth.agentId, "mysql-crm", "crm", "vault", "secret.aws_key"),
+          findingRow(auth.agentId, "mysql-crm", "crm", "vault", "secret.password_hash"),
+          // A false positive: excluded.
+          findingRow(auth.agentId, "pg-prod-1", "crm", "tokens", "secret.aws_key"),
+          findingRow(auth.agentId, "pg-prod-1", "crm", "tokens", "secret.password_hash"),
+        ]);
+      await getDb().execute(sql`update findings set false_positive_at = now() where agent_id = ${auth.agentId} and object_name = 'tokens'`);
+    }
+
+    it("stores the flag as sent and both scores; an event without it (a 0.8.0 agent) is scored exactly as before", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await send(auth, [
+        quiet({ objects: [named, crmStar], objects_overflowed: true }),
+        quiet({ objects: [{ database: "CRM ", object: "*" }], objects_overflowed: true }),
+        quiet({ objects: [{ database: "*", object: "*" }], objects_overflowed: true }),
+        quiet({ objects: [named, crmStar] }),
+        quiet({ objects: [clients, crmStar], objects_overflowed: true }),
+        quiet({ objects: [{ database: "shop", object: "*" }], objects_overflowed: true }),
+        quiet({ objects: [{ database: "crm", schema: "billing", object: "*" }], objects_overflowed: true }),
+      ]);
+      await drainPolicyWork(getDb());
+      const rows = await eventsOf(auth.agentId);
+      expect(rows.map((r) => r.objectsOverflowed)).toEqual([true, true, true, null, true, true, true]);
+      expect(rows.map((r) => r.sensitivity)).toEqual([0, 0, 0, 0, 10, 0, 0]);
+      expect(rows.map((r) => r.score)).toEqual([0, 0, 0, 0, 20, 0, 0]);
+      expect(rows.map((r) => r.boundSensitivity)).toEqual([10, 10, 15, 0, 10, 0, 10]);
+      expect(rows.map((r) => r.boundScore)).toEqual([20, 20, 30, 0, 20, 0, 20]);
+    });
+
+    it("objects, min_sensitivity and min_score policies see a flagged event through its bound; the incident keeps the named score", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      const byObject = await policy({ objects: { database: "crm", object: "clients" } });
+      const bySensitivity = await policy({ min_sensitivity: 5 });
+      const byScore = await policy({ min_score: 15 });
+      await send(auth, [quiet({ objects: [named, crmStar], objects_overflowed: true }), quiet({ ts: at(1000), principal: { db_user: "old" }, objects: [named, crmStar] })]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list.map((i) => i.policyId).sort()).toEqual([byObject, bySensitivity, byScore].sort());
+      const [first] = await eventsOf(auth.agentId);
+      for (const inc of list) {
+        expect(inc).toMatchObject({ principal: "app", eventDatabase: "crm", accessEventId: first?.id, eventScore: 0, eventBoundScore: 20, eventObjectsOverflowed: true });
+        const [d] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, inc.id));
+        expect(d?.payload).toMatchObject({ access: { score: 0, sensitivity: 0, objects_overflowed: true } });
+      }
+      const view = await getIncident(getDb(), String(list[0]?.id));
+      expect(view?.access).toMatchObject({ score: 0, boundScore: 20, objectsOverflowed: true });
+      const [ev] = await incidentEventViews(getDb(), String(list[0]?.id));
+      expect(ev).toMatchObject({ objectsOverflowed: true, score: 0, boundScore: 20, boundSensitivity: 10 });
+    });
+
+    it("an unflagged event opens incidents exactly as before (no flag, bound = named, payload key false)", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ objects: { database: "crm", object: "*" } });
+      await policy({ objects: { database: "crm", object: "clients" } });
+      await send(auth, [quiet({ objects: [named, crmStar] })]);
+      await drainPolicyWork(getDb());
+      const list = await incidentsOf(auth.agentId);
+      expect(list).toHaveLength(1);
+      expect(list[0]).toMatchObject({ eventScore: 0, eventBoundScore: 0, eventObjectsOverflowed: null, eventDatabase: "crm" });
+      const [d] = await getDb().select().from(notificationDeliveries).where(eq(notificationDeliveries.incidentId, String(list[0]?.id)));
+      expect(d?.payload).toMatchObject({ access: { objects_overflowed: false } });
+      expect((await getIncident(getDb(), String(list[0]?.id)))?.access).toMatchObject({ objectsOverflowed: false, boundScore: 0 });
+    });
+
+    it("the dedup object is the overflow `*` when its bound is the highest: the database `*`", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ min_sensitivity: 1 });
+      await send(auth, [quiet({ objects: [clients, { database: "*", object: "*" }], objects_overflowed: true })]);
+      await drainPolicyWork(getDb());
+      const [inc] = await incidentsOf(auth.agentId);
+      expect(inc).toMatchObject({ eventDatabase: "*", eventScore: 20, eventBoundScore: 30 });
+    });
+
+    it("a location exception covers an overflow `*` only when it covers the whole database", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      const narrow = await policy({ objects: { database: "crm" } });
+      const whole = await policy({ objects: { database: "crm" } });
+      const literal = await policy({ objects: { database: "crm" } });
+      const exception = (policyId: string, location: Record<string, string>) =>
+        createException(getDb(), { policyId, agentId: null, targetId: null, classifier: null, location, reason: "job", expiresAt: null }, actor());
+      await exception(narrow, { database: "crm", object: "clients" });
+      await exception(whole, { database: "crm", schema: "*", object: "*" });
+      await exception(literal, { database: "crm", object: "\\*" });
+      const inHour = async (h: number) =>
+        (await incidentsOf(auth.agentId)).filter((i) => i.eventBucket?.getTime() === T0 - (T0 % HOUR) + h * HOUR).map((i) => i.policyId);
+      await send(auth, [quiet({ objects: [crmStar], objects_overflowed: true })]);
+      await drainPolicyWork(getDb());
+      expect((await inHour(0)).sort()).toEqual([narrow, literal].sort());
+      // The same event without the flag (next hour): `\*` covers its literal `*`, the narrow one does not.
+      await send(auth, [quiet({ ts: at(HOUR), objects: [crmStar] })]);
+      await drainPolicyWork(getDb());
+      expect(await inHour(1)).toEqual([narrow]);
+      // With a named object too, the whole-database exception covers both.
+      await send(auth, [quiet({ ts: at(2 * HOUR), objects: [clients, crmStar], objects_overflowed: true })]);
+      await drainPolicyWork(getDb());
+      expect((await inHour(2)).sort()).toEqual([narrow, literal].sort());
+    });
+
+    it("test obligation 1: a resolved or false-positive incident opened by a flagged event does not hide a later event naming the sensitive object", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ objects: { database: "crm", object: "clients" } });
+      for (const [i, close] of [[0, "resolved"], [1, "false_positive"]] as const) {
+        const principal = { db_user: `etl${i}` };
+        const base = i * 10_000;
+        // The flagged event: named score 0, bound 60 (1 M rows).
+        await send(auth, [quiet({ ts: at(base), principal, objects: [named, crmStar], rows: 1_000_000, objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        const [opened] = (await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user);
+        expect(opened).toMatchObject({ eventScore: 0, eventBoundScore: 60 });
+        if (close === "resolved") await transitionIncident(getDb(), String(opened?.id), "resolved", actor());
+        else await transitionIncident(getDb(), String(opened?.id), "false_positive", actor());
+        // A later flagged event like it is only linked.
+        await send(auth, [quiet({ ts: at(base + 1000), principal, objects: [named, crmStar], rows: 10, objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        expect((await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user)).toHaveLength(1);
+        // An event naming crm.clients (named score 20 < the bound 60, > the incident's 0) opens a new incident.
+        await send(auth, [quiet({ ts: at(base + 2000), principal, objects: [clients], rows: 99 })]);
+        await drainPolicyWork(getDb());
+        const mine = (await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user);
+        expect(mine).toHaveLength(2);
+        expect(mine[1]).toMatchObject({ status: "open", eventScore: 20, eventObjectsOverflowed: null });
+      }
+    });
+
+    it("test obligation 2: after a flagged event joins the overflow incident, a later event above its named score still bypasses the cap", async () => {
+      process.env[EVENT_INCIDENTS_CAP_VAR] = "1";
+      try {
+        const auth = await agentWithTargets();
+        await seed(auth);
+        await policy({ objects: { database: "crm" } });
+        await send(auth, [quiet({ principal: { db_user: "p0" }, objects: [clients], rows: 99 })]);
+        await drainPolicyWork(getDb());
+        // Cap reached: the flagged event (named 0, bound 60) opens the overflow incident.
+        await send(auth, [quiet({ ts: at(1000), principal: { db_user: "p1" }, objects: [named, crmStar], rows: 1_000_000, objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        const [overflow] = (await incidentsOf(auth.agentId)).filter((x) => x.eventOverflow);
+        expect(overflow).toMatchObject({ eventScore: 0, eventBoundScore: 60, eventObjectsOverflowed: true });
+        // A second flagged event joins it: still the named scores only.
+        await send(auth, [quiet({ ts: at(2000), principal: { db_user: "p2" }, objects: [named, crmStar], rows: 1_000_000, objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        const [joined] = (await incidentsOf(auth.agentId)).filter((x) => x.eventOverflow);
+        expect(joined).toMatchObject({ id: overflow?.id, matchCount: 2, eventScore: 0, eventBoundScore: 60 });
+        // Named score 10 (crm.clients, 9 rows): above the overflow's 0, below the bound 60: severe.
+        await send(auth, [quiet({ ts: at(3000), principal: { db_user: "p3" }, objects: [clients], rows: 9 })]);
+        await drainPolicyWork(getDb());
+        const own = (await incidentsOf(auth.agentId)).filter((x) => x.principal === "p3");
+        expect(own).toHaveLength(1);
+        expect(own[0]).toMatchObject({ eventOverflow: false, eventScore: 10 });
+      } finally {
+        delete process.env[EVENT_INCIDENTS_CAP_VAR];
+      }
+    });
+
+    it("security review M1: a closed incident of the bound's database does not absorb a flagged event that the named objects' scope would open", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ min_sensitivity: 1 });
+      const staff = { database: "hr", schema: "public", object: "staff" };
+      const hrStar = { database: "hr", object: "*" };
+      for (const [i, close] of [[0, "false_positive"], [1, "resolved"]] as const) {
+        const principal = { db_user: `m1-${i}` };
+        const base = i * 10_000;
+        // An incident on hr (score 90), then closed.
+        await send(auth, [quiet({ ts: at(base), principal, objects: [staff], rows: 1_000_000 })]);
+        await drainPolicyWork(getDb());
+        const [onHr] = (await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user);
+        expect(onHr).toMatchObject({ eventDatabase: "hr", eventScore: 90 });
+        await transitionIncident(getDb(), String(onHr?.id), close, actor());
+        // Flagged: the bound picks hr (15 > 10), the named objects crm (named score 20 < 90).
+        await send(auth, [quiet({ ts: at(base + 1000), principal, objects: [clients, hrStar], objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        const mine = (await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user);
+        expect(mine.map((x) => x.eventDatabase)).toEqual(["hr", "crm"]);
+        expect(mine[1]).toMatchObject({ status: "open", eventScore: 20, eventBoundScore: 30, eventObjectsOverflowed: true });
+        // A second one joins the open crm incident, not the closed hr one.
+        await send(auth, [quiet({ ts: at(base + 2000), principal, objects: [clients, hrStar], objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        const after = (await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user);
+        expect(after).toHaveLength(2);
+        expect(after[1]?.matchCount).toBe(2);
+        // Once the crm incident is closed too and the event is no worse, it is linked to hr's, as before.
+        await transitionIncident(getDb(), String(after[1]?.id), "resolved", actor());
+        const links = await incidentEventCount(getDb(), String(onHr?.id));
+        await send(auth, [quiet({ ts: at(base + 3000), principal, objects: [clients, hrStar], objects_overflowed: true })]);
+        await drainPolicyWork(getDb());
+        expect((await incidentsOf(auth.agentId)).filter((x) => x.principal === principal.db_user)).toHaveLength(2);
+        expect(await incidentEventCount(getDb(), String(onHr?.id))).toBe(links + 1);
+      }
+    });
+
+    it("re-review N1: with both scopes closed as false positives, split flagged reads still count against the named scope's false positive", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      await policy({ min_sensitivity: 1 });
+      const principal = { db_user: "splitter" };
+      const staff = { database: "hr", schema: "public", object: "staff" };
+      // hr: score 90 over 1 M rows; crm: score 20.04 over 100 rows; both marked false positives.
+      await send(auth, [quiet({ principal, objects: [staff], rows: 1_000_000 }), quiet({ ts: at(1000), principal, objects: [clients], rows: 100 })]);
+      await drainPolicyWork(getDb());
+      const before = await incidentsOf(auth.agentId);
+      expect(before.map((x) => x.eventDatabase).sort()).toEqual(["crm", "hr"]);
+      for (const inc of before) await transitionIncident(getDb(), inc.id, "false_positive", actor());
+      // Flagged reads of 60 rows (named score 17.85 < 20.04): the bound picks hr, the named objects crm.
+      const split = (i: number) => quiet({ ts: at(2000 + i * 1000), principal, objects: [clients, { database: "hr", object: "*" }], rows: 60, objects_overflowed: true });
+      await send(auth, [split(0)]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(2);
+      const crm = before.find((x) => x.eventDatabase === "crm");
+      const hr = before.find((x) => x.eventDatabase === "hr");
+      expect(await incidentEventCount(getDb(), String(crm?.id))).toBe(2);
+      expect(await incidentEventCount(getDb(), String(hr?.id))).toBe(2);
+      // 120 rows since the mark, above crm's 100: an incident opens under crm.
+      await send(auth, [split(1)]);
+      await drainPolicyWork(getDb());
+      const after = await incidentsOf(auth.agentId);
+      expect(after).toHaveLength(3);
+      expect(after[2]).toMatchObject({ status: "open", eventDatabase: "crm", eventObjectsOverflowed: true });
+    });
+
+    it("security review L1: whole-target bounds are cached per process and read again when the target's findings change", async () => {
+      const auth = await agentWithTargets();
+      await seed(auth);
+      const inner = engine.boundedWholeTargetCache();
+      const set = vi.fn(inner.set);
+      const cache = { get: inner.get, set };
+      const events = [{ agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database: "*", object: "*" }], objectsOverflowed: true }];
+      const read = () => getDb().transaction((tx) => engine.loadDatabaseBounds(tx, events, undefined, cache));
+      const uncached = () => getDb().transaction((tx) => engine.loadDatabaseBounds(tx, events));
+      const both = async () => {
+        const [a, b] = [await read(), await uncached()];
+        for (const db of ["*", "crm", "hr"]) expect(a.get(auth.agentId, "pg-prod-1", db), db).toBe(b.get(auth.agentId, "pg-prod-1", db));
+        return a.get(auth.agentId, "pg-prod-1", "*");
+      };
+      expect(await both()).toBe(15);
+      expect(set).toHaveBeenCalledTimes(1);
+      expect(await both()).toBe(15);
+      expect(set).toHaveBeenCalledTimes(1);
+      // A new finding: read again.
+      await getDb().insert(schema.findings).values([findingRow(auth.agentId, "pg-prod-1", "hr", "staff", "secret.aws_key")]);
+      expect(await both()).toBe(25);
+      expect(set).toHaveBeenCalledTimes(2);
+      // A confidence change (a rescan), then a false-positive mark: read again each time.
+      await getDb().execute(sql`update findings set confidence = 0.5 where agent_id = ${auth.agentId} and classifier = 'secret.aws_key' and object_name = 'staff'`);
+      expect(await both()).toBe(20);
+      await getDb().execute(sql`update findings set false_positive_at = now() where agent_id = ${auth.agentId} and object_name = 'staff'`);
+      expect(await both()).toBe(10);
+      // And back (the mark reset).
+      await getDb().execute(sql`update findings set false_positive_at = null where agent_id = ${auth.agentId} and object_name = 'staff'`);
+      expect(await both()).toBe(20);
+      expect(set).toHaveBeenCalledTimes(5);
+      // A per-database request of a cached target is served from it too.
+      const perDb = await getDb().transaction((tx) => engine.loadDatabaseBounds(tx, [...events, { ...events[0]!, objects: [{ database: "crm", object: "*" }] }], undefined, cache));
+      expect(perDb.get(auth.agentId, "pg-prod-1", "crm")).toBe(10);
+      expect(set).toHaveBeenCalledTimes(5);
+    });
+
+    it("test obligation 3: the per-database lookup folds names, reads only the event's target, and gives the same result through the ASCII fallback", async () => {
+      // `undefined`: probed (this database's `lower`); `false`: the `C`-ctype fallback forced
+      // (event-engine-c-locale.test.ts runs the same rows on a `C` database).
+      const auth = await agentWithTargets();
+      await getDb()
+        .insert(schema.findings)
+        .values([
+          findingRow(auth.agentId, "pg-prod-1", "Crm", "a", "pii.email"),
+          findingRow(auth.agentId, "pg-prod-1", "ΒΆΣΗ", "b", "pii.iban"),
+          findingRow(auth.agentId, "pg-prod-1", "Krm", "c", "pii.phone"),
+          findingRow(auth.agentId, "mysql-crm", "crm", "z", "secret.aws_key"),
+          findingRow(auth.agentId, "mysql-crm", "βάση", "z", "secret.aws_key"),
+        ]);
+      const star = (database: string) => ({ agentId: auth.agentId, targetId: "pg-prod-1", objects: [{ database, object: "*" }], objectsOverflowed: true });
+      for (const unicodeLower of [undefined, false]) {
+        const bounds = await getDb().transaction((tx) => engine.loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none"), star("*")], unicodeLower));
+        expect(bounds.get(auth.agentId, "pg-prod-1", "crm  ")).toBe(3);
+        expect(bounds.get(auth.agentId, "pg-prod-1", "Βάση")).toBe(7);
+        expect(bounds.get(auth.agentId, "pg-prod-1", "KRM")).toBe(3);
+        expect(bounds.get(auth.agentId, "pg-prod-1", "none")).toBe(0);
+        expect(bounds.get(auth.agentId, "pg-prod-1", "*")).toBe(7);
+        expect(bounds.get(auth.agentId, "mysql-crm", "crm")).toBe(0);
+      }
+      // Without the database `*` (which reads the whole target), the per-database pre-filter alone.
+      for (const unicodeLower of [undefined, false]) {
+        const only = await getDb().transaction((tx) => engine.loadDatabaseBounds(tx, [star("CRM "), star("βάση"), star("krm"), star("none")], unicodeLower));
+        expect([only.get(auth.agentId, "pg-prod-1", "crm"), only.get(auth.agentId, "pg-prod-1", "ΒΆΣΗ"), only.get(auth.agentId, "pg-prod-1", "krm")]).toEqual([3, 7, 3]);
+        expect(only.get(auth.agentId, "pg-prod-1", "*")).toBe(0);
+      }
+      // Unflagged events read nothing.
+      const none = await getDb().transaction((tx) => engine.loadDatabaseBounds(tx, [{ ...star("crm"), objectsOverflowed: null }]));
+      expect(none.get(auth.agentId, "pg-prod-1", "crm")).toBe(0);
+    });
+  });
+
   it("exit criterion path: an accepted pg_dump batch wakes a real pg-boss worker, which opens the incident within seconds", async () => {
     const { url } = await createRuntimeRole();
     const boss = new PgBoss(pgBossOptions(url));
@@ -937,13 +1378,26 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
     const pool = new Pool({ connectionString: url, max: 2 });
     try {
       const db = drizzle(pool, { schema });
-      const body = { batch_id: uuidv7(), events: [dumpEvent(), dumpEvent({ ts: at(1000) })] };
+      // ADR-0053: the second event is flagged, so the bound columns and the incident flag are written too.
+      const flagged = dumpEvent({ ts: at(1000), objects: [{ database: "crm", schema: "public", object: "clients" }, { database: "crm", object: "*" }], objects_overflowed: true });
+      const body = { batch_id: uuidv7(), events: [dumpEvent(), flagged] };
       expect(await ingestEvents(db, auth.agentId, body as never)).toMatchObject({ kind: "accepted", duplicate: false });
       expect(await ingestEvents(db, auth.agentId, body as never)).toMatchObject({ kind: "accepted", duplicate: true });
       const stats = await drainPolicyWork(db);
       expect(stats.events).toBeGreaterThanOrEqual(2);
       const [inc] = await incidentsOf(auth.agentId);
       expect(inc?.matchCount).toBe(2);
+      expect(inc).toMatchObject({ eventObjectsOverflowed: true });
+      expect((await eventsOf(auth.agentId)).map((e) => [e.objectsOverflowed, e.boundScore !== null])).toEqual([[null, true], [true, true]]);
+      await expect(pool.query("update access_events set objects_overflowed = true")).rejects.toThrow(/permission denied/);
+      // Security review L2: the column grants of migration 0043, and nothing more.
+      const { rows: privs } = await pool.query<{ flag: boolean; bound: boolean; inc_flag: boolean; inc_bound: boolean }>(`
+        select has_column_privilege(current_user, 'public.access_events', 'objects_overflowed', 'UPDATE') as flag,
+               has_column_privilege(current_user, 'public.access_events', 'bound_score', 'UPDATE')
+                 and has_column_privilege(current_user, 'public.access_events', 'bound_sensitivity', 'UPDATE') as bound,
+               has_column_privilege(current_user, 'public.incidents', 'event_objects_overflowed', 'UPDATE') as inc_flag,
+               has_column_privilege(current_user, 'public.incidents', 'event_bound_score', 'UPDATE') as inc_bound`);
+      expect(privs[0]).toEqual({ flag: false, bound: true, inc_flag: true, inc_bound: true });
       expect(await transitionIncident(db, String(inc?.id), "resolved", actor())).toMatchObject({ outcome: "ok" });
       const r = await configureAudit(db, auth.agentId, "pg-prod-1", { enabled: true, aggregationWindowS: 60, pollIntervalS: 10, minRows: null, deriveFromFindings: true, manualObjects: [], confirm: null }, actor());
       expect(r.outcome).toBe("queued");

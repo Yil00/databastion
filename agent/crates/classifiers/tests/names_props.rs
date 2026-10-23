@@ -5,9 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use databastion_classifiers::names::{
-    MAX_INDEX_DIGITS, MAX_TOTAL_DIGITS, NormalizedName, PathPart, conforms, is_numeric_like,
-    longest_digit_run, normalize_field_path, normalize_ldap_attribute, normalize_ldap_dn,
-    normalize_path, violates_numeric_rule,
+    MAX_INDEX_DIGITS, MAX_TOTAL_DIGITS, NormalizedName, PathPart, conforms, is_identifier_produced,
+    is_numeric_like, longest_digit_run, normalize_field_path, normalize_ldap_attribute,
+    normalize_ldap_dn, normalize_path, produced_violations, violates_numeric_rule,
 };
 
 /// xorshift64*: reproducible, dependency-free.
@@ -102,6 +102,19 @@ const ALPHABET: &[&str] = &[
     "两",
     "拾",
     "陆壹贰叁肆伍陆柒捌",
+    // ADR-0057: MAC and IPv4 shapes, short separated runs, other digits,
+    // spaces and dashes, an unassigned code point.
+    "001a",
+    "2b3c",
+    "face",
+    "1_2",
+    "3-4",
+    "\u{A0}",
+    "\u{2010}",
+    "\u{FF0E}",
+    "\u{663}",
+    "\u{2165}",
+    "\u{378}",
 ];
 
 fn random_input(rng: &mut Rng) -> String {
@@ -142,6 +155,11 @@ fn check(input: &str, name: &NormalizedName) {
         "{input:?} -> {s:?} violates `not`"
     );
     assert!(conforms(s));
+    assert!(
+        is_identifier_produced(s),
+        "{input:?} -> {s:?} violates IdentifierProduced: {:?}",
+        produced_violations(s)
+    );
     assert!(
         longest_digit_run(s) <= MAX_INDEX_DIGITS,
         "{input:?} -> {s:?} keeps more than 6 consecutive digits"
@@ -333,6 +351,10 @@ mod gate {
         assert!(
             databastion_protocol::Identifier::try_from(out).is_ok() && conforms(out),
             "{input:?} -> {out:?} does not match Identifier"
+        );
+        assert!(
+            databastion_classifiers::names::is_identifier_produced(out),
+            "{input:?} -> {out:?} does not match IdentifierProduced"
         );
         assert!(
             !violates_numeric_rule(out),

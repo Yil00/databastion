@@ -3,6 +3,7 @@
 
 use super::*;
 use records::tests::rec;
+use zeroize::Zeroizing;
 
 const P1: &str = "N'/var/opt/mssql/audit/a_B5BEF79B-88AC-4A47-91AE-0081BBD71D51_*.sqlaudit'";
 
@@ -623,6 +624,7 @@ impl AuditFiles {
             let read = files.read(&c, top, skip);
             let returned = read.len();
             let got = batch(&c, read, returned, top, file_key);
+            assert!(!got.out_of_order, "the simulated server keeps file order");
             gap |= got.gap;
             seen.extend(got.kept.iter().map(|r| r.time_us));
             c = got.next;
@@ -705,6 +707,461 @@ proptest::proptest! {
         proptest::prop_assert!(!gap);
         proptest::prop_assert_eq!(seen, (0..total).collect::<Vec<_>>());
     }
+}
+
+/// #255 review: the latest time handled ([`advance_seen`]) is shared by
+/// both sources; records a read ends before (the deferral cut) are not
+/// seen yet, and an earlier, higher time is kept.
+#[test]
+fn advance_seen_stops_at_the_cut() {
+    let handled = [(0, 50), (1, 70), (2, 60), (3, 900), (4, 80)];
+    assert_eq!(advance_seen(None, &handled, None), Some(900));
+    assert_eq!(
+        advance_seen(None, &handled, Some(3)),
+        Some(70),
+        "the build at 3 is read again"
+    );
+    assert_eq!(
+        advance_seen(Some(40), &handled, Some(0)),
+        Some(40),
+        "a cut at the first record"
+    );
+    assert_eq!(advance_seen(None, &handled, Some(0)), None);
+    assert_eq!(
+        advance_seen(Some(1_000), &handled, None),
+        Some(1_000),
+        "never goes back"
+    );
+    assert_eq!(advance_seen(Some(5), &[], None), Some(5));
+    // The next read, from the build, sees it and what follows.
+    let next = [(0, 900), (1, 80)];
+    assert_eq!(advance_seen(Some(70), &next, None), Some(900));
+}
+
+/// #255 review: with the deferral cut, through the history rule. A first
+/// start's backlog holds a deferred build stamped far ahead of the
+/// records after it (its statement completed late): had the cut read
+/// counted the build, the records after it, read again by the next read,
+/// would class below the latest time seen by more than the tolerance and
+/// be counted as dropped. With the cut, they are history.
+#[test]
+fn the_deferral_cut_keeps_the_history_boundary() {
+    let mut c = Cursor::default();
+    c.first_start(Some(100_000_000_000), 0);
+    let delay = Duration::from_secs(1);
+    // Read 1: records 0, 1, then the build (2) the read ends before, then
+    // 3 and 4 (cut away), all below the first start.
+    let times = [
+        10_000_000_000,
+        10_000_100_000,
+        20_000_000_000,
+        10_000_200_000,
+        10_000_300_000,
+    ];
+    let handled: Vec<(usize, i64)> = times.iter().copied().enumerate().collect();
+    let mut seen = c.max_seen_us;
+    for t in &times[..2] {
+        assert_eq!(c.below(*t, seen, delay), Some(Below::History));
+        seen = Cursor::seen(seen, *t);
+    }
+    c.max_seen_us = advance_seen(c.max_seen_us, &handled, Some(2));
+    assert_eq!(c.max_seen_us, Some(10_000_100_000));
+    // Read 2, from the build: the build (paired now) and the records after
+    // it are classed in read order against the boundary of read 1.
+    let mut seen = c.max_seen_us;
+    let mut classes = Vec::new();
+    for t in &times[2..] {
+        classes.push(c.below(*t, seen, delay));
+        seen = Cursor::seen(seen, *t);
+    }
+    assert_eq!(classes[0], Some(Below::History), "the build");
+    // Inside one read, records stamped earlier than a build before them
+    // are still classed by order (as they would be without any cut).
+    assert_eq!(classes[1], Some(Below::Dropped));
+    // Without the cut, read 1 would have seen the build: the records the
+    // next read classes from the build on are compared to its time.
+    let without = advance_seen(None, &handled, None);
+    assert_eq!(without, Some(20_000_000_000));
+    assert_eq!(
+        c.below(times[3], without, delay),
+        Some(Below::Dropped),
+        "what the cut avoids for the records read again"
+    );
+}
+
+/// #253 review L1: the order the server-side skip relies on is checked at
+/// run time; any other order, or a name whose order cannot be read, is a
+/// gap.
+#[test]
+fn reads_out_of_file_order_are_gaps() {
+    let folder = "/var/opt/mssql/audit/";
+    let (a, b) = (f(folder, 1), f(folder, 2));
+    let c = Cursor::default();
+    let ok = pos(&[(&a, 4096), (&a, 4096), (&a, 8192), (&b, 4096)]);
+    assert!(in_file_order(&c, &ok, file_key));
+    assert!(in_file_order(&c, &[], file_key));
+    let back = pos(&[(&a, 8192), (&a, 4096)]);
+    assert!(!in_file_order(&c, &back, file_key), "an offset going back");
+    let files = pos(&[(&b, 4096), (&a, 8192)]);
+    assert!(
+        !in_file_order(&c, &files, file_key),
+        "an older file after a newer"
+    );
+    let odd = pos(&[(&a, 4096), ("/var/opt/mssql/audit/other.sqlaudit", 8192)]);
+    assert!(
+        !in_file_order(&c, &odd, file_key),
+        "a name without an order key"
+    );
+    // A read starts after the position's buffer.
+    let at_pos = Cursor {
+        file: Some(a.clone()),
+        offset: 8192,
+        ..Cursor::default()
+    };
+    assert!(in_file_order(&at_pos, &pos(&[(&a, 12_288)]), file_key));
+    assert!(in_file_order(&at_pos, &pos(&[(&b, 4096)]), file_key));
+    assert!(
+        !in_file_order(&at_pos, &pos(&[(&a, 8192)]), file_key),
+        "the position's buffer"
+    );
+    assert!(
+        !in_file_order(&at_pos, &pos(&[(&a, 4096)]), file_key),
+        "before the position"
+    );
+    // Not before the buffer whose first records the server skipped.
+    let skipping = Cursor {
+        file: Some(a.clone()),
+        offset: 4096,
+        skip: 3,
+        buffer: Some((a.clone(), 12_288)),
+        ..Cursor::default()
+    };
+    assert!(in_file_order(&skipping, &pos(&[(&a, 12_288)]), file_key));
+    assert!(in_file_order(&skipping, &pos(&[(&b, 4096)]), file_key));
+    assert!(
+        !in_file_order(&skipping, &pos(&[(&a, 8192)]), file_key),
+        "before the skipped buffer"
+    );
+    // Through `batch`: the flag, the records kept (read, reported: loud).
+    let got = batch(&c, vec![at(&b, 4096), at(&a, 4096)], 2, 500, file_key);
+    assert!(got.out_of_order);
+    assert_eq!(got.kept.len(), 2);
+    let got = batch(&c, vec![at(&a, 4096), at(&b, 4096)], 2, 500, file_key);
+    assert!(!got.out_of_order);
+    // The Extended Events file names.
+    let (x, y) = ("/x/databastion_xe_0_133.xel", "/x/databastion_xe_0_134.xel");
+    assert!(in_file_order(
+        &c,
+        &pos(&[(x, 4096), (y, 4096)]),
+        sql::xe_file_key
+    ));
+    assert!(!in_file_order(
+        &c,
+        &pos(&[(y, 4096), (x, 4096)]),
+        sql::xe_file_key
+    ));
+}
+
+/// The reads of [`AuditFiles`] from the first start, with rows the reader
+/// cannot parse (`malformed`, by index in the set: returned by the server,
+/// dropped and counted by the reader): the records kept per read, the
+/// malformed rows met, and whether a gap or a read out of order was seen.
+fn walk_reads(
+    mut files: AuditFiles,
+    batch_size: usize,
+    per_poll: usize,
+    malformed: &[usize],
+) -> (Vec<Vec<Record>>, usize, bool) {
+    let mut c = Cursor::default();
+    let mut reads = Vec::new();
+    let mut met = 0;
+    let mut gap = false;
+    loop {
+        let (top, skip) = request(&c, batch_size);
+        let rows = files.read(&c, top, skip);
+        let returned = rows.len();
+        let parsed: Vec<Record> = rows
+            .into_iter()
+            .filter(|r| {
+                let bad = malformed.contains(&usize::try_from(r.transaction).unwrap());
+                met += usize::from(bad);
+                !bad
+            })
+            .collect();
+        let got = batch(&c, parsed, returned, top, file_key);
+        assert!(!got.out_of_order, "the simulated server keeps file order");
+        gap |= got.gap;
+        reads.push(got.kept);
+        c = got.next;
+        if !got.full {
+            if files.visible == files.buffers.len() {
+                return (reads, met, gap);
+            }
+            files.visible = (files.visible + per_poll).min(files.buffers.len());
+        }
+    }
+}
+
+/// [`AuditFiles`] whose records carry their index as transaction id (each
+/// its own statement).
+fn indexed(buffers: Vec<(String, i64, usize)>) -> AuditFiles {
+    let mut files = AuditFiles::new(buffers, 0);
+    for (i, r) in files.all.iter_mut().enumerate() {
+        r.transaction = i64::try_from(i).unwrap();
+    }
+    files
+}
+
+/// #253 review L2, unparsed rows: the skip counts the records read while
+/// the server skips rows, so a row of a buffer still being walked that
+/// cannot be parsed makes the next read start one row early: no record is
+/// lost, and at most one per such row is read twice (each meeting of the
+/// row is counted as dropped).
+#[test]
+fn unparsed_rows_lose_no_record() {
+    let folder = "/var/opt/mssql/audit/";
+    let a = f(folder, 134_366_529_617_000_000);
+    let buffers = vec![(a.clone(), 4096, 700), (a.clone(), 512_000, 300)];
+    let total: usize = 1000;
+    for malformed in [vec![10], vec![499], vec![505, 650], vec![0, 1, 2, 703]] {
+        for batch_size in [16, 250, BATCH] {
+            let (reads, met, gap) = walk_reads(indexed(buffers.clone()), batch_size, 1, &malformed);
+            assert!(!gap);
+            let mut ids: Vec<i64> = reads.iter().flatten().map(|r| r.transaction).collect();
+            let handled = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            let want: Vec<i64> = (0..total)
+                .filter(|i| !malformed.contains(i))
+                .map(|i| i64::try_from(i).unwrap())
+                .collect();
+            assert_eq!(ids, want, "{malformed:?}, {batch_size}: none lost");
+            let twice = handled - want.len();
+            let again = met - malformed.len();
+            assert!(
+                twice + again <= malformed.len(),
+                "{malformed:?}, {batch_size}: bounded"
+            );
+            assert!(met >= malformed.len(), "every malformed row is counted");
+        }
+    }
+}
+
+/// #253 review L2, a statement split across a read boundary: the records
+/// of one statement (one per object, one `event_time`) cut by a full
+/// read give one event per read, each with its objects, none lost; a long
+/// text whose first part was in the earlier read is cut (`*`, always
+/// reported), never silently dropped.
+#[test]
+fn a_statement_split_across_reads_gives_two_events() {
+    let folder = "/var/opt/mssql/audit/";
+    let a = f(folder, 134_366_529_617_000_000);
+    let mut files = indexed(vec![(a.clone(), 4096, 40), (a.clone(), 8192, 10)]);
+    // Records 14 to 17: one statement reading four tables (a join).
+    for (k, r) in files.all.iter_mut().enumerate().skip(14).take(4) {
+        r.time_us = 14;
+        r.transaction = 14;
+        r.object = format!("t{k}");
+        r.statement = Zeroizing::new("SELECT * FROM t14 JOIN t15 JOIN t16 JOIN t17".to_owned());
+    }
+    // Records 30 and 31: one long text in two parts.
+    for (k, r) in files.all.iter_mut().enumerate().skip(30).take(2) {
+        r.time_us = 30;
+        r.transaction = 30;
+        r.group = "0x1e".to_owned();
+        r.sequence = i64::try_from(k - 29).unwrap();
+        r.statement = Zeroizing::new(
+            if k == 30 {
+                "SELECT a FROM crm.customers "
+            } else {
+                "WHERE b = 1"
+            }
+            .to_owned(),
+        );
+    }
+    let (reads, _, gap) = walk_reads(files, 16, 1, &[]);
+    assert!(!gap);
+    let statements: Vec<Vec<Statement>> = reads
+        .into_iter()
+        .map(|r| records::group(records::reassemble(r)))
+        .collect();
+    // Reads of 16: records 0..16, then 16..32: the join is split 2 + 2.
+    let join: Vec<(usize, usize)> = statements
+        .iter()
+        .enumerate()
+        .flat_map(|(i, ss)| {
+            ss.iter()
+                .filter(|s| s.head.transaction == 14)
+                .map(move |s| (i, s.objects.len()))
+        })
+        .collect();
+    // (The first read finds nothing written yet.)
+    assert_eq!(
+        join,
+        [(1, 2), (2, 2)],
+        "one event per read, every object kept"
+    );
+    // The two parts of the long text: in one read here (16..32), one event.
+    let long: Vec<bool> = statements
+        .iter()
+        .flatten()
+        .filter(|s| s.head.transaction == 30)
+        .map(|s| s.head.cut)
+        .collect();
+    assert_eq!(long, [false]);
+
+    // Cut between its two parts (reads of 31: 30 ends the first read),
+    // the second part alone is a cut text: a read of `*`, always reported.
+    let mut files = indexed(vec![(a.clone(), 4096, 40), (a, 8192, 10)]);
+    for (k, r) in files.all.iter_mut().enumerate().skip(30).take(2) {
+        r.time_us = 30;
+        r.transaction = 30;
+        r.group = "0x1e".to_owned();
+        r.sequence = i64::try_from(k - 29).unwrap();
+        r.statement = Zeroizing::new(
+            if k == 30 {
+                "SELECT a FROM crm.customers "
+            } else {
+                "WHERE b = 1"
+            }
+            .to_owned(),
+        );
+    }
+    let (reads, _, _) = walk_reads(files, 31, 1, &[]);
+    let parts: Vec<Statement> = reads
+        .into_iter()
+        .flat_map(|r| records::group(records::reassemble(r)))
+        .filter(|s| s.head.transaction == 30)
+        .collect();
+    assert_eq!(parts.len(), 2, "one event per read");
+    assert!(!parts[0].head.cut && parts[1].head.cut);
+    let (ev, _) = records::convert(&parts[1]).unwrap();
+    assert!(ev.always_report(), "the cut part is always reported");
+}
+
+/// End-of-phase-9 review L5: the 24 h gap memory survives an agent
+/// restart (another `Shared`, as in the next process), so the target does
+/// not show Partial again before the 24 h after a gap are over.
+#[test]
+fn the_gap_memory_survives_a_restart() {
+    let t = "gap-test";
+    let before = Shared::default();
+    before.note_gap(t);
+    before.note_dropped(t, 3);
+    let bytes = before.encode_gap(t);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.starts_with("v1\ngap ") && text.contains("\ndropped 3 "),
+        "{text}"
+    );
+
+    let after = Shared::default();
+    assert!(!after.facts(t).gap);
+    after.restore_gap(t, &bytes);
+    let f = after.facts(t);
+    assert!(f.gap, "the gap is remembered");
+    assert_eq!(f.dropped, 3);
+    // A stream restarted in the same process: not counted twice.
+    after.restore_gap(t, &bytes);
+    assert_eq!(after.facts(t).dropped, 3);
+    after.note_dropped(t, 1);
+    after.restore_gap(t, &bytes);
+    assert_eq!(after.facts(t).dropped, 4);
+
+    // Older than 24 h: forgotten.
+    let old_ms = agent_now_ms() - i64::try_from(FRESHNESS.as_millis()).unwrap() - 1_000;
+    let other = Shared::default();
+    other.restore_gap(
+        t,
+        format!("v1\ngap {old_ms}\ndropped 5 {old_ms}\n").as_bytes(),
+    );
+    let f = other.facts(t);
+    assert!(!f.gap && f.dropped == 0);
+    // Ahead of the agent's clock (it went back): counted from now.
+    let ahead = agent_now_ms() + 3_600_000;
+    other.restore_gap(t, format!("v1\ngap {ahead}\n").as_bytes());
+    assert!(other.facts(t).gap);
+    // Nothing to remember: an empty memory.
+    assert_eq!(Shared::default().encode_gap(t), b"v1\n");
+    // A file not understood is a gap now (review of #276, L4).
+    for bad in [
+        "",
+        "v2\n",
+        "v1\ngap x\n",
+        "v1\ngap 1 2\n",
+        "v1\nother 1\n",
+        "v1\ndropped 1\n",
+    ] {
+        let s = Shared::default();
+        s.restore_gap(t, bad.as_bytes());
+        let f = s.facts(t);
+        assert!(f.gap && f.dropped == 1, "{bad:?}");
+        assert!(decode_gap(bad.as_bytes()).is_none(), "{bad:?}");
+    }
+    // The level rule reads the restored gap: Limited, not Partial.
+    let s = Shared::default();
+    s.restore_gap(t, &bytes);
+    assert!(s.facts(t).gap);
+}
+
+/// #276 review L6: the stream-level wiring of a read's faults, on both
+/// sources: a read out of file order and a buffer over the bound are each
+/// a gap with one dropped record; a clean read notes nothing.
+#[test]
+fn read_faults_are_gaps_on_both_sources() {
+    for source in [Source::Audit, Source::Xevents] {
+        let state = CheckState::default();
+        let t = "faults-test";
+        note_read_faults(&state, t, source, false, false);
+        let facts = state.audit.facts(t);
+        assert!(!facts.gap && facts.dropped == 0, "{source:?}");
+        note_read_faults(&state, t, source, false, true);
+        let facts = state.audit.facts(t);
+        assert!(facts.gap && facts.dropped == 1, "{source:?}: out of order");
+        assert_eq!(state.audit.out_of_order_reads(t), 1);
+        note_read_faults(&state, t, source, true, true);
+        assert_eq!(state.audit.facts(t).dropped, 3, "{source:?}: both");
+        // From a batch out of order, through `batch`.
+        let folder = "/var/opt/mssql/audit/";
+        let got = batch(
+            &Cursor::default(),
+            vec![at(&f(folder, 2), 4096), at(&f(folder, 1), 4096)],
+            2,
+            500,
+            file_key,
+        );
+        let state = CheckState::default();
+        note_read_faults(&state, t, source, got.gap, got.out_of_order);
+        assert!(state.audit.facts(t).gap, "{source:?}");
+    }
+}
+
+/// Only reads of the history itself are paced as a history walk: once a
+/// record of after the first start was handled, the stream is behind live
+/// records, though the history phase lasts until a read that is not full.
+#[test]
+fn the_history_walk_ends_at_the_first_live_record() {
+    let mut c = Cursor::default();
+    assert!(!c.walking_history(), "no first start");
+    c.first_start(Some(1_000_000), 20_000);
+    assert!(c.walking_history(), "nothing read yet");
+    c.max_seen_us = Some(999_999);
+    assert!(c.walking_history(), "history only");
+    // Review L2: the threshold of `below` (the floor, the start plus the
+    // clock skew): a record within the skew is still history.
+    c.max_seen_us = Some(1_019_999);
+    assert!(c.walking_history(), "within the skew");
+    assert_eq!(
+        c.below(1_019_999, None, Duration::ZERO),
+        Some(Below::History)
+    );
+    c.max_seen_us = Some(1_020_000);
+    assert_eq!(c.below(1_020_000, None, Duration::ZERO), None);
+    assert!(!c.walking_history(), "a record at the floor");
+    assert!(c.history_us.is_some(), "the history phase goes on");
+    c.max_seen_us = Some(5);
+    c.history_us = None;
+    assert!(!c.walking_history(), "after the history phase");
 }
 
 /// 0.8.1 hotfix: a read over the response bound halves down to
@@ -806,7 +1263,7 @@ async fn a_response_over_the_byte_bound_leaves_the_session_usable() {
 
 /// A real `ResourceLimit` with the session poisoned: a response over the
 /// byte bound whose cancel is never acknowledged (the server closes).
-async fn poisoned_bound() -> SsError {
+pub(crate) async fn poisoned_bound() -> SsError {
     use crate::conn::{Flow, Shape, tests::scripted};
     use crate::token::{done, tests::build, tok};
 

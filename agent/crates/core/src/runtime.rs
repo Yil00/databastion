@@ -318,6 +318,21 @@ struct Counters {
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
+    /// Batches (counted per **batch**) whose gated fields a known console
+    /// set does not list, stripped at send time (ADR-0053 decision 2).
+    gated_fields_stripped_at_send: AtomicU64,
+    /// Findings (counted per **finding**, not per batch) whose
+    /// `Location.altered` was stripped at send time because the console's
+    /// capabilities were not known: no heartbeat answer yet, or any clear
+    /// since the last answer, a clear that did not start a hold included
+    /// (`Snapshot::known`). Findings are never held for them (ADR-0056
+    /// decision 2 item 3); counted apart from
+    /// `gated_fields_stripped_at_send` so the size of that residual is
+    /// visible.
+    findings_stripped_capabilities_unknown: AtomicU64,
+    /// Batches resent without `objects_overflowed` after the console found
+    /// a flagged event naming no `*` (ADR-0053; never expected).
+    overflow_flags_refused: AtomicU64,
     /// Scans whose terminal status was sent while some of their findings
     /// batches were still spooled (flush wait elapsed, or `/findings`
     /// parked).
@@ -1177,11 +1192,35 @@ impl Runtime {
                     r2026_10_b: self
                         .console_caps
                         .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_B),
+                    r2026_10_c: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_C),
                 },
             )
         } else {
             Vec::new()
         };
+        // ADR-0055: how names compare, for `mysql`, `mariadb` and
+        // `sqlserver` targets only, decided by the console's latest
+        // `accepts` alone (contract review I-4). Once listed, always sent
+        // (decision 2, security review M1): the connector's last value of
+        // the server run, kept across a failed, timed-out or skipped check,
+        // else `unknown` for both parts; never omitted. A gated field
+        // (`capabilities::strip_gated_target_status`).
+        let name_case = (matches!(
+            target.engine,
+            crate::config::TargetEngine::Mysql
+                | crate::config::TargetEngine::Mariadb
+                | crate::config::TargetEngine::Sqlserver
+        ) && self
+            .console_caps
+            .console_accepts(crate::capabilities::token::TARGET_STATUS_NAME_CASE))
+        .then(|| {
+            let report = connector
+                .and_then(|c| c.name_case(target))
+                .unwrap_or_else(crate::name_case::NameCaseReport::unknown);
+            crate::name_case::to_protocol(&report)
+        });
         let status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
@@ -1189,6 +1228,7 @@ impl Runtime {
             engine: proto_engine(target.engine),
             last_error,
             metrics: None,
+            name_case,
             notes,
             reachable,
             server_version: connector
@@ -1237,6 +1277,15 @@ impl Runtime {
             ("connector_panics_total", &c.connector_panics),
             ("audit_records_skipped_total", &c.audit_records_skipped),
             ("gated_fields_stripped_total", &c.gated_fields_stripped),
+            (
+                "gated_fields_stripped_at_send_total",
+                &c.gated_fields_stripped_at_send,
+            ),
+            (
+                "findings_stripped_capabilities_unknown_total",
+                &c.findings_stripped_capabilities_unknown,
+            ),
+            ("overflow_flags_refused_total", &c.overflow_flags_refused),
             (
                 "scan_status_before_flush_total",
                 &c.scan_status_before_flush,
@@ -1350,8 +1399,9 @@ impl Runtime {
         let spool = self.lock_spool().status();
         let detected_targets = self.detected_targets(&config).await;
         let mut heartbeat = HeartbeatRequest {
-            // No console -> agent field needs negotiating yet (ADR-0022).
-            accepts: None,
+            // The console -> agent fields and value forms this build
+            // decodes (ADR-0022 decision 3).
+            accepts: crate::capabilities::agent_accepts(),
             agent_version: agent_version()?,
             classifiers_version: classifiers_version(),
             connectors: connector_list(&engines),
@@ -1384,44 +1434,92 @@ impl Runtime {
     }
 
     /// Serialized heartbeat, used as the probe request before re-sending a
-    /// `/rotate` whose outcome is unknown.
-    async fn heartbeat_body(&self) -> Option<Vec<u8>> {
-        let request = self.build_heartbeat().await.ok()?;
-        serde_json::to_vec(&request).ok()
+    /// `/rotate` whose outcome is unknown: built like any heartbeat, gated
+    /// fields included (the console reads a probe as a heartbeat, and a
+    /// missing `name_case` as a loss: ADR-0055 decision 2), with the same
+    /// heartbeat stripped of its gated fields as the fallback sent once
+    /// after a `400` reporting an unknown field (#301 contract review I-3,
+    /// ADR-0022 decision 9; `None` when it carries none).
+    async fn heartbeat_body(&self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut request = self.build_heartbeat().await.ok()?;
+        let full = serde_json::to_vec(&request).ok()?;
+        let stripped = crate::capabilities::strip_gated_heartbeat(&mut request)
+            .then(|| serde_json::to_vec(&request).ok())
+            .flatten();
+        Some((full, stripped))
+    }
+
+    /// The probe of [`Self::heartbeat_body`] as the session takes it.
+    fn probe_of(
+        body: Option<&(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Option<crate::session::ProbeBody<'_>> {
+        body.map(|(full, stripped)| crate::session::ProbeBody {
+            full,
+            stripped: stripped.as_deref(),
+        })
     }
 
     /// Sends one heartbeat; returns the clamped interval from the console.
+    ///
+    /// A `400` reporting an unknown field (`additionalProperties`) to a
+    /// heartbeat that carried a gated `TargetStatus` field (`notes`,
+    /// `name_case`) clears the capabilities and sends the same heartbeat
+    /// once more with those fields stripped, instead of losing it (ADR-0022
+    /// decision 9): the console may be an older replica or a rolled-back
+    /// build. Never a loop: the stripped heartbeat carries no gated field.
+    /// Its engine values are kept as built (the refusal named a field, not
+    /// a value; an `enum` refusal of the resend takes the ordinary path,
+    /// and the next heartbeat withholds them, ADR-0039 decision 8).
     async fn heartbeat_once(&self) -> Result<Option<u64>, CallError> {
-        let request = self
+        let mut request = self
             .build_heartbeat()
             .await
             .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let body = serde_json::to_vec(&request)
-            .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
-        let result: Result<HeartbeatResponse, CallError> = self
-            .session
-            .call(
-                Method::POST,
-                "/heartbeat",
-                &[],
-                Some(&body),
-                uplink::REQUEST_TIMEOUT,
-                uplink::accept::heartbeat,
-            )
-            .await;
-        let response = match result {
-            Ok(r) => r,
-            Err(e) => {
-                if matches!(
-                    e,
-                    CallError::Uplink(UplinkError::Rejected { status: 400, .. })
-                ) {
-                    // The console may not accept a negotiated field any more
-                    // (rolled back): send none until a response lists them
-                    // again (ADR-0022).
-                    self.console_caps.clear();
+        let response = loop {
+            let body = serde_json::to_vec(&request)
+                .map_err(|_| CallError::Uplink(UplinkError::Setup("heartbeat body")))?;
+            let result: Result<HeartbeatResponse, CallError> = self
+                .session
+                .call(
+                    Method::POST,
+                    "/heartbeat",
+                    &[],
+                    Some(&body),
+                    uplink::REQUEST_TIMEOUT,
+                    uplink::accept::heartbeat,
+                )
+                .await;
+            match result {
+                Ok(r) => break r,
+                Err(e) => {
+                    if let CallError::Uplink(UplinkError::Rejected {
+                        status: 400,
+                        unknown_field,
+                        ..
+                    }) = &e
+                    {
+                        // The console may not accept a negotiated field any
+                        // more (rolled back): send none until a response
+                        // lists them again (ADR-0022).
+                        self.console_caps.clear();
+                        if *unknown_field
+                            && crate::capabilities::strip_gated_heartbeat(&mut request)
+                        {
+                            bump(&self.counters.gated_fields_stripped, 1);
+                            tracing::warn!(
+                                "heartbeat with gated target fields rejected (400): console \
+                                 capabilities cleared, heartbeat sent again without them"
+                            );
+                            continue;
+                        }
+                    } else if matches!(e, CallError::Uplink(UplinkError::Transport(_))) {
+                        // Not reached: a hold waiting for the console's
+                        // capabilities restarts (ADR-0053 decision 2), unless
+                        // a result endpoint answered since it started.
+                        self.console_caps.unanswered();
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
         if self.console_caps.record(response.accepts.as_ref()) {
@@ -1465,6 +1563,8 @@ impl Runtime {
                     self.on_call_error("heartbeat", &e, failures, interval)?
                 }
             };
+            // ADR-0053 decision 6 measurement: counts only, local log.
+            audit::census::log_changed();
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 _ = shutdown.changed() => return Ok(()),
@@ -1480,7 +1580,11 @@ impl Runtime {
             return Ok(());
         }
         let probe = self.heartbeat_body().await;
-        match self.session.rotate_probed(None, probe.as_deref()).await {
+        match self
+            .session
+            .rotate_probed_with(None, Self::probe_of(probe.as_ref()))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(CallError::RotationConflict) => Err(AgentError::RotationConflict),
             Err(e) => {
@@ -1695,15 +1799,64 @@ impl Runtime {
             let now = Instant::now();
             let mut parked = self.lock_parked();
             // A batch carrying an engine value the console has not listed
-            // (ADR-0039 decision 8) waits, spooled; the others still go.
-            self.lock_spool().front_sendable(
+            // (ADR-0039 decision 8) waits, spooled; the others still go. So
+            // does a batch carrying a gated field while the console's
+            // capabilities are not known yet (ADR-0053 decision 2): events
+            // spooled before a heartbeat answer keep the fields it lists. A
+            // batch with a `signature.*` signal never waits (its detection
+            // matters more than its gated fields); one already sent once is
+            // sent again as it is. A findings batch never waits (ADR-0056
+            // decision 2 item 3): the ADR-0025 wait for a scan's terminal
+            // status must not be spent on a heartbeat answer; it is sent
+            // stripped at once, counted below.
+            let caps = self.console_caps.snapshot(now);
+            let front = self.lock_spool().front_sendable(
                 |findings| !parked.is_parked(findings, now),
                 |gates| uplink::held_back(gates, &self.console_caps),
-            )
+                |_fields, signature, findings| !findings && !signature && !caps.settled(),
+            );
+            front.map(|f| (f, caps))
         };
-        let Some((key, batch)) = front else {
+        let Some(((key, batch), caps)) = front else {
             return Ok(Flush::Idle);
         };
+        // Spooled in full, stripped at send time (ADR-0053 decision 2): the
+        // fields whose tokens the console does not list are dropped, under
+        // a new `batch_id`, and the replacement takes the batch's place in
+        // the spool before it is sent (a retry resends the same bytes). A
+        // batch already sent once is sent as it is (security review L2: the
+        // console may hold it if an ack was lost; a refused field takes the
+        // `400` path below).
+        let decided = if batch.attempted() {
+            Ok(None)
+        } else {
+            batch.for_console(&caps)
+        };
+        match decided {
+            Ok(None) => {}
+            Ok(Some(stripped)) => {
+                if batch.is_findings() && !caps.known() {
+                    let n = u64::try_from(batch.gated_items()).unwrap_or(u64::MAX);
+                    bump(&self.counters.findings_stripped_capabilities_unknown, n);
+                } else {
+                    bump(&self.counters.gated_fields_stripped_at_send, 1);
+                }
+                if let Err(e) = self.lock_spool().replace(&key, &[stripped], 0) {
+                    tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+                    return Ok(Flush::Retry(spool_backoff(
+                        failures,
+                        backoff::random_fraction(),
+                    )));
+                }
+                return Ok(Flush::Progress);
+            }
+            Err(uplink::Unserializable) => {
+                self.count_unserializable(1);
+                self.lock_spool().drop_batch(&key);
+                return Ok(Flush::Progress);
+            }
+        }
+        self.lock_spool().mark_attempted(&key);
         let result = self
             .session
             .call(
@@ -1750,6 +1903,9 @@ impl Runtime {
         ) {
             // The endpoint is implemented: its `501` streak ends.
             self.lock_parked().answered(batch.is_findings());
+            // The console is reachable: unanswered heartbeats no longer
+            // extend a capability hold (ADR-0053 decision 2).
+            self.console_caps.result_answered();
         }
         match result {
             Ok(ack) => {
@@ -1788,6 +1944,7 @@ impl Runtime {
                 items,
                 unknown_field,
                 unknown_value,
+                overflow_rule,
             })) if (!unknown_field.is_empty() && batch.carries_gated())
                 || (!unknown_value.is_empty()
                     && batch.carries_gated_engine()
@@ -1799,15 +1956,29 @@ impl Runtime {
                     &items,
                     &unknown_field,
                     &unknown_value,
+                    &overflow_rule,
                     failures,
                 ))
+            }
+            // ADR-0053 decision 1 item 3 (contract review M2): a flagged
+            // event the console finds without a `*` (`contains` / `if`) is
+            // resent once without the flag, never lost. The capabilities are
+            // kept: the console knows the field. The resent items no longer
+            // carry the flag, so a second refusal takes the ordinary path.
+            Err(CallError::Uplink(UplinkError::ItemsRejected {
+                status: 400,
+                items,
+                overflow_rule,
+                ..
+            })) if !overflow_rule.is_empty() && batch.flagged_at(&overflow_rule) => {
+                Ok(self.resend_unflagged(&key, &batch, &items, &overflow_rule, failures))
             }
             Err(CallError::Uplink(UplinkError::Rejected {
                 status: 400,
                 code: Some(_),
                 unknown_field: true,
             })) if batch.carries_gated() => {
-                Ok(self.resend_stripped(&key, &batch, &[], &[], &[], failures))
+                Ok(self.resend_stripped(&key, &batch, &[], &[], &[], &[], failures))
             }
             Err(CallError::Uplink(UplinkError::ItemsRejected {
                 items,
@@ -1919,6 +2090,7 @@ impl Runtime {
     /// value (`enum`, `unknown_value`) are kept too: with the capabilities
     /// cleared, the replacement is held (`ResultBatch::held_back`) until a
     /// heartbeat response lists the engine's token again.
+    #[allow(clippy::too_many_arguments)]
     fn resend_stripped(
         &self,
         key: &[u64],
@@ -1926,11 +2098,49 @@ impl Runtime {
         rejected: &[usize],
         unknown: &[usize],
         unknown_value: &[usize],
+        overflow_rule: &[usize],
         failures: u32,
     ) -> Flush {
         self.console_caps.clear();
         bump(&self.counters.gated_fields_stripped, 1);
-        let (again, left_out) = match batch.stripped(rejected, unknown, unknown_value) {
+        let (again, left_out) =
+            match batch.stripped(rejected, unknown, unknown_value, overflow_rule) {
+                Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
+                Err(uplink::Unserializable) => {
+                    self.count_unserializable(1);
+                    (Vec::new(), batch.len())
+                }
+            };
+        tracing::warn!(
+            path = batch.path(),
+            left_out,
+            "batch with gated fields rejected (400): console capabilities cleared, items sent \
+             again without them"
+        );
+        let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
+        if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
+            tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
+            return Flush::Retry(spool_backoff(failures, backoff::random_fraction()));
+        }
+        Flush::Progress
+    }
+
+    /// A batch was rejected with `400` reporting the overflow rule on items
+    /// carrying `objects_overflowed` (an event flagged without a `*`,
+    /// ADR-0053 decision 1 item 3): those items are sent again without the
+    /// flag under a new `batch_id`, the other rejected items are left out.
+    /// The capabilities are kept (the console knows the field); at most once
+    /// per item, since the resent items no longer carry the flag.
+    fn resend_unflagged(
+        &self,
+        key: &[u64],
+        batch: &ResultBatch,
+        rejected: &[usize],
+        overflow_rule: &[usize],
+        failures: u32,
+    ) -> Flush {
+        bump(&self.counters.overflow_flags_refused, 1);
+        let (again, left_out) = match batch.unflagged(rejected, overflow_rule) {
             Ok((again, left_out)) => (again.into_iter().collect::<Vec<_>>(), left_out),
             Err(uplink::Unserializable) => {
                 self.count_unserializable(1);
@@ -1940,8 +2150,8 @@ impl Runtime {
         tracing::warn!(
             path = batch.path(),
             left_out,
-            "batch with gated fields rejected (400): console capabilities cleared, items sent \
-             again without them"
+            "events with objects_overflowed refused for naming no `*` (400): sent again \
+             without the flag"
         );
         let left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
         if let Err(e) = self.lock_spool().replace(key, &again, left_out) {
@@ -2216,6 +2426,11 @@ impl Runtime {
             tracing::warn!(job_id = %id, "audit.configure for an undeclared target");
             return Outcome::failed(FailureCode::UnknownTarget);
         };
+        // Key patterns name Redis / Valkey objects only (contract
+        // `SensitiveObject`).
+        if let Err(e) = params.check_engine(target.engine) {
+            return self.invalid_params(id, &e);
+        }
         let supported = self
             .connectors
             .iter()
@@ -2278,7 +2493,8 @@ impl Runtime {
             let params =
                 serde_json::from_slice::<databastion_protocol::AuditConfigureParams>(&json)
                     .ok()
-                    .and_then(|p| AuditParams::try_from(&p).ok());
+                    .and_then(|p| AuditParams::try_from(&p).ok())
+                    .filter(|p| p.check_engine(target.engine).is_ok());
             match params {
                 Some(p) if p.enabled() => {
                     tracing::info!(target_id = %target.id, "audit settings restored");
@@ -2315,9 +2531,6 @@ impl Runtime {
             target_id,
             events,
             fingerprints: &fingerprints,
-            accept_bytes: self
-                .console_caps
-                .console_accepts(crate::capabilities::token::ACCESS_EVENT_BYTES),
         });
         self.count_unserializable(built.unserializable_batches);
         let mut spool = self.lock_spool();
@@ -2350,6 +2563,9 @@ impl Runtime {
             .drain()
             .into_iter()
             .partition(|e| audit::reportable(cfg, e));
+        if let Some(t) = cfg.target() {
+            audit::census::record(t.engine, &keep, drop.len());
+        }
         bump(
             &self.counters.events_filtered,
             u64::try_from(drop.len()).unwrap_or(u64::MAX),
@@ -2400,6 +2616,7 @@ impl Runtime {
             while tasks.next().await.is_some() {}
         })
         .await;
+        audit::census::log_changed();
         Ok(())
     }
 
@@ -3117,7 +3334,11 @@ impl Runtime {
     async fn rotate_for_job(&self, id: Uuid) -> Result<Option<Outcome>, AgentError> {
         let probe = self.heartbeat_body().await;
         for attempt in 0..3 {
-            match self.session.rotate_probed(Some(id), probe.as_deref()).await {
+            match self
+                .session
+                .rotate_probed_with(Some(id), Self::probe_of(probe.as_ref()))
+                .await
+            {
                 Ok(RotateOutcome::Registered { duplicate }) => {
                     tracing::info!(job_id = %id, duplicate, "new secret registered as pending");
                     return Ok(Some(Outcome::SUCCEEDED));

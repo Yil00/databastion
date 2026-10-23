@@ -26,6 +26,7 @@ import { processGlobal } from "./process-global";
 
 type EventsBatch = Schemas["EventsBatch"];
 type AccessEvent = Schemas["AccessEvent"];
+type ObjectRefPart = Schemas["ObjectRefPart"];
 
 export type EventsIngestOutcome =
   /**
@@ -203,10 +204,18 @@ function eventRow(agentId: string, batchId: string, e: AccessEvent, i: number, u
     clientAddr: e.principal.client_addr ?? null,
     application: e.principal.application ?? null,
     action: e.action,
-    // Only the contract fields of each object, in a fixed shape.
-    objects: e.objects.map((o) => (o.schema !== undefined ? { database: o.database, schema: o.schema, object: o.object } : { database: o.database, object: o.object })),
+    // Only the contract fields of each object, in a fixed shape. ADR-0056 decision 3 item 1:
+    // `altered` stored as sent (absent means "not reported"), on a `*` part too (never rejected).
+    objects: e.objects.map((o) => ({
+      database: o.database,
+      ...(o.schema !== undefined ? { schema: o.schema } : {}),
+      object: o.object,
+      ...(o.altered !== undefined && o.altered.length > 0 ? { altered: [...o.altered] } : {}),
+    })),
     rows: e.rows ?? null,
     bytes: e.bytes ?? null,
+    // ADR-0053: stored only as sent (`true`); absent means "not known", stored as null.
+    objectsOverflowed: e.objects_overflowed === true ? true : null,
     signals: [...(e.signals ?? [])],
     source: e.source,
     aggregatedCount: e.aggregated_count,
@@ -389,7 +398,8 @@ export interface EventView {
   clientAddr: string | null;
   application: string | null;
   action: string;
-  objects: { database: string; schema?: string; object: string }[];
+  /** `altered`: contract `ObjectRef.altered` (ADR-0056), absent when not reported. */
+  objects: { database: string; schema?: string; object: string; altered?: ObjectRefPart[] }[];
   /**
    * Engine of the event: from its audit source when the source tells it, else from the target as
    * last reported by the agent; null when neither is known. Drives the LDAP labels (ADR-0029).
@@ -405,6 +415,18 @@ export interface EventView {
   evaluated: boolean;
   sensitivity: number | null;
   score: number | null;
+  /**
+   * Contract `AccessEvent.objects_overflowed` (ADR-0053): the event reached more objects than it
+   * lists, its `*` objects stand for the others. False when not sent ("not known").
+   */
+  objectsOverflowed: boolean;
+  /**
+   * Bound sensitivity and score (ADR-0053 decision 3 item 3): upper bounds where each `*` of a
+   * flagged event counts as its database's most sensitive object; null before evaluation or on
+   * rows evaluated before ADR-0053.
+   */
+  boundSensitivity: number | null;
+  boundScore: number | null;
   anomaly: boolean | null;
   baselineRows: number | null;
   /** Incidents this event matched (bounded). */
@@ -455,6 +477,9 @@ const EVENT_COLUMNS = {
   evaluatedAt: accessEvents.evaluatedAt,
   sensitivity: accessEvents.sensitivity,
   score: accessEvents.score,
+  objectsOverflowed: accessEvents.objectsOverflowed,
+  boundSensitivity: accessEvents.boundSensitivity,
+  boundScore: accessEvents.boundScore,
   anomaly: accessEvents.anomaly,
   baselineRows: accessEvents.baselineRows,
   targetEngine: sql<string | null>`(select ${agentTargets.engine} from ${agentTargets}
@@ -483,6 +508,7 @@ function toEventView({ dbUser, dbUserFingerprint, evaluatedAt, targetEngine, ...
     principal: principalLabel({ dbUser, dbUserFingerprint }),
     fingerprinted: dbUser === null && dbUserFingerprint !== null,
     evaluated: evaluatedAt !== null,
+    objectsOverflowed: r.objectsOverflowed === true,
     incidentIds: r.incidentIds ?? [],
   };
 }

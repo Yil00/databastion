@@ -8,6 +8,9 @@ import { AUDIT_SOURCES, ENGINES } from "@/lib/protocol/enums";
 import { fixtures } from "@/test/helpers";
 
 import {
+  AGENT_TOKENS,
+  agentAccepts,
+  agentAcceptsToStore,
   auditSourceTokens,
   connectorTokens,
   CONSOLE_ACCEPTS,
@@ -28,6 +31,7 @@ type RevisionToken = Extract<Token, `target_status.note_labels.${string}`>;
 /** The contract fields each field capability token stands for (ADR-0022). */
 const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: string, ...properties: string[]]> = {
   "access_event.bytes": ["AccessEvent", "bytes"],
+  "access_event.objects_overflowed": ["AccessEvent", "objects_overflowed"],
   "job_progress.coverage": [
     "JobProgress",
     "objects_sampled",
@@ -38,6 +42,9 @@ const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: strin
     "skipped_limit",
     "skipped_error",
   ],
+  "location.altered": ["Location", "altered"],
+  "object_ref.altered": ["ObjectRef", "altered"],
+  "target_status.name_case": ["TargetStatus", "name_case"],
   "target_status.notes": ["TargetStatus", "notes"],
 };
 
@@ -101,8 +108,17 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
     expect(CONSOLE_ACCEPTS).toContain("engine.sqlserver");
   });
 
+  it("lists location.altered and object_ref.altered together (ADR-0056 decision 1 item 5)", () => {
+    expect(CONSOLE_ACCEPTS).toContain("location.altered");
+    expect(CONSOLE_ACCEPTS).toContain("object_ref.altered");
+  });
+
   it("lists the SQL Server note-label revisions, whose labels are contract TargetNoteLabel values (ADR-0051 decision 4 and refinement)", () => {
-    expect(CONSOLE_ACCEPTS.filter(isRevisionToken)).toEqual(["target_status.note_labels.2026_10", "target_status.note_labels.2026_10_b"]);
+    expect(CONSOLE_ACCEPTS.filter(isRevisionToken)).toEqual([
+      "target_status.note_labels.2026_10",
+      "target_status.note_labels.2026_10_b",
+      "target_status.note_labels.2026_10_c",
+    ]);
     for (const label of ["sysadmin", "db_owner", "ms_login_manager", "control_server", "password_hash_probe"]) {
       expect(enumOf("TargetNoteLabel"), label).toContain(label);
     }
@@ -127,6 +143,7 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
       "logon_trigger_probe",
       "refusal_list_probe",
       "cas_store_guard_probe",
+      "on_failure_probe",
     ]) {
       expect(enumOf("TargetNoteLabel"), label).toContain(label);
     }
@@ -140,6 +157,24 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
 
 /** Every engine token of the contract, all listed since P9-E. */
 const ALL_ENGINE_TOKENS: ContractEngineToken[] = ["engine.cas", "engine.sqlserver", "engine.redis", "engine.valkey"];
+
+describe("AGENT_TOKENS (ADR-0022 decision 3)", () => {
+  it("is a valid, sorted CapabilityList that the contract names in HeartbeatRequest.accepts", () => {
+    expect(validateSchema("CapabilityList", [...AGENT_TOKENS]).ok).toBe(true);
+    expect([...AGENT_TOKENS]).toEqual([...new Set(AGENT_TOKENS)].sort());
+    const description = JSON.stringify(defs.HeartbeatRequest?.properties?.accepts ?? {});
+    for (const token of AGENT_TOKENS) expect(description, token).toContain(token);
+  });
+
+  it("stores only the known tokens of a heartbeat, and reads them back", () => {
+    expect(agentAcceptsToStore(undefined)).toEqual([]);
+    expect(agentAcceptsToStore(["future.token", "sensitive_object.key_pattern"])).toEqual(["sensitive_object.key_pattern"]);
+    expect(agentAccepts(["sensitive_object.key_pattern"], "sensitive_object.key_pattern")).toBe(true);
+    expect(agentAccepts([], "sensitive_object.key_pattern")).toBe(false);
+    expect(agentAccepts(null, "sensitive_object.key_pattern")).toBe(false);
+    expect(agentAccepts("sensitive_object.key_pattern", "sensitive_object.key_pattern")).toBe(false);
+  });
+});
 
 describe("engine token gate (ADR-0042, P9-C review H1)", () => {
   it("mirrors the agent's token functions (capabilities.rs)", () => {

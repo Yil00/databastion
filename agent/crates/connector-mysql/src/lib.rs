@@ -108,6 +108,13 @@ impl Connector for MysqlConnector {
     ) -> Option<databastion_classifiers::masking::EventSource> {
         self.check_state.audit_source(&target.id)
     }
+
+    fn name_case(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_core::name_case::NameCaseReport> {
+        self.check_state.name_case(&target.id)
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +141,31 @@ mod tests {
         assert!(!health.reachable);
         assert_eq!(health.audit_level, AuditLevel::None);
         assert_eq!(health.failure, Some(FailureCode::AuthenticationFailed));
+    }
+
+    /// ADR-0055 decision 2 (security review M1): a check that cannot reach
+    /// the server keeps the last value read; none read yet is `None` (the
+    /// core then sends `unknown` for both parts).
+    #[tokio::test]
+    async fn a_failed_check_keeps_the_last_name_case() {
+        use databastion_core::name_case::{NameCase, NameCaseReport};
+        let connector = MysqlConnector::new();
+        let t = target(
+            "{id: t, engine: mysql, host: 127.0.0.1, port: 9, account: a, \
+             secret: {env: DATABASTION_TEST_UNSET_MY_SECRET}, mysql: {tls: disable}}",
+        );
+        assert!(!connector.check(&t).await.reachable);
+        assert_eq!(connector.name_case(&t), None);
+        connector.check_state.set_name_case(
+            "t",
+            None,
+            NameCaseReport::uniform(NameCase::Insensitive),
+        );
+        assert!(!connector.check(&t).await.reachable);
+        assert_eq!(
+            connector.name_case(&t),
+            Some(NameCaseReport::uniform(NameCase::Insensitive))
+        );
     }
 
     #[tokio::test]

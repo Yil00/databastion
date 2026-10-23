@@ -57,6 +57,7 @@ use databastion_core::{
     AuditLevel, FailureCode, NoteCode, NoteLabel, Notes, TargetHealth, TargetNote,
 };
 
+use crate::audit::own_threads::ServerRun;
 use crate::audit::pfs::PsTable;
 use crate::catalog::{self, Coverage, EngineSkip};
 use crate::conn::{Flavor, Flow, Rows, Session, Timeouts};
@@ -64,6 +65,7 @@ use crate::discover::normalize;
 use crate::error::{MyError, Stage};
 use crate::grants::{self as grant_lines, Line, Scope};
 use crate::sql;
+use databastion_core::name_case::{NameCase, NameCaseReport};
 
 /// Statement timeout of `check()` queries.
 const CHECK_STATEMENT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -588,6 +590,128 @@ pub(crate) struct CheckState {
     /// when it is below the agent's longest statement, with that source
     /// (review of #165: a closed note rather than a log warning only).
     text_limits: Mutex<HashMap<String, (EventSource, usize)>>,
+    /// Per target: how names compare (ADR-0055), as last read, and the
+    /// server run it was read on (`None`: identity or start time not
+    /// read). Kept when a later check fails before reading it (decision
+    /// 2, security review M1).
+    name_cases: SharedNameCases,
+}
+
+/// The kept name-case values of every target (see [`CheckState`]), shared
+/// with the Audit streams, which reset a target's value when they see
+/// another server run (security review L1 of the ADR-0055 agent lot; the
+/// audit-log file sources since the #303 residual follow-up).
+pub(crate) type SharedNameCases = std::sync::Arc<Mutex<HashMap<String, KeptNameCase>>>;
+
+/// How far past the newest server time seen a server start from the audit
+/// log is noted at most (seconds): three times the longest heartbeat
+/// interval (300 s), so that a check still in flight across a restart
+/// stays ordered before it.
+///
+/// Residual (security review of 49143f6): when no read was stored for more
+/// than this before a restart (checks failing for over 15 minutes) and a
+/// check of the previous run is still in flight across it, that check's
+/// read may land after the clamped start and be stored, restoring the
+/// previous run's value until the next re-probe of the audit-log stream
+/// (5 minutes) or the next check reads the new run.
+const START_AHEAD_MAX_S: u64 = 900;
+
+/// One target's kept name-case value (ADR-0055 decision 2).
+#[derive(Debug, Clone)]
+pub(crate) struct KeptNameCase {
+    /// The server run it was read on (`None`: identity or start time not
+    /// read).
+    run: Option<ServerRun>,
+    report: NameCaseReport,
+    /// When it was read, on the server's clock (`UNIX_TIMESTAMP()` of the
+    /// same statement; `None`: not read).
+    read_at: Option<u64>,
+    /// The latest server start seen (a start record of the audit log, or
+    /// the start time of a new run an Audit stream saw), on the server's
+    /// clock: a read from before it is never stored again (security
+    /// review L1 of the #303 residual follow-up).
+    last_start: Option<u64>,
+}
+
+impl KeptNameCase {
+    fn note_start(&mut self, start: u64) {
+        self.last_start = Some(self.last_start.map_or(start, |s| s.max(start)));
+    }
+}
+
+/// One target's kept name-case value, as an Audit stream sees it.
+pub(crate) struct NameCaseRuns {
+    pub(crate) map: SharedNameCases,
+    pub(crate) target_id: String,
+}
+
+impl NameCaseRuns {
+    /// The stream's session is on `run`: a value read on another run of
+    /// the server (a restart since, which may have changed
+    /// `lower_case_table_names` on MariaDB) is no longer kept: `unknown`
+    /// until the next check reads it. A value whose run is not known is
+    /// left as it is (nothing tells the runs apart).
+    pub(crate) fn observe(&self, run: &ServerRun) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(kept) = map.get_mut(&self.target_id) else {
+            return;
+        };
+        if let Some(old) = kept.run.as_ref()
+            && !old.same(run)
+        {
+            if kept.report != NameCaseReport::unknown() {
+                tracing::info!(
+                    target_id = %self.target_id,
+                    "server restarted since the last check: name case unknown until the next one"
+                );
+            }
+            kept.run = Some(run.clone());
+            kept.report = NameCaseReport::unknown();
+            kept.note_start(run.boot());
+        }
+    }
+
+    /// The target's audit log records a server start (a startup record of
+    /// the Percona / MySQL Enterprise JSON log) at `start`, Unix seconds
+    /// on the server's clock (`None`: the record's time does not parse).
+    /// The kept value no longer holds unless it was read after that start
+    /// (the #303 residual follow-up, fail closed): it is `unknown` until
+    /// the next check when it was read in the same second or before, when
+    /// its read time is not known, or when the start time is not.
+    pub(crate) fn server_started(&self, start: Option<u64>) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(kept) = map.get_mut(&self.target_id) else {
+            return;
+        };
+        // The start noted no later than [`START_AHEAD_MAX_S`] past the
+        // newest server time seen (the kept read): a start record from a
+        // clock ahead (or a forged time) makes later reads look older for
+        // that long at most (`unknown` meanwhile, fail closed; security
+        // review L6), while a check of the previous run still in flight
+        // when the start is read (read within a heartbeat of the kept
+        // one) stays refused. Without a read time, nothing is noted.
+        if let (Some(s), Some(r)) = (start, kept.read_at) {
+            kept.note_start(s.min(r.saturating_add(START_AHEAD_MAX_S)));
+        }
+        if kept.report == NameCaseReport::unknown() {
+            return;
+        }
+        let read_after = matches!((start, kept.read_at), (Some(s), Some(r)) if s < r);
+        if !read_after {
+            tracing::info!(
+                target_id = %self.target_id,
+                "the audit log records a server start since the last check: name case unknown \
+                 until the next one"
+            );
+            kept.report = NameCaseReport::unknown();
+        }
+    }
 }
 
 /// An audit log record parsed within this period makes the log source
@@ -714,7 +838,7 @@ impl CheckState {
             .map(|(_, limit)| *limit)
     }
 
-    fn dropped(&self, target_id: &str) -> u64 {
+    pub(crate) fn dropped(&self, target_id: &str) -> u64 {
         self.dropped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -786,6 +910,140 @@ impl CheckState {
                 map.remove(target_id);
             }
         }
+    }
+
+    /// How `target_id`'s names compare, as last read (ADR-0055).
+    pub(crate) fn name_case(&self, target_id: &str) -> Option<NameCaseReport> {
+        self.name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .map(|k| k.report.clone())
+    }
+
+    /// The kept name-case value of `target_id`, for its Audit streams.
+    pub(crate) fn name_case_runs(&self, target_id: &str) -> NameCaseRuns {
+        NameCaseRuns {
+            map: std::sync::Arc::clone(&self.name_cases),
+            target_id: target_id.to_owned(),
+        }
+    }
+
+    /// Stores a value as is, its read time not known, without the
+    /// ordering rules of [`Self::set_name_case_read`] (tests).
+    #[cfg(test)]
+    pub(crate) fn set_name_case(
+        &self,
+        target_id: &str,
+        run: Option<ServerRun>,
+        report: NameCaseReport,
+    ) {
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last_start = map.get(target_id).and_then(|k| k.last_start);
+        map.insert(
+            target_id.to_owned(),
+            KeptNameCase {
+                run,
+                report,
+                read_at: None,
+                last_start,
+            },
+        );
+    }
+
+    /// Stores what a check (or an audit-log stream's re-probe) read, and
+    /// when, on the server's clock; logs a server restart seen since the
+    /// last one (another run).
+    ///
+    /// Monotonic (security review L1 of the #303 residual follow-up): a
+    /// read older than the kept one, or from before (or in the second of)
+    /// the latest server start seen, is not stored, so that a slow check
+    /// of the previous run never restores its value after a newer read or
+    /// a reset. A read whose time is not known is stored as `unknown`
+    /// once the order matters (a value or a start is kept already).
+    ///
+    /// A read on a run that started after the kept read is always stored.
+    /// A read refused by that order whose run is not the kept one (a
+    /// server clock stepped back, or a slow check of the previous run)
+    /// turns the kept value into `unknown`, on that run, rather than
+    /// leaving a value of another run in place (security review L5).
+    pub(crate) fn set_name_case_read(
+        &self,
+        target_id: &str,
+        run: Option<ServerRun>,
+        mut report: NameCaseReport,
+        read_at: Option<u64>,
+    ) {
+        let mut map = self
+            .name_cases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last_start = None;
+        if let Some(kept) = map.get_mut(target_id) {
+            last_start = kept.last_start;
+            let newer_run = run
+                .as_ref()
+                .is_some_and(|new| kept.read_at.is_some_and(|k| new.boot() > k));
+            match read_at {
+                Some(r)
+                    if !newer_run
+                        && (kept.read_at.is_some_and(|k| r < k)
+                            || kept.last_start.is_some_and(|s| r <= s)) =>
+                {
+                    let other_run = match (run.as_ref(), kept.run.as_ref()) {
+                        (Some(new), Some(old)) => !old.same(new),
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    if other_run {
+                        tracing::info!(
+                            target_id,
+                            "name case read on another server run before the kept one (server \
+                             clock stepped back?): unknown until the next check"
+                        );
+                        kept.run = run;
+                        kept.report = NameCaseReport::unknown();
+                    } else {
+                        tracing::debug!(
+                            target_id,
+                            "name case read before the kept one or a server start: not stored"
+                        );
+                    }
+                    return;
+                }
+                None if kept.read_at.is_some() || kept.last_start.is_some() => {
+                    report = NameCaseReport::unknown();
+                }
+                _ => {}
+            }
+            if let (Some(new), Some(old)) = (run.as_ref(), kept.run.as_ref())
+                && !old.same(new)
+                && kept.report != report
+            {
+                tracing::info!(
+                    target_id,
+                    "name case semantics changed with a server restart (lower_case_table_names)"
+                );
+            }
+        }
+        // A read on a newer run than any start seen: its start is one too.
+        if let (Some(new), Some(r)) = (run.as_ref(), read_at)
+            && new.boot() < r
+        {
+            last_start = Some(last_start.map_or(new.boot(), |s: u64| s.max(new.boot())));
+        }
+        map.insert(
+            target_id.to_owned(),
+            KeptNameCase {
+                run,
+                report,
+                read_at,
+                last_start,
+            },
+        );
     }
 
     fn due(&self, key: &str) -> bool {
@@ -913,6 +1171,15 @@ async fn check_inner(state: &CheckState, target: &TargetConfig) -> (TargetHealth
             codes.add(TargetNote::new(NoteCode::CheckServerIsMysql));
         }
         _ => {}
+    }
+    // ADR-0055 decision 4: read first, so that a later stage failing
+    // keeps this run's value (decision 2).
+    match read_name_case(&mut session).await {
+        Ok(read) => {
+            notes.push(read.text);
+            state.set_name_case_read(&target.id, read.run, read.report, read.read_at);
+        }
+        Err(e) => return (unreachable(&e), Source::None),
     }
     let probe = match audit_probe(&mut session).await {
         Ok(p) => p,
@@ -1172,6 +1439,97 @@ async fn optional_complete(
         Err(e) if !e.fatal => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// How names compare under `lower_case_table_names` (ADR-0055 decision
+/// 4): 0 with case, also on a file system that ignores case (a MariaDB
+/// forced to 0; the stricter answer, open question 2); 1 (stored in
+/// lowercase) and 2 (compared in lowercase) without; anything else, or no
+/// value, unknown. The prerequisite of decision 3 is met (#300): every
+/// source sends unquoted names as written.
+pub(crate) fn name_case_of(lower_case_table_names: Option<&str>) -> NameCase {
+    match lower_case_table_names.map(str::trim) {
+        Some("0") => NameCase::Sensitive,
+        Some("1" | "2") => NameCase::Insensitive,
+        _ => NameCase::Unknown,
+    }
+}
+
+/// The name case of a [`sql::name_case_settings`] row, the run it was read
+/// on (with `uptime`, `SHOW GLOBAL STATUS` `Uptime`), and the local detail
+/// (never sent). A missing row is `unknown`.
+pub(crate) fn name_case_row(
+    rows: &Rows,
+    uptime: Option<u64>,
+) -> (Option<ServerRun>, NameCaseReport, String) {
+    let lctn = cell(rows, 0, 0);
+    let lcfs = cell(rows, 0, 1);
+    let value = name_case_of(lctn);
+    let now = cell(rows, 0, 2).and_then(|v| v.trim().parse::<u64>().ok());
+    let run = match (rows.first(), now, uptime) {
+        (Some(row), Some(now), Some(up)) if row.len() > 3 && now > up => {
+            ServerRun::new(&row[3..], now - up)
+        }
+        _ => None,
+    };
+    let compared = match value {
+        NameCase::Sensitive => "with case",
+        NameCase::Insensitive => "without case",
+        NameCase::Unknown => "unknown (treated as with case)",
+    };
+    let forced = if value == NameCase::Sensitive && truthy(lcfs) {
+        " (0 on a file system that ignores case: a server forced to 0; names reported as \
+         compared with case)"
+    } else {
+        ""
+    };
+    let text = format!(
+        "lower_case_table_names {}, lower_case_file_system {}: database and table names \
+         compared {compared}{forced}",
+        lctn.unwrap_or("not read"),
+        lcfs.unwrap_or("not read"),
+    );
+    (run, NameCaseReport::uniform(value), text)
+}
+
+/// What [`read_name_case`] read.
+pub(crate) struct NameCaseRead {
+    pub(crate) run: Option<ServerRun>,
+    pub(crate) report: NameCaseReport,
+    /// The local detail (never sent).
+    pub(crate) text: String,
+    /// `UNIX_TIMESTAMP()` of the read, on the server's clock.
+    pub(crate) read_at: Option<u64>,
+}
+
+/// Reads how the server compares names (ADR-0055 decision 4). A read
+/// refused or failed without ending the session is `unknown`, with no run
+/// (decision 4: "a failed read, unknown"); a fatal error ends the check,
+/// and the last value is kept (decision 2). Also sent by the audit-log
+/// file streams at each re-probe (the #303 residual follow-up).
+pub(crate) async fn read_name_case(session: &mut Session) -> Result<NameCaseRead, MyError> {
+    let text = sql::name_case_settings(session.flavor());
+    let Some(rows) = optional(session, &text).await? else {
+        return Ok(NameCaseRead {
+            run: None,
+            report: NameCaseReport::unknown(),
+            text: "lower_case_table_names not readable: names compared unknown (treated as with \
+                   case)"
+                .to_owned(),
+            read_at: None,
+        });
+    };
+    let uptime = optional(session, sql::SERVER_UPTIME)
+        .await?
+        .and_then(|r| cell(&r, 0, 1).and_then(|v| v.trim().parse::<u64>().ok()));
+    let read_at = cell(&rows, 0, 2).and_then(|v| v.trim().parse::<u64>().ok());
+    let (run, report, text) = name_case_row(&rows, uptime);
+    Ok(NameCaseRead {
+        run,
+        report,
+        text,
+        read_at,
+    })
 }
 
 fn cell(rows: &Rows, row: usize, col: usize) -> Option<&str> {
@@ -1811,6 +2169,254 @@ mod tests {
 
     fn s(db: &str, p: &str) -> (String, String, bool) {
         (db.to_owned(), p.to_owned(), false)
+    }
+
+    /// ADR-0055 decision 4: the mapping of `lower_case_table_names`, a
+    /// failed or odd read as `unknown`.
+    #[test]
+    fn lower_case_table_names_maps_to_the_name_case() {
+        for (v, want) in [
+            (Some("0"), NameCase::Sensitive),
+            (Some(" 0 "), NameCase::Sensitive),
+            (Some("1"), NameCase::Insensitive),
+            (Some("2"), NameCase::Insensitive),
+            (Some("3"), NameCase::Unknown),
+            (Some("-1"), NameCase::Unknown),
+            (Some("00"), NameCase::Unknown),
+            (Some("ON"), NameCase::Unknown),
+            (Some(""), NameCase::Unknown),
+            (None, NameCase::Unknown),
+        ] {
+            assert_eq!(name_case_of(v), want, "{v:?}");
+        }
+        let row = |lctn: Option<&str>, lcfs: &str| -> Rows {
+            vec![vec![
+                lctn.map(str::to_owned),
+                Some(lcfs.to_owned()),
+                Some("1800000000".to_owned()),
+                Some("db1".to_owned()),
+                Some("3306".to_owned()),
+                Some("1".to_owned()),
+            ]]
+        };
+        // 0 on a file system that ignores case (open question 2):
+        // sensitive, said in the local detail only.
+        let (run, r, text) = name_case_row(&row(Some("0"), "1"), Some(100));
+        assert_eq!(r, NameCaseReport::uniform(NameCase::Sensitive));
+        assert!(text.contains("forced to 0"), "{text}");
+        let run = run.expect("identity and start time read");
+        let (again, ..) = name_case_row(&row(Some("0"), "0"), Some(100));
+        assert!(run.same(&again.unwrap()));
+        let (later, ..) = name_case_row(&row(Some("0"), "0"), Some(5));
+        assert!(!run.same(&later.unwrap()), "a restart is another run");
+        let (_, r, text) = name_case_row(&row(Some("1"), "0"), None);
+        assert_eq!(r, NameCaseReport::uniform(NameCase::Insensitive));
+        assert!(!text.contains("forced"), "{text}");
+        let (run, r, _) = name_case_row(&row(None, "0"), None);
+        assert_eq!(r, NameCaseReport::unknown());
+        assert!(run.is_none(), "no uptime: no run");
+        let (run, r, _) = name_case_row(&Vec::new(), Some(1));
+        assert_eq!((run, r), (None, NameCaseReport::unknown()));
+    }
+
+    /// Security review L1 of the ADR-0055 agent lot: an Audit stream on
+    /// another server run resets the kept value to `unknown`; the same run
+    /// (within the tolerance) or an unknown one leaves it.
+    #[test]
+    fn a_new_server_run_seen_by_audit_resets_the_name_case() {
+        let run = |boot: u64| {
+            ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], boot).unwrap()
+        };
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        runs.observe(&run(100));
+        assert_eq!(state.name_case("t"), None, "nothing kept: nothing to reset");
+        state.set_name_case("t", None, NameCaseReport::uniform(NameCase::Sensitive));
+        runs.observe(&run(100));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::uniform(NameCase::Sensitive)),
+            "run unknown"
+        );
+        state.set_name_case(
+            "t",
+            Some(run(100)),
+            NameCaseReport::uniform(NameCase::Insensitive),
+        );
+        runs.observe(&run(101));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::uniform(NameCase::Insensitive)),
+            "same run"
+        );
+        runs.observe(&run(5_000));
+        assert_eq!(
+            state.name_case("t"),
+            Some(NameCaseReport::unknown()),
+            "a restart"
+        );
+        // Another target is not touched.
+        state.set_name_case(
+            "u",
+            Some(run(100)),
+            NameCaseReport::uniform(NameCase::Sensitive),
+        );
+        runs.observe(&run(9_000));
+        assert_eq!(
+            state.name_case("u"),
+            Some(NameCaseReport::uniform(NameCase::Sensitive))
+        );
+    }
+
+    /// The #303 residual follow-up: a server start recorded by the audit
+    /// log resets a value read before it (or in the same second), or
+    /// whose read time or the start's time is not known; a value read
+    /// after it is kept, and an `unknown` one stays so.
+    #[test]
+    fn a_server_start_in_the_audit_log_resets_an_older_name_case() {
+        let run = || ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], 100);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        runs.server_started(Some(1_000));
+        assert_eq!(state.name_case("t"), None, "nothing kept: nothing to reset");
+        for (read_at, start, kept) in [
+            (Some(1_000), Some(999), true),
+            (Some(1_000), Some(1_000), false),
+            (Some(1_000), Some(1_001), false),
+            (Some(1_000), None, false),
+            (None, Some(1), false),
+        ] {
+            let state = CheckState::default();
+            let runs = state.name_case_runs("t");
+            state.set_name_case_read("t", run(), sensitive.clone(), read_at);
+            runs.server_started(start);
+            let want = if kept {
+                sensitive.clone()
+            } else {
+                NameCaseReport::unknown()
+            };
+            assert_eq!(state.name_case("t"), Some(want), "{read_at:?} {start:?}");
+        }
+        // Another target is not touched.
+        state.set_name_case_read("u", run(), sensitive.clone(), Some(1_000));
+        runs.server_started(Some(5_000));
+        assert_eq!(state.name_case("u"), Some(sensitive));
+    }
+
+    /// Security review L1 of the #303 residual follow-up: the store is
+    /// monotonic. A check reads the old run at `r`, the server restarts at
+    /// `s > r` with another setting, the audit-log stream's re-probe reads
+    /// the new run at `r1 > s`, the log's start record is consumed, then
+    /// the slow check lands: its value (read at `r < s`) is never stored
+    /// again, whatever the order of the start record and the re-probe; a
+    /// later read of the new run is; a read whose time is not known is
+    /// stored as `unknown`.
+    #[test]
+    fn a_slow_check_of_the_previous_run_never_restores_its_value() {
+        let run = |boot: u64| {
+            ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], boot).unwrap()
+        };
+        let old = NameCaseReport::uniform(NameCase::Insensitive);
+        let new = NameCaseReport::uniform(NameCase::Sensitive);
+        let (r, s, r1) = (1_000, 1_100, 1_200);
+        for start_first in [false, true] {
+            let state = CheckState::default();
+            let runs = state.name_case_runs("t");
+            if start_first {
+                runs.server_started(Some(s));
+                state.set_name_case_read("t", Some(run(s)), new.clone(), Some(r1));
+            } else {
+                state.set_name_case_read("t", Some(run(s)), new.clone(), Some(r1));
+                runs.server_started(Some(s));
+            }
+            assert_eq!(state.name_case("t"), Some(new.clone()), "{start_first}");
+            // The slow check of the old run lands now: never its value
+            // (`unknown`, since its run is not the kept one, L5).
+            state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r));
+            assert_eq!(
+                state.name_case("t"),
+                Some(NameCaseReport::unknown()),
+                "{start_first}"
+            );
+            // The same read on the kept run is only ignored.
+            state.set_name_case_read("t", Some(run(s)), new.clone(), Some(r1 + 30));
+            state.set_name_case_read("t", Some(run(s)), old.clone(), Some(r1));
+            assert_eq!(state.name_case("t"), Some(new.clone()), "{start_first}");
+            // A later read of the new run is stored.
+            state.set_name_case_read("t", Some(run(s)), old.clone(), Some(r1 + 60));
+            assert_eq!(state.name_case("t"), Some(old.clone()), "{start_first}");
+        }
+        // Without the re-probe: the start record resets the old value,
+        // and the slow check (read before the start) does not restore it.
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r - 30));
+        runs.server_started(Some(s));
+        state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // The same with the new run seen by a performance_schema stream.
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r - 30));
+        runs.observe(&run(s));
+        state.set_name_case_read("t", Some(run(100)), old.clone(), Some(r));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // A read whose time is not known, once the order matters.
+        state.set_name_case_read("t", None, old, None);
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+    }
+
+    /// Security review L5: the server clock steps back across a restart
+    /// with another setting. The new run's read is older than the kept
+    /// one: the old run's value is not kept (`unknown`); a read on a run
+    /// that started after the kept read is stored at once.
+    #[test]
+    fn a_clock_stepped_back_never_keeps_the_previous_run_value() {
+        let run = |boot: u64| {
+            ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], boot).unwrap()
+        };
+        let insensitive = NameCaseReport::uniform(NameCase::Insensitive);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        let state = CheckState::default();
+        state.set_name_case_read("t", Some(run(100)), insensitive.clone(), Some(5_000));
+        // Restarted with the clock an hour back: boot 1 000, read at 1 200.
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(1_200));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // Still behind: the same run's later reads stay ignored (unknown).
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(1_300));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        // Once the clock passes the floor, stored.
+        state.set_name_case_read("t", Some(run(1_000)), sensitive.clone(), Some(5_100));
+        assert_eq!(state.name_case("t"), Some(sensitive.clone()));
+        // A run that started after the kept read: stored at once.
+        state.set_name_case_read("t", Some(run(6_000)), insensitive.clone(), Some(6_050));
+        assert_eq!(state.name_case("t"), Some(insensitive));
+    }
+
+    /// Security review L6: a start record with a time far ahead of the
+    /// newest server time seen (a clock ahead, a forged record) resets the
+    /// value but is noted at most `START_AHEAD_MAX_S` past that time:
+    /// checks are stored again after it, not only once the clock reaches
+    /// the record's time.
+    #[test]
+    fn a_start_record_ahead_of_the_server_clock_is_clamped() {
+        let run = || ServerRun::new(&[Some("db1".to_owned()), Some("3306".to_owned())], 100);
+        let sensitive = NameCaseReport::uniform(NameCase::Sensitive);
+        let state = CheckState::default();
+        let runs = state.name_case_runs("t");
+        state.set_name_case_read("t", run(), sensitive.clone(), Some(1_000));
+        runs.server_started(Some(4_000_000_000));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.set_name_case_read("t", run(), sensitive.clone(), Some(1_060));
+        assert_eq!(state.name_case("t"), Some(NameCaseReport::unknown()));
+        state.set_name_case_read(
+            "t",
+            run(),
+            sensitive.clone(),
+            Some(1_000 + START_AHEAD_MAX_S + 1),
+        );
+        assert_eq!(state.name_case("t"), Some(sensitive));
     }
 
     #[test]

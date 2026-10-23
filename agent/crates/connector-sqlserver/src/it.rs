@@ -165,9 +165,12 @@ fn throwaway_target(name: &str, sqlserver: &str) -> TargetConfig {
 async fn sa() -> Session {
     let t = target("sa", "SQLSERVER_SA_PASSWORD", own_tls());
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    // The test's own statements are off the agent's allow-list.
+    s.any_text = true;
+    s
 }
 
 async fn exec(s: &mut Session, sql: &str) {
@@ -1016,6 +1019,7 @@ async fn measure_credential_bearing_reads() {
         let mut sess = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(10))
             .await
             .unwrap();
+        sess.any_text = true;
         for (label, sql) in probes {
             let r = sess.rows(sql, Stage::Check, Shape::rows(2, 1)).await;
             let shown = match r {
@@ -1135,9 +1139,11 @@ async fn foreign_session(account: &str, secret_env: &str) -> Session {
     let mut t = target(account, secret_env, own_tls());
     t.id = "it-foreign".to_owned();
     let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
-    conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+    let mut s = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
         .await
-        .unwrap()
+        .unwrap();
+    s.any_text = true;
+    s
 }
 
 /// Rows of `sql` (tests only), errors ignored.
@@ -1509,6 +1515,15 @@ async fn audit_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2: no ground-truth value, nor the DCL password, in what is sent.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_audit\""), "{json}");
@@ -1558,6 +1573,681 @@ async fn audit_scenario() {
     );
     Box::pin(drop_login(&mut s, "it_dump")).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #280 re-review L-b, a measurement: what the agent's Extended Events
+/// proofs see when a session's `error_reported` predicate is replaced
+/// (`DROP EVENT` then `ADD EVENT` with another predicate, on a running
+/// throwaway session): `create_time` and the event facts the agent reads
+/// (`probe::Probe::event_facts`, never the predicate). Printed as `[it] xe
+/// predicate change:`; the facts are expected unchanged, which is why the
+/// stream also clears the failed-login proof on an `ALTER EVENT SESSION`
+/// statement it reads.
+#[tokio::test]
+async fn measure_xe_predicate_change() {
+    Box::pin(xe_predicate_scenario()).await;
+}
+
+async fn xe_predicate_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let drop = "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'it_xe_pred') \
+                DROP EVENT SESSION it_xe_pred ON SERVER";
+    Box::pin(exec_ok(&mut s, drop)).await;
+    Box::pin(exec(
+        &mut s,
+        "CREATE EVENT SESSION it_xe_pred ON SERVER ADD EVENT sqlserver.error_reported \
+         (WHERE ([error_number] = (18456)))",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER STATE = START",
+    ))
+    .await;
+    let before = Box::pin(crate::audit::xe::probe::probe(
+        &mut s,
+        "it_xe_pred",
+        Stage::Check,
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER DROP EVENT sqlserver.error_reported",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION it_xe_pred ON SERVER ADD EVENT sqlserver.error_reported \
+         (WHERE ([error_number] = (18452)))",
+    ))
+    .await;
+    let after = Box::pin(crate::audit::xe::probe::probe(
+        &mut s,
+        "it_xe_pred",
+        Stage::Check,
+    ))
+    .await
+    .unwrap();
+    Box::pin(exec_ok(&mut s, drop)).await;
+    eprintln!(
+        "[it] xe predicate change: create_time moved {} us, event facts {:?} -> {:?} (equal: {})",
+        after.create_us - before.create_us,
+        before.event_facts(),
+        after.event_facts(),
+        before.event_facts() == after.event_facts()
+    );
+    assert!(before.failed_logins && before.failed_logins_filtered);
+    assert!(after.failed_logins && after.failed_logins_filtered);
+}
+
+/// The dev session's `error_reported` event as dev/sqlserver/initdb/30-audit.sql
+/// adds it (tests only: re-added as is by the predicate test).
+const XE_ERROR_REPORTED: &str = "ADD EVENT sqlserver.error_reported (ACTION \
+(sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id) WHERE ([error_number] = (18456)))";
+
+/// A failed login (error 18456) under the name `login`.
+async fn failed_login(login: &str) {
+    let mut bad = target(login, "DATABASTION_IT_SQLSERVER_THROWAWAY", own_tls());
+    bad.id = "it-foreign".to_owned();
+    let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
+    assert!(
+        Box::pin(conn::connect(
+            &bad,
+            &tls,
+            &TlsChoice::default(),
+            Duration::from_secs(10)
+        ))
+        .await
+        .is_err()
+    );
+}
+
+/// #280 re-review L-b (security review L7 of the follow-up): on the dev
+/// session, whose `error_reported` is filtered, a failed login read
+/// proves failed logins are recorded; replacing the event's predicate
+/// (`DROP EVENT` then `ADD EVENT`, here with the same predicate) brings
+/// `audit.failed_logins_not_audited` back, whether the `ALTER EVENT
+/// SESSION` is sent plainly, as concatenated dynamic SQL (`EXEC (N'ALTER
+/// EVENT SES' + N'SION …')`) or through `sp_executesql` with a variable;
+/// a later failed login proves it again.
+#[tokio::test]
+async fn xe_failed_login_proof_follows_event_session_changes() {
+    Box::pin(xe_predicate_proof_scenario()).await;
+}
+
+async fn xe_predicate_proof_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {XE}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-xepred-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let drop_add = |via: &str| -> String {
+        let drop =
+            "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported";
+        let add = format!("ALTER EVENT SESSION databastion_xe ON SERVER {XE_ERROR_REPORTED}");
+        let split = |x: &str| {
+            let rest = x.strip_prefix("ALTER EVENT SES").unwrap();
+            format!("N'ALTER EVENT SES' + N'{rest}'")
+        };
+        match via {
+            "plain" => format!("{drop}; {add}"),
+            "exec" => format!("EXEC ({}); EXEC ({})", split(drop), split(&add)),
+            _ => format!(
+                "DECLARE @d nvarchar(4000) = {}; DECLARE @a nvarchar(4000) = {}; \
+                 EXEC sp_executesql @d; EXEC sp_executesql @a",
+                split(drop),
+                split(&add)
+            ),
+        }
+    };
+    let notes = std::sync::Mutex::new(Vec::new());
+    // Whether `check()` reports the note `want` (or not) within `wait`,
+    // asked every second: what the agent guarantees is the eventual
+    // outcome, within the session's dispatch latency (5 s) and the poll
+    // interval; the time it takes is printed (CI runners are slower).
+    let note_within = async |want: bool, wait: Duration| -> Option<Duration> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < wait {
+            let h = Box::pin(c.check(&t)).await;
+            if has(&h, NoteCode::AuditFailedLoginsNotAudited) == want {
+                return Some(started.elapsed());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        None
+    };
+    let mut marker = Box::pin(sa()).await;
+    let (stream, _rx) = Box::pin(xe_stream_caught_up(
+        &c,
+        &t,
+        &dir,
+        &mut marker,
+        Duration::from_secs(300),
+    ))
+    .await;
+    marker.close().await;
+    {
+        for (i, via) in ["plain", "exec", "sp_executesql"].into_iter().enumerate() {
+            // A failed login proves the filtered error_reported: up to
+            // three, each given 20 s.
+            let mut proven = None;
+            for k in 0..3 {
+                Box::pin(failed_login(&format!("it_no_such_plogin{i}_{k}"))).await;
+                proven = note_within(false, Duration::from_secs(20)).await;
+                if proven.is_some() {
+                    break;
+                }
+            }
+            let sent = Box::pin(exec_try(&mut s, &drop_add(via))).await;
+            // The change clears it: within 30 s, with no failed login.
+            let back = note_within(true, Duration::from_secs(30)).await;
+            eprintln!(
+                "[it] xe predicate change: {via}: proven by a failed login {proven:?}, ALTER sent \
+                 {sent}, note back after it {back:?}"
+            );
+            notes
+                .lock()
+                .unwrap()
+                .push((via, proven.is_some(), sent, back.is_some()));
+            assert!(!stream.is_finished(), "the stream ended");
+        }
+    }
+    stream.abort();
+    let _ = stream.await;
+    // The dev session as it was, whatever happened above.
+    Box::pin(exec_ok(
+        &mut s,
+        &format!(
+            "IF NOT EXISTS (SELECT 1 FROM sys.server_event_session_events e JOIN \
+             sys.server_event_sessions x ON x.event_session_id = e.event_session_id WHERE \
+             x.name = N'databastion_xe' AND e.name = N'error_reported') ALTER EVENT SESSION \
+             databastion_xe ON SERVER {XE_ERROR_REPORTED}"
+        ),
+    ))
+    .await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    for (via, proven, sent, back) in notes.into_inner().unwrap() {
+        assert!(sent, "{via}: the ALTER EVENT SESSION failed");
+        assert!(
+            proven,
+            "{via}: the failed login did not prove the filtered error_reported"
+        );
+        assert!(
+            back,
+            "{via}: the ALTER EVENT SESSION did not clear the failed-login proof"
+        );
+    }
+}
+
+/// ADR-0055 decision 2, the #303 residual: the server run the Audit
+/// streams read on each new session (`sql::SERVER_RUN`, the agent's own
+/// session, allow-list on) is the run `check()` keeps with its name case;
+/// a session on another run resets the kept value to `unknown` until the
+/// next `check()`.
+#[tokio::test]
+async fn the_streams_server_run_is_the_checks() {
+    Box::pin(server_run_scenario()).await;
+}
+
+async fn server_run_scenario() {
+    use databastion_core::name_case::NameCaseReport;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let c = SqlserverConnector::new();
+    let t = agent(own_tls());
+    let h = Box::pin(c.check(&t)).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    let kept = c.state.name_case(&t.id).unwrap();
+    assert_ne!(kept, NameCaseReport::unknown());
+    let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+    let mut own = Box::pin(conn::connect(
+        &t,
+        &tls,
+        &TlsChoice::default(),
+        Duration::from_secs(30),
+    ))
+    .await
+    .unwrap();
+    let run = Box::pin(crate::name_case::read_run(&mut own))
+        .await
+        .unwrap()
+        .expect("the server run");
+    own.close().await;
+    eprintln!("[it] server run: read by the stream's statement, kept by check(): equal");
+    assert_eq!(c.state.name_case_run(&t.id).as_ref(), Some(&run));
+    // The same run: kept.
+    c.state.observe_server_run(&t.id, &run);
+    assert_eq!(c.state.name_case(&t.id).as_ref(), Some(&kept));
+    // Another run: unknown until the next check reads it again.
+    c.state.observe_server_run(&t.id, &run.restarted());
+    assert_eq!(c.state.name_case(&t.id), Some(NameCaseReport::unknown()));
+    // (Only the server-wide parts: an `AUTO_CLOSE` database of Express
+    // may have closed since, and is `unknown` with no memory of the run.)
+    let _ = Box::pin(c.check(&t)).await;
+    let again = c.state.name_case(&t.id).unwrap();
+    assert_eq!(
+        (again.databases, again.objects),
+        (kept.databases, kept.objects)
+    );
+}
+
+/// #281 review L2: role-membership changes on the SQL Server Audit source
+/// (`SERVER_ROLE_MEMBER_CHANGE_GROUP` and `DATABASE_ROLE_MEMBER_CHANGE_GROUP`
+/// in the dev specification, dev/sqlserver/initdb/30-audit.sql). The roles
+/// are created before the stream starts (their `CREATE` records are in
+/// the skipped history), so the DCL events naming them come from `ADD
+/// MEMBER` and `DROP MEMBER` alone, of a server role and of a database
+/// role. SQL Server 2019: no source (`CONTROL SERVER`).
+#[tokio::test]
+async fn audit_reports_role_membership_changes() {
+    Box::pin(role_membership_scenario()).await;
+}
+
+async fn drop_it_roles(s: &mut Session) {
+    Box::pin(exec_ok(
+        s,
+        "IF SUSER_ID(N'it_srv_role') IS NOT NULL DROP SERVER ROLE it_srv_role",
+    ))
+    .await;
+    Box::pin(exec_ok(
+        s,
+        &in_db(
+            "retail",
+            "IF DATABASE_PRINCIPAL_ID(N'it_db_role') IS NOT NULL DROP ROLE it_db_role",
+        ),
+    ))
+    .await;
+}
+
+async fn role_membership_scenario() {
+    use databastion_classifiers::masking::EventAction;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    if major < 16 {
+        return;
+    }
+    let mut s = Box::pin(sa()).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "master",
+            "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
+             DEFINITION TO databastion",
+        ),
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+    ))
+    .await;
+    Box::pin(throwaway(&mut s, "it_member", &[])).await;
+    Box::pin(drop_it_roles(&mut s)).await;
+    Box::pin(exec(&mut s, "CREATE SERVER ROLE it_srv_role")).await;
+    Box::pin(exec(&mut s, &in_db("retail", "CREATE ROLE it_db_role"))).await;
+    let c = Arc::new(SqlserverConnector::new());
+    let t = agent(&format!("{}, {AUDIT}", own_tls()));
+    let dir = std::env::temp_dir().join(format!(
+        "databastion-sqlserver-roles-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+    let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+    let c2 = Arc::clone(&c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    // The first start skips the audit's history (the roles' creation).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    for sql in [
+        "ALTER SERVER ROLE it_srv_role ADD MEMBER it_member".to_owned(),
+        in_db("retail", "ALTER ROLE it_db_role ADD MEMBER it_member"),
+        in_db("retail", "ALTER ROLE it_db_role DROP MEMBER it_member"),
+        "ALTER SERVER ROLE it_srv_role DROP MEMBER it_member".to_owned(),
+    ] {
+        Box::pin(exec(&mut s, &sql)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    stream.abort();
+    let _ = stream.await;
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    let dcl: Vec<Vec<String>> = events
+        .iter()
+        .filter(|e| {
+            e.action() == EventAction::Dcl
+                && e.principal().account_name().eq_ignore_ascii_case("sa")
+        })
+        .map(names_of)
+        .collect();
+    for names in &dcl {
+        eprintln!("[it] roles: dcl {names:?}");
+    }
+    let naming = |name: &str| {
+        dcl.iter()
+            .filter(|names| names.iter().any(|n| n.ends_with(&format!(".{name}"))))
+            .count()
+    };
+    let (server, database, member) = (
+        naming("it_srv_role"),
+        naming("it_db_role"),
+        naming("it_member"),
+    );
+    eprintln!(
+        "[it] roles: major {major}, {} DCL event(s) of sa: naming the server role {server}, the \
+         database role {database}, the member {member}",
+        dcl.len()
+    );
+    // Nothing else of `sa`'s is DCL in the window: the two additions and
+    // the two removals.
+    assert!(
+        dcl.len() >= 4,
+        "role membership changes not reported as DCL: {dcl:?}"
+    );
+    assert!(
+        server + database + member >= 4,
+        "the DCL events name neither the roles nor the member: {dcl:?}"
+    );
+    Box::pin(drop_it_roles(&mut s)).await;
+    Box::pin(drop_login(&mut s, "it_member")).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The table list as Discovery sent it before the #293 follow-up: an
+/// object-level `HAS_PERMS_BY_NAME` per table (tests only, measured
+/// against the current [`crate::sql::TABLES`]).
+const TABLES_WITH_PERMISSION_CHECK: &str = "SELECT TOP (16385) CONVERT(int, t.object_id), \
+CONVERT(nvarchar(128), s.name), CONVERT(nvarchar(128), t.name), \
+CONVERT(int, t.is_remote_data_archive_enabled), CONVERT(int, t.is_memory_optimized), \
+CONVERT(bigint, (SELECT SUM(p.rows) FROM [retail].sys.partitions p WHERE p.object_id = t.object_id \
+AND p.index_id IN (0, 1))), CONVERT(int, HAS_PERMS_BY_NAME(QUOTENAME(N'retail') + N'.' + \
+QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), N'OBJECT', N'SELECT')) FROM [retail].sys.tables t JOIN \
+[retail].sys.schemas s ON s.schema_id = t.schema_id WHERE t.type = 'U' AND t.is_ms_shipped = 0 AND \
+t.is_external = 0 AND t.is_filetable = 0 AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', \
+N'guest') AND s.name NOT LIKE N'db[_]%' ORDER BY t.object_id";
+
+/// Tables of the throwaway schema of [`discovery_tables_write_no_audit_record_per_table`]:
+/// more than the 15 named objects an event keeps.
+const MANY_TABLES: usize = 20;
+
+/// The server's UTC time, as an ISO literal for `fn_get_audit_file`.
+async fn server_utc(s: &mut Session) -> String {
+    let at = try_rows(s, "SELECT CONVERT(nvarchar(30), SYSUTCDATETIME(), 126)", 1)
+        .await
+        .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+        .unwrap();
+    assert!(
+        at.bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.T".contains(&b))
+    );
+    at
+}
+
+/// `SL` records of the agent's login on the tables of schema `it_many` in
+/// `[from, to)` (server UTC): (records, distinct tables, distinct
+/// statement texts).
+async fn many_records(s: &mut Session, from: &str, to: &str) -> (i64, i64, i64) {
+    let sql = format!(
+        "SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, COUNT(DISTINCT object_name)), \
+         CONVERT(bigint, COUNT(DISTINCT CONVERT(nvarchar(4000), statement))) \
+         FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL) \
+         WHERE action_id = 'SL' AND database_name = N'retail' AND schema_name = N'it_many' \
+         AND server_principal_name = N'databastion' \
+         AND event_time >= CONVERT(datetime2, N'{from}', 126) \
+         AND event_time < CONVERT(datetime2, N'{to}', 126)"
+    );
+    let rows = try_rows(s, &sql, 3).await.unwrap_or_default();
+    let n = |i: usize| {
+        rows.first()
+            .and_then(|r| r.get(i))
+            .and_then(Value::as_int)
+            .unwrap_or(-1)
+    };
+    (n(0), n(1), n(2))
+}
+
+/// ROADMAP phase 9 follow-up of #293: whether Discovery's table list writes
+/// SQL Server Audit `SL` records per table. Measured with the dev audit
+/// (`SCHEMA_OBJECT_ACCESS_GROUP`) on a throwaway schema of
+/// [`MANY_TABLES`] tables, from a session of the agent's login: the
+/// earlier text (an object-level `HAS_PERMS_BY_NAME` per table) and the
+/// current [`crate::sql::TABLES`] (no permission check), each alone in a
+/// time window; printed as `[it] tables:` lines, and the current text must
+/// write none. Then, on 2022 and later, a Discovery scan under the SQL
+/// Server Audit stream: no event of the agent's own (no overflowed `*`),
+/// its statements left out.
+#[tokio::test]
+async fn discovery_tables_write_no_audit_record_per_table() {
+    Box::pin(discovery_tables_scenario()).await;
+}
+
+async fn discovery_tables_scenario() {
+    use databastion_core::AuditLevel;
+
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let create: Vec<String> = (1..=MANY_TABLES)
+        .map(|i| format!("CREATE TABLE it_many.t{i:02} (id int)"))
+        .collect();
+    Box::pin(exec_ok(
+        &mut s,
+        &in_db(
+            "retail",
+            &(1..=MANY_TABLES)
+                .map(|i| format!("DROP TABLE IF EXISTS it_many.t{i:02};"))
+                .collect::<String>(),
+        ),
+    ))
+    .await;
+    Box::pin(exec_ok(
+        &mut s,
+        &in_db("retail", "DROP SCHEMA IF EXISTS it_many"),
+    ))
+    .await;
+    Box::pin(exec(&mut s, &in_db("retail", "CREATE SCHEMA it_many"))).await;
+    Box::pin(exec(&mut s, &in_db("retail", &create.join("; ")))).await;
+    Box::pin(exec(
+        &mut s,
+        &in_db("retail", "GRANT SELECT ON SCHEMA::it_many TO databastion"),
+    ))
+    .await;
+    let tables = crate::sql::tables("retail", 16_384).unwrap();
+    // Each text alone in its window, from a session of the agent's login.
+    let mut windows = Vec::new();
+    for (label, text, columns) in [
+        (
+            "with a per-table permission check (before)",
+            TABLES_WITH_PERMISSION_CHECK,
+            7,
+        ),
+        ("current", tables.as_str(), 6),
+    ] {
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let from = Box::pin(server_utc(&mut s)).await;
+        let mut f = Box::pin(foreign_session(
+            "databastion",
+            "SQLSERVER_DATABASTION_PASSWORD",
+        ))
+        .await;
+        let rows = Box::pin(try_rows(&mut f, text, columns))
+            .await
+            .unwrap_or_default();
+        f.close().await;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let to = Box::pin(server_utc(&mut s)).await;
+        windows.push((label, rows.len(), from, to));
+    }
+    // The audit's QUEUE_DELAY is 1 s.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let mut counts = Vec::new();
+    for (label, listed, from, to) in &windows {
+        let (records, objects, texts) = Box::pin(many_records(&mut s, from, to)).await;
+        eprintln!(
+            "[it] tables: major {major}, {label}: {listed} tables listed, {records} SL record(s) \
+             on {objects} of the {MANY_TABLES} it_many tables ({texts} statement text(s))"
+        );
+        counts.push((records, objects));
+    }
+    assert!(
+        windows
+            .iter()
+            .all(|(_, listed, _, _)| *listed >= MANY_TABLES),
+        "the table lists did not run"
+    );
+    assert_eq!(
+        counts[1],
+        (0, 0),
+        "the current table list writes an audit record per table"
+    );
+
+    if major >= 16 {
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {AUDIT}", own_tls()));
+        Box::pin(exec(
+            &mut s,
+            &in_db(
+                "master",
+                "GRANT VIEW SERVER SECURITY AUDIT TO databastion; GRANT VIEW ANY SECURITY \
+                 DEFINITION TO databastion",
+            ),
+        ))
+        .await;
+        Box::pin(exec(
+            &mut s,
+            &in_db("retail", "GRANT VIEW DEFINITION TO databastion"),
+        ))
+        .await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-tables-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!stream.is_finished(), "{:?}", stream.await);
+        let before = c.state.audit.own_left_out(&t.id);
+        let scan = {
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (sink, mut frx) = FindingSink::channel(10_000);
+            let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
+            let r = Box::pin(c.discover(&job, &sink)).await;
+            let coverage = databastion_core::test_support::coverage_of(&sink);
+            drop(sink);
+            drain.await.unwrap();
+            (r, coverage)
+        };
+        scan.0.unwrap();
+        eprintln!("[it] tables: scan coverage {:?}", scan.1);
+        assert!(
+            scan.1.sampled >= MANY_TABLES as u64,
+            "the it_many tables were not sampled: {:?}",
+            scan.1
+        );
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let h = Box::pin(c.check(&t)).await;
+        assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+        stream.abort();
+        let _ = stream.await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let own: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.principal()
+                    .account_name()
+                    .eq_ignore_ascii_case("databastion")
+            })
+            .collect();
+        for e in &own {
+            eprintln!(
+                "[it] tables: own event reported {:?} {:?} overflowed={} always={}",
+                e.action(),
+                names_of(e),
+                e.objects_overflowed(),
+                e.always_report()
+            );
+        }
+        let after = c.state.audit.own_left_out(&t.id);
+        eprintln!("[it] tables: own statements left out during the scan {before:?} -> {after:?}");
+        assert!(
+            !events.iter().any(|e| e.objects_overflowed()
+                && e.principal()
+                    .account_name()
+                    .eq_ignore_ascii_case("databastion")),
+            "the scan of a database of more than 15 tables is an own overflowed read"
+        );
+        assert!(own.is_empty(), "the agent's own scan raised events");
+        // Not vacuous: the scan's catalog reads and samples were in the
+        // audit and were left out.
+        assert!(
+            after[0] > before[0] && after[1] >= before[1] + MANY_TABLES as u64,
+            "{before:?} {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(exec(
+        &mut s,
+        &in_db(
+            "retail",
+            &(1..=MANY_TABLES)
+                .map(|i| format!("DROP TABLE it_many.t{i:02};"))
+                .collect::<String>(),
+        ),
+    ))
+    .await;
+    Box::pin(exec(&mut s, &in_db("retail", "DROP SCHEMA it_many"))).await;
 }
 
 /// P9-A obligation L4: the closed list of `sys` built-in functions
@@ -1680,6 +2370,13 @@ async fn xe_scenario() {
     assert!(!has(&h, NoteCode::AuditXeSessionFiltered));
     assert!(!has(&h, NoteCode::AuditXeCausalityOff));
     assert!(!has(&h, NoteCode::AuditLogWithoutRowCounts));
+    // The dev session filters `error_reported` (18456 only): no failed
+    // login read yet, so none is proven recorded (#280 review L2).
+    assert!(
+        has(&h, NoteCode::AuditFailedLoginsNotAudited),
+        "{:?}",
+        codes(&h)
+    );
     assert_eq!(
         c.audit_source(&t),
         Some(databastion_classifiers::masking::EventSource::SqlserverXevents)
@@ -1804,26 +2501,6 @@ async fn xe_scenario() {
         Box::pin(try_rows(&mut f, crate::sql::SERVER_PERMISSIONS, 1)).await;
         f.close().await;
     }
-    // A failed login.
-    {
-        let mut bad = target(
-            "it_no_such_xlogin",
-            "DATABASTION_IT_SQLSERVER_THROWAWAY",
-            own_tls(),
-        );
-        bad.id = "it-foreign".to_owned();
-        let tls = tls::configs(bad.sqlserver_settings().ca_file.as_deref()).unwrap();
-        assert!(
-            Box::pin(conn::connect(
-                &bad,
-                &tls,
-                &TlsChoice::default(),
-                Duration::from_secs(10)
-            ))
-            .await
-            .is_err()
-        );
-    }
     // Credential DCL in forms the server does not mask itself.
     Box::pin(drop_login(&mut s, "it_xcred")).await;
     Box::pin(exec(
@@ -1839,12 +2516,73 @@ async fn xe_scenario() {
     .await;
     Box::pin(exec(&mut s, "DROP CREDENTIAL it_xcred_c")).await;
     Box::pin(drop_login(&mut s, "it_xcred")).await;
+    // The e2e DCL batch (e2e/sqlserver.sh) by a login holding ALTER ANY
+    // LOGIN only: the server records the first two as `-- CREATE LOGIN`
+    // and `-- ALTER LOGIN` (measured on 2022), the third with its text;
+    // three DCL events (the fix of 2026-10-18: `DROP LOGIN` was DDL).
+    Box::pin(drop_login(&mut s, "it_xdcl_probe")).await;
+    Box::pin(throwaway(
+        &mut s,
+        "it_xadmin",
+        &[in_db("master", "GRANT ALTER ANY LOGIN TO [it_xadmin]")],
+    ))
+    .await;
+    {
+        let mut a = Box::pin(foreign_session(
+            "it_xadmin",
+            "DATABASTION_IT_SQLSERVER_THROWAWAY",
+        ))
+        .await;
+        Box::pin(exec_ok(
+            &mut a,
+            &format!(
+                "CREATE LOGIN it_xdcl_probe WITH PASSWORD = N'{marker}A1', CHECK_POLICY = OFF;\n\
+                 ALTER LOGIN it_xdcl_probe WITH PASSWORD = N'{marker}B2';\n\
+                 DROP LOGIN it_xdcl_probe;\n"
+            ),
+        ))
+        .await;
+        a.close().await;
+    }
+    Box::pin(drop_login(&mut s, "it_xdcl_probe")).await;
+    // A failed login, last: the failed-login proof counts only an 18456
+    // after any statement that may change an event session, in the file
+    // and in time (#280 re-review L-b), and the dev session's files hold
+    // the `ALTER EVENT SESSION` statements of the tests before this one
+    // (xe_failed_login_proof_follows_event_session_changes), which this
+    // stream reads in its history.
+    Box::pin(failed_login("it_no_such_xlogin")).await;
 
     // The session's dispatch latency is 5 s.
     tokio::time::sleep(Duration::from_secs(12)).await;
-    let h = Box::pin(c.check(&t)).await;
+    let mut h = Box::pin(c.check(&t)).await;
     eprintln!("[it] xe, streaming: {:?} {:?}", h.audit_level, codes(&h));
+    if has(&h, NoteCode::AuditFailedLoginsNotAudited) {
+        // The stream may still be reading the session's history (the
+        // whole suite's events): one more failed login, read once it has
+        // caught up.
+        eprintln!(
+            "[it] xe, streaming: failed logins not proven yet; one more failed login after the \
+             history"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        Box::pin(failed_login("it_no_such_xlogin_again")).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        h = Box::pin(c.check(&t)).await;
+        eprintln!(
+            "[it] xe, streaming again: {:?} {:?}",
+            h.audit_level,
+            codes(&h)
+        );
+    }
     assert_eq!(h.audit_level, AuditLevel::Partial, "{:?}", codes(&h));
+    // The failed login read proves the filtered `error_reported` admits
+    // them, aged on the server's clock (#280 re-review L-b).
+    assert!(
+        !has(&h, NoteCode::AuditFailedLoginsNotAudited),
+        "{:?}",
+        codes(&h)
+    );
     // The source's grant is expected while the stream uses it.
     let label = grant.to_lowercase().replace(' ', "_");
     assert!(
@@ -1918,6 +2656,20 @@ async fn xe_scenario() {
         by("sa").iter().any(|e| e.action() == EventAction::Dcl),
         "no DCL reported"
     );
+    let admin_dcl: Vec<&MaskedEvent> = by("it_xadmin")
+        .into_iter()
+        .filter(|e| e.action() == EventAction::Dcl)
+        .collect();
+    assert_eq!(
+        admin_dcl.len(),
+        3,
+        "CREATE / ALTER LOGIN … WITH PASSWORD and DROP LOGIN: three DCL events"
+    );
+    assert!(
+        admin_dcl
+            .iter()
+            .all(|e| e.always_report() && names_of(e).iter().all(|n| n.ends_with(".-.*")))
+    );
     // The agent's login: only the foreign session's statements.
     let agent_events = by("databastion");
     assert!(
@@ -1953,6 +2705,15 @@ async fn xe_scenario() {
         exact > 10 && sampling >= 5 && polls >= 2,
         "{exact} {sampling} {polls}"
     );
+    // Security review of #276, L6: a steady stream reads in file order
+    // and drops nothing.
+    assert_eq!(
+        c.state.audit.out_of_order_reads(&t.id),
+        0,
+        "reads out of file order"
+    );
+    let facts = c.state.audit.facts(&t.id);
+    assert_eq!(facts.dropped, 0, "audit.records_dropped in a steady stream");
     // I2.
     let json = databastion_core::test_support::contract_events_json(&events, &key());
     assert!(json.contains("\"source\":\"sqlserver_xevents\""), "{json}");
@@ -2026,6 +2787,7 @@ async fn xe_scenario() {
     assert_eq!(h.audit_level, AuditLevel::Limited, "{:?}", codes(&h));
     assert!(has(&h, NoteCode::AuditRecordsDropped), "{:?}", codes(&h));
     Box::pin(drop_login(&mut s, "it_xdump")).await;
+    Box::pin(drop_login(&mut s, "it_xadmin")).await;
     if major >= 16 {
         Box::pin(exec(
             &mut s,
@@ -2139,6 +2901,111 @@ async fn xe_stream_around<F: std::future::Future<Output = ()>>(
     events
 }
 
+/// Starts an Extended Events stream of `t` (state in `dir`) and returns
+/// once it has read past its first start's history: a read of
+/// `retail.crm.customers` by `sa` on `marker`, sent after the start, is
+/// received (at most `wait`). The engine matrix runs every test on one
+/// server, so the dev session's history a first start walks grows with
+/// the run (reproduced locally: with 90 000 events of history, the fixed
+/// waits of the predicate and statistics tests saw none of their events).
+async fn xe_stream_caught_up(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    marker: &mut Session,
+    wait: Duration,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectorError>>,
+    tokio::sync::mpsc::Receiver<databastion_classifiers::masking::MaskedEvent>,
+) {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!stream.is_finished(), "the stream started");
+    Box::pin(exec(
+        marker,
+        "DECLARE @n int; SELECT @n = COUNT(*) FROM retail.crm.customers",
+    ))
+    .await;
+    let started = std::time::Instant::now();
+    while started.elapsed() < wait {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            && e.principal().account_name().eq_ignore_ascii_case("sa")
+            && names_of(&e).contains(&"retail.crm.customers".to_owned())
+        {
+            eprintln!("[it] stream caught up after {:?}", started.elapsed());
+            return (stream, rx);
+        }
+    }
+    panic!("the stream did not read past its history within {wait:?}");
+}
+
+/// As [`xe_stream_around`], but after `work` waits until the stream has
+/// read past it: a read of `retail.crm.customers` by `sa` on `marker`,
+/// sent after `work`, is received (at most `wait`), then 2 s more. A first
+/// start behind a long history of the dev session (the engine matrix runs
+/// every test on one server) walks it before it reaches `work`'s events;
+/// a fixed wait made `xe_statistics_builds_match_the_fixture` see none of
+/// them on 2019 (PR #318's engine matrix).
+async fn xe_stream_until_read<F: std::future::Future<Output = ()>>(
+    c: &Arc<SqlserverConnector>,
+    t: &TargetConfig,
+    dir: &std::path::Path,
+    marker: &mut Session,
+    wait: Duration,
+    work: F,
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    let limits = Limits {
+        min_audit_poll_interval_s: 1,
+        ..Limits::default()
+    };
+    let cfg = databastion_core::AuditConfig::local(t, 1, &limits).with_state_dir(dir.to_path_buf());
+    let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
+    let c2 = Arc::clone(c);
+    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!stream.is_finished(), "{:?}", stream.await);
+    work.await;
+    Box::pin(exec(
+        marker,
+        "DECLARE @n int; SELECT @n = COUNT(*) FROM retail.crm.customers",
+    ))
+    .await;
+    let marked = |e: &databastion_classifiers::masking::MaskedEvent| {
+        e.principal().account_name().eq_ignore_ascii_case("sa")
+            && names_of(e).contains(&"retail.crm.customers".to_owned())
+    };
+    let mut events = Vec::new();
+    let deadline = std::time::Instant::now() + wait;
+    let mut seen = None;
+    while std::time::Instant::now() < deadline
+        && seen.is_none_or(|at: std::time::Instant| at.elapsed() < Duration::from_secs(2))
+    {
+        if let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+            if marked(&e) {
+                seen.get_or_insert_with(std::time::Instant::now);
+            }
+            events.push(e);
+        }
+    }
+    stream.abort();
+    let _ = stream.await;
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    assert!(
+        seen.is_some(),
+        "the stream read past the work within {wait:?}"
+    );
+    events
+}
+
 /// The Extended Events grant of the server's version, granted to the dev
 /// account for a test (2019: held already).
 async fn xe_grant(s: &mut Session, major: u32) -> &'static str {
@@ -2209,17 +3076,26 @@ async fn xe_statistics_scenario() {
     // then of another column inside `sp_executesql` (nest level 3).
     let q = format!("SELECT TOP (5) id FROM retail.crm.{table} WHERE v = 3");
     let q3 = format!("EXEC sp_executesql N'SELECT TOP (5) v FROM retail.crm.{table} WHERE id = 3'");
-    let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
-        let mut d = Box::pin(foreign_session(
-            "it_xstats",
-            "DATABASTION_IT_SQLSERVER_THROWAWAY",
-        ))
-        .await;
-        Box::pin(try_rows(&mut d, &q, 1)).await;
-        Box::pin(try_rows(&mut d, &q3, 1)).await;
-        d.close().await;
-    }))
+    let mut marker = Box::pin(sa()).await;
+    let events = Box::pin(xe_stream_until_read(
+        &c,
+        &t,
+        &dir,
+        &mut marker,
+        Duration::from_secs(300),
+        async {
+            let mut d = Box::pin(foreign_session(
+                "it_xstats",
+                "DATABASTION_IT_SQLSERVER_THROWAWAY",
+            ))
+            .await;
+            Box::pin(try_rows(&mut d, &q, 1)).await;
+            Box::pin(try_rows(&mut d, &q3, 1)).await;
+            d.close().await;
+        },
+    ))
     .await;
+    marker.close().await;
     let mine: Vec<_> = events
         .iter()
         .filter(|e| {
@@ -2361,9 +3237,15 @@ async fn xe_fresh_scenario() {
     // The same target naming an audit too: its `check()` sends the
     // `audit_file` proof (2022 and later). The own-session registry is
     // keyed by the target id, as for one agent's check and stream. The
-    // audit does not exist, so the proof stops there: the next proof
-    // (`audit_specifications`) builds statistics on `sys.sysaudacts`, which
-    // is not on case 2's list (measured on 2022 on 2026-10-16; reported).
+    // audit does not exist, so the proof stops there. A third `check()`
+    // names the dev service's audit: its next proof
+    // (`audit_specifications`) builds statistics on `sys.sysaudacts`
+    // (measured on 2022 on 2026-10-16), on case 2's list since 2026-10-18.
+    let t_spec = agent(&format!(
+        "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: databastion_audit, \
+         xe_session: databastion_xe}}",
+        own_tls()
+    ));
     let t_audit = agent(&format!(
         "{}, rls_visibility: view_definition, audit: {{source: auto, audit_name: it_no_such_audit, \
          xe_session: databastion_xe}}",
@@ -2372,6 +3254,7 @@ async fn xe_fresh_scenario() {
     let events = Box::pin(xe_stream_around(&c, &t, &dir, async {
         let _ = Box::pin(c.check(&t)).await;
         let _ = Box::pin(SqlserverConnector::new().check(&t_audit)).await;
+        let _ = Box::pin(SqlserverConnector::new().check(&t_spec)).await;
         let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
         let (sink, mut frx) = FindingSink::channel(10_000);
         let drain = tokio::spawn(async move { while frx.recv().await.is_some() {} });
@@ -2388,6 +3271,9 @@ async fn xe_fresh_scenario() {
                 .eq_ignore_ascii_case("databastion")
         })
         .collect();
+    // Captured before any assertion, so that a failing run still gives
+    // its fixture source.
+    Box::pin(xe_fresh_capture_statistics(&mut s, major)).await;
     for e in &own {
         eprintln!(
             "[it] xe fresh: own event reported {:?} {:?}",
@@ -2489,34 +3375,141 @@ async fn xe_fresh_sysguidrefs(
             .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysguidrefs"))),
         "the build on sysguidrefs paired with the audit_file proof is left out"
     );
+    // The `audit_specifications` proof's build on `sys.sysaudacts` (ADR-0051
+    // note of 2026-10-18): left out when the server built one.
+    let audacts = read(
+        Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
+                 WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+                 AND event_data LIKE N'%sysaudacts%' AND event_data LIKE N'%databastion%'"
+            ),
+            1,
+        ))
+        .await,
+    );
+    eprintln!("[it] xe fresh: builds on sysaudacts {}", audacts.len());
+    assert!(
+        !own.iter()
+            .any(|e| names_of(e).iter().any(|n| n.ends_with(".sys.sysaudacts"))),
+        "the build on sysaudacts paired with the audit_specifications proof is left out"
+    );
     let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
         return;
     };
-    let activity = |x: &str| -> Option<String> {
-        let at = x.find("name=\"attach_activity_id\"")?;
-        let rest = &x[at..];
-        let v = &rest[rest.find("<value>")? + 7..];
-        let v = &v[..v.find("</value>")?];
-        Some(v.rsplit_once('-')?.0.to_owned())
-    };
+    // The `sysaudacts` build's activity alone too (the source of the
+    // fixtures `sysaudacts-<build>.xml`).
+    let (only, cut) = Box::pin(activity_events(s, &audacts)).await;
+    eprintln!(
+        "[it] xe fresh capture: sysaudacts {} event(s), {cut} above 4000 characters",
+        only.len()
+    );
+    std::fs::write(capture_path(&path, "sysaudacts"), only.join("\n") + "\n").unwrap();
+    let builds: Vec<String> = builds.into_iter().chain(audacts).collect();
+    let (lines, cut) = Box::pin(activity_events(s, &builds)).await;
+    eprintln!(
+        "[it] xe fresh capture: sysguidrefs and sysaudacts {} event(s), {cut} above 4000 characters",
+        lines.len()
+    );
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+}
+
+/// The Extended Events files of the dev session (tests only).
+const XE_FILES: &str = "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', \
+                        NULL, NULL, NULL)";
+
+/// `base` with `-<part>` before its `.txt` extension: another capture
+/// file next to `DATABASTION_IT_SQLSERVER_CAPTURE` (the engine matrix
+/// uploads the whole directory).
+fn capture_path(base: &str, part: &str) -> String {
+    match base.strip_suffix(".txt") {
+        Some(stem) => format!("{stem}-{part}.txt"),
+        None => format!("{base}-{part}"),
+    }
+}
+
+/// The activity GUID of a captured event (`attach_activity_id`, without
+/// its sequence).
+fn activity_of(x: &str) -> Option<String> {
+    let at = x.find("name=\"attach_activity_id\"")?;
+    let rest = &x[at..];
+    let v = &rest[rest.find("<value>")? + 7..];
+    let v = &v[..v.find("</value>")?];
+    Some(v.rsplit_once('-')?.0.to_owned())
+}
+
+/// Every event of the activities of `builds` (captured events, one line
+/// each, in the order the files return them), and how many were above
+/// 4 000 characters (cut by the capture's `nvarchar(4000)`: such a line is
+/// not a fixture as is). Fake data only (the dev seed and the agent's
+/// constant texts).
+async fn activity_events(s: &mut Session, builds: &[String]) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
+    let mut cut = 0;
     let guids: std::collections::BTreeSet<String> =
-        builds.iter().filter_map(|b| activity(b)).collect();
+        builds.iter().filter_map(|b| activity_of(b)).collect();
     for guid in guids {
         assert!(guid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
-        lines.extend(read(
-            Box::pin(try_rows(
-                s,
-                &format!(
-                    "SELECT TOP (64) CONVERT(nvarchar(4000), event_data) FROM {FILES} \
-                     WHERE event_data LIKE N'%{guid}-%'"
-                ),
-                1,
-            ))
-            .await,
-        ));
+        let rows = Box::pin(try_rows(
+            s,
+            &format!(
+                "SELECT TOP (64) CONVERT(nvarchar(4000), event_data), \
+                 CONVERT(bigint, DATALENGTH(event_data)) FROM {XE_FILES} \
+                 WHERE event_data LIKE N'%{guid}-%'"
+            ),
+            2,
+        ))
+        .await
+        .unwrap_or_default();
+        for r in &rows {
+            if r.get(1).and_then(Value::as_int).unwrap_or(0) > 8_000 {
+                cut += 1;
+            }
+            if let Some(x) = r.first().and_then(Value::as_text) {
+                lines.push(x.replace('\n', " "));
+            }
+        }
     }
-    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    (lines, cut)
+}
+
+/// Every statistics build of the agent's login in the fresh run with the
+/// events of its activity, to `<capture>-statistics.txt`: the source of
+/// the drift fixtures `statistics-<build>.xml` (the agent's own builds on
+/// a fresh server; `statistics-16.0.4305.5.xml`'s own part was re-captured
+/// from it on 2026-10-22, ROADMAP follow-up of #293). Prints whether the
+/// CAS guard's current text (`sql::CAS_COLUMNS` on `retail`) is among them.
+async fn xe_fresh_capture_statistics(s: &mut Session, major: u32) {
+    let Ok(path) = std::env::var("DATABASTION_IT_SQLSERVER_CAPTURE") else {
+        return;
+    };
+    let builds: Vec<String> = Box::pin(try_rows(
+        s,
+        &format!(
+            "SELECT TOP (256) CONVERT(nvarchar(4000), event_data) FROM {XE_FILES} \
+             WHERE object_name = N'sp_statement_completed' AND event_data LIKE N'%StatMan%' \
+             AND event_data LIKE N'%databastion%'"
+        ),
+        1,
+    ))
+    .await
+    .unwrap_or_default()
+    .iter()
+    .filter_map(|r| r.first().and_then(Value::as_text).map(str::to_owned))
+    .collect();
+    let (lines, cut) = Box::pin(activity_events(s, &builds)).await;
+    let cas = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
+    let cas_partner = lines
+        .iter()
+        .any(|l| l.contains(&format!("<![CDATA[{cas}]]>")));
+    eprintln!(
+        "[it] xe fresh capture: major {major}, {} build(s), {} event(s) of their activities, {cut} \
+         above 4000 characters, CAS guard text among them: {cas_partner}",
+        builds.len(),
+        lines.len()
+    );
+    std::fs::write(capture_path(&path, "statistics"), lines.join("\n") + "\n").unwrap();
 }
 
 /// Re-review N1: the first start's floor is bounded. A saved position
@@ -2707,6 +3700,201 @@ async fn first_start_scenario() {
     }
 }
 
+/// Iterations of [`backlog_scenario`]'s tight batch for the Extended
+/// Events stream: three statement events each (the `SELECT`, the `SET`,
+/// the `WHILE` test), 12 000 events.
+const BACKLOG_XE_READS: u32 = 4_000;
+/// The same for the SQL Server Audit stream: one `SL` record each.
+const BACKLOG_AUDIT_READS: u32 = 10_500;
+/// The poll intervals (of 1 s) a first start behind a backlog of more
+/// than 10 000 records may take to reach the end of its source.
+const BACKLOG_POLLS: u32 = 60;
+/// The test's own Extended Events session ([`backlog_scenario`]).
+const BACKLOG_XE: &str = "it_backlog_xe";
+
+/// The Extended Events session [`BACKLOG_XE`] as the dev session is
+/// defined (dev/sqlserver/initdb/30-audit.sql), writing to `stem` files.
+fn backlog_session(stem: &str) -> String {
+    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
+    format!(
+        "CREATE EVENT SESSION {BACKLOG_XE} ON SERVER \
+         ADD EVENT sqlserver.sql_statement_completed ({actions}), \
+         ADD EVENT sqlserver.sp_statement_completed ({actions}), \
+         ADD EVENT sqlserver.rpc_completed ({actions}), \
+         ADD EVENT sqlserver.error_reported ({actions} WHERE ([error_number] = (18456))) \
+         ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
+         max_file_size = 16, max_rollover_files = 2) \
+         WITH (TRACK_CAUSALITY = ON, MAX_DISPATCH_LATENCY = 5 SECONDS)"
+    )
+}
+
+/// `reads` reads of `crm.customers` in one tight batch (`sa`).
+async fn backlog_reads(s: &mut Session, label: &str, reads: u32) {
+    let started = std::time::Instant::now();
+    Box::pin(exec(
+        s,
+        &in_db(
+            "retail",
+            &format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+                 WHILE @i < {reads} BEGIN \
+                 SELECT @n = COUNT(*) FROM crm.customers WHERE id = @i; SET @i += 1; END"
+            ),
+        ),
+    ))
+    .await;
+    eprintln!(
+        "[it] backlog ({label}): {reads} reads written in {} ms",
+        started.elapsed().as_millis()
+    );
+}
+
+/// Records in a source's files (`sa`).
+async fn source_records(s: &mut Session, files: &str) -> i64 {
+    try_rows(
+        s,
+        &format!("SELECT CONVERT(bigint, COUNT(*)) FROM {files}"),
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r.first().and_then(Value::as_int)))
+    .unwrap_or(-1)
+}
+
+/// Security review R3 of 527eb08 (the catch-up pacing of
+/// [`crate::audit::cycle`]): a fresh first start behind a backlog of more
+/// than 10 000 records (a tight batch of reads written before the stream
+/// starts, all history) reaches the end of its source within
+/// [`BACKLOG_POLLS`] poll intervals: a read by `sa` made just after the
+/// start is reported. No `audit.records_dropped`. Extended Events on its
+/// own session [`BACKLOG_XE`], and SQL Server Audit on 2022 and later.
+/// The dev session is stopped while the backlog is written, so that the
+/// other tests' first starts do not walk it.
+#[tokio::test]
+async fn a_backlog_is_caught_up_within_poll_intervals() {
+    Box::pin(backlog_scenario()).await;
+}
+
+async fn backlog_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let stem = format!("it_backlog_{}", std::process::id());
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{BACKLOG_XE}') \
+         DROP EVENT SESSION {BACKLOG_XE} ON SERVER"
+    );
+    let state = |name: &str, on: bool| {
+        format!(
+            "ALTER EVENT SESSION {name} ON SERVER STATE = {}",
+            if on { "START" } else { "STOP" }
+        )
+    };
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    Box::pin(exec(&mut s, &backlog_session(&stem))).await;
+    Box::pin(exec(&mut s, &state("databastion_xe", false))).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, true))).await;
+    Box::pin(backlog_reads(&mut s, "xevents", BACKLOG_XE_READS)).await;
+    // Its dispatch latency, then the SQL Server Audit backlog alone.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, false))).await;
+    if major >= 16 {
+        Box::pin(backlog_reads(&mut s, "audit", BACKLOG_AUDIT_READS)).await;
+    }
+    Box::pin(exec(&mut s, &state("databastion_xe", true))).await;
+    Box::pin(exec(&mut s, &state(BACKLOG_XE, true))).await;
+    // The audit's QUEUE_DELAY.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let xe = format!(
+        "rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {BACKLOG_XE}}}"
+    );
+    let xe_files = format!(
+        "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/{stem}_0_*.xel', NULL, NULL, NULL)"
+    );
+    let audit_files =
+        "sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL)".to_owned();
+    let mut sources = vec![(xe, "xevents", xe_files)];
+    if major >= 16 {
+        sources.push((AUDIT.to_owned(), "audit", audit_files));
+    }
+    for (settings, label, files) in sources {
+        let records = Box::pin(source_records(&mut s, &files)).await;
+        eprintln!("[it] backlog ({label}): {records} records in the source");
+        assert!(
+            records > 10_000,
+            "{label}: a backlog of more than 10 000 records"
+        );
+        let c = Arc::new(SqlserverConnector::new());
+        let t = agent(&format!("{}, {settings}", own_tls()));
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-sqlserver-backlog-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = Limits {
+            min_audit_poll_interval_s: 1,
+            ..Limits::default()
+        };
+        let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
+        let poll = cfg.poll_interval();
+        let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+        let c2 = Arc::clone(&c);
+        let started = std::time::Instant::now();
+        let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // After the first start: live, reported once the history is read.
+        Box::pin(exec(
+            &mut s,
+            &in_db(
+                "retail",
+                "DECLARE @n int; SELECT @n = COUNT(*) FROM finance.payment_cards",
+            ),
+        ))
+        .await;
+        let deadline = started + poll * BACKLOG_POLLS;
+        let mut reached = None;
+        while reached.is_none() && std::time::Instant::now() < deadline {
+            assert!(!stream.is_finished(), "{label}: the stream ended");
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(e)) => {
+                    if names_of(&e).contains(&"retail.finance.payment_cards".to_owned()) {
+                        reached = Some(started.elapsed());
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        stream.abort();
+        let _ = stream.await;
+        let dropped = c.state.audit.facts(&t.id).dropped;
+        eprintln!(
+            "[it] backlog ({label}): end of the source reached after {reached:?} (poll interval {poll:?}), records dropped {dropped}"
+        );
+        let reached = reached.unwrap_or_else(|| {
+            panic!("{label}: the end of the source within {BACKLOG_POLLS} poll intervals")
+        });
+        assert!(reached <= poll * BACKLOG_POLLS, "{label}");
+        assert_eq!(dropped, 0, "{label}: a backlog read drops nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Box::pin(exec_ok(&mut s, &state(BACKLOG_XE, false))).await;
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+}
+
 /// End-of-phase-9 review of G7 / N1, H1: SQL Server ignores trailing
 /// spaces in identifiers, so `[sys].[sql_logins ]` and `[sys ].[...]`
 /// resolve to the catalog views (an unknown name fails with error 208),
@@ -2738,44 +3926,1471 @@ async fn trailing_spaces_in_bracketed_names_resolve_to_the_listed_views() {
     }
 }
 
+/// The M2 case of P9-D's join (not an object of the lists).
+const P9D_JOIN: &str = "p9d_join";
+
+/// What a read of the decision 6 measurement (M2) gave on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum M2Outcome {
+    /// It ran (rows or not).
+    Ran,
+    /// It did not complete: refused by a permission (229, 262, 297, 300,
+    /// 2571, 8189, 9010, 27219…) or failed on its argument (569).
+    Error(i32),
+    /// The object or form does not exist on this image (208, 2812, 4121,
+    /// 313…): not measured.
+    Unavailable(i32),
+}
+
+/// The read of each object of decision 6's three always-reported lists
+/// (`tsql::STATEMENT_TEXT_OBJECTS`, `CREDENTIAL_OBJECTS`, `VALUE_OBJECTS`)
+/// the measurement sends; `None`: not sent (why).
+fn m2_read(object: &str, stats: &str) -> Result<(String, usize), &'static str> {
+    // One `int` answered (the session's closed type set reads it), so the
+    // read is never cancelled: a cancelled statement leaves no completion
+    // event.
+    let from_src = |src: &str| {
+        (
+            format!("SELECT CONVERT(int, COUNT(*)) FROM (SELECT TOP (1) 1 AS a FROM {src}) x"),
+            1,
+        )
+    };
+    let scalar = |e: &str| {
+        (
+            format!("SELECT CONVERT(int, CASE WHEN {e} IS NULL THEN 0 ELSE 1 END)"),
+            1,
+        )
+    };
+    let raw = |t: &str, columns: usize| (t.to_owned(), columns);
+    Ok(match object {
+        "dm_exec_sql_text" => from_src("sys.dm_exec_sql_text(0x01)"),
+        "dm_exec_input_buffer" => from_src("sys.dm_exec_input_buffer(@@SPID, NULL)"),
+        "dm_exec_query_stats" => from_src("sys.dm_exec_query_stats"),
+        "dm_exec_cached_plans" => from_src("sys.dm_exec_cached_plans"),
+        "dm_exec_query_plan" => from_src("sys.dm_exec_query_plan(0x01)"),
+        "dm_exec_text_query_plan" => from_src("sys.dm_exec_text_query_plan(0x01, 0, -1)"),
+        "dm_exec_query_statistics_xml" => from_src("sys.dm_exec_query_statistics_xml(@@SPID)"),
+        "dm_exec_query_plan_stats" => from_src("sys.dm_exec_query_plan_stats(0x01)"),
+        "fn_get_sql" => from_src("sys.fn_get_sql(0x01)"),
+        "query_store_query_text" => from_src("retail.sys.query_store_query_text"),
+        "query_store_plan" => from_src("retail.sys.query_store_plan"),
+        "fn_get_audit_file" => {
+            from_src("sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL)")
+        }
+        "fn_get_audit_file_v2" => from_src(
+            "sys.fn_get_audit_file_v2(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL, NULL, NULL)",
+        ),
+        "fn_xe_file_target_read_file" => from_src(
+            "sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', NULL, NULL, NULL)",
+        ),
+        "dm_xe_session_targets" => from_src("sys.dm_xe_session_targets"),
+        "fn_trace_gettable" => {
+            from_src("sys.fn_trace_gettable(N'/var/opt/mssql/log/log.trc', DEFAULT)")
+        }
+        "inputbuffer" => raw("DBCC INPUTBUFFER(1)", 3),
+        "sp_readerrorlog" => raw("EXEC sys.sp_readerrorlog 0, 1, N'databastion-m2-none'", 0),
+        "xp_readerrorlog" => raw(
+            "EXEC master.sys.xp_readerrorlog 0, 1, N'databastion-m2-none'",
+            0,
+        ),
+        "sysjobsteps" => from_src("msdb.dbo.sysjobsteps"),
+        "sysmail_mailitems" => from_src("msdb.dbo.sysmail_mailitems"),
+        "fn_sqlagent_jobsteps" => from_src("msdb.dbo.fn_sqlagent_jobsteps(NULL, NULL)"),
+        "sql_logins" => from_src("sys.sql_logins"),
+        "syslogins" => from_src("sys.syslogins"),
+        "loginproperty" => scalar("LOGINPROPERTY(N'sa', N'PasswordLastSetTime')"),
+        "credentials" => from_src("sys.credentials"),
+        "database_scoped_credentials" => from_src("retail.sys.database_scoped_credentials"),
+        "linked_logins" => from_src("sys.linked_logins"),
+        "servers" => from_src("sys.servers"),
+        "external_data_sources" => from_src("retail.sys.external_data_sources"),
+        "master_key_passwords" => from_src("sys.master_key_passwords"),
+        "symmetric_keys" => from_src("retail.sys.symmetric_keys"),
+        "key_encryptions" => from_src("retail.sys.key_encryptions"),
+        "column_master_keys" => from_src("retail.sys.column_master_keys"),
+        "column_encryption_key_values" => from_src("retail.sys.column_encryption_key_values"),
+        "certprivatekey" => scalar("CERTPRIVATEKEY(1, N'databastion-m2-x')"),
+        "pwdcompare" => scalar("PWDCOMPARE(N'databastion-m2-x', 0x0100)"),
+        "syslnklgns" => from_src("master.sys.syslnklgns"),
+        "sysoledbusers" => from_src("master.sys.sysoledbusers"),
+        "sysxlgns" => from_src("master.sys.sysxlgns"),
+        "sysmail_server" => from_src("msdb.dbo.sysmail_server"),
+        "sysmail_account" => from_src("msdb.dbo.sysmail_account"),
+        "sysproxies" => from_src("msdb.dbo.sysproxies"),
+        "sysssispackages" => from_src("msdb.dbo.sysssispackages"),
+        "environment_variables" => from_src("SSISDB.catalog.environment_variables"),
+        "fn_getproviderstring" => from_src("sys.fn_getproviderstring(N'databastion-m2-x')"),
+        "show_statistics" => (
+            format!("DBCC SHOW_STATISTICS(N'retail.crm.customers', [{stats}]) WITH NO_INFOMSGS"),
+            0,
+        ),
+        "dm_db_stats_histogram" => {
+            from_src("retail.sys.dm_db_stats_histogram(OBJECT_ID(N'retail.crm.customers'), 1)")
+        }
+        "clonedatabase" => return Err("it creates a database"),
+        // P9-D's read refused for a missing server permission (security
+        // review of #276, M1): the join of the statement-text views, as the
+        // load harness writes it (`e2e/load/sqlserver.sh`), a low-privilege
+        // case only.
+        P9D_JOIN => raw(
+            "SELECT TOP (1) st.text FROM sys.dm_exec_query_stats qs CROSS APPLY \
+             sys.dm_exec_sql_text(qs.sql_handle) st",
+            1,
+        ),
+        "fn_dblog" => from_src("retail.sys.fn_dblog(NULL, NULL)"),
+        "fn_dblog_xtp" => from_src("retail.sys.fn_dblog_xtp(NULL, NULL)"),
+        "fn_dump_dblog" | "fn_dump_dblog_xtp" => return Err("it needs a backup file"),
+        "fn_full_dblog" => from_src(
+            "sys.fn_full_dblog(NULL, NULL, DB_ID(N'retail'), NULL, NULL, NULL, NULL, NULL)",
+        ),
+        "fn_dbslog" => from_src("sys.fn_dbslog(NULL, NULL)"),
+        "page" => raw("DBCC PAGE(N'retail', 1, 0, 0)", 0),
+        "dm_db_page_info" => from_src("sys.dm_db_page_info(DB_ID(N'retail'), 1, 0, N'LIMITED')"),
+        _ => return Err("no read written for this object"),
+    })
+}
+
+/// ADR-0051 decision 6 measurement obligation (M2), as a drift test: on
+/// the image under test, each object of the three always-reported lists
+/// is read once by a low-privilege login (the throwaway login: `SELECT` on
+/// two `retail` schemas, nothing else) and once by a privileged one
+/// (`sa`), each read marked by a comment; then the records of both sources
+/// are read back as `sa`. A read that ran or was refused by a permission
+/// must show on each source exactly as `audit::probe::INVISIBLE` says
+/// for that version, which `check()`'s local detail of each source names
+/// (a drift fails the test, so that a changed image is measured again; a
+/// version not measured yet prints its table and passes). Every row is
+/// printed (`M2 | …`).
+#[tokio::test]
+async fn listed_object_reads_are_recorded_or_named_invisible() {
+    Box::pin(m2_scenario()).await;
+}
+
+async fn m2_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let major = Box::pin(major()).await;
+    let mut s = Box::pin(sa()).await;
+    let grant = Box::pin(xe_grant(&mut s, major)).await;
+    let low = "it_m2_low";
+    Box::pin(throwaway(&mut s, low, &[])).await;
+    let stats = try_rows(
+        &mut s,
+        "SELECT TOP (1) CONVERT(nvarchar(128), name) FROM retail.sys.stats \
+         WHERE object_id = OBJECT_ID(N'retail.crm.customers') ORDER BY stats_id",
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+    .unwrap_or_default();
+    // Records from now on (server UTC), matched by exact text and login:
+    // neither source keeps a trailing comment of a statement. (A
+    // `timestamp_utc` compared as `datetime2` matched nothing on 2022: it
+    // is compared in microseconds, as the polls read it.)
+    let start = try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(30), SYSUTCDATETIME(), 126)",
+        1,
+    )
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_text().map(str::to_owned)))
+    .unwrap();
+    assert!(
+        start
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.T".contains(&b))
+    );
+    let objects: Vec<&str> = databastion_classifiers::query::tsql::STATEMENT_TEXT_OBJECTS
+        .iter()
+        .chain(databastion_classifiers::query::tsql::CREDENTIAL_OBJECTS)
+        .chain(databastion_classifiers::query::tsql::VALUE_OBJECTS)
+        .copied()
+        .chain([P9D_JOIN])
+        .collect();
+    let low_session = || async {
+        let t = throwaway_target(low, own_tls());
+        let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+        let mut ls = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        ls.any_text = true;
+        ls.raw_text = true;
+        ls
+    };
+    let mut low_s = low_session().await;
+    s.raw_text = true;
+    let mut outcomes: Vec<(&str, &str, M2Outcome, String)> = Vec::new();
+    for account in ["low", "high"] {
+        for object in &objects {
+            if *object == P9D_JOIN && account == "high" {
+                continue;
+            }
+            let (read, columns) = match m2_read(object, &stats.replace(']', "]]")) {
+                Ok(r) => r,
+                Err(why) => {
+                    eprintln!("M2 | {major} | {object} | {account} | not sent: {why}");
+                    continue;
+                }
+            };
+            let text = read.clone();
+            let sess = if account == "low" { &mut low_s } else { &mut s };
+            let r = sess
+                .run(&text, Stage::Check, Shape::rows(columns, 64), |_| {
+                    conn::Flow::Continue
+                })
+                .await;
+            let outcome = match r {
+                Ok(_) => M2Outcome::Ran,
+                Err(e) => match e.number {
+                    // Not on this image, or not without what the dev server lacks.
+                    Some(
+                        n @ (102 | 174 | 195 | 208 | 313 | 2812 | 4121 | 8144 | 911 | 2520 | 7202
+                        | 567 | 22004 | 2560),
+                    ) => M2Outcome::Unavailable(n),
+                    Some(n) => M2Outcome::Error(n),
+                    // Sent, answered, and not read by the session's
+                    // closed type set: it ran.
+                    None if e.code != databastion_core::FailureCode::Internal => M2Outcome::Ran,
+                    None => panic!("{object} {account}: not sent ({e:?})"),
+                },
+            };
+            // A result the session's closed type set does not read: the
+            // server ran the read and answered; the session is replaced.
+            if sess.is_poisoned() {
+                if account == "low" {
+                    low_s = low_session().await;
+                } else {
+                    s = Box::pin(sa()).await;
+                    s.raw_text = true;
+                }
+            }
+            outcomes.push((object, account, outcome, text));
+        }
+    }
+    low_s.close().await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    // (text, login) of each record of both sources since `start`.
+    let audit_read = format!(
+        "SELECT TOP (20000) CONVERT(nvarchar(4000), statement), CONVERT(nvarchar(128), server_principal_name) \
+         FROM sys.fn_get_audit_file(N'/var/opt/mssql/audit/*.sqlaudit', NULL, NULL) \
+         WHERE event_time >= CONVERT(datetime2, N'{start}', 126) AND server_principal_name IN (N'sa', N'{low}')"
+    );
+    let xe_read = format!(
+        "SELECT TOP (20000) CONVERT(nvarchar(4000), x.value('(event/data[@name=\"statement\"]/value)[1]', \
+         'nvarchar(4000)')), CONVERT(nvarchar(128), x.value('(event/action[@name=\"server_principal_name\"]/value)[1]', \
+         'nvarchar(128)')) FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/databastion_xe_0_*.xel', \
+         NULL, NULL, NULL) f CROSS APPLY (SELECT CONVERT(xml, f.event_data)) e(x) \
+         WHERE DATEDIFF_BIG(microsecond, '19700101', f.timestamp_utc) >= \
+         DATEDIFF_BIG(microsecond, '19700101', CONVERT(datetime2, N'{start}', 126)) \
+         AND f.object_name IN (N'sql_statement_completed', N'sp_statement_completed')"
+    );
+    let audit_rows: Vec<(String, String)> = try_rows(&mut s, &audit_read, 2)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_text().unwrap_or_default().trim().to_owned(),
+                r[1].as_text().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let xe_rows: Vec<(String, String)> = try_rows(&mut s, &xe_read, 2)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].as_text().unwrap_or_default().trim().to_owned(),
+                r[1].as_text().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    eprintln!(
+        "[it] m2: {} audit records, {} statement events",
+        audit_rows.len(),
+        xe_rows.len()
+    );
+    let login = |account: &str| if account == "low" { low } else { "sa" };
+    let seen = |rows: &[(String, String)], text: &str, account: &str| {
+        rows.iter()
+            .any(|(t, p)| t == text.trim() && p.eq_ignore_ascii_case(login(account)))
+    };
+    // The drift: what each source shows against `audit::probe::INVISIBLE`.
+    let inv = &crate::audit::probe::INVISIBLE;
+    let measured = inv.measured.contains(&major);
+    let mut drift = Vec::new();
+    for (object, account, outcome, text) in &outcomes {
+        let on_audit = seen(&audit_rows, text, account);
+        let on_xe = seen(&xe_rows, text, account);
+        eprintln!(
+            "M2 | {major} | {object} | {account} | {outcome:?} | audit {on_audit} | xevents {on_xe}"
+        );
+        let (want_audit, want_xe) = match outcome {
+            M2Outcome::Unavailable(_) => continue,
+            M2Outcome::Ran => (!inv.audit.contains(object), !inv.xevents.contains(object)),
+            // P9-D's join, refused: as measured on 2022 on 2026-10-18.
+            M2Outcome::Error(n) if *object == P9D_JOIN => (
+                inv.audit_p9d_join_refused,
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
+            ),
+            // A read that did not complete: on Extended Events, an event
+            // only when the error came while it ran (the listed run-time
+            // refusals), none when it was refused as it compiled (security
+            // review of #276, M1).
+            M2Outcome::Error(n) => (
+                !inv.audit.contains(object) && !inv.audit_refused.contains(n),
+                inv.xevents_runtime_errors.contains(&(*object, *n)),
+            ),
+        };
+        // SQL Server Audit is a source on 2022 and later only.
+        if major >= 16 && on_audit != want_audit {
+            drift.push(format!(
+                "{object} ({account}, {outcome:?}): SQL Server Audit {on_audit}"
+            ));
+        }
+        if on_xe != want_xe {
+            drift.push(format!(
+                "{object} ({account}, {outcome:?}): Extended Events {on_xe}"
+            ));
+        }
+    }
+    Box::pin(drop_login(&mut s, low)).await;
+    if major >= 16 {
+        Box::pin(exec(
+            &mut s,
+            &in_db("master", &format!("REVOKE {grant} FROM databastion")),
+        ))
+        .await;
+    }
+    if !measured {
+        eprintln!(
+            "[it] m2: SQL Server {major} is not measured yet: record its table above in \
+             audit::probe::INVISIBLE and docs/08 (drift {drift:?})"
+        );
+        return;
+    }
+    assert!(
+        drift.is_empty(),
+        "reads of listed objects differ from audit::probe::INVISIBLE (measure and update it, \
+         check()'s detail and docs/08): {drift:#?}"
+    );
+}
+
+/// End-of-phase-9 review M3 (drift test of ADR-0051 refinement item 4):
+/// on the image under test, `StatMan` cannot be called by users (error
+/// 195, for a low-privilege login and for `sa`, as a batch and inside
+/// `sp_executesql`), and the server's build is on the allow-list of the
+/// statistics exclusions (`events::STATMAN_BUILDS`). A new build (a
+/// cumulative update of a matrix image) fails here until it is measured
+/// and listed; until then the agent turns the exclusions off on it (fail
+/// closed).
+#[tokio::test]
+async fn statman_is_not_callable_and_the_build_is_listed() {
+    Box::pin(statman_scenario()).await;
+}
+
+async fn statman_scenario() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let c = SqlserverConnector::new();
+    let t = agent("");
+    assert!(Box::pin(c.check(&t)).await.reachable);
+    let build = c.server_version(&t).unwrap();
+    let mut s = Box::pin(sa()).await;
+    s.raw_text = true;
+    let low = "it_statman";
+    Box::pin(throwaway(&mut s, low, &[])).await;
+    let mut low_s = {
+        let t = throwaway_target(low, own_tls());
+        let tls = tls::configs(t.sqlserver_settings().ca_file.as_deref()).unwrap();
+        let mut ls = conn::connect(&t, &tls, &TlsChoice::default(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        ls.raw_text = true;
+        ls
+    };
+    let call = "SELECT StatMan([SC0]) FROM (SELECT TOP 100 PERCENT [id] AS [SC0] FROM \
+                [retail].[crm].[customers] WITH (READUNCOMMITTED) ORDER BY [SC0]) AS _MS_UPDSTATS_TBL \
+                OPTION (MAXDOP 16)";
+    let forms = [
+        call.to_owned(),
+        format!("EXEC sp_executesql N'{}'", call.replace('\'', "''")),
+    ];
+    let mut callable = Vec::new();
+    for (who, sess) in [("low", &mut low_s), ("sa", &mut s)] {
+        for form in &forms {
+            let r = sess
+                .run(form, Stage::Check, Shape::rows(1, 1), |_| {
+                    conn::Flow::Continue
+                })
+                .await;
+            let number = r.err().and_then(|e| e.number);
+            eprintln!(
+                "[it] statman {build}: {who}, {}: error {number:?}",
+                if form.starts_with("EXEC") {
+                    "sp_executesql"
+                } else {
+                    "batch"
+                }
+            );
+            if number != Some(195) {
+                callable.push(format!("{who}: {number:?}"));
+            }
+        }
+    }
+    low_s.close().await;
+    Box::pin(drop_login(&mut s, low)).await;
+    assert!(
+        callable.is_empty(),
+        "StatMan answered other than error 195 on {build}: {callable:?}: the statistics \
+         exclusions must stay off on this build"
+    );
+    assert!(
+        crate::audit::xe::events::STATMAN_BUILDS.contains(&build.as_str()),
+        "build {build} is not on events::STATMAN_BUILDS: StatMan is not callable on it (checked \
+         above); measure the statistics builds and their internal statements on it (the fixtures \
+         of refinement item 4) before adding it"
+    );
+}
+
+/// Runs `sql` as `sa`; `false` (with the error) when the server refuses it
+/// (a case the dev service cannot set up is then skipped).
+async fn exec_try(s: &mut Session, sql: &str) -> bool {
+    match s
+        .run(sql, Stage::Check, Shape::rows(0, 0), |_| {
+            conn::Flow::Continue
+        })
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("refused by the server: {sql}: {e:?}");
+            false
+        }
+    }
+}
+
+/// The test databases of [`name_case_follows_the_collations`].
+const NC_DBS: [&str; 6] = [
+    "databastion_nc_snap",
+    "databastion_nc_cs",
+    "databastion_nc_bin2",
+    "databastion_nc_ci",
+    "databastion_nc_offline",
+    "databastion_nc_autoclose",
+];
+const NC_CONTAINED: &str = "databastion_nc_contained";
+/// A `_CS_` database converted to contained and back (security review L2
+/// of the ADR-0055 refinement).
+const NC_CONVERT: &str = "databastion_nc_convert";
+
+async fn nc_drop(s: &mut Session) {
+    for db in NC_DBS.iter().chain([&NC_CONTAINED, &NC_CONVERT]) {
+        exec_ok(
+            s,
+            &format!("IF DB_ID(N'{db}') IS NOT NULL ALTER DATABASE [{db}] SET ONLINE"),
+        )
+        .await;
+        exec_ok(
+            s,
+            &format!("IF DB_ID(N'{db}') IS NOT NULL DROP DATABASE [{db}]"),
+        )
+        .await;
+    }
+}
+
+/// The value the agent reports for the objects of `db` (`objects` when
+/// it is not listed), and the whole value.
+fn nc_value(c: &SqlserverConnector, t: &TargetConfig, db: &str) -> (String, serde_json::Value) {
+    let report = c.name_case(t).expect("a value after a check");
+    let v = serde_json::to_value(databastion_core::name_case::to_protocol(&report)).unwrap();
+    let listed = v["except"]
+        .as_array()
+        .and_then(|e| e.iter().find(|x| x["database"] == db))
+        .map(|x| x["objects"].as_str().unwrap().to_owned());
+    (
+        listed.unwrap_or_else(|| v["objects"].as_str().unwrap().to_owned()),
+        v,
+    )
+}
+
+/// One `sa` row of `sys.databases` for `db`: collation name and
+/// `DATABASEPROPERTYEX(…, 'Collation')`, printed as an engine fact.
+/// Whether `databastion_nc_autoclose` reads as closed (`collation_name`
+/// `NULL`).
+async fn nc_is_closed(s: &mut Session) -> bool {
+    let r = Box::pin(try_rows(
+        s,
+        "SELECT CONVERT(int, CASE WHEN collation_name IS NULL THEN 1 ELSE 0 END) FROM \
+         sys.databases WHERE name = N'databastion_nc_autoclose'",
+        1,
+    ))
+    .await;
+    r.and_then(|r| r.first().and_then(|r| r[0].as_int())) == Some(1)
+}
+
+/// Waits (at most 15 s) until `databastion_nc_autoclose` is closed.
+async fn nc_wait_closed(s: &mut Session) -> bool {
+    for _ in 0..30 {
+        if Box::pin(nc_is_closed(s)).await {
+            return true;
+        }
+        Box::pin(tokio::time::sleep(Duration::from_millis(500))).await;
+    }
+    false
+}
+
+/// How many times the server's current error log says it started
+/// `databastion_nc_autoclose` up (each open of an `AUTO_CLOSE` database is
+/// logged); `None` when the log cannot be read.
+async fn nc_startups(s: &mut Session) -> Option<i64> {
+    if !Box::pin(exec_try(
+        s,
+        "IF OBJECT_ID(N'tempdb..#nc_log') IS NULL CREATE TABLE #nc_log (d datetime, p \
+         nvarchar(128), t nvarchar(4000)); DELETE FROM #nc_log; INSERT INTO #nc_log EXEC \
+         master.dbo.xp_readerrorlog 0, 1, N'Starting up database', N'databastion_nc_autoclose'",
+    ))
+    .await
+    {
+        return None;
+    }
+    Box::pin(try_rows(
+        s,
+        "SELECT CONVERT(bigint, COUNT(*)) FROM #nc_log",
+        1,
+    ))
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_int()))
+}
+
+/// The startups between two counts, printed.
+fn nc_delta(a: Option<i64>, b: Option<i64>) -> String {
+    match (a, b) {
+        (Some(a), Some(b)) => (b - a).to_string(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+async fn nc_fact(s: &mut Session, db: &str, label: &str) {
+    let rows = try_rows(
+        s,
+        &format!(
+            "SELECT CONVERT(nvarchar(128), collation_name), CONVERT(nvarchar(128), \
+             DATABASEPROPERTYEX(name, 'Collation')), CONVERT(int, state), CONVERT(int, \
+             is_auto_close_on), CONVERT(nvarchar(60), DATABASEPROPERTYEX(name, 'Status')) \
+             FROM sys.databases WHERE name = N'{db}'"
+        ),
+        5,
+    )
+    .await;
+    eprintln!("engine fact ({label}) {db}: {rows:?}");
+}
+
+/// A value of a test row, printed: the number, the text, or `NULL`.
+fn nc_show(v: Option<&Value>) -> String {
+    match v {
+        Some(v) => v
+            .as_int()
+            .map(|i| i.to_string())
+            .or_else(|| v.as_text().map(str::to_owned))
+            .unwrap_or_else(|| "NULL".to_owned()),
+        None => "NULL".to_owned(),
+    }
+}
+
+/// The server's error number for `sql` (`None`: it ran).
+async fn exec_error(s: &mut Session, sql: &str) -> Option<i32> {
+    match s
+        .run(sql, Stage::Check, Shape::rows(0, 0), |_| {
+            conn::Flow::Continue
+        })
+        .await
+    {
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("refused by the server: {sql}: {e:?}");
+            Some(e.number.unwrap_or(-1))
+        }
+    }
+}
+
+/// Prints the `[it] name_case:` measurement line of `db` at `stage` and
+/// returns its `containment` and `catalog_collation_type`.
+async fn nc_measure(
+    s: &mut Session,
+    major: u32,
+    db: &str,
+    stage: &str,
+) -> (Option<i64>, Option<i64>) {
+    let r = Box::pin(try_rows(
+        s,
+        &format!(
+            "SELECT CONVERT(int, containment), CONVERT(int, catalog_collation_type), \
+             CONVERT(nvarchar(60), catalog_collation_type_desc), CONVERT(int, \
+             COLLATIONPROPERTY(CONVERT(nvarchar(128), collation_name), 'ComparisonStyle')) \
+             FROM sys.databases WHERE name = N'{db}'"
+        ),
+        4,
+    ))
+    .await
+    .and_then(|r| r.into_iter().next())
+    .unwrap_or_default();
+    let containment = r.first().and_then(Value::as_int);
+    let catalog = r.get(1).and_then(Value::as_int);
+    eprintln!(
+        "[it] name_case: major={major} db={db} stage={stage} contained={} \
+         catalog_collation_type={} desc={} comparison_style={}",
+        containment == Some(1),
+        nc_show(r.get(1)),
+        nc_show(r.get(2)),
+        nc_show(r.get(3)),
+    );
+    (containment, catalog)
+}
+
+/// The server's answer to two tables named `name` and its upper case in
+/// `db`: `true` when it refuses the second with error 2714 (the catalog
+/// compares names without case). Printed as an `[it] name_case:` line.
+async fn nc_duplicate(s: &mut Session, major: u32, db: &str, stage: &str, name: &str) -> bool {
+    let upper = name.to_uppercase();
+    let e = Box::pin(exec_error(
+        s,
+        &in_db(
+            db,
+            &format!("CREATE TABLE {name}(a int); CREATE TABLE {upper}(a int)"),
+        ),
+    ))
+    .await;
+    eprintln!(
+        "[it] name_case: major={major} db={db} stage={stage} case_only_duplicate_table \
+         error_2714={} error={}",
+        e == Some(2714),
+        e.map_or_else(|| "none".to_owned(), |n| n.to_string()),
+    );
+    e == Some(2714)
+}
+
+/// Security review L2 of the ADR-0055 refinement: a `_CS_` database
+/// converted to contained, then back, with the measurement lines, the
+/// case-only duplicate oracle and the reported value at each stage;
+/// skipped when the server refuses either `ALTER`.
+async fn nc_conversion(s: &mut Session, c: &SqlserverConnector, t: &TargetConfig, major: u32) {
+    // A `_CS_` database converted to contained, then back
+    // (security review L2); skipped when the server refuses.
+    Box::pin(exec(
+        s,
+        &format!("CREATE DATABASE [{NC_CONVERT}] COLLATE Latin1_General_100_CS_AS"),
+    ))
+    .await;
+    Box::pin(exec(
+        s,
+        &format!("ALTER DATABASE [{NC_CONVERT}] SET AUTO_CLOSE OFF"),
+    ))
+    .await;
+    if Box::pin(exec_try(
+        s,
+        &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = PARTIAL"),
+    ))
+    .await
+    {
+        let (containment, catalog) =
+            Box::pin(nc_measure(s, major, NC_CONVERT, "converted to partial")).await;
+        let refused = Box::pin(nc_duplicate(s, major, NC_CONVERT, "converted", "t")).await;
+        assert!(Box::pin(c.check(t)).await.reachable);
+        let got = nc_value(c, t, NC_CONVERT).0;
+        eprintln!(
+            "[it] name_case: major={major} db={NC_CONVERT} stage=converted to partial \
+             reported={got}"
+        );
+        let want = if containment == Some(1) {
+            nc_contained_expected(catalog)
+        } else {
+            "sensitive"
+        };
+        assert_eq!(got, want);
+        if got == "insensitive" {
+            assert!(
+                refused,
+                "{NC_CONVERT} reported insensitive, but the server accepted a case-only \
+                 duplicate table name"
+            );
+        }
+        if Box::pin(exec_try(
+            s,
+            &format!("ALTER DATABASE [{NC_CONVERT}] SET CONTAINMENT = NONE"),
+        ))
+        .await
+        {
+            let (containment, catalog) =
+                Box::pin(nc_measure(s, major, NC_CONVERT, "back to none")).await;
+            let refused = Box::pin(nc_duplicate(s, major, NC_CONVERT, "back", "u")).await;
+            assert!(Box::pin(c.check(t)).await.reachable);
+            let got = nc_value(c, t, NC_CONVERT).0;
+            eprintln!(
+                "[it] name_case: major={major} db={NC_CONVERT} stage=back to none \
+                 reported={got}"
+            );
+            assert_eq!((containment, catalog), (Some(0), Some(0)));
+            assert_eq!(got, "sensitive");
+            assert!(
+                !refused,
+                "a _CS_ database refused a case-only duplicate name"
+            );
+        } else {
+            eprintln!("skipped: SET CONTAINMENT = NONE refused on this server");
+        }
+    } else {
+        eprintln!("skipped: SET CONTAINMENT = PARTIAL refused on this server");
+    }
+}
+
+/// The value the agent reports for a contained database's objects with
+/// `catalog_collation_type` `v` (ADR-0055 decision 4 and its refinement of
+/// 2026-10-21): 0 (the fixed catalog collation), 1 (measured on 2022) and
+/// 2 are case-insensitive, anything else `unknown`.
+fn nc_contained_expected(v: Option<i64>) -> &'static str {
+    match v {
+        Some(0..=2) => "insensitive",
+        _ => "unknown",
+    }
+}
+
+/// ADR-0055 decisions 2, 4 and 10 on the dev server (the default
+/// collation): a `_CS_` and a `_BIN2` database `sensitive`, a default one
+/// and a contained `_CS_` one (when the server allows contained
+/// databases) not listed (`insensitive`), a snapshot of the `_CS_` one
+/// `sensitive`, an offline database `unknown`, an `AUTO_CLOSE` `_CS_`
+/// database closed between two checks still `sensitive` (no flapping),
+/// `VIEW ANY DATABASE` revoked from `public`: `objects: unknown` without
+/// `except`; and a failed check keeps the last value. Prints the engine
+/// facts of decision 10 (`catalog_collation_type`, `AUTO_CLOSE`, the
+/// `DATABASEPROPERTYEX` answer on a closed database).
+#[tokio::test]
+async fn name_case_follows_the_collations() {
+    Box::pin(name_case_follows_the_collations_body()).await;
+}
+
+/// The body of [`name_case_follows_the_collations`], boxed by it (its
+/// future outgrew the test thread's stack, like the other large tests).
+async fn name_case_follows_the_collations_body() {
+    if !enabled() {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    Box::pin(nc_drop(&mut s)).await;
+    let server = Box::pin(try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), CONVERT(int, \
+         COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), \
+         'ComparisonStyle')), CONVERT(int, COL_LENGTH('sys.databases', \
+         'catalog_collation_type'))",
+        3,
+    ))
+    .await
+    .unwrap();
+    eprintln!(
+        "engine fact: server collation, its ComparisonStyle, catalog_collation_type length: {server:?}"
+    );
+    let has_catalog_column = server[0][2].as_int().is_some();
+    let default_insensitive = server[0][1].as_int().is_some_and(|v| v & 1 == 1);
+    for (db, collate) in [
+        ("databastion_nc_cs", " COLLATE Latin1_General_100_CS_AS"),
+        ("databastion_nc_bin2", " COLLATE Latin1_General_100_BIN2"),
+        ("databastion_nc_ci", ""),
+        (
+            "databastion_nc_offline",
+            " COLLATE Latin1_General_100_CS_AS",
+        ),
+        (
+            "databastion_nc_autoclose",
+            " COLLATE Latin1_General_100_CS_AS",
+        ),
+    ] {
+        Box::pin(exec(&mut s, &format!("CREATE DATABASE [{db}]{collate}"))).await;
+    }
+    // Express turns `AUTO_CLOSE` on for every new database: off on all but
+    // the `AUTO_CLOSE` case, so that their collations stay readable.
+    for db in [
+        "databastion_nc_cs",
+        "databastion_nc_bin2",
+        "databastion_nc_ci",
+    ] {
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER DATABASE [{db}] SET AUTO_CLOSE OFF"),
+        ))
+        .await;
+    }
+    Box::pin(exec(
+        &mut s,
+        "ALTER DATABASE [databastion_nc_autoclose] SET AUTO_CLOSE ON",
+    ))
+    .await;
+    let snapshot = Box::pin(exec_try(
+        &mut s,
+        "DECLARE @f nvarchar(260) = (SELECT TOP (1) physical_name FROM \
+         sys.master_files WHERE database_id = DB_ID(N'databastion_nc_cs') AND type = 0); \
+         DECLARE @l sysname = (SELECT TOP (1) name FROM sys.master_files WHERE database_id = \
+         DB_ID(N'databastion_nc_cs') AND type = 0); \
+         DECLARE @s nvarchar(max) = N'CREATE DATABASE [databastion_nc_snap] ON (NAME = ' + \
+         QUOTENAME(@l) + N', FILENAME = ''' + REPLACE(@f, N'.mdf', N'_snap.ss') + N''') AS \
+         SNAPSHOT OF [databastion_nc_cs]'; EXEC sp_executesql @s",
+    ))
+    .await;
+    let previous_contained = Box::pin(try_rows(
+        &mut s,
+        "SELECT CONVERT(int, value_in_use) FROM sys.configurations WHERE name = N'contained \
+         database authentication'",
+        1,
+    ))
+    .await
+    .and_then(|r| r.first().and_then(|r| r[0].as_int()));
+    let contained = Box::pin(exec_try(
+        &mut s,
+        "EXEC sp_configure N'contained database authentication', 1; RECONFIGURE",
+    ))
+    .await
+        && Box::pin(exec_try(
+            &mut s,
+            &format!(
+                "CREATE DATABASE [{NC_CONTAINED}] CONTAINMENT = PARTIAL COLLATE \
+                 Latin1_General_100_CS_AS"
+            ),
+        ))
+        .await
+        && Box::pin(exec_try(
+            &mut s,
+            &format!("ALTER DATABASE [{NC_CONTAINED}] SET AUTO_CLOSE OFF"),
+        ))
+        .await;
+    // The server's own answer, as an oracle: two tables whose names differ
+    // by case only are two objects under a case-sensitive catalog.
+    for db in [
+        "databastion_nc_cs",
+        "databastion_nc_bin2",
+        "databastion_nc_ci",
+        NC_CONTAINED,
+    ] {
+        let two = Box::pin(exec_try(
+            &mut s,
+            &in_db(
+                db,
+                "CREATE TABLE dbo.Customers (id int); CREATE TABLE dbo.customers (id int)",
+            ),
+        ))
+        .await;
+        eprintln!("engine fact: {db}: Customers and customers are two tables: {two}");
+    }
+    Box::pin(exec(
+        &mut s,
+        "ALTER DATABASE [databastion_nc_offline] SET OFFLINE WITH ROLLBACK IMMEDIATE",
+    ))
+    .await;
+    // The AUTO_CLOSE database held open by a session of its own.
+    let mut holder = Box::pin(sa()).await;
+    Box::pin(exec(&mut holder, "USE [databastion_nc_autoclose]")).await;
+    Box::pin(nc_fact(&mut s, "databastion_nc_autoclose", "open")).await;
+    Box::pin(nc_fact(&mut s, "databastion_nc_offline", "offline")).await;
+    let rows = Box::pin(try_rows(
+        &mut s,
+        "SELECT CONVERT(nvarchar(128), name), CONVERT(int, catalog_collation_type), \
+         CONVERT(int, containment) FROM sys.databases WHERE name LIKE N'databastion_nc_%'",
+        3,
+    ))
+    .await;
+    eprintln!("engine fact: catalog_collation_type per test database: {rows:?}");
+    // One measurement line per test database (ADR-0055 refinement of
+    // 2026-10-21, recorded by the engine matrix on 2019, 2022 and 2025).
+    let major = Box::pin(major()).await;
+    let catalog = if has_catalog_column {
+        "CONVERT(int, catalog_collation_type), CONVERT(nvarchar(60), catalog_collation_type_desc)"
+    } else {
+        "CONVERT(int, NULL), CONVERT(nvarchar(60), NULL)"
+    };
+    let measured = Box::pin(try_rows(
+        &mut s,
+        &format!(
+            "SELECT CONVERT(nvarchar(128), name), CONVERT(int, containment), {catalog}, \
+             CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), collation_name), \
+             'ComparisonStyle')) FROM sys.databases WHERE name LIKE N'databastion[_]nc[_]%' \
+             ORDER BY name"
+        ),
+        5,
+    ))
+    .await
+    .unwrap_or_default();
+    let mut contained_catalog = None;
+    for r in &measured {
+        let name = nc_show(r.first());
+        let is_contained = r.get(1).and_then(Value::as_int) == Some(1);
+        if name == NC_CONTAINED {
+            contained_catalog = r.get(2).and_then(Value::as_int);
+        }
+        eprintln!(
+            "[it] name_case: major={major} db={name} contained={is_contained} \
+             catalog_collation_type={} desc={} comparison_style={}",
+            nc_show(r.get(2)),
+            nc_show(r.get(3)),
+            nc_show(r.get(4)),
+        );
+    }
+    // The server's answer to a case-only duplicate table name: error 2714
+    // when the catalog compares names without case.
+    let contained_2714 = if contained {
+        Box::pin(nc_duplicate(&mut s, major, NC_CONTAINED, "created", "t")).await
+    } else {
+        false
+    };
+
+    let c = SqlserverConnector::new();
+    let t = agent("");
+    let h = Box::pin(c.check(&t)).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    eprintln!("check: {:?}", h.detail);
+    let (_, whole) = nc_value(&c, &t, "databastion_nc_cs");
+    eprintln!("name_case: {whole}");
+    assert_eq!(
+        whole["databases"],
+        if default_insensitive {
+            "insensitive"
+        } else {
+            "sensitive"
+        }
+    );
+    if !has_catalog_column {
+        eprintln!("engine fact: no catalog_collation_type: objects unknown for the target");
+        assert_eq!(whole["objects"], "unknown");
+        assert!(whole.get("except").is_none());
+    } else {
+        assert_eq!(nc_value(&c, &t, "databastion_nc_cs").0, "sensitive");
+        assert_eq!(nc_value(&c, &t, "databastion_nc_bin2").0, "sensitive");
+        assert_eq!(
+            nc_value(&c, &t, "databastion_nc_ci").0,
+            if default_insensitive {
+                "insensitive"
+            } else {
+                "sensitive"
+            }
+        );
+        assert_eq!(nc_value(&c, &t, "databastion_nc_offline").0, "unknown");
+        assert_eq!(nc_value(&c, &t, "databastion_nc_autoclose").0, "sensitive");
+        if snapshot {
+            assert_eq!(nc_value(&c, &t, "databastion_nc_snap").0, "sensitive");
+        } else {
+            eprintln!("skipped: database snapshot not available on this server");
+        }
+        if contained {
+            // 2022 reads `catalog_collation_type` 1 for a contained
+            // database, `insensitive` (ADR-0055 refinement of 2026-10-21;
+            // the server refuses a case-only duplicate name, the oracle
+            // above). Another value on 2019 or 2025 is recorded and
+            // follows decision 4 (0 and 2 `insensitive`, anything else
+            // `unknown`), so that the matrix records it without failing.
+            let want = nc_contained_expected(contained_catalog);
+            if contained_catalog != Some(1) {
+                eprintln!(
+                    "[it] name_case: major={major} db={NC_CONTAINED} catalog_collation_type={} \
+                     is not 1: expected {want}",
+                    contained_catalog.map_or_else(|| "NULL".to_owned(), |v| v.to_string()),
+                );
+            }
+            assert_eq!(nc_value(&c, &t, NC_CONTAINED).0, want);
+            // Never `insensitive` where the server accepts a case-only
+            // duplicate (security review L3).
+            if want == "insensitive" {
+                assert!(
+                    contained_2714,
+                    "{NC_CONTAINED} reported insensitive, but the server accepted a case-only \
+                     duplicate table name"
+                );
+            }
+
+            Box::pin(nc_conversion(&mut s, &c, &t, major)).await;
+        } else {
+            eprintln!("skipped: contained databases not enabled on this server");
+        }
+        // Sorted, one entry per name (security review L2).
+        let names: Vec<String> = whole["except"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["database"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            names.windows(2).all(|w| w[0].as_bytes() < w[1].as_bytes()),
+            "{names:?}"
+        );
+
+        // The AUTO_CLOSE database closes once its last session ends.
+        Box::pin(holder.close()).await;
+        let closed = Box::pin(nc_wait_closed(&mut s)).await;
+        // What opens it again: the server logs "Starting up database" at
+        // each open of an AUTO_CLOSE database (counted around each step).
+        let n0 = Box::pin(nc_startups(&mut s)).await;
+        Box::pin(nc_fact(
+            &mut s,
+            "databastion_nc_autoclose",
+            "after its last session",
+        ))
+        .await;
+        let n1 = Box::pin(nc_startups(&mut s)).await;
+        if closed {
+            eprintln!("engine fact: an AUTO_CLOSE database closed reads collation_name NULL");
+        } else {
+            eprintln!("engine fact: the AUTO_CLOSE database's collation_name stayed readable");
+        }
+        let h = Box::pin(c.check(&t)).await;
+        let n2 = Box::pin(nc_startups(&mut s)).await;
+        assert!(h.reachable, "{:?}", h.detail);
+        assert_eq!(
+            nc_value(&c, &t, "databastion_nc_autoclose").0,
+            "sensitive",
+            "no flapping across a close"
+        );
+        eprintln!(
+            "[it] name_case: major={major} autoclose startups: the fact query {}, check() {}",
+            nc_delta(n0, n1),
+            nc_delta(n1, n2)
+        );
+        // A new connector never saw it open: unknown while it stays closed
+        // across that check. Something may open it again in between (a
+        // check() itself, or the server): the database is waited closed
+        // again, and the assertion holds only when no startup was logged
+        // during the fresh check and it was closed before and after it.
+        let before = Box::pin(nc_wait_closed(&mut s)).await;
+        let n3 = Box::pin(nc_startups(&mut s)).await;
+        let fresh = SqlserverConnector::new();
+        assert!(Box::pin(fresh.check(&t)).await.reachable);
+        let n4 = Box::pin(nc_startups(&mut s)).await;
+        let after = Box::pin(nc_is_closed(&mut s)).await;
+        let value = nc_value(&fresh, &t, "databastion_nc_autoclose").0;
+        let opened = match (n3, n4) {
+            (Some(a), Some(b)) => Some(b > a),
+            _ => None,
+        };
+        eprintln!(
+            "[it] name_case: major={major} autoclose fresh check: closed before {before}, after \
+             {after}, started up during it {}, value {value}",
+            opened.map_or_else(
+                || "unknown (errorlog not readable)".to_owned(),
+                |o| o.to_string()
+            )
+        );
+        if before && after && opened == Some(false) {
+            assert_eq!(value, "unknown", "closed across the fresh check");
+        } else {
+            // Open at some point of the check: its read may see the
+            // collation, and the value is then the database's.
+            assert!(
+                value == "unknown" || value == "sensitive",
+                "unexpected {value}"
+            );
+        }
+
+        // `VIEW ANY DATABASE` revoked from `public`: the list may be
+        // partial.
+        Box::pin(exec(&mut s, "REVOKE VIEW ANY DATABASE FROM public")).await;
+        let h = Box::pin(c.check(&t)).await;
+        Box::pin(exec(&mut s, "GRANT VIEW ANY DATABASE TO public")).await;
+        assert!(h.reachable, "{:?}", h.detail);
+        let (_, v) = nc_value(&c, &t, "databastion_nc_cs");
+        assert_eq!(v["objects"], "unknown", "{v}");
+        assert!(v.get("except").is_none(), "{v}");
+    }
+
+    // A failed check (unreachable port) keeps the last value (M1).
+    let before = c.name_case(&t);
+    let mut down = t.clone();
+    down.port = Some(9);
+    let h = Box::pin(c.check(&down)).await;
+    assert!(!h.reachable);
+    assert_eq!(c.name_case(&down), before);
+
+    Box::pin(nc_drop(&mut s)).await;
+    if let Some(v) = previous_contained {
+        Box::pin(exec_ok(
+            &mut s,
+            &format!("EXEC sp_configure N'contained database authentication', {v}; RECONFIGURE"),
+        ))
+        .await;
+    }
+}
+
+/// The read-cost measurement's own Extended Events session
+/// ([`measure_xe_read_cost`]).
+const READCOST_XE: &str = "it_readcost_xe";
+
+/// One timed poll of the measurement: `(ms, rows, largest row, bytes)`,
+/// or the error's failure code.
+async fn readcost_poll(
+    s: &mut Session,
+    text: &str,
+    file: &str,
+    offset: i64,
+    top: usize,
+    skip: u32,
+) -> Result<(f64, usize, usize, usize), databastion_core::FailureCode> {
+    let t = std::time::Instant::now();
+    let r = Box::pin(crate::audit::xe::poll_records(
+        s,
+        text,
+        crate::audit::own::PollKind::From,
+        file,
+        offset,
+        top,
+        skip,
+    ))
+    .await;
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    match r {
+        Ok(p) => Ok((ms, p.returned, p.largest_row, p.bytes)),
+        Err(e) => {
+            eprintln!("[it] readcost: poll ({top}, skip {skip}) failed after {ms:.0} ms: {e:?}");
+            Err(e.code)
+        }
+    }
+}
+
+fn median_of(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`), ADR-0051
+/// refinement of 2026-10-22 (Extended Events reads within one buffer),
+/// measurement plan item 1: the cost of the agent's poll
+/// (`sql::XE_POLL_FROM`, through [`crate::audit::xe::poll_records`]) by
+/// the rows asked at a buffer start and by the rows skipped inside a
+/// buffer, the events per buffer and the wire bytes per event, for small
+/// events (statements of the load workload's T-SQL loop) and for large
+/// ones (statements near the 128 KiB `event_data` bound). Prints `READCOST`
+/// lines and the least-squares fit of `c + a·k + b·s` (ms). On its own
+/// session [`READCOST_XE`], read as `sa` with the exact poll text.
+#[tokio::test]
+#[ignore = "measurement: DATABASTION_IT_SQLSERVER_MEASURE=1, --ignored"]
+async fn measure_xe_read_cost() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{READCOST_XE}') \
+         DROP EVENT SESSION {READCOST_XE} ON SERVER"
+    );
+    Box::pin(exec(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    let reps = 5usize;
+    let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (k, s, ms)
+    for (kind, iterations) in [("small", 2_500u32), ("large", 300u32)] {
+        let stem = format!("it_readcost_{kind}_{}", std::process::id());
+        Box::pin(exec_ok(&mut s, &drop)).await;
+        let session = backlog_session(&stem)
+            .replace(BACKLOG_XE, READCOST_XE)
+            .replace(
+                "max_file_size = 16, max_rollover_files = 2",
+                "max_file_size = 256, max_rollover_files = 4",
+            );
+        Box::pin(exec(&mut s, &session)).await;
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER EVENT SESSION {READCOST_XE} ON SERVER STATE = START"),
+        ))
+        .await;
+        let started = std::time::Instant::now();
+        let body = if kind == "small" {
+            // As the load workload's loop (seed.py tsql_workload): a
+            // schedule, a branch chain and a table variable insert.
+            let branches: String = (0..8)
+                .map(|k| {
+                    format!(
+                        "{} @k = {k} SELECT @n = COUNT(*) FROM crm.customers WHERE id = 1 + @r % 50; ",
+                        if k == 0 { "IF" } else { "ELSE IF" }
+                    )
+                })
+                .collect();
+            format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int, @k int, @r bigint, @w int; \
+                 DECLARE @lat TABLE (us bigint NOT NULL); \
+                 WHILE @i < {iterations} BEGIN \
+                 SET @w = DATEDIFF(millisecond, SYSUTCDATETIME(), SYSUTCDATETIME()); \
+                 IF @w > 0 SET @w = 0; ELSE IF @w < -1000 SET @w = 1; \
+                 SET @k = @i % 8; SET @r = ABS(CAST(CHECKSUM(NEWID()) AS bigint)); \
+                 {branches} INSERT @lat VALUES (@i); SET @i += 1; END"
+            )
+        } else {
+            // One statement of about 60 000 characters (a comment), built
+            // on the server (the client's batch bound): `event_data` near
+            // its 128 KiB bound, an `sp_statement_completed` each.
+            format!(
+                "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+                 DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+                 REPLICATE(CONVERT(nvarchar(max), N'x'), 60000) + N' */ FROM crm.customers WHERE id = @i'; \
+                 WHILE @i < {iterations} BEGIN \
+                 EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; END"
+            )
+        };
+        Box::pin(exec(&mut s, &in_db("retail", &body))).await;
+        eprintln!(
+            "[it] readcost ({kind}): {iterations} iterations written in {} ms",
+            started.elapsed().as_millis()
+        );
+        // The dispatch latency, then a stop flushes the buffers.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        Box::pin(exec(
+            &mut s,
+            &format!("ALTER EVENT SESSION {READCOST_XE} ON SERVER STATE = STOP"),
+        ))
+        .await;
+        let files = format!("N'/var/opt/mssql/xe/{stem}_0_*.xel'");
+        let layout = try_rows(
+            &mut s,
+            &format!(
+                "SELECT CONVERT(nvarchar(260), file_name), CONVERT(bigint, file_offset), \
+                 CONVERT(bigint, COUNT(*)) FROM sys.fn_xe_file_target_read_file({files}, NULL, NULL, NULL) \
+                 GROUP BY file_name, file_offset ORDER BY file_name, file_offset"
+            ),
+            3,
+        )
+        .await
+        .unwrap();
+        let buffers: Vec<(String, i64, i64)> = layout
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_text().unwrap().trim_end().to_owned(),
+                    r[1].as_int().unwrap(),
+                    r[2].as_int().unwrap(),
+                )
+            })
+            .collect();
+        let mut sizes: Vec<f64> = buffers.iter().map(|b| b.2 as f64).collect();
+        let total: f64 = sizes.iter().sum();
+        let max = sizes.iter().copied().fold(0.0, f64::max);
+        let min = sizes.iter().copied().fold(f64::MAX, f64::min);
+        eprintln!(
+            "READCOST | {kind} | buffers {} | events {total} | per buffer min {min} median {} max {max}",
+            buffers.len(),
+            median_of(&mut sizes)
+        );
+        let current = &buffers.last().unwrap().0;
+        let text = crate::sql::xe_poll(&crate::sql::xe_pattern(current).unwrap(), true).unwrap();
+        // Positions before buffers of the middle of the set, each followed
+        // by a buffer at least as large as the median.
+        let big: Vec<usize> = (1..buffers.len().saturating_sub(4))
+            .filter(|i| buffers[*i].2 as f64 >= max * 0.8)
+            .collect();
+        let starts: Vec<usize> = big.iter().map(|i| i - 1).take(reps).collect();
+        assert!(!starts.is_empty(), "{kind}: no buffer to start before");
+        let sizes_k: &[usize] = if kind == "small" {
+            &[100, 500, 1_000, 2_000, 3_000, 4_000]
+        } else {
+            &[16, 50, 100, 250, 500]
+        };
+        let mut per_event: Vec<f64> = Vec::new();
+        let mut largest = 0usize;
+        for &k in sizes_k {
+            let (mut ms, mut ok, mut failed) = (Vec::new(), 0usize, Vec::new());
+            for &i in &starts {
+                let (f, o, _) = &buffers[i];
+                match readcost_poll(&mut s, &text, f, *o, k, 0).await {
+                    Ok((t, rows, l, bytes)) => {
+                        ms.push(t);
+                        ok = rows;
+                        largest = largest.max(l);
+                        if rows > 0 {
+                            per_event.push(bytes as f64 / rows as f64);
+                        }
+                        if kind == "small" {
+                            samples.push((rows as f64, 0.0, t));
+                        }
+                    }
+                    Err(code) => failed.push(code),
+                }
+            }
+            eprintln!(
+                "READCOST | {kind} | rows {k} at skip 0 | returned {ok} | median {:.1} ms | failed {failed:?}",
+                median_of(&mut ms)
+            );
+        }
+        if kind == "small" {
+            for skip in [0u32, 500, 1_000, 2_000, 3_000, 4_000] {
+                let mut ms = Vec::new();
+                for &i in &starts {
+                    let (f, o, _) = &buffers[i];
+                    if let Ok((t, rows, _, _)) =
+                        readcost_poll(&mut s, &text, f, *o, 500, skip).await
+                    {
+                        ms.push(t);
+                        samples.push((rows as f64, f64::from(skip), t));
+                    }
+                }
+                eprintln!(
+                    "READCOST | {kind} | rows 500 at skip {skip} | median {:.1} ms",
+                    median_of(&mut ms)
+                );
+            }
+            // One buffer walked in reads of B (the quadratic re-skip): the
+            // time to read `max` events from the start of a large buffer.
+            for b in [500usize, 1_000, 2_000, 3_000] {
+                let mut times = Vec::new();
+                for &i in &starts {
+                    let (pf, po, _) = &buffers[i];
+                    let (mut done, mut sum) = (0usize, 0.0);
+                    while done < max as usize {
+                        let skip = u32::try_from(done).unwrap();
+                        match readcost_poll(&mut s, &text, pf, *po, b, skip).await {
+                            Ok((t, rows, _, _)) if rows > 0 => {
+                                sum += t;
+                                done += rows;
+                            }
+                            _ => break,
+                        }
+                    }
+                    times.push(sum / done.max(1) as f64 * 1000.0);
+                }
+                eprintln!(
+                    "READCOST | {kind} | {max} events walked from a buffer start in reads of {b} | median {:.1} ms per 1 000 events",
+                    median_of(&mut times)
+                );
+            }
+        }
+        eprintln!(
+            "READCOST | {kind} | wire bytes per event: median {:.0} | largest row {largest}",
+            median_of(&mut per_event)
+        );
+        Box::pin(exec_ok(&mut s, &drop)).await;
+    }
+    // Least squares of ms = c + a·k + b·s over the small-event samples.
+    let n = samples.len() as f64;
+    let (mut sk, mut ss, mut st, mut skk, mut sss, mut sks, mut skt, mut sst) =
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (k, s_, t) in &samples {
+        sk += k;
+        ss += s_;
+        st += t;
+        skk += k * k;
+        sss += s_ * s_;
+        sks += k * s_;
+        skt += k * t;
+        sst += s_ * t;
+    }
+    // Normal equations, 3x3, by Cramer's rule.
+    let m = [[n, sk, ss], [sk, skk, sks], [ss, sks, sss]];
+    let v = [st, skt, sst];
+    let det3 = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det3(m);
+    let col = |j: usize| {
+        let mut x = m;
+        for (i, row) in x.iter_mut().enumerate() {
+            row[j] = v[i];
+        }
+        det3(x) / d
+    };
+    eprintln!(
+        "READCOST | fit | c {:.1} ms | a {:.4} ms per event read | b {:.4} ms per event skipped | {} samples",
+        col(0),
+        col(1),
+        col(2),
+        samples.len()
+    );
+    Box::pin(exec_ok(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
+}
+
 /// The large-event test's own Extended Events session
 /// ([`xe_large_events_are_read_by_halving`]).
 const LARGE_XE: &str = "it_large_xe";
 
-/// `n` reads of `retail.crm.customers` by `sa` in one batch, each
-/// statement `pad` characters longer (a comment; built on the server and
-/// run through `sp_executesql`, since the client sends batches of one
-/// packet only; 20 ms apart, so that the session's buffers keep up and
-/// drop none): one statement event each naming the table, and the `SET`,
-/// `WHILE` (and `EXEC`, `WAITFOR`) events.
-async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
-    let body = if pad == 0 {
-        format!(
-            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
-             SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
-        )
-    } else {
-        format!(
-            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
-             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
-             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
-             WHILE @i < {n} BEGIN \
-             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
-             WAITFOR DELAY '00:00:00.020'; END"
-        )
-    };
+/// `n` reads of `retail.crm.customers` by `sa` in one tight batch: one
+/// statement event each naming the table, and the `SET` events.
+async fn customer_reads(s: &mut Session, n: u32) {
+    let body = format!(
+        "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
+         SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
+    );
     Box::pin(exec(s, &body)).await;
 }
 
-/// 0.8.1 hotfix: a run of large events (statements of 60 000 characters,
-/// `event_data` near the poll's 128 KiB bound) makes a read of `BATCH`
-/// events go above the 12 MiB response bound. The read is cancelled and
-/// asked again smaller from the same position (halved down to
-/// `MIN_BATCH`), then back up: the stream moves past them with no stream
-/// error, no event lost or reported twice and nothing dropped. In 0.8.0
-/// the halving never ran (its guard tested `SsError::fatal`, which every
-/// client-side bound sets): every read failed, and the stream restarted
-/// at the same position until the files rolled over.
+/// The large-event run: [`LARGE_EXECS`] calls of `sp_executesql`, each of
+/// [`LARGE_PER_EXEC`] reads of `retail.crm.customers` by `sa`, each read
+/// [`LARGE_PAD`] characters longer (a comment; built on the server, since
+/// the client sends batches of one packet only), [`LARGE_DELAY_MS`] apart,
+/// so that the session's buffers keep up and drop none: one statement
+/// event each naming the table (its `event_data` above `2 × LARGE_PAD`
+/// bytes), and 4 small events a call (`EXEC`, `SET`, `WHILE`,
+/// `WAITFOR`; measured on 2022: 1 498 events for 300 calls of one).
+async fn large_customer_reads(s: &mut Session) {
+    let body = format!(
+        "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+         DECLARE @one nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+         REPLICATE(CONVERT(nvarchar(max), N'x'), {LARGE_PAD}) + N' */ FROM retail.crm.customers WHERE id = @i; '; \
+         DECLARE @q nvarchar(max) = REPLICATE(@one, {LARGE_PER_EXEC}); \
+         WHILE @i < {LARGE_EXECS} BEGIN \
+         EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+         WAITFOR DELAY '00:00:00.{LARGE_DELAY_MS:03}'; END"
+    );
+    Box::pin(exec(s, &body)).await;
+}
+
+/// The large-event run's statements: each `event_data` of about 120 000
+/// bytes (UTF-16), within [`crate::sql::XE_EVENT_BYTES`], so that it is
+/// read with its text (a larger event comes back without it, a small row).
+const LARGE_PAD: usize = 60_000;
+/// Large statements per `sp_executesql` call: with 4 small events a call,
+/// any `BATCH` rows of the run hold about 250 large events (about 30 MB),
+/// more than twice the 102 a response above `POLL_BYTES` needs
+/// ([`LargeRun::assert_oversized`] checks it from the files). With one a
+/// call (before), `BATCH` rows held about 100 large events of
+/// 123 360 bytes, about 12.35 MB against 12.58: the sized bound after a
+/// large row is `BATCH`, so a response above `POLL_BYTES` came only from
+/// a read sized from small rows (up to `XE_MAX_ROWS`) that met enough of
+/// the run, or from a denser window, a race the reader keeping up with
+/// the run lost (engine matrix run 40013967157: 19 reads, no cancel).
+const LARGE_PER_EXEC: usize = 4;
+/// `sp_executesql` calls of the run: 300 large events.
+const LARGE_EXECS: usize = 75;
+/// The delay between two calls (the same event bytes per second as one
+/// large statement every 20 ms).
+const LARGE_DELAY_MS: u32 = 80;
+
+/// ADR-0051 refinement of 2026-10-22, test plan item 3: a backlog of small
+/// events is read at the sized bound (more than `BATCH` rows a read); a
+/// run of large events (statements of about 60 000 characters, `event_data`
+/// near its 128 KiB bound), written while the stream waits between two
+/// cycles (a reader behind by the whole run), makes its next read's
+/// response go above 12 MiB whatever its size (a precondition checked
+/// from the session's files, [`LargeRun::assert_oversized`]): it is
+/// cancelled and read again by halving, with no event lost or reported
+/// twice and no stream error; once the halving is forgotten (its 10
+/// minutes shortened to 20 s for the test), small events are read at the
+/// sized bound again, with no further cancel. Also the 0.8.1 hotfix's
+/// test (#320): no stream error, no gap, nothing dropped and none of the
+/// agent's own events reported; in 0.8.0 the halving never ran (its guard
+/// tested `SsError::fatal`, which every client-side bound sets): every read
+/// failed, and the stream restarted at the same position until the files
+/// rolled over. The one stream end allowed is the designed one (#321): a
+/// cancel the server did not acknowledge within `ATTENTION_WAIT` ends the
+/// stream, which is restarted as the runtime does, from the same position
+/// at the halved size the connector kept (each restart at one position
+/// reads less, at most [`LARGE_MAX_RESTARTS`], none on small events or
+/// after the memory, the stream alive at the end).
 #[tokio::test]
 async fn xe_large_events_are_read_by_halving() {
     Box::pin(xe_large_scenario()).await;
@@ -2787,8 +5402,8 @@ async fn xe_large_scenario() {
     }
     let _g = serial().await;
     let major = Box::pin(major()).await;
-    // The body in a task, so that the dev session is started again, the
-    // test's session dropped and the grant revoked whatever happens.
+    // The body in a task, so that the dev session is started again and
+    // the test's session dropped whatever happens (security review L4).
     let result = tokio::spawn(xe_large_body(major)).await;
     let mut s = Box::pin(sa()).await;
     Box::pin(exec_ok(
@@ -2820,37 +5435,25 @@ async fn xe_large_scenario() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn xe_large_body(major: u32) {
+    use crate::audit::xe::size::XE_MAX_ROWS;
     let mut s = Box::pin(sa()).await;
     let _ = Box::pin(xe_grant(&mut s, major)).await;
     let stem = format!("it_large_{}", std::process::id());
-    Box::pin(exec_ok(
-        &mut s,
-        &format!(
-            "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
-             DROP EVENT SESSION {LARGE_XE} ON SERVER"
-        ),
-    ))
-    .await;
-    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
-                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
-    Box::pin(exec(
-        &mut s,
-        &format!(
-            "CREATE EVENT SESSION {LARGE_XE} ON SERVER \
-             ADD EVENT sqlserver.sql_statement_completed ({actions}), \
-             ADD EVENT sqlserver.sp_statement_completed ({actions}), \
-             ADD EVENT sqlserver.rpc_completed ({actions}), \
-             ADD EVENT sqlserver.error_reported ({actions} WHERE ([error_number] = (18456))) \
-             ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
-             max_file_size = 256, max_rollover_files = 4) \
-             WITH (TRACK_CAUSALITY = ON, MAX_DISPATCH_LATENCY = 5 SECONDS)"
-        ),
-    ))
-    .await;
-    // The dev session is stopped meanwhile, so that the other tests'
-    // first starts do not walk these events.
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{LARGE_XE}') \
+         DROP EVENT SESSION {LARGE_XE} ON SERVER"
+    );
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    let session = backlog_session(&stem)
+        .replace(BACKLOG_XE, LARGE_XE)
+        .replace(
+            "max_file_size = 16, max_rollover_files = 2",
+            "max_file_size = 256, max_rollover_files = 4",
+        );
+    Box::pin(exec(&mut s, &session)).await;
+    // The dev session is stopped meanwhile (as in the backlog test), so
+    // that the other tests' first starts do not walk these events.
     Box::pin(exec(
         &mut s,
         "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
@@ -2862,6 +5465,8 @@ async fn xe_large_body(major: u32) {
     ))
     .await;
     let c = Arc::new(SqlserverConnector::new());
+    // This connector's streams remember outcomes for 20 s, not 10 minutes.
+    *c.state.audit.xe_size_memory.lock().unwrap() = Some(Duration::from_secs(20));
     let t = agent(&format!(
         "{}, rls_visibility: view_definition, audit: {{source: sqlserver_xevents, xe_session: {LARGE_XE}}}",
         own_tls()
@@ -2878,80 +5483,453 @@ async fn xe_large_body(major: u32) {
     };
     let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
     let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
-    let c2 = Arc::clone(&c);
-    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    let mut stream = large_stream(&c, &cfg, &sink);
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!stream.is_finished(), "the stream started");
     // Counts the stream's reads of `retail.crm.customers` by `sa` until
-    // `want` are counted, `wait` passes or the stream ends (a read error
-    // ends it).
+    // `want` are counted or `wait` passes.
     let mut seen = 0usize;
-    let mut own = 0usize;
-    let mut count_until = async |stream: &tokio::task::JoinHandle<Result<(), ConnectorError>>,
-                                 want: usize,
-                                 wait: Duration| {
+    let other = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    // Security review L6: the agent's own events (its polls, cancelled
+    // ones included, consumed by their credits) are never reported.
+    let own = std::sync::atomic::AtomicUsize::new(0);
+    // Restarts after a stream end by design (`large_stream_ended`): an
+    // oversized read whose cancel the server did not acknowledge within
+    // `ATTENTION_WAIT` poisons the session and ends the stream, which the
+    // runtime restarts with the same state (seen once in CI, job
+    // 120470354546, as "the stream ended"; reproduced by a forced
+    // unacknowledged cancel). The test restarts it the same way, after the
+    // poll interval, with the same state directory and connector (the
+    // position, the own sessions and the kept size carry over); any other
+    // end fails the test with its error.
+    let restarts = std::sync::atomic::AtomicUsize::new(0);
+    let mut last_kept = None;
+    let mut count_until = async |want: usize, wait: Duration| {
         let deadline = std::time::Instant::now() + wait;
-        while seen < want && std::time::Instant::now() < deadline && !stream.is_finished() {
+        while seen < want && std::time::Instant::now() < deadline {
+            if stream.is_finished() {
+                let end = (&mut stream).await.expect("the stream panicked");
+                let kept = large_stream_ended(&c, &t.id, end, last_kept.take());
+                let n = restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[it] large events: stream restart {n} (oversized read not cancelled in step), kept {kept:?}, reads {:?}",
+                    c.state.audit.xe_reads(&t.id)
+                );
+                assert!(n <= LARGE_MAX_RESTARTS, "restarts {n}");
+                last_kept = Some(kept);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                stream = large_stream(&c, &cfg, &sink);
+            }
             let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
             else {
                 continue;
             };
-            let who = e.principal().account_name();
-            if who.eq_ignore_ascii_case("databastion") {
-                own += 1;
-            }
-            if who.eq_ignore_ascii_case("sa")
-                && names_of(&e).contains(&"retail.crm.customers".to_owned())
+            if e.principal()
+                .account_name()
+                .eq_ignore_ascii_case("databastion")
             {
-                seen += usize::try_from(e.aggregated_count()).unwrap_or(1);
+                own.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if e.principal().account_name().eq_ignore_ascii_case("sa") {
+                let names = names_of(&e);
+                if names.contains(&"retail.crm.customers".to_owned()) {
+                    seen += usize::try_from(e.aggregated_count()).unwrap_or(1);
+                } else {
+                    *other
+                        .lock()
+                        .unwrap()
+                        .entry(format!("{:?} {names:?}", e.action()))
+                        .or_insert(0usize) += 1;
+                }
             }
         }
         seen
     };
-    // 1. Small events: read as before.
-    let small = 200u32;
-    Box::pin(customer_reads(&mut s, small, 0)).await;
-    let got = count_until(&stream, small as usize, Duration::from_secs(60)).await;
-    if stream.is_finished() {
-        panic!("the stream ended: {:?}", stream.await);
-    }
-    eprintln!("[it] large events: small reads {got}/{small}");
+    // 1. Small events, written at once: read at the sized bound.
+    let small = 6_000u32;
+    Box::pin(customer_reads(&mut s, small)).await;
+    let got = count_until(small as usize, Duration::from_secs(60)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: small backlog {got}/{small}, reads {r:?}");
     assert_eq!(got, small as usize, "every small read reported once");
-    // 2. About 300 events near 128 KiB within `BATCH` rows: a read of
-    // `BATCH` events is above 12 MiB, cancelled and asked again smaller.
-    let large = 300u32;
-    Box::pin(customer_reads(&mut s, large, 60_000)).await;
+    assert!(
+        r.largest_asked > crate::audit::BATCH && r.largest_asked <= XE_MAX_ROWS,
+        "{r:?}"
+    );
+    assert_eq!((r.cancels, r.timeouts), (0, 0), "{r:?}");
+    assert_eq!(
+        restarts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no restart on small events"
+    );
+    // 2. Large events: a response above 12 MiB, cancelled, read by halving.
+    // The whole run is written while the stream waits between two cycles
+    // (`xe_hold`), as a reader that fell behind, so that its next read (at
+    // least `BATCH` rows: no halving or cap is remembered yet) has every
+    // large event ahead of it. Without the hold the stream read the run as
+    // it was written, about a second of it a read: no response above
+    // 12 MiB unless a read sized from the small rows met enough of it, a
+    // race (engine matrix run 40013967157).
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        c.state.audit.xe_hold.store(true, SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !c.state.audit.xe_parked.load(SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream did not wait between cycles (or ended)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let before_run = c.state.audit.xe_reads(&t.id);
+    let started = std::time::Instant::now();
+    Box::pin(large_customer_reads(&mut s)).await;
+    eprintln!(
+        "[it] large events: run written in {} ms",
+        started.elapsed().as_millis()
+    );
+    let large = u32::try_from(LARGE_PER_EXEC * LARGE_EXECS).unwrap();
+    let facts = Box::pin(large_run_in_files(&mut s, &stem, large)).await;
+    assert_eq!(
+        c.state.audit.xe_reads(&t.id),
+        before_run,
+        "no read while held"
+    );
+    facts.assert_oversized(large);
+    c.state
+        .audit
+        .xe_hold
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     let want = (small + large) as usize;
-    let got = count_until(&stream, want, Duration::from_secs(180)).await;
-    if stream.is_finished() {
-        panic!("the stream ended after {got}/{want}: {:?}", stream.await);
-    }
-    eprintln!("[it] large events: {got}/{want} after the large reads");
+    let got = count_until(want, Duration::from_secs(120)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: {got}/{want} after the large ones, reads {r:?}");
+    eprintln!(
+        "[it] large events: other events of sa {:?}",
+        other.lock().unwrap()
+    );
+    let restarted = restarts.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[it] large events: stream restarts {restarted}");
     assert_eq!(got, want, "every large read reported once");
-    // 3. Small events again: the stream goes on past the large ones.
-    let more = 2_000u32;
-    Box::pin(customer_reads(&mut s, more, 0)).await;
+    assert!(
+        r.cancels + restarted as u64 >= 1,
+        "a response above 12 MiB: {r:?}"
+    );
+    assert_eq!(r.timeouts, 0, "{r:?}");
+    let cancels = r.cancels;
+    // 3. After the (shortened) memory: small events at the sized bound
+    // again, with no further cancel.
+    tokio::time::sleep(Duration::from_secs(22)).await;
+    let before = c.state.audit.xe_reads(&t.id);
+    let more = 6_000u32;
+    Box::pin(customer_reads(&mut s, more)).await;
     let want = want + more as usize;
-    let got = count_until(&stream, want, Duration::from_secs(90)).await;
-    if stream.is_finished() {
-        panic!("the stream ended after {got}/{want}: {:?}", stream.await);
-    }
-    eprintln!("[it] large events: {got}/{want} after the large ones");
-    assert_eq!(got, want, "every read after the large ones reported once");
-    // Nothing more arrives (none twice).
+    let got = count_until(want, Duration::from_secs(60)).await;
+    let r = c.state.audit.xe_reads(&t.id);
+    eprintln!("[it] large events: {got}/{want} after the memory, reads {r:?}");
+    assert_eq!(got, want, "every read reported once");
+    assert_eq!(r.cancels, cancels, "no further cancel: {r:?}");
+    assert_eq!(
+        restarts.load(std::sync::atomic::Ordering::Relaxed),
+        restarted,
+        "no further restart"
+    );
+    assert!(r.largest_returned > crate::audit::BATCH, "{r:?}");
+    assert!(
+        r.reads - before.reads < u64::from(more) * 3 / 500,
+        "read at more than BATCH: {before:?} {r:?}"
+    );
+    // Nothing more arrives (none twice) and nothing was dropped.
     tokio::time::sleep(Duration::from_secs(8)).await;
-    let got = count_until(&stream, want + 1, Duration::from_secs(2)).await;
+    let got = count_until(want + 1, Duration::from_secs(2)).await;
     assert_eq!(got, want, "no read reported twice");
     assert!(!stream.is_finished(), "the stream ended");
+    eprintln!(
+        "[it] large events: stream restarts {} in all",
+        restarts.load(std::sync::atomic::Ordering::Relaxed)
+    );
     stream.abort();
     let _ = stream.await;
-    let facts = c.state.audit.facts(&t.id);
+    let left_out = c.state.audit.own_left_out(&t.id);
+    let own = own.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "[it] large events: own events reported {own}, dropped {}, gap {}",
-        facts.dropped, facts.gap
+        "[it] large events: own statements left out {left_out:?} (credited polls {}), own events reported {own}, reads {:?}",
+        left_out[2],
+        c.state.audit.xe_reads(&t.id)
     );
     assert_eq!(own, 0, "none of the agent's own events reported");
+    let facts = c.state.audit.facts(&t.id);
+    eprintln!(
+        "[it] large events: dropped {}, gap {}",
+        facts.dropped, facts.gap
+    );
     assert_eq!(facts.dropped, 0, "records dropped");
     assert!(!facts.gap, "no gap");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The large-event run as the session's files hold it: every event
+/// stamped from the first large one to the last.
+#[derive(Debug)]
+struct LargeRun {
+    /// Events in that time span, of any session.
+    events: i64,
+    /// Large events (`event_data` above `2 × LARGE_PAD` bytes).
+    large: i64,
+    /// The smallest large event and the largest event (bytes).
+    smallest_large: i64,
+    largest: i64,
+}
+
+impl LargeRun {
+    /// The test's precondition: every large event read with its text, and
+    /// the stream's first read after the hold (at least `BATCH` rows, a
+    /// few events of the time before the run first) above `POLL_BYTES`
+    /// whatever the read size, from the measured share of large events.
+    fn assert_oversized(&self, large: u32) {
+        use crate::audit::{BATCH, POLL_BYTES};
+        // Events between the stream's last read and the run (the batch's
+        // `DECLARE`s, other sessions'): at most these.
+        const BEFORE: i64 = 50;
+        assert_eq!(self.large, i64::from(large), "precondition: {self:?}");
+        assert!(
+            usize::try_from(self.largest).unwrap() <= crate::sql::XE_EVENT_BYTES,
+            "precondition: every large event read with its text: {self:?}"
+        );
+        let rows = i64::try_from(BATCH).unwrap() - BEFORE;
+        let bytes = rows * self.large / self.events.max(1) * self.smallest_large;
+        eprintln!(
+            "[it] large events: {self:?}: the first read after the hold holds at least {bytes} bytes (POLL_BYTES {POLL_BYTES})"
+        );
+        assert!(
+            bytes > i64::try_from(POLL_BYTES).unwrap(),
+            "precondition: a read of BATCH rows from the run's start is above POLL_BYTES: {self:?}, {bytes} bytes"
+        );
+    }
+}
+
+/// Waits until the session's files hold `large` large events (their
+/// dispatch latency is 5 s), then measures the run ([`LargeRun`]). The
+/// time span is compared as `DATEDIFF_BIG` microseconds: a predicate on
+/// `timestamp_utc` itself selected no event (measured on 2022).
+async fn large_run_in_files(s: &mut Session, stem: &str, large: u32) -> LargeRun {
+    let big = 2 * LARGE_PAD;
+    let sql = format!(
+        "WITH f AS (SELECT CONVERT(bigint, DATALENGTH(event_data)) AS n, \
+         DATEDIFF_BIG(microsecond, '19700101', timestamp_utc) AS t \
+         FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/{stem}_0_*.xel', NULL, NULL, NULL)), \
+         b AS (SELECT MIN(t) AS a, MAX(t) AS z FROM f WHERE n > {big}) \
+         SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, ISNULL(SUM(CASE WHEN f.n > {big} THEN 1 ELSE 0 END), 0)), \
+         CONVERT(bigint, ISNULL(MIN(CASE WHEN f.n > {big} THEN f.n END), 0)), CONVERT(bigint, ISNULL(MAX(f.n), 0)) \
+         FROM f CROSS JOIN b WHERE f.t >= b.a AND f.t <= b.z"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = Box::pin(try_rows(s, &sql, 4))
+            .await
+            .expect("the run's events");
+        let v = |i: usize| rows[0][i].as_int().unwrap_or(0);
+        let run = LargeRun {
+            events: v(0),
+            large: v(1),
+            smallest_large: v(2),
+            largest: v(3),
+        };
+        if run.large >= i64::from(large) || std::time::Instant::now() >= deadline {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The large-event test's stream restarts at most (each one after an
+/// oversized read whose cancel was not acknowledged in time): 300 large
+/// events of about 120 KB, about 100 a read under 12 MiB, sizes halving
+/// from `XE_MAX_ROWS` and growing back by doubling up to `BATCH`.
+const LARGE_MAX_RESTARTS: usize = 12;
+
+/// The large-event test's Audit stream, as the runtime runs it.
+fn large_stream(
+    c: &Arc<SqlserverConnector>,
+    cfg: &databastion_core::AuditConfig,
+    sink: &databastion_core::EventSink,
+) -> tokio::task::JoinHandle<Result<(), ConnectorError>> {
+    let (c, cfg, sink) = (Arc::clone(c), cfg.clone(), sink.clone());
+    tokio::spawn(async move { c.audit_stream(&cfg, &sink).await })
+}
+
+/// Checks that the large-event test's stream ended by design, and returns
+/// the read size the connector kept for the restart: an oversized read
+/// (`ResourceLimit`, no server error number) on a session the cancel left
+/// unusable (the server did not acknowledge it within `ATTENTION_WAIT`),
+/// whose halved size and position the connector keeps for the next stream
+/// (`Shared::read_failed`, 0.8.1, #321). Any other end fails the test. A
+/// restart at the same position as the previous one reads less (the
+/// reads walk down, never at the same size twice).
+fn large_stream_ended(
+    c: &SqlserverConnector,
+    target_id: &str,
+    end: Result<(), ConnectorError>,
+    previous: Option<(crate::audit::ReadAt, usize)>,
+) -> (crate::audit::ReadAt, usize) {
+    let kept = c.state.audit.kept_read_size(target_id);
+    let reads = c.state.audit.xe_reads(target_id);
+    let by_design = matches!(
+        &end,
+        Err(ConnectorError::Target {
+            code: databastion_core::FailureCode::ResourceLimit,
+            engine_code: None,
+            ..
+        })
+    );
+    let Some((crate::audit::Source::Xevents, at, n)) = kept.clone().filter(|_| by_design) else {
+        panic!("the stream ended: {end:?}, kept {kept:?}, reads {reads:?}");
+    };
+    if let Some((before, m)) = previous
+        && before == at
+    {
+        assert!(
+            n < m,
+            "a restart at the same position reads less: {m} then {n} at {at:?}"
+        );
+    }
+    (at, n)
+}
+
+/// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`,
+/// `--ignored`), security review M1 of the read-size change (2026-10-22):
+/// the cost of the agent's poll over events above the poll's 128 KiB
+/// `event_data` bound (returned without their XML, but converted by the
+/// server: `DATALENGTH` and the `CASE`), statements of `pad` characters,
+/// against the 15 s statement timeout. Prints `OVERSIZED` lines.
+#[tokio::test]
+#[ignore = "measurement: DATABASTION_IT_SQLSERVER_MEASURE=1, --ignored"]
+async fn measure_xe_oversized_events() {
+    if !enabled() || std::env::var("DATABASTION_IT_SQLSERVER_MEASURE").as_deref() != Ok("1") {
+        return;
+    }
+    // `DATABASTION_IT_OVERSIZED_PAD`: the statements' length (default
+    // 200 000 characters; an event above a buffer, about 1.3 MB with the
+    // default `MAX_MEMORY`, is dropped by the session).
+    let pad: usize = std::env::var("DATABASTION_IT_OVERSIZED_PAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let _g = serial().await;
+    let mut s = Box::pin(sa()).await;
+    let name = "it_oversized_xe";
+    let stem = format!("it_oversized_{}", std::process::id());
+    let drop = format!(
+        "IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'{name}') \
+         DROP EVENT SESSION {name} ON SERVER"
+    );
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    // `sp_statement_completed` only: the large statements alone, every
+    // event above the bound.
+    let actions = "ACTION (sqlserver.server_principal_name, sqlserver.session_server_principal_name, \
+                   sqlserver.client_app_name, sqlserver.database_name, sqlserver.session_id)";
+    let session = format!(
+        "CREATE EVENT SESSION {name} ON SERVER ADD EVENT sqlserver.sp_statement_completed ({actions}) \
+         ADD TARGET package0.event_file (SET filename = N'/var/opt/mssql/xe/{stem}.xel', \
+         max_file_size = 512, max_rollover_files = 2) WITH (MAX_DISPATCH_LATENCY = 5 SECONDS)"
+    );
+    Box::pin(exec(&mut s, &session)).await;
+    Box::pin(exec_ok(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = STOP",
+    ))
+    .await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {name} ON SERVER STATE = START"),
+    ))
+    .await;
+    let n = 600u32;
+    let started = std::time::Instant::now();
+    for _ in 0..n / 100 {
+        let n = 100u32;
+        Box::pin(exec(
+        &mut s,
+        &format!(
+            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
+             WHILE @i < {n} BEGIN \
+             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+             WAITFOR DELAY '00:00:00.050'; END"
+        ),
+    ))
+    .await;
+    }
+    let n = 600u32;
+    eprintln!(
+        "OVERSIZED | {n} statements of {pad} characters written in {} ms",
+        started.elapsed().as_millis()
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    Box::pin(exec(
+        &mut s,
+        &format!("ALTER EVENT SESSION {name} ON SERVER STATE = STOP"),
+    ))
+    .await;
+    let files = format!("N'/var/opt/mssql/xe/{stem}_0_*.xel'");
+    let stats = try_rows(
+        &mut s,
+        &format!(
+            "SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, SUM(CASE WHEN DATALENGTH(event_data) > 131072 THEN 1 ELSE 0 END)), \
+             CONVERT(bigint, MAX(DATALENGTH(event_data))) FROM sys.fn_xe_file_target_read_file({files}, NULL, NULL, NULL)"
+        ),
+        3,
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "OVERSIZED | events {:?}, above 128 KiB {:?}, largest {:?} bytes",
+        stats[0][0].as_int(),
+        stats[0][1].as_int(),
+        stats[0][2].as_int()
+    );
+    let current = format!("/var/opt/mssql/xe/{stem}_0_1.xel");
+    let text = crate::sql::xe_poll(&crate::sql::xe_pattern(&current).unwrap(), false).unwrap();
+    for top in [100usize, 250, 500, 1_000, 2_000] {
+        let mut ms = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let r = Box::pin(crate::audit::xe::poll_records(
+                &mut s,
+                &text,
+                crate::audit::own::PollKind::Start,
+                "",
+                0,
+                top,
+                0,
+            ))
+            .await;
+            let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+            match r {
+                Ok(p) => {
+                    ms.push(elapsed);
+                    eprintln!(
+                        "OVERSIZED | read of {top}: {} rows, {} bytes, {elapsed:.0} ms",
+                        p.returned, p.bytes
+                    );
+                }
+                Err(e) => eprintln!(
+                    "OVERSIZED | read of {top}: {:?} after {elapsed:.0} ms",
+                    e.code
+                ),
+            }
+        }
+        eprintln!(
+            "OVERSIZED | read of {top}: median {:.0} ms",
+            median_of(&mut ms)
+        );
+    }
+    Box::pin(exec_ok(&mut s, &drop)).await;
+    Box::pin(exec_ok(
+        &mut s,
+        "ALTER EVENT SESSION databastion_xe ON SERVER STATE = START",
+    ))
+    .await;
 }

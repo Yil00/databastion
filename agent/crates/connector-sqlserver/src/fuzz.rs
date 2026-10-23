@@ -350,6 +350,7 @@ pub fn audit_records(data: &[u8]) {
                     o.object().as_str().chars().count()
                         <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
                 );
+                assert_produced(o);
             }
             // Past the bound, `*` and always reported: no object lost
             // without a sign (end-of-phase-9 review, gates G1 and G7).
@@ -362,6 +363,19 @@ pub fn audit_records(data: &[u8]) {
                 );
             }
         }
+    }
+}
+
+/// Every name of an event object matches the contract
+/// `IdentifierProduced` (ADR-0057 decision 2 item 2): the oracle of the
+/// name normalizer on the names the T-SQL analysis builds.
+fn assert_produced(o: &databastion_classifiers::masking::EventObject) {
+    use databastion_classifiers::names::is_identifier_produced;
+    for n in [Some(o.database()), o.schema(), Some(o.object())]
+        .into_iter()
+        .flatten()
+    {
+        assert!(is_identifier_produced(n.as_str()), "{:?}", n.as_str());
     }
 }
 
@@ -494,6 +508,7 @@ pub fn xe_records(data: &[u8]) {
                     o.object().as_str().chars().count()
                         <= databastion_classifiers::names::MAX_IDENTIFIER_CHARS
                 );
+                assert_produced(o);
             }
             // The exemption of masked names (a name normalization replaced
             // by `*`, protocol "The object `*`", under the filters as on

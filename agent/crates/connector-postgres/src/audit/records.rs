@@ -32,6 +32,11 @@ use zeroize::Zeroizing;
 
 /// Longest CSV field count accepted in a record.
 const MAX_FIELDS: usize = 64;
+/// Most columns of a csvlog record: the largest layout PostgreSQL writes
+/// (26 since PostgreSQL 14, with `backend_type`, `leader_pid` and
+/// `query_id`). A record with more is not one the server wrote (a hybrid
+/// of a damaged record and the next: security review of #278, M1).
+const MAX_CSV_COLUMNS: usize = 26;
 /// Prefix of pgaudit messages.
 const AUDIT_PREFIX: &str = "AUDIT: ";
 
@@ -322,7 +327,7 @@ pub(crate) fn parse_record_checked(
             }
             let text = std::str::from_utf8(record).map_err(|_| Skip::NotAudit)?;
             let f = parse_csv(text).ok_or(Skip::NotAudit)?;
-            if f.len() < 23 {
+            if f.len() < 23 || f.len() > MAX_CSV_COLUMNS {
                 return Err(Skip::NotAudit);
             }
             let audit = parse_pgaudit(&f[13]).ok_or(Skip::NotAudit)?;
@@ -733,6 +738,11 @@ pub(crate) fn parse_error_line(format: Format, record: &[u8]) -> Result<Option<E
             }
             let text = std::str::from_utf8(record).map_err(|_| Skip::NotAudit)?;
             let mut p = csv_pick(text, &CSV_PICKED, Some(col::QUERY)).ok_or(Skip::NotAudit)?;
+            // More columns than PostgreSQL writes: not a line of the
+            // server (security review of #278, M1); counted as dropped.
+            if p.present.len() > MAX_CSV_COLUMNS {
+                return Err(Skip::Damaged);
+            }
             let field = |c: usize| -> &str {
                 CSV_PICKED
                     .iter()
@@ -955,6 +965,33 @@ mod tests {
         assert_eq!(r.audit.command, "PREPARE");
         assert!(r.audit.statement.contains("'lit,eral'"));
         assert!(r.audit.statement.contains('\n'));
+    }
+
+    /// Security review of #278, M1: a csvlog record with more columns than
+    /// PostgreSQL writes (a hybrid of a damaged record and the next one) is
+    /// never read, as a pgaudit record or as an `ERROR` line.
+    #[test]
+    fn csvlog_records_past_the_largest_layout_are_refused() {
+        let ok = CSV_MULTILINE.trim_end();
+        assert_eq!(parse_csv(ok).unwrap().len(), MAX_CSV_COLUMNS);
+        assert!(parse_record(Format::Csvlog, ok.as_bytes(), "LOG").is_some());
+        let wide = format!("2026-10-18 09:00:00.000 UTC,mallory,{ok}");
+        assert_eq!(
+            parse_record_checked(Format::Csvlog, wide.as_bytes(), "LOG").err(),
+            Some(Skip::NotAudit)
+        );
+        let error = "2026-10-18 09:00:00.000 UTC,\"mallory\",\"shop\",1,\"127.0.0.1:1\",s,1,\"SELECT\",\
+                     2026-10-18 09:00:00 UTC,3/1,0,ERROR,57014,\"canceling statement\",,,,,,\
+                     \"SELECT * FROM crm.customers\",,,\"psql\",\"client backend\",,0";
+        assert!(matches!(
+            parse_error_line(Format::Csvlog, error.as_bytes()),
+            Ok(Some(_))
+        ));
+        let wide = format!("x,{error}");
+        assert_eq!(
+            parse_error_line(Format::Csvlog, wide.as_bytes()).err(),
+            Some(Skip::Damaged)
+        );
     }
 
     #[test]

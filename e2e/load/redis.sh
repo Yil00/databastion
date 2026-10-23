@@ -68,6 +68,7 @@ LOAD_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/databastion-load-redis.XXXXXX")"
 W="$LOAD_WORK_DIR"
 export E2E_WORK_DIR="$W"
 E2E_LOG_DIR="$LOAD_LOG_DIR"
+CENSUS_OUT_DIR="$LOAD_RESULTS_DIR"  # read by ../lib.sh (print_census): the results artifact
 mkdir -p "$LOAD_LOG_DIR" "$LOAD_RESULTS_DIR" "$W/out" "$W/redis"
 COMPOSE_ARGS=(-p "$PROJECT" -f "$E2E/docker-compose.yml" -f "$E2E/docker-compose.redis.yml" -f "$HERE/docker-compose.redis.yml")
 # shellcheck source=../lib.sh
@@ -95,6 +96,7 @@ cleanup() {
   log "collecting logs into $LOAD_LOG_DIR"
   dump_logs db migrate web worker proxy redis-tls-init "$SVC" agent
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census "load-${LOAD_REDIS_ENGINE}"
   cp -f "$W"/out/*.jsonl "$W"/out/*.json "$LOAD_LOG_DIR/" 2>/dev/null
   mkdir -p "$canary_dir"
   printf 'load-canary-%s\n' "$(openssl rand -hex 16)" >"$canary_dir/canary"
@@ -116,6 +118,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR" "$P"
   redact_dir "$LOAD_RESULTS_DIR" "$P"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose "${COMPOSE_ARGS[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"
@@ -224,6 +228,13 @@ done
 admin_cli BGSAVE >/dev/null || true
 DBSIZE="$(admin_cli DBSIZE | tr -d '\r')"
 log "seeded in $(( $(date +%s) - t0 )) s: dbsize ${DBSIZE}, used_memory $(info_field memory used_memory_human)"
+# The databases holding keys (the dev keyspace's db0 and db1 next to the load keys of db0). Slow-log
+# entries record no database, so with more than one, a key's object is a pattern learned in every
+# one of them, else `*` (docs/08-engine-capabilities.md, "Redis / Valkey Audit"): the load GETs are
+# reads of `*` in `*` here, `load:*:*` being learned in db0 only.
+KEYSPACE_DBS="$(admin_cli INFO keyspace | tr -d '\r' | sed -n 's/^\(db[0-9]*\):keys=\([0-9]*\),.*/\1=\2/p' | paste -sd ' ' -)"
+log "databases with keys: ${KEYSPACE_DBS:-none}"
+fact --arg t "$TARGET" --arg dbs "$KEYSPACE_DBS" '{kind: "keyspace", target: $t, databases: ($dbs | split(" ") | map(select(. != "")))}'
 if r="$(python3 "$LOADLIB" quiet --samples "$SAMPLES_DB" --names "$SVC" --below 0.02 --window 10 --timeout 180)"; then
   log "target quiet: $r"
 else
