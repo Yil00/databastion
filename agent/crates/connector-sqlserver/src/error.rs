@@ -95,7 +95,16 @@ pub(crate) struct SsError {
     /// The server's error number, if the server reported one.
     pub(crate) number: Option<i32>,
     pub(crate) stage: Stage,
-    /// The connection is unusable.
+    /// `false` only for a server error (an `ERROR` token of class 11 to 19,
+    /// outside the TLS, connect and login stages) after which the session
+    /// stays usable: the callers that go on with the same session test
+    /// `!fatal` (fail closed). `true` for every client-side failure
+    /// ([`SsError::new`]: I/O, protocol, the client's statement deadline
+    /// and its response bounds) and for a server error of class 20 or more
+    /// or at those stages. After a client-side deadline or bound the
+    /// session may still be usable, once the client's `ATTENTION` was
+    /// acknowledged: `Session::is_poisoned` tells (the Audit streams' read
+    /// retries test it, ADR-0051 refinement of 2026-10-22), not this flag.
     pub(crate) fatal: bool,
     pub(crate) detail: Option<Detail>,
 }

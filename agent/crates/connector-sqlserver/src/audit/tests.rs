@@ -1263,7 +1263,7 @@ async fn a_response_over_the_byte_bound_leaves_the_session_usable() {
 
 /// A real `ResourceLimit` with the session poisoned: a response over the
 /// byte bound whose cancel is never acknowledged (the server closes).
-async fn poisoned_bound() -> SsError {
+pub(crate) async fn poisoned_bound() -> SsError {
     use crate::conn::{Flow, Shape, tests::scripted};
     use crate::token::{done, tests::build, tok};
 

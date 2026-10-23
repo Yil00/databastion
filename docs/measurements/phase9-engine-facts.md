@@ -88,6 +88,36 @@ Measured with the agent's integration tests (`it::xe_reports_reads_and_leaves_th
 | Event time against `SYSUTCDATETIME()` (lot 2 follow-up) | 200 statements, each between two `SYSUTCDATETIME()` reads on one session, as `sa` | SQL Server Audit `event_time`: never outside the two reads (0 µs, 2019, 2022, 2025); Extended Events `timestamp_utc`: up to 0.9 ms (2019), 3.5 ms (2022) and 2.8 ms (2025) after the second read, up to 1.4 ms, 2.2 ms and 1.3 ms before the first | 2019, 2022, 2025 | Inside the clean-end tolerance (250 ms) and the start slack (10 ms) |
 
 
+### Extended Events read cost (2026-10-22)
+
+Step 1 of the measurement plan of the [ADR-0051 refinement of 2026-10-22](../adr/0051-sqlserver-connector.md#refinement-2026-10-22-accepted-by-the-maintainer-on-2026-10-22-option-b-extended-events-reads-within-one-buffer) (Extended Events reads within one buffer), before the change. Measured with `it::measure_xe_read_cost` (`DATABASTION_IT_SQLSERVER_MEASURE=1`, `--ignored`) on the dev service, SQL Server 2022 Express (16.0.4305.5, `mandatory`), on a local host: the agent's poll (`XE_POLL_FROM`, through the connector's own poll function, `MAXDOP 1`) on a session defined as the dev session, as `sa`, each figure the median of four or five reads starting at different buffers. Small events: statements of a T-SQL loop shaped as the load workload's (a branch chain, `SET`, `IF`, a table variable insert; 33 747 events). Large events: a statement of about 60 000 characters (a comment) run through `sp_executesql` (1 199 events, a quarter of them large).
+
+| Fact | Result | ADR impact |
+|---|---|---|
+| Events per buffer | Small events: 4 592 to 4 593 per buffer (one partial buffer at the end); large ones: 44 to 49 | A read of 500 small events re-skips up to about 4 000 events of its buffer |
+| Wire bytes per event (the client's count of each row's values) | Small events: median 3 512, largest 3 603; with large events: median 33 782, largest 123 603 (`event_data` near its 128 KiB bound) | The sized bound: 0.75 × 12 MiB / 3 603 = 2 619 rows for small events, 500 (its floor) as soon as a read held a large one |
+| Read of `k` small events at a buffer start (skip 0) | 100: 52 ms; 500: 292 ms (222 ms in a second series); 1 000: 558 ms; 2 000: 913 ms; 3 000: 1 366 ms; **4 000: cancelled above 12 MiB** (after about 1.5 to 1.9 s; about 14 MB of small events) | N ≤ 2 619 for these events; at 4 000 every read would be cancelled |
+| Read of 500 small events after skipping `s` in a buffer | 0: 222 ms; 500: 310 ms; 1 000: 292 ms; 2 000: 444 ms; 3 000: 431 ms; 4 000: 487 ms | The re-skip cost of the refinement's context |
+| Least-squares fit of `c + a·k + b·s` (44 reads) | `c` ≈ 37 ms, `a` ≈ 0.43 ms per event read, `b` ≈ 0.06 ms per event skipped | Mostly per-event cost (the refinement's pessimistic case): larger reads cut the re-skip, not the per-event cost |
+| One buffer of 4 593 small events walked from its start in reads of `B` | 500: 802 ms per 1 000 events (about 1 250 events/s of reading time); 1 000: 672 ms (1 490/s); 2 000: 543 ms (1 840/s); 3 000: 521 ms (1 920/s) | **N = 2 000** (`XE_MAX_ROWS`): 1.47 times the throughput of reads of 500, within 4 % of reads of 3 000, a read of about 0.9 s (a sixteenth of the 15 s statement timeout) and about 7 MB on the wire (under the sized bound of these events, so a modestly larger event does not cancel a read) |
+| Reads with large events | 16: 68 ms; 50: 192 ms; 100: 313 ms; 250: 811 ms; **500: cancelled above 12 MiB** in every read | A session with large events is read at 500 or less, halving after a cancel |
+| The cancel of a read above 12 MiB | The session stays usable (`ATTENTION` acknowledged); nothing of the response is handled | Found with this measurement: before the change, the cancel was a stream error (the halving's guard tested the error's `fatal` flag, which every client-side bound sets), so a read of 500 large events failed and restarted the stream at 500 again |
+
+Not measured: SQL Server 2019 and 2025 (the engine matrix does not run the measurement; the refinement's step 1 asks for them), a 2-CPU server, the large-event share of the load run (load step 4).
+
+### Extended Events polls over events above 128 KiB (2026-10-22)
+
+Security review M1 of the read-size change (a finding on the existing timeout rule, not changed here: a change would need an ADR-0051 refinement). The poll leaves out the XML of an event above 128 KiB (`DATALENGTH(event_data) <= 131072`), but the server still reads and measures every such event. Measured with `it::measure_xe_oversized_events` (`DATABASTION_IT_SQLSERVER_MEASURE=1`, `--ignored`; `DATABASTION_IT_OVERSIZED_PAD` the statements' length) on the dev service (Express, local host), on a session recording `sp_statement_completed` only (default `MAX_MEMORY` 4 MB, so every event of the file above the bound): 600 statements of 200 000 characters (events of about 400 KB) and of 600 000 characters (about 1.2 MB, near the largest event a buffer of about 1.3 MB holds); each read the agent's poll from the start of the file set, as `sa`, the median of three.
+
+| Events | Version | Read of 100 | 250 | 500 | 600 (reads of 1 000 / 2 000) |
+|---|---|---|---|---|---|
+| 600 × about 400 KB | 2022 (16.0.4305.5) | 83 ms | 194 ms | 337 ms | 443 / 416 ms |
+| 600 × about 1.2 MB | 2022 | 213 ms | 574 ms | 980 ms | 1 181 / 1 164 ms |
+| 600 × about 400 KB | 2019 (15.0.4500.2) | 85 ms | 188 ms | 418 ms | 487 / 486 ms |
+| 600 × about 1.2 MB | 2019 | 234 ms | 518 ms | 1 054 ms | 1 268 / 1 212 ms |
+
+A read of 500 events above the bound takes about 1 s at the largest event size, against the 15 s statement timeout; the rows come back without XML (about 233 wire bytes each), so the sized bound allows reads of 2 000 of them, about 2 ms an event at 1.2 MB, so about 4 s extrapolated (only 600 were written). Not measured: a 2-CPU server or a busy one, events of the default `MAX_MEMORY` written faster than the session's buffers keep (they drop events), and 2025.
+
 Not measured on SQL Server: the Developer edition (not used, maintainer decision); the 2019 and 2025 catalog visibility details beyond the rows above; `xp_dirtree` / `xp_fileexist` executability by `public`; procedure statements called by RPC on Extended Events (`rpc_completed` of a user procedure); `sql_batch_completed`; an `event_file` target rollover (`max_rollover_files`) while the agent reads; ownership chaining on SQL Server Audit; `sp_execute_external_script` and `sp_invoke_external_rest_endpoint`; arm64 emulation; the fallback certificate's restart behavior on 2019 and 2025 and whether `subjectalternativename` applies to it.
 
 ## Redis and Valkey (ADR-0052)

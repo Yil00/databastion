@@ -3632,6 +3632,69 @@ mod statistics_tests {
 
     const BATCH_FOR_TESTS: usize = crate::audit::BATCH;
 
+    /// ADR-0051 refinement of 2026-10-22 (reads of up to `XE_MAX_ROWS`):
+    /// rule 2 cuts a full read of N rows only at or past its last 256 rows
+    /// (at most 256 rows fetched again); a build before them is handled as
+    /// it stands (reported, fail closed); and the continuous-load bound
+    /// holds with reads of N.
+    #[test]
+    fn a_full_read_of_n_rows_is_cut_in_its_last_rows_only() {
+        let n = crate::audit::xe::size::XE_MAX_ROWS;
+        let spec = |kind: SpecKind, session: u32, seq: u64| Spec {
+            id: 0,
+            at_ms: 0,
+            kind,
+            session,
+            guid: format!("{session:08X}-0000-0000-0000-000000000000"),
+            seq,
+        };
+        let t0 = Instant::now();
+        let bound = Duration::from_secs(2);
+        for (build, want) in [
+            (n / 2, None),
+            (n - CONTEXT_WINDOW - 1, None),
+            (n - CONTEXT_WINDOW, Some(n - CONTEXT_WINDOW)),
+            (n - 10, Some(n - 10)),
+        ] {
+            let mut file: Vec<Spec> = (0..n + 100)
+                .map(|_| spec(SpecKind::Read("f".to_owned()), 60, 1))
+                .collect();
+            file[build] = spec(SpecKind::Build("x".to_owned()), 80, 1);
+            file[build + 1] = spec(SpecKind::Internal, 80, 2);
+            file[n + 50] = spec(SpecKind::Read("x".to_owned()), 80, 3);
+            let file = sorted(file);
+            let mut recs: Vec<XeRecord> = file
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(i, s)| s.record(i))
+                .collect();
+            context(&mut recs, true, &own);
+            let mut d = Deferrals::default();
+            let cut = d.cut(&recs, true, t0, bound, Some(n)).map(|c| c.at);
+            assert_eq!(cut, want, "build at {build}");
+            assert!(cut.is_none_or(|at| n - at <= CONTEXT_WINDOW));
+        }
+        let (poll, bound) = (1000u64, Duration::from_secs(2));
+        let limit = u64::try_from(MAX_DEFERRAL.as_millis()).unwrap() + 2000 + poll + 1000;
+        let end = 240_000u64;
+        let mut file = Vec::new();
+        fillers(&mut file, 100, end);
+        requests(&mut file, 80, 7000, end, Some(300), "l");
+        requests(&mut file, 70, 1000, end, None, "tmp");
+        let file = sorted(file);
+        let handled = simulate(&file, n, poll, bound, end + limit + 5000);
+        for s in &file {
+            let (at, _) = handled[&s.id];
+            assert!(
+                at - s.at_ms <= limit,
+                "event {} after {} ms",
+                s.id,
+                at - s.at_ms
+            );
+        }
+    }
+
     /// Review M1: a full read (more rows on the server) whose build's pair
     /// is in the rows not fetched yet ends before the build and reads on at
     /// once, using none of the build's deferral; a build at the start of a

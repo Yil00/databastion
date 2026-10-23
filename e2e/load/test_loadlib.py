@@ -958,6 +958,61 @@ class XeCatchupTest(unittest.TestCase):
             with open(summary, encoding="utf-8") as f:
                 self.assertIn("| load_app | 1 | 9 | 9 | 9 | 0 |", f.read())
 
+    @staticmethod
+    def retry(ts: str, reason: str) -> str:
+        rec = {"timestamp": ts, "level": "DEBUG", "target": "databastion_connector_sqlserver::audit::xe::size",
+               "fields": {"message": L.XE_RETRY_MESSAGE, "target_id": "mssql-load", "reason": reason,
+                          "asked": 2000, "next": 500, "cancels_total": 1, "timeouts_total": 0}}
+        return "agent-1  | " + json.dumps(rec)
+
+    def test_retried_reads(self) -> None:
+        # ADR-0051 refinement of 2026-10-22: cancels above 12 MiB (two within 10 minutes, one 10 minutes
+        # later), a timeout, and lines before `since`, of another reason or not JSON, left out.
+        lines = [self.retry("2026-10-22T10:00:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:09:59Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:20:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:21:00Z", "statement timeout"),
+                 self.retry("2026-10-22T09:00:00Z", "response above 12 MiB"),
+                 self.retry("2026-10-22T10:22:00Z", "something else"),
+                 "agent-1  | not json " + L.XE_RETRY_MESSAGE]
+        since = L._log_time({"timestamp": "2026-10-22T09:30:00Z"})
+        self.assertEqual(L.xe_retries(lines, since), {"cancels": 3, "timeouts": 1, "max_cancels_per_10min": 2})
+        self.assertEqual(L.xe_retries(lines[2:3], since)["max_cancels_per_10min"], 1)
+        self.assertEqual(L.xe_retries([], None), {"cancels": 0, "timeouts": 0, "max_cancels_per_10min": 0})
+        r = L.xe_catchup(lines, {}, [], {}, since, 30.0)
+        self.assertEqual(r["reads"]["cancels"], 3)
+        out = L.xe_catchup_lines(r, "load-sqlserver")
+        self.assertIn("XE-READS load-sqlserver cancels=3 timeouts=1 max_cancels_per_10min=2", out)
+        self.assertIn("Reads cancelled above 12 MiB and read again smaller: **3**", L.xe_catchup_markdown(r, "x"))
+
+
+class XeReadChecksTest(unittest.TestCase):
+    NAMES = {"audit.pg-load.xe_cancels_per_10min", "audit.pg-load.xe_timeouts"}
+
+    def run_with(self, fact: dict | None) -> tuple[dict, dict[str, dict]]:
+        facts, samples, hbs = scenario()
+        if fact is not None:
+            facts = facts + [{"kind": "xe_reads", "target": "pg-load", **fact}]
+        rep, ck = L.build_report(facts, samples, hbs, L.Limits())
+        return rep, {c["name"]: c for c in ck.items if c["name"] in self.NAMES}
+
+    def test_checks(self) -> None:
+        # No fact (SQL Server Audit, the other harnesses): no check.
+        self.assertEqual(self.run_with(None)[1], {})
+        rep, got = self.run_with({"cancels": 1, "timeouts": 0, "max_cancels_per_10min": 1, "large_bursts": 10})
+        self.assertEqual(set(got), self.NAMES)
+        self.assertTrue(all(c["pass"] is True for c in got.values()), got)
+        self.assertTrue(rep["pass"])
+        self.assertEqual(rep["audit"]["pg-load"]["xe_large_bursts"], 10)
+        _, got = self.run_with({"cancels": 2, "timeouts": 0, "max_cancels_per_10min": 2, "large_bursts": 10})
+        self.assertIs(got["audit.pg-load.xe_cancels_per_10min"]["pass"], False)
+        _, got = self.run_with({"cancels": 0, "timeouts": 1, "max_cancels_per_10min": 0, "large_bursts": 0})
+        self.assertIs(got["audit.pg-load.xe_timeouts"]["pass"], False)
+        # The agent's log not read: no data, failed.
+        rep, got = self.run_with({"cancels": None, "timeouts": None, "max_cancels_per_10min": None})
+        self.assertFalse(rep["pass"])
+        self.assertTrue(all(c["pass"] is None for c in got.values()))
+
 
 if __name__ == "__main__":
     unittest.main()
