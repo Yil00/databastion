@@ -7,6 +7,18 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+A security fix release after 0.8.1: the agent (an IBAN detector panic, `rustls-webpki`) and the console (Next.js). No migration, protocol or grant change. Upgrade the console and the agents; a 0.8.x console accepts this agent.
+
+### 🔒 Security
+- **Security fix**, agent (Discovery, every engine): a sampled value holding an ASCII letter, then `ſ` (U+017F), then two digits (for example `xſ12`) panicked the IBAN detector. Its case-insensitive start pattern matched `ſ` as a letter and the two-byte country-code slice then cut it in half. The agent's panic guard kept the agent running, but it failed the whole Discovery call of the target: every table, collection or column after that value in scan order was left unclassified, at every rescan. Anyone who can write a sampled value (an application user too) could hide a target's sensitive data from Discovery. No value was ever logged or sent (the panic message is not logged). The start pattern now takes ASCII letters only (every country code is), the country code is read without a slice that can panic, the same IBANs are found, and a property test checks that the detectors and the column classifier never panic on printable text. The Kelvin sign (U+212A) was a second trigger in the detector, unreachable because sampled values are normalized to NFC first.
+  - **Affected**: agent 0.1.0 to 0.8.1, Discovery of every target.
+  - **Workaround on 0.8.1 and earlier**: none by configuration (every detector runs whatever the scan's classifiers). A target hit by it fails its Discovery scans with an internal error at every run and raises `connector_panics_total`; upgrade its agent.
+- **Console: Next.js 16.4.1** (GHSA-2464-fhr4-w9xw and GHSA-673q-mjm6-r5xr, critical; GHSA-p3m5-59mp-jv5r, high; Next.js 16.0.0 to 16.4.0). We know of no exposure of the console (image optimization off, no `use cache` function, no Server Action), but every console from 0.1.0 to 0.8.1 ships an affected version: upgrade.
+- **Agent: `rustls-webpki` 0.103.16** (RUSTSEC-2026-0382): certificate paths through the distrusted emSign intermediates are refused, on the agent's TLS to the console and to the databases.
+
+### ✅ Tests
+- The holdout seed is rotated (183917532), since this release changes a classifier.
+
 ## [0.8.1](https://github.com/Yil00/databastion/compare/0.8.0...0.8.1) (2026-10-23)
 
 A security fix release after 0.8.0, agent only: no console, migration, protocol or grant change. Upgrade the agents that read SQL Server Audit through Extended Events; a 0.8.x console accepts this agent.
