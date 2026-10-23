@@ -459,6 +459,38 @@ describe.skipIf(!hasDb)("access event correlation (PostgreSQL)", () => {
       expect(await linked(xp)).toEqual([0, 1, 2]);
     });
 
+    it("ADR-0056: an object reported altered by normalization is covered only by an absent glob or `*` for that part; the plain object as today", async () => {
+      const auth = await agentWithTargets();
+      const exception = async (location: Record<string, string>) => {
+        const policyId = await policy({ objects: { object: "clients" } });
+        await createException(
+          getDb(),
+          { policyId, agentId: null, targetId: null, classifier: null, location, reason: "x", expiresAt: null },
+          actor(),
+        );
+        return policyId;
+      };
+      const named = await exception({ database: "crm", object: "clients" });
+      const star = await exception({ database: "crm", object: "*" });
+      const literal = await exception({ database: "crm", object: "\\*" });
+      const database = await exception({ database: "crm" });
+      const twin = { database: "crm", schema: "public", object: "clients", altered: ["object"] };
+      await send(auth, [
+        dumpEvent({ objects: [{ database: "crm", schema: "public", object: "clients" }], principal: { db_user: "plain" } }),
+        dumpEvent({ objects: [twin], principal: { db_user: "twin" } }),
+      ]);
+      await drainPolicyWork(getDb());
+      const evs = await eventsOf(auth.agentId);
+      // Stored as sent, `altered` included.
+      expect(evs.map((e) => e.objects)).toEqual([[{ database: "crm", schema: "public", object: "clients" }], [twin]]);
+      const principals = async (policyId: string) =>
+        (await incidentsOf(auth.agentId)).filter((i) => i.policyId === policyId).map((i) => i.principal).sort();
+      expect(await principals(named)).toEqual(["twin"]);
+      expect(await principals(literal)).toEqual(["plain", "twin"]);
+      expect(await principals(star)).toEqual([]);
+      expect(await principals(database)).toEqual([]);
+    });
+
     it("a policy change applies to the events evaluated after it, never to past ones", async () => {
       const auth = await agentWithTargets();
       await send(auth, [dumpEvent()]);

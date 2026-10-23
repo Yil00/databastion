@@ -40,6 +40,20 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * agent strips the field and resends (decision 9), and the target falls back to today's rule
  * until the next heartbeat reaches a replica of this build.
  *
+ * `location.altered` and `object_ref.altered` (ADR-0056 decisions 1 and 3), listed both or neither:
+ * the altered parts of an event object are stored as sent inside `access_events.objects`; those of
+ * a finding are merged on its row per location and scan job (`findings.altered`, the union within
+ * a batch and across the job's batches, replaced by the first batch of a new job,
+ * src/server/findings.ts), and a false positive marked while the row was not altered in a part is
+ * reset once it is (audited `finding.false_positive_reset`, reason `names_altered`). Location
+ * exceptions cover an altered part only with an absent glob or exactly `*` (`exceptionCovers`,
+ * `exceptionCoversEvent`, `alteredPartsCoverable` in src/lib/policy-common.ts); conditions,
+ * sensitivity, scores and the dedup key ignore the marker. The finding and event views say the
+ * name was altered. Multi-replica consoles: list them only once every replica runs this build
+ * (ADR-0022 decision 8); an older replica answers `400` to a batch that carries the field, the
+ * agent clears its capabilities and resends the items without it (decision 9), and those items
+ * lose the marker.
+ *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
  * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):
@@ -70,6 +84,8 @@ export const CONSOLE_ACCEPTS = [
   "engine.sqlserver",
   "engine.valkey",
   "job_progress.coverage",
+  "location.altered",
+  "object_ref.altered",
   "target_status.name_case",
   "target_status.note_labels.2026_10",
   "target_status.note_labels.2026_10_b",

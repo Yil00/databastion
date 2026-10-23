@@ -1,0 +1,29 @@
+{
+  "batch_id": "01925f40-2b3c-7d4e-8f50-6a7b8c9d0e41",
+  "events": [
+    {
+      "target_id": "cache-redis",
+      "ts": "2026-10-22T09:16:00Z",
+      "principal": {
+        "db_user": "cache_reader",
+        "client_addr": "198.51.100.31"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "db0",
+          "object": "user:*:email",
+          "altered": [
+            "field"
+          ]
+        },
+        {
+          "database": "db0",
+          "object": "session:*"
+        }
+      ],
+      "source": "redis_slowlog",
+      "aggregated_count": 1
+    }
+  ]
+}

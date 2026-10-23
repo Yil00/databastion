@@ -422,3 +422,96 @@ describe("incident lifecycle", () => {
     expect(transitionNeedsAdmin("resolved")).toBe(false);
   });
 });
+
+describe("exceptionCovers: names altered by normalization (ADR-0056 decision 3 item 4)", () => {
+  const NOW = new Date("2026-10-23T12:00:00Z");
+  const scope = (location: ExceptionScope["location"]): ExceptionScope => ({
+    policyId: null,
+    agentId: null,
+    targetId: null,
+    classifier: null,
+    location,
+    expiresAt: null,
+  });
+  const altered = (parts: FindingFacts["altered"], over: Partial<FindingFacts> = {}): FindingFacts => ({ ...FACTS, ...over, altered: parts });
+
+  it("an altered part is covered only by an absent glob or exactly `*`; `\\*` does not cover it", () => {
+    const f = altered(["object"]);
+    expect(exceptionCovers(scope({ object: "clients" }), "p", f, NOW)).toBe(false);
+    expect(exceptionCovers(scope({ object: "cli*" }), "p", f, NOW)).toBe(false);
+    expect(exceptionCovers(scope({ object: "\\*" }), "p", altered(["object"], { objectName: "*" }), NOW)).toBe(false);
+    expect(exceptionCovers(scope({ object: "*" }), "p", f, NOW)).toBe(true);
+    // Parts not altered keep today's rule, with case on PostgreSQL (ADR-0054).
+    expect(exceptionCovers(scope({ database: "crm", schema: "public" }), "p", f, NOW)).toBe(true);
+    expect(exceptionCovers(scope({ database: "CRM" }), "p", f, NOW)).toBe(false);
+    expect(exceptionCovers(scope({ database: "crm", object: "*", field: "email" }), "p", f, NOW)).toBe(true);
+    // Without the field (an older agent), or with an empty list: today's behaviour.
+    expect(exceptionCovers(scope({ object: "clients" }), "p", { ...FACTS, altered: null }, NOW)).toBe(true);
+    expect(exceptionCovers(scope({ object: "clients" }), "p", { ...FACTS }, NOW)).toBe(true);
+    expect(exceptionCovers(scope({ object: "clients" }), "p", altered([]), NOW)).toBe(true);
+    // Exceptions without a location are not restricted.
+    expect(exceptionCovers(scope(null), "p", altered(["database", "schema", "object", "field"]), NOW)).toBe(true);
+    // A CAS field converted to snake_case (ADR-0056 open question 2).
+    const cas = altered(["field"], { engine: "cas", databaseName: "json", schemaName: "regex", objectName: "app", fieldName: "user_name" });
+    expect(exceptionCovers(scope({ field: "user_name" }), "p", cas, NOW)).toBe(false);
+    expect(exceptionCovers(scope({ object: "app" }), "p", cas, NOW)).toBe(true);
+  });
+
+  it("case-blind engines keep their case rule on the parts not altered", () => {
+    const f = altered(["field"], { engine: "mysql", schemaName: null, databaseName: "CRM", objectName: "Clients" });
+    expect(exceptionCovers(scope({ database: "crm", object: "clients" }), "p", f, NOW)).toBe(true);
+    expect(exceptionCovers(scope({ database: "crm", object: "clients", field: "email" }), "p", f, NOW)).toBe(false);
+  });
+
+  it("property: for every glob and name, a cover of an altered part implies a glob absent or exactly `*`, and is today's cover when allowed", () => {
+    // Seeded PRNG (mulberry32), so a failure is reproducible.
+    let seed = 0x5eed0056;
+    const rand = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const CHARS = ["a", "A", "b", "c", "ｃ", "*", "?", "\\", " "];
+    const NAMES = ["a", "A", "b", "c", "ｃ", "*", " ", "ab"];
+    const pick = (xs: readonly string[], n: number) => Array.from({ length: n }, () => xs[Math.floor(rand() * xs.length)]).join("");
+    const PARTS = ["database", "schema", "object", "field"] as const;
+    const ENGINES_UNDER_TEST = ["postgres", "mysql", "sqlserver", "openldap", "redis", "cas", "unknown"];
+    let restricted = 0;
+    let coveredAltered = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const location: Record<string, string> = {};
+      for (const p of PARTS) {
+        const r = rand();
+        if (r < 0.3) continue;
+        location[p] = r < 0.5 ? "*" : r < 0.55 ? "\\*" : pick(CHARS, 1 + Math.floor(rand() * 3));
+      }
+      if (Object.keys(location).length === 0) location.object = "*";
+      const parts = PARTS.filter(() => rand() < 0.35);
+      const f: FindingFacts = {
+        ...FACTS,
+        engine: ENGINES_UNDER_TEST[Math.floor(rand() * ENGINES_UNDER_TEST.length)] as string,
+        databaseName: pick(NAMES, 1),
+        schemaName: rand() < 0.2 ? null : pick(NAMES, 1),
+        objectName: pick(NAMES, 1 + Math.floor(rand() * 2)),
+        fieldName: pick(NAMES, 1),
+      };
+      const x = scope(location);
+      const today = exceptionCovers(x, "p", f, NOW);
+      const marked = exceptionCovers(x, "p", { ...f, altered: parts }, NOW);
+      const allowed = parts.every((p) => location[p] === undefined || location[p] === "*");
+      if (marked) {
+        coveredAltered += parts.length > 0 ? 1 : 0;
+        for (const p of parts) {
+          if (location[p] !== undefined && location[p] !== "*") throw new Error(`altered ${p} covered by ${JSON.stringify(location)}`);
+        }
+      }
+      // Stricter only, and unchanged when every altered part is under an absent glob or `*`.
+      expect(marked).toBe(today && allowed);
+      if (today && !marked) restricted++;
+    }
+    expect(restricted).toBeGreaterThan(100);
+    expect(coveredAltered).toBeGreaterThan(100);
+  });
+});

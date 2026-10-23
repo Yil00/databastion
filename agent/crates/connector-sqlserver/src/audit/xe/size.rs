@@ -20,7 +20,16 @@
 //! - **Remembered for [`MEMORY`]**: a cancel above `POLL_BYTES`, or a
 //!   retried timeout, of a read of more than `BATCH` rows caps the reads
 //!   at `BATCH`. The memory lives in the stream (lost at a restart, which
-//!   can cost one more cancel or timeout).
+//!   can cost one more cancel or timeout), with one exception:
+//! - **Across a stream restart** (0.8.1, #321): a response above
+//!   `POLL_BYTES` is also kept by the connector for the target, the source
+//!   and the position (`Shared::read_failed`, the cancel acknowledged or
+//!   not), until the next successful read there. When a poisoned session
+//!   ended the stream, the next stream takes it in at its first read from
+//!   that position ([`ReadSize::resume`]): as a halved size and a cap at
+//!   `BATCH`, both for [`MEMORY`] from then, so a recurring poisoning still
+//!   walks down to `MIN_BATCH` and the reads then grow back as after an
+//!   in-stream cancel.
 //! - **A timeout is retried at `BATCH`** only when the read asked more than
 //!   `BATCH` rows, the timeout is the client's own statement deadline (no
 //!   server error number: 1222, 1205, 601 and 605 map to a timeout too and
@@ -34,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use databastion_core::FailureCode;
 
-use super::super::{BATCH, MIN_BATCH, POLL_BYTES};
+use super::super::{BATCH, MIN_BATCH, POLL_BYTES, halved};
 use crate::error::SsError;
 
 /// The Extended Events row bound (ADR-0051 refinement of 2026-10-22, N):
@@ -229,6 +238,26 @@ impl ReadSize {
         self.next = next.max(MIN_BATCH);
     }
 
+    /// Takes in `kept`, the size the connector kept at the position of the
+    /// next read after an oversized read there that a poisoned session
+    /// ended (`Shared::read_size`, 0.8.1): the next reads are at most
+    /// `kept` (a halved size kept for [`MEMORY`] from `now`) and, unless
+    /// this stream already remembers a cancel, capped at `BATCH` for
+    /// [`MEMORY`], as a cancel in this stream would have left them. A size
+    /// this stream already holds (its own cancel, also kept by the
+    /// connector) changes nothing.
+    pub(crate) fn resume(&mut self, kept: usize, now: Instant) {
+        let fresh = self.halved.is_none() && !active(self.capped, now, self.memory);
+        if kept < self.next {
+            self.halved = Some((kept, now));
+            self.next = kept.max(MIN_BATCH);
+        }
+        if fresh {
+            self.capped = Some(now);
+            self.next = self.next.min(BATCH);
+        }
+    }
+
     /// A read of `self.rows()` that failed with `e`, `poisoned` whether
     /// the session is unusable after it: `Some` when it is retried (the
     /// position unchanged), `None` when the stream fails, as before.
@@ -238,8 +267,10 @@ impl ReadSize {
             return None;
         }
         match e.code {
-            FailureCode::ResourceLimit if asked > MIN_BATCH => {
-                let size = (asked / 2).max(MIN_BATCH);
+            // The released rule of both sources (`super::super::halved`):
+            // the session in step, above `MIN_BATCH`.
+            FailureCode::ResourceLimit => {
+                let size = halved(e, false, asked)?;
                 self.halved = Some((size, now));
                 if asked > BATCH {
                     self.capped = Some(now);
@@ -521,6 +552,96 @@ mod tests {
             let e = SsError::new(code, Stage::Introspection);
             assert_eq!(full().failed(&e, false, t), None);
         }
+    }
+
+    /// The 0.8.1 guarantee (#321) with this stream state: a read above the
+    /// byte bound that poisons the session ends the stream, and the
+    /// restarted stream (a new `ReadSize`) takes in the halved size the
+    /// connector kept at that very position (`Shared::read_failed` /
+    /// `read_size`, as `read()` calls them), so a poisoning that recurs
+    /// there walks down to `MIN_BATCH`; the reads are then capped at
+    /// `BATCH` for 10 minutes; a successful read ends the connector's
+    /// size, not this stream's memory; a size this stream already holds
+    /// is not changed by it.
+    #[tokio::test]
+    async fn a_poisoned_read_keeps_its_halved_size_into_the_next_stream() {
+        use crate::audit::{Cursor, ReadAt, Shared, Source};
+        let t = Instant::now();
+        let at_s = |s: u64| t + Duration::from_secs(s);
+        let e = crate::audit::tests::poisoned_bound().await;
+        let cursor = Cursor {
+            file: Some("/var/opt/mssql/xe/x_0_1.xel".to_owned()),
+            offset: 8192,
+            skip: 3,
+            pattern: Some("N'/var/opt/mssql/xe/x*.xel'".to_owned()),
+            ..Cursor::default()
+        };
+        let at = ReadAt::of(&cursor);
+        let shared = Shared::default();
+        // What `read()` does before and after each read.
+        let start = |s: &mut ReadSize, now| {
+            let kept = shared.read_size("t", Source::Xevents, &at, usize::MAX);
+            if kept < usize::MAX {
+                s.resume(kept, now);
+            }
+            s.rows()
+        };
+        let fail = |s: &mut ReadSize, poisoned, now| {
+            let asked = s.rows();
+            let _ = shared.read_failed("t", Source::Xevents, at.clone(), &e, poisoned, asked);
+            s.failed(&e, poisoned, now)
+        };
+        // A first stream at the sized bound: the read poisons the session.
+        let mut s = ReadSize::default();
+        s.received(1_000, Path::Sized, t);
+        assert_eq!(start(&mut s, t), XE_MAX_ROWS);
+        assert_eq!(fail(&mut s, true, t), None, "the stream ends");
+        // Each restart reads less from the same position, down to the floor.
+        let mut sizes = Vec::new();
+        loop {
+            let mut s = ReadSize::default();
+            let n = start(&mut s, at_s(1));
+            if sizes.last() == Some(&n) {
+                break;
+            }
+            sizes.push(n);
+            assert_eq!(fail(&mut s, true, at_s(1)), None);
+        }
+        assert_eq!(sizes, [500, 250, 125, 62, 31, 16]);
+        // The next stream reads 16, then succeeds: the connector's size
+        // ends, this stream keeps 16 for 10 minutes and its cap.
+        let mut s = ReadSize::default();
+        assert_eq!(start(&mut s, at_s(2)), MIN_BATCH);
+        shared.read_succeeded("t");
+        s.received(1_000, Path::Sized, at_s(3));
+        assert_eq!(start(&mut s, at_s(3)), MIN_BATCH);
+        s.received(1_000, Path::Sized, at_s(603));
+        assert_eq!(s.rows(), 32, "then grows back by doubling");
+        let mut fresh = ReadSize::default();
+        assert_eq!(start(&mut fresh, at_s(3)), BATCH, "cleared for a restart");
+        // A kept size above BATCH (a poisoned read of more than BATCH):
+        // the restarted stream is capped at BATCH for 10 minutes.
+        let mut s = ReadSize::default();
+        s.received(1_000, Path::Sized, t);
+        assert_eq!(fail(&mut s, true, t), None);
+        let mut s = ReadSize::default();
+        assert_eq!(start(&mut s, at_s(1)), BATCH);
+        shared.read_succeeded("t");
+        s.received(1_000, Path::Sized, at_s(2));
+        assert_eq!(s.rows(), BATCH, "capped");
+        s.received(1_000, Path::Sized, at_s(602));
+        assert_eq!(s.rows(), XE_MAX_ROWS, "after 10 minutes");
+        // A cancel in step: the stream halves on its own, and the size the
+        // connector also keeps changes nothing in it.
+        let mut s = ReadSize::default();
+        s.received(1_000, Path::Sized, t);
+        assert_eq!(fail(&mut s, false, t), Some(Retry::Bytes));
+        assert_eq!(s.rows(), BATCH);
+        assert_eq!(fail(&mut s, false, t), Some(Retry::Bytes));
+        assert_eq!(start(&mut s, at_s(1)), 250);
+        let capped = s.capped;
+        assert_eq!(start(&mut s, at_s(2)), 250);
+        assert_eq!(s.capped, capped);
     }
 
     /// The `info` line at most once per 10 minutes per stream, with the

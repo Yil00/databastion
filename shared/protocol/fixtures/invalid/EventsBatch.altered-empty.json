@@ -1,0 +1,25 @@
+{
+  "batch_id": "01925f40-2b3c-7d4e-8f50-6a7b8c9d0e34",
+  "events": [
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-10-22T09:15:00Z",
+      "principal": {
+        "db_user": "report",
+        "client_addr": "192.0.2.14"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "schema": "public",
+          "object": "customers",
+          "altered": []
+        }
+      ],
+      "rows": 120,
+      "source": "pgaudit",
+      "aggregated_count": 1
+    }
+  ]
+}

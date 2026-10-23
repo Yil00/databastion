@@ -450,6 +450,34 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect((await unexcept(id)).status).toBe(404);
     });
 
+    it("ADR-0056: a finding altered by normalization is not covered by an exception naming the altered part; a scan without the look-alike is covered again", async () => {
+      const auth = await agentWithTargets();
+      const policyId = await newPolicy();
+      const res = await except({ policy_id: policyId, target_id: "pg-prod-1", location: { object: "clients" }, reason: "Known test data" });
+      expect(res.status).toBe(201);
+      const twin = finding({ location: { engine: "postgres", database: "crm", schema: "public", object: "clients", field: "email", altered: ["object"] } });
+      // Plain, altered, then plain again in one batch: the row stays altered.
+      await scanWith(auth, [finding(), twin, finding()]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      // An exception on the whole schema still covers it.
+      const wide = await except({ policy_id: policyId, target_id: "pg-prod-1", location: { schema: "public", object: "*" }, reason: "Schema of test data" });
+      expect(wide.status).toBe(201);
+      const { id: wideId } = (await wide.json()) as { id: string };
+      const [incident] = await incidentsOf(auth.agentId);
+      expect((await transition(String(incident?.id), "resolved")).status).toBe(204);
+      await scanWith(auth, [twin]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      // The next scan without the look-alike clears the marker: the named exception covers it.
+      expect((await unexcept(wideId)).status).toBe(204);
+      await scanWith(auth, [finding()]);
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(auth.agentId)).toHaveLength(1);
+      const [row] = await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId));
+      expect(row?.altered).toBeNull();
+    });
+
     it("a global exception covers every policy; deleting it re-evaluates", async () => {
       const auth = await agentWithTargets();
       await newPolicy();

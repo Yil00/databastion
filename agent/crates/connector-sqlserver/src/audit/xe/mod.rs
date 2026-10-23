@@ -72,7 +72,7 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 use super::own;
 use super::{
     APP, Batch, Below, Cursor, FLOOR_MAX, OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE,
-    REPROBE, on_bad_position, on_pattern, target_error,
+    REPROBE, ReadAt, Source, on_bad_position, on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -761,7 +761,18 @@ async fn read(
     // The server skips the events of the next buffer already handled
     // (`sql::XE_POLL_FROM`): a read returns at most `top` events, the size
     // the last read set (`size`: `BATCH`, the sized bound up to
-    // `XE_MAX_ROWS` after a full read, less after a cancel).
+    // `XE_MAX_ROWS` after a full read, less after a cancel), or less when
+    // an earlier stream ended on a poisoned oversized read at this very
+    // position (0.8.1: the size kept across restarts, `Shared::read_size`,
+    // taken into this stream's read-size memory, `size::ReadSize::resume`).
+    let at = ReadAt::of(&st.cursor);
+    let kept = st
+        .state
+        .audit
+        .read_size(&target_id, Source::Xevents, &at, usize::MAX);
+    if kept < usize::MAX {
+        st.size.resume(kept, Instant::now());
+    }
     let top = st.size.rows();
     let skip = st.cursor.skip;
     let poll_started = Instant::now();
@@ -793,7 +804,12 @@ async fn read(
     };
     st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
-        Ok(p) => p,
+        Ok(p) => {
+            // The size kept across restarts ends with a successful read;
+            // this stream's memory (`size`) keeps its own for 10 minutes.
+            st.state.audit.read_succeeded(&target_id);
+            p
+        }
         Err(e)
             if matches!(e.number, Some(ERR_BAD_OFFSET | ERR_FILE_GONE))
                 && st.cursor.file.is_some() =>
@@ -816,9 +832,22 @@ async fn read(
             // client's deadline on a read above `BATCH` rows, on a session
             // the cancel left usable: read again smaller, from the same
             // position (refinement of 2026-10-22, M2). Anything else fails
-            // the stream, as before.
+            // the stream, as before. The session tells, never `e.fatal`
+            // (0.8.1).
             let now = Instant::now();
-            return match st.size.failed(&e, s.is_poisoned(), now) {
+            let poisoned = s.is_poisoned();
+            // A response over the bound is also kept for this target,
+            // source and position across a stream restart, at its halved
+            // size, the cancel acknowledged or not (0.8.1, #321): a
+            // poisoned session ends the stream, and the next one reads
+            // that size from the same position, down to `MIN_BATCH`. Its
+            // result is the size `st.size.failed` sets (one rule,
+            // `super::halved`).
+            let _ = st
+                .state
+                .audit
+                .read_failed(&target_id, Source::Xevents, at, &e, poisoned, top);
+            return match st.size.failed(&e, poisoned, now) {
                 Some(retry) => {
                     st.state.audit.note_xe_retry(&target_id, retry);
                     st.size.log(&target_id, retry, top, now);

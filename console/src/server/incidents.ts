@@ -127,6 +127,8 @@ const FACT_COLUMNS = {
   matched: findings.matched,
   lastSeenAt: findings.lastSeenAt,
   falsePositiveAt: findings.falsePositiveAt,
+  /** ADR-0056: the altered parts merged for the latest scan job (location exceptions only). */
+  altered: findings.altered,
   /**
    * ADR-0055: the target's stored `name_case`, canonical (null: not reported, today's rule). A
    * scalar subquery too, so `FOR UPDATE` locks no `agent_targets` row (heartbeats never wait).

@@ -606,3 +606,92 @@ function literalCovers(location: EventExceptionScope["location"], e: EventFacts,
   if (idx.length === 0) return false;
   return idx.every((i) => objectMatches(parts, e.objects[i] as EventObject, exceptionGlobOptions(e.engine)));
 }
+
+describe("exceptionCoversEvent: names altered by normalization (ADR-0056 decision 3 item 4)", () => {
+  const now = new Date("2026-10-23T12:00:00Z");
+  const scope = (location: EventExceptionScope["location"]): EventExceptionScope => ({
+    policyId: null,
+    agentId: null,
+    targetId: null,
+    classifier: null,
+    location,
+    expiresAt: null,
+  });
+  const event = (objects: EventObject[], over: Partial<EventFacts> = {}): EventFacts => ({ ...FACTS, ...over, objects });
+  const PLAIN: EventObject = { database: "crm", schema: "public", object: "clients" };
+  const TWIN: EventObject = { database: "crm", schema: "public", object: "clients", altered: ["object"] };
+
+  it("per object and per part: the altered twin is covered only by an absent glob or `*`, the plain object as today", () => {
+    const e = event([PLAIN, TWIN]);
+    const named = scope({ database: "crm", object: "clients" });
+    expect(exceptionCoversEvent(named, "p", e, [0], now)).toBe(true);
+    expect(exceptionCoversEvent(named, "p", e, [1], now)).toBe(false);
+    expect(exceptionCoversEvent(named, "p", e, [0, 1], now)).toBe(false);
+    expect(exceptionCoversEvent(scope({ database: "crm", object: "*" }), "p", e, [0, 1], now)).toBe(true);
+    expect(exceptionCoversEvent(scope({ database: "crm" }), "p", e, [0, 1], now)).toBe(true);
+    expect(exceptionCoversEvent(scope({ object: "\\*" }), "p", event([{ database: "crm", object: "*", altered: ["object"] }]), [0], now)).toBe(false);
+    expect(exceptionCoversEvent(scope({ schema: "public", field: "*" }), "p", e, [1], now)).toBe(true);
+    // An altered database is not covered by a named database glob.
+    const db = event([{ database: "crm", object: "orders", altered: ["database"] }], { engine: "mongodb" });
+    expect(exceptionCoversEvent(scope({ database: "crm" }), "p", db, [0], now)).toBe(false);
+    expect(exceptionCoversEvent(scope({ object: "orders" }), "p", db, [0], now)).toBe(true);
+  });
+
+  it("an overflow `*` that carries the marker (never sent by a conforming agent) is tolerated, never covered more", () => {
+    const e = event([{ database: "crm", object: "*", altered: ["database"] }], { objectsOverflowed: true });
+    expect(exceptionCoversEvent(scope({ database: "crm" }), "p", e, [0], now)).toBe(false);
+    expect(exceptionCoversEvent(scope({ database: "*" }), "p", e, [0], now)).toBe(true);
+    expect(exceptionCoversEvent(scope({ object: "*" }), "p", e, [0], now)).toBe(true);
+  });
+
+  it("property: for every glob and name, a cover of an altered part implies a glob absent or exactly `*`; an unaltered object of the same event keeps today's result", () => {
+    let seed = 0x0056e7e1;
+    const rand = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = seed;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const CHARS = ["a", "A", "b", "ｃ", "*", "?", "\\", " "];
+    const NAMES = ["a", "A", "b", "ｃ", "*", " ", "ab"];
+    const pick = (xs: readonly string[], n: number) => Array.from({ length: n }, () => xs[Math.floor(rand() * xs.length)]).join("");
+    const PARTS = ["database", "schema", "object"] as const;
+    const ENGINES_UNDER_TEST = ["postgres", "mysql", "sqlserver", "openldap", "redis", "cas", null];
+    let restricted = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const location: Record<string, string> = {};
+      for (const p of [...PARTS, "field"] as const) {
+        const r = rand();
+        if (r < 0.3) continue;
+        location[p] = r < 0.5 ? "*" : r < 0.55 ? "\\*" : pick(CHARS, 1 + Math.floor(rand() * 3));
+      }
+      if (Object.keys(location).length === 0) location.object = "*";
+      const obj = (): EventObject => ({
+        database: pick(NAMES, 1),
+        ...(rand() < 0.8 ? { schema: pick(NAMES, 1) } : {}),
+        object: pick(NAMES, 1 + Math.floor(rand() * 2)),
+      });
+      const plainObjects = [obj(), obj()];
+      const parts = PARTS.filter(() => rand() < 0.4);
+      const markedObjects = [plainObjects[0] as EventObject, { ...(plainObjects[1] as EventObject), altered: parts }];
+      const base = { engine: ENGINES_UNDER_TEST[Math.floor(rand() * ENGINES_UNDER_TEST.length)] ?? null, objectsOverflowed: rand() < 0.2 };
+      const x = scope(location);
+      const today = event(plainObjects, base);
+      const marked = event(markedObjects, base);
+      // The unaltered object of the same event keeps today's result.
+      expect(exceptionCoversEvent(x, "p", marked, [0], now)).toBe(exceptionCoversEvent(x, "p", today, [0], now));
+      const covered = exceptionCoversEvent(x, "p", marked, [1], now);
+      const allowed = parts.every((p) => location[p] === undefined || location[p] === "*");
+      if (covered) {
+        for (const p of parts) {
+          if (location[p] !== undefined && location[p] !== "*") throw new Error(`altered ${p} covered by ${JSON.stringify(location)}`);
+        }
+      }
+      const was = exceptionCoversEvent(x, "p", today, [1], now);
+      expect(covered).toBe(was && allowed);
+      if (was && !covered) restricted++;
+    }
+    expect(restricted).toBeGreaterThan(100);
+  });
+});

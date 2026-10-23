@@ -1,0 +1,26 @@
+{
+  "batch_id": "01925f40-2b3c-7d4e-8f50-6a7b8c9d0e37",
+  "job_id": "01925f40-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+  "classifiers_version": "2026.09.1",
+  "findings": [
+    {
+      "target_id": "pg-prod-1",
+      "location": {
+        "engine": "postgres",
+        "database": "crm",
+        "schema": "public",
+        "object": "customers",
+        "field": "email",
+        "altered": []
+      },
+      "classifier": "pii.email",
+      "confidence": 0.97,
+      "sampled": 200,
+      "matched": 190,
+      "estimated_rows": 4200,
+      "masked_samples": [
+        "j*******@e******.com"
+      ]
+    }
+  ]
+}

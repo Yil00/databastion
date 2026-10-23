@@ -5350,7 +5350,12 @@ async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
 /// cancelled and read again by halving, with no event lost or reported
 /// twice and no stream error; once the halving is forgotten (its 10
 /// minutes shortened to 20 s for the test), small events are read at the
-/// sized bound again, with no further cancel.
+/// sized bound again, with no further cancel. Also the 0.8.1 hotfix's
+/// test (#320): no stream error, no gap, nothing dropped and none of the
+/// agent's own events reported; in 0.8.0 the halving never ran (its guard
+/// tested `SsError::fatal`, which every client-side bound sets): every read
+/// failed, and the stream restarted at the same position until the files
+/// rolled over.
 #[tokio::test]
 async fn xe_large_events_are_read_by_halving() {
     Box::pin(xe_large_scenario()).await;
@@ -5531,6 +5536,7 @@ async fn xe_large_body(major: u32) {
     tokio::time::sleep(Duration::from_secs(8)).await;
     let got = count_until(want + 1, Duration::from_secs(2)).await;
     assert_eq!(got, want, "no read reported twice");
+    assert!(!stream.is_finished(), "the stream ended");
     stream.abort();
     let _ = stream.await;
     let left_out = c.state.audit.own_left_out(&t.id);
@@ -5541,8 +5547,13 @@ async fn xe_large_body(major: u32) {
         c.state.audit.xe_reads(&t.id)
     );
     assert_eq!(own, 0, "none of the agent's own events reported");
-    let dropped = c.state.audit.facts(&t.id).dropped;
-    assert_eq!(dropped, 0, "records dropped");
+    let facts = c.state.audit.facts(&t.id);
+    eprintln!(
+        "[it] large events: dropped {}, gap {}",
+        facts.dropped, facts.gap
+    );
+    assert_eq!(facts.dropped, 0, "records dropped");
+    assert!(!facts.gap, "no gap");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

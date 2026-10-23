@@ -112,7 +112,11 @@ info:
     A `400` reporting an unknown field (keyword `additionalProperties`) on a request that carried
     such a field makes the agent forget the console's list and send the request once more with
     those fields removed (ADR-0022 decision 9): a heartbeat, a job status update, or the items
-    pointed at in a result batch are resent, never dropped for the field alone.
+    pointed at in a result batch are resent, never dropped for the field alone. This holds for
+    findings too: `Location.altered` (`location.altered`, ADR-0056) is the first gated field of
+    `POST /findings`. A console lists `location.altered` and `object_ref.altered` both or
+    neither, and only once every replica stores and applies them (ADR-0022 decision 8); a build
+    that accepts the fields without storing them does not count.
     Tokens are `Capability` values; unknown tokens are ignored. New enum values in a request
     (e.g. `TargetNoteLabel`) are negotiated the same way, with a revision token. A value form
     that a console -> agent field accepts only after protocol 0.1.0 is negotiated like a new
@@ -2057,7 +2061,8 @@ components:
           description: |
             Optional **request** fields and features this console accepts (ADR-0022), e.g.
             `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
-            `access_event.objects_overflowed`, `job_progress.coverage`, and the engines
+            `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
+            `job_progress.coverage`, and the engines
             added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
             the list of the latest heartbeat response and sends an optional request field
             introduced after protocol 0.1.0 only when that list names it; before its first
@@ -2560,6 +2565,25 @@ components:
           $ref: "#/components/schemas/ObjectName"
         field:
           $ref: "#/components/schemas/Identifier"
+        altered:
+          description: |
+            Parts of this location whose name was altered: the agent's name
+            normalization (ADR-0009: control and format characters stripped, NFKC; on
+            Redis / Valkey the same steps of the key-pattern normalizer; on CAS,
+            definition keys converted to snake_case) changed these parts, so another
+            object of the engine may be sent under the same name. Never set for a part
+            sent as `*`. It carries no value, no character and no count (I2). Unique
+            parts, at least one; absent when no part was altered. Sent only when the
+            latest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,
+            ADR-0056); a `400` reporting it as an unknown field clears the agent's
+            capability list, and the findings are resent once without it (ADR-0022
+            decision 9).
+          type: array
+          minItems: 1
+          maxItems: 4
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/LocationPart"
       if:
         required: [engine]
         properties:
@@ -2573,6 +2597,17 @@ components:
         properties:
           object:
             $ref: "#/components/schemas/Identifier"
+    LocationPart:
+      description: |
+        A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
+      type: string
+      enum: [database, schema, object, field]
+    ObjectRefPart:
+      description: |
+        A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event
+        object names no field).
+      type: string
+      enum: [database, schema, object]
     EventsBatch:
       description: Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).
       type: object
@@ -2688,6 +2723,26 @@ components:
                       $ref: "#/components/schemas/Identifier"
                     object:
                       $ref: "#/components/schemas/KeyPattern"
+                    altered:
+                      description: |
+                        Parts of this object whose name was altered: the agent's name normalization
+                        (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+                        the same steps of the key-pattern normalizer; on CAS, definition keys
+                        converted to snake_case) changed these parts, so another object of the
+                        engine may be sent under the same name. Never set for a part sent as `*`. It
+                        carries no value, no character and no count (I2). Unique parts, at least
+                        one; absent when no part was altered; an event object names no field. Sent
+                        only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+                        (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+                        agent's capability list, and the events are resent once without it (ADR-0022
+                        decision 9). Keep in step with the inline copies of `ObjectRef` in
+                        `AccessEvent`.
+                      type: array
+                      minItems: 1
+                      maxItems: 3
+                      uniqueItems: true
+                      items:
+                        $ref: "#/components/schemas/ObjectRefPart"
           else:
             properties:
               principal:
@@ -2711,6 +2766,26 @@ components:
                       $ref: "#/components/schemas/Identifier"
                     object:
                       $ref: "#/components/schemas/Identifier"
+                    altered:
+                      description: |
+                        Parts of this object whose name was altered: the agent's name normalization
+                        (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+                        the same steps of the key-pattern normalizer; on CAS, definition keys
+                        converted to snake_case) changed these parts, so another object of the
+                        engine may be sent under the same name. Never set for a part sent as `*`. It
+                        carries no value, no character and no count (I2). Unique parts, at least
+                        one; absent when no part was altered; an event object names no field. Sent
+                        only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+                        (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+                        agent's capability list, and the events are resent once without it (ADR-0022
+                        decision 9). Keep in step with the inline copies of `ObjectRef` in
+                        `AccessEvent`.
+                      type: array
+                      minItems: 1
+                      maxItems: 3
+                      uniqueItems: true
+                      items:
+                        $ref: "#/components/schemas/ObjectRefPart"
         - description: |
             An event whose objects overflowed (`objects_overflowed`) names at least one object
             `*` (ADR-0053 decision 1 item 3).
@@ -2735,6 +2810,26 @@ components:
                       $ref: "#/components/schemas/Identifier"
                     object:
                       const: "*"
+                    altered:
+                      description: |
+                        Parts of this object whose name was altered: the agent's name normalization
+                        (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+                        the same steps of the key-pattern normalizer; on CAS, definition keys
+                        converted to snake_case) changed these parts, so another object of the
+                        engine may be sent under the same name. Never set for a part sent as `*`. It
+                        carries no value, no character and no count (I2). Unique parts, at least
+                        one; absent when no part was altered; an event object names no field. Sent
+                        only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+                        (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+                        agent's capability list, and the events are resent once without it (ADR-0022
+                        decision 9). Keep in step with the inline copies of `ObjectRef` in
+                        `AccessEvent`.
+                      type: array
+                      minItems: 1
+                      maxItems: 3
+                      uniqueItems: true
+                      items:
+                        $ref: "#/components/schemas/ObjectRefPart"
         - description: |
             A failed authentication always names, or fingerprints, the name tried: never
             `account_not_recorded` (ADR-0052 implementation obligations).
@@ -2870,3 +2965,23 @@ components:
           $ref: "#/components/schemas/Identifier"
         object:
           $ref: "#/components/schemas/ObjectName"
+        altered:
+          description: |
+            Parts of this object whose name was altered: the agent's name normalization
+            (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+            the same steps of the key-pattern normalizer; on CAS, definition keys
+            converted to snake_case) changed these parts, so another object of the
+            engine may be sent under the same name. Never set for a part sent as `*`. It
+            carries no value, no character and no count (I2). Unique parts, at least
+            one; absent when no part was altered; an event object names no field. Sent
+            only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+            (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+            agent's capability list, and the events are resent once without it (ADR-0022
+            decision 9). Keep in step with the inline copies of `ObjectRef` in
+            `AccessEvent`.
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ObjectRefPart"

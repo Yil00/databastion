@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
 import { engineDisplayName, hasNamedLocationParts, isKeyPatternEngine, locationPartLabels } from "@/lib/location-labels";
+import { findingAlteredText, NAMES_ALTERED_TITLE } from "@/lib/names-altered";
 import type { Engine } from "@/lib/protocol/enums";
 import type { FindingSummaryRow, FindingView } from "@/server/findings";
 
@@ -71,6 +72,20 @@ export function LocationCell({ location, engine }: { location: LocationParts; en
         </div>
       ))}
     </dl>
+  );
+}
+
+/**
+ * ADR-0056 decision 3 item 6: the mark of a finding whose location the agent reported altered by
+ * its name normalization (nothing otherwise).
+ */
+export function FindingAlteredNote({ finding }: { finding: Pick<FindingView, "altered" | "engine" | "databaseName"> }) {
+  const text = findingAlteredText(finding.altered, finding.engine, finding.databaseName);
+  if (text === "") return null;
+  return (
+    <div className="text-xs text-muted-foreground first-letter:uppercase" title={NAMES_ALTERED_TITLE} data-names-altered="">
+      {text}
+    </div>
   );
 }
 
@@ -170,6 +185,7 @@ export function FindingsTable({
             </TableCell>
             <TableCell className="max-w-64 break-all whitespace-normal">
               <LocationCell location={f} engine={f.engine} />
+              <FindingAlteredNote finding={f} />
             </TableCell>
             <TableCell>
               {f.classifier}
