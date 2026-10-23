@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # shellcheck source-path=SCRIPTDIR
 # Load run of the SQL Server target (ROADMAP P9-D, ADR-0051 "End-to-end and load"; e2e/load/README.md
-# "SQL Server target"): the console, the agent and the dev SQL Server 2022 Express service
-# (e2e/docker-compose.yml + e2e/docker-compose.sqlserver.yml + docker-compose.sqlserver.yml here,
-# project databastion-load-sqlserver). Measures, as e2e/load/run.sh does for the other engines:
+# "SQL Server target"): the console, the agent and the dev SQL Server 2022 Express service (2019 or
+# 2025 with LOAD_SQLSERVER_VERSION, below) (e2e/docker-compose.yml + e2e/docker-compose.sqlserver.yml
+# + docker-compose.sqlserver.yml here, project databastion-load-sqlserver). Measures, as
+# e2e/load/run.sh does for the other engines:
 #   1. the database CPU impact of a paced Discovery scan of a scaled seed (< 2 % of the server's
 #      CPU capacity, LOAD_DB_CPUS);
 #   2. the Audit path (SQL Server Audit through sys.fn_get_audit_file) under a fixed-rate point-select
@@ -21,6 +22,12 @@
 # LOAD_SQLSERVER_LARGE_EVERY_S=N (Extended Events only; ADR-0051 refinement of 2026-10-22, load step 4),
 # a burst of LOAD_SQLSERVER_LARGE_BURST statements near the 128 KiB event bound every N seconds of the
 # Audit run, and the checks on the reads cancelled above 12 MiB and at the statement timeout.
+# LOAD_SQLSERVER_VERSION=2019 / 2025 (default 2022, the dev pin; workflow input sqlserver_version): the
+# engine matrix's pinned image of that version (as e2e/sqlserver.sh with E2E_SQLSERVER_VERSION, checked
+# against engine-matrix.yml), Express. 2019 (15.x) has no usable SQL Server Audit source (ADR-0051
+# decision 6): Extended Events only, its default there, with the dev script's 2019 grant VIEW SERVER
+# STATE (VIEW SERVER PERFORMANCE STATE is 2022+), and the scaled seed from a portable tally (no
+# GENERATE_SERIES before 2022).
 #
 # Requires: docker (compose v2.24+), openssl, curl, jq, python3. Every secret is generated at run time,
 # registered, masked under GitHub Actions, redacted from the collected logs and removed on exit.
@@ -52,9 +59,31 @@ LOAD_MSSQL_ROWS="${LOAD_MSSQL_ROWS:-500000}"
 # the table variable insert: about 30 per workload SELECT) is an Extended Events event, so the
 # default rate with that source is lower: 50 SELECTs/s, about 1 500 events/s, within the session's
 # 8 x 64 MB of files over a 600 s run.
-LOAD_SQLSERVER_AUDIT_SOURCE="${LOAD_SQLSERVER_AUDIT_SOURCE:-sqlserver_audit}"
+# The version under test (ROADMAP "Extended Events read size, merge review follow-ups": the 2019
+# drain run). 2019 and 2025: the engine matrix's pins (the same strings as engine-matrix.yml and
+# e2e/sqlserver.sh, checked below), which override E2E_MSSQL_IMAGE; 2022: the dev pin.
+LOAD_SQLSERVER_VERSION="${LOAD_SQLSERVER_VERSION:-2022}"
+MSSQL_PIN=""
+case "$LOAD_SQLSERVER_VERSION" in
+  2019) MSSQL_MAJOR=15 default_source=sqlserver_xevents
+    MSSQL_PIN="mcr.microsoft.com/mssql/server:2019-latest@sha256:07d7dedecdbfcf6776035dc5eefb5bfd9aa1804b2f6b99f7dedb397d8a599069" ;;
+  2022) MSSQL_MAJOR=16 default_source=sqlserver_audit ;;
+  2025) MSSQL_MAJOR=17 default_source=sqlserver_audit
+    MSSQL_PIN="mcr.microsoft.com/mssql/server:2025-latest@sha256:742481d1b1186cccc81220a1eaacef244ca8d0f7d19c8e5c70df8ae541ffbab2" ;;
+  *) echo "LOAD_SQLSERVER_VERSION must be 2019, 2022 or 2025" >&2; exit 2 ;;
+esac
+if [ -n "$MSSQL_PIN" ] && ! grep -qF "sqlserver_image: $MSSQL_PIN" "$HERE/../../.github/workflows/engine-matrix.yml"; then
+  echo "the SQL Server $LOAD_SQLSERVER_VERSION pin of sqlserver.sh must be the one of engine-matrix.yml" >&2
+  exit 1
+fi
+LOAD_SQLSERVER_AUDIT_SOURCE="${LOAD_SQLSERVER_AUDIT_SOURCE:-$default_source}"
 case "$LOAD_SQLSERVER_AUDIT_SOURCE" in
-  sqlserver_audit) AUDIT_YAML="{source: sqlserver_audit, audit_name: databastion_audit}" default_rate=300 ;;
+  sqlserver_audit)
+    # SQL Server Audit is a source on 2022 and later only (ADR-0051 decision 6).
+    if [ "$MSSQL_MAJOR" -lt 16 ]; then
+      echo "sqlserver_audit is not a source on SQL Server $LOAD_SQLSERVER_VERSION: use sqlserver_xevents" >&2; exit 2
+    fi
+    AUDIT_YAML="{source: sqlserver_audit, audit_name: databastion_audit}" default_rate=300 ;;
   sqlserver_xevents) AUDIT_YAML="{source: sqlserver_xevents, xe_session: databastion_xe}" default_rate=50 ;;
   *) echo "LOAD_SQLSERVER_AUDIT_SOURCE must be sqlserver_audit or sqlserver_xevents" >&2; exit 2 ;;
 esac
@@ -212,6 +241,9 @@ mssql_sa_q() { printf 'SET NOCOUNT ON;\n%s\n' "$1" | mssql_sa; }
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
   unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE E2E_MSSQL_IMAGE
 fi
+if [ -n "$MSSQL_PIN" ]; then
+  export E2E_MSSQL_IMAGE="$MSSQL_PIN"
+fi
 if [ "${LOAD_SKIP_BUILD:-0}" = 1 ] && [ "${GITHUB_ACTIONS:-}" != true ]; then
   for img in "${E2E_CONSOLE_IMAGE:-databastion-console:e2e}" "${E2E_AGENT_IMAGE:-databastion-agent:e2e}"; do
     docker image inspect "$img" >/dev/null 2>&1 || fail "LOAD_SKIP_BUILD=1 but image $img is missing"
@@ -223,7 +255,7 @@ else
 fi
 phase_done build
 
-log "starting the console and SQL Server 2022 Express (${LOAD_DB_CPUS} CPUs; Audit source ${LOAD_SQLSERVER_AUDIT_SOURCE})"
+log "starting the console and SQL Server ${LOAD_SQLSERVER_VERSION} Express (${LOAD_DB_CPUS} CPUs; Audit source ${LOAD_SQLSERVER_AUDIT_SOURCE})"
 timeout 900 docker compose "${COMPOSE_ARGS[@]}" up -d db web worker proxy target-mssql
 start_console
 deadline=$(( $(date +%s) + 420 ))
@@ -233,14 +265,28 @@ until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q target-
 done
 compose exec -T target-mssql cat /var/opt/mssql/databastion-tls/ca.pem >"$T/sqlserver-ca.pem" || fail "cannot copy the dev CA"
 chmod 0644 "$T/sqlserver-ca.pem"
+version="$(mssql_sa_q "SELECT CONCAT(CONVERT(nvarchar(64), SERVERPROPERTY('ProductVersion')), ' ', CONVERT(nvarchar(128), SERVERPROPERTY('Edition')), ' engine ', CONVERT(int, SERVERPROPERTY('EngineEdition')))")" \
+  || fail "cannot read the server version"
+log "target-mssql: $version"
+[[ "$version" == "${MSSQL_MAJOR}".* ]] || fail "target-mssql is not SQL Server ${LOAD_SQLSERVER_VERSION} ($version)"
+[[ "$version" == *" engine 4" ]] || fail "target-mssql is not the Express edition ($version)"
 # The Extended Events source's grant set (as e2e/sqlserver.sh, docs/08 "Extended Events: source and
-# grants"): the two SQL Server Audit grants revoked, VIEW SERVER PERFORMANCE STATE granted, before the
-# agent starts.
-if [ "$LOAD_SQLSERVER_AUDIT_SOURCE" = sqlserver_xevents ]; then
+# grants"): on 2022+, the two SQL Server Audit grants revoked, VIEW SERVER PERFORMANCE STATE granted,
+# before the agent starts; on 2019, the dev script's VIEW SERVER STATE (no SQL Server Audit grant).
+if [ "$LOAD_SQLSERVER_AUDIT_SOURCE" = sqlserver_xevents ] && [ "$MSSQL_MAJOR" -ge 16 ]; then
   log "Extended Events source: the agent login gets VIEW SERVER PERFORMANCE STATE, not the SQL Server Audit grants"
   mssql_sa_q "REVOKE VIEW SERVER SECURITY AUDIT FROM databastion; REVOKE VIEW ANY SECURITY DEFINITION FROM databastion;
     GRANT VIEW SERVER PERFORMANCE STATE TO databastion;" >/dev/null || fail "cannot set the Extended Events grant of the agent login"
 fi
+case "${LOAD_SQLSERVER_AUDIT_SOURCE}:${MSSQL_MAJOR}" in
+  sqlserver_audit:*) want_perms="CONNECT SQL+VIEW ANY SECURITY DEFINITION+VIEW SERVER SECURITY AUDIT" ;;
+  sqlserver_xevents:15) want_perms="CONNECT SQL+VIEW SERVER STATE" ;;
+  sqlserver_xevents:*) want_perms="CONNECT SQL+VIEW SERVER PERFORMANCE STATE" ;;
+esac
+perms="$(mssql_sa_q "SELECT STRING_AGG(permission_name, '+') WITHIN GROUP (ORDER BY permission_name)
+  FROM sys.server_permissions p JOIN sys.server_principals s ON s.principal_id = p.grantee_principal_id
+  WHERE s.name = N'databastion' AND p.state IN ('G', 'W')")" || fail "cannot read the agent login's server permissions"
+[ "$perms" = "$want_perms" ] || fail "unexpected server permissions of the agent login: $perms (expected $want_perms)"
 phase_done start
 
 # ------------------------------------------------------------------------------ sampler, seed
@@ -256,10 +302,10 @@ head -n -1 "$SAMPLES_DB" | jq -e 'select(.c["target-mssql"].cpu_usec != null)' >
 fact --arg t "$TARGET" '{kind: "target", target: $t, container: "target-mssql"}'
 fact --argjson r "$LOAD_MSSQL_RATE" --argjson soak "$LOAD_SOAK_S" --argjson base "$LOAD_BASELINE_S" \
   --argjson cpus "$LOAD_DB_CPUS" --argjson tables "$LOAD_MSSQL_TABLES" --argjson rows "$LOAD_MSSQL_ROWS" \
-  --arg src "$LOAD_SQLSERVER_AUDIT_SOURCE" --argjson reset "$LOAD_SQLSERVER_STATS_RESET_S" \
+  --arg src "$LOAD_SQLSERVER_AUDIT_SOURCE" --arg version "$LOAD_SQLSERVER_VERSION" --argjson reset "$LOAD_SQLSERVER_STATS_RESET_S" \
   --argjson large "$LOAD_SQLSERVER_LARGE_EVERY_S" --argjson burst "$LOAD_SQLSERVER_LARGE_BURST" \
   '{kind: "config", harness: "sqlserver", rate: $r, soak_s: $soak, baseline_s: $base, db_cpus: $cpus,
-    tables: $tables, rows: $rows, audit_source: $src, stats_reset_s: $reset, large_every_s: $large,
+    tables: $tables, rows: $rows, audit_source: $src, sqlserver_version: $version, stats_reset_s: $reset, large_every_s: $large,
     large_burst: (if $large > 0 then $burst else 0 end)}'
 
 log "creating the workload logins load_app and load_orm; seeding ${LOAD_MSSQL_TABLES} tables, ${LOAD_MSSQL_ROWS} rows (schema load of retail)"
@@ -283,7 +329,10 @@ if [ "$LOAD_SQLSERVER_LARGE_EVERY_S" -gt 0 ]; then
       >/dev/null || fail "cannot create the large-event login"
 fi
 t0="$(date +%s)"
-python3 "$SEED" sqlserver --tables "$LOAD_MSSQL_TABLES" --rows "$LOAD_MSSQL_ROWS" | mssql_sa >"$W/out/seed.out" 2>&1 \
+# No GENERATE_SERIES before 2022: the rows from a portable tally (the same values).
+SEED_SERIES=()
+if [ "$MSSQL_MAJOR" -lt 16 ]; then SEED_SERIES=(--no-generate-series); fi
+python3 "$SEED" sqlserver --tables "$LOAD_MSSQL_TABLES" --rows "$LOAD_MSSQL_ROWS" "${SEED_SERIES[@]}" | mssql_sa >"$W/out/seed.out" 2>&1 \
   || { tail -n 5 "$W/out/seed.out" >&2; fail "the scaled seed failed"; }
 if [ "$LOAD_SQLSERVER_LARGE_EVERY_S" -gt 0 ]; then
   mssql_sa_q "USE retail; GRANT SELECT ON SCHEMA::load TO load_big;" >/dev/null || fail "cannot grant the large-event login"
