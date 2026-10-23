@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.8.2](https://github.com/Yil00/databastion/compare/0.8.1...0.8.2) (2026-10-23)
+
 A security fix release after 0.8.1: the agent (an IBAN detector panic, `rustls-webpki`) and the console (Next.js). No migration, protocol or grant change. Upgrade the console and the agents; a 0.8.x console accepts this agent.
 
 ### 🔒 Security
