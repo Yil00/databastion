@@ -1993,6 +1993,10 @@ mod tests {
             "F\u{17F}76 3000 6000 0112 3456 7890 189",
             "\u{17F}x12 3456",
             "\u{17F}\u{17F}12",
+            // The Kelvin sign also folds to an ASCII letter (NFC makes it
+            // unreachable from a sampled value, but the detector must hold).
+            "\u{212A}x12",
+            "x\u{212A}12",
         ] {
             assert!(
                 !scan_tokens(v, &|_| true)
