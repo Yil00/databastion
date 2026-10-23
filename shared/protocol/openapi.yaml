@@ -2948,6 +2948,14 @@ components:
         anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
         therefore does not see such accesses: signal, volume and anomaly conditions do.
 
+        **Except for a flagged event** (ADR-0053 decision 3): when the event carries
+        `objects_overflowed`, every `*` of it (on Redis / Valkey, a real `*` key pattern too)
+        stands for one or more objects of its database that the event does not name (of the
+        target, for the database `*`): an `objects` condition retains it when its `database`
+        glob, if any, matches; `min_sensitivity`, `min_score` and the incident's database count
+        it as the database's most sensitive object; a location exception covers it only when it
+        covers the whole database. Without the field, the literal rule above applies.
+
         **Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log
         entry is reported under the pattern learned by the last scan, its longest learned literal
         prefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.
