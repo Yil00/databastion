@@ -459,6 +459,15 @@ impl Shared {
         lock(&self.halved).remove(target_id);
     }
 
+    /// The size [`Shared::read_failed`] keeps for `target_id` across a
+    /// stream restart, with its source and position, if any (integration
+    /// tests: a stream that ended on an oversized read whose cancel the
+    /// server did not acknowledge in time).
+    #[cfg(test)]
+    pub(crate) fn kept_read_size(&self, target_id: &str) -> Option<(Source, ReadAt, usize)> {
+        lock(&self.halved).get(target_id).cloned()
+    }
+
     /// Statistics statements left out (item 4, refinement of 2026-10-15).
     pub(crate) fn note_statistics(&self, target_id: &str, n: usize) {
         if let Some(c) = lock(&self.own_left_out)
