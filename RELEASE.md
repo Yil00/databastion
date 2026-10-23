@@ -110,7 +110,7 @@ Pushing the tag triggers [publish.yml](.github/workflows/publish.yml) (`0.1.0-al
 
 ### Hotfix
 1. `hotfix/<slug>` from `main`, PR to `main` with a `fix:` commit.
-2. The merge publishes `X.Y.(Z+1)`.
+2. Merge it with a **merge commit**, never a squash: release-it reads commit headers only, and a squash commit's header is the PR title (`release: X.Y.Z`), so its `fix:` lines would not count (0.8.1: #320 and #321 were squashed and released nothing). The merge publishes `X.Y.(Z+1)`; `release.yml` fails when a merge without `[skip-release]` computes no version.
 3. Back-merge `main` into `dev` through a PR (merge commit), as for a regular release.
 
 ### Security fix
