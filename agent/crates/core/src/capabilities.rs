@@ -50,6 +50,10 @@ pub(crate) mod token {
     pub(crate) const ACCESS_EVENT_BYTES: &str = "access_event.bytes";
     /// `AccessEvent.objects_overflowed` (ADR-0053).
     pub(crate) const ACCESS_EVENT_OBJECTS_OVERFLOWED: &str = "access_event.objects_overflowed";
+    /// `Location.altered` (ADR-0056): the first gated field of findings.
+    pub(crate) const LOCATION_ALTERED: &str = "location.altered";
+    /// `ObjectRef.altered` (ADR-0056), on every object of an event.
+    pub(crate) const OBJECT_REF_ALTERED: &str = "object_ref.altered";
     /// `JobProgress.objects_sampled` and `skipped_*`.
     pub(crate) const JOB_PROGRESS_COVERAGE: &str = "job_progress.coverage";
     /// The `cas` values of `Engine` and `Connector`, and `cas_audit_log` of
@@ -235,6 +239,7 @@ struct Accepted {
 pub(crate) struct Snapshot {
     tokens: BTreeSet<String>,
     settled: bool,
+    known: bool,
 }
 
 impl Snapshot {
@@ -248,13 +253,29 @@ impl Snapshot {
         self.settled
     }
 
+    /// Whether a heartbeat response recorded the set (it is not known from
+    /// the start of the agent, and from a clear that held, until the next
+    /// response). Findings are never held for it (ADR-0056 decision 2 item
+    /// 3): a findings batch sent while it is not known is stripped, and
+    /// counted apart.
+    pub(crate) fn known(&self) -> bool {
+        self.known
+    }
+
     /// A snapshot of a known set listing `tokens` (tests).
     #[cfg(test)]
     pub(crate) fn listing(tokens: &[&str]) -> Self {
         Self {
             tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
             settled: true,
+            known: true,
         }
+    }
+
+    /// A snapshot of a set not known yet (tests).
+    #[cfg(test)]
+    pub(crate) fn unknown() -> Self {
+        Self::default()
     }
 }
 
@@ -375,6 +396,7 @@ impl ConsoleCapabilities {
         Snapshot {
             tokens: a.tokens.clone(),
             settled: Self::settled_in(&a, now),
+            known: a.unknown_since.is_none(),
         }
     }
 

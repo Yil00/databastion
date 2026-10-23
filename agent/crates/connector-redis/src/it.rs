@@ -2386,3 +2386,175 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+/// ADR-0056 decision 2 item 5: a key with a fullwidth segment (`ｃｏｌｏｒ`,
+/// U+FF43 …, which NFKC maps to `color`) is marked altered in Discovery
+/// (the finding's `location.altered` names `object`) and in Audit (the
+/// event object read through the fullwidth spelling, and through the plain
+/// spelling mapped to the pattern learned from it, carry `object` in
+/// `altered`); a plain key of another shape is never marked. The contract
+/// JSON is the spooled form (before the send-time strip).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fullwidth_key_segment_is_marked_altered_in_discovery_and_audit() {
+    if !enabled() {
+        return;
+    }
+    let _serial = serial().await;
+    const ALTERED: &str = "fwtest/\u{FF43}\u{FF4F}\u{FF4C}\u{FF4F}\u{FF52}|theme";
+    const PLAIN_SPELLING: &[u8] = b"fwtest/color|theme";
+    const PLAIN: &str = "fwplain.color|theme/main";
+    const MARK: &str = "fwqzxk";
+    for (name, engine) in [
+        ("valkey", TargetEngine::Valkey),
+        ("redis", TargetEngine::Redis),
+    ] {
+        let t = tgt(name, engine, "databastion", "").await;
+        let value = format!("jane.{MARK}@example.com");
+        // In both databases of the dev keyspace: a slow-log entry names no
+        // database, so only patterns learned in every database with keys
+        // apply (ADR-0052 decision 8).
+        let mut set: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut del: Vec<Vec<Vec<u8>>> = Vec::new();
+        for db in [b"0", b"1"] {
+            set.push(vec![b"SELECT".to_vec(), db.to_vec()]);
+            del.push(vec![b"SELECT".to_vec(), db.to_vec()]);
+            for k in [ALTERED, PLAIN] {
+                set.push(vec![
+                    b"SET".to_vec(),
+                    k.as_bytes().to_vec(),
+                    value.clone().into_bytes(),
+                ]);
+                del.push(vec![b"DEL".to_vec(), k.as_bytes().to_vec()]);
+            }
+        }
+        admin_owned(&t, &set).await;
+        let dir = std::env::temp_dir().join(format!(
+            "databastion-redis-altered-{}-{name}",
+            std::process::id()
+        ));
+        let (t2, dir2) = (t.clone(), dir.clone());
+        let run = tokio::spawn(async move {
+            let (t, dir) = (t2, dir2);
+            let connector = Arc::new(RedisConnector::new());
+            let job = ScanJob::new(ScanParams::contract_defaults(), &t, &unpaced(), key());
+            let (fs, mut frx) = FindingSink::channel(4096);
+            let collect = tokio::spawn(async move {
+                let mut out = Vec::new();
+                while let Some(f) = frx.recv().await {
+                    out.push(f);
+                }
+                out
+            });
+            connector.discover(&job, &fs).await.unwrap();
+            drop(fs);
+            let findings = collect.await.unwrap();
+            let json = findings_json(&findings, engine);
+            let at = |object: &str| -> Vec<serde_json::Value> {
+                json.iter()
+                    .filter(|f| f["location"]["object"] == object)
+                    .cloned()
+                    .collect()
+            };
+            let altered = at("fwtest/color|theme");
+            assert!(!altered.is_empty(), "{name}: {json:#?}");
+            for f in &altered {
+                assert_eq!(
+                    f["location"]["altered"],
+                    serde_json::json!(["object"]),
+                    "{name}: {f:#}"
+                );
+            }
+            let plain = at(PLAIN);
+            assert!(!plain.is_empty(), "{name}: {json:#?}");
+            for f in &plain {
+                assert!(f["location"].get("altered").is_none(), "{name}: {f:#}");
+            }
+            // The learned pattern keeps its marker for Audit.
+            let learned = connector.state.audit.learned(&t.id);
+            let db0: Vec<(String, bool)> = learned.dbs[&0]
+                .marked()
+                .map(|(p, a)| (p.to_owned(), a))
+                .collect();
+            assert!(
+                db0.contains(&("fwtest/color|theme".to_owned(), true)),
+                "{name}: {db0:?}"
+            );
+            assert!(db0.contains(&(PLAIN.to_owned(), false)), "{name}: {db0:?}");
+
+            std::fs::create_dir_all(&dir).unwrap();
+            let limits = Limits {
+                min_audit_poll_interval_s: 1,
+                ..Limits::default()
+            };
+            let cfg = databastion_core::AuditConfig::local(&t, 1, &limits)
+                .with_state_dir(dir.to_path_buf());
+            let (sink, mut rx) = databastion_core::EventSink::channel(8192);
+            let c2 = Arc::clone(&connector);
+            let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+            let _stop = AbortOnDrop(stream.abort_handle());
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(!stream.is_finished(), "{:?}", stream.await);
+            let pw = admin_password();
+            raw_held(
+                &t,
+                "admin",
+                &pw,
+                std::time::Duration::from_secs(3),
+                &[
+                    vec![b"GET", ALTERED.as_bytes()],
+                    vec![b"GET", PLAIN_SPELLING],
+                    vec![b"GET", PLAIN.as_bytes()],
+                ],
+                std::time::Duration::from_secs(4),
+            )
+            .await;
+            stream.abort();
+            let _ = stream.await;
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            let json = events_json(&events);
+            let reads: Vec<(String, Option<serde_json::Value>)> = json
+                .iter()
+                .filter(|e| {
+                    e["principal"]["db_user"] == "admin"
+                        && e["action"] == "read"
+                        && e["source"] == "redis_slowlog"
+                })
+                .flat_map(|e| e["objects"].as_array().cloned().unwrap_or_default())
+                .map(|o| {
+                    (
+                        o["object"].as_str().unwrap_or_default().to_owned(),
+                        o.get("altered").cloned(),
+                    )
+                })
+                .collect();
+            let object = Some(serde_json::json!(["object"]));
+            // The two `fwtest` reads (fullwidth and plain spelling) are one
+            // object, aggregated or not; the plain key apart, unmarked.
+            assert!(
+                reads.contains(&("fwtest/color|theme".to_owned(), object.clone())),
+                "{name}: {json:#?}"
+            );
+            assert!(
+                !reads.contains(&("fwtest/color|theme".to_owned(), None)),
+                "{name}: {json:#?}"
+            );
+            assert!(
+                reads.contains(&(PLAIN.to_owned(), None)),
+                "{name}: {json:#?}"
+            );
+            // No raw spelling and no value reaches the contract JSON (I2).
+            for text in [format!("{json:?}"), format!("{findings:?}")] {
+                assert!(!text.contains('\u{FF43}') && !text.contains(MARK), "{name}");
+            }
+        })
+        .await;
+        admin_owned(&t, &del).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = run {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+}

@@ -82,12 +82,22 @@ fn snake(key: &str) -> String {
 }
 
 /// The Discovery `field` of a definition path.
+///
+/// ADR-0056 decision 2 item 1: the field is marked altered when the snake
+/// case conversion changed one of its keys (`userName`, `UserName` and
+/// `user_name` all arrive as `user_name`), as well as when the ADR-0009
+/// first step did; never when it is `*`.
 #[must_use]
 pub fn field_name(path: &[Seg]) -> NormalizedName {
+    let mut converted = false;
     let keys: Vec<Option<String>> = path
         .iter()
         .map(|s| match s {
-            Seg::Key(k) => Some(snake(k)),
+            Seg::Key(k) => {
+                let snake = snake(k);
+                converted |= snake != *k;
+                Some(snake)
+            }
             Seg::Wildcard => Some("*".to_owned()),
             Seg::Index => None,
         })
@@ -96,7 +106,12 @@ pub fn field_name(path: &[Seg]) -> NormalizedName {
         .iter()
         .map(|k| k.as_deref().map_or(PathPart::Index, PathPart::Key))
         .collect();
-    normalize_field_path(&parts)
+    let name = normalize_field_path(&parts);
+    if converted {
+        name.marked_altered()
+    } else {
+        name
+    }
 }
 
 /// The Discovery `object` of a definition.
@@ -372,6 +387,32 @@ mod tests {
         assert_eq!(field_name(&[k("serviceId")]).as_str(), "service_id");
         assert_eq!(field_name(&[k("jane.doe@example.org")]).as_str(), "*");
         assert_eq!(snake("URLValue"), "u_r_l_value");
+    }
+
+    /// ADR-0056 decision 2 item 5: a definition key the snake case
+    /// conversion changed (`userName`) is marked altered, one it kept
+    /// (`user_name`) is not; nor is a field sent as `*`, even when its key
+    /// was converted.
+    #[test]
+    fn converted_definition_keys_are_marked_altered() {
+        let k = |s: &str| Seg::Key(s.to_owned());
+        let camel = field_name(&[k("userName")]);
+        assert_eq!(camel.as_str(), "user_name");
+        assert!(camel.altered());
+        let snake_kept = field_name(&[k("user_name")]);
+        assert_eq!(snake_kept.as_str(), "user_name");
+        assert!(!snake_kept.altered());
+        // Equal names whatever the marker (the same location).
+        assert_eq!(camel, snake_kept);
+        assert!(field_name(&[k("UserName")]).altered());
+        assert!(field_name(&[k("contacts"), Seg::Index, k("emailAddress")]).altered());
+        assert!(!field_name(&[k("contacts"), Seg::Index, k("email")]).altered());
+        // A value as a key: `*`, never marked.
+        let star = field_name(&[k("Jane.Doe@example.org")]);
+        assert_eq!(star.as_str(), "*");
+        assert!(!star.altered());
+        // The ADR-0009 first step marks too (a fullwidth letter).
+        assert!(field_name(&[k("\u{FF55}ser")]).altered());
     }
 
     #[test]

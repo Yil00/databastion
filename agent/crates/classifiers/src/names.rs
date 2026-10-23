@@ -84,20 +84,78 @@ const CONTAINER_TYPES: [&str; 6] = ["ou", "dc", "o", "c", "l", "st"];
 /// `Identifier` schema, except a Redis / Valkey key pattern built by
 /// [`crate::keys`], which matches the contract `KeyPattern` schema
 /// instead. No public constructor from a string.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct NormalizedName(String);
+///
+/// It also records whether normalization **altered** it (ADR-0056
+/// decision 2 item 1, contract `Location.altered` / `ObjectRef.altered`):
+/// the first step (control and format characters stripped, NFKC) changed
+/// the input as read from the engine, so another object of the engine may
+/// be sent under the same name. Never set on `*`. The marker carries no
+/// character and no count (I2).
+///
+/// Equality and hashing compare the **name only**: two names sent as the
+/// same string are one name for every comparison the agent makes
+/// (aggregation, object lists, sensitive objects), and their markers are
+/// united where they merge ([`Self::absorb_marker`]).
+#[derive(Clone)]
+pub struct NormalizedName {
+    name: String,
+    altered: bool,
+}
+
+impl PartialEq for NormalizedName {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for NormalizedName {}
+
+impl std::hash::Hash for NormalizedName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
 
 impl NormalizedName {
     /// The normalized name.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.name
     }
 
-    /// The `*` wildcard.
+    /// The `*` wildcard (never altered).
     #[must_use]
     pub fn wildcard() -> Self {
-        Self(WILDCARD.to_owned())
+        Self {
+            name: WILDCARD.to_owned(),
+            altered: false,
+        }
+    }
+
+    /// Whether normalization altered the name (see the type): the first
+    /// step changed the engine's name and the result is not `*`.
+    #[must_use]
+    pub fn altered(&self) -> bool {
+        self.altered
+    }
+
+    /// The same name, marked altered (ADR-0056: a connector-specific
+    /// conversion that may send two engine names as one, such as the CAS
+    /// definition keys turned into snake case). `*` is never marked. There
+    /// is no way to clear the marker: a connector can only mark more.
+    #[must_use]
+    pub fn marked_altered(mut self) -> Self {
+        self.altered = self.name != WILDCARD;
+        self
+    }
+
+    /// Unites `other`'s marker into this name when both are the same name
+    /// (two engine objects merged under one name: the result is altered
+    /// if either was). A different name, or `*`, is left as it is.
+    pub fn absorb_marker(&mut self, other: &Self) {
+        if other.altered && self.name == other.name && self.name != WILDCARD {
+            self.altered = true;
+        }
     }
 
     /// Final gate: the contract `Identifier` (pattern and `not` rule), no
@@ -105,17 +163,26 @@ impl NormalizedName {
     /// script, at most [`MAX_TOTAL_DIGITS`] numeric characters in the whole
     /// name (both counted with [`is_numeric_like`]), no percent-encoded
     /// byte or `%uXXXX` escape; `*` otherwise.
-    fn checked(candidate: String) -> Self {
+    ///
+    /// `altered`: the first step changed the input; dropped when the
+    /// result is `*`.
+    fn checked(candidate: String, altered: bool) -> Self {
         let digits = candidate.chars().filter(|c| is_numeric_like(*c)).count();
         if conforms(&candidate)
             && longest_digit_run(&candidate) <= MAX_INDEX_DIGITS
             && digits <= MAX_TOTAL_DIGITS
             && !has_percent_escape(&candidate)
         {
-            Self(candidate)
+            Self::named(candidate, altered)
         } else {
             Self::wildcard()
         }
+    }
+
+    /// A name that passed its gate; never altered when `*`.
+    fn named(name: String, altered: bool) -> Self {
+        let altered = altered && name != WILDCARD;
+        Self { name, altered }
     }
 }
 
@@ -125,9 +192,12 @@ impl NormalizedName {
     /// [`crate::keys::is_key_pattern`]); `*` otherwise. Only that module
     /// builds key patterns; the core sends one only for a `redis` or
     /// `valkey` location, and replaces it by `*` on any other engine.
-    pub(crate) fn key_pattern(candidate: String) -> Self {
+    ///
+    /// `altered`: NFKC changed a segment the pattern keeps (ADR-0056);
+    /// dropped when the result is `*`.
+    pub(crate) fn key_pattern(candidate: String, altered: bool) -> Self {
         if crate::keys::is_key_pattern(&candidate) {
-            Self(candidate)
+            Self::named(candidate, altered)
         } else {
             Self::wildcard()
         }
@@ -166,7 +236,7 @@ pub(crate) fn key_value_spans(s: &str) -> Vec<Range<usize>> {
 
 impl fmt::Debug for NormalizedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("NormalizedName").field(&self.0).finish()
+        f.debug_tuple("NormalizedName").field(&self.name).finish()
     }
 }
 
@@ -764,6 +834,8 @@ pub fn normalize_path(raw: &str) -> NormalizedName {
     let Some(cleaned) = fold(raw) else {
         return NormalizedName::wildcard();
     };
+    // ADR-0056: the first step changed the name as read from the engine.
+    let altered = cleaned != raw;
     let spans = value_spans(&cleaned);
     let mut out: Vec<String> = Vec::new();
     let mut in_value = false;
@@ -791,7 +863,7 @@ pub fn normalize_path(raw: &str) -> NormalizedName {
             out.push(segment.to_owned());
         }
     }
-    NormalizedName::checked(out.join("."))
+    NormalizedName::checked(out.join("."), altered)
 }
 
 /// Whether a (possibly empty) segment range touches a value span.
@@ -828,10 +900,15 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
     // be folded within the bound (NFKC expansion) makes the whole path `*`:
     // the joined path would exceed the bound anyway.
     let mut folded: Vec<Option<String>> = Vec::with_capacity(parts.len());
+    // ADR-0056: the first step changed one of the keys.
+    let mut altered = false;
     for p in parts {
         folded.push(match p {
             PathPart::Key(k) => match fold(k) {
-                Some(k) => Some(k),
+                Some(f) => {
+                    altered |= f != *k;
+                    Some(f)
+                }
                 None => return NormalizedName::wildcard(),
             },
             PathPart::Index => None,
@@ -900,7 +977,7 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
             }
         }
     }
-    NormalizedName::checked(out.join("."))
+    NormalizedName::checked(out.join("."), altered)
 }
 
 /// Normalizes an LDAP attribute type (lowercased).
@@ -928,6 +1005,10 @@ pub fn normalize_ldap_dn(raw: &str) -> NormalizedName {
     let Some(cleaned) = fold(raw) else {
         return NormalizedName::wildcard();
     };
+    // ADR-0056: the first step changed the DN as read from the server
+    // (compared on the whole input, so a change in the entry RDN the
+    // container drops marks the container too: more marked, never less).
+    let altered = cleaned != raw;
     if cleaned.contains('\\') || cleaned.contains('+') {
         return NormalizedName::wildcard();
     }
@@ -957,7 +1038,7 @@ pub fn normalize_ldap_dn(raw: &str) -> NormalizedName {
             || value.split('.').any(segment_looks_like_value);
         parts.push(format!("{ty}={}", if bad { WILDCARD } else { value }));
     }
-    NormalizedName::checked(parts.join(","))
+    NormalizedName::checked(parts.join(","), altered)
 }
 
 #[cfg(test)]
@@ -1241,7 +1322,7 @@ mod tests {
         // Gate: every segment below the per-segment bound, the total above
         // `MAX_TOTAL_DIGITS`.
         assert_eq!(
-            NormalizedName::checked("ou=一二三四,dc=五六七八九".to_owned()).as_str(),
+            NormalizedName::checked("ou=一二三四,dc=五六七八九".to_owned(), false).as_str(),
             "*"
         );
         assert_eq!(normalize_ldap_dn("ou=一二三四,dc=五六七八九").as_str(), "*");

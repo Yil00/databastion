@@ -317,9 +317,11 @@ pub(crate) async fn discover(
             continue;
         };
         // The patterns Audit maps log keys to (decision 8, H1).
-        let learned: Vec<String> = emitted
+        // Each with its ADR-0056 marker: an Audit object mapped to an
+        // altered pattern is altered.
+        let learned: Vec<(String, bool)> = emitted
             .iter()
-            .map(|p| p.pattern.as_str().to_owned())
+            .map(|p| (p.pattern.as_str().to_owned(), p.pattern.altered()))
             .collect();
         state.audit.learn(&target.id, *db, &learned, complete);
         sample_database(&mut conn, job, sink, &name, emitted, &mut facts).await?;

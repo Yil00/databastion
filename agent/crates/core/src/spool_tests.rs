@@ -569,7 +569,11 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
         spool.push(&cas_batch()).unwrap();
     }
     assert_eq!(spool.held_batches(held), 3);
-    assert!(spool.front_sendable(|_| true, held, |_, _| false).is_none());
+    assert!(
+        spool
+            .front_sendable(|_| true, held, |_, _, _| false)
+            .is_none()
+    );
     // The bound applies to held batches like any other: a new batch
     // evicts the oldest (counted).
     let pg = batches(1).remove(0);
@@ -581,7 +585,7 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
     // The sendable batch is found behind the held ones.
     assert_eq!(
         spool
-            .front_sendable(|_| true, held, |_, _| false)
+            .front_sendable(|_| true, held, |_, _, _| false)
             .unwrap()
             .1
             .batch_id(),
@@ -595,7 +599,7 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
             fs::write(&p, b"not a batch").unwrap();
         }
     }
-    let _ = spool.front_sendable(|_| false, held, |_, _| false);
+    let _ = spool.front_sendable(|_| false, held, |_, _, _| false);
     assert_eq!(spool.counters.quarantined, 0);
     // Reloaded (agent restart): the tokens come from the files again.
     let dir2 = TempDir::new();
@@ -604,10 +608,14 @@ fn held_batches_are_skipped_without_reading_and_count_against_the_bounds() {
     drop(again);
     let mut again = Spool::open(dir2.path(), &config(1 << 20, 8)).unwrap();
     assert_eq!(again.held_batches(held), 1);
-    assert!(again.front_sendable(|_| true, held, |_, _| false).is_none());
     assert!(
         again
-            .front_sendable(|_| true, |_| false, |_, _| false)
+            .front_sendable(|_| true, held, |_, _, _| false)
+            .is_none()
+    );
+    assert!(
+        again
+            .front_sendable(|_| true, |_| false, |_, _, _| false)
             .is_some()
     );
 }

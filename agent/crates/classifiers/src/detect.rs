@@ -69,7 +69,10 @@ static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
         r"[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)*\.\p{L}{2,}",
     )
 });
-static IBAN_START: LazyLock<Regex> = LazyLock::new(|| re("IBAN_START", r"(?i)\b[a-z]{2}[0-9]{2}"));
+// ASCII letters only: under `(?i)`, `[a-z]` also matches `ſ` (U+017F) and
+// the Kelvin sign (U+212A), which no country code holds, and the two-byte
+// country slice below would split them (a panic on a sampled value).
+static IBAN_START: LazyLock<Regex> = LazyLock::new(|| re("IBAN_START", r"\b[A-Za-z]{2}[0-9]{2}"));
 static CARD: LazyLock<Regex> = LazyLock::new(|| re("CARD", r"\b[0-9](?:[ \-]?[0-9]){11,22}\b"));
 static NIR: LazyLock<Regex> = LazyLock::new(|| {
     re(
@@ -1972,6 +1975,33 @@ pub fn contains_value(s: &str) -> bool {
 mod tests {
     use super::*;
     use ClassifierId as C;
+
+    /// A value whose letters case-fold to ASCII (`ſ` U+017F, the Kelvin
+    /// sign U+212A) before two digits never panics the IBAN detector (it
+    /// sliced the two-byte country code inside them), and is no IBAN.
+    #[test]
+    fn letters_that_fold_to_ascii_never_split_the_country_code() {
+        for v in [
+            "\u{17F}x12 3456",
+            "x\u{17F}12 3456",
+            "FR\u{212A}2 3456",
+            "\u{212A}\u{17F}12 3456",
+            "\u{17F}E76 3000 6000 0112 3456 7890 189",
+        ] {
+            assert!(
+                !scan_tokens(v, &|_| true)
+                    .iter()
+                    .any(|t| t.classifier == C::Iban),
+                "{v:?}"
+            );
+        }
+        // A real IBAN next to them is still found.
+        assert!(
+            scan_tokens("\u{17F}x12 FR76 3000 6000 0112 3456 7890 189", &|_| true)
+                .iter()
+                .any(|t| t.classifier == C::Iban)
+        );
+    }
 
     fn found(v: &str) -> Vec<(ClassifierId, &str)> {
         scan_tokens(v, &|_| true)

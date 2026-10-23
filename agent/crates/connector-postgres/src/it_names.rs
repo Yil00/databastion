@@ -13,8 +13,11 @@
 //! - Relations whose names differ from `crm.names_it` only by a character
 //!   ADR-0009 strips (U+200B) or maps with NFKC (a fullwidth `ｎ`, U+FF4E)
 //!   reach the console as `crm.names_it`, the same name as the plain
-//!   relation: the residual risk "Normalization merges names" of ADR-0054,
-//!   pinned here as the current behaviour.
+//!   relation: the residual risk "Normalization merges names" of ADR-0054.
+//!   Since ADR-0056 (decision 2 item 5) the two look-alikes carry `object`
+//!   in `altered` (`ObjectRef.altered` on events, `Location.altered` on
+//!   findings), and the plain relation carries no marker, so location
+//!   exceptions that name the object no longer cover the look-alikes.
 //!
 //! Same prerequisites as `it.rs`. The fixtures (the schema `CrmArchive`
 //! with two tables, three tables of `crm` and a reader role) are created
@@ -122,6 +125,46 @@ fn names_it_events(ev: &[MaskedEvent]) -> usize {
         .iter()
         .filter(|e| objects(e).iter().any(|(_, s, o)| s == "crm" && o == PLAIN))
         .count()
+}
+
+/// ADR-0056: whether each part (database, schema, object) of the reader's
+/// event objects is marked altered, by (schema, object), sorted.
+fn altered_parts(ev: &[MaskedEvent]) -> Vec<(String, String, [bool; 3])> {
+    let mut out: Vec<(String, String, [bool; 3])> = reader_reads(ev)
+        .iter()
+        .flat_map(|e| e.objects())
+        .map(|o| {
+            (
+                o.schema().map_or("", |s| s.as_str()).to_owned(),
+                o.object().as_str().to_owned(),
+                [
+                    o.database().altered(),
+                    o.schema().is_some_and(|s| s.altered()),
+                    o.object().altered(),
+                ],
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// What [`altered_parts`] must give for [`reads`]: the two look-alikes of
+/// `crm.names_it` with `object` marked, everything else unmarked.
+fn expected_altered() -> Vec<(String, String, [bool; 3])> {
+    let mut want: Vec<(String, String, [bool; 3])> = vec![
+        (MIXED_SCHEMA.to_owned(), MIXED_TABLE.to_owned(), [false; 3]),
+        (
+            MIXED_SCHEMA.to_owned(),
+            "crmcustomers".to_owned(),
+            [false; 3],
+        ),
+        ("crm".to_owned(), PLAIN.to_owned(), [false; 3]),
+        ("crm".to_owned(), PLAIN.to_owned(), [false, false, true]),
+        ("crm".to_owned(), PLAIN.to_owned(), [false, false, true]),
+    ];
+    want.sort();
+    want
 }
 
 /// Creates the fixtures (dropped first: a failed run leaves them).
@@ -258,6 +301,21 @@ async fn audit_events_name_relations_as_in_the_catalog() {
             assert_eq!(objects(e).len(), 1, "{label}: {described:#?}");
         }
         assert_eq!(names_it_events(&events), 3, "{label}: {described:#?}");
+        // ADR-0056: the look-alikes are marked, the plain relation is not.
+        assert_eq!(
+            altered_parts(&events),
+            expected_altered(),
+            "{label}: {described:#?}"
+        );
+        // In the contract form the core spools: `object` in `altered` on
+        // the two look-alikes only.
+        let json = databastion_core::test_support::contract_events_json(
+            &reader.iter().map(|e| (*e).clone()).collect::<Vec<_>>(),
+            &key(),
+        );
+        let marked = json.matches(r#""altered":["object"]"#).count();
+        assert_eq!(marked, 2, "{label}: {json}");
+        assert_eq!(json.matches(r#""altered""#).count(), 2, "{label}: {json}");
         let source = if log.is_some() {
             EventSource::Pgaudit
         } else {
@@ -351,6 +409,48 @@ async fn discovery_locates_relations_as_in_the_catalog() {
     want.sort();
     got.sort();
     assert_eq!(got, want);
+    // ADR-0056: of the three `crm.names_it.email` findings, the two
+    // look-alikes carry `object` in `altered`, the plain one nothing; the
+    // mixed-case relations are not altered (case is kept, not changed).
+    let mut marks: Vec<(String, [bool; 4])> = findings
+        .iter()
+        .filter_map(|f| {
+            let l = f.location()?;
+            let schema = l.schema.as_ref().map_or("", |s| s.as_str());
+            (schema.eq_ignore_ascii_case(MIXED_SCHEMA) || l.object.as_str() == PLAIN).then(|| {
+                (
+                    l.object.as_str().to_owned(),
+                    [
+                        l.database.altered(),
+                        l.schema.as_ref().is_some_and(|s| s.altered()),
+                        l.object.altered(),
+                        l.field.altered(),
+                    ],
+                )
+            })
+        })
+        .collect();
+    marks.sort();
+    let mut want_marks = vec![
+        (MIXED_TABLE.to_owned(), [false; 4]),
+        ("crmcustomers".to_owned(), [false; 4]),
+        (PLAIN.to_owned(), [false; 4]),
+        (PLAIN.to_owned(), [false, false, true, false]),
+        (PLAIN.to_owned(), [false, false, true, false]),
+    ];
+    want_marks.sort();
+    assert_eq!(marks, want_marks);
+    let fixture: Vec<MaskedFinding> = findings
+        .iter()
+        .filter(|f| f.location().is_some_and(|l| l.object.as_str() == PLAIN))
+        .cloned()
+        .collect();
+    let json = databastion_core::test_support::contract_findings_json(
+        &fixture,
+        databastion_core::config::TargetEngine::Postgres,
+    );
+    assert_eq!(json.matches(r#""altered":["object"]"#).count(), 2, "{json}");
+    assert_eq!(json.matches(r#""altered""#).count(), 2, "{json}");
     for f in &findings {
         let d = format!("{f:?}");
         assert!(!d.contains('\u{200B}') && !d.contains('\u{FF4E}'), "{d}");
