@@ -7,6 +7,7 @@ import { agents, agentTargets, findings, findingsBatches, incidents, jobs } from
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 
 import type { FindingFilter } from "@/lib/findings-filter";
+import { LOCATION_PARTS, type LocationPart } from "@/lib/policy-model";
 import { registeredClassifiers } from "@/lib/protocol/classifiers";
 
 import { writeAudit } from "./audit";
@@ -239,12 +240,31 @@ export async function ingestFindings(db: Database, agentId: string, batch: Findi
 
 export type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
+/**
+ * ADR-0056 decision 3 item 2: the union of two lists of altered location parts, in
+ * `LOCATION_PARTS` order, or null when neither names a part (the column's "not altered").
+ */
+export function mergeAltered(
+  a: readonly string[] | null | undefined,
+  b: readonly string[] | null | undefined,
+): LocationPart[] | null {
+  const parts = new Set<string>([...(a ?? []), ...(b ?? [])]);
+  const out = LOCATION_PARTS.filter((p) => parts.has(p));
+  return out.length > 0 ? out : null;
+}
+
 const excluded = (column: string) => sql.raw(`excluded.${column}`);
 
 async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Promise<void> {
-  // One row per location + classifier: within a batch, the last item wins.
+  // One row per location + classifier: within a batch, the last item wins, except `altered`
+  // (ADR-0056 decision 3 item 2): the union of the altered parts of every item of the location.
   const byKey = new Map<string, Finding>();
-  for (const f of batch.findings) byKey.set(findingLocationKey(f), f);
+  const batchAltered = new Map<string, LocationPart[] | null>();
+  for (const f of batch.findings) {
+    const k = findingLocationKey(f);
+    byKey.set(k, f);
+    batchAltered.set(k, mergeAltered(batchAltered.get(k), f.location.altered));
+  }
   const keys = [...byKey.keys()];
   // Locked: a concurrent false-positive marking waits, so the reset decision below is exact.
   const existing = await tx
@@ -254,14 +274,29 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
       falsePositiveAt: findings.falsePositiveAt,
       falsePositiveMatched: findings.falsePositiveMatched,
       falsePositiveClassifiersVersion: findings.falsePositiveClassifiersVersion,
+      falsePositiveAltered: findings.falsePositiveAltered,
+      altered: findings.altered,
+      lastJobId: findings.lastJobId,
     })
     .from(findings)
     .where(and(eq(findings.agentId, agentId), inArray(findings.locationKey, keys)))
     .for("update");
   const ids = new Map(existing.map((r) => [r.locationKey, r.id]));
-  const resets = existing.filter((r) => {
+  // ADR-0056 decision 3 item 2: across the batches of one job, the union with the stored parts;
+  // the first batch of another job (or of a row whose job is gone) replaces them. Exact: the rows
+  // are locked and the batches of one agent serialized (advisory lock in `ingestFindings`).
+  const altered = new Map<string, LocationPart[] | null>();
+  for (const k of keys) altered.set(k, batchAltered.get(k) ?? null);
+  for (const r of existing) {
+    if (r.lastJobId !== null && r.lastJobId === batch.job_id) {
+      altered.set(r.locationKey, mergeAltered(r.altered, altered.get(r.locationKey)));
+    }
+  }
+  const resets = existing.flatMap((r) => {
     const f = byKey.get(r.locationKey);
-    return f !== undefined && r.falsePositiveAt !== null && fpResetNeeded(r, f.matched, batch.classifiers_version);
+    if (f === undefined || r.falsePositiveAt === null) return [];
+    const reason = fpResetReason(r, f.matched, batch.classifiers_version, altered.get(r.locationKey) ?? null);
+    return reason === null ? [] : [{ ...r, reason }];
   });
   // Fail closed: without the server key, no sample is stored (the finding still is).
   const key = maskedSamplesKey();
@@ -290,6 +325,7 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
       firstJobId: batch.job_id,
       lastJobId: batch.job_id,
       lastBatchId: batch.batch_id,
+      altered: altered.get(locationKey) ?? null,
     };
   });
   await tx
@@ -309,12 +345,15 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
         fingerprints: excluded("fingerprints"),
         lastJobId: excluded("last_job_id"),
         lastBatchId: excluded("last_batch_id"),
+        // ADR-0056: already merged above for this job (`excluded.altered`).
+        altered: excluded("altered"),
         lastSeenAt: sql`now()`,
         // M2: same predicate as `fpResetNeeded`, evaluated on the locked row.
         falsePositiveAt: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveAt} end`,
         falsePositiveBy: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveBy} end`,
         falsePositiveMatched: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveMatched} end`,
         falsePositiveClassifiersVersion: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveClassifiersVersion} end`,
+        falsePositiveAltered: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveAltered} end`,
       },
     });
   for (const r of resets) {
@@ -329,16 +368,47 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
         target_id: f.target_id,
         classifier: f.classifier,
         job_id: batch.job_id,
-        reason:
-          r.falsePositiveClassifiersVersion !== batch.classifiers_version ? "classifiers_version" : "matched_increased",
+        reason: r.reason,
       },
     });
   }
 }
 
 /**
+ * ADR-0056 decision 3 item 3: the row is altered now in a part it was not altered in when its false
+ * positive was marked (a mark without that snapshot, set before migration 0046, was set on a row
+ * without the marker: "not altered").
+ */
+export function fpNamesAltered(
+  row: { falsePositiveAltered: readonly string[] | null },
+  altered: readonly string[] | null,
+): boolean {
+  const marked = new Set(row.falsePositiveAltered ?? []);
+  return (altered ?? []).some((p) => !marked.has(p));
+}
+
+export type FpResetReason = "names_altered" | "classifiers_version" | "matched_increased";
+
+/**
+ * Why the false positive of `row` is reset by a revision with `matched`, `classifiersVersion` and
+ * the merged `altered` parts, or null when it is kept. `names_altered` first: it asks the
+ * administrator to check the database for look-alike names.
+ */
+export function fpResetReason(
+  row: { falsePositiveMatched: number | null; falsePositiveClassifiersVersion: string | null; falsePositiveAltered: readonly string[] | null },
+  matched: number,
+  classifiersVersion: string,
+  altered: readonly string[] | null,
+): FpResetReason | null {
+  if (fpNamesAltered(row, altered)) return "names_altered";
+  if (!fpResetNeeded(row, matched, classifiersVersion)) return null;
+  return row.falsePositiveClassifiersVersion !== classifiersVersion ? "classifiers_version" : "matched_increased";
+}
+
+/**
  * M2: a false positive is reset when a later scan matches more values than when it was marked, or
- * ran another classifier set (a mark without a snapshot is kept).
+ * ran another classifier set (a mark without a snapshot is kept). The ADR-0056 reset
+ * (`fpNamesAltered`) is checked on findings rows by `fpResetReason`.
  */
 export function fpResetNeeded(
   row: { falsePositiveMatched: number | null; falsePositiveClassifiersVersion: string | null },
@@ -352,7 +422,9 @@ export function fpResetNeeded(
 const FP_RESET_SQL = sql`(${findings.falsePositiveAt} is not null and (
   (${findings.falsePositiveMatched} is not null and excluded.matched > ${findings.falsePositiveMatched})
   or (${findings.falsePositiveClassifiersVersion} is not null
-      and excluded.classifiers_version <> ${findings.falsePositiveClassifiersVersion})))`;
+      and excluded.classifiers_version <> ${findings.falsePositiveClassifiersVersion})
+  or (excluded.altered is not null
+      and not (excluded.altered <@ coalesce(${findings.falsePositiveAltered}, '{}'::text[])))))`;
 
 // ----------------------------------------------------------------------------- view
 
@@ -381,6 +453,11 @@ export interface FindingView {
   firstSeenAt: Date;
   lastSeenAt: Date;
   falsePositiveAt: Date | null;
+  /**
+   * Contract `Location.altered` merged for the latest scan job (ADR-0056): the parts whose names
+   * the agent's normalization altered; null when none (or not reported).
+   */
+  altered: LocationPart[] | null;
 }
 
 function filterWhere(filter: FindingFilter): SQL | undefined {
@@ -451,6 +528,7 @@ const FINDING_VIEW_COLUMNS = {
   firstSeenAt: findings.firstSeenAt,
   lastSeenAt: findings.lastSeenAt,
   falsePositiveAt: findings.falsePositiveAt,
+  altered: findings.altered,
 };
 
 type FindingViewRow = Omit<FindingView, "samples"> & { maskedSamples: Buffer | null };
@@ -577,12 +655,15 @@ export async function applyFalsePositive(
             falsePositiveBy: sql`coalesce(${findings.falsePositiveBy}, ${actor.userId}::uuid)`,
             falsePositiveMatched: sql`case when ${findings.falsePositiveAt} is null then ${findings.matched} else ${findings.falsePositiveMatched} end`,
             falsePositiveClassifiersVersion: sql`case when ${findings.falsePositiveAt} is null then ${findings.classifiersVersion} else ${findings.falsePositiveClassifiersVersion} end`,
+            // ADR-0056 decision 3 item 3: the altered state at marking time (`{}`: not altered).
+            falsePositiveAltered: sql`case when ${findings.falsePositiveAt} is null then coalesce(${findings.altered}, '{}'::text[]) else ${findings.falsePositiveAltered} end`,
           }
         : {
             falsePositiveAt: null,
             falsePositiveBy: null,
             falsePositiveMatched: null,
             falsePositiveClassifiersVersion: null,
+            falsePositiveAltered: null,
             policyEvaluatedAt: null,
           },
     )

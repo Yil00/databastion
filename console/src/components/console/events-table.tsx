@@ -16,6 +16,7 @@ import {
   shortFingerprint,
   UNRECORDED_PRINCIPAL_TITLE,
 } from "@/lib/location-labels";
+import { NAMES_ALTERED_TITLE } from "@/lib/names-altered";
 import { signalDescription } from "@/lib/protocol/signals";
 import type { EventView, PrincipalView } from "@/server/events";
 
@@ -104,6 +105,20 @@ export function ObjectsOverflowedNote() {
   return (
     <div className="text-xs text-muted-foreground" title={OBJECTS_OVERFLOWED_TITLE} data-objects-overflowed="">
       more objects than listed (left out)
+    </div>
+  );
+}
+
+/**
+ * ADR-0056 decision 3 item 6: the objects of an event whose names the agent reported altered by
+ * its name normalization (nothing when none), as escaped text.
+ */
+export function NamesAlteredNote({ objects, engine }: { objects: EventView["objects"]; engine: string | null }) {
+  const altered = objects.filter((o) => (o.altered?.length ?? 0) > 0);
+  if (altered.length === 0) return null;
+  return (
+    <div className="text-xs text-muted-foreground" title={NAMES_ALTERED_TITLE} data-names-altered="">
+      name altered by normalization: {objectsLabel(altered, 3, engine)} (check for look-alike names)
     </div>
   );
 }
@@ -236,6 +251,7 @@ export function EventsTable({ events, now }: { events: EventView[]; now: number 
             <TableCell className="max-w-64 break-all whitespace-normal text-xs">
               <ObjectsCell objects={e.objects} engine={e.engine} />
               {e.objectsOverflowed && <ObjectsOverflowedNote />}
+              <NamesAlteredNote objects={e.objects} engine={e.engine} />
             </TableCell>
             <TableCell>
               {formatCount(e.rows)}

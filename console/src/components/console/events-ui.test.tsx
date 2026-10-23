@@ -85,6 +85,20 @@ describe("access events view", () => {
     expect(boundScoreLabel(4, null)).toBeNull();
   });
 
+  it("ADR-0056: says which objects have a name altered by normalization, as escaped text; nothing without the marker", () => {
+    const altered = event({
+      objects: [
+        { database: "crm", schema: "public", object: "clients" },
+        { database: "crm", schema: "public", object: HOSTILE, altered: ["object"] },
+      ],
+    });
+    const html = renderToStaticMarkup(<EventsTable events={[altered]} now={NOW} />);
+    expect(html).toContain("data-names-altered");
+    expect(html).toContain(`name altered by normalization: crm.public.${ESCAPED} (check for look-alike names)`);
+    expect(html).not.toContain("<img");
+    expect(renderToStaticMarkup(<EventsTable events={[event()]} now={NOW} />)).not.toContain("altered by normalization");
+  });
+
   it("escapes every agent-provided string and links principal, signals and incidents", () => {
     const html = renderToStaticMarkup(
       <EventsTable

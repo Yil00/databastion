@@ -5,6 +5,7 @@ import { parseEventConditions, type EventConditions } from "./event-model";
 import { SEVERITIES, type Severity } from "./incident-lifecycle";
 import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
+  alteredPartsCoverable,
   ENGINES,
   fail,
   globMatch,
@@ -254,6 +255,12 @@ export interface FindingFacts {
    * `sqlserver` findings.
    */
   nameCase?: NameCaseRule | null;
+  /**
+   * Contract `Location.altered` (ADR-0056), as merged on the finding row per location and job
+   * (src/server/findings.ts): the parts whose names the agent's normalization altered. Absent or
+   * null: not reported, today's rule. Used by location exceptions only (decision 3 items 4 and 5).
+   */
+  altered?: readonly LocationPart[] | null;
 }
 
 /**
@@ -308,7 +315,9 @@ export interface ExceptionScope {
  * location globs compare `database`, `schema`, `object` and `field` with case on PostgreSQL,
  * MongoDB, Redis, Valkey, CAS and an unknown engine, without case on OpenLDAP, and on SQL Server,
  * MySQL and MariaDB while their target reports no `name_case` (ADR-0054 decision 1); with one,
- * per part as the target compares names (ADR-0055 decision 6, `exceptionPartOptions`).
+ * per part as the target compares names (ADR-0055 decision 6, `exceptionPartOptions`). A part
+ * the agent reported altered by its name normalization is covered only by an absent glob or
+ * exactly `*` (ADR-0056 decision 3 item 4, `alteredPartsCoverable`).
  */
 export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingFacts, now: Date): boolean {
   if (e.expiresAt !== null && e.expiresAt.getTime() <= now.getTime()) return false;
@@ -316,7 +325,10 @@ export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingF
   if (e.agentId !== null && e.agentId !== f.agentId) return false;
   if (e.targetId !== null && e.targetId !== f.targetId) return false;
   if (e.classifier !== null && !classifierSelected([e.classifier], f.classifier)) return false;
-  if (e.location !== null && !locationMatches(e.location, f, exceptionPartOptions(f.engine, f.nameCase, f.databaseName))) return false;
+  if (e.location !== null) {
+    if (!alteredPartsCoverable(e.location, f.altered)) return false;
+    if (!locationMatches(e.location, f, exceptionPartOptions(f.engine, f.nameCase, f.databaseName))) return false;
+  }
   return true;
 }
 

@@ -20,6 +20,7 @@ import {
 } from "drizzle-orm/pg-core";
 
 import type { NameCaseRule } from "../lib/name-case";
+import type { LocationPart } from "../lib/policy-model";
 
 /**
  * Console internal schema. Changes go through `pnpm db:generate`, which
@@ -544,6 +545,22 @@ export const findings = pgTable(
     falsePositiveMatched: integer("false_positive_matched"),
     falsePositiveClassifiersVersion: text("false_positive_classifiers_version"),
     /**
+     * ADR-0056 decision 3 item 3: the row's `altered` parts when the false positive was marked
+     * (`{}` when it was not altered), cleared with the mark; null without a mark, or for a mark set
+     * before this column (then read as "not altered"). A later revision altered in a part not in
+     * this list resets the mark (audited, reason `names_altered`).
+     */
+    falsePositiveAltered: text("false_positive_altered").array().$type<LocationPart[]>(),
+    /**
+     * Contract `Location.altered` (ADR-0056 decision 3 item 2): the union of the altered parts of
+     * every item of this location within one scan job, within a batch and across that job's
+     * batches; the first batch of a new job for the location replaces it. Null: no item of that
+     * job reported an altered part (or an older agent, or a console that did not list
+     * `location.altered`). Kept in `LOCATION_PARTS` order. The one agent-reported column that
+     * changes under a merge rule rather than "as sent" (written only by the findings upsert).
+     */
+    altered: text("altered").array().$type<LocationPart[]>(),
+    /**
      * `last_seen_at` of the revision last evaluated by the policy engine (P3-A). The finding is
      * pending evaluation while it differs from `last_seen_at` (set by the worker with a
      * compare-and-set on `last_seen_at`, so a rescan during an evaluation is never lost).
@@ -948,8 +965,15 @@ export const accessEvents = pgTable(
     clientAddr: text("client_addr"),
     application: text("application"),
     action: text("action").notNull(),
-    /** Contract `ObjectRef[]` (normalized names), at most 16. */
-    objects: jsonb("objects").$type<{ database: string; schema?: string; object: string }[]>().notNull(),
+    /**
+     * Contract `ObjectRef[]` (normalized names), at most 16. `altered` (ADR-0056 decision 3 item
+     * 1): the parts the agent's name normalization altered, as sent; absent when not reported (an
+     * older agent, or a console that did not list `object_ref.altered`). Not updatable by the
+     * runtime role, like the rest of the column (migration 0022).
+     */
+    objects: jsonb("objects")
+      .$type<{ database: string; schema?: string; object: string; altered?: ("database" | "schema" | "object")[] }[]>()
+      .notNull(),
     rows: bigint("rows", { mode: "number" }),
     /**
      * Contract `AccessEvent.bytes` (P4-D): size of the result returned or of the data affected, when
