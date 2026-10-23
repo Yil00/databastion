@@ -6,6 +6,7 @@ tests of each connector (`src/proptests.rs`).
 
 | Target | Entry point | Input |
 |--------|-------------|-------|
+| `classifiers_names` | `databastion_classifiers::names::fuzz_normalize` | A name (lossy UTF-8; `/` separates field-path keys, a `*` part is an array level): `normalize_path`, `normalize_field_path`, `normalize_ldap_dn` and `normalize_ldap_attribute`; every emitted name must be `*` or match the contract `IdentifierProduced` ([ADR-0057](../../docs/adr/0057-identifier-hardening-agent-first.md) decision 1), else it panics |
 | `core_csv_splitter` | `databastion_core::audit::tail::fuzz::splitter` | Selector bytes (chunk size, start offset, damage position, record bound), then statement texts: csvlog records quoted as PostgreSQL writes them (pgaudit and `log_statement`) fed to the CSV splitter; oracles: aligned input gives exactly the records with no realignment, a first start anywhere in the first record exactly the records after it, a record cut inside a quoted field only that record lost (one damaged count), a record bound never a forged record (#267 review L3) |
 | `mongodb_bson` | `databastion_connector_mongodb::fuzz::bson` | A BSON document, every element walked |
 | `mongodb_op_msg` | `…::fuzz::op_msg` | An `OP_MSG` reply: header, flags, body section |

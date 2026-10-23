@@ -600,8 +600,11 @@ fn corpus() -> Corpus {
 }
 
 /// ADR-0057 decision 2 item 4: of the names the agent keeps (not `*`),
-/// how many the rules refuse, per rule, and none of them after the change
-/// (the agent masks them). Counts only (I2).
+/// how many the rules refuse, per rule. Run on the normalizer before it
+/// applied the rules (commit `6e0310c`, 2026-10-23): 4 163 distinct names,
+/// 4 140 kept, **none** refused by any rule (the ADR's implementation note
+/// of 2026-10-23). Since the normalizer applies them, every kept name passes
+/// (asserted). Counts only (I2).
 #[test]
 fn measurement_over_the_dev_corpus() {
     let corpus = corpus();
@@ -641,4 +644,110 @@ fn measurement_over_the_dev_corpus() {
         eprintln!("    rule {r}: {n}");
     }
     assert!(total > 1000, "the corpus is too small: {total}");
+    assert_eq!(refused, 0, "kept names refused by the rules: {by_rule:?}");
+}
+
+// ------------------------------------------------- Emitted names (oracles)
+
+/// Every normalizer's output on `input` matches the contract (generated
+/// `Identifier`, its `not` rule and `IdentifierProduced` under `regress`).
+fn assert_emitted(input: &str) {
+    let keys: Vec<PathPart<'_>> = input
+        .split('/')
+        .map(|k| {
+            if k == "*" {
+                PathPart::Index
+            } else {
+                PathPart::Key(k)
+            }
+        })
+        .collect();
+    for out in [
+        normalize_path(input),
+        normalize_ldap_dn(input),
+        normalize_ldap_attribute(input),
+        normalize_field_path(&keys),
+    ] {
+        let out = out.as_str();
+        assert!(names::is_identifier_produced(out), "{input:?} -> {out:?}");
+        assert!(contract_accepts(out), "{input:?} -> {out:?}");
+    }
+}
+
+fn name_alphabet() -> impl Strategy<Value = String> {
+    let pieces = prop::sample::select(vec![
+        "a", "b", "face", "cafe", "001a", "2b3c", "4d5e", "00", "1a", "0", "1", "9", "10", "255",
+        "12", ".", ".", ".", "-", "_", "+", " ", "/", "%", "%4", "%u00", "41", "ou=", "dc=",
+        "uid=", ",", "@", "*", "\u{ff10}", "\u{ff0e}", "\u{a0}", "\u{2010}", "\u{2212}", "\u{663}",
+        "\u{2165}", "\u{378}", "一", "六", "é", "\u{200b}",
+    ]);
+    prop::collection::vec(pieces, 0..32).prop_map(|v| v.concat())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4000))]
+
+    #[test]
+    fn emitted_names_match_identifier_produced(s in name_alphabet()) {
+        assert_emitted(&s);
+    }
+
+    /// No panic, and the contract holds, on arbitrary text.
+    #[test]
+    fn emitted_names_on_any_text(s in any::<String>()) {
+        assert_emitted(&s);
+    }
+
+    #[test]
+    fn emitted_names_on_any_bytes(b in prop::collection::vec(any::<u8>(), 0..96)) {
+        assert_emitted(&String::from_utf8_lossy(&b));
+    }
+}
+
+/// Every Unicode scalar value, in the shapes the rules look at (inside a
+/// segment, a run of 9, a digit-to-digit run, a dotted MAC with it): the
+/// agent's check never accepts what the contract refuses (Unicode version
+/// drift between the `regex` crate and `regress`), and the emitted names
+/// pass. Seconds in release mode: `cargo test --release -p
+/// databastion-classifiers --test identifier_produced -- --include-ignored`.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "full code-point sweep: run in release mode"
+)]
+fn no_drift_on_any_code_point() {
+    let mut drift = Vec::new();
+    let mut emitted = Vec::new();
+    for c in (0..=0x10_FFFF_u32).filter_map(char::from_u32) {
+        let shapes = [
+            format!("a{c}b"),
+            c.to_string().repeat(9),
+            format!("1{}2", c.to_string().repeat(7)),
+            format!("x.{c}01a.2b3c.4d5e"),
+            format!("ou=a{c},dc=x"),
+        ];
+        for s in &shapes {
+            if names::is_identifier_produced(s) && !contract_accepts(s) {
+                drift.push(format!("U+{:04X}", u32::from(c)));
+            }
+        }
+        for s in &shapes[..4] {
+            let out = normalize_path(s);
+            if !contract_accepts(out.as_str()) {
+                emitted.push(format!("U+{:04X}", u32::from(c)));
+            }
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "drift: {} {:?}",
+        drift.len(),
+        &drift[..drift.len().min(40)]
+    );
+    assert!(
+        emitted.is_empty(),
+        "emitted: {} {:?}",
+        emitted.len(),
+        &emitted[..emitted.len().min(40)]
+    );
 }
