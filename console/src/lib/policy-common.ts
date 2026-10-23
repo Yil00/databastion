@@ -143,6 +143,27 @@ export type NamePart = "database" | "schema" | "object" | "field";
  */
 export type PartGlobOptions = { readonly perPart: Readonly<Record<NamePart, GlobOptions>> };
 
+/**
+ * ADR-0056 decision 3 item 4: whether location exception globs may cover the parts the agent
+ * reported altered by its name normalization (contract `Location.altered` / `ObjectRef.altered`).
+ * An altered part is covered only by a glob that is absent or exactly `*` (the glob `\*`, which
+ * selects the literal name only, does not): another object of the engine may have been sent under
+ * the same name. The parts not altered are left to the caller's usual match (ADR-0054 / ADR-0055
+ * case rules). No list (an older agent, or a console that did not list the tokens): nothing is
+ * restricted, the console never guesses an alteration from the name. A part sent as `*` that also
+ * carries the marker (the contract says it never should) gets the same rule: stricter only.
+ */
+export function alteredPartsCoverable(
+  globs: Readonly<Partial<Record<NamePart, string>>>,
+  altered: readonly string[] | null | undefined,
+): boolean {
+  if (!altered || altered.length === 0) return true;
+  return altered.every((part) => {
+    const g = globs[part as NamePart];
+    return g === undefined || g === "*";
+  });
+}
+
 /** The options of `part`: the same for every part when `opts` is a plain {@link GlobOptions}. */
 export function optionsFor(opts: GlobOptions | PartGlobOptions, part: NamePart): GlobOptions {
   return "perPart" in opts ? opts.perPart[part] : opts;

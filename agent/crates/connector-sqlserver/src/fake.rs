@@ -1,7 +1,7 @@
 //! A scripted fake server for unit tests (as `connector-mysql/src/fake.rs`):
 //! for each client message (packets up to `EOM`), the next scripted
 //! response is sent as one `TABULAR_RESULT` message, or nothing for
-//! [`SILENT`].
+//! [`SILENT`], or the connection is closed for [`CLOSE`].
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -9,6 +9,8 @@ use crate::tds;
 
 /// A scripted "response" that sends nothing.
 pub(crate) const SILENT: &[u8] = b"\0silent";
+/// A scripted "response" that closes the connection instead.
+pub(crate) const CLOSE: &[u8] = b"\0close";
 
 /// Serves `responses` in order; returns the client's messages, each as
 /// its packet type followed by its payload.
@@ -36,6 +38,7 @@ pub(crate) async fn serve(mut io: DuplexStream, responses: Vec<Vec<u8>>) -> Vec<
         received.push(std::mem::take(&mut current));
         match responses.next() {
             Some(r) if r == SILENT => {}
+            Some(r) if r == CLOSE => return received,
             Some(r) => {
                 let framed = tds::frame(tds::ptype::TABULAR_RESULT, &r, 4096);
                 if io.write_all(&framed).await.is_err() {

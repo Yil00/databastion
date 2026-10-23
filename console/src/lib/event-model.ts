@@ -3,6 +3,7 @@ import { validateSchema } from "@/lib/protocol/validate";
 
 import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
+  alteredPartsCoverable,
   ENGINES,
   fail,
   globMatch,
@@ -363,6 +364,12 @@ export interface EventObject {
   database: string;
   schema?: string | null;
   object: string;
+  /**
+   * Contract `ObjectRef.altered` (ADR-0056), stored as sent: the parts whose names the agent's
+   * normalization altered. Absent: not reported, today's rule. Used by location exceptions only
+   * (decision 3 items 4 and 5); conditions, sensitivity, scores and the dedup key ignore it.
+   */
+  altered?: readonly ObjectPart[];
 }
 
 /** The event fields a policy may look at (no value: events carry none). */
@@ -512,7 +519,9 @@ export interface EventExceptionScope {
  * trailing spaces only on the target's engine of `TRAILING_SPACE_BLIND_ENGINES`
  * (src/lib/policy-common.ts) (N1; an unknown engine: never). An overflow `*` of a flagged event
  * (ADR-0053) is covered only by an exception that covers every object of its database
- * (`exceptionCoversOverflowStar`).
+ * (`exceptionCoversOverflowStar`). A part of an object that the agent reported altered by its name
+ * normalization is covered only by an absent glob or exactly `*` (ADR-0056 decision 3 item 4,
+ * `alteredPartsCoverable`), per object: the other objects of the event keep their own result.
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,
@@ -532,6 +541,8 @@ export function exceptionCoversEvent(
     if (objectIdx.length === 0) return false;
     return objectIdx.every((i) => {
       const o = e.objects[i] as EventObject;
+      // ADR-0056 decision 3 item 4: an altered part only under an absent glob or exactly `*`.
+      if (!alteredPartsCoverable(parts, o.altered)) return false;
       // ADR-0055 decision 6: per part, from the target's `name_case` and the object's database.
       const opts = exceptionPartOptions(e.engine, e.nameCase, o.database);
       return isOverflowStar(e, o) ? exceptionCoversOverflowStar(parts, o, opts.perPart.database) : objectMatches(parts, o, opts);

@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 
 import { getDb } from "@/db/client";
 import { auditLog, findings, findingsBatches, jobs, securityEvents } from "@/db/schema";
+import { exceptionCovers } from "@/lib/policy-model";
 import { validateSchema } from "@/lib/protocol/validate";
 import {
   canonicalJson,
@@ -759,6 +760,204 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       const [row] = await getDb().select().from(findings).where(eq(findings.id, id));
       expect(row?.falsePositiveAt).toBeNull();
       expect((await resets(id))[0]?.details).toMatchObject({ reason: "classifiers_version" });
+    });
+  });
+
+  describe("ADR-0056: altered parts merged per location and job", () => {
+    const TWIN = { ...PG_FINDING, location: { ...PG_FINDING.location, altered: ["object"] } };
+    const rowOf = async (agentId: string) => {
+      const rows = await getDb().select().from(findings).where(eq(findings.agentId, agentId));
+      expect(rows).toHaveLength(1);
+      return rows[0] as typeof findings.$inferSelect;
+    };
+    const covers = (row: typeof findings.$inferSelect, location: Record<string, string>) =>
+      exceptionCovers(
+        { policyId: null, agentId: null, targetId: null, classifier: null, location, expiresAt: null },
+        "p",
+        { ...row, altered: row.altered },
+        new Date(),
+      );
+    const resets = (id: string) =>
+      getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.action, "finding.false_positive_reset"), eq(auditLog.targetId, id)));
+
+    it("plain, altered, then plain in one batch leave the row altered; an exception naming the object never covers it", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      expect((await post(auth, batch(jobId, [PG_FINDING, TWIN, { ...PG_FINDING, matched: 3 }]))).status).toBe(202);
+      const row = await rowOf(auth.agentId);
+      expect(row.matched).toBe(3);
+      expect(row.altered).toEqual(["object"]);
+      expect(covers(row, { object: "clients" })).toBe(false);
+      expect(covers(row, { schema: "public", object: "*" })).toBe(true);
+      expect(covers(row, { database: "crm" })).toBe(true);
+      expect((await listFindings(getDb(), { agentId: auth.agentId }))[0]?.altered).toEqual(["object"]);
+    });
+
+    it("across batches of one job: plain, altered, plain leave the row altered (parts unioned); the next job's first batch replaces it", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      expect((await post(auth, batch(jobId, [PG_FINDING]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).altered).toBeNull();
+      expect((await post(auth, batch(jobId, [TWIN]))).status).toBe(202);
+      expect((await post(auth, batch(jobId, [PG_FINDING]))).status).toBe(202);
+      let row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object"]);
+      expect(covers(row, { object: "clients" })).toBe(false);
+      // A later batch of the same job altered in another part: the union, in location order.
+      const fieldTwin = { ...PG_FINDING, location: { ...PG_FINDING.location, altered: ["field"] } };
+      expect((await post(auth, batch(jobId, [fieldTwin]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object", "field"]);
+
+      // The next job reports the location without the look-alike: cleared.
+      await getDb().update(jobs).set({ status: "succeeded" }).where(eq(jobs.id, jobId));
+      const next = await deliveredScan(auth);
+      expect((await post(auth, batch(next, [PG_FINDING]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toBeNull();
+      expect(covers(row, { object: "clients" })).toBe(true);
+      // ...and a further batch of that job with the look-alike marks it again.
+      expect((await post(auth, batch(next, [TWIN]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).altered).toEqual(["object"]);
+    });
+
+    it("a late batch of an earlier job never clears the parts of a newer one (review L1: B1 altered, late A plain, B2 plain)", async () => {
+      const auth = await agentWithTargets();
+      const a = await deliveredScan(auth);
+      expect((await post(auth, batch(a, [PG_FINDING]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, a));
+      const b = await deliveredScan(auth);
+      // B1: the look-alike.
+      expect((await post(auth, batch(b, [TWIN]))).status).toBe(202);
+      // Late A, plain: the row's last job becomes A for the other columns, the parts stay B's.
+      expect((await post(auth, batch(a, [PG_FINDING]))).status).toBe(202);
+      let row = await rowOf(auth.agentId);
+      expect(row.lastJobId).toBe(a);
+      expect(row.altered).toEqual(["object"]);
+      expect(row.alteredJobId).toBe(b);
+      // B2, plain: still B's job, so the union keeps the marker.
+      expect((await post(auth, batch(b, [PG_FINDING]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object"]);
+      expect(covers(row, { object: "clients" })).toBe(false);
+      // A late batch of the older job that is altered adds its parts (fail closed).
+      const fieldTwin = { ...PG_FINDING, location: { ...PG_FINDING.location, altered: ["field"] } };
+      expect((await post(auth, batch(a, [fieldTwin]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object", "field"]);
+      expect(row.alteredJobId).toBe(b);
+      // The first batch of a newer job replaces them.
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, b));
+      const c = await deliveredScan(auth);
+      expect((await post(auth, batch(c, [PG_FINDING]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toBeNull();
+      expect(row.alteredJobId).toBe(c);
+    });
+
+    it("a stored job that is gone counts as older: the next batch replaces its parts", async () => {
+      const auth = await agentWithTargets();
+      const a = await deliveredScan(auth);
+      expect((await post(auth, batch(a, [TWIN]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, a));
+      const b = await deliveredScan(auth);
+      const gone = "01925f40-0000-7000-8000-000000000056";
+      await getDb().update(findings).set({ alteredJobId: gone }).where(eq(findings.agentId, auth.agentId));
+      expect((await post(auth, batch(b, [PG_FINDING]))).status).toBe(202);
+      const row = await rowOf(auth.agentId);
+      expect(row.altered).toBeNull();
+      expect(row.alteredJobId).toBe(b);
+    });
+
+    it("a false positive marked on the unaltered row does not apply to the altered one (reset, audited names_altered)", async () => {
+      const auth = await agentWithTargets();
+      const first = await deliveredScan(auth);
+      expect((await post(auth, batch(first, [PG_FINDING]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded" }).where(eq(jobs.id, first));
+      const { id } = await rowOf(auth.agentId);
+      const userId = await adminUser();
+      expect(await setFalsePositive(getDb(), id, true, { userId, ip: null })).toBe(true);
+      let row = await rowOf(auth.agentId);
+      expect(row.falsePositiveAltered).toEqual([]);
+
+      // A rescan without the look-alike keeps the mark.
+      const second = await deliveredScan(auth);
+      expect((await post(auth, batch(second, [PG_FINDING]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).not.toBeNull();
+      expect(await resets(id)).toHaveLength(0);
+
+      // The same job then reports the altered look-alike: the mark is reset and audited.
+      expect((await post(auth, batch(second, [TWIN]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object"]);
+      expect(row.falsePositiveAt).toBeNull();
+      expect(row.falsePositiveBy).toBeNull();
+      expect(row.falsePositiveMatched).toBeNull();
+      expect(row.falsePositiveAltered).toBeNull();
+      const audit = await resets(id);
+      expect(audit).toHaveLength(1);
+      expect(audit[0]?.details).toMatchObject({ agent_id: auth.agentId, target_id: "pg-prod-1", classifier: "pii.email", job_id: second, reason: "names_altered" });
+      // The audit log keeps the earlier mark.
+      const marks = await getDb()
+        .select()
+        .from(auditLog)
+        .where(and(eq(auditLog.action, "finding.false_positive"), eq(auditLog.targetId, id)));
+      expect(marks).toHaveLength(1);
+
+      // Marked again on the altered row: kept while no other part is altered, even once cleared.
+      expect(await setFalsePositive(getDb(), id, true, { userId, ip: null })).toBe(true);
+      expect((await rowOf(auth.agentId)).falsePositiveAltered).toEqual(["object"]);
+      expect((await post(auth, batch(second, [TWIN]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded" }).where(eq(jobs.id, second));
+      const third = await deliveredScan(auth);
+      expect((await post(auth, batch(third, [PG_FINDING]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).not.toBeNull();
+      expect((await post(auth, batch(third, [TWIN]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).not.toBeNull();
+      // Altered in a part it was not altered in when marked: reset again.
+      const schemaTwin = { ...PG_FINDING, location: { ...PG_FINDING.location, altered: ["schema"] } };
+      expect((await post(auth, batch(third, [schemaTwin]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).toBeNull();
+      expect(await resets(id)).toHaveLength(2);
+      // Unmarking clears the snapshot.
+      expect(await setFalsePositive(getDb(), id, true, { userId, ip: null })).toBe(true);
+      expect(await setFalsePositive(getDb(), id, false, { userId, ip: null })).toBe(true);
+      expect((await rowOf(auth.agentId)).falsePositiveAltered).toBeNull();
+    });
+
+    it("a mark set before migration 0046 (no snapshot) is read as \"not altered\"", async () => {
+      const auth = await agentWithTargets();
+      const jobId = await deliveredScan(auth);
+      expect((await post(auth, batch(jobId, [PG_FINDING]))).status).toBe(202);
+      const { id } = await rowOf(auth.agentId);
+      await getDb().update(findings).set({ falsePositiveAt: new Date(), falsePositiveMatched: 194 }).where(eq(findings.id, id));
+      expect((await post(auth, batch(jobId, [PG_FINDING]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).not.toBeNull();
+      expect((await post(auth, batch(jobId, [TWIN]))).status).toBe(202);
+      expect((await rowOf(auth.agentId)).falsePositiveAt).toBeNull();
+      expect((await resets(id))[0]?.details).toMatchObject({ reason: "names_altered" });
+    });
+
+    it("stores the contract fixtures' parts (PostgreSQL and CAS)", async () => {
+      for (const [name, target] of [["FindingsBatch.postgres-altered.json", "pg-prod-1"], ["FindingsBatch.cas-altered-field.json", "cas-prod"]] as const) {
+        const [, found] = fixtures("valid", "FindingsBatch").find(([f]) => f === name) ?? [];
+        expect(found, name).toBeDefined();
+        const fixture = structuredClone(found) as Body;
+        const auth = await agentWithTargets();
+        const jobId = await deliveredScan(auth, target);
+        expect((await post(auth, { ...fixture, batch_id: uuidv7(), job_id: jobId })).status, name).toBe(202);
+        const rows = await getDb()
+          .select()
+          .from(findings)
+          .where(and(eq(findings.agentId, auth.agentId), eq(findings.targetId, target)));
+        const byObject = new Map(rows.map((r) => [`${r.objectName}/${r.fieldName}`, r.altered]));
+        for (const f of fixture.findings as { location: { object: string; field: string; altered?: string[] } }[]) {
+          expect(byObject.get(`${f.location.object}/${f.location.field}`), `${name} ${f.location.object}`).toEqual(f.location.altered ?? null);
+        }
+      }
     });
   });
 
