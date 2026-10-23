@@ -331,9 +331,27 @@ def _choose(n_expr: str, values: tuple[str, ...]) -> str:
     return f"CHOOSE(1 + CAST({n_expr} AS int), {_sql_list(values)})"
 
 
-def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
-    """Schema, tables, rows (GENERATE_SERIES, SQL Server 2022, compatibility level 160) and grants,
-    in sqlcmd batches (GO) of `batch` tables."""
+def _tsql_numbers(rows: int, series: bool) -> str:
+    """A derived table of the integers 1..rows (bigint) in column `value`: GENERATE_SERIES (SQL Server
+    2022+, compatibility level 160) when `series`, else a portable tally (SQL Server 2019: cross joins
+    of a 10-row VALUES list, numbered with ROW_NUMBER, TOP (rows))."""
+    if rows < 1:
+        raise ValueError("rows must be positive")
+    if series:
+        return f"GENERATE_SERIES(CAST(1 AS bigint), CAST({rows} AS bigint))"
+    levels = 1
+    while 10 ** levels < rows:
+        levels += 1
+    digits = "(VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9))"
+    joins = " CROSS JOIN ".join(f"{digits} AS d{k}(x)" for k in range(levels))
+    return (f"(SELECT TOP (CAST({rows} AS bigint)) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS value "
+            f"FROM {joins}) AS n")
+
+
+def sqlserver_sql(tables: list[Table], batch: int = 20, series: bool = True) -> str:
+    """Schema, tables, rows and grants, in sqlcmd batches (GO) of `batch` tables. The rows come from
+    GENERATE_SERIES (SQL Server 2022+, the default) or, with `series=False`, from a portable tally
+    (SQL Server 2019, which has no GENERATE_SERIES): the same values either way."""
     nf, nl, nd = len(FIRST_NAMES), len(LAST_NAMES), len(MAIL_DOMAINS)
     types = {"email": "nvarchar(128)", "phone": "nvarchar(32)", "iban": "nvarchar(34)",
              "amount": "decimal(12,2)", "quantity": "int"}
@@ -361,7 +379,7 @@ def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
             f"{_choose(f's.g % {len(STATUSES)}', STATUSES)}, CONCAT('order ', s.g, ' batch ', s.g % 97), {sel} "
             f"FROM (SELECT value AS g, CONCAT('{BANK_CODE}', RIGHT(CONCAT('0000', {t.index}), 5), "
             f"RIGHT(CONCAT('0000000000', value), 11), RIGHT(CONCAT('0', value % 97), 2)) AS bban "
-            f"FROM GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))) AS s;"
+            f"FROM {_tsql_numbers(t.rows, series)}) AS s;"
         )
         if (i + 1) % batch == 0:
             out.append("GO")
@@ -588,6 +606,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rows", type=int, required=True)
     p.add_argument("--out", help="output directory (pgbench)")
     p.add_argument("--dialect", choices=ORM_DIALECTS, help="orm: the SQL dialect")
+    p.add_argument("--no-generate-series", action="store_true",
+                   help="sqlserver: rows from a portable tally instead of GENERATE_SERIES (SQL Server 2019)")
     p.add_argument("--workload-tables", type=int, default=40,
                    help="tables the pgbench / sysbench workload reads (the first ones of the plan)")
     a = p.parse_args(argv)
@@ -615,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     elif a.what == "sysbench":
         sys.stdout.write(sysbench_lua(hot))
     elif a.what == "sqlserver":
-        sys.stdout.write(sqlserver_sql(tables))
+        sys.stdout.write(sqlserver_sql(tables, series=not a.no_generate_series))
     elif a.what == "tsql":
         sys.stdout.write(tsql_workload(hot))
     elif a.what == "orm":

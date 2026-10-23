@@ -184,7 +184,7 @@ const print = (x) => console.error(String(x));
 
 
 class SqlServerTest(unittest.TestCase):
-    """The T-SQL generators (run against SQL Server 2022 Express by e2e/load/sqlserver.sh)."""
+    """The T-SQL generators (run against SQL Server 2022 Express, or 2019 / 2025, by e2e/load/sqlserver.sh)."""
 
     def test_seed_shape(self) -> None:
         p = seed.plan(45, 9000)
@@ -201,6 +201,30 @@ class SqlServerTest(unittest.TestCase):
             self.assertIn(f"GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))", sql)
         # No value literal of a row: the server generates them.
         self.assertNotIn("@inbox.example.com", sql)
+
+    def test_seed_without_generate_series(self) -> None:
+        # SQL Server 2019 (sqlserver.sh with LOAD_SQLSERVER_VERSION=2019) has no GENERATE_SERIES: a
+        # tally of enough 10-row cross joins, cut at the table's rows; otherwise the same script.
+        p = seed.plan(45, 9000)
+        sql = seed.sqlserver_sql(p, batch=20, series=False)
+        self.assertNotIn("GENERATE_SERIES", sql)
+        self.assertEqual(sql.count("INSERT INTO load.t"), 45)
+        for t in p:
+            self.assertIn(f"SELECT TOP (CAST({t.rows} AS bigint)) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS value", sql)
+        with_series = seed.sqlserver_sql(p, batch=20)
+        self.assertEqual(with_series.count("GENERATE_SERIES"), 45)
+        # Only the row source differs.
+        self.assertEqual(sql.count("\nGO\n"), with_series.count("\nGO\n"))
+        # Levels: 10^levels >= rows, no more.
+        for rows, levels in ((1, 1), (10, 1), (11, 2), (100, 2), (101, 3), (500000, 6), (1000001, 7)):
+            self.assertEqual(seed._tsql_numbers(rows, False).count("CROSS JOIN"), levels - 1, rows)
+        with self.assertRaises(ValueError):
+            seed._tsql_numbers(0, False)
+        out = subprocess.run([sys.executable, os.path.join(os.path.dirname(seed.__file__), "seed.py"),
+                              "sqlserver", "--tables", "10", "--rows", "2000", "--no-generate-series"],
+                             capture_output=True, text=True, timeout=60, check=True).stdout
+        self.assertNotIn("GENERATE_SERIES", out)
+        self.assertEqual(out.count("INSERT INTO load.t"), 10)
 
     def test_iban_expression_matches_the_reference(self) -> None:
         # The T-SQL builds the same BBAN as bban(): bank code, table index on 5 digits, row id on

@@ -89,7 +89,8 @@ local `e2e/run.sh`).
 | `LOAD_DRAIN_TIMEOUT_S` | 300 | Longest wait for the Audit run's events after the workload |
 | `LOAD_PG_AUDIT` | `pgaudit` | `pss`: local runs without the pgaudit image (above) |
 | `LOAD_HTTPS_PORT` | 8543 | Port of the TLS proxy on 127.0.0.1 |
-| `LOAD_SQLSERVER_AUDIT_SOURCE` | `sqlserver_audit` | `sqlserver.sh` only: `sqlserver_xevents` for the Extended Events source ([below](#extended-events-source-catch-up-noise-282-review-n3)) |
+| `LOAD_SQLSERVER_VERSION` | 2022 | `sqlserver.sh` only: 2019 or 2025, the engine matrix's pinned image of that version ([below](#other-versions-sql-server-2019-and-2025)) |
+| `LOAD_SQLSERVER_AUDIT_SOURCE` | `sqlserver_audit` (`sqlserver_xevents` on 2019) | `sqlserver.sh` only: `sqlserver_xevents` for the Extended Events source ([below](#extended-events-source-catch-up-noise-282-review-n3)) |
 | `LOAD_SQLSERVER_STATS_RESET_S` | 0 | `sqlserver.sh` only: drop the load schema's auto-created statistics every N seconds of the Audit run |
 | `LOAD_LIMIT_<NAME>` | see below | Every field of `loadlib.Limits`, upper case, e.g. `LOAD_LIMIT_DISCOVERY_PCT=2.0`, `LOAD_LIMIT_DRAIN_S=240`, `LOAD_LIMIT_AGENT_REF_CPU_CORES=0.013` (the release reference of the agent checks) |
 
@@ -369,14 +370,35 @@ LOAD_SKIP_BUILD=1 e2e/load/sqlserver.sh                 # reuse the images built
 LOAD_MSSQL_DIAG=1 e2e/load/sqlserver.sh                 # local only: the scan's top statements
 ```
 
+### Other versions: SQL Server 2019 and 2025
+
+`LOAD_SQLSERVER_VERSION=2019` or `2025` (default 2022, the dev pin; workflow input
+`sqlserver_version` of `load.yml`) runs the same measurement against the engine matrix's pinned
+image of that version (2019: 15.0.4500.2; 2025: 17.0.5015.4), Express, as
+[`e2e/sqlserver.sh`](../sqlserver.sh) does with `E2E_SQLSERVER_VERSION`; the pin must be the one of
+[`engine-matrix.yml`](../../.github/workflows/engine-matrix.yml) (checked at start), and the run
+checks that the server reports that major version and the Express edition. On 2019, which has no
+usable SQL Server Audit source ([ADR-0051](../../docs/adr/0051-sqlserver-connector.md) decision 6),
+the source is Extended Events (the default there; `sqlserver_audit` is refused), the agent login
+holds the dev script's 2019 grant `VIEW SERVER STATE` (`VIEW SERVER PERFORMANCE STATE` is 2022+),
+and the scaled seed comes from a portable tally (`seed.py sqlserver --no-generate-series`:
+`GENERATE_SERIES` is 2022+; the same values). The agent login's server permissions are checked
+before the agent starts on every version. The 2019 drain run (ROADMAP "Extended Events read size,
+merge review follow-ups"):
+
+```sh
+LOAD_SQLSERVER_VERSION=2019 e2e/load/sqlserver.sh       # Extended Events, 50 SELECTs/s
+```
+
 ### Extended Events source: catch-up noise (#282 review N3)
 
 `LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents` (default `sqlserver_audit`; workflow input
 `sqlserver_audit_source` of `load.yml`) runs the same measurement with the Extended Events source:
 `audit: {source: sqlserver_xevents, xe_session: databastion_xe}` (the dev session, as
 [`e2e/sqlserver.sh`](../sqlserver.sh) with `E2E_SQLSERVER_AUDIT_SOURCE`), and the agent login holds
-that source's grant only (the two SQL Server Audit grants revoked, `VIEW SERVER PERFORMANCE STATE`
-granted, before the agent starts). Every statement of the workload's T-SQL loop is an Extended
+that source's grant only (on 2022+, the two SQL Server Audit grants revoked, `VIEW SERVER
+PERFORMANCE STATE` granted, before the agent starts; on 2019, `VIEW SERVER STATE`,
+[below](#other-versions-sql-server-2019-and-2025)). Every statement of the workload's T-SQL loop is an Extended
 Events event (`SET`, `IF`, `WAITFOR`, the table-variable insert: about 30 per workload `SELECT`), so
 the default rate is 50 `SELECT`s per second with this source (`LOAD_MSSQL_RATE`, workflow input
 `sqlserver_rate`), about 1 500 events per second, within the session's 8 files of 64 MB over a
