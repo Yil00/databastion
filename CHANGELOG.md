@@ -55,6 +55,10 @@ The project follows [semantic versioning](https://semver.org/).
 - **Agent, SQL Server: a name case kept from before a server restart is reset** (phase 9 follow-up, the #303 residual, [ADR-0055](docs/adr/0055-agent-reported-name-case-semantics.md) decision 2). Each new session of either Audit stream reads the server run (server name and `tempdb`'s creation time, one new constant statement on `sys.databases`, no new grant); a `name_case` read on another run is sent as `unknown` until the next `check()`, also when a check that read on the earlier run ends after the stream saw the new one.
 - **Agent, SQL Server Extended Events: the failed-login proof of a filtered `error_reported` follows changes of the session and ignores clock skew** (#280 re-review L-b). The 18456 that proves failed logins are recorded is aged on the server's clock against the agent's own session's read-back and kept for 24 h on the agent's clock. The proof is taken again when the session's events, actions or the presence of a predicate change, and when the stream reads a statement that may create, alter or drop an event session (dynamic SQL included) or a statement event whose text was not read whole; only a later 18456 proves it again, so `audit.failed_logins_not_audited` can come back after an operator changes the session.
 
+### 🔒 Security
+
+- **Agent: `ctutils` 0.4.5** (RUSTSEC-2026-0385: mask generation and `u128` comparisons that should run in constant time could branch). It sits under `digest`, used by the agent's HMAC fingerprints, SHA-256 and the database authentication hashes; the agent compares no secret against attacker-timed input with it, so we know of no exposure.
+
 ### ⚡️ Performance
 
 - **Load harness, SQL Server: database CPU and latency during the catch-up** (`e2e/load/`). The `load-sqlserver` report adds the database CPU of the drain window (`db_cores_drain`), the p95 of a constant-`SELECT` latency probe before Audit and during the drain (`probe_p95_us_off`, `probe_p95_us_drain`), and the drain's progress (`stored_at_workload_end`, `drain_rate_per_s`), for information.
