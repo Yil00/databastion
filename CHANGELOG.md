@@ -7,6 +7,8 @@ The project follows [semantic versioning](https://semver.org/).
 
 ## Unreleased
 
+## [0.8.1](https://github.com/Yil00/databastion/compare/0.8.0...0.8.1) (2026-10-23)
+
 A security fix release after 0.8.0, agent only: no console, migration, protocol or grant change. Upgrade the agents that read SQL Server Audit through Extended Events; a 0.8.x console accepts this agent.
 
 ### 🔒 Security
