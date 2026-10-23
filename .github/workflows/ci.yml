@@ -736,14 +736,15 @@ jobs:
   # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
   # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
   # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
-  # up. Ignored in debug builds (5 to 11 minutes there), about 20 s in release. A job of its own so
+  # up. Ignored in debug builds (5 to 11 minutes there), about 20 s in release. Also the normalized
+  # names' IdentifierProduced sweep (ADR-0057). A job of its own so
   # that the release build neither shares the debug cache nor eats the Agent job's time budget.
   agent-keys-sweep:
     name: Agent key-pattern code-point sweep (release)
     needs: detect
     if: needs.detect.outputs.agent == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: agent
@@ -760,6 +761,10 @@ jobs:
           key: release-sweep
       - name: Code-point sweep (keys_contract, release)
         run: timeout 600 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test --release --locked -p databastion-classifiers --test keys_contract -- --include-ignored
+      # The same sweep for the normalized names against the contract's IdentifierProduced rule
+      # (ADR-0057, classifiers test identifier_produced): about 3 minutes in release.
+      - name: Code-point sweep (identifier_produced, release)
+        run: timeout 600 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test --release --locked -p databastion-classifiers --test identifier_produced -- --include-ignored
 
   # Phase 7: stable smoke run of the parser fuzz targets (agent/fuzz, own workspace): MongoDB BSON,
   # OP_MSG, auditLog / server log lines, profiler entries; OpenLDAP BER, LDAPMessage, search filters,

@@ -1011,7 +1011,13 @@ pub fn normalize_path(raw: &str) -> NormalizedName {
     };
     // ADR-0056: the first step changed the name as read from the engine.
     let altered = cleaned != raw;
-    let spans = value_spans(&cleaned);
+    let mut spans = value_spans(&cleaned);
+    // ADR-0057 (review M1): the `IdentifierProduced` rules also on the
+    // folded input, before digit-only segments become `[]`, so a dotted MAC
+    // or a split run with an index-like part (`dev.ab3c.1234.4d5e`,
+    // `a.1_2.3_4.5`) is masked as a whole. The output is checked again in
+    // `NormalizedName::checked`.
+    spans.extend(produced_spans(&cleaned));
     let mut out: Vec<String> = Vec::new();
     let mut in_value = false;
     let mut offset = 0;
@@ -1127,7 +1133,11 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
     if joined.len() > MAX_INPUT_BYTES {
         return NormalizedName::wildcard();
     }
-    let spans = value_spans(&joined);
+    let mut spans = value_spans(&joined);
+    // ADR-0057 (review M1): the rules on the joined keys too, before
+    // digit-only keys become `*` (`dev` / `ab3c` / `1234` / `4d5e`); array
+    // levels are `#`, which no rule reads.
+    spans.extend(produced_spans(&joined));
     let mut out: Vec<String> = Vec::new();
     let mut in_value = false;
     for ((part, key), range) in parts.iter().zip(&keys).zip(&ranges) {
@@ -1722,9 +1732,18 @@ mod tests {
             // Rule 3, dashed MAC (already a long hexadecimal key).
             ("00-1a-2b-3c-4d-5e", "*"),
             ("device.00-1a-2b-3c-4d-5e.port", "device.*.port"),
-            // Rule 3, IPv4: digit-only segments are indices, never kept.
-            ("host.10.0.0.1", "host[][][][]"),
-            ("10.0.0.1", "*[][][]"),
+            // Rule 3, IPv4, read on the input (review M1).
+            ("host.10.0.0.1", "host.*"),
+            ("10.0.0.1", "*"),
+            // Dotted MACs with an index-like part (review M1).
+            ("dev.abcd.ef01.2345", "dev.*"),
+            ("dev.ab3c.1234.4d5e", "dev.*"),
+            ("1234.ab3c.4d5e", "*"),
+            ("ou=001a.2b3c.4d5e,dc=x", "*"),
+            ("a.1_2.3_4.5", "a.*"),
+            ("matrix.1.2.3.4.5", "matrix.*"),
+            ("matrix.1.2.3.4", "matrix.*"),
+            ("matrix.1.2.3", "matrix[][][]"),
             // Rule 2: short runs split inside one segment, and across
             // segments.
             ("1_2_3_4_5", "*"),
@@ -1767,6 +1786,11 @@ mod tests {
                 "by_version.*.count",
             ),
             (vec![Key("macs"), Key("00-1a-2b-3c-4d-5e")], "macs.*"),
+            (
+                vec![Key("dev"), Key("ab3c"), Key("1234"), Key("4d5e")],
+                "dev.*",
+            ),
+            (vec![Key("a"), Key("1_2"), Key("3_4"), Key("5")], "a.*"),
             (vec![Key("cards"), Index, Key("face")], "cards[].face"),
         ] {
             let out = normalize_field_path(&parts);

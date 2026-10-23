@@ -7,23 +7,20 @@
 //!   crate) accepts exactly what the contract accepts (the generated
 //!   `Identifier` type, its `not` rule and the producer rules compiled with
 //!   `regress` in ECMAScript `u` mode, as the console's Ajv);
-//! - the measurement of ADR-0057 decision 2 item 4: the rules run over the
-//!   names of the dev ground truth, the dev seeds and init scripts (which
-//!   the engine matrix and the end-to-end runs load), the CAS fixtures and
-//!   the `load` seed's names, counted per rule. Counts only, never a name
-//!   (I2). Run with `--nocapture` to see the table.
+//! - every name the normalizers emit matches it, and a dotted MAC, an IPv4
+//!   address or a split digit run in the input leaves none of its parts in
+//!   the output, index-like parts included (security review M1).
+//!
+//! The measurement of decision 2 item 4 is `identifier_produced_measure.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// The measurement table is the purpose of one test; it carries counts only.
-#![allow(clippy::print_stderr)]
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use databastion_classifiers::names::{
-    self, IDENTIFIER_PRODUCED_RULES, NormalizedName, PathPart, normalize_field_path,
-    normalize_ldap_attribute, normalize_ldap_dn, normalize_path,
+    self, IDENTIFIER_PRODUCED_RULES, PathPart, normalize_field_path, normalize_ldap_attribute,
+    normalize_ldap_dn, normalize_path,
 };
 use databastion_protocol::Identifier;
 use databastion_protocol_codegen::{default_openapi_path, json_schema_from_openapi};
@@ -221,432 +218,6 @@ proptest! {
     }
 }
 
-// ------------------------------------------------------------ Measurement
-
-/// Which normalizer a raw name goes through, as the connectors use them.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Raw {
-    /// `normalize_path`: databases, schemas, tables, columns, collections.
-    Path(String),
-    /// `normalize_field_path`: MongoDB field paths with their real keys
-    /// (`None` is an array level).
-    Field(Vec<Option<String>>),
-    /// `normalize_ldap_dn`: suffixes and entry DNs (reduced to containers).
-    Dn(String),
-    /// `normalize_ldap_attribute`.
-    Attribute(String),
-}
-
-impl Raw {
-    fn normalize(&self) -> NormalizedName {
-        match self {
-            Self::Path(s) => normalize_path(s),
-            Self::Dn(s) => normalize_ldap_dn(s),
-            Self::Attribute(s) => normalize_ldap_attribute(s),
-            Self::Field(parts) => {
-                let parts: Vec<PathPart<'_>> = parts
-                    .iter()
-                    .map(|p| p.as_deref().map_or(PathPart::Index, PathPart::Key))
-                    .collect();
-                normalize_field_path(&parts)
-            }
-        }
-    }
-}
-
-type Corpus = BTreeMap<&'static str, BTreeSet<Raw>>;
-
-fn add_path(c: &mut Corpus, source: &'static str, name: &str) {
-    let name = name
-        .trim()
-        .trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'));
-    if !name.is_empty() && !name.contains(['{', '}', '\\']) {
-        c.entry(source)
-            .or_default()
-            .insert(Raw::Path(name.to_owned()));
-    }
-}
-
-/// A possibly qualified SQL name (`schema.table`, `[db].[dbo].[t]`), each
-/// part on its own, as the connectors read them from the catalogs.
-fn add_qualified(c: &mut Corpus, source: &'static str, name: &str) {
-    for part in name.split('.') {
-        add_path(c, source, part);
-    }
-}
-
-const SQL_KEYWORDS: [&str; 12] = [
-    "PRIMARY",
-    "UNIQUE",
-    "CONSTRAINT",
-    "FOREIGN",
-    "CHECK",
-    "KEY",
-    "INDEX",
-    "PERIOD",
-    "FULLTEXT",
-    "SPATIAL",
-    "LIKE",
-    "EXCLUDE",
-];
-
-/// The body of the parenthesis opening at `open` (byte index of `(`).
-fn paren_body(s: &str, open: usize) -> Option<&str> {
-    let mut depth = 0usize;
-    for (i, ch) in s[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[open + 1..open + i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Top-level comma-separated items of a parenthesized body.
-fn top_level_items(body: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let (mut depth, mut start) = (0usize, 0usize);
-    for (i, ch) in body.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                out.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(&body[start..]);
-    out
-}
-
-/// Object and column names of the SQL statements in `text` (seeds, init
-/// scripts): `CREATE TABLE / VIEW / SCHEMA / DATABASE` names, the columns
-/// of `CREATE TABLE` bodies and of `INSERT INTO … (columns)` lists.
-fn add_sql(c: &mut Corpus, source: &'static str, text: &str) {
-    static CREATE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|SCHEMA|DATABASE)\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(;]+)"#,
-        )
-        .unwrap()
-    });
-    static INSERT: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?i)\bINSERT\s+INTO\s+([^\s(;]+)\s*\("#).unwrap());
-    for m in CREATE.captures_iter(text) {
-        let kind = m[1].to_ascii_uppercase();
-        add_qualified(c, source, &m[2]);
-        if kind != "TABLE" {
-            continue;
-        }
-        let end = m.get(0).unwrap().end();
-        let rest = &text[end..];
-        let Some(open) = rest.find(|ch: char| !ch.is_whitespace()) else {
-            continue;
-        };
-        if !rest[open..].starts_with('(') {
-            continue;
-        }
-        if let Some(body) = paren_body(rest, open) {
-            for item in top_level_items(body) {
-                let first = item.split_whitespace().next().unwrap_or("");
-                if !SQL_KEYWORDS.contains(&first.to_ascii_uppercase().as_str()) {
-                    add_path(c, source, first);
-                }
-            }
-        }
-    }
-    for m in INSERT.captures_iter(text) {
-        add_qualified(c, source, &m[1]);
-        let open = m.get(0).unwrap().end() - 1;
-        if let Some(body) = paren_body(text, open) {
-            for item in top_level_items(body) {
-                let col = item.trim();
-                // A column list, not a VALUES tuple.
-                if !col.is_empty()
-                    && col.chars().all(|ch| {
-                        ch.is_alphanumeric() || matches!(ch, '_' | '"' | '`' | '[' | ']' | '$')
-                    })
-                {
-                    add_path(c, source, col);
-                }
-            }
-        }
-    }
-}
-
-fn files(dir: &str, exts: &[&str]) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(repo().join(dir)) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = rd
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| exts.contains(&e))
-        })
-        .map(|p| {
-            p.strip_prefix(repo())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    out.sort();
-    out
-}
-
-fn walk_mongo(v: &serde_json::Value, path: &mut Vec<Option<String>>, out: &mut BTreeSet<Raw>) {
-    match v {
-        serde_json::Value::Object(map) => {
-            for (k, child) in map {
-                path.push(Some(k.clone()));
-                out.insert(Raw::Field(path.clone()));
-                walk_mongo(child, path, out);
-                path.pop();
-            }
-        }
-        serde_json::Value::Array(items) => {
-            path.push(None);
-            for item in items {
-                walk_mongo(item, path, out);
-            }
-            path.pop();
-        }
-        _ => {}
-    }
-}
-
-fn json_keys(v: &serde_json::Value, c: &mut Corpus, source: &'static str) {
-    match v {
-        serde_json::Value::Object(map) => {
-            for (k, child) in map {
-                add_path(c, source, k);
-                json_keys(child, c, source);
-            }
-        }
-        serde_json::Value::Array(items) => items.iter().for_each(|i| json_keys(i, c, source)),
-        _ => {}
-    }
-}
-
-/// The `load` seed's names (`e2e/load/seed.py`: `PG_SCHEMAS`, `Table.pg_name`,
-/// `mariadb_name`, `mongo_name`, `mssql_name`, `columns`, up to
-/// `MAX_TABLES` = 999 tables).
-fn add_load(c: &mut Corpus) {
-    const SOURCE: &str = "load seed";
-    for s in [
-        "load_a",
-        "load_b",
-        "load_c",
-        "load_d",
-        "support",
-        "app",
-        "retail",
-        "load",
-        "shop",
-        "id",
-        "created_at",
-        "status",
-        "note",
-        "email",
-        "phone",
-        "iban",
-        "amount",
-        "quantity",
-    ] {
-        add_path(c, SOURCE, s);
-    }
-    for i in 1..=999 {
-        add_path(c, SOURCE, &format!("t{i:03}"));
-        add_path(c, SOURCE, &format!("load_t{i:03}"));
-        add_path(c, SOURCE, &format!("load_c{i:03}"));
-    }
-}
-
-fn corpus() -> Corpus {
-    let mut c = Corpus::new();
-    // Ground truth: every location's names and the targets' databases.
-    let gt: serde_json::Value = serde_json::from_str(&read("dev/ground-truth.json")).unwrap();
-    for loc in gt["locations"].as_array().unwrap() {
-        let s = |k: &str| loc[k].as_str().map(str::to_owned);
-        let engine = s("engine").unwrap_or_default();
-        let ldap = engine == "openldap";
-        let keys = engine == "redis" || engine == "valkey";
-        for (k, value) in [
-            ("database", s("database")),
-            ("container", s("container")),
-            ("object", s("object")),
-            ("field", s("field")),
-            ("expected_normalized_name", s("expected_normalized_name")),
-        ] {
-            let Some(v) = value else { continue };
-            // Placeholders of dynamic keys (`contacts.<email>.phone`), and
-            // Redis / Valkey objects (key patterns, not `Identifier`s).
-            if v.contains('<') || (keys && k == "object") {
-                continue;
-            }
-            let raw = match (ldap, k) {
-                (true, "database" | "container") => Raw::Dn(v),
-                (true, "field") => Raw::Attribute(v),
-                _ => Raw::Path(v),
-            };
-            c.entry("ground truth").or_default().insert(raw);
-        }
-    }
-    for (engine, t) in gt["targets"].as_object().unwrap() {
-        for db in t["databases"].as_array().unwrap() {
-            let db = db.as_str().unwrap().to_owned();
-            c.entry("ground truth")
-                .or_default()
-                .insert(if engine == "openldap" {
-                    Raw::Dn(db)
-                } else {
-                    Raw::Path(db)
-                });
-        }
-    }
-    // Dev seeds (dev, e2e and the engine matrix load them).
-    for f in files("dev/seed/out", &["sql"]) {
-        add_sql(&mut c, "dev seeds", &read(&f));
-    }
-    let mongo: serde_json::Value = serde_json::from_str(&read("dev/seed/out/mongo.json")).unwrap();
-    for (name, docs) in mongo["collections"].as_object().unwrap() {
-        add_path(&mut c, "dev seeds", name);
-        let mut fields = BTreeSet::new();
-        for d in docs.as_array().unwrap() {
-            walk_mongo(d, &mut Vec::new(), &mut fields);
-        }
-        c.entry("dev seeds").or_default().extend(fields);
-    }
-    for entry in read("dev/seed/out/openldap.ldif").split("\n\n") {
-        for line in entry.lines().filter(|l| !l.starts_with('#')) {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = value.trim_start_matches(':').trim();
-            match name {
-                "dn" if !line.starts_with("dn::") => {
-                    c.entry("dev seeds")
-                        .or_default()
-                        .insert(Raw::Dn(value.to_owned()));
-                }
-                "objectClass" => add_path(&mut c, "dev seeds", value),
-                _ => {
-                    c.entry("dev seeds")
-                        .or_default()
-                        .insert(Raw::Attribute(name.to_owned()));
-                }
-            }
-        }
-    }
-    // Init scripts of the dev services, the end-to-end and load targets
-    // (the engine matrix runs the connectors' integration tests on the dev
-    // services).
-    for dir in [
-        "dev/postgres/initdb",
-        "dev/mysql/initdb",
-        "dev/mariadb/initdb",
-        "dev/percona/initdb",
-        "dev/sqlserver/initdb",
-        "dev/cas",
-        "e2e/target-initdb",
-        "e2e/load/initdb",
-    ] {
-        for f in files(dir, &["sql", "sh", "js"]) {
-            add_sql(&mut c, "init scripts", &read(&f));
-        }
-    }
-    // The tables the connectors' integration tests create (the engine
-    // matrix runs them on every listed version); format placeholders
-    // (`{table}`) left out.
-    for dir in [
-        "agent/crates/connector-postgres/src",
-        "agent/crates/connector-mysql/src",
-        "agent/crates/connector-sqlserver/src",
-    ] {
-        for f in files(dir, &["rs"]) {
-            if f.rsplit('/').next().is_some_and(|n| n.starts_with("it")) {
-                add_sql(&mut c, "connector integration tests", &read(&f));
-            }
-        }
-    }
-    // CAS service registries (keys become field names) and audit records.
-    for dir in [
-        "dev/cas/services",
-        "agent/crates/connector-cas/fixtures/registry",
-    ] {
-        for f in files(dir, &["json"]) {
-            let v: serde_json::Value = serde_json::from_str(&read(&f)).unwrap();
-            json_keys(&v, &mut c, "cas fixtures");
-        }
-    }
-    for line in read("agent/crates/connector-cas/fixtures/cas-8.0.2-oauth-oidc-audit.jsonl").lines()
-    {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            json_keys(&v, &mut c, "cas fixtures");
-        }
-    }
-    add_load(&mut c);
-    c
-}
-
-/// ADR-0057 decision 2 item 4: of the names the agent keeps (not `*`),
-/// how many the rules refuse, per rule. Run on the normalizer before it
-/// applied the rules (commit `6e0310c`, 2026-10-23): 4 163 distinct names,
-/// 4 140 kept, **none** refused by any rule (the ADR's implementation note
-/// of 2026-10-23). Since the normalizer applies them, every kept name passes
-/// (asserted). Counts only (I2).
-#[test]
-fn measurement_over_the_dev_corpus() {
-    let corpus = corpus();
-    let mut total = 0usize;
-    let mut kept = 0usize;
-    let mut by_rule: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut refused = 0usize;
-    eprintln!("ADR-0057 measurement (distinct raw names per source; counts only)");
-    for (source, raws) in &corpus {
-        let mut s_kept = 0usize;
-        let mut s_refused = 0usize;
-        for raw in raws {
-            let out = raw.normalize();
-            let out = out.as_str();
-            if out == "*" {
-                continue;
-            }
-            s_kept += 1;
-            let v = names::produced_violations(out);
-            if !v.is_empty() {
-                s_refused += 1;
-                for r in v {
-                    *by_rule.entry(r).or_default() += 1;
-                }
-            }
-        }
-        eprintln!(
-            "  {source}: {} names, {s_kept} kept (not `*`), {s_refused} refused by the rules",
-            raws.len()
-        );
-        total += raws.len();
-        kept += s_kept;
-        refused += s_refused;
-    }
-    eprintln!("  total: {total} names, {kept} kept, {refused} refused");
-    for (r, n) in &by_rule {
-        eprintln!("    rule {r}: {n}");
-    }
-    assert!(total > 1000, "the corpus is too small: {total}");
-    assert_eq!(refused, 0, "kept names refused by the rules: {by_rule:?}");
-}
-
 // ------------------------------------------------- Emitted names (oracles)
 
 /// Every normalizer's output on `input` matches the contract (generated
@@ -701,6 +272,109 @@ proptest! {
     #[test]
     fn emitted_names_on_any_bytes(b in prop::collection::vec(any::<u8>(), 0..96)) {
         assert_emitted(&String::from_utf8_lossy(&b));
+    }
+}
+
+/// Words of letters that are not hexadecimal and hold no digit.
+fn plain_word() -> impl Strategy<Value = String> {
+    "[g-z]{2,6}"
+}
+
+fn hex_group(digit: bool) -> impl Strategy<Value = String> {
+    if digit {
+        "[0-9a-f]{3}[0-9]".prop_shuffle_string().boxed()
+    } else {
+        "[0-9a-f]{4}".boxed()
+    }
+}
+
+trait ShuffleString {
+    fn prop_shuffle_string(self) -> BoxedStrategy<String>;
+}
+
+impl ShuffleString for &'static str {
+    fn prop_shuffle_string(self) -> BoxedStrategy<String> {
+        self.prop_map(|s: String| s.chars().collect::<Vec<_>>())
+            .prop_shuffle()
+            .prop_map(|v| v.into_iter().collect())
+            .boxed()
+    }
+}
+
+/// A value the rules refuse: a dotted MAC (one group with a digit, the
+/// others any 4 hexadecimal characters, digit-only ones included), an IPv4
+/// address, or a digit-to-digit run of 9 or more characters split by
+/// separators (at most 6 digits, below the older digit rules).
+fn refused_value() -> impl Strategy<Value = String> {
+    prop_oneof![
+        (
+            0usize..3,
+            hex_group(true),
+            hex_group(false),
+            hex_group(false)
+        )
+            .prop_map(|(at, d, a, b)| {
+                let mut g = vec![a, b];
+                g.insert(at, d);
+                g.join(".")
+            }),
+        prop::collection::vec(0u16..256, 4)
+            .prop_map(|v| { v.iter().map(u16::to_string).collect::<Vec<_>>().join(".") }),
+        (
+            prop::collection::vec(
+                (1u8..10, prop::sample::select(vec![".", "_", "-", "+", " "])),
+                5..=6
+            ),
+            1u8..10
+        )
+            .prop_map(|(v, last)| {
+                let mut s = String::new();
+                for (d, sep) in v {
+                    s.push_str(&d.to_string());
+                    s.push_str(sep);
+                }
+                s.push_str(&last.to_string());
+                s
+            }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4000))]
+
+    /// Review M1: no part of a refused value survives in the output, as a
+    /// path or as the real keys of a field path, wherever it sits.
+    #[test]
+    fn refused_values_leave_no_part(
+        pre in prop::collection::vec(plain_word(), 0..3),
+        value in refused_value(),
+        post in prop::collection::vec(plain_word(), 0..3),
+    ) {
+        let input = pre.iter().cloned().chain([value.clone()]).chain(post.iter().cloned())
+            .collect::<Vec<_>>().join(".");
+        let keys: Vec<PathPart<'_>> = input.split('.').map(PathPart::Key).collect();
+        for out in [normalize_path(&input), normalize_field_path(&keys)] {
+            let out = out.as_str();
+            prop_assert!(names::is_identifier_produced(out), "{:?} -> {:?}", input, out);
+            for seg in out.split('.') {
+                let seg = seg.trim_end_matches("[]");
+                prop_assert!(!seg.chars().any(|c| c.is_ascii_digit()), "{:?} -> {:?}", input, out);
+                prop_assert!(
+                    !(seg.len() == 4 && seg.chars().all(|c| c.is_ascii_hexdigit())),
+                    "{:?} -> {:?}", input, out
+                );
+            }
+            // Words that are values on their own (first names) are masked.
+            for w in pre.iter().chain(&post).filter(|w| !names::segment_looks_like_value(w)) {
+                prop_assert!(out.split('.').any(|s| s == w), "{:?} -> {:?} lost {:?}", input, out, w);
+            }
+        }
+        let dn = normalize_ldap_dn(&format!("uid=x,ou={value},dc=example"));
+        // `+` makes an RDN multi-valued: the whole DN is `*`.
+        prop_assert!(
+            dn.as_str() == "ou=*,dc=example" || dn.as_str() == "*",
+            "{:?} -> {:?}", value, dn
+        );
     }
 }
 
