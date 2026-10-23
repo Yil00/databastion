@@ -318,9 +318,18 @@ struct Counters {
     /// Requests or batches rejected with `400` while carrying a gated
     /// field (ADR-0022), sent again once with every gated field stripped.
     gated_fields_stripped: AtomicU64,
-    /// Batches whose gated fields the console does not list, stripped at
-    /// send time (ADR-0053 decision 2).
+    /// Batches (counted per **batch**) whose gated fields a known console
+    /// set does not list, stripped at send time (ADR-0053 decision 2).
     gated_fields_stripped_at_send: AtomicU64,
+    /// Findings (counted per **finding**, not per batch) whose
+    /// `Location.altered` was stripped at send time because the console's
+    /// capabilities were not known: no heartbeat answer yet, or any clear
+    /// since the last answer, a clear that did not start a hold included
+    /// (`Snapshot::known`). Findings are never held for them (ADR-0056
+    /// decision 2 item 3); counted apart from
+    /// `gated_fields_stripped_at_send` so the size of that residual is
+    /// visible.
+    findings_stripped_capabilities_unknown: AtomicU64,
     /// Batches resent without `objects_overflowed` after the console found
     /// a flagged event naming no `*` (ADR-0053; never expected).
     overflow_flags_refused: AtomicU64,
@@ -1272,6 +1281,10 @@ impl Runtime {
                 "gated_fields_stripped_at_send_total",
                 &c.gated_fields_stripped_at_send,
             ),
+            (
+                "findings_stripped_capabilities_unknown_total",
+                &c.findings_stripped_capabilities_unknown,
+            ),
             ("overflow_flags_refused_total", &c.overflow_flags_refused),
             (
                 "scan_status_before_flush_total",
@@ -1792,12 +1805,15 @@ impl Runtime {
             // spooled before a heartbeat answer keep the fields it lists. A
             // batch with a `signature.*` signal never waits (its detection
             // matters more than its gated fields); one already sent once is
-            // sent again as it is.
+            // sent again as it is. A findings batch never waits (ADR-0056
+            // decision 2 item 3): the ADR-0025 wait for a scan's terminal
+            // status must not be spent on a heartbeat answer; it is sent
+            // stripped at once, counted below.
             let caps = self.console_caps.snapshot(now);
             let front = self.lock_spool().front_sendable(
                 |findings| !parked.is_parked(findings, now),
                 |gates| uplink::held_back(gates, &self.console_caps),
-                |_fields, signature| !signature && !caps.settled(),
+                |_fields, signature, findings| !findings && !signature && !caps.settled(),
             );
             front.map(|f| (f, caps))
         };
@@ -1819,7 +1835,12 @@ impl Runtime {
         match decided {
             Ok(None) => {}
             Ok(Some(stripped)) => {
-                bump(&self.counters.gated_fields_stripped_at_send, 1);
+                if batch.is_findings() && !caps.known() {
+                    let n = u64::try_from(batch.gated_items()).unwrap_or(u64::MAX);
+                    bump(&self.counters.findings_stripped_capabilities_unknown, n);
+                } else {
+                    bump(&self.counters.gated_fields_stripped_at_send, 1);
+                }
                 if let Err(e) = self.lock_spool().replace(&key, &[stripped], 0) {
                     tracing::warn!(kind = %e.kind(), "spool write failed; will retry");
                     return Ok(Flush::Retry(spool_backoff(

@@ -168,10 +168,19 @@ impl EventBuilder {
                 };
                 if hit {
                     // The console's names are normalized (contract
-                    // `Identifier`), and are sent back as they came.
+                    // `Identifier`), and are sent back as they came. The
+                    // container the operation named was altered by
+                    // normalization (ADR-0056, security review M2): the
+                    // container reached may be a look-alike of the
+                    // console's, so the schema is marked, in the exact and
+                    // the subtree case.
+                    let mut named = databastion_classifiers::names::normalize_ldap_dn(schema);
+                    if container.altered() {
+                        named = named.marked_altered();
+                    }
                     out.push(EventObject::new(
                         database.clone(),
-                        Some(databastion_classifiers::names::normalize_ldap_dn(schema)),
+                        Some(named),
                         databastion_classifiers::names::normalize_path(&o.object),
                     ));
                 }
@@ -553,6 +562,67 @@ mod tests {
         assert_eq!(n.len(), 16);
         assert!(n.contains(&("dc=example,dc=org".to_owned(), None, "*".to_owned())));
         assert_eq!(n.iter().filter(|o| o.2 == "inetOrgPerson").count(), 15);
+    }
+
+    /// ADR-0056 (security review M2): a search whose base holds a
+    /// character the first normalization step strips (U+200B in an RDN)
+    /// names the console's sensitive objects with the schema marked
+    /// altered, one level and subtree alike; the same search on the plain
+    /// base does not; an entry read whose own RDN is altered marks nothing
+    /// (its container is named from the parent).
+    #[test]
+    fn an_altered_search_base_marks_the_sensitive_schema() {
+        let mut b = builder(vec![people()]);
+        let schema_altered = |e: &MaskedEvent| -> Vec<(String, bool)> {
+            e.objects()
+                .iter()
+                .map(|o| {
+                    let s = o.schema().unwrap();
+                    (s.as_str().to_owned(), s.altered())
+                })
+                .collect()
+        };
+        for scope in ["one", "sub"] {
+            let altered = S {
+                base: "ou=peo\u{200B}ple,dc=example,dc=org",
+                scope,
+                ..DEFAULT
+            };
+            let e = b
+                .convert(vec![search(&altered)], Instant::now())
+                .pop()
+                .unwrap();
+            assert_eq!(
+                schema_altered(&e),
+                [("ou=people,dc=example,dc=org".to_owned(), true)],
+                "{scope}"
+            );
+            assert_eq!(e.objects()[0].object().as_str(), "inetOrgPerson");
+            assert!(!format!("{e:?}").contains('\u{200B}'));
+            let plain = S { scope, ..DEFAULT };
+            let e = b
+                .convert(vec![search(&plain)], Instant::now())
+                .pop()
+                .unwrap();
+            assert_eq!(
+                schema_altered(&e),
+                [("ou=people,dc=example,dc=org".to_owned(), false)],
+                "{scope}"
+            );
+        }
+        let entry = S {
+            base: "uid=jd\u{200B}oe,ou=people,dc=example,dc=org",
+            scope: "base",
+            ..DEFAULT
+        };
+        let e = b
+            .convert(vec![search(&entry)], Instant::now())
+            .pop()
+            .unwrap();
+        assert_eq!(
+            schema_altered(&e),
+            [("ou=people,dc=example,dc=org".to_owned(), false)]
+        );
     }
 
     #[test]

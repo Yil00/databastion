@@ -29,21 +29,24 @@ pub(crate) struct Learned {
 }
 
 impl Learned {
-    /// The persisted form: `v1`, `gen <n>`, then per database `db <index>`
+    /// The persisted form: `v2`, `gen <n>`, then per database `db <index>`
     /// followed by its patterns, one per line (contract `KeyPattern`s: no
-    /// line break, no key-name text). Cut at the file bound.
+    /// line break, no key-name text), each prefixed with `p ` or, when
+    /// altered by NFKC (ADR-0056), `a ` (the marker only: no character).
+    /// Cut at the file bound.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = format!("v1\ngen {}\n", self.generation).into_bytes();
+        let mut out = format!("v2\ngen {}\n", self.generation).into_bytes();
         for (db, set) in &self.dbs {
             let head = format!("db {db}\n");
             if out.len() + head.len() > MAX_FILE {
                 break;
             }
             out.extend_from_slice(head.as_bytes());
-            for p in set.patterns() {
-                if out.len() + p.len() + 1 > MAX_FILE {
+            for (p, altered) in set.marked() {
+                if out.len() + p.len() + 3 > MAX_FILE {
                     break;
                 }
+                out.extend_from_slice(if altered { b"a " } else { b"p " });
                 out.extend_from_slice(p.as_bytes());
                 out.push(b'\n');
             }
@@ -51,17 +54,21 @@ impl Learned {
         out
     }
 
-    /// Reads [`Self::encode`]'s form; every pattern goes through the
-    /// contract gate again (`LearnedPatterns::new`). `None` when not
-    /// understood.
+    /// Reads [`Self::encode`]'s form, and the `v1` form of earlier agents
+    /// (patterns without a prefix and without a marker: none altered until
+    /// the next walk of the database); every pattern goes through the
+    /// contract gate again (`LearnedPatterns::with_markers`). `None` when
+    /// not understood.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
-        if lines.next()? != "v1" {
-            return None;
-        }
+        let v2 = match lines.next()? {
+            "v1" => false,
+            "v2" => true,
+            _ => return None,
+        };
         let generation = lines.next()?.strip_prefix("gen ")?.parse().ok()?;
-        let mut dbs: BTreeMap<u16, Vec<&str>> = BTreeMap::new();
+        let mut dbs: BTreeMap<u16, Vec<(&str, bool)>> = BTreeMap::new();
         let mut current: Option<u16> = None;
         for l in lines {
             if let Some(db) = l.strip_prefix("db ") {
@@ -69,14 +76,21 @@ impl Learned {
                 dbs.entry(db).or_default();
                 current = Some(db);
             } else if let Some(db) = current {
-                dbs.entry(db).or_default().push(l);
+                let pattern = if !v2 {
+                    (l, false)
+                } else if let Some(p) = l.strip_prefix("p ") {
+                    (p, false)
+                } else {
+                    (l.strip_prefix("a ")?, true)
+                };
+                dbs.entry(db).or_default().push(pattern);
             }
         }
         Some(Self {
             generation,
             dbs: dbs
                 .into_iter()
-                .map(|(db, p)| (db, Arc::new(LearnedPatterns::new(p))))
+                .map(|(db, p)| (db, Arc::new(LearnedPatterns::with_markers(p))))
                 .collect(),
         })
     }
@@ -137,7 +151,14 @@ impl Shared {
     /// Records the patterns of one database walk (Discovery). A complete
     /// walk replaces the database's set; a walk stopped early only fills
     /// a database without one (its patterns are still gated, but fewer).
-    pub(crate) fn learn(&self, target_id: &str, db: u16, patterns: &[String], complete: bool) {
+    /// Each pattern comes with its ADR-0056 marker.
+    pub(crate) fn learn(
+        &self,
+        target_id: &str,
+        db: u16,
+        patterns: &[(String, bool)],
+        complete: bool,
+    ) {
         let mut map = lock(&self.learned);
         let l = map.entry(target_id.to_owned()).or_default();
         if !complete && l.dbs.contains_key(&db) {
@@ -145,7 +166,9 @@ impl Shared {
         }
         l.dbs.insert(
             db,
-            Arc::new(LearnedPatterns::new(patterns.iter().map(String::as_str))),
+            Arc::new(LearnedPatterns::with_markers(
+                patterns.iter().map(|(p, a)| (p.as_str(), *a)),
+            )),
         );
         l.generation = l.generation.saturating_add(1);
     }
@@ -256,28 +279,40 @@ mod tests {
     #[test]
     fn learned_patterns_round_trip_through_the_gate() {
         let s = Shared::default();
+        let p = |s: &str| (s.to_owned(), false);
         s.learn(
             "t",
             0,
-            &["session:*".to_owned(), "user:*:email".to_owned()],
+            &[p("session:*"), ("user:*:email".to_owned(), true)],
             true,
         );
-        s.learn(
-            "t",
-            3,
-            &["cart:*".to_owned(), "user:123456789".to_owned()],
-            false,
-        );
+        s.learn("t", 3, &[p("cart:*"), p("user:123456789")], false);
         // A partial walk does not replace a complete one.
-        s.learn("t", 0, &["other:*".to_owned()], false);
+        s.learn("t", 0, &[p("other:*")], false);
         let l = s.learned("t");
         assert_eq!(l.generation, 2);
         let back = Learned::decode(&l.encode()).unwrap();
         assert_eq!(back.generation, 2);
         assert_eq!(back.dbs[&0].patterns(), ["session:*", "user:*:email"]);
+        // ADR-0056: the marker survives a restart.
+        assert_eq!(
+            back.dbs[&0].marked().collect::<Vec<_>>(),
+            [("session:*", false), ("user:*:email", true)]
+        );
         // A pattern that is not a contract `KeyPattern` never comes back.
         assert_eq!(back.dbs[&3].patterns(), ["cart:*"]);
-        assert!(Learned::decode(b"v2\ngen 1\n").is_none());
+        assert!(Learned::decode(b"v3\ngen 1\n").is_none());
+        let tampered = b"v2\ngen 1\ndb 0\na user:jane.doe@example.com\n";
+        assert!(Learned::decode(tampered).unwrap().dbs[&0].is_empty());
+        // A `v2` pattern line without its prefix is not understood.
+        assert!(Learned::decode(b"v2\ngen 1\ndb 0\nsession:*\n").is_none());
+        // The `v1` form of an earlier agent: its patterns, none altered.
+        let v1 = Learned::decode(b"v1\ngen 4\ndb 0\nsession:*\nuser:*:email\n").unwrap();
+        assert_eq!(v1.generation, 4);
+        assert_eq!(
+            v1.dbs[&0].marked().collect::<Vec<_>>(),
+            [("session:*", false), ("user:*:email", false)]
+        );
         let tampered = b"v1\ngen 1\ndb 0\nuser:jane.doe@example.com\n";
         assert!(Learned::decode(tampered).unwrap().dbs[&0].is_empty());
     }

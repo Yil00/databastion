@@ -4489,17 +4489,229 @@ async fn events_without_gated_fields_keep_the_ordinary_400_rules() {
     assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
 }
 
+/// A findings batch **without** `Location.altered` carries no gated field
+/// (ADR-0056 decision 2 item 3 keeps this for such batches): a `400` on an
+/// item, even reported as an unknown field, takes the ordinary path (the
+/// item dropped) and keeps the capabilities.
 #[tokio::test]
 async fn findings_carry_no_gated_field_so_a_400_keeps_the_capabilities() {
     use crate::capabilities::token;
+    for step in [
+        Step::Items(&["/findings/0"]),
+        Step::Unknown(&["/findings/0/location"]),
+    ] {
+        let server = MockServer::start().await;
+        let (_env, rt) = spooled_runtime(&server, vec![step], 3).await;
+        accept_tokens(&rt, &[token::TARGET_STATUS_NOTES, token::LOCATION_ALTERED]);
+        drain(&rt).await;
+        let sent = sent_batches(&server).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+        assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+        assert!(rt.console_caps.console_accepts(token::LOCATION_ALTERED));
+        assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    }
+}
+
+/// `field` with a fullwidth `ｅ` (U+FF45): NFKC gives `email`, altered
+/// (ADR-0056).
+const ALTERED_FIELD: &str = "\u{FF45}mail";
+
+/// [`spooled_runtime`] with findings on `field`.
+async fn spooled_findings_runtime(
+    server: &MockServer,
+    steps: Vec<Step>,
+    findings: usize,
+    field: &str,
+) -> (Env, Runtime) {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(findings, field),
+    )
+    .unwrap();
+    (env, rt)
+}
+
+/// The `altered` lists of a sent findings batch, item by item.
+fn location_altered(batch: &serde_json::Value) -> Vec<Option<serde_json::Value>> {
+    batch["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["location"].get("altered").cloned())
+        .collect()
+}
+
+/// ADR-0056 decision 2 item 3, the inverted case: a findings batch **with**
+/// `Location.altered` carries a gated field, so a `400` reporting it as an
+/// unknown field (a console rolled back, or a replica that does not know
+/// it) clears the capabilities and resends the items once, every one kept,
+/// without the field; the replacement is never stripped again.
+#[tokio::test]
+async fn altered_findings_carry_a_gated_field_so_a_400_clears_the_capabilities() {
+    use crate::capabilities::token;
     let server = MockServer::start().await;
-    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/0"])], 3).await;
-    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+    let (_env, rt) = spooled_findings_runtime(
+        &server,
+        vec![Step::Unknown(&["/findings/0/location"])],
+        3,
+        ALTERED_FIELD,
+    )
+    .await;
+    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES, token::LOCATION_ALTERED]);
     drain(&rt).await;
     let sent = sent_batches(&server).await;
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
-    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let field = Some(serde_json::json!(["field"]));
+    assert_eq!(
+        location_altered(&sent[0]),
+        [field.clone(), field.clone(), field]
+    );
+    // Every item kept, the field stripped, under a new `batch_id`.
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert_eq!(location_altered(&sent[1]), [None, None, None]);
+    assert!(
+        sent[1]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["location"]["field"] == "email")
+    );
+    serde_json::from_value::<databastion_protocol::FindingsBatch>(sent[1].clone()).unwrap();
+    assert!(!rt.console_caps.console_accepts(token::LOCATION_ALTERED));
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.map_or(0, |c| c.0), 0);
+    assert_eq!(status.batches.0, 0);
+}
+
+/// ADR-0056 decision 2 item 3: findings are never held while the console's
+/// capabilities are not known (no heartbeat answer yet): the batch goes at
+/// once, stripped, and its findings are counted apart
+/// (`findings_stripped_capabilities_unknown_total`, per finding), not as
+/// stripped for an unlisted token. Plain findings are not counted.
+#[tokio::test]
+async fn findings_are_sent_stripped_at_once_while_the_capabilities_are_unknown() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_findings_runtime(&server, Vec::new(), 3, ALTERED_FIELD).await;
+    rt.spool_findings(
+        Uuid::try_from(JOB).unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(2, "email"),
+    )
+    .unwrap();
+    assert!(!rt.console_caps.snapshot(std::time::Instant::now()).known());
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "never held: {sent:?}");
+    assert_eq!(location_altered(&sent[0]), [None, None, None]);
+    assert_eq!(location_altered(&sent[1]), [None, None]);
+    assert_eq!(
+        metric(&rt, "findings_stripped_capabilities_unknown_total"),
+        3.0
+    );
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0056 decision 2 item 3: a console that lists `location.altered`
+/// receives the field; one known not to list it receives the findings
+/// stripped at send time (counted per batch as an unlisted token, not as
+/// capabilities unknown).
+#[tokio::test]
+async fn findings_keep_location_altered_only_for_a_console_that_lists_it() {
+    use crate::capabilities::token;
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let (_env, rt) = spooled_findings_runtime(&server, Vec::new(), 2, ALTERED_FIELD).await;
+        if listed {
+            accept_tokens(&rt, &[token::LOCATION_ALTERED]);
+        } else {
+            accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+        }
+        drain(&rt).await;
+        let sent = sent_batches(&server).await;
+        assert_eq!(sent.len(), 1);
+        let want = listed.then(|| serde_json::json!(["field"]));
+        assert_eq!(location_altered(&sent[0]), [want.clone(), want]);
+        serde_json::from_value::<databastion_protocol::FindingsBatch>(sent[0].clone()).unwrap();
+        assert_eq!(
+            metric(&rt, "gated_fields_stripped_at_send_total"),
+            if listed { 0.0 } else { 1.0 }
+        );
+        assert_eq!(
+            metric(&rt, "findings_stripped_capabilities_unknown_total"),
+            0.0
+        );
+    }
+}
+
+/// ADR-0056 decision 2 item 2: an event object altered by normalization
+/// carries `ObjectRef.altered`, spooled in full and held like the other
+/// gated event fields while the capabilities are not known; sent to a
+/// console that lists `object_ref.altered`, stripped for one that does
+/// not.
+#[tokio::test]
+async fn events_with_altered_objects_wait_and_are_stripped_per_token() {
+    use crate::capabilities::token;
+    use databastion_classifiers::masking::{
+        EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent,
+    };
+    use databastion_classifiers::names::normalize_path;
+    let target = TargetId::try_from("pg-main").unwrap();
+    let event = |table: &str| {
+        MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("report"),
+            std::time::SystemTime::now(),
+        )
+        .with_object(EventObject::new(
+            normalize_path("crm"),
+            Some(normalize_path("public")),
+            normalize_path(table),
+        ))
+    };
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let env = events_mock(&server, Vec::new()).await;
+        let rt = runtime(&env);
+        rt.spool_events(&target, &[event("orders"), event("orders\u{200B}x")]);
+        // Not known yet: the batch waits.
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        if listed {
+            accept_tokens(&rt, &[token::OBJECT_REF_ALTERED]);
+        } else {
+            accept_tokens(&rt, &[]);
+        }
+        drain(&rt).await;
+        let sent = sent_event_batches(&server).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let altered: Vec<Option<serde_json::Value>> = sent[0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["objects"][0].get("altered").cloned())
+            .collect();
+        let want = listed.then(|| serde_json::json!(["object"]));
+        assert_eq!(altered, [None, want]);
+        serde_json::from_value::<databastion_protocol::EventsBatch>(sent[0].clone()).unwrap();
+    }
 }
 
 #[tokio::test]

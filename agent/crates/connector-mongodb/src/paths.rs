@@ -245,7 +245,14 @@ impl Collector {
                     .collect();
                 let name = normalize_steps(&flat);
                 let slot = match self.by_name.get(&name) {
-                    Some(i) => Some(*i),
+                    Some(i) => {
+                        // Pooled under the same name: an altered path
+                        // marks the pool's (ADR-0056).
+                        if let Some((kept, _)) = self.paths.get_mut(*i) {
+                            kept.absorb_marker(&name);
+                        }
+                        Some(*i)
+                    }
                     None if self.paths.len() < MAX_PATHS => {
                         self.paths.push((name.clone(), Vec::new()));
                         self.by_name.insert(name, self.paths.len() - 1);

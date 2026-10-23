@@ -246,12 +246,18 @@ async fn scan_registry(
                 continue;
             }
             let pool = pools.entry(key).or_insert_with(|| Pool {
-                field,
+                field: field.clone(),
                 values: Vec::new(),
                 services: 0,
                 last_service: None,
                 object: Some(object.clone()),
             });
+            // Pooled under one name: an altered key or service name marks
+            // the pool's (ADR-0056).
+            pool.field.absorb_marker(&field);
+            if let Some(o) = pool.object.as_mut() {
+                o.absorb_marker(&object);
+            }
             if pool.last_service != Some(i) {
                 pool.last_service = Some(i);
                 pool.services = pool.services.saturating_add(1);

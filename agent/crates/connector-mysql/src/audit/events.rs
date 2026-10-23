@@ -7237,6 +7237,64 @@ mod tests {
         }
     }
 
+    /// #308 final review N8, the agent part (ADR-0056 decision 2): a user
+    /// database whose name NFKC folds onto a system schema's spelling
+    /// (`performance_ſchema`, `ſys`) or changes (`MYſQL` gives `MYsQL`)
+    /// reaches the console with `database` in `altered`: the folded name
+    /// is not the server's, and the console's exceptions refuse to cover
+    /// it by name. Where the as-written object and the listed one are the
+    /// same name, they are one object, altered (the markers are united);
+    /// a listed name that differs (`mysql`) and a plain system read are
+    /// not altered.
+    #[test]
+    fn folded_system_spellings_are_marked_altered() {
+        let marks = |e: &MaskedEvent| -> Vec<(String, bool, bool)> {
+            e.objects()
+                .iter()
+                .map(|o| {
+                    (
+                        format!("{}.{}", o.database().as_str(), o.object().as_str()),
+                        o.database().altered(),
+                        o.object().altered(),
+                    )
+                })
+                .collect()
+        };
+        let m = |n: &str, db: bool| (n.to_owned(), db, false);
+        for (text, want) in [
+            (
+                "SELECT SQL_TEXT FROM performance_\u{17F}chema.events_statements_current LIMIT 1",
+                vec![m("performance_schema.events_statements_current", true)],
+            ),
+            (
+                "SELECT * FROM `\u{17F}ys`.`processlist`",
+                vec![m("sys.processlist", true)],
+            ),
+            (
+                "SELECT min_value FROM MY\u{17F}QL.column_stats",
+                vec![
+                    m("MYsQL.column_stats", true),
+                    m("mysql.column_stats", false),
+                ],
+            ),
+            (
+                "SELECT * FROM MY\u{17F}QL.people",
+                vec![m("MYsQL.people", true)],
+            ),
+            (
+                "SELECT SQL_TEXT FROM performance_schema.events_statements_current LIMIT 1",
+                vec![m("performance_schema.events_statements_current", false)],
+            ),
+        ] {
+            for user in ["app", "databastion"] {
+                for (source, ev) in on_every_source(user, text) {
+                    let ev = ev.unwrap_or_else(|| panic!("{user} {source:?}: {text}"));
+                    assert_eq!(marks(&ev), want, "{user} {source:?}: {text}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn statement_text_tables_follow_the_flavor() {
         let text = "SELECT * FROM performance_schema.events_statements_summary_by_digest";

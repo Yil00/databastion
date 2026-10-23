@@ -1379,6 +1379,26 @@ impl EventObject {
         &self.object
     }
 
+    /// Whether any part was altered by normalization (ADR-0056).
+    #[must_use]
+    pub fn altered(&self) -> bool {
+        self.database.altered()
+            || self.schema.as_ref().is_some_and(NormalizedName::altered)
+            || self.object.altered()
+    }
+
+    /// Unites the ADR-0056 markers of `other`, the same object (equal
+    /// names), part by part: an object merged from an altered and a plain
+    /// spelling is altered. Only ever marks more. For connectors that keep
+    /// their own list of distinct objects before the event.
+    pub fn absorb_markers(&mut self, other: &Self) {
+        self.database.absorb_marker(&other.database);
+        if let (Some(s), Some(o)) = (self.schema.as_mut(), other.schema.as_ref()) {
+            s.absorb_marker(o);
+        }
+        self.object.absorb_marker(&other.object);
+    }
+
     fn sort_key(&self) -> (&str, &str, &str) {
         (
             self.database.as_str(),
@@ -1515,7 +1535,9 @@ impl MaskedEvent {
     }
 
     fn add_object(&mut self, object: EventObject) {
-        if self.objects.contains(&object) {
+        if let Some(existing) = self.objects.iter_mut().find(|o| **o == object) {
+            // ADR-0056: the markers of a duplicate are united.
+            existing.absorb_markers(&object);
             return;
         }
         let fits = self.objects.len() < MAX_EVENT_OBJECTS
@@ -1551,7 +1573,9 @@ impl MaskedEvent {
                     .as_ref()
                     .is_none_or(|s| object.schema.as_ref() == Some(s))
         };
-        if self.objects.iter().any(covers) {
+        if let Some(o) = self.objects.iter_mut().find(|o| covers(o)) {
+            // ADR-0056: a `*` of the same database stands for the object.
+            o.database.absorb_marker(&object.database);
             return;
         }
         let wildcard = NormalizedName::wildcard;
@@ -1670,6 +1694,13 @@ impl MaskedEvent {
         };
         for s in other.signals {
             self.add_signal(s);
+        }
+        // ADR-0056 decision 2 item 2: the same group names the same
+        // objects (equal names, same order); their markers are united.
+        if self.objects == other.objects {
+            for (o, x) in self.objects.iter_mut().zip(&other.objects) {
+                o.absorb_markers(x);
+            }
         }
         self.always_report |= other.always_report;
         self.objects_overflowed |= other.objects_overflowed;
@@ -2349,6 +2380,69 @@ mod tests {
 
     fn normalize_name(n: &str) -> NormalizedName {
         crate::names::normalize_path(n)
+    }
+
+    /// ADR-0056 decision 2 item 2: objects merged under one name unite
+    /// their markers, part by part: a duplicate object, a `*` that stands
+    /// for an overflowed object of its database, and events aggregated in
+    /// one group (the marker is not part of the group key).
+    #[test]
+    fn merged_objects_unite_their_markers() {
+        let parts = |e: &MaskedEvent| -> Vec<(String, bool, bool)> {
+            e.objects()
+                .iter()
+                .map(|o| {
+                    (
+                        o.object().as_str().to_owned(),
+                        o.database().altered(),
+                        o.object().altered(),
+                    )
+                })
+                .collect()
+        };
+        // `orders` then `orders<U+200B>`: one object, altered.
+        let e = read_event()
+            .with_object(obj("shop", None, "orders"))
+            .with_object(obj("shop", None, "orders\u{200B}"));
+        assert_eq!(parts(&e), [("orders".to_owned(), false, true)]);
+        assert!(e.objects()[0].altered());
+        // In the other order too.
+        let e = read_event()
+            .with_object(obj("shop", None, "\u{FF4F}rders"))
+            .with_object(obj("shop", None, "orders"));
+        assert_eq!(parts(&e), [("orders".to_owned(), false, true)]);
+        // Aggregation: a plain and an altered event of one group merge, the
+        // result altered whatever the order.
+        let plain = read_event().with_object(obj("shop", None, "orders"));
+        let altered = read_event().with_object(obj("\u{FF53}hop", None, "orders"));
+        assert_eq!(plain.group_key(), altered.group_key());
+        for (mut a, b) in [
+            (plain.clone(), altered.clone()),
+            (altered.clone(), plain.clone()),
+        ] {
+            a.merge(b);
+            assert_eq!(parts(&a), [("orders".to_owned(), true, false)]);
+        }
+        let mut a = plain.clone();
+        a.merge(plain);
+        assert!(!a.objects()[0].altered());
+        // An overflowed object of an altered database: the `*` standing for
+        // it names that database, altered.
+        let mut e = read_event();
+        for i in 0..15u8 {
+            e = e.with_object(obj("shop", None, &format!("t_{}", char::from(b'a' + i))));
+        }
+        e = e.with_object(obj("\u{FF53}hop", None, "z"));
+        assert!(e.objects_overflowed());
+        let star = e
+            .objects()
+            .iter()
+            .find(|o| o.object().as_str() == "*")
+            .unwrap();
+        assert_eq!(star.database().as_str(), "shop");
+        assert!(star.database().altered() && !star.object().altered());
+        // The `*` is never altered itself: `(*, -, *)` carries no marker.
+        assert!(!NormalizedName::wildcard().marked_altered().altered());
     }
 
     #[test]

@@ -528,7 +528,7 @@ impl Spool {
         &mut self,
         endpoint: impl FnMut(bool) -> bool,
     ) -> Option<(Key, ResultBatch)> {
-        self.front_sendable(endpoint, |_| false, |_, _| false)
+        self.front_sendable(endpoint, |_| false, |_, _, _| false)
     }
 
     /// Number of spooled batches whose engine tokens `held` refuses
@@ -546,15 +546,16 @@ impl Spool {
     /// it does; and those whose gated-field tokens `waits` refuses: those
     /// carrying a gated field while the console's capabilities are not
     /// known yet (ADR-0053 decision 2). `waits` is told whether the batch
-    /// holds a `signature.*` signal, and is not asked for a batch already
-    /// sent once (sent again as it is). Decided from the entry's tokens
-    /// (recorded when the batch was written or loaded), so a held batch is
-    /// never read here.
+    /// holds a `signature.*` signal and whether it is a findings batch
+    /// (never held, ADR-0056 decision 2 item 3), and is not asked for a
+    /// batch already sent once (sent again as it is). Decided from the
+    /// entry's tokens (recorded when the batch was written or loaded), so
+    /// a held batch is never read here.
     pub(crate) fn front_sendable(
         &mut self,
         mut endpoint: impl FnMut(bool) -> bool,
         mut held: impl FnMut(&[&'static str]) -> bool,
-        mut waits: impl FnMut(&[&'static str], bool) -> bool,
+        mut waits: impl FnMut(&[&'static str], bool, bool) -> bool,
     ) -> Option<(Key, ResultBatch)> {
         let mut index = 0;
         loop {
@@ -563,7 +564,7 @@ impl Spool {
                 || (!entry.gates.is_empty() && held(&entry.gates))
                 || (!entry.fields.is_empty()
                     && !entry.attempted
-                    && waits(&entry.fields, entry.signature))
+                    && waits(&entry.fields, entry.signature, entry.findings))
             {
                 index += 1;
                 continue;

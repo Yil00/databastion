@@ -635,7 +635,7 @@ impl Parsed {
 
     fn fields(&self) -> Vec<&'static str> {
         let mut fields: Vec<&'static str> = match self {
-            Self::Findings(_) => Vec::new(),
+            Self::Findings(b) => b.findings.iter().flat_map(finding_field_tokens).collect(),
             Self::Events(b) => b.events.iter().flat_map(event_field_tokens).collect(),
         };
         fields.sort_unstable();
@@ -706,45 +706,89 @@ impl ResultBatch {
     }
 
     /// The batch to send to a console whose capabilities are `caps`
-    /// (ADR-0053 decision 2): `Ok(None)` when it lists the token of every
-    /// gated field the batch carries (sent as spooled); otherwise the same
-    /// items under a **new** `batch_id`, with the fields whose tokens it
-    /// does not list stripped, and only those (a console that lists
-    /// `access_event.bytes` keeps `bytes`). `Err` if the bytes could not be
-    /// decoded or the result serialized. Byte-for-byte what the conversion
-    /// would have built without those fields, apart from `batch_id`.
+    /// (ADR-0053 decision 2, ADR-0056 decision 2 items 2 and 3): `Ok(None)`
+    /// when it lists the token of every gated field the batch carries (sent
+    /// as spooled); otherwise the same items under a **new** `batch_id`,
+    /// with the fields whose tokens it does not list stripped, and only
+    /// those (a console that lists `access_event.bytes` keeps `bytes`).
+    /// `Err` if the bytes could not be decoded or the result serialized.
+    /// Byte-for-byte what the conversion would have built without those
+    /// fields, apart from `batch_id`.
     pub(crate) fn for_console(
         &self,
         caps: &crate::capabilities::Snapshot,
     ) -> Result<Option<Self>, Unserializable> {
+        use crate::capabilities::token;
         if self.fields.iter().all(|t| caps.accepts(t)) {
             return Ok(None);
         }
-        let Some(Parsed::Events(b)) = Self::decode(self.findings, &self.bytes) else {
-            return Err(Unserializable);
+        let parsed = match Self::decode(self.findings, &self.bytes) {
+            Some(Parsed::Findings(b)) => {
+                let altered = caps.accepts(token::LOCATION_ALTERED);
+                let findings = b
+                    .findings
+                    .into_iter()
+                    .map(|mut f| {
+                        if !altered {
+                            f.location.altered = None;
+                        }
+                        f
+                    })
+                    .collect();
+                Parsed::Findings(FindingsBatch {
+                    batch_id: new_batch_id(),
+                    findings,
+                    ..b
+                })
+            }
+            Some(Parsed::Events(b)) => {
+                let bytes = caps.accepts(token::ACCESS_EVENT_BYTES);
+                let overflowed = caps.accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED);
+                let altered = caps.accepts(token::OBJECT_REF_ALTERED);
+                let events = b
+                    .events
+                    .into_iter()
+                    .map(|mut e| {
+                        if !bytes {
+                            e.bytes = None;
+                        }
+                        if !overflowed {
+                            e.objects_overflowed = None;
+                        }
+                        if !altered {
+                            for o in &mut e.objects {
+                                o.altered = None;
+                            }
+                        }
+                        e
+                    })
+                    .collect();
+                Parsed::Events(EventsBatch {
+                    batch_id: new_batch_id(),
+                    events,
+                })
+            }
+            None => return Err(Unserializable),
         };
-        let bytes = caps.accepts(crate::capabilities::token::ACCESS_EVENT_BYTES);
-        let overflowed = caps.accepts(crate::capabilities::token::ACCESS_EVENT_OBJECTS_OVERFLOWED);
-        let events = b
-            .events
-            .into_iter()
-            .map(|mut e| {
-                if !bytes {
-                    e.bytes = None;
-                }
-                if !overflowed {
-                    e.objects_overflowed = None;
-                }
-                e
-            })
-            .collect();
-        let mut out = Parsed::Events(EventsBatch {
-            batch_id: new_batch_id(),
-            events,
-        })
-        .into_batch()?;
+        let mut out = parsed.into_batch()?;
         out.kept_once = self.kept_once;
         Ok(Some(out))
+    }
+
+    /// Number of items carrying a gated field (`0` if the bytes cannot be
+    /// decoded): for a findings batch, the findings with `Location.altered`
+    /// (ADR-0056 decision 2 item 3, the findings sent stripped while the
+    /// capabilities are not known).
+    pub(crate) fn gated_items(&self) -> usize {
+        match Self::decode(self.findings, &self.bytes) {
+            Some(Parsed::Findings(b)) => b
+                .findings
+                .iter()
+                .filter(|f| finding_carries_gated(f))
+                .count(),
+            Some(Parsed::Events(b)) => b.events.iter().filter(|e| event_carries_gated(e)).count(),
+            None => 0,
+        }
     }
 
     /// Whether an item at `items` (sorted) carries `objects_overflowed`.
@@ -875,12 +919,15 @@ impl ResultBatch {
     }
 
     /// Whether an item carries a field gated by capability negotiation
-    /// (ADR-0022): `AccessEvent.bytes`. Findings have none. `false` if the
-    /// bytes cannot be decoded.
+    /// (ADR-0022): `AccessEvent.bytes`, `objects_overflowed` (ADR-0053) and
+    /// `ObjectRef.altered` (ADR-0056) on events, `Location.altered` on
+    /// findings (ADR-0056 decision 2 item 3, the first gated finding
+    /// field). `false` if the bytes cannot be decoded.
     pub(crate) fn carries_gated(&self) -> bool {
         match Self::decode(self.findings, &self.bytes) {
             Some(Parsed::Events(b)) => b.events.iter().any(event_carries_gated),
-            Some(Parsed::Findings(_)) | None => false,
+            Some(Parsed::Findings(b)) => b.findings.iter().any(finding_carries_gated),
+            None => false,
         }
     }
 
@@ -948,8 +995,9 @@ impl ResultBatch {
         let keep_values = !self.kept_once;
         let mut kept_values = false;
         let mut out = match parsed {
-            // No gated finding field exists: only the rejected items go,
-            // except those of a gated engine rejected as an unknown value.
+            // Only the rejected items go, except those pointed at as an
+            // unknown field that carried `Location.altered` (ADR-0056) and
+            // those of a gated engine rejected as an unknown value.
             Parsed::Findings(b) => {
                 let n = b.findings.len();
                 let findings: Vec<Finding> = b
@@ -960,13 +1008,19 @@ impl ResultBatch {
                         if rejected.binary_search(i).is_err() {
                             return true;
                         }
-                        let keep = keep_values
+                        let field = unknown.binary_search(i).is_ok() && finding_carries_gated(f);
+                        let value = keep_values
                             && unknown_value.binary_search(i).is_ok()
                             && !finding_gate(f).is_empty();
-                        kept_values |= keep;
-                        keep
+                        kept_values |= value;
+                        field || value
                     })
-                    .map(|(_, f)| f)
+                    .map(|(_, mut f)| {
+                        if strip_all {
+                            strip_gated_finding(&mut f);
+                        }
+                        f
+                    })
                     .collect();
                 left_out = n - findings.len();
                 Parsed::Findings(FindingsBatch {
@@ -1030,9 +1084,14 @@ impl ResultBatch {
     }
 }
 
+/// Whether any object of an event carries `ObjectRef.altered` (ADR-0056).
+fn event_objects_altered(e: &AccessEvent) -> bool {
+    e.objects.iter().any(|o| o.altered.is_some())
+}
+
 /// Whether an event carries a gated field (ADR-0022).
 fn event_carries_gated(e: &AccessEvent) -> bool {
-    e.bytes.is_some() || e.objects_overflowed.is_some()
+    e.bytes.is_some() || e.objects_overflowed.is_some() || event_objects_altered(e)
 }
 
 /// The capability tokens of the gated fields an event carries.
@@ -1043,18 +1102,43 @@ fn event_field_tokens(e: &AccessEvent) -> impl Iterator<Item = &'static str> {
         e.objects_overflowed
             .is_some()
             .then_some(token::ACCESS_EVENT_OBJECTS_OVERFLOWED),
+        event_objects_altered(e).then_some(token::OBJECT_REF_ALTERED),
     ]
     .into_iter()
     .flatten()
 }
 
-/// Removes every gated field of an event (ADR-0022): `bytes` and
-/// `objects_overflowed` (ADR-0053). A new gated `AccessEvent` field must be
-/// added here, in [`event_carries_gated`], in [`event_field_tokens`] and in
+/// Removes every gated field of an event (ADR-0022): `bytes`,
+/// `objects_overflowed` (ADR-0053) and every object's `altered`
+/// (ADR-0056). A new gated `AccessEvent` field must be added here, in
+/// [`event_carries_gated`], in [`event_field_tokens`] and in
 /// [`ResultBatch::for_console`].
 fn strip_gated_event(e: &mut AccessEvent) {
     e.bytes = None;
     e.objects_overflowed = None;
+    for o in &mut e.objects {
+        o.altered = None;
+    }
+}
+
+/// Whether a finding carries a gated field: `Location.altered` (ADR-0056).
+fn finding_carries_gated(f: &Finding) -> bool {
+    f.location.altered.is_some()
+}
+
+/// The capability tokens of the gated fields a finding carries.
+fn finding_field_tokens(f: &Finding) -> impl Iterator<Item = &'static str> {
+    finding_carries_gated(f)
+        .then_some(crate::capabilities::token::LOCATION_ALTERED)
+        .into_iter()
+}
+
+/// Removes every gated field of a finding (ADR-0022): `Location.altered`
+/// (ADR-0056). A new gated `Finding` field must be added here, in
+/// [`finding_carries_gated`], in [`finding_field_tokens`] and in
+/// [`ResultBatch::for_console`].
+fn strip_gated_finding(f: &mut Finding) {
+    f.location.altered = None;
 }
 
 /// Batches built from masked results, and the items dropped on the way.
@@ -1235,10 +1319,16 @@ fn event_item(
                 Some(s) => Some(id(s)?),
                 None => None,
             },
-            // ADR-0056 decision 1: in the contract, gated by
-            // `object_ref.altered`. Not sent yet: the marker and its
-            // send-time gate are the agent lot (decision 2).
-            altered: None,
+            // ADR-0056 decision 2: the parts normalization altered,
+            // always spooled, stripped at send time unless the console
+            // lists `object_ref.altered` (`ResultBatch::for_console`). The
+            // sanitizer drops the parts sent as `*`.
+            altered: sanitize::object_ref_parts(
+                o.database().altered(),
+                o.schema()
+                    .is_some_and(databastion_classifiers::names::NormalizedName::altered),
+                o.object().altered(),
+            ),
         });
     }
     let signals: Vec<Signal> = e
@@ -1307,10 +1397,18 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             (!fps.is_empty()).then_some(fps)
         },
         location: Location {
-            // ADR-0056 decision 1: in the contract, gated by
-            // `location.altered`. Not sent yet: the marker and the findings
-            // gate are the agent lot (decision 2).
-            altered: None,
+            // ADR-0056 decision 2 item 3: the parts normalization altered,
+            // always spooled, stripped at send time unless the console
+            // lists `location.altered` (`ResultBatch::for_console`). The
+            // sanitizer drops the parts sent as `*`.
+            altered: sanitize::location_parts(
+                loc.database.altered(),
+                loc.schema
+                    .as_ref()
+                    .is_some_and(databastion_classifiers::names::NormalizedName::altered),
+                loc.object.altered(),
+                loc.field.altered(),
+            ),
             database: id(&loc.database)?,
             engine,
             field: id(&loc.field)?,
@@ -1970,8 +2068,279 @@ mod tests {
         );
         let batch = &built.batches[0];
         assert!(!batch.carries_gated());
+        assert!(batch.fields().is_empty());
         let (again, left_out) = batch.stripped(&[1], &[1], &[], &[]).unwrap();
         assert_eq!((again.unwrap().len(), left_out), (2, 1));
+    }
+
+    /// Masked findings at `crm.public.<object>.<field>` (raw names).
+    fn masked_at(object: &str, field: &str) -> MaskedFinding {
+        use databastion_classifiers::masking::{FindingLocation, RawSample, mask};
+        use databastion_classifiers::names::normalize_path;
+        MaskedFinding::new(
+            databastion_classifiers::id::ClassifierId::PII_EMAIL,
+            vec![mask(&RawSample::new("a@b.c"))],
+        )
+        .with_location(FindingLocation {
+            database: normalize_path("crm"),
+            schema: Some(normalize_path("public")),
+            object: normalize_path(object),
+            field: normalize_path(field),
+        })
+        .with_counts(10, 5, 0.9)
+    }
+
+    fn findings_batch(findings: &[MaskedFinding]) -> ResultBatch {
+        let built = to_batches(MaskedResults::Findings {
+            job_id: Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+            classifiers_version: &ClassifiersVersion::try_from("2026.09.1").unwrap(),
+            target_id: &databastion_protocol::TargetId::try_from("pg-main").unwrap(),
+            engine: Engine::Postgres,
+            findings,
+        });
+        assert_eq!(built.batches.len(), 1);
+        built.batches.into_iter().next().unwrap()
+    }
+
+    fn findings_of(batch: &ResultBatch) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_slice(batch.bytes()).unwrap();
+        v["findings"].as_array().unwrap().clone()
+    }
+
+    /// ADR-0056 decision 2 items 1 and 3: the location of a finding names
+    /// the parts normalization altered (a zero-width space in the table, a
+    /// fullwidth letter in the column), in contract order, never empty and
+    /// never twice; the plain location carries no list. `Location.altered`
+    /// is the first gated finding field: spooled in full, stripped at send
+    /// time unless the console lists `location.altered`, and a `400` on it
+    /// strips it and keeps the item.
+    #[test]
+    fn findings_name_their_altered_parts_and_gate_them() {
+        use crate::capabilities::token;
+        let batch = findings_batch(&[
+            masked_at("clients", "email"),
+            masked_at("clients\u{200B}", "\u{FF45}mail"),
+            masked_at("\u{FF43}lients", "email"),
+        ]);
+        let f = findings_of(&batch);
+        assert!(f[0]["location"].get("altered").is_none());
+        assert_eq!(
+            f[1]["location"]["altered"],
+            serde_json::json!(["object", "field"])
+        );
+        assert_eq!(f[2]["location"]["altered"], serde_json::json!(["object"]));
+        // Every name the same as the plain location's (I2: no character).
+        for x in &f {
+            assert_eq!(x["location"]["object"], "clients");
+            assert_eq!(x["location"]["field"], "email");
+        }
+        assert!(batch.carries_gated());
+        assert_eq!(batch.fields(), [token::LOCATION_ALTERED]);
+        assert_eq!(batch.gated_items(), 2);
+        // Listed: sent as spooled.
+        assert!(
+            batch
+                .for_console(&caps(&[token::LOCATION_ALTERED]))
+                .unwrap()
+                .is_none()
+        );
+        // Not listed, or not known: stripped under a new `batch_id`, the
+        // batch the conversion would have built without the field.
+        for snapshot in [
+            caps(&[token::OBJECT_REF_ALTERED]),
+            crate::capabilities::Snapshot::unknown(),
+        ] {
+            let sent = batch.for_console(&snapshot).unwrap().unwrap();
+            assert_ne!(sent.batch_id(), batch.batch_id());
+            assert!(!sent.carries_gated() && sent.fields().is_empty());
+            let mut want = findings_of(&batch);
+            for x in &mut want {
+                x["location"].as_object_mut().unwrap().remove("altered");
+            }
+            assert_eq!(findings_of(&sent), want);
+        }
+        // A `400` `additionalProperties` on item 1: kept, every field
+        // stripped; item 0 rejected for another reason is left out.
+        let (again, left_out) = batch.stripped(&[0, 1], &[1], &[], &[]).unwrap();
+        let again = again.unwrap();
+        assert_eq!((again.len(), left_out), (2, 1));
+        assert!(!again.carries_gated());
+        assert!(
+            findings_of(&again)
+                .iter()
+                .all(|x| x["location"].get("altered").is_none())
+        );
+        // Item 0 pointed at as an unknown field, but it carried none: left
+        // out (rejected for something else).
+        let (again, left_out) = batch.stripped(&[0], &[0], &[], &[]).unwrap();
+        assert_eq!((again.unwrap().len(), left_out), (2, 1));
+        // The spooled bytes parse back with their tokens (agent restart).
+        let back = ResultBatch::parse(true, batch.bytes().to_vec()).unwrap();
+        assert_eq!(back.fields(), [token::LOCATION_ALTERED]);
+    }
+
+    /// ADR-0056: a part sent as `*` is never in `altered` (an altered
+    /// name the sanitizer turns into `*`, or a schema-less location), and
+    /// an empty or repeated list never leaves the agent (contract review
+    /// N2).
+    #[test]
+    fn altered_lists_follow_the_contract_rules() {
+        let mut f = crate::sanitize::tests::finding();
+        f.location.schema = None;
+        f.location.altered = Some(vec![
+            databastion_protocol::LocationPart::Field,
+            databastion_protocol::LocationPart::Schema,
+            databastion_protocol::LocationPart::Database,
+            databastion_protocol::LocationPart::Field,
+        ]);
+        f.location.database = Identifier::try_from("123456789").unwrap();
+        assert!(crate::sanitize::check_finding(&mut f));
+        // The database became `*` (the `not` rule), the schema is absent:
+        // only `field` is left, once.
+        assert_eq!(f.location.database.as_str(), "*");
+        assert_eq!(
+            f.location.altered,
+            Some(vec![databastion_protocol::LocationPart::Field])
+        );
+        f.location.field = Identifier::try_from("*").unwrap();
+        assert!(crate::sanitize::check_finding(&mut f));
+        assert!(f.location.altered.is_none(), "never an empty list");
+        let mut e = crate::sanitize::tests::event("read", 1);
+        e.objects[0].object =
+            databastion_protocol::ObjectName::Variant0(Identifier::try_from("orders").unwrap());
+        e.objects[0].altered = Some(vec![
+            databastion_protocol::ObjectRefPart::Object,
+            databastion_protocol::ObjectRefPart::Object,
+            databastion_protocol::ObjectRefPart::Schema,
+        ]);
+        e.objects[0].schema = None;
+        assert!(crate::sanitize::check_event(&mut e));
+        assert_eq!(
+            e.objects[0].altered,
+            Some(vec![databastion_protocol::ObjectRefPart::Object])
+        );
+        e.objects[0].object =
+            databastion_protocol::ObjectName::Variant0(Identifier::try_from("*").unwrap());
+        assert!(crate::sanitize::check_event(&mut e));
+        assert!(e.objects[0].altered.is_none());
+    }
+
+    /// ADR-0056 decision 2 item 2: an event's objects name their altered
+    /// parts; `ObjectRef.altered` is a gated event field with its own
+    /// token, stripped at send time alone (a console that lists the other
+    /// event tokens keeps them) and by a `400`.
+    #[test]
+    fn event_objects_name_their_altered_parts_and_gate_them() {
+        use crate::capabilities::token;
+        use databastion_classifiers::masking::{
+            EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent,
+        };
+        use databastion_classifiers::names::normalize_path;
+        let event = MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("report"),
+            std::time::SystemTime::now(),
+        )
+        .with_object(EventObject::new(
+            normalize_path("\u{FF43}rm"),
+            Some(normalize_path("public")),
+            normalize_path("orders"),
+        ))
+        .with_object(EventObject::new(
+            normalize_path("crm"),
+            Some(normalize_path("p\u{00AD}ublic")),
+            normalize_path("orders\u{200B}"),
+        ))
+        .with_object(EventObject::new(
+            normalize_path("crm"),
+            Some(normalize_path("public")),
+            normalize_path("lines"),
+        ))
+        .with_bytes(Some(10));
+        struct NoFp;
+        impl sanitize::Fingerprinter for NoFp {
+            fn fingerprint(&self, _: &str) -> Option<databastion_protocol::Fingerprint> {
+                None
+            }
+        }
+        let built = to_batches(MaskedResults::Events {
+            target_id: &databastion_protocol::TargetId::try_from("pg-main").unwrap(),
+            events: &[event],
+            fingerprints: &NoFp,
+        });
+        let batch = &built.batches[0];
+        let e = &events_of(batch)[0];
+        let objects = e["objects"].as_array().unwrap();
+        // The two altered spellings of `crm.public.orders` are one object
+        // (the same names), with the union of their parts; `lines` is plain.
+        assert_eq!(objects.len(), 2, "{objects:?}");
+        assert_eq!(objects[0]["object"], "lines");
+        assert!(objects[0].get("altered").is_none());
+        assert_eq!(objects[1]["object"], "orders");
+        assert_eq!(
+            objects[1]["altered"],
+            serde_json::json!(["database", "schema", "object"])
+        );
+        assert!(batch.carries_gated());
+        assert_eq!(
+            batch.fields(),
+            [token::ACCESS_EVENT_BYTES, token::OBJECT_REF_ALTERED]
+        );
+        let sent = batch
+            .for_console(&caps(&[token::ACCESS_EVENT_BYTES]))
+            .unwrap()
+            .unwrap();
+        let e = &events_of(&sent)[0];
+        assert_eq!(e["bytes"], 10);
+        assert!(
+            e["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o.get("altered").is_none())
+        );
+        let (again, _) = batch.stripped(&[0], &[0], &[], &[]).unwrap();
+        let again = again.unwrap();
+        assert!(!again.carries_gated());
+        let e = &events_of(&again)[0];
+        assert!(e.get("bytes").is_none());
+        assert!(
+            e["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o.get("altered").is_none())
+        );
+    }
+
+    /// ADR-0056 with ADR-0053: the `*` the sanitizer adds for objects it
+    /// leaves out of an overflowed event carries their database marker
+    /// when it names their database; the flagged event stays valid.
+    #[test]
+    fn the_sanitizer_overflow_star_keeps_the_database_marker() {
+        let mut e = crate::sanitize::tests::event("read", 17);
+        for (i, o) in e.objects.iter_mut().enumerate() {
+            o.object = databastion_protocol::ObjectName::Variant0(
+                Identifier::try_from(format!("t{i}").as_str()).unwrap(),
+            );
+        }
+        e.objects[16].altered = Some(vec![databastion_protocol::ObjectRefPart::Database]);
+        assert!(crate::sanitize::check_event(&mut e));
+        assert_eq!(e.objects_overflowed, Some(true));
+        let star = e
+            .objects
+            .iter()
+            .find(|o| matches!(&o.object, databastion_protocol::ObjectName::Variant0(id) if id.as_str() == "*"))
+            .unwrap();
+        assert_eq!(star.database.as_str(), "crm");
+        assert_eq!(
+            star.altered,
+            Some(vec![databastion_protocol::ObjectRefPart::Database])
+        );
+        let batch = pack_events(vec![e]);
+        let v: serde_json::Value = serde_json::from_slice(batch.batches[0].bytes()).unwrap();
+        serde_json::from_value::<EventsBatch>(v).unwrap();
     }
 
     /// The CAS fixtures' items, packed by the core as a connector's output

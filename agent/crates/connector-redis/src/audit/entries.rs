@@ -345,7 +345,10 @@ fn objects_of(
                 }
             }
         };
-        if out.len() < KEPT_OBJECTS && !out.contains(&obj) {
+        // A duplicate unites its ADR-0056 marker into the one kept.
+        if let Some(kept) = out.iter_mut().find(|o| **o == obj) {
+            kept.absorb_marker(&obj);
+        } else if out.len() < KEPT_OBJECTS {
             out.push(obj);
         }
     }
@@ -854,6 +857,35 @@ mod tests {
         );
         let e = entry(&[b"GET", b"orders:ABCD-12-x"]);
         assert_eq!((objs(&e), e.signals.clone()), (vec!["*"], vec![]));
+    }
+
+    /// ADR-0056 decision 2 items 1 and 5: a key read through a fullwidth
+    /// segment (NFKC gives the learned pattern's literal) is marked
+    /// altered; so is a plain key mapped to a pattern learned altered; a
+    /// plain key mapped to a plain pattern, and a key mapped to `*`, are
+    /// not.
+    #[test]
+    fn audit_objects_carry_the_altered_marker() {
+        let learned = LearnedPatterns::with_markers([("user:*:email", false), ("cart:*", true)]);
+        let ctx = Context {
+            learned: &learned,
+            stores: None,
+            dbs: &[],
+        };
+        let one = |key: &[u8]| {
+            let e = parse_log_entry(
+                &decode(&resp_entry(7, &[b"GET", key], "10.0.0.9:51000", "app")),
+                &ctx,
+            )
+            .unwrap();
+            let o = e.objects.first().unwrap();
+            (o.as_str().to_owned(), o.altered())
+        };
+        let fullwidth = "\u{FF55}\u{FF53}\u{FF45}\u{FF52}:42:email";
+        assert_eq!(one(fullwidth.as_bytes()), ("user:*:email".to_owned(), true));
+        assert_eq!(one(b"user:42:email"), ("user:*:email".to_owned(), false));
+        assert_eq!(one(b"cart:jdupont"), ("cart:*".to_owned(), true));
+        assert_eq!(one("\u{FF4E}ope:1".as_bytes()), ("*".to_owned(), false));
     }
 
     #[test]
