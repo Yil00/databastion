@@ -1163,3 +1163,217 @@ fn the_history_walk_ends_at_the_first_live_record() {
     c.history_us = None;
     assert!(!c.walking_history(), "after the history phase");
 }
+
+/// 0.8.1 hotfix: a read over the response bound halves down to
+/// `MIN_BATCH` from the same position, whatever `fatal` says (every
+/// client-side bound sets it: in 0.8.0 the guard tested it and the read
+/// never halved), and only while the session is in step.
+#[test]
+fn an_oversized_read_halves_down_to_the_floor() {
+    let bound = SsError::new(FailureCode::ResourceLimit, Stage::Introspection);
+    assert!(bound.fatal, "a client-side bound sets fatal");
+    let mut sizes = vec![BATCH];
+    while let Some(n) = halved(&bound, false, *sizes.last().unwrap()) {
+        sizes.push(n);
+    }
+    assert_eq!(sizes, [500, 250, 125, 62, 31, 16]);
+    assert_eq!(*sizes.last().unwrap(), MIN_BATCH);
+    // The same failure at the floor ends the stream.
+    assert_eq!(halved(&bound, false, MIN_BATCH), None);
+    // A session out of step (the cancel not acknowledged) ends it too.
+    assert_eq!(halved(&bound, true, BATCH), None);
+    // Other failures are not retried smaller.
+    for code in [
+        FailureCode::Timeout,
+        FailureCode::Internal,
+        FailureCode::TargetUnreachable,
+        FailureCode::Unsupported,
+    ] {
+        assert_eq!(
+            halved(&SsError::new(code, Stage::Introspection), false, BATCH),
+            None,
+            "{code:?}"
+        );
+    }
+    assert_eq!(
+        halved(
+            &SsError::server(229, 14, Stage::Introspection),
+            false,
+            BATCH
+        ),
+        None
+    );
+    // A successful read doubles back up to BATCH (`read`).
+    let mut n = MIN_BATCH;
+    let mut up = vec![n];
+    while n < BATCH {
+        n = (n * 2).min(BATCH);
+        up.push(n);
+    }
+    assert_eq!(up, [16, 32, 64, 128, 256, 500]);
+}
+
+/// 0.8.1 hotfix: a response over the poll's byte bound is cancelled with
+/// the ATTENTION acknowledged: the error is `ResourceLimit` with `fatal`
+/// set, the session stays in step, and the read halves; the next,
+/// smaller read on the same session succeeds.
+#[tokio::test]
+async fn a_response_over_the_byte_bound_leaves_the_session_usable() {
+    use crate::conn::{Flow, Shape, tests::scripted};
+    use crate::token::{done, tests::build, tok};
+
+    let mut big = build::colmeta_int(&["a"]);
+    for i in 0..4_000 {
+        big.extend(build::row_int(&[Some(i)]));
+    }
+    big.extend(build::done(tok::DONE, done::COUNT, 4_000));
+    let ack = build::done(tok::DONE, done::ATTN, 0);
+    let mut next = build::colmeta_int(&["a"]);
+    next.extend(build::row_int(&[Some(1)]));
+    next.extend(build::done(tok::DONE, 0, 1));
+    let (mut s, h) = scripted(vec![big, ack, next]);
+    let shape = |max_bytes| Shape {
+        columns: 1,
+        max_rows: 10_000,
+        max_bytes,
+        plp_cap: 0,
+    };
+    let e = s
+        .run("SELECT a", Stage::Introspection, shape(1024), |_| {
+            Flow::Continue
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, FailureCode::ResourceLimit);
+    assert!(e.fatal, "a client-side bound sets fatal");
+    assert!(!s.is_poisoned(), "attention acknowledged");
+    assert_eq!(halved(&e, s.is_poisoned(), BATCH), Some(BATCH / 2));
+    let rows = s
+        .rows("SELECT a", Stage::Introspection, shape(POLL_BYTES))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    drop(s);
+    let sent = h.await.unwrap();
+    assert!(
+        sent.iter()
+            .any(|m| m.first() == Some(&crate::tds::ptype::ATTENTION))
+    );
+}
+
+/// A real `ResourceLimit` with the session poisoned: a response over the
+/// byte bound whose cancel is never acknowledged (the server closes).
+async fn poisoned_bound() -> SsError {
+    use crate::conn::{Flow, Shape, tests::scripted};
+    use crate::token::{done, tests::build, tok};
+
+    let mut big = build::colmeta_int(&["a"]);
+    for i in 0..4_000 {
+        big.extend(build::row_int(&[Some(i)]));
+    }
+    big.extend(build::done(tok::DONE, done::COUNT, 4_000));
+    let (mut s, _h) = scripted(vec![big, crate::fake::CLOSE.to_vec()]);
+    let shape = Shape {
+        columns: 1,
+        max_rows: 10_000,
+        max_bytes: 1024,
+        plp_cap: 0,
+    };
+    let e = s
+        .run("SELECT a", Stage::Introspection, shape, |_| Flow::Continue)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, FailureCode::ResourceLimit);
+    assert!(s.is_poisoned(), "attention not acknowledged");
+    e
+}
+
+/// Security review L1 of the 0.8.1 fix: a read over the bound whose
+/// cancel poisons the session ends the stream, and the restarted stream
+/// (which starts at `BATCH`) reads the halved size from the same
+/// position, so a poisoning that recurs there still walks down to
+/// `MIN_BATCH`; a successful read clears it. Both sources, each with its
+/// own key.
+#[tokio::test]
+async fn a_poisoned_oversized_read_keeps_its_halved_size_across_restarts() {
+    let e = poisoned_bound().await;
+    let audit = Cursor {
+        file: Some(f("/var/opt/mssql/audit/", 1)),
+        offset: 4096,
+        skip: 7,
+        pattern: Some(P1.to_owned()),
+        ..Cursor::default()
+    };
+    let xe = Cursor {
+        file: Some("/var/opt/mssql/xe/x_0_1.xel".to_owned()),
+        offset: 8192,
+        skip: 3,
+        pattern: Some("N'/var/opt/mssql/xe/x*.xel'".to_owned()),
+        ..Cursor::default()
+    };
+    for (source, cursor, other) in [
+        (Source::Audit, &audit, Source::Xevents),
+        (Source::Xevents, &xe, Source::Audit),
+    ] {
+        let shared = Shared::default();
+        let at = ReadAt::of(cursor);
+        // A first stream: the read fails poisoned, the stream ends.
+        let first = shared.read_size("t1", source, &at, BATCH);
+        assert_eq!(first, BATCH);
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &e, true, first),
+            None,
+            "{source:?}: a poisoned session ends the stream"
+        );
+        // Restarts at the same position read smaller each time, down to
+        // the floor, never below it.
+        let mut sizes = vec![first];
+        loop {
+            let n = shared.read_size("t1", source, &ReadAt::of(cursor), BATCH);
+            if n == *sizes.last().unwrap() {
+                break;
+            }
+            sizes.push(n);
+            assert_eq!(
+                shared.read_failed("t1", source, ReadAt::of(cursor), &e, true, n),
+                None
+            );
+        }
+        assert_eq!(sizes, [500, 250, 125, 62, 31, 16], "{source:?}");
+        // Only for this target, this source and this position.
+        assert_eq!(shared.read_size("t2", source, &at, BATCH), BATCH);
+        assert_eq!(shared.read_size("t1", other, &at, BATCH), BATCH);
+        let mut moved = cursor.clone();
+        moved.skip += 1;
+        assert_eq!(
+            shared.read_size("t1", source, &ReadAt::of(&moved), BATCH),
+            BATCH
+        );
+        let mut refiled = cursor.clone();
+        refiled.pattern = None;
+        assert_eq!(
+            shared.read_size("t1", source, &ReadAt::of(&refiled), BATCH),
+            BATCH
+        );
+        // A smaller in-stream size is never raised by it.
+        assert_eq!(shared.read_size("t1", source, &at, 8), 8);
+        // A successful read clears it: the next restart reads BATCH.
+        shared.read_succeeded("t1");
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH);
+        // A session still in step halves in the stream, and the size is
+        // kept for a restart too until a read succeeds.
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &e, false, BATCH),
+            Some(BATCH / 2)
+        );
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH / 2);
+        shared.read_succeeded("t1");
+        // Other failures keep nothing.
+        let timeout = SsError::new(FailureCode::Timeout, Stage::Introspection);
+        assert_eq!(
+            shared.read_failed("t1", source, at.clone(), &timeout, false, BATCH),
+            None
+        );
+        assert_eq!(shared.read_size("t1", source, &at, BATCH), BATCH);
+    }
+}
