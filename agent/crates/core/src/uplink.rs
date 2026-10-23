@@ -1235,6 +1235,10 @@ fn event_item(
                 Some(s) => Some(id(s)?),
                 None => None,
             },
+            // ADR-0056 decision 1: in the contract, gated by
+            // `object_ref.altered`. Not sent yet: the marker and its
+            // send-time gate are the agent lot (decision 2).
+            altered: None,
         });
     }
     let signals: Vec<Signal> = e
@@ -1303,6 +1307,10 @@ fn finding_item(target_id: &TargetId, engine: Engine, f: &MaskedFinding) -> Opti
             (!fps.is_empty()).then_some(fps)
         },
         location: Location {
+            // ADR-0056 decision 1: in the contract, gated by
+            // `location.altered`. Not sent yet: the marker and the findings
+            // gate are the agent lot (decision 2).
+            altered: None,
             database: id(&loc.database)?,
             engine,
             field: id(&loc.field)?,

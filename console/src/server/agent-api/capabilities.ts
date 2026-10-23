@@ -40,6 +40,12 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * agent strips the field and resends (decision 9), and the target falls back to today's rule
  * until the next heartbeat reaches a replica of this build.
  *
+ * Exception, on purpose: `location.altered` and `object_ref.altered` (ADR-0056) are accepted by
+ * the generated schema since the contract change (decision 1), but they are not listed here and the
+ * fields are not stored or used: they are listed, both or neither, only by the console change of
+ * ADR-0056 decision 3 (the per-job merge on the finding row and the exception rule for altered
+ * parts). A conforming agent does not send them before.
+ *
  * Engines added after protocol 0.1.0 are tokens too (`engine.<value>`, ADR-0039 decision 8): until
  * the console lists one, a conforming agent sends no `Engine`, `Connector` or `AuditSource` value of
  * that engine (no target, detected target, finding or event). `engine.cas` (ADR-0041 decision 12):

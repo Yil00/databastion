@@ -202,7 +202,10 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         expect(r.dbUserFingerprint).toBe(e.principal.db_user_fingerprint ?? null);
         expect(r.accountNotRecorded).toBe((e.principal as { account_not_recorded?: boolean }).account_not_recorded === true);
         expect(r.principalKey).toBe(principalKey(e.principal));
-        expect(r.objects).toEqual(e.objects);
+        // ADR-0056: `ObjectRef.altered` is accepted by the contract but not stored before the console
+        // lot (decision 3, which lists `object_ref.altered`); every other object field is stored.
+        const objects = e.objects as Array<Record<string, unknown> & { altered?: unknown }>;
+        expect(r.objects).toEqual(objects.map(({ altered: _altered, ...o }) => o));
         expect(r.signals).toEqual(e.signals ?? []);
         expect(r.rows).toBe(e.rows ?? null);
         expect(r.bytes).toBe((e as { bytes?: number }).bytes ?? null);

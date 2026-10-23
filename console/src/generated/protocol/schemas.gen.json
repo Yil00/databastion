@@ -1019,7 +1019,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }
@@ -1620,6 +1620,16 @@
         },
         "field": {
           "$ref": "#/$defs/Identifier"
+        },
+        "altered": {
+          "description": "Parts of this location whose name was altered: the agent's name\nnormalization (ADR-0009: control and format characters stripped, NFKC; on\nRedis / Valkey the same steps of the key-pattern normalizer; on CAS,\ndefinition keys converted to snake_case) changed these parts, so another\nobject of the engine may be sent under the same name. Never set for a part\nsent as `*`. It carries no value, no character and no count (I2). Unique\nparts, at least one; absent when no part was altered. Sent only when the\nlatest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,\nADR-0056); a `400` reporting it as an unknown field clears the agent's\ncapability list, and the findings are resent once without it (ADR-0022\ndecision 9).\n",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/LocationPart"
+          }
         }
       },
       "if": {
@@ -1649,6 +1659,25 @@
           }
         }
       }
+    },
+    "LocationPart": {
+      "description": "A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.\n",
+      "type": "string",
+      "enum": [
+        "database",
+        "schema",
+        "object",
+        "field"
+      ]
+    },
+    "ObjectRefPart": {
+      "description": "A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event\nobject names no field).\n",
+      "type": "string",
+      "enum": [
+        "database",
+        "schema",
+        "object"
+      ]
     },
     "EventsBatch": {
       "description": "Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).",
@@ -1812,6 +1841,16 @@
                     },
                     "object": {
                       "$ref": "#/$defs/KeyPattern"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
                     }
                   }
                 }
@@ -1852,6 +1891,16 @@
                     },
                     "object": {
                       "$ref": "#/$defs/Identifier"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
                     }
                   }
                 }
@@ -1892,6 +1941,16 @@
                     },
                     "object": {
                       "const": "*"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
                     }
                   }
                 }
@@ -1996,6 +2055,16 @@
         },
         "object": {
           "$ref": "#/$defs/ObjectName"
+        },
+        "altered": {
+          "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ObjectRefPart"
+          }
         }
       }
     }

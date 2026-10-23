@@ -45,6 +45,8 @@
 // - #/$defs/DiscoveryScanParams/properties/databases
 // - #/$defs/DiscoveryScanParams/properties/include_objects
 // - #/$defs/DiscoveryScanParams/properties/schemas
+// - #/$defs/Location/properties/altered
+// - #/$defs/ObjectRef/properties/altered
 
 /**Normalized access event, pre-aggregated by the agent. Contains no query text, no bound parameter
 and no returned value: only who, what object, which action, how many rows, and signals.
@@ -2397,7 +2399,8 @@ console's configuration wizard. Never a target network address, never a process 
 pub struct HeartbeatResponse {
     /**Optional **request** fields and features this console accepts (ADR-0022), e.g.
 `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
-`access_event.objects_overflowed`, `job_progress.coverage`, and the engines
+`access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
+`job_progress.coverage`, and the engines
 added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
 the list of the latest heartbeat response and sends an optional request field
 introduced after protocol 0.1.0 only when that list names it; before its first
@@ -2903,12 +2906,90 @@ every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containin
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
+    /**Parts of this location whose name was altered: the agent's name
+normalization (ADR-0009: control and format characters stripped, NFKC; on
+Redis / Valkey the same steps of the key-pattern normalizer; on CAS,
+definition keys converted to snake_case) changed these parts, so another
+object of the engine may be sent under the same name. Never set for a part
+sent as `*`. It carries no value, no character and no count (I2). Unique
+parts, at least one; absent when no part was altered. Sent only when the
+latest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,
+ADR-0056); a `400` reporting it as an unknown field clears the agent's
+capability list, and the findings are resent once without it (ADR-0022
+decision 9).
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub altered: ::std::option::Option<::std::vec::Vec<LocationPart>>,
     pub database: Identifier,
     pub engine: Engine,
     pub field: Identifier,
     pub object: ObjectName,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
+}
+/**A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
+*/
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum LocationPart {
+    #[serde(rename = "database")]
+    Database,
+    #[serde(rename = "schema")]
+    Schema,
+    #[serde(rename = "object")]
+    Object,
+    #[serde(rename = "field")]
+    Field,
+}
+impl ::std::fmt::Display for LocationPart {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Database => f.write_str("database"),
+            Self::Schema => f.write_str("schema"),
+            Self::Object => f.write_str("object"),
+            Self::Field => f.write_str("field"),
+        }
+    }
+}
+impl ::std::str::FromStr for LocationPart {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "database" => Ok(Self::Database),
+            "schema" => Ok(Self::Schema),
+            "object" => Ok(Self::Object),
+            "field" => Ok(Self::Field),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for LocationPart {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for LocationPart {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
 }
 /**Sample masked by `classifiers::masking` (e.g. `j***@e***.com`,
 `FR** **** **** **** **** ***0 189`). Schema rules: contains at least one `*`, no run of more than
@@ -3324,10 +3405,86 @@ targets, `Identifier` on every other target). The `KeyPattern` rendering rule ap
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectRef {
+    /**Parts of this object whose name was altered: the agent's name normalization
+(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+the same steps of the key-pattern normalizer; on CAS, definition keys
+converted to snake_case) changed these parts, so another object of the
+engine may be sent under the same name. Never set for a part sent as `*`. It
+carries no value, no character and no count (I2). Unique parts, at least
+one; absent when no part was altered; an event object names no field. Sent
+only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+agent's capability list, and the events are resent once without it (ADR-0022
+decision 9). Keep in step with the inline copies of `ObjectRef` in
+`AccessEvent`.
+*/
+    #[serde(skip_serializing_if = "::std::option::Option::is_none")]
+    pub altered: ::std::option::Option<::std::vec::Vec<ObjectRefPart>>,
     pub database: Identifier,
     pub object: ObjectName,
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub schema: ::std::option::Option<Identifier>,
+}
+/**A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event
+object names no field).
+*/
+#[derive(
+    ::serde::Deserialize,
+    ::serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd
+)]
+pub enum ObjectRefPart {
+    #[serde(rename = "database")]
+    Database,
+    #[serde(rename = "schema")]
+    Schema,
+    #[serde(rename = "object")]
+    Object,
+}
+impl ::std::fmt::Display for ObjectRefPart {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match *self {
+            Self::Database => f.write_str("database"),
+            Self::Schema => f.write_str("schema"),
+            Self::Object => f.write_str("object"),
+        }
+    }
+}
+impl ::std::str::FromStr for ObjectRefPart {
+    type Err = self::error::ConversionError;
+    fn from_str(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        match value {
+            "database" => Ok(Self::Database),
+            "schema" => Ok(Self::Schema),
+            "object" => Ok(Self::Object),
+            _ => Err("invalid value".into()),
+        }
+    }
+}
+impl ::std::convert::TryFrom<&str> for ObjectRefPart {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: &str,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
+}
+impl ::std::convert::TryFrom<::std::string::String> for ObjectRefPart {
+    type Error = self::error::ConversionError;
+    fn try_from(
+        value: ::std::string::String,
+    ) -> ::std::result::Result<Self, self::error::ConversionError> {
+        value.parse()
+    }
 }
 /**Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
 an account that does not exist on the target (the attempted name may be a mistyped password), and
