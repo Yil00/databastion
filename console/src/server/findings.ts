@@ -276,6 +276,7 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
       falsePositiveClassifiersVersion: findings.falsePositiveClassifiersVersion,
       falsePositiveAltered: findings.falsePositiveAltered,
       altered: findings.altered,
+      alteredJobId: findings.alteredJobId,
       lastJobId: findings.lastJobId,
     })
     .from(findings)
@@ -283,13 +284,26 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
     .for("update");
   const ids = new Map(existing.map((r) => [r.locationKey, r.id]));
   // ADR-0056 decision 3 item 2: across the batches of one job, the union with the stored parts;
-  // the first batch of another job (or of a row whose job is gone) replaces them. Exact: the rows
-  // are locked and the batches of one agent serialized (advisory lock in `ingestFindings`).
+  // the first batch of a newer job replaces them, and a late batch of an older job only adds to
+  // them (security review L1: fail closed, it never clears what a newer job reported). Exact: the
+  // rows are locked and the batches of one agent serialized (advisory lock in `ingestFindings`).
   const altered = new Map<string, LocationPart[] | null>();
-  for (const k of keys) altered.set(k, batchAltered.get(k) ?? null);
+  const alteredJob = new Map<string, string>();
+  for (const k of keys) {
+    altered.set(k, batchAltered.get(k) ?? null);
+    alteredJob.set(k, batch.job_id);
+  }
+  const storedJobs = [...new Set(existing.flatMap((r) => r.alteredJobId ?? r.lastJobId ?? []))].filter((j) => j !== batch.job_id);
+  const order = await jobOrder(tx, [batch.job_id, ...storedJobs]);
   for (const r of existing) {
-    if (r.lastJobId !== null && r.lastJobId === batch.job_id) {
-      altered.set(r.locationKey, mergeAltered(r.altered, altered.get(r.locationKey)));
+    const stored = r.alteredJobId ?? r.lastJobId;
+    if (stored === null) continue;
+    const merged = mergeAltered(r.altered, altered.get(r.locationKey));
+    if (stored === batch.job_id) {
+      altered.set(r.locationKey, merged);
+    } else if (!jobIsNewer(order, batch.job_id, stored)) {
+      altered.set(r.locationKey, merged);
+      alteredJob.set(r.locationKey, stored);
     }
   }
   const resets = existing.flatMap((r) => {
@@ -326,6 +340,7 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
       lastJobId: batch.job_id,
       lastBatchId: batch.batch_id,
       altered: altered.get(locationKey) ?? null,
+      alteredJobId: alteredJob.get(locationKey) ?? batch.job_id,
     };
   });
   await tx
@@ -347,6 +362,7 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
         lastBatchId: excluded("last_batch_id"),
         // ADR-0056: already merged above for this job (`excluded.altered`).
         altered: excluded("altered"),
+        alteredJobId: excluded("altered_job_id"),
         lastSeenAt: sql`now()`,
         // M2: same predicate as `fpResetNeeded`, evaluated on the locked row.
         falsePositiveAt: sql`case when ${FP_RESET_SQL} then null else ${findings.falsePositiveAt} end`,
@@ -372,6 +388,28 @@ async function upsertFindings(tx: Tx, agentId: string, batch: FindingsBatch): Pr
       },
     });
   }
+}
+
+/** `jobs.created_at` (microseconds) and id of the given jobs (immutable: read without a lock). */
+async function jobOrder(tx: Tx, ids: readonly string[]): Promise<Map<string, [bigint, string]>> {
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({ id: jobs.id, at: sql<string>`(extract(epoch from ${jobs.createdAt}) * 1000000)::bigint::text` })
+    .from(jobs)
+    .where(inArray(jobs.id, [...ids]));
+  return new Map(rows.map((r) => [r.id, [BigInt(r.at), r.id] as [bigint, string]]));
+}
+
+/**
+ * Whether job `a` is newer than job `b` (`created_at`, then id). A stored job that is gone counts
+ * as older, so the parts it held are replaced (they would otherwise never clear).
+ */
+function jobIsNewer(order: ReadonlyMap<string, [bigint, string]>, a: string, b: string): boolean {
+  const ka = order.get(a);
+  const kb = order.get(b);
+  if (kb === undefined) return true;
+  if (ka === undefined) return false;
+  return ka[0] !== kb[0] ? ka[0] > kb[0] : ka[1] > kb[1];
 }
 
 /**

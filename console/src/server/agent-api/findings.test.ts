@@ -824,18 +824,52 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect((await rowOf(auth.agentId)).altered).toEqual(["object"]);
     });
 
-    it("a late batch of an earlier job replaces the parts of the latest one (the row's job changes)", async () => {
+    it("a late batch of an earlier job never clears the parts of a newer one (review L1: B1 altered, late A plain, B2 plain)", async () => {
       const auth = await agentWithTargets();
-      const first = await deliveredScan(auth);
-      expect((await post(auth, batch(first, [TWIN]))).status).toBe(202);
-      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, first));
-      const second = await deliveredScan(auth);
-      expect((await post(auth, batch(second, [PG_FINDING]))).status).toBe(202);
-      expect((await rowOf(auth.agentId)).altered).toBeNull();
-      expect((await post(auth, batch(first, [TWIN]))).status).toBe(202);
-      const row = await rowOf(auth.agentId);
-      expect(row.lastJobId).toBe(first);
+      const a = await deliveredScan(auth);
+      expect((await post(auth, batch(a, [PG_FINDING]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, a));
+      const b = await deliveredScan(auth);
+      // B1: the look-alike.
+      expect((await post(auth, batch(b, [TWIN]))).status).toBe(202);
+      // Late A, plain: the row's last job becomes A for the other columns, the parts stay B's.
+      expect((await post(auth, batch(a, [PG_FINDING]))).status).toBe(202);
+      let row = await rowOf(auth.agentId);
+      expect(row.lastJobId).toBe(a);
       expect(row.altered).toEqual(["object"]);
+      expect(row.alteredJobId).toBe(b);
+      // B2, plain: still B's job, so the union keeps the marker.
+      expect((await post(auth, batch(b, [PG_FINDING]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object"]);
+      expect(covers(row, { object: "clients" })).toBe(false);
+      // A late batch of the older job that is altered adds its parts (fail closed).
+      const fieldTwin = { ...PG_FINDING, location: { ...PG_FINDING.location, altered: ["field"] } };
+      expect((await post(auth, batch(a, [fieldTwin]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toEqual(["object", "field"]);
+      expect(row.alteredJobId).toBe(b);
+      // The first batch of a newer job replaces them.
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, b));
+      const c = await deliveredScan(auth);
+      expect((await post(auth, batch(c, [PG_FINDING]))).status).toBe(202);
+      row = await rowOf(auth.agentId);
+      expect(row.altered).toBeNull();
+      expect(row.alteredJobId).toBe(c);
+    });
+
+    it("a stored job that is gone counts as older: the next batch replaces its parts", async () => {
+      const auth = await agentWithTargets();
+      const a = await deliveredScan(auth);
+      expect((await post(auth, batch(a, [TWIN]))).status).toBe(202);
+      await getDb().update(jobs).set({ status: "succeeded", finishedAt: new Date() }).where(eq(jobs.id, a));
+      const b = await deliveredScan(auth);
+      const gone = "01925f40-0000-7000-8000-000000000056";
+      await getDb().update(findings).set({ alteredJobId: gone }).where(eq(findings.agentId, auth.agentId));
+      expect((await post(auth, batch(b, [PG_FINDING]))).status).toBe(202);
+      const row = await rowOf(auth.agentId);
+      expect(row.altered).toBeNull();
+      expect(row.alteredJobId).toBe(b);
     });
 
     it("a false positive marked on the unaltered row does not apply to the altered one (reset, audited names_altered)", async () => {

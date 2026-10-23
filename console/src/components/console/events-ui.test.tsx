@@ -97,6 +97,12 @@ describe("access events view", () => {
     expect(html).toContain(`name altered by normalization: crm.public.${ESCAPED} (check for look-alike names)`);
     expect(html).not.toContain("<img");
     expect(renderToStaticMarkup(<EventsTable events={[event()]} now={NOW} />)).not.toContain("altered by normalization");
+    // Redis / Valkey: key patterns as inline code, as elsewhere (review N6).
+    const redis = event({ engine: "redis", source: "redis_slowlog", objects: [{ database: "0", object: "user:*:ｓession", altered: ["object"] }] });
+    const keys = renderToStaticMarkup(<EventsTable events={[redis]} now={NOW} />);
+    const note = /<div[^>]*data-names-altered="">(.*?)<\/div>/.exec(keys)?.[1] ?? "";
+    expect(note).toMatch(/<code[^>]*data-key-pattern="">user:\*:ｓession<\/code>/);
+    expect(note.replace(/<!-- -->/g, "").replace(/<[^>]+>/g, "")).toBe("name altered by normalization: user:*:ｓession in 0 (check for look-alike names)");
   });
 
   it("escapes every agent-provided string and links principal, signals and incidents", () => {

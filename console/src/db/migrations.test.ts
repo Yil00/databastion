@@ -216,17 +216,18 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
-  describe("0046: findings altered parts (ADR-0056 decision 3)", () => {
+  describe("0046 and 0047: findings altered parts (ADR-0056 decision 3)", () => {
     it("adds nullable text[] columns with no default and no constraint; the runtime role updates them, never an event's objects", async () => {
       const columns = await withClient(ownerUrl, (c) =>
         c.query<{ column_name: string; data_type: string; is_nullable: string; column_default: string | null }>(
           `select column_name, data_type, is_nullable, column_default from information_schema.columns
-            where table_schema = 'public' and table_name = 'findings' and column_name in ('altered', 'false_positive_altered')
+            where table_schema = 'public' and table_name = 'findings' and column_name in ('altered', 'altered_job_id', 'false_positive_altered')
             order by column_name`,
         ),
       );
       expect(columns.rows).toEqual([
         { column_name: "altered", data_type: "ARRAY", is_nullable: "YES", column_default: null },
+        { column_name: "altered_job_id", data_type: "uuid", is_nullable: "YES", column_default: null },
         { column_name: "false_positive_altered", data_type: "ARRAY", is_nullable: "YES", column_default: null },
       ]);
       // Nothing to validate (ADR-0028): no constraint names either column.

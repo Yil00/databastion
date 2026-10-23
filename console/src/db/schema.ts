@@ -561,6 +561,14 @@ export const findings = pgTable(
      */
     altered: text("altered").array().$type<LocationPart[]>(),
     /**
+     * ADR-0056 (security review L1 of the console lot): the scan job whose items `altered` holds.
+     * A batch of that job adds to it, a batch of a newer job (by `jobs.created_at`, then id)
+     * replaces it, and a late batch of an older job only adds to it, so it never clears what a
+     * newer job reported (fail closed). Separate from `last_job_id`, which every batch still sets.
+     * No foreign key (none to validate on a large table): a job that is gone counts as older.
+     */
+    alteredJobId: uuid("altered_job_id"),
+    /**
      * `last_seen_at` of the revision last evaluated by the policy engine (P3-A). The finding is
      * pending evaluation while it differs from `last_seen_at` (set by the worker with a
      * compare-and-set on `last_seen_at`, so a rescan during an evaluation is never lost).

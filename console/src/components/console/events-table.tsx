@@ -118,7 +118,21 @@ export function NamesAlteredNote({ objects, engine }: { objects: EventView["obje
   if (altered.length === 0) return null;
   return (
     <div className="text-xs text-muted-foreground" title={NAMES_ALTERED_TITLE} data-names-altered="">
-      name altered by normalization: {objectsLabel(altered, 3, engine)} (check for look-alike names)
+      name altered by normalization:{" "}
+      {isKeyPatternEngine(engine) ? (
+        <>
+          {altered.slice(0, 3).map((o, i) => (
+            <span key={i}>
+              {i > 0 ? ", " : ""}
+              <KeyPatternText value={o.object} /> in {o.database}
+            </span>
+          ))}
+          {altered.length > 3 ? ` and ${altered.length - 3} more` : ""}
+        </>
+      ) : (
+        objectsLabel(altered, 3, engine)
+      )}{" "}
+      (check for look-alike names)
     </div>
   );
 }
