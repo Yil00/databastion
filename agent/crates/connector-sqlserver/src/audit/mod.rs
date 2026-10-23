@@ -445,8 +445,9 @@ impl Shared {
         if poisoned {
             tracing::warn!(
                 target_id = %target_id,
+                source = ?source,
                 batch = smaller,
-                "SQL Server Audit: an oversized read was not cancelled in step: the next stream reads fewer records from the same position"
+                "SQL Server audit read: an oversized read was not cancelled in step: the next stream reads fewer records from the same position"
             );
             return None;
         }
