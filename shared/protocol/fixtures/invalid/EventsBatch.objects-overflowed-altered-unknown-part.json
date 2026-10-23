@@ -18,10 +18,7 @@
         {
           "database": "crm",
           "schema": "public",
-          "object": "orders",
-          "altered": [
-            "object"
-          ]
+          "object": "orders"
         },
         {
           "database": "crm",
