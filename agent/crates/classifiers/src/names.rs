@@ -54,6 +54,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crate::detect;
 use crate::hints::word_tokens;
@@ -315,6 +316,94 @@ pub fn conforms(name: &str) -> bool {
                 && !value.chars().any(|c| c == '+' || is_plain_excluded(c))
         })
     })
+}
+
+/// The `not` rules of the contract `IdentifierProduced` (ADR-0057 decision
+/// 1, `shared/protocol/identifier-produced.schema.json`, checked verbatim by
+/// `tests/identifier_produced.rs`): rule id and pattern. Applied to the name,
+/// to each `.`-separated segment and to each LDAP RDN value (the `[.,=]`
+/// boundaries). A digit is `\p{Nd}`, a space `\p{Zs}`, a numeric character
+/// `\p{N}`.
+pub const IDENTIFIER_PRODUCED_RULES: [(&str, &str); 8] = [
+    // 1: a segment made only of 9 or more digits, spaces, `_`, `+`, `-`.
+    ("1", r"(^|[.,=])[0-9\p{Nd}\p{Zs}_+-]{9,}([.,]|$)"),
+    // 2: a digit-to-digit run of 9 or more digits and separators.
+    (
+        "2",
+        r"[0-9\p{Nd}][0-9\p{Nd}\p{Zs}\p{Pd}_+.\uFF0E-]{7,}[0-9\p{Nd}]",
+    ),
+    // 3: an IPv4 address as whole segments, a dashed MAC address, a dotted
+    // MAC address (three 4-character hexadecimal segments, one with a digit).
+    (
+        "3-ipv4",
+        r"(^|[.,=])[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}([.,]|$)",
+    ),
+    (
+        "3-mac-dashed",
+        r"[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}",
+    ),
+    (
+        "3-mac-dotted",
+        r"(^|[.,=])(?:(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9]))([.,]|$)",
+    ),
+    // 4: a percent-encoded byte or a `%uXXXX` escape.
+    ("4", r"%[0-9A-Fa-f]{2}|%[Uu][0-9A-Fa-f]{4}"),
+    // 5: the agent's digit gate, as the contract states it (`\p{N}` only;
+    // the agent also counts the CJK numerals, see [`is_numeric_like`]).
+    ("5-run", r"\p{N}{7,}"),
+    ("5-total", r"\p{N}(?:\P{N}*\p{N}){8}"),
+];
+
+/// Rule id of the agent-only refusal of a code point unassigned in its
+/// Unicode tables (`\p{Cn}`): the console's engine may know it as a digit or
+/// a space (as `keys::is_key_pattern` refuses it, security review L1 of the
+/// key patterns), so the agent sends no such character.
+pub const UNASSIGNED_RULE: &str = "unassigned";
+
+/// The compiled [`IDENTIFIER_PRODUCED_RULES`] and the unassigned class (the
+/// linear-time `regex` engine; the contract's ECMAScript syntax used here is
+/// a common subset, checked against `regress` by the contract test).
+#[allow(clippy::expect_used, reason = "constant patterns, compiled in tests")]
+static PRODUCED: LazyLock<(Vec<(&'static str, regex::Regex)>, regex::Regex)> =
+    LazyLock::new(|| {
+        (
+            IDENTIFIER_PRODUCED_RULES
+                .iter()
+                .map(|(id, p)| {
+                    (
+                        *id,
+                        regex::Regex::new(p).expect("IdentifierProduced rule compiles"),
+                    )
+                })
+                .collect(),
+            regex::Regex::new(r"\p{Cn}").expect("unassigned class compiles"),
+        )
+    });
+
+/// The ids of the `IdentifierProduced` rules `name` violates (ADR-0057
+/// decision 1), in [`IDENTIFIER_PRODUCED_RULES`] order, then
+/// [`UNASSIGNED_RULE`]. Empty for a name that passes them all. Only the
+/// `not` rules: [`conforms`] checks the `Identifier` schema itself.
+#[must_use]
+pub fn produced_violations(name: &str) -> Vec<&'static str> {
+    let (rules, unassigned) = &*PRODUCED;
+    let mut out: Vec<&'static str> = rules
+        .iter()
+        .filter(|(_, re)| re.is_match(name))
+        .map(|(id, _)| *id)
+        .collect();
+    if unassigned.is_match(name) {
+        out.push(UNASSIGNED_RULE);
+    }
+    out
+}
+
+/// Whether `name` matches the contract `IdentifierProduced`: the
+/// `Identifier` schema ([`conforms`]) and every rule of
+/// [`produced_violations`].
+#[must_use]
+pub fn is_identifier_produced(name: &str) -> bool {
+    conforms(name) && produced_violations(name).is_empty()
 }
 
 /// CJK numerals that `char::is_numeric` does not report (they are letters,

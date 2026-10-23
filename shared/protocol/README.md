@@ -22,12 +22,14 @@ Engines added after protocol 0.1.0 follow the same rule ([ADR-0041](../../docs/a
 | `signals.schema.json` | JSON Schema of the signal registry (keys `Signal`, engines `Engine`, from `openapi.yaml`) |
 | `target-notes.json` | Target-note registry: the `TargetNote` codes a conforming agent sends, with their phrase (`{count}`, `{labels}` placeholders) and engines |
 | `target-notes.schema.json` | JSON Schema of the target-note registry (keys `TargetNoteCode`, engines `Engine`) |
+| `identifier-produced.schema.json` | `IdentifierProduced` ([ADR-0057](../../docs/adr/0057-identifier-hardening-agent-first.md) decision 1): the producer rule of every normalized name a conforming agent sends as an `Identifier` (`Identifier` plus `not` rules: digit runs, IPv4 and MAC addresses, percent escapes, the digit bounds). Referenced by nothing in `openapi.yaml` and read by no generator; checked by the agent's contract tests (`agent/crates/classifiers/tests/identifier_produced.rs`) |
 | `fixtures/valid/<Schema>.<case>.json` | Bodies that must be accepted by `<Schema>` |
 | `fixtures/invalid/<Schema>.<case>.json` | Bodies that must be rejected by `<Schema>` |
 | `fixtures/invalid-expectations.json` | For each invalid fixture, the JSON Schema keyword it must fail on (so it fails for the intended reason) |
 | `scripts/schema-lint.mjs` | Closure / bounds lint of every schema (used by `validate-fixtures.mjs`) |
 | `scripts/schema-lint.test.mjs` | Self-test: the contract passes the lint, and known mutations (`{}`, `true`, nullable unbounded types, open objects…) are caught |
 | `scripts/inline-objectref.test.mjs` | Drift test: the three `ObjectRef` shapes inlined in `AccessEvent` (the two branches of its `source` conditional, and the `contains` item of the ADR-0053 rule that a flagged event names a `*`) keep `ObjectRef`'s properties, `required` and `additionalProperties` (only `object` differs: `KeyPattern` / `Identifier` / `const: "*"`); known mutations are caught |
+| `scripts/identifier-produced.test.mjs` | Self-test of `identifier-produced.schema.json`: it refines `Identifier` by one `$ref`, nothing in `openapi.yaml` refers to it, and the ADR-0057 examples are accepted or refused for their rule |
 | `scripts/validate-fixtures.mjs` | Schema lint + fixture validation + coverage check + `x-databastion-max-bytes` check + classifier, signal and target-note registry checks |
 | `scripts/contract-ajv.mjs` | Builds the Ajv instance (contract schemas as `$defs`, registry schemas) shared by the scripts |
 | `scripts/classifier-registry.mjs` | Registry checks: schema, ids sorted, published versions unchanged (lock), valid fixtures only use ids registered for their `classifiers_version` |
