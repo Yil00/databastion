@@ -24,6 +24,7 @@ import { BODY_READ_DEADLINE_MS, clientIp, ipBucket, readJsonBody, type BodyResul
 
 import { authenticateAgent, authPrecheck, countTimedOutBody, type AuthOptions, type AuthResult } from "./auth";
 import { listedAccepts, unlistedEngineDetails } from "./capabilities";
+import { tokensHoldWarningDue } from "./token-hold";
 import { agentError, invalidRequest, NO_STORE, rateLimited, unauthorized, unavailable } from "./errors";
 import { jobHub } from "./job-hub";
 import {
@@ -137,6 +138,9 @@ export function handleHeartbeat(req: Request): Promise<Response> {
         logger.error({ agentId: auth.agent.id, err: e instanceof Error ? e.name : "error" }, "audit settings not queued again after a capability change");
       }
     }
+    // Security review of the token hold, L1: a hold left set is reported at most once an hour.
+    const holdWarning = tokensHoldWarningDue();
+    if (holdWarning !== null) logger.warn(holdWarning);
     return conformingJson("HeartbeatResponse", {
       console_min_protocol: CONSOLE_MIN_PROTOCOL,
       heartbeat_interval_s: HEARTBEAT_INTERVAL_S,

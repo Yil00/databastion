@@ -1,6 +1,6 @@
-import { AGENT_TOKENS_HOLD_VAR, agentTokensHold, ConfigError } from "@/config/env";
+import { agentTokensHold, ConfigError } from "@/config/env";
 
-import { heldAccepts } from "./agent-api/capabilities";
+import { agentTokensHoldWarning } from "./agent-api/token-hold";
 import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
 import { localLoginMode, oidcConfigWarnings, oidcEnabled, oidcStartupFatal } from "./oidc/config";
@@ -32,32 +32,15 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
   const localLogin = localLoginWarning(env);
   if (localLogin !== null) warnings.push(localLogin);
   warnings.push(...oidcConfigWarnings(env));
+  // ADR-0022 decision 8: also repeated hourly from the heartbeat path (agent-api/token-hold.ts).
   const hold = agentTokensHoldWarning(env);
   if (hold !== null) warnings.push(hold);
   return warnings;
 }
 
-/**
- * ADR-0022 decision 8 (end-of-phase-9 review L1): while `DATABASTION_AGENT_TOKENS_HOLD` is set, the
- * heartbeat answers do not list the newer tokens, so agents keep sending the older forms. Meant for
- * the duration of a rolling upgrade only. Names the release line and the held tokens (constants).
- */
-export function agentTokensHoldWarning(env: NodeJS.ProcessEnv = process.env): string | null {
-  let hold: string | null;
-  try {
-    hold = agentTokensHold(env);
-  } catch {
-    return null; // reported by startupFatal
-  }
-  if (hold === null) return null;
-  const held = heldAccepts(env);
-  return (
-    `${AGENT_TOKENS_HOLD_VAR}=${hold}: heartbeat answers list the capability tokens of console ${hold}, not ${held.length === 0 ? "(none held)" : held.join(", ")}; ` +
-    "every field is still accepted. Remove it from every replica once none runs an older release (deploy/README.md, \"Rolling upgrade of several console replicas\")."
-  );
-}
-
 /** `DATABASTION_AGENT_TOKENS_HOLD` with an unknown value (fatal in every environment, like OIDC). */
+export { agentTokensHoldWarning };
+
 function agentTokensHoldFatal(env: NodeJS.ProcessEnv): string | null {
   try {
     agentTokensHold(env);

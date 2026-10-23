@@ -5,12 +5,15 @@ import { getDb } from "@/db/client";
 import { accessEvents, agentTargets, findings } from "@/db/schema";
 import { validateSchema } from "@/lib/protocol/validate";
 import { enqueueJob } from "@/server/jobs";
+import { logger } from "@/lib/logger";
+import { collectMetrics } from "@/server/metrics";
 import { agentTokensHoldWarning, startupFatal, startupWarnings } from "@/server/startup-checks";
 import { hasDb, setupTestDatabase } from "@/test/db";
 import { adminUser, agentRequest, enroll, fixtures } from "@/test/helpers";
 
 import { CONSOLE_ACCEPTS, heldAccepts, listedAccepts, RELEASE_ACCEPTS } from "./capabilities";
 import { handleEvents, handleFindings, handleHeartbeat, handlePollJobs } from "./handlers";
+import { resetTokensHoldWarning, TOKENS_HOLD_WARNING_INTERVAL_MS, tokensHoldMetric, tokensHoldWarningDue } from "./token-hold";
 
 /**
  * DATABASTION_AGENT_TOKENS_HOLD (ADR-0022 decision 8, end-of-phase-9 review L1): a held console lists
@@ -96,6 +99,35 @@ describe("token hold: startup checks (unit)", () => {
   });
 });
 
+describe("token hold: recurring signals (unit, review L1)", () => {
+  it("warns at the first call while held, then at most once an hour per process", () => {
+    resetTokensHoldWarning();
+    const t0 = 1_000_000_000_000;
+    const first = tokensHoldWarningDue(t0, held);
+    expect(first).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.8");
+    expect(first).toContain("ADR-0053, ADR-0055, ADR-0056");
+    expect(tokensHoldWarningDue(t0 + 1, held)).toBeNull();
+    expect(tokensHoldWarningDue(t0 + TOKENS_HOLD_WARNING_INTERVAL_MS - 1, held)).toBeNull();
+    expect(tokensHoldWarningDue(t0 + TOKENS_HOLD_WARNING_INTERVAL_MS, held)).toBe(first);
+    expect(tokensHoldWarningDue(t0 + TOKENS_HOLD_WARNING_INTERVAL_MS + 1, held)).toBeNull();
+    // A clock stepped back does not silence it.
+    expect(tokensHoldWarningDue(t0, held)).toBe(first);
+    resetTokensHoldWarning();
+  });
+
+  it("never warns when unset, empty or invalid (invalid is fatal at startup)", () => {
+    resetTokensHoldWarning();
+    for (const v of [undefined, "", "0.9"]) expect(tokensHoldWarningDue(Date.now(), { DATABASTION_AGENT_TOKENS_HOLD: v })).toBeNull();
+  });
+
+  it("the gauge series: 1 with the release line while held, 0 without label when unset", () => {
+    expect(tokensHoldMetric(held)).toEqual({ value: 1, labels: { release: "0.8" } });
+    expect(tokensHoldMetric({})).toEqual({ value: 0, labels: {} });
+    expect(tokensHoldMetric({ DATABASTION_AGENT_TOKENS_HOLD: "" })).toEqual({ value: 0, labels: {} });
+    expect(tokensHoldMetric({ DATABASTION_AGENT_TOKENS_HOLD: "0.9" })).toEqual({ value: 1, labels: { release: "invalid" } });
+  });
+});
+
 // ------------------------------------------------------------------------------------- DB
 
 type Auth = { agentId: string; secret: string };
@@ -146,6 +178,21 @@ describe.skipIf(!hasDb)("token hold: a held console still accepts and stores eve
     res = await heartbeat(auth, body);
     out = (await res.json()) as { accepts: string[] };
     expect(out.accepts).toEqual([...CONSOLE_ACCEPTS]);
+  });
+
+  it("exposes the hold on /metrics and logs it from the heartbeat path at most once an hour", async () => {
+    expect(await collectMetrics(getDb())).toMatch(/^databastion_console_agent_tokens_hold 0$/m);
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.8");
+    expect(await collectMetrics(getDb())).toMatch(/^databastion_console_agent_tokens_hold\{release="0\.8"\} 1$/m);
+    resetTokensHoldWarning();
+    const warn = vi.spyOn(logger, "warn");
+    const auth = await enroll();
+    const body = fixture<Hb>("HeartbeatRequest.name-case-sqlserver.json");
+    expect((await heartbeat(auth, body)).status).toBe(200);
+    expect((await heartbeat(auth, body)).status).toBe(200);
+    const holdWarnings = warn.mock.calls.filter(([m]) => typeof m === "string" && m.startsWith("DATABASTION_AGENT_TOKENS_HOLD=0.8"));
+    expect(holdWarnings).toHaveLength(1);
+    resetTokensHoldWarning();
   });
 
   it("accepts the 2026_10_c note label while holding its token", async () => {

@@ -288,14 +288,28 @@ older replica remains:
    0.8.1 or 0.8.2, the only value today) in the environment of every web process of the new build
    (in `compose.yaml`, the `environment` of the `console` service; the worker answers no agent and
    only checks the value). An older build ignores the variable; a value the new build does not
-   know stops it at startup.
+   know stops it at startup. **Check every replica**: each web process reports its hold on its
+   own `/metrics` as `databastion_console_agent_tokens_hold{release="0.8"} 1` (`0` when unset), and
+   logs a warning naming the held tokens at startup and then at most once an hour while it answers
+   agents. A new-build replica started without the hold is not detected by the others: it lists
+   the new tokens, agents learn them from it and send the new fields to every replica, and then,
+   until the last 0.8 replica is gone, the items that reach a 0.8 replica are stored without
+   those fields (the agent strips them after the `400`); a target's `name_case` alternates between
+   its value and none from one heartbeat to the next, which reruns the ADR-0055 exception
+   inventory of that target every hour (each run an audit entry `policy_exception.name_case_inventory`).
+   If a replica shows `0` during the rollout, set the hold on it and restart it.
 2. Run the migrations once, then roll the new image out replica by replica. The upgraded replicas
    accept and store every field of the new release, but list only the tokens of the held release
    (each logs a warning at startup naming the tokens it holds back), so the agents keep sending
    what the older replicas accept.
 3. Once **every** replica runs the new build, remove the variable and restart the replicas, one
    by one if you like: every replica now accepts the new fields, so a replica that already lists
-   them and one that does not yet can answer side by side.
+   them and one that does not yet can answer side by side. **Do not leave the hold set**: until
+   it is removed, no agent sends the held fields, so the detection rules of the new release that
+   depend on them do not apply (for 0.9: overflowed event objects reaching object- and
+   sensitivity-scoped policies, ADR-0053; exceptions following the server's name case, ADR-0055;
+   exceptions not covering names altered by normalization, ADR-0056). Check that every replica's
+   `databastion_console_agent_tokens_hold` is back to `0`; alerting on it staying `1` is a good idea.
 4. Upgrade the agents. They send the new fields once a heartbeat answer lists their tokens.
 
 Upgrading from a release older than 0.8.0 this way is not covered by `0.8` (those releases do not
