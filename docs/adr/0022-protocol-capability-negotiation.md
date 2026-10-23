@@ -55,7 +55,7 @@ The P4-D protocol change adds the first optional request fields meant for later 
 
 ## Implementation note (2026-10-21): the first agent capability token
 
-Records #280 (not released yet). The decisions are unchanged; decision 3's "None exists yet, so the agent omits the list" described the state at the time it was written and no longer holds.
+Records #280 (released in 0.9.0). The decisions are unchanged; decision 3's "None exists yet, so the agent omits the list" described the state at the time it was written and no longer holds.
 
 - **The first console -> agent value form.** Since #280, `SensitiveObject.object` in `audit.configure` jobs is an `ObjectName`: an `Identifier`, or, on a `redis` or `valkey` target only, a `KeyPattern`. An agent built before #280 decodes the field as an `Identifier` and cannot decode a job carrying a key pattern that is not one, so it would lose the whole job. A value form that a console -> agent field accepts only after protocol 0.1.0 is therefore negotiated like a new field, under decision 3, with the token `sensitive_object.key_pattern` (contract: "Compatibility and capability negotiation", `HeartbeatRequest.accepts`, `SensitiveObject`).
 - **Agent.** The agent lists `sensitive_object.key_pattern` in `HeartbeatRequest.accepts` (`AGENT_ACCEPTS` in `agent/crates/core/src/capabilities.rs`, the only token of this build). It checks every received key pattern against the whole `KeyPattern` schema and refuses an `audit.configure` job whose key pattern names a target of another engine (`invalid_params`).

@@ -169,7 +169,15 @@ Every item is checked on the `dev` commit that becomes the release (and on the `
 - [ ] **After publishing**: images signed, with SBOM and provenance, and `SHA256SUMS` with its cosign bundle published ([publish.yml](.github/workflows/publish.yml)); `cosign verify` with the exact tag identity passes on both images and on `SHA256SUMS` ([§ 4](#4-published-artifacts), [deploy/README.md](deploy/README.md#verify-the-artifacts)); the installation test of the publish run is green (under 15 minutes with the published image and `.deb`); the GHCR packages are public
 
 ### Open release gates
-Gates that hold back the next release containing a given change; removed from this list once that release is out. None is open: the two gates of 0.7.0 (ADR-0037 refinement of 2026-10-12, met by #214; ADR-0049 part 2, met by #211) were removed after the 0.7.0 release, and the gates of 0.8.0 (end-of-phase-9 security review G1 to G7 and N1, met on `dev` at `ab27504`: G1 by fuzz run 39037887966, G2 by load run 39037884737, G3 to G5 by #259, G6 by engine matrix run 39037886302, G7 and N1 by #261 and #262; [ROADMAP](docs/ROADMAP.md#phase-9-follow-ups)) were removed after the 0.8.0 release.
+Gates that hold back the next release containing a given change; removed from this list once that release is out.
+
+**0.9.0**: the gates G-a to G-h of the end-of-phase-9 security review of 2026-10-23 ([ROADMAP](docs/ROADMAP.md#phase-9-follow-ups)).
+- [x] **G-a**, the Extended Events read size on SQL Server 2019: met by #340 and load run 40003873141 (the read-cost measurement on 2019 and 2025 is deferred by the maintainer).
+- [x] **G-f**, the holdout seed rotation: met by #342 (seed 399851027).
+- [x] **G-g**, advisories green: met by #337. It is checked again on the release commit, as for every release (§ 7).
+- [ ] **The runs on the release head**, being run on `dev`: the engine matrix, the nightly fuzz campaign and the load runs. Their run ids are recorded here and in the ROADMAP when they are green.
+
+Earlier gates, all met: the two gates of 0.7.0 (ADR-0037 refinement of 2026-10-12, met by #214; ADR-0049 part 2, met by #211) were removed after the 0.7.0 release, and the gates of 0.8.0 (end-of-phase-9 security review G1 to G7 and N1, met on `dev` at `ab27504`: G1 by fuzz run 39037887966, G2 by load run 39037884737, G3 to G5 by #259, G6 by engine matrix run 39037886302, G7 and N1 by #261 and #262; [ROADMAP](docs/ROADMAP.md#phase-9-follow-ups)) were removed after the 0.8.0 release.
 
 ### Additional items for v0.1.0
 - [ ] **72 h stability test**, run by the maintainer on the release candidate, result recorded in the [ROADMAP](docs/ROADMAP.md) (phase 7)
