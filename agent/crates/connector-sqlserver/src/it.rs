@@ -5355,7 +5355,12 @@ async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
 /// agent's own events reported; in 0.8.0 the halving never ran (its guard
 /// tested `SsError::fatal`, which every client-side bound sets): every read
 /// failed, and the stream restarted at the same position until the files
-/// rolled over.
+/// rolled over. The one stream end allowed is the designed one (#321): a
+/// cancel the server did not acknowledge within `ATTENTION_WAIT` ends the
+/// stream, which is restarted as the runtime does, from the same position
+/// at the halved size the connector kept (each restart at one position
+/// reads less, at most [`LARGE_MAX_RESTARTS`], none on small events or
+/// after the memory, the stream alive at the end).
 #[tokio::test]
 async fn xe_large_events_are_read_by_halving() {
     Box::pin(xe_large_scenario()).await;
@@ -5448,8 +5453,7 @@ async fn xe_large_body(major: u32) {
     };
     let cfg = databastion_core::AuditConfig::local(&t, 1, &limits).with_state_dir(dir.clone());
     let (sink, mut rx) = databastion_core::EventSink::channel(65_536);
-    let c2 = Arc::clone(&c);
-    let stream = tokio::spawn(async move { c2.audit_stream(&cfg, &sink).await });
+    let mut stream = large_stream(&c, &cfg, &sink);
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!stream.is_finished(), "the stream started");
     // Counts the stream's reads of `retail.crm.customers` by `sa` until
@@ -5459,10 +5463,33 @@ async fn xe_large_body(major: u32) {
     // Security review L6: the agent's own events (its polls, cancelled
     // ones included, consumed by their credits) are never reported.
     let own = std::sync::atomic::AtomicUsize::new(0);
+    // Restarts after a stream end by design (`large_stream_ended`): an
+    // oversized read whose cancel the server did not acknowledge within
+    // `ATTENTION_WAIT` poisons the session and ends the stream, which the
+    // runtime restarts with the same state (seen once in CI, job
+    // 120470354546, as "the stream ended"; reproduced by a forced
+    // unacknowledged cancel). The test restarts it the same way, after the
+    // poll interval, with the same state directory and connector (the
+    // position, the own sessions and the kept size carry over); any other
+    // end fails the test with its error.
+    let restarts = std::sync::atomic::AtomicUsize::new(0);
+    let mut last_kept = None;
     let mut count_until = async |want: usize, wait: Duration| {
         let deadline = std::time::Instant::now() + wait;
         while seen < want && std::time::Instant::now() < deadline {
-            assert!(!stream.is_finished(), "the stream ended");
+            if stream.is_finished() {
+                let end = (&mut stream).await.expect("the stream panicked");
+                let kept = large_stream_ended(&c, &t.id, end, last_kept.take());
+                let n = restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[it] large events: stream restart {n} (oversized read not cancelled in step), kept {kept:?}, reads {:?}",
+                    c.state.audit.xe_reads(&t.id)
+                );
+                assert!(n <= LARGE_MAX_RESTARTS, "restarts {n}");
+                last_kept = Some(kept);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                stream = large_stream(&c, &cfg, &sink);
+            }
             let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
             else {
                 continue;
@@ -5500,6 +5527,11 @@ async fn xe_large_body(major: u32) {
         "{r:?}"
     );
     assert_eq!((r.cancels, r.timeouts), (0, 0), "{r:?}");
+    assert_eq!(
+        restarts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no restart on small events"
+    );
     // 2. Large events: a response above 12 MiB, cancelled, read by halving.
     let large = 300u32;
     Box::pin(customer_reads(&mut s, large, 60_000)).await;
@@ -5511,8 +5543,13 @@ async fn xe_large_body(major: u32) {
         "[it] large events: other events of sa {:?}",
         other.lock().unwrap()
     );
+    let restarted = restarts.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("[it] large events: stream restarts {restarted}");
     assert_eq!(got, want, "every large read reported once");
-    assert!(r.cancels >= 1, "a response above 12 MiB: {r:?}");
+    assert!(
+        r.cancels + restarted as u64 >= 1,
+        "a response above 12 MiB: {r:?}"
+    );
     assert_eq!(r.timeouts, 0, "{r:?}");
     let cancels = r.cancels;
     // 3. After the (shortened) memory: small events at the sized bound
@@ -5527,6 +5564,11 @@ async fn xe_large_body(major: u32) {
     eprintln!("[it] large events: {got}/{want} after the memory, reads {r:?}");
     assert_eq!(got, want, "every read reported once");
     assert_eq!(r.cancels, cancels, "no further cancel: {r:?}");
+    assert_eq!(
+        restarts.load(std::sync::atomic::Ordering::Relaxed),
+        restarted,
+        "no further restart"
+    );
     assert!(r.largest_returned > crate::audit::BATCH, "{r:?}");
     assert!(
         r.reads - before.reads < u64::from(more) * 3 / 500,
@@ -5537,6 +5579,10 @@ async fn xe_large_body(major: u32) {
     let got = count_until(want + 1, Duration::from_secs(2)).await;
     assert_eq!(got, want, "no read reported twice");
     assert!(!stream.is_finished(), "the stream ended");
+    eprintln!(
+        "[it] large events: stream restarts {} in all",
+        restarts.load(std::sync::atomic::Ordering::Relaxed)
+    );
     stream.abort();
     let _ = stream.await;
     let left_out = c.state.audit.own_left_out(&t.id);
@@ -5555,6 +5601,60 @@ async fn xe_large_body(major: u32) {
     assert_eq!(facts.dropped, 0, "records dropped");
     assert!(!facts.gap, "no gap");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The large-event test's stream restarts at most (each one after an
+/// oversized read whose cancel was not acknowledged in time): 300 large
+/// events of about 120 KB, about 100 a read under 12 MiB, sizes halving
+/// from `XE_MAX_ROWS` and growing back by doubling up to `BATCH`.
+const LARGE_MAX_RESTARTS: usize = 12;
+
+/// The large-event test's Audit stream, as the runtime runs it.
+fn large_stream(
+    c: &Arc<SqlserverConnector>,
+    cfg: &databastion_core::AuditConfig,
+    sink: &databastion_core::EventSink,
+) -> tokio::task::JoinHandle<Result<(), ConnectorError>> {
+    let (c, cfg, sink) = (Arc::clone(c), cfg.clone(), sink.clone());
+    tokio::spawn(async move { c.audit_stream(&cfg, &sink).await })
+}
+
+/// Checks that the large-event test's stream ended by design, and returns
+/// the read size the connector kept for the restart: an oversized read
+/// (`ResourceLimit`, no server error number) on a session the cancel left
+/// unusable (the server did not acknowledge it within `ATTENTION_WAIT`),
+/// whose halved size and position the connector keeps for the next stream
+/// (`Shared::read_failed`, 0.8.1, #321). Any other end fails the test. A
+/// restart at the same position as the previous one reads less (the
+/// reads walk down, never at the same size twice).
+fn large_stream_ended(
+    c: &SqlserverConnector,
+    target_id: &str,
+    end: Result<(), ConnectorError>,
+    previous: Option<(crate::audit::ReadAt, usize)>,
+) -> (crate::audit::ReadAt, usize) {
+    let kept = c.state.audit.kept_read_size(target_id);
+    let reads = c.state.audit.xe_reads(target_id);
+    let by_design = matches!(
+        &end,
+        Err(ConnectorError::Target {
+            code: databastion_core::FailureCode::ResourceLimit,
+            engine_code: None,
+            ..
+        })
+    );
+    let Some((crate::audit::Source::Xevents, at, n)) = kept.clone().filter(|_| by_design) else {
+        panic!("the stream ended: {end:?}, kept {kept:?}, reads {reads:?}");
+    };
+    if let Some((before, m)) = previous
+        && before == at
+    {
+        assert!(
+            n < m,
+            "a restart at the same position reads less: {m} then {n} at {at:?}"
+        );
+    }
+    (at, n)
 }
 
 /// Measurement (not a check; `DATABASTION_IT_SQLSERVER_MEASURE=1`,
