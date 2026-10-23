@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc b96a4b2eac9571d0addf1f54f96fef6d948ff88d98263b6c8c6d2e2ad439ea69 # shrinks to pre = [], value = "1.1.1+1.1.1", post = []
 cc c6cbe7bb1d23f32d6f58af58ff9defe16ee114f30bf76445d92042e9052cb429 # shrinks to pre = [], value = "a000.aaaa.a0aa", post = ["lily"]
+cc 0cf932076f29e216b59cc68f2f83ac514d42f9141fb5ed51f2a1c5a113b7b8f1 # shrinks to pre = [], value = "0000.aa00.0000", post = ["gg", "0"]
+cc a08b2a190bccc2cba22d22c652d913e1d0539b150114e9869e9ce43b16a907ee # shrinks to pre = ["a000", "gg"], value = "0.0.0.0", post = ["a000", "000a"]

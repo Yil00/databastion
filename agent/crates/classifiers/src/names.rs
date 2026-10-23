@@ -435,16 +435,49 @@ fn passes_gate(candidate: &str) -> bool {
 /// unassigned code points); rule 5 bounds the whole name.
 const SEGMENT_RULES: [&str; 6] = ["1", "2", "3-ipv4", "3-mac-dashed", "3-mac-dotted", "4"];
 
+/// The rules anchored on segment boundaries (`(^|[.,=])…([.,]|$)`): one
+/// match consumes the boundaries of its neighbours, so they are searched
+/// from every boundary (re-review N1: `face.001a.2b3c.4d5e`, where a
+/// leftmost search starting at `face` finds no MAC).
+const ANCHORED_RULES: [&str; 3] = ["1", "3-ipv4", "3-mac-dotted"];
+
+/// Boundaries after a search start that an anchored rule may span: the
+/// start's own, the 3 inside an IPv4 address and the one ending it.
+const WINDOW_BOUNDARIES: usize = 5;
+
 /// Byte ranges of `s` matched by a [`SEGMENT_RULES`] rule or holding an
-/// unassigned code point.
+/// unassigned code point. The anchored rules are searched from the start
+/// and from every `.`, `,` and `=`, each in a window that ends just after
+/// the [`WINDOW_BOUNDARIES`]-th boundary (the boundary character included,
+/// so `$` matches only at the real end of `s`): every match of a window is
+/// a match of `s`, and overlapping matches are all found.
 fn produced_spans(s: &str) -> Vec<Range<usize>> {
     let (rules, unassigned) = &*PRODUCED;
-    rules
-        .iter()
-        .filter(|(id, _)| SEGMENT_RULES.contains(id))
-        .flat_map(|(_, re)| re.find_iter(s).map(|m| m.range()))
-        .chain(unassigned.find_iter(s).map(|m| m.range()))
-        .collect()
+    let boundaries: Vec<usize> = s
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '.' | ',' | '='))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = Vec::new();
+    for (id, re) in rules.iter().filter(|(id, _)| SEGMENT_RULES.contains(id)) {
+        if !ANCHORED_RULES.contains(id) {
+            out.extend(re.find_iter(s).map(|m| m.range()));
+            continue;
+        }
+        // Starts: 0, then each boundary (`boundaries[k - 1]`).
+        for k in 0..=boundaries.len() {
+            let start = if k == 0 { 0 } else { boundaries[k - 1] };
+            let first = k.saturating_sub(1);
+            let end = boundaries
+                .get(first + WINDOW_BOUNDARIES)
+                .map_or(s.len(), |&b| b + 1);
+            if let Some(m) = re.find(&s[start..end]) {
+                out.push(start + m.start()..start + m.end());
+            }
+        }
+    }
+    out.extend(unassigned.find_iter(s).map(|m| m.range()));
+    out
 }
 
 /// ADR-0057 decision 2 item 1, on a plain name: every `.`-separated
@@ -1739,6 +1772,11 @@ mod tests {
             ("dev.abcd.ef01.2345", "dev.*"),
             ("dev.ab3c.1234.4d5e", "dev.*"),
             ("1234.ab3c.4d5e", "*"),
+            // Re-review N1: a MAC after a 4-hexadecimal or 4-digit segment.
+            ("face.001a.2b3c.4d5e", "*"),
+            ("dev.face.001a.2b3c.4d5e.port", "dev.*.port"),
+            ("x.1234.001a.2b3c.4d5e", "x.*"),
+            ("x.10.0.0.1.2.y", "x.*.y"),
             ("ou=001a.2b3c.4d5e,dc=x", "*"),
             ("a.1_2.3_4.5", "a.*"),
             ("matrix.1.2.3.4.5", "matrix.*"),
@@ -1791,6 +1829,21 @@ mod tests {
                 "dev.*",
             ),
             (vec![Key("a"), Key("1_2"), Key("3_4"), Key("5")], "a.*"),
+            (
+                vec![
+                    Key("dev"),
+                    Key("face"),
+                    Key("001a"),
+                    Key("2b3c"),
+                    Key("4d5e"),
+                    Key("port"),
+                ],
+                "dev.*.port",
+            ),
+            (
+                vec![Key("x"), Key("1234"), Key("001a"), Key("2b3c"), Key("4d5e")],
+                "x.*",
+            ),
             (vec![Key("cards"), Index, Key("face")], "cards[].face"),
         ] {
             let out = normalize_field_path(&parts);

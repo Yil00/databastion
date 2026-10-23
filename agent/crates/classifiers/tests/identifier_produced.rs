@@ -275,9 +275,11 @@ proptest! {
     }
 }
 
-/// Words of letters that are not hexadecimal and hold no digit.
+/// Neighbouring words: letters that are not hexadecimal (never part of a
+/// match, so always kept unless a first name), 4 hexadecimal characters
+/// and digit-only words (re-review N1: a MAC after `face` or `1234`).
 fn plain_word() -> impl Strategy<Value = String> {
-    "[g-z]{2,6}"
+    prop_oneof!["[g-z]{2,6}", "[a-f]{4}", "[0-9a-f]{4}", "[0-9]{1,4}"]
 }
 
 fn hex_group(digit: bool) -> impl Strategy<Value = String> {
@@ -356,17 +358,27 @@ proptest! {
         for out in [normalize_path(&input), normalize_field_path(&keys)] {
             let out = out.as_str();
             prop_assert!(names::is_identifier_produced(out), "{:?} -> {:?}", input, out);
-            for seg in out.split('.') {
-                let seg = seg.trim_end_matches("[]");
-                prop_assert!(!seg.chars().any(|c| c.is_ascii_digit()), "{:?} -> {:?}", input, out);
+            // No part of the value survives as a segment (a part equal to
+            // a neighbouring word cannot be told apart and is skipped).
+            for part in value.split('.') {
+                if pre.iter().chain(&post).any(|w| w == part) {
+                    continue;
+                }
                 prop_assert!(
-                    !(seg.len() == 4 && seg.chars().all(|c| c.is_ascii_hexdigit())),
-                    "{:?} -> {:?}", input, out
+                    !out.split('.').any(|seg| seg.trim_end_matches("[]") == part),
+                    "{:?} -> {:?} keeps {:?}", input, out, part
                 );
             }
-            // Words that are values on their own (first names) are masked.
-            for w in pre.iter().chain(&post).filter(|w| !names::segment_looks_like_value(w)) {
-                prop_assert!(out.split('.').any(|s| s == w), "{:?} -> {:?} lost {:?}", input, out, w);
+            prop_assert!(!out.contains(&value), "{:?} -> {:?}", input, out);
+            // Words of non-hexadecimal letters are kept (first names
+            // excepted), unless the whole name is `*` (the digit bounds of
+            // rule 5 count the neighbouring words' digits too).
+            for w in pre.iter().chain(&post).filter(|w| {
+                out != "*"
+                    && w.chars().all(|c| ('g'..='z').contains(&c))
+                    && !names::segment_looks_like_value(w)
+            }) {
+                prop_assert!(out.split('.').any(|s| s.trim_end_matches("[]") == w), "{:?} -> {:?} lost {:?}", input, out, w);
             }
         }
         let dn = normalize_ldap_dn(&format!("uid=x,ou={value},dc=example"));
