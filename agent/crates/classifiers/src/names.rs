@@ -46,7 +46,17 @@
 //!   [`MAX_TOTAL_DIGITS`] numeric characters in total, in any script
 //!   (CJK ideographic digits `零〇一二三四五六七八九` and financial
 //!   numerals `壹贰叁肆伍陆柒捌玖` included, see [`is_numeric_like`]);
-//! - an LDAP DN value that is empty or BER-encoded (`#…`) becomes `*`.
+//! - an LDAP DN value that is empty or BER-encoded (`#…`) becomes `*`;
+//! - last, the producer rules of the contract `IdentifierProduced`
+//!   (ADR-0057, [`IDENTIFIER_PRODUCED_RULES`]): a segment (or an LDAP RDN
+//!   value) that a rule touches becomes `*`: a run of 9 or more digits and
+//!   separators starting and ending with a digit (`1_2_3_4_5`,
+//!   `06_12_34_56_78`), a segment of 9 or more digits, spaces, `_`, `+`
+//!   and `-`, an IPv4 address as whole segments, a dashed or dotted MAC
+//!   address (`001a.2b3c.4d5e`, not `face.cafe.beef`), a percent escape,
+//!   and a code point unassigned in the agent's Unicode tables. A name
+//!   still violating a rule is `*`. Every [`NormalizedName`] that is not a
+//!   key pattern matches `IdentifierProduced` ([`is_identifier_produced`]).
 //!
 //! Known gap: a surname alone, or a first name missing from the list, is
 //! not recognized (`archive_martin`). No detector recognizes arbitrary
@@ -54,6 +64,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crate::detect;
 use crate::hints::word_tokens;
@@ -81,7 +92,9 @@ pub const MAX_TOTAL_DIGITS: usize = 8;
 const CONTAINER_TYPES: [&str; 6] = ["ou", "dc", "o", "c", "l", "st"];
 
 /// A name that went through this module. Always matches the contract
-/// `Identifier` schema, except a Redis / Valkey key pattern built by
+/// `Identifier` schema and its producer rule `IdentifierProduced`
+/// (ADR-0057, [`is_identifier_produced`]), except a Redis / Valkey key
+/// pattern built by
 /// [`crate::keys`], which matches the contract `KeyPattern` schema
 /// instead. No public constructor from a string.
 ///
@@ -166,13 +179,23 @@ impl NormalizedName {
     ///
     /// `altered`: the first step changed the input; dropped when the
     /// result is `*`.
+    ///
+    /// Then the contract `IdentifierProduced` (ADR-0057): on a plain name
+    /// that passed, every segment a rule of [`produced_violations`] touches
+    /// becomes `*` ([`mask_produced_segments`]; an LDAP container DN has its
+    /// values checked by [`normalize_ldap_dn`]), and a name that still
+    /// violates one (the digit bounds of rule 5 are whole-name rules) is
+    /// `*`.
     fn checked(candidate: String, altered: bool) -> Self {
-        let digits = candidate.chars().filter(|c| is_numeric_like(*c)).count();
-        if conforms(&candidate)
-            && longest_digit_run(&candidate) <= MAX_INDEX_DIGITS
-            && digits <= MAX_TOTAL_DIGITS
-            && !has_percent_escape(&candidate)
-        {
+        if !passes_gate(&candidate) {
+            return Self::wildcard();
+        }
+        let candidate = if candidate.contains('=') {
+            candidate
+        } else {
+            mask_produced_segments(candidate)
+        };
+        if passes_gate(&candidate) && produced_violations(&candidate).is_empty() {
             Self::named(candidate, altered)
         } else {
             Self::wildcard()
@@ -315,6 +338,191 @@ pub fn conforms(name: &str) -> bool {
                 && !value.chars().any(|c| c == '+' || is_plain_excluded(c))
         })
     })
+}
+
+/// The `not` rules of the contract `IdentifierProduced` (ADR-0057 decision
+/// 1, `shared/protocol/identifier-produced.schema.json`, checked verbatim by
+/// `tests/identifier_produced.rs`): rule id and pattern. Applied to the name,
+/// to each `.`-separated segment and to each LDAP RDN value (the `[.,=]`
+/// boundaries). A digit is `\p{Nd}`, a space `\p{Zs}`, a numeric character
+/// `\p{N}`.
+pub const IDENTIFIER_PRODUCED_RULES: [(&str, &str); 8] = [
+    // 1: a segment made only of 9 or more digits, spaces, `_`, `+`, `-`.
+    ("1", r"(^|[.,=])[0-9\p{Nd}\p{Zs}_+-]{9,}([.,]|$)"),
+    // 2: a digit-to-digit run of 9 or more digits and separators.
+    (
+        "2",
+        r"[0-9\p{Nd}][0-9\p{Nd}\p{Zs}\p{Pd}_+.\uFF0E-]{7,}[0-9\p{Nd}]",
+    ),
+    // 3: an IPv4 address as whole segments, a dashed MAC address, a dotted
+    // MAC address (three 4-character hexadecimal segments, one with a digit).
+    (
+        "3-ipv4",
+        r"(^|[.,=])[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}\.[0-9\p{Nd}]{1,3}([.,]|$)",
+    ),
+    (
+        "3-mac-dashed",
+        r"[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}",
+    ),
+    (
+        "3-mac-dotted",
+        r"(^|[.,=])(?:(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9]))([.,]|$)",
+    ),
+    // 4: a percent-encoded byte or a `%uXXXX` escape.
+    ("4", r"%[0-9A-Fa-f]{2}|%[Uu][0-9A-Fa-f]{4}"),
+    // 5: the agent's digit gate, as the contract states it (`\p{N}` only;
+    // the agent also counts the CJK numerals, see [`is_numeric_like`]).
+    ("5-run", r"\p{N}{7,}"),
+    ("5-total", r"\p{N}(?:\P{N}*\p{N}){8}"),
+];
+
+/// Rule id of the agent-only refusal of a code point unassigned in its
+/// Unicode tables (`\p{Cn}`): the console's engine may know it as a digit or
+/// a space (as `keys::is_key_pattern` refuses it, security review L1 of the
+/// key patterns), so the agent sends no such character.
+pub const UNASSIGNED_RULE: &str = "unassigned";
+
+/// The compiled [`IDENTIFIER_PRODUCED_RULES`] and the unassigned class (the
+/// linear-time `regex` engine; the contract's ECMAScript syntax used here is
+/// a common subset, checked against `regress` by the contract test).
+#[allow(clippy::expect_used, reason = "constant patterns, compiled in tests")]
+static PRODUCED: LazyLock<(Vec<(&'static str, regex::Regex)>, regex::Regex)> =
+    LazyLock::new(|| {
+        (
+            IDENTIFIER_PRODUCED_RULES
+                .iter()
+                .map(|(id, p)| {
+                    (
+                        *id,
+                        regex::Regex::new(p).expect("IdentifierProduced rule compiles"),
+                    )
+                })
+                .collect(),
+            regex::Regex::new(r"\p{Cn}").expect("unassigned class compiles"),
+        )
+    });
+
+/// The ids of the `IdentifierProduced` rules `name` violates (ADR-0057
+/// decision 1), in [`IDENTIFIER_PRODUCED_RULES`] order, then
+/// [`UNASSIGNED_RULE`]. Empty for a name that passes them all. Only the
+/// `not` rules: [`conforms`] checks the `Identifier` schema itself.
+#[must_use]
+pub fn produced_violations(name: &str) -> Vec<&'static str> {
+    let (rules, unassigned) = &*PRODUCED;
+    let mut out: Vec<&'static str> = rules
+        .iter()
+        .filter(|(_, re)| re.is_match(name))
+        .map(|(id, _)| *id)
+        .collect();
+    if unassigned.is_match(name) {
+        out.push(UNASSIGNED_RULE);
+    }
+    out
+}
+
+/// The gate every name passed before ADR-0057: the contract `Identifier`,
+/// no run of more than [`MAX_INDEX_DIGITS`] and at most
+/// [`MAX_TOTAL_DIGITS`] numeric characters ([`is_numeric_like`]), no
+/// percent-encoded byte or `%uXXXX` escape.
+fn passes_gate(candidate: &str) -> bool {
+    conforms(candidate)
+        && longest_digit_run(candidate) <= MAX_INDEX_DIGITS
+        && candidate.chars().filter(|c| is_numeric_like(*c)).count() <= MAX_TOTAL_DIGITS
+        && !has_percent_escape(candidate)
+}
+
+/// The `IdentifierProduced` rules that mark segments (1 to 4, and the
+/// unassigned code points); rule 5 bounds the whole name.
+const SEGMENT_RULES: [&str; 6] = ["1", "2", "3-ipv4", "3-mac-dashed", "3-mac-dotted", "4"];
+
+/// The rules anchored on segment boundaries (`(^|[.,=])…([.,]|$)`): one
+/// match consumes the boundaries of its neighbours, so they are searched
+/// from every boundary (re-review N1: `face.001a.2b3c.4d5e`, where a
+/// leftmost search starting at `face` finds no MAC).
+const ANCHORED_RULES: [&str; 3] = ["1", "3-ipv4", "3-mac-dotted"];
+
+/// Boundaries after a search start that an anchored rule may span: the
+/// start's own, the 3 inside an IPv4 address and the one ending it.
+const WINDOW_BOUNDARIES: usize = 5;
+
+/// Byte ranges of `s` matched by a [`SEGMENT_RULES`] rule or holding an
+/// unassigned code point. The anchored rules are searched from the start
+/// and from every `.`, `,` and `=`, each in a window that ends just after
+/// the [`WINDOW_BOUNDARIES`]-th boundary (the boundary character included,
+/// so `$` matches only at the real end of `s`): every match of a window is
+/// a match of `s`, and overlapping matches are all found.
+fn produced_spans(s: &str) -> Vec<Range<usize>> {
+    let (rules, unassigned) = &*PRODUCED;
+    let boundaries: Vec<usize> = s
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '.' | ',' | '='))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = Vec::new();
+    for (id, re) in rules.iter().filter(|(id, _)| SEGMENT_RULES.contains(id)) {
+        if !ANCHORED_RULES.contains(id) {
+            out.extend(re.find_iter(s).map(|m| m.range()));
+            continue;
+        }
+        // Starts: 0, then each boundary (`boundaries[k - 1]`).
+        for k in 0..=boundaries.len() {
+            let start = if k == 0 { 0 } else { boundaries[k - 1] };
+            let first = k.saturating_sub(1);
+            let end = boundaries
+                .get(first + WINDOW_BOUNDARIES)
+                .map_or(s.len(), |&b| b + 1);
+            if let Some(m) = re.find(&s[start..end]) {
+                out.push(start + m.start()..start + m.end());
+            }
+        }
+    }
+    out.extend(unassigned.find_iter(s).map(|m| m.range()));
+    out
+}
+
+/// ADR-0057 decision 2 item 1, on a plain name: every `.`-separated
+/// segment a rule match touches becomes `*`, consecutive such segments
+/// collapse into one `*` (`device.001a.2b3c.4d5e.port` ->
+/// `device.*.port`), until no rule matches. Matches are searched again
+/// after each round (a rule's segment boundaries are consumed by the
+/// previous match); each round masks at least one segment.
+fn mask_produced_segments(mut name: String) -> String {
+    for _ in 0..=MAX_IDENTIFIER_CHARS {
+        let spans = produced_spans(&name);
+        if spans.is_empty() {
+            break;
+        }
+        let mut out: Vec<&str> = Vec::new();
+        let mut in_value = false;
+        let mut offset = 0;
+        for segment in name.split('.') {
+            let range = offset..offset + segment.len();
+            offset = range.end + 1;
+            if overlaps(&spans, &range) {
+                if !in_value {
+                    out.push(WILDCARD);
+                }
+                in_value = true;
+            } else {
+                in_value = false;
+                out.push(segment);
+            }
+        }
+        let next = out.join(".");
+        if next == name {
+            break;
+        }
+        name = next;
+    }
+    name
+}
+
+/// Whether `name` matches the contract `IdentifierProduced`: the
+/// `Identifier` schema ([`conforms`]) and every rule of
+/// [`produced_violations`].
+#[must_use]
+pub fn is_identifier_produced(name: &str) -> bool {
+    conforms(name) && produced_violations(name).is_empty()
 }
 
 /// CJK numerals that `char::is_numeric` does not report (they are letters,
@@ -836,7 +1044,13 @@ pub fn normalize_path(raw: &str) -> NormalizedName {
     };
     // ADR-0056: the first step changed the name as read from the engine.
     let altered = cleaned != raw;
-    let spans = value_spans(&cleaned);
+    let mut spans = value_spans(&cleaned);
+    // ADR-0057 (review M1): the `IdentifierProduced` rules also on the
+    // folded input, before digit-only segments become `[]`, so a dotted MAC
+    // or a split run with an index-like part (`dev.ab3c.1234.4d5e`,
+    // `a.1_2.3_4.5`) is masked as a whole. The output is checked again in
+    // `NormalizedName::checked`.
+    spans.extend(produced_spans(&cleaned));
     let mut out: Vec<String> = Vec::new();
     let mut in_value = false;
     let mut offset = 0;
@@ -952,7 +1166,11 @@ pub fn normalize_field_path(parts: &[PathPart<'_>]) -> NormalizedName {
     if joined.len() > MAX_INPUT_BYTES {
         return NormalizedName::wildcard();
     }
-    let spans = value_spans(&joined);
+    let mut spans = value_spans(&joined);
+    // ADR-0057 (review M1): the rules on the joined keys too, before
+    // digit-only keys become `*` (`dev` / `ab3c` / `1234` / `4d5e`); array
+    // levels are `#`, which no rule reads.
+    spans.extend(produced_spans(&joined));
     let mut out: Vec<String> = Vec::new();
     let mut in_value = false;
     for ((part, key), range) in parts.iter().zip(&keys).zip(&ranges) {
@@ -1035,10 +1253,41 @@ pub fn normalize_ldap_dn(raw: &str) -> NormalizedName {
             || value.starts_with('#')
             || value.contains('=')
             || !value_spans(value).is_empty()
-            || value.split('.').any(segment_looks_like_value);
+            || value.split('.').any(segment_looks_like_value)
+            // ADR-0057: the `IdentifierProduced` rules on each RDN value
+            // (`ou=001a.2b3c.4d5e`, `ou=10.0.0.1`).
+            || !produced_violations(value).is_empty();
         parts.push(format!("{ty}={}", if bad { WILDCARD } else { value }));
     }
     NormalizedName::checked(parts.join(","), altered)
+}
+
+/// Fuzz entry point (`agent/fuzz`, target `classifiers_names`): every
+/// normalizer of this module on the input read as text (lossy UTF-8),
+/// the field path split on `/` (a `*` part is an array level). Every
+/// result must be `*` or a contract `IdentifierProduced`
+/// ([`is_identifier_produced`]); the target asserts it. No panic and no
+/// hang on any input.
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_normalize(data: &[u8]) -> [NormalizedName; 4] {
+    let text = String::from_utf8_lossy(data);
+    let parts: Vec<PathPart<'_>> = text
+        .split('/')
+        .map(|k| {
+            if k == "*" {
+                PathPart::Index
+            } else {
+                PathPart::Key(k)
+            }
+        })
+        .collect();
+    [
+        normalize_path(&text),
+        normalize_field_path(&parts),
+        normalize_ldap_dn(&text),
+        normalize_ldap_attribute(&text),
+    ]
 }
 
 #[cfg(test)]
@@ -1498,5 +1747,172 @@ mod tests {
         assert!(conforms("a.12345678.b"));
         assert_eq!(normalize_path("a.12345678.b").as_str(), "a.*.b");
         assert!(!conforms(&"a".repeat(257)));
+    }
+
+    /// ADR-0057 decision 1, rule by rule: what each normalizer sends.
+    #[test]
+    fn identifier_produced_rules_mask_segments() {
+        use PathPart::{Index, Key};
+        for (raw, want) in [
+            // Rule 3, dotted MAC: three 4-character hexadecimal segments,
+            // one with a digit; hexadecimal-looking words are kept.
+            ("001a.2b3c.4d5e", "*"),
+            ("device.001a.2b3c.4d5e.port", "device.*.port"),
+            ("device.001a.2b3c.4d5e", "device.*"),
+            ("face.cafe.beef", "face.cafe.beef"),
+            ("x.face.cafe.beef.y", "x.face.cafe.beef.y"),
+            ("abcd.ef01", "abcd.ef01"),
+            // Rule 3, dashed MAC (already a long hexadecimal key).
+            ("00-1a-2b-3c-4d-5e", "*"),
+            ("device.00-1a-2b-3c-4d-5e.port", "device.*.port"),
+            // Rule 3, IPv4, read on the input (review M1).
+            ("host.10.0.0.1", "host.*"),
+            ("10.0.0.1", "*"),
+            // Dotted MACs with an index-like part (review M1).
+            ("dev.abcd.ef01.2345", "dev.*"),
+            ("dev.ab3c.1234.4d5e", "dev.*"),
+            ("1234.ab3c.4d5e", "*"),
+            // Re-review N1: a MAC after a 4-hexadecimal or 4-digit segment.
+            ("face.001a.2b3c.4d5e", "*"),
+            ("dev.face.001a.2b3c.4d5e.port", "dev.*.port"),
+            ("x.1234.001a.2b3c.4d5e", "x.*"),
+            ("x.10.0.0.1.2.y", "x.*.y"),
+            ("ou=001a.2b3c.4d5e,dc=x", "*"),
+            ("a.1_2.3_4.5", "a.*"),
+            ("matrix.1.2.3.4.5", "matrix.*"),
+            ("matrix.1.2.3.4", "matrix.*"),
+            ("matrix.1.2.3", "matrix[][][]"),
+            // Rule 2: short runs split inside one segment, and across
+            // segments.
+            ("1_2_3_4_5", "*"),
+            ("v1-2-3-4-5", "*"),
+            ("crm.v1_2_3_4_5.orders", "crm.*.orders"),
+            ("a1-2.3-4.5b", "*"),
+            ("x.a1-2.3-4.5b.y", "x.*.y"),
+            ("v1_2_3_4", "v1_2_3_4"),
+            ("06.12.34.56.78", "*"),
+            ("06_12_34_56_78", "*"),
+            ("tel.06_12_34_56_78", "tel.*"),
+            // Rule 1: a segment of digits and separators only.
+            ("_________", "*"),
+            ("a.+_-_+_-_+.b", "a.*.b"),
+            ("a.________", "a.________"),
+            // Rule 4 (already a value).
+            ("%41", "*"),
+            ("%u0041", "*"),
+            ("x.name%u00e9", "x.*"),
+            // Rule 5 (already the gate), CJK numerals included.
+            ("tel_六一二三四五六七八", "*"),
+            ("第一名", "第一名"),
+            ("sales.一月", "sales.一月"),
+            // Ordinary names are kept.
+            ("v2.users", "v2.users"),
+            ("events_2024_09", "events_2024_09"),
+            ("orders.3.email", "orders[].email"),
+        ] {
+            let out = normalize_path(raw);
+            assert_eq!(out.as_str(), want, "{raw}");
+            assert!(is_identifier_produced(out.as_str()), "{raw} -> {out:?}");
+        }
+        for (parts, want) in [
+            (
+                vec![Key("device"), Key("001a"), Key("2b3c"), Key("4d5e")],
+                "device.*",
+            ),
+            (
+                vec![Key("by_version"), Key("v1_2_3_4_5"), Key("count")],
+                "by_version.*.count",
+            ),
+            (vec![Key("macs"), Key("00-1a-2b-3c-4d-5e")], "macs.*"),
+            (
+                vec![Key("dev"), Key("ab3c"), Key("1234"), Key("4d5e")],
+                "dev.*",
+            ),
+            (vec![Key("a"), Key("1_2"), Key("3_4"), Key("5")], "a.*"),
+            (
+                vec![
+                    Key("dev"),
+                    Key("face"),
+                    Key("001a"),
+                    Key("2b3c"),
+                    Key("4d5e"),
+                    Key("port"),
+                ],
+                "dev.*.port",
+            ),
+            (
+                vec![Key("x"), Key("1234"), Key("001a"), Key("2b3c"), Key("4d5e")],
+                "x.*",
+            ),
+            (vec![Key("cards"), Index, Key("face")], "cards[].face"),
+        ] {
+            let out = normalize_field_path(&parts);
+            assert_eq!(out.as_str(), want, "{parts:?}");
+            assert!(is_identifier_produced(out.as_str()));
+        }
+        for (dn, want) in [
+            ("ou=10.0.0.1,dc=x", "ou=*,dc=x"),
+            ("uid=a,ou=001a.2b3c.4d5e,dc=x", "ou=*,dc=x"),
+            ("ou=1_2_3_4_5,dc=x", "ou=*,dc=x"),
+            ("ou=face.cafe.beef,dc=x", "ou=face.cafe.beef,dc=x"),
+            ("ou=people,dc=example,dc=org", "ou=people,dc=example,dc=org"),
+        ] {
+            let out = normalize_ldap_dn(dn);
+            assert_eq!(out.as_str(), want, "{dn}");
+            assert!(is_identifier_produced(out.as_str()));
+        }
+        assert_eq!(normalize_ldap_attribute("x1_2_3_4_5").as_str(), "*");
+    }
+
+    #[test]
+    fn identifier_produced_check_by_rule() {
+        for (s, rule) in [
+            ("06.12.34.56.78", "2"),
+            ("06_12_34_56_78", "2"),
+            ("host.10.0.0.1", "3-ipv4"),
+            ("00-1a-2b-3c-4d-5e", "3-mac-dashed"),
+            ("001a.2b3c.4d5e", "3-mac-dotted"),
+            ("%41", "4"),
+            ("%u0041", "4"),
+            (
+                "a\u{FF10}\u{FF11}\u{FF12}\u{FF13}\u{FF14}\u{FF15}\u{FF16}",
+                "5-run",
+            ),
+            ("a\u{0660}1_2_3_4_5", "2"),
+            ("1\u{00A0}2\u{00A0}3\u{00A0}4\u{00A0}5", "1"),
+        ] {
+            assert!(produced_violations(s).contains(&rule), "{s}");
+            assert!(!is_identifier_produced(s), "{s}");
+        }
+        // The CJK numerals are letters for the contract: the agent's gate
+        // is the stricter one.
+        assert!(is_identifier_produced("一二三四五六七八九"));
+        assert_eq!(normalize_path("一二三四五六七八九").as_str(), "*");
+        assert!(!is_identifier_produced("face.cafe.\u{0378}"));
+        assert_eq!(
+            produced_violations("face.cafe.\u{0378}"),
+            vec![UNASSIGNED_RULE]
+        );
+        assert_eq!(
+            normalize_path("face.cafe.x\u{0378}").as_str(),
+            "face.cafe.*"
+        );
+        for s in ["face.cafe.beef", "*", "orders[].email", "ou=people,dc=x"] {
+            assert!(is_identifier_produced(s), "{s}");
+        }
+    }
+
+    /// A name masked whole by the new rules is `*`, never marked altered
+    /// (ADR-0056); a partly masked name keeps its marker.
+    #[test]
+    fn identifier_produced_masking_and_the_altered_marker() {
+        let whole = normalize_path("\u{FF10}01a.2b3c.4d5e");
+        assert_eq!(whole.as_str(), "*");
+        assert!(!whole.altered());
+        let part = normalize_path("\u{FF44}evice.001a.2b3c.4d5e");
+        assert_eq!(part.as_str(), "device.*");
+        assert!(part.altered());
+        let plain = normalize_path("device.001a.2b3c.4d5e");
+        assert!(!plain.altered());
     }
 }

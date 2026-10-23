@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://databastion.invalid/protocol/v1/identifier-produced.schema.json",
+  "title": "IdentifierProduced",
+  "description": "Producer rule of every normalized name a conforming agent sends as an `Identifier` (ADR-0057 decision 1): the `Identifier` schema of openapi.yaml plus the `not` rules below, applied to the name, to each `.`-separated segment and, in the LDAP container DN form, to each RDN value. A digit is any Unicode decimal digit (`\\p{Nd}`), a space any Unicode space separator (`\\p{Zs}`), a numeric character any `\\p{N}` character. Not referenced by openapi.yaml and read by no generator: no request or response uses it, and no console validates against it yet (its masking is ADR-0057 decision 3, a later release). The agent's contract tests check that every normalized name that is not a `KeyPattern` matches it (agent/crates/classifiers/tests/identifier_produced.rs). Patterns use Unicode property escapes (the `u` flag) and the subset of the syntax the Rust `regex` crate shares.",
+  "type": "string",
+  "allOf": [
+    {
+      "$ref": "schemas.json#/$defs/Identifier"
+    }
+  ],
+  "not": {
+    "anyOf": [
+      {
+        "title": "rule 1",
+        "description": "No name, segment or LDAP RDN value made only of 9 or more digits (\\p{Nd}), spaces (\\p{Zs}), `_`, `+` and `-`.",
+        "type": "string",
+        "pattern": "(^|[.,=])[0-9\\p{Nd}\\p{Zs}_+-]{9,}([.,]|$)"
+      },
+      {
+        "title": "rule 2",
+        "description": "No run of 9 or more characters made of digits (\\p{Nd}) and separators (`.`, `_`, `+`, `-`, \\p{Zs} spaces, \\p{Pd} dashes, U+FF0E) that starts and ends with a digit (a phone or card number split across segments: `06.12.34.56.78`, `06_12_34_56_78`).",
+        "type": "string",
+        "pattern": "[0-9\\p{Nd}][0-9\\p{Nd}\\p{Zs}\\p{Pd}_+.\\uFF0E-]{7,}[0-9\\p{Nd}]"
+      },
+      {
+        "title": "rule 3-ipv4",
+        "description": "No IPv4 address as whole segments (`host.10.0.0.1`, `10.0.0.1`, `ou=10.0.0.1`).",
+        "type": "string",
+        "pattern": "(^|[.,=])[0-9\\p{Nd}]{1,3}\\.[0-9\\p{Nd}]{1,3}\\.[0-9\\p{Nd}]{1,3}\\.[0-9\\p{Nd}]{1,3}([.,]|$)"
+      },
+      {
+        "title": "rule 3-mac-dashed",
+        "description": "No MAC address written with `-` (`00-1a-2b-3c-4d-5e`).",
+        "type": "string",
+        "pattern": "[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}"
+      },
+      {
+        "title": "rule 3-mac-dotted",
+        "description": "No dotted MAC address as whole segments: three segments of 4 hexadecimal characters, at least one of which holds a digit (`001a.2b3c.4d5e` is refused, `face.cafe.beef` is not).",
+        "type": "string",
+        "pattern": "(^|[.,=])(?:(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\\.[0-9A-Fa-f]{4}\\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9])\\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}\\.[0-9A-Fa-f]{4}\\.(?:[0-9][0-9A-Fa-f]{3}|[A-Fa-f][0-9][0-9A-Fa-f]{2}|[A-Fa-f]{2}[0-9][0-9A-Fa-f]|[A-Fa-f]{3}[0-9]))([.,]|$)"
+      },
+      {
+        "title": "rule 4",
+        "description": "No percent-encoded byte (`%` and two hexadecimal digits) and no `%uXXXX` escape.",
+        "type": "string",
+        "pattern": "%[0-9A-Fa-f]{2}|%[Uu][0-9A-Fa-f]{4}"
+      },
+      {
+        "title": "rule 5-run",
+        "description": "No run of more than 6 numeric characters (\\p{N}).",
+        "type": "string",
+        "pattern": "\\p{N}{7,}"
+      },
+      {
+        "title": "rule 5-total",
+        "description": "No more than 8 numeric characters (\\p{N}) in the whole name.",
+        "type": "string",
+        "pattern": "\\p{N}(?:\\P{N}*\\p{N}){8}"
+      }
+    ]
+  }
+}

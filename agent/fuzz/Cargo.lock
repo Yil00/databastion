@@ -304,6 +304,7 @@ dependencies = [
 name = "databastion-fuzz"
 version = "0.0.0"
 dependencies = [
+ "databastion-classifiers",
  "databastion-connector-cas",
  "databastion-connector-mongodb",
  "databastion-connector-openldap",
