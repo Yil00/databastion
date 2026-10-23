@@ -1,3 +1,4 @@
+import { AGENT_TOKENS_HOLD_RELEASES, agentTokensHold, type AgentTokensHold, type Env } from "@/config/env";
 import type { components } from "@/generated/protocol/types.gen";
 import { auditSourceEngines } from "@/lib/location-labels";
 import type { AuditSource, Engine } from "@/lib/protocol/enums";
@@ -17,6 +18,11 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * `target_status.notes` is stored for the latest heartbeat and rendered, and the
  * `job_progress.coverage` counters are stored with the job's progress and shown with the target's
  * latest scan (src/lib/scan-coverage.ts).
+ *
+ * Multi-replica consoles (ADR-0022 decision 8): `DATABASTION_AGENT_TOKENS_HOLD` makes every replica
+ * list only the tokens of an older release line while still accepting every field below
+ * ({@link listedAccepts}); "list it only once every replica runs this build" below means: keep the
+ * hold set until then.
  *
  * `access_event.objects_overflowed` (ADR-0053 decisions 1 and 3) is stored with the event
  * (`access_events.objects_overflowed`) and gives every `*` object of a flagged event the meaning
@@ -94,6 +100,64 @@ export const CONSOLE_ACCEPTS = [
 ] as const;
 
 export type ConsoleCapability = (typeof CONSOLE_ACCEPTS)[number];
+
+// ------------------------------------------------------------- token hold (ADR-0022 decision 8)
+
+/**
+ * The tokens each console release line lists in its heartbeat answers, for
+ * `DATABASTION_AGENT_TOKENS_HOLD` (ADR-0022 decision 8; end-of-phase-9 review L1). During a rolling
+ * upgrade from release line `X.Y`, every replica runs with the hold set to `X.Y`: the upgraded
+ * replicas then list only what every `X.Y` replica accepts, while still accepting every field of
+ * {@link CONSOLE_ACCEPTS}; once no `X.Y` replica remains, the hold is removed and the full list is
+ * served. An agent therefore never learns a token from one replica that another rejects.
+ *
+ * `0.8`: the list of 0.8.0, 0.8.1 and 0.8.2 (identical in the three releases). Held back with it:
+ * `access_event.objects_overflowed` (ADR-0053, #296), `target_status.name_case` (ADR-0055, #302),
+ * `location.altered` and `object_ref.altered` (ADR-0056, #324) and
+ * `target_status.note_labels.2026_10_c` (#280: a 0.8 replica answers `400` to `on_failure_probe`).
+ * The engine tokens and every earlier token are in the 0.8 list, so they are listed as always.
+ *
+ * A release line is added here when its successor lists a new token (its entry is the list it
+ * shipped, never edited afterwards); the env value set is `AGENT_TOKENS_HOLD_RELEASES`
+ * (src/config/env.ts), and the `Record` fails `tsc` until each value has its list. Each list must
+ * be a subset of {@link CONSOLE_ACCEPTS} (tested).
+ */
+export const RELEASE_ACCEPTS: Record<AgentTokensHold, readonly ConsoleCapability[]> = {
+  "0.8": [
+    "access_event.bytes",
+    "engine.cas",
+    "engine.redis",
+    "engine.sqlserver",
+    "engine.valkey",
+    "job_progress.coverage",
+    "target_status.note_labels.2026_10",
+    "target_status.note_labels.2026_10_b",
+    "target_status.notes",
+  ],
+};
+
+/**
+ * The tokens the heartbeat answer lists (`HeartbeatResponse.accepts`): {@link CONSOLE_ACCEPTS}, or
+ * the held release line's list while `DATABASTION_AGENT_TOKENS_HOLD` is set. Listing only:
+ * validation, the engine gate ({@link unlistedEngineDetails}) and storage always use
+ * {@link CONSOLE_ACCEPTS}. An invalid value is fatal at startup (`startupFatal`); should a process
+ * still see one, the oldest known list is served (fail closed: fewer tokens listed, nothing lost).
+ */
+export function listedAccepts(env: Env = process.env): ConsoleCapability[] {
+  let hold: AgentTokensHold | null;
+  try {
+    hold = agentTokensHold(env);
+  } catch {
+    hold = AGENT_TOKENS_HOLD_RELEASES[0];
+  }
+  return hold === null ? [...CONSOLE_ACCEPTS] : [...RELEASE_ACCEPTS[hold]];
+}
+
+/** The tokens of {@link CONSOLE_ACCEPTS} that `DATABASTION_AGENT_TOKENS_HOLD` holds back (none when unset). */
+export function heldAccepts(env: Env = process.env): ConsoleCapability[] {
+  const listed = new Set<string>(listedAccepts(env));
+  return CONSOLE_ACCEPTS.filter((t) => !listed.has(t));
+}
 
 // ------------------------------------------------------------- console -> agent (ADR-0022 decision 3)
 

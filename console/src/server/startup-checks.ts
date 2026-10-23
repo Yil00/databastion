@@ -1,3 +1,6 @@
+import { agentTokensHold, ConfigError } from "@/config/env";
+
+import { agentTokensHoldWarning } from "./agent-api/token-hold";
 import { alertingFatal, alertingWarnings } from "./alerting-config";
 import { serverSubkey } from "./crypto";
 import { localLoginMode, oidcConfigWarnings, oidcEnabled, oidcStartupFatal } from "./oidc/config";
@@ -29,7 +32,23 @@ export function startupWarnings(env: NodeJS.ProcessEnv = process.env): string[] 
   const localLogin = localLoginWarning(env);
   if (localLogin !== null) warnings.push(localLogin);
   warnings.push(...oidcConfigWarnings(env));
+  // ADR-0022 decision 8: also repeated hourly from the heartbeat path (agent-api/token-hold.ts).
+  const hold = agentTokensHoldWarning(env);
+  if (hold !== null) warnings.push(hold);
   return warnings;
+}
+
+/** `DATABASTION_AGENT_TOKENS_HOLD` with an unknown value (fatal in every environment, like OIDC). */
+export { agentTokensHoldWarning };
+
+function agentTokensHoldFatal(env: NodeJS.ProcessEnv): string | null {
+  try {
+    agentTokensHold(env);
+    return null;
+  } catch (err) {
+    if (err instanceof ConfigError) return `Agent capability configuration error: ${err.message} Refusing to start.`;
+    return "Agent capability configuration error: refusing to start.";
+  }
 }
 
 /**
@@ -69,6 +88,9 @@ export function startupFatal(env: NodeJS.ProcessEnv = process.env): string | nul
   // explicit opt-in, and it needs the server key even where the override below applies).
   const oidc = oidcStartupFatal(env);
   if (oidc !== null) return oidc;
+  // ADR-0022 decision 8: an unknown hold value would list an unintended token set.
+  const hold = agentTokensHoldFatal(env);
+  if (hold !== null) return hold;
   if (env.NODE_ENV !== "production") return null;
   // L5 (P3-C): the alerting dev flag needs a second explicit opt-in in production.
   const alerting = alertingFatal(env);
