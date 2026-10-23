@@ -106,7 +106,7 @@ pub(crate) const MAX_SKIP: u32 = 1_000_000;
 /// Smallest read after responses over [`POLL_BYTES`] (the read halves).
 const MIN_BATCH: usize = 16;
 /// Bound of one poll's response.
-const POLL_BYTES: usize = 12 * 1024 * 1024;
+pub(crate) const POLL_BYTES: usize = 12 * 1024 * 1024;
 /// The catalog proofs are read again this often (decision 6).
 const REPROBE: Duration = Duration::from_secs(300);
 /// The account's evaluation (refusal list) is read again this often.
@@ -190,6 +190,13 @@ pub(crate) struct Shared {
     /// this connector's streams ([`xe::size::ReadSize::with_memory`]).
     #[cfg(test)]
     pub(crate) xe_size_memory: Mutex<Option<Duration>>,
+    /// Integration tests only: while set, this connector's Extended Events
+    /// streams wait between cycles ([`Shared::xe_hold_point`]), as a
+    /// reader that fell behind; `xe_parked` tells one is waiting.
+    #[cfg(test)]
+    pub(crate) xe_hold: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) xe_parked: std::sync::atomic::AtomicBool,
     /// The read size halved at a position, kept across stream restarts
     /// ([`Shared::read_failed`]): at most one per target, cleared by the
     /// next successful read.
@@ -591,6 +598,20 @@ impl Shared {
         {
             None
         }
+    }
+
+    /// Integration tests only: the point between two cycles of an
+    /// Extended Events stream where it waits while `xe_hold` is set (the
+    /// large-event test writes its run of large events meanwhile, so that
+    /// the next read has all of them ahead of it).
+    #[cfg(test)]
+    pub(crate) async fn xe_hold_point(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        while self.xe_hold.load(SeqCst) {
+            self.xe_parked.store(true, SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.xe_parked.store(false, SeqCst);
     }
 
     /// The Extended Events reads of `target_id` since the agent started.
