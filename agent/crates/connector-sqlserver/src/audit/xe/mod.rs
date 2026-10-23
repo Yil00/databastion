@@ -445,6 +445,8 @@ pub(crate) async fn stream(
         };
         st.save();
         tokio::time::sleep(end.pause(cfg.poll_interval())).await;
+        #[cfg(test)]
+        state.audit.xe_hold_point().await;
     }
 }
 

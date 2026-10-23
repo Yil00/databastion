@@ -5318,35 +5318,65 @@ async fn measure_xe_read_cost() {
 /// ([`xe_large_events_are_read_by_halving`]).
 const LARGE_XE: &str = "it_large_xe";
 
-/// `n` reads of `retail.crm.customers` by `sa` in one tight batch, each
-/// statement `pad` characters longer (a comment; built on the server and
-/// run through `sp_executesql`, since the client sends batches of one
-/// packet only; 20 ms apart, so that the session's buffers keep up and
-/// drop none): one statement event each naming the table, and the `SET`,
-/// `WHILE` (and `EXEC`, `WAITFOR`) events.
-async fn customer_reads(s: &mut Session, n: u32, pad: usize) {
-    let body = if pad == 0 {
-        format!(
-            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
-             SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
-        )
-    } else {
-        format!(
-            "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
-             DECLARE @q nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
-             REPLICATE(CONVERT(nvarchar(max), N'x'), {pad}) + N' */ FROM retail.crm.customers WHERE id = @i'; \
-             WHILE @i < {n} BEGIN \
-             EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
-             WAITFOR DELAY '00:00:00.020'; END"
-        )
-    };
+/// `n` reads of `retail.crm.customers` by `sa` in one tight batch: one
+/// statement event each naming the table, and the `SET` events.
+async fn customer_reads(s: &mut Session, n: u32) {
+    let body = format!(
+        "SET NOCOUNT ON; DECLARE @i int = 0, @n int; WHILE @i < {n} BEGIN \
+         SELECT @n = COUNT(*) FROM retail.crm.customers WHERE id = @i; SET @i += 1; END"
+    );
     Box::pin(exec(s, &body)).await;
 }
+
+/// The large-event run: [`LARGE_EXECS`] calls of `sp_executesql`, each of
+/// [`LARGE_PER_EXEC`] reads of `retail.crm.customers` by `sa`, each read
+/// [`LARGE_PAD`] characters longer (a comment; built on the server, since
+/// the client sends batches of one packet only), [`LARGE_DELAY_MS`] apart,
+/// so that the session's buffers keep up and drop none: one statement
+/// event each naming the table (its `event_data` above `2 × LARGE_PAD`
+/// bytes), and 4 small events a call (`EXEC`, `SET`, `WHILE`,
+/// `WAITFOR`; measured on 2022: 1 498 events for 300 calls of one).
+async fn large_customer_reads(s: &mut Session) {
+    let body = format!(
+        "SET NOCOUNT ON; DECLARE @i int = 0, @n int; \
+         DECLARE @one nvarchar(max) = N'SELECT @n = COUNT(*) /* ' + \
+         REPLICATE(CONVERT(nvarchar(max), N'x'), {LARGE_PAD}) + N' */ FROM retail.crm.customers WHERE id = @i; '; \
+         DECLARE @q nvarchar(max) = REPLICATE(@one, {LARGE_PER_EXEC}); \
+         WHILE @i < {LARGE_EXECS} BEGIN \
+         EXEC sys.sp_executesql @q, N'@i int, @n int OUTPUT', @i, @n OUTPUT; SET @i += 1; \
+         WAITFOR DELAY '00:00:00.{LARGE_DELAY_MS:03}'; END"
+    );
+    Box::pin(exec(s, &body)).await;
+}
+
+/// The large-event run's statements: each `event_data` of about 120 000
+/// bytes (UTF-16), within [`crate::sql::XE_EVENT_BYTES`], so that it is
+/// read with its text (a larger event comes back without it, a small row).
+const LARGE_PAD: usize = 60_000;
+/// Large statements per `sp_executesql` call: with 4 small events a call,
+/// any `BATCH` rows of the run hold about 250 large events (about 30 MB),
+/// more than twice the 102 a response above `POLL_BYTES` needs
+/// ([`LargeRun::assert_oversized`] checks it from the files). With one a
+/// call (before), `BATCH` rows held about 100 large events of
+/// 123 360 bytes, about 12.35 MB against 12.58: the sized bound after a
+/// large row is `BATCH`, so a response above `POLL_BYTES` came only from
+/// a read sized from small rows (up to `XE_MAX_ROWS`) that met enough of
+/// the run, or from a denser window, a race the reader keeping up with
+/// the run lost (engine matrix run 40013967157: 19 reads, no cancel).
+const LARGE_PER_EXEC: usize = 4;
+/// `sp_executesql` calls of the run: 300 large events.
+const LARGE_EXECS: usize = 75;
+/// The delay between two calls (the same event bytes per second as one
+/// large statement every 20 ms).
+const LARGE_DELAY_MS: u32 = 80;
 
 /// ADR-0051 refinement of 2026-10-22, test plan item 3: a backlog of small
 /// events is read at the sized bound (more than `BATCH` rows a read); a
 /// run of large events (statements of about 60 000 characters, `event_data`
-/// near its 128 KiB bound) makes a read's response go above 12 MiB: it is
+/// near its 128 KiB bound), written while the stream waits between two
+/// cycles (a reader behind by the whole run), makes its next read's
+/// response go above 12 MiB whatever its size (a precondition checked
+/// from the session's files, [`LargeRun::assert_oversized`]): it is
 /// cancelled and read again by halving, with no event lost or reported
 /// twice and no stream error; once the halving is forgotten (its 10
 /// minutes shortened to 20 s for the test), small events are read at the
@@ -5517,7 +5547,7 @@ async fn xe_large_body(major: u32) {
     };
     // 1. Small events, written at once: read at the sized bound.
     let small = 6_000u32;
-    Box::pin(customer_reads(&mut s, small, 0)).await;
+    Box::pin(customer_reads(&mut s, small)).await;
     let got = count_until(small as usize, Duration::from_secs(60)).await;
     let r = c.state.audit.xe_reads(&t.id);
     eprintln!("[it] large events: small backlog {got}/{small}, reads {r:?}");
@@ -5533,8 +5563,44 @@ async fn xe_large_body(major: u32) {
         "no restart on small events"
     );
     // 2. Large events: a response above 12 MiB, cancelled, read by halving.
-    let large = 300u32;
-    Box::pin(customer_reads(&mut s, large, 60_000)).await;
+    // The whole run is written while the stream waits between two cycles
+    // (`xe_hold`), as a reader that fell behind, so that its next read (at
+    // least `BATCH` rows: no halving or cap is remembered yet) has every
+    // large event ahead of it. Without the hold the stream read the run as
+    // it was written, about a second of it a read: no response above
+    // 12 MiB unless a read sized from the small rows met enough of it, a
+    // race (engine matrix run 40013967157).
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        c.state.audit.xe_hold.store(true, SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !c.state.audit.xe_parked.load(SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream did not wait between cycles (or ended)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let before_run = c.state.audit.xe_reads(&t.id);
+    let started = std::time::Instant::now();
+    Box::pin(large_customer_reads(&mut s)).await;
+    eprintln!(
+        "[it] large events: run written in {} ms",
+        started.elapsed().as_millis()
+    );
+    let large = u32::try_from(LARGE_PER_EXEC * LARGE_EXECS).unwrap();
+    let facts = Box::pin(large_run_in_files(&mut s, &stem, large)).await;
+    assert_eq!(
+        c.state.audit.xe_reads(&t.id),
+        before_run,
+        "no read while held"
+    );
+    facts.assert_oversized(large);
+    c.state
+        .audit
+        .xe_hold
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     let want = (small + large) as usize;
     let got = count_until(want, Duration::from_secs(120)).await;
     let r = c.state.audit.xe_reads(&t.id);
@@ -5557,7 +5623,7 @@ async fn xe_large_body(major: u32) {
     tokio::time::sleep(Duration::from_secs(22)).await;
     let before = c.state.audit.xe_reads(&t.id);
     let more = 6_000u32;
-    Box::pin(customer_reads(&mut s, more, 0)).await;
+    Box::pin(customer_reads(&mut s, more)).await;
     let want = want + more as usize;
     let got = count_until(want, Duration::from_secs(60)).await;
     let r = c.state.audit.xe_reads(&t.id);
@@ -5601,6 +5667,80 @@ async fn xe_large_body(major: u32) {
     assert_eq!(facts.dropped, 0, "records dropped");
     assert!(!facts.gap, "no gap");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The large-event run as the session's files hold it: every event
+/// stamped from the first large one to the last.
+#[derive(Debug)]
+struct LargeRun {
+    /// Events in that time span, of any session.
+    events: i64,
+    /// Large events (`event_data` above `2 × LARGE_PAD` bytes).
+    large: i64,
+    /// The smallest large event and the largest event (bytes).
+    smallest_large: i64,
+    largest: i64,
+}
+
+impl LargeRun {
+    /// The test's precondition: every large event read with its text, and
+    /// the stream's first read after the hold (at least `BATCH` rows, a
+    /// few events of the time before the run first) above `POLL_BYTES`
+    /// whatever the read size, from the measured share of large events.
+    fn assert_oversized(&self, large: u32) {
+        use crate::audit::{BATCH, POLL_BYTES};
+        // Events between the stream's last read and the run (the batch's
+        // `DECLARE`s, other sessions'): at most these.
+        const BEFORE: i64 = 50;
+        assert_eq!(self.large, i64::from(large), "precondition: {self:?}");
+        assert!(
+            usize::try_from(self.largest).unwrap() <= crate::sql::XE_EVENT_BYTES,
+            "precondition: every large event read with its text: {self:?}"
+        );
+        let rows = i64::try_from(BATCH).unwrap() - BEFORE;
+        let bytes = rows * self.large / self.events.max(1) * self.smallest_large;
+        eprintln!(
+            "[it] large events: {self:?}: the first read after the hold holds at least {bytes} bytes (POLL_BYTES {POLL_BYTES})"
+        );
+        assert!(
+            bytes > i64::try_from(POLL_BYTES).unwrap(),
+            "precondition: a read of BATCH rows from the run's start is above POLL_BYTES: {self:?}, {bytes} bytes"
+        );
+    }
+}
+
+/// Waits until the session's files hold `large` large events (their
+/// dispatch latency is 5 s), then measures the run ([`LargeRun`]). The
+/// time span is compared as `DATEDIFF_BIG` microseconds: a predicate on
+/// `timestamp_utc` itself selected no event (measured on 2022).
+async fn large_run_in_files(s: &mut Session, stem: &str, large: u32) -> LargeRun {
+    let big = 2 * LARGE_PAD;
+    let sql = format!(
+        "WITH f AS (SELECT CONVERT(bigint, DATALENGTH(event_data)) AS n, \
+         DATEDIFF_BIG(microsecond, '19700101', timestamp_utc) AS t \
+         FROM sys.fn_xe_file_target_read_file(N'/var/opt/mssql/xe/{stem}_0_*.xel', NULL, NULL, NULL)), \
+         b AS (SELECT MIN(t) AS a, MAX(t) AS z FROM f WHERE n > {big}) \
+         SELECT CONVERT(bigint, COUNT(*)), CONVERT(bigint, ISNULL(SUM(CASE WHEN f.n > {big} THEN 1 ELSE 0 END), 0)), \
+         CONVERT(bigint, ISNULL(MIN(CASE WHEN f.n > {big} THEN f.n END), 0)), CONVERT(bigint, ISNULL(MAX(f.n), 0)) \
+         FROM f CROSS JOIN b WHERE f.t >= b.a AND f.t <= b.z"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = Box::pin(try_rows(s, &sql, 4))
+            .await
+            .expect("the run's events");
+        let v = |i: usize| rows[0][i].as_int().unwrap_or(0);
+        let run = LargeRun {
+            events: v(0),
+            large: v(1),
+            smallest_large: v(2),
+            largest: v(3),
+        };
+        if run.large >= i64::from(large) || std::time::Instant::now() >= deadline {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// The large-event test's stream restarts at most (each one after an
