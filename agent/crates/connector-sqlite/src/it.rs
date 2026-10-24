@@ -57,13 +57,13 @@ fn open_req(path: &Path, rollback_read: bool) -> OpenRequest {
 }
 
 fn session(path: &Path) -> Session {
-    Session::open(&open_req(path, true), Policy::TESTS)
+    Session::open(&open_req(path, true), Policy::TESTS, None)
         .unwrap()
         .0
 }
 
 fn open_code(path: &Path, rollback_read: bool, policy: Policy) -> Code {
-    match Session::open(&open_req(path, rollback_read), policy) {
+    match Session::open(&open_req(path, rollback_read), policy, None) {
         Ok(_) => panic!("opened"),
         Err(f) => f.code,
     }
@@ -251,7 +251,7 @@ fn a_rollback_file_is_read_with_the_opt_in_only() {
     assert!(
         stats
             .iter()
-            .any(|(n, c)| n.as_slice() == b"strict_t" && *c == 50)
+            .any(|r| r.name.as_slice() == b"strict_t" && r.rows == 50)
     );
     let Response::Pragmas(p) = s.handle(&Request::Pragmas) else {
         panic!()
@@ -276,7 +276,7 @@ fn a_wal_file_is_read_while_its_writer_holds_it_open() {
         )
         .unwrap();
     assert!(crate::files::side_path(&p, "-wal").exists());
-    let (mut s, info) = Session::open(&open_req(&p, false), Policy::TESTS).unwrap();
+    let (mut s, info) = Session::open(&open_req(&p, false), Policy::TESTS, None).unwrap();
     assert!(info.wal);
     let _ = catalog(&mut s);
     let a = sampled(sample(

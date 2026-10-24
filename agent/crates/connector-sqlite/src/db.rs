@@ -510,7 +510,10 @@ impl Db {
                 if out.len() >= MAX_STATS || bytes > SAMPLE_RESPONSE_BUDGET {
                     break;
                 }
-                out.push((Zeroizing::new(tbl.to_vec()), n));
+                out.push(crate::ipc::StatRow {
+                    name: Zeroizing::new(tbl.to_vec()),
+                    rows: n,
+                });
             }
             Ok(out)
         })();

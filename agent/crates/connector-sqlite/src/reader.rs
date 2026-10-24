@@ -33,6 +33,9 @@ pub struct Session {
     side: SideFiles,
     wal: bool,
     first_statement_done: bool,
+    /// The side files the Landlock grant covers (`None` in-process): one
+    /// that appears later cannot be read, the file changed (review L4).
+    granted: Option<Vec<PathBuf>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -56,7 +59,11 @@ impl Session {
     ///
     /// # Errors
     /// The failure of the first step that refused the file.
-    pub fn open(req: &OpenRequest, policy: Policy) -> Result<(Self, OpenInfo), Failure> {
+    pub fn open(
+        req: &OpenRequest,
+        policy: Policy,
+        granted: Option<Vec<PathBuf>>,
+    ) -> Result<(Self, OpenInfo), Failure> {
         let path = PathBuf::from(OsString::from_vec(req.path.to_vec()));
         let (lo, hi) = databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE;
         if !(lo..=hi).contains(&req.max_statement_ms) {
@@ -83,6 +90,7 @@ impl Session {
             wal,
             world_readable: checked.world_readable,
             writer_version: checked.header.writer_version,
+            shm_ino: side.shm.map_or(0, |s| s.id.ino),
         };
         Ok((
             Self {
@@ -93,6 +101,7 @@ impl Session {
                 side,
                 wal,
                 first_statement_done: false,
+                granted,
             },
             info,
         ))
@@ -103,6 +112,18 @@ impl Session {
     /// the held descriptor, the `-wal` size.
     fn before_unit(&mut self) -> Result<(), Failure> {
         let side = files::recheck(&self.path, &self.checked, self.policy)?;
+        if let Some(granted) = &self.granted {
+            let present = [
+                (side.wal.is_some(), "-wal"),
+                (side.shm.is_some(), "-shm"),
+                (side.journal.is_some(), "-journal"),
+            ];
+            for (here, suffix) in present {
+                if here && !granted.contains(&files::side_path(&self.path, suffix)) {
+                    return Err(Failure::new(Code::SideFileAppeared));
+                }
+            }
+        }
         if self.wal && side.wal.is_some_and(|w| w.size > MAX_WAL_BYTES) {
             return Err(Failure::new(Code::WalTooLarge));
         }
@@ -238,14 +259,22 @@ pub fn main() -> i32 {
         return 1;
     };
     let path = PathBuf::from(OsString::from_vec(open.path.to_vec()));
+    // Review M1: the path rules (canonical, no symlink in any component,
+    // the ancestors) before the Landlock grant is built from it; the grant
+    // itself follows no symlink and is checked again after
+    // `restrict_self`.
     let ready = early
+        .and_then(|()| files::check_ancestors(&path, Policy::STRICT))
         .and_then(|()| sandbox::restrict(&path))
-        .and_then(|()| db::self_check());
-    if let Err(f) = ready {
-        let _ = write_response(&Response::Failed(f));
-        return 1;
-    }
-    let (mut session, info) = match Session::open(&open, Policy::STRICT) {
+        .and_then(|sides| db::self_check().map(|()| sides));
+    let granted = match ready {
+        Ok(sides) => sides,
+        Err(f) => {
+            let _ = write_response(&Response::Failed(f));
+            return 1;
+        }
+    };
+    let (mut session, info) = match Session::open(&open, Policy::STRICT, Some(granted)) {
         Ok(s) => s,
         Err(f) => {
             let _ = write_response(&Response::Failed(f));

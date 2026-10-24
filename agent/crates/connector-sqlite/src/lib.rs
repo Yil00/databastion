@@ -38,6 +38,7 @@ pub mod files;
 pub mod fuzz;
 pub mod header;
 pub mod ipc;
+pub mod locks;
 pub mod process;
 pub mod reader;
 pub mod sandbox;

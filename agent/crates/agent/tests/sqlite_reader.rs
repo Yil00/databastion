@@ -317,6 +317,15 @@ async fn a_wal_file_is_read_while_another_process_writes_and_nothing_changes() {
     );
     // The directory, the -wal and the -shm: byte for byte and mtime.
     assert!(before == snapshot(), "the reader changed a file");
+    // No reader was killed (review L3: the idle locks of a WAL reader are
+    // those of an idle connection).
+    let h = c.check(&t).await;
+    assert!(
+        !h.notes
+            .iter()
+            .any(|n| n.code() == NoteCode::CoverageReaderProcessFailed),
+        "{h:?}"
+    );
     // A write after the scan is seen by the next one.
     writer.insert_email("later@example.com");
     let (again, _) = scan(&c, &t).await;

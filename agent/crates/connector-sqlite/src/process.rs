@@ -158,12 +158,18 @@ impl ReaderProcess {
         }
     }
 
+    /// The reader's process id (`None` once reaped).
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Test support: the reader's process id.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     #[must_use]
     pub fn pid_for_tests(&self) -> Option<u32> {
-        self.child.id()
+        self.pid()
     }
 
     /// `SIGKILL` and reap (bounded).

@@ -53,3 +53,9 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
+
+# Review L2: the reader's sandbox applied in a child process (re-exec), and
+# the calls it must refuse. Its own harness: the sandbox is per process.
+[[test]]
+name = "sandbox"
+harness = false

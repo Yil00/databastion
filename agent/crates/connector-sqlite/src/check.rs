@@ -117,7 +117,9 @@ pub fn outcome(code: Code) -> (FailureCode, Option<Stage>, Option<NoteCode>) {
             Some(Stage::Connect),
             Some(NoteCode::CoverageRollbackModeNotRead),
         ),
-        Code::Busy | Code::Interrupted => (F::Timeout, None, Some(NoteCode::CheckTimedOut)),
+        Code::Busy | Code::Interrupted | Code::SideFileAppeared => {
+            (F::Timeout, None, Some(NoteCode::CheckTimedOut))
+        }
         Code::NoMemory | Code::TooBig => (F::ResourceLimit, None, None),
         Code::Corrupt
         | Code::NoRowid
@@ -177,7 +179,7 @@ struct Inner {
 pub struct TargetState {
     /// Held for the whole life of a reader of this target, and by the
     /// agent's own light check.
-    pub lock: tokio::sync::Mutex<()>,
+    pub lock: Arc<tokio::sync::Mutex<()>>,
     inner: std::sync::Mutex<Inner>,
 }
 
@@ -332,7 +334,11 @@ pub async fn check(
     settings: &SqliteSettings,
     st: Arc<TargetState>,
 ) -> TargetHealth {
-    let Ok(guard) = st.lock.try_lock() else {
+    // Review L1: the guard moves into the light check's blocking thread,
+    // so a check stuck in the kernel (an `lstat` on a hung mount) holds the
+    // target, and only one thread: later checks find it busy and report
+    // the last result.
+    let Ok(guard) = Arc::clone(&st.lock).try_lock_owned() else {
         // A scan's reader holds the target: the last result.
         return st.with(|i| i.last.clone()).unwrap_or_else(|| {
             failed_health(
@@ -343,16 +349,19 @@ pub async fn check(
         });
     };
     let budget = Instant::now() + CHECK_BUDGET;
-    let health =
-        match tokio::time::timeout(CHECK_BUDGET, run(target_id, settings, &st, budget)).await {
-            Ok(h) => h,
-            Err(_) => failed_health(
-                FailureCode::Timeout,
-                Stage::Connect,
-                Some(NoteCode::CheckTimedOut),
-            ),
-        };
-    drop(guard);
+    let health = match tokio::time::timeout(
+        CHECK_BUDGET,
+        run(target_id, settings, &st, budget, guard),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(_) => failed_health(
+            FailureCode::Timeout,
+            Stage::Connect,
+            Some(NoteCode::CheckTimedOut),
+        ),
+    };
     st.with(|i| i.last = Some(health.clone()));
     health
 }
@@ -362,20 +371,24 @@ async fn run(
     settings: &SqliteSettings,
     st: &TargetState,
     budget: Instant,
+    guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> TargetHealth {
     if let Err(f) = pre_check(settings) {
         log_refusal(target_id, f, Stage::Connect);
         return failure_health(f, Stage::Connect);
     }
     let path = settings.path().to_owned();
-    let lit = tokio::task::spawn_blocking(move || light(&path)).await;
+    let lit = tokio::task::spawn_blocking(move || (light(&path), guard)).await;
+    let (lit, _guard) = match lit {
+        Ok((r, g)) => (r, g),
+        Err(_) => return failed_health(FailureCode::Internal, Stage::Connect, None),
+    };
     let (fp, wal, wal_ok, world_readable) = match lit {
-        Ok(Ok(x)) => x,
-        Ok(Err(f)) => {
+        Ok(x) => x,
+        Err(f) => {
             log_refusal(target_id, f, Stage::Connect);
             return failure_health(f, Stage::Connect);
         }
-        Err(_) => return failed_health(FailureCode::Internal, Stage::Connect, None),
     };
     let mut notes = Vec::new();
     if world_readable {

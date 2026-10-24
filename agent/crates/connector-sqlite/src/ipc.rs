@@ -154,8 +154,8 @@ impl std::fmt::Debug for SampleRequest {
     }
 }
 
-/// Agent -> reader.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Agent -> reader. `Debug` is written by hand: never a raw name.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Request {
     /// The self-check, the open procedure and the connection setup.
     Open(OpenRequest),
@@ -175,6 +175,22 @@ pub enum Request {
     LightCheck,
     /// Close the connection and exit.
     Close,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(o) => f.debug_tuple("Open").field(o).finish(),
+            Self::Catalog => f.write_str("Catalog"),
+            Self::Stats => f.write_str("Stats"),
+            Self::Columns(_) => f.write_str("Columns(..)"),
+            Self::Bounds(_, a) => f.debug_tuple("Bounds").field(&"..").field(a).finish(),
+            Self::Sample(s) => f.debug_tuple("Sample").field(s).finish(),
+            Self::Pragmas => f.write_str("Pragmas"),
+            Self::LightCheck => f.write_str("LightCheck"),
+            Self::Close => f.write_str("Close"),
+        }
+    }
 }
 
 /// A closed failure code of the reader (decision 7's table, by cause).
@@ -227,13 +243,16 @@ pub enum Code {
     Auth,
     /// The file is no longer the one opened.
     FileChanged,
+    /// A side file appeared after the reader's grant was built (review L4):
+    /// the unit is lost, the next reader gets a new grant.
+    SideFileAppeared,
     /// A malformed or out-of-order request.
     Protocol,
     /// Anything else.
     Internal,
 }
 
-const CODES: [Code; 25] = [
+const CODES: [Code; 26] = [
     Code::NotFound,
     Code::NotReadable,
     Code::PathRefused,
@@ -257,6 +276,7 @@ const CODES: [Code; 25] = [
     Code::ViewProhibited,
     Code::Auth,
     Code::FileChanged,
+    Code::SideFileAppeared,
     Code::Protocol,
     Code::Internal,
 ];
@@ -304,6 +324,7 @@ impl Code {
             Self::ViewProhibited => "view_prohibited",
             Self::Auth => "auth",
             Self::FileChanged => "file_changed",
+            Self::SideFileAppeared => "side_file_appeared",
             Self::Protocol => "protocol",
             Self::Internal => "internal",
         }
@@ -436,6 +457,9 @@ pub struct OpenInfo {
     /// The SQLite version number that last wrote the file (header offset
     /// 96), for the agent's log only.
     pub writer_version: u32,
+    /// The `-shm` file's `st_ino` (0: none), for the agent's lock check
+    /// (review L3).
+    pub shm_ino: u64,
 }
 
 /// A row of the catalog (`sqlite_schema`): `table` or `view`.
@@ -515,8 +539,23 @@ pub struct PragmaInfo {
     pub encoding: u8,
 }
 
-/// A `sqlite_stat1` row count: the raw table name and its rows.
-pub type StatRow = (Zeroizing<Vec<u8>>, u64);
+/// A `sqlite_stat1` row count: the raw table name and its rows. `Debug`
+/// is written by hand: never the name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StatRow {
+    /// The raw table name.
+    pub name: Zeroizing<Vec<u8>>,
+    /// Its row count.
+    pub rows: u64,
+}
+
+impl std::fmt::Debug for StatRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatRow")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Reader -> agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,10 +587,21 @@ pub enum Response {
 struct Writer(Zeroizing<Vec<u8>>);
 
 impl Writer {
-    fn new(tag: u8) -> Self {
-        let mut v = Zeroizing::new(Vec::with_capacity(64));
+    /// A body of at most `capacity` bytes, allocated once: no reallocation
+    /// leaves an unzeroized copy of a raw value behind (review L6). A body
+    /// longer than that is refused by [`frame`] anyway.
+    fn with_capacity(tag: u8, capacity: usize) -> Self {
+        let mut v = Zeroizing::new(Vec::with_capacity(capacity));
         v.push(tag);
         Self(v)
+    }
+
+    fn new(tag: u8) -> Self {
+        Self::with_capacity(tag, 64)
+    }
+
+    fn fits(&self, n: usize) -> bool {
+        self.0.len().saturating_add(n) <= self.0.capacity()
     }
     fn u8(&mut self, v: u8) {
         self.0.push(v);
@@ -568,6 +618,16 @@ impl Writer {
     fn bytes(&mut self, b: &[u8]) {
         self.u32(u32::try_from(b.len()).unwrap_or(u32::MAX));
         self.0.extend_from_slice(b);
+    }
+
+    /// [`Self::bytes`] for a raw value, refused rather than reallocated
+    /// when it does not fit.
+    fn raw(&mut self, b: &[u8]) -> Result<(), Violation> {
+        if !self.fits(b.len().saturating_add(4)) {
+            return Err(Violation::TooLarge);
+        }
+        self.bytes(b);
+        Ok(())
     }
     fn len(&self) -> usize {
         self.0.len()
@@ -657,8 +717,8 @@ impl Request {
                 if too_long(&o.path) {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(1);
-                w.bytes(&o.path);
+                let mut w = Writer::with_capacity(1, MAX_REQUEST);
+                w.raw(&o.path)?;
                 w.u32(o.max_statement_ms);
                 w.u8(opt_tag(o.rollback_read));
                 w
@@ -669,16 +729,16 @@ impl Request {
                 if too_long(t) {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(4);
-                w.bytes(t);
+                let mut w = Writer::with_capacity(4, MAX_NAME + 8);
+                w.raw(t)?;
                 w
             }
             Self::Bounds(t, a) => {
                 if too_long(t) {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(5);
-                w.bytes(t);
+                let mut w = Writer::with_capacity(5, MAX_NAME + 8);
+                w.raw(t)?;
                 w.u8(a.tag());
                 w
             }
@@ -691,12 +751,12 @@ impl Request {
                 {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(6);
-                w.bytes(&s.table);
+                let mut w = Writer::with_capacity(6, MAX_REQUEST);
+                w.raw(&s.table)?;
                 w.u8(s.alias.map_or(0, RowidAlias::tag));
                 w.u32(u32::try_from(s.columns.len()).unwrap_or(u32::MAX));
                 for c in &s.columns {
-                    w.bytes(c);
+                    w.raw(c)?;
                 }
                 match s.range {
                     SampleRange::From(a) => {
@@ -834,13 +894,14 @@ impl Response {
                 w.u8(opt_tag(o.wal));
                 w.u8(opt_tag(o.world_readable));
                 w.u32(o.writer_version);
+                w.u64(o.shm_ino);
                 w
             }
             Self::Catalog(rows, cut) => {
                 if rows.len() > MAX_CATALOG {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(0x82);
+                let mut w = Writer::with_capacity(0x82, MAX_RESPONSE);
                 w.u8(opt_tag(*cut));
                 w.u32(u32::try_from(rows.len()).unwrap_or(u32::MAX));
                 for row in rows {
@@ -848,7 +909,7 @@ impl Response {
                         return Err(Violation::TooLarge);
                     }
                     w.u8(opt_tag(row.view));
-                    w.bytes(&row.name);
+                    w.raw(&row.name)?;
                     w.i64(row.rootpage);
                 }
                 w
@@ -857,14 +918,14 @@ impl Response {
                 if rows.len() > MAX_STATS {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(0x83);
+                let mut w = Writer::with_capacity(0x83, MAX_RESPONSE);
                 w.u32(u32::try_from(rows.len()).unwrap_or(u32::MAX));
-                for (name, n) in rows {
-                    if name.len() > MAX_NAME {
+                for row in rows {
+                    if row.name.len() > MAX_NAME {
                         return Err(Violation::TooLarge);
                     }
-                    w.bytes(name);
-                    w.u64(*n);
+                    w.raw(&row.name)?;
+                    w.u64(row.rows);
                 }
                 w
             }
@@ -872,13 +933,13 @@ impl Response {
                 if cols.len() > MAX_TABLE_COLUMNS {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(0x84);
+                let mut w = Writer::with_capacity(0x84, MAX_RESPONSE);
                 w.u32(u32::try_from(cols.len()).unwrap_or(u32::MAX));
                 for c in cols {
                     if c.name.len() > MAX_NAME {
                         return Err(Violation::TooLarge);
                     }
-                    w.bytes(&c.name);
+                    w.raw(&c.name)?;
                     w.i64(c.pk);
                     w.i64(c.hidden);
                 }
@@ -900,7 +961,7 @@ impl Response {
                 if s.values.len() > MAX_COLUMNS || s.rows > MAX_ROWS {
                     return Err(Violation::TooLarge);
                 }
-                let mut w = Writer::new(0x86);
+                let mut w = Writer::with_capacity(0x86, MAX_RESPONSE);
                 w.u32(s.rows);
                 match s.last_rowid {
                     Some(r) => {
@@ -922,7 +983,7 @@ impl Response {
                                     return Err(Violation::TooLarge);
                                 }
                                 w.u8(1);
-                                w.bytes(v);
+                                w.raw(v)?;
                             }
                             None => w.u8(0),
                         }
@@ -977,6 +1038,7 @@ impl Response {
                 wal: r.bool()?,
                 world_readable: r.bool()?,
                 writer_version: r.u32()?,
+                shm_ino: r.u64()?,
             }),
             0x82 => {
                 let cut = r.bool()?;
@@ -999,7 +1061,10 @@ impl Response {
                 let mut rows = Vec::with_capacity(n);
                 for _ in 0..n {
                     let name = r.bytes(MAX_NAME)?;
-                    rows.push((name, r.u64()?));
+                    rows.push(StatRow {
+                        name,
+                        rows: r.u64()?,
+                    });
                 }
                 Self::Stats(rows)
             }
@@ -1097,7 +1162,7 @@ impl FrameBuffer {
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
-            buf: Zeroizing::new(Vec::new()),
+            buf: Zeroizing::new(Vec::with_capacity(4)),
             max,
         }
     }
@@ -1121,15 +1186,27 @@ impl FrameBuffer {
     /// [`Violation::TooLarge`] for a declared length over the bound, or
     /// bytes past the end of the frame (a peer sends one frame per turn).
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), Violation> {
-        self.buf.extend_from_slice(bytes);
-        if let Some(n) = self.needed()?
-            && self.buf.len() > n + 4
-        {
+        // The prefix first (never a raw byte); then, once the length is
+        // known, the whole frame's room at once (review L6: no reallocation
+        // leaves an unzeroized copy of the body behind).
+        let take = 4usize.saturating_sub(self.buf.len()).min(bytes.len());
+        let (prefix, body) = bytes.split_at(take);
+        self.buf.extend_from_slice(prefix);
+        if body.is_empty() {
+            self.needed()?;
+            return Ok(());
+        }
+        let Some(n) = self.needed()? else {
+            return Err(Violation::Malformed);
+        };
+        if self.buf.len() + body.len() > n + 4 {
             return Err(Violation::Malformed);
         }
-        if self.buf.len() > self.max + 4 {
-            return Err(Violation::TooLarge);
+        let (len, cap) = (self.buf.len(), self.buf.capacity());
+        if cap < n + 4 {
+            self.buf.reserve_exact(n + 4 - len);
         }
+        self.buf.extend_from_slice(body);
         Ok(())
     }
 
@@ -1153,7 +1230,9 @@ impl FrameBuffer {
         match self.needed()? {
             Some(n) if self.buf.len() == n + 4 => {
                 let body = Zeroizing::new(self.buf.get(4..).unwrap_or_default().to_vec());
-                self.buf.clear();
+                // A fresh buffer: the old one is zeroized on drop, and its room
+                // is never reallocated with a body in it.
+                self.buf = Zeroizing::new(Vec::with_capacity(4));
                 Ok(Some(body))
             }
             _ => Ok(None),
@@ -1310,6 +1389,7 @@ mod tests {
                 wal: true,
                 world_readable: false,
                 writer_version: 3_053_002,
+                shm_ino: 7,
             }),
             Response::Catalog(
                 vec![CatalogRow {
@@ -1319,7 +1399,10 @@ mod tests {
                 }],
                 true,
             ),
-            Response::Stats(vec![(z(b"t"), 42)]),
+            Response::Stats(vec![StatRow {
+                name: z(b"t"),
+                rows: 42,
+            }]),
             Response::Columns(vec![ColumnRow {
                 name: z(b"c"),
                 pk: 1,

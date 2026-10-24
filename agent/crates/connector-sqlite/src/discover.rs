@@ -192,8 +192,40 @@ impl Scan<'_> {
                 }
             })
             .await?;
-        if let Paced::Done(Err(UnitError::Dead(d))) = &paced {
-            self.died(*d);
+        // Review L3: an idle reader holds no more than an idle connection.
+        if let Paced::Done(Ok(_)) = &paced
+            && let (Some(reader), Some(info)) = (self.reader.as_ref(), self.opened)
+            && let Some(pid) = reader.pid()
+        {
+            let db = crate::files::Identity {
+                dev: info.dev,
+                ino: info.ino,
+            };
+            match crate::locks::idle_ok_now(pid, db, info.shm_ino, info.wal) {
+                Some(true) => {}
+                Some(false) => {
+                    tracing::warn!(
+                        target_id = %self.target.id,
+                        "sqlite reader held a lock while idle: killed"
+                    );
+                    if let Some(mut r) = self.reader.take() {
+                        r.kill().await;
+                    }
+                    self.died(Death::Protocol);
+                    return Ok(Paced::Done(Err(UnitError::Dead(Death::Protocol))));
+                }
+                // Not readable: fail closed, the reader is restarted.
+                None => self.close().await,
+            }
+        }
+        match &paced {
+            Paced::Done(Err(UnitError::Dead(d))) => self.died(*d),
+            // A side file the grant does not cover: a new reader, a new
+            // grant (review L4).
+            Paced::Done(Err(UnitError::Failed(f))) if f.code == Code::SideFileAppeared => {
+                self.close().await;
+            }
+            _ => {}
         }
         Ok(paced)
     }
@@ -297,7 +329,7 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
         match scan.unit(Request::Stats).await? {
             Paced::Done(Ok(Response::Stats(rows))) => rows
                 .into_iter()
-                .filter_map(|(n, c)| Some((String::from_utf8(n.to_vec()).ok()?, c)))
+                .filter_map(|r| Some((String::from_utf8(r.name.to_vec()).ok()?, r.rows)))
                 .collect(),
             Paced::OutOfTime => {
                 job.skip_out_of_time(sink, tables.len());
@@ -389,6 +421,29 @@ fn start_key(job: &ScanJob, lo: i64, hi: i64) -> i64 {
     let len = usize::try_from(span.clamp(1, i128::from(u32::MAX))).unwrap_or(1);
     let off = job.rotation_offset(len).unwrap_or(0);
     lo.saturating_add(i64::try_from(off).unwrap_or(0))
+}
+
+/// Whether a sampling response fits its request (review L8): at most
+/// `limit` rows, one value list per requested column, each with one value
+/// per row; on a rowid range, the last rowid inside the range (a
+/// continuation starts after it, so the rowids read strictly increase),
+/// none on an empty response or the plain read; a cut response is not
+/// empty.
+fn response_fits(range: SampleRange, limit: u32, columns: usize, got: &Sampled) -> bool {
+    let rows = got.rows;
+    let shape = rows <= limit
+        && got.values.len() == columns
+        && got.values.iter().all(|c| c.len() == rows as usize)
+        && (!got.truncated || rows > 0);
+    let rowid = match (range, got.last_rowid) {
+        (SampleRange::Plain { .. }, last) => last.is_none(),
+        (_, None) => rows == 0,
+        (_, Some(_)) if rows == 0 => false,
+        (SampleRange::From(a), Some(l)) => l >= a,
+        (SampleRange::Below(b), Some(l)) => l < b,
+        (SampleRange::Between(a, b), Some(l)) => a <= l && l < b,
+    };
+    shape && rowid
 }
 
 /// The per-table outcome counters.
@@ -606,6 +661,19 @@ async fn sample_table(
                 }
                 Err(e) => return Ok(table_failed(scan, &e, name)),
             };
+            // Review L8: a response that does not fit its request is a
+            // protocol violation: the reader is killed.
+            if !response_fits(range, n - rows, chunk.len(), &got) {
+                tracing::warn!(
+                    target_id = %scan.target.id,
+                    "sqlite reader answered outside its request: killed"
+                );
+                if let Some(mut r) = scan.reader.take() {
+                    r.kill().await;
+                }
+                scan.died(Death::Protocol);
+                return Ok(table_failed(scan, &UnitError::Dead(Death::Protocol), name));
+            }
             any = true;
             rows += got.rows;
             for (col, vals) in values.iter_mut().zip(got.values) {
@@ -727,6 +795,59 @@ mod tests {
             assert!(s >= lo && s <= hi, "{lo} {hi} {s}");
         }
         assert_eq!(start_key(&ScanJob::default(), 7, 100), 7);
+    }
+
+    #[test]
+    fn responses_must_fit_their_request() {
+        let ok = |rows: u32, last: Option<i64>| Sampled {
+            rows,
+            last_rowid: last,
+            truncated: false,
+            values: vec![vec![None; rows as usize]],
+        };
+        assert!(response_fits(SampleRange::From(5), 10, 1, &ok(2, Some(9))));
+        assert!(response_fits(SampleRange::From(5), 10, 1, &ok(0, None)));
+        assert!(
+            !response_fits(SampleRange::From(5), 1, 1, &ok(2, Some(9))),
+            "over the limit"
+        );
+        assert!(
+            !response_fits(SampleRange::From(5), 10, 2, &ok(2, Some(9))),
+            "columns"
+        );
+        assert!(
+            !response_fits(SampleRange::From(5), 10, 1, &ok(2, Some(4))),
+            "below the range"
+        );
+        assert!(
+            !response_fits(SampleRange::Below(5), 10, 1, &ok(2, Some(5))),
+            "above the range"
+        );
+        assert!(response_fits(
+            SampleRange::Between(1, 5),
+            10,
+            1,
+            &ok(2, Some(4))
+        ));
+        assert!(!response_fits(
+            SampleRange::Between(1, 5),
+            10,
+            1,
+            &ok(2, Some(0))
+        ));
+        assert!(
+            !response_fits(SampleRange::From(5), 10, 1, &ok(2, None)),
+            "rows without rowid"
+        );
+        assert!(!response_fits(
+            SampleRange::Plain { reverse: false },
+            10,
+            1,
+            &ok(2, Some(1))
+        ));
+        let mut bad = ok(2, Some(9));
+        bad.values[0].pop();
+        assert!(!response_fits(SampleRange::From(5), 10, 1, &bad), "ragged");
     }
 
     #[test]

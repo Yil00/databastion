@@ -112,7 +112,7 @@ pub fn file(data: &[u8]) {
         require_read_only_fs: false,
         exact_descriptor_set: false,
     };
-    let Ok((mut s, _)) = Session::open(&req, policy) else {
+    let Ok((mut s, _)) = Session::open(&req, policy, None) else {
         return;
     };
     let Response::Catalog(rows, _) = s.handle(&Request::Catalog) else {

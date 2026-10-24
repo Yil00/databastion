@@ -240,9 +240,14 @@ pub fn check_ancestors(path: &Path, policy: Policy) -> Result<(), Failure> {
         if i < last {
             check_dir(&prefix)?;
         } else {
+            // The file itself: not a symlink, and a regular file before
+            // anything opens it (review L7: never a FIFO or a device).
             let m = std::fs::symlink_metadata(&prefix).map_err(|e| std_failure(&e))?;
             if m.file_type().is_symlink() {
                 return Err(Failure::rule(Code::PathRefused, Rule::SymlinkComponent));
+            }
+            if !m.is_file() {
+                return Err(Failure::rule(Code::PathRefused, Rule::NotRegularFile));
             }
         }
     }
