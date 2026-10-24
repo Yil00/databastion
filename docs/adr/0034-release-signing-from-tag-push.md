@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-30
+- **Amended by**: [ADR-0058](0058-release-automation-one-approval.md) (decisions 3 and 5; since its [implementation note of 2026-10-24](0058-release-automation-one-approval.md#implementation-note-2026-10-24-publishyml-without-approvals-before-the-hard-gate), `build`, `manifest` and `release-assets` no longer run in the `release` environment: final versions are checked in `prepare`, pre-release tags approved once)
 
 ## Context
 Releases publish the console and agent images to GHCR and, from phase 7, the agent `.deb` files, the
