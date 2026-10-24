@@ -46,6 +46,7 @@ const ACCOUNT_HINTS: Record<Engine, string> = {
     "an ACL user with an explicit command allow-list (ADR-0052 decision 4), never the default user. A port alone cannot tell Redis from Valkey: declare the engine the server runs",
   valkey:
     "an ACL user with an explicit command allow-list (ADR-0052 decision 4), never the default user",
+  sqlite: "no account: a declared database file, read-only for the agent (ADR-0059); never detected",
 };
 
 /**

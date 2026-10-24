@@ -185,7 +185,27 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
     });
 
-    it.each(fixtures("valid", "FindingsBatch"))("valid fixture %s -> 202 and stored", async (_f, fixture) => {
+    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`sqlite`, ADR-0059
+    // decision 8: in the contract since P10-C, listed by P10-E).
+    const unlistedFindings = ([, body]: [string, unknown]) => unlistedEngineDetails("FindingsBatch", body).length > 0;
+
+    it.each(fixtures("valid", "FindingsBatch").filter(unlistedFindings))(
+      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
+      async (_f, fixture) => {
+        const auth = await agentWithTargets();
+        const body = structuredClone(fixture) as Body;
+        body.job_id = await deliveredScan(auth);
+        body.batch_id = uuidv7();
+        const res = await post(auth, body);
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err.code).toBe("invalid_request");
+        expect(err.details).toEqual(body.findings.map((_, i) => ({ pointer: `/findings/${i}/location/engine`, keyword: "enum" })));
+        expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
+      },
+    );
+
+    it.each(fixtures("valid", "FindingsBatch").filter((f) => !unlistedFindings(f)))("valid fixture %s -> 202 and stored", async (_f, fixture) => {
       const auth = await agentWithTargets();
       const body = structuredClone(fixture) as Body;
       const target = String(body.findings[0]?.target_id);

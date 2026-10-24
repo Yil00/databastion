@@ -482,18 +482,23 @@ export interface components {
          *     handling in ADR-0042). Every later engine value follows the
          *     same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
          *     ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
-         *     and `engine.valkey`.
+         *     and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.
+         *     A `sqlite` target is Discovery only: it has no server and no access log, so its
+         *     `TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or
+         *     `edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059
+         *     decision 7).
          * @enum {string}
          */
-        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "valkey";
+        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "valkey" | "sqlite";
         /**
          * @description Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
          *     Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
-         *     only when it listed `engine.sqlserver`, and `redis` only when it listed **both**
-         *     `engine.redis` and `engine.valkey` (see `Engine`).
+         *     only when it listed `engine.sqlserver`, `redis` only when it listed **both**
+         *     `engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`
+         *     (ADR-0059 decision 8; see `Engine`).
          * @enum {string}
          */
-        Connector: "postgres" | "mysql" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis";
+        Connector: "postgres" | "mysql" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "sqlite";
         /**
          * @description Connectors compiled in and enabled in this agent. A connector of an engine added after
          *     protocol 0.1.0 is listed only once the console's latest heartbeat response lists its
@@ -504,7 +509,8 @@ export interface components {
         /**
          * @description Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
          *     e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
-         *     `limited` (or `partial` with profiler level 2), a target with audit disabled `none`.
+         *     `limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a
+         *     SQLite target is always `none` (no access log exists, ADR-0059 decision 7).
          * @enum {string}
          */
         AuditLevel: "full" | "partial" | "limited" | "none";
@@ -531,6 +537,7 @@ export interface components {
          *     - `cas_audit_log` -> `cas`;
          *     - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
          *     - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+         *     No value serves `sqlite` (Discovery only, ADR-0059 decision 7).
          * @enum {string}
          */
         AuditSource: "pgaudit" | "pg_stat_statements" | "pg_stat_activity" | "mariadb_server_audit" | "mysql_audit_log" | "performance_schema" | "mongodb_audit_log" | "mongodb_profiler" | "mongodb_log" | "openldap_accesslog" | "cas_audit_log" | "sqlserver_audit" | "sqlserver_xevents" | "sqlserver_query_stats" | "redis_slowlog" | "redis_commandlog" | "redis_acl_log" | "redis_sync";
@@ -714,7 +721,8 @@ export interface components {
              * @description Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
              *     Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
              *     or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
-             *     not match this pattern.
+             *     not match this pattern. Never sent for a `sqlite` target, which has no server (the
+             *     SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
              */
             server_version?: string;
             /** @description Whether the last connection attempt with the configured read-only account succeeded. */
@@ -741,7 +749,7 @@ export interface components {
              */
             name_case?: components["schemas"]["TargetNameCase"];
             metrics?: components["schemas"]["MetricsMap"];
-        };
+        } & (unknown & unknown);
         /**
          * @description How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
          *     `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
@@ -904,7 +912,7 @@ export interface components {
              *     `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
              *     `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
              *     `job_progress.coverage`, and the engines
-             *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
+             *     added after protocol 0.1.0 (`engine.cas`, `engine.sqlite`…; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
              *     heartbeat response, and when the list is absent, it sends none of them. The console
@@ -1220,6 +1228,10 @@ export interface components {
          *     (`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and
          *     sorted-set members, the normalized field name for hash fields and stream entry fields, or
          *     `#key` / `#field` for values found in key names / hash field names.
+         *     SQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the file's
+         *     database, the same on every SQLite target: the `target_id` tells files apart; checked by
+         *     this schema), no `schema`, `object` = the table name, `field` = the column name. Never
+         *     the file's path, its name or a side file's name.
          *
          *     `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
          *     every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
@@ -1245,7 +1257,7 @@ export interface components {
              *     decision 9).
              */
             altered?: components["schemas"]["LocationPart"][];
-        };
+        } & (unknown & unknown);
         /**
          * @description A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
          * @enum {string}
