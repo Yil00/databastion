@@ -3,7 +3,8 @@
 # profiler entries; OpenLDAP BER, LDAPMessage, logged search filters and
 # cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
 # serde_yaml_ng as a differential oracle) and JSON audit log lines; and the name normalizers
-# (classifiers, ADR-0057). See
+# (classifiers, ADR-0057); SQLite database files with their -wal, -shm and -journal
+# files, the SQLite header pre-check and the reader IPC decoders (ADR-0059). See
 # README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
@@ -32,6 +33,17 @@ databastion-connector-sqlserver = { path = "../crates/connector-sqlserver", feat
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
+# SQLite (ADR-0059 decision 5): hostile database files through the reader's
+# pipeline, built with the production LIBSQLITE3_FLAGS (agent/.cargo/config.toml,
+# read when cargo runs under agent/; the targets' setup runs the self-check
+# and fails otherwise).
+databastion-connector-sqlite = { path = "../crates/connector-sqlite", features = ["fuzzing"] }
+# AddressSanitizer for the bundled SQLite C code (feature `asan`, nightly
+# campaigns only: .github/scripts/fuzz-nightly.sh), never outside this workspace.
+libsqlite3-sys = { version = "=0.38.2", optional = true }
+
+[features]
+asan = ["dep:libsqlite3-sys", "libsqlite3-sys/with-asan"]
 
 [workspace]
 members = ["."]
@@ -238,6 +250,27 @@ bench = false
 [[bin]]
 name = "classifiers_names"
 path = "fuzz_targets/classifiers_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_file"
+path = "fuzz_targets/sqlite_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_header"
+path = "fuzz_targets/sqlite_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sqlite_ipc"
+path = "fuzz_targets/sqlite_ipc.rs"
 test = false
 doc = false
 bench = false

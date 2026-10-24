@@ -47,7 +47,19 @@ case "$TARGET" in
   cas_registry_yaml | cas_registry_yaml_diff)
     cp "$FIXTURES"/registry/*.yml "$FIXTURES"/registry/*.yaml "$FIXTURES"/registry-hostile/*.yml "$CORPUS"/ ;;
   cas_audit_log) split -l 1 -a 3 -d "$FIXTURES/cas-8.0.2-oauth-oidc-audit.jsonl" "$CORPUS/fixture-" ;;
+  sqlite_file) python3 -I "$FUZZ/sqlite_seed.py" "$CORPUS/seed" ;;
   *) ;; # the MongoDB and OpenLDAP targets start from an empty corpus, as in smoke.sh
+esac
+# The SQLite targets (ADR-0059 decision 5): the bundled C code with AddressSanitizer
+# (libsqlite3-sys's with-asan, feature `asan` of the fuzz crate) and libFuzzer's coverage
+# instrumentation, so the fuzzer sees inside SQLite; clang, as rustc's sanitizer runtime is
+# LLVM's. The production LIBSQLITE3_FLAGS come from agent/.cargo/config.toml (cargo runs under
+# agent/ below); the targets' setup runs the self-check and fails the run without them.
+FEATURES=()
+case "$TARGET" in
+  sqlite_*)
+    export CC=clang CFLAGS="-fsanitize=fuzzer-no-link"
+    FEATURES=(--features asan) ;;
 esac
 echo "fuzz-nightly: $TARGET for ${SECS}s, $(find "$CORPUS" -type f | wc -l) seed input(s)" >&2
 
@@ -55,5 +67,5 @@ cd "$ROOT/agent"
 # The lockfile must be used as committed (cargo-fuzz has no --locked flag).
 cargo fetch --locked --manifest-path fuzz/Cargo.toml
 # Same libFuzzer bounds as smoke.sh, with more memory for the ASan shadow.
-cargo fuzz run --fuzz-dir fuzz -O -a -s address "$TARGET" "$CORPUS" -- \
+cargo fuzz run --fuzz-dir fuzz -O -a -s address "${FEATURES[@]}" "$TARGET" "$CORPUS" -- \
   -max_total_time="$SECS" -max_len=4096 -timeout=10 -rss_limit_mb=2560 -print_final_stats=1

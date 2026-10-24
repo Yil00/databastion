@@ -33,6 +33,9 @@ pub mod check;
 pub mod db;
 pub mod discover;
 pub mod files;
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzz;
 pub mod header;
 pub mod ipc;
 pub mod process;
