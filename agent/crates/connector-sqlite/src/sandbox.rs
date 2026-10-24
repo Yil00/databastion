@@ -89,6 +89,9 @@ pub const EARLY_STEPS: [(&str, Step); 4] = [
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(unavailable)
     }),
+    // Before the limits: with `RLIMIT_NOFILE` lowered first, many inherited
+    // descriptors would make the `/proc/self/fd` listing fail (`EMFILE`).
+    ("inherited_descriptors", close_inherited_descriptors),
     ("limits", || {
         limit(Resource::Core, 0)?;
         limit(Resource::Fsize, 0)?;
@@ -96,11 +99,10 @@ pub const EARLY_STEPS: [(&str, Step); 4] = [
         limit(Resource::Cpu, CPU_SECONDS)?;
         limit(Resource::As, ADDRESS_SPACE)
     }),
-    ("inherited_descriptors", close_inherited_descriptors),
 ];
 
-/// Step 3 of the reader (decision 4): no new privileges, not dumpable, the
-/// resource limits, and every inherited descriptor but 0, 1 and 2 closed.
+/// Step 3 of the reader (decision 4): no new privileges, not dumpable, every
+/// inherited descriptor but 0, 1 and 2 closed, then the resource limits.
 ///
 /// Must run first in the reader process, before anything opens a
 /// descriptor (the reader's `main`, before the open request).
