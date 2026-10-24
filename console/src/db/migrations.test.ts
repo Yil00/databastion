@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { applyAccessEventsBytesOnline, DEFERRED_VALIDATIONS, ONLINE_0027_TAG, quotePlainIdentifier, validateDeferredConstraints } from "@/db/online-constraints";
 import { MIGRATION_LOCK_KEY, MIGRATIONS_FOLDER, PgbossOwnerError, runMigrations } from "@/db/run-migrations";
-import { adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
+import { adminDropDatabase, adminQuery, createRuntimeRole, hasDb, pgAdminUrl, roleUrl, setupTestDatabase } from "@/test/db";
 
 async function withClient<T>(url: string, fn: (c: Client) => Promise<T>): Promise<T> {
   const c = new Client({ connectionString: url });
@@ -296,7 +296,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
           expect(done).toBe(true);
         });
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -396,7 +396,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         }
       } finally {
         before.cleanup();
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -475,7 +475,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         });
       } finally {
         before.cleanup();
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
       }
     });
@@ -517,7 +517,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
         await adminInDb(db, `alter schema pgboss owner to ${owner}`);
         await expect(runMigrations(url)).resolves.toBeUndefined();
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
         await adminQuery(`drop role if exists ${other}`);
       }
@@ -544,7 +544,7 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
           expect(rows[0]).toEqual({ absent: true });
         });
       } finally {
-        await adminQuery(`drop database if exists ${db} with (force)`);
+        await adminDropDatabase(db);
         await adminQuery(`drop role if exists ${owner}`);
         await adminQuery(`drop role if exists ${other}`);
       }
