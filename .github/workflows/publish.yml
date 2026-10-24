@@ -6,9 +6,15 @@ name: Publish
 # the identity `…/.github/workflows/publish.yml@refs/tags/<version>` with the `push` trigger:
 # - X.Y.Z (pushed by release-it from release.yml)   → tags X.Y.Z, X.Y, latest
 # - X.Y.Z-… (pre-release, pushed by a maintainer)   → tags X.Y.Z-…, next (never latest)
-# The jobs that push or sign run in the `release` GitHub Environment (reviewers and tag rules:
-# RELEASE.md, "Repository configuration"). Builds use no cache: nothing another workflow wrote
-# can end up in a release. An image is only built if its Dockerfile exists.
+# Approvals (ADR-0058, implementation note of 2026-10-24):
+# - final versions: no approval here. The one human step is the approval of the `release-it`
+#   environment in release.yml; `prepare` checks that the tag is release-it's release commit on
+#   main, made in that approved run (.github/scripts/check-final-release.sh), and fails otherwise;
+# - pre-release tags: one approval, in the `prerelease-approval` job (`release` environment:
+#   reviewers and tag rules, RELEASE.md, "Repository configuration").
+# These are checks of the honest path: whoever chooses the publish.yml a tag runs can remove them.
+# Builds use no cache: nothing another workflow wrote can end up in a release. An image is only
+# built if its Dockerfile exists.
 #
 # Chain of trust (deploy/README.md, "Verify the artifacts"):
 # - images: built natively per architecture with SBOM + SLSA provenance attestations (BuildKit),
@@ -37,10 +43,11 @@ jobs:
   prepare:
     name: Preparation
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Above the 20-minute wait for the release.yml run, plus the tree recomputation.
+    timeout-minutes: 30
     permissions:
       contents: read
-      actions: read   # read the `release` environment's protection rules (settings guard)
+      actions: read   # the `release` environment's protection rules (settings guard); the release.yml run
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
@@ -56,13 +63,20 @@ jobs:
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::Invalid version: $VERSION"; exit 1
           fi
+          if [[ "$VERSION" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          # Exactly `true` or `false`: the conditions of `prerelease-approval` and `build` rely on it.
+          case "$prerelease" in true | false) ;; *) echo "::error::prerelease is '$prerelease'"; exit 1 ;; esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          [[ "$VERSION" == *-* ]] && echo "prerelease=true" >> "$GITHUB_OUTPUT" || echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+      # The whole history, with origin/main and the tags (final-version checks below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       # ADR-0034 relies on repository settings the maintainer makes (RELEASE.md, section 6): refuse
-      # to publish without them. A defence against a forgotten setup only.
+      # to publish without them. A defence against a forgotten setup only. The `release`
+      # environment keeps its required reviewers, but only the `prerelease-approval` job declares
+      # it now: they approve pre-release tags only (ADR-0058, implementation note of 2026-10-24).
       - name: Release settings in place
         env:
           GH_TOKEN: ${{ github.token }}
@@ -71,6 +85,45 @@ jobs:
         run: |
           .github/scripts/check-release-settings.sh environment release tag
           .github/scripts/check-release-settings.sh tag-ruleset
+      # Final versions (ADR-0058 decision 3.2, without the release record): instead of an approval,
+      # the tag must be release-it's: an annotated tag on a commit `chore(release): X.Y.Z` on main,
+      # whose only parent P is a merge commit, that changes only the version and changelog files,
+      # whose tree is the release hooks applied to P, and that the approved release.yml run on the
+      # push of P made. Any failure stops the run before anything is built or signed.
+      - name: Final version is release-it's release commit
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+          TAG_SHA: ${{ github.sha }}
+          RELEASE_EMAIL: ${{ vars.RELEASE_GIT_EMAIL || format('{0}+{1}@users.noreply.github.com', github.repository_owner_id, github.repository_owner) }}
+        run: .github/scripts/check-final-release.sh commit
+      - name: Final version comes from an approved release.yml run
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+          TAG_SHA: ${{ github.sha }}
+          POLL_TIMEOUT_S: "1200"
+          POLL_INTERVAL_S: "20"
+        run: .github/scripts/check-final-release.sh release-run
+      # The same toolchains as release.yml's release-it job, to rerun its after:bump hooks on P.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.meta.outputs.prerelease == 'false'
+        with:
+          node-version: 24
+      # Same pin as release.yml (the workspace rust-version): agent/Cargo.lock must come out the same.
+      - name: Rust (to recompute agent/Cargo.lock)
+        if: steps.meta.outputs.prerelease == 'false' && hashFiles('agent/Cargo.lock') != ''
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.88.0
+      - name: Final version's tree is the release hooks applied to its parent
+        if: steps.meta.outputs.prerelease == 'false'
+        env:
+          VERSION: ${{ github.ref_name }}
+          TAG_SHA: ${{ github.sha }}
+        run: .github/scripts/check-final-release.sh tree
       - name: Images to build
         id: images
         run: |
@@ -80,10 +133,33 @@ jobs:
           echo "Images: $json"
           echo "images=$json" >> "$GITHUB_OUTPUT"
 
+  # Pre-release tags only: the one approval of a pre-release (ADR-0058 decision 3.3, in the existing
+  # `release` environment). Runs for anything but exactly `false`, so that an unexpected value asks
+  # for the approval instead of skipping it (`prepare` fails on such a value anyway).
+  prerelease-approval:
+    name: Pre-release approval
+    needs: prepare
+    if: needs.prepare.outputs.prerelease != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    permissions: {}
+    steps:
+      - env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: echo "Pre-release $VERSION approved"
+
+  # From here on, every job states the results it needs: a skipped `prerelease-approval` (final
+  # versions) would otherwise skip every job downstream of it. `!cancelled()`, not `always()`.
   build:
     name: Build ${{ matrix.image }} (${{ matrix.arch }})
-    needs: prepare
-    if: needs.prepare.outputs.images != '[]' && needs.prepare.outputs.images != ''
+    needs: [prepare, prerelease-approval]
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success'
+      && needs.prepare.outputs.images != '[]' && needs.prepare.outputs.images != ''
+      && ((needs.prepare.outputs.prerelease == 'false' && needs.prerelease-approval.result == 'skipped')
+          || (needs.prepare.outputs.prerelease == 'true' && needs.prerelease-approval.result == 'success'))
     strategy:
       fail-fast: true
       matrix:
@@ -91,7 +167,6 @@ jobs:
         arch: [amd64, arm64]
     runs-on: ${{ matrix.arch == 'amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 60
-    environment: release
     permissions:
       contents: read
       packages: write
@@ -141,13 +216,15 @@ jobs:
   manifest:
     name: Manifest & signature ${{ matrix.image }}
     needs: [prepare, build]
-    if: needs.prepare.outputs.images != '[]' && needs.prepare.outputs.images != ''
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success' && needs.build.result == 'success'
+      && needs.prepare.outputs.images != '[]' && needs.prepare.outputs.images != ''
     strategy:
       matrix:
         image: ${{ fromJSON(needs.prepare.outputs.images) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: release
     permissions:
       contents: read
       packages: write
@@ -237,7 +314,10 @@ jobs:
   deb:
     name: Agent .deb
     needs: [prepare, manifest]
-    if: contains(needs.prepare.outputs.images, '"agent"')
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success' && needs.manifest.result == 'success'
+      && contains(needs.prepare.outputs.images, '"agent"')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -305,10 +385,14 @@ jobs:
   release-assets:
     name: Release assets (SHA256SUMS signed)
     needs: [prepare, manifest, deb]
-    if: ${{ !failure() && !cancelled() && needs.manifest.result == 'success' }}
+    # `deb` may be skipped only when no agent image is built.
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success' && needs.manifest.result == 'success'
+      && (needs.deb.result == 'success'
+          || (needs.deb.result == 'skipped' && !contains(needs.prepare.outputs.images, '"agent"')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: release
     permissions:
       contents: write   # upload the release assets
       id-token: write   # keyless cosign signing (OIDC)
@@ -376,7 +460,10 @@ jobs:
   install-test:
     name: Installation test (published artifacts)
     needs: [prepare, manifest, deb]
-    if: contains(needs.prepare.outputs.images, '"console"') && contains(needs.prepare.outputs.images, '"agent"')
+    if: >-
+      !cancelled()
+      && needs.prepare.result == 'success' && needs.manifest.result == 'success' && needs.deb.result == 'success'
+      && contains(needs.prepare.outputs.images, '"console"') && contains(needs.prepare.outputs.images, '"agent"')
     uses: ./.github/workflows/packaging.yml
     with:
       build-deb: false
