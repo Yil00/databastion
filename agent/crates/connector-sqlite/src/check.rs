@@ -296,6 +296,39 @@ fn light(path: &Path) -> Result<(Fingerprint, bool, bool, bool), Failure> {
     Ok((fp, wal, wal_ok, c.world_readable))
 }
 
+/// What the agent's own checks see of a target (review N2): the lock
+/// policy of an idle reader is built from this, never from the reader's
+/// answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentView {
+    /// The database file's identity.
+    pub id: Identity,
+    /// Read in WAL mode (header, or a `-wal` next to it).
+    pub wal: bool,
+    /// The `-shm` file's inode (0: none).
+    pub shm_ino: u64,
+}
+
+/// The agent's own view of the file: the file rules on a descriptor
+/// opened, checked and closed here (call under the target's lock).
+///
+/// # Errors
+/// The rule the file breaks.
+pub fn agent_view(path: &Path) -> Result<AgentView, Failure> {
+    #[allow(unused_mut)]
+    let mut policy = Policy::AGENT;
+    #[cfg(any(test, feature = "test-support"))]
+    if crate::process::test_credentials() {
+        policy.refuse_agent_writable = false;
+    }
+    let c = files::open_checked(path, policy)?;
+    Ok(AgentView {
+        id: c.id,
+        wal: c.header.wal || c.side.wal.is_some(),
+        shm_ino: c.side.shm.map_or(0, |s| s.id.ino),
+    })
+}
+
 /// A full check: a short-lived reader opens the file, reads the catalog
 /// and the check pragmas, and exits.
 async fn full(settings: &SqliteSettings, budget: Instant) -> Result<(), TargetHealth> {

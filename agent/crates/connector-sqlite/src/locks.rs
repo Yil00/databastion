@@ -12,6 +12,12 @@
 //!   which would pin checkpoints) nor a write lock (a read-only descriptor
 //!   cannot take one anyway).
 //!
+//! The reader is stopped (`SIGSTOP`) before the locks are read and stays
+//! stopped until its next request (`SIGCONT`, review N1): it cannot drop its
+//! locks for the check and take them again during the pause. The database
+//! identity, the journal mode and the `-shm` inode come from the agent's own
+//! checks, never from the reader's answers (review N2).
+//!
 //! Chosen over closing the reader at every pacing pause: at the default 1 %
 //! duty cycle that would start a reader (exec, self-check, open procedure,
 //! and on a WAL file without a writer the heap index rebuilt from the whole
@@ -23,6 +29,11 @@ use crate::files::Identity;
 
 /// The `DMS` byte of the `-shm` (`UNIX_SHM_BASE + SQLITE_SHM_NLOCK`).
 const SHM_DMS: u64 = 128;
+/// SQLite's `SHARED` range on the database file (`PENDING_BYTE + 2` and
+/// `SHARED_SIZE` 510): the only database lock an idle WAL connection holds
+/// (review N2). The `PENDING` and `RESERVED` bytes are never accepted.
+const SHARED_FIRST: u64 = 0x4000_0002;
+const SHARED_LAST: u64 = SHARED_FIRST + 509;
 
 /// One `/proc/locks` line: (pid, major, minor, inode, write, start, end).
 type Line = (u32, u64, u64, u64, bool, u64, Option<u64>);
@@ -66,7 +77,7 @@ pub fn idle_ok(text: &str, pid: u32, db: Identity, shm_ino: u64, wal: bool) -> b
         let allowed = same_dev
             && !write
             && if ino == db.ino {
-                wal
+                wal && start >= SHARED_FIRST && end.is_some_and(|e| e <= SHARED_LAST)
             } else {
                 shm_ino != 0 && ino == shm_ino && start == SHM_DMS && end == Some(SHM_DMS)
             };
@@ -104,6 +115,11 @@ mod tests {
         assert!(idle_ok(wal, 42, db(), 9999, true));
         // Rollback mode: no lock at all while idle.
         assert!(!idle_ok(wal, 42, db(), 9999, false));
+        // The PENDING byte (or any lock outside the SHARED range).
+        let pending = "1: POSIX  ADVISORY  READ 42 08:01:5678 1073741824 1073741824\n";
+        assert!(!idle_ok(pending, 42, db(), 9999, true));
+        let whole = "1: POSIX  ADVISORY  READ 42 08:01:5678 0 EOF\n";
+        assert!(!idle_ok(whole, 42, db(), 9999, true));
         // A read mark on the -shm pins checkpoints.
         let mark = "1: POSIX  ADVISORY  READ 42 08:01:9999 123 123\n";
         assert!(!idle_ok(mark, 42, db(), 9999, true));

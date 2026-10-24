@@ -568,6 +568,26 @@ async fn the_reader_is_sandboxed_and_its_crashes_stay_its_own() {
         matches!(resp, Response::Sample(ref s) if s.rows == 10),
         "{resp:?}"
     );
+    // Review N1: between units the reader is stopped, its locks read while
+    // it cannot change them (those of an idle WAL connection, by the
+    // agent's own view of the file), and it answers again once continued.
+    assert!(r.pause().await, "the reader did not stop");
+    let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    assert!(
+        state.rsplit_once(") ").unwrap().1.starts_with('T'),
+        "{state}"
+    );
+    let view = databastion_connector_sqlite::check::agent_view(&ro).unwrap();
+    assert!(view.wal && view.shm_ino != 0);
+    assert_eq!(
+        databastion_connector_sqlite::locks::idle_ok_now(pid, view.id, view.shm_ino, view.wal),
+        Some(true)
+    );
+    let resp = r.call(&sample, Duration::from_secs(5)).await.unwrap();
+    assert!(
+        matches!(resp, Response::Sample(ref s) if s.rows == 10),
+        "{resp:?}"
+    );
     // The application's account truncates the -shm under the reader.
     std::fs::OpenOptions::new()
         .write(true)

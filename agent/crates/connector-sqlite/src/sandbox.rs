@@ -206,10 +206,24 @@ impl Grant {
         }
     }
 
-    /// The paths of the side files the grant covers.
+    /// The side files the grant covers, with their identity (the
+    /// descriptor's, equal to the path's after [`Self::verify`]).
     #[must_use]
-    pub fn side_files(&self) -> Vec<PathBuf> {
-        self.files.iter().skip(1).map(|(_, p)| p.clone()).collect()
+    pub fn side_files(&self) -> Vec<(PathBuf, crate::files::Identity)> {
+        self.files
+            .iter()
+            .skip(1)
+            .filter_map(|(fd, p)| {
+                let st = rustix::fs::fstat(fd.as_fd()).ok()?;
+                Some((
+                    p.clone(),
+                    crate::files::Identity {
+                        dev: st.st_dev,
+                        ino: st.st_ino,
+                    },
+                ))
+            })
+            .collect()
     }
 }
 
@@ -222,7 +236,7 @@ impl Grant {
 ///
 /// # Errors
 /// [`Code::SandboxUnavailable`], or the rule the path breaks.
-pub fn restrict(database: &Path) -> Result<Vec<PathBuf>, Failure> {
+pub fn restrict(database: &Path) -> Result<Vec<(PathBuf, crate::files::Identity)>, Failure> {
     let grant = Grant::open(database)?;
     landlock(&grant)?;
     grant.verify()?;

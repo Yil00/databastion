@@ -48,6 +48,13 @@ impl Death {
     }
 }
 
+/// The state letter of process `pid` (`/proc/<pid>/stat`, after the
+/// command name).
+fn process_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?.1.chars().next()
+}
+
 /// Test support: the reader executable of other crates' tests (the agent
 /// binary built by Cargo), instead of `/proc/self/exe` (a test harness).
 static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
@@ -92,6 +99,8 @@ fn executable() -> PathBuf {
 pub struct ReaderProcess {
     child: tokio::process::Child,
     sock: Option<Channel>,
+    /// Stopped with `SIGSTOP` between units (review N1).
+    stopped: bool,
 }
 
 impl std::fmt::Debug for ReaderProcess {
@@ -124,6 +133,7 @@ impl ReaderProcess {
         Ok(Self {
             child,
             sock: Some(agent),
+            stopped: false,
         })
     }
 
@@ -133,6 +143,7 @@ impl ReaderProcess {
     /// # Errors
     /// The [`Death`].
     pub async fn call(&mut self, req: &Request, deadline: Duration) -> Result<Response, Death> {
+        self.resume();
         let Some(sock) = self.sock.take() else {
             return Err(Death::Died);
         };
@@ -170,6 +181,45 @@ impl ReaderProcess {
     #[must_use]
     pub fn pid_for_tests(&self) -> Option<u32> {
         self.pid()
+    }
+
+    /// Stops the reader with `SIGSTOP` (review N1): between units it cannot
+    /// run, so the locks the agent reads while it is stopped are the locks
+    /// it holds until the next request. Waits (at most 200 ms) until the
+    /// kernel reports it stopped; `false` if it is not.
+    pub async fn pause(&mut self) -> bool {
+        let Some(pid) = self.pid().and_then(|p| i32::try_from(p).ok()) else {
+            return false;
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            return false;
+        };
+        if rustix::process::kill_process(pid, rustix::process::Signal::STOP).is_err() {
+            return false;
+        }
+        self.stopped = true;
+        for _ in 0..200 {
+            if process_state(pid.as_raw_nonzero().get()) == Some('T') {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    /// Continues a stopped reader (`SIGCONT`), just before its next
+    /// request.
+    pub fn resume(&mut self) {
+        if !std::mem::take(&mut self.stopped) {
+            return;
+        }
+        if let Some(pid) = self
+            .pid()
+            .and_then(|p| i32::try_from(p).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+        }
     }
 
     /// `SIGKILL` and reap (bounded).

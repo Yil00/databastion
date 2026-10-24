@@ -84,6 +84,9 @@ struct Scan<'a> {
     settings: &'a SqliteSettings,
     reader: Option<ReaderProcess>,
     opened: Option<OpenInfo>,
+    /// The agent's own view of the file, checked against every reader's
+    /// open answer (review N2).
+    view: Option<check::AgentView>,
     deaths: u64,
     notes: ScanNotes,
 }
@@ -148,6 +151,28 @@ impl Scan<'_> {
                     r.kill().await;
                     return Err(UnitError::Failed(Failure::new(Code::FileChanged)));
                 }
+                // Review N2: the reader's answer must match what the agent
+                // sees itself; the lock policy uses the agent's view.
+                let path = self.settings.path().to_owned();
+                let view = tokio::task::spawn_blocking(move || check::agent_view(&path)).await;
+                let view = match view {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(f)) => {
+                        r.kill().await;
+                        return Err(UnitError::Failed(f));
+                    }
+                    Err(_) => {
+                        r.kill().await;
+                        return Err(UnitError::Failed(Failure::new(Code::Internal)));
+                    }
+                };
+                if (view.id.dev, view.id.ino, view.wal, view.shm_ino)
+                    != (info.dev, info.ino, info.wal, info.shm_ino)
+                {
+                    r.kill().await;
+                    return Err(UnitError::Failed(Failure::new(Code::FileChanged)));
+                }
+                self.view = Some(view);
                 if self.opened.is_none() {
                     tracing::info!(
                         target_id = %self.target.id,
@@ -192,16 +217,21 @@ impl Scan<'_> {
                 }
             })
             .await?;
-        // Review L3: an idle reader holds no more than an idle connection.
+        // Review L3 and N1: an idle reader holds no more than an idle
+        // connection. It is stopped first, and stays stopped until its next
+        // request, so it cannot drop its locks for the check and take them
+        // again during the pause; the policy is the agent's view (N2).
         if let Paced::Done(Ok(_)) = &paced
-            && let (Some(reader), Some(info)) = (self.reader.as_ref(), self.opened)
-            && let Some(pid) = reader.pid()
+            && let (Some(reader), Some(view)) = (self.reader.as_mut(), self.view)
         {
-            let db = crate::files::Identity {
-                dev: info.dev,
-                ino: info.ino,
+            let verdict = if reader.pause().await {
+                reader
+                    .pid()
+                    .and_then(|pid| crate::locks::idle_ok_now(pid, view.id, view.shm_ino, view.wal))
+            } else {
+                None
             };
-            match crate::locks::idle_ok_now(pid, db, info.shm_ino, info.wal) {
+            match verdict {
                 Some(true) => {}
                 Some(false) => {
                     tracing::warn!(
@@ -214,7 +244,8 @@ impl Scan<'_> {
                     self.died(Death::Protocol);
                     return Ok(Paced::Done(Err(UnitError::Dead(Death::Protocol))));
                 }
-                // Not readable: fail closed, the reader is restarted.
+                // Not stopped, or not readable: fail closed, the reader is
+                // restarted.
                 None => self.close().await,
             }
         }
@@ -253,6 +284,7 @@ pub async fn discover(
         settings,
         reader: None,
         opened: None,
+        view: None,
         deaths: 0,
         notes: ScanNotes::default(),
     };

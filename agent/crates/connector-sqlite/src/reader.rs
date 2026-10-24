@@ -35,7 +35,7 @@ pub struct Session {
     first_statement_done: bool,
     /// The side files the Landlock grant covers (`None` in-process): one
     /// that appears later cannot be read, the file changed (review L4).
-    granted: Option<Vec<PathBuf>>,
+    granted: Option<Vec<(PathBuf, files::Identity)>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -62,7 +62,7 @@ impl Session {
     pub fn open(
         req: &OpenRequest,
         policy: Policy,
-        granted: Option<Vec<PathBuf>>,
+        granted: Option<Vec<(PathBuf, files::Identity)>>,
     ) -> Result<(Self, OpenInfo), Failure> {
         let path = PathBuf::from(OsString::from_vec(req.path.to_vec()));
         let (lo, hi) = databastion_core::config::sqlite::MAX_STATEMENT_MS_RANGE;
@@ -113,13 +113,17 @@ impl Session {
     fn before_unit(&mut self) -> Result<(), Failure> {
         let side = files::recheck(&self.path, &self.checked, self.policy)?;
         if let Some(granted) = &self.granted {
+            // By path and by `(st_dev, st_ino)`: a side file re-created with
+            // a new inode is not the one granted either.
             let present = [
-                (side.wal.is_some(), "-wal"),
-                (side.shm.is_some(), "-shm"),
-                (side.journal.is_some(), "-journal"),
+                (side.wal, "-wal"),
+                (side.shm, "-shm"),
+                (side.journal, "-journal"),
             ];
             for (here, suffix) in present {
-                if here && !granted.contains(&files::side_path(&self.path, suffix)) {
+                let Some(f) = here else { continue };
+                let path = files::side_path(&self.path, suffix);
+                if !granted.iter().any(|(p, id)| *p == path && *id == f.id) {
                     return Err(Failure::new(Code::SideFileAppeared));
                 }
             }
