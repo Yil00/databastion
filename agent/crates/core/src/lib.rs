@@ -64,11 +64,11 @@ mod sanitize;
 mod session;
 pub mod sink;
 mod spool;
+#[cfg(test)]
+mod sqlite_contract_tests;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod uplink;
-#[cfg(test)]
-mod sqlite_contract_tests;
 
 pub use config::AgentConfig;
 pub use connector::{Connector, ConnectorError};

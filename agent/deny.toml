@@ -56,6 +56,14 @@ deny = [
     # A new normal-graph user of either crate fails this check.
     { crate = "serde_yaml_ng", wrappers = ["databastion-core", "databastion-protocol-codegen"], reason = "ADR-0046 decision 5: agent.yaml only" },
     { crate = "unsafe-libyaml", wrappers = ["serde_yaml_ng"], reason = "ADR-0046: only through serde_yaml_ng" },
+    # ADR-0059 decision 1: the bundled SQLite C library, only through rusqlite,
+    # and rusqlite only in the SQLite connector. A reviewed exception to
+    # "no C client library" (ADR-0039 decision 4); widening it needs an ADR.
+    { crate = "rusqlite", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 1: SQLite connector only" },
+    { crate = "libsqlite3-sys", wrappers = ["rusqlite"], reason = "ADR-0059 decision 1: bundled SQLite only through rusqlite" },
+    # ADR-0059 decision 4: the reader sandbox.
+    { crate = "landlock", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
+    { crate = "seccompiler", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
     # TLS: rustls only (AGENTS.md).
     { name = "openssl", reason = "rustls only" },
     { name = "openssl-sys", reason = "rustls only" },
@@ -82,6 +90,14 @@ deny = [
 features = [
     { crate = "hyper", deny = ["server"] },
     { crate = "hyper-util", deny = ["server", "server-auto", "server-graceful"] },
+    # ADR-0059 decision 1: only these features of the SQLite crates may be
+    # enabled (no load_extension, loadable_extension, vtab, functions, trace,
+    # backup, blob, serialize, session, sqlcipher, buildtime_bindgen,
+    # with-asan outside the fuzz workspace, or the integrations).
+    { crate = "rusqlite", allow = ["bundled", "modern_sqlite", "hooks", "limits"] },
+    # `default` is `min_sqlite_version_3_34_1` (cargo-deny 0.20 lists it as a
+    # feature of its own); the bundled build ignores pkg-config and vcpkg.
+    { crate = "libsqlite3-sys", allow = ["bundled", "bundled_bindings", "cc", "default", "min_sqlite_version_3_34_1", "pkg-config", "vcpkg"] },
 ]
 
 [sources]

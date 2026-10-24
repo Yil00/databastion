@@ -2007,7 +2007,10 @@ targets:
             "/proc",
             "/run/user",
         ] {
-            assert!(s.refused().iter().any(|r| r == Path::new(refused)), "{refused}");
+            assert!(
+                s.refused().iter().any(|r| r == Path::new(refused)),
+                "{refused}"
+            );
         }
         assert!(cfg.targets[1].sqlite_settings().is_none());
         let set = parse(&SQLITE.replace(
@@ -2023,10 +2026,16 @@ targets:
             ("    port: 8443\n", "targets[0].port"),
             ("    socket: /run/x.sock\n", "targets[0].socket"),
             ("    account: databastion\n", "targets[0].account"),
-            ("    secret:\n      env: DATABASTION_X\n", "targets[0].secret"),
+            (
+                "    secret:\n      env: DATABASTION_X\n",
+                "targets[0].secret",
+            ),
             ("    postgres: {}\n", "targets[0].postgres"),
         ] {
-            let text = SQLITE.replace("    engine: sqlite\n", &format!("    engine: sqlite\n{extra}"));
+            let text = SQLITE.replace(
+                "    engine: sqlite\n",
+                &format!("    engine: sqlite\n{extra}"),
+            );
             assert!(err(&text).contains(key), "{extra}: {}", err(&text));
         }
         // Only the ADR's keys.
@@ -2054,7 +2063,10 @@ targets:
         ] {
             let text = SQLITE.replace("/srv/crm/data/crm.db", path);
             let e = err(&text);
-            assert!(e.contains("targets[0].sqlite.path") && e.contains(rule), "{path}: {e}");
+            assert!(
+                e.contains("targets[0].sqlite.path") && e.contains(rule),
+                "{path}: {e}"
+            );
             assert!(!e.contains(path), "{e}");
         }
         let range = SQLITE.replace(
@@ -2161,6 +2173,40 @@ targets:
         let text = include_str!("../../../agent.example.yaml");
         let cfg = parse(text).unwrap();
         assert!(!cfg.targets.is_empty());
+    }
+
+    /// The commented SQLite target of the example file is valid once
+    /// uncommented, with its optional keys uncommented too.
+    #[test]
+    fn example_sqlite_target_is_valid_uncommented() {
+        let text = include_str!("../../../agent.example.yaml");
+        let start = text.find("  # - id: crm-app\n").unwrap();
+        let end = start + text[start..].find("\n\n").unwrap() + 1;
+        let block: String = text[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("  # ").map(|r| format!("  {r}"))?;
+                let t = l.trim_start();
+                // The optional keys are uncommented too; other comments go.
+                if t.starts_with("# max_statement_ms:") || t.starts_with("# rollback_mode:") {
+                    Some(l.replacen("# ", "", 1))
+                } else if t.starts_with('#') {
+                    None
+                } else {
+                    Some(l)
+                }
+            })
+            .map(|l| l + "\n")
+            .collect();
+        assert!(block.contains("max_statement_ms: 500") && block.contains("rollback_mode: skip"));
+        let base = BASE.split("targets:\n").next().unwrap();
+        let cfg =
+            parse(&format!("{base}targets:\n{block}")).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Sqlite);
+        let s = t.sqlite_settings().unwrap();
+        assert_eq!(s.max_statement_ms(), 500);
+        assert_eq!(s.rollback_mode(), sqlite::RollbackMode::Skip);
     }
 
     /// The commented SQL Server target of the example file is valid once

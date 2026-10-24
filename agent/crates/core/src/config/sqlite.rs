@@ -284,7 +284,10 @@ mod tests {
 
     #[test]
     fn refused_locations_compare_by_component() {
-        let refused = vec![PathBuf::from("/var/lib/databastion"), PathBuf::from("/proc")];
+        let refused = vec![
+            PathBuf::from("/var/lib/databastion"),
+            PathBuf::from("/proc"),
+        ];
         assert!(is_refused_location(
             Path::new("/var/lib/databastion/spool/x.db"),
             &refused
@@ -307,8 +310,8 @@ mod tests {
     #[test]
     fn validation_names_the_rule_never_the_path() {
         let refused = vec![PathBuf::from("/etc/databastion")];
-        let s = SqliteSettings::validate(raw("/srv/none/x.db"), refused.clone(), Vec::new())
-            .unwrap();
+        let s =
+            SqliteSettings::validate(raw("/srv/none/x.db"), refused.clone(), Vec::new()).unwrap();
         assert_eq!(s.max_statement_ms(), 500);
         assert_eq!(s.rollback_mode(), RollbackMode::Skip);
         for (path, rule) in [
@@ -331,7 +334,9 @@ mod tests {
         let mut r = raw("/srv/x.db");
         r.max_statement_ms = Some(49);
         assert_eq!(
-            SqliteSettings::validate(r, refused, Vec::new()).unwrap_err().0,
+            SqliteSettings::validate(r, refused, Vec::new())
+                .unwrap_err()
+                .0,
             "max_statement_ms"
         );
     }

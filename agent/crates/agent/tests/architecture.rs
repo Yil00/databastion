@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 7] = [
+const CONNECTORS: [&str; 8] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
@@ -27,6 +27,7 @@ const CONNECTORS: [&str; 7] = [
     "connector-cas",
     "connector-redis",
     "connector-sqlserver",
+    "connector-sqlite",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
@@ -290,14 +291,22 @@ fn no_listening_socket_in_agent_code() {
 /// the full resolve covers every platform, so it may need crates (e.g.
 /// Windows / UEFI targets of `getrandom`) that a host build never fetched.
 fn cargo_metadata() -> serde_json::Value {
+    cargo_metadata_with(&[])
+}
+
+/// [`cargo_metadata`] with extra arguments (`--filter-platform …`).
+fn cargo_metadata_with(extra: &[&str]) -> serde_json::Value {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::temp_dir().join(format!(
-        "databastion-arch-metadata-{}.json",
+        "databastion-arch-metadata-{}-{n}.json",
         std::process::id()
     ));
     let out_file = fs::File::create(&out_path).unwrap();
     let mut child = Command::new(cargo)
         .args(["metadata", "--format-version", "1", "--locked"])
+        .args(extra)
         .current_dir(workspace_root())
         .stdout(out_file)
         .stderr(Stdio::null())
@@ -401,16 +410,19 @@ fn only_core_depends_on_protocol_types() {
 /// the agent binary's normal dependencies never enable.
 #[test]
 fn agent_owned_logs_are_allowed_in_tests_only() {
-    const SWITCHES: [&str; 2] = [
+    const SWITCHES: [&str; 4] = [
         "allow_agent_owned_logs_for_tests(",
         "allow_agent_owned_files_for_tests(",
+        "set_reader_executable_for_tests(",
+        "set_reader_credentials_for_tests(",
     ];
-    const TEST_ONLY: [&str; 5] = [
+    const TEST_ONLY: [&str; 6] = [
         "connector-postgres/src/it.rs",
         "connector-mysql/src/it/audit_it.rs",
         "connector-mongodb/src/it_audit.rs",
         "core/tests/",
         "agent/tests/cas_runtime.rs",
+        "agent/tests/sqlite_reader.rs",
     ];
     for source in all_crate_sources() {
         let text = fs::read_to_string(&source).unwrap();
@@ -507,4 +519,433 @@ fn sqlserver_statements_never_read_definitions() {
     assert!(!databastion_connector_sqlserver::statement_checked(
         "SELECT definition FROM sys.sql_modules"
     ));
+}
+
+/// The resolved graph: `(package name, links, [(dependency name, normal,
+/// build)]], resolved features)` per node.
+type Node = (
+    String,
+    Option<String>,
+    Vec<(String, bool, bool)>,
+    Vec<String>,
+);
+
+fn resolved_nodes(metadata: &serde_json::Value) -> Vec<Node> {
+    let packages = metadata["packages"].as_array().unwrap();
+    let package = |id: &str| packages.iter().find(|p| p["id"] == id).unwrap();
+    metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| {
+            let p = package(node["id"].as_str().unwrap());
+            let deps = node["deps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    let kinds = d["dep_kinds"].as_array().unwrap();
+                    let name = package(d["pkg"].as_str().unwrap())["name"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    (
+                        name,
+                        kinds.iter().any(|k| k["kind"].is_null()),
+                        kinds.iter().any(|k| k["kind"] == "build"),
+                    )
+                })
+                .collect();
+            let features = node["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f.as_str().unwrap().to_owned())
+                .collect();
+            (
+                p["name"].as_str().unwrap().to_owned(),
+                p["links"].as_str().map(str::to_owned),
+                deps,
+                features,
+            )
+        })
+        .collect()
+}
+
+/// The packages the shipped binary is built from: `databastion-agent` and
+/// everything it reaches through normal and build edges (build scripts
+/// compile C into the crates they build), never dev-dependencies.
+fn shipped(nodes: &[Node]) -> Vec<&Node> {
+    let mut seen: Vec<&str> = vec!["databastion-agent"];
+    let mut i = 0;
+    while let Some(name) = seen.get(i).copied() {
+        for n in nodes.iter().filter(|n| n.0 == name) {
+            for (d, normal, build) in &n.2 {
+                if (*normal || *build) && !seen.contains(&d.as_str()) {
+                    seen.push(d);
+                }
+            }
+        }
+        i += 1;
+    }
+    nodes
+        .iter()
+        .filter(|n| seen.contains(&n.0.as_str()))
+        .collect()
+}
+
+/// ADR-0059 decision 1 (security review L7): "no C client library" made
+/// mechanical. On each release target, every package of the shipped
+/// binary's graph with a
+/// `links` key or a build dependency on `cc`, `cmake`, `bindgen`,
+/// `pkg-config`, `autotools` or `vcpkg` is in a closed list: `ring` and
+/// `libsqlite3-sys` (with its expected build dependencies). Any new C code
+/// needs this list changed, so a review.
+#[test]
+fn c_code_is_allow_listed() {
+    const BUILD_TOOLS: [&str; 6] = ["cc", "cmake", "bindgen", "pkg-config", "autotools", "vcpkg"];
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let metadata = cargo_metadata_with(&["--filter-platform", target]);
+        let nodes = resolved_nodes(&metadata);
+        let mut found = Vec::new();
+        for (name, links, deps, _) in shipped(&nodes).into_iter().cloned() {
+            let mut tools: Vec<String> = deps
+                .iter()
+                .filter(|(d, _, build)| *build && BUILD_TOOLS.contains(&d.as_str()))
+                .map(|(d, _, _)| d.clone())
+                .collect();
+            tools.sort();
+            if links.is_none() && tools.is_empty() {
+                continue;
+            }
+            match name.as_str() {
+                "ring" => {
+                    assert!(
+                        links
+                            .as_deref()
+                            .is_some_and(|l| l.starts_with("ring_core_")),
+                        "{target}: ring links {links:?}"
+                    );
+                    assert_eq!(tools, ["cc"], "{target}: ring");
+                }
+                "libsqlite3-sys" => {
+                    assert_eq!(links.as_deref(), Some("sqlite3"), "{target}");
+                    assert_eq!(
+                        tools,
+                        ["cc", "pkg-config", "vcpkg"],
+                        "{target}: libsqlite3-sys"
+                    );
+                }
+                other => panic!(
+                    "{target}: {other} builds C code (links {links:?}, build tools {tools:?}): \
+                     the agent links no other C library (ADR-0039 decision 4, ADR-0059 decision 1)"
+                ),
+            }
+            found.push(name);
+        }
+        found.sort();
+        found.dedup();
+        if cfg!(feature = "sqlite") {
+            assert_eq!(found, ["libsqlite3-sys", "ring"], "{target}");
+        }
+    }
+}
+
+/// ADR-0059 decision 1: the reviewed features of the SQLite crates in the
+/// resolved graph (the fuzz workspace, which enables `with-asan`, has its
+/// own lock and is not checked here).
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_features_are_the_reviewed_ones() {
+    let metadata = cargo_metadata();
+    let nodes = resolved_nodes(&metadata);
+    let features = |crate_name: &str| -> Vec<String> {
+        let mut f: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.0 == crate_name)
+            .flat_map(|n| n.3.clone())
+            .collect();
+        f.sort();
+        f.dedup();
+        f
+    };
+    assert_eq!(
+        features("rusqlite"),
+        ["bundled", "hooks", "limits", "modern_sqlite"],
+        "rusqlite features"
+    );
+    let sys = features("libsqlite3-sys");
+    assert!(sys.iter().any(|f| f == "bundled"), "{sys:?}");
+    for off in [
+        "with-asan",
+        "loadable_extension",
+        "buildtime_bindgen",
+        "bundled-sqlcipher",
+        "bundled-sqlcipher-vendored-openssl",
+        "sqlcipher",
+        "session",
+        "preupdate_hook",
+        "column_metadata",
+    ] {
+        assert!(
+            !sys.iter().any(|f| f == off),
+            "libsqlite3-sys has {off}: {sys:?}"
+        );
+    }
+}
+
+/// ADR-0059 decisions 1 and 4: in the resolved graph, the only normal
+/// dependent of `rusqlite` and of the sandbox crates is the SQLite
+/// connector, and the only one of `libsqlite3-sys` is `rusqlite`.
+#[test]
+fn only_connector_sqlite_uses_rusqlite() {
+    let metadata = cargo_metadata();
+    let nodes = resolved_nodes(&metadata);
+    let dependents = |dep: &str| -> Vec<String> {
+        let mut v: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.2.iter().any(|(d, normal, _)| d == dep && *normal))
+            .map(|n| n.0.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for dep in ["rusqlite", "landlock", "seccompiler"] {
+        let d = dependents(dep);
+        assert!(
+            d.is_empty() || d == ["databastion-connector-sqlite"],
+            "{dep} is used by {d:?}"
+        );
+    }
+    let d = dependents("libsqlite3-sys");
+    assert!(
+        d.is_empty() || d == ["rusqlite"],
+        "libsqlite3-sys is used by {d:?}"
+    );
+}
+
+/// The source files of the SQLite connector, with their code lines (no
+/// comment lines) before the first `mod tests {`.
+fn sqlite_sources() -> Vec<(PathBuf, Vec<String>)> {
+    let krate = workspace_root().join("crates").join("connector-sqlite");
+    let mut sources = Vec::new();
+    rust_sources(&krate.join("src"), &mut sources);
+    assert!(sources.len() >= 10, "source discovery looks broken");
+    sources
+        .into_iter()
+        .map(|p| {
+            let text = fs::read_to_string(&p).unwrap();
+            let lines: Vec<String> = code_lines(&text)
+                .take_while(|l| !l.trim_end().ends_with("mod tests {"))
+                .map(str::to_owned)
+                .collect();
+            (p, lines)
+        })
+        .collect()
+}
+
+fn is_test_file(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name == "it.rs" || name == "testing.rs"
+}
+
+/// ADR-0059 decisions 1 and 4, I1 (the CAS test's twin): the SQLite
+/// connector opens no network connection: no TLS crate, no tokio `net`
+/// feature, no TCP type, and `UnixStream` only as `UnixStream::pair` in
+/// the IPC module, never connected.
+#[test]
+fn sqlite_connector_opens_no_network_connection() {
+    let krate = workspace_root().join("crates").join("connector-sqlite");
+    let manifest = fs::read_to_string(krate.join("Cargo.toml")).unwrap();
+    for (key, _) in declared_dependencies(&manifest) {
+        assert!(
+            !key.contains("rustls") && !key.contains("tls") && key != "socket2",
+            "connector-sqlite depends on {key}"
+        );
+    }
+    for line in code_lines(&manifest).filter(|l| l.starts_with("tokio")) {
+        assert!(
+            !line.contains("\"net\""),
+            "connector-sqlite enables tokio's net feature"
+        );
+    }
+    for (source, lines) in sqlite_sources() {
+        let shown = source.display().to_string();
+        let ipc = shown.ends_with("connector-sqlite/src/ipc.rs");
+        for l in &lines {
+            for api in [
+                "TcpStream",
+                "tokio::net",
+                "std::net::Tcp",
+                "ToSocketAddrs",
+                ".connect(",
+            ] {
+                assert!(!l.contains(api), "{shown} uses {api}");
+            }
+            if l.contains("UnixStream") {
+                assert!(ipc, "{shown} uses UnixStream outside the IPC module");
+                let calls: Vec<&str> = l.split("UnixStream::").skip(1).collect();
+                assert!(
+                    calls.iter().all(|c| c.starts_with("pair(")),
+                    "{shown}: UnixStream other than UnixStream::pair: {l}"
+                );
+            }
+        }
+    }
+}
+
+/// ADR-0059 decision 5: the statements are a closed list of templates;
+/// none reaches beyond reading; every sampling template keeps the planner
+/// on the table's own b-tree (`NOT INDEXED`); and no source line reaches
+/// SQLite's C API, its log callback or extension loading.
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_connector_statements_are_closed() {
+    const BANNED: [&str; 21] = [
+        "attach",
+        "load_extension",
+        "writable_schema",
+        "immutable",
+        "nolock",
+        "mode=rw",
+        "insert",
+        "update",
+        "delete",
+        "replace",
+        "create",
+        "drop",
+        "alter",
+        "vacuum",
+        "reindex",
+        "analyze",
+        "begin",
+        "savepoint",
+        "table_list",
+        "pragma_",
+        "sqlite_dbpage",
+    ];
+    let list = databastion_connector_sqlite::statement_allow_list();
+    assert!(list.len() >= 15, "allow-list looks empty");
+    for (name, text) in list {
+        let lower = text.to_ascii_lowercase();
+        for b in BANNED {
+            assert!(!lower.contains(b), "statement {name} contains {b}");
+        }
+    }
+    for t in databastion_connector_sqlite::sql::sampling_templates() {
+        assert!(t.contains("NOT INDEXED"), "{t}");
+    }
+    for (source, lines) in sqlite_sources() {
+        if is_test_file(&source) {
+            continue;
+        }
+        let shown = source.display().to_string();
+        for l in &lines {
+            let version_constant = shown.ends_with("connector-sqlite/src/db.rs")
+                && (l.contains("rusqlite::ffi::SQLITE_VERSION")
+                    || l.contains("rusqlite::ffi::SQLITE_SOURCE_ID"));
+            if !version_constant {
+                assert!(!l.contains("rusqlite::ffi"), "{shown}: {l}");
+            }
+            for banned in [
+                "libsqlite3_sys",
+                "config_log",
+                "load_extension",
+                "Connection::handle",
+                ".handle()",
+            ] {
+                assert!(!l.contains(banned), "{shown} names {banned}");
+            }
+        }
+    }
+}
+
+/// ADR-0059 decision 5 (security review L1): no `rusqlite::Error` is ever
+/// formatted. Only the `db` module names `rusqlite` (the test support and
+/// in-process tests aside); its code has no formatting, logging or
+/// `to_string` at all, so an error it maps can never be printed; and the
+/// crate's `clippy.toml` bans `ToString::to_string`.
+#[test]
+fn sqlite_errors_are_never_formatted() {
+    for (source, lines) in sqlite_sources() {
+        let shown = source.display().to_string();
+        let db = shown.ends_with("connector-sqlite/src/db.rs");
+        if !db && !is_test_file(&source) {
+            for l in &lines {
+                assert!(
+                    !l.contains("rusqlite"),
+                    "{shown} names rusqlite outside db.rs: {l}"
+                );
+            }
+        }
+        if db {
+            for l in &lines {
+                for banned in [
+                    "format!(",
+                    "write!(",
+                    "writeln!(",
+                    "print",
+                    "tracing",
+                    ".to_string()",
+                    "{:?}",
+                    "{e",
+                    "{err",
+                    "?e",
+                    "%e",
+                    "panic!(",
+                    ".unwrap()",
+                    ".expect(",
+                    "dbg!(",
+                ] {
+                    assert!(!l.contains(banned), "db.rs: {banned} in {l}");
+                }
+            }
+        }
+    }
+    let clippy = fs::read_to_string(
+        workspace_root()
+            .join("crates")
+            .join("connector-sqlite")
+            .join("clippy.toml"),
+    )
+    .unwrap();
+    assert!(
+        clippy.contains("std::string::ToString::to_string"),
+        "{clippy}"
+    );
+}
+
+/// ADR-0059 decision 4: the only process the agent's code starts is its
+/// own binary, in the SQLite reader mode (`/proc/self/exe sqlite-reader`):
+/// one `Command::new` in the crates' code, test code aside.
+#[test]
+fn the_only_spawned_process_is_the_sqlite_reader() {
+    let mut found = Vec::new();
+    for source in all_crate_sources() {
+        let shown = source.display().to_string();
+        if shown.contains("/tests/")
+            || shown.contains("/it/")
+            || shown.contains("/it.rs")
+            || shown.contains("/it_")
+            || shown.contains("testserver")
+        {
+            continue;
+        }
+        let text = fs::read_to_string(&source).unwrap();
+        for l in code_lines(&text).take_while(|l| !l.trim_end().ends_with("mod tests {")) {
+            if l.contains("Command::new") {
+                found.push((shown.clone(), l.trim().to_owned()));
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (file, line) = &found[0];
+    assert!(file.ends_with("connector-sqlite/src/process.rs"), "{file}");
+    assert!(line.contains("Command::new(executable())"), "{line}");
+    let process =
+        fs::read_to_string(workspace_root().join("crates/connector-sqlite/src/process.rs"))
+            .unwrap();
+    assert!(process.contains("PathBuf::from(\"/proc/self/exe\")"));
+    assert!(process.contains(".env_clear()"));
 }

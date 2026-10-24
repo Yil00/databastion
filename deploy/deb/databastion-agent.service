@@ -76,6 +76,10 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# The SQLite reader process (ADR-0059 decision 4) sandboxes itself: landlock_create_ruleset,
+# landlock_add_rule, landlock_restrict_self and seccomp, which @system-service does not include
+# (systemd 255). Filters stack: the reader runs under this filter and its own.
+SystemCallFilter=@sandbox
 SystemCallFilter=~@privileged
 SystemCallFilter=~bind listen accept accept4
 # io_uring could perform socket operations outside the filter above (the agent's runtime uses epoll).
