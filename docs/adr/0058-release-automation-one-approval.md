@@ -544,15 +544,18 @@ Documentation job of `ci.yml`):
        and `completed_at`, with 2 minutes of slack (review L2). `prepare` polls every 20 s for up
        to 20 minutes, the `timeout-minutes` of that job, for it to complete, since release-it
        pushes the tag before it creates the draft, and **fails** if it has not (review L1);
-   - in a separate job `release-tree` (`permissions: {}`, checkout with `fetch-depth: 0` and
-     `persist-credentials: false`, Node 24 and Rust 1.88.0; review L3), **`T`'s tree is
+   - in a separate job `release-tree` (`permissions: contents: read` only, checkout with
+     `fetch-depth: 0` and `persist-credentials: false`, Node 24 and Rust 1.88.0; review L3), **`T`'s tree is
      recomputed** (L4 of the ADR review): `P` is checked out in a scratch worktree, the agent
      dependencies are fetched (`cargo fetch --locked`), the two `after:bump` hooks run in their
      order, every tracked change is staged as release-it does, and the tree must equal `T`'s. The
      Rust pin is the one of `release.yml`; the two must change together, or final publishes fail.
      The changelog heading carries the date the hook ran: the UTC dates of `T`'s committer time and
-     of 10 minutes earlier are tried. It runs the hooks of the tagged code, hence no token
-     permission. It runs only for final versions, and is `skipped` for pre-release tags.
+     of 10 minutes earlier are tried. It runs the hooks of the tagged code, hence a token that
+     can only read the contents, which on a public repository anyone can read (re-review N2:
+     `contents: read` rather than `permissions: {}`, so that the checkout does not depend on an
+     unverified anonymous read). It runs only for final versions, and is `skipped` for
+     pre-release tags.
 4. **One approval gate**, `prerelease-approval` (decision 3.3), in the existing `release`
    environment, `permissions: {}`, one `echo` step. It runs
    `if: needs.prepare.outputs.prerelease != 'false' || github.run_attempt != '1'`: for pre-release
@@ -561,6 +564,8 @@ Documentation job of `ci.yml`):
    - `build` runs only when `needs.prepare.result == 'success'` and either a final version with
      `release-tree` `success` and the gate `skipped` on attempt 1 or `success` on a later attempt,
      or a pre-release with `release-tree` `skipped` and the gate `success`;
+   - for pre-release tags, `prepare` and `manifest` (before signing and before moving `next`)
+     refuse a version below another version tag (see the deviations);
    - `manifest` and `release-assets`, the other jobs that sign, also require
      `github.run_attempt == '1'` or the gate `success`: *Re-run failed jobs* keeps the results of
      the jobs it does not re-run, so a re-run of `manifest` alone would otherwise follow the
@@ -592,15 +597,21 @@ Documentation job of `ci.yml`):
 - `P` is checked to be a merge commit, not to be the `merge_commit_sha` of a merged pull request
   into `main` (that needs `pull-requests: read`, and comes with decision 2).
 - A *Re-run failed jobs* of a **pre-release** run keeps the gate's first-attempt `success`, so the
-  jobs it re-runs need no new approval. As before this change, where the approval of a job was
-  kept on a re-run of other jobs; the version is a pre-release, and `next` is the only floating
-  tag it moves.
+  jobs it re-runs need no new approval. Before this change, `manifest` and `release-assets` were
+  themselves in the `release` environment, so a re-run of them asked for an approval again: this
+  is a loss of control, found by the re-review (N1). It is bounded by a check instead: a
+  pre-release `V` is refused when any version tag, pre-release or final, is above `V` in SemVer
+  precedence (`X.Y.Z-rc.10` above `X.Y.Z-rc.9`, a final `X.Y.Z` above every `X.Y.Z-…`; a tag that
+  starts like a version but does not parse fails the check). `prepare` runs it, and `manifest`
+  runs it again right before `cosign sign` and right before moving `next`, so that a re-run of an
+  old pre-release run cannot sign again and move `next` back. A re-run of the **latest**
+  pre-release can still sign it again without a new approval: new digests for the same
+  pre-release tag, `next` unchanged in version.
 
 **Not verified in a run yet** (to watch at the first releases; RELEASE.md § 5, step 5): that
 `GET /actions/runs/{id}/approvals` is readable with `actions: read`; that an administrator bypass
 of the `release-it` approval leaves no `approved` record (then the check fails: approve, do not
-bypass); the gate's behaviour under *Re-run failed jobs* (item 4); and the checkout of
-`release-tree` with `permissions: {}` (it relies on the repository being public).
+bypass); and the gate's behaviour under *Re-run failed jobs* (item 4).
 
 **Concurrency** (review L5). Publish runs share `concurrency: publish` without cancelling a running
 run, but GitHub keeps one pending run per group: a third tag push cancels the pending run. Nothing

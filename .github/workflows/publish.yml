@@ -14,7 +14,8 @@ name: Publish
 #   `manifest` checks the last point again before it signs and moves `X.Y` / `latest`;
 # - pre-release tags, and every re-run (`github.run_attempt` above 1) of a final version: one
 #   approval, in the `prerelease-approval` job (`release` environment: reviewers and tag rules,
-#   RELEASE.md, "Repository configuration").
+#   RELEASE.md, "Repository configuration"). A pre-release is refused, in `prepare` and again in
+#   `manifest` before it signs and moves `next`, when any version tag is above it (SemVer).
 # These are checks of the honest path: whoever chooses the publish.yml a tag runs can remove them.
 # Builds use no cache: nothing another workflow wrote can end up in a release. An image is only
 # built if its Dockerfile exists.
@@ -121,6 +122,14 @@ jobs:
           POLL_TIMEOUT_S: "1200"
           POLL_INTERVAL_S: "20"
         run: .github/scripts/check-final-release.sh release-run
+      # Pre-release tags: no version tag above this one, so that `next` never moves back. Checked
+      # again in `manifest`, where it matters for a re-run (re-review N1).
+      - name: Pre-release not superseded
+        if: steps.meta.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: .github/scripts/check-final-release.sh prerelease-not-superseded
       - name: Images to build
         id: images
         run: |
@@ -131,15 +140,17 @@ jobs:
           echo "images=$json" >> "$GITHUB_OUTPUT"
 
   # Final versions only: T's tree is exactly release-it's after:bump hooks run on P (ADR-0058 review
-  # L4). It runs the hooks of the tagged code (node, cargo fetch), so in a job of its own with no
-  # token permission (review L3). Skipped for pre-release tags.
+  # L4). It runs the hooks of the tagged code (node, cargo fetch), so in a job of its own whose token
+  # can only read the (public) repository contents (review L3, re-review N2). Skipped for pre-release
+  # tags.
   release-tree:
     name: Release commit tree
     needs: prepare
     if: needs.prepare.result == 'success' && needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions: {}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -275,10 +286,11 @@ jobs:
           pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
           path: /tmp/digests
-      # Final versions: the checks script only, to repeat the "not published, not superseded" check
-      # of `prepare` right before signing and before moving X.Y / latest (review H1).
+      # The checks script only, to repeat the "not superseded" checks of `prepare` right before
+      # signing and before moving X.Y / latest or next: a re-run of this job alone keeps an earlier
+      # approval for a pre-release, and none is asked on the first attempt of a final version
+      # (review H1, re-review N1).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.prepare.outputs.prerelease == 'false'
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
@@ -296,6 +308,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: release-checks/.github/scripts/check-final-release.sh not-superseded
+      - name: Pre-release not superseded (before signing)
+        if: needs.prepare.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: release-checks/.github/scripts/check-final-release.sh prerelease-not-superseded
       - name: Create multi-arch manifest and sign
         id: sign
         env:
@@ -342,6 +360,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: release-checks/.github/scripts/check-final-release.sh not-superseded
+      - name: Pre-release not superseded (before moving next)
+        if: needs.prepare.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: release-checks/.github/scripts/check-final-release.sh prerelease-not-superseded
       - name: Move the floating tags to the verified index
         env:
           REF: ${{ steps.sign.outputs.ref }}

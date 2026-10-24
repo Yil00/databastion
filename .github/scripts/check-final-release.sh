@@ -3,8 +3,9 @@
 # release-it made in an approved release.yml run, and that it is neither published nor superseded
 # (ADR-0058 decision 3.2, as implemented without the release record of decision 2.10;
 # implementation note of 2026-10-24). It replaces the approvals of the `release` environment for
-# final versions. Pre-release tags are not checked here: they go through the approval gate of
-# publish.yml.
+# final versions. Pre-release tags go through the approval gate of publish.yml; the only check
+# here for them is `prerelease-not-superseded`, which keeps a re-run of an old pre-release run from
+# signing again and moving `next` back (re-review N1).
 #
 # A check of the honest path only: whoever can choose the publish.yml that a tag runs (an
 # administrator, or the holder of RELEASE_TOKEN) can remove it (ADR-0058, decision 3.4).
@@ -13,13 +14,15 @@
 #   check-final-release.sh commit          # the tag object, the release commit T, its parent P, the files
 #   check-final-release.sh release-run     # the approved release.yml run on P that made T (polls)
 #   check-final-release.sh tree            # T's tree recomputed from P with the after:bump hooks
+#   check-final-release.sh prerelease-not-superseded  # pre-release V: no version tag above V (API)
 #
 # The pure parts are reachable for the tests (test_check_final_release.sh), on stdin:
 #   check-final-release.sh test-runs P | test-job | test-approvals | test-diff
 #   check-final-release.sh test-higher V | test-published V | test-window CT STARTED COMPLETED
+#   check-final-release.sh test-above V (SemVer precedence) | test-cmp A B (prints -1, 0 or 1)
 #
 # Environment:
-#   VERSION            the tag name (X.Y.Z)
+#   VERSION            the tag name (X.Y.Z; X.Y.Z-… for prerelease-not-superseded)
 #   TAG_SHA            the commit the tag points to (GITHUB_SHA of the tag-push run)
 #   GITHUB_REPOSITORY  owner/repo
 #   GH_TOKEN           read access to contents and actions (not-superseded, commit, release-run)
@@ -109,6 +112,75 @@ in_window() {
   [ "$ct" -ge $((s - WINDOW_SLACK_S)) ] && [ "$ct" -le $((e + WINDOW_SLACK_S)) ]
 }
 
+# SemVer 2.0.0 precedence (semver.org, item 11), for the pre-release channel. Build metadata (`+…`)
+# is not accepted: no release tag carries it. Numbers are compared as strings of digits (length,
+# then characters), so any size works.
+SEMVER_ID='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+SEMVER_RE="^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-($SEMVER_ID(\\.$SEMVER_ID)*))?\$"
+# A tag that starts like a version (what the publish.yml trigger can match): it must parse.
+VERSION_LIKE_RE='^[0-9]+\.[0-9]+\.[0-9]+(-|$)'
+
+# num_cmp A B: digit strings without leading zeros; prints -1, 0 or 1.
+num_cmp() {
+  if [ "${#1}" -ne "${#2}" ]; then
+    if [ "${#1}" -lt "${#2}" ]; then echo -1; else echo 1; fi
+  elif [ "$1" = "$2" ]; then echo 0
+  elif [[ "$1" < "$2" ]]; then echo -1
+  else echo 1
+  fi
+}
+
+# semver_cmp A B: prints -1, 0 or 1; returns 2 when A or B is not a SemVer version.
+semver_cmp() {
+  local a="$1" b="$2" an=() bn=() ap="" bp="" i c x y xa ya
+  local LC_ALL=C
+  [[ "$a" =~ $SEMVER_RE ]] || return 2
+  an=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); ap="${BASH_REMATCH[5]}"
+  [[ "$b" =~ $SEMVER_RE ]] || return 2
+  bn=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); bp="${BASH_REMATCH[5]}"
+  for i in 0 1 2; do
+    c="$(num_cmp "${an[$i]}" "${bn[$i]}")"
+    [ "$c" = 0 ] || { echo "$c"; return 0; }
+  done
+  # A version without pre-release is above any pre-release of the same X.Y.Z.
+  if [ -z "$ap" ] && [ -z "$bp" ]; then echo 0; return 0; fi
+  if [ -z "$ap" ]; then echo 1; return 0; fi
+  if [ -z "$bp" ]; then echo -1; return 0; fi
+  IFS=. read -r -a xa <<<"$ap"
+  IFS=. read -r -a ya <<<"$bp"
+  for ((i = 0; i < ${#xa[@]} && i < ${#ya[@]}; i++)); do
+    x="${xa[$i]}" y="${ya[$i]}"
+    if [[ "$x" =~ ^[0-9]+$ ]] && [[ "$y" =~ ^[0-9]+$ ]]; then c="$(num_cmp "$x" "$y")"
+    elif [[ "$x" =~ ^[0-9]+$ ]]; then c=-1   # numeric identifiers are below alphanumeric ones
+    elif [[ "$y" =~ ^[0-9]+$ ]]; then c=1
+    elif [ "$x" = "$y" ]; then c=0
+    elif [[ "$x" < "$y" ]]; then c=-1        # ASCII order (LC_ALL=C)
+    else c=1
+    fi
+    [ "$c" = 0 ] || { echo "$c"; return 0; }
+  done
+  # Equal so far: the longer list of identifiers is above.
+  if [ "${#xa[@]}" -eq "${#ya[@]}" ]; then echo 0
+  elif [ "${#xa[@]}" -lt "${#ya[@]}" ]; then echo -1
+  else echo 1
+  fi
+}
+
+# versions_above V < tag names, one per line: the version tags above V in SemVer precedence. Fails
+# (status 1, with an error) when V, or any tag that starts like a version, does not parse: an
+# unparsable tag might be above V. Tags that do not start like a version (`latest`) are ignored.
+versions_above() {
+  local v="$1" t c
+  [[ "$v" =~ $SEMVER_RE ]] || { echo "::error::'$v' is not a SemVer version" >&2; return 1; }
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [[ "$t" =~ $VERSION_LIKE_RE ]] || continue
+    c="$(semver_cmp "$t" "$v")" || { echo "::error::tag '$t' starts like a version but is not SemVer" >&2; return 1; }
+    if [ "$c" = 1 ]; then echo "$t"; fi
+  done
+  return 0
+}
+
 # --- Checks ------------------------------------------------------------------------------------
 
 need_version() {
@@ -141,6 +213,19 @@ check_not_superseded() {
   higher="$(higher_finals "$version" <<<"$tags")"
   [ -z "$higher" ] || fail "final tags above $version exist ($(tr '\n' ' ' <<<"$higher")): refusing to publish an older version (publish.yml does not support a release on an older line)"
   echo "release $version: not published, no final tag above it"
+}
+
+# A re-run of an old pre-release run keeps the approval of its first attempt (Re-run failed jobs):
+# it must not sign again or move `next` back. Refuse when any version tag, pre-release or final, is
+# above V in SemVer precedence (re-review N1).
+check_prerelease_not_superseded() {
+  local repo="${GITHUB_REPOSITORY:?}" v="${VERSION:-}" tags above
+  [[ "$v" == *-* ]] || fail "not a pre-release version: '$v'"
+  tags="$(gh api --paginate "repos/$repo/git/matching-refs/tags" --jq '.[].ref | ltrimstr("refs/tags/")')" \
+    || fail "tags not readable"
+  above="$(versions_above "$v" <<<"$tags")" || fail "cannot order the tags against $v (see above)"
+  [ -z "$above" ] || fail "version tags above $v exist ($(tr '\n' ' ' <<<"$above")): refusing to sign it or move next back"
+  echo "pre-release $v: no version tag above it"
 }
 
 check_commit() {
@@ -270,6 +355,9 @@ case "${1:-}" in
   commit) need_version; need_tag_sha; check_commit ;;
   release-run) need_version; need_tag_sha; check_release_run ;;
   tree) need_version; need_tag_sha; check_tree ;;
+  prerelease-not-superseded) check_prerelease_not_superseded ;;
+  test-above) versions_above "${2?V}" ;;
+  test-cmp) semver_cmp "${2?A}" "${3?B}" ;;
   test-runs) runs_on "${2:?P}" ;;
   test-job) release_it_jobs ;;
   test-approvals) release_it_approvers ;;

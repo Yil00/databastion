@@ -103,6 +103,45 @@ expect published-pages ok 1 '[{"tag_name":"0.9.0","draft":false}]
 [{"tag_name":"0.9.1","draft":false}]' -- test-published 0.9.1
 expect published-empty ok 0 '[]' -- test-published 0.9.1
 
+# --- SemVer precedence (pre-release channel, re-review N1) --------------------------------------
+# The ordering example of semver.org item 11, each pair in both directions.
+order=(1.0.0-alpha 1.0.0-alpha.1 1.0.0-alpha.beta 1.0.0-beta 1.0.0-beta.2 1.0.0-beta.11 1.0.0-rc.1 1.0.0)
+for ((i = 0; i + 1 < ${#order[@]}; i++)); do
+  expect "cmp-${order[$i]}<${order[$((i + 1))]}" ok -1 '' -- test-cmp "${order[$i]}" "${order[$((i + 1))]}"
+  expect "cmp-${order[$((i + 1))]}>${order[$i]}" ok 1 '' -- test-cmp "${order[$((i + 1))]}" "${order[$i]}"
+done
+expect cmp-rc.10-rc.9 ok 1 '' -- test-cmp 0.9.0-rc.10 0.9.0-rc.9
+expect cmp-equal ok 0 '' -- test-cmp 0.9.0-rc.2 0.9.0-rc.2
+expect cmp-numeric-core ok 1 '' -- test-cmp 0.10.0-rc.1 0.9.0
+expect cmp-big-numbers ok 1 '' -- test-cmp 0.9.0-rc.100000000000000000000 0.9.0-rc.99999999999999999999
+expect cmp-numeric-below-alpha ok -1 '' -- test-cmp 1.0.0-1 1.0.0-a
+expect cmp-ascii-order ok -1 '' -- test-cmp 1.0.0-RC.1 1.0.0-rc.1
+expect cmp-leading-zero fail - '' -- test-cmp 1.0.0-rc.01 1.0.0
+expect cmp-leading-zero-core fail - '' -- test-cmp 01.0.0 1.0.0
+expect cmp-empty-identifier fail - '' -- test-cmp 1.0.0-rc..1 1.0.0
+expect cmp-build-metadata fail - '' -- test-cmp 1.0.0+build.1 1.0.0
+expect cmp-not-a-version fail - '' -- test-cmp latest 1.0.0
+
+ptags='0.1.0-rc.2
+0.9.0
+0.9.1-rc.9
+0.9.1-rc.10
+latest
+v1.0.0'
+expect above-rc9 ok '0.9.1-rc.10' "$ptags" -- test-above 0.9.1-rc.9
+expect above-rc10 ok '' "$ptags" -- test-above 0.9.1-rc.10
+expect above-final-of-same ok '0.9.0
+0.9.1-rc.9
+0.9.1-rc.10' "$ptags" -- test-above 0.9.0-rc.1
+expect above-final-present ok '' "$ptags
+0.9.1-rc.11" -- test-above 0.9.2-rc.1
+expect above-final-above ok '0.9.1' "$ptags
+0.9.1" -- test-above 0.9.1-rc.10
+expect above-unparsable-tag fail - "$ptags
+0.9.1-rc.01" -- test-above 0.9.1-rc.10
+expect above-unparsable-version fail - "$ptags" -- test-above 0.9.1-rc..1
+expect above-empty ok '' '' -- test-above 0.9.1-rc.1
+
 # --- T committed during the release-it job (0.9.0: job 22:56:14Z to 22:56:55Z, T at 22:56:47Z) ---
 ct=$(date -u -d 2026-10-23T22:56:47Z +%s)
 expect window-0.9.0 ok in '' -- test-window "$ct" 2026-10-23T22:56:14Z 2026-10-23T22:56:55Z
