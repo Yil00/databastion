@@ -2017,6 +2017,8 @@ components:
       description: |
         A local engine spotted by a Unix socket, a local listening port or a process name. At least one
         of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
+        Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
+        local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
       type: object
       additionalProperties: false
       required: [engine]
@@ -2039,6 +2041,15 @@ components:
             `Engine`): a detected target of such an engine is not sent before the token is listed.
           type: string
           enum: [postgres, mysqld, mariadbd, mongod, slapd, sqlservr, redis-server, valkey-server]
+      if:
+        required: [engine]
+        properties:
+          engine:
+            const: sqlite
+      then:
+        description: No detected target of the `sqlite` engine (ADR-0059 decision 2).
+        properties:
+          engine: false
     SpoolStatus:
       type: object
       additionalProperties: false

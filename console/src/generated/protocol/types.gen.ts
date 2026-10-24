@@ -869,6 +869,8 @@ export interface components {
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
+         *     Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
+         *     local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
          */
         DetectedTarget: {
             engine: components["schemas"]["Engine"];

@@ -12,6 +12,8 @@
 // - #/$defs/AccessEvent/allOf/2/then
 // - #/$defs/AccessEvent/if
 // - #/$defs/AccessEvent/then
+// - #/$defs/DetectedTarget/if
+// - #/$defs/DetectedTarget/then
 // - #/$defs/JobStatusUpdate/else
 // - #/$defs/JobStatusUpdate/if
 // - #/$defs/JobStatusUpdate/then
@@ -1158,6 +1160,8 @@ impl ::std::convert::TryFrom<String> for Count {
 }
 /**A local engine spotted by a Unix socket, a local listening port or a process name. At least one
 of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
+Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
+local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]

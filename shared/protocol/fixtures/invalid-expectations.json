@@ -141,6 +141,7 @@
   "HeartbeatRequest.socket-path-traversal.json": "pattern",
   "HeartbeatRequest.sqlite-audit-level-limited.json": "const",
   "HeartbeatRequest.sqlite-audit-source.json": "false schema",
+  "HeartbeatRequest.sqlite-detected-target.json": "false schema",
   "HeartbeatRequest.sqlite-edition.json": "false schema",
   "HeartbeatRequest.sqlite-name-case.json": "enum",
   "HeartbeatRequest.sqlite-server-version.json": "false schema",

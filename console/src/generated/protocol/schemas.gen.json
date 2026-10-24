@@ -946,7 +946,7 @@
       ]
     },
     "DetectedTarget": {
-      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\n",
+      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\nNever `sqlite` (checked by this schema): SQLite targets are declared files only, with no\nlocal detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -979,6 +979,22 @@
             "redis-server",
             "valkey-server"
           ]
+        }
+      },
+      "if": {
+        "required": [
+          "engine"
+        ],
+        "properties": {
+          "engine": {
+            "const": "sqlite"
+          }
+        }
+      },
+      "then": {
+        "description": "No detected target of the `sqlite` engine (ADR-0059 decision 2).",
+        "properties": {
+          "engine": false
         }
       }
     },

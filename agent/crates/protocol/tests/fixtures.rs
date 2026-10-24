@@ -268,6 +268,10 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "false schema (via if/then on engine, removed before generation)",
     ),
     (
+        "HeartbeatRequest.sqlite-detected-target.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
         "HeartbeatRequest.sqlite-edition.json",
         "false schema (via if/then on engine, removed before generation)",
     ),
