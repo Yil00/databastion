@@ -715,7 +715,10 @@ jobs:
           uname -r
           cat /sys/kernel/security/lsm 2>/dev/null || true
           echo
-      - name: Connector tests (unit, property, in-process integration)
+      - name: Connector tests (unit, property, in-process integration, the sandbox's refusals)
+        env:
+          # tests/sandbox.rs applies the reader's sandbox in a child process: it must run.
+          DATABASTION_IT_SQLITE_REQUIRE: "1"
         run: |
           set -o pipefail
           timeout 1200 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-sqlite --all-features --locked 2>&1 | tee "$RUNNER_TEMP/it.log"

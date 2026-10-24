@@ -187,12 +187,29 @@ async fn scan(
     Vec<(String, String, String)>,
     databastion_core::ScanCoverage,
 ) {
+    let (found, cov, _) = scan_masked(c, t).await;
+    (found, cov)
+}
+
+/// The masked findings of a scan.
+type Masked = Vec<databastion_classifiers::masking::MaskedFinding>;
+
+/// [`scan`], with the masked findings themselves.
+async fn scan_masked(
+    c: &SqliteConnector,
+    t: &TargetConfig,
+) -> (
+    Vec<(String, String, String)>,
+    databastion_core::ScanCoverage,
+    Masked,
+) {
     let job = job(t);
     let (sink, mut rx) = FindingSink::channel(4096);
     c.discover(&job, &sink).await.unwrap();
     let cov = sink.coverage_for_tests().unwrap_or_default();
     drop(sink);
     let mut out = Vec::new();
+    let mut masked = Vec::new();
     while let Some(f) = rx.recv().await {
         let l = f.location().unwrap();
         assert_eq!(l.database.as_str(), "main");
@@ -202,8 +219,41 @@ async fn scan(
             l.field.as_str().to_owned(),
             f.classifier().as_str().to_owned(),
         ));
+        masked.push(f);
     }
-    (out, cov)
+    (out, cov, masked)
+}
+
+/// The `then` properties of the `allOf` entry of `$defs/<def>` whose `if`
+/// is `engine: const sqlite` (review L9; no full JSON Schema validator is
+/// in the dependencies: the generated types check the rest).
+fn sqlite_branch(def: &str) -> serde_json::Map<String, serde_json::Value> {
+    let path = databastion_protocol_codegen::default_openapi_path();
+    let yaml = std::fs::read_to_string(path).unwrap();
+    let doc = databastion_protocol_codegen::json_schema_from_openapi(&yaml).unwrap();
+    doc["$defs"][def]["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["if"]["properties"]["engine"]["const"] == "sqlite")
+        .unwrap()["then"]["properties"]
+        .as_object()
+        .unwrap()
+        .clone()
+}
+
+/// Only `const` and `false` are understood; anything else fails the test.
+fn conforms(rules: &serde_json::Map<String, serde_json::Value>, item: &serde_json::Value) {
+    for (key, rule) in rules {
+        match rule {
+            serde_json::Value::Bool(false) => assert!(item.get(key).is_none(), "{key}: {item}"),
+            serde_json::Value::Object(o) => {
+                assert_eq!(o.keys().collect::<Vec<_>>(), ["const"], "{key}");
+                assert_eq!(item.get(key), Some(&o["const"]), "{key}: {item}");
+            }
+            other => panic!("unsupported rule {other} under {key}"),
+        }
+    }
 }
 
 /// A log writer for the I2 check: every line the connector logs.
@@ -262,6 +312,38 @@ async fn a_rollback_file_is_scanned_by_the_sandboxed_reader() {
             .any(|x| x.0 == "v_clients" || x.1 == "initial" || x.1 == "note" || x.1 == "score")
     );
     assert!(cov.sampled >= 5, "{cov:?}");
+    // Review L9: what the connector produced, through the core's one
+    // conversion: none dropped, every batch a valid FindingsBatch, every
+    // location conforming to the contract's sqlite branch.
+    let (_, _, masked) = scan_masked(&c, &t).await;
+    let bodies = databastion_core::test_support::contract_findings_json(
+        &masked,
+        databastion_core::config::TargetEngine::Sqlite,
+    );
+    let location = sqlite_branch("Location");
+    let mut sent = 0;
+    for body in bodies.lines() {
+        let batch: databastion_protocol::FindingsBatch = serde_json::from_str(body).unwrap();
+        let v = serde_json::to_value(&batch).unwrap();
+        for f in v["findings"].as_array().unwrap() {
+            conforms(&location, &f["location"]);
+            sent += 1;
+        }
+    }
+    assert!(sent > 0);
+    assert_eq!(sent, masked.len(), "findings dropped by the core");
+    // And the target status the heartbeat would send for the connector's
+    // health, even if a connector reported a server version.
+    let status = databastion_core::test_support::contract_target_status_json(
+        &h,
+        databastion_core::config::TargetEngine::Sqlite,
+        Some("3.53.2"),
+    );
+    let parsed: databastion_protocol::TargetStatus = serde_json::from_str(&status).unwrap();
+    conforms(
+        &sqlite_branch("TargetStatus"),
+        &serde_json::to_value(&parsed).unwrap(),
+    );
     // I2 and decision 2: no sampled value and no path in the logs.
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(!text.is_empty());

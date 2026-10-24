@@ -53,6 +53,12 @@ wiremock = "0.6"
 databastion-connector-sqlite = { workspace = true, features = ["test-support"] }
 databastion-classifiers.workspace = true
 zeroize.workspace = true
+# tests/sqlite_reader.rs (review L9): what the connector produced, through the
+# core's conversion, checked against the generated types and the contract's
+# `sqlite` branches read from openapi.yaml (dev-dependencies only: the binary
+# never links the protocol types outside the core).
+databastion-protocol.workspace = true
+databastion-protocol-codegen.workspace = true
 
 [lints]
 workspace = true

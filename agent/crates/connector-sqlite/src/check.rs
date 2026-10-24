@@ -489,6 +489,30 @@ mod tests {
         assert_eq!(death_outcome(Death::Deadline).0, FailureCode::Timeout);
     }
 
+    /// Review L10: the agent's own light check, under `Policy::AGENT`,
+    /// refuses a file the agent's account owns before any reader starts
+    /// (the tests' own files; the CI job `agent-sqlite` runs this as an
+    /// unprivileged user, and as root every file is the agent's too).
+    #[tokio::test]
+    async fn the_agent_light_check_refuses_an_agent_owned_file() {
+        let d = crate::it::Dir::new("light-own");
+        let p = d.path("own.db");
+        crate::testing::seed(&p, false);
+        let settings = SqliteSettings::for_tests(p, 500, RollbackMode::Read);
+        let st = Arc::new(TargetState::default());
+        let h = check("own", &settings, Arc::clone(&st)).await;
+        assert!(!h.reachable);
+        assert_eq!(h.failure, Some(FailureCode::Unsupported));
+        assert!(
+            h.notes
+                .iter()
+                .any(|n| n.code() == NoteCode::PrivilegeDatabaseFileWritable),
+            "{h:?}"
+        );
+        // No full check ran: nothing was recorded as checked in full.
+        assert!(st.with(|i| i.last_full.is_none()));
+    }
+
     #[test]
     fn failures_carry_their_stage() {
         let h = failure_health(Failure::new(Code::Corrupt), Stage::Sample);

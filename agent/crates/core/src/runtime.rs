@@ -3560,7 +3560,7 @@ fn poll_gap(elapsed: Duration, got_jobs: bool, fast_empty: &mut u32, fraction: f
     gap
 }
 
-fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
+pub(crate) fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
     match level {
         AuditLevel::None => databastion_protocol::AuditLevel::None,
         AuditLevel::Limited => databastion_protocol::AuditLevel::Limited,

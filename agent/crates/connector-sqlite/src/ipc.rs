@@ -1446,6 +1446,14 @@ mod tests {
         }
     }
 
+    /// `deploy/deb/test-install.sh` reads these failure codes by number.
+    #[test]
+    fn the_codes_the_install_test_reads_keep_their_numbers() {
+        assert_eq!(Code::NotReadOnlyFs.tag(), 4);
+        assert_eq!(Code::SandboxUnavailable.tag(), 6);
+        assert_eq!(Code::SelfCheckFailed.tag(), 7);
+    }
+
     #[test]
     fn bounds_are_enforced_on_both_sides() {
         let long = Request::Columns(z(&[b'a'; MAX_NAME + 1]));

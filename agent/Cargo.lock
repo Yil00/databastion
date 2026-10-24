@@ -253,6 +253,8 @@ dependencies = [
  "databastion-connector-sqlite",
  "databastion-connector-sqlserver",
  "databastion-core",
+ "databastion-protocol",
+ "databastion-protocol-codegen",
  "serde_json",
  "tokio",
  "tracing",

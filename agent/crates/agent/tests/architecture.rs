@@ -651,6 +651,75 @@ fn c_code_is_allow_listed() {
     }
 }
 
+/// Review L11: no shipped crate links a library through `#[link(` or a
+/// `rustc-link-lib` directive outside a closed list, so C code cannot come
+/// in through a prebuilt or system library either. Scans `src/` and
+/// `build.rs` of every package the shipped binary is built from, on both
+/// release targets.
+#[test]
+fn linked_libraries_are_allow_listed() {
+    const ALLOWED: [(&str, &str); 9] = [
+        ("libc", "bindings of the platform C library"),
+        (
+            "getrandom",
+            "the platform random source on other operating systems",
+        ),
+        ("whoami", "platform user APIs on other operating systems"),
+        (
+            "ring",
+            "its own C and assembly objects (c_code_is_allow_listed)",
+        ),
+        (
+            "libsqlite3-sys",
+            "the bundled SQLite (c_code_is_allow_listed)",
+        ),
+        (
+            "cc",
+            "a build tool emitting the directives of the crates above",
+        ),
+        (
+            "pkg-config",
+            "a build tool (libsqlite3-sys, unused by the bundled build)",
+        ),
+        (
+            "vcpkg",
+            "a build tool (libsqlite3-sys, unused by the bundled build)",
+        ),
+        ("find-msvc-tools", "cc's Windows support, a build tool"),
+    ];
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let metadata = cargo_metadata_with(&["--filter-platform", target]);
+        let nodes = resolved_nodes(&metadata);
+        let shipped: Vec<String> = shipped(&nodes).iter().map(|n| n.0.clone()).collect();
+        for p in metadata["packages"].as_array().unwrap() {
+            let name = p["name"].as_str().unwrap();
+            if !shipped.iter().any(|s| s == name) {
+                continue;
+            }
+            let dir = Path::new(p["manifest_path"].as_str().unwrap())
+                .parent()
+                .unwrap()
+                .to_owned();
+            let mut sources = Vec::new();
+            rust_sources(&dir.join("src"), &mut sources);
+            if dir.join("build.rs").is_file() {
+                sources.push(dir.join("build.rs"));
+            }
+            let links = sources.iter().any(|f| {
+                let text = fs::read_to_string(f).unwrap_or_default();
+                text.contains("#[link(") || text.contains("rustc-link-lib")
+            });
+            if links {
+                assert!(
+                    ALLOWED.iter().any(|(n, _)| *n == name),
+                    "{target}: {name} links a library (#[link( or rustc-link-lib): review it \
+                     and extend the allow-list (ADR-0059 decision 1)"
+                );
+            }
+        }
+    }
+}
+
 /// ADR-0059 decision 1: the reviewed features of the SQLite crates in the
 /// resolved graph (the fuzz workspace, which enables `with-asan`, has its
 /// own lock and is not checked here).
