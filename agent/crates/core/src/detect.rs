@@ -130,6 +130,10 @@ fn family(engine: Engine) -> u8 {
         Engine::Sqlserver => 5,
         // ADR-0052 decision 11: one family, as MySQL and MariaDB.
         Engine::Redis | Engine::Valkey => 6,
+        // Never detected (ADR-0059 decision 2, ADR-0006: declared files
+        // only, no process or port to detect, no file system search); its
+        // own family.
+        Engine::Sqlite => 7,
     }
 }
 

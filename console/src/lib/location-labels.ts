@@ -54,6 +54,7 @@ const ENGINE_NAMES: Record<Engine, string> = {
   sqlserver: "Microsoft SQL Server",
   redis: "Redis",
   valkey: "Valkey",
+  sqlite: "SQLite",
 };
 
 /** Display name of an engine; a string that is not a contract engine is returned as is. */

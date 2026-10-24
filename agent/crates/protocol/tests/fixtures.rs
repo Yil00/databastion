@@ -248,6 +248,41 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "FindingsBatch.sqlserver-slash-in-object.json",
         "pattern (via if/then/else on engine, removed before generation; ObjectName)",
     ),
+    // SQLite (P10-C, ADR-0059 decisions 6 to 8): the console's Ajv
+    // validation enforces these engine conditionals; the SQLite connector
+    // (P10-A) builds its target status and locations to match them.
+    (
+        "FindingsBatch.sqlite-file-name-as-database.json",
+        "const (via if/then on engine, removed before generation)",
+    ),
+    (
+        "FindingsBatch.sqlite-with-schema.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-audit-level-limited.json",
+        "const (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-audit-source.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-detected-target.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-edition.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-name-case.json",
+        "enum (via if/then on name_case, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.sqlite-server-version.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
 ];
 
 fn fixtures_dir(kind: &str) -> PathBuf {

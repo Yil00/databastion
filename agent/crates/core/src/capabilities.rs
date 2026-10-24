@@ -18,7 +18,8 @@
 //! holds for `sqlserver` (`engine.sqlserver`, ADR-0051 decision 8) and for
 //! `redis` / `valkey` (`engine.redis`, `engine.valkey`, ADR-0052 decision
 //! 12); the `redis` connector and the `redis_*` audit sources serve both
-//! engines, so they wait for **both** tokens.
+//! engines, so they wait for **both** tokens. `sqlite` waits for
+//! `engine.sqlite` (ADR-0059 decision 8); no audit source serves it.
 //!
 //! In the other direction (ADR-0022 decision 3), the agent lists in
 //! `HeartbeatRequest.accepts` the console -> agent fields and value forms
@@ -79,6 +80,9 @@ pub(crate) mod token {
     pub(crate) const ENGINE_REDIS: &str = "engine.redis";
     /// The `valkey` value of `Engine` (ADR-0052 decision 12).
     pub(crate) const ENGINE_VALKEY: &str = "engine.valkey";
+    /// The `sqlite` values of `Engine` and `Connector` (ADR-0059 decision
+    /// 8; SQLite has no `AuditSource` value).
+    pub(crate) const ENGINE_SQLITE: &str = "engine.sqlite";
 }
 
 /// Tokens of the console -> agent fields and value forms this build
@@ -112,6 +116,8 @@ const SQLSERVER: &[&str] = &[token::ENGINE_SQLSERVER];
 /// The values shared by Redis and Valkey (the `redis` connector, the
 /// `redis_*` audit sources): both tokens (ADR-0052 decision 12).
 const REDIS_AND_VALKEY: &[&str] = &[token::ENGINE_REDIS, token::ENGINE_VALKEY];
+/// `engine.sqlite`.
+const SQLITE: &[&str] = &[token::ENGINE_SQLITE];
 
 /// The tokens gating an `Engine` value (ADR-0039 decision 8): none for the
 /// engines of protocol 0.1.0, always sendable; otherwise the value is sent
@@ -126,6 +132,7 @@ pub(crate) fn engine_token(engine: Engine) -> &'static [&'static str] {
         Engine::Sqlserver => SQLSERVER,
         Engine::Redis => &[token::ENGINE_REDIS],
         Engine::Valkey => &[token::ENGINE_VALKEY],
+        Engine::Sqlite => SQLITE,
     }
 }
 
@@ -158,6 +165,7 @@ pub(crate) fn connector_token(connector: Connector) -> &'static [&'static str] {
         Connector::Cas => CAS,
         Connector::Sqlserver => SQLSERVER,
         Connector::Redis => REDIS_AND_VALKEY,
+        Connector::Sqlite => SQLITE,
     }
 }
 
@@ -766,6 +774,7 @@ mod tests {
             (Engine::Sqlserver, "sqlserver"),
             (Engine::Redis, "redis"),
             (Engine::Valkey, "valkey"),
+            (Engine::Sqlite, "sqlite"),
         ] {
             assert_eq!(engine_token(engine), [format!("engine.{value}").as_str()]);
             assert_eq!(engine.to_string(), value);
@@ -779,6 +788,10 @@ mod tests {
         assert_eq!(
             connector_token(Connector::Sqlserver),
             engine_token(Engine::Sqlserver)
+        );
+        assert_eq!(
+            connector_token(Connector::Sqlite),
+            engine_token(Engine::Sqlite)
         );
         for s in [
             AuditSource::SqlserverAudit,
@@ -833,6 +846,56 @@ mod tests {
         assert!(caps.accepts_connector(Connector::Redis));
         assert!(caps.accepts_audit_source(AuditSource::RedisCommandlog));
         assert!(!caps.accepts_engine(Engine::Sqlserver));
+    }
+
+    #[test]
+    fn sqlite_values_wait_for_engine_sqlite() {
+        let caps = ConsoleCapabilities::default();
+        assert!(!caps.accepts_engine(Engine::Sqlite));
+        assert!(!caps.accepts_connector(Connector::Sqlite));
+        // Every other engine token, but not SQLite's.
+        caps.record(Some(&list(&[
+            token::ENGINE_CAS,
+            token::ENGINE_SQLSERVER,
+            token::ENGINE_REDIS,
+            token::ENGINE_VALKEY,
+            "engine.sqlite3",
+        ])));
+        assert!(!caps.accepts_engine(Engine::Sqlite));
+        assert!(!caps.accepts_connector(Connector::Sqlite));
+        caps.record(Some(&list(&[token::ENGINE_SQLITE])));
+        assert!(caps.accepts_engine(Engine::Sqlite));
+        assert!(caps.accepts_connector(Connector::Sqlite));
+        assert!(!caps.accepts_engine(Engine::Cas));
+        caps.clear();
+        assert!(!caps.accepts_engine(Engine::Sqlite));
+    }
+
+    /// The contract fixture of a heartbeat reporting `sqlite` targets.
+    fn sqlite_heartbeat() -> HeartbeatRequest {
+        serde_json::from_str(include_str!(
+            "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.sqlite.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_heartbeat_reports_no_sqlite_value_until_the_console_lists_engine_sqlite() {
+        let caps = ConsoleCapabilities::default();
+        let mut hb = sqlite_heartbeat();
+        let targets = hb.targets.len();
+        let withheld = withhold_unaccepted_engines(&mut hb, &caps);
+        assert_eq!(withheld.len(), targets);
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(!json.contains("sqlite"), "{json}");
+        assert!(hb.targets.is_empty());
+        assert_eq!(hb.connectors.0.len(), 4);
+
+        caps.record(Some(&list(&[token::ENGINE_SQLITE])));
+        let mut hb = sqlite_heartbeat();
+        let before = serde_json::to_value(&hb).unwrap();
+        assert!(withhold_unaccepted_engines(&mut hb, &caps).is_empty());
+        assert_eq!(serde_json::to_value(&hb).unwrap(), before);
     }
 
     /// The contract fixture of a heartbeat reporting `cas` targets.
@@ -930,7 +993,8 @@ mod tests {
             "openldap",
             "cas",
             "sqlserver",
-            "redis"
+            "redis",
+            "sqlite"
         ]))
         .unwrap();
         let sent = enroll_connectors(all);

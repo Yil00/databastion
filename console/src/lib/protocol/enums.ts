@@ -62,6 +62,7 @@ export const ENGINES = exhaustive<Engine>()([
   "sqlserver",
   "redis",
   "valkey",
+  "sqlite",
 ]);
 
 /** Every contract `AccessEvent.action`, in contract order. */

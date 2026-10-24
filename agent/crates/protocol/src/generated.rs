@@ -12,14 +12,20 @@
 // - #/$defs/AccessEvent/allOf/2/then
 // - #/$defs/AccessEvent/if
 // - #/$defs/AccessEvent/then
+// - #/$defs/DetectedTarget/if
+// - #/$defs/DetectedTarget/then
 // - #/$defs/JobStatusUpdate/else
 // - #/$defs/JobStatusUpdate/if
 // - #/$defs/JobStatusUpdate/then
-// - #/$defs/Location/else
-// - #/$defs/Location/if
-// - #/$defs/Location/then
-// - #/$defs/TargetStatus/if
-// - #/$defs/TargetStatus/then
+// - #/$defs/Location/allOf/0/else
+// - #/$defs/Location/allOf/0/if
+// - #/$defs/Location/allOf/0/then
+// - #/$defs/Location/allOf/1/if
+// - #/$defs/Location/allOf/1/then
+// - #/$defs/TargetStatus/allOf/0/if
+// - #/$defs/TargetStatus/allOf/0/then
+// - #/$defs/TargetStatus/allOf/1/if
+// - #/$defs/TargetStatus/allOf/1/then
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
@@ -459,7 +465,8 @@ a signal or reach `min_rows`; it can never widen what is reported.
 }
 /**Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
 e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
-`limited` (or `partial` with profiler level 2), a target with audit disabled `none`.
+`limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a
+SQLite target is always `none` (no access log exists, ADR-0059 decision 7).
 */
 #[derive(
     ::serde::Deserialize,
@@ -545,6 +552,7 @@ see "Heartbeat target checks" and, for access events, "Target engine" under `POS
 - `cas_audit_log` -> `cas`;
 - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
 - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+No value serves `sqlite` (Discovery only, ADR-0059 decision 7).
 */
 #[derive(
     ::serde::Deserialize,
@@ -1001,8 +1009,9 @@ impl ::std::convert::TryFrom<::std::string::String> for ClientAddressVariant2 {
 }
 /**Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
 Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
-only when it listed `engine.sqlserver`, and `redis` only when it listed **both**
-`engine.redis` and `engine.valkey` (see `Engine`).
+only when it listed `engine.sqlserver`, `redis` only when it listed **both**
+`engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`
+(ADR-0059 decision 8; see `Engine`).
 */
 #[derive(
     ::serde::Deserialize,
@@ -1031,6 +1040,8 @@ pub enum Connector {
     Sqlserver,
     #[serde(rename = "redis")]
     Redis,
+    #[serde(rename = "sqlite")]
+    Sqlite,
 }
 impl ::std::fmt::Display for Connector {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1042,6 +1053,7 @@ impl ::std::fmt::Display for Connector {
             Self::Cas => f.write_str("cas"),
             Self::Sqlserver => f.write_str("sqlserver"),
             Self::Redis => f.write_str("redis"),
+            Self::Sqlite => f.write_str("sqlite"),
         }
     }
 }
@@ -1058,6 +1070,7 @@ impl ::std::str::FromStr for Connector {
             "cas" => Ok(Self::Cas),
             "sqlserver" => Ok(Self::Sqlserver),
             "redis" => Ok(Self::Redis),
+            "sqlite" => Ok(Self::Sqlite),
             _ => Err("invalid value".into()),
         }
     }
@@ -1147,6 +1160,8 @@ impl ::std::convert::TryFrom<String> for Count {
 }
 /**A local engine spotted by a Unix socket, a local listening port or a process name. At least one
 of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
+Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
+local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -1432,7 +1447,11 @@ capability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and 
 handling in ADR-0042). Every later engine value follows the
 same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
 ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
-and `engine.valkey`.
+and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.
+A `sqlite` target is Discovery only: it has no server and no access log, so its
+`TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or
+`edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059
+decision 7).
 */
 #[derive(
     ::serde::Deserialize,
@@ -1465,6 +1484,8 @@ pub enum Engine {
     Redis,
     #[serde(rename = "valkey")]
     Valkey,
+    #[serde(rename = "sqlite")]
+    Sqlite,
 }
 impl ::std::fmt::Display for Engine {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1478,6 +1499,7 @@ impl ::std::fmt::Display for Engine {
             Self::Sqlserver => f.write_str("sqlserver"),
             Self::Redis => f.write_str("redis"),
             Self::Valkey => f.write_str("valkey"),
+            Self::Sqlite => f.write_str("sqlite"),
         }
     }
 }
@@ -1496,6 +1518,7 @@ impl ::std::str::FromStr for Engine {
             "sqlserver" => Ok(Self::Sqlserver),
             "redis" => Ok(Self::Redis),
             "valkey" => Ok(Self::Valkey),
+            "sqlite" => Ok(Self::Sqlite),
             _ => Err("invalid value".into()),
         }
     }
@@ -2401,7 +2424,7 @@ pub struct HeartbeatResponse {
 `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
 `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
 `job_progress.coverage`, and the engines
-added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
+added after protocol 0.1.0 (`engine.cas`, `engine.sqlite`…; see `Engine`). The agent keeps
 the list of the latest heartbeat response and sends an optional request field
 introduced after protocol 0.1.0 only when that list names it; before its first
 heartbeat response, and when the list is absent, it sends none of them. The console
@@ -2898,6 +2921,10 @@ Redis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the R
 (`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and
 sorted-set members, the normalized field name for hash fields and stream entry fields, or
 `#key` / `#field` for values found in key names / hash field names.
+SQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the file's
+database, the same on every SQLite target: the `target_id` tells files apart; checked by
+this schema), no `schema`, `object` = the table name, `field` = the column name. Never
+the file's path, its name or a side file's name.
 
 `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
 every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
@@ -5318,7 +5345,8 @@ Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes
     /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
 Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
 or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
-not match this pattern.
+not match this pattern. Never sent for a `sqlite` target, which has no server (the
+SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub server_version: ::std::option::Option<TargetStatusServerVersion>,
@@ -5327,7 +5355,8 @@ not match this pattern.
 /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
 Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
 or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
-not match this pattern.
+not match this pattern. Never sent for a `sqlite` target, which has no server (the
+SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
 */
 #[derive(::serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[serde(transparent)]

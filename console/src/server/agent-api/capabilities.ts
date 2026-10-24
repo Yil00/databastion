@@ -70,7 +70,8 @@ import { MAX_VALIDATION_DETAILS, type ValidationDetail } from "@/lib/protocol/va
  * their targets, connectors, detected targets, findings (`KeyPattern` objects for Redis / Valkey)
  * and events (`account_not_recorded` principals included, ADR-0052 decision 8) are validated,
  * stored and rendered like those of any engine. The gate (`unlistedEngineDetails`, P9-C review H1)
- * stays for any engine token added to the contract later.
+ * stays for any engine token added to the contract later: `engine.sqlite` (ADR-0059 decision 8, P10-C)
+ * is in the contract but not listed until P10-E, so `sqlite` values are refused with `enum`.
  *
  * `target_status.note_labels.2026_10` (ADR-0051 decision 4, ADR-0022 decision 4): the SQL Server
  * `TargetNoteLabel` values of that revision are accepted and rendered with their display names
@@ -194,7 +195,7 @@ type Connector = ProtocolSchemas["Connector"];
 type DetectedProcess = NonNullable<ProtocolSchemas["DetectedTarget"]["process"]>;
 
 /** Every `engine.<value>` token of the contract, listed by this console or not yet. */
-export type EngineToken = "engine.cas" | "engine.sqlserver" | "engine.redis" | "engine.valkey";
+export type EngineToken = "engine.cas" | "engine.sqlserver" | "engine.redis" | "engine.valkey" | "engine.sqlite";
 
 /**
  * The tokens gating each `Engine` value (ADR-0039 decision 8, ADR-0042): none for the engines of
@@ -214,6 +215,7 @@ const ENGINE_TOKENS: Record<Engine, readonly EngineToken[]> = {
   sqlserver: ["engine.sqlserver"],
   redis: ["engine.redis"],
   valkey: ["engine.valkey"],
+  sqlite: ["engine.sqlite"],
 };
 
 /** Engines each `Connector` serves (`mysql` covers MySQL and MariaDB, `redis` Redis and Valkey). */
@@ -225,6 +227,7 @@ const CONNECTOR_ENGINES: Record<Connector, readonly Engine[]> = {
   cas: ["cas"],
   sqlserver: ["sqlserver"],
   redis: ["redis", "valkey"],
+  sqlite: ["sqlite"],
 };
 
 /** Engine of each `DetectedTarget.process`. */

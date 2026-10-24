@@ -333,7 +333,8 @@
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite"
     ]
   },
   "check.timed_out": {
@@ -347,7 +348,8 @@
       "cas",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite"
     ]
   },
   "coverage.cas_guard_tripped": {
@@ -360,7 +362,8 @@
       "openldap",
       "sqlserver",
       "redis",
-      "valkey"
+      "valkey",
+      "sqlite"
     ]
   },
   "coverage.cluster_node_only": {
@@ -371,15 +374,34 @@
     ]
   },
   "coverage.computed_columns_not_sampled": {
-    "description": "{count} computed column(s) not sampled: reading them can run user code (a function in the column's expression).",
+    "description": "{count} computed column(s) not sampled: reading them can run user code (a function in the column's expression; on SQLite, a VIRTUAL generated column's expression taken from the file).",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "sqlite"
     ]
   },
   "coverage.encrypted_columns": {
     "description": "{count} Always Encrypted column(s) not sampled: the server holds their ciphertext only.",
     "engines": [
       "sqlserver"
+    ]
+  },
+  "coverage.file_path_refused": {
+    "description": "The declared SQLite path or a file next to it is refused: a symbolic link in the path, not a regular file, more than one hard link, the same file as another target, a refused location (the agent's own state, configuration or key files), a -wal, -shm or -journal file of another owner or on another file system, or an open file that is not the checked one.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.filesystem_not_read_only": {
+    "description": "The file system holding the SQLite file is not mounted read-only for the agent: mount its directory read-only (systemd ProtectSystem=strict or BindReadOnlyPaths=, a :ro bind mount in a container). The file is refused until then.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.hot_journal_pending": {
+    "description": "The SQLite database has a hot rollback journal (an interrupted write the application has not recovered yet): it cannot be read without writing, so it is not read until the application recovers it at its next open.",
+    "engines": [
+      "sqlite"
     ]
   },
   "coverage.masked_columns": {
@@ -395,11 +417,29 @@
       "valkey"
     ]
   },
+  "coverage.network_filesystem_refused": {
+    "description": "The SQLite file is on a network or FUSE file system (NFS, SMB / CIFS, 9P, Ceph, AFS, Coda, Lustre, GPFS, FUSE): file locks and the WAL index are not reliable there, so the file is refused.",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.other_engine_tables": {
     "description": "{count} table(s) with a storage engine outside the local-data allow-list, not sampled.",
     "engines": [
       "mysql",
       "mariadb"
+    ]
+  },
+  "coverage.reader_process_failed": {
+    "description": "{count} SQLite reader process failure(s) in the last scan (killed by a signal, out of its limits, or broken off on an invalid message): each cost one unit of work; after 3 the scan stopped for this target. The agent process is not affected.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.reader_sandbox_unavailable": {
+    "description": "The sandboxed SQLite reader process cannot run on this host (no Landlock in the kernel, or a sandbox step failed): the agent opens no SQLite file without it.",
+    "engines": [
+      "sqlite"
     ]
   },
   "coverage.registry_files_skipped": {
@@ -435,6 +475,12 @@
       "sqlserver"
     ]
   },
+  "coverage.rollback_mode_not_read": {
+    "description": "The SQLite database is in rollback-journal mode, where every read delays the application's commits: it is not read unless sqlite.rollback_mode is read in agent.yaml for this target (counted in skipped_unsupported).",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.schemas_without_usage": {
     "description": "{count} schema(s) without USAGE for the agent's role, not covered.",
     "engines": [
@@ -447,13 +493,32 @@
       "mongodb"
     ]
   },
+  "coverage.unrecognized_file_format": {
+    "description": "The declared SQLite file is not a database file the agent reads: its header is not a SQLite 3 header within the supported file format range (an encrypted, compressed or other file), the file is not a database, or its schema cannot be loaded (syntax newer than the bundled SQLite, a schema entry above the length limits, corruption). Nothing was sampled.",
+    "engines": [
+      "sqlite"
+    ]
+  },
   "coverage.views_not_sampled": {
     "description": "{count} view(s) not sampled (their base tables or collections are).",
     "engines": [
       "mysql",
       "mariadb",
       "mongodb",
-      "sqlserver"
+      "sqlserver",
+      "sqlite"
+    ]
+  },
+  "coverage.virtual_tables_not_sampled": {
+    "description": "{count} virtual table(s) not sampled: reading them would run a module's code. Their shadow tables, which hold the indexed content, are ordinary tables and are sampled.",
+    "engines": [
+      "sqlite"
+    ]
+  },
+  "coverage.wal_files_not_readable": {
+    "description": "The SQLite database is in WAL mode and its -wal and -shm files are missing (no application holds the file open), only one exists, one is unreadable, the -wal is above 128 MiB, or the WAL index cannot be read without writing: the file is not read; it is read again while the application holds it open.",
+    "engines": [
+      "sqlite"
     ]
   },
   "privilege.accesslog_without_audit": {
@@ -500,6 +565,12 @@
     "engines": [
       "openldap",
       "cas"
+    ]
+  },
+  "privilege.database_file_writable": {
+    "description": "The SQLite file, one of its -wal, -shm or -journal files, or a directory on its path is writable by the agent's account: the agent must only read, so the file is refused until the agent's write access is removed.",
+    "engines": [
+      "sqlite"
     ]
   },
   "privilege.database_roles": {
@@ -713,6 +784,12 @@
     "engines": [
       "redis",
       "valkey"
+    ]
+  },
+  "security.file_world_readable": {
+    "description": "The SQLite database file is readable by every local user: every account of the host can read its data. Restrict it to the application and the agent's group.",
+    "engines": [
+      "sqlite"
     ]
   },
   "security.init_connect": {

@@ -198,7 +198,7 @@
       ]
     },
     "Engine": {
-      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,\nADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`\nand `engine.valkey`.\n",
+      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,\nADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`\nand `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.\nA `sqlite` target is Discovery only: it has no server and no access log, so its\n`TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or\n`edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059\ndecision 7).\n",
       "type": "string",
       "enum": [
         "postgres",
@@ -209,11 +209,12 @@
         "cas",
         "sqlserver",
         "redis",
-        "valkey"
+        "valkey",
+        "sqlite"
       ]
     },
     "Connector": {
-      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and\nValkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`\nonly when it listed `engine.sqlserver`, and `redis` only when it listed **both**\n`engine.redis` and `engine.valkey` (see `Engine`).\n",
+      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and\nValkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`\nonly when it listed `engine.sqlserver`, `redis` only when it listed **both**\n`engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`\n(ADR-0059 decision 8; see `Engine`).\n",
       "type": "string",
       "enum": [
         "postgres",
@@ -222,7 +223,8 @@
         "openldap",
         "cas",
         "sqlserver",
-        "redis"
+        "redis",
+        "sqlite"
       ]
     },
     "ConnectorList": {
@@ -235,7 +237,7 @@
       }
     },
     "AuditLevel": {
-      "description": "Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:\ne.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community\n`limited` (or `partial` with profiler level 2), a target with audit disabled `none`.\n",
+      "description": "Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:\ne.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community\n`limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a\nSQLite target is always `none` (no access log exists, ADR-0059 decision 7).\n",
       "type": "string",
       "enum": [
         "full",
@@ -245,7 +247,7 @@
       ]
     },
     "AuditSource": {
-      "description": "Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only\nunder their engine's token (see `Engine`):\n- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;\n- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through\n  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's\n  `event_file` target), `sqlserver_query_stats` (plan cache statistics,\n  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;\n- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),\n  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`\n  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)\n  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when\n  **both** `engine.redis` and `engine.valkey` are listed.\n\nThe engines each source serves (a source is reported only for a target of one of them;\nsee \"Heartbeat target checks\" and, for access events, \"Target engine\" under `POST /events`):\n- `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;\n- `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;\n- `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;\n- `openldap_accesslog` -> `openldap`;\n- `cas_audit_log` -> `cas`;\n- `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;\n- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.\n",
+      "description": "Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only\nunder their engine's token (see `Engine`):\n- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;\n- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through\n  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's\n  `event_file` target), `sqlserver_query_stats` (plan cache statistics,\n  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;\n- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),\n  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`\n  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)\n  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when\n  **both** `engine.redis` and `engine.valkey` are listed.\n\nThe engines each source serves (a source is reported only for a target of one of them;\nsee \"Heartbeat target checks\" and, for access events, \"Target engine\" under `POST /events`):\n- `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;\n- `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;\n- `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;\n- `openldap_accesslog` -> `openldap`;\n- `cas_audit_log` -> `cas`;\n- `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;\n- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.\nNo value serves `sqlite` (Discovery only, ADR-0059 decision 7).\n",
       "type": "string",
       "enum": [
         "pgaudit",
@@ -572,7 +574,7 @@
           "$ref": "#/$defs/Edition"
         },
         "server_version": {
-          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL\nServer's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`\nor Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does\nnot match this pattern.\n",
+          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL\nServer's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`\nor Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does\nnot match this pattern. Never sent for a `sqlite` target, which has no server (the\nSQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).\n",
           "type": "string",
           "maxLength": 32,
           "pattern": "^[0-9A-Za-z._+-]+$"
@@ -607,28 +609,55 @@
           "$ref": "#/$defs/MetricsMap"
         }
       },
-      "if": {
-        "required": [
-          "name_case"
-        ],
-        "properties": {
-          "name_case": {
-            "$ref": "#/$defs/TargetNameCase"
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "name_case"
+            ],
+            "properties": {
+              "name_case": {
+                "$ref": "#/$defs/TargetNameCase"
+              }
+            }
+          },
+          "then": {
+            "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).\n",
+            "properties": {
+              "engine": {
+                "enum": [
+                  "mysql",
+                  "mariadb",
+                  "sqlserver"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "sqlite"
+              }
+            }
+          },
+          "then": {
+            "description": "A `sqlite` target (ADR-0059 decision 7) is Discovery only: `audit_level` is `none`,\nand it has no `audit_source` (no access log), no `server_version` and no `edition`\n(no server).\n",
+            "properties": {
+              "audit_level": {
+                "const": "none"
+              },
+              "audit_source": false,
+              "server_version": false,
+              "edition": false
+            }
           }
         }
-      },
-      "then": {
-        "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).\n",
-        "properties": {
-          "engine": {
-            "enum": [
-              "mysql",
-              "mariadb",
-              "sqlserver"
-            ]
-          }
-        }
-      }
+      ]
     },
     "NameCase": {
       "description": "How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;\n`insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it\nas `sensitive`, the stricter rule). A closed value: never a collation name, a setting value\nor free text.\n",
@@ -917,7 +946,7 @@
       ]
     },
     "DetectedTarget": {
-      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\n",
+      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\nNever `sqlite` (checked by this schema): SQLite targets are declared files only, with no\nlocal detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -950,6 +979,22 @@
             "redis-server",
             "valkey-server"
           ]
+        }
+      },
+      "if": {
+        "required": [
+          "engine"
+        ],
+        "properties": {
+          "engine": {
+            "const": "sqlite"
+          }
+        }
+      },
+      "then": {
+        "description": "No detected target of the `sqlite` engine (ADR-0059 decision 2).",
+        "properties": {
+          "engine": false
         }
       }
     },
@@ -1019,7 +1064,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`, `engine.sqlite`…; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }
@@ -1596,7 +1641,7 @@
       }
     },
     "Location": {
-      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\nSQL Server (ADR-0051 decision 5): database, schema, table, column.\nRedis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type\n(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern\n(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and\nsorted-set members, the normalized field name for hash fields and stream entry fields, or\n`#key` / `#field` for values found in key names / hash field names.\n\n`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on\nevery other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or\n`/` is still rejected).\n",
+      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\nSQL Server (ADR-0051 decision 5): database, schema, table, column.\nRedis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type\n(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern\n(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and\nsorted-set members, the normalized field name for hash fields and stream entry fields, or\n`#key` / `#field` for values found in key names / hash field names.\nSQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the file's\ndatabase, the same on every SQLite target: the `target_id` tells files apart; checked by\nthis schema), no `schema`, `object` = the table name, `field` = the column name. Never\nthe file's path, its name or a side file's name.\n\n`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on\nevery other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or\n`/` is still rejected).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1632,33 +1677,58 @@
           }
         }
       },
-      "if": {
-        "required": [
-          "engine"
-        ],
-        "properties": {
-          "engine": {
-            "enum": [
-              "redis",
-              "valkey"
-            ]
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "enum": [
+                  "redis",
+                  "valkey"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "object": {
+                "$ref": "#/$defs/KeyPattern"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "object": {
+                "$ref": "#/$defs/Identifier"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "sqlite"
+              }
+            }
+          },
+          "then": {
+            "description": "SQLite (ADR-0059 decision 6): `database` is always `main` and there is no `schema`,\nso a file path or file name cannot be sent as a location part.\n",
+            "properties": {
+              "database": {
+                "const": "main"
+              },
+              "schema": false
+            }
           }
         }
-      },
-      "then": {
-        "properties": {
-          "object": {
-            "$ref": "#/$defs/KeyPattern"
-          }
-        }
-      },
-      "else": {
-        "properties": {
-          "object": {
-            "$ref": "#/$defs/Identifier"
-          }
-        }
-      }
+      ]
     },
     "LocationPart": {
       "description": "A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.\n",
