@@ -146,6 +146,7 @@ fn target_family(engine: TargetEngine) -> u8 {
         TargetEngine::Cas => 4,
         TargetEngine::Sqlserver => 5,
         TargetEngine::Redis | TargetEngine::Valkey => 6,
+        TargetEngine::Sqlite => 7,
     }
 }
 
@@ -168,6 +169,8 @@ fn default_port(engine: TargetEngine) -> u16 {
         TargetEngine::Cas => 0,
         TargetEngine::Redis | TargetEngine::Valkey => crate::config::redis::DEFAULT_PORT,
         TargetEngine::Sqlserver => crate::config::sqlserver::DEFAULT_PORT,
+        // Never detected (declared files only; ADR-0059 decision 2).
+        TargetEngine::Sqlite => 0,
     }
 }
 

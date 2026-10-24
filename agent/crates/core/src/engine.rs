@@ -21,6 +21,8 @@ pub enum Engine {
     Redis,
     /// Microsoft SQL Server (ADR-0051).
     Sqlserver,
+    /// SQLite database files (declared local files only, ADR-0059).
+    Sqlite,
 }
 
 impl Engine {
@@ -35,6 +37,7 @@ impl Engine {
             Self::Cas => "cas",
             Self::Redis => "redis",
             Self::Sqlserver => "sqlserver",
+            Self::Sqlite => "sqlite",
         }
     }
 }

@@ -342,8 +342,41 @@ fn fix_location_object(name: &mut ObjectName, engine: Engine) -> bool {
     }
 }
 
+/// The SQLite location rule of the contract (ADR-0059 decision 6, the
+/// `Location` `if` / `then` on `engine: sqlite`, P10-C review R1): a
+/// `sqlite` location names the database `main` and no schema, so a file
+/// path or file name can never be sent as a location part. Enforced in the
+/// core, whatever the connector built: before spooling
+/// ([`check_finding`], the item dropped and counted) and before sending (a
+/// spooled batch breaking it is not sent, `ResultBatch::parse`).
+pub(crate) fn sqlite_location_ok(l: &databastion_protocol::Location) -> bool {
+    l.engine != Engine::Sqlite || (l.database.as_str() == SQLITE_DATABASE && l.schema.is_none())
+}
+
+/// The one `Location.database` of a `sqlite` target (ADR-0059 decision 6).
+pub(crate) const SQLITE_DATABASE: &str = "main";
+
+/// The SQLite target status rule of the contract (ADR-0059 decision 7, the
+/// `TargetStatus` `if` / `then` on `engine: sqlite`, P10-C review R1),
+/// applied to every heartbeat target status before it is sent: a `sqlite`
+/// target is Discovery only, so `audit_level` is `none` and it has no
+/// `audit_source`, `server_version`, `edition` or `name_case`, whatever the
+/// connector reported.
+pub(crate) fn enforce_sqlite_target_status(t: &mut databastion_protocol::TargetStatus) {
+    if t.engine == Engine::Sqlite {
+        t.audit_level = databastion_protocol::AuditLevel::None;
+        t.audit_source = None;
+        t.server_version = None;
+        t.edition = None;
+        t.name_case = None;
+    }
+}
+
 /// Validates and sanitizes a finding in place. `false`: drop it.
 pub(crate) fn check_finding(f: &mut Finding) -> bool {
+    if !sqlite_location_ok(&f.location) {
+        return false;
+    }
     let l = &mut f.location;
     let names_ok = fix_identifier(&mut l.database)
         && fix_location_object(&mut l.object, l.engine)
@@ -354,8 +387,11 @@ pub(crate) fn check_finding(f: &mut Finding) -> bool {
     }
     // ADR-0056: after the names above were fixed (a name turned into `*`
     // is not altered).
-    let database = l.database.as_str() != "*";
-    let schema = l.schema.as_ref().is_some_and(|s| s.as_str() != "*");
+    // A `sqlite` location's database is the constant `main` and it has no
+    // schema: neither is ever marked altered (ADR-0059 decision 6).
+    let sqlite = l.engine == Engine::Sqlite;
+    let database = l.database.as_str() != "*" && !sqlite;
+    let schema = l.schema.as_ref().is_some_and(|s| s.as_str() != "*") && !sqlite;
     let object = !is_wildcard_name(&l.object);
     let field = l.field.as_str() != "*";
     canonical_parts(&mut l.altered, |p| match p {

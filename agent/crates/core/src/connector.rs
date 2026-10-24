@@ -30,6 +30,21 @@ pub fn tls_stage_failure(code: FailureCode) -> FailureCode {
     }
 }
 
+/// SQLite reader processes that died (a signal, an exit, an IPC violation)
+/// or were killed at their deadline (ADR-0059 decision 4): heartbeat metric
+/// `sqlite_reader_failures_total`.
+static SQLITE_READER_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts one SQLite reader failure (see [`SQLITE_READER_FAILURES`]).
+pub fn count_sqlite_reader_failure() {
+    SQLITE_READER_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`count_sqlite_reader_failure`].
+pub(crate) fn sqlite_reader_failures() -> u64 {
+    SQLITE_READER_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Errors returned by connectors.
 ///
 /// Messages must never contain a sampled value or a credential.

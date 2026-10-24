@@ -29,7 +29,7 @@ use crate::config::TargetEngine;
 pub const CENSUS_MESSAGE: &str = "audit event census";
 
 /// Every target engine, in the order of the counters.
-const ENGINES: [TargetEngine; 9] = [
+const ENGINES: [TargetEngine; 10] = [
     TargetEngine::Postgres,
     TargetEngine::Mysql,
     TargetEngine::Mariadb,
@@ -39,6 +39,7 @@ const ENGINES: [TargetEngine; 9] = [
     TargetEngine::Redis,
     TargetEngine::Valkey,
     TargetEngine::Sqlserver,
+    TargetEngine::Sqlite,
 ];
 
 const fn index(engine: TargetEngine) -> usize {
@@ -52,6 +53,7 @@ const fn index(engine: TargetEngine) -> usize {
         TargetEngine::Redis => 6,
         TargetEngine::Valkey => 7,
         TargetEngine::Sqlserver => 8,
+        TargetEngine::Sqlite => 9,
     }
 }
 
@@ -66,6 +68,7 @@ const fn name(engine: TargetEngine) -> &'static str {
         TargetEngine::Redis => "redis",
         TargetEngine::Valkey => "valkey",
         TargetEngine::Sqlserver => "sqlserver",
+        TargetEngine::Sqlite => "sqlite",
     }
 }
 
@@ -116,7 +119,8 @@ impl Counts {
     }
 }
 
-static COUNTS: [Counts; 9] = [
+static COUNTS: [Counts; 10] = [
+    Counts::new(),
     Counts::new(),
     Counts::new(),
     Counts::new(),
@@ -129,7 +133,7 @@ static COUNTS: [Counts; 9] = [
 ];
 
 /// Snapshots last written, per engine.
-static LOGGED: Mutex<[[u64; 7]; 9]> = Mutex::new([[0; 7]; 9]);
+static LOGGED: Mutex<[[u64; 7]; 10]> = Mutex::new([[0; 7]; 10]);
 
 /// The kind of a spooled event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

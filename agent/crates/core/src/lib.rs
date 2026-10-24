@@ -67,6 +67,8 @@ mod spool;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod uplink;
+#[cfg(test)]
+mod sqlite_contract_tests;
 
 pub use config::AgentConfig;
 pub use connector::{Connector, ConnectorError};
