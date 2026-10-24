@@ -1,6 +1,6 @@
 # ADR-0059: SQLite connector: the bundled SQLite C library through `rusqlite` as a scoped exception, run in a sandboxed reader process, declared files only, read-only access that never writes a side file, hardened against hostile files, Discovery only
 
-- **Status**: Proposed
+- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question (process isolation of the reader from the first implementation; rollback-mode files only with the local opt-in), revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes)
 - **Date**: 2026-10-24
 - **Revised**: 2026-10-24, after the P10-F security review of the first draft (461856c, verdict "sound after changes"): H1, M1 to M5, L1 to L8, N2 and N3 folded in; see [Security review of 2026-10-24](#security-review-of-2026-10-24).
 - **Relies on**: [ADR-0039](0039-engine-scope-expansion.md) decision 1 (accepted: end-of-life versions not supported) and decision 8 (accepted: new engines as capability tokens, with [ADR-0042](0042-hold-items-of-unlisted-engines.md)). It applies, and **proposes for acceptance for SQLite only**, ADR-0039 decisions 3 (ceilings, SQLite row), 4 (client criteria, with the SQLite exception and an exception to "spawns no process"), 5 (least privilege, SQLite item), 7 (I5, SQLite part) and 9 (test obligations). Where this ADR differs from ADR-0039's text (the reader process, symlinks, the parent-directory rule, the lowered limits, `ConnectorList.maxItems`), it says so and why.
