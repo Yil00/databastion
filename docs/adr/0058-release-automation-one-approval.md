@@ -496,56 +496,89 @@ human step of a final release; the draft is still published by hand.
 **Residual risk H1, accepted.** While agents act as the administrator, they can already push a
 final-version tag on a commit whose `publish.yml` has no environment and no checks, and get
 artifacts signed with the exact identity (Context; decision 3.4): the `release` approvals never
-stopped them. Removing those approvals adds nothing to that power. What it removes is the pause on
-the honest path for final tags: once `release-it` is approved, the signed artifacts follow with no
-other human step, and a mistake that the old prompts could have caught is caught only by the
-checks below. Decision 1.3 holds: until decision 6.1 is met, this design gives no protection
-against agents.
+stopped them. For an administrator, removing those approvals adds nothing to that power. What it
+removes is the pause on the honest path for final tags: once `release-it` is approved, the signed
+artifacts follow with no other human step, and a mistake that the old prompts could have caught is
+caught only by the checks below. Decision 1.3 holds: until decision 6.1 is met, this design gives
+no protection against agents.
+
+For a collaborator with *Write* only, the approvals were a real control on **re-runs**: *Write* is
+enough to re-run a run for 30 days, and every check of `prepare` is about past facts, so it would
+pass again; a re-run of an old final publish run would build new digests, sign `:X.Y.Z` again and
+move `:X.Y` and `:latest` back to an older version (review of this implementation, H1). Re-runs of
+final versions therefore keep the approval (item 4 below), and a version that is published or below
+another final tag is refused (item 2).
 
 **What is implemented** ([publish.yml](../../.github/workflows/publish.yml),
-[check-final-release.sh](../../.github/scripts/check-final-release.sh)):
+[check-final-release.sh](../../.github/scripts/check-final-release.sh), its fixture tests
+[test_check_final_release.sh](../../.github/scripts/test_check_final_release.sh), run by the
+Documentation job of `ci.yml`):
 1. `build`, `manifest` and `release-assets` no longer declare `environment: release`.
-2. **Final versions** (decision 3.2, without the release record of decision 2.10). Before anything
-   is built or signed, `prepare` (`timeout-minutes: 30`, checkout with `fetch-depth: 0`) checks,
-   for a tag `V` on the commit `T` of the run, and fails with an `::error::` on the first failure:
-   - through the API, `refs/tags/V` is an annotated tag object whose message is `DataBastion V`
-     (`.release-it.json`, `tagAnnotation`) and whose target is `T`;
-   - `T` is an ancestor of `origin/main`;
-   - `T`'s subject is exactly `chore(release): V` (`commitMessage`), its author and committer
-     e-mail are the release identity of `release.yml` (`vars.RELEASE_GIT_EMAIL`, or the owner's
-     noreply address), and it carries a `Signed-off-by` trailer (`commitArgs: -s`);
-   - `T` has exactly one parent `P`, and `P` has two parents;
-   - `git diff --no-renames --name-status P T` lists only modifications (`M`) of the files that
-     `scripts/changelog-release.mjs changelog` and `scripts/bump-version.mjs` can change:
-     `CHANGELOG.md`, `package.json`, `package-lock.json`, `console/package.json`,
-     `agent/Cargo.toml`, `agent/Cargo.lock`, `agent/fuzz/Cargo.lock` and
-     `helm/databastion/Chart.yaml`, with `CHANGELOG.md` and `package.json` among them;
-   - **`T`'s tree is recomputed** (L4): `P` is checked out in a scratch worktree, the agent
+2. **Not published, not superseded** (review H1, L6). For a final version `V`, `prepare` fails when
+   a published release of `V` exists (a draft, or a release the token cannot see, counts as absent)
+   or when any final tag `X.Y.Z` above `V` exists. `manifest` runs the same check again right before
+   `cosign sign` and right before moving `X.Y` / `latest`. Failing closed was chosen over moving the
+   floating tags only for the highest version: `publish.yml` does not support a release on an
+   older line, which is acceptable before 1.0 (`release/X.Y` branches start at 1.0, RELEASE.md
+   § 1); a hotfix on an older line then needs a change of this rule.
+3. **Final versions** (decision 3.2, without the release record of decision 2.10). Before anything
+   is built or signed, for a tag `V` on the commit `T` of the run, the first failure printing an
+   `::error::` and stopping the run:
+   - in `prepare` (`timeout-minutes: 30`, checkout with `fetch-depth: 0`):
+     - through the API, `refs/tags/V` is an annotated tag object whose message is `DataBastion V`
+       (`.release-it.json`, `tagAnnotation`) and whose target is `T`;
+     - `T` is an ancestor of `origin/main`;
+     - `T`'s subject is exactly `chore(release): V` (`commitMessage`), its author and committer
+       e-mail are the release identity of `release.yml` (`vars.RELEASE_GIT_EMAIL`, or the owner's
+       noreply address), and it carries a `Signed-off-by` trailer (`commitArgs: -s`);
+     - `T` has exactly one parent `P`, and `P` has two parents;
+     - `git diff --no-renames --name-status P T` lists only modifications (`M`) of the files that
+       `scripts/changelog-release.mjs changelog` and `scripts/bump-version.mjs` can change:
+       `CHANGELOG.md`, `package.json`, `package-lock.json`, `console/package.json`,
+       `agent/Cargo.toml`, `agent/Cargo.lock`, `agent/fuzz/Cargo.lock` and
+       `helm/databastion/Chart.yaml`, with `CHANGELOG.md` and `package.json` among them;
+     - exactly one run with `path == .github/workflows/release.yml`, `event == push`,
+       `head_branch == main` and `head_sha == P` exists; its `release-it` job concluded `success`;
+       its approvals (`GET /actions/runs/{id}/approvals`) include one `approved` for the
+       `release-it` environment; and `T`'s committer time lies between that job's `started_at`
+       and `completed_at`, with 2 minutes of slack (review L2). `prepare` polls every 20 s for up
+       to 20 minutes, the `timeout-minutes` of that job, for it to complete, since release-it
+       pushes the tag before it creates the draft, and **fails** if it has not (review L1);
+   - in a separate job `release-tree` (`permissions: {}`, checkout with `fetch-depth: 0` and
+     `persist-credentials: false`, Node 24 and Rust 1.88.0; review L3), **`T`'s tree is
+     recomputed** (L4 of the ADR review): `P` is checked out in a scratch worktree, the agent
      dependencies are fetched (`cargo fetch --locked`), the two `after:bump` hooks run in their
-     order with Node 24 and Rust 1.88.0 (the pin of `release.yml`; the two pins must change
-     together, or final publishes fail), every tracked change is staged as release-it does, and
-     the tree must equal `T`'s. The changelog heading carries the date the hook ran: the UTC dates
-     of `T`'s committer time and of 10 minutes earlier are tried;
-   - exactly one run with `path == .github/workflows/release.yml`, `event == push`,
-     `head_branch == main` and `head_sha == P` exists; its approvals
-     (`GET /actions/runs/{id}/approvals`, readable with `actions: read`) include one `approved`
-     for the `release-it` environment; its `release-it` job concluded `success`. `prepare` polls
-     every 20 s for up to 20 minutes for that job to complete, since release-it pushes the tag
-     before it creates the draft. A job still `in_progress` at the deadline is accepted with a
-     `::warning::`: a job of the `release-it` environment starts only after its approval, which
-     is checked. Any other state fails.
-3. **Pre-release tags** skip these checks and go through one gate job, `prerelease-approval`
-   (decision 3.3), `permissions: {}`, one `echo` step. Exact conditions (L5): `prepare` sets
-   `prerelease` to exactly `true` or `false` and fails otherwise; the gate runs
-   `if: needs.prepare.outputs.prerelease != 'false'`; `build` runs only when
-   `needs.prepare.result == 'success'` and either `prerelease == 'false'` with the gate `skipped`,
-   or `prerelease == 'true'` with the gate `success`. `manifest`, `deb`, `release-assets` and
-   `install-test` state each result they need with `needs.<job>.result == 'success'` and
-   `!cancelled()`, instead of `!failure()` or the implicit `success()`, so that the skipped gate
-   does not skip them; `deb` may be `skipped` for `release-assets` only when no agent image is
-   built.
-4. The settings guard is unchanged: `check-release-settings.sh environment release tag` still
-   requires the reviewers, which now apply to the pre-release gate only.
+     order, every tracked change is staged as release-it does, and the tree must equal `T`'s. The
+     Rust pin is the one of `release.yml`; the two must change together, or final publishes fail.
+     The changelog heading carries the date the hook ran: the UTC dates of `T`'s committer time and
+     of 10 minutes earlier are tried. It runs the hooks of the tagged code, hence no token
+     permission. It runs only for final versions, and is `skipped` for pre-release tags.
+4. **One approval gate**, `prerelease-approval` (decision 3.3), in the existing `release`
+   environment, `permissions: {}`, one `echo` step. It runs
+   `if: needs.prepare.outputs.prerelease != 'false' || github.run_attempt != '1'`: for pre-release
+   tags, and for **every re-run of a final version** (review H1). Exact conditions (L5):
+   - `prepare` sets `prerelease` to exactly `true` or `false` and fails otherwise;
+   - `build` runs only when `needs.prepare.result == 'success'` and either a final version with
+     `release-tree` `success` and the gate `skipped` on attempt 1 or `success` on a later attempt,
+     or a pre-release with `release-tree` `skipped` and the gate `success`;
+   - `manifest` and `release-assets`, the other jobs that sign, also require
+     `github.run_attempt == '1'` or the gate `success`: *Re-run failed jobs* keeps the results of
+     the jobs it does not re-run, so a re-run of `manifest` alone would otherwise follow the
+     first attempt's skipped gate;
+   - `manifest`, `deb`, `release-assets` and `install-test` state each result they need with
+     `needs.<job>.result == 'success'` and `!cancelled()`, instead of `!failure()` or the
+     implicit `success()`, so that a skipped job upstream does not skip them; `deb` may be
+     `skipped` for `release-assets` only when no agent image is built.
+
+   `github.run_attempt` starts at 1 and increments with every re-run of the run, whichever jobs
+   are re-run. *Re-run failed jobs* re-runs the failed jobs and the jobs that depend on them; the
+   gate depends only on `prepare`, so it is not re-run, and its first-attempt result, `skipped`,
+   is kept. The jobs re-run then require the gate `success` and are skipped: nothing is signed,
+   and the maintainer uses *Re-run all jobs*, which runs `prepare`'s checks again and asks for the
+   approval. Should GitHub evaluate the gate again instead, it asks for the approval. Both
+   outcomes fail closed; which one GitHub takes is not verified in a run.
+5. The settings guard is unchanged: `check-release-settings.sh environment release tag` still
+   requires the reviewers, which now apply to the gate only.
 
 **Deviations from the accepted text.**
 - The gate uses the existing `release` environment, not a new `release-prerelease`: it keeps its
@@ -554,13 +587,25 @@ against agents.
   3.1 wanted to keep. They still run only in a tag-push run (the trigger, and the check of
   `prepare`), and `build` runs only after `prepare` passed; an edited `publish.yml` could drop
   either, as it could drop the `environment:` lines before.
-- A `release-it` job still running after 20 minutes is accepted (decision 3.2 requires a completed
-  run with `success`).
+- The gate also covers re-runs of final versions (item 4), which the accepted text does not
+  mention.
 - `P` is checked to be a merge commit, not to be the `merge_commit_sha` of a merged pull request
   into `main` (that needs `pull-requests: read`, and comes with decision 2).
-- An administrator bypass of the `release-it` approval is expected to leave no `approved` record,
-  so a release made that way fails the final-version checks (fail closed; not tested). Approve,
-  do not bypass.
+- A *Re-run failed jobs* of a **pre-release** run keeps the gate's first-attempt `success`, so the
+  jobs it re-runs need no new approval. As before this change, where the approval of a job was
+  kept on a re-run of other jobs; the version is a pre-release, and `next` is the only floating
+  tag it moves.
+
+**Not verified in a run yet** (to watch at the first releases; RELEASE.md § 5, step 5): that
+`GET /actions/runs/{id}/approvals` is readable with `actions: read`; that an administrator bypass
+of the `release-it` approval leaves no `approved` record (then the check fails: approve, do not
+bypass); the gate's behaviour under *Re-run failed jobs* (item 4); and the checkout of
+`release-tree` with `permissions: {}` (it relies on the repository being public).
+
+**Concurrency** (review L5). Publish runs share `concurrency: publish` without cancelling a running
+run, but GitHub keeps one pending run per group: a third tag push cancels the pending run. Nothing
+of it is built or signed, but the cancellation is silent. It is re-run, and as a re-run it needs
+the approval.
 
 **Not implemented yet**: decision 2 (`release-criteria`, the release record and its checks in
 `prepare`, including the conclusions of `release-criteria` and `release-record`), the pre-release
@@ -573,12 +618,17 @@ administrator bypass removed).
 
 **Dry check against 0.9.0** (tag `0.9.0` on the release commit `3aa768e`, parent the merge commit
 `6b26b05`, release-it run 40035014723), on 2026-10-24, with `git` after fetching `main` and the tags
-and `gh api` for the run: every check passes. The tag is annotated with `DataBastion 0.9.0`; `T`
-is on `main`, signed off, under the owner's noreply address; `P..T` modifies `CHANGELOG.md`,
-`agent/Cargo.lock`, `agent/Cargo.toml`, `agent/fuzz/Cargo.lock`, `console/package.json`,
-`package-lock.json` and `package.json`; the tree recomputed with Rust 1.88.0 and the date
-2026-10-23 equals `T`'s (`a3c0e39`); run 40035014723 is the only `release.yml` push run on `P`,
-its `release-it` job concluded `success`, approved for `release-it` by the maintainer. The commit
-and run checks also pass for 0.8.0, 0.8.1 and 0.8.2 (runs 39048168229, 39874289734 and
-39940184838). This change touches release signing: a `security-reviewer` review before it is
+and `gh api` for the run. The tag is annotated with `DataBastion 0.9.0`; `T` is on `main`, signed
+off, under the owner's noreply address; `P..T` modifies `CHANGELOG.md`, `agent/Cargo.lock`,
+`agent/Cargo.toml`, `agent/fuzz/Cargo.lock`, `console/package.json`, `package-lock.json` and
+`package.json`; the tree recomputed with Rust 1.88.0 and the date 2026-10-23 equals `T`'s
+(`a3c0e39`); run 40035014723 is the only `release.yml` push run on `P`, its `release-it` job
+(22:56:14Z to 22:56:55Z on 2026-10-23) concluded `success`, approved for `release-it` by the
+maintainer, and `T` was committed at 22:56:47Z. The "not published, not superseded" check
+**refuses** 0.9.0 today, as it must for a re-run, since 0.9.0 is published; on the API data with
+the 0.9.0 release set back to a draft, as it was during its publish run, it passes (no published
+release of 0.9.0, no final tag above it). The commit and run checks, the job window included, also pass for
+0.8.0, 0.8.1 and 0.8.2 (runs 39048168229, 39874289734 and 39940184838); the "not published" check
+refuses all three today, and with 0.8.2 set back to a draft, the "superseded" check would still
+refuse it (0.9.0 is above it). This change touches release signing: a `security-reviewer` review before it is
 merged.
