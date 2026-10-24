@@ -1,6 +1,6 @@
 # ADR-0058: Release automation with one human approval
 
-- **Status**: Proposed, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24)
+- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24); hard gate of decision 6.1 not met: the maintainer keeps the current agent identity (decision of 2026-10-24), so rollout step 6 is not done and the `release` reviewers and the hand publication stay
   (sound after changes)
 - **Date**: 2026-10-24
 
