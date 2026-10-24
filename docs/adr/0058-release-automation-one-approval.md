@@ -1,7 +1,7 @@
 # ADR-0058: Release automation with one human approval
 
 - **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24); hard gate of decision 6.1 not met: the maintainer keeps the current agent identity (decision of 2026-10-24), so rollout step 6 is not done and the `release` reviewers and the hand publication stay
-  (sound after changes)
+  (sound after changes). Partly implemented on 2026-10-24 ahead of the hard gate, by maintainer decision: `publish.yml` asks no approval for final versions, which it checks instead, and keeps one approval for pre-release tags ([implementation note of 2026-10-24](#implementation-note-2026-10-24-publishyml-without-approvals-before-the-hard-gate))
 - **Date**: 2026-10-24
 
 ## Context
@@ -483,3 +483,163 @@ Each with a proposed answer, for the maintainer.
 10. **CI wait.** Proposed: the criteria job waits up to 140 minutes for the `push` run on `main`
     (the longest `ci.yml` run with every end-to-end job, plus a margin); to adjust after the first
     releases.
+
+## Implementation note (2026-10-24): publish.yml without approvals, before the hard gate
+**Maintainer decision of 2026-10-24**, explicit, given after the H1 risk of the
+[security review](#security-review-of-2026-10-24) was explained: remove the three approvals of the
+`release` environment in `publish.yml` for final releases now, with the current configuration. The
+agents keep using the maintainer's administrator account, so the hard gate of decision 6.1 is
+**not met**, and the maintainer accepts that residual risk. This departs from the order of the
+rollout (decision 7, step 6) for this one part. The `release-it` approval stays, and is the only
+human step of a final release; the draft is still published by hand.
+
+**Residual risk H1, accepted.** While agents act as the administrator, they can already push a
+final-version tag on a commit whose `publish.yml` has no environment and no checks, and get
+artifacts signed with the exact identity (Context; decision 3.4): the `release` approvals never
+stopped them. For an administrator, removing those approvals adds nothing to that power. What it
+removes is the pause on the honest path for final tags: once `release-it` is approved, the signed
+artifacts follow with no other human step, and a mistake that the old prompts could have caught is
+caught only by the checks below. Decision 1.3 holds: until decision 6.1 is met, this design gives
+no protection against agents.
+
+For a collaborator with *Write* only, the approvals were a real control on **re-runs**: *Write* is
+enough to re-run a run for 30 days, and every check of `prepare` is about past facts, so it would
+pass again; a re-run of an old final publish run would build new digests, sign `:X.Y.Z` again and
+move `:X.Y` and `:latest` back to an older version (review of this implementation, H1). Re-runs of
+final versions therefore keep the approval (item 4 below), and a version that is published or below
+another final tag is refused (item 2).
+
+**What is implemented** ([publish.yml](../../.github/workflows/publish.yml),
+[check-final-release.sh](../../.github/scripts/check-final-release.sh), its fixture tests
+[test_check_final_release.sh](../../.github/scripts/test_check_final_release.sh), run by the
+Documentation job of `ci.yml`):
+1. `build`, `manifest` and `release-assets` no longer declare `environment: release`.
+2. **Not published, not superseded** (review H1, L6). For a final version `V`, `prepare` fails when
+   a published release of `V` exists (a draft, or a release the token cannot see, counts as absent)
+   or when any final tag `X.Y.Z` above `V` exists. `manifest` runs the same check again right before
+   `cosign sign` and right before moving `X.Y` / `latest`. Failing closed was chosen over moving the
+   floating tags only for the highest version: `publish.yml` does not support a release on an
+   older line, which is acceptable before 1.0 (`release/X.Y` branches start at 1.0, RELEASE.md
+   § 1); a hotfix on an older line then needs a change of this rule.
+3. **Final versions** (decision 3.2, without the release record of decision 2.10). Before anything
+   is built or signed, for a tag `V` on the commit `T` of the run, the first failure printing an
+   `::error::` and stopping the run:
+   - in `prepare` (`timeout-minutes: 30`, checkout with `fetch-depth: 0`):
+     - through the API, `refs/tags/V` is an annotated tag object whose message is `DataBastion V`
+       (`.release-it.json`, `tagAnnotation`) and whose target is `T`;
+     - `T` is an ancestor of `origin/main`;
+     - `T`'s subject is exactly `chore(release): V` (`commitMessage`), its author and committer
+       e-mail are the release identity of `release.yml` (`vars.RELEASE_GIT_EMAIL`, or the owner's
+       noreply address), and it carries a `Signed-off-by` trailer (`commitArgs: -s`);
+     - `T` has exactly one parent `P`, and `P` has two parents;
+     - `git diff --no-renames --name-status P T` lists only modifications (`M`) of the files that
+       `scripts/changelog-release.mjs changelog` and `scripts/bump-version.mjs` can change:
+       `CHANGELOG.md`, `package.json`, `package-lock.json`, `console/package.json`,
+       `agent/Cargo.toml`, `agent/Cargo.lock`, `agent/fuzz/Cargo.lock` and
+       `helm/databastion/Chart.yaml`, with `CHANGELOG.md` and `package.json` among them;
+     - exactly one run with `path == .github/workflows/release.yml`, `event == push`,
+       `head_branch == main` and `head_sha == P` exists; its `release-it` job concluded `success`;
+       its approvals (`GET /actions/runs/{id}/approvals`) include one `approved` for the
+       `release-it` environment; and `T`'s committer time lies between that job's `started_at`
+       and `completed_at`, with 2 minutes of slack (review L2). `prepare` polls every 20 s for up
+       to 20 minutes, the `timeout-minutes` of that job, for it to complete, since release-it
+       pushes the tag before it creates the draft, and **fails** if it has not (review L1);
+   - in a separate job `release-tree` (`permissions: contents: read` only, checkout with
+     `fetch-depth: 0` and `persist-credentials: false`, Node 24 and Rust 1.88.0; review L3), **`T`'s tree is
+     recomputed** (L4 of the ADR review): `P` is checked out in a scratch worktree, the agent
+     dependencies are fetched (`cargo fetch --locked`), the two `after:bump` hooks run in their
+     order, every tracked change is staged as release-it does, and the tree must equal `T`'s. The
+     Rust pin is the one of `release.yml`; the two must change together, or final publishes fail.
+     The changelog heading carries the date the hook ran: the UTC dates of `T`'s committer time and
+     of 10 minutes earlier are tried. It runs the hooks of the tagged code, hence a token that
+     can only read the contents, which on a public repository anyone can read (re-review N2:
+     `contents: read` rather than `permissions: {}`, so that the checkout does not depend on an
+     unverified anonymous read). It runs only for final versions, and is `skipped` for
+     pre-release tags.
+4. **One approval gate**, `prerelease-approval` (decision 3.3), in the existing `release`
+   environment, `permissions: {}`, one `echo` step. It runs
+   `if: needs.prepare.outputs.prerelease != 'false' || github.run_attempt != '1'`: for pre-release
+   tags, and for **every re-run of a final version** (review H1). Exact conditions (L5):
+   - `prepare` sets `prerelease` to exactly `true` or `false` and fails otherwise;
+   - `build` runs only when `needs.prepare.result == 'success'` and either a final version with
+     `release-tree` `success` and the gate `skipped` on attempt 1 or `success` on a later attempt,
+     or a pre-release with `release-tree` `skipped` and the gate `success`;
+   - for pre-release tags, `prepare` and `manifest` (before signing and before moving `next`)
+     refuse a version below another version tag (see the deviations);
+   - `manifest` and `release-assets`, the other jobs that sign, also require
+     `github.run_attempt == '1'` or the gate `success`: *Re-run failed jobs* keeps the results of
+     the jobs it does not re-run, so a re-run of `manifest` alone would otherwise follow the
+     first attempt's skipped gate;
+   - `manifest`, `deb`, `release-assets` and `install-test` state each result they need with
+     `needs.<job>.result == 'success'` and `!cancelled()`, instead of `!failure()` or the
+     implicit `success()`, so that a skipped job upstream does not skip them; `deb` may be
+     `skipped` for `release-assets` only when no agent image is built.
+
+   `github.run_attempt` starts at 1 and increments with every re-run of the run, whichever jobs
+   are re-run. *Re-run failed jobs* re-runs the failed jobs and the jobs that depend on them; the
+   gate depends only on `prepare`, so it is not re-run, and its first-attempt result, `skipped`,
+   is kept. The jobs re-run then require the gate `success` and are skipped: nothing is signed,
+   and the maintainer uses *Re-run all jobs*, which runs `prepare`'s checks again and asks for the
+   approval. Should GitHub evaluate the gate again instead, it asks for the approval. Both
+   outcomes fail closed; which one GitHub takes is not verified in a run.
+5. The settings guard is unchanged: `check-release-settings.sh environment release tag` still
+   requires the reviewers, which now apply to the gate only.
+
+**Deviations from the accepted text.**
+- The gate uses the existing `release` environment, not a new `release-prerelease`: it keeps its
+  reviewers and its tag rule, so no settings change is needed. Since only the gate declares it,
+  the signing jobs are no longer under the environment's tag-only deployment rule, which decision
+  3.1 wanted to keep. They still run only in a tag-push run (the trigger, and the check of
+  `prepare`), and `build` runs only after `prepare` passed; an edited `publish.yml` could drop
+  either, as it could drop the `environment:` lines before.
+- The gate also covers re-runs of final versions (item 4), which the accepted text does not
+  mention.
+- `P` is checked to be a merge commit, not to be the `merge_commit_sha` of a merged pull request
+  into `main` (that needs `pull-requests: read`, and comes with decision 2).
+- A *Re-run failed jobs* of a **pre-release** run keeps the gate's first-attempt `success`, so the
+  jobs it re-runs need no new approval. Before this change, `manifest` and `release-assets` were
+  themselves in the `release` environment, so a re-run of them asked for an approval again: this
+  is a loss of control, found by the re-review (N1). It is bounded by a check instead: a
+  pre-release `V` is refused when any version tag, pre-release or final, is above `V` in SemVer
+  precedence (`X.Y.Z-rc.10` above `X.Y.Z-rc.9`, a final `X.Y.Z` above every `X.Y.Z-…`; a tag that
+  starts like a version but does not parse fails the check). `prepare` runs it, and `manifest`
+  runs it again right before `cosign sign` and right before moving `next`, so that a re-run of an
+  old pre-release run cannot sign again and move `next` back. A re-run of the **latest**
+  pre-release can still sign it again without a new approval: new digests for the same
+  pre-release tag, `next` unchanged in version.
+
+**Not verified in a run yet** (to watch at the first releases; RELEASE.md § 5, step 5): that
+`GET /actions/runs/{id}/approvals` is readable with `actions: read`; that an administrator bypass
+of the `release-it` approval leaves no `approved` record (then the check fails: approve, do not
+bypass); and the gate's behaviour under *Re-run failed jobs* (item 4).
+
+**Concurrency** (review L5). Publish runs share `concurrency: publish` without cancelling a running
+run, but GitHub keeps one pending run per group: a third tag push cancels the pending run. Nothing
+of it is built or signed, but the cancellation is silent. It is re-run, and as a re-run it needs
+the approval.
+
+**Not implemented yet**: decision 2 (`release-criteria`, the release record and its checks in
+`prepare`, including the conclusions of `release-criteria` and `release-record`), the pre-release
+checks of decision 3.3 (verified tag signature, ancestor of `origin/dev` or `origin/main`, version
+above the latest final tag), `release-assets` requiring the draft of the release record instead of
+creating one, decision 4 (automatic publication, `RELEASE_AUTO_PUBLISH`), decision 5 (the
+`no-reviewers` argument, the `release-prerelease` environment and its check), decision 6.1 and the
+rollout steps 1 to 6 (immutable releases, `CI result` pinned, Code Owners review, the
+administrator bypass removed).
+
+**Dry check against 0.9.0** (tag `0.9.0` on the release commit `3aa768e`, parent the merge commit
+`6b26b05`, release-it run 40035014723), on 2026-10-24, with `git` after fetching `main` and the tags
+and `gh api` for the run. The tag is annotated with `DataBastion 0.9.0`; `T` is on `main`, signed
+off, under the owner's noreply address; `P..T` modifies `CHANGELOG.md`, `agent/Cargo.lock`,
+`agent/Cargo.toml`, `agent/fuzz/Cargo.lock`, `console/package.json`, `package-lock.json` and
+`package.json`; the tree recomputed with Rust 1.88.0 and the date 2026-10-23 equals `T`'s
+(`a3c0e39`); run 40035014723 is the only `release.yml` push run on `P`, its `release-it` job
+(22:56:14Z to 22:56:55Z on 2026-10-23) concluded `success`, approved for `release-it` by the
+maintainer, and `T` was committed at 22:56:47Z. The "not published, not superseded" check
+**refuses** 0.9.0 today, as it must for a re-run, since 0.9.0 is published; on the API data with
+the 0.9.0 release set back to a draft, as it was during its publish run, it passes (no published
+release of 0.9.0, no final tag above it). The commit and run checks, the job window included, also pass for
+0.8.0, 0.8.1 and 0.8.2 (runs 39048168229, 39874289734 and 39940184838); the "not published" check
+refuses all three today, and with 0.8.2 set back to a draft, the "superseded" check would still
+refuse it (0.9.0 is above it). This change touches release signing: a `security-reviewer` review before it is
+merged.

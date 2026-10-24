@@ -134,6 +134,9 @@ jobs:
       # Release settings guard of release.yml / publish.yml (ADR-0034) on fixture rulesets.
       - name: Release settings check (fixtures)
         run: timeout 60 .github/scripts/test_check_release_settings.sh
+      # Final-version checks of publish.yml (ADR-0058, implementation note of 2026-10-24) on fixtures.
+      - name: Final release checks (fixtures)
+        run: timeout 60 .github/scripts/test_check_final_release.sh
 
   secrets:
     name: Secret scanning (gitleaks)
