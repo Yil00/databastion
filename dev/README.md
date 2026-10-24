@@ -93,7 +93,7 @@ Without local clients, use `docker compose -f dev/docker-compose.yml exec <servi
 `make dev` creates `dev/.state/logs/{postgres,mariadb,mongodb,percona}` world-writable (the engines run as non-root users with other UIDs). Run `make dev-dirs dev-metrics-token` first if you call `docker compose` directly.
 
 ### Other engine versions
-The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environment variables (unset or empty: the pinned defaults above). Pin every image by tag **and** index digest, as the repository does; the [engine-matrix workflow](../.github/workflows/engine-matrix.yml) lists the pinned versions it tests (PostgreSQL 13 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8, MongoDB 6.0 / 7.0 / 8.0).
+The PostgreSQL, MySQL, MariaDB and MongoDB images can be overridden with environment variables (unset or empty: the pinned defaults above). Pin every image by tag **and** index digest, as the repository does; the [engine-matrix workflow](../.github/workflows/engine-matrix.yml) lists the pinned versions it tests (PostgreSQL 14 to 18, MySQL 8.0 / 8.4 / 9.7, MariaDB 10.11 / 11.4 / 11.8, MongoDB 6.0 / 7.0 / 8.0).
 
 | Variable | Service | Meaning |
 |----------|---------|---------|

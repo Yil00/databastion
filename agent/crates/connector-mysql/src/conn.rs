@@ -50,9 +50,20 @@ pub(crate) const STALE_AFTER: Duration = Duration::from_secs(45);
 /// Most rows / bytes collected by [`Session::query`] (catalog reads).
 const MAX_QUERY_ROWS: usize = 200_000;
 const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
-/// Oldest supported servers.
+/// Oldest supported servers (ADR-0039 decision 1: end-of-life versions
+/// are refused; MariaDB 10.6 reached its end of life in July 2026).
 const MIN_MYSQL: (u32, u32, u32) = (8, 0, 0);
-const MIN_MARIADB: (u32, u32, u32) = (10, 6, 0);
+const MIN_MARIADB: (u32, u32, u32) = (10, 11, 0);
+
+/// Whether a server of `flavor` at `version` (from the handshake) is
+/// supported; an older one is refused at connection time (`unsupported`).
+pub(crate) fn supported_version(flavor: Flavor, version: (u32, u32, u32)) -> bool {
+    let minimum = match flavor {
+        Flavor::Mysql => MIN_MYSQL,
+        Flavor::Mariadb => MIN_MARIADB,
+    };
+    version >= minimum
+}
 
 /// Server family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,15 +390,11 @@ impl Session {
         }
         let (flavor, version) = parse_version(&handshake.server_version)
             .ok_or(MyError::new(FailureCode::Unsupported, Stage::Connect))?;
-        let minimum = match flavor {
-            Flavor::Mysql => MIN_MYSQL,
-            Flavor::Mariadb => MIN_MARIADB,
-        };
-        if version < minimum {
+        if !supported_version(flavor, version) {
             tracing::warn!(
                 target_id = %target.id,
                 flavor = flavor.as_str(),
-                "server version not supported (MySQL 8.0+ or MariaDB 10.6+)"
+                "server version not supported (MySQL 8.0+ or MariaDB 10.11+)"
             );
             return Err(MyError::new(FailureCode::Unsupported, Stage::Connect));
         }
@@ -991,5 +998,41 @@ mod tests {
         assert!(!same_series(Flavor::Mariadb, (11, 4, 13), "11.8.9-MariaDB"));
         assert!(!same_series(Flavor::Mysql, (8, 4, 11), ""));
         assert!(parse_version("5.7.44").unwrap().1 < MIN_MYSQL);
+    }
+
+    /// ADR-0039 decision 1: MySQL 8.0+ and MariaDB 10.11+ only.
+    #[test]
+    fn old_servers_are_refused() {
+        let supported = |v: &str| {
+            let (flavor, version) = parse_version(v).unwrap();
+            supported_version(flavor, version)
+        };
+        for v in [
+            "5.7.44",
+            "5.5.5-10.6.20-MariaDB-log",
+            "5.5.5-10.6.99-MariaDB",
+            "10.10.7-MariaDB",
+            "10.5.27-MariaDB",
+            "5.5.5-10.4.34-MariaDB",
+        ] {
+            assert!(!supported(v), "{v}");
+        }
+        for v in [
+            "8.0.0",
+            "8.0.46",
+            "8.4.11",
+            "9.7.2",
+            "5.5.5-10.11.0-MariaDB",
+            "10.11.19-MariaDB-ubu2204",
+            "11.4.13-MariaDB-ubu2404",
+            "11.8.9-MariaDB",
+            "12.1.0-MariaDB",
+        ] {
+            assert!(supported(v), "{v}");
+        }
+        // The flavor decides the minimum: a MySQL 10.6 would be newer
+        // than 9.x, a MariaDB 8.4 does not exist and is refused.
+        assert!(supported_version(Flavor::Mysql, (10, 6, 0)));
+        assert!(!supported_version(Flavor::Mariadb, (8, 4, 0)));
     }
 }
