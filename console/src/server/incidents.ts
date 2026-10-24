@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gt, inArray, or, sql, type SQL } from "drizzle-orm"
 import type { Database } from "@/db/client";
 import { agents, agentTargets, findings, incidents, jobs, policies, policyExceptions, users } from "@/db/schema";
 import { errorSummary, logger } from "@/lib/logger";
+import { canonicalNameCase, type NameCaseRule } from "@/lib/name-case";
 import {
   ACTIVE_STATUSES,
   canTransition,
@@ -126,6 +127,17 @@ const FACT_COLUMNS = {
   matched: findings.matched,
   lastSeenAt: findings.lastSeenAt,
   falsePositiveAt: findings.falsePositiveAt,
+  /** ADR-0056: the altered parts merged for the latest scan job (location exceptions only). */
+  altered: findings.altered,
+  /**
+   * ADR-0055: the target's stored `name_case`, canonical (null: not reported, today's rule). A
+   * scalar subquery too, so `FOR UPDATE` locks no `agent_targets` row (heartbeats never wait).
+   */
+  // Qualified by hand: drizzle renders the columns of a single-table select unqualified, which
+  // would resolve both sides of the join condition to `agent_targets`.
+  nameCase: sql<NameCaseRule | null>`(select nc.name_case from agent_targets nc where nc.agent_id = "findings"."agent_id" and nc.target_id = "findings"."target_id")`.mapWith(
+    (v: unknown) => canonicalNameCase(v),
+  ),
   /**
    * N1: first delivery (console clock) of the scan job that produced the latest revision; no
    * value of that revision was read before it. Null for a job that is gone (then `last_seen_at`).
@@ -555,6 +567,12 @@ export interface IncidentView {
     anomaly: boolean;
     /** Per-policy overflow incident of an hour (H1). */
     overflow: boolean;
+    /**
+     * ADR-0053: an event of the incident reached more objects than it lists, and the highest
+     * bound score of its events (an upper bound, display only; null before ADR-0053).
+     */
+    objectsOverflowed: boolean;
+    boundScore: number | null;
   } | null;
   createdAt: Date;
   updatedAt: Date;
@@ -611,6 +629,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       lastEventAt: incidents.lastEventAt,
       eventAnomaly: incidents.eventAnomaly,
       eventOverflow: incidents.eventOverflow,
+      eventObjectsOverflowed: incidents.eventObjectsOverflowed,
+      eventBoundScore: incidents.eventBoundScore,
       createdAt: incidents.createdAt,
       updatedAt: incidents.updatedAt,
       acknowledgedAt: incidents.acknowledgedAt,
@@ -642,6 +662,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
       lastEventAt,
       eventAnomaly,
       eventOverflow,
+      eventObjectsOverflowed,
+      eventBoundScore,
       ...r
     }) => ({
     ...r,
@@ -658,6 +680,8 @@ async function selectIncidents(db: Database, where: SQL | undefined, limit: numb
             lastEventAt,
             anomaly: eventAnomaly === true,
             overflow: eventOverflow,
+            objectsOverflowed: eventObjectsOverflowed === true,
+            boundScore: eventBoundScore,
           }
         : null,
     location:

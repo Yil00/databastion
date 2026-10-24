@@ -730,7 +730,63 @@ export interface components {
              *     Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes`.
              */
             notes?: components["schemas"]["TargetNote"][];
+            /**
+             * @description How the target compares names that differ only by case, from the last `check()`
+             *     (ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this
+             *     schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+             *     `target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055
+             *     sends it in every `TargetStatus` of those engines, also when `check()` fails or
+             *     times out (then the last value read on the same server run, else `unknown` for both
+             *     parts). Absent, the console keeps comparing these engines' names without case.
+             */
+            name_case?: components["schemas"]["TargetNameCase"];
             metrics?: components["schemas"]["MetricsMap"];
+        };
+        /**
+         * @description How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
+         *     `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
+         *     as `sensitive`, the stricter rule). A closed value: never a collation name, a setting value
+         *     or free text.
+         * @enum {string}
+         */
+        NameCase: "sensitive" | "insensitive" | "unknown";
+        /**
+         * @description Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the
+         *     server's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL
+         *     Server). Three closed values and normalized database names only (invariant I2).
+         */
+        TargetNameCase: {
+            /** @description How database names compare. */
+            databases: components["schemas"]["NameCase"];
+            /** @description How schema, object and column names compare in every database not listed in `except`. */
+            objects: components["schemas"]["NameCase"];
+            /**
+             * @description Databases whose schema, object and column names compare otherwise than `objects`
+             *     (SQL Server catalog collations; MySQL / MariaDB send none, their setting is
+             *     server-wide). Database names are `Identifier`s, normalized and sanitized like every
+             *     location (ADR-0009): two databases whose names reach the console as one name (`*`,
+             *     stripped characters) are one entry with the stricter value (`sensitive`, then
+             *     `unknown`, then `insensitive`). It may name databases the agent never sends in a
+             *     finding or an event (outside the scan's scope, snapshots, databases its login cannot
+             *     enter; ADR-0055 decision 9).
+             *
+             *     One entry per `database` name, and entries sorted by `database` in the byte order of
+             *     its UTF-8 form (after normalization): a conforming agent merges the entries of one
+             *     name into one, with the stricter value. Not checked by this schema (`uniqueItems`
+             *     compares whole entries, not names); the console reads several entries of one name as
+             *     the stricter of their values (ADR-0055 decision 6).
+             *
+             *     At most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8
+             *     JSON: an agent-side bound, which the console does not check (its request size limit
+             *     applies). A conforming agent that would pass either bound, or that cannot list every
+             *     database, sends `objects: unknown` without `except`.
+             */
+            except?: components["schemas"]["TargetNameCaseException"][];
+        };
+        /** @description One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`. */
+        TargetNameCaseException: {
+            database: components["schemas"]["Identifier"];
+            objects: components["schemas"]["NameCase"];
         };
         /**
          * @description One explanation of a target's status: a registered `code`, an optional `count` and
@@ -845,7 +901,9 @@ export interface components {
             server_time: components["schemas"]["Timestamp"];
             /**
              * @description Optional **request** fields and features this console accepts (ADR-0022), e.g.
-             *     `target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines
+             *     `target_status.notes`, `target_status.name_case`, `access_event.bytes`,
+             *     `access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,
+             *     `job_progress.coverage`, and the engines
              *     added after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps
              *     the list of the latest heartbeat response and sends an optional request field
              *     introduced after protocol 0.1.0 only when that list names it; before its first
@@ -1173,7 +1231,32 @@ export interface components {
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
             field: components["schemas"]["Identifier"];
+            /**
+             * @description Parts of this location whose name was altered: the agent's name
+             *     normalization (ADR-0009: control and format characters stripped, NFKC; on
+             *     Redis / Valkey the same steps of the key-pattern normalizer; on CAS,
+             *     definition keys converted to snake_case) changed these parts, so another
+             *     object of the engine may be sent under the same name. Never set for a part
+             *     sent as `*`. It carries no value, no character and no count (I2). Unique
+             *     parts, at least one; absent when no part was altered. Sent only when the
+             *     latest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,
+             *     ADR-0056); a `400` reporting it as an unknown field clears the agent's
+             *     capability list, and the findings are resent once without it (ADR-0022
+             *     decision 9).
+             */
+            altered?: components["schemas"]["LocationPart"][];
         };
+        /**
+         * @description A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
+         * @enum {string}
+         */
+        LocationPart: "database" | "schema" | "object" | "field";
+        /**
+         * @description A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event
+         *     object names no field).
+         * @enum {string}
+         */
+        ObjectRefPart: "database" | "schema" | "object";
         /** @description Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`). */
         EventsBatch: {
             batch_id: components["schemas"]["UuidV7"];
@@ -1209,12 +1292,22 @@ export interface components {
              *     latest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).
              */
             bytes?: components["schemas"]["Count"];
+            /**
+             * @description Objects of this event were left out under a bound (the agent core's 15 named objects,
+             *     or a connector's own bound); the event's `*` objects stand for them (see `ObjectRef`,
+             *     the name `*`). Carries no value, no name and no count. Only `true` is valid; absent
+             *     otherwise. An event that carries it names at least one object `*` (checked by this
+             *     schema). Sent only when the latest `HeartbeatResponse.accepts` lists
+             *     `access_event.objects_overflowed` (ADR-0022, ADR-0053).
+             * @constant
+             */
+            objects_overflowed?: true;
             /** @description Signal ids of the registry `signals.json` (see `Signal`). */
             signals?: components["schemas"]["Signal"][];
             source: components["schemas"]["AuditSource"];
             /** @description Number of raw events merged into this one. */
             aggregated_count: number;
-        } & (unknown & unknown);
+        } & (unknown & unknown & unknown);
         /**
          * @description Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
          *     an account that does not exist on the target (the attempted name may be a mistyped password), and
@@ -1275,7 +1368,7 @@ export interface components {
          * @description Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.
          *
          *     **The name `*`.** An `object` equal to `*` means the agent does not name the object, for
-         *     one of two reasons:
+         *     one of three reasons:
          *     - **unknown object**: the source does not say which objects were reached and the agent
          *       cannot tell from the statement (dynamic SQL, a function or procedure body, a statement
          *       it cannot parse). `database` is the session's database and `schema` is absent. Such a
@@ -1283,9 +1376,17 @@ export interface components {
          *       `*`, the objects the agent could tell;
          *     - **masked name**: normalization replaced the name (a name matched by a classifier, or
          *       one that does not conform to `Identifier`). This also applies to `database` and
-         *       `schema`.
+         *       `schema`;
+         *     - **overflowed objects**: the event reached more objects than it may list (the agent
+         *       core keeps at most 15 named objects, and a connector may drop objects under a bound of
+         *       its own), and the `*` stands for the objects left out. It is `(<database>, -, *)` when
+         *       they share a database, `(*, -, *)` once objects of another database are left out too,
+         *       and none is added when a `*` already in the event covers them. Such an event is always
+         *       reported, and carries `AccessEvent.objects_overflowed` when the console lists
+         *       `access_event.objects_overflowed` (ADR-0053); without the field, the overflow is not
+         *       known to the console.
          *
-         *     In both cases `*` is a **literal name, not a wildcard**: it never means "every object".
+         *     In every case `*` is a **literal name, not a wildcard**: it never means "every object".
          *     The console compares it as the string `*` (ADR-0021): an `objects` condition or a
          *     location exception selects it only when its glob matches the string `*` (the glob `*`,
          *     or `\*` for that name only); a glob such as `clients` or `crm_*` does not. Its
@@ -1294,6 +1395,14 @@ export interface components {
          *     still matches conditions that do not depend on objects (signals, principals, rows,
          *     anomaly), and the dedup scope uses its `database`. A policy scoped to named objects
          *     therefore does not see such accesses: signal, volume and anomaly conditions do.
+         *
+         *     **Except for a flagged event** (ADR-0053 decision 3): when the event carries
+         *     `objects_overflowed`, every `*` of it (on Redis / Valkey, a real `*` key pattern too)
+         *     stands for one or more objects of its database that the event does not name (of the
+         *     target, for the database `*`): an `objects` condition retains it when its `database`
+         *     glob, if any, matches; `min_sensitivity`, `min_score` and the incident's database count
+         *     it as the database's most sensitive object; a location exception covers it only when it
+         *     covers the whole database. Without the field, the literal rule above applies.
          *
          *     **Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log
          *     entry is reported under the pattern learned by the last scan, its longest learned literal
@@ -1307,6 +1416,21 @@ export interface components {
             database: components["schemas"]["Identifier"];
             schema?: components["schemas"]["Identifier"];
             object: components["schemas"]["ObjectName"];
+            /**
+             * @description Parts of this object whose name was altered: the agent's name normalization
+             *     (ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey
+             *     the same steps of the key-pattern normalizer; on CAS, definition keys
+             *     converted to snake_case) changed these parts, so another object of the
+             *     engine may be sent under the same name. Never set for a part sent as `*`. It
+             *     carries no value, no character and no count (I2). Unique parts, at least
+             *     one; absent when no part was altered; an event object names no field. Sent
+             *     only when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`
+             *     (ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the
+             *     agent's capability list, and the events are resent once without it (ADR-0022
+             *     decision 9). Keep in step with the inline copies of `ObjectRef` in
+             *     `AccessEvent`.
+             */
+            altered?: components["schemas"]["ObjectRefPart"][];
         };
     };
     responses: {

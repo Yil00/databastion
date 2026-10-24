@@ -828,7 +828,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       ).toHaveLength(1);
     });
 
-    it("#274 review L5: with 25 mismatched targets, every one is stored without its source and listed; only the details are capped", async () => {
+    it("#274 review L5 and #277: with 25 mismatched targets, every one is stored without its source, listed and counted; only the details are capped", async () => {
       const auth = await enroll();
       const bad = Array.from({ length: 25 }, (_v, i) => ({
         target_id: `pg-${String(i).padStart(2, "0")}`,
@@ -868,7 +868,8 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(events[0]?.details).toMatchObject({
         endpoint: "heartbeat",
         status: 200,
-        details_count: MAX_VALIDATION_DETAILS,
+        // #277: the true count; the first pointer comes from the capped details.
+        details_count: 25,
         pointer: "/targets/1/audit_source",
         keyword: "const",
         target_ids: bad.map((t) => t.target_id).sort().join(","),

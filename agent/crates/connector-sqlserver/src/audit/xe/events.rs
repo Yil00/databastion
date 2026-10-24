@@ -92,6 +92,81 @@ fn system_rpc(name: &str) -> bool {
     ) || n.starts_with("sp_cursor")
 }
 
+/// Whether `text` holds `CREATE`, `ALTER` or `DROP` followed by `EVENT
+/// SESSION`, as words compared without case, with any white space or
+/// comments (`--` to the end of the line, `/* … */`, nested as T-SQL
+/// nests them) between them. String literals and bracketed names are read
+/// as words too (dynamic SQL in a literal matches; more matches only clear
+/// the proof more often). The text is never copied: each word is
+/// classified in place.
+pub(crate) fn event_session_ddl(text: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum W {
+        Verb,
+        Event,
+        Session,
+        Other,
+    }
+    let class = |w: &str| {
+        if ["create", "alter", "drop"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+        {
+            W::Verb
+        } else if w.eq_ignore_ascii_case("event") {
+            W::Event
+        } else if w.eq_ignore_ascii_case("session") {
+            W::Session
+        } else {
+            W::Other
+        }
+    };
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+    let mut last = [W::Other; 2];
+    let mut i = 0;
+    while let Some(rest) = text.get(i..).filter(|r| !r.is_empty()) {
+        if rest.starts_with("--") {
+            i += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let mut depth = 0usize;
+            let mut j = 0;
+            while let Some(r) = rest.get(j..).filter(|r| !r.is_empty()) {
+                if r.starts_with("/*") {
+                    depth += 1;
+                    j += 2;
+                } else if r.starts_with("*/") {
+                    depth = depth.saturating_sub(1);
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += r.chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            i += j;
+            continue;
+        }
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        if is_word(c) {
+            let len = rest.find(|c: char| !is_word(c)).unwrap_or(rest.len());
+            let w = class(rest.get(..len).unwrap_or_default());
+            if last == [W::Verb, W::Event] && w == W::Session {
+                return true;
+            }
+            last = [last[1], w];
+            i += len;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    false
+}
+
 /// One poll row.
 pub(crate) struct XeRecord {
     pub(crate) file: String,
@@ -236,6 +311,26 @@ impl XeRecord {
     pub(crate) fn is_failed_login_18456(&self) -> bool {
         self.kind() == Kind::ErrorReported
             && self.event.as_ref().and_then(|e| e.error_number) == Some(18_456)
+    }
+
+    /// Whether the record may create, change or drop an Extended Events
+    /// session (#280 re-review L-b: a predicate the agent never reads may
+    /// have changed): a statement event (`sql_statement_completed`,
+    /// `sp_statement_completed`: the texts the agent keeps; an RPC's or a
+    /// batch's text is never stored, decision 6 M5, and the statements
+    /// they run are statement events of their own) whose text names
+    /// `CREATE`, `ALTER` or `DROP` `EVENT SESSION` ([`event_session_ddl`]),
+    /// or whose text was not read whole (above the poll's bound,
+    /// unreadable, cut): fail closed.
+    pub(crate) fn may_change_event_session(&self) -> bool {
+        if !self.kind().is_statement() {
+            return false;
+        }
+        let Some(e) = &self.event else {
+            return true;
+        };
+        // No text kept: fail closed too (security review L3).
+        e.statement_cut || e.statement.as_deref().is_none_or(|t| event_session_ddl(t))
     }
 
     /// The acting login: the session's login (`session_server_principal_name`,
@@ -699,7 +794,8 @@ const MAX_BUILD_INTERNALS: u64 = 3;
 /// 2022 and 2025) joined the list on 2026-10-16 (ADR-0051, addendum to the
 /// refinement of 2026-10-16), under the same conditions as the others.
 /// `sysaudacts` (in `master`, a build on `audit_spec_id` at `nest_level`
-/// 2 paired with the `audit_specifications` proof, measured on 2022)
+/// 2 paired with the `audit_specifications` proof, measured on 2022 and
+/// 2025)
 /// joined it on 2026-10-18 (ADR-0051 note of that day, accepted by the
 /// maintainer), under the same conditions.
 pub(crate) const SYS_BASE_TABLES: &[&str] = &[
@@ -990,6 +1086,86 @@ pub(crate) mod tests {
             unreadable: false,
             index: 0,
         }
+    }
+
+    /// #280 re-review L-b: the statements that may change an event session.
+    #[test]
+    fn event_session_statements_are_recognized() {
+        for t in [
+            "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported",
+            "alter event session [databastion_xe] on server add event sqlserver.error_reported",
+            "DROP EVENT SESSION x ON SERVER",
+            "CREATE  EVENT\tSESSION x ON SERVER ADD EVENT sqlserver.login",
+            "ALTER/* a /* nested */ comment */EVENT -- x\n SESSION s ON SERVER STATE = STOP",
+            "EXEC (N'ALTER EVENT SESSION s ON SERVER STATE = STOP')",
+            "SELECT 1; alter event session s on server state = start",
+        ] {
+            assert!(event_session_ddl(t), "{t}");
+        }
+        for t in [
+            "SELECT event_session_address FROM sys.dm_xe_sessions",
+            "SELECT * FROM t WHERE event = 1 AND session = 2",
+            "ALTER EVENT_SESSION x",
+            "ALTER -- EVENT SESSION\n TABLE t ADD c int",
+            "ALTER /* EVENT SESSION */ TABLE t ADD c int",
+            "ALTER EVENTS SESSION",
+            "SELECT N'alter event' + N'session'",
+            "",
+        ] {
+            assert!(!event_session_ddl(t), "{t}");
+        }
+        let with = |name: &str, data: &[(&str, &str)]| rec(name, data, &[]);
+        assert!(
+            with(
+                "sql_statement_completed",
+                &[("statement", "ALTER EVENT SESSION s ON SERVER STATE = STOP")]
+            )
+            .may_change_event_session()
+        );
+        assert!(
+            with(
+                "sp_statement_completed",
+                &[("statement", "DROP EVENT SESSION s ON SERVER")]
+            )
+            .may_change_event_session()
+        );
+        // An RPC's text is never kept: its statements are events of their
+        // own.
+        assert!(
+            !with(
+                "rpc_completed",
+                &[(
+                    "statement",
+                    "exec sp_executesql N'DROP EVENT SESSION s ON SERVER'"
+                )]
+            )
+            .may_change_event_session()
+        );
+        assert!(
+            !with("sql_statement_completed", &[("statement", "SELECT 1")])
+                .may_change_event_session()
+        );
+        // Another event, even naming it: not a statement.
+        assert!(
+            !with(
+                "error_reported",
+                &[
+                    ("message", "ALTER EVENT SESSION"),
+                    ("error_number", "50000")
+                ]
+            )
+            .may_change_event_session()
+        );
+        // A statement event whose text was not read whole: fail closed.
+        let mut cut = with("sql_statement_completed", &[("statement", "SELECT 1")]);
+        cut.event.as_mut().unwrap().statement_cut = true;
+        assert!(cut.may_change_event_session());
+        // An event with no statement kept (security review L3).
+        assert!(with("sql_statement_completed", &[("row_count", "1")]).may_change_event_session());
+        let mut unread = with("sp_statement_completed", &[("statement", "SELECT 1")]);
+        unread.event = None;
+        unread.unreadable = true;
+        assert!(unread.may_change_event_session());
     }
 
     pub(crate) fn who(login: &str, session: &str) -> Vec<(&'static str, String)> {
@@ -1795,6 +1971,32 @@ mod statistics_tests {
         assert!(recs[0].skip && recs[1].skip && recs[2].skip && !recs[3].skip);
     }
 
+    /// #280 re-review L-b: none of the captured events (statements with
+    /// empty texts, the statistics builds' internal statements, the
+    /// password-bearing DCL) is read as a change of an event session.
+    #[test]
+    fn captured_events_do_not_change_an_event_session() {
+        for file in [
+            "dcl-procedures-16.0.4305.5.xml",
+            "password-dcl-16.0.4305.5.xml",
+            "statistics-15.0.4500.2.xml",
+            "statistics-16.0.4305.5.xml",
+            "statistics-17.0.5015.4.xml",
+            "sysaudacts-16.0.4305.5.xml",
+            "sysaudacts-17.0.5015.4.xml",
+            "sysguidrefs-16.0.4305.5.xml",
+            "sysguidrefs-17.0.5015.4.xml",
+        ] {
+            let flagged: Vec<usize> = fixture(file)
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.may_change_event_session())
+                .map(|(i, _)| i)
+                .collect();
+            assert!(flagged.is_empty(), "{file}: {flagged:?}");
+        }
+    }
+
     /// Reads a fixture: one event per line, captured on the image.
     fn fixture(name: &str) -> Vec<XeRecord> {
         let text =
@@ -1818,6 +2020,80 @@ mod statistics_tests {
                 }
             })
             .collect()
+    }
+
+    /// Security review L2 of bbfcab7, closed by the re-capture of
+    /// 2026-10-22: the 2022 drift fixture's own part (the agent's builds on
+    /// `sysschobjs` and `sysclsobjs` and the CAS guard statement that made
+    /// them) was captured from a new 16.0.4305.5 data volume with the
+    /// current `sql::CAS_COLUMNS` text as the agent sent it. Nothing in the
+    /// file is synthesized, the current text is there once, it is the
+    /// partner of the two builds (their activity, after them), and the
+    /// guard's earlier text (with its `HAS_PERMS_BY_NAME` column) is gone.
+    #[test]
+    fn statistics_fixture_of_2022_holds_the_current_cas_text_as_captured() {
+        let file = "statistics-16.0.4305.5.xml";
+        let raw =
+            std::fs::read_to_string(format!("{}/fixtures/xe/{file}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        assert!(!raw.contains("SYNTHESIZED"), "{file}");
+        assert!(
+            raw.lines().all(|l| l.starts_with("<event")),
+            "{file}: one captured event per line, no comment"
+        );
+        assert!(!raw.contains("N'SELECT', c.name, N'COLUMN')) FROM [retail].sys.tables"));
+        let current = crate::sql::in_database(crate::sql::CAS_COLUMNS, "retail").unwrap();
+        let recs = fixture(file);
+        let partners: Vec<usize> = recs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| statement(r) == Some(current.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(partners.len(), 1, "{file}: {partners:?}");
+        let partner = &recs[partners[0]];
+        assert_eq!(partner.login(), "databastion");
+        assert_eq!(partner.kind(), Kind::SqlStatementCompleted);
+        let guid = |r: &XeRecord| r.event.as_ref().and_then(|e| e.activity.clone());
+        let (g, seq) = guid(partner).unwrap();
+        let builds: Vec<&XeRecord> = recs
+            .iter()
+            .filter(|r| statement(r).is_some_and(|t| t.contains("StatMan")))
+            .filter(|r| r.login() == "databastion")
+            .collect();
+        assert_eq!(builds.len(), 2, "{file}");
+        for (b, table) in builds
+            .iter()
+            .zip(["[sys].[sysschobjs]", "[sys].[sysclsobjs]"])
+        {
+            assert!(statement(b).is_some_and(|t| t.contains(table)), "{table}");
+            let (h, s) = guid(b).unwrap();
+            assert!(
+                h == g && s < seq,
+                "{table}: a build of the partner's activity"
+            );
+        }
+        // Both sides: the builds and their internal statements are left
+        // out with the captured partner, the partner itself stays; from a
+        // foreign session, everything stays.
+        let mut left = fixture(file);
+        context(&mut left, true, &own);
+        for (i, r) in left
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.login() == "databastion")
+        {
+            assert_eq!(r.skip, i != partners[0], "{file} {i}");
+        }
+        let mut foreign = fixture(file);
+        context(&mut foreign, true, &|_| false);
+        assert!(
+            foreign
+                .iter()
+                .filter(|r| r.login() == "databastion")
+                .all(|r| !r.skip),
+            "{file}"
+        );
     }
 
     /// The drift fixtures, one per matrix image (captured on 2026-10-16:
@@ -2297,49 +2573,82 @@ mod statistics_tests {
         }
     }
 
-    /// The `audit_specifications` proof's build on a fresh 2022 server
-    /// (captured on 2026-10-18 from a new data volume by the fresh-server
-    /// integration test, the dev service's audit named): the build on
-    /// `sysaudacts` at nest level 2 and its internal statement at 1, in the
-    /// proof's activity, left out; the proof itself is not touched. Each is
+    /// The `audit_specifications` proof's build on a fresh server, one
+    /// fixture per image with a SQL Server Audit source (captured from a
+    /// new data volume by the fresh-server integration test, the dev
+    /// service's audit named: 2022 on 2026-10-18, 2025 with strict TLS on
+    /// 2026-10-22, the same shape): the build on `sysaudacts` at nest
+    /// level 2 in `master` and its internal statement at 1, in the proof's
+    /// activity, left out; the proof itself is not touched. Each is
     /// reported without causality, from a foreign session, or off the
     /// allow-listed builds (ADR-0051 note of 2026-10-18).
     #[test]
-    fn sysaudacts_fixture_of_2022() {
-        let file = "sysaudacts-16.0.4305.5.xml";
-        let recs = fixture(file);
-        assert_eq!(recs.len(), 3, "{file}");
-        let builds: Vec<&XeRecord> = recs
-            .iter()
-            .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
-            .collect();
-        assert_eq!(builds.len(), 1, "{file}");
-        assert_eq!(builds[0].event.as_ref().and_then(|e| e.nest_level), Some(2));
-        let proof = recs
-            .iter()
-            .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
-            .count();
-        assert_eq!(proof, 1, "{file}: the audit_specifications proof");
-        let mut left = fixture(file);
-        assert_eq!(context(&mut left, true, &own), 2, "{file}");
-        for r in &left {
-            assert_eq!(
-                r.skip,
-                !statement(r).is_some_and(crate::sql::catalog_text),
-                "{file}"
+    fn sysaudacts_fixtures_of_the_audit_images() {
+        for file in ["sysaudacts-16.0.4305.5.xml", "sysaudacts-17.0.5015.4.xml"] {
+            let recs = fixture(file);
+            assert_eq!(recs.len(), 3, "{file}");
+            let builds: Vec<&XeRecord> = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(|t| t.contains("[sys].[sysaudacts]")))
+                .collect();
+            assert_eq!(builds.len(), 1, "{file}");
+            let build = builds[0].event.as_ref().unwrap();
+            assert_eq!(build.nest_level, Some(2), "{file}");
+            assert_eq!(build.database.as_deref(), Some("master"), "{file}");
+            assert!(
+                recs.iter().all(|r| r.login() == "databastion"),
+                "{file}: the agent's login"
             );
-        }
-        let mut off = fixture(file);
-        assert_eq!(context(&mut off, false, &own), 0, "{file}");
-        let mut foreign = fixture(file);
-        assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
-        let mut no_causality = fixture(file);
-        for r in &mut no_causality {
-            if let Some(e) = r.event.as_mut() {
-                e.activity = None;
+            let activities: std::collections::BTreeSet<String> = recs
+                .iter()
+                .filter_map(|r| r.event.as_ref().and_then(|e| e.activity.as_ref()))
+                .map(|(g, _)| g.clone())
+                .collect();
+            assert_eq!(activities.len(), 1, "{file}: one activity");
+            let proof = recs
+                .iter()
+                .filter(|r| statement(r).is_some_and(crate::sql::catalog_text))
+                .count();
+            assert_eq!(proof, 1, "{file}: the audit_specifications proof");
+            let mut left = fixture(file);
+            assert_eq!(context(&mut left, true, &own), 2, "{file}");
+            for r in &left {
+                assert_eq!(
+                    r.skip,
+                    !statement(r).is_some_and(crate::sql::catalog_text),
+                    "{file}"
+                );
+            }
+            let mut off = fixture(file);
+            assert_eq!(context(&mut off, false, &own), 0, "{file}");
+            let mut foreign = fixture(file);
+            assert_eq!(context(&mut foreign, true, &|_| false), 0, "{file}");
+            let mut no_causality = fixture(file);
+            for r in &mut no_causality {
+                if let Some(e) = r.event.as_mut() {
+                    e.activity = None;
+                }
+            }
+            assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
+            // The proof in another activity than the build: reported.
+            let mut apart = fixture(file);
+            for r in &mut apart {
+                if statement(r).is_some_and(crate::sql::catalog_text)
+                    && let Some((g, _)) = r.event.as_mut().and_then(|e| e.activity.as_mut())
+                {
+                    *g = GUID2.to_owned();
+                }
+            }
+            assert_eq!(context(&mut apart, true, &own), 0, "{file}");
+            for r in off
+                .iter()
+                .chain(&foreign)
+                .chain(&no_causality)
+                .chain(&apart)
+            {
+                assert!(!r.skip, "{file}");
             }
         }
-        assert_eq!(context(&mut no_causality, true, &own), 0, "{file}");
     }
 
     /// The credential-bearing tables stay reported next to a `sysguidrefs`
@@ -2969,6 +3278,7 @@ mod statistics_tests {
             "sysguidrefs-16.0.4305.5.xml",
             "sysguidrefs-17.0.5015.4.xml",
             "sysaudacts-16.0.4305.5.xml",
+            "sysaudacts-17.0.5015.4.xml",
         ] {
             let mut whole = fixture(file);
             context(&mut whole, true, &own);
@@ -3153,8 +3463,8 @@ mod statistics_tests {
     /// The stream over `file` (sorted by `at_ms`) as `read` and `cycle`
     /// run it: reads of at most `batch` rows from the position; a full read
     /// that is not a deferral reads on at once (5 ms), at most 20 s in a
-    /// cycle (`CATCH_UP`); a deferral or a read that reached the end waits
-    /// `poll_ms`. Returns, per event id, when it was handled and whether it
+    /// cycle (`CATCH_UP`), and the next cycle follows its pause; a deferral
+    /// or a read that reached the end waits `poll_ms`. Returns, per event id, when it was handled and whether it
     /// was left out; asserts that none is handled twice.
     fn simulate(
         file: &[Spec],
@@ -3196,9 +3506,14 @@ mod statistics_tests {
                     r.time_us
                 );
             }
-            let waits = cut.is_some_and(|c| c.wait) || !full || t - cycle >= 20_000;
-            if waits {
-                t += poll_ms;
+            // As `read` and `cycle`: a deferral reads as a read that
+            // reached the end; a cycle that ends behind is followed by the
+            // next one after its pause (`cycle::End::pause`).
+            let reads_on = full && !cut.is_some_and(|c| c.wait);
+            let elapsed = Duration::from_millis(t - cycle);
+            if let Some(end) = crate::audit::cycle::end(reads_on, false, elapsed) {
+                let pause = end.pause(Duration::from_millis(poll_ms));
+                t += u64::try_from(pause.as_millis()).unwrap();
                 cycle = t;
             } else {
                 t += 5;
@@ -3316,6 +3631,69 @@ mod statistics_tests {
     }
 
     const BATCH_FOR_TESTS: usize = crate::audit::BATCH;
+
+    /// ADR-0051 refinement of 2026-10-22 (reads of up to `XE_MAX_ROWS`):
+    /// rule 2 cuts a full read of N rows only at or past its last 256 rows
+    /// (at most 256 rows fetched again); a build before them is handled as
+    /// it stands (reported, fail closed); and the continuous-load bound
+    /// holds with reads of N.
+    #[test]
+    fn a_full_read_of_n_rows_is_cut_in_its_last_rows_only() {
+        let n = crate::audit::xe::size::XE_MAX_ROWS;
+        let spec = |kind: SpecKind, session: u32, seq: u64| Spec {
+            id: 0,
+            at_ms: 0,
+            kind,
+            session,
+            guid: format!("{session:08X}-0000-0000-0000-000000000000"),
+            seq,
+        };
+        let t0 = Instant::now();
+        let bound = Duration::from_secs(2);
+        for (build, want) in [
+            (n / 2, None),
+            (n - CONTEXT_WINDOW - 1, None),
+            (n - CONTEXT_WINDOW, Some(n - CONTEXT_WINDOW)),
+            (n - 10, Some(n - 10)),
+        ] {
+            let mut file: Vec<Spec> = (0..n + 100)
+                .map(|_| spec(SpecKind::Read("f".to_owned()), 60, 1))
+                .collect();
+            file[build] = spec(SpecKind::Build("x".to_owned()), 80, 1);
+            file[build + 1] = spec(SpecKind::Internal, 80, 2);
+            file[n + 50] = spec(SpecKind::Read("x".to_owned()), 80, 3);
+            let file = sorted(file);
+            let mut recs: Vec<XeRecord> = file
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(i, s)| s.record(i))
+                .collect();
+            context(&mut recs, true, &own);
+            let mut d = Deferrals::default();
+            let cut = d.cut(&recs, true, t0, bound, Some(n)).map(|c| c.at);
+            assert_eq!(cut, want, "build at {build}");
+            assert!(cut.is_none_or(|at| n - at <= CONTEXT_WINDOW));
+        }
+        let (poll, bound) = (1000u64, Duration::from_secs(2));
+        let limit = u64::try_from(MAX_DEFERRAL.as_millis()).unwrap() + 2000 + poll + 1000;
+        let end = 240_000u64;
+        let mut file = Vec::new();
+        fillers(&mut file, 100, end);
+        requests(&mut file, 80, 7000, end, Some(300), "l");
+        requests(&mut file, 70, 1000, end, None, "tmp");
+        let file = sorted(file);
+        let handled = simulate(&file, n, poll, bound, end + limit + 5000);
+        for s in &file {
+            let (at, _) = handled[&s.id];
+            assert!(
+                at - s.at_ms <= limit,
+                "event {} after {} ms",
+                s.id,
+                at - s.at_ms
+            );
+        }
+    }
 
     /// Review M1: a full read (more rows on the server) whose build's pair
     /// is in the rows not fetched yet ends before the build and reads on at

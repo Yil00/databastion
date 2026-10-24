@@ -15,6 +15,7 @@ import {
   eventMatches,
   eventScore,
   exceptionCoversEvent,
+  isOverflowStar,
   mergeSignals,
   objectSensitivity,
   parseEventConditions,
@@ -26,6 +27,8 @@ import {
   type EventFacts,
   type EventObject,
 } from "@/lib/event-model";
+import { auditSourceEngine } from "@/lib/location-labels";
+import { canonicalNameCase } from "@/lib/name-case";
 import { logger } from "@/lib/logger";
 import { dedupDatabaseName, FINAL_SIGMA, foldName, SIGMA } from "@/lib/policy-common";
 import type { AccessIncidentOpenedPayload } from "@/lib/notification-render";
@@ -49,13 +52,17 @@ import { processGlobal } from "./process-global";
 /**
  * Correlation of Audit access events (P4-C, worker). Pending events (`evaluated_at` null) are
  * processed in arrival order, in chunks of `EVENT_CHUNK` per transaction; one transaction:
- * 1. computes each event's sensitivity (from the findings of its objects) and score;
+ * 1. computes each event's sensitivity (from the findings of its objects) and score, and for an
+ *    event flagged `objects_overflowed` (ADR-0053) its bound sensitivity and score, from the
+ *    highest object sensitivity of the database of each `*` object (`loadDatabaseBounds`, one
+ *    aggregate per target and database for the whole chunk);
  * 2. judges its volume against the principal's baseline, then updates the baseline;
  * 3. applies every enabled `access_event` policy: incidents are deduplicated per policy, agent,
  *    target, principal, database and hour (src/lib/event-model.ts), linked to every matching event
  *    (`incident_events`) and notified through the outbox, in the same transaction;
  * 4. records the evaluation on the event (`evaluated_at`, `sensitivity`, `score`, `anomaly`,
- *    `baseline_rows`), the only columns of an event the runtime role may update.
+ *    `baseline_rows`, `bound_sensitivity`, `bound_score`), the only columns of an event the
+ *    runtime role may update.
  * Evaluations are serialized by a transaction-scoped advisory lock, so the baselines see the
  * events of a principal in order and two workers never race on an incident. A lost wake-up delays
  * nothing beyond the one-minute schedule of `policies.evaluate`; a crash rolls the chunk back and it
@@ -142,6 +149,7 @@ const PENDING_COLUMNS = {
   rows: accessEvents.rows,
   signals: accessEvents.signals,
   source: accessEvents.source,
+  objectsOverflowed: accessEvents.objectsOverflowed,
 };
 
 type PendingEvent = {
@@ -160,6 +168,8 @@ type PendingEvent = {
   rows: number | null;
   signals: string[];
   source: string;
+  /** Contract `AccessEvent.objects_overflowed` (ADR-0053): true when sent, else null. */
+  objectsOverflowed: boolean | null;
 };
 
 const SEP = "\u0000";
@@ -287,6 +297,243 @@ export async function loadObjectHits(
   return out;
 }
 
+/** Key of a database bound: agent, target and the `foldName` of the database (`*`: the target). */
+const databaseKey = (agentId: string, targetId: string, database: string) => [agentId, targetId, foldName(database)].join(SEP);
+const wholeTargetKey = (agentId: string, targetId: string) => [agentId, targetId, ""].join(SEP);
+
+/**
+ * Highest object sensitivities per target and database, for the overflow `*` objects of the
+ * chunk (ADR-0053 decision 3 item 3): `get(agentId, targetId, database)` is the highest object
+ * sensitivity among the target's findings (false positives excluded) in that database, compared
+ * with `foldName` as `objectKey` does, or among all the target's findings for the database `*`;
+ * 0 when there is none.
+ */
+export interface DatabaseBounds {
+  get(agentId: string, targetId: string, database: string): number;
+}
+
+const NO_BOUNDS: DatabaseBounds = { get: () => 0 };
+
+/**
+ * Loads the {@link DatabaseBounds} the chunk needs: nothing (no query) when no event of the chunk
+ * is flagged with a `*` object, so a chunk without the flag reads exactly what it read before.
+ * One aggregate query per chunk, always restricted to the (agent, target) pairs of the flagged
+ * events (a bound never reads another target's findings) and, except for the database `*`, to
+ * their databases through the same pre-filter as `loadObjectHits`: `sqlFold` when the console
+ * database's `lower` folds Unicode, else the ASCII form and every non-ASCII database name, left to
+ * the JavaScript `foldName` (the `C` / `POSIX`-ctype fallback). The rows are grouped per database,
+ * object name and classifier in SQL and folded in JavaScript, so both paths give the same result.
+ *
+ * An object's sensitivity here takes its findings in every schema (as an event object without a
+ * schema does, `loadObjectHits`), so the bound is at least the named sensitivity any object of the
+ * database could get, whatever schema the left-out objects had (fail closed: only higher).
+ *
+ * The database `*` needs every finding of its target (ADR-0053 security review L1): with `cache`,
+ * the bounds of a whole target are kept per process and reused while the target's findings stamp
+ * ({@link findingsStamp}, one aggregate row per target, read in the same transaction) is unchanged,
+ * so a target's findings are read again only after a scan, a new finding, a false-positive change
+ * or a removal. Exported for the tests.
+ */
+export async function loadDatabaseBounds(
+  tx: Tx,
+  events: readonly Pick<PendingEvent, "agentId" | "targetId" | "objects" | "objectsOverflowed">[],
+  unicodeLower?: boolean,
+  cache?: WholeTargetCache,
+): Promise<DatabaseBounds> {
+  const whole = new Map<string, readonly [string, string]>();
+  const perDb = new Map<string, readonly [string, string]>();
+  const names = new Set<string>();
+  for (const e of events) {
+    for (const o of e.objects) {
+      if (!isOverflowStar(e, o)) continue;
+      const pair = [e.agentId, e.targetId] as const;
+      if (o.database === "*") whole.set(targetKey(e), pair);
+      else {
+        perDb.set(targetKey(e), pair);
+        names.add(o.database);
+      }
+    }
+  }
+  if (whole.size === 0 && perDb.size === 0) return NO_BOUNDS;
+  const bounds = new Map<string, number>();
+  // Whole targets whose cached bounds are still current: served from the cache, not read.
+  const fresh = new Map<string, string>();
+  if (cache && whole.size > 0) {
+    const stamps = await findingsStamps(tx, [...whole.values()]);
+    for (const k of [...whole.keys()]) {
+      const stamp = stamps.get(k) ?? "0";
+      const hit = cache.get(k);
+      if (hit && hit.stamp === stamp) {
+        for (const [bk, v] of hit.bounds) bounds.set(bk, v);
+        whole.delete(k);
+        // Its databases are known too: no per-database read for this target.
+        perDb.delete(k);
+      } else {
+        fresh.set(k, stamp);
+      }
+    }
+    if (whole.size === 0 && perDb.size === 0) return boundsOf(bounds);
+  }
+  const pairsIn = (pairs: Iterable<readonly [string, string]>) =>
+    sql`(${findings.agentId}, ${findings.targetId}) in (${sql.join(
+      [...pairs].map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )})`;
+  const scopes: SQL[] = [];
+  if (whole.size > 0) scopes.push(pairsIn(whole.values()));
+  const dbPairs = [...perDb.entries()].filter(([k]) => !whole.has(k)).map(([, p]) => p);
+  if (dbPairs.length > 0) {
+    const pre = prefilterNames([...names], unicodeLower ?? (await lowerFoldsUnicode(tx)));
+    const sameDb =
+      pre.kind === "fold"
+        ? sql`${sqlFold(sql`${findings.databaseName}`)} in (${sql.join(
+            pre.names.map((n) => sqlFold(sql`${n}::text`)),
+            sql`, `,
+          )})`
+        : sql`(${sqlFold(sql`${findings.databaseName}`)} in (${sql.join(
+            pre.folded.map((n) => sql`${n}::text`),
+            sql`, `,
+          )}) or ${findings.databaseName} ~ ${NON_ASCII_RE}::text)`;
+    scopes.push(sql`(${pairsIn(dbPairs)} and ${sameDb})`);
+  }
+  // One statement, so one snapshot (ADR-0053 re-review N2): the grouped rows and, for the whole
+  // targets to cache, their stamp over the same rows. The stamp checked before (statement 1) only
+  // decides whether to read; the cache keeps the stamp of what was read.
+  const stamped = cache && fresh.size > 0 ? [...fresh.keys()].map((k) => whole.get(k) as readonly [string, string]) : [];
+  const res = await tx.execute<{
+    kind: "g" | "s";
+    agent_id: string;
+    target_id: string;
+    database_name: string | null;
+    object_name: string | null;
+    classifier: string | null;
+    confidence: number | null;
+    stamp: string | null;
+  }>(sql`
+    with base as (
+      select agent_id, target_id, database_name, object_name, classifier, confidence, id, false_positive_at
+      from findings where (${sql.join(scopes, sql` or `)}))
+    select 'g' as kind, agent_id, target_id, database_name, object_name, classifier, max(confidence)::float8 as confidence, null::text as stamp
+    from base where false_positive_at is null
+    group by agent_id, target_id, database_name, object_name, classifier
+    ${
+      stamped.length > 0
+        ? sql`union all
+    select 's', agent_id, target_id, null, null, null, null, ${STAMP_SQL}
+    from base where (agent_id, target_id) in (${sql.join(
+      stamped.map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )})
+    group by agent_id, target_id`
+        : sql``
+    }`);
+  const readStamps = new Map<string, string>();
+  const rows: { agentId: string; targetId: string; databaseName: string; objectName: string; classifier: string; confidence: number }[] = [];
+  for (const r of res.rows) {
+    if (r.kind === "s") readStamps.set(targetKey({ agentId: r.agent_id, targetId: r.target_id }), String(r.stamp));
+    else {
+      rows.push({
+        agentId: r.agent_id,
+        targetId: r.target_id,
+        databaseName: String(r.database_name),
+        objectName: String(r.object_name),
+        classifier: String(r.classifier),
+        confidence: Number(r.confidence),
+      });
+    }
+  }
+  // Hits per object (database and object folded, any schema), then the highest per database.
+  const objects = new Map<string, { db: string; target: string; hits: ClassifierHit[] }>();
+  for (const r of rows) {
+    const db = databaseKey(r.agentId, r.targetId, r.databaseName);
+    const key = [db, foldName(r.objectName)].join(SEP);
+    const entry = objects.get(key) ?? { db, target: targetKey(r), hits: [] };
+    entry.hits.push({ classifier: r.classifier, confidence: Number(r.confidence) });
+    objects.set(key, entry);
+  }
+  const raise = (k: string, v: number) => bounds.set(k, Math.max(bounds.get(k) ?? 0, v));
+  const perTarget = new Map<string, Map<string, number>>();
+  for (const o of objects.values()) {
+    const s = objectSensitivity(o.hits);
+    raise(o.db, s);
+    const pair = whole.get(o.target);
+    if (pair) {
+      raise(wholeTargetKey(...pair), s);
+      const m = perTarget.get(o.target) ?? new Map<string, number>();
+      m.set(o.db, Math.max(m.get(o.db) ?? 0, s));
+      m.set(wholeTargetKey(...pair), Math.max(m.get(wholeTargetKey(...pair)) ?? 0, s));
+      perTarget.set(o.target, m);
+    }
+  }
+  if (cache) for (const k of fresh.keys()) cache.set(k, { stamp: readStamps.get(k) ?? "0", bounds: perTarget.get(k) ?? new Map() });
+  return boundsOf(bounds);
+}
+
+function boundsOf(bounds: ReadonlyMap<string, number>): DatabaseBounds {
+  return {
+    get: (agentId, targetId, database) =>
+      bounds.get(database === "*" ? wholeTargetKey(agentId, targetId) : databaseKey(agentId, targetId, database)) ?? 0,
+  };
+}
+
+/** Cached whole-target bounds, by {@link targetKey}: the findings stamp they were read at. */
+export interface WholeTargetCache {
+  get(key: string): { stamp: string; bounds: ReadonlyMap<string, number> } | undefined;
+  set(key: string, value: { stamp: string; bounds: ReadonlyMap<string, number> }): void;
+}
+
+/** At most this many targets in a process's whole-target cache (the oldest entry goes first). */
+export const WHOLE_TARGET_CACHE_MAX = 1024;
+
+/** A bounded {@link WholeTargetCache} (insertion order: a refreshed entry moves last). */
+export function boundedWholeTargetCache(max = WHOLE_TARGET_CACHE_MAX): WholeTargetCache {
+  const m = new Map<string, { stamp: string; bounds: ReadonlyMap<string, number> }>();
+  return {
+    get: (k) => m.get(k),
+    set: (k, v) => {
+      m.delete(k);
+      m.set(k, v);
+      while (m.size > max) m.delete(m.keys().next().value as string);
+    },
+  };
+}
+
+/**
+ * Stamp of each target's findings, by {@link targetKey}: the number of rows and two order-free
+ * sums of 64-bit hashes (two seeds) of what the bound reads of each row: its id (which fixes its
+ * database, object and classifier, `location_key`), its confidence and whether it is a false
+ * positive. Any insert, removal, confidence change or false-positive change changes it, whatever
+ * the commit order of concurrent scans (timestamps would not: `now()` is a transaction's start).
+ * One row per target; a target without findings has none ("0").
+ */
+const STAMP_SQL = sql.raw(`concat_ws('|', count(*),
+             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 1)::numeric),
+             sum(hashtextextended(id::text || ':' || confidence::text || ':' || (false_positive_at is null)::text, 2)::numeric))`);
+
+async function findingsStamps(tx: Tx, pairs: readonly (readonly [string, string])[]): Promise<Map<string, string>> {
+  const r = await tx.execute<{ agent_id: string; target_id: string; stamp: string }>(sql`
+    select agent_id, target_id, ${STAMP_SQL} as stamp
+    from findings
+    where (agent_id, target_id) in (${sql.join(
+      pairs.map(([a, t]) => sql`(${a}::uuid, ${t}::text)`),
+      sql`, `,
+    )})
+    group by agent_id, target_id`);
+  return new Map(r.rows.map((row) => [targetKey({ agentId: row.agent_id, targetId: row.target_id }), row.stamp]));
+}
+
+/** Per console database and process (the worker): keyed by the `Database` handle. */
+const wholeTargetCaches = processGlobal("eventEngine.wholeTargetBounds", () => new WeakMap<object, WholeTargetCache>());
+
+function wholeTargetCacheOf(db: Database): WholeTargetCache {
+  let c = wholeTargetCaches.get(db);
+  if (!c) {
+    c = boundedWholeTargetCache();
+    wholeTargetCaches.set(db, c);
+  }
+  return c;
+}
+
 type BaselineRow = BaselineState & {
   rowsTotal: number;
   maxScore: number;
@@ -392,7 +639,13 @@ type ApplyResult = "created" | "reopened" | "overflow_created" | "overflow" | "r
 interface Evaluated {
   event: PendingEvent;
   facts: EventFacts;
+  /**
+   * Bound sensitivity of each object (ADR-0053): the named one, raised to its database's bound
+   * for an overflow `*`. Sets the dedup object (decision 3 item 4).
+   */
   objectSensitivities: number[];
+  /** Named sensitivity of each object (ADR-0053 review M1: the dedup scope without the bound). */
+  namedSensitivities: number[];
 }
 
 interface LatestIncident {
@@ -523,6 +776,8 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
       eventRows: sql`coalesce(${incidents.eventRows}, 0) + ${e.rows ?? 0}::double precision`,
       eventSignals: signals,
       eventAnomaly: sql`coalesce(${incidents.eventAnomaly}, false) or ${facts.anomaly}`,
+      // ADR-0053 decision 3 item 4: display only, never read back by the comparisons.
+      ...overflowColumns(facts),
       lastEventAt: sql`greatest(coalesce(${incidents.lastEventAt}, ${e.ts}), ${e.ts})`,
       updatedAt: sql`now()`,
     })
@@ -548,6 +803,17 @@ async function rematch(tx: Tx, latest: LatestIncident, e: PendingEvent, facts: E
   await link(tx, latest.id, e.id);
 }
 
+/**
+ * The incident columns of ADR-0053 updated when an event joins an active incident: the highest
+ * bound score (from `event_score` on an incident opened before ADR-0053; equal to it while no
+ * flagged event joined) and the flag, set once a flagged event joins. Display only: no comparison
+ * reads them back (review H1 of ADR-0053).
+ */
+function overflowColumns(facts: EventFacts) {
+  const eventBoundScore = sql`greatest(coalesce(${incidents.eventBoundScore}, ${incidents.eventScore}, 0), ${facts.boundScore ?? facts.score}::double precision)`;
+  return facts.objectsOverflowed === true ? { eventBoundScore, eventObjectsOverflowed: true } : { eventBoundScore };
+}
+
 async function applyEventPolicy(
   tx: Tx,
   policy: LoadedEventPolicy,
@@ -559,8 +825,6 @@ async function applyEventPolicy(
   const kept = eventMatches(policy.conditions, facts);
   if (kept === null) return "no_match";
   if (exceptions.some((x) => exceptionCoversEvent(x, policy.id, facts, kept, state.now))) return "excepted";
-  const oi = dedupObject(kept, ev.objectSensitivities);
-  const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
   const bucket = eventBucket(e.ts);
   // ADR-0021 decision 6, implementation note of 2026-10-18 (PR #274 review M1): the database part
   // keeps the case as sent and drops trailing spaces only on the engines that ignore them.
@@ -579,12 +843,20 @@ async function applyEventPolicy(
       databaseKey,
       bucket,
     });
-  const keyed = database === null ? null : dedupDatabaseName(database, facts.engine);
-  const key = keyOf(keyed === null ? "-" : sha256Hex(keyed));
-  // Consoles before the note hashed the name as sent: only a name with trailing spaces on such an
-  // engine has another key, looked up so an incident open across the upgrade keeps its events.
-  const legacyKey = database === null || keyed === database ? null : keyOf(sha256Hex(database));
-  const latest = await latestIncident(tx, state, key, legacyKey);
+  const scopeOf = (sensitivities: readonly number[]) => {
+    const oi = dedupObject(kept, sensitivities);
+    const database = oi === null ? null : (facts.objects[oi] as EventObject).database;
+    const keyed = database === null ? null : dedupDatabaseName(database, facts.engine);
+    const key = keyOf(keyed === null ? "-" : sha256Hex(keyed));
+    // Consoles before the note hashed the name as sent: only a name with trailing spaces on such an
+    // engine has another key, looked up so an incident open across the upgrade keeps its events.
+    const legacyKey = database === null || keyed === database ? null : keyOf(sha256Hex(database));
+    return { database, key, legacyKey };
+  };
+  // ADR-0053 decision 3 item 4: the dedup object is chosen on the bound sensitivities.
+  const bound = scopeOf(ev.objectSensitivities);
+  let { database, key } = bound;
+  let latest = await latestIncident(tx, state, key, bound.legacyKey);
   if (latest && (ACTIVE_STATUSES as readonly string[]).includes(latest.status)) {
     await rematch(tx, latest, e, facts);
     return "rematched";
@@ -592,8 +864,30 @@ async function applyEventPolicy(
   // M1: after a resolution or a false positive, only a clearly worse event opens a new incident
   // (`worseThanClosed`); otherwise the event is linked to the closed incident (visible there).
   if (latest && !worseThanClosedIncident(latest, e, facts)) {
-    await linkClosed(tx, latest, e);
-    return "linked";
+    // ADR-0053 security review M1 (fail closed): when the bound moved the scope to another
+    // database (an overflow `*`) whose closed incident would absorb the event, the scope of the
+    // named objects decides too: its active incident collects the event, and without an incident
+    // there, or with a closed one the event is worse than, an incident opens under it. The bound
+    // never makes a flagged event less visible than it would be without the flag.
+    const named = scopeOf(ev.namedSensitivities);
+    if (named.key === key) {
+      await linkClosed(tx, latest, e);
+      return "linked";
+    }
+    const namedLatest = await latestIncident(tx, state, named.key, named.legacyKey);
+    if (namedLatest && (ACTIVE_STATUSES as readonly string[]).includes(namedLatest.status)) {
+      await rematch(tx, namedLatest, e, facts);
+      return "rematched";
+    }
+    if (namedLatest && !worseThanClosedIncident(namedLatest, e, facts)) {
+      // Re-review N1: linked to both closed incidents, so the named scope's false positive keeps
+      // counting the rows linked since it was marked (ADR-0031 decision 2, anti-splitting).
+      await linkClosed(tx, latest, e);
+      await linkClosed(tx, namedLatest, e);
+      return "linked";
+    }
+    ({ database, key } = named);
+    latest = namedLatest;
   }
   // H1 / N1: cap of new incidents per policy, target and hour; beyond, one overflow incident of
   // the policy on that target counts the rest, except severe events, which always open their own.
@@ -640,6 +934,8 @@ async function applyEventPolicy(
       eventSignals: mergeSignals([], facts.signals),
       eventAnomaly: facts.anomaly,
       eventOverflow: overflow,
+      eventObjectsOverflowed: facts.objectsOverflowed === true ? true : null,
+      eventBoundScore: facts.boundScore ?? facts.score,
       lastEventAt: e.ts,
     })
     .onConflictDoNothing({ target: incidents.dedupKey, where: sql`${incidents.status} in ('open', 'acknowledged')` })
@@ -701,6 +997,8 @@ async function applyEventPolicy(
       signals: [...facts.signals],
       unregistered_signals: unregisteredSignals(facts.signals),
       objects: facts.objects.map((o) => ({ database: o.database, schema: o.schema ?? null, object: o.object })),
+      // ADR-0053 decision 3 item 7: the event reached more objects than it lists.
+      objects_overflowed: facts.objectsOverflowed === true,
     },
   };
   await enqueueIncidentNotifications(tx, row.id, policy.notifyChannels, payload);
@@ -762,11 +1060,15 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
     const nowDate = new Date(now);
     const state: ChunkState = { now: nowDate, hour: eventBucket(nowDate), cap: eventIncidentsPerPolicyHour(), latest: new Map(), created: new Map() };
     const targets = await tx
-      .select({ agentId: agentTargets.agentId, targetId: agentTargets.targetId, engine: agentTargets.engine })
+      .select({ agentId: agentTargets.agentId, targetId: agentTargets.targetId, engine: agentTargets.engine, nameCase: agentTargets.nameCase })
       .from(agentTargets)
       .where(inArray(agentTargets.agentId, [...new Set(events.map((e) => e.agentId))]));
     const engines = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, t.engine]));
-    const hits = await loadObjectHits(tx, events, await cachedLowerFoldsUnicode(db, tx));
+    // ADR-0055 decision 6: each target's current `name_case`, canonical (null: today's rule).
+    const nameCases = new Map(targets.map((t) => [`${t.agentId}${SEP}${t.targetId}`, canonicalNameCase(t.nameCase)]));
+    const unicodeLower = await cachedLowerFoldsUnicode(db, tx);
+    const hits = await loadObjectHits(tx, events, unicodeLower);
+    const bounds = await loadDatabaseBounds(tx, events, unicodeLower, wholeTargetCacheOf(db));
     const active = await loadEventPolicies(tx);
     const exceptions = await loadExceptions(tx);
     const baselines = await loadBaselines(tx, events);
@@ -776,6 +1078,13 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       const objectSensitivities = e.objects.map((o) => objectSensitivity(hits.get(objectKey(e.agentId, e.targetId, o)) ?? []));
       const sensitivity = objectSensitivities.reduce((m, s) => Math.max(m, s), 0);
       const score = eventScore(sensitivity, e.rows);
+      // ADR-0053 decision 3 item 3: the bound; the named values for an event without the flag.
+      const boundSensitivities = objectSensitivities.map((s, i) => {
+        const o = e.objects[i] as EventObject;
+        return isOverflowStar(e, o) ? Math.max(s, bounds.get(e.agentId, e.targetId, o.database)) : s;
+      });
+      const boundSensitivity = boundSensitivities.reduce((m, s) => Math.max(m, s), 0);
+      const boundScore = eventScore(boundSensitivity, e.rows);
       const bk = baselineKey(e);
       const base = baselineEligible(e) ? baselines.get(bk) : undefined;
       const verdict = base ? baselineVerdict(base, e.rows) : { anomaly: false, baselineRows: null };
@@ -793,7 +1102,11 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
       const facts: EventFacts = {
         agentId: e.agentId,
         targetId: e.targetId,
-        engine: engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
+        // The engine the source tells (checked against the target at ingest), else the target's
+        // current one (security review L1 of ADR-0054: a target's engine may change after ingest).
+        engine: auditSourceEngine(e.source) ?? engines.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
+        // Location exceptions only, and only when that engine is MySQL, MariaDB or SQL Server.
+        nameCase: nameCases.get(`${e.agentId}${SEP}${e.targetId}`) ?? null,
         principal: principalLabel(e),
         accountNotRecorded: e.accountNotRecorded,
         action: e.action,
@@ -803,16 +1116,19 @@ export async function evaluateChunk(db: Database, stats: EventDrainStats): Promi
         signals: e.signals,
         sensitivity,
         score,
+        objectsOverflowed: e.objectsOverflowed === true,
+        boundSensitivity,
+        boundScore,
         anomaly: verdict.anomaly,
       };
       for (const p of active) {
-        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities }, exceptions, state);
+        const r = await applyEventPolicy(tx, p, { event: e, facts, objectSensitivities: boundSensitivities, namedSensitivities: objectSensitivities }, exceptions, state);
         if (r === "created" || r === "reopened" || r === "overflow_created") stats.created += 1;
       }
       if (verdict.anomaly) stats.anomalies += 1;
       await tx
         .update(accessEvents)
-        .set({ evaluatedAt: sql`now()`, sensitivity, score, anomaly: verdict.anomaly, baselineRows: verdict.baselineRows })
+        .set({ evaluatedAt: sql`now()`, sensitivity, score, boundSensitivity, boundScore, anomaly: verdict.anomaly, baselineRows: verdict.baselineRows })
         .where(eq(accessEvents.id, e.id));
     }
     await saveBaselines(tx, baselines, touched);

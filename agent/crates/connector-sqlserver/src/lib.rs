@@ -36,6 +36,7 @@ mod check;
 mod conn;
 mod discover;
 mod error;
+mod name_case;
 mod sql;
 mod tds;
 mod tls;
@@ -152,6 +153,13 @@ impl Connector for SqlserverConnector {
 
     fn server_version(&self, target: &TargetConfig) -> Option<String> {
         self.state.version(&target.id)
+    }
+
+    fn name_case(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_core::name_case::NameCaseReport> {
+        self.state.name_case(&target.id)
     }
 }
 

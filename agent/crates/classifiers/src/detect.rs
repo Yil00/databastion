@@ -69,7 +69,11 @@ static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
         r"[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}\-]+(?:\.[\p{L}\p{N}\-]+)*\.\p{L}{2,}",
     )
 });
-static IBAN_START: LazyLock<Regex> = LazyLock::new(|| re("IBAN_START", r"(?i)\b[a-z]{2}[0-9]{2}"));
+// ASCII letters only: under `(?i)`, `[a-z]` also matches `ſ` (U+017F,
+// two bytes in UTF-8), which no country code holds, and the two-byte
+// country slice of `iban_tokens` then split it (a panic on a sampled
+// value). The slice is also checked there.
+static IBAN_START: LazyLock<Regex> = LazyLock::new(|| re("IBAN_START", r"\b[A-Za-z]{2}[0-9]{2}"));
 static CARD: LazyLock<Regex> = LazyLock::new(|| re("CARD", r"\b[0-9](?:[ \-]?[0-9]){11,22}\b"));
 static NIR: LazyLock<Regex> = LazyLock::new(|| {
     re(
@@ -190,7 +194,8 @@ static PASSWORD_HASH: LazyLock<Regex> = LazyLock::new(|| {
             r"|unsalted_(?:md5|sha1)\$\$?[0-9a-f]{32,40}",
             // PostgreSQL SCRAM and md5, MySQL native and caching_sha2
             r"|SCRAM-SHA-(?:1|256)\$[0-9]+:[A-Za-z0-9+/]+=*\$[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*",
-            r"|md5[0-9a-f]{32}",
+            // Any case: a name or text kept as written (`MD5…`) still matches.
+            r"|(?i:md5[0-9a-f]{32})",
             r"|\*[0-9A-F]{40}",
             r"|\$A\$[0-9]{3}\$[!-~]{20}[./A-Za-z0-9]{43}",
             // LDAP / RFC 2307 schemes, Atlassian PKCS5S2
@@ -816,7 +821,12 @@ fn iban_tokens(v: &str) -> Vec<(Range<usize>, bool)> {
     let start_re = &*IBAN_START;
     let mut out = Vec::new();
     for m in start_re.find_iter(v) {
-        let Some(len) = validate::iban_length(&m.as_str()[..2].to_ascii_uppercase()) else {
+        // Never a panic, whatever the pattern matches: a country code is
+        // two ASCII letters, anything else is no IBAN.
+        let Some(country) = m.as_str().get(..2) else {
+            continue;
+        };
+        let Some(len) = validate::iban_length(&country.to_ascii_uppercase()) else {
             continue;
         };
         let mut compact = Zeroizing::new(String::with_capacity(len));
@@ -1972,6 +1982,62 @@ mod tests {
     use super::*;
     use ClassifierId as C;
 
+    /// An ASCII letter then `ſ` (U+017F) then two digits (`xſ12`) panicked
+    /// the IBAN detector: `(?i)[a-z]` matched `ſ`, and the two-byte country
+    /// slice split it. The panic failed the target's whole Discovery call
+    /// on every scan. Never a panic now, and no IBAN.
+    #[test]
+    fn a_long_s_after_a_letter_never_splits_the_country_code() {
+        for v in [
+            "x\u{17F}12 3456",
+            "F\u{17F}76 3000 6000 0112 3456 7890 189",
+            "\u{17F}x12 3456",
+            "\u{17F}\u{17F}12",
+            // The Kelvin sign also folds to an ASCII letter (NFC makes it
+            // unreachable from a sampled value, but the detector must hold).
+            "\u{212A}x12",
+            "x\u{212A}12",
+        ] {
+            assert!(
+                !scan_tokens(v, &|_| true)
+                    .iter()
+                    .any(|t| t.classifier == C::Iban),
+                "{v:?}"
+            );
+            let _ = crate::column::classify_column("iban", &[crate::masking::RawSample::new(v)]);
+        }
+        // A real IBAN next to one is still found, lowercase too.
+        for v in [
+            "x\u{17F}12 FR76 3000 6000 0112 3456 7890 189",
+            "fr76 3000 6000 0112 3456 7890 189",
+        ] {
+            assert!(
+                scan_tokens(v, &|_| true)
+                    .iter()
+                    .any(|t| t.classifier == C::Iban),
+                "{v:?}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1024))]
+
+        /// The detectors and the column classifier never panic on
+        /// arbitrary printable text (security review L3).
+        #[test]
+        fn detection_never_panics(v in "\\PC{0,64}", w in "[a-zA-Z\u{17F}\u{212A}0-9 .-]{0,24}") {
+            for s in [v.as_str(), w.as_str()] {
+                let _ = scan_tokens(s, &|_| true);
+                let _ = scan(s, &|_| true);
+                let _ = crate::column::classify_column(
+                    "value",
+                    &[crate::masking::RawSample::new(s)],
+                );
+            }
+        }
+    }
+
     fn found(v: &str) -> Vec<(ClassifierId, &str)> {
         scan_tokens(v, &|_| true)
             .into_iter()
@@ -2408,6 +2474,7 @@ mod tests {
             "{SSHA}DnKiYrOFTEkn+VpML/5/mBX+VpPyx0J0rjW88Q==",
             "{PKCS5S2}QnVpbGRlclNhbHQxMjM0NTY3ODkwYWJjZGVmZ2hpamtsbW5vcA==",
             "md5c2b1a09f8e7d6c5b4a39281706f5e4d3",
+            "MD5C2B1A09F8E7D6C5B4A39281706F5E4D3",
             "*6BB4837EB74329105EE4568DDA7DC67ED2CA2AD9",
             "SCRAM-SHA-256$4096:c2FsdHNhbHQ=$c3RvcmVka2V5c3RvcmVka2V5:c2VydmVya2V5c2VydmVy",
         ] {

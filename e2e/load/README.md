@@ -89,6 +89,9 @@ local `e2e/run.sh`).
 | `LOAD_DRAIN_TIMEOUT_S` | 300 | Longest wait for the Audit run's events after the workload |
 | `LOAD_PG_AUDIT` | `pgaudit` | `pss`: local runs without the pgaudit image (above) |
 | `LOAD_HTTPS_PORT` | 8543 | Port of the TLS proxy on 127.0.0.1 |
+| `LOAD_SQLSERVER_VERSION` | 2022 | `sqlserver.sh` only: 2019 or 2025, the engine matrix's pinned image of that version ([below](#other-versions-sql-server-2019-and-2025)) |
+| `LOAD_SQLSERVER_AUDIT_SOURCE` | `sqlserver_audit` (`sqlserver_xevents` on 2019) | `sqlserver.sh` only: `sqlserver_xevents` for the Extended Events source ([below](#extended-events-source-catch-up-noise-282-review-n3)) |
+| `LOAD_SQLSERVER_STATS_RESET_S` | 0 | `sqlserver.sh` only: drop the load schema's auto-created statistics every N seconds of the Audit run |
 | `LOAD_LIMIT_<NAME>` | see below | Every field of `loadlib.Limits`, upper case, e.g. `LOAD_LIMIT_DISCOVERY_PCT=2.0`, `LOAD_LIMIT_DRAIN_S=240`, `LOAD_LIMIT_AGENT_REF_CPU_CORES=0.013` (the release reference of the agent checks) |
 
 ## Flow
@@ -202,6 +205,9 @@ resolution shows), and the agent account's own statement time from the engine's 
 | `audit.<target>.workload_ran` | issued > 0, 0 failed | pgbench `failed transactions`, sysbench `ignored errors` |
 | `audit.<target>.events_accounted` | 0.99 to 1.01 | sum of `aggregated_count` of `load_app`'s `read` events / statements issued during the Audit run: nothing lost, nothing counted twice |
 | `audit.<target>.drain_s` | ≤ 240 s | end of the workload → last of those events stored (`received_at`); includes the 60 s aggregation window by design |
+| `audit.<target>.db_cores_drain` | ≤ 0.5 × the server's CPUs (1.0 core of 2) | SQL Server runs only (a `drain` fact): the server's CPU over the drain, when no workload runs (the agent's catch-up reads, the probe, the server's own work). Skipped (reported, not failed) when every workload statement was stored when the workload ended |
+| `audit.<target>.db_cores_drain_vs_audit_on` | ≤ DB cores with Audit on + 0.25 | the same figure against the Audit-on run, which has the same reads plus the workload; skipped as above |
+| `audit.<target>.drain_probe_p95_us` | ≤ max(2 × p95 before Audit, p95 before Audit + 1000 µs) | the `sa` latency probe's p95 during the drain against the one before Audit; skipped as above |
 | `audit.<target>.p95_latency_ms` | ≤ 3 × p95 without Audit + 5 ms | p95 latency of the workload with Audit vs without (pgbench: per-transaction log, from the scheduled start; sysbench: its 95th percentile). Generous on purpose: shared CI runners are noisy |
 | `audit.mariadb-load.monitor_ran`, `.builtins_ran` | issued > 0, 0 failed | the side accounts ran in both phases (statements counted for the Audit run) |
 | `audit.mariadb-load.monitor_reported` | `threads` and `PROCESSLIST` named | the reader's reads of [statement-text tables](../../docs/08-engine-capabilities.md#statement-text-tables) are events naming them (ADR-0045 part (a); the digest summary has no statement text on MariaDB and stays quiet) |
@@ -364,6 +370,123 @@ LOAD_SKIP_BUILD=1 e2e/load/sqlserver.sh                 # reuse the images built
 LOAD_MSSQL_DIAG=1 e2e/load/sqlserver.sh                 # local only: the scan's top statements
 ```
 
+### Other versions: SQL Server 2019 and 2025
+
+`LOAD_SQLSERVER_VERSION=2019` or `2025` (default 2022, the dev pin; workflow input
+`sqlserver_version` of `load.yml`) runs the same measurement against the engine matrix's pinned
+image of that version (2019: 15.0.4500.2; 2025: 17.0.5015.4), Express, as
+[`e2e/sqlserver.sh`](../sqlserver.sh) does with `E2E_SQLSERVER_VERSION`; the pin must be the one of
+[`engine-matrix.yml`](../../.github/workflows/engine-matrix.yml) (checked at start), and the run
+checks that the server reports that major version and the Express edition. On 2019, which has no
+usable SQL Server Audit source ([ADR-0051](../../docs/adr/0051-sqlserver-connector.md) decision 6),
+the source is Extended Events (the default there; `sqlserver_audit` is refused), the agent login
+holds the dev script's 2019 grant `VIEW SERVER STATE` (`VIEW SERVER PERFORMANCE STATE` is 2022+),
+and the scaled seed comes from a portable tally (`seed.py sqlserver --no-generate-series`:
+`GENERATE_SERIES` is 2022+; the same values). The agent login's server permissions are checked
+before the agent starts on every version. The 2019 drain run (ROADMAP "Extended Events read size,
+merge review follow-ups"):
+
+```sh
+LOAD_SQLSERVER_VERSION=2019 e2e/load/sqlserver.sh       # Extended Events, 50 SELECTs/s
+```
+
+### Extended Events source: catch-up noise (#282 review N3)
+
+`LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents` (default `sqlserver_audit`; workflow input
+`sqlserver_audit_source` of `load.yml`) runs the same measurement with the Extended Events source:
+`audit: {source: sqlserver_xevents, xe_session: databastion_xe}` (the dev session, as
+[`e2e/sqlserver.sh`](../sqlserver.sh) with `E2E_SQLSERVER_AUDIT_SOURCE`), and the agent login holds
+that source's grant only (on 2022+, the two SQL Server Audit grants revoked, `VIEW SERVER
+PERFORMANCE STATE` granted, before the agent starts; on 2019, `VIEW SERVER STATE`,
+[below](#other-versions-sql-server-2019-and-2025)). Every statement of the workload's T-SQL loop is an Extended
+Events event (`SET`, `IF`, `WAITFOR`, the table-variable insert: about 30 per workload `SELECT`), so
+the default rate is 50 `SELECT`s per second with this source (`LOAD_MSSQL_RATE`, workflow input
+`sqlserver_rate`), about 1 500 events per second, within the session's 8 files of 64 MB over a
+600 s run. `LOAD_SQLSERVER_STATS_RESET_S=N` (default 0, off; workflow input
+`sqlserver_stats_reset_s`) drops the load schema's auto-created statistics as `sa` every N seconds
+of the Audit run (`DROP STATISTICS`, logged as `statistics resets: …`), so that the ORM-style
+session's next reporting queries (`GROUP BY a0.status`) build them again in `load_orm`'s session:
+statistics builds under load, which the stream may defer (ADR-0051 refinement of 2026-10-18). The
+`sa` drops are DDL events of `sa`, always reported; they are not in the figures below.
+
+The stream lag (both sources): while it waits for the drain, the run samples the statements stored
+every 5 s, logs `drain: <stored>/<expected> statements stored <s> s after the workload` every 30 s,
+and records a `drain` fact (`facts.jsonl`, not a check): the samples (seconds since the last
+workload statement, statements stored), `stored_at_workload_end` and `rate_per_s`, the statements
+stored per second during the drain. `drain_s` (the check) is the time from the last workload
+statement to the last of them stored, `null` when the drain times out; the `drain` fact still shows
+how far behind the stream was and how fast it caught up. The catch-up's impact, in `results.json`
+under the target's Audit figures and checked since the #311 review R2 (`db_cores_drain`,
+`db_cores_drain_vs_audit_on`, `drain_probe_p95_us` in [2.](#2-audit-path-under-load); `drain_happened`
+says whether they applied): `db_cores_drain`, the SQL Server container's CPU
+over the drain (a `drain_<target>` window; no workload runs then), and `probe_p95_us_off` /
+`probe_p95_us_drain`, a latency probe as `sa` (blocks of 100 constant `SELECT`s every 5 s, which
+name no table and so produce no access event; one `PROBE <µs per statement>` line per block, the
+p95 over the blocks) run for 30 s before Audit and throughout the drain. The agent logs an `info`
+line at most once a minute while a stream is behind its source ("Audit stream behind its source",
+with `cycles`, `reads`, `busy_ms` and `window_ms`; the read rate is about
+`reads × 500 / busy_ms × 1000` events per second at most) and one when it caught up. Load run
+39687119269 (Extended Events, 50 `SELECT`s/s, before the fix) stored 15 028 of 30 000 `SELECT`s
+300 s after the workload: a stream still in its first start's history phase waited the poll
+interval after every 20 reads, about 700 events/s against 1 500 written.
+
+After the drain, the run prints (and writes to `$LOAD_RESULTS_DIR/xe-catchup.json` and
+`xe-catchup.md`, the latter added to the job summary on exit, once the results directory is
+redacted), never as a check:
+
+- `XE-CATCHUP load-sqlserver cuts=… episodes=… longest_episode_s=… episodes_at_60s_cap=…`: the
+  agent's debug line "a statistics build not paired yet: the read ends before it" since Audit
+  started, one per read cut before an unpaired build (deferrals and full-read cuts alike: the
+  agent logs both the same way), grouped in runs of cuts at most 30 s apart; a run that lasts about
+  60 s reached the hold bound (`MAX_DEFERRAL`), after which nothing is deferred until the stream
+  has caught up, and builds still unpaired are reported. The agent has no counter of the builds
+  reported that way (the connector's left-out counts are test-only), hence the two sides below.
+- `XE-BUILDS … principal=… statistics_builds_in_session_files=…`: the statistics builds
+  (`sp_statement_completed` whose text is the `StatMan` grammar) in the session's files since
+  Audit started, per principal (as `sa`, counts only); `XE-SELECTS`: `load_app`'s workload
+  `SELECT`s there since the soak started (also the report's "In the target's log" column).
+- `XE-NOISE … principal=load_app|load_orm events=… read_statements=… issued=…
+  excess_read_statements=… unknown_star_events=… star_only_events=…`: the console's events of the
+  workload principals. A reported build is a read of its table and its internal statements reads
+  of `*`: the noise shows as read statements beyond those issued and as events naming `*` that the
+  agent did not flag overflowed (`star_only`: `*` is the event's only object, the shape of a build's
+  internal statement); `load_orm`'s overflowed reporting queries are counted apart.
+
+```sh
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_SQLSERVER_STATS_RESET_S=10 e2e/load/sqlserver.sh
+```
+
+### Extended Events source: read size and large events (ADR-0051 refinement of 2026-10-22)
+
+With the Extended Events source, the agent reads up to 2 000 events after a full read (sized from the
+wire bytes of the largest event of that read), 500 otherwise, and reads a response above 12 MiB again
+at half the size ([ADR-0051 refinement of 2026-10-22](../../docs/adr/0051-sqlserver-connector.md#refinement-2026-10-22-accepted-by-the-maintainer-on-2026-10-22-option-b-extended-events-reads-within-one-buffer),
+load step 4). `LOAD_SQLSERVER_LARGE_EVERY_S=N` (default 0, off; workflow input
+`sqlserver_large_every_s`; refused with `sqlserver_audit`) adds, every N seconds of the Audit run, a
+burst of `LOAD_SQLSERVER_LARGE_BURST` (default 60) reads of the first load table by the login
+`load_big` (created with the same password as `load_app`, `SELECT` on the load schema), each through
+`sp_executesql` with a statement holding a comment of about 60 000 characters: an Extended Events event
+of about 120 KiB, near the poll's 128 KiB bound. The statements of a burst are 20 ms apart (back to
+back, the session's 4 MB of buffers drop events, measured locally). A burst met by a read of 2 000
+events is above 12 MiB: that read is cancelled and read again smaller, and the reads then stay at 500
+or less for 10 minutes. `load_big`'s events are reported as reads of that table; they are not counted
+in the workload figures (`load_app`). The large-event session prints `large-event session (on): LARGE
+<statements run>`.
+
+In every Extended Events run, `xe-catchup` also prints `XE-READS load-sqlserver cancels=… timeouts=…
+max_cancels_per_10min=…`, from the agent's debug line "Extended Events read cancelled: read again
+smaller" (one per read cancelled above 12 MiB, `reason` "response above 12 MiB", or at the client's
+statement timeout, "statement timeout", since Audit started), and the run records an `xe_reads` fact
+that the report checks: `audit.mssql-load.xe_cancels_per_10min` (at most 1 in any 10 minutes,
+`LOAD_LIMIT_XE_CANCELS_PER_10MIN`) and `audit.mssql-load.xe_timeouts` (0, `LOAD_LIMIT_XE_TIMEOUTS`);
+"no data" (failed) when the agent's log could not be read.
+
+```sh
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents e2e/load/sqlserver.sh                                     # 50 SELECTs/s
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_MSSQL_RATE=100 e2e/load/sqlserver.sh                 # recorded only
+LOAD_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents LOAD_SQLSERVER_LARGE_EVERY_S=60 e2e/load/sqlserver.sh     # large events
+```
+
 `LOAD_MSSQL_DIAG=1` (refused under GitHub Actions) writes the 15 statements that used the most CPU
 during the scan (their first 70 characters, which may name a value-bearing table) to
 `diag-top-statements.txt` in the log directory. Results go to `$LOAD_RESULTS_DIR` (default
@@ -459,6 +582,61 @@ with Audit; every check passed:
   service time p95 1.127 ms without and 1.081 ms with Audit.
 - Agent: 0.019 core with Audit on (97 ms of CPU per 1 000 commands), 32.7 MiB peak RSS, no growth,
   nothing spooled or dropped.
+
+## Event census (ADR-0053 decision 6, informational)
+
+[ADR-0053](../../docs/adr/0053-overflowed-event-objects-flag.md) is accepted only after the rate of
+events whose objects overflowed the agent's bound (15 named objects per event, then `*`) is measured,
+and its open question 1 asks for the rate of events naming an unknown-object `*`. Neither is in the
+protocol, so the agent core counts them locally: once per heartbeat, when the counts changed, it logs
+one `audit event census` info line per engine (`agent/crates/core/src/audit/census.rs`) with the
+events spooled since it started (after aggregation and the `audit.configure` filter), the raw
+statements they stand for (`aggregated_count`), the overflowed events, the events naming a `*` without
+having overflowed (dynamic SQL, user code, a text the connector could not analyse; on Redis / Valkey
+also a real `*` key pattern), each with their statements, and the events filtered. Counts and engine
+names only (I2); nothing reaches the console (I6).
+
+Every load run (`run.sh`, `cas.sh`, `sqlserver.sh`, `redis.sh`) and every end-to-end run
+(`e2e/run.sh`, `cas.sh`, `sqlserver.sh`, `redis.sh`) prints, on exit, the agent's last census line per
+engine as `CENSUS <label> engine=<engine> events=… overflowed=… unknown_star=… overflowed_rate=…`
+in its log (`loadlib.py census`), and an "Event census" section in the job summary. Every run also
+reads the console database on exit (read-only, the queries of `loadlib.py census-sql`) and adds:
+
+- `CENSUS-CONSOLE` lines: per target and principal (an account name as stored, `fp:` and the first 8
+  hex digits of a fingerprint, `(not-recorded)` for Redis / Valkey events without an account), the
+  events stored, the statements, the events naming `*`, those the agent flagged
+  `objects_overflowed` (ADR-0053) and the longest object list;
+- `STAR-EVENTS` lines: the events naming `*`, grouped by target, source, action, principal kind
+  (`account`, `fingerprint`, `not_recorded`), signals, the databases of their `*` objects, whether
+  `*` is their only object and whether they were flagged overflowed; and `STAR-FINDINGS` lines: per
+  target and database, the distinct finding objects (on Redis / Valkey the key patterns that
+  Discovery reported, from the scan whose patterns Audit maps keys to) and whether `*` is one of
+  them. No object name other than `*`, no principal name, no value (I2). For the Valkey question of
+  ADR-0053 decision 6: the agent never learns `*` as a key pattern (`LearnedPatterns` ignores it),
+  so a slow-log read of `*` is a key that matched no learned pattern (or one the second gate masked,
+  a guarded CAS key, an oversized or non-UTF-8 key), a command whose keys the agent cannot place, a
+  script (`EVAL` and the like, a write of `*`), an `ACL LOG` entry (source `redis_acl_log`) or a full synchronization
+  (source `redis_sync`, signal `signature.full_sync`, principal `not_recorded`).
+
+The job summary sections are not written by `loadlib.py`: each harness appends the
+`census-<label>.md` files to the summary in its exit handler, after the leak scan and redaction of
+their directory. The census is also kept as files: `census-<label>.json` and `.md` in the results directory of the
+load runs (the `load-*-results` artifacts) and in `<log dir>/census/` of the end-to-end runs (the CI
+artifacts `e2e-census`, `e2e-cas-census`, `e2e-sqlserver-census`, `e2e-redis-census`, and
+`e2e-sqlserver-census-<version>-<source>` from the engine matrix, uploaded whatever the result).
+None of this is a check: the run never fails on it.
+
+The **ORM-style workload** runs next to the workload, in both phases (so the latency comparison is
+unchanged), as `load_orm`: on `target-pg` and `target-mariadb` in the side clients, on SQL Server in
+its own `sqlcmd` session. Every 2 s it runs one cycle of 18 statements generated by
+`seed.py orm` from the scaled seed (fake data only): six lazy loads (N+1 primary-key selects), eager
+loading over 2 to 6 tables (`LEFT JOIN`s), `select_related`-like chains over 8, 12 and 15 tables (at
+the bound, not past it), a pagination count over a 3-table join, and three reporting queries over
+16, 20 (`UNION ALL`) and 24 tables, past the bound. Every statement is bounded by primary-key
+predicates. Three statements of 18 read more than 15 tables; after the 60 s aggregation, each of the
+18 shapes gives about one event per window. MongoDB has no Audit in the load run, and Redis /
+Valkey commands read key patterns, not joins: their census only shows the base rates of their
+traffic.
 
 ## Not covered, and why
 - **Prometheus / Grafana**: not used. The agent has no metrics listener (invariant I1, ADR-0004;

@@ -24,6 +24,9 @@ pub(crate) const STATEMENTS: &[(&str, &str)] = &[
     ("logon_triggers", LOGON_TRIGGERS),
     ("accessible_databases", ACCESSIBLE_DATABASES),
     ("user_databases", USER_DATABASES),
+    ("database_collations", DATABASE_COLLATIONS),
+    ("database_collations_v0", DATABASE_COLLATIONS_V0),
+    ("server_run", SERVER_RUN),
     ("database_permissions", DATABASE_PERMISSIONS),
     ("database_roles", DATABASE_ROLES),
     ("database_grants", DATABASE_GRANTS),
@@ -329,6 +332,60 @@ pub(crate) const ACCESSIBLE_DATABASES: &str = "SELECT TOP (1025) CONVERT(nvarcha
 FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state = 0 AND source_database_id IS NULL \
 ORDER BY name";
 
+/// Rows read by [`DATABASE_COLLATIONS`] at most: one more means the list
+/// is cut (ADR-0055 decision 4: `objects: unknown`).
+pub(crate) const MAX_COLLATION_DATABASES: usize = 1024;
+
+/// How names compare (ADR-0055 decision 4, security review M3 and L5):
+/// **every** `sys.databases` row, with no `HAS_DBACCESS`, `state` or
+/// `source_database_id` filter (snapshots, offline databases and those the
+/// login cannot enter included), at most [`MAX_COLLATION_DATABASES`] + 1.
+/// Per row: `database_id`, name, `create_date` (µs since 1970), the
+/// `ComparisonStyle` of its collation (`NULL` when the collation reads
+/// `NULL`: not online, closed by `AUTO_CLOSE`), `containment`,
+/// `is_auto_close_on`, `state`, `catalog_collation_type`; and on every row
+/// the server collation's `ComparisonStyle`, whether the login holds `VIEW
+/// ANY DATABASE` (the list is whole), and the server name. Collation names
+/// themselves are never read. The server's run is the server name with
+/// `tempdb`'s `create_date` (`tempdb` is created at every start and always
+/// listed). Ordered by `database_id`, so that `master` and `tempdb` come
+/// first. A catalog read (case 2: `sys.databases`, like
+/// [`ACCESSIBLE_DATABASES`]); an exact own text.
+pub(crate) const DATABASE_COLLATIONS: &str = "SELECT TOP (1025) CONVERT(int, d.database_id), \
+CONVERT(nvarchar(128), d.name), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', d.create_date)), \
+CONVERT(int, COLLATIONPROPERTY(d.collation_name, 'ComparisonStyle')), CONVERT(int, d.containment), \
+CONVERT(int, d.is_auto_close_on), CONVERT(int, d.state), CONVERT(int, d.catalog_collation_type), \
+CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), 'ComparisonStyle')), \
+CONVERT(int, HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')), \
+CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')) FROM sys.databases d ORDER BY d.database_id";
+
+/// [`DATABASE_COLLATIONS`] on a server whose `sys.databases` has no
+/// `catalog_collation_type` (error 207 on the first): the same columns, a
+/// `NULL` in its place; the target then reports `objects: unknown`
+/// (decision 4, L5).
+pub(crate) const DATABASE_COLLATIONS_V0: &str = "SELECT TOP (1025) CONVERT(int, d.database_id), \
+CONVERT(nvarchar(128), d.name), CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', d.create_date)), \
+CONVERT(int, COLLATIONPROPERTY(d.collation_name, 'ComparisonStyle')), CONVERT(int, d.containment), \
+CONVERT(int, d.is_auto_close_on), CONVERT(int, d.state), CONVERT(int, NULL), \
+CONVERT(int, COLLATIONPROPERTY(CONVERT(nvarchar(128), SERVERPROPERTY('Collation')), 'ComparisonStyle')), \
+CONVERT(int, HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')), \
+CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')) FROM sys.databases d ORDER BY d.database_id";
+
+/// The server run alone (ADR-0055 decision 2; the #303 residual): the
+/// server name and `tempdb`'s `create_date` (µs since 1970), the same
+/// expressions as [`DATABASE_COLLATIONS`]. Read by the Audit streams when
+/// they open a session, so that a name case kept from another run of the
+/// server (a restart since the last `check()`, which may have changed the
+/// collations) is reset to `unknown` even while `check()` fails, as the
+/// MySQL / MariaDB `performance_schema` stream does. A catalog read (case
+/// 2: `sys.databases`); an exact own text.
+pub(crate) const SERVER_RUN: &str = "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ServerName')), \
+CONVERT(bigint, DATEDIFF_BIG(microsecond, '19700101', d.create_date)) FROM sys.databases d \
+WHERE d.database_id = 2";
+
+/// The number of columns of [`DATABASE_COLLATIONS`].
+pub(crate) const DATABASE_COLLATIONS_COLUMNS: usize = 11;
+
 /// The user databases Discovery may read (decision 5).
 pub(crate) const USER_DATABASES: &str = "SELECT TOP (1025) CONVERT(nvarchar(128), name) \
 FROM sys.databases WHERE HAS_DBACCESS(name) = 1 AND state = 0 AND source_database_id IS NULL \
@@ -416,13 +473,27 @@ WHERE is_ms_shipped = 0)) FROM {db}.sys.columns c JOIN {db}.sys.tables t ON t.ob
 c.object_id WHERE t.is_ms_shipped = 0 AND t.type = 'U'";
 
 /// User tables of `{db}` (decision 5): id, schema, name, Stretch, memory
-/// optimized, row estimate (metadata), `SELECT` on the table.
+/// optimized, row estimate (metadata).
+///
+/// **No permission check** (ROADMAP phase 9 follow-up of #293): an
+/// object-level `HAS_PERMS_BY_NAME` per table, as this statement had, is a
+/// `SELECT` permission check that SQL Server Audit records as one `SL`
+/// record on each table it checks (`SCHEMA_OBJECT_ACCESS_GROUP`, or a
+/// database specification auditing `SELECT`), like the column-level form
+/// measured on 2022 for the CAS guard (ADR-0041 implementation note of
+/// 2026-10-20). One statement then named every user table of the
+/// database: past 15 tables, the core's overflow, always reported, so a
+/// Discovery scan under Audit of such a database was reported as the
+/// agent's own read of 15 tables and `*`. The table's `SELECT` is known
+/// from its columns ([`COLUMNS`], one table per statement, whose
+/// column-level check is the object's `SELECT` unless the column is
+/// denied); the integration test `discovery_tables_write_no_audit_record_per_table`
+/// counts the records of both forms.
 pub(crate) const TABLES: &str = "SELECT TOP ({n}) CONVERT(int, t.object_id), \
 CONVERT(nvarchar(128), s.name), CONVERT(nvarchar(128), t.name), \
 CONVERT(int, t.is_remote_data_archive_enabled), CONVERT(int, t.is_memory_optimized), \
 CONVERT(bigint, (SELECT SUM(p.rows) FROM {db}.sys.partitions p WHERE p.object_id = t.object_id \
-AND p.index_id IN (0, 1))), CONVERT(int, HAS_PERMS_BY_NAME(QUOTENAME({dbname}) + N'.' + \
-QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), N'OBJECT', N'SELECT')) FROM {db}.sys.tables t JOIN \
+AND p.index_id IN (0, 1))) FROM {db}.sys.tables t JOIN \
 {db}.sys.schemas s ON s.schema_id = t.schema_id WHERE t.type = 'U' AND t.is_ms_shipped = 0 AND \
 t.is_external = 0 AND t.is_filetable = 0 AND s.name NOT IN (N'sys', N'INFORMATION_SCHEMA', \
 N'guest') AND s.name NOT LIKE N'db[_]%' ORDER BY t.object_id";
@@ -439,13 +510,24 @@ DB_ID({dbname}))) + N'.' + QUOTENAME(OBJECT_NAME(c.object_id, DB_ID({dbname}))),
 N'SELECT', c.name, N'COLUMN')) FROM {db}.sys.columns c WHERE c.object_id = {obj} ORDER BY c.column_id";
 
 /// The CAS store guard's `check()` read (ADR-0041 decision 6): table and
-/// column names with the column `SELECT`, bounded.
+/// column names, bounded, **without** the column `SELECT`: a column-level
+/// `HAS_PERMS_BY_NAME` writes one SQL Server Audit `SL` record on each
+/// table it checks (measured on 2022), so checking every column of every
+/// user table at each `check()` wrote a record per user table of every
+/// monitored database, and a statement of more than 15 objects is the
+/// core's overflow, always reported: the agent's own read surfaced as a
+/// read of `*` at every heartbeat on a database of more than 15 tables
+/// (load run 39453966277). The permission is checked only on the tables
+/// the guard recognizes, one at a time ([`COLUMNS`], `check::cas_readable`).
+///
+/// The catalog views read are those of the earlier text (with the column
+/// `SELECT`), so that the system base tables a fresh server builds
+/// statistics on for it stay those measured (case 2 of the ADR-0051
+/// refinement of 2026-10-15; the 2022 fixture's partner is this text).
 pub(crate) const CAS_COLUMNS: &str = "SELECT TOP (20001) CONVERT(int, t.object_id), \
-CONVERT(nvarchar(128), t.name), CONVERT(nvarchar(128), c.name), CONVERT(int, \
-HAS_PERMS_BY_NAME(QUOTENAME({dbname}) + N'.' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), \
-N'OBJECT', N'SELECT', c.name, N'COLUMN')) FROM {db}.sys.tables t JOIN {db}.sys.schemas s ON \
-s.schema_id = t.schema_id JOIN {db}.sys.columns c ON c.object_id = t.object_id WHERE t.type = 'U' \
-AND t.is_ms_shipped = 0 ORDER BY t.object_id";
+CONVERT(nvarchar(128), t.name), CONVERT(nvarchar(128), c.name) FROM {db}.sys.tables t JOIN \
+{db}.sys.schemas s ON s.schema_id = t.schema_id JOIN {db}.sys.columns c ON c.object_id = \
+t.object_id WHERE t.type = 'U' AND t.is_ms_shipped = 0 ORDER BY t.object_id";
 
 /// A CAS ticket registry's metadata (ADR-0041 decision 5): counts per
 /// `type`, never a ticket.
@@ -581,6 +663,9 @@ const CATALOG_READS: &[&str] = &[
     "logon_triggers",
     "accessible_databases",
     "user_databases",
+    "database_collations",
+    "database_collations_v0",
+    "server_run",
     "database_permissions",
     "database_roles",
     "database_grants",
@@ -812,9 +897,9 @@ pub(crate) fn in_database(template: &str, db: &str) -> Option<String> {
 /// The table list of `{db}`, at most `limit` tables (one more read to
 /// detect the cut).
 pub(crate) fn tables(db: &str, limit: u32) -> Option<String> {
-    let (q, l) = (quote_ident(db)?, quote_literal(db)?);
+    let q = quote_ident(db)?;
     let n = (u64::from(limit) + 1).to_string();
-    render(TABLES, &[("db", &q), ("dbname", &l), ("n", &n)])
+    render(TABLES, &[("db", &q), ("n", &n)])
 }
 
 /// The columns of one table.
@@ -1281,7 +1366,7 @@ mod tests {
             xe_poll(&ap, false).unwrap(),
             audit_poll("@p9", false).unwrap(),
             // A database template whose two names differ.
-            render(CAS_COLUMNS, &[("db", "[a]"), ("dbname", "N'b'")]).unwrap(),
+            render(COLUMNS, &[("db", "[a]"), ("dbname", "N'b'"), ("obj", "1")]).unwrap(),
         ] {
             assert!(!allowed(&bad), "{bad}");
         }
@@ -1355,9 +1440,12 @@ mod tests {
         );
         assert_ne!(own_text(&other), OwnText::Exact);
         // `{dbname}` and `{db}` must name the same database.
-        let t = tables("a", 10).unwrap().replacen("N'a'", "N'b'", 1);
-        assert!(!matches_template(TABLES, &t));
+        let t = columns("a", 10).unwrap().replacen("N'a'", "N'b'", 1);
+        assert!(!matches_template(COLUMNS, &t));
+        assert!(matches_template(COLUMNS, &columns("a]]b'c", 10).unwrap()));
         assert!(matches_template(TABLES, &tables("a]]b'c", 10).unwrap()));
+        // #293 follow-up: no per-table permission check in the table list.
+        assert!(!TABLES.contains("HAS_PERMS_BY_NAME"));
         // Sampling texts need a credit.
         let sample = sample_statement("d", "s", "t", &[("c", Sampled::Text)], 5, None).unwrap();
         assert_eq!(own_text(&sample), OwnText::NeedsCredit);
@@ -1487,5 +1575,42 @@ mod tests {
         ] {
             assert_eq!(sampled_kind(id), k, "{id}");
         }
+    }
+
+    /// ADR-0055 decision 4 (security review M3, L7): the name-case reads
+    /// are on the allow-list, pass the deny-list, are exact own texts and
+    /// catalog reads, read every `sys.databases` row (no filter), and the
+    /// fallback differs only by the `catalog_collation_type` column.
+    #[test]
+    fn the_collation_reads_are_reviewed_exact_own_texts() {
+        for text in [DATABASE_COLLATIONS, DATABASE_COLLATIONS_V0] {
+            assert!(allowed(text), "{text}");
+            assert!(checked(text), "{text}");
+            assert_eq!(own_text(text), OwnText::Exact, "{text}");
+            assert!(catalog_text(text), "{text}");
+            assert_eq!(denied_token(text), None);
+            let bare = unquoted(text);
+            for filter in ["has_dbaccess", "state =", "source_database_id", "where"] {
+                assert!(!bare.contains(filter), "{filter} in {text}");
+            }
+            assert!(text.starts_with(&format!("SELECT TOP ({}) ", MAX_COLLATION_DATABASES + 1)));
+            assert!(text.ends_with("FROM sys.databases d ORDER BY d.database_id"));
+            assert_eq!(
+                text.matches("CONVERT(").count()
+                    - text
+                        .matches("CONVERT(nvarchar(128), SERVERPROPERTY('Collation'))")
+                        .count(),
+                DATABASE_COLLATIONS_COLUMNS
+            );
+            // Near copies are not own texts.
+            assert_ne!(own_text(&format!("{text} ")), OwnText::Exact);
+            assert!(!allowed(&text.replace("TOP (1025)", "TOP (1026)")));
+            // No collation name, no definition-bearing column.
+            assert!(!bare.contains("collation_name)"), "{text}");
+        }
+        assert_eq!(
+            DATABASE_COLLATIONS.replace("d.catalog_collation_type", "NULL"),
+            DATABASE_COLLATIONS_V0
+        );
     }
 }

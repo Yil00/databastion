@@ -225,16 +225,16 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
 
 [[package]]
 name = "databastion-agent"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clap",
  "databastion-connector-cas",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-classifiers"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "databastion-protocol",
  "databastion-protocol-codegen",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-cas"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-mongodb"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-mysql"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-openldap"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-postgres"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-redis"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-connector-sqlserver"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "databastion-classifiers",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-protocol"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "databastion-protocol-codegen",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "databastion-protocol-codegen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "prettyplease",
  "quote",
@@ -533,7 +533,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1314,7 +1314,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1517,7 +1517,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1559,9 +1559,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -1914,9 +1914,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",

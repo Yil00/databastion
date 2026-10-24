@@ -13,20 +13,26 @@ import { startupErrors, startupFatal } from "@/server/startup-checks";
 
 import { getDb } from "@/db/client";
 import { alertingWarnings } from "@/server/alerting-config";
+import { CASE_INVENTORY_QUEUE } from "@/server/case-inventory-queue";
+import { runStartupCaseInventory } from "@/server/exception-case-inventory";
 import { NOTIFICATION_QUEUE } from "@/server/notification-queue";
 import { POLICY_QUEUE } from "@/server/policy-queue";
 
 import {
   createNoopHandler,
   EVENTS_PURGE_QUEUE,
+  NAME_CASE_INVENTORY_QUEUE,
   NOOP_QUEUE,
   pgBossOptions,
   RATE_LIMITS_PRUNE_QUEUE,
+  registerCaseInventoryQueue,
   registerEventsPurgeQueue,
+  registerNameCaseInventoryQueue,
   registerNotificationQueue,
   registerPolicyQueue,
   registerRateLimitsPruneQueue,
   scheduleEventsPurgeQueue,
+  scheduleNameCaseInventoryQueue,
   scheduleNotificationQueue,
   schedulePolicyQueue,
   scheduleRateLimitsPruneQueue,
@@ -91,7 +97,17 @@ async function main(): Promise<void> {
   await registerRateLimitsPruneQueue(boss, getDb, log);
   await scheduleRateLimitsPruneQueue(boss);
 
-  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE, RATE_LIMITS_PRUNE_QUEUE] }, "worker started");
+  // ADR-0054 decision 6: the on-demand case inventory (queued by the web process).
+  await registerCaseInventoryQueue(boss, getDb, log);
+  // ADR-0054 decision 6: at the first start after the upgrade, the location exceptions that no
+  // longer cover names differing by case only (ids and counts only; never blocks the start).
+  void runStartupCaseInventory(getDb(), log);
+  // ADR-0055 decision 7: the inventory of each target whose name case semantics changed
+  // (debounced: at most once per target and hour).
+  await registerNameCaseInventoryQueue(boss, getDb, log);
+  await scheduleNameCaseInventoryQueue(boss);
+
+  log.info({ queues: [NOOP_QUEUE, POLICY_QUEUE, NOTIFICATION_QUEUE, EVENTS_PURGE_QUEUE, RATE_LIMITS_PRUNE_QUEUE, CASE_INVENTORY_QUEUE, NAME_CASE_INVENTORY_QUEUE] }, "worker started");
 }
 
 main().catch((err: unknown) => {

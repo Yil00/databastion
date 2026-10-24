@@ -4,10 +4,11 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { EventConditions, ObjectPattern } from "@/lib/event-model";
 import type { FindingConditions, LocationPattern, PolicyConditions, PolicySource } from "@/lib/policy-model";
+import type { CaseInventoryStatus } from "@/server/exception-case-inventory";
 import type { ExceptionView, PolicyView } from "@/server/policies";
 
 import { SeverityBadge } from "./incidents-table";
-import { DeleteExceptionButton, PolicyRowActions } from "./policy-actions";
+import { DeleteExceptionButton, PolicyRowActions, RunCaseInventoryButton } from "./policy-actions";
 
 /**
  * Policies view parts (server components). Admin-typed names, descriptions and reasons, and every
@@ -193,12 +194,7 @@ export function ExceptionsTable({
       <TableBody>
         {exceptions.map((e) => {
           const expired = e.expiresAt !== null && e.expiresAt.getTime() <= now;
-          const scope = [
-            e.agentId ? `agent ${e.agentName ?? e.agentId}` : null,
-            e.targetId ? `target ${e.targetId}` : null,
-            e.classifier ? `classifier ${e.classifier}` : null,
-            e.location ? locationPatternLabel(e.location) : null,
-          ].filter((x): x is string => x !== null);
+          const scope = exceptionScopeLabels(e);
           return (
             <TableRow key={e.id} className={expired ? "text-muted-foreground" : undefined}>
               <TableCell>{e.policyId ? (e.policyName ?? "?") : "all policies"}</TableCell>
@@ -218,5 +214,120 @@ export function ExceptionsTable({
         })}
       </TableBody>
     </Table>
+  );
+}
+
+export function exceptionScopeLabels(e: ExceptionView): string[] {
+  return [
+    e.agentId ? `agent ${e.agentName ?? e.agentId}` : null,
+    e.targetId ? `target ${e.targetId}` : null,
+    e.classifier ? `classifier ${e.classifier}` : null,
+    e.location ? locationPatternLabel(e.location) : null,
+  ].filter((x): x is string => x !== null);
+}
+
+/**
+ * Exceptions whose effect changed with case-sensitive matching (ADR-0054 decision 6): the latest
+ * inventory (worker start after the upgrade, or an administrator's run), with the findings and
+ * events each one may no longer cover (upper bounds), and a failed run more recent than it.
+ * Exceptions deleted since are shown by id.
+ */
+export function CaseInventoryView({
+  status,
+  exceptions,
+  isAdmin,
+  csrfToken,
+}: {
+  status: CaseInventoryStatus;
+  exceptions: ExceptionView[];
+  isAdmin: boolean;
+  csrfToken: string;
+}) {
+  const byId = new Map(exceptions.map((e) => [e.id, e]));
+  const { latest: inventory, failure } = status;
+  const when = (d: Date) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-sm text-muted-foreground">
+        Location exceptions compare names with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS
+        targets. The exceptions below covered stored findings or access events only because case was ignored: review them, and
+        correct a pattern written in another case than the real name.
+      </p>
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          The inventory run of {when(failure.at)} ({failure.trigger === "user" ? "on demand" : "worker start"}) failed
+          {failure.errorCode === "inventory_running"
+            ? ": another run was in progress."
+            : failure.errorCode === "actor_gone"
+              ? ": the administrator who requested it is no longer an enabled administrator."
+              : ` (error ${failure.errorCode}); the worker log has the details.`}
+        </p>
+      )}
+      {inventory === null ? (
+        <p className="text-sm text-muted-foreground">No inventory has run yet (the worker runs one at its first start).</p>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground">
+            Last run {when(inventory.at)} ({inventory.trigger === "user" ? "on demand" : "worker start"}):
+            {" "}
+            {inventory.exceptionsCompared} of {inventory.exceptionsTotal} active location exceptions compared against{" "}
+            {inventory.findingNamesCompared} finding names and {inventory.eventNamesCompared} event object names.
+          </p>
+          {inventory.boundReached && (
+            <p role="alert" className="text-sm text-destructive">
+              The run reached its bound: only the names and exceptions compared above were checked, so other exceptions may be
+              affected.
+              {inventory.exceptionsCompared < inventory.exceptionsTotal &&
+                ` The ${inventory.exceptionsTotal - inventory.exceptionsCompared} most recently created exceptions were not compared.`}
+            </p>
+          )}
+          {inventory.entries.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No exception is affected.</p>
+          ) : (
+            <>
+            <p className="text-xs text-muted-foreground">
+              Counts are upper bounds: another exception may still cover an item, and an event is counted when at least one of its
+              objects is no longer covered by this exception.
+            </p>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Exception</TableHead>
+                  <TableHead>Findings no longer covered (up to)</TableHead>
+                  <TableHead>Events no longer covered (up to)</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {inventory.entries.map((entry) => {
+                  const e = byId.get(entry.exceptionId);
+                  return (
+                    <TableRow key={entry.exceptionId}>
+                      <TableCell className="max-w-96 break-all whitespace-normal text-xs">
+                        {e ? (
+                          <>
+                            {e.policyId ? (e.policyName ?? "?") : "all policies"}: {exceptionScopeLabels(e).join("; ")}
+                          </>
+                        ) : (
+                          <span className="text-muted-foreground">deleted exception {entry.exceptionId}</span>
+                        )}
+                      </TableCell>
+                      <TableCell>{entry.findings}</TableCell>
+                      <TableCell>{entry.events}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+            </>
+          )}
+          {inventory.truncated && (
+            <p className="text-xs text-muted-foreground">
+              {inventory.exceptionsListed} exceptions are affected; the {inventory.entries.length} with the most items are listed.
+            </p>
+          )}
+        </>
+      )}
+      {isAdmin && <RunCaseInventoryButton csrfToken={csrfToken} />}
+    </div>
   );
 }

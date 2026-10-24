@@ -11,9 +11,21 @@
 //!   text (M1), never from configuration.
 //! - **Polls**: one `sp_executesql` RPC each, text constant for a given
 //!   catalog state, the file name, the buffer offset and the row bound as
-//!   parameters; at most `BATCH` events per read, halved after a response
-//!   over `POLL_BYTES`; each poll gets a credit (its own events are left
-//!   out only for this session and this text). Each event's XML is read by
+//!   parameters. The row bound is stream state set inside `read`
+//!   ([`size`], ADR-0051 refinement of 2026-10-22, option (b)): `BATCH`
+//!   (500) first and after any read that is not full (a deferral, a clamp,
+//!   a restart at the oldest file, a re-probe that moved the cursor
+//!   included); after a full read, the sized bound: at most
+//!   [`size::XE_MAX_ROWS`] and at most 0.75 × `POLL_BYTES` over the largest
+//!   row of that read (in wire bytes), never below `BATCH`. A response
+//!   over `POLL_BYTES` is cancelled before any of it is handled and read
+//!   again at half the size, kept for 10 minutes; a cancel, or a retried
+//!   client statement timeout, of a read above `BATCH` caps the reads at
+//!   `BATCH` for 10 minutes. Full reads follow one another within a cycle,
+//!   and a cycle that ends behind the session's files is followed by the
+//!   next one after a bounded pause (`super::cycle`); each poll gets a
+//!   credit (its own events are left out only for this session and this
+//!   text). Each event's XML is read by
 //!   the bounded reader of [`xml`], under panic isolation, and is at most
 //!   `sql::XE_EVENT_BYTES` on the wire (the server sends larger ones
 //!   without their XML).
@@ -44,9 +56,12 @@
 
 pub(crate) mod events;
 pub(crate) mod probe;
+#[cfg(test)]
+mod sim_tests;
+pub(crate) mod size;
 pub(crate) mod xml;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use databastion_classifiers::masking::{EventAction, MaskedEvent};
 use databastion_core::audit::CursorStore;
@@ -56,9 +71,8 @@ use databastion_core::{AuditConfig, ConnectorError, EventSink, FailureCode};
 
 use super::own;
 use super::{
-    APP, BATCH, Batch, Below, CATCH_UP, Cursor, FLOOR_MAX, HISTORY_READS, MIN_BATCH,
-    OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE, REPROBE, on_bad_position, on_pattern,
-    target_error,
+    APP, Batch, Below, Cursor, FLOOR_MAX, OWN_FILE_BYTES, OWN_SESSIONS, POLL_BYTES, REEVALUATE,
+    REPROBE, ReadAt, Source, on_bad_position, on_pattern, target_error,
 };
 use crate::check::{self, CheckState};
 use crate::conn::{Cell, Flow, Session, Shape};
@@ -100,7 +114,10 @@ struct Stream<'a> {
     poll_from: String,
     reprobe_at: Instant,
     evaluated_at: Option<Instant>,
-    batch: usize,
+    /// The size of the next read ([`size`]), set inside [`read`].
+    size: size::ReadSize,
+    /// Time spent in poll statements, summed ([`super::cycle::Read::statements`]).
+    poll_time: Duration,
     /// The statistics exclusion applies (an allow-listed build).
     statman: bool,
     /// The server's major version and the account's server permissions at
@@ -244,9 +261,12 @@ impl Stream<'_> {
 /// The event time (µs) of the latest failed login (error 18456) among
 /// `records` whose name tried is not the agent's `account` (re-review of
 /// #280, N3).
-fn failed_login_proof(records: &[XeRecord], account: &str) -> Option<i64> {
+fn failed_login_proof<'a>(
+    records: impl IntoIterator<Item = &'a XeRecord>,
+    account: &str,
+) -> Option<i64> {
     records
-        .iter()
+        .into_iter()
         .filter(|r| r.is_failed_login_18456() && !r.login().eq_ignore_ascii_case(account))
         .map(|r| r.time_us)
         .max()
@@ -393,7 +413,8 @@ pub(crate) async fn stream(
         poll_from: String::new(),
         reprobe_at: Instant::now(),
         evaluated_at: None,
-        batch: BATCH,
+        size: size::ReadSize::with_memory(state.audit.xe_size_memory()),
+        poll_time: Duration::ZERO,
         statman: false,
         major: 0,
         perms: std::collections::BTreeSet::new(),
@@ -402,6 +423,7 @@ pub(crate) async fn stream(
     };
     let tls = crate::tls::configs(target.sqlserver_settings().ca_file.as_deref())
         .ok_or_else(|| target_error(FailureCode::Internal))?;
+    let mut log = super::cycle::BehindLog::default();
     loop {
         if session.is_poisoned() || session.is_stale() {
             let old = std::mem::replace(
@@ -411,15 +433,20 @@ pub(crate) async fn stream(
                     .map_err(SsError::into_connector_error)?,
             );
             old.close().await;
+            Box::pin(super::observe_server_run(state, &target.id, &mut session)).await;
         }
-        let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
-        if let Err(e) = r {
-            st.save();
-            session.close().await;
-            return Err(e);
-        }
+        let end = match Box::pin(cycle(&mut st, &mut session, sink, &mut log)).await {
+            Ok(end) => end,
+            Err(e) => {
+                st.save();
+                session.close().await;
+                return Err(e);
+            }
+        };
         st.save();
-        tokio::time::sleep(cfg.poll_interval()).await;
+        tokio::time::sleep(end.pause(cfg.poll_interval())).await;
+        #[cfg(test)]
+        state.audit.xe_hold_point().await;
     }
 }
 
@@ -429,7 +456,8 @@ async fn cycle(
     st: &mut Stream<'_>,
     s: &mut Session,
     sink: &EventSink,
-) -> Result<(), ConnectorError> {
+    log: &mut super::cycle::BehindLog,
+) -> Result<super::cycle::End, ConnectorError> {
     let target = st.target;
     if st.evaluated_at.is_none_or(|t| t.elapsed() >= REEVALUATE) {
         let v = check::version(s)
@@ -465,28 +493,57 @@ async fn cycle(
             tracing::warn!(target_id = %target.id, "Extended Events: the session is not running");
             return Err(target_error(FailureCode::Unsupported));
         }
-        observe(st, &p);
+        observe(st, &p, s.own.as_ref().map(own::Handle::server_now));
         st.probe = Some(p);
     }
-    let started = Instant::now();
-    let mut history_reads = 0usize;
-    loop {
-        let in_history = st.cursor.history_us.is_some();
-        let full = Box::pin(read(st, s, sink)).await?;
-        st.save();
-        history_reads += usize::from(in_history);
-        if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
-            break;
-        }
-        if st.probe.is_none() {
-            Box::pin(reprobe(st, s)).await?;
-        }
+    // A deferral or a clamped position ends the cycle as a read that
+    // reached the end (`read` returns `false`): the poll interval.
+    let mut reads = Reads { st, s, sink };
+    Box::pin(super::cycle::run(&mut reads, log)).await
+}
+
+/// One cycle's reads ([`super::cycle::run`]).
+struct Reads<'r, 's> {
+    st: &'r mut Stream<'s>,
+    s: &'r mut Session,
+    sink: &'r EventSink,
+}
+
+impl super::cycle::Reads for Reads<'_, '_> {
+    fn target_id(&self) -> &str {
+        &self.st.target.id
     }
-    Ok(())
+
+    fn source(&self) -> &'static str {
+        "Extended Events"
+    }
+
+    fn walking_history(&self) -> bool {
+        self.st.cursor.walking_history()
+    }
+
+    async fn read_once(&mut self) -> Result<super::cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
+        let full = Box::pin(read(self.st, self.s, self.sink)).await?;
+        self.st.save();
+        Ok(super::cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
+    }
+
+    async fn between(&mut self) -> Result<(), ConnectorError> {
+        if self.st.probe.is_none() {
+            Box::pin(reprobe(self.st, self.s)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// A restart of the session or grown drop counters: a gap.
-fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
+/// `server_now`: the server's time on the stream's session (the floor of
+/// the failed-login proof when it is cleared here).
+fn observe(st: &mut Stream<'_>, p: &probe::Probe, server_now: Option<i64>) {
     let target_id = &st.target.id;
     if st
         .cursor
@@ -496,10 +553,24 @@ fn observe(st: &mut Stream<'_>, p: &probe::Probe) {
         tracing::warn!(target_id = %target_id, "Extended Events: the session was stopped and started (create_time changed): what happened in between was not recorded");
         st.state.audit.note_gap(target_id);
         // Its events may have changed: the failed-login proof starts over.
-        st.state.audit.clear_failed_login(target_id);
+        st.state.audit.clear_failed_login(target_id, server_now);
         st.state.audit.note_dropped(target_id, 1);
     }
     st.cursor.session = Some(p.create_us);
+    // #280 re-review L-b: the events the agent can see changed (one added
+    // or dropped, a predicate added or removed, a catalog read that failed):
+    // a predicate it cannot read may have changed too.
+    // The last facts are kept per target with the proof (security review
+    // L2): a new stream compares with them; with none, the proof is taken
+    // again.
+    match st.state.audit.swap_event_facts(target_id, p.event_facts()) {
+        Some(prev) if prev == p.event_facts() => {}
+        Some(_) => {
+            tracing::info!(target_id = %target_id, "Extended Events: the session's events changed: the failed-login proof is taken again");
+            st.state.audit.clear_failed_login(target_id, server_now);
+        }
+        None => st.state.audit.clear_failed_login(target_id, server_now),
+    }
     if st.state.audit.observe_xe(target_id, p.counters()) {
         tracing::warn!(target_id = %target_id, "Extended Events: the session dropped events or was restarted");
     }
@@ -536,10 +607,12 @@ async fn reprobe(st: &mut Stream<'_>, s: &mut Session) -> Result<(), ConnectorEr
     if on_pattern(&mut st.cursor, &pattern) {
         tracing::warn!(target_id = %target.id, "Extended Events: the session's file set changed (folder or file name): reading the new set from its start");
         st.state.audit.note_gap(&target.id);
-        st.state.audit.clear_failed_login(&target.id);
+        st.state
+            .audit
+            .clear_failed_login(&target.id, s.own.as_ref().map(own::Handle::server_now));
         st.state.audit.note_dropped(&target.id, 1);
     }
-    observe(st, &p);
+    observe(st, &p, s.own.as_ref().map(own::Handle::server_now));
     st.poll_start = start;
     st.poll_from = from;
     st.probe = Some(p);
@@ -574,15 +647,39 @@ pub(crate) fn xe_next(cursor: &Cursor, positions: &[(String, i64)], full: bool) 
 }
 
 /// What one poll returned.
-struct Polled {
-    records: Vec<XeRecord>,
-    returned: usize,
-    malformed: u64,
+pub(crate) struct Polled {
+    pub(crate) records: Vec<XeRecord>,
+    pub(crate) returned: usize,
+    pub(crate) malformed: u64,
+    /// The largest row of the response, in wire bytes ([`row_wire_bytes`]).
+    pub(crate) largest_row: usize,
+    /// Every row's wire bytes, summed.
+    pub(crate) bytes: usize,
+}
+
+/// The bytes a row took on the wire, as the client counts them: each
+/// value's bytes (UTF-16 for text, as sent) and its length prefix (2
+/// bytes, the widest of the poll's column types), and the row token. An
+/// estimate within a few bytes per column of the TDS framing, used to
+/// size the next read (refinement of 2026-10-22, M2).
+pub(crate) fn row_wire_bytes(row: &[Value]) -> usize {
+    1 + row
+        .iter()
+        .map(|v| {
+            2 + match v {
+                Value::Null => 0,
+                Value::Bit(_) => 1,
+                Value::Int(_) => 8,
+                Value::Text(t) => t.encode_utf16().count() * 2,
+                Value::Binary(b) | Value::DateTime2(b) => b.len(),
+            }
+        })
+        .sum::<usize>()
 }
 
 /// Sends one poll; each row becomes a record as it ends, alone under panic
 /// isolation.
-async fn poll_records(
+pub(crate) async fn poll_records(
     s: &mut Session,
     text: &str,
     kind: own::PollKind,
@@ -602,6 +699,8 @@ async fn poll_records(
         records: Vec::new(),
         returned: 0,
         malformed: 0,
+        largest_row: 0,
+        bytes: 0,
     };
     let mut row: Vec<Value> = Vec::with_capacity(sql::XE_POLL_COLUMNS);
     s.rpc(
@@ -620,6 +719,9 @@ async fn poll_records(
                 Cell::RowEnd => {
                     out.returned += 1;
                     let r = std::mem::take(&mut row);
+                    let wire = row_wire_bytes(&r);
+                    out.largest_row = out.largest_row.max(wire);
+                    out.bytes = out.bytes.saturating_add(wire);
                     match databastion_core::isolate(|| XeRecord::from_row(r)) {
                         Some(Ok(mut rec)) => {
                             rec.index = out.records.len();
@@ -636,7 +738,9 @@ async fn poll_records(
     Ok(out)
 }
 
-/// One read from the position; `true` when it was full (more to read).
+/// One read from the position; `true` when more is to be read at once (a
+/// full read, or a read retried smaller). Sets the size of the next read
+/// (`st.size`, ADR-0051 refinement of 2026-10-22, M1) on every path.
 async fn read(
     st: &mut Stream<'_>,
     s: &mut Session,
@@ -657,9 +761,23 @@ async fn read(
             ))
         });
     // The server skips the events of the next buffer already handled
-    // (`sql::XE_POLL_FROM`): a read returns at most `batch` events.
-    let top = st.batch;
+    // (`sql::XE_POLL_FROM`): a read returns at most `top` events, the size
+    // the last read set (`size`: `BATCH`, the sized bound up to
+    // `XE_MAX_ROWS` after a full read, less after a cancel), or less when
+    // an earlier stream ended on a poisoned oversized read at this very
+    // position (0.8.1: the size kept across restarts, `Shared::read_size`,
+    // taken into this stream's read-size memory, `size::ReadSize::resume`).
+    let at = ReadAt::of(&st.cursor);
+    let kept = st
+        .state
+        .audit
+        .read_size(&target_id, Source::Xevents, &at, usize::MAX);
+    if kept < usize::MAX {
+        st.size.resume(kept, Instant::now());
+    }
+    let top = st.size.rows();
     let skip = st.cursor.skip;
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         None => {
             Box::pin(poll_records(
@@ -686,9 +804,12 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
-            st.batch = (st.batch * 2).min(BATCH);
+            // The size kept across restarts ends with a successful read;
+            // this stream's memory (`size`) keeps its own for 10 minutes.
+            st.state.audit.read_succeeded(&target_id);
             p
         }
         Err(e)
@@ -706,14 +827,42 @@ async fn read(
                 st.state.audit.note_gap(&target_id);
                 st.state.audit.note_dropped(&target_id, 1);
             }
-            return Ok(true);
+            return Ok(st.size.ended(size::ReadEnd::Restarted, Instant::now()));
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            st.batch = (st.batch / 2).max(MIN_BATCH);
-            return Ok(true);
+        Err(e) => {
+            // A response above `POLL_BYTES` (nothing of it handled), or the
+            // client's deadline on a read above `BATCH` rows, on a session
+            // the cancel left usable: read again smaller, from the same
+            // position (refinement of 2026-10-22, M2). Anything else fails
+            // the stream, as before. The session tells, never `e.fatal`
+            // (0.8.1).
+            let now = Instant::now();
+            let poisoned = s.is_poisoned();
+            // A response over the bound is also kept for this target,
+            // source and position across a stream restart, at its halved
+            // size, the cancel acknowledged or not (0.8.1, #321): a
+            // poisoned session ends the stream, and the next one reads
+            // that size from the same position, down to `MIN_BATCH`. Its
+            // result is the size `st.size.failed` sets (one rule,
+            // `super::halved`).
+            let _ = st
+                .state
+                .audit
+                .read_failed(&target_id, Source::Xevents, at, &e, poisoned, top);
+            return match st.size.failed(&e, poisoned, now) {
+                Some(retry) => {
+                    st.state.audit.note_xe_retry(&target_id, retry);
+                    st.size.log(&target_id, retry, top, now);
+                    Ok(true)
+                }
+                None => Err(e.into_connector_error()),
+            };
         }
-        Err(e) => return Err(e.into_connector_error()),
     };
+    let largest_row = polled.largest_row;
+    st.state
+        .audit
+        .note_xe_read(&target_id, top, polled.returned);
     let positions: Vec<(String, i64)> = polled
         .records
         .iter()
@@ -739,7 +888,9 @@ async fn read(
         // re-probe left (the gap is already noted).
         if reprobe_moved(&before, &st.cursor) {
             tracing::info!(target_id = %target_id, "Extended Events: the session's file set or start changed during a read: reading again from the new position");
-            return Ok(true);
+            return Ok(st
+                .size
+                .ended(size::ReadEnd::ReprobeMoved { largest_row }, Instant::now()));
         }
     }
     st.state.audit.note_dropped(&target_id, polled.malformed);
@@ -763,6 +914,11 @@ async fn read(
     // counted as dropped (re-review N1: the server's clock may have
     // stepped back).
     let mut records = b.kept;
+    // #280 re-review L-b (security review L1 of the follow-up): a statement
+    // that may change an event session, found among every record of the
+    // read, those the history, floor and skip filters then drop included;
+    // its place and time cut the failed-login proof below.
+    let changed = session_change(&records);
     // The agent's sessions on this source's clock: each read-back event
     // calibrates its session (own::calibrate), before any own rule.
     own::calibrate(&target_id, &readbacks(&records, &st.target.account));
@@ -791,10 +947,28 @@ async fn read(
     }
     // The proof that a filtered `error_reported` admits failed logins
     // (re-review of #280, N3): from records past the history and floor
-    // filter only, by their event time, never a failed login of the
-    // agent's own account.
-    if let Some(at) = failed_login_proof(&records, &st.target.account) {
-        st.state.audit.note_failed_login(&target_id, at);
+    // filter only, never a failed login of the agent's own account. A
+    // statement that may change an event session (#280 re-review L-b)
+    // clears it, and only what follows it in the file proves it again.
+    // Only a failed login after it, in the file and in time (file order
+    // follows the session's per-CPU buffers, security review L4), proves
+    // it again.
+    // Across reads too: the proof is then taken only from a failed login
+    // stamped after the change, whichever read it comes in (a later read
+    // can hold an earlier event: fail closed).
+    if let Some((_, t)) = changed {
+        tracing::info!(target_id = %target_id, "Extended Events: a statement that may change an event session was read: the failed-login proof is taken again");
+        st.state.audit.clear_failed_login(&target_id, Some(t));
+    }
+    let after = records
+        .iter()
+        .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
+    if let Some(at) = failed_login_proof(after, &st.target.account) {
+        // Aged on the server's clock against the agent's own session's
+        // read-back of it, so that the 24 h window does not depend on the
+        // skew between the two clocks (#280 re-review L-b).
+        let server_now = s.own.as_ref().map(own::Handle::server_now);
+        st.state.audit.note_failed_login(&target_id, at, server_now);
     }
     let unreadable = records.iter().filter(|r| r.unreadable).count();
     if unreadable > 0 {
@@ -890,7 +1064,33 @@ async fn read(
     // A deferral ends the cycle: the next read waits a poll interval. A
     // full read cut before a build whose pair may be in the rows that
     // follow reads on (it moved the position by half the read at least).
-    Ok(b.full && !waits && clamped.is_none())
+    // That read, and a full read not cut, set the next one to the sized
+    // bound; any other read to `BATCH` (M1).
+    Ok(st.size.ended(
+        size::ReadEnd::Handled {
+            largest_row,
+            full: b.full,
+            waits,
+            clamped: clamped.is_some(),
+        },
+        Instant::now(),
+    ))
+}
+
+/// The statements of a read that may change an event session (#280
+/// re-review L-b), as one change: the last one's place in the read and the
+/// latest event time of them all (security review L2 of the read-size
+/// change: with two changes in one read, a failed login must follow both,
+/// in the file and in time).
+pub(crate) fn session_change(records: &[XeRecord]) -> Option<(usize, i64)> {
+    records
+        .iter()
+        .filter(|r| r.may_change_event_session())
+        .fold(None, |acc: Option<(usize, i64)>, r| {
+            Some(acc.map_or((r.index, r.time_us), |(i, t)| {
+                (i.max(r.index), t.max(r.time_us))
+            }))
+        })
 }
 
 /// Whether the re-probe inside a read changed what `before` (the cursor's
@@ -1129,25 +1329,179 @@ mod failed_login_proof_tests {
         assert_eq!(failed_login_proof(&[], "databastion_agent"), None);
     }
 
+    /// #280 re-review L-b: the age is taken on the server's clock (the
+    /// event time against the read-back's server time), so the window does
+    /// not move with the skew between the two clocks.
     #[test]
-    fn the_proof_is_fresh_by_event_time_and_cleared_on_a_change() {
-        let shared = crate::audit::Shared::default();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
+    fn the_proof_is_aged_on_the_server_clock_and_cleared_on_a_change() {
         let day = 24 * 3_600 * 1_000_000i64;
-        // An old event read now proves nothing.
-        shared.note_failed_login("t", now - day - 1_000_000);
-        assert!(!shared.facts("t").failed_login_seen);
-        shared.note_failed_login("t", now - 1_000_000);
+        for skew in [0, 3 * day, -3 * day, 25 * day] {
+            // The server's clock, `skew` away from the agent's.
+            let server_now = 1_800_000_000_000_000i64 + skew;
+            let shared = crate::audit::Shared::default();
+            // An old event read now proves nothing, whatever the skew.
+            shared.note_failed_login("t", server_now - day - 1_000_000, Some(server_now));
+            assert!(!shared.facts("t").failed_login_seen, "skew {skew}");
+            // A recent one does.
+            shared.note_failed_login("t", server_now - 1_000_000, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // An older event read later does not move the proof back.
+            shared.note_failed_login("t", server_now - 2 * day, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // A session restart, a new file set or changed events: taken
+            // again.
+            shared.clear_failed_login("t", None);
+            assert!(!shared.facts("t").failed_login_seen);
+            assert!(!shared.facts("other").failed_login_seen);
+            // Stamped ahead of the read-back (the event clock's lead): fresh.
+            shared.note_failed_login("t", server_now + 2_000, Some(server_now));
+            assert!(shared.facts("t").failed_login_seen, "skew {skew}");
+            // Without the server's time: nothing proven.
+            let none = crate::audit::Shared::default();
+            none.note_failed_login("t", server_now, None);
+            assert!(!none.facts("t").failed_login_seen);
+        }
+    }
+
+    /// Engine-matrix failures of the predicate test on PR #316: a change
+    /// read in one read sets a floor, and a failed login stamped at or
+    /// before it proves nothing in any later read (a later read can hold an
+    /// earlier event); one stamped after it does. A clear without a time
+    /// keeps the floor.
+    #[test]
+    fn a_failed_login_before_the_change_proves_nothing_in_a_later_read() {
+        let now = 1_800_000_000_000_000i64;
+        let shared = crate::audit::Shared::default();
+        shared.note_failed_login("t", now - 10_000_000, Some(now));
         assert!(shared.facts("t").failed_login_seen);
-        // An older event read later does not move the proof back.
-        shared.note_failed_login("t", now - 2 * day);
-        assert!(shared.facts("t").failed_login_seen);
-        // A session restart or a new file set: taken again.
-        shared.clear_failed_login("t");
+        // The ALTER EVENT SESSION, stamped 5 s ago, read now.
+        shared.clear_failed_login("t", Some(now - 5_000_000));
         assert!(!shared.facts("t").failed_login_seen);
-        assert!(!shared.facts("other").failed_login_seen);
+        // A later read holds a failed login stamped before it, or at it.
+        shared.note_failed_login("t", now - 6_000_000, Some(now));
+        shared.note_failed_login("t", now - 5_000_000, Some(now));
+        assert!(
+            !shared.facts("t").failed_login_seen,
+            "stamped before the change"
+        );
+        // A plain clear keeps the floor; an earlier floor does not lower it.
+        shared.clear_failed_login("t", None);
+        shared.clear_failed_login("t", Some(now - 9_000_000));
+        shared.note_failed_login("t", now - 5_500_000, Some(now));
+        assert!(!shared.facts("t").failed_login_seen);
+        // One stamped after it proves again; another target is apart.
+        shared.note_failed_login("t", now - 4_000_000, Some(now));
+        assert!(shared.facts("t").failed_login_seen);
+        shared.note_failed_login("u", now - 6_000_000, Some(now));
+        assert!(shared.facts("u").failed_login_seen);
+    }
+
+    /// #280 re-review L-b: a statement that may change an event session
+    /// clears the proof; only a failed login after it in the file proves
+    /// it again.
+    #[test]
+    fn an_event_session_statement_before_the_failed_login_is_required() {
+        use crate::audit::xe::events::tests::rec;
+        let stmt = |text: &str| {
+            rec(
+                "sql_statement_completed",
+                &[("statement", text)],
+                &[("session_server_principal_name", "admin")],
+            )
+        };
+        let mut recs = vec![
+            failed("jane", "18456", 10),
+            stmt(
+                "ALTER EVENT SESSION databastion_xe ON SERVER DROP EVENT sqlserver.error_reported",
+            ),
+            stmt("SELECT 1"),
+            failed("bob", "18456", 30),
+            failed("ann", "18456", 40),
+        ];
+        for (i, r) in recs.iter_mut().enumerate() {
+            r.index = i;
+        }
+        recs[1].time_us = 35;
+        let changed = session_change(&recs);
+        assert_eq!(changed, Some((1, 35)));
+        // Security review L2: two changes, the later in the file stamped
+        // earlier (another buffer): the last place and the latest time.
+        assert_eq!(session_change(&recs[2..3]), None);
+        // After it in the file and in time: `ann` only (`bob` is later in
+        // the file but stamped before it, another CPU's buffer).
+        let after = recs
+            .iter()
+            .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
+        assert_eq!(failed_login_proof(after, "databastion"), Some(40));
+        let after = recs[..4]
+            .iter()
+            .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
+        assert_eq!(failed_login_proof(after, "databastion"), None);
+        assert_eq!(failed_login_proof(&recs, "databastion"), Some(40));
+        // Security review L2: a second change later in the file but
+        // stamped earlier (another buffer): the last place and the latest
+        // time of both.
+        let mut second = stmt("DROP EVENT SESSION other ON SERVER");
+        second.index = 3;
+        second.time_us = 20;
+        recs[3] = second;
+        let changed = session_change(&recs);
+        assert_eq!(changed, Some((3, 35)));
+        let after = recs
+            .iter()
+            .filter(|r| changed.is_none_or(|(i, t)| r.index > i && r.time_us > t));
+        assert_eq!(failed_login_proof(after, "databastion"), Some(40));
+    }
+
+    /// Security review L2: the last event facts live with the proof, per
+    /// target, across streams.
+    #[test]
+    fn event_facts_are_kept_per_target() {
+        let shared = crate::audit::Shared::default();
+        let a = probe::Probe::default().event_facts();
+        let b = probe::Probe {
+            missing: 1,
+            ..probe::Probe::default()
+        }
+        .event_facts();
+        assert_eq!(shared.swap_event_facts("t", a), None);
+        assert_eq!(shared.swap_event_facts("t", a), Some(a));
+        assert_eq!(shared.swap_event_facts("t", b), Some(a));
+        assert_eq!(shared.swap_event_facts("other", b), None);
+    }
+
+    #[test]
+    fn event_facts_tell_a_changed_session_apart() {
+        let base = probe::Probe {
+            failed_logins: true,
+            failed_logins_filtered: true,
+            ..probe::Probe::default()
+        };
+        assert_eq!(base.event_facts(), base.clone().event_facts());
+        for other in [
+            probe::Probe {
+                failed_logins_filtered: false,
+                ..base.clone()
+            },
+            probe::Probe {
+                failed_logins: false,
+                failed_logins_filtered: false,
+                ..base.clone()
+            },
+            probe::Probe {
+                filtered: true,
+                ..base.clone()
+            },
+            probe::Probe {
+                missing: 1,
+                ..base.clone()
+            },
+            probe::Probe {
+                incomplete: true,
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(base.event_facts(), other.event_facts());
+        }
     }
 }

@@ -124,7 +124,26 @@ pub(crate) struct Probe {
     pub(crate) incomplete: bool,
 }
 
+/// What the agent sees of a session's events ([`Probe::event_facts`]):
+/// `error_reported` present, with a predicate; a predicate on a required
+/// event; required events, actions or statement collection missing; a
+/// catalog read that failed or was cut.
+pub(crate) type EventFacts = (bool, bool, bool, u64, bool);
+
 impl Probe {
+    /// The session's event facts: two probes that differ mean its events
+    /// changed (#280 re-review L-b; the predicates themselves are never
+    /// read).
+    pub(crate) fn event_facts(&self) -> EventFacts {
+        (
+            self.failed_logins,
+            self.failed_logins_filtered,
+            self.filtered,
+            self.missing,
+            self.incomplete,
+        )
+    }
+
     /// The quoted file pattern of the poll (`sql::xe_pattern`).
     pub(crate) fn pattern(&self) -> Option<String> {
         sql::xe_pattern(&self.current_file)
@@ -419,13 +438,21 @@ mod tests {
         let l = at(&p, 15, &[GRANT_2019], LIVE);
         assert_eq!(l.level, AuditLevel::Partial, "{:?}", codes(&l));
         assert!(l.source);
-        // Review of #276, L1: 2019 is not measured yet; 2022 is.
+        // Review of #276, L1: 2019, 2022 and 2025 are measured (2019 and
+        // 2025 by engine-matrix run 39139682239); a later major is not.
         assert!(
-            l.details
+            !l.details
                 .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
         );
+        for major in [16, 17] {
+            assert!(
+                !at(&p, major, &[GRANT_2022], LIVE)
+                    .details
+                    .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
+            );
+        }
         assert!(
-            !at(&p, 16, &[GRANT_2022], LIVE)
+            at(&p, 18, &[GRANT_2022], LIVE)
                 .details
                 .contains(&crate::audit::probe::INVISIBLE_NOT_MEASURED)
         );

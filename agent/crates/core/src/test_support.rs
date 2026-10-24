@@ -59,7 +59,6 @@ pub fn contract_events_json(events: &[MaskedEvent], key: &HmacKey) -> String {
         target_id: &target,
         events,
         fingerprints: &fingerprints,
-        accept_bytes: true,
     }))
 }
 

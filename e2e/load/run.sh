@@ -81,7 +81,23 @@ LOAD_SOAK_MAX_S=1800
   || { echo "LOAD_SOAK_S must be at most $LOAD_SOAK_MAX_S seconds (got $LOAD_SOAK_S)" >&2; exit 2; }
 
 log() { printf '[load %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-fail() { log "FAIL: $*"; exit 1; }
+# Under GitHub Actions the reason is also an error annotation (readable through the check-run API
+# when the job log is not; registered secrets are masked in it as in the log).
+# Workflow command escaping: the message (% CR LF) and the title property (also : and ,), so that a
+# reason can neither end the annotation early nor start another workflow command.
+gha_escape() {
+  local s="$1"
+  s="${s//%/%25}"; s="${s//$'\r'/%0D}"; s="${s//$'\n'/%0A}"
+  [ "${2:-}" = property ] && { s="${s//:/%3A}"; s="${s//,/%2C}"; }
+  printf '%s' "$s"
+}
+fail() {
+  log "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "$(gha_escape "${LOG_TAG:-load}" property)" "$(gha_escape "$*")"
+  fi
+  exit 1
+}
 now_s() { date +%s.%3N; }
 
 T_RUN="$(date +%s)"
@@ -170,6 +186,34 @@ redact_dir() {
 
 compose() { timeout 120 docker compose -f "$COMPOSE_FILE" "$@"; }
 
+# print_census: ADR-0053 decision 6, the agent's event census (counts only) per engine, the console's
+# per-target and per-principal counts (census-sql, overflow flag included) and its events naming `*`
+# by kind (census-sql --star), read here (console_sql, once defined), in the log and
+# $LOAD_RESULTS_DIR/census-load.json / .md (the results artifact; added to the job summary by
+# summary_append once redacted). Never fails the run.
+print_census() {
+  local line con="$W/out/census-console.json" star="$W/out/census-star.json" id=""
+  [[ "${AGENT_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && id="$AGENT_ID"
+  rm -f -- "$con" "$star"
+  if declare -F console_sql >/dev/null; then
+    console_sql "$(python3 "$LOADLIB" census-sql ${id:+--agent-id "$id"})" >"$con" 2>/dev/null || rm -f -- "$con"
+    console_sql "$(python3 "$LOADLIB" census-sql --star ${id:+--agent-id "$id"})" >"$star" 2>/dev/null || rm -f -- "$star"
+  fi
+  python3 "$LOADLIB" census --log "$LOAD_LOG_DIR/agent.log" --label load --console "$con" --star "$star" \
+    --out-dir "$LOAD_RESULTS_DIR" \
+    2>&1 | while IFS= read -r line; do log "$line"; done || true
+}
+# summary_append FILE...: appends the existing files to the job summary (under GitHub Actions), only
+# called on files already redacted (cleanup).
+summary_append() {
+  local f
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  for f in "$@"; do
+    [ -f "$f" ] && cat -- "$f" >>"$GITHUB_STEP_SUMMARY"
+  done
+  return 0
+}
+
 BG_PIDS=()
 stop_background() {
   local pid
@@ -189,6 +233,7 @@ cleanup() {
     compose logs --no-color --timestamps "$svc" >"$LOAD_LOG_DIR/$svc.log" 2>&1
   done
   compose ps -a >"$LOAD_LOG_DIR/ps.txt" 2>&1
+  print_census
   # Measurement inputs (counters, timestamps, the raw pgbench / sysbench summaries), for a failed
   # run's investigation: logs only, never in the results artifact.
   cp -f "$W"/out/*.jsonl "$W"/out/*.summary "$LOAD_LOG_DIR/" 2>/dev/null
@@ -216,6 +261,8 @@ cleanup() {
   done
   redact_dir "$LOAD_LOG_DIR"
   redact_dir "$LOAD_RESULTS_DIR"
+  # The census (and catch-up) Markdown, redacted above, into the job summary.
+  summary_append "$LOAD_RESULTS_DIR"/census-*.md "$LOAD_RESULTS_DIR"/xe-catchup.md
   log "tearing down"
   timeout 180 docker compose -f "$COMPOSE_FILE" --profile tools down -v --remove-orphans >/dev/null 2>&1
   rm -rf "$W"
@@ -328,8 +375,12 @@ python3 "$SEED" pgbench --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --workload-t
   --out "$W/workload/pg"
 python3 "$SEED" sysbench --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --workload-tables "$LOAD_WORKLOAD_TABLES" \
   >"$W/workload/mariadb/point_select.lua"
-chmod 0755 "$W/workload" "$W/workload/pg" "$W/workload/mariadb"
-chmod 0644 "$W/workload/pg/"*.sql "$W/workload/mariadb/point_select.lua"
+# ADR-0053 decision 6: the ORM-style cycle of load_orm (side clients), one statement per line.
+mkdir -p "$W/workload/orm"
+python3 "$SEED" orm --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --dialect pg >"$W/workload/orm/pg.sql"
+python3 "$SEED" orm --tables "$LOAD_TABLES" --rows "$LOAD_ROWS" --dialect mariadb >"$W/workload/orm/mariadb.sql"
+chmod 0755 "$W/workload" "$W/workload/pg" "$W/workload/mariadb" "$W/workload/orm"
+chmod 0644 "$W/workload/pg/"*.sql "$W/workload/mariadb/point_select.lua" "$W/workload/orm/"*.sql
 
 # ------------------------------------------------------------------------------ build + start
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
@@ -549,7 +600,7 @@ python3 "$LOADLIB" sample --out "$SAMPLES_AGENT" --interval 1 "agent=${CID[agent
 BG_PIDS+=("$!")
 
 console_sql() {
-  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T db \
+  timeout 30 docker compose -f "$COMPOSE_FILE" exec -T -e "PGOPTIONS=-c default_transaction_read_only=on" db \
     psql -XAt -v ON_ERROR_STOP=1 -U postgres -d databastion -c "$1"
 }
 agent_json() {
@@ -962,6 +1013,8 @@ if [ "$LOAD_PG_AUDIT" = pgaudit ]; then
       '{kind: "pgaudit_volume", target: "pg-load", log_catalog: $lc, soak_s: $soak} + $v'
   fi
 fi
+# ADR-0053 decision 6: the console's per-principal counts and `*` events are read by print_census
+# (cleanup), with the agent's census.
 lost="$(timeout 30 docker compose -f "$COMPOSE_FILE" logs --no-color agent 2>/dev/null \
   | grep -cE 'cannot spool findings|batch dropped|; dropped|findings dropped|events dropped|rejected batch items|unreadable spool file' || true)"
 fact --argjson n "$lost" '{kind: "agent_log", lost: $n}'

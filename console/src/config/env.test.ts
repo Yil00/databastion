@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ConfigError, getDatabaseUrl, readEnvOrFile, requireEnvOrFile } from "./env";
+import { agentTokensHold, AGENT_TOKENS_HOLD_RELEASES, ConfigError, getDatabaseUrl, readEnvOrFile, requireEnvOrFile } from "./env";
 
 const SECRET_URL = "postgresql://databastion:s3cr3t-pw@db:5432/databastion";
 
@@ -84,5 +84,30 @@ describe("getDatabaseUrl", () => {
     }
     expect(message).not.toBe("");
     expect(message).not.toContain("s3cr3t-pw");
+  });
+});
+
+describe("agentTokensHold (DATABASTION_AGENT_TOKENS_HOLD, ADR-0022 decision 8)", () => {
+  const hold = (v: string | undefined) => agentTokensHold({ DATABASTION_AGENT_TOKENS_HOLD: v });
+
+  it("is null when unset, empty or blank (no hold)", () => {
+    expect(agentTokensHold({})).toBeNull();
+    expect(hold(undefined)).toBeNull();
+    expect(hold("")).toBeNull();
+    expect(hold("  ")).toBeNull();
+  });
+
+  it("accepts each known release line, trimmed", () => {
+    expect(AGENT_TOKENS_HOLD_RELEASES).toEqual(["0.8"]);
+    expect(hold("0.8")).toBe("0.8");
+    expect(hold(" 0.8\n")).toBe("0.8");
+  });
+
+  it("refuses any other value without echoing it (fail closed: the processes refuse to start)", () => {
+    const message =
+      "DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8 (the release line of the oldest console replica).";
+    for (const v of ["0.8.2", "0.8.0", "v0.8", "0.7", "0.9", "1", "true", "0.8,0.9", "0,8", "08"]) {
+      expect(() => hold(v), v).toThrow(new ConfigError(message));
+    }
   });
 });

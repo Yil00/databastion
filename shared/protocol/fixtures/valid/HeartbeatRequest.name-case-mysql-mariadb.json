@@ -1,0 +1,53 @@
+{
+  "ts": "2026-10-21T09:00:00Z",
+  "agent_version": "0.9.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql"
+  ],
+  "targets": [
+    {
+      "target_id": "mysql-prod",
+      "engine": "mysql",
+      "reachable": true,
+      "audit_level": "partial",
+      "server_version": "8.4.6",
+      "audit_source": "performance_schema",
+      "name_case": {
+        "databases": "insensitive",
+        "objects": "insensitive"
+      }
+    },
+    {
+      "target_id": "mariadb-prod",
+      "engine": "mariadb",
+      "reachable": true,
+      "audit_level": "partial",
+      "server_version": "11.4.8",
+      "audit_source": "mariadb_server_audit",
+      "name_case": {
+        "databases": "sensitive",
+        "objects": "sensitive"
+      }
+    },
+    {
+      "target_id": "mysql-down",
+      "engine": "mysql",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "target_unreachable",
+      "name_case": {
+        "databases": "unknown",
+        "objects": "unknown"
+      }
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

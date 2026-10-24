@@ -216,6 +216,53 @@ describe.skipIf(!hasDb)("migrations (PostgreSQL)", () => {
     });
   });
 
+  describe("0046 and 0047: findings altered parts (ADR-0056 decision 3)", () => {
+    it("adds nullable text[] columns with no default and no constraint; the runtime role updates them, never an event's objects", async () => {
+      const columns = await withClient(ownerUrl, (c) =>
+        c.query<{ column_name: string; data_type: string; is_nullable: string; column_default: string | null }>(
+          `select column_name, data_type, is_nullable, column_default from information_schema.columns
+            where table_schema = 'public' and table_name = 'findings' and column_name in ('altered', 'altered_job_id', 'false_positive_altered')
+            order by column_name`,
+        ),
+      );
+      expect(columns.rows).toEqual([
+        { column_name: "altered", data_type: "ARRAY", is_nullable: "YES", column_default: null },
+        { column_name: "altered_job_id", data_type: "uuid", is_nullable: "YES", column_default: null },
+        { column_name: "false_positive_altered", data_type: "ARRAY", is_nullable: "YES", column_default: null },
+      ]);
+      // Nothing to validate (ADR-0028): no constraint names either column.
+      const constraints = await withClient(ownerUrl, (c) =>
+        c.query(`select conname from pg_constraint where conrelid = 'public.findings'::regclass
+                  and pg_get_constraintdef(oid) ~ 'altered'`),
+      );
+      expect(constraints.rows).toEqual([]);
+      const { url } = await createRuntimeRole();
+      await withClient(url, async (c) => {
+        const agent = await c.query<{ id: string }>("insert into agents (name, hostname, version) values ('h46', 'h46', '0.8.0') returning id");
+        const agentId = agent.rows[0]?.id;
+        await c.query(
+          "insert into agent_targets (agent_id, target_id, engine, reachable, audit_level) values ($1, 'pg', 'postgres', true, 'none')",
+          [agentId],
+        );
+        await c.query(
+          `insert into findings (id, agent_id, target_id, location_key, engine, database_name, object_name,
+             field_name, classifier, classifiers_version, confidence, sampled, matched, last_batch_id, altered)
+           values ($1, $2, 'pg', $3, 'postgres', 'crm', 'clients', 'email', 'pii.email', '2026.09.1', 0.5, 10, 5, $1, '{object}')`,
+          ["01920f60-3c1a-7b2e-9f00-5a1b2c3d4e46", agentId, "4".repeat(64)],
+        );
+        await c.query("update findings set altered = '{object,field}', false_positive_altered = '{}' where agent_id = $1", [agentId]);
+        const read = await c.query<{ altered: string[]; false_positive_altered: string[] }>(
+          "select altered, false_positive_altered from findings where agent_id = $1",
+          [agentId],
+        );
+        expect(read.rows).toEqual([{ altered: ["object", "field"], false_positive_altered: [] }]);
+        // Event objects (and their `altered` parts) stay insert-only for the runtime role (0022).
+        await expect(c.query("update access_events set objects = '[]'::jsonb")).rejects.toThrow(/permission denied/);
+        await c.query("delete from agents where id = $1", [agentId]);
+      });
+    });
+  });
+
   describe("concurrent migrate runs are serialized (security review L1)", () => {
     it("two concurrent runs on a fresh database both succeed, each migration applied once; a run waits for the lock", async () => {
       const suffix = randomBytes(6).toString("hex");

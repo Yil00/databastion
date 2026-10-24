@@ -5,6 +5,7 @@ import { agents, agentTargets, enrollmentTokens, jobs, securityEvents } from "@/
 import { auditSourceEngines } from "@/lib/location-labels";
 import { MAX_VALIDATION_DETAILS, type Schemas, type ValidationDetail } from "@/lib/protocol/validate";
 import { parseDetectedTargets } from "@/lib/detected-targets";
+import { canonicalNameCase } from "@/lib/name-case";
 import { notesToStore, parseStoredNotes } from "@/lib/target-notes";
 
 import { writeAudit } from "./audit";
@@ -17,6 +18,7 @@ import { jobHub, REVOKED_CHANNEL } from "./agent-api/job-hub";
 import { argon2Hash, enrollArgon2Gate, newAgentSecret, sha256Hex } from "./crypto";
 import { RateLimiter } from "./rate-limit";
 import { lockAgentJobs } from "./job-lock";
+import { storeNameCase } from "./name-case-inventory";
 
 /**
  * Consumes an enrollment token and creates the agent.
@@ -176,7 +178,8 @@ export function withoutMismatchedSources(hb: Schemas["HeartbeatRequest"], indice
 
 /**
  * Stores a (validated) heartbeat: agent status, targets, detections, spool, metrics and the agent's
- * capability tokens (`acceptsChanged` when they differ from the stored ones). A rise of
+ * capability tokens (`acceptsChanged` when they differ from the stored ones; `auditRequeueDue` when
+ * an earlier change is still to be acted on, #280 re-review L-a). A rise of
  * `spool.dropped_batches` since the previous heartbeat is counted and alerted (P7, see
  * `dropped-batches.ts`), in the same transaction.
  */
@@ -184,7 +187,7 @@ export async function recordHeartbeat(
   db: Database,
   agentId: string,
   hb: Schemas["HeartbeatRequest"],
-): Promise<{ acceptsChanged: boolean }> {
+): Promise<{ acceptsChanged: boolean; auditRequeueDue: boolean }> {
   const skew = Date.parse(hb.ts) - Date.now();
   const accepts = agentAcceptsToStore(hb.accepts);
   const clockSkewMs = Math.max(-2_000_000_000, Math.min(2_000_000_000, Math.round(skew)));
@@ -197,6 +200,7 @@ export async function recordHeartbeat(
         unalerted: agents.droppedBatchesUnalerted,
         stopsUnalerted: agents.auditStreamStopsUnalerted,
         accepts: agents.accepts,
+        auditRequeueDueAt: agents.auditRequeueDueAt,
       })
       .from(agents)
       .where(and(eq(agents.id, agentId), isNull(agents.revokedAt), isNull(agents.lockedAt)))
@@ -238,6 +242,10 @@ export async function recordHeartbeat(
         .insert(agentTargets)
         .values({ agentId, targetId: t.target_id, ...values })
         .onConflictDoUpdate({ target: [agentTargets.agentId, agentTargets.targetId], set: values });
+      // ADR-0055 decision 7 (L8): compare-and-set of the canonical `name_case` in this transaction,
+      // so one replica sees each change and marks the target's inventory due. Absent -> cleared
+      // (today's rule), whatever the agent's version.
+      await storeNameCase(tx, agentId, t.target_id, t.engine, t.name_case);
     }
     await tx
       .update(agentTargets)
@@ -247,7 +255,7 @@ export async function recordHeartbeat(
           ? and(eq(agentTargets.agentId, agentId), notInArray(agentTargets.targetId, ids))
           : eq(agentTargets.agentId, agentId),
       );
-    if (!previous) return { raised: false, acceptsChanged: false };
+    if (!previous) return { raised: false, acceptsChanged: false, auditRequeueDue: false };
     // Security review of #280, M2: the caller queues the settings again when this changes.
     const acceptsChanged = JSON.stringify(previous.accepts ?? []) !== JSON.stringify(accepts);
     const delta = droppedBatchesDelta(previous, { spool: hb.spool, uptimeS: hb.uptime_s });
@@ -257,10 +265,10 @@ export async function recordHeartbeat(
     let raised = false;
     if (previous.unalerted + delta > 0) raised = (await raiseDroppedBatchesAlert(tx, agentId)) !== null;
     if (previous.stopsUnalerted + stops > 0) raised = (await raiseAuditStreamStoppedAlert(tx, agentId)) !== null || raised;
-    return { raised, acceptsChanged };
+    return { raised, acceptsChanged, auditRequeueDue: previous.auditRequeueDueAt !== null };
   });
   if (alerted.raised) void requestNotificationDelivery();
-  return { acceptsChanged: alerted.acceptsChanged };
+  return { acceptsChanged: alerted.acceptsChanged, auditRequeueDue: alerted.auditRequeueDue };
 }
 
 /**
@@ -442,6 +450,7 @@ export async function getAgentDetail(db: Database, agentId: string) {
       auditSource: agentTargets.auditSource,
       lastError: agentTargets.lastError,
       notes: agentTargets.notes,
+      nameCase: agentTargets.nameCase,
       present: agentTargets.present,
       lastReportedAt: agentTargets.lastReportedAt,
     })
@@ -454,6 +463,7 @@ export async function getAgentDetail(db: Database, agentId: string) {
     detectedTargets: parseDetectedTargets(agent.detectedTargets),
     droppedAlerts,
     streamStopAlerts,
-    targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes) })),
+    // ADR-0055: re-read in canonical form (a corrupt stored value reads as the strict form).
+    targets: targets.map((t) => ({ ...t, notes: parseStoredNotes(t.notes), nameCase: canonicalNameCase(t.nameCase) })),
   };
 }

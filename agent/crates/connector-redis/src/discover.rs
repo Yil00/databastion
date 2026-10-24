@@ -317,9 +317,11 @@ pub(crate) async fn discover(
             continue;
         };
         // The patterns Audit maps log keys to (decision 8, H1).
-        let learned: Vec<String> = emitted
+        // Each with its ADR-0056 marker: an Audit object mapped to an
+        // altered pattern is altered.
+        let learned: Vec<(String, bool)> = emitted
             .iter()
-            .map(|p| p.pattern.as_str().to_owned())
+            .map(|p| (p.pattern.as_str().to_owned(), p.pattern.altered()))
             .collect();
         state.audit.learn(&target.id, *db, &learned, complete);
         sample_database(&mut conn, job, sink, &name, emitted, &mut facts).await?;
@@ -530,8 +532,9 @@ async fn scan_batch(
 /// The values read from one pattern's keys, per normalized field.
 #[derive(Default)]
 struct Pool {
-    /// Field name (normalized) -> values.
-    fields: BTreeMap<String, Vec<Zeroizing<String>>>,
+    /// Field name (normalized) -> the name, with its ADR-0056 marker
+    /// united over every raw field that normalized to it, and the values.
+    fields: BTreeMap<String, (NormalizedName, Vec<Zeroizing<String>>)>,
     /// Raw field names that normalized to `*` (values found in names).
     field_names: Vec<Zeroizing<String>>,
 }
@@ -543,17 +546,22 @@ impl Pool {
     /// names).
     fn collapse_fields(&mut self, cap: usize) {
         let fields = std::mem::take(&mut self.fields);
-        for (_, values) in fields {
+        for (_, (_, values)) in fields {
             for v in values {
-                self.push("*", v, cap);
+                // `*`: never altered.
+                self.push(&NormalizedName::wildcard(), v, cap);
             }
         }
     }
 
-    fn push(&mut self, field: &str, value: Zeroizing<String>, cap: usize) {
-        let slot = self.fields.entry(field.to_owned()).or_default();
-        if slot.len() < cap {
-            slot.push(value);
+    fn push(&mut self, field: &NormalizedName, value: Zeroizing<String>, cap: usize) {
+        let slot = self
+            .fields
+            .entry(field.as_str().to_owned())
+            .or_insert_with(|| (field.clone(), Vec::new()));
+        slot.0.absorb_marker(field);
+        if slot.1.len() < cap {
+            slot.1.push(value);
         }
     }
 }
@@ -572,8 +580,9 @@ fn value_text(bytes: &[u8]) -> Option<Zeroizing<String>> {
     Some(Zeroizing::new(text.to_owned()))
 }
 
-/// The normalized name of a hash or stream field (an `Identifier`).
-fn field_name(raw: &[u8], pool: &mut Pool) -> Option<String> {
+/// The normalized name of a hash or stream field (an `Identifier`), with
+/// its ADR-0056 marker.
+fn field_name(raw: &[u8], pool: &mut Pool) -> Option<NormalizedName> {
     let text = std::str::from_utf8(raw).ok();
     let normalized = text.map_or_else(NormalizedName::wildcard, names::normalize_path);
     if normalized.as_str() == "*"
@@ -581,7 +590,7 @@ fn field_name(raw: &[u8], pool: &mut Pool) -> Option<String> {
     {
         pool.field_names.push(Zeroizing::new(t.to_owned()));
     }
-    Some(normalized.as_str().to_owned())
+    Some(normalized)
 }
 
 async fn sample_database(
@@ -662,15 +671,16 @@ async fn emit(
     pattern: &EmittedPattern,
     pool: Pool,
 ) -> Result<(), ConnectorError> {
-    let location = |field: &str| FindingLocation {
+    // The field as pooled, marker included (never normalized again).
+    let location = |field: NormalizedName| FindingLocation {
         database: names::normalize_path(database),
         schema: Some(names::normalize_path(kind.schema())),
         object: pattern.pattern.clone(),
-        field: names::normalize_path(field),
+        field,
     };
     let rows = pattern.group.count;
     let mut submit = Vec::new();
-    for (field, values) in &pool.fields {
+    for (field, (name, values)) in &pool.fields {
         let raws: Vec<RawSample<'_>> = values.iter().map(|v| RawSample::new(v.as_str())).collect();
         let column = if field == "value" {
             hint(pattern.pattern.as_str())
@@ -678,7 +688,10 @@ async fn emit(
             field.as_str()
         };
         for f in job.classify(column, &raws) {
-            submit.push(f.into_finding(location(field)).with_estimated_rows(rows));
+            submit.push(
+                f.into_finding(location(name.clone()))
+                    .with_estimated_rows(rows),
+            );
         }
     }
     // Values found in key names (`#key`) and hash / stream field names
@@ -691,7 +704,10 @@ async fn emit(
         .collect();
     if !key_values.is_empty() {
         for f in job.classify("key", &key_values) {
-            submit.push(f.into_finding(location("#key")).with_estimated_rows(rows));
+            submit.push(
+                f.into_finding(location(names::normalize_path("#key")))
+                    .with_estimated_rows(rows),
+            );
         }
     }
     let field_values: Vec<RawSample<'_>> = pool
@@ -701,7 +717,10 @@ async fn emit(
         .collect();
     if !field_values.is_empty() {
         for f in job.classify("field", &field_values) {
-            submit.push(f.into_finding(location("#field")).with_estimated_rows(rows));
+            submit.push(
+                f.into_finding(location(names::normalize_path("#field")))
+                    .with_estimated_rows(rows),
+            );
         }
     }
     for f in submit {
@@ -729,7 +748,7 @@ async fn sample_pattern(
         let s = conn.get(job).await.map_err(Walk::Failed)?;
         let k = key.expose();
         // Per key: (field, value) pairs read.
-        let mut read: Vec<(String, Zeroizing<String>)> = Vec::new();
+        let mut read: Vec<(NormalizedName, Zeroizing<String>)> = Vec::new();
         let mut tripped = false;
         let mut check = |bytes: &[u8]| {
             if guard::value_trips(bytes) {
@@ -749,7 +768,7 @@ async fn sample_pattern(
                 if let Some(b) = r.as_bytes() {
                     check(b);
                     if let Some(t) = value_text(b) {
-                        read.push(("value".to_owned(), t));
+                        read.push((names::normalize_path("value"), t));
                     }
                 }
             }
@@ -771,7 +790,7 @@ async fn sample_pattern(
                         if let Some(b) = item.as_bytes() {
                             check(b);
                             if let Some(t) = value_text(b) {
-                                read.push(("value".to_owned(), t));
+                                read.push((names::normalize_path("value"), t));
                             }
                         }
                     }
@@ -882,8 +901,8 @@ async fn sample_pattern(
             continue;
         }
         for (field, value) in read {
-            if field != "value" && field != "*" {
-                distinct_fields.insert(field.clone());
+            if field.as_str() != "value" && field.as_str() != "*" {
+                distinct_fields.insert(field.as_str().to_owned());
             }
             pool.push(&field, value, cap);
         }
@@ -911,12 +930,53 @@ mod tests {
     #[test]
     fn a_data_keyed_hash_keeps_no_field_name() {
         let mut pool = Pool::default();
-        for name in ["jdupont", "amartin", "lucas"] {
-            pool.push(name, Zeroizing::new("v".to_owned()), 16);
+        for name in ["jdupont", "amartin", "lucas\u{200B}"] {
+            pool.push(
+                &names::normalize_path(name),
+                Zeroizing::new("v".to_owned()),
+                16,
+            );
         }
         pool.collapse_fields(16);
         assert_eq!(pool.fields.keys().collect::<Vec<_>>(), ["*"]);
-        assert_eq!(pool.fields["*"].len(), 3);
+        assert_eq!(pool.fields["*"].1.len(), 3);
+        // `*` is never altered, even from an altered field name.
+        assert!(!pool.fields["*"].0.altered());
+    }
+
+    /// ADR-0056 (security review M1): a hash or stream field whose raw
+    /// name the first normalization step changed (a fullwidth letter,
+    /// U+200B) keeps its marker in the pool, united over every raw field
+    /// that normalizes to the same name, whatever the order; a plain field
+    /// stays plain.
+    #[test]
+    fn pooled_field_names_keep_the_altered_marker() {
+        let mut pool = Pool::default();
+        for raw in [
+            "email",
+            "\u{FF45}mail",
+            "email",
+            "phone",
+            "pho\u{200B}ne",
+            "city",
+        ] {
+            let f = field_name(raw.as_bytes(), &mut pool).unwrap();
+            pool.push(&f, Zeroizing::new("v".to_owned()), 16);
+        }
+        let marks: Vec<(&str, bool, usize)> = pool
+            .fields
+            .iter()
+            .map(|(k, (n, v))| (k.as_str(), n.altered(), v.len()))
+            .collect();
+        assert_eq!(
+            marks,
+            [("city", false, 1), ("email", true, 3), ("phone", true, 2)]
+        );
+        assert!(
+            pool.fields
+                .values()
+                .all(|(n, _)| !n.as_str().contains('\u{FF45}'))
+        );
     }
 
     #[test]

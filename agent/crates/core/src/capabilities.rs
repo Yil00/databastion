@@ -28,10 +28,11 @@
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use databastion_protocol::{
     AuditSource, CapabilityList, Connector, ConnectorList, DetectedTargetProcess, Engine,
-    HeartbeatRequest, TargetId,
+    HeartbeatRequest, TargetId, TargetStatus,
 };
 
 /// Contract `CapabilityList.maxItems`: tokens past it are ignored (the
@@ -43,8 +44,16 @@ pub(crate) const MAX_CAPABILITIES: usize = 64;
 pub(crate) mod token {
     /// `TargetStatus.notes`.
     pub(crate) const TARGET_STATUS_NOTES: &str = "target_status.notes";
+    /// `TargetStatus.name_case` (ADR-0055).
+    pub(crate) const TARGET_STATUS_NAME_CASE: &str = "target_status.name_case";
     /// `AccessEvent.bytes`.
     pub(crate) const ACCESS_EVENT_BYTES: &str = "access_event.bytes";
+    /// `AccessEvent.objects_overflowed` (ADR-0053).
+    pub(crate) const ACCESS_EVENT_OBJECTS_OVERFLOWED: &str = "access_event.objects_overflowed";
+    /// `Location.altered` (ADR-0056): the first gated field of findings.
+    pub(crate) const LOCATION_ALTERED: &str = "location.altered";
+    /// `ObjectRef.altered` (ADR-0056), on every object of an event.
+    pub(crate) const OBJECT_REF_ALTERED: &str = "object_ref.altered";
     /// `JobProgress.objects_sampled` and `skipped_*`.
     pub(crate) const JOB_PROGRESS_COVERAGE: &str = "job_progress.coverage";
     /// The `cas` values of `Engine` and `Connector`, and `cas_audit_log` of
@@ -178,17 +187,128 @@ pub(crate) fn audit_source_token(source: AuditSource) -> &'static [&'static str]
     }
 }
 
+/// How long gated fields may wait for a heartbeat answer while the
+/// capability set is not known (see [`ConsoleCapabilities::settled`]): two
+/// of the longest heartbeat intervals the agent accepts, so one heartbeat
+/// lost on the way does not strip them. Counted from the latest heartbeat
+/// attempt that failed with a transport error, until a result endpoint
+/// answers: during an outage the hold does not run out.
+pub(crate) const UNKNOWN_HOLD: std::time::Duration =
+    std::time::Duration::from_secs(2 * crate::backoff::HEARTBEAT_MAX_S.unsigned_abs());
+
+/// The longest the set may stay not known before gated fields are stripped
+/// anyway, whatever the heartbeats do (heartbeats failing while `/events`
+/// works must not hold events until the spool evicts them).
+pub(crate) const UNKNOWN_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// What the console accepts, from its latest heartbeat response.
-#[derive(Debug, Default)]
+///
+/// The set is **not known** from the start of the agent until the first
+/// heartbeat response, and again from a [`clear`](Self::clear) (a `400` on
+/// a gated field or on a heartbeat) until the next response. Gated
+/// `AccessEvent` fields are spooled in full and stripped at send time
+/// (ADR-0053 decision 2): batches carrying them wait while the set is not
+/// known (see [`settled`](Self::settled)), so that events spooled before a
+/// response keep fields the console then lists.
+#[derive(Debug)]
 pub(crate) struct ConsoleCapabilities {
-    accepted: RwLock<BTreeSet<String>>,
+    accepted: RwLock<Accepted>,
+}
+
+#[derive(Debug)]
+struct Accepted {
+    tokens: BTreeSet<String>,
+    /// Since when the set has not been known; `None` once a heartbeat
+    /// response recorded it (or after a clear that did not hold).
+    unknown_since: Option<Instant>,
+    /// Start of the current hold: `unknown_since`, moved to every heartbeat
+    /// attempt the console did not answer since.
+    hold_from: Option<Instant>,
+    /// When a clear last started a hold (security review M1): a clear
+    /// within [`UNKNOWN_HOLD`] of it does not hold again.
+    last_hold: Option<Instant>,
+    /// A result endpoint (`/events`, `/findings`) answered since the set
+    /// became unknown: the console is reachable, so unanswered heartbeats
+    /// no longer restart the hold (re-review N1).
+    results_answered: bool,
+    /// The set is empty because of a [`clear`](ConsoleCapabilities::clear)
+    /// that no heartbeat response has replaced yet, whether that clear
+    /// started a hold or not (ADR-0056 security review L1).
+    cleared: bool,
+}
+
+/// The capability set read once (security review I-2): the tokens and
+/// whether gated fields may be decided now.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshot {
+    tokens: BTreeSet<String>,
+    settled: bool,
+    known: bool,
+}
+
+impl Snapshot {
+    /// Whether the set listed `token`.
+    pub(crate) fn accepts(&self, token: &str) -> bool {
+        self.tokens.contains(token)
+    }
+
+    /// See [`ConsoleCapabilities::settled`].
+    pub(crate) fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// Whether a heartbeat response recorded the set and no clear came
+    /// since: false from the start of the agent until the first response,
+    /// and from any clear (one that started a hold, or one within
+    /// [`UNKNOWN_HOLD`] of the last hold, which leaves the set empty
+    /// without holding) until the next response. Findings are never held
+    /// (ADR-0056 decision 2 item 3): a findings batch stripped while the
+    /// set is not known is counted per finding
+    /// (`findings_stripped_capabilities_unknown_total`), apart from the
+    /// batches stripped because a known set does not list a token.
+    pub(crate) fn known(&self) -> bool {
+        self.known
+    }
+
+    /// A snapshot of a known set listing `tokens` (tests).
+    #[cfg(test)]
+    pub(crate) fn listing(tokens: &[&str]) -> Self {
+        Self {
+            tokens: tokens.iter().map(|t| (*t).to_owned()).collect(),
+            settled: true,
+            known: true,
+        }
+    }
+
+    /// A snapshot of a set not known yet (tests).
+    #[cfg(test)]
+    pub(crate) fn unknown() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for ConsoleCapabilities {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            accepted: RwLock::new(Accepted {
+                tokens: BTreeSet::new(),
+                unknown_since: Some(now),
+                hold_from: Some(now),
+                last_hold: None,
+                results_answered: false,
+                cleared: false,
+            }),
+        }
+    }
 }
 
 impl ConsoleCapabilities {
     /// Replaces the set with the `accepts` of a heartbeat response (absent:
-    /// nothing is accepted). Only the first [`MAX_CAPABILITIES`] tokens are
-    /// kept, so a hostile or buggy console cannot grow the set.
-    /// Returns whether the set changed.
+    /// nothing is accepted); the set is then known. Only the first
+    /// [`MAX_CAPABILITIES`] tokens are kept, so a hostile or buggy console
+    /// cannot grow the set. Returns whether the set changed, or became
+    /// known.
     pub(crate) fn record(&self, accepts: Option<&CapabilityList>) -> bool {
         let set: BTreeSet<String> = accepts
             .map(|list| {
@@ -198,18 +318,109 @@ impl ConsoleCapabilities {
                     .collect()
             })
             .unwrap_or_default();
-        let mut accepted = self
-            .accepted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = *accepted != set;
-        *accepted = set;
+        let mut accepted = self.write();
+        let changed = accepted.tokens != set || accepted.unknown_since.is_some();
+        accepted.tokens = set;
+        accepted.unknown_since = None;
+        accepted.hold_from = None;
+        accepted.cleared = false;
         changed
     }
 
-    /// Forgets every capability (heartbeat rejected with `400`).
+    /// Forgets every capability (a `400` on a heartbeat or on a gated
+    /// field): nothing is accepted, and the set is not known until the next
+    /// heartbeat response. At most one clear per [`UNKNOWN_HOLD`] starts a
+    /// hold (security review M1): an older replica refusing a field after
+    /// every heartbeat that lists it would otherwise let one gated batch
+    /// through per heartbeat. A clear within that window leaves the set
+    /// known and empty, so batches are stripped at once.
     pub(crate) fn clear(&self) {
-        self.record(None);
+        self.clear_at(Instant::now());
+    }
+
+    pub(crate) fn clear_at(&self, now: Instant) {
+        let mut accepted = self.write();
+        accepted.tokens.clear();
+        accepted.cleared = true;
+        if accepted.unknown_since.is_some() {
+            return;
+        }
+        if accepted
+            .last_hold
+            .is_some_and(|t| now.saturating_duration_since(t) < UNKNOWN_HOLD)
+        {
+            return;
+        }
+        accepted.unknown_since = Some(now);
+        accepted.hold_from = Some(now);
+        accepted.last_hold = Some(now);
+        accepted.results_answered = false;
+    }
+
+    /// A heartbeat attempt that failed with a transport error: while the
+    /// set is not known, and no result endpoint has answered since, the
+    /// hold restarts from it (security review L1), so batches spooled
+    /// during an outage keep their fields until the console answers.
+    pub(crate) fn unanswered(&self) {
+        self.unanswered_at(Instant::now());
+    }
+
+    pub(crate) fn unanswered_at(&self, now: Instant) {
+        let mut accepted = self.write();
+        if accepted.unknown_since.is_some() && !accepted.results_answered {
+            accepted.hold_from = Some(now);
+        }
+    }
+
+    /// A result endpoint answered (an ack or a contract error): the console
+    /// is reachable, so the current hold is no longer extended by
+    /// unanswered heartbeats.
+    pub(crate) fn result_answered(&self) {
+        let mut accepted = self.write();
+        if accepted.unknown_since.is_some() && !accepted.results_answered {
+            accepted.results_answered = true;
+        }
+    }
+
+    /// Whether gated fields may be decided at `now`: the set is known, or
+    /// the console has not answered for [`UNKNOWN_HOLD`] since the latest
+    /// unanswered heartbeat attempt (or since the set became unknown), or
+    /// the set has not been known for [`UNKNOWN_MAX`] (a console whose
+    /// heartbeats keep failing must not hold events forever; they are then
+    /// sent without the unlisted fields).
+    #[cfg(test)]
+    pub(crate) fn settled(&self, now: Instant) -> bool {
+        Self::settled_in(&self.read(), now)
+    }
+
+    fn settled_in(a: &Accepted, now: Instant) -> bool {
+        let since = |t: Option<Instant>| t.map(|t| now.saturating_duration_since(t));
+        match (since(a.unknown_since), since(a.hold_from)) {
+            (None, _) => true,
+            (Some(total), hold) => total >= UNKNOWN_MAX || hold.is_none_or(|h| h >= UNKNOWN_HOLD),
+        }
+    }
+
+    /// The set and [`settled`](Self::settled), read once.
+    pub(crate) fn snapshot(&self, now: Instant) -> Snapshot {
+        let a = self.read();
+        Snapshot {
+            tokens: a.tokens.clone(),
+            settled: Self::settled_in(&a, now),
+            known: a.unknown_since.is_none() && !a.cleared,
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Accepted> {
+        self.accepted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Accepted> {
+        self.accepted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether the console accepts every one of `tokens` (none: a value of
@@ -235,11 +446,40 @@ impl ConsoleCapabilities {
 
     /// Whether the latest heartbeat response listed `token`.
     pub(crate) fn console_accepts(&self, token: &str) -> bool {
-        self.accepted
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(token)
+        self.read().tokens.contains(token)
     }
+}
+
+/// Whether a target status carries a gated field (ADR-0022):
+/// `notes` (`target_status.notes`; the note-label revisions are values
+/// inside it) and `name_case` (`target_status.name_case`, ADR-0055). A new
+/// gated `TargetStatus` field must be added here and in
+/// [`strip_gated_target_status`].
+pub(crate) fn target_status_carries_gated(t: &TargetStatus) -> bool {
+    !t.notes.is_empty() || t.name_case.is_some()
+}
+
+/// Removes every gated field of a target status (see
+/// [`target_status_carries_gated`]).
+pub(crate) fn strip_gated_target_status(t: &mut TargetStatus) {
+    t.notes.clear();
+    t.name_case = None;
+}
+
+/// Strips the gated fields of every target status of a heartbeat, for its
+/// resend after a `400` reporting an unknown field (ADR-0022 decision 9).
+/// Returns whether anything was stripped: `false` means the heartbeat
+/// carried no gated field, so the refusal is not about one and the
+/// heartbeat is not resent.
+pub(crate) fn strip_gated_heartbeat(heartbeat: &mut HeartbeatRequest) -> bool {
+    let mut stripped = false;
+    for t in &mut heartbeat.targets {
+        if target_status_carries_gated(t) {
+            strip_gated_target_status(t);
+            stripped = true;
+        }
+    }
+    stripped
 }
 
 /// Removes from a heartbeat every value of an engine the console has not
@@ -296,6 +536,29 @@ mod tests {
         serde_json::from_value(serde_json::json!(tokens)).unwrap()
     }
 
+    /// ADR-0056 security review L1: the set is known only once a heartbeat
+    /// response recorded it with no clear since, including a clear within
+    /// the hold window that leaves the set known and empty without holding.
+    #[test]
+    fn a_clear_makes_the_set_unknown_for_findings_until_the_next_answer() {
+        let caps = ConsoleCapabilities::default();
+        let now = Instant::now();
+        assert!(!caps.snapshot(now).known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
+        caps.clear_at(now);
+        assert!(!caps.snapshot(now).known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
+        // A second clear within the hold window: no hold, settled, but not
+        // known.
+        caps.clear_at(now + std::time::Duration::from_secs(1));
+        let snap = caps.snapshot(now + std::time::Duration::from_secs(1));
+        assert!(snap.settled() && !snap.known());
+        caps.record(None);
+        assert!(caps.snapshot(now).known());
+    }
+
     #[test]
     fn the_agent_lists_every_token_it_decodes() {
         let sent = agent_accepts().unwrap();
@@ -341,6 +604,103 @@ mod tests {
         caps.record(Some(&list(&[token::TARGET_STATUS_NOTES])));
         caps.clear();
         assert!(!caps.console_accepts(token::TARGET_STATUS_NOTES));
+    }
+
+    /// ADR-0053 decision 2: the set is not known before the first
+    /// response and after a clear, until the next response or the hold.
+    #[test]
+    fn the_set_is_settled_by_a_response_or_after_the_hold() {
+        use std::time::Duration;
+        let caps = ConsoleCapabilities::default();
+        let now = Instant::now();
+        assert!(!caps.settled(now));
+        assert!(!caps.snapshot(now).settled());
+        assert!(caps.settled(now + UNKNOWN_HOLD + Duration::from_secs(1)));
+        // An empty answer is an answer: the set became known.
+        assert!(caps.record(None), "known now");
+        assert!(caps.settled(now));
+        assert!(!caps.record(None), "unchanged");
+        caps.record(Some(&list(&[token::ACCESS_EVENT_OBJECTS_OVERFLOWED])));
+        assert!(
+            caps.snapshot(now)
+                .accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED)
+        );
+        let t0 = Instant::now();
+        caps.clear_at(t0);
+        assert!(!caps.settled(t0));
+        assert!(!caps.console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED));
+        // A second clear does not restart the hold.
+        caps.clear_at(t0 + Duration::from_secs(60));
+        assert!(caps.settled(t0 + UNKNOWN_HOLD));
+        assert!(caps.record(Some(&list(&[token::ACCESS_EVENT_OBJECTS_OVERFLOWED]))));
+        assert!(caps.settled(t0));
+        assert_eq!(UNKNOWN_HOLD, Duration::from_secs(600));
+    }
+
+    /// Security review M1: within [`UNKNOWN_HOLD`] of the clear that last
+    /// started a hold, a clear leaves the set known and empty (no hold);
+    /// once the window has passed, a clear holds again.
+    #[test]
+    fn a_clear_holds_at_most_once_per_window() {
+        use std::time::Duration;
+        let caps = ConsoleCapabilities::default();
+        let t0 = Instant::now();
+        let listed = || list(&[token::ACCESS_EVENT_OBJECTS_OVERFLOWED]);
+        caps.record(Some(&listed()));
+        caps.clear_at(t0);
+        assert!(!caps.settled(t0));
+        for minute in 1..10 {
+            let t = t0 + Duration::from_secs(60 * minute);
+            caps.record(Some(&listed()));
+            caps.clear_at(t);
+            assert!(caps.settled(t), "minute {minute}: no second hold");
+            assert!(!caps.console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED));
+        }
+        let later = t0 + UNKNOWN_HOLD;
+        caps.record(Some(&listed()));
+        caps.clear_at(later);
+        assert!(!caps.settled(later), "a new window: holds again");
+    }
+
+    /// Re-review N1: once a result endpoint has answered, unanswered
+    /// heartbeats no longer restart the hold; a new hold starts afresh.
+    #[test]
+    fn a_result_answer_stops_extending_the_hold() {
+        use std::time::Duration;
+        let caps = ConsoleCapabilities::default();
+        let t0 = Instant::now();
+        caps.unanswered_at(t0 + Duration::from_secs(300));
+        assert!(!caps.settled(t0 + Duration::from_secs(800)));
+        caps.result_answered();
+        caps.unanswered_at(t0 + Duration::from_secs(600));
+        assert!(caps.settled(t0 + Duration::from_secs(900)), "not extended");
+        // A later hold (after an answer and a clear) is extended again.
+        caps.record(None);
+        let t1 = t0 + Duration::from_secs(2000);
+        caps.clear_at(t1);
+        caps.unanswered_at(t1 + Duration::from_secs(300));
+        assert!(!caps.settled(t1 + Duration::from_secs(800)));
+    }
+
+    /// Security review L1: unanswered heartbeat attempts restart the hold,
+    /// up to [`UNKNOWN_MAX`]; they do nothing while the set is known.
+    #[test]
+    fn unanswered_heartbeats_restart_the_hold_up_to_the_cap() {
+        use std::time::Duration;
+        let caps = ConsoleCapabilities::default();
+        let t0 = Instant::now();
+        let mut t = t0;
+        while t < t0 + UNKNOWN_MAX - UNKNOWN_HOLD {
+            t += Duration::from_secs(300);
+            caps.unanswered_at(t);
+            assert!(!caps.settled(t + Duration::from_secs(299)));
+        }
+        caps.unanswered_at(t0 + UNKNOWN_MAX);
+        assert!(caps.settled(t0 + UNKNOWN_MAX), "the cap");
+        assert_eq!(UNKNOWN_MAX, Duration::from_secs(3600));
+        caps.record(None);
+        caps.unanswered_at(t0 + UNKNOWN_MAX);
+        assert!(caps.settled(t0), "known: an outage does not unsettle it");
     }
 
     #[test]
@@ -577,6 +937,118 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&sent).unwrap(),
             serde_json::json!(["postgres", "mysql", "mongodb", "openldap"])
+        );
+    }
+
+    /// ADR-0055: `name_case` is a gated `TargetStatus` field, like
+    /// `notes`: a heartbeat carrying either is stripped of both for its
+    /// resend; one carrying neither is not resent.
+    #[test]
+    fn gated_target_status_fields_are_stripped_for_a_resend() {
+        for fixture in [
+            include_str!(
+                "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.name-case-sqlserver.json"
+            ),
+            include_str!(
+                "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.name-case-mysql-mariadb.json"
+            ),
+        ] {
+            let mut hb: HeartbeatRequest = serde_json::from_str(fixture).unwrap();
+            // Security review L2: `except` sorted by name, one entry per name.
+            for t in &hb.targets {
+                let names: Vec<&[u8]> = t
+                    .name_case
+                    .iter()
+                    .flat_map(|n| &n.except)
+                    .map(|e| e.database.as_str().as_bytes())
+                    .collect();
+                assert!(names.windows(2).all(|w| w[0] < w[1]), "{names:?}");
+            }
+            assert!(hb.targets.iter().all(target_status_carries_gated));
+            assert!(strip_gated_heartbeat(&mut hb));
+            assert!(!hb.targets.iter().any(target_status_carries_gated));
+            let text = serde_json::to_string(&hb).unwrap();
+            assert!(!text.contains("name_case") && !text.contains("notes"));
+            // The rest of each status is kept.
+            assert_eq!(hb.targets.len(), 3);
+            assert!(!strip_gated_heartbeat(&mut hb), "nothing left to strip");
+        }
+
+        let mut notes_only: HeartbeatRequest = serde_json::from_str(include_str!(
+            "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.target-notes.json"
+        ))
+        .unwrap();
+        assert!(notes_only.targets.iter().any(target_status_carries_gated));
+        assert!(strip_gated_heartbeat(&mut notes_only));
+        assert!(notes_only.targets.iter().all(|t| t.notes.is_empty()));
+    }
+
+    /// Security review I-2 (ADR-0055 contract): a target status with every
+    /// optional field set keeps, once stripped, exactly the fields of
+    /// protocol 0.1.0. The destructuring below has no `..`: a field added
+    /// to `TargetStatus` does not compile until it is classified here (and,
+    /// if gated, in [`target_status_carries_gated`] and
+    /// [`strip_gated_target_status`]).
+    #[test]
+    fn stripping_a_target_status_leaves_only_the_0_1_0_fields() {
+        let mut t: TargetStatus = serde_json::from_value(serde_json::json!({
+            "target_id": "mssql-prod",
+            "engine": "sqlserver",
+            "edition": "enterprise",
+            "server_version": "16.0.4305.5",
+            "reachable": true,
+            "audit_level": "partial",
+            "audit_source": "sqlserver_audit",
+            "last_error": "timeout",
+            "notes": [{"code": "check.timed_out"}],
+            "name_case": {
+                "databases": "insensitive",
+                "objects": "insensitive",
+                "except": [{"database": "crm_cs", "objects": "sensitive"}]
+            },
+            "metrics": {"checks_total": 1}
+        }))
+        .unwrap();
+        let TargetStatus {
+            audit_level: _,
+            audit_source,
+            edition,
+            engine: _,
+            last_error,
+            metrics,
+            name_case,
+            notes,
+            reachable: _,
+            server_version,
+            target_id: _,
+        } = &t;
+        assert!(audit_source.is_some() && edition.is_some() && last_error.is_some());
+        assert!(metrics.is_some() && server_version.is_some());
+        assert!(name_case.is_some() && !notes.is_empty());
+        assert!(target_status_carries_gated(&t));
+        strip_gated_target_status(&mut t);
+        assert!(!target_status_carries_gated(&t));
+        let value = serde_json::to_value(&t).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "audit_level",
+                "audit_source",
+                "edition",
+                "engine",
+                "last_error",
+                "metrics",
+                "reachable",
+                "server_version",
+                "target_id",
+            ]
         );
     }
 

@@ -117,6 +117,11 @@ const SOURCE_ENGINES: Record<AuditSource, readonly Engine[]> = {
   redis_sync: ["redis", "valkey"],
 };
 
+/** Every contract `AuditSource` with its engines. */
+export function auditSourceTable(): readonly (readonly [AuditSource, readonly Engine[]])[] {
+  return Object.entries(SOURCE_ENGINES) as [AuditSource, readonly Engine[]][];
+}
+
 /** Engines served by a contract `AuditSource` (empty for a string that is not one). */
 export function auditSourceEngines(source: string): readonly Engine[] {
   return Object.hasOwn(SOURCE_ENGINES, source) ? SOURCE_ENGINES[source as AuditSource] : [];

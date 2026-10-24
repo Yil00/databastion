@@ -18,8 +18,13 @@ name: Engine matrix
 #     printed by the main test run), and the fresh-server test
 #     `xe_fresh_server_own_reads_raise_no_event` run first on the new data volume
 #     (DATABASTION_IT_SQLSERVER_FRESH=1: the `sysaudacts` and `sysguidrefs` builds, with the
-#     captured events of their activity, DATABASTION_IT_SQLSERVER_CAPTURE, fake data only). The
-#     fresh-server step never fails the job: it is a measurement on 2019 and 2025.
+#     captured events of their activity, DATABASTION_IT_SQLSERVER_CAPTURE, fake data only:
+#     fresh-capture.txt, the `sysaudacts` build's activity alone in fresh-capture-sysaudacts.txt,
+#     and every statistics build of the agent's login with its activity in
+#     fresh-capture-statistics.txt, the source of the fixtures statistics-<build>.xml). The
+#     fresh-server step never fails the job: it is a measurement on 2019 and 2025. The main run's
+#     `[it] tables:`, `[it] roles:`, `[it] server run:` and `[it] xe predicate change:` lines (the
+#     #293, #281, #303 and #280 follow-ups) are kept in follow-ups.txt.
 #   - MySQL / MariaDB (#256): the digests of the agent's performance_schema poll and stats texts as
 #     each service renders them, in the format of the connector's fixture poll_digests.tsv
 #     (dev/capture-poll-digests.sh, after the tests sent every text).
@@ -135,6 +140,21 @@ jobs:
             it: mysql
             services: mysql mariadb percona
             mariadb_image: mariadb:11.8.9@sha256:6422478cb8e159f080fb1d8ccf65101e26fe51385787fde7d16c3b165a331f15
+          # ADR-0055 decision 10: a MySQL and a MariaDB server started with lower_case_table_names =
+          # 1 (names stored in lowercase, compared without case), at their default versions: check()
+          # reports `insensitive` (name_case_it asserts the setting through dev/agent-it.sh); the
+          # tests that need 0 (names as written, the CTE rule, `SYS` / `MySQL` user databases) skip
+          # with a message.
+          - engine: MySQL
+            version: "8.4.11 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mysql_lower_case_table_names: "1"
+          - engine: MariaDB
+            version: "11.4.13 (lower_case_table_names = 1)"
+            it: mysql
+            services: mysql mariadb percona
+            mariadb_lower_case_table_names: "1"
           # MongoDB Community (5.0+ is enforced by the connector).
           - engine: MongoDB
             version: "6.0.28"
@@ -271,6 +291,8 @@ jobs:
       DATABASTION_DEV_POSTGRES_LOG_FORMAT: ${{ matrix.postgres_log_format }}
       DATABASTION_DEV_MYSQL_IMAGE: ${{ matrix.mysql_image }}
       DATABASTION_DEV_MARIADB_IMAGE: ${{ matrix.mariadb_image }}
+      DATABASTION_DEV_MYSQL_LOWER_CASE_TABLE_NAMES: ${{ matrix.mysql_lower_case_table_names }}
+      DATABASTION_DEV_MARIADB_LOWER_CASE_TABLE_NAMES: ${{ matrix.mariadb_lower_case_table_names }}
       DATABASTION_DEV_MONGO_IMAGE: ${{ matrix.mongo_image }}
       DATABASTION_DEV_REDIS_IMAGE: ${{ matrix.redis_image }}
       DATABASTION_DEV_VALKEY_IMAGE: ${{ matrix.valkey_image }}
@@ -370,11 +392,24 @@ jobs:
             if [ "$IT_ENGINE" = sqlserver ]; then
               # With --nocapture the first line of a test can follow its `test … ...` prefix.
               grep -oE '(M2 \| |\[it\] m2: ).*' "$RUNNER_TEMP/it.log" >"$d/m2.txt" 2>/dev/null || true
+              # ADR-0055 name case facts (catalog_collation_type, ComparisonStyle, case-only duplicates).
+              grep -oE '\[it\] name_case: .*' "$RUNNER_TEMP/it.log" >"$d/name_case.txt" 2>/dev/null || true
+              # Phase 9 follow-ups: Discovery's table list under SQL Server Audit (#293), role
+              # membership changes (#281 review L2), the streams' server run (#303).
+              grep -oE '\[it\] (tables|roles|server run|xe predicate change): .*' "$RUNNER_TEMP/it.log" >"$d/follow-ups.txt" 2>/dev/null || true
               grep -oE '(\[it\] xe fresh|panicked at|^test .* (ok|FAILED|ignored)$|test result: ).*' \
                 "$d/fresh.log" >"$d/fresh-summary.txt" 2>/dev/null || true
               echo "M2 drift table: $(grep -c '^M2 | ' "$d/m2.txt" || true) row(s) (m2.txt); fresh-server test: ${FRESH_OUTCOME:-not run}"
               echo '```'
               cat "$d/fresh-summary.txt" 2>/dev/null || true
+              echo '```'
+              echo "phase 9 follow-ups: $(grep -c '' "$d/follow-ups.txt" || true) line(s) (follow-ups.txt)"
+              echo '```'
+              cat "$d/follow-ups.txt" 2>/dev/null || true
+              echo '```'
+              echo "name case: $(grep -c 'name_case: ' "$d/name_case.txt" || true) line(s) (name_case.txt)"
+              echo '```'
+              cat "$d/name_case.txt" 2>/dev/null || true
               echo '```'
             else
               timeout 300 dev/capture-poll-digests.sh >"$d/poll_digests.tsv" || echo "capture incomplete (see poll_digests.tsv)"
@@ -385,6 +420,12 @@ jobs:
               echo '```'
             fi
           } >>"$GITHUB_STEP_SUMMARY"
+          # The full rows in the job log too (readable without the artifact): `sed -n l` shows
+          # tabs as \t and ends each row with `$`, so the MariaDB digests' trailing space stays visible.
+          if [ -f "$d/poll_digests.tsv" ]; then
+            echo "poll_digests.tsv of $ENTRY:"
+            sed -n l "$d/poll_digests.tsv"
+          fi
       - name: Upload the measurements
         if: always() && steps.measure.outcome != 'skipped'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -472,10 +513,20 @@ jobs:
           {
             echo "### E2E SQL Server $E2E_SQLSERVER_VERSION ($E2E_SQLSERVER_AUDIT_SOURCE)"
             echo '```'
-            grep -E '\] (target-mssql: |mssql-e2e: (checked|SQL Server|audit level)|Audit: (bcp start|exporter events|.* hold .* statement)|all checks passed|PASS$|FAIL: |timings: )' \
+            grep -E '\] (target-mssql: |mssql-e2e: (checked|SQL Server|audit level)|Audit: (bcp start|exporter events|.* hold .* statement)|(CENSUS|XE-CATCHUP) |all checks passed|PASS$|FAIL: |timings: )' \
               "$RUNNER_TEMP/e2e.log" || true
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
+      # ADR-0053 decision 6 and #282 review N3: the event census (counts, target ids, principals as
+      # stored, the `*` events by kind; no value), whatever the result. Also in the summary.
+      - name: Upload event census
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-sqlserver-census-${{ matrix.version }}-${{ matrix.source }}
+          path: e2e-sqlserver-logs/census/
+          retention-days: 30
+          if-no-files-found: ignore
       - name: Upload container logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

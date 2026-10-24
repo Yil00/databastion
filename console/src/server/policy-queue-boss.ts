@@ -4,6 +4,7 @@ import { getDatabaseUrl } from "@/config/env";
 import { errorSummary, logger } from "@/lib/logger";
 import { pgBossOptions } from "@/worker/queues";
 
+import { CASE_INVENTORY_QUEUE, setCaseInventoryJobSender } from "./case-inventory-queue";
 import { NOTIFICATION_QUEUE, setNotificationJobSender } from "./notification-queue";
 import { POLICY_QUEUE, setPolicyJobSender } from "./policy-queue";
 import { processGlobal } from "./process-global";
@@ -36,7 +37,10 @@ function boss(): Promise<PgBoss> {
   return shared.starting;
 }
 
-/** Installs the web process senders: policy engine and notification delivery wake-ups. */
+/**
+ * Installs the web process senders: policy engine and notification delivery wake-ups, and the
+ * on-demand case inventory (ADR-0054).
+ */
 export function installPgBossPolicySender(): void {
   setPolicyJobSender(async () => {
     await (await boss()).send(POLICY_QUEUE, {});
@@ -44,4 +48,5 @@ export function installPgBossPolicySender(): void {
   setNotificationJobSender(async () => {
     await (await boss()).send(NOTIFICATION_QUEUE, {});
   });
+  setCaseInventoryJobSender(async (job) => (await boss()).send(CASE_INVENTORY_QUEUE, { userId: job.userId, ip: job.ip }));
 }

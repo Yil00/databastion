@@ -81,6 +81,12 @@ export interface AccessIncidentOpenedPayload {
      */
     unregistered_signals?: string[];
     objects: { database: string; schema: string | null; object: string }[];
+    /**
+     * Contract `AccessEvent.objects_overflowed` (ADR-0053 decision 3 item 7): the access reached
+     * more objects than `objects` lists; its `*` objects stand for the others. False when the
+     * agent did not send it (not known). Absent in rows written before ADR-0053.
+     */
+    objects_overflowed?: boolean;
   };
 }
 
@@ -309,7 +315,7 @@ function renderAccessIncident(p: AccessIncidentOpenedPayload, link: string): { s
     `Principal:  ${principalText(p)}`,
     `Database:   ${p.database === null ? "none" : one(p.database, 128)} (hour starting ${p.hour})`,
     `Access:     ${one(a.action, 16)} at ${a.ts} (${one(a.source, 32)})`,
-    `Objects:    ${objects || "none"}`,
+    `Objects:    ${objects || "none"}${a.objects_overflowed === true ? " (and objects the event does not list: left out by the agent under a bound)" : ""}`,
     `Rows:       ${a.rows === null ? "not reported by the source" : a.rows}`,
     `Score:      ${a.score} (sensitivity ${a.sensitivity})${a.anomaly ? ", above the principal's baseline" : ""}`,
     `Signals:    ${a.signals.map((s) => `${one(s, 64)}${unregistered.has(s) ? " (unregistered)" : ""}`).join(", ") || "none"}`,

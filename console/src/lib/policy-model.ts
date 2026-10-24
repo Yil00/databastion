@@ -3,19 +3,22 @@ import { validateSchema } from "@/lib/protocol/validate";
 
 import { parseEventConditions, type EventConditions } from "./event-model";
 import { SEVERITIES, type Severity } from "./incident-lifecycle";
+import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
+  alteredPartsCoverable,
   ENGINES,
-  exceptionGlobOptions,
   fail,
   globMatch,
   isGlob,
   isPlainObject,
   onlyKeys,
+  optionsFor,
   stringList,
   TEXT,
   UUID,
   type GlobOptions,
   type Parsed,
+  type PartGlobOptions,
 } from "./policy-common";
 
 export * from "./incident-lifecycle";
@@ -246,14 +249,28 @@ export interface FindingFacts {
   confidence: number;
   sampled: number;
   matched: number;
+  /**
+   * The target's `name_case` (ADR-0055), canonical (`canonicalNameCase`); absent or null: not
+   * reported, today's rule. Used by location exceptions only, and only on `mysql`, `mariadb` and
+   * `sqlserver` findings.
+   */
+  nameCase?: NameCaseRule | null;
+  /**
+   * Contract `Location.altered` (ADR-0056), as merged on the finding row per location and job
+   * (src/server/findings.ts): the parts whose names the agent's normalization altered. Absent or
+   * null: not reported, today's rule. Used by location exceptions only (decision 3 items 4 and 5).
+   */
+  altered?: readonly LocationPart[] | null;
 }
 
 /**
- * Globs are case-insensitive (ADR-0014 decision 1); policy conditions also ignore trailing spaces
- * (the default, end-of-phase-9 review N1), location exceptions only on the engines of
- * `TRAILING_SPACE_BLIND_ENGINES` (src/lib/policy-common.ts).
+ * Globs are case-insensitive (ADR-0014 decision 1) in policy conditions, which also ignore trailing
+ * spaces (the default, end-of-phase-9 review N1); location exceptions pass
+ * `exceptionGlobOptions(engine)` (src/lib/policy-common.ts): trailing spaces ignored only on
+ * `TRAILING_SPACE_BLIND_ENGINES`, case compared on every engine but `CASE_BLIND_EXCEPTION_ENGINES`
+ * (ADR-0054).
  */
-export function locationMatches(pattern: LocationPattern, f: FindingFacts, opts: GlobOptions = { ignoreTrailingSpaces: true }): boolean {
+export function locationMatches(pattern: LocationPattern, f: FindingFacts, opts: GlobOptions | PartGlobOptions = { ignoreTrailingSpaces: true }): boolean {
   const names: Record<LocationPart, string | null> = {
     database: f.databaseName,
     schema: f.schemaName,
@@ -265,7 +282,7 @@ export function locationMatches(pattern: LocationPattern, f: FindingFacts, opts:
     if (g === undefined) return true;
     const name = names[part];
     // A location without a schema (MySQL, MongoDB...) only matches a schema glob of `*`.
-    return name === null ? g === "*" : globMatch(g, name, opts);
+    return name === null ? g === "*" : globMatch(g, name, optionsFor(opts, part));
   });
 }
 
@@ -293,14 +310,25 @@ export interface ExceptionScope {
   expiresAt: Date | null;
 }
 
-/** The exception is active at `now` and covers `f` for `policyId` (every set scope must match). */
+/**
+ * The exception is active at `now` and covers `f` for `policyId` (every set scope must match). Its
+ * location globs compare `database`, `schema`, `object` and `field` with case on PostgreSQL,
+ * MongoDB, Redis, Valkey, CAS and an unknown engine, without case on OpenLDAP, and on SQL Server,
+ * MySQL and MariaDB while their target reports no `name_case` (ADR-0054 decision 1); with one,
+ * per part as the target compares names (ADR-0055 decision 6, `exceptionPartOptions`). A part
+ * the agent reported altered by its name normalization is covered only by an absent glob or
+ * exactly `*` (ADR-0056 decision 3 item 4, `alteredPartsCoverable`).
+ */
 export function exceptionCovers(e: ExceptionScope, policyId: string, f: FindingFacts, now: Date): boolean {
   if (e.expiresAt !== null && e.expiresAt.getTime() <= now.getTime()) return false;
   if (e.policyId !== null && e.policyId !== policyId) return false;
   if (e.agentId !== null && e.agentId !== f.agentId) return false;
   if (e.targetId !== null && e.targetId !== f.targetId) return false;
   if (e.classifier !== null && !classifierSelected([e.classifier], f.classifier)) return false;
-  if (e.location !== null && !locationMatches(e.location, f, exceptionGlobOptions(f.engine))) return false;
+  if (e.location !== null) {
+    if (!alteredPartsCoverable(e.location, f.altered)) return false;
+    if (!locationMatches(e.location, f, exceptionPartOptions(f.engine, f.nameCase, f.databaseName))) return false;
+  }
   return true;
 }
 

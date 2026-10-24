@@ -36,7 +36,8 @@
 //! only has to cover the statement's run, and a stream that reads late
 //! still matches it (security review of P9-A lot 2, L3). A credit covers
 //! the records of one execution, by transaction id; a record without one
-//! (0) consumes it once. At most [`MAX_CREDITS`] per target (the oldest are dropped: their
+//! (0) consumes it once. At most [`MAX_CREDITS`] per target (consumed credits whose window
+//! has passed are dropped first, then the oldest: their
 //! statements are then reported, fail closed); credits are forgotten an
 //! hour after their window. A credit holds a keyed hash of the text
 //! (SipHash with a per-process random key), never the text. Poll credits
@@ -411,9 +412,7 @@ impl Handle {
         }
         let ttl = (statement_timeout + CREDIT_SLACK).min(MAX_CREDIT_TTL);
         expire(&mut t.credits, now_us);
-        while t.credits.len() >= MAX_CREDITS {
-            t.credits.pop_front();
-        }
+        evict(&mut t.credits, now_us);
         let tag = if poll.is_none() {
             if t.salt.is_none() {
                 t.salt = Salt::fresh();
@@ -444,6 +443,30 @@ impl Drop for Handle {
 
 fn expire(credits: &mut VecDeque<Credit>, now_us: i64) {
     credits.retain(|c| now_us.saturating_sub(c.until_us) <= CREDIT_KEEP_US);
+}
+
+/// Makes room for one credit under [`MAX_CREDITS`] (review of the
+/// catch-up fix, L1): first the oldest credit already consumed whose
+/// window has passed (it only matches the other records of its one
+/// execution, all stamped within its window and mostly read by then),
+/// then the oldest credit. An unconsumed credit still waits for its
+/// statement's record (a stream behind the source reads it late): it is
+/// dropped only when no consumed one is left, and its statement is then
+/// reported (fail closed).
+fn evict(credits: &mut VecDeque<Credit>, now_us: i64) {
+    while credits.len() >= MAX_CREDITS {
+        let spent = credits
+            .iter()
+            .position(|c| c.used_tx.is_some() && c.until_us < now_us);
+        match spent {
+            Some(i) => {
+                credits.remove(i);
+            }
+            None => {
+                credits.pop_front();
+            }
+        }
+    }
 }
 
 fn prune(t: &mut Target, now_us: i64) {
@@ -1000,6 +1023,50 @@ pub(crate) fn reset(target_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of the catch-up fix, L1: at the cap, a consumed credit whose
+    /// window has passed goes before any unconsumed one, whatever its age;
+    /// with none, the oldest goes.
+    #[test]
+    fn consumed_past_credits_are_evicted_first() {
+        let credit = |spid: i64, until_us: i64, used: bool| Credit {
+            spid,
+            hash: Some(1),
+            tag: None,
+            poll: None,
+            from_us: until_us - 10,
+            until_us,
+            used_tx: used.then_some(5),
+        };
+        let now = 1_000;
+        let mut c: VecDeque<Credit> = (0..MAX_CREDITS - 2)
+            .map(|i| credit(i64::try_from(i).unwrap(), now + 100, false))
+            .collect();
+        // Newest: consumed, its window passed; and consumed, still open.
+        c.push_back(credit(-1, now - 1, true));
+        c.push_back(credit(-2, now + 100, true));
+        evict(&mut c, now);
+        assert_eq!(c.len(), MAX_CREDITS - 1);
+        assert!(c.iter().all(|k| k.spid != -1), "the spent credit went");
+        assert_eq!(
+            c.front().map(|k| k.spid),
+            Some(0),
+            "the oldest unconsumed stays"
+        );
+        assert!(
+            c.iter().any(|k| k.spid == -2),
+            "an open consumed credit stays"
+        );
+        // No spent credit left: the oldest goes.
+        c.push_back(credit(-3, now + 100, false));
+        evict(&mut c, now);
+        assert_eq!(c.len(), MAX_CREDITS - 1);
+        assert_eq!(c.front().map(|k| k.spid), Some(1));
+        // Under the cap: nothing goes.
+        let mut few: VecDeque<Credit> = std::iter::once(credit(9, now - 1, true)).collect();
+        evict(&mut few, now);
+        assert_eq!(few.len(), 1);
+    }
 
     #[test]
     fn lifetime_and_clean_close() {

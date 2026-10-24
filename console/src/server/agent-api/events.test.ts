@@ -202,6 +202,8 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         expect(r.dbUserFingerprint).toBe(e.principal.db_user_fingerprint ?? null);
         expect(r.accountNotRecorded).toBe((e.principal as { account_not_recorded?: boolean }).account_not_recorded === true);
         expect(r.principalKey).toBe(principalKey(e.principal));
+        // Every contract field of each object is stored as sent, `altered` included (ADR-0056
+        // decision 3 item 1).
         expect(r.objects).toEqual(e.objects);
         expect(r.signals).toEqual(e.signals ?? []);
         expect(r.rows).toBe(e.rows ?? null);

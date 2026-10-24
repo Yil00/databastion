@@ -101,6 +101,7 @@ impl Group {
                 continue;
             }
             let time = schema.is_time(&a.name);
+            mark_key(&mut self.fields, &field);
             let values = self.fields.entry(field).or_default();
             for v in &a.values {
                 if values.len() >= n {
@@ -116,6 +117,19 @@ impl Group {
 
 /// Groups of containers with the same normalized name, by object class.
 type Groups = HashMap<NormalizedName, Group>;
+
+/// Pools keyed by a normalized name: when `name` is altered (ADR-0056)
+/// and the key kept for it is not, the key is replaced by the altered one,
+/// so the pooled location is marked whatever the order.
+fn mark_key<V>(map: &mut HashMap<NormalizedName, V>, name: &NormalizedName) {
+    if !name.altered() {
+        return;
+    }
+    if let Some((mut key, value)) = map.remove_entry(name) {
+        key.absorb_marker(name);
+        map.insert(key, value);
+    }
+}
 
 /// Per-scan totals, for the final log line.
 #[derive(Debug, Default)]
@@ -320,6 +334,11 @@ where
                 && let Some((name, groups)) = current.take()
             {
                 flush(job, sink, &database, &name, groups, &mut totals).await?;
+            }
+            // Containers pooled under one name: an altered one marks the
+            // pool's name (ADR-0056).
+            if let Some((name, _)) = current.as_mut() {
+                name.absorb_marker(&container);
             }
             // The pooled sample of the containers that share this
             // normalized name is full: the others are not searched.
@@ -609,6 +628,7 @@ async fn sample_container<S: AsyncRead + AsyncWrite + Unpin>(
                 *skipped.entry(object.as_str().to_owned()).or_default() += 1;
             }
             kind => {
+                mark_key(groups, &object);
                 let group = groups.entry(object).or_default();
                 group.cas_registry |= kind == Some(StoreKind::ServiceRegistry);
                 group.add(schema, &e, n);

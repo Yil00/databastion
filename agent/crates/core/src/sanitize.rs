@@ -34,8 +34,9 @@ use databastion_classifiers::masking::{HmacKey, RawSample};
 use databastion_classifiers::names::{is_forbidden_char, violates_numeric_rule};
 use databastion_protocol::{
     AccessEvent, AccessEventAction, AuditSource, ClientAddress, Count, Engine, Finding,
-    Fingerprint, Identifier, ObjectName, Principal, PrincipalVariant0Application,
-    PrincipalVariant0DbUser, PrincipalVariant1Application, PrincipalVariant2Application,
+    Fingerprint, Identifier, LocationPart, ObjectName, ObjectRef, ObjectRefPart, Principal,
+    PrincipalVariant0Application, PrincipalVariant0DbUser, PrincipalVariant1Application,
+    PrincipalVariant2Application,
 };
 
 /// Contract `Count` maximum (JavaScript safe integer).
@@ -202,6 +203,79 @@ fn wildcard() -> Option<Identifier> {
     Identifier::try_from("*").ok()
 }
 
+/// `ObjectRef.altered` (ADR-0056) from the markers of an object's parts:
+/// `None` when no part is altered, never an empty list.
+pub(crate) fn object_ref_parts(
+    database: bool,
+    schema: bool,
+    object: bool,
+) -> Option<Vec<ObjectRefPart>> {
+    let parts: Vec<ObjectRefPart> = [
+        database.then_some(ObjectRefPart::Database),
+        schema.then_some(ObjectRefPart::Schema),
+        object.then_some(ObjectRefPart::Object),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// `Location.altered` (ADR-0056) from the markers of a location's parts:
+/// `None` when no part is altered, never an empty list.
+pub(crate) fn location_parts(
+    database: bool,
+    schema: bool,
+    object: bool,
+    field: bool,
+) -> Option<Vec<LocationPart>> {
+    let parts: Vec<LocationPart> = [
+        database.then_some(LocationPart::Database),
+        schema.then_some(LocationPart::Schema),
+        object.then_some(LocationPart::Object),
+        field.then_some(LocationPart::Field),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// The contract rules of an `altered` list (ADR-0056, contract review
+/// N2), in place: unique parts in canonical (contract) order, only parts
+/// that are sent (`sent`) and not named `*` (never set for a part sent as
+/// `*`), and `None` instead of an empty list.
+fn canonical_parts<P: Ord + Copy>(parts: &mut Option<Vec<P>>, sent: impl Fn(P) -> bool) {
+    if let Some(list) = parts.as_mut() {
+        list.retain(|p| sent(*p));
+        list.sort_unstable();
+        list.dedup();
+        if list.is_empty() {
+            *parts = None;
+        }
+    }
+}
+
+/// Whether an `ObjectName` is `*`.
+fn is_wildcard_name(name: &ObjectName) -> bool {
+    match name {
+        ObjectName::Variant0(id) => id.as_str() == "*",
+        ObjectName::Variant1(p) => p.as_str() == "*",
+    }
+}
+
+/// [`canonical_parts`] for an event object.
+fn canonical_object_parts(o: &mut ObjectRef) {
+    let database = o.database.as_str() != "*";
+    let schema = o.schema.as_ref().is_some_and(|s| s.as_str() != "*");
+    let object = !is_wildcard_name(&o.object);
+    canonical_parts(&mut o.altered, |p| match p {
+        ObjectRefPart::Database => database,
+        ObjectRefPart::Schema => schema,
+        ObjectRefPart::Object => object,
+    });
+}
+
 /// Applies the `Identifier` `not` rule: a violating name becomes `*`.
 fn fix_identifier(id: &mut Identifier) -> bool {
     if violates_numeric_rule(id.as_str()) {
@@ -278,6 +352,18 @@ pub(crate) fn check_finding(f: &mut Finding) -> bool {
     if !names_ok {
         return false;
     }
+    // ADR-0056: after the names above were fixed (a name turned into `*`
+    // is not altered).
+    let database = l.database.as_str() != "*";
+    let schema = l.schema.as_ref().is_some_and(|s| s.as_str() != "*");
+    let object = !is_wildcard_name(&l.object);
+    let field = l.field.as_str() != "*";
+    canonical_parts(&mut l.altered, |p| match p {
+        LocationPart::Database => database,
+        LocationPart::Schema => schema,
+        LocationPart::Object => object,
+        LocationPart::Field => field,
+    });
     if !f.confidence.is_finite() || !(0.0..=1.0).contains(&f.confidence) {
         return false;
     }
@@ -303,6 +389,80 @@ pub(crate) fn check_finding(f: &mut Finding) -> bool {
     true
 }
 
+/// Whether an object is named `*` (an `Identifier` or a `KeyPattern`).
+fn is_wildcard_object(o: &ObjectRef) -> bool {
+    is_wildcard_name(&o.object)
+}
+
+/// Keeps a `*` object in an event whose objects overflowed (ADR-0053
+/// decision 1 item 3: the contract requires one) that covers the objects
+/// the sanitizer itself left out. Fail closed: never clears the flag; adds `(<database>, -, *)` when every object it names
+/// and every one left out (`left_out`, their databases) share a database,
+/// `(*, -, *)` otherwise, in the last slot when the list is full (that
+/// object is then left out too). The `MaskedEvent` invariant makes this a
+/// no-op for events built by the core. `left_out`: the databases of the
+/// objects left out, each with whether its name was altered (ADR-0056):
+/// the `*` added for them carries the database marker of the objects it
+/// stands for.
+fn keep_overflow_wildcard(e: &mut AccessEvent, left_out: &[(Identifier, bool)]) {
+    // A `*` already there covers objects the sanitizer left out only when
+    // its database is `*` or theirs (security review L4); any `*` covers
+    // the connector's own overflow (the core's database rule).
+    let covers = |o: &ObjectRef| {
+        is_wildcard_object(o)
+            && (left_out.is_empty()
+                || o.database.as_str() == "*"
+                || left_out.iter().all(|(d, _)| *d == o.database))
+    };
+    let database_altered = |o: &ObjectRef| {
+        o.altered
+            .as_ref()
+            .is_some_and(|a| a.contains(&ObjectRefPart::Database))
+    };
+    if let Some(o) = e.objects.iter_mut().find(|o| covers(o)) {
+        // ADR-0056: the `*` of the same database stands for the objects
+        // left out, so it carries their database marker.
+        if o.database.as_str() != "*"
+            && left_out.iter().any(|(d, a)| *a && *d == o.database)
+            && !database_altered(o)
+        {
+            o.altered
+                .get_or_insert_with(Vec::new)
+                .push(ObjectRefPart::Database);
+            canonical_object_parts(o);
+        }
+        return;
+    }
+    let Some(star) = wildcard() else {
+        return;
+    };
+    let mut databases: Vec<(Identifier, bool)> = left_out.to_vec();
+    if e.objects.len() >= MAX_OBJECTS {
+        databases.extend(e.objects.drain(MAX_OBJECTS - 1..).map(|o| {
+            let a = database_altered(&o);
+            (o.database, a)
+        }));
+    }
+    databases.extend(
+        e.objects
+            .iter()
+            .map(|o| (o.database.clone(), database_altered(o))),
+    );
+    let (database, altered) = match databases.split_first() {
+        Some(((first, _), rest)) if rest.iter().all(|(d, _)| d == first) => (
+            first.clone(),
+            first.as_str() != "*" && databases.iter().any(|(_, a)| *a),
+        ),
+        _ => (star.clone(), false),
+    };
+    e.objects.push(ObjectRef {
+        database,
+        schema: None,
+        object: ObjectName::Variant0(star),
+        altered: object_ref_parts(altered, false, false),
+    });
+}
+
 /// Validates and sanitizes an access event in place. `false`: drop it.
 pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
     let redis = is_redis_source(e.source);
@@ -316,7 +476,27 @@ pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
     {
         return false;
     }
-    e.objects.truncate(MAX_OBJECTS);
+    // Objects past the contract bound are left out: the event then
+    // overflowed (ADR-0053), whatever the connector said.
+    // Their databases are kept (sanitized) for the `*` that stands for them.
+    let mut left_out: Vec<(Identifier, bool)> = Vec::new();
+    if e.objects.len() > MAX_OBJECTS {
+        left_out = e
+            .objects
+            .drain(MAX_OBJECTS..)
+            .map(|o| {
+                let a = o
+                    .altered
+                    .as_ref()
+                    .is_some_and(|a| a.contains(&ObjectRefPart::Database));
+                (o.database, a)
+            })
+            .collect();
+        e.objects_overflowed = Some(true);
+    }
+    if !left_out.iter_mut().all(|(d, _)| fix_identifier(d)) {
+        return false;
+    }
     for o in &mut e.objects {
         // A Redis / Valkey source names objects with a `KeyPattern`
         // (contract `ObjectRef`), any other source with an `Identifier`.
@@ -331,6 +511,14 @@ pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
         if !ok {
             return false;
         }
+        // ADR-0056: after the names above were fixed.
+        canonical_object_parts(o);
+    }
+    // The contract requires a `*` in a flagged event (ADR-0053 decision 1
+    // item 3, contract review M2); after the names above were fixed.
+    if e.objects_overflowed.is_some() {
+        e.objects_overflowed = Some(true);
+        keep_overflow_wildcard(e, &left_out);
     }
     if matches!(e.action, AccessEventAction::Read | AccessEventAction::Write)
         && e.objects.is_empty()
@@ -660,5 +848,115 @@ pub(crate) mod tests {
         );
         // Without any fingerprint source the item cannot be built.
         assert!(principal("hunter2-SECRET", false, None, None, &NoFingerprints).is_none());
+    }
+
+    fn objects_of(e: &AccessEvent) -> Vec<(String, Option<String>, String)> {
+        e.objects
+            .iter()
+            .map(|o| {
+                (
+                    o.database.as_str().to_owned(),
+                    o.schema.as_ref().map(|s| s.as_str().to_owned()),
+                    o.object.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn named(objects: &[(&str, &str)]) -> AccessEvent {
+        let mut e = event("read", 0);
+        e.objects = objects
+            .iter()
+            .map(|(d, o)| {
+                serde_json::from_value(serde_json::json!({"database": d, "object": o})).unwrap()
+            })
+            .collect();
+        e
+    }
+
+    /// Contract review M2 (ADR-0053 decision 1 item 3): a flagged event is
+    /// never sent without a `*`. Fail closed: the `*` is added, the flag
+    /// kept.
+    #[test]
+    fn a_flagged_event_always_names_a_wildcard() {
+        let star = |d: &str| (d.to_owned(), None, "*".to_owned());
+        // Room left: `(<database>, -, *)` appended.
+        let mut e = named(&[("crm", "orders"), ("crm", "customers")]);
+        e.objects_overflowed = Some(true);
+        assert!(check_event(&mut e));
+        assert_eq!(e.objects_overflowed, Some(true));
+        assert_eq!(e.objects.len(), 3);
+        assert_eq!(objects_of(&e)[2], star("crm"));
+        // Full: the last named object makes room, and its database counts.
+        let names: Vec<String> = (0..16).map(|i| format!("t{i}")).collect();
+        let mut list: Vec<(&str, &str)> = names.iter().map(|n| ("crm", n.as_str())).collect();
+        let mut e = named(&list);
+        e.objects_overflowed = Some(true);
+        assert!(check_event(&mut e));
+        assert_eq!(e.objects.len(), 16);
+        assert_eq!(objects_of(&e)[15], star("crm"));
+        assert_eq!(objects_of(&e)[14].2, "t14");
+        list[15] = ("billing", "t15");
+        let mut e = named(&list);
+        e.objects_overflowed = Some(true);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e)[15], star("*"), "another database left out");
+        // A `*` already there (here one with a schema) covers it: unchanged.
+        let mut e = named(&[("crm", "orders")]);
+        e.objects.push(
+            serde_json::from_value(
+                serde_json::json!({"database": "crm", "schema": "s", "object": "*"}),
+            )
+            .unwrap(),
+        );
+        e.objects_overflowed = Some(true);
+        let before = objects_of(&e);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e), before);
+        // A name the sanitizer turns into `*` is a `*` too.
+        let mut e = named(&[("crm", "123456789012")]);
+        e.objects_overflowed = Some(true);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e), [star("crm")]);
+        // Without the flag nothing is added.
+        let mut e = named(&[("crm", "orders")]);
+        assert!(check_event(&mut e));
+        assert_eq!((e.objects.len(), e.objects_overflowed), (1, None));
+    }
+
+    /// Objects past the contract bound are cut by the sanitizer only as a
+    /// safety net (the core bounds events first): the cut event is flagged
+    /// and names a `*` for what was left out, with sanitized databases.
+    #[test]
+    fn objects_cut_by_the_sanitizer_flag_the_event() {
+        let names: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let mut list: Vec<(&str, &str)> = names.iter().map(|n| ("crm", n.as_str())).collect();
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        assert_eq!(e.objects.len(), 16);
+        assert_eq!(e.objects_overflowed, Some(true));
+        assert_eq!(objects_of(&e)[15], ("crm".to_owned(), None, "*".to_owned()));
+        // A left-out object of another database, whose name breaks the
+        // numeric rule: `(*, -, *)`, never its raw name.
+        list[19] = ("123456789012", "t19");
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e)[15], ("*".to_owned(), None, "*".to_owned()));
+        assert!(!serde_json::to_string(&e).unwrap().contains("123456789012"));
+        // Security review L4: a `*` of another database does not cover the
+        // objects cut here; `(*, -, *)` takes the last slot.
+        let mut list: Vec<(&str, &str)> = names.iter().map(|n| ("crm", n.as_str())).collect();
+        list[3] = ("billing", "*");
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        let objects = objects_of(&e);
+        assert_eq!(objects.len(), 16);
+        assert_eq!(objects[3], ("billing".to_owned(), None, "*".to_owned()));
+        assert_eq!(objects[15], ("*".to_owned(), None, "*".to_owned()));
+        // A `*` of their own database does.
+        list[3] = ("crm", "*");
+        let mut e = named(&list);
+        assert!(check_event(&mut e));
+        assert_eq!(objects_of(&e)[15].2, "t15");
     }
 }

@@ -599,8 +599,87 @@
             "$ref": "#/$defs/TargetNote"
           }
         },
+        "name_case": {
+          "description": "How the target compares names that differ only by case, from the last `check()`\n(ADR-0055). Only on `mysql`, `mariadb` and `sqlserver` targets (checked by this\nschema). Sent only when the latest `HeartbeatResponse.accepts` lists\n`target_status.name_case` (ADR-0022); once it does, an agent implementing ADR-0055\nsends it in every `TargetStatus` of those engines, also when `check()` fails or\ntimes out (then the last value read on the same server run, else `unknown` for both\nparts). Absent, the console keeps comparing these engines' names without case.\n",
+          "$ref": "#/$defs/TargetNameCase"
+        },
         "metrics": {
           "$ref": "#/$defs/MetricsMap"
+        }
+      },
+      "if": {
+        "required": [
+          "name_case"
+        ],
+        "properties": {
+          "name_case": {
+            "$ref": "#/$defs/TargetNameCase"
+          }
+        }
+      },
+      "then": {
+        "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).\n",
+        "properties": {
+          "engine": {
+            "enum": [
+              "mysql",
+              "mariadb",
+              "sqlserver"
+            ]
+          }
+        }
+      }
+    },
+    "NameCase": {
+      "description": "How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;\n`insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it\nas `sensitive`, the stricter rule). A closed value: never a collation name, a setting value\nor free text.\n",
+      "type": "string",
+      "enum": [
+        "sensitive",
+        "insensitive",
+        "unknown"
+      ]
+    },
+    "TargetNameCase": {
+      "description": "Case semantics of a target's names (ADR-0055 decision 1), as the agent read them from the\nserver's settings (`lower_case_table_names` on MySQL / MariaDB, collations on SQL\nServer). Three closed values and normalized database names only (invariant I2).\n",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "databases",
+        "objects"
+      ],
+      "properties": {
+        "databases": {
+          "description": "How database names compare.",
+          "$ref": "#/$defs/NameCase"
+        },
+        "objects": {
+          "description": "How schema, object and column names compare in every database not listed in `except`.\n",
+          "$ref": "#/$defs/NameCase"
+        },
+        "except": {
+          "description": "Databases whose schema, object and column names compare otherwise than `objects`\n(SQL Server catalog collations; MySQL / MariaDB send none, their setting is\nserver-wide). Database names are `Identifier`s, normalized and sanitized like every\nlocation (ADR-0009): two databases whose names reach the console as one name (`*`,\nstripped characters) are one entry with the stricter value (`sensitive`, then\n`unknown`, then `insensitive`). It may name databases the agent never sends in a\nfinding or an event (outside the scan's scope, snapshots, databases its login cannot\nenter; ADR-0055 decision 9).\n\nOne entry per `database` name, and entries sorted by `database` in the byte order of\nits UTF-8 form (after normalization): a conforming agent merges the entries of one\nname into one, with the stricter value. Not checked by this schema (`uniqueItems`\ncompares whole entries, not names); the console reads several entries of one name as\nthe stricter of their values (ADR-0055 decision 6).\n\nAt most 32 entries, and at most **8 KiB** (8192 bytes) serialized as compact UTF-8\nJSON: an agent-side bound, which the console does not check (its request size limit\napplies). A conforming agent that would pass either bound, or that cannot list every\ndatabase, sends `objects: unknown` without `except`.\n",
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/TargetNameCaseException"
+          }
+        }
+      }
+    },
+    "TargetNameCaseException": {
+      "description": "One database whose schema, object and column names compare otherwise than `TargetNameCase.objects`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "database",
+        "objects"
+      ],
+      "properties": {
+        "database": {
+          "$ref": "#/$defs/Identifier"
+        },
+        "objects": {
+          "$ref": "#/$defs/NameCase"
         }
       }
     },
@@ -940,7 +1019,7 @@
           "$ref": "#/$defs/Timestamp"
         },
         "accepts": {
-          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `access_event.bytes`, `job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
+          "description": "Optional **request** fields and features this console accepts (ADR-0022), e.g.\n`target_status.notes`, `target_status.name_case`, `access_event.bytes`,\n`access_event.objects_overflowed`, `location.altered`, `object_ref.altered`,\n`job_progress.coverage`, and the engines\nadded after protocol 0.1.0 (`engine.cas`; see `Engine`). The agent keeps\nthe list of the latest heartbeat response and sends an optional request field\nintroduced after protocol 0.1.0 only when that list names it; before its first\nheartbeat response, and when the list is absent, it sends none of them. The console\nlists everything it accepts. Unknown tokens are ignored by the agent.\n",
           "$ref": "#/$defs/CapabilityList"
         }
       }
@@ -1541,6 +1620,16 @@
         },
         "field": {
           "$ref": "#/$defs/Identifier"
+        },
+        "altered": {
+          "description": "Parts of this location whose name was altered: the agent's name\nnormalization (ADR-0009: control and format characters stripped, NFKC; on\nRedis / Valkey the same steps of the key-pattern normalizer; on CAS,\ndefinition keys converted to snake_case) changed these parts, so another\nobject of the engine may be sent under the same name. Never set for a part\nsent as `*`. It carries no value, no character and no count (I2). Unique\nparts, at least one; absent when no part was altered. Sent only when the\nlatest `HeartbeatResponse.accepts` lists `location.altered` (ADR-0022,\nADR-0056); a `400` reporting it as an unknown field clears the agent's\ncapability list, and the findings are resent once without it (ADR-0022\ndecision 9).\n",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/LocationPart"
+          }
         }
       },
       "if": {
@@ -1570,6 +1659,25 @@
           }
         }
       }
+    },
+    "LocationPart": {
+      "description": "A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.\n",
+      "type": "string",
+      "enum": [
+        "database",
+        "schema",
+        "object",
+        "field"
+      ]
+    },
+    "ObjectRefPart": {
+      "description": "A part of an `ObjectRef` (ADR-0056): its `database`, `schema` or `object` name (an event\nobject names no field).\n",
+      "type": "string",
+      "enum": [
+        "database",
+        "schema",
+        "object"
+      ]
     },
     "EventsBatch": {
       "description": "Serialized size at most 1 MiB (agent-side bound, `x-databastion-max-bytes`).",
@@ -1648,6 +1756,11 @@
         "bytes": {
           "description": "Size in bytes of the result returned (or of the data affected), when the source\nreports it; absent otherwise, never estimated. For a pre-aggregated event, the total\nof the merged events, as for `rows`. Not produced by the PostgreSQL connector:\nneither pgaudit nor `pg_stat_statements` reports a result size. Sent only when the\nlatest `HeartbeatResponse.accepts` lists `access_event.bytes` (ADR-0022).\n",
           "$ref": "#/$defs/Count"
+        },
+        "objects_overflowed": {
+          "description": "Objects of this event were left out under a bound (the agent core's 15 named objects,\nor a connector's own bound); the event's `*` objects stand for them (see `ObjectRef`,\nthe name `*`). Carries no value, no name and no count. Only `true` is valid; absent\notherwise. An event that carries it names at least one object `*` (checked by this\nschema). Sent only when the latest `HeartbeatResponse.accepts` lists\n`access_event.objects_overflowed` (ADR-0022, ADR-0053).\n",
+          "type": "boolean",
+          "const": true
         },
         "signals": {
           "description": "Signal ids of the registry `signals.json` (see `Signal`).",
@@ -1728,6 +1841,16 @@
                     },
                     "object": {
                       "$ref": "#/$defs/KeyPattern"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
                     }
                   }
                 }
@@ -1768,6 +1891,66 @@
                     },
                     "object": {
                       "$ref": "#/$defs/Identifier"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "An event whose objects overflowed (`objects_overflowed`) names at least one object\n`*` (ADR-0053 decision 1 item 3).\n",
+          "if": {
+            "required": [
+              "objects_overflowed"
+            ],
+            "properties": {
+              "objects_overflowed": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "objects": {
+                "type": "array",
+                "contains": {
+                  "description": "An `ObjectRef` named `*` (keep in step with `ObjectRef`).",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "database",
+                    "object"
+                  ],
+                  "properties": {
+                    "database": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "schema": {
+                      "$ref": "#/$defs/Identifier"
+                    },
+                    "object": {
+                      "const": "*"
+                    },
+                    "altered": {
+                      "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 3,
+                      "uniqueItems": true,
+                      "items": {
+                        "$ref": "#/$defs/ObjectRefPart"
+                      }
                     }
                   }
                 }
@@ -1856,7 +2039,7 @@
       ]
     },
     "ObjectRef": {
-      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of two reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`.\n\nIn both cases `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n\n**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log\nentry is reported under the pattern learned by the last scan, its longest learned literal\nprefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.\n`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its\n`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),\nand by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`\ntargets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.\n",
+      "description": "Object reached by an access. Names are normalized (see `Identifier`); never an LDAP entry DN.\n\n**The name `*`.** An `object` equal to `*` means the agent does not name the object, for\none of three reasons:\n- **unknown object**: the source does not say which objects were reached and the agent\n  cannot tell from the statement (dynamic SQL, a function or procedure body, a statement\n  it cannot parse). `database` is the session's database and `schema` is absent. Such a\n  read or write is reported against `*`, never dropped; the event may also list, next to\n  `*`, the objects the agent could tell;\n- **masked name**: normalization replaced the name (a name matched by a classifier, or\n  one that does not conform to `Identifier`). This also applies to `database` and\n  `schema`;\n- **overflowed objects**: the event reached more objects than it may list (the agent\n  core keeps at most 15 named objects, and a connector may drop objects under a bound of\n  its own), and the `*` stands for the objects left out. It is `(<database>, -, *)` when\n  they share a database, `(*, -, *)` once objects of another database are left out too,\n  and none is added when a `*` already in the event covers them. Such an event is always\n  reported, and carries `AccessEvent.objects_overflowed` when the console lists\n  `access_event.objects_overflowed` (ADR-0053); without the field, the overflow is not\n  known to the console.\n\nIn every case `*` is a **literal name, not a wildcard**: it never means \"every object\".\nThe console compares it as the string `*` (ADR-0021): an `objects` condition or a\nlocation exception selects it only when its glob matches the string `*` (the glob `*`,\nor `\\*` for that name only); a glob such as `clients` or `crm_*` does not. Its\nsensitivity is that of the findings recorded under the same normalized name (any\nschema when `schema` is absent), usually none, so its score is usually 0; the event\nstill matches conditions that do not depend on objects (signals, principals, rows,\nanomaly), and the dedup scope uses its `database`. A policy scoped to named objects\ntherefore does not see such accesses: signal, volume and anomaly conditions do.\n\n**Except for a flagged event** (ADR-0053 decision 3): when the event carries\n`objects_overflowed`, every `*` of it (on Redis / Valkey, a real `*` key pattern too)\nstands for one or more objects of its database that the event does not name (of the\ntarget, for the database `*`): an `objects` condition retains it when its `database`\nglob, if any, matches; `min_sensitivity`, `min_score` and the incident's database count\nit as the database's most sensitive object; a location exception covers it only when it\ncovers the whole database. Without the field, the literal rule above applies.\n\n**Redis / Valkey.** `object` is a `KeyPattern` (ADR-0052 decision 8: a key read from a log\nentry is reported under the pattern learned by the last scan, its longest learned literal\nprefix followed by `*`, or `*`), `database` is `db<index>` or `*`, `schema` is absent.\n`ObjectRef` names no engine, so the rule is enforced twice: by `AccessEvent` from its\n`source` (`KeyPattern` for the `redis_*` sources, `Identifier` for every other source),\nand by the console from the **target's** engine (`KeyPattern` on `redis` and `valkey`\ntargets, `Identifier` on every other target). The `KeyPattern` rendering rule applies.\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1872,6 +2055,16 @@
         },
         "object": {
           "$ref": "#/$defs/ObjectName"
+        },
+        "altered": {
+          "description": "Parts of this object whose name was altered: the agent's name normalization\n(ADR-0009: control and format characters stripped, NFKC; on Redis / Valkey\nthe same steps of the key-pattern normalizer; on CAS, definition keys\nconverted to snake_case) changed these parts, so another object of the\nengine may be sent under the same name. Never set for a part sent as `*`. It\ncarries no value, no character and no count (I2). Unique parts, at least\none; absent when no part was altered; an event object names no field. Sent\nonly when the latest `HeartbeatResponse.accepts` lists `object_ref.altered`\n(ADR-0022, ADR-0056); a `400` reporting it as an unknown field clears the\nagent's capability list, and the events are resent once without it (ADR-0022\ndecision 9). Keep in step with the inline copies of `ObjectRef` in\n`AccessEvent`.\n",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/ObjectRefPart"
+          }
         }
       }
     }

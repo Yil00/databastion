@@ -370,7 +370,14 @@ pub(crate) fn level(i: &Inputs<'_>) -> Level {
 /// whose reads **that run** leave no record on each source, whatever the
 /// account (a low-privilege login and `sa` alike). Measured on 2022
 /// (16.0.4305.5, 2026-10-18) with the dev service's specification
-/// (`SCHEMA_OBJECT_ACCESS_GROUP`, no `DBCC_GROUP`) and session. The local
+/// (`SCHEMA_OBJECT_ACCESS_GROUP`, no `DBCC_GROUP`) and session; then on
+/// 2019 (15.0.4500.2) and 2025 (17.0.5015.4, strict) by engine-matrix run
+/// 39139682239 (2026-10-18), whose tables match these lists with no drift
+/// (2019: Extended Events only, SQL Server Audit is not a source there).
+/// On 2025 the low-privilege `dm_exec_sql_text` read is refused with 371
+/// (300 on 2019 and 2022), the `sa` reads of `sp_readerrorlog` /
+/// `xp_readerrorlog` could not run (22004, not compared), and
+/// `fn_get_audit_file_v2` exists (recorded on both sources). The local
 /// details below ([`AUDIT_INVISIBLE_DETAIL`], [`XE_INVISIBLE_DETAIL`]) say
 /// the same, and are updated with it.
 #[cfg(test)]
@@ -395,14 +402,15 @@ pub(crate) struct Invisible {
     pub(crate) xevents_runtime_errors: &'static [(&'static str, i32)],
     /// SQL Server Audit: the P9-D join (`dm_exec_query_stats` ×
     /// `dm_exec_sql_text`) refused for a low-privilege login leaves a
-    /// record (`true`, measured on 2022 on 2026-10-18) or not (P9-D).
+    /// record (`true`, measured on 2022 on 2026-10-18, and on 2025 by run
+    /// 39139682239) or not (P9-D).
     pub(crate) audit_p9d_join_refused: bool,
 }
 
 /// The versions (major) [`AUDIT_INVISIBLE_DETAIL`] and
 /// [`XE_INVISIBLE_DETAIL`] were measured on; on another, the local detail
 /// adds [`INVISIBLE_NOT_MEASURED`] (security review of #276, L1).
-pub(crate) const INVISIBLE_MEASURED: &[u32] = &[16];
+pub(crate) const INVISIBLE_MEASURED: &[u32] = &[15, 16, 17];
 
 /// Whether the invisible reads were measured on SQL Server `major`.
 pub(crate) fn invisible_measured(major: i64) -> bool {
@@ -433,14 +441,14 @@ pub(crate) const INVISIBLE: Invisible = Invisible {
 
 /// The local detail of `INVISIBLE` for SQL Server Audit.
 pub(crate) const AUDIT_INVISIBLE_DETAIL: &str = "reads invisible on SQL Server Audit (measured on \
-2022): DBCC INPUTBUFFER, DBCC SHOW_STATISTICS and DBCC PAGE without DBCC_GROUP in a specification, \
+2022 and 2025): DBCC INPUTBUFFER, DBCC SHOW_STATISTICS and DBCC PAGE without DBCC_GROUP in a specification, \
 LOGINPROPERTY, CERTPRIVATEKEY and PWDCOMPARE (built-in functions, no permission check recorded), \
 DBCC or Query Store reads refused by a permission, and reads refused by a missing server permission \
 may leave no record";
 
 /// The local detail of `INVISIBLE` for Extended Events.
-pub(crate) const XE_INVISIBLE_DETAIL: &str = "Extended Events: reads invisible (measured on 2022): \
-statements calling CERTPRIVATEKEY or PWDCOMPARE (the server leaves no statement event) and reads \
+pub(crate) const XE_INVISIBLE_DETAIL: &str = "Extended Events: reads invisible (measured on 2019, \
+2022 and 2025): statements calling CERTPRIVATEKEY or PWDCOMPARE (the server leaves no statement event) and reads \
 refused by a permission as they compile (no statement completes)";
 
 #[cfg(test)]
@@ -506,7 +514,14 @@ mod tests {
         // Review of #276, L1: a version not measured says so.
         assert!(!l.details.contains(&INVISIBLE_NOT_MEASURED));
         // (2019 has no SQL Server Audit source: the rule stops before.)
-        let other = level(&Inputs { major: 17, ..i });
+        // 2025 is measured too (engine-matrix run 39139682239); a later
+        // major is not.
+        assert!(
+            !level(&Inputs { major: 17, ..i })
+                .details
+                .contains(&INVISIBLE_NOT_MEASURED)
+        );
+        let other = level(&Inputs { major: 18, ..i });
         assert!(other.details.contains(&INVISIBLE_NOT_MEASURED));
         // Decision 6 measurement obligation (M2): the reads this source
         // cannot see are named in the local detail.

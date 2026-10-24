@@ -15,9 +15,13 @@
 //!   parameter (M1); the file name, the buffer offset and the row bound
 //!   and the records of the next buffer already handled (skipped on the
 //!   server) are parameters. At most [`BATCH`] records per read (halved after a
-//!   response over [`POLL_BYTES`]), each turned into a record as its row
-//!   ends; a full read is followed by another, within [`CATCH_UP`] (and
-//!   [`HISTORY_READS`] reads while the first start skips the history). Each poll gets a credit
+//!   response over [`POLL_BYTES`]; the Extended Events source reads up to
+//!   [`xe::size::XE_MAX_ROWS`] after a full read), each turned into a record as its row
+//!   ends; a full read is followed by another, within [`cycle::CATCH_UP`] (and
+//!   less while the first start's history is walked), and a cycle that
+//!   ends while still behind is followed by the next one after a pause
+//!   bounding the reads' share of the time, not after the poll interval
+//!   ([`cycle`]). Each poll gets a credit
 //!   (its own record is left out only for this session and this text).
 //! - **Position** (M4), persisted through the core: the file and the
 //!   offset of the last buffer read whole (a read starts after it,
@@ -53,6 +57,7 @@
 //!   rule shared by `check()` and the stream, re-evaluated every 5
 //!   minutes: a stream whose choice changes ends and is restarted).
 
+pub(crate) mod cycle;
 pub(crate) mod objects;
 pub(crate) mod own;
 pub(crate) mod probe;
@@ -78,11 +83,16 @@ use crate::tls;
 use crate::token::Value;
 use records::{Mapped, Record, Statement};
 
-/// Records read per poll (decision 6: at most 1 000). A record is at most
-/// about 9.3 KiB on the wire (an `nvarchar(4000)` statement, five
-/// `nvarchar(128)` names, a 260-character file name and the numbers), so a
-/// read of `BATCH` rows stays under [`POLL_BYTES`] (security review of
-/// P9-A lot 2, L5: the agent's measured peak RSS is 42 MiB).
+/// Records read per poll by SQL Server Audit (decision 6: at most 1 000),
+/// and the Extended Events source's base read size: its first read, and
+/// every read after one that was not full; after a full read, that source
+/// reads up to [`xe::size::XE_MAX_ROWS`] events, sized from the wire bytes
+/// per row (ADR-0051 refinement of 2026-10-22, option (b); [`xe::size`]).
+/// A SQL Server Audit record is at most about 9.3 KiB on the wire (an
+/// `nvarchar(4000)` statement, five `nvarchar(128)` names, a 260-character
+/// file name and the numbers), so a read of `BATCH` rows stays under
+/// [`POLL_BYTES`] (security review of P9-A lot 2, L5: the agent's measured
+/// peak RSS is 42 MiB).
 pub(crate) const BATCH: usize = 500;
 /// Records of one buffer handled across reads at most; beyond, the rest
 /// of that buffer is dropped (a gap). The handled records are skipped on
@@ -95,13 +105,8 @@ pub(crate) const BATCH: usize = 500;
 pub(crate) const MAX_SKIP: u32 = 1_000_000;
 /// Smallest read after responses over [`POLL_BYTES`] (the read halves).
 const MIN_BATCH: usize = 16;
-/// Time spent catching up (full reads one after the other) per cycle.
-const CATCH_UP: Duration = Duration::from_secs(20);
-/// Reads of the audit's history (first start) per cycle: the scan to the
-/// end of the file set is spread over cycles.
-const HISTORY_READS: usize = 20;
 /// Bound of one poll's response.
-const POLL_BYTES: usize = 12 * 1024 * 1024;
+pub(crate) const POLL_BYTES: usize = 12 * 1024 * 1024;
 /// The catalog proofs are read again this often (decision 6).
 const REPROBE: Duration = Duration::from_secs(300);
 /// The account's evaluation (refusal list) is read again this often.
@@ -111,12 +116,20 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The level proofs last this long.
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(24 * 3600);
 
-/// The agent's clock, µs since 1970 (0 before it).
-fn now_us() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+/// The Extended Events reads of a target ([`Shared::xe_reads`]): reads
+/// whose response came, the events they returned, the largest read asked
+/// and returned, and the reads cancelled above [`POLL_BYTES`] or at the
+/// client's statement deadline and read again smaller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct XeReads {
+    pub(crate) reads: u64,
+    pub(crate) events: u64,
+    pub(crate) largest_asked: usize,
+    pub(crate) largest_returned: usize,
+    pub(crate) cancels: u64,
+    pub(crate) timeouts: u64,
 }
+
 /// Cursor and own-sessions file names.
 const CURSOR: &str = "sqlserver_audit";
 const OWN_SESSIONS: &str = "sqlserver_own_sessions";
@@ -143,9 +156,19 @@ pub(crate) struct Shared {
     running: Mutex<HashMap<String, usize>>,
     fresh: Mutex<HashMap<String, Instant>>,
     gap: Mutex<HashMap<String, Instant>>,
-    /// The event time (µs since 1970) of the last failed login (error
-    /// 18456) read from the target's Extended Events session.
-    failed_login: Mutex<HashMap<String, i64>>,
+    /// When the last failed login (error 18456) read from the target's
+    /// Extended Events session happened, on the agent's monotonic clock
+    /// ([`Shared::note_failed_login`]).
+    failed_login: Mutex<HashMap<String, Instant>>,
+    /// The server time (µs) of the latest change the failed-login proof
+    /// was cleared for, per target: a failed login stamped at or before it
+    /// proves nothing, whichever read it comes in (a later read can hold
+    /// an earlier event, file order following the session's buffers).
+    failed_login_floor: Mutex<HashMap<String, i64>>,
+    /// The Extended Events session's event facts at the last probe of a
+    /// stream ([`xe::probe::Probe::event_facts`]): a change clears the
+    /// failed-login proof (#280 re-review L-b).
+    event_facts: Mutex<HashMap<String, xe::probe::EventFacts>>,
     dropped: Mutex<HashMap<String, (u64, Instant)>>,
     own_usage: Mutex<HashMap<String, SharedOwnUsage>>,
     chosen: Mutex<HashMap<String, Source>>,
@@ -160,6 +183,24 @@ pub(crate) struct Shared {
     own_left_out: Mutex<HashMap<String, [u64; 4]>>,
     /// Reads out of file order, for the logs and the tests.
     out_of_order: Mutex<HashMap<String, u64>>,
+    /// Extended Events reads (ADR-0051 refinement of 2026-10-22), for the
+    /// logs and the tests: [`XeReads`].
+    xe_reads: Mutex<HashMap<String, XeReads>>,
+    /// Integration tests only: the Extended Events read-size memory of
+    /// this connector's streams ([`xe::size::ReadSize::with_memory`]).
+    #[cfg(test)]
+    pub(crate) xe_size_memory: Mutex<Option<Duration>>,
+    /// Integration tests only: while set, this connector's Extended Events
+    /// streams wait between cycles ([`Shared::xe_hold_point`]), as a
+    /// reader that fell behind; `xe_parked` tells one is waiting.
+    #[cfg(test)]
+    pub(crate) xe_hold: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) xe_parked: std::sync::atomic::AtomicBool,
+    /// The read size halved at a position, kept across stream restarts
+    /// ([`Shared::read_failed`]): at most one per target, cleared by the
+    /// next successful read.
+    halved: Mutex<HashMap<String, (Source, ReadAt, usize)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -201,26 +242,75 @@ impl Shared {
         lock(&self.fresh).insert(target_id.to_owned(), Instant::now());
     }
 
-    /// A failed login (error 18456) was recorded at `at_us` (event time):
-    /// the session's `error_reported`, whatever its predicate, admits it.
-    pub(crate) fn note_failed_login(&self, target_id: &str, at_us: i64) {
+    /// A failed login (error 18456) was recorded at `at_us` (event time,
+    /// the server's clock), read while the server's clock read `server_now_us`
+    /// (the agent's own session's read-back, carried forward on the
+    /// agent's monotonic clock, `own::Handle::server_now`): the session's
+    /// `error_reported`, whatever its predicate, admits it.
+    ///
+    /// #280 re-review L-b: the record's age is the difference of two
+    /// readings of the **server's** clock, so a skew between the server's
+    /// and the agent's clocks cancels out, and the 24 h window then runs
+    /// on the agent's monotonic clock (an [`Instant`]), as the other
+    /// freshness facts. Without the server's time (no read-back on the
+    /// session) or with an age at or beyond the window, nothing is proven
+    /// (fail closed); an event stamped slightly ahead of the read-back
+    /// (the event clock's lead) is aged 0.
+    pub(crate) fn note_failed_login(
+        &self,
+        target_id: &str,
+        at_us: i64,
+        server_now_us: Option<i64>,
+    ) {
+        let Some(now) = server_now_us else {
+            return;
+        };
+        if lock(&self.failed_login_floor)
+            .get(target_id)
+            .is_some_and(|floor| at_us <= *floor)
+        {
+            return;
+        }
+        let age = Duration::from_micros(u64::try_from(now.saturating_sub(at_us)).unwrap_or(0));
+        if age >= FRESHNESS {
+            return;
+        }
+        let Some(at) = Instant::now().checked_sub(age) else {
+            return;
+        };
         let mut map = lock(&self.failed_login);
-        let e = map.entry(target_id.to_owned()).or_insert(at_us);
-        *e = (*e).max(at_us);
+        let e = map.entry(target_id.to_owned()).or_insert(at);
+        *e = (*e).max(at);
     }
 
-    /// The session was restarted or its file set changed: the proof is
-    /// taken again.
-    pub(crate) fn clear_failed_login(&self, target_id: &str) {
+    /// The session was restarted, its file set or its events changed, or
+    /// a statement that may change an event session was read: the proof
+    /// is taken again, and only from a failed login stamped after `since_us`
+    /// (the server time of the change, or the server's time when the change
+    /// was seen; `None`: the floor is kept as it is).
+    pub(crate) fn clear_failed_login(&self, target_id: &str, since_us: Option<i64>) {
         lock(&self.failed_login).remove(target_id);
+        if let Some(since) = since_us {
+            let mut m = lock(&self.failed_login_floor);
+            let f = m.entry(target_id.to_owned()).or_insert(since);
+            *f = (*f).max(since);
+        }
     }
 
-    /// Whether a failed login was recorded in the 24 h before `now_us`.
-    fn failed_login_within(&self, target_id: &str, now_us: i64) -> bool {
-        let window = i64::try_from(FRESHNESS.as_micros()).unwrap_or(i64::MAX);
+    /// Keeps `facts` as the target's last event facts; the previous ones.
+    pub(crate) fn swap_event_facts(
+        &self,
+        target_id: &str,
+        facts: xe::probe::EventFacts,
+    ) -> Option<xe::probe::EventFacts> {
+        lock(&self.event_facts).insert(target_id.to_owned(), facts)
+    }
+
+    /// Whether a failed login was recorded in the last 24 h (agent clock).
+    fn failed_login_within(&self, target_id: &str) -> bool {
         lock(&self.failed_login)
             .get(target_id)
-            .is_some_and(|at| now_us.saturating_sub(*at) < window)
+            .is_some_and(|at| at.elapsed() < FRESHNESS)
     }
 
     fn note_gap(&self, target_id: &str) {
@@ -252,7 +342,7 @@ impl Shared {
             running: self.is_running(target_id),
             fresh: within(&self.fresh),
             gap: within(&self.gap),
-            failed_login_seen: self.failed_login_within(target_id, now_us()),
+            failed_login_seen: self.failed_login_within(target_id),
             dropped: lock(&self.dropped)
                 .get(target_id)
                 .filter(|(_, at)| at.elapsed() < FRESHNESS)
@@ -317,6 +407,72 @@ impl Shared {
         {
             *n += 1;
         }
+    }
+
+    /// The size of a read at `at`: `batch`, or the smaller size an
+    /// earlier failed read of this source at this very position left
+    /// ([`Shared::read_failed`]), so a restarted stream does not start
+    /// again at [`BATCH`] where a read over the bound poisoned the session
+    /// (security review L1 of the 0.8.1 fix).
+    pub(crate) fn read_size(
+        &self,
+        target_id: &str,
+        source: Source,
+        at: &ReadAt,
+        batch: usize,
+    ) -> usize {
+        match lock(&self.halved).get(target_id) {
+            Some((s, a, n)) if *s == source && a == at => batch.min(*n),
+            _ => batch,
+        }
+    }
+
+    /// After a failed read at `at`: the size of the next read from the
+    /// same position in this stream, or `None` (the error ends the
+    /// stream). A read over the bound ([`halved`]) is kept at its halved
+    /// size for the target even when the cancel was not acknowledged (the
+    /// session poisoned, the stream ends): the next stream reads that size
+    /// from the same position (fail closed: the position unchanged,
+    /// nothing skipped), so a poisoning that recurs there still walks
+    /// down to [`MIN_BATCH`]. The Extended Events source sizes its reads
+    /// in the stream ([`xe::size::ReadSize`], the same [`halved`] rule) and
+    /// uses only the kept size here, taken in by the next stream
+    /// ([`xe::size::ReadSize::resume`]).
+    pub(crate) fn read_failed(
+        &self,
+        target_id: &str,
+        source: Source,
+        at: ReadAt,
+        e: &SsError,
+        poisoned: bool,
+        batch: usize,
+    ) -> Option<usize> {
+        let smaller = halved(e, false, batch)?;
+        lock(&self.halved).insert(target_id.to_owned(), (source, at, smaller));
+        if poisoned {
+            tracing::warn!(
+                target_id = %target_id,
+                source = ?source,
+                batch = smaller,
+                "SQL Server audit read: an oversized read was not cancelled in step: the next stream reads fewer records from the same position"
+            );
+            return None;
+        }
+        Some(smaller)
+    }
+
+    /// A read succeeded: the size kept by [`Shared::read_failed`] ends.
+    pub(crate) fn read_succeeded(&self, target_id: &str) {
+        lock(&self.halved).remove(target_id);
+    }
+
+    /// The size [`Shared::read_failed`] keeps for `target_id` across a
+    /// stream restart, with its source and position, if any (integration
+    /// tests: a stream that ended on an oversized read whose cancel the
+    /// server did not acknowledge in time).
+    #[cfg(test)]
+    pub(crate) fn kept_read_size(&self, target_id: &str) -> Option<(Source, ReadAt, usize)> {
+        lock(&self.halved).get(target_id).cloned()
     }
 
     /// Statistics statements left out (item 4, refinement of 2026-10-15).
@@ -409,6 +565,62 @@ impl Shared {
             .get(target_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// An Extended Events read of `asked` rows that returned `returned`.
+    pub(crate) fn note_xe_read(&self, target_id: &str, asked: usize, returned: usize) {
+        let mut m = lock(&self.xe_reads);
+        let r = m.entry(target_id.to_owned()).or_default();
+        r.reads = r.reads.saturating_add(1);
+        r.events = r.events.saturating_add(returned as u64);
+        r.largest_asked = r.largest_asked.max(asked);
+        r.largest_returned = r.largest_returned.max(returned);
+    }
+
+    /// An Extended Events read retried smaller ([`xe::size::Retry`]).
+    pub(crate) fn note_xe_retry(&self, target_id: &str, retry: xe::size::Retry) {
+        let mut m = lock(&self.xe_reads);
+        let r = m.entry(target_id.to_owned()).or_default();
+        match retry {
+            xe::size::Retry::Bytes => r.cancels = r.cancels.saturating_add(1),
+            xe::size::Retry::Timeout => r.timeouts = r.timeouts.saturating_add(1),
+        }
+    }
+
+    /// The read-size memory of a new Extended Events stream (`None`: the
+    /// default; integration tests only otherwise).
+    pub(crate) fn xe_size_memory(&self) -> Option<Duration> {
+        #[cfg(test)]
+        {
+            *lock(&self.xe_size_memory)
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// Integration tests only: the point between two cycles of an
+    /// Extended Events stream where it waits while `xe_hold` is set (the
+    /// large-event test writes its run of large events meanwhile, so that
+    /// the next read has all of them ahead of it).
+    #[cfg(test)]
+    pub(crate) async fn xe_hold_point(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        while self.xe_hold.load(SeqCst) {
+            self.xe_parked.store(true, SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.xe_parked.store(false, SeqCst);
+    }
+
+    /// The Extended Events reads of `target_id` since the agent started.
+    #[cfg(test)]
+    pub(crate) fn xe_reads(&self, target_id: &str) -> XeReads {
+        lock(&self.xe_reads)
+            .get(target_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Statements left out: exact texts, credited sampling, credited
@@ -709,6 +921,25 @@ impl Cursor {
         }
     }
 
+    /// Whether a read from this position walks the first start's history:
+    /// the history phase is on and no record handled so far is stamped at
+    /// or after its start. The history phase itself lasts until a read
+    /// that is not full ([`Self::settle`]), however far past the history
+    /// the stream is: a stream behind live records stays in it, and must
+    /// not be paced as a history walk ([`cycle::HISTORY_CATCH_UP`]).
+    ///
+    /// "Stamped at or after its start" uses the threshold of
+    /// [`Self::below`] (the later of the start and the floor, which adds
+    /// the source's clock skew): a record [`Self::below`] still classes as
+    /// history keeps the walk on (review L2).
+    pub(crate) fn walking_history(&self) -> bool {
+        let Some(h) = self.history_us else {
+            return false;
+        };
+        let threshold = self.floor.map_or(h, |f| f.max(h));
+        self.max_seen_us.is_none_or(|m| m < threshold)
+    }
+
     /// `seen` with a record handled at `time_us`.
     pub(crate) fn seen(seen: Option<i64>, time_us: i64) -> Option<i64> {
         Some(seen.map_or(time_us, |m| m.max(time_us)))
@@ -904,6 +1135,42 @@ pub(crate) fn request(cursor: &Cursor, batch: usize) -> (usize, u32) {
     (batch, cursor.skip)
 }
 
+/// The size of the next read after a failed one, asked again from the
+/// same position, or `None` (the error ends the stream): a response over
+/// [`POLL_BYTES`] (or more rows than asked) was cancelled with the session
+/// still in step, and the read halves, never below [`MIN_BATCH`]; a
+/// successful read doubles it back up to [`BATCH`]. Used by both sources.
+///
+/// The session tells, not [`SsError::fatal`]: every client-side bound
+/// sets `fatal`, so the check `!e.fatal` of 0.8.0 never halved, and a run
+/// of large Extended Events events failed every read from the same
+/// position until the files rolled over (fixed in 0.8.1).
+pub(crate) fn halved(e: &SsError, poisoned: bool, batch: usize) -> Option<usize> {
+    (e.code == FailureCode::ResourceLimit && !poisoned && batch > MIN_BATCH)
+        .then(|| (batch / 2).max(MIN_BATCH))
+}
+
+/// Where a read starts (file set, buffer, records of it skipped on the
+/// server): the key of a read size kept across stream restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    pattern: Option<String>,
+    file: Option<String>,
+    offset: i64,
+    skip: u32,
+}
+
+impl ReadAt {
+    pub(crate) fn of(c: &Cursor) -> Self {
+        Self {
+            pattern: c.pattern.clone(),
+            file: c.file.clone(),
+            offset: c.offset,
+            skip: c.skip,
+        }
+    }
+}
+
 /// The order key of an audit file of one file set, (timestamp,
 /// partition), from `…_<partition>_<timestamp>.sqlaudit` (measured: the
 /// name of the audit and its GUID, then the partition and an 18-digit
@@ -1065,6 +1332,8 @@ struct Stream<'a> {
     evaluated_at: Option<Instant>,
     /// Records asked per read (halved after an oversized response).
     batch: usize,
+    /// Time spent in poll statements, summed ([`cycle::Read::statements`]).
+    poll_time: Duration,
 }
 
 impl Stream<'_> {
@@ -1195,6 +1464,21 @@ impl Stream<'_> {
     }
 }
 
+/// Reads the server run on a stream's new session (a restart of the server
+/// ends every session, so each new one is checked) and resets a name case
+/// kept from another run (ADR-0055 decision 2, the #303 residual). Not
+/// read: nothing changes (a fatal error ends the session's next statement
+/// and the stream reconnects).
+pub(crate) async fn observe_server_run(state: &CheckState, target_id: &str, s: &mut Session) {
+    match crate::name_case::read_run(s).await {
+        Ok(Some(run)) => state.observe_server_run(target_id, &run),
+        Ok(None) | Err(_) => tracing::debug!(
+            target_id,
+            "SQL Server: the server run could not be read on the Audit session"
+        ),
+    }
+}
+
 /// `Connector::audit_stream` for SQL Server.
 pub(crate) async fn audit_stream(
     cfg: &AuditConfig,
@@ -1230,6 +1514,7 @@ pub(crate) async fn audit_stream(
     let mut session = conn::connect(target, &tls, &state.choice, POLL_TIMEOUT)
         .await
         .map_err(SsError::into_connector_error)?;
+    Box::pin(observe_server_run(state, &target.id, &mut session)).await;
     // The preference rule (decision 6): SQL Server Audit when usable, then
     // the Extended Events session.
     let use_audit = match (&audit_name, &xe_name) {
@@ -1324,7 +1609,9 @@ pub(crate) async fn audit_stream(
         reprobe_at: Instant::now(),
         evaluated_at: None,
         batch: BATCH,
+        poll_time: Duration::ZERO,
     };
+    let mut log = cycle::BehindLog::default();
     loop {
         if session.is_poisoned() || session.is_stale() {
             let old = std::mem::replace(
@@ -1334,15 +1621,18 @@ pub(crate) async fn audit_stream(
                     .map_err(SsError::into_connector_error)?,
             );
             old.close().await;
+            Box::pin(observe_server_run(state, &target.id, &mut session)).await;
         }
-        let r = Box::pin(cycle(&mut st, &mut session, sink)).await;
-        if let Err(e) = r {
-            st.save();
-            session.close().await;
-            return Err(e);
-        }
+        let end = match Box::pin(cycle(&mut st, &mut session, sink, &mut log)).await {
+            Ok(end) => end,
+            Err(e) => {
+                st.save();
+                session.close().await;
+                return Err(e);
+            }
+        };
         st.save();
-        tokio::time::sleep(cfg.poll_interval()).await;
+        tokio::time::sleep(end.pause(cfg.poll_interval())).await;
     }
 }
 
@@ -1351,7 +1641,8 @@ async fn cycle(
     st: &mut Stream<'_>,
     s: &mut Session,
     sink: &EventSink,
-) -> Result<(), ConnectorError> {
+    log: &mut cycle::BehindLog,
+) -> Result<cycle::End, ConnectorError> {
     let target = st.target;
     if st.evaluated_at.is_none_or(|t| t.elapsed() >= REEVALUATE) {
         let v = check::version(s)
@@ -1381,21 +1672,46 @@ async fn cycle(
     if st.probe.is_none() || st.reprobe_at.elapsed() >= REPROBE {
         Box::pin(reprobe(st, s)).await?;
     }
-    let started = Instant::now();
-    let mut history_reads = 0usize;
-    loop {
-        let in_history = st.cursor.history_us.is_some();
-        let full = Box::pin(read(st, s, sink)).await?;
-        st.save();
-        history_reads += usize::from(in_history);
-        if !full || started.elapsed() >= CATCH_UP || history_reads >= HISTORY_READS {
-            break;
-        }
-        if st.probe.is_none() {
-            Box::pin(reprobe(st, s)).await?;
-        }
+    let mut reads = Reads { st, s, sink };
+    Box::pin(cycle::run(&mut reads, log)).await
+}
+
+/// One cycle's reads ([`cycle::run`]).
+struct Reads<'r, 's> {
+    st: &'r mut Stream<'s>,
+    s: &'r mut Session,
+    sink: &'r EventSink,
+}
+
+impl cycle::Reads for Reads<'_, '_> {
+    fn target_id(&self) -> &str {
+        &self.st.target.id
     }
-    Ok(())
+
+    fn source(&self) -> &'static str {
+        "SQL Server Audit"
+    }
+
+    fn walking_history(&self) -> bool {
+        self.st.cursor.walking_history()
+    }
+
+    async fn read_once(&mut self) -> Result<cycle::Read, ConnectorError> {
+        let before = self.st.poll_time;
+        let full = Box::pin(read(self.st, self.s, self.sink)).await?;
+        self.st.save();
+        Ok(cycle::Read {
+            full,
+            statements: self.st.poll_time.saturating_sub(before),
+        })
+    }
+
+    async fn between(&mut self) -> Result<(), ConnectorError> {
+        if self.st.probe.is_none() {
+            Box::pin(reprobe(self.st, self.s)).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Reads the catalog proofs and rebuilds the poll texts.
@@ -1509,8 +1825,15 @@ async fn read(
     // The audit's delivery delay (`QUEUE_DELAY`): the history and floor
     // bound.
     let delay = st.probe.as_ref().map_or(FLOOR_MAX, |p| p.queue_delay);
+    // The size an earlier stream halved to at this position, if any.
+    let at = ReadAt::of(&st.cursor);
+    st.batch = st
+        .state
+        .audit
+        .read_size(&target_id, Source::Audit, &at, st.batch);
     // The server skips the records of the next buffer already handled.
     let (top, skip) = request(&st.cursor, st.batch);
+    let poll_started = Instant::now();
     let polled = match st.cursor.file.clone() {
         // Boxed: the poll's future is large (a debug build's stack).
         None => {
@@ -1538,8 +1861,10 @@ async fn read(
             .await
         }
     };
+    st.poll_time = st.poll_time.saturating_add(poll_started.elapsed());
     let polled = match polled {
         Ok(p) => {
+            st.state.audit.read_succeeded(&target_id);
             st.batch = (st.batch * 2).min(BATCH);
             p
         }
@@ -1559,12 +1884,21 @@ async fn read(
             }
             return Ok(true);
         }
-        Err(e) if e.code == FailureCode::ResourceLimit && !e.fatal && st.batch > MIN_BATCH => {
-            // A response over the bound: smaller reads.
-            st.batch = (st.batch / 2).max(MIN_BATCH);
-            return Ok(true);
+        Err(e) => {
+            if let Some(smaller) = st.state.audit.read_failed(
+                &target_id,
+                Source::Audit,
+                at,
+                &e,
+                s.is_poisoned(),
+                st.batch,
+            ) {
+                // A response over the bound: smaller reads, same position.
+                st.batch = smaller;
+                return Ok(true);
+            }
+            return Err(e.into_connector_error());
         }
-        Err(e) => return Err(e.into_connector_error()),
     };
     st.state.audit.note_dropped(&target_id, polled.malformed);
     let b = batch(&st.cursor, polled.records, polled.returned, top, file_key);
@@ -1646,4 +1980,4 @@ async fn read(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

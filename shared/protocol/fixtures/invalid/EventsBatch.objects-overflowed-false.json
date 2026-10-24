@@ -1,0 +1,22 @@
+{
+  "batch_id": "01925f10-2a3b-7c4d-8e5f-6a7b8c9d0e21",
+  "events": [
+    {
+      "target_id": "pg-prod-1",
+      "ts": "2026-10-20T08:15:00Z",
+      "principal": {
+        "db_user": "report_job"
+      },
+      "action": "read",
+      "objects": [
+        {
+          "database": "crm",
+          "object": "*"
+        }
+      ],
+      "source": "pgaudit",
+      "aggregated_count": 1,
+      "objects_overflowed": false
+    }
+  ]
+}

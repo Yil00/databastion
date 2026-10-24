@@ -1,6 +1,6 @@
 # ADR-0053: Tell the console that an event's `*` may hide objects past the 15-object bound
 
-- **Status**: Proposed (revised on 2026-10-18 after its security review, "sound after changes": H1, M1 to M3, L1 to L3)
+- **Status**: Accepted (2026-10-20). **Accepted** by the maintainer on 2026-10-20: option (a), with no mitigation from decision 6, and the proposed answers to open questions 1 to 3 (see [Open questions](#open-questions-answered)). History: proposed on 2026-10-18, revised the same day after its security review ("sound after changes": H1, M1 to M3, L1 to L3); flagged-event rate measured on 2026-10-20 (decision 6)
 - **Date**: 2026-10-18
 - **Refines**: [ADR-0021](0021-access-event-correlation.md) (which stays Accepted), decisions 3 (score), 5 (conditions and exceptions), 6 (dedup scope) and 10 (notifications), for events whose objects overflowed; uses [ADR-0022](0022-protocol-capability-negotiation.md) (capability negotiation) without changing it
 - **Context references**: ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), "Contract, after G7"; [08-engine-capabilities.md, Objects per event and sensitive objects](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine); [09-agent-protocol.md, the object `*`](../09-agent-protocol.md#the-object-); `MaskedEvent` in `agent/crates/classifiers/src/masking.rs`; `to_batches` and `stripped` in `agent/crates/core/src/uplink.rs`; `console/src/lib/event-model.ts` and `console/src/server/event-engine.ts` (read at `72e87d5`, `dev`)
@@ -60,9 +60,9 @@ A form-only registry id, for example `shape.objects_overflowed`, needs no negoti
 - Being a new signal, it makes a later event "worse" than a resolved incident without it (ADR-0021 decision 7), so it would reopen incidents for a reason that is not about the access.
 - Object-scoped and sensitivity-scoped policies, the actual gap, still need the console code of option (a) to see the event.
 
-## Decision (proposed)
+## Decision
 
-Option (a), under the precondition of decision 6 (measure first).
+Option (a). The precondition of decision 6 (measure first) is met; no mitigation is taken.
 
 ### 1. Contract (`shared/protocol/`, `security-reviewer` review)
 
@@ -125,6 +125,10 @@ Before this ADR is accepted, the rate of flagged events is measured and recorded
 - **`min_sensitivity` with rows.** A flagged event is kept by `min_sensitivity` through its bound only when it reports `rows > 0` or no `rows` at all; a flagged event that reports 0 rows uses its named sensitivity there.
 - **A per-policy opt-out.** A policy condition that makes the policy use the named score and the literal-`*` rule for flagged events, for policies whose author accepts the gap (audited like any policy change).
 
+**Measurement note (2026-10-20).** A first measurement is recorded in [docs/measurements/adr-0053-flagged-event-rate.md](../measurements/adr-0053-flagged-event-rate.md): load run 39453966277, a 600 s soak with an ORM-style principal next to the regular load on PostgreSQL, MariaDB and SQL Server, plus Valkey and CAS. Overflowed events: 5.18 % of events (0.47 % of statements) on PostgreSQL, 4.80 % (0.48 %) on MariaDB, 12.93 % (0.47 %) on SQL Server, of which 74 of 120 were the agent's own reads, none on Valkey and CAS; none from the regular application principal. Unknown-object `*` events without overflow: 8.26 % on PostgreSQL, 1.60 % on MariaDB, every event on Valkey. The 74 own SQL Server events were the CAS store guard's `check()` read, which wrote one SQL Server Audit record per user table (fixed by #293, [ADR-0041 implementation note of 2026-10-20](0041-cas-connector.md#implementation-note-2026-10-20-the-sql-server-guard-check-one-table-at-a-time)); a second SQL Server run after the fix (load run 39476569869 at `bbfcab7`) gave 43 overflowed events of 805 (5.34 %), all from the ORM-style principal, and no event of the agent's own account. Not covered: the end-to-end runs, MongoDB Audit, and engines other than those five (a ROADMAP [phase 9 follow-up](../ROADMAP.md#phase-9-follow-ups)).
+
+**Decision 6 met (2026-10-20).** The maintainer took the measurement above as meeting this precondition and chose no mitigation: flagged events use the bound for `min_sensitivity` whatever their `rows`, and no per-policy opt-out is added.
+
 ## Consequences
 
 - Object-scoped and sensitivity-scoped policies see an event that reached a sensitive object past the 15th, or one a connector dropped under its own bound; a statement can no longer hide one behind 15 harmless names from those policies.
@@ -153,9 +157,57 @@ Before this ADR is accepted, the rate of flagged events is measured and recorded
 - **A count of the objects left out**: it tells the console nothing it can act on, and a count of distinct objects is engine text the agent would have to bound and the console to trust.
 - **Sensitivity of the whole target for an overflow `*` with a named database**: the core keeps the database whenever every left-out object shares it, so the database bound is already fail closed and the target bound would only add noise.
 
-## Open questions (for the maintainer)
+## Open questions (answered)
 
 1. Should the agent also set the flag (or a sibling field, `objects_unknown`) for an unknown-object `*`? Proposed answer: not in this change. Unknown-object `*` events are much more frequent (every dynamic SQL, user function or unparsable text on every engine), and selecting each of them like the database's most sensitive object would raise incidents on most application traffic; decide after measuring how often they occur, with the measurement of decision 6.
+   **Answer (decided by the maintainer on 2026-10-20)**: not in this change; no flag for an unknown-object `*`. The measurement found unknown-object `*` events more frequent than overflowed ones on PostgreSQL and Valkey.
 2. Should the bound sensitivity of an overflow `*` be the database's highest object sensitivity (proposed) or the sum over the database's objects capped at 30? Proposed answer: the highest, as ADR-0021 decision 3 takes the event's most sensitive object, not a sum.
+   **Answer (decided by the maintainer on 2026-10-20)**: the database's highest object sensitivity (decision 3 item 3).
 3. Should a flagged event bypass the per-target hourly cap as a severe event (ADR-0021 decision 8)? Proposed answer: no. It bypasses the cap through the existing rule only, on its named score. Using the bound there would not help: once a bound entered the overflow incident's highest score, later events would need a higher score to bypass the cap, so bypasses would become less likely, not more; this is why decision 3 item 4 keeps the overflow incident's highest score on named scores.
+   **Answer (decided by the maintainer on 2026-10-20)**: no; no cap bypass beyond the existing rule, on the named score.
 4. Which mitigation of decision 6, if any, once the rate is measured? Proposed answer: decided on the measurement; `min_sensitivity` with rows first, since it needs no new policy key.
+   **Answer (decided by the maintainer on 2026-10-20)**: none (decision 6 met).
+
+## Implementation (from 2026-10-20)
+
+In ROADMAP [phase 9 follow-ups](../ROADMAP.md#phase-9-follow-ups), one lot per owner, in this order: the contract (decision 1, `security-reviewer` review), then the agent (decision 2), the console (decision 3) and the documentation (decision 5). Until both sides ship, the behaviour of the Context stays (Residual risks).
+
+## Implementation note (2026-10-20)
+
+Implemented by #295 (contract, decision 1), #297 (agent, decision 2), #296 (console, decision 3) and the documentation of decision 5 ([08-engine-capabilities.md](../08-engine-capabilities.md#objects-per-event-and-sensitive-objects-every-engine), [09-agent-protocol.md](../09-agent-protocol.md#the-object-), [10-user-guide.md](../10-user-guide.md#11-policies-incidents-and-notifications), [05-security.md](../05-security.md#access-events-ingestion-and-correlation)). The decisions are unchanged; this note records the choices the ADR left open.
+
+### Contract (#295)
+
+- **The `*` rule is in the schema** (decision 1 item 3, the preferred form): an `AccessEvent.allOf` `if` / `then` entry with `contains`, whose item is a closed `ObjectRef` shape with `object` `const: "*"` (kept in step with `ObjectRef` by hand, as the other `allOf` entries are). A console refuses a flagged event without `*` with `400`, keyword `contains`, pointer `/events/<i>/objects`; no new `Error.code`. The Rust generator drops `if` / `then`, as for the existing entries, so the agent enforces the rule itself (below).
+- **The strip helpers know the field.** `event_carries_gated` and `strip_gated_event` cover `objects_overflowed`, so a console that rejects it as an unknown field (`additionalProperties`) gets the items back stripped, never dropped (contract review M1).
+- **Fixtures**: two valid batches (PostgreSQL and MySQL; Redis with a `KeyPattern`) and two invalid ones (the flag without `*`, keyword `contains`; `false`, keyword `const`).
+
+### Agent (#297)
+
+- **Spooled in full, stripped per token at send time** (decision 2 items 1 and 2), for `bytes` too (item 6 taken in the same change). A batch whose tokens are all listed is sent as spooled; otherwise it is rewritten without the unlisted fields only, under a new `batch_id` persisted in the spool before it is sent (heartbeat metric `gated_fields_stripped_at_send_total`). After a `400` on a gated field (`additionalProperties`) every gated field is still dropped, once, and the capabilities cleared (ADR-0022 decision 9).
+- **Hold while the capability set is not known.** Before the first heartbeat answer and after a clear, event batches that carry a gated field wait for the next heartbeat answer, so that events spooled at start keep the fields the console then lists (test obligation 1):
+  - at most 600 s (two of the longest heartbeat intervals the agent accepts), and at most one hold per 600 s window: a clear inside the window leaves the set known and empty, so a replica that refuses the flag after every heartbeat does not throttle the spool (agent review M1);
+  - the hold is extended only by a heartbeat that fails with a transport error (the console unreachable), and only until `/events` or `/findings` answers; never by a `5xx`, throttled or unexpected heartbeat answer (re-review N1);
+  - 1 h in all, after which the set is settled as empty and the fields are stripped, whatever the heartbeats do;
+  - batches with a `signature.*` signal never wait (review I-5), and the capability set is read once per flush (review I-2).
+- **A batch already sent once is resent as it is**, under the same `batch_id`, even if the tokens changed meanwhile (a mark kept in memory), so a lost `202` does not turn into a duplicate under a new `batch_id` (review L2).
+- **The overflow rule `400`** (contract review M2): a `400` with the keyword `contains` on `/events/<i>/objects` or `if` on `/events/<i>`, for an item that carries the flag, resends that item once without the flag, and **keeps** the capabilities (heartbeat metric `overflow_flags_refused_total`). This reads ADR-0022 decision 9 as written: only an unknown field (`additionalProperties`) clears them; a console that lists the token and refuses one flagged event has not been rolled back.
+- **Sanitizer.** `sanitize::check_event` never sends the flag without `*`: it keeps a `*` that covers the objects it cut, and adds one otherwise, `(<database>, -, *)` when every named and left-out object shares that database, `(*, -, *)` otherwise, in the last slot when the list is full. A `*` already present covers them only when its database is `*` or theirs (review L4). It flags an event it cuts above 16 objects, and never clears the flag. For events built by the core this is a no-op (`MaskedEvent` invariant).
+- **Spool replacement marker.** A batch rewritten at send time replaces its spool file in steps: the replacements are written, then a `<file>.replaced` marker, then the old file is removed, the directory synced, and the marker removed. At start, a marked batch is removed (the replacement finished) and the replacements of an unmarked batch still present are removed (rolled back), so a crash never sends a batch and its replacement both (review L3). Agents older than #297 quarantine such a marker, and after a crash during a replacement send both; agents older than #295 quarantine a spooled batch carrying the flag (CHANGELOG upgrade notes: drain the spool before a downgrade).
+- **Security review** (two rounds, approved): M1 (hold throttling with a mixed-replica console), L1 to L4, I-2, I-4 (quarantined spool files are never read again, documented) and I-5 fixed in `b9a8d48`; N1 (the hold extended by `5xx` heartbeats; the cap lowered from 6 h to 1 h) and the directory-sync ordering fixed in `e1d7cb6`.
+
+### Console (#296)
+
+- **Token and storage.** `access_event.objects_overflowed` is in `CONSOLE_ACCEPTS`. Migration `0042` adds nullable columns, catalog-only with nothing to validate: `access_events.objects_overflowed` (as sent), `bound_sensitivity`, `bound_score`, and `incidents.event_objects_overflowed`, `event_bound_score`. Migration `0043` grants the runtime role `UPDATE` on the bound columns only; `access_events.objects_overflowed` stays not updatable, like every agent-reported column (a test checks the grants).
+- **Which objects** (decision 3 item 1): `isOverflowStar` is true for every object named `*` of a flagged event, whatever its database and schema, including a real Redis / Valkey `*` key pattern.
+- **Bound sensitivity** (decision 3 item 3): the database's highest object sensitivity **across all its schemas**, from the event target's findings only, false positives excluded, database names compared with the `objectKey` fold (also in the `C`-ctype fallback); the target's highest for the database `*`. The bound of an overflow `*` is the maximum of its literal-name sensitivity and that database bound, so it is never below the named score. One aggregate query per evaluation chunk, scoped to the (agent, target) pairs of its flagged events, and none without one. Whole-target bounds are cached per worker process (at most 1024 targets) under a findings stamp (count and order-free hash sums of id, confidence and false-positive state), read in the same statement as the grouped rows, so the cached bound and its stamp come from one snapshot (review L1, re-review N2).
+- **Where each score is used** (decision 3 item 4, as decided): the bound for `min_score`, `min_sensitivity`, the choice of the dedup object and display; the named score for `incidents.event_score`, the overflow incident's highest score, the baselines, the "worse than resolved / false positive" checks and the cap bypass.
+- **Dedup fallback** (review M1): when the bound moves an event's dedup scope to another database whose incident is closed and the event is not worse than it, the named objects' scope decides too: its active incident collects the event, and without an incident there, or with a closed one the event is worse than, the incident opens under it. A flagged event never opens fewer incidents than the same event unflagged. When both scopes hold a closed incident the event is not worse than, it is linked to both, so the named scope's false positive keeps counting the rows linked since its mark (ADR-0031 decision 2, anti-splitting; re-review N1).
+- **Exceptions** (decision 3 item 6): an exception covers an overflow `*` only when its `schema` and `object` globs are absent or exactly `*` and its `database` glob, if any, matches with the ADR-0054 case rules (absent or exactly `*` for the database `*`). A location exception whose only glob is `field: "*"` covers it too, as it covers every object of its agent or target scope (a `field` glob other than `*` never covers an event, which names no field).
+- **Incident display fields** (`event_objects_overflowed`, `event_bound_score`) are updated only while the incident is active; they are never compared with later events.
+- **Payload** (decision 3 item 7): the key is `access.objects_overflowed` in the `incident.opened` access payload, always present in rows written since this change (`false` when the event was not flagged or the flag is not known); the e-mail adds a sentence to its objects line.
+- **Security review** (three rounds): mergeable on `ccc225c`; M1 (the dedup move onto a closed scope) and L1 to L3 (the whole-target cache, the grant test, the payload documented in `console/README.md`) fixed in `4bfc229`; N1 (the link to both closed incidents) and N2 (stamp and rows in one snapshot) fixed in `ac120d3`.
+
+### Residuals
+
+Those of the ADR stand. In addition: events resent without the flag after a `400` (a replica not upgraded yet, a rolled-back console) or after the 1 h cap with an unreachable heartbeat keep the literal `*` rule; the release notes say to upgrade every console replica before any agent sees the token.

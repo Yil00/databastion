@@ -164,9 +164,86 @@ pub(crate) fn kill_query(connection_id: u32) -> String {
     format!("KILL QUERY {connection_id}")
 }
 
-/// System schemas, never sampled (compared case-insensitively).
-pub(crate) const SYSTEM_SCHEMAS: [&str; 4] =
-    ["mysql", "sys", "information_schema", "performance_schema"];
+/// System schemas, never sampled nor guarded (the #300 follow-up, ADR-0055
+/// decision 3, measured in the CI runs of PR #308), by name:
+/// - `information_schema` and `performance_schema` in ASCII case only: no
+///   user table can exist under an ASCII case variant of them (MySQL
+///   refuses the database, 1044; MariaDB accepts `CREATE DATABASE
+///   Performance_Schema` but refuses a table in it, 1142, and MariaDB 11.8
+///   lists the `performance_schema` tables under that spelling). A
+///   non-ASCII spelling is not folded: MySQL lets a user create tables in
+///   `performance_ſchema` (U+017F), a user database there, while MariaDB
+///   folds names with `utf8mb3_general_ci`, where it is the system schema;
+///   no fold of a name can serve both flavors, and the flavor comes from a
+///   version string a proxy can rewrite.
+/// - `mysql` and `sys` only as written: with `lower_case_table_names = 0`
+///   (the Linux default) `MySQL` and `SYS` are user databases on both
+///   servers. With 1 (names stored in lowercase) or 2 (compared in
+///   lowercase) no database in another case can stand next to them.
+///
+/// And by object, whatever the schema's name ([`is_system_object`]): the
+/// system tables an alias spelling may list are left out by their engine
+/// or type.
+pub(crate) const SYSTEM_SCHEMAS_ANY_CASE: [&str; 2] = ["information_schema", "performance_schema"];
+pub(crate) const SYSTEM_SCHEMAS_AS_WRITTEN: [&str; 2] = ["mysql", "sys"];
+
+/// Whether `schema`, as the catalog spells it, is a system schema
+/// ([`SYSTEM_SCHEMAS_ANY_CASE`] in ASCII case, [`SYSTEM_SCHEMAS_AS_WRITTEN`]
+/// as written).
+#[must_use]
+pub(crate) fn is_system_schema(schema: &str) -> bool {
+    SYSTEM_SCHEMAS_ANY_CASE
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(schema))
+        || SYSTEM_SCHEMAS_AS_WRITTEN.contains(&schema)
+}
+
+/// Whether a catalog row (`TABLE_TYPE`, `ENGINE`) is a system object,
+/// whatever its schema's name: a `performance_schema` table (engine
+/// `PERFORMANCE_SCHEMA`) or an `information_schema` view (type
+/// `SYSTEM VIEW`), on MySQL and MariaDB. An alias of the system schema
+/// under a spelling the agent does not fold (MariaDB) never exposes them.
+#[must_use]
+pub(crate) fn is_system_object(table_type: Option<&str>, engine: Option<&str>) -> bool {
+    engine.is_some_and(|e| e.eq_ignore_ascii_case("PERFORMANCE_SCHEMA"))
+        || table_type.is_some_and(|t| t.eq_ignore_ascii_case("SYSTEM VIEW"))
+}
+
+/// The schema rule in SQL, on `TABLE_SCHEMA` (of `information_schema.TABLES`
+/// or `COLUMNS`): `mysql` and `sys` compared as bytes, since the column's
+/// collation ignores case on MariaDB (and on MySQL with
+/// `lower_case_table_names` 1 or 2); `information_schema` and
+/// `performance_schema` in ASCII case only (`LOWER` of a name whose bytes
+/// are its characters, so that no non-ASCII character is folded).
+macro_rules! user_schemas {
+    ($col:literal) => {
+        concat!(
+            "CAST(",
+            $col,
+            " AS BINARY) NOT IN ('mysql', 'sys') AND NOT (LENGTH(",
+            $col,
+            ") = CHAR_LENGTH(",
+            $col,
+            ") AND LOWER(",
+            $col,
+            ") IN ('information_schema', 'performance_schema'))"
+        )
+    };
+}
+
+/// The object rule in SQL ([`is_system_object`]), on a row of
+/// `information_schema.TABLES`.
+macro_rules! user_objects {
+    ($prefix:literal) => {
+        concat!(
+            "COALESCE(",
+            $prefix,
+            "ENGINE, '') <> 'PERFORMANCE_SCHEMA' AND ",
+            $prefix,
+            "TABLE_TYPE <> 'SYSTEM VIEW'"
+        )
+    };
+}
 
 /// Most tables introspected per scan.
 pub(crate) const MAX_TABLES: u32 = 100_000;
@@ -182,12 +259,14 @@ pub(crate) const MAX_COLUMNS: u32 = 4096;
 /// its remote server (verified on MySQL 8.4, I5). Row estimates are read
 /// per sampled table by [`table_rows`], once [`table_engine`] showed a local
 /// engine.
-pub(crate) const INTROSPECT: &str = "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
-     FROM information_schema.TABLES t \
-     WHERE LOWER(t.TABLE_SCHEMA) NOT IN \
-       ('mysql', 'sys', 'information_schema', 'performance_schema') \
-     ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME \
-     LIMIT 100000";
+pub(crate) const INTROSPECT: &str = concat!(
+    "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.TABLE_TYPE, t.ENGINE \
+     FROM information_schema.TABLES t WHERE ",
+    user_schemas!("t.TABLE_SCHEMA"),
+    " AND ",
+    user_objects!("t."),
+    " ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME LIMIT 100000"
+);
 
 /// Type and engine of one table (no statistics column: see
 /// [`INTROSPECT`]). Columns: type, engine.
@@ -466,9 +545,9 @@ pub(crate) fn server_audit_escaped_len(s: &str) -> usize {
             .count()
 }
 
-/// The schemas the guard never looks at.
-const CAS_GUARD_SCHEMAS: &str =
-    "LOWER(TABLE_SCHEMA) NOT IN ('mysql', 'sys', 'information_schema', 'performance_schema')";
+/// The schemas the guard never looks at: the system schemas, compared as
+/// Discovery compares them ([`is_system_schema`]).
+const CAS_GUARD_SCHEMAS: &str = user_schemas!("TABLE_SCHEMA");
 
 /// The CAS store guard's table list (ADR-0041 decision 6): the schema and
 /// name of every table and view outside the system schemas, nothing else.
@@ -480,9 +559,13 @@ const CAS_GUARD_SCHEMAS: &str =
 /// keeps only the keys it knows; no name is kept. At most
 /// [`CAS_GUARD_MAX_TABLES`] + 1 rows: one more tells a cut list (the guard
 /// is then not evaluated).
-pub(crate) const CAS_GUARD_TABLES: &str = "SELECT TABLE_SCHEMA, TABLE_NAME \
-     FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) NOT IN \
-     ('mysql', 'sys', 'information_schema', 'performance_schema') LIMIT 1000001";
+pub(crate) const CAS_GUARD_TABLES: &str = concat!(
+    "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES WHERE ",
+    user_schemas!("TABLE_SCHEMA"),
+    " AND ",
+    user_objects!(""),
+    " LIMIT 1000001"
+);
 
 /// Most rows of [`CAS_GUARD_TABLES`] read; it asks for one more.
 pub(crate) const CAS_GUARD_MAX_TABLES: usize = 1_000_000;
@@ -901,6 +984,23 @@ pub(crate) fn ps_own_pin(flavor: Flavor) -> String {
 /// the server start) from one of an earlier server run.
 pub(crate) const SERVER_UPTIME: &str = "SHOW GLOBAL STATUS LIKE 'Uptime'";
 
+/// How the server compares database and table names (ADR-0055 decision
+/// 4): `lower_case_table_names` and `lower_case_file_system`, both
+/// readable by any account, with the server's clock and identity
+/// (`audit::own_threads::ServerRun`, the run the value was read on; the
+/// start time is this clock minus [`SERVER_UPTIME`]). Sent at every
+/// `check()`; a constant text per flavor, among the agent's own texts
+/// (ADR-0045, security review L7). Columns: the two settings,
+/// `UNIX_TIMESTAMP()`, the identity columns.
+#[must_use]
+pub(crate) fn name_case_settings(flavor: Flavor) -> String {
+    format!(
+        "SELECT @@GLOBAL.lower_case_table_names, @@GLOBAL.lower_case_file_system, \
+         UNIX_TIMESTAMP(), {}",
+        identity_columns(flavor)
+    )
+}
+
 /// Text limits of `performance_schema` (statement text, digest text).
 pub(crate) const PS_TEXT_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_sql_text_length";
 pub(crate) const PS_DIGEST_LIMIT: &str = "SELECT @@GLOBAL.performance_schema_max_digest_length";
@@ -1212,6 +1312,8 @@ mod tests {
             PS_DIGEST_LIMIT.to_owned(),
             MAX_DIGEST_LIMIT.to_owned(),
             SERVER_UPTIME.to_owned(),
+            name_case_settings(Flavor::Mysql),
+            name_case_settings(Flavor::Mariadb),
             ps_stats("events_statements_history_long"),
             ps_poll_variables(8),
         ];
@@ -1438,6 +1540,7 @@ mod tests {
         .map(|s| (*s).to_owned())
         .collect();
         for flavor in [Flavor::Mysql, Flavor::Mariadb] {
+            all.push(name_case_settings(flavor));
             all.push(session_setup(flavor, u32::MAX));
             all.push(set_statement_timeout(flavor, u32::MAX));
             all.push(session_check(flavor, "transaction_read_only"));
@@ -1462,6 +1565,79 @@ mod tests {
             assert!(server_audit_escaped_len(s) <= MAX_OWN_STATEMENT, "{s}");
             // Not taken as cut by `performance_schema` either (S1).
             assert!(stored_len(s.as_bytes()) + 4 < 1024, "{s}");
+        }
+    }
+
+    /// The #300 follow-up and the CI runs of PR #308: by name,
+    /// `information_schema` and `performance_schema` in ASCII case only (a
+    /// non-ASCII spelling such as `performance_ſchema` is a user database
+    /// on MySQL), `mysql` and `sys` only as written; by object, the
+    /// `PERFORMANCE_SCHEMA` engine and `SYSTEM VIEW`s whatever the schema;
+    /// in Rust and in every statement that filters them (Discovery's table
+    /// list, the CAS store guard's).
+    #[test]
+    fn system_schemas_and_objects_compare_as_the_servers_allow() {
+        for s in [
+            "information_schema",
+            "INFORMATION_SCHEMA",
+            "Performance_Schema",
+            "PERFORMANCE_SCHEMA",
+            "performance_schema",
+            "mysql",
+            "sys",
+        ] {
+            assert!(is_system_schema(s), "{s}");
+        }
+        for s in [
+            "MySQL",
+            "MYSQL",
+            "SYS",
+            "Sys",
+            "\u{17F}ys",
+            "performance_\u{17F}chema",
+            "\u{131}nformation_\u{17F}chema",
+            "PERFORMANCE_\u{17F}CHEMA",
+            "\u{130}NFORMATION_SCHEMA",
+            "hr",
+            "mysql ",
+            "sys_x",
+            "performance_schemas",
+            "",
+        ] {
+            assert!(!is_system_schema(s), "{s:?}");
+        }
+        assert!(is_system_object(
+            Some("BASE TABLE"),
+            Some("PERFORMANCE_SCHEMA")
+        ));
+        assert!(is_system_object(Some("SYSTEM VIEW"), None));
+        assert!(is_system_object(Some("SYSTEM VIEW"), Some("MEMORY")));
+        for (t, e) in [
+            (Some("BASE TABLE"), Some("InnoDB")),
+            (Some("SYSTEM VERSIONED"), Some("InnoDB")),
+            (Some("VIEW"), None),
+            (Some("SEQUENCE"), Some("InnoDB")),
+            (None, None),
+        ] {
+            assert!(!is_system_object(t, e), "{t:?} {e:?}");
+        }
+        let filter = "CAST(t.TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
+                      NOT (LENGTH(t.TABLE_SCHEMA) = CHAR_LENGTH(t.TABLE_SCHEMA) AND \
+                      LOWER(t.TABLE_SCHEMA) IN ('information_schema', 'performance_schema')) \
+                      AND COALESCE(t.ENGINE, '') <> 'PERFORMANCE_SCHEMA' AND \
+                      t.TABLE_TYPE <> 'SYSTEM VIEW'";
+        assert!(INTROSPECT.contains(filter), "{INTROSPECT}");
+        let guard_schemas = "CAST(TABLE_SCHEMA AS BINARY) NOT IN ('mysql', 'sys') AND \
+                             NOT (LENGTH(TABLE_SCHEMA) = CHAR_LENGTH(TABLE_SCHEMA) AND \
+                             LOWER(TABLE_SCHEMA) IN ('information_schema', 'performance_schema'))";
+        assert_eq!(CAS_GUARD_SCHEMAS, guard_schemas);
+        assert!(
+            CAS_GUARD_TABLES.contains(&filter.replace("t.", "")),
+            "{CAS_GUARD_TABLES}"
+        );
+        let g = cas_guard_statements(&["castickets".to_owned()]).unwrap();
+        for text in g.texts() {
+            assert!(text.contains(guard_schemas), "{text}");
         }
     }
 

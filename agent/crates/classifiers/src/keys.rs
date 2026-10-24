@@ -216,6 +216,9 @@ pub struct Unit {
 #[derive(Debug, Clone)]
 pub struct KeyUnits {
     units: Vec<Unit>,
+    /// Per unit: NFKC changed this token, kept as a literal (ADR-0056
+    /// decision 2 item 1). Same length as `units`.
+    altered: Vec<bool>,
     /// Text of the values found in the name (classifier matches), to be
     /// classified under `#key`.
     pub name_values: Vec<Secret>,
@@ -228,6 +231,7 @@ impl KeyUnits {
                 sep: String::new(),
                 tok: Tok::Wild,
             }],
+            altered: vec![false],
             name_values: Vec::new(),
         }
     }
@@ -236,7 +240,90 @@ impl KeyUnits {
     /// gate. Used for names met outside a walk (tests, fuzzing).
     #[must_use]
     pub fn pattern(&self) -> NormalizedName {
-        NormalizedName::key_pattern(render(&self.units))
+        NormalizedName::key_pattern(
+            render(&self.units),
+            kept_altered(&self.units, &self.altered),
+        )
+    }
+
+    /// Marks the literals NFKC changed (ADR-0056 decision 2 item 1).
+    /// `starts`: the byte offset in `folded` of each literal unit. `raw`
+    /// and `folded` are split on the separators only (no detector runs on
+    /// the unfolded name): when the two splits have the same shape (same
+    /// separator runs), a literal is altered when the raw token at its
+    /// place differs; otherwise (NFKC made or removed a separator) every
+    /// literal is marked: more marked, never less.
+    fn mark_changed(&mut self, starts: &[Option<usize>], raw: &str, folded: &str) {
+        let (r, f) = (separator_split(raw), separator_split(folded));
+        let same_shape = r.len() == f.len() && r.iter().zip(&f).all(|(a, b)| a.0 == b.0);
+        for (i, u) in self.units.iter().enumerate() {
+            if !matches!(u.tok, Tok::Lit(_)) {
+                continue;
+            }
+            let changed = !same_shape
+                || starts.get(i).copied().flatten().is_none_or(|at| {
+                    f.iter()
+                        .position(|t| t.2 == at)
+                        .is_none_or(|j| r.get(j).map(|t| t.1) != f.get(j).map(|t| t.1))
+                });
+            if let Some(a) = self.altered.get_mut(i) {
+                *a = changed;
+            }
+        }
+    }
+}
+
+/// `s` split on the segment and token separators only: per token, the
+/// separator run before it, the token and its byte offset; a trailing
+/// separator run is a last entry with an empty token. Borrowed slices
+/// only (no copy of the key name).
+fn separator_split(s: &str) -> Vec<(&str, &str, usize)> {
+    let is_sep = |c: char| is_segment_sep(c) || is_token_sep(c);
+    let mut out = Vec::new();
+    let mut sep_start = 0;
+    let mut tok_start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if is_sep(c) {
+            if let Some(t) = tok_start.take() {
+                out.push((
+                    s.get(sep_start..t).unwrap_or(""),
+                    s.get(t..i).unwrap_or(""),
+                    t,
+                ));
+                sep_start = i;
+            }
+        } else if tok_start.is_none() {
+            tok_start = Some(i);
+        }
+    }
+    match tok_start {
+        Some(t) => out.push((
+            s.get(sep_start..t).unwrap_or(""),
+            s.get(t..).unwrap_or(""),
+            t,
+        )),
+        None if sep_start < s.len() => out.push((s.get(sep_start..).unwrap_or(""), "", s.len())),
+        None => {}
+    }
+    out
+}
+
+/// Whether a literal unit of `units` is marked in `altered` (a unit that
+/// became `*` is not altered, ADR-0056 decision 2 item 1).
+fn kept_altered(units: &[Unit], altered: &[bool]) -> bool {
+    units
+        .iter()
+        .zip(altered)
+        .any(|(u, a)| *a && matches!(u.tok, Tok::Lit(_)))
+}
+
+/// `into |= from`, unit by unit (`into` grows to `from`'s length).
+fn unite(into: &mut Vec<bool>, from: &[bool]) {
+    if into.len() < from.len() {
+        into.resize(from.len(), false);
+    }
+    for (a, b) in into.iter_mut().zip(from) {
+        *a |= *b;
     }
 }
 
@@ -370,7 +457,12 @@ pub fn split_key(raw: &[u8]) -> KeyUnits {
         return KeyUnits::wildcard();
     };
     let mut folded: String = text.nfkc().collect();
-    let result = split_folded(&folded);
+    let (mut result, starts) = split_folded_at(&folded);
+    // ADR-0056: which kept literals NFKC changed; only for the names it
+    // changed.
+    if folded != text {
+        result.mark_changed(&starts, text, &folded);
+    }
     folded.zeroize();
     result
 }
@@ -383,9 +475,11 @@ struct Seg {
     sep_start: usize,
 }
 
-fn split_folded(s: &str) -> KeyUnits {
+/// The per-key rules on a folded name, with the byte offset in `s` of
+/// each literal unit (`None` for a `*`).
+fn split_folded_at(s: &str) -> (KeyUnits, Vec<Option<usize>>) {
     if s.is_empty() || s.len() > MAX_KEY_BYTES {
-        return KeyUnits::wildcard();
+        return (KeyUnits::wildcard(), vec![None]);
     }
     // Segments and the separator runs before them.
     let mut segs: Vec<Seg> = Vec::new();
@@ -414,7 +508,7 @@ fn split_folded(s: &str) -> KeyUnits {
     }
     let trailing_sep = segs.last().is_some_and(|l| l.end < s.len());
     if segs.is_empty() {
-        return KeyUnits::wildcard();
+        return (KeyUnits::wildcard(), vec![None]);
     }
     // Values located in the whole name, as is and with every separator
     // read as a space (same byte length: ASCII for ASCII).
@@ -436,6 +530,8 @@ fn split_folded(s: &str) -> KeyUnits {
             .any(|r| r.start < seg.end.max(seg.start + 1) && seg.start < r.end)
     };
     let mut units: Vec<Unit> = Vec::new();
+    // Per unit: the byte offset of a literal in `s`.
+    let mut starts: Vec<Option<usize>> = Vec::new();
     let mut name_values: Vec<Secret> = Vec::new();
     let mut in_value: Option<usize> = None;
     for (idx, seg) in segs.iter().enumerate() {
@@ -450,6 +546,7 @@ fn split_folded(s: &str) -> KeyUnits {
                         sep,
                         tok: Tok::Wild,
                     });
+                    starts.push(None);
                 }
             }
             in_value = Some(in_value.unwrap_or(seg.start));
@@ -473,6 +570,7 @@ fn split_folded(s: &str) -> KeyUnits {
                 sep,
                 tok: Tok::Wild,
             });
+            starts.push(None);
             continue;
         }
         // A generated-looking segment, `_` and `-` included, is one `*`.
@@ -481,16 +579,21 @@ fn split_folded(s: &str) -> KeyUnits {
                 sep,
                 tok: Tok::Wild,
             });
+            starts.push(None);
             continue;
         }
         // Tokens of the segment.
         let mut tok_sep = sep;
         let mut tok_start: Option<usize> = None;
-        let mut pending: Vec<(String, &str)> = Vec::new();
+        let mut pending: Vec<(String, &str, usize)> = Vec::new();
         for (i, c) in text.char_indices() {
             if is_token_sep(c) {
                 if let Some(ts) = tok_start.take() {
-                    pending.push((std::mem::take(&mut tok_sep), text.get(ts..i).unwrap_or("")));
+                    pending.push((
+                        std::mem::take(&mut tok_sep),
+                        text.get(ts..i).unwrap_or(""),
+                        seg.start + ts,
+                    ));
                 }
                 tok_sep.push(c);
             } else if tok_start.is_none() {
@@ -498,27 +601,33 @@ fn split_folded(s: &str) -> KeyUnits {
             }
         }
         if let Some(ts) = tok_start {
-            pending.push((std::mem::take(&mut tok_sep), text.get(ts..).unwrap_or("")));
+            pending.push((
+                std::mem::take(&mut tok_sep),
+                text.get(ts..).unwrap_or(""),
+                seg.start + ts,
+            ));
         }
         if pending.is_empty() || !tok_sep.is_empty() {
             // A segment made of token separators only, or ending with one:
             // the whole segment is one `*`.
             let sep = pending
                 .first()
-                .map_or(tok_sep.clone(), |(sp, _)| sp.clone());
+                .map_or(tok_sep.clone(), |(sp, _, _)| sp.clone());
             units.push(Unit {
                 sep,
                 tok: Tok::Wild,
             });
+            starts.push(None);
             continue;
         }
-        for (sp, t) in pending {
-            let tok = if token_is_value(t) {
-                Tok::Wild
+        for (sp, t, at) in pending {
+            let (tok, start) = if token_is_value(t) {
+                (Tok::Wild, None)
             } else {
-                Tok::Lit(Secret(t.to_owned()))
+                (Tok::Lit(Secret(t.to_owned())), Some(at))
             };
             units.push(Unit { sep: sp, tok });
+            starts.push(start);
         }
     }
     if let Some(vs) = in_value {
@@ -530,12 +639,25 @@ fn split_folded(s: &str) -> KeyUnits {
     if trailing_sep || units.len() > MAX_UNITS {
         // A trailing separator cannot be a `KeyPattern`; too many tokens:
         // the whole name.
-        return KeyUnits {
-            units: KeyUnits::wildcard().units,
-            name_values,
-        };
+        let w = KeyUnits::wildcard();
+        return (
+            KeyUnits {
+                units: w.units.clone(),
+                altered: w.altered.clone(),
+                name_values,
+            },
+            vec![None],
+        );
     }
-    KeyUnits { units, name_values }
+    let altered = vec![false; units.len()];
+    (
+        KeyUnits {
+            units,
+            altered,
+            name_values,
+        },
+        starts,
+    )
 }
 
 /// What the connector keeps per pattern and kind (a Redis type) during the
@@ -548,10 +670,14 @@ pub struct Group {
     pub samples: Vec<SecretBytes>,
     /// Values found in the names (at most the builder's `samples`).
     pub name_values: Vec<Secret>,
+    /// Per unit of the template: a key of the group had this literal
+    /// changed by NFKC (ADR-0056).
+    altered: Vec<bool>,
 }
 
 impl Group {
     fn merge(&mut self, other: Self, cap: usize) {
+        unite(&mut self.altered, &other.altered);
         self.count = self.count.saturating_add(other.count);
         for s in other.samples {
             if self.samples.len() < cap {
@@ -712,6 +838,7 @@ impl PatternBuilder {
     pub fn add(&mut self, raw: &[u8], key: KeyUnits, kind: u8) {
         let KeyUnits {
             mut units,
+            altered,
             name_values,
         } = key;
         self.apply_collapsed(&mut units);
@@ -769,6 +896,7 @@ impl PatternBuilder {
             return;
         }
         let group = self.templates.entry(slot_key).or_default();
+        unite(&mut group.altered, &altered);
         group.count = group.count.saturating_add(1);
         if group.samples.len() < cap {
             group.samples.push(SecretBytes::new(raw));
@@ -852,20 +980,28 @@ impl PatternBuilder {
             self.rebuild();
         }
         let cap = self.samples;
-        let mut merged: BTreeMap<(String, u8), Group> = BTreeMap::new();
+        // Per pattern: the group and whether a literal it keeps was
+        // changed by NFKC in one of its keys (ADR-0056), united over the
+        // templates that render to it.
+        let mut merged: BTreeMap<(String, u8), (Group, bool)> = BTreeMap::new();
         for ((units, kind), group) in std::mem::take(&mut self.templates) {
-            let pattern = NormalizedName::key_pattern(render(&units));
+            let altered = kept_altered(&units, &group.altered);
+            let pattern = NormalizedName::key_pattern(render(&units), altered);
             match merged.get_mut(&(pattern.as_str().to_owned(), kind)) {
-                Some(g) => g.merge(group, cap),
+                Some((g, a)) => {
+                    g.merge(group, cap);
+                    *a |= pattern.altered();
+                }
                 None => {
-                    merged.insert((pattern.as_str().to_owned(), kind), group);
+                    let a = pattern.altered();
+                    merged.insert((pattern.as_str().to_owned(), kind), (group, a));
                 }
             }
         }
         merged
             .into_iter()
-            .map(|((p, kind), group)| EmittedPattern {
-                pattern: NormalizedName::key_pattern(p),
+            .map(|((p, kind), (group, altered))| EmittedPattern {
+                pattern: NormalizedName::key_pattern(p, altered),
                 kind,
                 group,
             })
@@ -994,35 +1130,55 @@ fn matches_units(pattern: &[LUnit], key: &[LUnit]) -> bool {
 /// and the contract gate ([`is_key_pattern`]).
 ///
 /// Holds only emitted patterns (contract `KeyPattern`s, no key-name
-/// text); at most [`MAX_LEARNED`].
+/// text) and, per pattern, whether it was altered by NFKC in the walk that
+/// emitted it (ADR-0056); at most [`MAX_LEARNED`].
 #[derive(Debug, Default, Clone)]
 pub struct LearnedPatterns {
     /// The patterns, as emitted, sorted and unique.
     texts: Vec<String>,
+    /// Per pattern: altered (ADR-0056 decision 2 item 1).
+    altered: Vec<bool>,
     /// Their units.
     parsed: Vec<Vec<LUnit>>,
     /// Indices of the patterns by their first token (`None`: `*` first).
     by_first: HashMap<Option<String>, Vec<usize>>,
     /// Every literal prefix (whole units, before the first `*`) of every
-    /// pattern, rendered.
-    prefixes: HashSet<String>,
+    /// pattern, rendered, and whether a pattern holding it is altered.
+    prefixes: HashMap<String, bool>,
 }
 
 impl LearnedPatterns {
-    /// The learned set of `patterns`; those that are not contract
-    /// `KeyPattern`s, and `*`, are ignored.
+    /// The learned set of `patterns`, none of them altered; those that are
+    /// not contract `KeyPattern`s, and `*`, are ignored.
     #[must_use]
     pub fn new<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Self {
-        let mut texts: Vec<String> = patterns
+        Self::with_markers(patterns.into_iter().map(|p| (p, false)))
+    }
+
+    /// The learned set of `patterns`, each with its ADR-0056 marker (a
+    /// pattern listed twice is altered if either is); those that are not
+    /// contract `KeyPattern`s, and `*`, are ignored.
+    #[must_use]
+    pub fn with_markers<'a>(patterns: impl IntoIterator<Item = (&'a str, bool)>) -> Self {
+        let mut texts: Vec<(String, bool)> = patterns
             .into_iter()
-            .filter(|p| *p != "*" && is_key_pattern(p))
-            .map(str::to_owned)
+            .filter(|(p, _)| *p != "*" && is_key_pattern(p))
+            .map(|(p, a)| (p.to_owned(), a))
             .collect();
         texts.sort_unstable();
-        texts.dedup();
+        // Sorted with `false` first: keep the last of each run, so a
+        // pattern listed altered once stays altered.
+        texts.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                earlier.1 |= later.1;
+                true
+            } else {
+                false
+            }
+        });
         texts.truncate(MAX_LEARNED);
         let mut out = Self::default();
-        for t in texts {
+        for (t, altered) in texts {
             let Some((units, tail)) = units_of(&t, MAX_UNITS, true) else {
                 continue;
             };
@@ -1035,7 +1191,7 @@ impl LearnedPatterns {
                 let Some(lit) = &u.tok else { break };
                 prefix.push_str(&u.sep);
                 prefix.push_str(lit);
-                out.prefixes.insert(prefix.clone());
+                *out.prefixes.entry(prefix.clone()).or_default() |= altered;
             }
             out.by_first
                 .entry(units.first().and_then(|u| u.tok.clone()))
@@ -1043,6 +1199,7 @@ impl LearnedPatterns {
                 .push(idx);
             out.parsed.push(units);
             out.texts.push(t);
+            out.altered.push(altered);
         }
         out
     }
@@ -1051,6 +1208,14 @@ impl LearnedPatterns {
     #[must_use]
     pub fn patterns(&self) -> &[String] {
         &self.texts
+    }
+
+    /// The patterns, sorted, each with its ADR-0056 marker.
+    pub fn marked(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.texts
+            .iter()
+            .map(String::as_str)
+            .zip(self.altered.iter().copied())
     }
 
     /// Number of patterns.
@@ -1072,18 +1237,25 @@ impl LearnedPatterns {
         let Some((first, rest)) = sets.split_first() else {
             return Self::default();
         };
-        Self::new(
-            first
-                .texts
-                .iter()
-                .filter(|t| rest.iter().all(|s| s.texts.binary_search(t).is_ok()))
-                .map(String::as_str),
-        )
+        // A pattern of every set, altered when it is in any of them.
+        Self::with_markers(first.marked().filter_map(|(t, a)| {
+            let mut altered = a;
+            for s in rest {
+                let i = s.texts.binary_search_by(|x| x.as_str().cmp(t)).ok()?;
+                altered |= s.altered.get(i).copied().unwrap_or(true);
+            }
+            Some((t, altered))
+        }))
     }
 
     /// The object of a key name `raw` read from a log entry. `cut`: the
     /// server cut the argument (its last unit is incomplete): only the
     /// literal-prefix rule applies, on the complete units.
+    ///
+    /// ADR-0056 decision 2 item 1: the object is altered when the learned
+    /// pattern it maps to is (for a literal prefix followed by `*`, when a
+    /// pattern holding that prefix is), or when NFKC changed the key name
+    /// itself; never when it is `*`.
     #[must_use]
     pub fn object(&self, raw: &[u8], cut: bool) -> NormalizedName {
         if raw.is_empty() || raw.len() > MAX_KEY_BYTES {
@@ -1093,15 +1265,20 @@ impl LearnedPatterns {
             return NormalizedName::wildcard();
         };
         let mut folded: String = text.nfkc().collect();
+        let own = folded != text;
         let found = self.find(&folded, cut);
         folded.zeroize();
         match found {
             // The second gate: the per-key rules again, then the contract
             // gate; they only ever turn literals into `*`.
-            Some((mut p, _)) => {
+            Some((mut p, _, learned)) => {
                 let gated = split_key(p.as_bytes()).pattern();
                 p.zeroize();
-                gated
+                if learned || own {
+                    gated.marked_altered()
+                } else {
+                    gated
+                }
             }
             None => NormalizedName::wildcard(),
         }
@@ -1122,12 +1299,12 @@ impl LearnedPatterns {
         let found = self.find(&folded, false);
         folded.zeroize();
         match found {
-            Some((mut p, true)) => {
+            Some((mut p, true, _)) => {
                 let gated = split_key(p.as_bytes()).pattern();
                 p.zeroize();
                 Some(gated)
             }
-            Some((mut p, false)) => {
+            Some((mut p, false, _)) => {
                 p.zeroize();
                 None
             }
@@ -1135,9 +1312,11 @@ impl LearnedPatterns {
         }
     }
 
-    /// The object text of `folded` and whether it is a learned pattern
-    /// matched as a whole (`false`: a literal prefix followed by `*`).
-    fn find(&self, folded: &str, cut: bool) -> Option<(String, bool)> {
+    /// The object text of `folded`, whether it is a learned pattern
+    /// matched as a whole (`false`: a literal prefix followed by `*`), and
+    /// its ADR-0056 marker (the pattern's; for a prefix, whether a pattern
+    /// holding it is altered).
+    fn find(&self, folded: &str, cut: bool) -> Option<(String, bool, bool)> {
         let (units, tail) = units_of(folded, MAX_MATCH_UNITS, false)?;
         // The best full match: (literal tokens, index).
         let mut full: Option<(usize, usize)> = None;
@@ -1194,9 +1373,9 @@ impl LearnedPatterns {
         for k in (1..=rendered.len()).rev() {
             let Some(next) = units.get(k) else { continue };
             if let Some(prefix) = rendered.get(k - 1)
-                && self.prefixes.contains(prefix)
+                && let Some(&altered) = self.prefixes.get(prefix)
             {
-                prefixed = Some((k, format!("{prefix}{}*", next.sep)));
+                prefixed = Some((k, format!("{prefix}{}*", next.sep), altered));
                 break;
             }
         }
@@ -1204,12 +1383,14 @@ impl LearnedPatterns {
             r.zeroize();
         }
         // The one naming more learned literals; a full match on a tie.
+        let full_match = |i: usize| {
+            let altered = self.altered.get(i).copied().unwrap_or(true);
+            self.texts.get(i).cloned().map(|t| (t, true, altered))
+        };
         match (full, prefixed) {
-            (Some((lits, i)), Some((k, _))) if lits >= k => {
-                self.texts.get(i).cloned().map(|t| (t, true))
-            }
-            (_, Some((_, p))) => Some((p, false)),
-            (Some((_, i)), None) => self.texts.get(i).cloned().map(|t| (t, true)),
+            (Some((lits, i)), Some((k, _, _))) if lits >= k => full_match(i),
+            (_, Some((_, p, altered))) => Some((p, false, altered)),
+            (Some((_, i)), None) => full_match(i),
             (None, None) => None,
         }
     }
@@ -1419,6 +1600,7 @@ mod tests {
                     tok: Tok::Lit(Secret(t.clone())),
                 })
                 .collect(),
+            altered: vec![false; tokens.len()],
             name_values: Vec::new(),
         }
     }

@@ -27,6 +27,7 @@
 //!   reached. It is applied after
 //!   aggregation, so many small reads of one group add up.
 
+pub mod census;
 pub mod own;
 pub mod tail;
 

@@ -31,6 +31,7 @@ type RevisionToken = Extract<Token, `target_status.note_labels.${string}`>;
 /** The contract fields each field capability token stands for (ADR-0022). */
 const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: string, ...properties: string[]]> = {
   "access_event.bytes": ["AccessEvent", "bytes"],
+  "access_event.objects_overflowed": ["AccessEvent", "objects_overflowed"],
   "job_progress.coverage": [
     "JobProgress",
     "objects_sampled",
@@ -41,6 +42,9 @@ const FIELDS: Record<Exclude<Token, EngineToken | RevisionToken>, [schema: strin
     "skipped_limit",
     "skipped_error",
   ],
+  "location.altered": ["Location", "altered"],
+  "object_ref.altered": ["ObjectRef", "altered"],
+  "target_status.name_case": ["TargetStatus", "name_case"],
   "target_status.notes": ["TargetStatus", "notes"],
 };
 
@@ -102,6 +106,11 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
     expect(CONSOLE_ACCEPTS).toContain("engine.redis");
     expect(CONSOLE_ACCEPTS).toContain("engine.valkey");
     expect(CONSOLE_ACCEPTS).toContain("engine.sqlserver");
+  });
+
+  it("lists location.altered and object_ref.altered together (ADR-0056 decision 1 item 5)", () => {
+    expect(CONSOLE_ACCEPTS).toContain("location.altered");
+    expect(CONSOLE_ACCEPTS).toContain("object_ref.altered");
   });
 
   it("lists the SQL Server note-label revisions, whose labels are contract TargetNoteLabel values (ADR-0051 decision 4 and refinement)", () => {

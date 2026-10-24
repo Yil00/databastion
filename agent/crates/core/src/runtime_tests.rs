@@ -1984,6 +1984,78 @@ async fn target_notes_are_sent_only_while_the_console_accepts_them() {
     assert!(bodies[3]["targets"][0].get("notes").is_none());
 }
 
+/// ADR-0022 decision 9 on heartbeats (ADR-0055 contract): a `400`
+/// reporting an unknown field to a heartbeat carrying a gated
+/// `TargetStatus` field clears the capabilities and sends the same
+/// heartbeat once more stripped, instead of losing it; a second refusal is
+/// not retried (never a loop), and a `400` for another keyword is not
+/// resent.
+#[tokio::test]
+async fn a_heartbeat_rejected_for_a_gated_field_is_resent_once_stripped() {
+    use crate::capabilities::token;
+    use crate::notes::TargetNote;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    // 1: lists the notes; 2: unknown field on the notes; 3: the stripped
+    // resend accepted, listing the notes again; 4: unknown field again;
+    // 5: the stripped resend refused too; 6: listing the notes;
+    // 7: another keyword.
+    let steps = vec![
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        rejected_400("/targets/0/notes"),
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        rejected_400("/targets/0/name_case"),
+        rejected_400("/targets/0/notes"),
+        accepts_response(&[token::TARGET_STATUS_NOTES]),
+        details_400([("/ts", "formatMaximum")].into_iter()),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(seq(steps, heartbeat_response(30)))
+        .mount(&server)
+        .await;
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: vec![TargetNote::new(NoteCode::SecurityTlsDisabled)],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![Box::new(Health(health))],
+    )
+    .unwrap();
+    rt.heartbeat_once().await.unwrap();
+    // Refused for the field, resent stripped and accepted.
+    rt.heartbeat_once().await.unwrap();
+    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    // Refused twice: resent once only, then lost.
+    rt.heartbeat_once().await.unwrap_err();
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    // Another keyword: capabilities cleared (any heartbeat `400`), not
+    // resent.
+    rt.heartbeat_once().await.unwrap();
+    rt.heartbeat_once().await.unwrap_err();
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    let bodies = heartbeat_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(bodies.len(), 7, "{bodies:?}");
+    let notes = |i: usize| bodies[i]["targets"][0].get("notes").is_some();
+    assert_eq!(
+        (0..7).map(notes).collect::<Vec<_>>(),
+        [false, true, false, true, false, false, true]
+    );
+    // The resend is the same heartbeat, the gated field aside.
+    for (sent, resent) in [(1, 2), (3, 4)] {
+        let (mut a, b) = (bodies[sent].clone(), bodies[resent].clone());
+        a["targets"][0].as_object_mut().unwrap().remove("notes");
+        assert_eq!(a, b);
+    }
+}
+
 #[tokio::test]
 async fn sqlserver_note_labels_are_sent_per_negotiated_revision() {
     use crate::capabilities::token;
@@ -4417,17 +4489,229 @@ async fn events_without_gated_fields_keep_the_ordinary_400_rules() {
     assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
 }
 
+/// A findings batch **without** `Location.altered` carries no gated field
+/// (ADR-0056 decision 2 item 3 keeps this for such batches): a `400` on an
+/// item, even reported as an unknown field, takes the ordinary path (the
+/// item dropped) and keeps the capabilities.
 #[tokio::test]
 async fn findings_carry_no_gated_field_so_a_400_keeps_the_capabilities() {
     use crate::capabilities::token;
+    for step in [
+        Step::Items(&["/findings/0"]),
+        Step::Unknown(&["/findings/0/location"]),
+    ] {
+        let server = MockServer::start().await;
+        let (_env, rt) = spooled_runtime(&server, vec![step], 3).await;
+        accept_tokens(&rt, &[token::TARGET_STATUS_NOTES, token::LOCATION_ALTERED]);
+        drain(&rt).await;
+        let sent = sent_batches(&server).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+        assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+        assert!(rt.console_caps.console_accepts(token::LOCATION_ALTERED));
+        assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    }
+}
+
+/// `field` with a fullwidth `ｅ` (U+FF45): NFKC gives `email`, altered
+/// (ADR-0056).
+const ALTERED_FIELD: &str = "\u{FF45}mail";
+
+/// [`spooled_runtime`] with findings on `field`.
+async fn spooled_findings_runtime(
+    server: &MockServer,
+    steps: Vec<Step>,
+    findings: usize,
+    field: &str,
+) -> (Env, Runtime) {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    let rt = runtime(&env);
+    rt.spool_findings(
+        Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(findings, field),
+    )
+    .unwrap();
+    (env, rt)
+}
+
+/// The `altered` lists of a sent findings batch, item by item.
+fn location_altered(batch: &serde_json::Value) -> Vec<Option<serde_json::Value>> {
+    batch["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["location"].get("altered").cloned())
+        .collect()
+}
+
+/// ADR-0056 decision 2 item 3, the inverted case: a findings batch **with**
+/// `Location.altered` carries a gated field, so a `400` reporting it as an
+/// unknown field (a console rolled back, or a replica that does not know
+/// it) clears the capabilities and resends the items once, every one kept,
+/// without the field; the replacement is never stripped again.
+#[tokio::test]
+async fn altered_findings_carry_a_gated_field_so_a_400_clears_the_capabilities() {
+    use crate::capabilities::token;
     let server = MockServer::start().await;
-    let (_env, rt) = spooled_runtime(&server, vec![Step::Items(&["/findings/0"])], 3).await;
-    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+    let (_env, rt) = spooled_findings_runtime(
+        &server,
+        vec![Step::Unknown(&["/findings/0/location"])],
+        3,
+        ALTERED_FIELD,
+    )
+    .await;
+    accept_tokens(&rt, &[token::TARGET_STATUS_NOTES, token::LOCATION_ALTERED]);
     drain(&rt).await;
     let sent = sent_batches(&server).await;
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
-    assert!(rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let field = Some(serde_json::json!(["field"]));
+    assert_eq!(
+        location_altered(&sent[0]),
+        [field.clone(), field.clone(), field]
+    );
+    // Every item kept, the field stripped, under a new `batch_id`.
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    assert_eq!(location_altered(&sent[1]), [None, None, None]);
+    assert!(
+        sent[1]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["location"]["field"] == "email")
+    );
+    serde_json::from_value::<databastion_protocol::FindingsBatch>(sent[1].clone()).unwrap();
+    assert!(!rt.console_caps.console_accepts(token::LOCATION_ALTERED));
+    assert!(!rt.console_caps.console_accepts(token::TARGET_STATUS_NOTES));
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    let status = rt.lock_spool().status();
+    assert_eq!(status.dropped_items.map_or(0, |c| c.0), 0);
+    assert_eq!(status.batches.0, 0);
+}
+
+/// ADR-0056 decision 2 item 3: findings are never held while the console's
+/// capabilities are not known (no heartbeat answer yet): the batch goes at
+/// once, stripped, and its findings are counted apart
+/// (`findings_stripped_capabilities_unknown_total`, per finding), not as
+/// stripped for an unlisted token. Plain findings are not counted.
+#[tokio::test]
+async fn findings_are_sent_stripped_at_once_while_the_capabilities_are_unknown() {
+    let server = MockServer::start().await;
+    let (_env, rt) = spooled_findings_runtime(&server, Vec::new(), 3, ALTERED_FIELD).await;
+    rt.spool_findings(
+        Uuid::try_from(JOB).unwrap(),
+        &TargetId::try_from("pg-main").unwrap(),
+        databastion_protocol::Engine::Postgres,
+        &databastion_protocol::ClassifiersVersion::try_from("2026.09.1").unwrap(),
+        &crate::spool::tests::masked(2, "email"),
+    )
+    .unwrap();
+    assert!(!rt.console_caps.snapshot(std::time::Instant::now()).known());
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "never held: {sent:?}");
+    assert_eq!(location_altered(&sent[0]), [None, None, None]);
+    assert_eq!(location_altered(&sent[1]), [None, None]);
+    assert_eq!(
+        metric(&rt, "findings_stripped_capabilities_unknown_total"),
+        3.0
+    );
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0056 decision 2 item 3: a console that lists `location.altered`
+/// receives the field; one known not to list it receives the findings
+/// stripped at send time (counted per batch as an unlisted token, not as
+/// capabilities unknown).
+#[tokio::test]
+async fn findings_keep_location_altered_only_for_a_console_that_lists_it() {
+    use crate::capabilities::token;
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let (_env, rt) = spooled_findings_runtime(&server, Vec::new(), 2, ALTERED_FIELD).await;
+        if listed {
+            accept_tokens(&rt, &[token::LOCATION_ALTERED]);
+        } else {
+            accept_tokens(&rt, &[token::TARGET_STATUS_NOTES]);
+        }
+        drain(&rt).await;
+        let sent = sent_batches(&server).await;
+        assert_eq!(sent.len(), 1);
+        let want = listed.then(|| serde_json::json!(["field"]));
+        assert_eq!(location_altered(&sent[0]), [want.clone(), want]);
+        serde_json::from_value::<databastion_protocol::FindingsBatch>(sent[0].clone()).unwrap();
+        assert_eq!(
+            metric(&rt, "gated_fields_stripped_at_send_total"),
+            if listed { 0.0 } else { 1.0 }
+        );
+        assert_eq!(
+            metric(&rt, "findings_stripped_capabilities_unknown_total"),
+            0.0
+        );
+    }
+}
+
+/// ADR-0056 decision 2 item 2: an event object altered by normalization
+/// carries `ObjectRef.altered`, spooled in full and held like the other
+/// gated event fields while the capabilities are not known; sent to a
+/// console that lists `object_ref.altered`, stripped for one that does
+/// not.
+#[tokio::test]
+async fn events_with_altered_objects_wait_and_are_stripped_per_token() {
+    use crate::capabilities::token;
+    use databastion_classifiers::masking::{
+        EventAction, EventObject, EventPrincipal, EventSource, MaskedEvent,
+    };
+    use databastion_classifiers::names::normalize_path;
+    let target = TargetId::try_from("pg-main").unwrap();
+    let event = |table: &str| {
+        MaskedEvent::new(
+            EventSource::Pgaudit,
+            EventAction::Read,
+            EventPrincipal::account("report"),
+            std::time::SystemTime::now(),
+        )
+        .with_object(EventObject::new(
+            normalize_path("crm"),
+            Some(normalize_path("public")),
+            normalize_path(table),
+        ))
+    };
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let env = events_mock(&server, Vec::new()).await;
+        let rt = runtime(&env);
+        rt.spool_events(&target, &[event("orders"), event("orders\u{200B}x")]);
+        // Not known yet: the batch waits.
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        if listed {
+            accept_tokens(&rt, &[token::OBJECT_REF_ALTERED]);
+        } else {
+            accept_tokens(&rt, &[]);
+        }
+        drain(&rt).await;
+        let sent = sent_event_batches(&server).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let altered: Vec<Option<serde_json::Value>> = sent[0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["objects"][0].get("altered").cloned())
+            .collect();
+        let want = listed.then(|| serde_json::json!(["object"]));
+        assert_eq!(altered, [None, want]);
+        serde_json::from_value::<databastion_protocol::EventsBatch>(sent[0].clone()).unwrap();
+    }
 }
 
 #[tokio::test]
@@ -5352,4 +5636,802 @@ async fn a_held_batch_survives_an_agent_restart() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["findings"][0]["location"]["engine"], "cas");
     assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+// ------------------------------------------------- ADR-0053 send-time gate
+
+/// Masked events of `n` reads, those at `flagged` with objects left out
+/// under a connector's bound (`objects_overflowed`) and `bytes`.
+fn overflowed_events(
+    n: usize,
+    flagged: &[usize],
+) -> Vec<databastion_classifiers::masking::MaskedEvent> {
+    use databastion_classifiers::masking::{EventAction, EventObject, EventPrincipal, EventSource};
+    use databastion_classifiers::names::normalize_path;
+    (0..n)
+        .map(|i| {
+            let e = databastion_classifiers::masking::MaskedEvent::new(
+                EventSource::Pgaudit,
+                EventAction::Read,
+                EventPrincipal::account("report"),
+                std::time::SystemTime::now(),
+            )
+            .with_object(EventObject::new(
+                normalize_path("crm"),
+                Some(normalize_path("public")),
+                normalize_path("orders"),
+            ));
+            if flagged.contains(&i) {
+                e.with_unlisted_objects(normalize_path("crm"))
+                    .with_bytes(Some(4096))
+            } else {
+                e
+            }
+        })
+        .collect()
+}
+
+async fn events_mock(server: &MockServer, steps: Vec<Step>) -> Env {
+    let env = enrolled(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(steps.into())))
+        .mount(server)
+        .await;
+    env
+}
+
+fn flags(batch: &serde_json::Value, field: &str) -> Vec<bool> {
+    batch["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.get(field).is_some())
+        .collect()
+}
+
+/// ADR-0053 decision 2 item 4 (1): events flagged and spooled before the
+/// first heartbeat answer survive a restart with the flag; a console that
+/// lists the token receives it, one that does not receives the events
+/// without it, none dropped.
+#[tokio::test]
+async fn events_spooled_before_the_first_answer_keep_the_flag_across_a_restart() {
+    use crate::capabilities::token;
+    let target = TargetId::try_from("pg-main").unwrap();
+    for listed in [true, false] {
+        let server = MockServer::start().await;
+        let env = events_mock(&server, Vec::new()).await;
+        let rt = runtime(&env);
+        rt.spool_events(&target, &overflowed_events(3, &[1]));
+        // Not known yet: the batch waits, nothing is sent.
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        drop(rt);
+        let rt = runtime(&env);
+        drain(&rt).await;
+        assert!(sent_event_batches(&server).await.is_empty());
+        if listed {
+            accept_tokens(&rt, &[token::ACCESS_EVENT_OBJECTS_OVERFLOWED]);
+        } else {
+            accept_tokens(&rt, &[]);
+        }
+        drain(&rt).await;
+        let sent = sent_event_batches(&server).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["events"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            flags(&sent[0], "objects_overflowed"),
+            [false, listed, false]
+        );
+        assert_eq!(flags(&sent[0], "bytes"), [false, false, false]);
+        if listed {
+            assert_eq!(sent[0]["events"][1]["objects_overflowed"], true);
+        }
+        serde_json::from_value::<databastion_protocol::EventsBatch>(sent[0].clone()).unwrap();
+        // `bytes` is not listed in either case: stripped at send time.
+        assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 1.0);
+        let status = rt.lock_spool().status();
+        assert_eq!(
+            (status.batches.0, status.dropped_items.map_or(0, |c| c.0)),
+            (0, 0)
+        );
+    }
+}
+
+/// `bytes` keeps its own token at send time: a console that lists
+/// `access_event.bytes` but not the flag gets `bytes` only.
+#[tokio::test]
+async fn bytes_are_kept_for_a_console_that_lists_only_bytes() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    accept_tokens(&rt, &[token::ACCESS_EVENT_BYTES]);
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(2, &[0]),
+    );
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(flags(&sent[0], "bytes"), [true, false]);
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false, false]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 1.0);
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+}
+
+/// ADR-0053 decision 2 item 4 (2): after a `400` clears the capabilities
+/// (the rejected batch resent once with every gated field stripped), events
+/// converted before the next heartbeat answer wait, and are sent with the
+/// flag once the token is listed again.
+#[tokio::test]
+async fn after_a_400_events_converted_before_the_next_answer_keep_the_flag() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, vec![Step::Unknown(&["/events/0"])]).await;
+    let rt = runtime(&env);
+    let both = [
+        token::ACCESS_EVENT_BYTES,
+        token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+    ];
+    accept_tokens(&rt, &both);
+    let target = TargetId::try_from("pg-main").unwrap();
+    rt.spool_events(&target, &overflowed_events(2, &[0]));
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [true, false]);
+    // Every gated field stripped after the 400, both events kept.
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [false, false]);
+    assert_eq!(flags(&sent[1], "bytes"), [false, false]);
+    assert!(
+        !rt.console_caps
+            .console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED)
+    );
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    // Converted while the capabilities are cleared: waits.
+    rt.spool_events(&target, &overflowed_events(2, &[1]));
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 2);
+    accept_tokens(&rt, &both);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3);
+    assert_eq!(flags(&sent[2], "objects_overflowed"), [false, true]);
+    assert_eq!(flags(&sent[2], "bytes"), [false, true]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 1.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+}
+
+/// Contract review M2: a `400` `contains` / `if` on a flagged event (the
+/// console found no `*`) resends it once without the flag, keeping the
+/// capabilities; the other rejected items take the ordinary rule, and a
+/// second refusal of the unflagged item drops it.
+#[tokio::test]
+async fn a_flagged_event_refused_by_the_overflow_rule_is_resent_once_without_the_flag() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(
+        &server,
+        vec![
+            Step::Details(&[
+                ("/events/1/objects", "contains"),
+                ("/events/1", "if"),
+                ("/events/2/ts", "formatMinimum"),
+            ]),
+            Step::Details(&[("/events/1/objects", "contains"), ("/events/1", "if")]),
+        ],
+    )
+    .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+        ],
+    );
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(3, &[1]),
+    );
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false, true, false]);
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [false, false]);
+    assert_eq!(
+        flags(&sent[1], "bytes"),
+        [false, true],
+        "only the flag stripped"
+    );
+    assert_ne!(sent[0]["batch_id"], sent[1]["batch_id"]);
+    // The second refusal: the ordinary item rule.
+    assert_eq!(sent[2]["events"].as_array().unwrap().len(), 1);
+    assert!(
+        rt.console_caps
+            .console_accepts(token::ACCESS_EVENT_OBJECTS_OVERFLOWED)
+    );
+    assert!(rt.console_caps.console_accepts(token::ACCESS_EVENT_BYTES));
+    assert_eq!(metric(&rt, "overflow_flags_refused_total"), 1.0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 0.0);
+    let status = rt.lock_spool().status();
+    assert_eq!((status.batches.0, status.dropped_items.unwrap().0), (0, 2));
+}
+
+/// The heartbeat metrics stay within the contract's `maxProperties`.
+#[tokio::test]
+async fn heartbeat_metrics_stay_within_the_contract_bound() {
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let rt = runtime(&env);
+    assert!(rt.metrics().0.len() <= 128, "{}", rt.metrics().0.len());
+}
+
+/// Security review M1: a misconfigured older replica refuses the flag after
+/// every heartbeat that lists it. Only the first clear holds; the next
+/// ones, within the hold window, leave the set known and empty, so the
+/// spooled flagged batches drain without a heartbeat wait each.
+#[tokio::test]
+async fn a_replica_refusing_the_flag_after_each_heartbeat_does_not_throttle_the_spool() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = events_mock(
+        &server,
+        vec![
+            Step::Unknown(&["/events/0"]),
+            Step::Ack(false),
+            Step::Unknown(&["/events/0"]),
+        ],
+    )
+    .await;
+    let rt = runtime(&env);
+    let listed = [token::ACCESS_EVENT_OBJECTS_OVERFLOWED];
+    accept_tokens(&rt, &listed);
+    let target = TargetId::try_from("pg-main").unwrap();
+    for _ in 0..4 {
+        rt.spool_events(&target, &overflowed_events(1, &[0]));
+    }
+    // First refusal: the hold starts; batch 1 is resent stripped, the
+    // others wait for the next answer.
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 2);
+    // The heartbeat lists the token again: batch 2 goes with the flag and
+    // is refused again. No second hold: batch 2 resent stripped, batches 3
+    // and 4 stripped at send time, all without another answer.
+    accept_tokens(&rt, &listed);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 6, "{sent:?}");
+    let flagged: Vec<bool> = sent
+        .iter()
+        .map(|b| flags(b, "objects_overflowed")[0])
+        .collect();
+    assert_eq!(flagged, [true, false, true, false, false, false]);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+    assert_eq!(metric(&rt, "gated_fields_stripped_total"), 2.0);
+    // Every batch carries `bytes`, which is never listed here: 1 and 2 lose
+    // it at send time, 3 and 4 lose both fields.
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 4.0);
+}
+
+/// Security review L2: a batch sent once whose ack was lost is sent again
+/// as it is (same `batch_id`, same fields) even after the capabilities
+/// changed; never re-stripped under a new `batch_id`.
+#[tokio::test]
+async fn a_batch_sent_once_is_resent_as_it_is_after_a_token_change() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/events"))
+        .respond_with(Script(std::sync::Mutex::new(Vec::new().into())))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ACCESS_EVENT_OBJECTS_OVERFLOWED,
+        ],
+    );
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[0]),
+    );
+    assert!(matches!(rt.flush_once(1).await.unwrap(), Flush::Retry(_)));
+    // A heartbeat answer without the token, before the retry.
+    accept_tokens(&rt, &[]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], sent[1], "the same body, same batch_id");
+    assert_eq!(flags(&sent[1], "objects_overflowed"), [true]);
+    assert_eq!(flags(&sent[1], "bytes"), [true]);
+    assert_eq!(metric(&rt, "gated_fields_stripped_at_send_total"), 0.0);
+}
+
+/// Security review I-5: a batch with a `signature.*` signal does not wait
+/// for the capabilities; it is sent at once without the unlisted fields.
+#[tokio::test]
+async fn a_signature_batch_does_not_wait_for_the_capabilities() {
+    use databastion_classifiers::masking::Signal;
+    let server = MockServer::start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let target = TargetId::try_from("pg-main").unwrap();
+    let signed: Vec<_> = overflowed_events(1, &[0])
+        .into_iter()
+        .map(|e| e.with_signal(Signal::PgDump))
+        .collect();
+    rt.spool_events(&target, &signed);
+    rt.spool_events(&target, &overflowed_events(1, &[0]));
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "only the signature batch: {sent:?}");
+    assert_eq!(flags(&sent[0], "objects_overflowed"), [false]);
+    assert!(sent[0].to_string().contains("signature.pg_dump"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1);
+}
+
+/// Security review L1, re-review N1: a heartbeat that fails with a
+/// transport error restarts the hold; a heartbeat answered with `503` does
+/// not.
+#[tokio::test]
+async fn only_an_unreachable_console_keeps_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    // Not from the pool: dropping it closes its port.
+    let server = MockServer::builder().start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    let started = std::time::Instant::now();
+    assert!(rt.heartbeat_once().await.is_err());
+    assert!(
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1)),
+        "a 503 is an answer: the hold is not restarted"
+    );
+    // Unreachable: the hold restarts from the failed attempt.
+    drop(server);
+    let before = std::time::Instant::now();
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(!rt.console_caps.settled(before + UNKNOWN_HOLD));
+}
+
+/// Re-review N1: once `/events` has answered, a transport error on the
+/// heartbeat no longer restarts the hold.
+#[tokio::test]
+async fn an_events_answer_stops_extending_the_hold() {
+    use crate::capabilities::UNKNOWN_HOLD;
+    let server = MockServer::builder().start().await;
+    let env = events_mock(&server, Vec::new()).await;
+    let rt = runtime(&env);
+    let started = std::time::Instant::now();
+    // A batch without gated fields does not wait: answered.
+    rt.spool_events(
+        &TargetId::try_from("pg-main").unwrap(),
+        &overflowed_events(1, &[]),
+    );
+    drain(&rt).await;
+    assert_eq!(sent_event_batches(&server).await.len(), 1);
+    drop(server);
+    assert!(matches!(
+        rt.heartbeat_once().await,
+        Err(CallError::Uplink(UplinkError::Transport(_)))
+    ));
+    assert!(
+        rt.console_caps
+            .settled(started + UNKNOWN_HOLD + std::time::Duration::from_secs(1))
+    );
+}
+
+// ------------------------------------------------------ name case (ADR-0055)
+
+/// A MySQL or SQL Server connector whose `check()` succeeds, fails or
+/// hangs, and whose last name-case value is set by the test.
+struct NameCaseConn {
+    engine: Engine,
+    hang: Arc<std::sync::atomic::AtomicBool>,
+    reachable: Arc<std::sync::atomic::AtomicBool>,
+    report: Arc<StdMutex<std::collections::HashMap<String, crate::name_case::NameCaseReport>>>,
+}
+
+#[async_trait::async_trait]
+impl Connector for NameCaseConn {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    async fn check(&self, _: &crate::config::TargetConfig) -> TargetHealth {
+        if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let reachable = self.reachable.load(std::sync::atomic::Ordering::SeqCst);
+        TargetHealth {
+            reachable,
+            audit_level: AuditLevel::None,
+            failure: (!reachable).then_some(FailureCode::TargetUnreachable),
+            detail: None,
+            notes: Vec::new(),
+        }
+    }
+
+    async fn discover(
+        &self,
+        _: &crate::ScanJob,
+        _: &crate::FindingSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    async fn audit_stream(
+        &self,
+        _: &crate::AuditConfig,
+        _: &crate::EventSink,
+    ) -> Result<(), crate::ConnectorError> {
+        Ok(())
+    }
+
+    fn name_case(
+        &self,
+        target: &crate::config::TargetConfig,
+    ) -> Option<crate::name_case::NameCaseReport> {
+        self.report.lock().unwrap().get(&target.id).cloned()
+    }
+}
+
+/// An enrolled environment with a PostgreSQL, a MySQL, a MariaDB and a SQL
+/// Server target.
+async fn name_case_env(server: &MockServer) -> Env {
+    let env = enrolled(server).await;
+    let text = std::fs::read_to_string(&env.config_path).unwrap();
+    let mut text = text;
+    for (id, engine) in [
+        ("my-main", "mysql"),
+        ("maria-main", "mariadb"),
+        ("mssql-main", "sqlserver"),
+    ] {
+        text.push_str(&format!(
+            "  - id: {id}\n    engine: {engine}\n    host: 127.0.0.1\n    port: 3306\n    \
+             account: databastion_{id}\n    secret:\n      env: DATABASTION_X\n"
+        ));
+    }
+    std::fs::write(&env.config_path, &text).unwrap();
+    Env {
+        config: AgentConfig::parse(&text).unwrap(),
+        ..env
+    }
+}
+
+fn name_case_of(statuses: &[TargetStatus], id: &str) -> Option<serde_json::Value> {
+    let s = statuses
+        .iter()
+        .find(|s| s.target_id.as_str() == id)
+        .unwrap_or_else(|| panic!("{id} reported"));
+    s.name_case
+        .as_ref()
+        .map(|n| serde_json::to_value(n).unwrap())
+}
+
+/// ADR-0055 decisions 1 and 2 (security review M1, contract review I-4):
+/// `name_case` is sent only for `mysql`, `mariadb` and `sqlserver`
+/// targets and only while the console lists the token; once listed, in
+/// every such status, also when `check()` fails or times out (the
+/// connector's last value, else `unknown` for both parts), never omitted.
+#[tokio::test]
+async fn name_case_is_always_sent_for_the_three_engines_once_accepted() {
+    use crate::capabilities::token;
+    use crate::name_case::{NameCase, NameCaseReport};
+    use databastion_classifiers::names::{PathPart, normalize_field_path};
+    let server = MockServer::start().await;
+    let env = name_case_env(&server).await;
+    let flag = |v: bool| Arc::new(std::sync::atomic::AtomicBool::new(v));
+    let (my_hang, my_up) = (flag(false), flag(true));
+    let reports = Arc::new(StdMutex::new(std::collections::HashMap::new()));
+    let ss_reports = Arc::new(StdMutex::new(std::collections::HashMap::new()));
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: Vec::new(),
+    };
+    let mut rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![
+            Box::new(Health(health)),
+            Box::new(NameCaseConn {
+                engine: Engine::Mysql,
+                hang: Arc::clone(&my_hang),
+                reachable: Arc::clone(&my_up),
+                report: Arc::clone(&reports),
+            }),
+            Box::new(NameCaseConn {
+                engine: Engine::Sqlserver,
+                hang: flag(false),
+                reachable: flag(true),
+                report: Arc::clone(&ss_reports),
+            }),
+        ],
+    )
+    .unwrap();
+    rt.check_timeout = Duration::from_millis(300);
+    reports.lock().unwrap().insert(
+        "my-main".to_owned(),
+        NameCaseReport::uniform(NameCase::Sensitive),
+    );
+    ss_reports.lock().unwrap().insert(
+        "mssql-main".to_owned(),
+        NameCaseReport {
+            databases: NameCase::Insensitive,
+            objects: NameCase::Insensitive,
+            except: vec![
+                (
+                    normalize_field_path(&[PathPart::Key("crm_cs")]),
+                    NameCase::Sensitive,
+                ),
+                (
+                    normalize_field_path(&[PathPart::Key("jane.doe@example.com")]),
+                    NameCase::Unknown,
+                ),
+            ],
+        },
+    );
+    // Not listed: never sent (an older console rejects the heartbeat).
+    accept_tokens(&rt, &[token::ENGINE_SQLSERVER, token::TARGET_STATUS_NOTES]);
+    let st = rt.target_statuses(&env.config).await;
+    assert_eq!(st.len(), 4);
+    assert!(st.iter().all(|s| s.name_case.is_none()));
+    // Listed: on the three engines only; the MariaDB target has no value
+    // yet (`unknown`), PostgreSQL none.
+    accept_tokens(
+        &rt,
+        &[token::ENGINE_SQLSERVER, token::TARGET_STATUS_NAME_CASE],
+    );
+    let st = rt.target_statuses(&env.config).await;
+    assert_eq!(name_case_of(&st, "pg-main"), None);
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    assert_eq!(
+        name_case_of(&st, "maria-main"),
+        Some(serde_json::json!({"databases": "unknown", "objects": "unknown"}))
+    );
+    assert_eq!(
+        name_case_of(&st, "mssql-main"),
+        Some(serde_json::json!({
+            "databases": "insensitive",
+            "objects": "insensitive",
+            "except": [
+                {"database": "*", "objects": "unknown"},
+                {"database": "crm_cs", "objects": "sensitive"}
+            ]
+        }))
+    );
+    let text = serde_json::to_string(&st).unwrap();
+    assert!(!text.contains("jane"), "{text}");
+    // A failed check keeps the connector's last value.
+    my_up.store(false, std::sync::atomic::Ordering::SeqCst);
+    let st = rt.target_statuses(&env.config).await;
+    let my = st
+        .iter()
+        .find(|s| s.target_id.as_str() == "my-main")
+        .unwrap();
+    assert!(!my.reachable);
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    // A check that times out too.
+    my_hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let st = rt.target_statuses(&env.config).await;
+    let my = st
+        .iter()
+        .find(|s| s.target_id.as_str() == "my-main")
+        .unwrap();
+    assert_eq!(
+        my.last_error.as_ref().map(ToString::to_string).as_deref(),
+        Some("timeout")
+    );
+    assert_eq!(
+        name_case_of(&st, "my-main"),
+        Some(serde_json::json!({"databases": "sensitive", "objects": "sensitive"}))
+    );
+    // Still running at the next heartbeat (account busy): still sent.
+    let st = rt.target_statuses(&env.config).await;
+    assert!(name_case_of(&st, "my-main").is_some());
+    // Every status conforms to the contract (the engine rule included).
+    for s in &st {
+        let v = serde_json::to_value(s).unwrap();
+        serde_json::from_value::<TargetStatus>(v).unwrap();
+    }
+    // Withdrawn by the console: no longer sent.
+    accept_tokens(&rt, &[token::ENGINE_SQLSERVER]);
+    let st = rt.target_statuses(&env.config).await;
+    assert!(st.iter().all(|s| s.name_case.is_none()));
+}
+
+/// The rotation probe is the heartbeat as built, gated fields included
+/// (ADR-0055 decision 2, security review M1 of the agent lot), with a
+/// fallback stripped of them for a `400` on an unknown field (#301
+/// contract review I-3).
+#[tokio::test]
+async fn the_rotation_probe_is_a_full_heartbeat_with_a_stripped_fallback() {
+    use crate::capabilities::token;
+    use crate::notes::TargetNote;
+    let server = MockServer::start().await;
+    let env = name_case_env(&server).await;
+    let flag = |v: bool| Arc::new(std::sync::atomic::AtomicBool::new(v));
+    let health = TargetHealth {
+        reachable: true,
+        audit_level: AuditLevel::Limited,
+        failure: None,
+        detail: None,
+        notes: vec![TargetNote::new(NoteCode::SecurityTlsDisabled)],
+    };
+    let rt = Runtime::new(
+        &env.config_path,
+        env.config.clone(),
+        vec![
+            Box::new(Health(health)),
+            Box::new(NameCaseConn {
+                engine: Engine::Mysql,
+                hang: flag(false),
+                reachable: flag(true),
+                report: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            }),
+        ],
+    )
+    .unwrap();
+    accept_tokens(
+        &rt,
+        &[token::TARGET_STATUS_NOTES, token::TARGET_STATUS_NAME_CASE],
+    );
+    // The ordinary heartbeat carries both.
+    let hb = rt.build_heartbeat().await.unwrap();
+    assert!(hb.targets.iter().any(|t| !t.notes.is_empty()));
+    assert!(hb.targets.iter().any(|t| t.name_case.is_some()));
+    // The probe too (ADR-0055 decision 2: a probe is a heartbeat to the
+    // console); its fallback neither.
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    let probe: HeartbeatRequest = serde_json::from_slice(&full).unwrap();
+    assert_eq!(probe.targets.len(), hb.targets.len());
+    let text = String::from_utf8(full).unwrap();
+    assert!(
+        text.contains("name_case") && text.contains("notes"),
+        "{text}"
+    );
+    let stripped = stripped.expect("a fallback without the gated fields");
+    let probe: HeartbeatRequest = serde_json::from_slice(&stripped).unwrap();
+    assert_eq!(probe.targets.len(), hb.targets.len());
+    let text = String::from_utf8(stripped).unwrap();
+    assert!(
+        !text.contains("name_case") && !text.contains("notes"),
+        "{text}"
+    );
+    // Nothing gated listed: no fallback.
+    accept_tokens(&rt, &[]);
+    let (full, stripped) = rt.heartbeat_body().await.unwrap();
+    assert!(stripped.is_none());
+    assert!(!String::from_utf8(full).unwrap().contains("name_case"));
+}
+
+/// Security review M1 of the ADR-0055 agent lot (ADR-0022 decision 9
+/// applied to the rotation probe): a probe refused with `400` reporting an
+/// unknown field is sent once more stripped of its gated fields, and its
+/// acceptance still promotes `S1` (a `400` never costs a rotation, #301
+/// I-3); a probe with nothing to strip is not resent.
+#[tokio::test]
+async fn a_rotation_probe_refused_on_a_gated_field_is_resent_stripped_once() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    let s1 = env
+        .state
+        .load_identity()
+        .unwrap()
+        .pending
+        .unwrap()
+        .expose()
+        .to_owned();
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(body_partial_json(serde_json::json!({"gated": true})))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .and(header("authorization", bearer(&s1).as_str()))
+        .and(body_partial_json(serde_json::json!({"gated": false})))
+        .respond_with(heartbeat_response(30))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(error_body(409, "rotation_conflict"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let outcome = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: Some(br#"{"gated": false}"#),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RotateOutcome::AlreadyDone);
+    let stored = env.state.load_identity().unwrap();
+    assert!(stored.pending.is_none());
+    assert_eq!(stored.secret.expose(), s1);
+}
+
+/// The same refusal without a fallback (nothing gated in the probe): not
+/// resent, the error is returned and `S1` stays pending.
+#[tokio::test]
+async fn a_rotation_probe_without_a_fallback_is_not_resent() {
+    use crate::session::ProbeBody;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    let session = session(&env);
+    let guard = Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount_as_scoped(&server)
+        .await;
+    assert!(session.rotate(None).await.is_err());
+    drop(guard);
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/heartbeat"))
+        .respond_with(rejected_400("/targets/0/name_case"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/rotate"))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let r = session
+        .rotate_probed_with(
+            None,
+            Some(ProbeBody {
+                full: br#"{"gated": true}"#,
+                stripped: None,
+            }),
+        )
+        .await;
+    assert!(r.is_err());
+    assert!(env.state.load_identity().unwrap().pending.is_some());
 }

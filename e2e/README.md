@@ -768,3 +768,11 @@ login workload, with [`load/sqlserver.sh`](load/README.md#sql-server-target) the
 with [`load/redis.sh`](load/README.md#valkey-and-redis-targets) a Valkey (or Redis) target, on the
 compose files of the scenarios above. It runs in its own workflow, outside the required `CI result`
 check.
+
+Every scenario above with an agent (`run.sh`, `cas.sh`, `sqlserver.sh`, `redis.sh`) prints the
+agent's event census and the console's per-principal counts and `*` events on exit (ADR-0053
+decision 6, informational: `CENSUS`, `CENSUS-CONSOLE`, `STAR-EVENTS`, `STAR-FINDINGS` lines and a job
+summary section) and keeps them in `$E2E_LOG_DIR/census/` (CI artifact `<job>-census`, uploaded
+whatever the result); see [load/README.md](load/README.md#event-census-adr-0053-decision-6-informational).
+With `E2E_SQLSERVER_AUDIT_SOURCE=sqlserver_xevents`, `sqlserver.sh` also prints the `XE-CATCHUP` line
+of the agent's cut reads ([load/README.md](load/README.md#extended-events-source-catch-up-noise-282-review-n3)).

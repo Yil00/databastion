@@ -28,6 +28,9 @@ Usage:
   seed.py tsql     --tables N --rows N              T-SQL fixed-rate point-select loop of one
                                                     workload session (sqlcmd variable CTX, see
                                                     tsql_context; prints one RESULT line)
+  seed.py orm      --tables N --rows N --dialect D  ORM-style statements (ADR-0053 decision 6), one per
+                                                    line, for D = pg, mariadb or tsql (see
+                                                    orm_statements)
   seed.py redis    --rows N                         Lua script for EVAL (Valkey / Redis): the keys
                                                     ARGV[1]..ARGV[2] of the scaled keyspace
   (--workload-tables N, default 40: the workload reads the first N tables of the plan)
@@ -219,8 +222,8 @@ def pg_sql(tables: list[Table]) -> str:
         f"VACUUM (ANALYZE) {', '.join(t.pg_name for t in tables)};",
         # Flush the load now rather than at a timed checkpoint inside a measurement window.
         "CHECKPOINT;",
-        f"GRANT USAGE ON SCHEMA {schemas} TO databastion_agent, load_app;",
-        f"GRANT SELECT ON ALL TABLES IN SCHEMA {schemas} TO databastion_agent, load_app;",
+        f"GRANT USAGE ON SCHEMA {schemas} TO databastion_agent, load_app, load_orm;",
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA {schemas} TO databastion_agent, load_app, load_orm;",
         "SELECT count(*) || ' tables' FROM pg_tables WHERE schemaname IN ("
         + _sql_list(PG_SCHEMAS) + ");",
     ]
@@ -258,8 +261,9 @@ def mariadb_sql(tables: list[Table]) -> str:
         )
     out.append(f"ANALYZE TABLE {', '.join(t.mariadb_name for t in tables)};")
     # The workload account reads the load tables only (as on PostgreSQL), table by table.
+    # load_orm: the ORM-style reader of ADR-0053 decision 6 (side-clients.sh), same tables.
     for t in tables:
-        out.append(f"GRANT SELECT ON {MARIADB_DATABASE}.{t.mariadb_name} TO 'load_app'@'%';")
+        out.append(f"GRANT SELECT ON {MARIADB_DATABASE}.{t.mariadb_name} TO 'load_app'@'%', 'load_orm'@'%';")
     out.append(
         f"SELECT CONCAT(COUNT(*), ' tables') FROM information_schema.TABLES "
         f"WHERE TABLE_SCHEMA = '{MARIADB_DATABASE}' AND TABLE_NAME LIKE 'load\\_t%';"
@@ -327,9 +331,27 @@ def _choose(n_expr: str, values: tuple[str, ...]) -> str:
     return f"CHOOSE(1 + CAST({n_expr} AS int), {_sql_list(values)})"
 
 
-def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
-    """Schema, tables, rows (GENERATE_SERIES, SQL Server 2022, compatibility level 160) and grants,
-    in sqlcmd batches (GO) of `batch` tables."""
+def _tsql_numbers(rows: int, series: bool) -> str:
+    """A derived table of the integers 1..rows (bigint) in column `value`: GENERATE_SERIES (SQL Server
+    2022+, compatibility level 160) when `series`, else a portable tally (SQL Server 2019: cross joins
+    of a 10-row VALUES list, numbered with ROW_NUMBER, TOP (rows))."""
+    if rows < 1:
+        raise ValueError("rows must be positive")
+    if series:
+        return f"GENERATE_SERIES(CAST(1 AS bigint), CAST({rows} AS bigint))"
+    levels = 1
+    while 10 ** levels < rows:
+        levels += 1
+    digits = "(VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9))"
+    joins = " CROSS JOIN ".join(f"{digits} AS d{k}(x)" for k in range(levels))
+    return (f"(SELECT TOP (CAST({rows} AS bigint)) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS value "
+            f"FROM {joins}) AS n")
+
+
+def sqlserver_sql(tables: list[Table], batch: int = 20, series: bool = True) -> str:
+    """Schema, tables, rows and grants, in sqlcmd batches (GO) of `batch` tables. The rows come from
+    GENERATE_SERIES (SQL Server 2022+, the default) or, with `series=False`, from a portable tally
+    (SQL Server 2019, which has no GENERATE_SERIES): the same values either way."""
     nf, nl, nd = len(FIRST_NAMES), len(LAST_NAMES), len(MAIL_DOMAINS)
     types = {"email": "nvarchar(128)", "phone": "nvarchar(32)", "iban": "nvarchar(34)",
              "amount": "decimal(12,2)", "quantity": "int"}
@@ -357,7 +379,7 @@ def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
             f"{_choose(f's.g % {len(STATUSES)}', STATUSES)}, CONCAT('order ', s.g, ' batch ', s.g % 97), {sel} "
             f"FROM (SELECT value AS g, CONCAT('{BANK_CODE}', RIGHT(CONCAT('0000', {t.index}), 5), "
             f"RIGHT(CONCAT('0000000000', value), 11), RIGHT(CONCAT('0', value % 97), 2)) AS bban "
-            f"FROM GENERATE_SERIES(CAST(1 AS bigint), CAST({t.rows} AS bigint))) AS s;"
+            f"FROM {_tsql_numbers(t.rows, series)}) AS s;"
         )
         if (i + 1) % batch == 0:
             out.append("GO")
@@ -365,6 +387,7 @@ def sqlserver_sql(tables: list[Table], batch: int = 20) -> str:
         "GO",
         f"GRANT SELECT ON SCHEMA::{MSSQL_SCHEMA} TO databastion;",
         f"GRANT SELECT ON SCHEMA::{MSSQL_SCHEMA} TO load_app;",
+        f"GRANT SELECT ON SCHEMA::{MSSQL_SCHEMA} TO load_orm;",
         # The log flushed now rather than inside a measurement window.
         "CHECKPOINT;",
         f"SELECT CONCAT(COUNT(*), ' tables') FROM sys.tables WHERE schema_id = SCHEMA_ID(N'{MSSQL_SCHEMA}');",
@@ -433,6 +456,75 @@ def tsql_context(statements: int, interval_us: int, session: int) -> str:
             raise ValueError("out of range")
     return f"0x{statements:016x}{interval_us:016x}{session:016x}"
 
+
+
+# ------------------------------------------------------------------------------------ ORM-style
+# ADR-0053 decision 6: the rate of access events whose objects overflow the agent's bound (15 named
+# objects per event) under an ORM-style workload. One cycle of statements, as generated by an ORM:
+# lazy loads (N+1 primary-key selects), eager loading (LEFT JOINs over 2 to 6 related tables),
+# deep `select_related` chains (8, 12 and 15 tables: at the bound, not past it), a pagination count
+# over a join, and reporting queries over 16, 20 (UNION ALL) and 24 tables (past the bound). Every
+# statement is bounded by primary-key predicates. Fake data only (the scaled seed).
+ORM_SHAPES: tuple[tuple[str, int], ...] = (
+    ("lazy", 1), ("lazy", 1), ("lazy", 1), ("lazy", 1), ("lazy", 1), ("lazy", 1),
+    ("eager", 2), ("eager", 3), ("eager", 4), ("eager", 5), ("eager", 6),
+    ("chain", 8), ("chain", 12), ("chain", 15),
+    ("count", 3),
+    ("report", 16), ("union", 20), ("report", 24),
+)
+# The agent core keeps 15 named objects per event (MaskedEvent, MAX_EVENT_OBJECTS - 1).
+ORM_EVENT_BOUND = 15
+ORM_DIALECTS = ("pg", "mariadb", "tsql")
+
+
+def orm_table_name(t: Table, dialect: str) -> str:
+    if dialect == "pg":
+        return t.pg_name
+    if dialect == "mariadb":
+        return f"{MARIADB_DATABASE}.{t.mariadb_name}"
+    if dialect == "tsql":
+        return mssql_name(t)
+    raise ValueError(f"dialect must be one of {', '.join(ORM_DIALECTS)}")
+
+
+def orm_statements(tables: list[Table], dialect: str) -> list[tuple[str, int]]:
+    """One cycle of ORM-style statements: (text, number of distinct tables it reads). The tables of
+    a statement are consecutive in the plan from a per-statement offset, so cycles read different
+    sets; every statement's distinct tables are distinct names."""
+    if len(tables) < max(n for _, n in ORM_SHAPES):
+        raise ValueError(f"the ORM workload needs at least {max(n for _, n in ORM_SHAPES)} tables")
+    out: list[tuple[str, int]] = []
+    for k, (shape, n) in enumerate(ORM_SHAPES):
+        start = (k * 7) % len(tables)
+        picked = [tables[(start + j) % len(tables)] for j in range(n)]
+        names = [orm_table_name(t, dialect) for t in picked]
+        key = 1 + (k * 37) % min(t.rows for t in picked)
+        joins = " ".join(f"LEFT JOIN {name} a{j} ON a{j}.id = a0.id" for j, name in enumerate(names) if j)
+        if shape == "lazy":
+            text = f"SELECT a0.id, a0.created_at, a0.status, a0.note FROM {names[0]} a0 WHERE a0.id = {key}"
+        elif shape in ("eager", "chain"):
+            cols = ", ".join(f"a{j}.status AS s{j}, a{j}.note AS n{j}" for j in range(n))
+            text = f"SELECT a0.id, {cols} FROM {names[0]} a0 {joins} WHERE a0.id = {key}"
+        elif shape == "count":
+            inner = " ".join(f"JOIN {name} a{j} ON a{j}.id = a0.id" for j, name in enumerate(names) if j)
+            text = (f"SELECT count(*) AS total FROM (SELECT a0.id FROM {names[0]} a0 {inner} "
+                    f"WHERE a0.id <= 100) sub")
+        elif shape == "report":
+            inner = " ".join(f"JOIN {name} a{j} ON a{j}.id = a0.id" for j, name in enumerate(names) if j)
+            text = (f"SELECT a0.status, count(*) AS n, max(a{n - 1}.created_at) AS last_at FROM {names[0]} a0 "
+                    f"{inner} WHERE a0.id <= 50 GROUP BY a0.status")
+        else:  # union
+            text = " UNION ALL ".join(
+                f"SELECT '{t.tag}' AS src, count(*) AS n FROM {name} WHERE id <= 50"
+                for t, name in zip(picked, names))
+        out.append((text + ";", n))
+    return out
+
+
+def orm_expected(statements: list[tuple[str, int]]) -> dict[str, int]:
+    """Statements per cycle, and those past the agent's bound (expected overflowed events)."""
+    return {"statements": len(statements),
+            "past_bound": sum(1 for _, n in statements if n > ORM_EVENT_BOUND)}
 
 # ------------------------------------------------------------------------------------ Redis / Valkey
 REDIS_LOAD_PREFIX = "load"
@@ -509,10 +601,13 @@ end
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("what", choices=["plan", "pg", "mariadb", "mongo", "pgbench", "sysbench", "sqlserver",
-                                    "tsql", "redis"])
+                                    "tsql", "redis", "orm"])
     p.add_argument("--tables", type=int, default=None)
     p.add_argument("--rows", type=int, required=True)
     p.add_argument("--out", help="output directory (pgbench)")
+    p.add_argument("--dialect", choices=ORM_DIALECTS, help="orm: the SQL dialect")
+    p.add_argument("--no-generate-series", action="store_true",
+                   help="sqlserver: rows from a portable tally instead of GENERATE_SERIES (SQL Server 2019)")
     p.add_argument("--workload-tables", type=int, default=40,
                    help="tables the pgbench / sysbench workload reads (the first ones of the plan)")
     a = p.parse_args(argv)
@@ -540,9 +635,20 @@ def main(argv: list[str] | None = None) -> int:
     elif a.what == "sysbench":
         sys.stdout.write(sysbench_lua(hot))
     elif a.what == "sqlserver":
-        sys.stdout.write(sqlserver_sql(tables))
+        sys.stdout.write(sqlserver_sql(tables, series=not a.no_generate_series))
     elif a.what == "tsql":
         sys.stdout.write(tsql_workload(hot))
+    elif a.what == "orm":
+        if not a.dialect:
+            print("seed.py: --dialect is required for orm", file=sys.stderr)
+            return 2
+        try:
+            stmts = orm_statements(tables, a.dialect)
+        except ValueError as e:
+            print(f"seed.py: {e}", file=sys.stderr)
+            return 2
+        for text, _ in stmts:
+            print(text)
     else:
         if not a.out:
             print("seed.py: --out is required for pgbench", file=sys.stderr)
