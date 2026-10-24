@@ -16,6 +16,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SECS="${1:-10}"
 TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HERE/target}"
+# Under agent/: cargo reads agent/.cargo/config.toml from the current directory, which sets the
+# production LIBSQLITE3_FLAGS of the bundled SQLite (ADR-0059 decision 1; the sqlite_* targets'
+# self-check fails without them).
+cd "$HERE"
 # --target keeps these flags off the build scripts (as cargo-fuzz does).
 RUSTFLAGS="-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 \
 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table \
@@ -42,6 +46,11 @@ seed() {
     cas_audit_log)
       grep -E '"action":"OAUTH2_ACCESS_TOKEN_(REQUEST|RESPONSE)_CREATED"' "$AUDIT_FIXTURE" >"$2/token-records.jsonl"
       split -l 2 "$2/token-records.jsonl" "$2/token-pair-" ;;
+    # A small SQLite file (rollback mode), as one length-prefixed part (ADR-0059).
+    sqlite_file)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -I "$HERE/sqlite_seed.py" "$2/seed" || true
+      fi ;;
   esac
 }
 for src in "$HERE"/fuzz_targets/*.rs; do

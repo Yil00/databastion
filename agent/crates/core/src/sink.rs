@@ -90,6 +90,17 @@ impl FindingSink {
     }
 
     /// The coverage cell, readable after the sink itself is dropped.
+    /// Test support: the coverage counters added so far.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn coverage_for_tests(&self) -> Option<ScanCoverage> {
+        *self
+            .coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn coverage_cell(&self) -> CoverageCell {
         Arc::clone(&self.coverage)
     }

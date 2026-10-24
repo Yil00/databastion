@@ -5396,7 +5396,24 @@ async fn long_poll_intervals_never_crash_the_audit_worker() {
 /// Spools findings of `engine` through the core's conversion, as a scan
 /// of a target of that engine would.
 fn spool_engine_findings(rt: &Runtime, engine: databastion_protocol::Engine, n: usize) {
-    let found = crate::spool::tests::masked(n, "email");
+    let mut found = crate::spool::tests::masked(n, "email");
+    if engine == databastion_protocol::Engine::Sqlite {
+        // A `sqlite` location is `main` with no schema (ADR-0059 decision
+        // 6), or the core drops it.
+        use databastion_classifiers::masking::FindingLocation;
+        use databastion_classifiers::names::normalize_path;
+        found = found
+            .into_iter()
+            .map(|f| {
+                f.with_location(FindingLocation {
+                    database: normalize_path("main"),
+                    schema: None,
+                    object: normalize_path("clients"),
+                    field: normalize_path("email"),
+                })
+            })
+            .collect();
+    }
     rt.spool_findings(
         Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
         &TargetId::try_from("t-1").unwrap(),

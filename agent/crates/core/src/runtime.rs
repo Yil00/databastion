@@ -107,6 +107,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Cas => ProtoConnector::Cas,
         Engine::Redis => ProtoConnector::Redis,
         Engine::Sqlserver => ProtoConnector::Sqlserver,
+        Engine::Sqlite => ProtoConnector::Sqlite,
     }
 }
 
@@ -1221,7 +1222,7 @@ impl Runtime {
                 .unwrap_or_else(crate::name_case::NameCaseReport::unknown);
             crate::name_case::to_protocol(&report)
         });
-        let status = TargetStatus {
+        let mut status = TargetStatus {
             audit_level: proto_audit_level(level),
             audit_source,
             edition: None,
@@ -1236,6 +1237,9 @@ impl Runtime {
                 .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
             target_id,
         };
+        // ADR-0059 decision 7 (P10-C review R1): a `sqlite` target status is
+        // rewritten to the contract rule, whatever its connector reported.
+        crate::sanitize::enforce_sqlite_target_status(&mut status);
         (status, outcome)
     }
 
@@ -1331,6 +1335,12 @@ impl Runtime {
         }
         // Audit log cursors discarded at open: the file was truncated or
         // rewritten while the agent was stopped (end-of-phase-7 review L1).
+        // SQLite reader processes that died or were killed (ADR-0059
+        // decision 4).
+        if let Ok(key) = MetricsMapKey::try_from("sqlite_reader_failures_total") {
+            #[allow(clippy::cast_precision_loss, reason = "metric counters")]
+            map.insert(key, crate::connector::sqlite_reader_failures() as f64);
+        }
         if let Ok(key) = MetricsMapKey::try_from("audit_cursor_reset_total") {
             #[allow(clippy::cast_precision_loss, reason = "metric counters")]
             map.insert(key, crate::audit::cursor_resets() as f64);
@@ -1413,6 +1423,11 @@ impl Runtime {
             ts: now(),
             uptime_s: crate::sanitize::clamped_count(self.started.elapsed().as_secs()),
         };
+        // ADR-0059 decision 7 (P10-C review R1): the last step before the
+        // heartbeat leaves, on every target status.
+        for t in &mut heartbeat.targets {
+            crate::sanitize::enforce_sqlite_target_status(t);
+        }
         // Engines added after protocol 0.1.0 are reported only once the
         // console lists their token (ADR-0039 decision 8): an older console
         // rejects the whole heartbeat for an unknown `Engine` value.
@@ -3545,7 +3560,7 @@ fn poll_gap(elapsed: Duration, got_jobs: bool, fast_empty: &mut u32, fraction: f
     gap
 }
 
-fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
+pub(crate) fn proto_audit_level(level: AuditLevel) -> databastion_protocol::AuditLevel {
     match level {
         AuditLevel::None => databastion_protocol::AuditLevel::None,
         AuditLevel::Limited => databastion_protocol::AuditLevel::Limited,
@@ -3565,6 +3580,7 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Redis => databastion_protocol::Engine::Redis,
         TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
         TargetEngine::Sqlserver => databastion_protocol::Engine::Sqlserver,
+        TargetEngine::Sqlite => databastion_protocol::Engine::Sqlite,
     }
 }
 

@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis", "sqlserver"]
+default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis", "sqlserver", "sqlite"]
 postgres = ["dep:databastion-connector-postgres"]
 mysql = ["dep:databastion-connector-mysql"]
 mongodb = ["dep:databastion-connector-mongodb"]
@@ -17,6 +17,9 @@ openldap = ["dep:databastion-connector-openldap"]
 cas = ["dep:databastion-connector-cas"]
 redis = ["dep:databastion-connector-redis"]
 sqlserver = ["dep:databastion-connector-sqlserver"]
+# ADR-0059: the bundled SQLite C library, run only in the sandboxed reader
+# process (`databastion-agent sqlite-reader`).
+sqlite = ["dep:databastion-connector-sqlite"]
 
 [dependencies]
 databastion-core.workspace = true
@@ -27,6 +30,7 @@ databastion-connector-openldap = { workspace = true, optional = true }
 databastion-connector-cas = { workspace = true, optional = true }
 databastion-connector-redis = { workspace = true, optional = true }
 databastion-connector-sqlserver = { workspace = true, optional = true }
+databastion-connector-sqlite = { workspace = true, optional = true }
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing.workspace = true
@@ -43,6 +47,18 @@ databastion-core = { workspace = true, features = ["test-support"] }
 databastion-connector-cas = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 wiremock = "0.6"
+# tests/sqlite_reader.rs: the SQLite connector with its real reader process
+# (this crate's binary in reader mode), on files the test created
+# (`test-support` switches, never in the binary).
+databastion-connector-sqlite = { workspace = true, features = ["test-support"] }
+databastion-classifiers.workspace = true
+zeroize.workspace = true
+# tests/sqlite_reader.rs (review L9): what the connector produced, through the
+# core's conversion, checked against the generated types and the contract's
+# `sqlite` branches read from openapi.yaml (dev-dependencies only: the binary
+# never links the protocol types outside the core).
+databastion-protocol.workspace = true
+databastion-protocol-codegen.workspace = true
 
 [lints]
 workspace = true

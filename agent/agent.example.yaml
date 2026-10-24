@@ -272,6 +272,27 @@ targets:
   #     # auto naming both: the server audit when usable, else the session.
   #     # audit: {source: auto, audit_name: databastion_audit, xe_session: databastion_xe}
 
+  # SQLite (ADR-0059; in development, not released yet: results reach a
+  # console that lists engine.sqlite only). Discovery only (Audit none). One
+  # declared database file per target: no directory, no glob, no search. The
+  # path is never sent nor logged (refusals name the target and the rule).
+  # Requirements: Linux with Landlock enabled (the file is read by a sandboxed
+  # reader process); the file and its directory owned by the application,
+  # readable by the agent through a group, never writable by it (e.g. file
+  # 0640 and directory 2750, group databastion); no symlink in the path; and
+  # the file system mounted read-only for the agent (ProtectSystem=strict
+  # under the systemd unit, BindReadOnlyPaths= for /home, `:ro` in a
+  # container). A WAL database is read while its application holds it open.
+  # - id: crm-app
+  #   engine: sqlite
+  #   sqlite:
+  #     path: /srv/crm/data/crm.db
+  #     # Statement deadline, 50..=5000 ms (default 500): a local limit.
+  #     # max_statement_ms: 500
+  #     # Rollback-journal mode files: skip (default; every read delays the
+  #     # application's commits) or read.
+  #     # rollback_mode: skip
+
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
 # it is rejected.

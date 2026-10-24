@@ -10,6 +10,13 @@
 //!   local HMAC key;
 //! - `run --config <agent.yaml>`: heartbeat and jobs loops until SIGTERM /
 //!   SIGINT.
+//!
+//! Hidden mode (ADR-0059 decision 4): `sqlite-reader`, the SQLite reader
+//! process the agent starts itself with a fresh `execve` of this binary,
+//! its environment cleared and no other argument. It is handled first in
+//! `main`, before the runtime, the logger, any configuration, state or
+//! identity file: the reader holds no secret, and talks only over the IPC
+//! channel it gets as its standard input.
 
 #![forbid(unsafe_code)]
 
@@ -79,6 +86,8 @@ fn compiled_connectors() -> Vec<Box<dyn Connector>> {
         Box::new(databastion_connector_redis::RedisConnector::new()),
         #[cfg(feature = "sqlserver")]
         Box::new(databastion_connector_sqlserver::SqlserverConnector::new()),
+        #[cfg(feature = "sqlite")]
+        Box::new(databastion_connector_sqlite::SqliteConnector::new()),
     ]
 }
 
@@ -163,8 +172,32 @@ async fn enroll(config: PathBuf, token_file: PathBuf, options: EnrollOptions) ->
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Whether the process was started as the SQLite reader: exactly the mode
+/// as the only argument (ADR-0059 decision 4).
+#[cfg(feature = "sqlite")]
+fn is_sqlite_reader(args: &[std::ffi::OsString]) -> bool {
+    args.len() == 2
+        && args
+            .get(1)
+            .is_some_and(|a| a == databastion_connector_sqlite::READER_MODE)
+}
+
+fn main() -> ExitCode {
+    #[cfg(feature = "sqlite")]
+    if is_sqlite_reader(&std::env::args_os().collect::<Vec<_>>()) {
+        let status = databastion_connector_sqlite::reader_main();
+        return ExitCode::from(u8::try_from(status).unwrap_or(1));
+    }
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(agent_main()),
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+async fn agent_main() -> ExitCode {
     let cli = Cli::parse();
 
     if init_logging().is_err() {
@@ -290,5 +323,26 @@ mod tests {
             engines.contains(&Engine::Sqlserver),
             cfg!(feature = "sqlserver")
         );
+        assert_eq!(engines.contains(&Engine::Sqlite), cfg!(feature = "sqlite"));
+    }
+
+    /// The reader mode is the mode alone: never with another argument,
+    /// and not a clap subcommand (hidden from `--help`).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_reader_mode_is_the_mode_alone() {
+        let args = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(is_sqlite_reader(&args(&[
+            "databastion-agent",
+            "sqlite-reader"
+        ])));
+        assert!(!is_sqlite_reader(&args(&[
+            "databastion-agent",
+            "sqlite-reader",
+            "x"
+        ])));
+        assert!(!is_sqlite_reader(&args(&["databastion-agent", "run"])));
+        assert!(!is_sqlite_reader(&args(&["databastion-agent"])));
+        assert!(Cli::try_parse_from(["databastion-agent", "sqlite-reader"]).is_err());
     }
 }

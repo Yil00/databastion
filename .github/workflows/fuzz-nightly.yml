@@ -70,6 +70,13 @@ jobs:
           - { target: sqlserver_xe_records, seconds: 180 }
           - { target: core_csv_splitter, seconds: 180 }
           - { target: classifiers_names, seconds: 300 }
+          # ADR-0059 decision 5: hostile SQLite files (with their -wal, -shm and -journal files)
+          # through the reader's pipeline, the header pre-check and the reader IPC decoders. The
+          # bundled SQLite C code is built with AddressSanitizer and coverage instrumentation
+          # (.github/scripts/fuzz-nightly.sh) and the production LIBSQLITE3_FLAGS.
+          - { target: sqlite_file, seconds: 600 }
+          - { target: sqlite_header, seconds: 120 }
+          - { target: sqlite_ipc, seconds: 180 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

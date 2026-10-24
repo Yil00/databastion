@@ -22,6 +22,7 @@ use crate::engine::Engine;
 
 pub mod cas;
 pub mod redis;
+pub mod sqlite;
 pub mod sqlserver;
 
 /// Hard upper bound on the rows sampled per object (contract `sample_rows`
@@ -269,6 +270,9 @@ pub enum TargetEngine {
     Valkey,
     /// Microsoft SQL Server (ADR-0051).
     Sqlserver,
+    /// SQLite: one declared local database file (`sqlite:` block;
+    /// ADR-0059).
+    Sqlite,
 }
 
 impl TargetEngine {
@@ -283,6 +287,7 @@ impl TargetEngine {
             Self::Cas => Engine::Cas,
             Self::Redis | Self::Valkey => Engine::Redis,
             Self::Sqlserver => Engine::Sqlserver,
+            Self::Sqlite => Engine::Sqlite,
         }
     }
 }
@@ -347,6 +352,15 @@ pub struct TargetConfig {
     /// configuration was loaded ([`AgentConfig::parse`]).
     #[serde(skip)]
     cas_resolved: Option<cas::CasSettings>,
+    /// SQLite settings (`engine: sqlite` only, required there): one
+    /// declared database file (ADR-0059 decision 2).
+    #[serde(default)]
+    pub sqlite: Option<sqlite::RawSqliteSettings>,
+    /// The `sqlite` block validated when the configuration was loaded
+    /// ([`AgentConfig::parse`]), with the refused locations and the other
+    /// `sqlite` targets' files.
+    #[serde(skip)]
+    sqlite_resolved: Option<sqlite::SqliteSettings>,
     /// The agent's `state_dir`, set when the configuration was loaded
     /// ([`AgentConfig::parse`]): where a connector keeps small per-target
     /// marks ([`crate::local_state`]).
@@ -769,7 +783,7 @@ impl TargetConfig {
             TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Redis | TargetEngine::Valkey => self.redis.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Sqlserver => self.sqlserver.as_ref()?.cas_stores.as_ref(),
-            TargetEngine::Cas => None,
+            TargetEngine::Cas | TargetEngine::Sqlite => None,
         }
     }
 
@@ -780,6 +794,43 @@ impl TargetConfig {
     #[must_use]
     pub fn cas_settings(&self) -> Option<&cas::CasSettings> {
         self.cas_resolved.as_ref()
+    }
+
+    /// The validated `sqlite` block of an `engine: sqlite` target (ADR-0059
+    /// decision 2). `None` for other engines (and for a target that did not
+    /// come from [`AgentConfig::parse`]).
+    #[must_use]
+    pub fn sqlite_settings(&self) -> Option<&sqlite::SqliteSettings> {
+        self.sqlite_resolved.as_ref()
+    }
+
+    /// Test support: a `sqlite` target with these settings (the connector's
+    /// own tests).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn sqlite_for_tests(id: &str, settings: sqlite::SqliteSettings) -> Self {
+        Self {
+            id: id.to_owned(),
+            engine: TargetEngine::Sqlite,
+            host: None,
+            port: None,
+            socket: None,
+            account: String::new(),
+            secret: SecretRef::default(),
+            phone_region: None,
+            postgres: None,
+            mysql: None,
+            mongodb: None,
+            openldap: None,
+            redis: None,
+            sqlserver: None,
+            cas: None,
+            cas_resolved: None,
+            sqlite: None,
+            sqlite_resolved: Some(settings),
+            state_dir: None,
+        }
     }
 
     /// Redis / Valkey settings, defaults when absent.
@@ -815,8 +866,9 @@ impl TargetConfig {
     pub fn effective_port(&self) -> Option<u16> {
         self.host.as_ref()?;
         Some(self.port.unwrap_or(match self.engine {
-            // A `cas` target has no host (refused by the validation).
-            TargetEngine::Cas => return None,
+            // A `cas` or `sqlite` target has no host (refused by the
+            // validation).
+            TargetEngine::Cas | TargetEngine::Sqlite => return None,
             TargetEngine::Postgres => 5432,
             TargetEngine::Mysql | TargetEngine::Mariadb => 3306,
             TargetEngine::Mongodb => 27017,
@@ -1047,6 +1099,12 @@ const KNOWN_KEYS: &[&str] = &[
     "sqlserver_audit",
     "sqlserver_xevents",
     "replicas",
+    "sqlite",
+    "path",
+    "max_statement_ms",
+    "rollback_mode",
+    "skip",
+    "read",
     "spool",
     "max_batches",
     "max_bytes",
@@ -1130,7 +1188,7 @@ impl AgentConfig {
             path: path.to_owned(),
             kind: e.kind(),
         })?;
-        Self::parse(&text)
+        Self::parse_at(&text, Some(path))
     }
 
     /// Parses and validates a YAML document.
@@ -1138,6 +1196,12 @@ impl AgentConfig {
     /// # Errors
     /// [`ConfigError`] without any configuration value.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        Self::parse_at(text, None)
+    }
+
+    /// [`Self::parse`] for the file at `path` (its directory is a refused
+    /// location for `sqlite` targets, ADR-0059 decision 2).
+    fn parse_at(text: &str, path: Option<&Path>) -> Result<Self, ConfigError> {
         let config: Self = serde_yaml_ng::from_str(text).map_err(|e| {
             let (line, column) = e.location().map_or((0, 0), |l| (l.line(), l.column()));
             ConfigError::Parse {
@@ -1149,6 +1213,7 @@ impl AgentConfig {
         config.validate()?;
         let mut config = config;
         config.resolve_cas()?;
+        config.resolve_sqlite(path)?;
         for target in &mut config.targets {
             target.state_dir = Some(config.state_dir.clone());
         }
@@ -1174,6 +1239,99 @@ impl AgentConfig {
                         }
                     })?;
                 target.cas_resolved = Some(settings);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every location a `sqlite` target may not be under (ADR-0059 decision
+    /// 2): the agent's state directory, the directory of `agent.yaml`,
+    /// `/etc/databastion`, every file the configuration references (secret
+    /// files, CA files, client keys and certificates, audit logs, CAS
+    /// registries) and the directory holding it, and the system roots.
+    fn sqlite_refused_locations(&self, config_path: Option<&Path>) -> Vec<PathBuf> {
+        let mut refused: Vec<PathBuf> = sqlite::SYSTEM_ROOTS.iter().map(PathBuf::from).collect();
+        refused.push(self.state_dir.clone());
+        let mut files: Vec<PathBuf> = Vec::new();
+        if let Some(p) = config_path {
+            files.push(p.to_owned());
+        }
+        files.extend(self.console.ca_file.clone());
+        for t in &self.targets {
+            files.extend(t.secret.file.clone());
+            files.extend(t.socket.clone());
+            if let Some(pg) = &t.postgres {
+                files.extend(pg.ca_file.clone());
+                files.extend(pg.audit_log.as_ref().map(|l| l.path.clone()));
+            }
+            if let Some(my) = &t.mysql {
+                files.extend(my.ca_file.clone());
+                files.extend(my.audit_log.as_ref().map(|l| l.path.clone()));
+            }
+            if let Some(mo) = &t.mongodb {
+                files.extend(mo.ca_file.clone());
+                files.extend(mo.audit_log.as_ref().map(|l| l.path.clone()));
+            }
+            if let Some(ld) = &t.openldap {
+                files.extend(ld.ca_file.clone());
+            }
+            if let Some(r) = &t.redis {
+                files.extend(r.ca_file.clone());
+                files.extend(r.client_cert.clone());
+                files.extend(r.client_key.clone());
+            }
+            if let Some(ss) = &t.sqlserver {
+                files.extend(ss.ca_file.clone());
+            }
+            if let Some(cas) = &t.cas {
+                files.extend(cas.referenced_paths());
+            }
+        }
+        for f in files.into_iter().filter(|f| f.is_absolute()) {
+            if let Some(dir) = f.parent().filter(|d| *d != Path::new("/")) {
+                refused.push(dir.to_owned());
+            }
+            refused.push(f);
+        }
+        refused.sort();
+        refused.dedup();
+        refused
+    }
+
+    /// Validates the `sqlite:` blocks (ADR-0059 decision 2): the path rules,
+    /// the refused locations and duplicates (the same declared path, or the
+    /// same `(st_dev, st_ino)` for files that exist; a duplicate refuses
+    /// both). Errors name the target index and the rule, never the path.
+    fn resolve_sqlite(&mut self, config_path: Option<&Path>) -> Result<(), ConfigError> {
+        use std::os::unix::fs::MetadataExt;
+        let refused = self.sqlite_refused_locations(config_path);
+        let paths: Vec<(usize, PathBuf)> = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.sqlite.as_ref().map(|s| (i, s.path.clone())))
+            .collect();
+        let inode = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        for (i, path) in &paths {
+            let others: Vec<PathBuf> = paths
+                .iter()
+                .filter(|(j, _)| j != i)
+                .map(|(_, p)| p.clone())
+                .collect();
+            let mine = inode(path);
+            if mine.is_some() && others.iter().any(|o| inode(o) == mine) {
+                return Err(invalid(
+                    format!("targets[{i}].sqlite.path"),
+                    "duplicate_file: the same file as another target's",
+                ));
+            }
+            let Some(raw) = self.targets.get(*i).and_then(|t| t.sqlite.clone()) else {
+                continue;
+            };
+            let settings = sqlite::SqliteSettings::validate(raw, refused.clone(), others)
+                .map_err(|(key, reason)| invalid(format!("targets[{i}].sqlite.{key}"), reason))?;
+            if let Some(t) = self.targets.get_mut(*i) {
+                t.sqlite_resolved = Some(settings);
             }
         }
         Ok(())
@@ -1334,6 +1492,12 @@ impl TargetConfig {
         if self.engine == TargetEngine::Cas {
             return self.validate_cas(i);
         }
+        if self.sqlite.is_some() && self.engine != TargetEngine::Sqlite {
+            return Err(invalid(f("sqlite"), "only for engine sqlite"));
+        }
+        if self.engine == TargetEngine::Sqlite {
+            return self.validate_sqlite(i);
+        }
         if self.redis.is_some()
             && !matches!(self.engine, TargetEngine::Redis | TargetEngine::Valkey)
         {
@@ -1486,6 +1650,8 @@ impl TargetConfig {
             ("mongodb", self.mongodb.is_some()),
             ("openldap", self.openldap.is_some()),
             ("redis", self.redis.is_some()),
+            ("sqlserver", self.sqlserver.is_some()),
+            ("sqlite", self.sqlite.is_some()),
         ];
         if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
             return Err(invalid(
@@ -1495,6 +1661,38 @@ impl TargetConfig {
         }
         if self.cas.is_none() {
             return Err(invalid(f("cas"), "required for engine cas"));
+        }
+        Ok(())
+    }
+
+    /// A `sqlite` target is one declared local file (ADR-0059 decision 2,
+    /// I3, I5): no host, port, socket, account, secret, phone-region-free
+    /// engine block of another engine. The `sqlite` block itself is
+    /// validated by [`AgentConfig::resolve_sqlite`].
+    fn validate_sqlite(&self, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].{name}");
+        let refused = [
+            ("host", self.host.is_some()),
+            ("port", self.port.is_some()),
+            ("socket", self.socket.is_some()),
+            ("account", !self.account.is_empty()),
+            ("secret", self.secret != SecretRef::default()),
+            ("postgres", self.postgres.is_some()),
+            ("mysql", self.mysql.is_some()),
+            ("mongodb", self.mongodb.is_some()),
+            ("openldap", self.openldap.is_some()),
+            ("redis", self.redis.is_some()),
+            ("sqlserver", self.sqlserver.is_some()),
+            ("cas", self.cas.is_some()),
+        ];
+        if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
+            return Err(invalid(
+                f(name),
+                "not used by a sqlite target, which reads one declared local file (remove it)",
+            ));
+        }
+        if self.sqlite.is_none() {
+            return Err(invalid(f("sqlite"), "required for engine sqlite"));
         }
         Ok(())
     }
@@ -1767,6 +1965,123 @@ targets:
       clear_principals: [svc-monitoring]
 ";
 
+    const SQLITE: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: crm-app
+    engine: sqlite
+    sqlite:
+      path: /srv/crm/data/crm.db
+  - id: pg-main
+    engine: postgres
+    host: db1.internal
+    account: databastion
+    secret:
+      file: /etc/pg-secrets/pg-main
+";
+
+    /// ADR-0059 decision 2: one declared file, the keys of the ADR only,
+    /// no host, port, socket, account, secret or other engine block, the
+    /// path rules, and errors that name the rule, never the path.
+    #[test]
+    fn sqlite_targets_are_one_declared_file() {
+        let cfg = parse(SQLITE).unwrap();
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Sqlite);
+        assert_eq!(t.engine.connector(), Engine::Sqlite);
+        assert_eq!(t.effective_port(), None);
+        assert!(t.cas_stores().is_none());
+        let s = t.sqlite_settings().unwrap();
+        assert_eq!(s.path(), Path::new("/srv/crm/data/crm.db"));
+        assert_eq!(s.max_statement_ms(), sqlite::DEFAULT_MAX_STATEMENT_MS);
+        assert_eq!(s.rollback_mode(), sqlite::RollbackMode::Skip);
+        // The secret file of another target and its directory are refused
+        // locations, with the state directory and the system roots.
+        for refused in [
+            "/etc/pg-secrets",
+            "/etc/pg-secrets/pg-main",
+            "/var/lib/databastion",
+            "/etc/databastion",
+            "/proc",
+            "/run/user",
+        ] {
+            assert!(
+                s.refused().iter().any(|r| r == Path::new(refused)),
+                "{refused}"
+            );
+        }
+        assert!(cfg.targets[1].sqlite_settings().is_none());
+        let set = parse(&SQLITE.replace(
+            "      path: /srv/crm/data/crm.db\n",
+            "      path: /srv/crm/data/crm.db\n      max_statement_ms: 5000\n      rollback_mode: read\n",
+        ))
+        .unwrap();
+        let s = set.targets[0].sqlite_settings().unwrap();
+        assert_eq!(s.max_statement_ms(), 5000);
+        assert_eq!(s.rollback_mode(), sqlite::RollbackMode::Read);
+        for (extra, key) in [
+            ("    host: crm.example.org\n", "targets[0].host"),
+            ("    port: 8443\n", "targets[0].port"),
+            ("    socket: /run/x.sock\n", "targets[0].socket"),
+            ("    account: databastion\n", "targets[0].account"),
+            (
+                "    secret:\n      env: DATABASTION_X\n",
+                "targets[0].secret",
+            ),
+            ("    postgres: {}\n", "targets[0].postgres"),
+        ] {
+            let text = SQLITE.replace(
+                "    engine: sqlite\n",
+                &format!("    engine: sqlite\n{extra}"),
+            );
+            assert!(err(&text).contains(key), "{extra}: {}", err(&text));
+        }
+        // Only the ADR's keys.
+        let unknown = SQLITE.replace(
+            "      path: /srv/crm/data/crm.db\n",
+            "      path: /srv/crm/data/crm.db\n      immutable: true\n",
+        );
+        assert!(err(&unknown).contains("unknown field"), "{}", err(&unknown));
+        let bare = "console:\n  url: https://c.example\nstate_dir: /s\ntargets:\n  - id: c\n    engine: sqlite\n";
+        assert!(err(bare).contains("targets[0].sqlite"));
+        let misplaced = BASE.replace(
+            "    port: 5432\n",
+            "    port: 5432\n    sqlite: {path: /srv/x.db}\n",
+        );
+        assert!(err(&misplaced).contains("targets[0].sqlite"));
+        // Path rules: the error names the rule, never the path.
+        for (path, rule) in [
+            ("/srv/crm//crm.db", "not_canonical"),
+            ("/srv/crm/../crm.db", "not_canonical"),
+            ("relative/crm.db", "not_canonical"),
+            ("/var/lib/databastion/spool/x.db", "refused_location"),
+            ("/etc/databastion/x.db", "refused_location"),
+            ("/etc/pg-secrets/x.db", "refused_location"),
+            ("/proc/self/root/x.db", "refused_location"),
+        ] {
+            let text = SQLITE.replace("/srv/crm/data/crm.db", path);
+            let e = err(&text);
+            assert!(
+                e.contains("targets[0].sqlite.path") && e.contains(rule),
+                "{path}: {e}"
+            );
+            assert!(!e.contains(path), "{e}");
+        }
+        let range = SQLITE.replace(
+            "      path: /srv/crm/data/crm.db\n",
+            "      path: /srv/crm/data/crm.db\n      max_statement_ms: 10\n",
+        );
+        assert!(err(&range).contains("targets[0].sqlite.max_statement_ms"));
+        // Two targets naming the same file.
+        let dup = SQLITE.replace(
+            "  - id: pg-main\n",
+            "  - id: crm-copy\n    engine: sqlite\n    sqlite:\n      path: /srv/crm/data/crm.db\n  - id: pg-main\n",
+        );
+        assert!(err(&dup).contains("duplicate_file"), "{}", err(&dup));
+    }
+
     #[test]
     fn cas_targets_are_local_paths_only() {
         let cfg = parse(CAS).unwrap();
@@ -1858,6 +2173,40 @@ targets:
         let text = include_str!("../../../agent.example.yaml");
         let cfg = parse(text).unwrap();
         assert!(!cfg.targets.is_empty());
+    }
+
+    /// The commented SQLite target of the example file is valid once
+    /// uncommented, with its optional keys uncommented too.
+    #[test]
+    fn example_sqlite_target_is_valid_uncommented() {
+        let text = include_str!("../../../agent.example.yaml");
+        let start = text.find("  # - id: crm-app\n").unwrap();
+        let end = start + text[start..].find("\n\n").unwrap() + 1;
+        let block: String = text[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("  # ").map(|r| format!("  {r}"))?;
+                let t = l.trim_start();
+                // The optional keys are uncommented too; other comments go.
+                if t.starts_with("# max_statement_ms:") || t.starts_with("# rollback_mode:") {
+                    Some(l.replacen("# ", "", 1))
+                } else if t.starts_with('#') {
+                    None
+                } else {
+                    Some(l)
+                }
+            })
+            .map(|l| l + "\n")
+            .collect();
+        assert!(block.contains("max_statement_ms: 500") && block.contains("rollback_mode: skip"));
+        let base = BASE.split("targets:\n").next().unwrap();
+        let cfg =
+            parse(&format!("{base}targets:\n{block}")).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Sqlite);
+        let s = t.sqlite_settings().unwrap();
+        assert_eq!(s.max_statement_ms(), 500);
+        assert_eq!(s.rollback_mode(), sqlite::RollbackMode::Skip);
     }
 
     /// The commented SQL Server target of the example file is valid once

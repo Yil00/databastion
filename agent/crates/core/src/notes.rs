@@ -343,6 +343,30 @@ pub enum NoteCode {
     PrivilegeRefused,
     /// `privilege.server_roles` (Microsoft SQL Server, ADR-0051).
     PrivilegeServerRoles,
+    /// `coverage.unrecognized_file_format` (SQLite, ADR-0059).
+    CoverageUnrecognizedFileFormat,
+    /// `coverage.wal_files_not_readable` (SQLite, ADR-0059).
+    CoverageWalFilesNotReadable,
+    /// `coverage.hot_journal_pending` (SQLite, ADR-0059).
+    CoverageHotJournalPending,
+    /// `coverage.network_filesystem_refused` (SQLite, ADR-0059).
+    CoverageNetworkFilesystemRefused,
+    /// `coverage.filesystem_not_read_only` (SQLite, ADR-0059).
+    CoverageFilesystemNotReadOnly,
+    /// `coverage.file_path_refused` (SQLite, ADR-0059).
+    CoverageFilePathRefused,
+    /// `coverage.rollback_mode_not_read` (SQLite, ADR-0059).
+    CoverageRollbackModeNotRead,
+    /// `coverage.reader_sandbox_unavailable` (SQLite, ADR-0059).
+    CoverageReaderSandboxUnavailable,
+    /// `coverage.reader_process_failed` (SQLite, ADR-0059).
+    CoverageReaderProcessFailed,
+    /// `coverage.virtual_tables_not_sampled` (SQLite, ADR-0059).
+    CoverageVirtualTablesNotSampled,
+    /// `privilege.database_file_writable` (SQLite, ADR-0059).
+    PrivilegeDatabaseFileWritable,
+    /// `security.file_world_readable` (SQLite, ADR-0059).
+    SecurityFileWorldReadable,
 }
 
 impl NoteCode {
@@ -452,6 +476,18 @@ impl NoteCode {
         Self::PrivilegeDatabaseRoles,
         Self::PrivilegeRefused,
         Self::PrivilegeServerRoles,
+        Self::CoverageUnrecognizedFileFormat,
+        Self::CoverageWalFilesNotReadable,
+        Self::CoverageHotJournalPending,
+        Self::CoverageNetworkFilesystemRefused,
+        Self::CoverageFilesystemNotReadOnly,
+        Self::CoverageFilePathRefused,
+        Self::CoverageRollbackModeNotRead,
+        Self::CoverageReaderSandboxUnavailable,
+        Self::CoverageReaderProcessFailed,
+        Self::CoverageVirtualTablesNotSampled,
+        Self::PrivilegeDatabaseFileWritable,
+        Self::SecurityFileWorldReadable,
     ];
 
     /// The registered code.
@@ -566,6 +602,18 @@ impl NoteCode {
             Self::PrivilegeDatabaseRoles => "privilege.database_roles",
             Self::PrivilegeRefused => "privilege.refused",
             Self::PrivilegeServerRoles => "privilege.server_roles",
+            Self::CoverageUnrecognizedFileFormat => "coverage.unrecognized_file_format",
+            Self::CoverageWalFilesNotReadable => "coverage.wal_files_not_readable",
+            Self::CoverageHotJournalPending => "coverage.hot_journal_pending",
+            Self::CoverageNetworkFilesystemRefused => "coverage.network_filesystem_refused",
+            Self::CoverageFilesystemNotReadOnly => "coverage.filesystem_not_read_only",
+            Self::CoverageFilePathRefused => "coverage.file_path_refused",
+            Self::CoverageRollbackModeNotRead => "coverage.rollback_mode_not_read",
+            Self::CoverageReaderSandboxUnavailable => "coverage.reader_sandbox_unavailable",
+            Self::CoverageReaderProcessFailed => "coverage.reader_process_failed",
+            Self::CoverageVirtualTablesNotSampled => "coverage.virtual_tables_not_sampled",
+            Self::PrivilegeDatabaseFileWritable => "privilege.database_file_writable",
+            Self::SecurityFileWorldReadable => "security.file_world_readable",
         }
     }
 

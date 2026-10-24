@@ -675,6 +675,18 @@ impl ResultBatch {
     /// deduplication). `None` if invalid or empty.
     pub(crate) fn parse(findings: bool, bytes: Vec<u8>) -> Option<Self> {
         let parsed = Self::decode(findings, &bytes)?;
+        // ADR-0059 decision 6 (P10-C review R1): a spooled findings batch
+        // with a `sqlite` location that breaks the contract rule (written by
+        // another build, or altered on disk) is never sent: `None`, so the
+        // spool counts and quarantines it as corrupt.
+        if let Parsed::Findings(b) = &parsed
+            && !b
+                .findings
+                .iter()
+                .all(|f| sanitize::sqlite_location_ok(&f.location))
+        {
+            return None;
+        }
         let signature = parsed.signature();
         let gates = parsed.gates();
         let fields = parsed.fields();

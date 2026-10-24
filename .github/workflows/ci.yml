@@ -683,6 +683,58 @@ jobs:
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
 
+  # SQLite connector tests (P10-A, ADR-0059): no service container. The connector's own tests
+  # (unit, property and in-process integration tests on files they create) run as the runner's
+  # user; the reader-process tests (agent/crates/agent/tests/sqlite_reader.rs: the agent binary in
+  # its sandboxed `sqlite-reader` mode, Landlock and seccomp, the strict file policy on a
+  # read-only bind mount, the writer in another process, a truncated -shm killing the reader and
+  # never the agent) run as root, which they need to play the application's account, the agent's
+  # account and the read-only mount; DATABASTION_IT_SQLITE_REQUIRE=1 makes them fail instead of
+  # skipping (no root, no Landlock). Required through ci-result.
+  agent-sqlite:
+    name: Agent SQLite
+    needs: detect
+    if: needs.detect.outputs.agent == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Kernel and Landlock
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || true
+          echo
+      - name: Connector tests (unit, property, in-process integration, the sandbox's refusals)
+        env:
+          # tests/sandbox.rs applies the reader's sandbox in a child process: it must run.
+          DATABASTION_IT_SQLITE_REQUIRE: "1"
+        run: |
+          set -o pipefail
+          timeout 1200 "$GITHUB_WORKSPACE/scripts/ci/cargo-test-annotate.sh" cargo test -p databastion-connector-sqlite --all-features --locked 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Reader-process tests (as root, read-only bind mounts)
+        run: |
+          set -o pipefail
+          exe="$(timeout 1200 cargo test -p databastion-agent --test sqlite_reader --all-features --locked --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sqlite_reader" and .executable != null) | .executable')"
+          test -x "$exe"
+          sudo env DATABASTION_IT_SQLITE_REQUIRE=1 timeout 600 "$exe" --test-threads 1 2>&1 | tee -a "$RUNNER_TEMP/it.log"
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error" "$RUNNER_TEMP/it.log" | head -n 60 || true
+
   # SQL Server connector integration tests (P9-A, P9-D, ADR-0051) against the opt-in dev profile
   # `sqlserver`: SQL Server 2022 Express (MSSQL_PID=Express, set by docker-compose.yml: the
   # maintainer's choice until the Developer license terms are confirmed for CI, ADR-0051 open
@@ -1092,7 +1144,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

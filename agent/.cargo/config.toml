@@ -1,0 +1,13 @@
+# ADR-0059 decision 1: the compile options of the bundled SQLite C library
+# (`libsqlite3-sys`, through `rusqlite`, in `connector-sqlite` only).
+# `force = true`: an inherited `LIBSQLITE3_FLAGS` cannot override them. The
+# reader's start-up self-check (`connector-sqlite`, `db::self_check`) fails
+# closed when a build did not get them (a `cargo` run outside `agent/`).
+#
+# Extension loading compiled out; connections defensive and schemas
+# untrusted by default; no memory-mapped I/O; no single allocation above
+# 32 MiB; a 2 MiB page cache and temporary storage in memory only, both at
+# compile time (no schema-reading pragma before the descriptor binding of
+# decision 2); and no optional module the reader never uses.
+[env]
+LIBSQLITE3_FLAGS = { value = "-DSQLITE_OMIT_LOAD_EXTENSION -USQLITE_ENABLE_LOAD_EXTENSION -DSQLITE_DEFAULT_DEFENSIVE -DSQLITE_TRUSTED_SCHEMA=0 -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_MAX_ALLOCATION_SIZE=33554432 -DSQLITE_DEFAULT_CACHE_SIZE=-2048 -DSQLITE_TEMP_STORE=3 -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_SOUNDEX", force = true }

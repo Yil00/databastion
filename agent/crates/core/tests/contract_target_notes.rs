@@ -30,6 +30,7 @@ const NOTE_ENGINES: &[&str] = &[
     "redis",
     "valkey",
     "sqlserver",
+    "sqlite",
 ];
 
 /// Registered engines and description of each code.

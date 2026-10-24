@@ -1,0 +1,68 @@
+[package]
+name = "databastion-connector-sqlite"
+description = "DataBastion agent: SQLite connector (declared local files, sandboxed reader process)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rules (ADR-0059 decisions 1 and 4, crates/agent/tests/architecture.rs):
+# a connector depends on `databastion-core` and `databastion-classifiers` only for
+# its results; this one opens no network connection of any kind (no network client,
+# no TLS crate, no tokio `net` feature). The bundled SQLite C library is a reviewed
+# exception to "no C client library" (ADR-0039 decision 4), scoped to this crate by
+# agent/deny.toml, and runs only in the sandboxed reader process.
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+# `process`: the reader process (a fresh execve of the agent's own binary,
+# ADR-0059 decision 4); `rt`: its IPC on a blocking thread.
+tokio = { workspace = true, features = ["rt", "time", "sync", "process"] }
+tracing.workspace = true
+zeroize.workspace = true
+# ADR-0059 decision 1: exactly these features (agent/deny.toml allow-lists them;
+# architecture test `sqlite_features_are_the_reviewed_ones`). No load_extension,
+# vtab, functions, trace, backup, blob, serialize, session or integrations.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }
+# The reader sandbox (ADR-0059 decision 4), scoped to this crate by agent/deny.toml.
+landlock = { version = "0.4.7", default-features = false }
+seccompiler = { version = "0.5.0", default-features = false }
+# System call numbers and flag values for the seccomp filter (constants only).
+libc = { version = "0.2", default-features = false }
+# open / fstat / fstatfs / fstatvfs / pread / faccessat / prctl / setrlimit
+# without `unsafe`, as the core's state files and the CAS connector.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "thread", "stdio"] }
+# Only `nix::unistd::close(RawFd)`, in the reader's first step: the
+# descriptors it inherited are closed, since `rustix` exposes no safe
+# `close` / `close_range` (CI on PR #356: cargo's jobserver pipes). Kept on
+# 0.29, the last series where `close` takes a descriptor number; sound there
+# because the reader has opened nothing yet (sandbox::early). Scoped to this
+# crate by agent/deny.toml.
+nix = { version = "0.29", default-features = false }
+
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+# Test helpers for other crates' tests (enabled from their
+# `[dev-dependencies]` only, never by the agent binary): the reader executable
+# of the tests.
+test-support = ["databastion-core/test-support"]
+
+[dev-dependencies]
+databastion-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "process"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
+
+# Review L2: the reader's sandbox applied in a child process (re-exec), and
+# the calls it must refuse. Its own harness: the sandbox is per process.
+[[test]]
+name = "sandbox"
+harness = false
