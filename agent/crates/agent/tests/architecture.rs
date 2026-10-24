@@ -780,7 +780,7 @@ fn only_connector_sqlite_uses_rusqlite() {
         v.dedup();
         v
     };
-    for dep in ["rusqlite", "landlock", "seccompiler"] {
+    for dep in ["rusqlite", "landlock", "seccompiler", "nix"] {
         let d = dependents(dep);
         assert!(
             d.is_empty() || d == ["databastion-connector-sqlite"],

@@ -36,6 +36,13 @@ libc = { version = "0.2", default-features = false }
 # open / fstat / fstatfs / fstatvfs / pread / faccessat / prctl / setrlimit
 # without `unsafe`, as the core's state files and the CAS connector.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "thread", "stdio"] }
+# Only `nix::unistd::close(RawFd)`, in the reader's first step: the
+# descriptors it inherited are closed, since `rustix` exposes no safe
+# `close` / `close_range` (CI on PR #356: cargo's jobserver pipes). Kept on
+# 0.29, the last series where `close` takes a descriptor number; sound there
+# because the reader has opened nothing yet (sandbox::early). Scoped to this
+# crate by agent/deny.toml.
+nix = { version = "0.29", default-features = false }
 
 [features]
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,

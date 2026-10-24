@@ -64,6 +64,7 @@ deny = [
     # ADR-0059 decision 4: the reader sandbox.
     { crate = "landlock", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
     { crate = "seccompiler", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
+    { crate = "nix", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: the reader closes its inherited descriptors" },
     # TLS: rustls only (AGENTS.md).
     { name = "openssl", reason = "rustls only" },
     { name = "openssl-sys", reason = "rustls only" },

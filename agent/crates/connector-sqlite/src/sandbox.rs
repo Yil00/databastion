@@ -4,7 +4,8 @@
 //! 1. [`early`], first thing in reader mode: `PR_SET_NO_NEW_PRIVS`,
 //!    `PR_SET_DUMPABLE` = 0, the resource limits `RLIMIT_AS` (512 MiB),
 //!    `RLIMIT_CPU` (60 s), `RLIMIT_NOFILE` (16), `RLIMIT_FSIZE` (0),
-//!    `RLIMIT_CORE` (0), and no descriptor but 0, 1 and 2.
+//!    `RLIMIT_CORE` (0), and every inherited descriptor but 0, 1 and 2
+//!    closed, then checked gone.
 //! 2. [`restrict`], once the open request is read and the path checked by
 //!    `files::check_ancestors` (decision 2, path based):
 //!    - the declared file's directory, the file and its side files present
@@ -30,7 +31,8 @@
 //!    Without Landlock, or when the ruleset is not enforced, the reader
 //!    refuses to open anything ([`Code::SandboxUnavailable`]).
 //!
-//! The `unsafe` code is inside `rustix`, `landlock` and `seccompiler`.
+//! The `unsafe` code is inside `rustix`, `landlock`, `seccompiler` and
+//! `nix` (`close` only).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -74,27 +76,56 @@ fn limit(resource: Resource, value: u64) -> Result<(), Failure> {
     .map_err(unavailable)
 }
 
+/// One step of [`early`].
+pub type Step = fn() -> Result<(), Failure>;
+
+/// The steps of [`early`], in order, each with its name (the sandbox test
+/// prints the step that failed).
+pub const EARLY_STEPS: [(&str, Step); 4] = [
+    ("no_new_privs", || {
+        rustix::thread::set_no_new_privs(true).map_err(unavailable)
+    }),
+    ("not_dumpable", || {
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(unavailable)
+    }),
+    ("limits", || {
+        limit(Resource::Core, 0)?;
+        limit(Resource::Fsize, 0)?;
+        limit(Resource::Nofile, OPEN_FILES)?;
+        limit(Resource::Cpu, CPU_SECONDS)?;
+        limit(Resource::As, ADDRESS_SPACE)
+    }),
+    ("inherited_descriptors", close_inherited_descriptors),
+];
+
 /// Step 3 of the reader (decision 4): no new privileges, not dumpable, the
-/// resource limits, and only descriptors 0, 1 and 2 inherited.
+/// resource limits, and every inherited descriptor but 0, 1 and 2 closed.
+///
+/// Must run first in the reader process, before anything opens a
+/// descriptor (the reader's `main`, before the open request).
+///
+/// # Errors
+/// The name of the step that failed and [`Code::SandboxUnavailable`].
+pub fn early_step() -> Result<(), (&'static str, Failure)> {
+    for (name, step) in EARLY_STEPS {
+        step().map_err(|f| (name, f))?;
+    }
+    Ok(())
+}
+
+/// [`early_step`] without the step name.
 ///
 /// # Errors
 /// [`Code::SandboxUnavailable`].
 pub fn early() -> Result<(), Failure> {
-    rustix::thread::set_no_new_privs(true).map_err(unavailable)?;
-    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-        .map_err(unavailable)?;
-    limit(Resource::Core, 0)?;
-    limit(Resource::Fsize, 0)?;
-    limit(Resource::Nofile, OPEN_FILES)?;
-    limit(Resource::Cpu, CPU_SECONDS)?;
-    limit(Resource::As, ADDRESS_SPACE)?;
-    only_standard_descriptors()
+    early_step().map_err(|(_, f)| f)
 }
 
-/// Defence in depth: the reader inherits nothing but its IPC channel and
-/// `/dev/null` (everything the agent opens is `O_CLOEXEC`).
-fn only_standard_descriptors() -> Result<(), Failure> {
+/// The descriptors above 2 open now, but the listing's own.
+fn inherited_descriptors() -> Result<Vec<i32>, Failure> {
     let listing = std::fs::metadata("/proc/self/fd").map_err(unavailable)?;
+    let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc/self/fd").map_err(unavailable)? {
         let entry = entry.map_err(unavailable)?;
         let Some(n) = entry
@@ -107,13 +138,35 @@ fn only_standard_descriptors() -> Result<(), Failure> {
         if (0..=2).contains(&n) {
             continue;
         }
-        // The listing's own descriptor.
-        let target = std::fs::metadata(entry.path()).map_err(unavailable)?;
-        if (target.dev(), target.ino()) != (listing.dev(), listing.ino()) {
-            return Err(Failure::new(Code::SandboxUnavailable));
+        // The listing's own descriptor (a directory of procfs: an inherited
+        // one would be closed at the second pass, its number then gone).
+        match std::fs::metadata(entry.path()) {
+            Ok(target) if (target.dev(), target.ino()) == (listing.dev(), listing.ino()) => {}
+            // Gone between the listing and the stat: the listing's own.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => found.push(n),
         }
     }
-    Ok(())
+    Ok(found)
+}
+
+/// The reader keeps nothing but its IPC channel and `/dev/null`: a
+/// descriptor the agent inherited without `O_CLOEXEC` (the agent's own are
+/// all `O_CLOEXEC`; cargo's jobserver pipes in CI, PR #356) is closed, then
+/// the set is checked again, and any failure refuses the reader.
+///
+/// Sound although `nix::unistd::close` takes a bare number: this runs
+/// before the reader opens anything, so no Rust value owns these
+/// descriptors (the listing's `ReadDir` is dropped before the close).
+fn close_inherited_descriptors() -> Result<(), Failure> {
+    for n in inherited_descriptors()? {
+        nix::unistd::close(n).map_err(unavailable)?;
+    }
+    if inherited_descriptors()?.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::new(Code::SandboxUnavailable))
+    }
 }
 
 /// An `O_PATH` descriptor of `path`, no symbolic link followed anywhere in
