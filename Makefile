@@ -12,7 +12,7 @@ WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb percona psmdb
 # Opt-in dev services (Compose profiles), stopped by dev-down / dev-reset too.
-DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas --profile sqlserver --profile redis
+DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas --profile sqlserver --profile redis --profile sqlite
 # pnpm at the version pinned by console/package.json (`packageManager`), through corepack.
 PNPM ?= corepack pnpm
 export COREPACK_ENABLE_DOWNLOAD_PROMPT ?= 0
@@ -31,7 +31,7 @@ AGENT_CONFIG ?=
 
 .PHONY: help \
 	install doctor \
-	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-sqlserver dev-redis dev-down \
+	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-sqlserver dev-redis dev-sqlite dev-down \
 	dev-reset dev-logs dev-ps seed seed-check test-dev \
 	console-dev console-worker console-migrate console-lint console-typecheck console-test console-build \
 	console-licenses \
@@ -101,7 +101,7 @@ dev/.env:
 	cp dev/.env.example dev/.env
 
 dev-dirs: ## Create the engine log directories (world-writable: engines run as non-root users)
-	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS)) dev/.state/cas
+	mkdir -p $(addprefix dev/.state/logs/,$(LOG_DIRS)) dev/.state/cas dev/.state/sqlite
 	chmod 0777 $(addprefix dev/.state/logs/,$(LOG_DIRS))
 
 dev-metrics-token: ## Create dev/.state/metrics_token (48 random chars, 0600) if missing; never committed
@@ -141,6 +141,9 @@ dev-sqlserver: dev/.env ## Start the opt-in SQL Server service (ADR-0051 target,
 dev-redis: dev/.env ## Start the opt-in Valkey and Redis services (ADR-0052 targets) and wait until healthy
 	timeout $(UP_TIMEOUT) $(COMPOSE) --profile redis up -d --wait --wait-timeout $(WAIT_TIMEOUT) valkey redis
 
+dev-sqlite: dev/.env dev-dirs ## Start the opt-in SQLite writer (ADR-0059 files in dev/.state/sqlite/data: crm.db, app.db held open, intl.db) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile sqlite up -d --wait --wait-timeout $(WAIT_TIMEOUT) sqlite
+
 dev-down: ## Stop the dev environment (keeps data volumes)
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down --remove-orphans
 
@@ -150,6 +153,9 @@ dev-reset: ## Stop and delete volumes and dev/.state (reloads the seed on next `
 	@# by the same one-shot container, as the host user cannot.
 	if [ -e dev/.state/cas/services ] || [ -e dev/.state/logs/cas ]; then \
 	  timeout 120 $(COMPOSE) run --rm --no-deps -T cas-files-init sh /usr/local/bin/files-init.sh clean; fi
+	@# The SQLite files belong to the application's account (dev/sqlite/files-init.sh): the same.
+	if [ -e dev/.state/sqlite/data ]; then \
+	  timeout 120 $(COMPOSE) --profile sqlite run --rm --no-deps -T sqlite-files-init sh /usr/local/bin/files-init.sh clean; fi
 	rm -rf dev/.state
 
 dev-logs: ## Show the last TAIL (200) log lines of every service (not followed)
@@ -226,7 +232,7 @@ agent-deny: ## cargo-deny bans / licenses / sources, dev-dependencies too (CI; n
 	cd agent && timeout 600 cargo deny --locked check bans licenses sources
 	cd agent && timeout 600 cargo deny --config deny-dev.toml --locked check licenses sources
 
-agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|redis|all (redis: after `make dev-redis`)
+agent-it: ## Connector integration tests on the running dev env (`make dev`); ENGINE=postgres|mysql|mongodb|openldap|redis|sqlite|all (redis: after `make dev-redis`; sqlite: sudo, no service)
 	timeout $(CARGO_TIMEOUT) dev/agent-it.sh $(ENGINE)
 
 agent-fuzz: ## Fuzz smoke run of the parser targets, FUZZ_SECONDS each (CI: 10)
@@ -262,10 +268,10 @@ protocol-check: protocol-lint protocol-append-only protocol-test protocol-drift 
 docs-check: ## Internal Markdown links (CI)
 	timeout 120 python3 scripts/check-md-links.py
 
-shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and the Keycloak and CAS dev scripts
+shell-lint: ## shellcheck of the load harness (CI), the OIDC e2e scenario (CI), dev/agent-it.sh and the Keycloak, CAS and SQLite dev scripts
 	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
 	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh dev/sqlserver/entrypoint.sh dev/redis/entrypoint.sh \
-	  dev/redis/tls-init.sh
+	  dev/redis/tls-init.sh dev/sqlite/files-init.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'

@@ -519,6 +519,60 @@ services:
     security_opt: ["no-new-privileges:true"]
     healthcheck: *redis-healthcheck
 
+  # SQLite (phase 10, P10-D): the files of the SQLite connector (ADR-0059 decision 10). Opt-in
+  # (profile `sqlite`): `make dev-sqlite`. No server: sqlite/build.py, in the pinned Python image,
+  # writes crm.db (rollback journal), app.db (WAL) and intl.db (UTF-16le) from seed/out/sqlite.json
+  # into .state/sqlite/data on the first start, then stays up as the application: it keeps app.db
+  # open (so its -wal and -shm exist; a WAL file nobody holds open is not readable) and inserts a
+  # row into writer_heartbeat every 5 s. sqlite-files-init gives the directory the decision 2
+  # permissions first: owner the application's account (10020), group the agent's (10001), 2750,
+  # files 0640. The agent reads them through a read-only view only (decision 2: the file system
+  # must be read-only for the agent): dev/README.md "SQLite". `DATABASTION_DEV_SQLITE_IMAGE`
+  # selects another writer (its SQLite version writes the files).
+  sqlite-files-init:
+    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    profiles: [sqlite]
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_SQLITE_UID: ${DATABASTION_DEV_SQLITE_UID:-10020}
+      DATABASTION_DEV_AGENT_GID: ${DATABASTION_DEV_AGENT_GID:-10001}
+    command: ["sh", "/usr/local/bin/files-init.sh", "setup"]
+    volumes:
+      - ./sqlite/files-init.sh:/usr/local/bin/files-init.sh:ro
+      # Only the SQLite part of .state (`make dev-dirs` creates it), not the metrics token.
+      - ./.state/sqlite:/state
+    restart: "no"
+
+  sqlite:
+    image: ${DATABASTION_DEV_SQLITE_IMAGE:-python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641}
+    profiles: [sqlite]
+    depends_on:
+      sqlite-files-init: { condition: service_completed_successfully }
+    user: "${DATABASTION_DEV_SQLITE_UID:-10020}:${DATABASTION_DEV_AGENT_GID:-10001}"
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+    # -I: isolated (no user site, no PYTHON* variables); -B: no bytecode written.
+    entrypoint: ["python3", "-I", "-B", "/opt/sqlite/build.py"]
+    command: ["serve", "--manifest", "/opt/seed/sqlite.json", "--out", "/data",
+              "--ready", "/tmp/databastion-ready", "--write-every", "5"]
+    volumes:
+      - ./sqlite/build.py:/opt/sqlite/build.py:ro
+      - ./seed/out:/opt/seed:ro
+      - ./.state/sqlite/data:/data
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # An application that crashed (a truncated -shm raises SIGBUS in every process mapping it) is
+    # started again: its next open recovers the WAL index.
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/databastion-ready"]
+      <<: *healthcheck
+
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     environment:
