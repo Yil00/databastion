@@ -22,10 +22,14 @@
 // - #/$defs/Location/allOf/0/then
 // - #/$defs/Location/allOf/1/if
 // - #/$defs/Location/allOf/1/then
+// - #/$defs/Location/allOf/2/if
+// - #/$defs/Location/allOf/2/then
 // - #/$defs/TargetStatus/allOf/0/if
 // - #/$defs/TargetStatus/allOf/0/then
 // - #/$defs/TargetStatus/allOf/1/if
 // - #/$defs/TargetStatus/allOf/1/then
+// - #/$defs/TargetStatus/allOf/2/if
+// - #/$defs/TargetStatus/allOf/2/then
 //
 // `not` keywords (not enforced by the generated types; same as above):
 // - #/$defs/Identifier/not
@@ -466,7 +470,9 @@ a signal or reach `min_rows`; it can never widen what is reported.
 /**Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
 e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
 `limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a
-SQLite target is always `none` (no access log exists, ADR-0059 decision 7).
+SQLite target is always `none` (no access log exists, ADR-0059 decision 7); a Firebird
+target is never `full` (the trace does not see file-level copies, embedded access or
+replication, ADR-0060 decision 6).
 */
 #[derive(
     ::serde::Deserialize,
@@ -541,7 +547,9 @@ under their engine's token (see `Engine`):
   `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`
   (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
   (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
-  **both** `engine.redis` and `engine.valkey` are listed.
+  **both** `engine.redis` and `engine.valkey` are listed;
+- `firebird_audit_trace` (the Firebird system audit trace log, `AuditTraceConfigFile`,
+  read locally as a text file, ADR-0060 decision 6): `engine.firebird`.
 
 The engines each source serves (a source is reported only for a target of one of them;
 see "Heartbeat target checks" and, for access events, "Target engine" under `POST /events`):
@@ -551,7 +559,8 @@ see "Heartbeat target checks" and, for access events, "Target engine" under `POS
 - `openldap_accesslog` -> `openldap`;
 - `cas_audit_log` -> `cas`;
 - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
-- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;
+- `firebird_audit_trace` -> `firebird`.
 No value serves `sqlite` (Discovery only, ADR-0059 decision 7).
 */
 #[derive(
@@ -603,6 +612,8 @@ pub enum AuditSource {
     RedisAclLog,
     #[serde(rename = "redis_sync")]
     RedisSync,
+    #[serde(rename = "firebird_audit_trace")]
+    FirebirdAuditTrace,
 }
 impl ::std::fmt::Display for AuditSource {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -625,6 +636,7 @@ impl ::std::fmt::Display for AuditSource {
             Self::RedisCommandlog => f.write_str("redis_commandlog"),
             Self::RedisAclLog => f.write_str("redis_acl_log"),
             Self::RedisSync => f.write_str("redis_sync"),
+            Self::FirebirdAuditTrace => f.write_str("firebird_audit_trace"),
         }
     }
 }
@@ -652,6 +664,7 @@ impl ::std::str::FromStr for AuditSource {
             "redis_commandlog" => Ok(Self::RedisCommandlog),
             "redis_acl_log" => Ok(Self::RedisAclLog),
             "redis_sync" => Ok(Self::RedisSync),
+            "firebird_audit_trace" => Ok(Self::FirebirdAuditTrace),
             _ => Err("invalid value".into()),
         }
     }
@@ -1010,8 +1023,9 @@ impl ::std::convert::TryFrom<::std::string::String> for ClientAddressVariant2 {
 /**Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
 Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
 only when it listed `engine.sqlserver`, `redis` only when it listed **both**
-`engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`
-(ADR-0059 decision 8; see `Engine`).
+`engine.redis` and `engine.valkey`, `sqlite` only when it listed `engine.sqlite`
+(ADR-0059 decision 8), and `firebird` only when it listed `engine.firebird` (ADR-0060
+decision 8; see `Engine`).
 */
 #[derive(
     ::serde::Deserialize,
@@ -1042,6 +1056,8 @@ pub enum Connector {
     Redis,
     #[serde(rename = "sqlite")]
     Sqlite,
+    #[serde(rename = "firebird")]
+    Firebird,
 }
 impl ::std::fmt::Display for Connector {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1054,6 +1070,7 @@ impl ::std::fmt::Display for Connector {
             Self::Sqlserver => f.write_str("sqlserver"),
             Self::Redis => f.write_str("redis"),
             Self::Sqlite => f.write_str("sqlite"),
+            Self::Firebird => f.write_str("firebird"),
         }
     }
 }
@@ -1071,6 +1088,7 @@ impl ::std::str::FromStr for Connector {
             "sqlserver" => Ok(Self::Sqlserver),
             "redis" => Ok(Self::Redis),
             "sqlite" => Ok(Self::Sqlite),
+            "firebird" => Ok(Self::Firebird),
             _ => Err("invalid value".into()),
         }
     }
@@ -1161,7 +1179,9 @@ impl ::std::convert::TryFrom<String> for Count {
 /**A local engine spotted by a Unix socket, a local listening port or a process name. At least one
 of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
 Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
-local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
+local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A
+`firebird` server is detected by its local port (3050) or its `firebird` process
+(ADR-0060 decision 7).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -1172,8 +1192,9 @@ pub struct DetectedTarget {
     pub port: ::std::option::Option<::std::num::NonZeroU64>,
     /**Process name only (the command line may contain secrets and is never read or sent).
 `sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
-`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
-`Engine`): a detected target of such an engine is not sent before the token is listed.
+`valkey-server` (ADR-0052 decision 11) and `firebird` (the Firebird server, ADR-0060
+decision 7) belong to engines gated by their token (see `Engine`): a detected target
+of such an engine is not sent before the token is listed.
 */
     #[serde(skip_serializing_if = "::std::option::Option::is_none")]
     pub process: ::std::option::Option<DetectedTargetProcess>,
@@ -1182,8 +1203,9 @@ pub struct DetectedTarget {
 }
 /**Process name only (the command line may contain secrets and is never read or sent).
 `sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
-`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
-`Engine`): a detected target of such an engine is not sent before the token is listed.
+`valkey-server` (ADR-0052 decision 11) and `firebird` (the Firebird server, ADR-0060
+decision 7) belong to engines gated by their token (see `Engine`): a detected target
+of such an engine is not sent before the token is listed.
 */
 #[derive(
     ::serde::Deserialize,
@@ -1214,6 +1236,8 @@ pub enum DetectedTargetProcess {
     RedisServer,
     #[serde(rename = "valkey-server")]
     ValkeyServer,
+    #[serde(rename = "firebird")]
+    Firebird,
 }
 impl ::std::fmt::Display for DetectedTargetProcess {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1226,6 +1250,7 @@ impl ::std::fmt::Display for DetectedTargetProcess {
             Self::Sqlservr => f.write_str("sqlservr"),
             Self::RedisServer => f.write_str("redis-server"),
             Self::ValkeyServer => f.write_str("valkey-server"),
+            Self::Firebird => f.write_str("firebird"),
         }
     }
 }
@@ -1243,6 +1268,7 @@ impl ::std::str::FromStr for DetectedTargetProcess {
             "sqlservr" => Ok(Self::Sqlservr),
             "redis-server" => Ok(Self::RedisServer),
             "valkey-server" => Ok(Self::ValkeyServer),
+            "firebird" => Ok(Self::Firebird),
             _ => Err("invalid value".into()),
         }
     }
@@ -1447,11 +1473,14 @@ capability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and 
 handling in ADR-0042). Every later engine value follows the
 same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
 ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
-and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.
+and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`,
+`firebird` (Firebird 4.0 and 5.0, ADR-0060) with `engine.firebird`.
 A `sqlite` target is Discovery only: it has no server and no access log, so its
 `TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or
 `edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059
-decision 7).
+decision 7). A `firebird` target never reports `audit_level` `full` (checked by this
+schema; ADR-0060 decision 6) and never sends `name_case` (its name rules are the
+engine's, fixed: ADR-0060 decision 5).
 */
 #[derive(
     ::serde::Deserialize,
@@ -1486,6 +1515,8 @@ pub enum Engine {
     Valkey,
     #[serde(rename = "sqlite")]
     Sqlite,
+    #[serde(rename = "firebird")]
+    Firebird,
 }
 impl ::std::fmt::Display for Engine {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -1500,6 +1531,7 @@ impl ::std::fmt::Display for Engine {
             Self::Redis => f.write_str("redis"),
             Self::Valkey => f.write_str("valkey"),
             Self::Sqlite => f.write_str("sqlite"),
+            Self::Firebird => f.write_str("firebird"),
         }
     }
 }
@@ -1519,6 +1551,7 @@ impl ::std::str::FromStr for Engine {
             "redis" => Ok(Self::Redis),
             "valkey" => Ok(Self::Valkey),
             "sqlite" => Ok(Self::Sqlite),
+            "firebird" => Ok(Self::Firebird),
             _ => Err("invalid value".into()),
         }
     }
@@ -2925,6 +2958,9 @@ SQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the fil
 database, the same on every SQLite target: the `target_id` tells files apart; checked by
 this schema), no `schema`, `object` = the table name, `field` = the column name. Never
 the file's path, its name or a side file's name.
+Firebird (ADR-0060 decision 5): `database` = the name declared in `agent.yaml`, never a
+file path or alias; `object` = the table; `field` = the column; no `schema` (checked by
+this schema: Firebird 4.0 and 5.0 have no schemas).
 
 `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
 every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
@@ -4386,6 +4422,20 @@ Revisions:
   for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
   whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
   read, so records lost to a failing audit target are not counted.
+- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird
+  labels below `on_failure_probe`. Firebird system privileges are lowercased as written
+  in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
+  `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
+  the `RDB$ADMIN` role, `database_owner`, `security_database_admin` for the security
+  database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,
+  exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
+  relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
+  (another readable credential relation, `privilege.global_privileges`); `role_graph`
+  (the role graph not evaluated, `privilege.not_evaluated`); and the trace configuration
+  settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
+  `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
+  and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
+  `references`, `execute`, `create`, `alter`, `drop`) use that value, with no token.
 
 Each revision is negotiated on its own: a value is sent only when the token of its own
 revision is listed.
@@ -4793,6 +4843,106 @@ pub enum TargetNoteLabel {
     CasStoreGuardProbe,
     #[serde(rename = "on_failure_probe")]
     OnFailureProbe,
+    #[serde(rename = "user_management")]
+    UserManagement,
+    #[serde(rename = "read_raw_pages")]
+    ReadRawPages,
+    #[serde(rename = "create_user_types")]
+    CreateUserTypes,
+    #[serde(rename = "use_nbackup_utility")]
+    UseNbackupUtility,
+    #[serde(rename = "change_shutdown_mode")]
+    ChangeShutdownMode,
+    #[serde(rename = "trace_any_attachment")]
+    TraceAnyAttachment,
+    #[serde(rename = "monitor_any_attachment")]
+    MonitorAnyAttachment,
+    #[serde(rename = "access_shutdown_database")]
+    AccessShutdownDatabase,
+    #[serde(rename = "create_database")]
+    CreateDatabase,
+    #[serde(rename = "drop_database")]
+    DropDatabase,
+    #[serde(rename = "use_gbak_utility")]
+    UseGbakUtility,
+    #[serde(rename = "use_gstat_utility")]
+    UseGstatUtility,
+    #[serde(rename = "use_gfix_utility")]
+    UseGfixUtility,
+    #[serde(rename = "ignore_db_triggers")]
+    IgnoreDbTriggers,
+    #[serde(rename = "change_header_settings")]
+    ChangeHeaderSettings,
+    #[serde(rename = "select_any_object_in_database")]
+    SelectAnyObjectInDatabase,
+    #[serde(rename = "access_any_object_in_database")]
+    AccessAnyObjectInDatabase,
+    #[serde(rename = "modify_any_object_in_database")]
+    ModifyAnyObjectInDatabase,
+    #[serde(rename = "change_mapping_rules")]
+    ChangeMappingRules,
+    #[serde(rename = "use_granted_by_clause")]
+    UseGrantedByClause,
+    #[serde(rename = "grant_revoke_on_any_object")]
+    GrantRevokeOnAnyObject,
+    #[serde(rename = "grant_revoke_any_ddl_right")]
+    GrantRevokeAnyDdlRight,
+    #[serde(rename = "create_privileged_roles")]
+    CreatePrivilegedRoles,
+    #[serde(rename = "get_dbcrypt_info")]
+    GetDbcryptInfo,
+    #[serde(rename = "modify_ext_conn_pool")]
+    ModifyExtConnPool,
+    #[serde(rename = "replicate_into_database")]
+    ReplicateIntoDatabase,
+    #[serde(rename = "profile_any_attachment")]
+    ProfileAnyAttachment,
+    #[serde(rename = "sysdba")]
+    Sysdba,
+    #[serde(rename = "rdb_admin")]
+    RdbAdmin,
+    #[serde(rename = "database_owner")]
+    DatabaseOwner,
+    #[serde(rename = "security_database_admin")]
+    SecurityDatabaseAdmin,
+    #[serde(rename = "usage")]
+    Usage,
+    #[serde(rename = "verifier_relation_readable")]
+    VerifierRelationReadable,
+    #[serde(rename = "credential_relation_readable")]
+    CredentialRelationReadable,
+    #[serde(rename = "role_graph")]
+    RoleGraph,
+    #[serde(rename = "enabled")]
+    Enabled,
+    #[serde(rename = "log_filename")]
+    LogFilename,
+    #[serde(rename = "log_connections")]
+    LogConnections,
+    #[serde(rename = "log_statement_finish")]
+    LogStatementFinish,
+    #[serde(rename = "log_blr_requests")]
+    LogBlrRequests,
+    #[serde(rename = "log_procedure_finish")]
+    LogProcedureFinish,
+    #[serde(rename = "log_function_finish")]
+    LogFunctionFinish,
+    #[serde(rename = "log_trigger_finish")]
+    LogTriggerFinish,
+    #[serde(rename = "log_errors")]
+    LogErrors,
+    #[serde(rename = "log_services")]
+    LogServices,
+    #[serde(rename = "time_threshold")]
+    TimeThreshold,
+    #[serde(rename = "print_perf")]
+    PrintPerf,
+    #[serde(rename = "include_filter")]
+    IncludeFilter,
+    #[serde(rename = "exclude_filter")]
+    ExcludeFilter,
+    #[serde(rename = "connection_id")]
+    ConnectionId,
 }
 impl ::std::fmt::Display for TargetNoteLabel {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -5054,6 +5204,64 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::RefusalListProbe => f.write_str("refusal_list_probe"),
             Self::CasStoreGuardProbe => f.write_str("cas_store_guard_probe"),
             Self::OnFailureProbe => f.write_str("on_failure_probe"),
+            Self::UserManagement => f.write_str("user_management"),
+            Self::ReadRawPages => f.write_str("read_raw_pages"),
+            Self::CreateUserTypes => f.write_str("create_user_types"),
+            Self::UseNbackupUtility => f.write_str("use_nbackup_utility"),
+            Self::ChangeShutdownMode => f.write_str("change_shutdown_mode"),
+            Self::TraceAnyAttachment => f.write_str("trace_any_attachment"),
+            Self::MonitorAnyAttachment => f.write_str("monitor_any_attachment"),
+            Self::AccessShutdownDatabase => f.write_str("access_shutdown_database"),
+            Self::CreateDatabase => f.write_str("create_database"),
+            Self::DropDatabase => f.write_str("drop_database"),
+            Self::UseGbakUtility => f.write_str("use_gbak_utility"),
+            Self::UseGstatUtility => f.write_str("use_gstat_utility"),
+            Self::UseGfixUtility => f.write_str("use_gfix_utility"),
+            Self::IgnoreDbTriggers => f.write_str("ignore_db_triggers"),
+            Self::ChangeHeaderSettings => f.write_str("change_header_settings"),
+            Self::SelectAnyObjectInDatabase => {
+                f.write_str("select_any_object_in_database")
+            }
+            Self::AccessAnyObjectInDatabase => {
+                f.write_str("access_any_object_in_database")
+            }
+            Self::ModifyAnyObjectInDatabase => {
+                f.write_str("modify_any_object_in_database")
+            }
+            Self::ChangeMappingRules => f.write_str("change_mapping_rules"),
+            Self::UseGrantedByClause => f.write_str("use_granted_by_clause"),
+            Self::GrantRevokeOnAnyObject => f.write_str("grant_revoke_on_any_object"),
+            Self::GrantRevokeAnyDdlRight => f.write_str("grant_revoke_any_ddl_right"),
+            Self::CreatePrivilegedRoles => f.write_str("create_privileged_roles"),
+            Self::GetDbcryptInfo => f.write_str("get_dbcrypt_info"),
+            Self::ModifyExtConnPool => f.write_str("modify_ext_conn_pool"),
+            Self::ReplicateIntoDatabase => f.write_str("replicate_into_database"),
+            Self::ProfileAnyAttachment => f.write_str("profile_any_attachment"),
+            Self::Sysdba => f.write_str("sysdba"),
+            Self::RdbAdmin => f.write_str("rdb_admin"),
+            Self::DatabaseOwner => f.write_str("database_owner"),
+            Self::SecurityDatabaseAdmin => f.write_str("security_database_admin"),
+            Self::Usage => f.write_str("usage"),
+            Self::VerifierRelationReadable => f.write_str("verifier_relation_readable"),
+            Self::CredentialRelationReadable => {
+                f.write_str("credential_relation_readable")
+            }
+            Self::RoleGraph => f.write_str("role_graph"),
+            Self::Enabled => f.write_str("enabled"),
+            Self::LogFilename => f.write_str("log_filename"),
+            Self::LogConnections => f.write_str("log_connections"),
+            Self::LogStatementFinish => f.write_str("log_statement_finish"),
+            Self::LogBlrRequests => f.write_str("log_blr_requests"),
+            Self::LogProcedureFinish => f.write_str("log_procedure_finish"),
+            Self::LogFunctionFinish => f.write_str("log_function_finish"),
+            Self::LogTriggerFinish => f.write_str("log_trigger_finish"),
+            Self::LogErrors => f.write_str("log_errors"),
+            Self::LogServices => f.write_str("log_services"),
+            Self::TimeThreshold => f.write_str("time_threshold"),
+            Self::PrintPerf => f.write_str("print_perf"),
+            Self::IncludeFilter => f.write_str("include_filter"),
+            Self::ExcludeFilter => f.write_str("exclude_filter"),
+            Self::ConnectionId => f.write_str("connection_id"),
         }
     }
 }
@@ -5288,6 +5496,56 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "refusal_list_probe" => Ok(Self::RefusalListProbe),
             "cas_store_guard_probe" => Ok(Self::CasStoreGuardProbe),
             "on_failure_probe" => Ok(Self::OnFailureProbe),
+            "user_management" => Ok(Self::UserManagement),
+            "read_raw_pages" => Ok(Self::ReadRawPages),
+            "create_user_types" => Ok(Self::CreateUserTypes),
+            "use_nbackup_utility" => Ok(Self::UseNbackupUtility),
+            "change_shutdown_mode" => Ok(Self::ChangeShutdownMode),
+            "trace_any_attachment" => Ok(Self::TraceAnyAttachment),
+            "monitor_any_attachment" => Ok(Self::MonitorAnyAttachment),
+            "access_shutdown_database" => Ok(Self::AccessShutdownDatabase),
+            "create_database" => Ok(Self::CreateDatabase),
+            "drop_database" => Ok(Self::DropDatabase),
+            "use_gbak_utility" => Ok(Self::UseGbakUtility),
+            "use_gstat_utility" => Ok(Self::UseGstatUtility),
+            "use_gfix_utility" => Ok(Self::UseGfixUtility),
+            "ignore_db_triggers" => Ok(Self::IgnoreDbTriggers),
+            "change_header_settings" => Ok(Self::ChangeHeaderSettings),
+            "select_any_object_in_database" => Ok(Self::SelectAnyObjectInDatabase),
+            "access_any_object_in_database" => Ok(Self::AccessAnyObjectInDatabase),
+            "modify_any_object_in_database" => Ok(Self::ModifyAnyObjectInDatabase),
+            "change_mapping_rules" => Ok(Self::ChangeMappingRules),
+            "use_granted_by_clause" => Ok(Self::UseGrantedByClause),
+            "grant_revoke_on_any_object" => Ok(Self::GrantRevokeOnAnyObject),
+            "grant_revoke_any_ddl_right" => Ok(Self::GrantRevokeAnyDdlRight),
+            "create_privileged_roles" => Ok(Self::CreatePrivilegedRoles),
+            "get_dbcrypt_info" => Ok(Self::GetDbcryptInfo),
+            "modify_ext_conn_pool" => Ok(Self::ModifyExtConnPool),
+            "replicate_into_database" => Ok(Self::ReplicateIntoDatabase),
+            "profile_any_attachment" => Ok(Self::ProfileAnyAttachment),
+            "sysdba" => Ok(Self::Sysdba),
+            "rdb_admin" => Ok(Self::RdbAdmin),
+            "database_owner" => Ok(Self::DatabaseOwner),
+            "security_database_admin" => Ok(Self::SecurityDatabaseAdmin),
+            "usage" => Ok(Self::Usage),
+            "verifier_relation_readable" => Ok(Self::VerifierRelationReadable),
+            "credential_relation_readable" => Ok(Self::CredentialRelationReadable),
+            "role_graph" => Ok(Self::RoleGraph),
+            "enabled" => Ok(Self::Enabled),
+            "log_filename" => Ok(Self::LogFilename),
+            "log_connections" => Ok(Self::LogConnections),
+            "log_statement_finish" => Ok(Self::LogStatementFinish),
+            "log_blr_requests" => Ok(Self::LogBlrRequests),
+            "log_procedure_finish" => Ok(Self::LogProcedureFinish),
+            "log_function_finish" => Ok(Self::LogFunctionFinish),
+            "log_trigger_finish" => Ok(Self::LogTriggerFinish),
+            "log_errors" => Ok(Self::LogErrors),
+            "log_services" => Ok(Self::LogServices),
+            "time_threshold" => Ok(Self::TimeThreshold),
+            "print_perf" => Ok(Self::PrintPerf),
+            "include_filter" => Ok(Self::IncludeFilter),
+            "exclude_filter" => Ok(Self::ExcludeFilter),
+            "connection_id" => Ok(Self::ConnectionId),
             _ => Err("invalid value".into()),
         }
     }
@@ -5344,7 +5602,8 @@ Sent only when the latest `HeartbeatResponse.accepts` lists `target_status.notes
     pub reachable: bool,
     /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
 Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
-or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+or Valkey `valkey_version` such as `8.1.0-rc1`; Firebird's `ENGINE_VERSION` context
+variable such as `5.0.4`). Omitted when the reported string does
 not match this pattern. Never sent for a `sqlite` target, which has no server (the
 SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
 */
@@ -5354,7 +5613,8 @@ SQLite version that last wrote the file stays in the agent's log, ADR-0059 decis
 }
 /**Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
 Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
-or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+or Valkey `valkey_version` such as `8.1.0-rc1`; Firebird's `ENGINE_VERSION` context
+variable such as `5.0.4`). Omitted when the reported string does
 not match this pattern. Never sent for a `sqlite` target, which has no server (the
 SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
 */

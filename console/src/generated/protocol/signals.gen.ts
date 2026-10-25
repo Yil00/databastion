@@ -16,13 +16,14 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "shape.full_table_read": {
-    "description": "A read (SELECT, TABLE; a MongoDB find or aggregate) of whole relations or collections: no top-level filter, no aggregation, and no limit or a limit above the agent's large-result threshold. Heuristic: evadable by design.",
+    "description": "A read (SELECT, TABLE; a MongoDB find or aggregate) of whole relations or collections: no top-level filter, no aggregation, and no limit or a limit above the agent's large-result threshold (Firebird: FIRST, ROWS or FETCH FIRST). Heuristic: evadable by design.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
       "mongodb",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "shape.keyspace_enumeration": {
@@ -33,9 +34,10 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "signature.backup_database": {
-    "description": "A full copy of a SQL Server database made by the server: BACKUP DATABASE or BACKUP LOG (to a file or URL), DBCC CLONEDATABASE, or sp_detach_db (the data files become copyable).",
+    "description": "A full copy of a database made by the server. SQL Server: BACKUP DATABASE or BACKUP LOG (to a file or URL), DBCC CLONEDATABASE, or sp_detach_db (the data files become copyable). Firebird: a services Backup Database or Incremental Backup Database, ALTER DATABASE BEGIN BACKUP (nbackup), CREATE SHADOW, ALTER DATABASE ADD FILE or ADD DIFFERENCE FILE, or BLR requests reading a whole relation from a client whose process name is gbak (declared by the client, so evadable).",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "signature.bcp": {
@@ -103,9 +105,10 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "signature.remote_data_access": {
-    "description": "Data leaving through the SQL Server server to another place, flagged even when the server refused it: OPENROWSET (including BULK), OPENDATASOURCE, OPENQUERY, EXEC ... AT, a four-part name in a write target, BULK INSERT, CREATE EXTERNAL TABLE AS SELECT, xp_cmdshell, xp_dirtree / xp_fileexist / xp_subdirs (an outbound connection to a named host), sp_send_dbmail with @query, sp_invoke_external_rest_endpoint, sp_OACreate / sp_OAMethod, or sp_execute_external_script.",
+    "description": "Data leaving through the server to another place, flagged even if refused. SQL Server: OPENROWSET (BULK too), OPENDATASOURCE, OPENQUERY, EXEC ... AT, a four-part name in a write target, BULK INSERT, CREATE EXTERNAL TABLE AS SELECT, xp_cmdshell, xp_dirtree / xp_fileexist / xp_subdirs, sp_send_dbmail with @query, sp_invoke_external_rest_endpoint, sp_OACreate / sp_OAMethod, sp_execute_external_script. Firebird: EXECUTE STATEMENT ... ON EXTERNAL, external-file table reads, CREATE TABLE ... EXTERNAL FILE.",
     "engines": [
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   },
   "volume.failed_logins_many_accounts": {
@@ -127,14 +130,15 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "volume.large_result": {
-    "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it).",
+    "description": "More rows returned or affected than the agent's large-result threshold (above its maximum Discovery sample, so the agent's own sampling never carries it). Rows, not bytes: on Firebird, a few rows of large blobs do not raise it.",
     "engines": [
       "postgres",
       "mysql",
       "mariadb",
       "mongodb",
       "openldap",
-      "sqlserver"
+      "sqlserver",
+      "firebird"
     ]
   }
 } as const;

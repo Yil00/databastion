@@ -61,6 +61,7 @@ const ENGINE_NAMES: Record<Engine, string> = {
   redis: "Redis",
   valkey: "Valkey",
   sqlite: "SQLite",
+  firebird: "Firebird",
 };
 
 /** Display name of an engine; a string that is not a contract engine is returned as is. */
@@ -152,6 +153,7 @@ const SOURCE_ENGINES: Record<AuditSource, readonly Engine[]> = {
   redis_commandlog: ["redis", "valkey"],
   redis_acl_log: ["redis", "valkey"],
   redis_sync: ["redis", "valkey"],
+  firebird_audit_trace: ["firebird"],
 };
 
 /** Every contract `AuditSource` with its engines. */

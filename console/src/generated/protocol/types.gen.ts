@@ -482,23 +482,27 @@ export interface components {
          *     handling in ADR-0042). Every later engine value follows the
          *     same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
          *     ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
-         *     and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.
+         *     and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`,
+         *     `firebird` (Firebird 4.0 and 5.0, ADR-0060) with `engine.firebird`.
          *     A `sqlite` target is Discovery only: it has no server and no access log, so its
          *     `TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or
          *     `edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059
-         *     decision 7).
+         *     decision 7). A `firebird` target never reports `audit_level` `full` (checked by this
+         *     schema; ADR-0060 decision 6) and never sends `name_case` (its name rules are the
+         *     engine's, fixed: ADR-0060 decision 5).
          * @enum {string}
          */
-        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "valkey" | "sqlite";
+        Engine: "postgres" | "mysql" | "mariadb" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "valkey" | "sqlite" | "firebird";
         /**
          * @description Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
          *     Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
          *     only when it listed `engine.sqlserver`, `redis` only when it listed **both**
-         *     `engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`
-         *     (ADR-0059 decision 8; see `Engine`).
+         *     `engine.redis` and `engine.valkey`, `sqlite` only when it listed `engine.sqlite`
+         *     (ADR-0059 decision 8), and `firebird` only when it listed `engine.firebird` (ADR-0060
+         *     decision 8; see `Engine`).
          * @enum {string}
          */
-        Connector: "postgres" | "mysql" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "sqlite";
+        Connector: "postgres" | "mysql" | "mongodb" | "openldap" | "cas" | "sqlserver" | "redis" | "sqlite" | "firebird";
         /**
          * @description Connectors compiled in and enabled in this agent. A connector of an engine added after
          *     protocol 0.1.0 is listed only once the console's latest heartbeat response lists its
@@ -510,7 +514,9 @@ export interface components {
          * @description Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
          *     e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
          *     `limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a
-         *     SQLite target is always `none` (no access log exists, ADR-0059 decision 7).
+         *     SQLite target is always `none` (no access log exists, ADR-0059 decision 7); a Firebird
+         *     target is never `full` (the trace does not see file-level copies, embedded access or
+         *     replication, ADR-0060 decision 6).
          * @enum {string}
          */
         AuditLevel: "full" | "partial" | "limited" | "none";
@@ -526,7 +532,9 @@ export interface components {
          *       `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`
          *       (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
          *       (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
-         *       **both** `engine.redis` and `engine.valkey` are listed.
+         *       **both** `engine.redis` and `engine.valkey` are listed;
+         *     - `firebird_audit_trace` (the Firebird system audit trace log, `AuditTraceConfigFile`,
+         *       read locally as a text file, ADR-0060 decision 6): `engine.firebird`.
          *
          *     The engines each source serves (a source is reported only for a target of one of them;
          *     see "Heartbeat target checks" and, for access events, "Target engine" under `POST /events`):
@@ -536,11 +544,12 @@ export interface components {
          *     - `openldap_accesslog` -> `openldap`;
          *     - `cas_audit_log` -> `cas`;
          *     - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
-         *     - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+         *     - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;
+         *     - `firebird_audit_trace` -> `firebird`.
          *     No value serves `sqlite` (Discovery only, ADR-0059 decision 7).
          * @enum {string}
          */
-        AuditSource: "pgaudit" | "pg_stat_statements" | "pg_stat_activity" | "mariadb_server_audit" | "mysql_audit_log" | "performance_schema" | "mongodb_audit_log" | "mongodb_profiler" | "mongodb_log" | "openldap_accesslog" | "cas_audit_log" | "sqlserver_audit" | "sqlserver_xevents" | "sqlserver_query_stats" | "redis_slowlog" | "redis_commandlog" | "redis_acl_log" | "redis_sync";
+        AuditSource: "pgaudit" | "pg_stat_statements" | "pg_stat_activity" | "mariadb_server_audit" | "mysql_audit_log" | "performance_schema" | "mongodb_audit_log" | "mongodb_profiler" | "mongodb_log" | "openldap_accesslog" | "cas_audit_log" | "sqlserver_audit" | "sqlserver_xevents" | "sqlserver_query_stats" | "redis_slowlog" | "redis_commandlog" | "redis_acl_log" | "redis_sync" | "firebird_audit_trace";
         /**
          * @description Engine edition or distribution, when the agent can tell.
          * @enum {string}
@@ -720,7 +729,8 @@ export interface components {
             /**
              * @description Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
              *     Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
-             *     or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+             *     or Valkey `valkey_version` such as `8.1.0-rc1`; Firebird's `ENGINE_VERSION` context
+             *     variable such as `5.0.4`). Omitted when the reported string does
              *     not match this pattern. Never sent for a `sqlite` target, which has no server (the
              *     SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
              */
@@ -749,7 +759,7 @@ export interface components {
              */
             name_case?: components["schemas"]["TargetNameCase"];
             metrics?: components["schemas"]["MetricsMap"];
-        } & (unknown & unknown);
+        } & (unknown & unknown & unknown);
         /**
          * @description How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
          *     `insensitive`, they are one name; `unknown`, the agent could not tell (the console reads it
@@ -860,17 +870,33 @@ export interface components {
          *       for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
          *       whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
          *       read, so records lost to a failing audit target are not counted.
+         *     - `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird
+         *       labels below `on_failure_probe`. Firebird system privileges are lowercased as written
+         *       in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
+         *       `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
+         *       the `RDB$ADMIN` role, `database_owner`, `security_database_admin` for the security
+         *       database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,
+         *       exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
+         *       relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
+         *       (another readable credential relation, `privilege.global_privileges`); `role_graph`
+         *       (the role graph not evaluated, `privilege.not_evaluated`); and the trace configuration
+         *       settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
+         *       `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
+         *       and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
+         *       `references`, `execute`, `create`, `alter`, `drop`) use that value, with no token.
          *
          *     Each revision is negotiated on its own: a value is sent only when the token of its own
          *     revision is listed.
          * @enum {string}
          */
-        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe" | "on_failure_probe";
+        TargetNoteLabel: "other" | "superuser" | "bypassrls" | "replication" | "createrole" | "createdb" | "pg_checkpoint" | "pg_create_subscription" | "pg_database_owner" | "pg_execute_server_program" | "pg_maintain" | "pg_monitor" | "pg_read_all_data" | "pg_read_all_settings" | "pg_read_all_stats" | "pg_read_server_files" | "pg_signal_autovacuum_worker" | "pg_signal_backend" | "pg_stat_scan_tables" | "pg_use_reserved_connections" | "pg_write_all_data" | "pg_write_server_files" | "alter" | "alter_routine" | "binlog_admin" | "binlog_monitor" | "binlog_replay" | "connection_admin" | "create" | "create_role" | "create_routine" | "create_tablespace" | "create_temporary_tables" | "create_user" | "create_view" | "delete" | "delete_history" | "drop" | "drop_role" | "event" | "execute" | "federated_admin" | "file" | "index" | "insert" | "lock_tables" | "process" | "read_only_admin" | "references" | "reload" | "replica_monitor" | "replication_client" | "replication_master_admin" | "replication_slave" | "replication_slave_admin" | "select" | "set_user" | "show_create_routine" | "show_databases" | "show_view" | "shutdown" | "slave_monitor" | "super" | "trigger" | "update" | "application_password_admin" | "audit_abort_exempt" | "audit_admin" | "authentication_policy_admin" | "backup_admin" | "binlog_encryption_admin" | "clone_admin" | "encryption_key_admin" | "firewall_admin" | "flush_optimizer_costs" | "flush_status" | "flush_tables" | "flush_user_resources" | "group_replication_admin" | "innodb_redo_log_archive" | "passwordless_user_admin" | "persist_ro_variables_admin" | "replication_applier" | "resource_group_admin" | "resource_group_user" | "role_admin" | "sensitive_variables_observer" | "session_variables_admin" | "set_any_definer" | "set_user_id" | "show_routine" | "system_user" | "system_variables_admin" | "table_encryption_admin" | "xa_recover_admin" | "logging_on" | "logging_off" | "file_output" | "non_file_output" | "stage_secret" | "stage_tls" | "stage_connect" | "stage_auth" | "stage_session_setup" | "stage_begin" | "stage_commit" | "stage_introspection" | "stage_columns" | "stage_sample" | "stage_check" | "stage_audit" | "stage_kill" | "sysadmin" | "securityadmin" | "serveradmin" | "setupadmin" | "processadmin" | "diskadmin" | "dbcreator" | "bulkadmin" | "ms_database_connector" | "ms_database_manager" | "ms_definition_reader" | "ms_login_manager" | "ms_performance_definition_reader" | "ms_security_definition_reader" | "ms_server_performance_state_reader" | "ms_server_security_state_reader" | "ms_server_state_manager" | "ms_server_state_reader" | "db_owner" | "db_securityadmin" | "db_accessadmin" | "db_backupoperator" | "db_ddladmin" | "db_datawriter" | "db_datareader" | "db_denydatareader" | "db_denydatawriter" | "control_server" | "alter_any_server_audit" | "alter_any_event_session" | "alter_any_event_session_enable" | "alter_any_event_session_disable" | "alter_any_event_session_add_event" | "alter_any_event_session_drop_event" | "alter_any_event_session_add_target" | "alter_any_event_session_drop_target" | "alter_any_event_session_option" | "create_any_event_session" | "drop_any_event_session" | "alter_any_login" | "alter_any_server_role" | "impersonate_any_login" | "view_any_cryptographically_secured_definition" | "view_any_definition" | "view_any_security_definition" | "administer_bulk_operations" | "alter_any_linked_server" | "alter_trace" | "view_server_state" | "view_server_performance_state" | "view_server_security_audit" | "view_server_security_state" | "control" | "impersonate" | "take_ownership" | "alter_any_database_audit" | "view_database_security_audit" | "unmask" | "view_definition" | "view_database_state" | "showplan" | "password_hash_probe" | "alter_any_database_event_session" | "alter_any_database_event_session_enable" | "alter_any_database_event_session_disable" | "alter_any_database_event_session_add_event" | "alter_any_database_event_session_drop_event" | "alter_any_database_event_session_add_target" | "alter_any_database_event_session_drop_target" | "alter_any_database_event_session_option" | "create_any_database_event_session" | "drop_any_database_event_session" | "view_any_performance_definition" | "view_security_definition" | "view_performance_definition" | "view_database_security_state" | "view_database_performance_state" | "view_any_column_encryption_key_definition" | "view_any_column_master_key_definition" | "logon_trigger_probe" | "refusal_list_probe" | "cas_store_guard_probe" | "on_failure_probe" | "user_management" | "read_raw_pages" | "create_user_types" | "use_nbackup_utility" | "change_shutdown_mode" | "trace_any_attachment" | "monitor_any_attachment" | "access_shutdown_database" | "create_database" | "drop_database" | "use_gbak_utility" | "use_gstat_utility" | "use_gfix_utility" | "ignore_db_triggers" | "change_header_settings" | "select_any_object_in_database" | "access_any_object_in_database" | "modify_any_object_in_database" | "change_mapping_rules" | "use_granted_by_clause" | "grant_revoke_on_any_object" | "grant_revoke_any_ddl_right" | "create_privileged_roles" | "get_dbcrypt_info" | "modify_ext_conn_pool" | "replicate_into_database" | "profile_any_attachment" | "sysdba" | "rdb_admin" | "database_owner" | "security_database_admin" | "usage" | "verifier_relation_readable" | "credential_relation_readable" | "role_graph" | "enabled" | "log_filename" | "log_connections" | "log_statement_finish" | "log_blr_requests" | "log_procedure_finish" | "log_function_finish" | "log_trigger_finish" | "log_errors" | "log_services" | "time_threshold" | "print_perf" | "include_filter" | "exclude_filter" | "connection_id";
         /**
          * @description A local engine spotted by a Unix socket, a local listening port or a process name. At least one
          *     of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
          *     Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
-         *     local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
+         *     local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A
+         *     `firebird` server is detected by its local port (3050) or its `firebird` process
+         *     (ADR-0060 decision 7).
          */
         DetectedTarget: {
             engine: components["schemas"]["Engine"];
@@ -880,11 +906,12 @@ export interface components {
             /**
              * @description Process name only (the command line may contain secrets and is never read or sent).
              *     `sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
-             *     `valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
-             *     `Engine`): a detected target of such an engine is not sent before the token is listed.
+             *     `valkey-server` (ADR-0052 decision 11) and `firebird` (the Firebird server, ADR-0060
+             *     decision 7) belong to engines gated by their token (see `Engine`): a detected target
+             *     of such an engine is not sent before the token is listed.
              * @enum {string}
              */
-            process?: "postgres" | "mysqld" | "mariadbd" | "mongod" | "slapd" | "sqlservr" | "redis-server" | "valkey-server";
+            process?: "postgres" | "mysqld" | "mariadbd" | "mongod" | "slapd" | "sqlservr" | "redis-server" | "valkey-server" | "firebird";
         };
         SpoolStatus: {
             bytes: components["schemas"]["Count"];
@@ -1234,6 +1261,9 @@ export interface components {
          *     database, the same on every SQLite target: the `target_id` tells files apart; checked by
          *     this schema), no `schema`, `object` = the table name, `field` = the column name. Never
          *     the file's path, its name or a side file's name.
+         *     Firebird (ADR-0060 decision 5): `database` = the name declared in `agent.yaml`, never a
+         *     file path or alias; `object` = the table; `field` = the column; no `schema` (checked by
+         *     this schema: Firebird 4.0 and 5.0 have no schemas).
          *
          *     `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
          *     every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
@@ -1259,7 +1289,7 @@ export interface components {
              *     decision 9).
              */
             altered?: components["schemas"]["LocationPart"][];
-        } & (unknown & unknown);
+        } & (unknown & unknown & unknown);
         /**
          * @description A part of a `Location` (ADR-0056): its `database`, `schema`, `object` or `field` name.
          * @enum {string}

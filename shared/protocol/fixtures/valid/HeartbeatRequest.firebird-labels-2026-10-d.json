@@ -1,0 +1,87 @@
+{
+  "ts": "2026-10-25T09:00:00Z",
+  "agent_version": "0.10.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "firebird"
+  ],
+  "targets": [
+    {
+      "target_id": "fb-sysdba",
+      "engine": "firebird",
+      "server_version": "5.0.4",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "privilege.refused",
+          "labels": [
+            "sysdba",
+            "rdb_admin",
+            "trace_any_attachment",
+            "verifier_relation_readable"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "fb-crm",
+      "engine": "firebird",
+      "server_version": "5.0.4",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "firebird_audit_trace",
+      "notes": [
+        {
+          "code": "privilege.global_privileges",
+          "count": 2,
+          "labels": [
+            "select_any_object_in_database",
+            "credential_relation_readable"
+          ]
+        },
+        {
+          "code": "privilege.beyond_select",
+          "count": 3,
+          "labels": [
+            "insert",
+            "usage",
+            "create"
+          ]
+        },
+        {
+          "code": "privilege.not_evaluated",
+          "labels": [
+            "role_graph"
+          ]
+        },
+        {
+          "code": "audit.trace_settings_missing",
+          "labels": [
+            "time_threshold",
+            "print_perf",
+            "log_blr_requests",
+            "exclude_filter"
+          ]
+        },
+        {
+          "code": "audit.services_not_audited",
+          "labels": [
+            "enabled",
+            "log_services"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  },
+  "accepts": [
+    "sensitive_object.key_pattern"
+  ]
+}

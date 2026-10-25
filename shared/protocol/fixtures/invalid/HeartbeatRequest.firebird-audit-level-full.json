@@ -1,0 +1,25 @@
+{
+  "ts": "2026-10-25T09:00:00Z",
+  "agent_version": "0.10.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "firebird"
+  ],
+  "targets": [
+    {
+      "target_id": "fb-crm",
+      "engine": "firebird",
+      "server_version": "5.0.4",
+      "reachable": true,
+      "audit_level": "full",
+      "audit_source": "firebird_audit_trace"
+    }
+  ],
+  "detected_targets": [],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}

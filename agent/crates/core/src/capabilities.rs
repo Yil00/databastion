@@ -20,6 +20,9 @@
 //! 12); the `redis` connector and the `redis_*` audit sources serve both
 //! engines, so they wait for **both** tokens. `sqlite` waits for
 //! `engine.sqlite` (ADR-0059 decision 8); no audit source serves it.
+//! `firebird`, its `firebird` detected process and the
+//! `firebird_audit_trace` audit source wait for `engine.firebird`
+//! (ADR-0060 decision 8).
 //!
 //! In the other direction (ADR-0022 decision 3), the agent lists in
 //! `HeartbeatRequest.accepts` the console -> agent fields and value forms
@@ -83,6 +86,15 @@ pub(crate) mod token {
     /// The `sqlite` values of `Engine` and `Connector` (ADR-0059 decision
     /// 8; SQLite has no `AuditSource` value).
     pub(crate) const ENGINE_SQLITE: &str = "engine.sqlite";
+    /// The `firebird` values of `Engine`, `Connector` and
+    /// `DetectedTarget.process`, and `firebird_audit_trace` of
+    /// `AuditSource` (ADR-0060 decision 8).
+    pub(crate) const ENGINE_FIREBIRD: &str = "engine.firebird";
+    /// The `TargetNoteLabel` values of the Firebird revision (ADR-0060
+    /// decisions 4 and 6; ADR-0022 decision 4): system privileges, the
+    /// identities of the refusal list, `usage`, the credential-relation and
+    /// role-graph probes, and the trace configuration settings.
+    pub(crate) const NOTE_LABELS_2026_10_D: &str = "target_status.note_labels.2026_10_d";
 }
 
 /// Tokens of the console -> agent fields and value forms this build
@@ -118,6 +130,8 @@ const SQLSERVER: &[&str] = &[token::ENGINE_SQLSERVER];
 const REDIS_AND_VALKEY: &[&str] = &[token::ENGINE_REDIS, token::ENGINE_VALKEY];
 /// `engine.sqlite`.
 const SQLITE: &[&str] = &[token::ENGINE_SQLITE];
+/// `engine.firebird`.
+const FIREBIRD: &[&str] = &[token::ENGINE_FIREBIRD];
 
 /// The tokens gating an `Engine` value (ADR-0039 decision 8): none for the
 /// engines of protocol 0.1.0, always sendable; otherwise the value is sent
@@ -133,6 +147,7 @@ pub(crate) fn engine_token(engine: Engine) -> &'static [&'static str] {
         Engine::Redis => &[token::ENGINE_REDIS],
         Engine::Valkey => &[token::ENGINE_VALKEY],
         Engine::Sqlite => SQLITE,
+        Engine::Firebird => FIREBIRD,
     }
 }
 
@@ -153,6 +168,7 @@ pub(crate) fn process_token(process: DetectedTargetProcess) -> &'static [&'stati
         DetectedTargetProcess::Sqlservr => SQLSERVER,
         DetectedTargetProcess::RedisServer => &[token::ENGINE_REDIS],
         DetectedTargetProcess::ValkeyServer => &[token::ENGINE_VALKEY],
+        DetectedTargetProcess::Firebird => FIREBIRD,
     }
 }
 
@@ -166,6 +182,7 @@ pub(crate) fn connector_token(connector: Connector) -> &'static [&'static str] {
         Connector::Sqlserver => SQLSERVER,
         Connector::Redis => REDIS_AND_VALKEY,
         Connector::Sqlite => SQLITE,
+        Connector::Firebird => FIREBIRD,
     }
 }
 
@@ -192,6 +209,7 @@ pub(crate) fn audit_source_token(source: AuditSource) -> &'static [&'static str]
         | AuditSource::RedisCommandlog
         | AuditSource::RedisAclLog
         | AuditSource::RedisSync => REDIS_AND_VALKEY,
+        AuditSource::FirebirdAuditTrace => FIREBIRD,
     }
 }
 
@@ -775,6 +793,7 @@ mod tests {
             (Engine::Redis, "redis"),
             (Engine::Valkey, "valkey"),
             (Engine::Sqlite, "sqlite"),
+            (Engine::Firebird, "firebird"),
         ] {
             assert_eq!(engine_token(engine), [format!("engine.{value}").as_str()]);
             assert_eq!(engine.to_string(), value);
@@ -792,6 +811,18 @@ mod tests {
         assert_eq!(
             connector_token(Connector::Sqlite),
             engine_token(Engine::Sqlite)
+        );
+        assert_eq!(
+            connector_token(Connector::Firebird),
+            engine_token(Engine::Firebird)
+        );
+        assert_eq!(
+            audit_source_token(AuditSource::FirebirdAuditTrace),
+            engine_token(Engine::Firebird)
+        );
+        assert_eq!(
+            process_token(DetectedTargetProcess::Firebird),
+            engine_token(Engine::Firebird)
         );
         for s in [
             AuditSource::SqlserverAudit,
@@ -869,6 +900,63 @@ mod tests {
         assert!(!caps.accepts_engine(Engine::Cas));
         caps.clear();
         assert!(!caps.accepts_engine(Engine::Sqlite));
+    }
+
+    #[test]
+    fn firebird_values_wait_for_engine_firebird() {
+        let caps = ConsoleCapabilities::default();
+        assert!(!caps.accepts_engine(Engine::Firebird));
+        assert!(!caps.accepts_connector(Connector::Firebird));
+        assert!(!caps.accepts_audit_source(AuditSource::FirebirdAuditTrace));
+        // Every other engine token, but not Firebird's.
+        caps.record(Some(&list(&[
+            token::ENGINE_CAS,
+            token::ENGINE_SQLSERVER,
+            token::ENGINE_REDIS,
+            token::ENGINE_VALKEY,
+            token::ENGINE_SQLITE,
+            "engine.firebird3",
+        ])));
+        assert!(!caps.accepts_engine(Engine::Firebird));
+        assert!(!caps.accepts_connector(Connector::Firebird));
+        assert!(!caps.accepts_audit_source(AuditSource::FirebirdAuditTrace));
+        caps.record(Some(&list(&[token::ENGINE_FIREBIRD])));
+        assert!(caps.accepts_engine(Engine::Firebird));
+        assert!(caps.accepts_connector(Connector::Firebird));
+        assert!(caps.accepts_audit_source(AuditSource::FirebirdAuditTrace));
+        assert!(!caps.accepts_engine(Engine::Sqlite));
+        caps.clear();
+        assert!(!caps.accepts_engine(Engine::Firebird));
+    }
+
+    /// The contract fixture of a heartbeat reporting `firebird` targets
+    /// and a detected `firebird` server.
+    fn firebird_heartbeat() -> HeartbeatRequest {
+        serde_json::from_str(include_str!(
+            "../../../../shared/protocol/fixtures/valid/HeartbeatRequest.firebird.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_heartbeat_reports_no_firebird_value_until_the_console_lists_engine_firebird() {
+        let caps = ConsoleCapabilities::default();
+        let mut hb = firebird_heartbeat();
+        let targets = hb.targets.len();
+        assert!(!hb.detected_targets.is_empty());
+        let withheld = withhold_unaccepted_engines(&mut hb, &caps);
+        assert_eq!(withheld.len(), targets);
+        let json = serde_json::to_string(&hb).unwrap();
+        assert!(!json.contains("firebird"), "{json}");
+        assert!(hb.targets.is_empty());
+        assert!(hb.detected_targets.is_empty());
+        assert_eq!(hb.connectors.0.len(), 4);
+
+        caps.record(Some(&list(&[token::ENGINE_FIREBIRD])));
+        let mut hb = firebird_heartbeat();
+        let before = serde_json::to_value(&hb).unwrap();
+        assert!(withhold_unaccepted_engines(&mut hb, &caps).is_empty());
+        assert_eq!(serde_json::to_value(&hb).unwrap(), before);
     }
 
     /// The contract fixture of a heartbeat reporting `sqlite` targets.
@@ -994,7 +1082,8 @@ mod tests {
             "cas",
             "sqlserver",
             "redis",
-            "sqlite"
+            "sqlite",
+            "firebird"
         ]))
         .unwrap();
         let sent = enroll_connectors(all);

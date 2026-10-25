@@ -108,7 +108,8 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
  * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
  * Redis, Valkey, Apereo CAS and SQLite by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES};
  * SQLite: ADR-0059 decision 6, it folds ASCII letters only, so the Unicode fold would let an
- * exception for `Ärzte` cover a distinct table `ärzte`), and an engine added later is never
+ * exception for `Ärzte` cover a distinct table `ärzte`; Firebird: ADR-0060 decision 5, quoted names
+ * are compared exactly), and an engine added later is never
  * loosened before its connector ADR decides. Policy conditions,
  * per-object sensitivity and scores stay case-insensitive on every engine (looser matching only
  * reports more).
@@ -116,7 +117,7 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
 export const CASE_BLIND_EXCEPTION_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "openldap"];
 
 /** The contract engines on which location exceptions compare names with case (ADR-0054). */
-export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas", "sqlite"];
+export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas", "sqlite", "firebird"];
 
 /** Whether location exceptions compare names with case on `engine` (ADR-0054 decision 1). */
 export function exceptionMatchesCase(engine: string | null): boolean {

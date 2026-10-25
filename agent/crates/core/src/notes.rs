@@ -745,6 +745,66 @@ pub(crate) const LABELS_REVISION_2026_10_B: &[&str] = &[
 /// [`LABELS_REVISION_2026_10_B`]: `other` until the console lists it.
 pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 
+/// The `TargetNoteLabel` values of the revision
+/// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
+/// and 6): the Firebird 4.0 and 5.0 system privileges, the identities of
+/// the refusal list, the `usage` object right, the credential-relation and
+/// role-graph probes, and the trace configuration settings. Negotiated on
+/// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
+/// console lists it. Only [`NoteLabel::firebird`] builds them.
+pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
+    "user_management",
+    "read_raw_pages",
+    "create_user_types",
+    "use_nbackup_utility",
+    "change_shutdown_mode",
+    "trace_any_attachment",
+    "monitor_any_attachment",
+    "access_shutdown_database",
+    "create_database",
+    "drop_database",
+    "use_gbak_utility",
+    "use_gstat_utility",
+    "use_gfix_utility",
+    "ignore_db_triggers",
+    "change_header_settings",
+    "select_any_object_in_database",
+    "access_any_object_in_database",
+    "modify_any_object_in_database",
+    "change_mapping_rules",
+    "use_granted_by_clause",
+    "grant_revoke_on_any_object",
+    "grant_revoke_any_ddl_right",
+    "create_privileged_roles",
+    "get_dbcrypt_info",
+    "modify_ext_conn_pool",
+    "replicate_into_database",
+    "profile_any_attachment",
+    "sysdba",
+    "rdb_admin",
+    "database_owner",
+    "security_database_admin",
+    "usage",
+    "verifier_relation_readable",
+    "credential_relation_readable",
+    "role_graph",
+    "enabled",
+    "log_filename",
+    "log_connections",
+    "log_statement_finish",
+    "log_blr_requests",
+    "log_procedure_finish",
+    "log_function_finish",
+    "log_trigger_finish",
+    "log_errors",
+    "log_services",
+    "time_threshold",
+    "print_perf",
+    "include_filter",
+    "exclude_filter",
+    "connection_id",
+];
+
 /// The `target_status.note_labels.<revision>` tokens the console listed in
 /// its latest heartbeat response (ADR-0022 decision 4). Each revision is
 /// negotiated on its own: a label is sent only when the token of its own
@@ -757,6 +817,8 @@ pub(crate) struct LabelRevisions {
     pub(crate) r2026_10_b: bool,
     /// `target_status.note_labels.2026_10_c` ([`LABELS_REVISION_2026_10_C`]).
     pub(crate) r2026_10_c: bool,
+    /// `target_status.note_labels.2026_10_d` ([`LABELS_REVISION_2026_10_D`]).
+    pub(crate) r2026_10_d: bool,
 }
 
 impl LabelRevisions {
@@ -766,6 +828,7 @@ impl LabelRevisions {
         r2026_10: true,
         r2026_10_b: true,
         r2026_10_c: true,
+        r2026_10_d: true,
     };
 
     /// Whether `value` (a contract `TargetNoteLabel` value) may be sent.
@@ -773,6 +836,7 @@ impl LabelRevisions {
         (self.r2026_10 || !LABELS_REVISION_2026_10.contains(&value))
             && (self.r2026_10_b || !LABELS_REVISION_2026_10_B.contains(&value))
             && (self.r2026_10_c || !LABELS_REVISION_2026_10_C.contains(&value))
+            && (self.r2026_10_d || !LABELS_REVISION_2026_10_D.contains(&value))
     }
 }
 
@@ -781,6 +845,7 @@ fn in_a_revision(value: &str) -> bool {
     LABELS_REVISION_2026_10.contains(&value)
         || LABELS_REVISION_2026_10_B.contains(&value)
         || LABELS_REVISION_2026_10_C.contains(&value)
+        || LABELS_REVISION_2026_10_D.contains(&value)
 }
 
 /// Closed label of a note: a value of the contract `TargetNoteLabel` enum.
@@ -790,11 +855,12 @@ fn in_a_revision(value: &str) -> bool {
 /// New label values are a contract enum change, negotiated with a
 /// `target_status.note_labels.<revision>` token (ADR-0022 decision 4). The
 /// values of this build are those of protocol 0.1.0, sent without a token,
-/// and those of the SQL Server revisions `2026_10`
+/// those of the SQL Server revisions `2026_10`
 /// ([`LABELS_REVISION_2026_10`]), `2026_10_b`
 /// ([`LABELS_REVISION_2026_10_B`]) and `2026_10_c`
-/// ([`LABELS_REVISION_2026_10_C`]), each sent only once the console lists
-/// its own token, `other` before ([`to_protocol`]).
+/// ([`LABELS_REVISION_2026_10_C`]), and those of the Firebird revision
+/// `2026_10_d` ([`LABELS_REVISION_2026_10_D`]), each sent only once the
+/// console lists its own token, `other` before ([`to_protocol`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NoteLabel(TargetNoteLabel);
 
@@ -807,8 +873,10 @@ impl NoteLabel {
     /// and so are the values of the SQL Server revisions
     /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
     /// [`LABELS_REVISION_2026_10_C`]), which only
-    /// [`sqlserver`](Self::sqlserver) builds: a MySQL / MariaDB server
-    /// could name a dynamic privilege after one of them.
+    /// [`sqlserver`](Self::sqlserver) builds, and of the Firebird revision
+    /// ([`LABELS_REVISION_2026_10_D`]), which only
+    /// [`firebird`](Self::firebird) builds: a MySQL / MariaDB server could
+    /// name a dynamic privilege after one of them.
     #[must_use]
     pub fn parse(value: &str) -> Self {
         if in_a_revision(value) {
@@ -872,6 +940,17 @@ impl NoteLabel {
     /// its token, see [`to_protocol`]); anything else is `other`.
     #[must_use]
     pub fn sqlserver(value: &str) -> Self {
+        value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
+    }
+
+    /// A Firebird label (ADR-0060 decisions 4 and 6): any contract value,
+    /// the revision `target_status.note_labels.2026_10_d` included (sent as
+    /// `other` until the console lists its token, see [`to_protocol`]);
+    /// anything else is `other`. Firebird system privileges are given
+    /// lowercased (`trace_any_attachment`); object and DDL rights use the
+    /// values of protocol 0.1.0 (`insert`, `create`…).
+    #[must_use]
+    pub fn firebird(value: &str) -> Self {
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
@@ -1105,7 +1184,8 @@ fn sent_labels(labels: &[NoteLabel], revisions: LabelRevisions) -> Vec<TargetNot
 ///
 /// The labels of a revision after protocol 0.1.0
 /// ([`LABELS_REVISION_2026_10`], [`LABELS_REVISION_2026_10_B`],
-/// [`LABELS_REVISION_2026_10_C`]) are sent only when `revisions` holds its token (the console listed it), `other`
+/// [`LABELS_REVISION_2026_10_C`], [`LABELS_REVISION_2026_10_D`]) are sent
+/// only when `revisions` holds its token (the console listed it), `other`
 /// otherwise (ADR-0022 decision 4). Negotiation comes first, then the
 /// ranking by [`SEVERITY`] (`other` last), then the cut to [`MAX_LABELS`]:
 /// labels the console cannot receive never push out labels it can.
@@ -1162,6 +1242,7 @@ mod tests {
 
     const REVISION_B_MARKER: &str = "        # Revision target_status.note_labels.2026_10_b (ADR-0051 refinement of 2026-10-14):\n";
     const REVISION_C_MARKER: &str = "        # Revision target_status.note_labels.2026_10_c (ADR-0051 refinement option (a')):\n";
+    const REVISION_D_MARKER: &str = "        # Revision target_status.note_labels.2026_10_d (ADR-0060 decisions 4 and 6): Firebird.\n";
 
     /// The labels sent for `note` with `revisions`.
     fn sent(note: &TargetNote, revisions: LabelRevisions) -> Vec<String> {
@@ -1211,11 +1292,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         assert_eq!(sent(&note, none), vec!["other", "select"]);
         assert_eq!(sent(&note, b), vec!["other", "select"]);
@@ -1275,11 +1358,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let b = LabelRevisions {
             r2026_10: false,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         // Not negotiated: every revision value is `other`, once.
         assert_eq!(sent(&refused, LabelRevisions::default()), vec!["other"]);
@@ -1325,9 +1410,9 @@ mod tests {
 
     #[test]
     fn labels_of_revision_2026_10_c_are_sent_as_other_until_negotiated() {
-        // The list is exactly the contract values of the revision, the
-        // last ones of the enum.
-        let revision = contract_revision(REVISION_C_MARKER, "    DetectedTarget:");
+        // The list is exactly the contract values of the revision, up to
+        // the next one.
+        let revision = contract_revision(REVISION_C_MARKER, REVISION_D_MARKER);
         assert_eq!(revision, super::LABELS_REVISION_2026_10_C);
         for value in super::LABELS_REVISION_2026_10_C {
             assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
@@ -1346,11 +1431,13 @@ mod tests {
             r2026_10: true,
             r2026_10_b: true,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         let c = LabelRevisions {
             r2026_10: false,
             r2026_10_b: false,
             r2026_10_c: true,
+            r2026_10_d: false,
         };
         assert_eq!(sent(&note, LabelRevisions::default()), vec!["other"]);
         assert_eq!(sent(&note, ab), vec!["other", "password_hash_probe"]);
@@ -1358,6 +1445,60 @@ mod tests {
         assert_eq!(
             sent(&note, LabelRevisions::ALL),
             vec!["password_hash_probe", "on_failure_probe"]
+        );
+    }
+
+    #[test]
+    fn labels_of_revision_2026_10_d_are_sent_as_other_until_negotiated() {
+        // The list is exactly the contract values of the revision, the
+        // last ones of the enum.
+        let revision = contract_revision(REVISION_D_MARKER, "    DetectedTarget:");
+        assert_eq!(revision, super::LABELS_REVISION_2026_10_D);
+        for value in super::LABELS_REVISION_2026_10_D {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            // Never built from a MySQL / MariaDB or PostgreSQL name.
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), *value);
+            assert!(
+                !super::LABELS_REVISION_2026_10.contains(value)
+                    && !super::LABELS_REVISION_2026_10_B.contains(value)
+                    && !super::LABELS_REVISION_2026_10_C.contains(value),
+                "a value belongs to one revision only"
+            );
+        }
+        // A MySQL privilege named like a Firebird one stays `other`.
+        assert!(super::NoteLabel::privilege("CREATE DATABASE").is_other());
+        assert!(super::NoteLabel::privilege("USAGE").is_other());
+        // Not a contract value: `other`, never the raw name.
+        assert!(super::NoteLabel::firebird("TRACE_ANY_ATTACHMENT").is_other());
+        assert!(super::NoteLabel::firebird("trace any attachment").is_other());
+        let refused = super::TargetNote::new(super::NoteCode::PrivilegeRefused).with_labels(
+            ["trace_any_attachment", "rdb_admin", "select"].map(super::NoteLabel::firebird),
+        );
+        let abc = LabelRevisions {
+            r2026_10: true,
+            r2026_10_b: true,
+            r2026_10_c: true,
+            r2026_10_d: false,
+        };
+        let d = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: false,
+            r2026_10_c: false,
+            r2026_10_d: true,
+        };
+        assert_eq!(
+            sent(&refused, LabelRevisions::default()),
+            vec!["other", "select"]
+        );
+        assert_eq!(sent(&refused, abc), vec!["other", "select"]);
+        assert_eq!(
+            sent(&refused, d),
+            vec!["select", "trace_any_attachment", "rdb_admin"]
+        );
+        assert_eq!(
+            sent(&refused, LabelRevisions::ALL),
+            vec!["select", "trace_any_attachment", "rdb_admin"]
         );
     }
 
@@ -1496,6 +1637,7 @@ mod tests {
             r2026_10: true,
             r2026_10_b: false,
             r2026_10_c: false,
+            r2026_10_d: false,
         };
         // 14 labels of 2026_10 outside the severity list, the hash probe,
         // and the 20 labels of 2026_10_b (three of them in the severity

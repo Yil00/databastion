@@ -134,6 +134,9 @@ fn family(engine: Engine) -> u8 {
         // only, no process or port to detect, no file system search); its
         // own family.
         Engine::Sqlite => 7,
+        // ADR-0060 decision 7: port 3050 and the `firebird` process (not
+        // detected yet: local detection comes with the connector, P10-B).
+        Engine::Firebird => 8,
     }
 }
 
