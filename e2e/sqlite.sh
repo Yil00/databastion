@@ -106,6 +106,10 @@ truth_for() {
   jq --arg f "$1" '.locations |= map(select(.engine != "sqlite" or .file == $f))' "$GROUND_TRUTH" >"$2"
 }
 
+# The application's log (every run of its container, restarts included), and its lines with TEXT.
+app_logs() { timeout 30 docker compose "${COMPOSE_ARGS[@]}" logs --no-color target-sqlite 2>/dev/null || true; }
+app_log_count() { app_logs | grep -cF "$1" || true; }
+
 # --------------------------------------------------------------------------- secrets, CA, agent.yaml
 console_secrets
 test_ca "e2e SQLite"
@@ -288,8 +292,13 @@ phase_done audit-configure
 # gets SIGBUS at its next unit (ADR-0059 decision 4): one reader lost (its unit counted
 # `skipped_error`), the agent unaffected. Until the application rebuilds its WAL index, the next
 # readers find the file not readable (`wal_files_not_readable`) and count their tables
-# `skipped_error` too, without dying. The application crashes at its next heartbeat write (every
-# 20 s) and is restarted (restart: on-failure); its next open rebuilds the WAL index.
+# `skipped_error` too, without dying (on this file every later table: the scan ends with all its
+# tables `skipped_error` and none sampled, unless the application restarted during it). The
+# application exits at its next heartbeat write (build.py: a -shm truncated under its connection)
+# and is restarted (restart: on-failure); the restarted process's open rebuilds the WAL index.
+# No cadence decides when either: once the scan ended, the run triggers that write (SIGUSR1), waits
+# for the restart and the restarted process's "paced.db: held open, -shm N bytes" line (the WAL index
+# rebuilt), then for an agent heartbeat reported after it, before the next scan.
 # No delay decides when to truncate: the trigger is the agent's "sqlite catalog read" line for this
 # target, logged when the scan's first unit is done (the catalog read, whose failure fails the whole
 # scan, so it must not be the unit that meets the truncation; the reader has mapped the -shm then and
@@ -300,6 +309,9 @@ phase_done audit-configure
 log "truncated -shm: a scan of ${PACED_TARGET} (${PACED_TABLES} tables), the -shm truncated once its catalog was read"
 agent_cid="$(compose ps -q agent)"
 restarts0="$(docker inspect -f '{{.RestartCount}}' "$agent_cid")"
+app_cid="$(compose ps -q target-sqlite)"
+app_restarts0="$(docker inspect -f '{{.RestartCount}}' "$app_cid")"
+app_opens0="$(app_log_count "${PACED_FILE}: held open")"
 deaths0="$(agent_log_count "sqlite reader process lost" "$PACED_TARGET")"
 catalogs0="$(agent_log_count "sqlite catalog read" "$PACED_TARGET")"
 printf '%s' '{"sample_rows":100,"max_duration_s":600,"statement_timeout_ms":5000}' >"$E2E_WORK_DIR/scan-req.json"
@@ -332,10 +344,31 @@ deaths=$(( $(agent_log_count "sqlite reader process lost" "$PACED_TARGET") - dea
 log "truncated -shm: scan succeeded, coverage ${progress}, reader(s) lost ${deaths}; agent running, not restarted"
 [ "$deaths" = 1 ] || fail "the truncated -shm cost ${deaths} reader(s), expected 1"
 [ "$lost" -ge 1 ] || fail "the truncated -shm cost no unit (skipped_error ${lost})"
-# The application restarted and the file is readable again; a new scan succeeds with no lost unit.
-wait_target_state "$PACED_TARGET" 180 '.reachable == true and ([.notes[]?.code] | index("coverage.wal_files_not_readable") | not)' \
-  "reachable again after the application's restart"
-log "application restarts: $(docker inspect -f '{{.RestartCount}}' "$(compose ps -q target-sqlite)")"
+# The application's next write (triggered now; it may already have come at its 20 s cadence): it
+# exits, is restarted, and the restarted process rebuilds the WAL index.
+if [ "$(docker inspect -f '{{.RestartCount}}' "$app_cid")" = "$app_restarts0" ]; then
+  # Not fatal: a write at its cadence may have just made it exit (the wait below decides).
+  docker kill -s USR1 "$app_cid" >/dev/null || log "target-sqlite not signalled (SIGUSR1): already exiting?"
+fi
+deadline=$(( $(date +%s) + 90 ))
+until [ "$(docker inspect -f '{{.RestartCount}}' "$app_cid")" -gt "$app_restarts0" ] \
+    && [ "$(app_log_count "${PACED_FILE}: held open")" -gt "$app_opens0" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "target-sqlite did not restart and reopen ${PACED_FILE} within 90 s \
+($(docker inspect -f '{{.State.Status}} exit {{.State.ExitCode}} restarts {{.RestartCount}}' "$app_cid"))"
+  sleep 0.5
+done
+shm="$(app_logs | grep -F "${PACED_FILE}: held open, -shm " | tail -n1 | sed -n 's/.*-shm \([0-9]*\) bytes.*/\1/p')"
+[ "${shm:-0}" -ge 32768 ] || fail "the restarted application did not rebuild the WAL index of ${PACED_FILE} (-shm ${shm:-?} bytes)"
+log "application restarts: $(( $(docker inspect -f '{{.RestartCount}}' "$app_cid") - app_restarts0 )), WAL index rebuilt (-shm ${shm} bytes)"
+# Then an agent heartbeat checked after it, reporting the target reachable with no WAL note.
+reopened="$(console_sql "SELECT now()")"
+deadline=$(( $(date +%s) + 120 ))
+until [ "$(console_sql "SELECT count(*) FROM agent_targets WHERE agent_id = '${AGENT_ID}' AND target_id = '${PACED_TARGET}' AND last_reported_at > '${reopened}'::timestamptz")" = 1 ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "no agent heartbeat for ${PACED_TARGET} within 120 s of the application's restart"
+  sleep 1
+done
+wait_target_state "$PACED_TARGET" 60 '.reachable == true and ([.notes[]?.code] | index("coverage.wal_files_not_readable") | not)' \
+  "reachable after the application's restart"
 scan_targets "$SCAN_TIMEOUT_S" "$PACED_TARGET"
 progress="$(console_sql "SELECT coalesce(progress, '{}'::jsonb) FROM jobs WHERE id = '${SCAN_JOB_IDS[0]}'")"
 [ "$(jq -r '.skipped_error // 0' <<<"$progress")" = 0 ] || fail "the scan after the restart lost units ($progress)"

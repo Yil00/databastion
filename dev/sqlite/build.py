@@ -22,7 +22,10 @@ Subcommands
       The application: keeps every WAL-mode database of DIR open (so its `-wal` and `-shm` exist, as
       with a running application; ADR-0059 decision 3), writes FILE once they are all open, and with
       --write-every inserts a row into `writer_heartbeat` of each held file that has that table
-      every S seconds. Runs until SIGTERM / SIGINT.
+      every S seconds, and once more at each SIGUSR1. Logs "<file>: held open, -shm <size> bytes"
+      per file once open (the WAL index built or rebuilt). Before each write, a `-shm` shorter than
+      one WAL-index region (truncated under the held connection) makes it exit with status 75 (the
+      write would raise SIGBUS), for a restart policy to restart it. Runs until SIGTERM / SIGINT.
   serve  --manifest M --out DIR [--ready FILE] [--write-every S] [--paced-tables N]
       `build --if-missing`, then `hold`: the dev and e2e sidecar (Compose profile `sqlite`). With
       --paced-tables N, also DIR/paced.db if missing (as `paced`).
@@ -59,6 +62,8 @@ ENCODINGS = ("UTF-8", "UTF-16le", "UTF-16be")
 REQUIRES = "-- databastion:requires "
 REQUIRES_END = "-- databastion:end"
 HEARTBEAT_TABLE = "writer_heartbeat"
+# The first region of a WAL index (32 KiB): a -shm in use is never shorter.
+SHM_REGION = 32768
 
 
 def log(msg: str) -> None:
@@ -225,6 +230,13 @@ def wal_files(directory: Path) -> list[Path]:
     return out
 
 
+def shm_size(db: Path) -> int:
+    try:
+        return os.stat(f"{db}-shm").st_size
+    except FileNotFoundError:
+        return 0
+
+
 def hold(directory: Path, ready: str | None, write_every: float) -> int:
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
@@ -238,19 +250,39 @@ def hold(directory: Path, ready: str | None, write_every: float) -> int:
         beats = con.execute("SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",
                             (HEARTBEAT_TABLE,)).fetchone()[0] == 1
         cons.append((p, con, beats))
+        # The read above built (or rebuilt) the WAL index: the e2e run waits for this line after
+        # a restart.
+        log(f"{p.name}: held open, -shm {shm_size(p)} bytes")
     log(f"holding {len(cons)} WAL database(s) open (SQLite {sqlite3.sqlite_version})")
     if ready:
         Path(ready).write_text("ready\n", encoding="utf-8")
+    # SIGUSR1: one heartbeat write now (the e2e run's truncated -shm scenario), besides the cadence.
+    poke = []
+    signal.signal(signal.SIGUSR1, lambda *_: poke.append(1))
     n = 0
     next_beat = time.monotonic() + write_every
     while not stop:
         time.sleep(0.2)
-        if write_every > 0 and time.monotonic() >= next_beat:
+        due = write_every > 0 and time.monotonic() >= next_beat
+        if due or poke:
             n += 1
-            for _, con, beats in cons:
-                if beats:
-                    con.execute(f"INSERT INTO {HEARTBEAT_TABLE} (beat) VALUES (?)", (n,))
-            next_beat += write_every
+            for p, con, beats in cons:
+                if not beats:
+                    continue
+                # A -shm truncated under this connection: the write would raise SIGBUS here. Exit
+                # instead, with a status the restart policy restarts (on-failure), so that the
+                # crash does not depend on how a container's PID 1 takes SIGBUS; the restarted
+                # process's open rebuilds the WAL index.
+                if shm_size(p) < SHM_REGION:
+                    log(f"{p.name}-shm: truncated under the held connection: exiting")
+                    # No close: closing the connection would touch the -shm (SIGBUS) too.
+                    os._exit(75)
+                con.execute(f"INSERT INTO {HEARTBEAT_TABLE} (beat) VALUES (?)", (n,))
+            if poke:
+                log(f"heartbeat write {n} (SIGUSR1)")
+                poke.clear()
+            if due:
+                next_beat += write_every
     for _, con, _ in cons:
         con.close()
     log(f"stopped after {n} heartbeat write(s)")

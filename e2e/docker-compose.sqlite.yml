@@ -16,9 +16,10 @@
 #                      Also paced.db (build.py --paced-tables 400: WAL, held open, 400 small tables of
 #                      integers, no ground truth), the truncated -shm scenario's own file.
 #                      Restarted after a crash: sqlite.sh truncates paced.db's -shm during a scan,
-#                      which raises SIGBUS in every process mapping it, the agent's reader at its
-#                      next unit and this writer at its next heartbeat (seconds later: the reader
-#                      sees the truncated file first, not a WAL index the restarted writer rebuilt).
+#                      which raises SIGBUS in every process mapping it (the agent's reader at its
+#                      next unit). This writer exits (status 75) at its next heartbeat write, which
+#                      sqlite.sh triggers with SIGUSR1 once the scan ended (or its 20 s cadence came
+#                      first); its restarted process's open rebuilds the WAL index.
 #   agent              the files through the same volume mounted read-only (`:ro`, ADR-0059
 #                      decision 2: the file system must be read-only for the agent), its root file
 #                      system read-only (x-hardening), group 10030 added; no secret but its own.

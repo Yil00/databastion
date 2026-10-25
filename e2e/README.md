@@ -795,8 +795,18 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   (`build.py truncate-shm`), and the scan must still be running after the truncation (a scan that
   had already ended fails the run). Then: exactly one reader lost
   (the agent's "sqlite reader process lost" line), at least one unit counted `skipped_error`, the
-  scan succeeded, the agent neither restarted nor stopped; once the application crashed at its next
-  write and restarted, the target is readable again and a new scan loses no unit and finds nothing. Last, the I2 scans of the console
+  scan succeeded, the agent neither restarted nor stopped. On this file the scan normally ends with
+  every table `skipped_error` and none sampled (`{"skipped_error": 401, "objects_sampled": 0}`: 400
+  tables and `writer_heartbeat`): one death costs one unit (ADR-0059 decision 4), and until the
+  application rebuilds its WAL index the next readers cannot use the truncated `-shm` (a read-only
+  reader cannot map or rebuild it) and count each later table `skipped_error` without dying, so the 3-deaths stop is not reached; fewer
+  only if the application restarted during the scan, hence `≥ 1`. Then, with no wait on the
+  application's 20 s write cadence: the run sends it `SIGUSR1` (one write now), the application
+  exits at that write (a `-shm` truncated under its connection, status 75) and is restarted; the run
+  waits (90 s at most) for its restart count to grow and for the restarted process's
+  "paced.db: held open, -shm N bytes" line with N ≥ 32 768 (the WAL index rebuilt), then (120 s at
+  most) for an agent heartbeat reported after that, with the target reachable and no
+  `coverage.wal_files_not_readable` note. A new scan then loses no unit and finds nothing. Last, the I2 scans of the console
   database, the pages, the agent's state and every log (no ground-truth value or value-bearing
   name), no path or side-file name on the console side or in the agent's log, and the secret
   hygiene of the other runs.
