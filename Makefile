@@ -271,7 +271,7 @@ docs-check: ## Internal Markdown links (CI)
 shell-lint: ## shellcheck of the load harness (CI), the OIDC and SQLite e2e scenarios (CI), dev/agent-it.sh and the Keycloak, CAS and SQLite dev scripts
 	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
 	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh dev/sqlserver/entrypoint.sh dev/redis/entrypoint.sh \
-	  dev/redis/tls-init.sh dev/sqlite/files-init.sh e2e/sqlite.sh
+	  dev/redis/tls-init.sh dev/sqlite/files-init.sh e2e/sqlite.sh e2e/load/sqlite.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'

@@ -4,7 +4,8 @@ name: Load / database impact
 # (PostgreSQL, MariaDB, MongoDB; MVP criterion < 2 %), the Audit path under a sustained workload
 # (pgbench, sysbench; nothing dropped, p95 latency with and without Audit) and the agent's CPU / RSS
 # over a 10-minute run. About 30 minutes: NOT part of the required "CI result" check (ci.yml).
-# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey / Redis targets the same way.
+# load-cas, load-sqlserver and load-redis run the CAS, SQL Server and Valkey / Redis targets the same way;
+# load-sqlite measures the impact of a SQLite scan on a concurrent writer (SQLite has no server).
 # Runs weekly, on demand, and on pull requests labelled `load-test`; the harness unit tests run on
 # every pull request.
 on:
@@ -17,10 +18,10 @@ on:
         required: false
         default: "600"
       only:
-        description: Run one job only (all, database, cas, sqlserver, redis)
+        description: Run one job only (all, database, cas, sqlserver, redis, sqlite)
         required: false
         type: choice
-        options: [all, database, cas, sqlserver, redis]
+        options: [all, database, cas, sqlserver, redis, sqlite]
         default: all
       sqlserver_version:
         description: "load-sqlserver: SQL Server version (2019 and 2025: the engine matrix pins; 2019 has the Extended Events source only)"
@@ -69,7 +70,7 @@ jobs:
       - name: Unit tests (seed generator, sampler, analysis)
         run: timeout 120 python3 -m unittest discover -s e2e/load -p 'test_*.py' -v
       - name: shellcheck
-        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/sqlserver.sh e2e/load/redis.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
+        run: shellcheck -x e2e/load/run.sh e2e/load/cas.sh e2e/load/sqlserver.sh e2e/load/redis.sh e2e/load/sqlite.sh e2e/load/side-clients.sh e2e/load/pg-side-clients.sh e2e/load/initdb/*.sh
 
   load:
     name: Load / database impact
@@ -272,5 +273,54 @@ jobs:
         with:
           name: load-${{ matrix.engine }}-logs
           path: load-${{ matrix.engine }}-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The SQLite targets (e2e/load/README.md "SQLite targets", ADR-0059 decision 10 "Load"): two files of
+  # about 1 GiB (WAL, held open; rollback journal, `rollback_mode: read`), mounted read-only into the
+  # agent; a writer at 200 transactions per second with its busy timeout at 0 and at 5 s, without then
+  # during a paced Discovery scan: its commit latency, SQLITE_BUSY count and -wal growth, and the CPU
+  # and memory of the agent and its readers. Needs the console to list `engine.sqlite` (P10-E). In
+  # parallel with the other runs, same triggers.
+  load-sqlite:
+    name: Load / SQLite targets
+    needs: unit
+    if: (github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'load-test') && (github.event.action != 'labeled' || github.event.label.name == 'load-test'))) && (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'sqlite')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LOAD_LOG_DIR: ${{ github.workspace }}/load-sqlite-logs
+      LOAD_RESULTS_DIR: ${{ github.workspace }}/load-sqlite-results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner
+        run: |
+          docker version --format '{{.Server.Version}}'
+          docker compose version
+          echo "CPUs: $(nproc)"; free -m | head -n 2
+          df -h "$GITHUB_WORKSPACE" /var/lib/docker 2>/dev/null || true
+          stat -fc 'cgroup filesystem: %T' /sys/fs/cgroup
+          uname -r
+      - name: Run e2e/load/sqlite.sh
+        # Within the job budget, so that cleanup (logs, redaction, teardown) always completes.
+        run: timeout 3300 e2e/load/sqlite.sh
+      # Counters, timings and latencies only: no value, no secret (sqlite.sh redacts every generated
+      # secret from its outputs on exit, whatever the result).
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlite-results
+          path: load-sqlite-results/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-sqlite-logs
+          path: load-sqlite-logs/
           retention-days: 7
           if-no-files-found: ignore

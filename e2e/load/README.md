@@ -15,7 +15,8 @@ MariaDB and a MongoDB target, the agent and two workload clients) and measures:
 
 The SQL Server, Valkey / Redis and CAS targets have runs of their own on the same model:
 [SQL Server target](#sql-server-target), [Valkey and Redis targets](#valkey-and-redis-targets) and
-[CAS target](#cas-target).
+[CAS target](#cas-target); SQLite, which has no server, measures the impact on a concurrent writer:
+[SQLite targets](#sqlite-targets).
 
 The CI job is `load` in [`.github/workflows/load.yml`](../../.github/workflows/load.yml): weekly,
 on demand (`workflow_dispatch`, with the Audit run length as input) and on pull requests labelled
@@ -582,6 +583,65 @@ with Audit; every check passed:
   service time p95 1.127 ms without and 1.081 ms with Audit.
 - Agent: 0.019 core with Audit on (97 ms of CPU per 1 000 commands), 32.7 MiB peak RSS, no growth,
   nothing spooled or dropped.
+
+## SQLite targets
+ROADMAP P10-D, [ADR-0059](../../docs/adr/0059-sqlite-connector.md) decision 10 ("Load").
+[`sqlite.sh`](sqlite.sh) runs the console and the agent with
+[`docker-compose.sqlite.yml`](docker-compose.sqlite.yml) here (Compose project
+`databastion-load-sqlite`). The CI job is `load-sqlite` in
+[`load.yml`](../../.github/workflows/load.yml) (60 min budget, artifact `load-sqlite-results`); like
+the end-to-end job `e2e-sqlite`, it needs the console to list `engine.sqlite` (ROADMAP P10-E).
+
+SQLite has no server whose CPU a scan could cost: the reader runs in the agent's processes and the
+locks it takes are what an application feels. So the run measures **the impact on a concurrent
+writer**, the application ([`sqlite_writer.py`](sqlite_writer.py), Python standard library, in the
+pinned Python image as uid 10020, gid 10030, no network):
+
+1. **Two files** of about `LOAD_SQLITE_SIZE_MB` (default 1024) in `LOAD_SQLITE_TABLES` (8) tables of
+   1 KiB rows (`sqlite_writer.py seed`), in a volume the agent mounts read-only (`:ro`, group 10030
+   added, read-only root file system; the directory `2750` with the application's owner, ADR-0059
+   decision 2): `load-wal.db` in WAL mode, held open for the whole run by `sqlite-holder` (an
+   application's idle connection: its `-wal` and `-shm` exist), and `load-rollback.db` in
+   rollback-journal mode (`LOAD_SQLITE_ROLLBACK_JOURNAL`: `delete`, the default, `truncate` or
+   `persist`), declared `rollback_mode: read`.
+2. **The workload** (`sqlite_writer.py run`): `LOAD_SQLITE_RATE` (200) transactions per second on a
+   fixed schedule, each `BEGIN IMMEDIATE`, one INSERT and one UPDATE of `load_writes`, `COMMIT`, at
+   the SQLite defaults (`synchronous = FULL`), with `PRAGMA busy_timeout` at 0 and at 5 000 ms. Per
+   transaction its commit latency (BEGIN to the end of COMMIT), whether it committed, and where
+   `SQLITE_BUSY` / `SQLITE_LOCKED` came back (the transaction is then rolled back and counted
+   failed); every second the `-wal` size.
+3. For each file and busy timeout: a **baseline** run of `LOAD_SQLITE_BASELINE_S` (60) without scan,
+   then the writer again with a **paced Discovery scan** of the file (the agent's default 1 % duty
+   cycle, `LOAD_SAMPLE_ROWS` rows per table); the scan phase counts the transactions started from the
+   scan's delivery to its end. Four scans in all.
+4. **The agent's container** (the agent and its reader processes) sampled every second: its CPU over
+   each scan and its peak memory (cgroup anonymous memory, the readers included).
+
+[`sqliteload.py`](sqliteload.py) (unit tests in [`test_sqliteload.py`](test_sqliteload.py)) writes
+`results.json` and `results.md` with these checks, the criteria ADR-0059 proposes to the maintainer
+(limits from `LOAD_LIMIT_SQLITE_<NAME>`):
+
+| Check | Criterion |
+|---|---|
+| `sqlite.<mode>.b<busy>.workload_ran` | the baseline issued at least 95 % of rate x duration (else the runner, not the agent, sets the figures) |
+| `sqlite.<mode>.b<busy>.scan_succeeded` | each scan succeeded |
+| `sqlite.wal.b<busy>.busy_during_scan` | WAL mode, both busy timeouts: no `SQLITE_BUSY` during the scan |
+| `sqlite.wal.b<busy>.p95_ms` | WAL mode: the commit p95 within 5 % of the baseline's, plus 0.5 ms for the runner's timer noise |
+| `sqlite.wal.b<busy>.wal_peak_mib` | WAL mode: the `-wal` peak during the scan at most max(2 x the baseline's peak, the baseline's peak + 8 MiB): no checkpoint starvation |
+| `sqlite.rollback.b5000.failed_during_scan` | rollback mode with a 5 s busy timeout: no failed commit |
+| `sqlite.rollback.b5000.p99_added_ms` | rollback mode with a 5 s busy timeout: the commit p99 less than `max_statement_ms` (500 ms) above the baseline's |
+| `sqlite.rollback.b0.busy_during_scan` | rollback mode without a busy timeout: the `SQLITE_BUSY` count and rate **measured, not judged** (ADR-0059 open question 8: whether `rollback_mode` keeps its `skip` default) |
+| `agent.<mode>.b<busy>.cpu_cores_scan` | the agent and its readers under 2 % of one core over each scan (the analogue of the < 2 % criterion: SQLite's work happens on the application's host) |
+| `agent.memory_mb_peak`, `agent.no_loss` | at most 256 MiB at the peak; nothing dropped in the agent's log |
+
+In rollback-journal `delete` mode, the application creates and deletes its `-journal` at every
+commit: a reader whose Landlock grant predates a new `-journal` loses its unit (ADR-0059
+implementation note, item 10), so the rollback scans' coverage (in the scans table) is part of the
+measurement; `LOAD_SQLITE_ROLLBACK_JOURNAL=truncate` or `persist` keeps one `-journal` for the run.
+
+**Status**: not run yet (it needs P10-E); the first run's figures go to
+[docs/08](../../docs/08-engine-capabilities.md#load-and-database-impact-measured) with the
+maintainer's decision on the criteria.
 
 ## Event census (ADR-0053 decision 6, informational)
 
