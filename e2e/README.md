@@ -15,7 +15,8 @@ gates** of phase 7; and a password-bearing DCL statement on the Audit path (Post
 [Adding an Audit target](#adding-an-audit-target). The console's OIDC login against Keycloak (P8-D)
 is a separate scenario on part of this stack: [OIDC login scenario](#oidc-login-scenario), and so
 are the Apereo CAS target (P8-D): [CAS target](#cas-target), and the phase 9 engines (P9-D):
-[SQL Server target](#sql-server-target) and [Valkey and Redis targets](#valkey-and-redis-targets). The same `run.sh` also runs with the
+[SQL Server target](#sql-server-target) and [Valkey and Redis targets](#valkey-and-redis-targets), and the phase 10
+engine SQLite (P10-D): [SQLite targets](#sqlite-targets). The same `run.sh` also runs with the
 previous release's agent: [Compatibility with the previous agent](#compatibility-with-the-previous-agent).
 [`run.sh`](run.sh) drives [`docker-compose.yml`](docker-compose.yml); the CI job is `e2e` in
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), required through the `CI result` gate.
@@ -759,6 +760,68 @@ e2e/redis.sh                                  # about 8 minutes once the images 
 E2E_SKIP_BUILD=1 e2e/redis.sh                 # reuse databastion-console:e2e and databastion-agent:e2e
 E2E_REDIS_SCAN_UNDER_AUDIT=0 e2e/redis.sh     # without the Discovery scan under Audit (step 4)
 ```
+
+## SQLite targets
+ROADMAP P10-D, [ADR-0059](../docs/adr/0059-sqlite-connector.md) decision 10 ("End to end"): the dev
+seed's three SQLite files as three targets, Discovery only, with the I2 check on values **and
+names**. [`sqlite.sh`](sqlite.sh) merges [`docker-compose.sqlite.yml`](docker-compose.sqlite.yml)
+over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`, `migrate`, `web`,
+`worker`, `proxy`, `sqlite-files-init`, `target-sqlite` and `agent`.
+
+- **The application** (`target-sqlite`): [`dev/sqlite/build.py`](../dev/sqlite/build.py) in the dev
+  sidecar's pinned Python image (`sqlite.sh` checks the pin is the same) writes `crm.db` (rollback
+  journal, declared `rollback_mode: read`), `app.db` (WAL) and `intl.db` (UTF-16le) into the
+  `sqlite-data` volume on its first start, as uid 10020 and gid 10030 with umask `027`, then keeps
+  `app.db` and `paced.db` open and inserts a heartbeat row in each every 20 s. `sqlite-files-init`
+  ([`dev/sqlite/files-init.sh`](../dev/sqlite/files-init.sh)) makes the directory `2750` first. No
+  network, read-only root file system, restarted after a crash.
+- **The agent** sees the volume read-only (`/srv/sqlite`, `:ro`), its root file system read-only,
+  with group 10030 added (the files' group, not its own): readable, writable by none of its ids
+  (ADR-0059 decision 2). The run checks the owners and modes, the read-only mount and that no
+  refusal note (`coverage.filesystem_not_read_only`, `privilege.database_file_writable`,
+  `coverage.reader_sandbox_unavailable`…) is reported; the reader's Landlock and seccomp calls run
+  under Docker's default seccomp profile (it allows the `landlock_*` calls since Docker 25).
+- **Checks**: the three targets online, reachable, Audit level None with no source, the agent page
+  showing "Discovery only"; one scan per target checked against
+  [`dev/ground-truth.json`](../dev/ground-truth.json) restricted to that target's file (`file`):
+  every expected classifier, no negative control, value-bearing names stored as `*`, database `main`
+  without a schema; an `audit.configure` attempt ending `unsupported` (refused by the console, or
+  the job failed with that code by the agent); then the truncated `-shm` scenario, on a fourth
+  target of its own, `sqlite-paced` (`paced.db`: WAL, held open, 400 small tables of integers and no
+  ground truth, written by `build.py serve --paced-tables 400`, so that its paced scan lasts long
+  enough on any runner). No delay decides when: once the agent logs "sqlite catalog read" for that
+  target (the scan's first unit is done; a failure of that unit fails the whole scan, so it must not
+  meet the truncation; the reader has mapped the `-shm` then), the application truncates the `-shm`
+  (`build.py truncate-shm`), and the scan must still be running after the truncation (a scan that
+  had already ended fails the run). Then: exactly one reader lost
+  (the agent's "sqlite reader process lost" line), at least one unit counted `skipped_error`, the
+  scan succeeded, the agent neither restarted nor stopped. On this file the scan normally ends with
+  every table `skipped_error` and none sampled (`{"skipped_error": 401, "objects_sampled": 0}`: 400
+  tables and `writer_heartbeat`): one death costs one unit (ADR-0059 decision 4), and until the
+  application rebuilds its WAL index the next readers cannot use the truncated `-shm` (a read-only
+  reader cannot map or rebuild it) and count each later table `skipped_error` without dying, so the 3-deaths stop is not reached; fewer
+  only if the application restarted during the scan, hence `≥ 1`. Then, with no wait on the
+  application's 20 s write cadence: the run sends it `SIGUSR1` from inside its container (one write
+  now; not `docker kill`, after which Docker did not apply the restart policy in CI), the
+  application exits at that write (a `-shm` truncated under its connection, status 75), and either
+  Docker restarts it (`restart: on-failure`) or, once it is seen exited, the run starts it
+  (`docker compose start`), as an operator or a supervisor would: the scenario proves the agent's
+  recovery, not Docker's restart. The run waits (90 s at most) for the restarted process's
+  "paced.db: held open, -shm N bytes" line with N ≥ 32 768 (the WAL index rebuilt), then (120 s at
+  most) for an agent heartbeat received at least 3 s after it (so its checks ran after the
+  rebuild), with the target reachable and no `coverage.wal_files_not_readable` note. A new scan then loses no unit and finds nothing. Last, the I2 scans of the console
+  database, the pages, the agent's state and every log (no ground-truth value or value-bearing
+  name), no path or side-file name on the console side or in the agent's log, and the secret
+  hygiene of the other runs.
+- **Depends on the console listing `engine.sqlite`** (ROADMAP P10-E): until then the agent holds the
+  SQLite targets' items (ADR-0042) and the run fails at its first wait ("agent not online").
+
+The CI job is `e2e-sqlite` in [`ci.yml`](../.github/workflows/ci.yml) (40 min budget, `sqlite.sh`
+at most 1980 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`,
+`dev/sqlite/`, the SQLite seed, `dev/ground-truth.json`, `dev/docker-compose.yml` or `ci.yml`
+change. It is **not required** through `CI result` until P10-E is merged and the job is green; then
+it joins `e2e-cas`, `e2e-sqlserver` and `e2e-redis` there. Locally: `e2e/sqlite.sh`
+(`E2E_SKIP_BUILD=1` reuses the images; logs in `e2e/.logs-sqlite`).
 
 ## Load / database impact
 The load harness ([`load/`](load/README.md), phase 7) reuses this stack's targets and accounts to

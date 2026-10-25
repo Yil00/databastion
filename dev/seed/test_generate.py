@@ -88,7 +88,7 @@ class Outputs(unittest.TestCase):
         locs = self.truth["locations"]
         engines = {loc["engine"] for loc in locs}
         self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap", "cas",
-                                   "sqlserver", "valkey", "redis"})
+                                   "sqlserver", "valkey", "redis", "sqlite"})
         for loc in locs:
             for key in ("engine", "database", "object", "expected_classifiers", "negative_control",
                         "name_contains_value"):
@@ -128,9 +128,12 @@ class Outputs(unittest.TestCase):
                      "mongodb": "mongo.json", "sqlserver": "sqlserver.sql", "valkey": "redis.txt",
                      "redis": "redis.txt"}
         for loc in self.truth["locations"]:
-            if loc["engine"] not in seed_file:
+            if loc["engine"] == "sqlite":
+                content = self.files[f"seed/out/sqlite-{loc['file'][:-3]}.sql"]
+            elif loc["engine"] not in seed_file:
                 continue  # LDIF: non-ASCII values are base64-encoded
-            content = self.files["seed/out/" + seed_file[loc["engine"]]]
+            else:
+                content = self.files["seed/out/" + seed_file[loc["engine"]]]
             for v in loc.get("values", []):
                 if loc["engine"] == "mongodb":
                     needle = v
@@ -172,6 +175,87 @@ class SqlServerAndRedis(unittest.TestCase):
         self.assertTrue(all(line.startswith('"') for line in commands))
         for name in ("SET", "HSET", "SADD", "ZADD", "RPUSH", "XADD", "SELECT"):
             self.assertIn(f'"{name}" ', text)
+
+
+class Sqlite(unittest.TestCase):
+    """The opt-in SQLite seed (ADR-0059 decision 10) and dev/sqlite/build.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = g.build()
+        cls.truth = json.loads(cls.files["ground-truth.json"])
+        cls.manifest = json.loads(cls.files["seed/out/sqlite.json"])
+        cls.locs = [loc for loc in cls.truth["locations"] if loc["engine"] == "sqlite"]
+        sys.path.insert(0, str(g.DEV_DIR / "sqlite"))
+        import build  # noqa: E402
+
+        cls.build = build
+
+    def test_manifest_and_targets(self):
+        files = {e["file"]: e for e in self.manifest["files"]}
+        self.assertEqual(self.truth["targets"]["sqlite"]["files"],
+                         {name: e["target"] for name, e in files.items()})
+        self.assertEqual({e["journal_mode"] for e in files.values()}, {"delete", "wal"})
+        self.assertIn("UTF-16le", {e["encoding"] for e in files.values()})
+        for e in files.values():
+            self.assertIn("seed/out/" + e["sql"], self.files)
+        for loc in self.locs:
+            self.assertEqual(loc["database"], "main")
+            self.assertIsNone(loc["container"])
+            self.assertIn(loc["file"], files)
+
+    def test_fixtures(self):
+        sql = "".join(v for k, v in self.files.items() if k.startswith("seed/out/sqlite-"))
+        for fixture in ("WITHOUT ROWID", ") STRICT", "CREATE VIEW", "VIRTUAL", "STORED", "USING fts5",
+                        "AS BLOB", "zeroblob(", "INTEGER NOT NULL"):
+            self.assertIn(fixture, sql)
+        named = [loc for loc in self.locs if loc["name_contains_value"]]
+        self.assertTrue(any(loc["object"] != "escalation_contacts" for loc in named), "table name")
+        self.assertTrue(any(loc["object"] == "escalation_contacts" for loc in named), "column name")
+        fts = [loc for loc in self.locs if loc.get("requires") == "fts5"]
+        self.assertEqual({(loc["object"], bool(loc["expected_classifiers"])) for loc in fts},
+                         {("support_notes_content", True), ("support_notes", False)})
+
+    def test_requires_blocks(self):
+        crm = self.files["seed/out/sqlite-crm.sql"]
+        stripped, kept = self.build.strip_blocks(crm, {"fts5"})
+        self.assertNotIn("fts5", stripped)
+        self.assertEqual(kept, set())
+        full, kept = self.build.strip_blocks(crm, set())
+        self.assertEqual(kept, {"fts5"})
+        self.assertNotIn("databastion:", full)
+        with self.assertRaises(ValueError):
+            self.build.strip_blocks("-- databastion:requires fts5\nx;\n", set())
+        with self.assertRaises(ValueError):
+            self.build.strip_blocks("-- databastion:requires rtree\nx;\n-- databastion:end\n", set())
+
+    def test_builder_writes_every_variant(self):
+        import sqlite3
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            man = Path(d) / "m"
+            man.mkdir()
+            for name, content in self.files.items():
+                if name.startswith("seed/out/sqlite"):
+                    (man / name.rsplit("/", 1)[1]).write_text(content, encoding="utf-8")
+            out = Path(d) / "out"
+            out.mkdir()
+            without = [] if self.build.has_module("fts5") else ["--without", "fts5"]
+            self.assertEqual(self.build.main(["build", "--manifest", str(man / "sqlite.json"),
+                                              "--out", str(out), *without]), 0)
+            for e in self.manifest["files"]:
+                h = self.build.header(out / e["file"])
+                self.assertEqual(h[18] == 2, e["journal_mode"] == "wal")
+            con = sqlite3.connect(f"file:{out / 'intl.db'}?mode=ro", uri=True)
+            self.assertEqual(con.execute("PRAGMA encoding").fetchone()[0], "UTF-16le")
+            con.close()
+            # Never over an existing file.
+            with self.assertRaises(FileExistsError):
+                self.build.main(["build", "--manifest", str(man / "sqlite.json"), "--out", str(out), *without])
+            self.assertEqual(self.build.main(["build", "--manifest", str(man / "sqlite.json"), "--out", str(out),
+                                              "--if-missing", *without]), 0)
+            self.assertEqual([p.name for p in self.build.wal_files(out)], ["app.db"])
 
 
 class CasRegistry(unittest.TestCase):

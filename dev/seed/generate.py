@@ -12,6 +12,8 @@ byte-identical files. Outputs:
 - ``dev/cas/services/*.json``    Apereo CAS JSON service registry (opt-in service ``cas``)
 - ``dev/seed/out/sqlserver.sql`` SQL Server database ``retail`` (opt-in service ``sqlserver``)
 - ``dev/seed/out/redis.txt``     Redis / Valkey keyspace, databases 0 and 1 (opt-in profile ``redis``)
+- ``dev/seed/out/sqlite-*.sql``  SQLite files ``crm.db``, ``app.db``, ``intl.db`` and their manifest
+                                 ``sqlite.json`` (built by ``dev/sqlite/build.py``, opt-in profile ``sqlite``)
 - ``dev/ground-truth.json``      every seeded location and the classifiers expected on it
 
 All values are fictitious by construction:
@@ -239,7 +241,8 @@ class Truth:
             classifiers: list[str], values: list[str] | None = None, *, negative_control: bool = False,
             name_values: list[str] | None = None, name_value_classifiers: list[str] | None = None,
             normalized: str | None = None, note: str | None = None,
-            never_sampled: bool = False) -> None:
+            never_sampled: bool = False, file: str | None = None,
+            requires: str | None = None) -> None:
         loc: dict = {
             "engine": engine, "database": database, "container": container, "object": obj,
             "field": field, "expected_classifiers": sorted(classifiers),
@@ -254,6 +257,10 @@ class Truth:
             loc["note"] = note
         if never_sampled:
             loc["never_sampled"] = True
+        if file:
+            loc["file"] = file
+        if requires:
+            loc["requires"] = requires
         if values is not None and (classifiers or never_sampled):
             loc["values"] = sorted({v for v in values if v})
         self.locations.append(loc)
@@ -1261,6 +1268,272 @@ def gen_redis(f: Fake, t: Truth) -> str:
 
 
 # --------------------------------------------------------------------------------------------------
+# SQLite: three database files (opt-in profile `sqlite`, ADR-0059 decision 10)
+# --------------------------------------------------------------------------------------------------
+# (file, dev target id, journal mode, text encoding, agent.yaml `sqlite.rollback_mode`). The binary
+# files are never committed: dev/sqlite/build.py writes them from the committed SQL below with the
+# SQLite of the Python that runs it (dev/.state/sqlite in dev, a volume in e2e, the engine matrix's
+# writers), so the same content can be written by several SQLite versions, journal modes and page
+# sizes.
+SQLITE_FILES = (
+    ("crm.db", "sqlite-crm", "delete", "UTF-8", "read"),
+    ("app.db", "sqlite-app", "wal", "UTF-8", "skip"),
+    ("intl.db", "sqlite-intl", "delete", "UTF-16le", "read"),
+)
+# Statements between these markers need a module that a writer may lack (the agent's bundled
+# library compiles FTS5 out, ADR-0059 decision 1): dev/sqlite/build.py fails without it unless told
+# to leave the block out, and the locations it creates are marked `requires` in the ground truth.
+SQLITE_REQUIRES = "-- databastion:requires {module}\n"
+SQLITE_REQUIRES_END = "-- databastion:end\n"
+# Length of the filler that makes a value longer than the 64 KiB the connector samples.
+SQLITE_LONG_FILLER = 70_000
+
+
+def sqlite_lit(v) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def sqlite_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def gen_sqlite(f: Fake, t: Truth) -> dict[str, str]:
+    """One SQL script per file, run by dev/sqlite/build.py after the file's page size, `auto_vacuum`,
+    text encoding and journal mode are set; and the manifest sqlite.json. Locations: database
+    `main` (one database per file, ADR-0059 decision 6), no container, `file` the database file
+    (one dev target per file). The decision 10 fixtures: rowid, `WITHOUT ROWID` and `STRICT`
+    tables; personal data in TEXT and INTEGER columns; value-bearing table and column names; a
+    view; `VIRTUAL` and `STORED` generated columns; an FTS5 table whose content is in its shadow
+    table; a BLOB holding a value as bytes; a value above 64 KiB; a UTF-16 file."""
+    E, DB = "sqlite", "main"
+    out: dict[str, str] = {}
+
+    def add(file: str, obj: str, field: str | None, classifiers: list[str], values=None, **kw) -> None:
+        t.add(E, DB, None, obj, field, classifiers, values, file=file, **kw)
+
+    def ins(table: str, cols: list[str], rows: list[tuple]) -> str:
+        return inserts(table, cols, rows, sqlite_lit, '"')
+
+    # ---------------------------------------------------------------- crm.db (rollback journal)
+    F = "crm.db"
+    people = [f.person() for _ in range(80)]
+    s = [HEADER.format(seed=SEED)]
+    s.append("""CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL, email TEXT NOT NULL,
+  phone TEXT, birth_date TEXT, nir TEXT, contact_card BLOB, email_opt_in INTEGER NOT NULL,
+  loyalty_points INTEGER NOT NULL,
+  email_lower TEXT GENERATED ALWAYS AS (lower(email)) STORED,
+  email_upper TEXT GENERATED ALWAYS AS (upper(email)) VIRTUAL
+);
+CREATE INDEX customers_email ON customers (email);
+""")
+    cards = [f.email(p["first"], p["last"]) for p in people[:20]]
+    rows = [(i + 1, p["first"], p["last"], p["email"], p["phone"], p["birth_date"], p["nir"],
+             f.r.random() < 0.5, f.r.randint(0, 5000)) for i, p in enumerate(people)]
+    s.append(ins("customers", ["id", "first_name", "last_name", "email", "phone", "birth_date", "nir",
+                               "email_opt_in", "loyalty_points"], rows))
+    # BLOB values: the bytes of an e-mail address. The connector samples TEXT and INTEGER values only.
+    for i, em in enumerate(cards):
+        s.append(f"UPDATE customers SET contact_card = CAST({sqlite_lit(em)} AS BLOB) WHERE id = {i + 1};\n")
+    add(F, "customers", "first_name", ["pii.person_name"], [r[1] for r in rows])
+    add(F, "customers", "last_name", ["pii.person_name"], [r[2] for r in rows])
+    add(F, "customers", "email", ["pii.email"], [r[3] for r in rows])
+    add(F, "customers", "phone", ["pii.phone"], [r[4] for r in rows])
+    add(F, "customers", "birth_date", ["pii.birth_date"], [r[5] for r in rows])
+    add(F, "customers", "nir", ["pii.nir"], [r[6] for r in rows])
+    add(F, "customers", "email_lower", ["pii.email"], [r[3].lower() for r in rows],
+        note="STORED generated column: stored in the record, sampled")
+    add(F, "customers", "email_upper", [], note="VIRTUAL generated column (computed on read): not sampled, "
+        "counted as a computed column")
+    add(F, "customers", "contact_card", [], cards, never_sampled=True,
+        note="BLOB holding e-mail addresses as bytes: BLOB values are not sampled (expected: not found)")
+    add(F, "customers", "email_opt_in", [], negative_control=True, note="0 / 1 flag; name looks sensitive")
+    add(F, "customers", "loyalty_points", [], negative_control=True)
+
+    # A STRICT table: card numbers and phone numbers in INTEGER columns.
+    s.append("""CREATE TABLE payment_cards (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, card_number INTEGER NOT NULL,
+  card_holder TEXT NOT NULL, phone INTEGER NOT NULL, tracking_ref INTEGER NOT NULL
+) STRICT;
+""")
+    rows = []
+    for i, p in enumerate(people[:60]):
+        phone = int("33" + f.fr_phone().replace(" ", "")[1:])
+        rows.append((i + 1, i + 1, int(p["card"].replace(" ", "")), f"{p['first']} {p['last']}", phone,
+                     int(f.not_luhn(16))))
+    s.append(ins("payment_cards", ["id", "customer_id", "card_number", "card_holder", "phone", "tracking_ref"],
+                 rows))
+    add(F, "payment_cards", "card_number", ["pii.card_number"], [str(r[2]) for r in rows],
+        note="INTEGER column")
+    add(F, "payment_cards", "card_holder", ["pii.person_name"], [r[3] for r in rows])
+    add(F, "payment_cards", "phone", ["pii.phone"], [str(r[4]) for r in rows],
+        note="INTEGER column: E.164 digits without `+`")
+    add(F, "payment_cards", "tracking_ref", [], negative_control=True,
+        note="16-digit INTEGER values that FAIL the Luhn check")
+
+    # A WITHOUT ROWID table.
+    s.append("""CREATE TABLE iban_accounts (
+  iban TEXT PRIMARY KEY, holder_email TEXT NOT NULL, opened_on TEXT NOT NULL
+) WITHOUT ROWID;
+""")
+    rows = [(p["iban"], f.email(p["first"], p["last"]), f.date(2015, 2026)) for p in people[:50]]
+    s.append(ins("iban_accounts", ["iban", "holder_email", "opened_on"], rows))
+    add(F, "iban_accounts", "iban", ["pii.iban"], [r[0] for r in rows], note="WITHOUT ROWID table")
+    add(F, "iban_accounts", "holder_email", ["pii.email"], [r[1] for r in rows], note="WITHOUT ROWID table")
+    add(F, "iban_accounts", "opened_on", [], negative_control=True, note="dates, not birth dates")
+
+    # A view: never read (its rows are its tables' rows).
+    s.append("CREATE VIEW v_customer_contacts AS SELECT email, phone FROM customers;\n")
+    add(F, "v_customer_contacts", "email", [], note="view: never read")
+
+    # Value-bearing names: a table named after an e-mail address, a column named after another one.
+    p = people[3]
+    tname = f"export_{p['email']}"
+    phones = [f.fr_phone() for _ in range(5)]
+    s.append(f"CREATE TABLE {sqlite_ident(tname)} (id INTEGER PRIMARY KEY, phone TEXT NOT NULL);\n")
+    s.append(ins(sqlite_ident(tname), ["id", "phone"], [(i + 1, ph) for i, ph in enumerate(phones)]))
+    add(F, tname, "phone", ["pii.phone"], phones, name_values=[p["email"]],
+        name_value_classifiers=["pii.email"], normalized="*", note="table name embeds an e-mail address")
+    p = people[4]
+    cname = p["email"]
+    phones = [f.fr_phone() for _ in range(8)]
+    s.append(f"CREATE TABLE escalation_contacts (id INTEGER PRIMARY KEY, {sqlite_ident(cname)} TEXT NOT NULL);\n")
+    s.append(ins("escalation_contacts", ["id", cname], [(i + 1, ph) for i, ph in enumerate(phones)]))
+    add(F, "escalation_contacts", cname, ["pii.phone"], phones, name_values=[cname],
+        name_value_classifiers=["pii.email"], normalized="*", note="column name is an e-mail address")
+
+    # A value above 64 KiB: not sampled (the connector reads values of at most 64 KiB).
+    hidden = f.email(people[5]["first"], people[5]["last"])
+    s.append("CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL);\n")
+    s.append(ins("documents", ["id", "title", "body"],
+                 [(i + 1, f"Quarterly report {2020 + i}", "Draft, no content yet.") for i in range(4)]))
+    s.append(f"INSERT INTO documents (id, title, body) VALUES (5, 'Archive', "
+             f"replace(hex(zeroblob({SQLITE_LONG_FILLER // 2})), '0', 'x') || ' Contact: ' || "
+             f"{sqlite_lit(hidden)});\n")
+    add(F, "documents", "body", [], [hidden], never_sampled=True,
+        note=f"one value of {SQLITE_LONG_FILLER} characters and more, ending with an e-mail address: above "
+             "the 64 KiB the connector samples (expected: not found); the other values hold no data")
+    add(F, "documents", "title", [], negative_control=True)
+
+    # FTS5: the text is stored in the shadow table support_notes_content (column c0), an ordinary
+    # table the connector samples; the virtual table itself is never read.
+    notes, note_emails, note_phones = [], [], []
+    for _ in range(40):
+        q = f.r.choice(people)
+        ph, em = f.fr_phone(), f.email(q["first"], q["last"])
+        note_phones.append(ph)
+        note_emails.append(em)
+        notes.append((f"Customer called from {ph} and asked to use {em} for invoices.",))
+    s.append(SQLITE_REQUIRES.format(module="fts5"))
+    s.append("CREATE VIRTUAL TABLE support_notes USING fts5(body);\n")
+    s.append(ins("support_notes", ["body"], notes))
+    s.append(SQLITE_REQUIRES_END)
+    add(F, "support_notes_content", "c0", ["pii.email", "pii.phone"], note_emails + note_phones,
+        requires="fts5", note="FTS5 shadow table holding the text of support_notes (free text)")
+    add(F, "support_notes", "body", [], requires="fts5", note="FTS5 virtual table: never read")
+
+    # Look-alikes.
+    s.append("CREATE TABLE invoices (id INTEGER PRIMARY KEY, invoice_number TEXT NOT NULL, "
+             "amount_cents INTEGER NOT NULL);\n")
+    s.append(ins("invoices", ["id", "invoice_number", "amount_cents"],
+                 [(i + 1, f"INV-2026-{i + 1:06d}", f.r.randint(500, 250000)) for i in range(60)]))
+    add(F, "invoices", "invoice_number", [], negative_control=True)
+    add(F, "invoices", "amount_cents", [], negative_control=True)
+    s.append("ANALYZE;\n")
+    out["seed/out/sqlite-crm.sql"] = "".join(s)
+
+    # ---------------------------------------------------------------- app.db (WAL)
+    F = "app.db"
+    people = [f.person() for _ in range(60)]
+    s = [HEADER.format(seed=SEED)]
+    s.append("""CREATE TABLE users (
+  id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, first_name TEXT NOT NULL, last_name TEXT NOT NULL,
+  phone TEXT, created_at TEXT NOT NULL
+);
+""")
+    rows = [(i + 1, p["email"], p["first"], p["last"], p["phone"], f.timestamp()) for i, p in enumerate(people)]
+    s.append(ins("users", ["id", "email", "first_name", "last_name", "phone", "created_at"], rows))
+    add(F, "users", "email", ["pii.email"], [r[1] for r in rows])
+    add(F, "users", "first_name", ["pii.person_name"], [r[2] for r in rows])
+    add(F, "users", "last_name", ["pii.person_name"], [r[3] for r in rows])
+    add(F, "users", "phone", ["pii.phone"], [r[4] for r in rows])
+    add(F, "users", "created_at", [], negative_control=True, note="timestamps, not birth dates")
+    s.append("""CREATE TABLE sessions (
+  token TEXT PRIMARY KEY, user_email TEXT NOT NULL, expires_at TEXT NOT NULL
+) WITHOUT ROWID;
+""")
+    rows = [(f.chars("0123456789abcdef", 32), f.r.choice(people)["email"], f.timestamp()) for _ in range(40)]
+    s.append(ins("sessions", ["token", "user_email", "expires_at"], rows))
+    add(F, "sessions", "user_email", ["pii.email"], [r[1] for r in rows], note="WITHOUT ROWID table")
+    add(F, "sessions", "token", [], negative_control=True, note="random hex, not a secret shape")
+    s.append("""CREATE TABLE app_credentials (
+  id INTEGER PRIMARY KEY, service TEXT NOT NULL, aws_access_key_id TEXT NOT NULL,
+  aws_secret_access_key TEXT NOT NULL, owner_email TEXT NOT NULL
+) STRICT;
+""")
+    rows = []
+    for i, svc in enumerate(("mobile-sync", "export", "backup")):
+        a, k = f.aws_key_pair()
+        rows.append((i + 1, svc, a, k, f.r.choice(people)["email"]))
+    s.append(ins("app_credentials", ["id", "service", "aws_access_key_id", "aws_secret_access_key", "owner_email"],
+                 rows))
+    add(F, "app_credentials", "aws_access_key_id", ["secret.aws_key"], [r[2] for r in rows], note="STRICT table")
+    add(F, "app_credentials", "aws_secret_access_key", ["secret.aws_key"], [r[3] for r in rows],
+        note="STRICT table")
+    add(F, "app_credentials", "owner_email", ["pii.email"], [r[4] for r in rows], note="STRICT table")
+    add(F, "app_credentials", "service", [], negative_control=True)
+    s.append("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, card_number TEXT NOT NULL, "
+             "amount_cents INTEGER NOT NULL);\n")
+    rows = [(i + 1, f.r.randint(1, len(people)), p["card"], f.r.randint(500, 90000))
+            for i, p in enumerate(people[:50])]
+    s.append(ins("orders", ["id", "user_id", "card_number", "amount_cents"], rows))
+    add(F, "orders", "card_number", ["pii.card_number"], [r[2] for r in rows])
+    add(F, "orders", "amount_cents", [], negative_control=True)
+    # The writer sidecar's own table: it inserts a row every few seconds (dev/sqlite/build.py hold).
+    s.append("CREATE TABLE writer_heartbeat (id INTEGER PRIMARY KEY, beat INTEGER NOT NULL);\n")
+    s.append("INSERT INTO writer_heartbeat (beat) VALUES (0);\n")
+    add(F, "writer_heartbeat", "beat", [], negative_control=True, note="written by the writer sidecar")
+    s.append("ANALYZE;\n")
+    out["seed/out/sqlite-app.sql"] = "".join(s)
+
+    # ---------------------------------------------------------------- intl.db (UTF-16le, rollback)
+    F = "intl.db"
+    people = [f.person() for _ in range(40)]
+    s = [HEADER.format(seed=SEED)]
+    s.append("CREATE TABLE contacts (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL, email TEXT NOT NULL, "
+             "phone TEXT, city TEXT NOT NULL);\n")
+    rows = [(i + 1, f"{p['first']} {p['last']}", p["email"], p["phone"], p["city"]) for i, p in enumerate(people)]
+    s.append(ins("contacts", ["id", "full_name", "email", "phone", "city"], rows))
+    add(F, "contacts", "full_name", ["pii.person_name"], [r[1] for r in rows], note="UTF-16le file")
+    add(F, "contacts", "email", ["pii.email"], [r[2] for r in rows], note="UTF-16le file")
+    add(F, "contacts", "phone", ["pii.phone"], [r[3] for r in rows], note="UTF-16le file")
+    add(F, "contacts", "city", [], negative_control=True, note="city names alone")
+    s.append("ANALYZE;\n")
+    out["seed/out/sqlite-intl.sql"] = "".join(s)
+
+    manifest = {
+        "version": 1,
+        "generator": "dev/seed/generate.py",
+        "seed": SEED,
+        "note": "FAKE data only. Read by dev/sqlite/build.py; the SQL is run after the pragmas of its file.",
+        "requires_markers": [SQLITE_REQUIRES.strip(), SQLITE_REQUIRES_END.strip()],
+        "files": [
+            {"file": file, "target": target, "sql": f"sqlite-{file[:-3]}.sql", "journal_mode": jm,
+             "encoding": enc, "rollback_mode": rm}
+            for file, target, jm, enc, rm in SQLITE_FILES
+        ],
+    }
+    out["seed/out/sqlite.json"] = json.dumps(manifest, indent=1, sort_keys=True) + "\n"
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
 def build(seed: int = SEED) -> dict[str, str]:
     f = Fake(seed)
     t = Truth()
@@ -1275,6 +1548,7 @@ def build(seed: int = SEED) -> dict[str, str]:
     files.update(gen_cas(Fake(seed + 41), t))
     files["seed/out/sqlserver.sql"] = gen_sqlserver(Fake(seed + 51), t)
     files["seed/out/redis.txt"] = gen_redis(Fake(seed + 52), t)
+    files.update(gen_sqlite(Fake(seed + 53), t))
     truth = {
         "version": 1,
         "generator": "dev/seed/generate.py",
@@ -1303,6 +1577,12 @@ def build(seed: int = SEED) -> dict[str, str]:
             "keyspace (dev/seed/out/redis.txt). database is db<index>, container the Redis type, "
             "object the expected key pattern, field `value`, a hash or stream field, `*` for fields "
             "keyed by data, `#key` / `#field` for values found in key or field names.",
+            "sqlite: opt-in profile `sqlite` (ADR-0059 decision 10); one dev target per file "
+            "(targets.sqlite.files, dev/seed/out/sqlite.json), written by dev/sqlite/build.py. database "
+            "is `main`, no container, `file` the database file. `requires: fts5`: created only by a "
+            "writer with FTS5 (the agent's bundled library has none). Locations with a note and no "
+            "classifier are fixtures Discovery must not report (view, VIRTUAL generated column, BLOB, "
+            "value above 64 KiB, FTS5 virtual table).",
         ],
         "targets": {
             "postgresql": {"service": "postgres", "databases": ["shop"]},
@@ -1316,6 +1596,8 @@ def build(seed: int = SEED) -> dict[str, str]:
                        "key_patterns_scoped_user": list(REDIS_SCOPED_PATTERNS)},
             "redis": {"service": "redis", "databases": ["db0", "db1"],
                       "key_patterns_scoped_user": list(REDIS_SCOPED_PATTERNS)},
+            "sqlite": {"service": "sqlite", "databases": ["main"],
+                       "files": {file: target for file, target, *_ in SQLITE_FILES}},
         },
         "locations": t.locations,
     }

@@ -1,0 +1,88 @@
+# Load run of the SQLite targets (e2e/load/sqlite.sh, ADR-0059 decision 10 "Load"), merged over
+# e2e/docker-compose.yml (project databastion-load-sqlite). Only db, migrate, web, worker, proxy,
+# bootstrap-admin, sqlite-files-init, sqlite-holder, the one-shot sqlite-writer runs, agent and
+# agent-files are started.
+#
+#   sqlite-files-init  as the e2e run's (dev/sqlite/files-init.sh): the sqlite-load volume's `data`
+#                      directory 2750, owner the application's account (10020), group the one the
+#                      agent reads through (10030).
+#   sqlite-writer      the application's one-shots (`tools` profile, e2e/load/sqlite_writer.py in the
+#                      pinned Python image, as 10020:10030, no network): `seed` writes the two load
+#                      files (about LOAD_SQLITE_SIZE_MB each), `run` the fixed workload whose per
+#                      transaction records go to the run directory's writer/ (the only directory the
+#                      container writes on the host).
+#   sqlite-holder      keeps load-wal.db open for the whole run (its -wal and -shm exist), as an
+#                      application's idle connection does; started once the file is seeded.
+#   agent              the volume read-only (`:ro`), group 10030 added, root file system read-only.
+
+x-python-image: &python-image python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+
+x-sqlite-app: &sqlite-app
+  image: *python-image
+  user: "10020:10030"
+  network_mode: none
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: [/tmp]
+  entrypoint: ["python3", "-I", "-B", "/opt/load/sqlite_writer.py"]
+
+services:
+  sqlite-files-init:
+    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    profiles: [tools]
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_SQLITE_UID: "10020"
+      DATABASTION_DEV_AGENT_GID: "10030"
+    entrypoint: ["sh", "/usr/local/bin/files-init.sh", "setup"]
+    volumes:
+      - ../../dev/sqlite/files-init.sh:/usr/local/bin/files-init.sh:ro
+      - sqlite-load:/state
+
+  sqlite-writer:
+    <<: *sqlite-app
+    profiles: [tools]
+    volumes:
+      - ./sqlite_writer.py:/opt/load/sqlite_writer.py:ro
+      - sqlite-load:/srv/sqlite
+      - ${E2E_WORK_DIR:?set by sqlite.sh}/writer:/out
+
+  sqlite-holder:
+    <<: *sqlite-app
+    command: ["hold", "/srv/sqlite/data/load-wal.db", "--ready", "/tmp/databastion-ready"]
+    volumes:
+      - ./sqlite_writer.py:/opt/load/sqlite_writer.py:ro
+      - sqlite-load:/srv/sqlite
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/databastion-ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  agent:
+    group_add: !override ["10030"]
+    volumes: !override
+      - agent-state:/var/lib/databastion
+      - agent-secrets:/run/databastion-secrets:ro
+      - ${E2E_WORK_DIR:?set by sqlite.sh}/agent/agent.yaml:/etc/databastion/agent.yaml:ro
+      - ${E2E_WORK_DIR:?set by sqlite.sh}/tls/ca.crt:/etc/databastion/console-ca.pem:ro
+      - sqlite-load:/srv/sqlite:ro
+    depends_on: !override
+      proxy:
+        condition: service_started
+      sqlite-holder:
+        condition: service_healthy
+
+  agent-files:
+    volumes: !override
+      - agent-state:/state
+      - agent-secrets:/secrets
+
+volumes:
+  sqlite-load: {}
