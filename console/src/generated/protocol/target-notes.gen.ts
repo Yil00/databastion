@@ -140,8 +140,14 @@ export const TARGET_NOTE_REGISTRY = {
       "mariadb"
     ]
   },
+  "audit.log_readable_by_others": {
+    "description": "A uid other than root, the server's account and the agent's account can read the Firebird trace log, a rotated file it still tracks or new files in its directory (mode bits, groups, access or default ACLs; also when a group's members cannot be enumerated, or the agent's identity files are not the host's): that account sees the logged statements, passwords set through SQL included, and every live token. Partial is withheld while it lasts.",
+    "engines": [
+      "firebird"
+    ]
+  },
   "audit.log_records_ambiguous": {
-    "description": "{count} Firebird trace record(s) in the last 24 h could not be told apart from text a client wrote (a forged or split record, an unexpected header token, a cut text, a database path matched only by file name or inode): each is reported as a read of * by an unchecked principal, and the level is Limited for 24 h.",
+    "description": "{count} Firebird trace record(s) in the last 24 h could not be told apart from text a client wrote (a forged or split record, an unexpected header token, a cut text, a database path matched only by file name or inode, an unconfirmed server run): each is reported as a read of * by an unchecked principal, and the level is Limited for 24 h. Label run_confirmation_stalled: the stream stopped more than 60 s within one hour waiting for server run confirmations.",
     "engines": [
       "firebird"
     ]
@@ -304,7 +310,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.trace_config_not_evaluated": {
-    "description": "Limited: the Firebird trace configuration that applies to a declared database could not be evaluated. Labels give the reason: firebird_conf_unreadable or trace_config_unreadable (not readable, refused or not parsed), trace_config_file_mismatch (AuditTraceConfigFile names another file), config_changed_since_start, server_process_not_visible (e.g. another pid namespace), similar_to_pattern (a section with a SIMILAR TO pattern, or _ or % in a file name).",
+    "description": "Limited: the Firebird trace configuration of a declared database could not be evaluated. Labels give the reason: firebird_conf_unreadable, trace_config_unreadable (refused or not parsed), trace_config_file_mismatch, config_changed_since_start, server_process_not_visible, similar_to_pattern (a SIMILAR TO pattern, or _ or % in a file name), databases_conf (alias map not evaluated or changed), foreign_databases_logged (undeclared databases can reach the log), database_path_not_unique (several hard links).",
     "engines": [
       "firebird"
     ]
@@ -645,7 +651,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "privilege.global_privileges": {
-    "description": "{count} global or server-level privilege(s) beyond those the agent needs (MySQL / MariaDB: other than SELECT and USAGE; SQL Server: server permissions other than CONNECT SQL and VIEW ANY DATABASE; Firebird: system privileges, or a credential relation other than the account's own SEC$USERS row readable); the most severe: {labels}.",
+    "description": "{count} global or server-level privilege(s) beyond those the agent needs (MySQL / MariaDB: other than SELECT and USAGE; SQL Server: server permissions other than CONNECT SQL and VIEW ANY DATABASE; Firebird: system privileges, a credential relation other than the account's own SEC$USERS row readable, or the server configuration readable through RDB$CONFIG); the most severe: {labels}.",
     "engines": [
       "mysql",
       "mariadb",

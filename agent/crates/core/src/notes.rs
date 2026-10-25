@@ -760,10 +760,12 @@ pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 
 /// The `TargetNoteLabel` values of the revision
 /// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
-/// and 6): the Firebird 4.0 and 5.0 system privileges, the identities of
-/// the refusal list, the `usage` object right, the credential-relation and
-/// role-graph probes, the reasons of `audit.trace_config_not_evaluated`
-/// and the trace configuration settings. Negotiated on
+/// and 6 and its refinement of 2026-10-25): the Firebird 4.0 and 5.0
+/// system privileges, the identities of the refusal list, the `usage`
+/// object right, the credential-relation, server-configuration and
+/// role-graph probes, the reasons of `audit.trace_config_not_evaluated`,
+/// `run_confirmation_stalled` for `audit.log_records_ambiguous` and the
+/// trace configuration settings. Negotiated on
 /// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
 /// console lists it. Only [`NoteLabel::firebird`] builds them.
 pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
@@ -801,6 +803,7 @@ pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
     "usage",
     "verifier_relation_readable",
     "credential_relation_readable",
+    "server_config_readable",
     "role_graph",
     "firebird_conf_unreadable",
     "trace_config_unreadable",
@@ -808,6 +811,10 @@ pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
     "config_changed_since_start",
     "server_process_not_visible",
     "similar_to_pattern",
+    "databases_conf",
+    "foreign_databases_logged",
+    "database_path_not_unique",
+    "run_confirmation_stalled",
     "enabled",
     "log_filename",
     "log_connections",
@@ -1560,6 +1567,59 @@ mod tests {
         assert_eq!(
             sent(&refused, LabelRevisions::ALL),
             vec!["select", "trace_any_attachment", "rdb_admin"]
+        );
+    }
+
+    /// The labels of the ADR-0060 refinement of 2026-10-25 belong to the
+    /// same revision `2026_10_d`: `other` until the console lists its token.
+    #[test]
+    fn labels_of_the_firebird_refinement_are_in_revision_2026_10_d() {
+        const REFINEMENT: [&str; 5] = [
+            "databases_conf",
+            "foreign_databases_logged",
+            "database_path_not_unique",
+            "run_confirmation_stalled",
+            "server_config_readable",
+        ];
+        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 61);
+        for value in REFINEMENT {
+            assert!(super::LABELS_REVISION_2026_10_D.contains(&value), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+        }
+        let d = LabelRevisions {
+            r2026_10: false,
+            r2026_10_b: false,
+            r2026_10_c: false,
+            r2026_10_d: true,
+        };
+        let readable = TargetNote::new(NoteCode::PrivilegeGlobalPrivileges)
+            .with_labels(["server_config_readable"].map(NoteLabel::firebird));
+        assert_eq!(sent(&readable, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&readable, d), vec!["server_config_readable"]);
+        // The Firebird audit note codes come with the connector (P10-B);
+        // negotiation does not depend on the code.
+        let audit = TargetNote::new(NoteCode::AuditStreamStopped).with_labels(
+            [
+                "databases_conf",
+                "foreign_databases_logged",
+                "database_path_not_unique",
+                "run_confirmation_stalled",
+            ]
+            .map(NoteLabel::firebird),
+        );
+        assert_eq!(sent(&audit, LabelRevisions::default()), vec!["other"]);
+        let mut kept = sent(&audit, d);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "database_path_not_unique",
+                "databases_conf",
+                "foreign_databases_logged",
+                "run_confirmation_stalled"
+            ]
         );
     }
 

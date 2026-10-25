@@ -1818,7 +1818,8 @@ components:
           for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
           whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
           read, so records lost to a failing audit target are not counted.
-        - `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird
+        - `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6, and its refinement of
+          2026-10-25): the Firebird
           labels below `on_failure_probe`. Firebird system privileges are lowercased as written
           in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
           `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
@@ -1826,13 +1827,19 @@ components:
           database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,
           exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
           relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
-          (another readable credential relation, `privilege.global_privileges`); `role_graph`
+          (another readable credential relation, `privilege.global_privileges`);
+          `server_config_readable` (`RDB$CONFIG` readable, `privilege.global_privileges`); `role_graph`
           (the role graph not evaluated, `privilege.not_evaluated`); the reasons of
           `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,
           `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:
           `AuditTraceConfigFile` names another file; `config_changed_since_start`;
           `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a
-          section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration
+          section with a `SIMILAR TO` pattern or `_` / `%` in a file name; `databases_conf`: the
+          `databases.conf` alias map not evaluated, or changed since the server started;
+          `foreign_databases_logged`: records of undeclared databases can reach the declared log;
+          `database_path_not_unique`: the declared database file has more than one link);
+          `run_confirmation_stalled` (`audit.log_records_ambiguous`: the stream stopped more than
+          60 s within one hour waiting for server run confirmations); and the trace configuration
           settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
           `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
           and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
@@ -2097,6 +2104,7 @@ components:
         # Firebird credential relations
         - verifier_relation_readable
         - credential_relation_readable
+        - server_config_readable
         # Firebird check() reads not evaluated (privilege.not_evaluated)
         - role_graph
         # Firebird trace configuration not evaluated (audit.trace_config_not_evaluated)
@@ -2106,6 +2114,11 @@ components:
         - config_changed_since_start
         - server_process_not_visible
         - similar_to_pattern
+        - databases_conf
+        - foreign_databases_logged
+        - database_path_not_unique
+        # Firebird trace records not told apart from client text (audit.log_records_ambiguous)
+        - run_confirmation_stalled
         # Firebird trace configuration settings (fbtrace.conf)
         - enabled
         - log_filename
