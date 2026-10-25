@@ -357,6 +357,15 @@ async fn run(scan: &mut Scan<'_>) -> Result<(), ConnectorError> {
         sink.add_coverage(cov(|c| c.limit = over as u64));
     }
     job.rotate(&mut tables);
+    // Counts only, never a name: the end of the scan's first unit (the
+    // end-to-end run truncates a -shm after it, ADR-0059 decision 10).
+    tracing::info!(
+        target_id = %scan.target.id,
+        tables = tables.len(),
+        views,
+        virtual_tables = virtuals,
+        "sqlite catalog read"
+    );
     let estimated = if stat1 {
         match scan.unit(Request::Stats).await? {
             Paced::Done(Ok(Response::Stats(rows))) => rows

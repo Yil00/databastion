@@ -23,8 +23,14 @@ Subcommands
       with a running application; ADR-0059 decision 3), writes FILE once they are all open, and with
       --write-every inserts a row into `writer_heartbeat` of each held file that has that table
       every S seconds. Runs until SIGTERM / SIGINT.
-  serve  --manifest M --out DIR [--ready FILE] [--write-every S]
-      `build --if-missing`, then `hold`: the dev and e2e sidecar (Compose profile `sqlite`).
+  serve  --manifest M --out DIR [--ready FILE] [--write-every S] [--paced-tables N]
+      `build --if-missing`, then `hold`: the dev and e2e sidecar (Compose profile `sqlite`). With
+      --paced-tables N, also DIR/paced.db if missing (as `paced`).
+  paced  --out FILE --tables N
+      A WAL database of N small tables of integers (no sensitive value, no ground truth) and
+      `writer_heartbeat`: the e2e run's truncated `-shm` scenario, whose paced scan of N tables lasts
+      long enough (about 3 units per table, each followed by a pause 99 times its length at the
+      agent's 1 % duty cycle) for the truncation to land before its end on any runner.
   truncate-shm FILE
       Truncates the `-shm` of FILE to 0 bytes (the e2e run's "truncated -shm during a scan": every
       process mapping it, the agent's reader included, gets SIGBUS at its next access).
@@ -262,7 +268,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
     args.auto_vacuum = "none"
     args.without = []
     cmd_build(args)
+    paced = Path(args.out) / "paced.db"
+    if args.paced_tables and not paced.exists():
+        write_paced(paced, args.paced_tables)
+        log(f"paced.db: written (wal, {args.paced_tables} tables)")
     return hold(Path(args.out), args.ready, args.write_every)
+
+
+def write_paced(path: Path, tables: int) -> None:
+    if not 1 <= tables <= 1000:
+        raise ValueError("--tables must be 1..1000")
+    sql = [f"CREATE TABLE {HEARTBEAT_TABLE} (id INTEGER PRIMARY KEY, beat INTEGER NOT NULL);",
+           f"INSERT INTO {HEARTBEAT_TABLE} (beat) VALUES (0);"]
+    for i in range(1, tables + 1):
+        sql.append(f"CREATE TABLE paced_t{i:04d} (id INTEGER PRIMARY KEY, counter INTEGER NOT NULL);")
+        sql.append(f"INSERT INTO paced_t{i:04d} (counter) VALUES " + ", ".join(f"({j})" for j in range(20)) + ";")
+    write_db(path, "\n".join(sql) + "\n", "wal", "UTF-8", 4096, "none")
+
+
+def cmd_paced(args: argparse.Namespace) -> int:
+    path = Path(args.out)
+    if path.exists():
+        raise FileExistsError(f"{path.name} exists")
+    write_paced(path, args.tables)
+    log(f"{path.name}: written (wal, {args.tables} tables, SQLite {sqlite3.sqlite_version})")
+    return 0
 
 
 def cmd_truncate_shm(args: argparse.Namespace) -> int:
@@ -299,11 +329,15 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--out", required=True)
     s.add_argument("--ready")
     s.add_argument("--write-every", type=float, default=0.0)
+    s.add_argument("--paced-tables", type=int, default=0)
+    pc = sub.add_parser("paced")
+    pc.add_argument("--out", required=True)
+    pc.add_argument("--tables", type=int, required=True)
     t = sub.add_parser("truncate-shm")
     t.add_argument("file")
     args = ap.parse_args(argv)
     return {"build": cmd_build, "matrix": cmd_matrix, "hold": cmd_hold, "serve": cmd_serve,
-            "truncate-shm": cmd_truncate_shm}[args.cmd](args)
+            "paced": cmd_paced, "truncate-shm": cmd_truncate_shm}[args.cmd](args)
 
 
 if __name__ == "__main__":

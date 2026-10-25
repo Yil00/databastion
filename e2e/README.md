@@ -772,7 +772,7 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   sidecar's pinned Python image (`sqlite.sh` checks the pin is the same) writes `crm.db` (rollback
   journal, declared `rollback_mode: read`), `app.db` (WAL) and `intl.db` (UTF-16le) into the
   `sqlite-data` volume on its first start, as uid 10020 and gid 10030 with umask `027`, then keeps
-  `app.db` open and inserts a heartbeat row every 20 s. `sqlite-files-init`
+  `app.db` and `paced.db` open and inserts a heartbeat row in each every 20 s. `sqlite-files-init`
   ([`dev/sqlite/files-init.sh`](../dev/sqlite/files-init.sh)) makes the directory `2750` first. No
   network, read-only root file system, restarted after a crash.
 - **The agent** sees the volume read-only (`/srv/sqlite`, `:ro`), its root file system read-only,
@@ -786,11 +786,17 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   [`dev/ground-truth.json`](../dev/ground-truth.json) restricted to that target's file (`file`):
   every expected classifier, no negative control, value-bearing names stored as `*`, database `main`
   without a schema; an `audit.configure` attempt ending `unsupported` (refused by the console, or
-  the job failed with that code by the agent); then the application truncates `app.db`'s `-shm`
-  1.5 s into a paced scan (`build.py truncate-shm`): exactly one reader lost (the agent's "sqlite
-  reader process lost" line), at least one unit counted `skipped_error`, the scan succeeded, the
-  agent neither restarted nor stopped; once the application crashed at its next write and restarted,
-  the target is readable again and a new scan loses no unit. Last, the I2 scans of the console
+  the job failed with that code by the agent); then the truncated `-shm` scenario, on a fourth
+  target of its own, `sqlite-paced` (`paced.db`: WAL, held open, 400 small tables of integers and no
+  ground truth, written by `build.py serve --paced-tables 400`, so that its paced scan lasts long
+  enough on any runner). No delay decides when: once the agent logs "sqlite catalog read" for that
+  target (the scan's first unit is done; a failure of that unit fails the whole scan, so it must not
+  meet the truncation; the reader has mapped the `-shm` then), the application truncates the `-shm`
+  (`build.py truncate-shm`), and the scan must still be running after the truncation (a scan that
+  had already ended fails the run). Then: exactly one reader lost
+  (the agent's "sqlite reader process lost" line), at least one unit counted `skipped_error`, the
+  scan succeeded, the agent neither restarted nor stopped; once the application crashed at its next
+  write and restarted, the target is readable again and a new scan loses no unit and finds nothing. Last, the I2 scans of the console
   database, the pages, the agent's state and every log (no ground-truth value or value-bearing
   name), no path or side-file name on the console side or in the agent's log, and the secret
   hygiene of the other runs.

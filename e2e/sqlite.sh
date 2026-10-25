@@ -14,10 +14,11 @@
 #     control, value-bearing names stored as `*`, never raw.
 #   - An `audit.configure` attempt ends `unsupported` (refused by the console, or the job failed with
 #     that code by the agent).
-#   - A `-shm` truncated by the application during a scan of app.db (SIGBUS in every process mapping
-#     it): the reader dies and costs one unit (`skipped_error`), the agent keeps running, the scan
-#     succeeds, the target is readable again once the application restarted, and the next scan
-#     succeeds.
+#   - A `-shm` truncated by the application during a scan of paced.db (a fourth target, WAL, many
+#     small tables, no ground truth), once the scan read its catalog (SIGBUS in every
+#     process mapping it): exactly one reader dies, its unit counted `skipped_error`, the agent
+#     keeps running, the scan succeeds, the target is readable again once the application
+#     restarted, and the next scan loses nothing.
 #   - I2: no ground-truth value (names included) in the console database, the logs, the pages or the
 #     agent's state; no generated secret in any container log.
 # See e2e/README.md "SQLite targets". Requires: docker (compose v2.24+), openssl, curl, jq, python3.
@@ -44,6 +45,13 @@ mapfile -t TARGETS < <(jq -r '.files[] | "\(.target) \(.file) \(.rollback_mode)"
 [ "${#TARGETS[@]}" -eq 3 ] || { echo "expected 3 SQLite files in $MANIFEST" >&2; exit 1; }
 WAL_TARGET="$(jq -r '.files[] | select(.journal_mode == "wal") | .target' "$MANIFEST")"
 WAL_FILE="$(jq -r '.files[] | select(.journal_mode == "wal") | .file' "$MANIFEST")"
+# The truncated -shm scenario's own file (build.py paced, written by target-sqlite with
+# --paced-tables, docker-compose.sqlite.yml): WAL, held open, PACED_TABLES tables of integers, no
+# ground truth. Its paced scan (about 3 units per table, each followed by a pause 99 times its
+# length at the 1 % duty cycle) lasts long after its reader opened the file, which is the trigger.
+PACED_TARGET=sqlite-paced
+PACED_FILE=paced.db
+PACED_TABLES=400
 
 # The writer image is the dev sidecar's (dev/docker-compose.yml): the same pin.
 dev_img="$(sed -n 's/.*DATABASTION_DEV_SQLITE_IMAGE:-\([^}]*\)}.*/\1/p' "$HERE/../dev/docker-compose.yml")"
@@ -52,6 +60,10 @@ if [ -z "$dev_img" ] || [ "$dev_img" != "$e2e_img" ]; then
   echo "the writer image of docker-compose.sqlite.yml must be the one of dev/docker-compose.yml" >&2
   exit 1
 fi
+grep -qF "\"--paced-tables\", \"${PACED_TABLES}\"" "$HERE/docker-compose.sqlite.yml" || {
+  echo "target-sqlite must write paced.db with --paced-tables ${PACED_TABLES} (docker-compose.sqlite.yml)" >&2
+  exit 1
+}
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
   unset E2E_CONSOLE_IMAGE E2E_AGENT_IMAGE
 fi
@@ -119,6 +131,12 @@ EOF
       rollback_mode: ${mode}
 EOF
   done
+  cat <<EOF
+  - id: ${PACED_TARGET}
+    engine: sqlite
+    sqlite:
+      path: ${SQLITE_DIR}/${PACED_FILE}
+EOF
 } >"$E2E_WORK_DIR/agent/agent.yaml"
 chmod 0644 "$E2E_WORK_DIR/agent/agent.yaml"
 
@@ -166,8 +184,10 @@ for spec in "${TARGETS[@]}"; do
   read -r _ file _ <<<"$spec"
   grep -q "^${file} " <<<"$listing" || fail "${file} was not written"
 done
-for side in -wal -shm; do
-  grep -q "^${WAL_FILE}${side} " <<<"$listing" || fail "${WAL_FILE}${side} missing: the application does not hold it open"
+for f in "$WAL_FILE" "$PACED_FILE"; do
+  for side in "" -wal -shm; do
+    grep -q "^${f}${side} " <<<"$listing" || fail "${f}${side} missing: the application does not hold it open"
+  done
 done
 log "files: $(awk '{print $1}' <<<"$listing" | tr '\n' ' ')"
 
@@ -186,8 +206,8 @@ docker inspect "$(compose ps -q agent)" | jq -e '.[0].HostConfig.ReadonlyRootfs 
 # and this wait fails.
 specs=()
 for spec in "${TARGETS[@]}"; do read -r id _ <<<"$spec"; specs+=("${id}:sqlite"); done
-wait_online 120 "${specs[@]}"
-for spec in "${TARGETS[@]}"; do
+wait_online 120 "${specs[@]}" "${PACED_TARGET}:sqlite"
+for spec in "${TARGETS[@]}" "$PACED_TARGET"; do
   read -r id _ <<<"$spec"
   t="$(target_json "$id")"
   log "target ${id}: $(target_summary "$t")"
@@ -264,49 +284,63 @@ wait_target_state "$WAL_TARGET" 60 '.auditLevel == "none"' "audit level still no
 phase_done audit-configure
 
 # --------------------------------------------------------------------------- truncated -shm
-# The application truncates app.db's -shm during a scan: the reader, which maps it, gets SIGBUS at
-# its next unit (ADR-0059 decision 4): one reader lost (its unit counted `skipped_error`), the agent
-# unaffected. Until the application rebuilds its WAL index, the next readers find the file not
-# readable (`wal_files_not_readable`) and count their tables `skipped_error` too, without dying. The
-# application crashes at its next heartbeat write (every 20 s) and is restarted (restart:
-# on-failure); its next open rebuilds the WAL index.
-log "truncated -shm: a scan of ${WAL_TARGET}, the application truncating its -shm once the scan runs"
+# The application truncates the -shm of paced.db during a scan of it: the reader, which maps it,
+# gets SIGBUS at its next unit (ADR-0059 decision 4): one reader lost (its unit counted
+# `skipped_error`), the agent unaffected. Until the application rebuilds its WAL index, the next
+# readers find the file not readable (`wal_files_not_readable`) and count their tables
+# `skipped_error` too, without dying. The application crashes at its next heartbeat write (every
+# 20 s) and is restarted (restart: on-failure); its next open rebuilds the WAL index.
+# No delay decides when to truncate: the trigger is the agent's "sqlite catalog read" line for this
+# target, logged when the scan's first unit is done (the catalog read, whose failure fails the whole
+# scan, so it must not be the unit that meets the truncation; the reader has mapped the -shm then and
+# is paused until its next unit). The scan must still be running once the truncation is done
+# (checked after it: a scan that had already ended fails the run, it never passes it). PACED_TABLES
+# keeps the scan running long after that line: its remaining units (about 3 per table), each
+# followed by a pause, far outlast one `docker compose logs` poll on any runner.
+log "truncated -shm: a scan of ${PACED_TARGET} (${PACED_TABLES} tables), the -shm truncated once its catalog was read"
 agent_cid="$(compose ps -q agent)"
 restarts0="$(docker inspect -f '{{.RestartCount}}' "$agent_cid")"
-deaths0="$(agent_log_count "sqlite reader process lost" "$WAL_TARGET")"
+deaths0="$(agent_log_count "sqlite reader process lost" "$PACED_TARGET")"
+catalogs0="$(agent_log_count "sqlite catalog read" "$PACED_TARGET")"
 printf '%s' '{"sample_rows":100,"max_duration_s":600,"statement_timeout_ms":5000}' >"$E2E_WORK_DIR/scan-req.json"
-r="$(api POST "/api/agents/${AGENT_ID}/targets/${WAL_TARGET}/scan" "$E2E_WORK_DIR/scan-req.json")"
-[ "$(status_of "$r")" = 202 ] || fail "scan request (${WAL_TARGET}): HTTP $(status_of "$r")"
+r="$(api POST "/api/agents/${AGENT_ID}/targets/${PACED_TARGET}/scan" "$E2E_WORK_DIR/scan-req.json")"
+[ "$(status_of "$r")" = 202 ] || fail "scan request (${PACED_TARGET}): HTTP $(status_of "$r")"
 job_id="$(body_of "$r" | jq -r '.job_id')"
-[[ "$job_id" =~ $UUID_RE ]] || fail "scan request (${WAL_TARGET}): no job id"
+[[ "$job_id" =~ $UUID_RE ]] || fail "scan request (${PACED_TARGET}): no job id"
 deadline=$(( $(date +%s) + 120 ))
-until [ "$(console_sql "SELECT first_delivered_at IS NOT NULL FROM jobs WHERE id = '$job_id'")" = t ]; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "the scan of ${WAL_TARGET} was not delivered within 120 s"
-  sleep 0.5
+until [ "$(agent_log_count "sqlite catalog read" "$PACED_TARGET")" -gt "$catalogs0" ]; do
+  st="$(console_sql "SELECT status FROM jobs WHERE id = '$job_id'")"
+  case "$st" in
+    succeeded | failed | cancelled | expired) fail "the scan of ${PACED_TARGET} ended (${st}) before its catalog was read" ;;
+  esac
+  [ "$(date +%s)" -lt "$deadline" ] || fail "the scan of ${PACED_TARGET} did not read its catalog within 120 s"
+  sleep 0.2
 done
-# Past the first units (at the default 1 % duty cycle each unit of a few milliseconds is followed by
-# a pause a hundred times as long), well before the scan's end: the reader has mapped the -shm.
-sleep 1.5
+compose exec -T target-sqlite python3 -I -B /opt/sqlite/build.py truncate-shm "${SQLITE_DIR}/${PACED_FILE}" >&2 \
+  || fail "cannot truncate the -shm of ${PACED_FILE}"
 st="$(console_sql "SELECT status FROM jobs WHERE id = '$job_id'")"
-[ "$st" != succeeded ] || fail "the scan of ${WAL_TARGET} ended before the -shm could be truncated"
-compose exec -T target-sqlite python3 -I -B /opt/sqlite/build.py truncate-shm "${SQLITE_DIR}/${WAL_FILE}" >&2 \
-  || fail "cannot truncate the -shm of ${WAL_FILE}"
-wait_job "$job_id" "scan (${WAL_TARGET}, truncated -shm)" "$SCAN_TIMEOUT_S"
+case "$st" in
+  succeeded | failed | cancelled | expired)
+    fail "the scan of ${PACED_TARGET} had ended (${st}) when the -shm was truncated: raise PACED_TABLES" ;;
+esac
+wait_job "$job_id" "scan (${PACED_TARGET}, truncated -shm)" "$SCAN_TIMEOUT_S"
 [ "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$agent_cid")" = "true ${restarts0}" ] \
   || fail "the agent did not survive the truncated -shm ($(docker inspect -f '{{.State.Status}} restarts {{.RestartCount}}' "$agent_cid"))"
 progress="$(console_sql "SELECT coalesce(progress, '{}'::jsonb) FROM jobs WHERE id = '$job_id'")"
 lost="$(jq -r '.skipped_error // 0' <<<"$progress")"
-deaths=$(( $(agent_log_count "sqlite reader process lost" "$WAL_TARGET") - deaths0 ))
+deaths=$(( $(agent_log_count "sqlite reader process lost" "$PACED_TARGET") - deaths0 ))
 log "truncated -shm: scan succeeded, coverage ${progress}, reader(s) lost ${deaths}; agent running, not restarted"
 [ "$deaths" = 1 ] || fail "the truncated -shm cost ${deaths} reader(s), expected 1"
 [ "$lost" -ge 1 ] || fail "the truncated -shm cost no unit (skipped_error ${lost})"
 # The application restarted and the file is readable again; a new scan succeeds with no lost unit.
-wait_target_state "$WAL_TARGET" 180 '.reachable == true and ([.notes[]?.code] | index("coverage.wal_files_not_readable") | not)' \
+wait_target_state "$PACED_TARGET" 180 '.reachable == true and ([.notes[]?.code] | index("coverage.wal_files_not_readable") | not)' \
   "reachable again after the application's restart"
 log "application restarts: $(docker inspect -f '{{.RestartCount}}' "$(compose ps -q target-sqlite)")"
-scan_targets "$SCAN_TIMEOUT_S" "$WAL_TARGET"
+scan_targets "$SCAN_TIMEOUT_S" "$PACED_TARGET"
 progress="$(console_sql "SELECT coalesce(progress, '{}'::jsonb) FROM jobs WHERE id = '${SCAN_JOB_IDS[0]}'")"
 [ "$(jq -r '.skipped_error // 0' <<<"$progress")" = 0 ] || fail "the scan after the restart lost units ($progress)"
+[ "$(console_sql "SELECT count(*) FROM findings WHERE agent_id = '${AGENT_ID}' AND target_id = '${PACED_TARGET}'")" = 0 ] \
+  || fail "${PACED_TARGET} holds no sensitive value, yet has findings"
 phase_done shm
 
 # --------------------------------------------------------------------------- I2 and secret hygiene
@@ -316,7 +350,7 @@ for f in agent.log web.log worker.log; do
   [ -s "$E2E_LOG_DIR/$f" ] || fail "$f is empty: the scans would prove nothing"
 done
 # Decision 2: the path, the file names and the side-file names never reach the agent's logs.
-for needle in "$SQLITE_DIR" "${WAL_FILE}-shm"; do
+for needle in "$SQLITE_DIR" "${WAL_FILE}-shm" "${PACED_FILE}-shm"; do
   ! grep -qF "$needle" "$E2E_LOG_DIR/agent.log" || fail "the agent logged a path or a file name"
 done
 D="$E2E_WORK_DIR/dump"

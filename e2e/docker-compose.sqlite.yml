@@ -13,7 +13,9 @@
 #                      app.db (WAL) and intl.db (UTF-16le) from the committed seed on its first
 #                      start, then keeps app.db open (its -wal and -shm exist) and inserts a row
 #                      into writer_heartbeat every 20 s. No network, read-only root file system.
-#                      Restarted after a crash: sqlite.sh truncates app.db's -shm during a scan,
+#                      Also paced.db (build.py --paced-tables 400: WAL, held open, 400 small tables of
+#                      integers, no ground truth), the truncated -shm scenario's own file.
+#                      Restarted after a crash: sqlite.sh truncates paced.db's -shm during a scan,
 #                      which raises SIGBUS in every process mapping it, the agent's reader at its
 #                      next unit and this writer at its next heartbeat (seconds later: the reader
 #                      sees the truncated file first, not a WAL index the restarted writer rebuilt).
@@ -52,7 +54,7 @@ services:
     # -I: isolated (no user site, no PYTHON* variables); -B: no bytecode written.
     entrypoint: ["python3", "-I", "-B", "/opt/sqlite/build.py"]
     command: ["serve", "--manifest", "/opt/seed/sqlite.json", "--out", "/srv/sqlite/data",
-              "--ready", "/tmp/databastion-ready", "--write-every", "20"]
+              "--ready", "/tmp/databastion-ready", "--write-every", "20", "--paced-tables", "400"]
     volumes:
       - ../dev/sqlite/build.py:/opt/sqlite/build.py:ro
       - ../dev/seed/out:/opt/seed:ro

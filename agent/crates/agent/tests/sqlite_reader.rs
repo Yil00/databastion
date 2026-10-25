@@ -915,6 +915,9 @@ async fn seeded_dev_files_match_the_ground_truth() {
     }
 }
 
+/// Tables added to the paced-scan file (as the e2e run's `paced.db`).
+const PACED_TABLES: u32 = 120;
+
 /// ADR-0059 decision 4 and the end-to-end scenario of decision 10: a
 /// `-shm` truncated by the application while a paced scan (the default
 /// 1 % duty cycle) runs kills the reader at its next unit with `SIGBUS`:
@@ -937,6 +940,19 @@ async fn a_shm_truncated_during_a_paced_scan_costs_a_unit_never_the_agent() {
     let _guard = tracing::subscriber::set_default(subscriber);
     let rw = env.rw.join("app.db");
     seed(&rw, true);
+    // As the e2e run's paced.db (dev/sqlite/build.py paced): enough
+    // tables that the paced scan (about 3 units per table, each followed by
+    // a pause 99 times its length) cannot end before the truncation below,
+    // whatever the machine's speed.
+    let extra: String = (1..=PACED_TABLES)
+        .map(|i| {
+            format!(
+                "CREATE TABLE paced_t{i:04} (id INTEGER PRIMARY KEY, counter INTEGER NOT NULL);\n\
+                 INSERT INTO paced_t{i:04} (counter) VALUES (1), (2), (3);\n"
+            )
+        })
+        .collect();
+    build_from_sql(&rw, &extra, "wal", "UTF-8", 4096, "none");
     env.mount();
     let mut writer = writer_process(&rw);
     let c = SqliteConnector::new();
@@ -952,20 +968,38 @@ async fn a_shm_truncated_during_a_paced_scan_costs_a_unit_never_the_agent() {
     .with_rotation(42);
     let (sink, mut rx) = FindingSink::channel(4096);
     let shm = databastion_connector_sqlite::files::side_path(&rw, "-shm");
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let scan_fut = async {
+        let r = c.discover(&job, &sink).await;
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        r
+    };
+    // Triggered by an observable signal, never a delay: the scan's first
+    // unit (the catalog, whose failure fails the scan) is done, so its
+    // reader has mapped the -shm and is paused before its next unit; the
+    // scan still runs.
     let truncate = async {
-        // A few paced units in: the reader has mapped the -shm.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        loop {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            if String::from_utf8_lossy(&logs.0.lock().unwrap()).contains("sqlite catalog read") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .open(&shm)
             .unwrap()
             .set_len(0)
             .unwrap();
-        std::time::Instant::now()
+        Some(std::time::Instant::now())
     };
     let started = std::time::Instant::now();
-    let (outcome, truncated_at) = tokio::join!(c.discover(&job, &sink), truncate);
+    let (outcome, truncated_at) = tokio::join!(scan_fut, truncate);
     outcome.unwrap();
+    let truncated_at = truncated_at.expect("the scan ended before its catalog was read");
     let cov = sink.coverage_for_tests().unwrap_or_default();
     drop(sink);
     let mut found = 0;
@@ -976,10 +1010,6 @@ async fn a_shm_truncated_during_a_paced_scan_costs_a_unit_never_the_agent() {
         "[it] sqlite paced scan with a truncated -shm: truncated after {:?}, scan {:?}, {found} finding(s), {cov:?}",
         truncated_at - started,
         started.elapsed()
-    );
-    assert!(
-        started.elapsed() > truncated_at - started,
-        "the scan ended before the truncation"
     );
     assert!(cov.error >= 1, "no unit lost: {cov:?}");
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
