@@ -1,6 +1,6 @@
 # ADR-0060: Firebird connector: own bounded wire client, Firebird 4.0 and 5.0, SRP-256 with ChaCha wire encryption on loopback only, least-privilege grants, Discovery bounds, Audit from the system audit trace log
 
-- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, awaiting the maintainer's decision
+- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, revised after its security review of 2026-10-25, awaiting the maintainer's decision
 - **Date**: 2026-10-24
 - **Amends** (on acceptance, subject to open question 1): [ADR-0039](0039-engine-scope-expansion.md) decision 3, the Firebird row of the ceilings table, whose first cell reads "Firebird (4.0, 5.0; 3.0 if still maintained when the connector ships)". This ADR refuses Firebird 3.0 at connection whatever its maintenance status (decision 2), for technical reasons that ADR-0039 decision 1 allows ("a connector may keep refusing old servers at connection time"). ADR-0039 is not edited in place; the docs-keeper records the amendment in its status line if this ADR is accepted.
 - **Relies on**: [ADR-0039](0039-engine-scope-expansion.md) decision 1 (end-of-life versions, accepted) and decision 8 (new engines as capability tokens, accepted, with [ADR-0042](0042-hold-items-of-unlisted-engines.md)), and proposes for acceptance, **for Firebird only**, its decisions 3 (the Firebird row: ceiling Partial), 4 (client criteria), 5 (the Firebird bullet: least privilege and a refusal list), 6 (transport: this ADR chooses loopback only), 7 (I5 and local detection) and 9 (test obligations). Decision 2 (order of delivery) is the ROADMAP's. Nothing here applies to SQLite, whose connector ADR is written separately (ADR-0059).
@@ -400,53 +400,143 @@ Open questions adjusted by the review: 2 (tunnels an explicit opt-in), 5 (only w
 
 ## Refinement (2026-10-25, proposed, awaiting the maintainer's decision): the P10-B measurements
 
-Status: **Proposed on 2026-10-25, awaiting the maintainer's decision.** A `security-reviewer` review is requested before the decision: the refinement changes the forged-record rules of the Audit parser, the extended variant, and adds note labels to the contract (P10-C). It answers the three contradictions found by the [P10-B measurements](../measurements/phase10-firebird-facts.md) (#361; [implementation note of 2026-10-25](#p10-b-implementation-obligations)) and records the measured facts that refine the text without a new decision. It refines decision 6 ("Database paths", "Records of undeclared databases", "Header tokens", proofs 2, 3, 8 and 10, "Code that runs out of sight"), decision 4 (the extended variant, "How `check()` reads privileges"), and the answers to open questions 5, 9, 11 and 13. The accepted text above stays as it is; where this refinement differs from it, the refinement applies once accepted. Until then, the P10-B Audit lot (decision 10, pull request 3) does not merge, and `extended_grants: true` is not offered (open question 5 already made it depend on obligation 3). ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
+Status: **Proposed on 2026-10-25, awaiting the maintainer's decision.** Revised after its [security review of 2026-10-25](#security-review-of-2026-10-25-refinement). That review found the first version **not ready**: one blocking High, six Mediums and six Lows, all applied in this revision. A re-review by `security-reviewer` is requested before the decision. The refinement changes the forged-record rules of the Audit parser, adds two Partial proofs, changes the extended variant, and adds a note and note labels to the contract (P10-C).
+
+It answers the three contradictions found by the [P10-B measurements](../measurements/phase10-firebird-facts.md) (#361; [implementation note of 2026-10-25](#p10-b-implementation-obligations)), and records the measured facts that refine the text without a new decision. It refines:
+- decision 6: "Database paths", "Records of undeclared databases", "Header tokens", proofs 1, 2, 3, 8 and 10, a new proof 11, "Code that runs out of sight", the own-attachment rule, and the residual "Forged trace records";
+- decision 4: the extended variant, and "How `check()` reads privileges";
+- the answers to open questions 5, 9, 11 and 13.
+
+The accepted text above stays as it is; where this refinement differs from it, the refinement applies once accepted. Until then, the P10-B Audit lot (decision 10, pull request 3) does not merge, and `extended_grants: true` is not offered (open question 5 already made it depend on obligation 3). ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
 
 ### R1. Header tokens are per attachment (obligation 8)
 
-**Measured** (5.0.4 and 4.0.7). The header token `(<pid>:<address>)` is the server pid and a heap address. Within one server run the pid is constant; it changes only at a server restart. The address differs per attachment: one SuperServer log held 21 distinct tokens under a single pid, so many tokens are current at once for the same database. In SuperServer, `TRACE_INIT` / `TRACE_FINI` bracket the server run; in SuperClassic, each attachment writes its own `TRACE_INIT` / `TRACE_FINI`. The accepted rule ("a token per database path … changed only at a `TRACE_INIT` / `TRACE_FINI` boundary"; a token that is not the current one for its database, a `TRACE_INIT` before the current instance ended, or a token seen for two databases, makes records ambiguous) would mark almost every record ambiguous, and its `TRACE_INIT` / `TRACE_FINI` boundary does not exist in SuperClassic.
+**Measured** (5.0.4 and 4.0.7):
+- The header token `(<pid>:<address>)` is the server pid and a heap address.
+- Within one server run the pid is constant; it changes only at a server restart.
+- The address differs per attachment: one SuperServer log held 21 distinct tokens under a single pid, so many tokens are current at once for the same database.
+- In SuperServer, `TRACE_INIT` / `TRACE_FINI` bracket the server run; in SuperClassic, each attachment writes its own `TRACE_INIT` / `TRACE_FINI`.
 
-**Proposed rule**, replacing the "Header tokens" paragraph of decision 6. It is applied to every database in the log, declared or not, as H1 fix 4 required. The token keeps the role of H1 fix 7: it is not a secret, and its value is that a wrong guess is loud.
+The accepted rule cannot stand. It kept "a token per database path … changed only at a `TRACE_INIT` / `TRACE_FINI` boundary", and made records ambiguous when a token was not the current one for its database, when a `TRACE_INIT` came before the current instance ended, or when a token was seen for two databases. Applied to the measured log, it would mark almost every record ambiguous, and its `TRACE_INIT` / `TRACE_FINI` boundary does not exist in SuperClassic.
 
-1. **Run pid.** The pid identifies a server run. At every `check()`, the connector reads `MON$SERVER_PID` from the `MON$ATTACHMENTS` row of `CURRENT_CONNECTION` on its own attachment (a constant text). That value is in the server's own pid namespace, the one the header prints, so the check holds when the agent runs in another pid namespace. The agent's own records must carry it. The **current run pid** is the pid confirmed this way. A record whose pid is not the current run pid is ambiguous, except as the confirmed start of a new run (rule 2).
-2. **Run change, confirmed by the server.** Every client can read its own `MON$SERVER_PID`, so a pid in a header proves nothing by itself. When a record with a new pid arrives:
-   - the stream stops before it, without advancing its position (nothing is lost), and asks for an immediate `check()`;
-   - if `MON$SERVER_PID` then equals the new pid, a new run starts at that record, every binding of the old run ends, and any later record with the old pid is ambiguous (a run does not resume);
-   - if the check reads another pid, or no check succeeds within 10 minutes, the records with the unconfirmed pid are handled as ambiguous and the old run continues.
+**Proposed rules**, replacing the "Header tokens" and "Records of undeclared databases" paragraphs of decision 6. They apply to every database in the log, declared or not, as H1 fix 4 required. The token keeps the role of H1 fix 7: it is not a secret, and its value is that a wrong guess is loud. As security review H-1 showed, a forger needs no guess at all for some forgeries; the forger analysis below states what remains.
 
-   In SuperServer, a confirmed run whose first record is not its `TRACE_INIT` has its records before that `TRACE_INIT` marked ambiguous. When a history walk (a first start, or after a gap) reads earlier runs, those runs come from the log alone: a pid change starts a run only at a `TRACE_INIT` record in SuperServer, or at a `TRACE_INIT` or `ATTACH_DATABASE` record in SuperClassic. Any other pid change is ambiguous, and the first `check()` confirms the current run. A `TRACE_FINI` ends nothing by itself, because a forged `TRACE_FINI` carrying the known pid must not end the bindings. In SuperServer, a second `TRACE_INIT` with the run pid, or a record with the run pid after its `TRACE_FINI`, is ambiguous. In SuperClassic, `TRACE_INIT` / `TRACE_FINI` records belong to attachments: they are checked against the run pid, and their token is checked as measurement 8c settles (until then, against the run pid only).
-3. **Attachment binding.** An attachment is identified by its printed database name (R2) and its attachment id, within a run. The token on its `ATTACH_DATABASE` record is its **binding**, and the binding is **anchored**. The binding ends at a `DETACH_DATABASE` record that carries the same token. Every record of the attachment must carry the binding's token: a record that carries another token is ambiguous, as is a second `ATTACH_DATABASE` for an attachment whose binding is live.
+1. **Run identity.** A server run is identified by the pair (pid, process start time).
+   - The pid comes from `MON$SERVER_PID`, read at every `check()` from the `MON$ATTACHMENTS` row of `CURRENT_CONNECTION` on the agent's own attachment (a constant text).
+   - The start time comes from `/proc/<pid>/stat` of that process. Proof 2 already requires the server process to be in the agent's pid namespace, so that file can be read.
+   - The agent's own records must carry the pid.
+   - A server in another pid namespace is Limited under proof 2. There the rules below run with `MON$SERVER_PID` alone, as a fail-closed best effort.
+   - The **current run** is the run so confirmed. A record whose pid is not the current run's pid is ambiguous, except as the confirmed start of a new run (rule 2).
+2. **Run change, confirmed by the server, with bounded stops.** Every client can read its own `MON$SERVER_PID`, so a pid in a header proves nothing by itself.
+   - **The stop.** When a record with a new pid arrives, the stream stops before it, without advancing its position (nothing is lost), and asks for an immediate `check()`.
+   - **A confirmed change.** If `MON$SERVER_PID` and the start time then identify a new run whose pid is the record's pid, a new run starts at that record. Every binding of the old run ends, detached or not, and the own-attachment lifetimes of the old run close.
+   - **A changed start time** with the same pid is a confirmed run change too (the pid was reused).
+   - **After a confirmed change**, a record that carries the pid of an ended run is a new pid like any other. It is confirmed only if the current server process has that pid, with a start time later than the ended run's.
+   - **A failed confirmation.** If the check reads another run, or does not answer within 60 s, the records with the unconfirmed pid are handled as ambiguous and the current run continues.
+   - **Limits on stops** (security review M-3):
+     - at most one unresolved stop at a time;
+     - a pid that failed confirmation is remembered for the run (at most 64 pids), and its records are ambiguous at once, with no stop;
+     - after a failed confirmation, a 10-minute cooldown, during which records with any new pid are ambiguous without stopping the stream.
+   - **Measuring stops.** The heartbeat metrics `firebird_audit_stream_stopped_seconds_total` and `firebird_audit_run_confirmations_failed_total` count the stops and the failed confirmations. When the stream has been stopped for more than 60 s within one hour, `audit.log_records_ambiguous` carries the new label `run_confirmation_stalled`.
+   - **`TRACE_INIT` / `TRACE_FINI`.**
+     - A `TRACE_FINI` ends nothing by itself: a forged one carries the known pid.
+     - In SuperServer, a second `TRACE_INIT` in the current run, or a record of the current run after its `TRACE_FINI`, is ambiguous.
+     - **After a crash** there is no `TRACE_FINI`. The restarted server's `TRACE_INIT` carries a new pid, or the same pid with a new start time. It goes through the stop and the confirmation. Once confirmed, it ends the old run and its bindings, and a last record of the old run cut by the crash is ambiguous (H1 fix 2, or the held-at-EOF rule).
+     - In SuperClassic, `TRACE_INIT` / `TRACE_FINI` records belong to attachments. They are checked against the run pid; their token is checked as measurement 8c settles (until then, against the run pid only).
+   - **History walks.** When a history walk (a first start, or after a gap) reads earlier runs, those runs come from the log alone. A pid change starts a run only at a `TRACE_INIT` record in SuperServer, or at a `TRACE_INIT` or `ATTACH_DATABASE` record in SuperClassic; any other pid change is ambiguous. The first `check()` confirms the current run.
+3. **Attachment binding.**
+   - **Key.** An attachment is identified by its **database identity** and its attachment id, within a run. For a declared database, the identity is the declared database, whatever name the record prints: its path or any alias that maps to it (R2). For an undeclared database, it is a keyed hash of the printed name (rule 11).
+   - **The binding.** The token on the attachment's `ATTACH_DATABASE` record is its **binding**, and the binding is **anchored**. It ends at a `DETACH_DATABASE` record that carries the same token, or with its run.
+   - **Every record of the attachment** must carry the binding's token; a record that carries another token is ambiguous.
+   - **Duplicate ids** (security review M-1). An attachment id is never reused within a database's life (obligation 10). A second `ATTACH_DATABASE` for the same database identity and id within one run, outside a confirmed restore (rule 5), **poisons both bindings**, whether or not the first has detached: all their records are ambiguous, and neither is the agent's own.
 4. **One live binding per token.** A token held by a live binding is ambiguous on any other record: a record of another attachment, a `FAILED` / `UNAUTHORIZED ATTACH_DATABASE`, or a service record. Heap addresses are reused, so after its detach a token can come back for a new attachment, through that attachment's own `ATTACH_DATABASE` record.
-5. **Attachments the stream did not see attach.**
+5. **Attachments the stream did not see attach, and restores.**
    - **Learned bindings.** At a first start or after a gap, an attachment can predate the read position. Its binding is learned from its first record. After a mismatch on a learned binding, every later record of that attachment is ambiguous, because the first record may have been the forged one.
-   - **Own attachments.** An attachment is the agent's own only when its binding is anchored. This is a new condition of the own-attachment rule; the agent reads its own `ATTACH_DATABASE` records anyway.
-   - **Watermark** for declared databases. Attachment ids come from a counter in the database header, in order (obligation 10). The **watermark** is the id of the agent's first own attachment in the run whose `ATTACH_DATABASE` record the stream read. A record of an attachment with a higher id, but with no `ATTACH_DATABASE` record read for it, names an attachment that cannot predate the read position: it is ambiguous.
-   - **After a restore**, the ids restart from a low value (obligation 10), seen as an `ATTACH_DATABASE` below the highest id seen for that database. The watermark is then set again from the agent's next own attachment.
-   - Undeclared databases have no watermark (the agent has no attachment there): rule 7 covers them.
+   - **Own attachments.** An attachment is the agent's own only when its binding is anchored and not poisoned. This is a new condition of the own-attachment rule; the agent reads its own `ATTACH_DATABASE` records anyway.
+   - **Watermark** for declared databases. Attachment ids come from a counter in the database header, in order (obligation 10). The **watermark** is the id of the agent's first own attachment in the run whose `ATTACH_DATABASE` record the stream read. A record of an attachment with a higher id, but with no `ATTACH_DATABASE` record read for it, names an attachment that cannot predate the read position: it is ambiguous. Measurement 8e checks whether system attachments write such records.
+   - **Restores** (security review M-1) are recognised from `check()` only, never from a log record. A restore is confirmed when:
+     - the agent's own `CURRENT_CONNECTION` is below the watermark; or
+     - `RDB$GET_CONTEXT('SYSTEM', 'DB_GUID')` or `MON$DATABASE.MON$CREATION_DATE` has changed since the last check.
+
+     On a confirmed restore, that database's own-attachment set is cleared, its bindings end, and its watermark is set again from the agent's next own attachment. An `ATTACH_DATABASE` in the log whose id is not above the highest id seen for its database identity in the run, without that confirmation, is ambiguous.
 6. **Service sessions** are bound in the same way, from `ATTACH_SERVICE` to `DETACH_SERVICE`, within the run.
-7. **Split windows** (H1 fixes 2 and 3, made explicit). A finish record of a declared database that has no trailer (fix 2) opens a **window**. Every following record is ambiguous until the first record whose token is that of a binding that existed before the window. The records of the window, and the record that ends it, are never dropped as records of an undeclared database. A binding created by an `ATTACH_DATABASE` inside the window is tainted: its records are ambiguous until it detaches.
-8. **Classic** server mode: each attachment is served by its own process, so the pid is not a per-run constant and rule 1 does not hold. Audit stays Limited there, with a local detail, until a later refinement. This refines the answer to open question 9 (the "Partial if the token rule holds there" branch is withdrawn for now; the peer-uid measurement under Classic stays open).
-9. **Bounds and persistence.** Live bindings, the run pid and the watermarks are persisted with the stream position, as the own-attachment set is. A target keeps at most 65 536 live bindings; beyond that, records of attachments without a kept binding are ambiguous and counted.
+7. **Split windows** (H1 fixes 2 and 3, made explicit; security review M-1).
+   - **Opening.** A finish record of a declared database that has no trailer (fix 2) opens a **window**.
+   - **Ending.** The window ends only at a record of one of the agent's own anchored, unpoisoned bindings, or at the first record that the agent reads at least 60 s after the record that opened the window (agent clock: the forged records of one append are read together).
+   - **Inside the window.** Every record of the window is ambiguous, and so is the record that ends it unless it is the agent's own. All of them, the ending one included, take the fix-3 attribution, and none is dropped as a record of an undeclared database. A binding created by an `ATTACH_DATABASE` inside the window is tainted: its records are ambiguous until it detaches.
+8. **Records of undeclared databases** (security review H-1), amending "Records of undeclared databases" of decision 6:
+   - **Under proof 11** (below), the server writes no record of an undeclared database into the declared log. A record that names one is therefore forged or misconfigured: it is ambiguous, with the fix-3 attribution, and never dropped.
+   - **Without proof 11**, the level is Limited, with `audit.trace_config_not_evaluated` and the new label `foreign_databases_logged`. Records of undeclared databases that are not ambiguous are then dropped and counted, as the accepted text says (I5), and docs/08 states that, at Limited, a forged record of an undeclared database can hide a read.
+9. **Remote 4-tuple corroboration**, conditional on measurement 8f. Under this rule, a new binding is ambiguous when the attachment line's `<protocol>:<address>/<port>`:
+   - equals that of another live binding; or
+   - has no matching server-side socket in `/proc/net/tcp` / `/proc/net/tcp6` (the same bounded lookup as decision 3) while the binding is live and its `ATTACH_DATABASE` record is read within 10 s of being written.
 
-**Fail closed, as before.** An ambiguous record follows H1 fix 3: always reported, never the agent's own, never dropped as a record of an undeclared database, with `*` added, its counters' objects and its row counts, counted in `audit.log_records_ambiguous`, and capping the level for 24 h (proof 8, "no header-token anomaly", now meaning a breach of rules 1 to 9). H1 fixes 1 (trailer-first parse of every record), 2 (a finish record with no trailer is ambiguous), 3 (the drop of records of undeclared databases applies only to records that are not ambiguous), 5, 6 and 7 are unchanged. Fix 4 becomes rules 3 to 5, applied to every database in the log.
+   It applies only if 8f shows that the remote address can be corroborated in this way. It raises the cost of a forged `ATTACH_DATABASE`, but does not remove it: a local forger can hold an extra TCP connection to the server port open without attaching, and use its port.
+10. **Classic** server mode: each attachment is served by its own process, so the pid is not a per-run constant and rule 1 does not hold. Audit stays Limited there, with a local detail, until a later refinement. This refines the answer to open question 9: the "Partial if the token rule holds there" branch is withdrawn for now, and the peer-uid measurement under Classic stays open.
+11. **Bounds and persistence** (security review M-4).
+    - **Persisted state.** The live bindings, the current run, the remembered pids, the watermarks and the open window are persisted with the stream position, as the own-attachment set is.
+    - **Names.** A printed database name longer than 4 KiB is ambiguous and is not kept. Undeclared names are kept only as a keyed hash (HMAC under the agent's local key), never in clear.
+    - **Caps:**
+      - 16 384 live bindings per declared database;
+      - 4 096 per undeclared database identity;
+      - 256 undeclared identities;
+      - 1 024 service bindings;
+      - one open window (overlapping windows merge);
+      - a global cap of 16 MiB on the persisted state.
+    - **Eviction** is fail closed. The oldest learned bindings and the bindings of undeclared databases go first; anchored bindings of declared databases are never evicted. A record of an evicted binding is ambiguous and counted.
+    - **When nothing can be evicted**, a new binding is not kept, and its records are ambiguous.
 
-**What a forger can do under this rule.** The forger is any client that can put header-shaped lines into its own record (the H1 injection points) and cannot read the log.
+**Fail closed, as before.** An ambiguous record follows H1 fix 3:
+- it is always reported, never the agent's own, and never dropped as a record of an undeclared database;
+- `*` is added, with its counters' objects and its row counts;
+- it is counted in `audit.log_records_ambiguous`;
+- it caps the level for 24 h (proof 8, whose "no header-token anomaly" now means a breach of rules 1 to 11).
 
-- **What the forger knows**: the pid (its own `MON$ATTACHMENTS` row) and attachment ids (sequential; its own from `CURRENT_CONNECTION`).
-- **What it does not know**: any attachment's address, its own included, unless it can read the log or learns one from a leak (a crash report, an old copy of the log).
+H1 fixes 1 (trailer-first parse of every record), 2 (a finish record with no trailer is ambiguous), 5, 6 and 7 are unchanged. Fix 3 is strengthened by rules 7 and 8. Fix 4 becomes rules 3 to 5, applied to every database in the log.
+
+**New Partial proof 11: the declared log holds only declared databases** (security review H-1). Every condition must hold, for each declared database, under the first-match semantics of R2 rule 4:
+- **The default section** is disabled (`enabled = false`), or its `log_filename` is not the declared log.
+- **Every named section whose `log_filename` is the declared log** has a pattern with no `SIMILAR TO` metacharacter that equals exactly:
+  - the resolved path of a declared database; or
+  - pending measurement 12b, an alias of the map that maps to one.
+- **The declared database file has a single link** (`st_nlink` = 1, from a `stat` without opening the file).
+  - A client that attaches through another path of the same file (a hard link) matches no section, so its records are not written to the declared log at all.
+  - Otherwise the level is Limited, with `audit.trace_config_not_evaluated` and the new label `database_path_not_unique`.
+  - Bind mounts of the database directory cannot be detected this way, and are a residual stated in docs/08.
+
+**What a forger can do under these rules** (corrected after security review H-1). The forger is any client with no privilege that can put header-shaped lines into its own record (the H1 injection points), and cannot read the log.
+- **What the forger knows and controls.** It knows the pid (its own `MON$ATTACHMENTS` row) and attachment ids (sequential; its own from `CURRENT_CONNECTION`). It controls all the text before its injected header, so it can **end its own record with a complete fake trailer** (a `^` line, `1 records fetched`, a performance line, a per-table block naming `RDB$DATABASE`). Its record then looks well formed, and no split window opens.
+- **What it does not know**: the address of any live attachment, its own included, unless it can read the log or learns one from a leak (a crash report, an old copy of the log).
+- **Hiding a read in an undeclared database.** The forged header names an undeclared database and an invented attachment, so the real trailer lands in a well-formed record of an undeclared database. Under proof 11 that record is ambiguous (rule 8): the read is reported with its real counters and row count. Without proof 11, the level is Limited, and the read can be dropped quietly (the stated Limited residual).
+- **Misattribution on a declared database: quiet, and needs no guess.** The forger writes a fake trailer, then a forged `ATTACH_DATABASE` for a new attachment id above the watermark with a fresh token, then a forged finish header and attachment line for that attachment. The real trailer then lands under the forged principal.
+  - No rule makes this ambiguous: the forged attachment is anchored, its id is new, and its token is not live.
+  - The read **is reported, with its real objects and row count**. Only the principal is wrong: the user, the role, the address and the attachment can name an invented principal, or another user's name.
+  - The forger's real record appears as a small read of `RDB$DATABASE` under its true principal.
+  - Policies and baselines keyed on the principal can therefore be evaded, or turned against another user. "Every read" policies and the volume and shape signals still apply.
+  - Rule 9, if measurement 8f allows it, makes this harder (a live socket with no other binding is needed). Measurement 8f may show that the server escapes line breaks in some fields, which would close those injection points. Until then, misattribution is the stated residual of Partial, for the maintainer to accept or reject (open question 6).
 - **A forged record of a live attachment** needs that attachment's address. A wrong guess is ambiguous (rules 3 and 4): loud.
-- **A forged record of an invented attachment** is ambiguous on a declared database above the watermark (rule 5). Below the watermark, or on an undeclared database, the token rule does not catch it. When such a record carries a real trailer moved by a split, the forger's own record has lost its trailer (fix 2) and opens a window (rule 7): the forged record is ambiguous and is not dropped, so the read stays reported with its real counters and row count.
-- **Separating a real read from its trailer quietly.** To get a real trailer dropped, or attached to another principal, without an ambiguous record, the forger must first end the window. That takes a correct guess of a live binding's token, together with its attachment id and database name. Only then can it place a further record of an undeclared database (which is dropped) or of another principal. Each wrong guess is loud. Even when every guess is right, the forger's own record, cut before its trailer, stays ambiguous and is reported with `*` against its declared database (fix 3). The read is therefore reported, but its row count and objects can be lost or attributed to the wrong principal. This is the accepted residual "Forged trace records", stated precisely.
-- **Over-reporting** is unchanged: anyone can add forged events. Records forged with wrong tokens make records ambiguous and cap the level: this can deny the Partial level, but it cannot hide a read.
-- **A forged new pid** stops the stream until a `check()`, then its records are ambiguous. A forged `TRACE_FINI` ends nothing.
-- **Compared with the accepted rule**, a token now belongs to one attachment, so a leaked token is of use only while that attachment lives.
-- **Readers of the log** see every live token, and the rule does not protect against them. Only the server and the agent may read the log (R4: the log holds secrets).
+- **A forged duplicate `ATTACH_DATABASE`**, including for the agent's predicted next id, poisons the bindings involved (rule 3). The agent's own reads are then reported as other reads: loud, not hidden.
+- **Over-reporting** is unchanged: anyone can add forged events. Records forged with wrong tokens make records ambiguous and cap the level: this denies the Partial level, but does not hide a read.
+- **A forged new pid** costs one stop of at most 60 s; after that its pid is remembered, and the cooldown applies (rule 2). A forged `TRACE_FINI` ends nothing.
+- **Readers of the log** see every live token, and every password set through SQL (R4). The rules do not protect against them; proof 1 (R4, security review M-6) withholds Partial while anyone other than root, the server and the agent can read the log.
 
-**New measurements before the Audit lot** (to add to obligation 8):
-- **8a**: the address is the same on every record of one attachment for its whole life, under concurrent load, in SuperServer (worker threads) and in SuperClassic. If it is not (for example, per thread), rule 3 cannot stand, Partial is withheld, and this refinement is revised.
+**Residual "Forged trace records", restated.** Once this refinement is accepted, this statement replaces the accepted residual of that name:
+
+> Any client can write text that looks like other records. Every split that the parser can see is loud: ambiguous records are always reported, with `*`, attributed to a declared database. Under proof 11, a record of an undeclared database in the declared log is ambiguous. On a declared database, a client with no privilege can attribute its own real read to an invented principal, or to another user's name, with no ambiguous record, by ending its record with a fake trailer and forging an `ATTACH_DATABASE` and a finish header. The read is still reported with its real objects and row count; only the principal is wrong. Anyone can add forged events (over-reporting).
+
+**New measurements before the Audit lot** (added to obligation 8):
+- **8a**: the address is the same on every record of one attachment for its whole life, under concurrent load, in SuperServer and in SuperClassic (worker threads in both). If it is not (for example, if it changes per thread), rule 3 cannot stand, Partial is withheld, and this refinement is revised.
 - **8b**: `DETACH_DATABASE` carries the attachment's token, and an address is reused after a detach.
 - **8c**: the token carried by `TRACE_INIT` / `TRACE_FINI`, `FAILED ATTACH_DATABASE` and service records, in SuperServer and SuperClassic.
-- **8d**: `MON$SERVER_PID` is readable by the minimal account on its own row and equals the header pid, including when the agent runs in another pid namespace.
+- **8d**: `MON$SERVER_PID` is readable by the minimal account on its own row and equals the header pid. `RDB$GET_CONTEXT('SYSTEM', 'DB_GUID')` and `MON$DATABASE.MON$CREATION_DATE` change at a restore.
+- **8e**: the attachment ids consumed by system attachments (garbage collector, cache writer, sweep, profiler) and by failed attaches, and whether those write records without an `ATTACH_DATABASE` record (rule 5's watermark).
+- **8f**: whether the server escapes line breaks or writes them verbatim, in:
+  - the statement text;
+  - `isc_dpb_process_name`;
+  - the user name of a `FAILED ATTACH_DATABASE`;
+  - error texts.
+
+  Also, whether an attachment's `TCPv4:<address>/<port>` can be corroborated with `/proc/net/tcp` at read time (rule 9).
 
 ### R2. Database names: aliases (obligation 12)
 
@@ -456,24 +546,32 @@ Status: **Proposed on 2026-10-25, awaiting the maintainer's decision.** A `secur
 - A hard link is printed as the path used, in both.
 - Under the accepted text, records of a client that attaches through an alias match no declared database, so they would be dropped as records of an undeclared database.
 
-**Proposed rules**, refining "Database paths" and "Records of undeclared databases" of decision 6:
+**Proposed rules**, refining "Database paths" of decision 6 (records of undeclared databases: R1 rule 8):
 
 1. **The names of a declared database** are:
    - (a) its **resolved path**, from `MON$DATABASE.MON$DATABASE_NAME` read on the agent's own attachment at every `check()`: a constant text, a monitoring table, no file opened by the agent and no path in any statement;
    - (b) when `attach` is an alias, **the alias string exactly as written** in `agent.yaml`, byte for byte, with no case folding and no trimming.
 
-   A record belongs to a declared database when its printed name equals one of these names exactly. The path and the alias stay on the agent host (decision 5).
+   A record belongs to a declared database when its printed name equals one of these names exactly, or resolves to one through rule 2. A case-only variant of a declared alias (`APPALIAS` for `appalias`) is not equal: it is ambiguous, never dropped, pending measurement 12c. The path and the alias stay on the agent host (decision 5).
 2. **Other aliases of the same file.** Another client can attach through another alias of the same file, and that alias cannot be matched to the file without the alias map.
-   - **Reading the map.** `agent.yaml` names `firebird.audit.databases_conf` (an absolute path), read under the file rules of decision 6 with a closed grammar: `alias = path` lines, comments, and per-database `{ … }` blocks with a closed key set. An `include`, an unknown key, a parse error or a writable file means the map is not evaluated.
+   - **Reading the map.** `agent.yaml` names `firebird.audit.databases_conf`. Its path must equal `<root>/databases.conf`, where `<root>` is the declared Firebird root directory (decision 6, M3). The file is read under the file rules of [ADR-0043](0043-audit-logs-opened-without-following-a-final-symlink.md): `O_NOFOLLOW`, one hard link, no ancestor directory the agent can write, and the `with_open_check` check that the path still names the handle.
+   - **Grammar.** The grammar is closed: `alias = path` lines, comments, and per-database `{ … }` blocks with a closed key set. An `include`, an unknown key, a parse error or a writable file means the map is not evaluated.
+   - **Macros** (security review L-4). The `$(root)` and `$(dir_*)` macros of a closed list, checked per image by a drift test, are resolved against the declared root. An entry that uses any other macro is an alias with an unknown path: its printed name is ambiguous, but the rest of the map stays evaluated.
    - **Resolving a printed name.** A printed name that is not an absolute path is looked up exactly in the map:
      - an alias that maps to a declared database's resolved path belongs to that database;
-     - an alias that maps to another path names an undeclared database, and that path then goes through rule 3;
+     - an alias that maps to another path names an undeclared database (R1 rule 8 decides what becomes of its records), and that path goes through rule 3;
      - a name that is not in the map is ambiguous, and never dropped.
    - **Without an evaluated map**, every non-absolute printed name other than a declared alias is ambiguous, and the level is Limited with `audit.trace_config_not_evaluated` and the new label `databases_conf`.
-3. **M4 is kept.** After alias resolution, a name that is not one of a declared database's names is ambiguous, and caps that database at Limited until the operator's configuration is fixed, when it either has the same file name as the declared database or names a file whose `(st_dev, st_ino)` (from a `stat` of the resolved path, without opening the file) equals the declared database's. The hard-link case measured above is that case. When the agent's own `attach` names a hard link, records of clients that use the other path are ambiguous through this rule. The user guide asks operators to declare the path or alias that clients use.
-4. **Trace sections and aliases** (obligations 12 and 13).
-   - **Section order.** Sections are matched on the full database path, and only the first matching named section applies, after the default section (R4). Proof 3 therefore evaluates **the first matching section in file order**. A section the agent cannot evaluate that comes before that match caps the level. A section after it is never reached, so it does not cap the level and is named in the local detail.
-   - **Aliases.** It was not measured whether, for an attach through an alias, the server matches sections against the alias string or the resolved path (measurement 12b). Until it is, proofs 3 and 4 are evaluated for the resolved path **and** for every alias that maps to it, the declared alias included. If the effective settings differ between these names, the level is Limited (`audit.trace_config_not_evaluated`). Without this rule, a client using an alias could fall into a section with weaker settings, or into a disabled default section.
+3. **M4 is kept.** After alias resolution, a name that is not one of a declared database's names is ambiguous, and caps that database at Limited until the operator's configuration is fixed, when it either:
+   - has the same file name as the declared database; or
+   - names a file whose `(st_dev, st_ino)` (from a `stat` of the resolved path, without opening the file) equals the declared database's.
+
+   Proof 11 (R1) adds the single-link condition, because under it a client that attaches through a hard link is not logged at all.
+4. **Trace sections, restated with the measured semantics** (obligations 12 and 13; security review M-5). This replaces the section rule of proof 3.
+   - **When a named section applies.** It applies to a declared database only when its pattern contains no `SIMILAR TO` metacharacter (`_` and `%` included) and **equals the full resolved path**, or, pending measurement 12b, the alias string. A plain file name is **not** a match: the measurement matched sections on the full path. A section whose pattern the agent cannot evaluate (a `SIMILAR TO` pattern, or a plain file name) caps the level when it comes **before** the first matching section, because the server might apply it instead.
+   - **The effective settings** are the default section's, overridden by those of the first matching named section. Measurement 13b verifies this inheritance. Proofs 3, 4 and 11 are evaluated on the effective settings.
+   - **First match.** Only the first matching named section applies (measured). A section after it is never reached, so it does not cap the level and is named in the local detail. With the restatement above, this relaxation of the accepted proof 3 is sound.
+   - **Aliases.** It was not measured whether, for an attach through an alias, the server matches sections against the alias string or the resolved path (measurement 12b). Until it is, proofs 3, 4 and 11 are evaluated for the resolved path **and** for every alias that maps to it, the declared alias included. If the effective settings differ between these names, the level is Limited (`audit.trace_config_not_evaluated`). A client that uses an alias absent from the map is ambiguous (rule 2).
 5. **`databases.conf` changed while the server runs.** It was not measured whether the server applies a changed `databases.conf` without a restart, for example at the next attach (measurement 12c). Until it is, the rule is fail closed:
    - `databases.conf` follows proof 2: a file changed after the server process started is not proven (Limited, label `databases_conf`) until the next server restart;
    - the agent checks the file's `mtime` and `ctime` with a `stat` before each read cycle. After a change it re-reads the map, and the records it handles between the change and the re-read and re-evaluation that use a non-absolute name are ambiguous;
@@ -482,31 +580,66 @@ Status: **Proposed on 2026-10-25, awaiting the maintainer's decision.** A `secur
 **New measurements**:
 - **12b**: section matching for an attach through an alias (alias string or resolved path).
 - **12c**: when the server applies a changed `databases.conf` (at restart only, or at the next attach), whether alias lookup is case-sensitive, and which per-database keys of `databases.conf` can change what the trace logs.
+- **13b** (extends obligation 13): on 4.0 and 5.0, in SuperServer and SuperClassic, with an enabled default section:
+  - the inheritance of default settings by a named section;
+  - whether a plain file-name pattern matches;
+  - the case sensitivity of path matching.
 
 ### R3. The extended variant and `RDB$CONFIG` (obligation 3)
 
-**Measured**: with `SELECT_ANY_OBJECT_IN_DATABASE`, the `ext` account reads the whole server configuration from `RDB$CONFIG` (77 rows on 5.0, 73 on 4.0: `ExternalFileAccess`, `UdfAccess`, `AuthServer`, `WireCrypt`, `RemoteBindAddress`, `ServerMode` and the rest). `min` and `none` read 0 rows, with no error. The privilege does not reveal other attachments in `MON$ATTACHMENTS`, nor other users' rows in `SEC$USERS`. The answer to open question 5 assumed that the variant "exposes nothing beyond user tables and the already public `RDB$` tables". That assumption does not hold.
+**Measured**:
+- With `SELECT_ANY_OBJECT_IN_DATABASE`, the `ext` account reads the whole server configuration from `RDB$CONFIG`: 77 rows on 5.0 and 73 on 4.0, including `ExternalFileAccess`, `UdfAccess`, `AuthServer`, `WireCrypt`, `RemoteBindAddress` and `ServerMode`.
+- `min` and `none` read 0 rows, with no error.
+- The privilege does not reveal other attachments in `MON$ATTACHMENTS`, nor other users' rows in `SEC$USERS`.
+
+The answer to open question 5 assumed that the variant "exposes nothing beyond user tables and the already public `RDB$` tables". That assumption does not hold.
 
 **Options**:
 - **(a) Keep the variant opt-in, with the exposure stated, and contain it** (proposed):
-  - **Never sampled.** `RDB$CONFIG` is named in the closed list of relations never sampled (decision 5, M5), so the drift test asserts that it is listed. It is a virtual table and is not sampled under decision 5 already (virtual tables and system relations are never sampled); naming it keeps that from depending on its system flag.
+  - **Never sampled.** `RDB$CONFIG` is named in the closed list of relations never sampled (decision 5, M5), so the drift test asserts that it is listed. It is a virtual table and is not sampled under decision 5 already; naming it keeps that from depending on its system flag.
   - **No findings on it.** Its values are the server's settings (paths, addresses, plugin names), not user data. Classified, they would produce findings that say nothing about the data the operator protects, and would send masked samples of server paths and addresses to the console.
   - **A note when readable.** `check()` probes whether `RDB$CONFIG` is readable with the one-bit form of decision 4 (`SELECT CASE WHEN EXISTS (SELECT 1 FROM RDB$CONFIG) THEN 1 ELSE 0 END FROM RDB$DATABASE`; the minimal account gets 0). When it is readable, `check()` reports `privilege.global_privileges` with the new label `server_config_readable` at every check, with or without `extended_grants: true`. This is the stated cost of the variant, next to `privilege.extended_variant`.
-  - **The agent's own reads.** Decision 4 reads the server settings "through `RDB$CONFIG` where visible", and decision 6 lists `RDB$CONFIG` as always reported. The agent reads it only when the probe returns 1, with one constant text that names a closed list of keys (the decision 4 settings and `ServerMode` for the proof 2 cross-check). The values go to the local detail only, never to the console. That exact text and the probe join the own exceptions of the credential-bearing list, under the own-attachment rule (anchored binding, exact text, not ambiguous). Any other read of `RDB$CONFIG` stays always reported.
-  - **Drift test.** On the matrix, per image, it lists the `RDB$CONFIG` key names and every relation whose visible rows differ between `min` (with its table grants) and `ext`. It fails on a key or a relation outside the reviewed list, so that a later version cannot widen the variant without notice (measurement 3b).
+  - **The agent's own reads.** Decision 4 reads the server settings "through `RDB$CONFIG` where visible", and decision 6 lists `RDB$CONFIG` as always reported. The agent reads it only when the probe returns 1, with one constant text that names a closed list of keys: the decision 4 settings, and `ServerMode` for the proof 2 cross-check. The values go to the local detail only, never to the console.
+  - **Own-read exceptions.** That exact text and the probe join the own exceptions of the credential-bearing list. A record is the agent's own only when every condition holds (security review L-1):
+    - the own-attachment rule holds: the binding is anchored and not poisoned, and the record is not ambiguous;
+    - the text is exactly the constant one;
+    - the per-table block names exactly the relations the matrix records for that constant text: `RDB$CONFIG` for the read, `RDB$DATABASE` for the probe (measurement 3b confirms whether virtual relations appear in the counters);
+    - `records fetched` is at most the number of keys in the closed list (1 for the probe).
+
+    Any other read of `RDB$CONFIG` stays always reported. A forged duplicate `ATTACH_DATABASE` for the agent's predicted id makes the agent's attachment non-own (R1 rule 3), so its reads are then reported: loud, not hidden.
+  - **Drift test** (measurement 3b). On the matrix, per image, it lists the `RDB$CONFIG` key names and every relation whose visible rows differ between `min` (with its table grants) and `ext`. It fails on a key or a relation outside the reviewed list, so that a later version cannot widen the variant without notice. It runs on a **populated** state (security review L-6):
+    - other attachments live;
+    - other users in the security database;
+    - context variables set;
+    - a profiler session running;
+    - a database that is its own security database;
+
+    and it covers every `MON$`, `SEC$`, `PLG$` and virtual relation of the image.
 - **(b) Drop the extended variant**: only per-table grants. This is simpler, and a stolen agent credential never shows the server configuration. On the other hand, every new table needs a grant (the ADR-0012 maintenance cost), and operators with many tables or changing schemas lose the variant.
 
 **Recommendation: (a).** The exposure is the server's configuration, not user data. The parameters on it that matter to an attacker (`ExternalFileAccess`, `UdfAccess`, the bind address, the authentication plugins) are reconnaissance for someone who already holds the agent's credential. The variant is opt-in, reported, and never samples the relation. The drift test listing the key names is the condition: if a key appears that carries a credential, the recommendation is reopened.
 
-### R4. Measured facts that refine the text (no new decision)
+### R4. Measured facts that refine the text, and their handling
 
-- **The trace log holds secrets.** `CREATE USER … PASSWORD '…'` is written verbatim in the statement text; the server does not mask it. The internal `PLG$SRP_VIEW` update that follows carries the verifier and the salt as parameters. With every client's parameter values (decision 6), this makes the audit log a **secret-bearing file**: whoever can read it reads the passwords set through SQL, and every live header token (R1).
-  - The threat model of docs/05 states this.
-  - The agent handles the log as it handles the CAS audit lines: record buffers zeroized, parameter lines dropped at parse.
-  - The password-bearing rule of decision 6 applies to the forms that were measured. The #82 end-to-end marker test **must** cover `CREATE USER … PASSWORD` (and `ALTER USER … PASSWORD`), asserting that no marker appears in any uplink payload, agent log line or metric.
-
-  Decision 6 already treats statement text and parameters as literals (I2), so no rule changes.
-- **Access to the log.** The server creates the audit log `0600`, owned by `firebird:firebird`, so an agent in the `firebird` group cannot read it. The operator grants the agent read access explicitly. The user guide recommends a default ACL for the agent's user on the log directory (read only, so that the files the server creates at rotation inherit it), and advises against adding the agent to the `firebird` group, whose members can often write the database and security database files. The file rules (decision 6) still refuse a log the agent can write. That rotated files inherit the default ACL is confirmed in the dev service (P10-D).
+- **The trace log holds secrets.** `CREATE USER … PASSWORD '…'` is written verbatim in the statement text; the server does not mask it. The internal `PLG$SRP_VIEW` update that follows carries the verifier and the salt as parameters. With every client's parameter values (decision 6), this makes the audit log a **secret-bearing file**: whoever can read it reads the passwords set through SQL, and every live header token (R1). The threat model of docs/05 states this. Decision 6 already treats statement text and parameters as literals (I2), and parameter lines are dropped at parse.
+  - **Handling the record buffers** (security review L-5):
+    - record buffers are reserved once at the 1 MiB record bound, or are `Zeroizing` buffers, so that no reallocation leaves an unzeroized copy;
+    - the tailer's read chunks, the skip path of an oversized record, and the record held at EOF are zeroized as well;
+    - parse errors, panic payloads and `tracing` fields carry offsets and kinds only, never record content.
+  - **The #82 end-to-end marker test must cover**, asserting that no marker appears in any uplink payload, agent log line, metric (the `audit_own_*` metrics included) or spool file:
+    - `CREATE USER … PASSWORD` and `ALTER USER … PASSWORD`;
+    - a literal cut at `max_sql_length`;
+    - `EXECUTE BLOCK` with `EXECUTE STATEMENT … ON EXTERNAL … AS USER … PASSWORD`;
+    - a marker in the user field of a `FAILED ATTACH_DATABASE` (fingerprinted, never in clear);
+    - a marker in `isc_dpb_process_name`;
+    - the `PLG$SRP_VIEW` parameter record.
+- **Access to the log.** The server creates the audit log `0600`, owned by `firebird:firebird`, so an agent in the `firebird` group cannot read it. The operator grants the agent read access explicitly.
+  - **The user guide's setup.** The user guide recommends a default ACL on the log directory that gives the agent's user read only, so that the files the server creates at rotation inherit it. It advises against adding the agent to the `firebird` group, whose members can often write the database and security database files. The file rules (decision 6) still refuse a log the agent can write. That rotated files inherit the default ACL is confirmed in the dev service (P10-D).
+  - **Proof 1 gains a readers check** (security review M-6):
+    - **What is inspected.** At every re-evaluation, `check()` inspects the log, the rotated files it still tracks, and the log directory: the mode bits, the owner and group, and the ACLs (`system.posix_acl_access` and `system.posix_acl_default`, with the mask applied).
+    - **Group members.** The members of every group that has read access are enumerated from `/etc/group` and `/etc/passwd`. A group whose membership cannot be enumerated (for example through NSS) counts as readable by others.
+    - **The finding.** Read access for any uid other than root, the server's account and the agent's account is reported with the new note `audit.log_readable_by_others` (the local detail names the uids and groups), and Partial is withheld while it lasts.
+    - **Documentation.** The docs/05 follow-up (P10-G) states the check.
 - **Roles.** A role granted `DEFAULT` is in use (`RDB$ROLE_IN_USE` is `TRUE` and its grants work) while `CURRENT_ROLE` is `NONE`, and the trace's attachment line shows the role `NONE`.
   - `check()` decides which roles are in use with `RDB$ROLE_IN_USE` and `RDB$SYSTEM_PRIVILEGE`, never `CURRENT_ROLE`. `CURRENT_ROLE` is read for the local detail only.
   - `RDB$SYSTEM_PRIVILEGE` takes an unquoted keyword, not a string.
@@ -517,56 +650,95 @@ Status: **Proposed on 2026-10-25, awaiting the maintainer's decision.** A `secur
   - **Measurement 7b**: nested finish records are written before the finish record of their statement.
 - **Unquoted identifiers are ASCII only** (security review L9, open question 11). `CREATE TABLE café` is a syntax error on 4.0 and 5.0, whatever the client character set and the user. A quoted `"café"` is stored as written. ASCII upper-casing of unquoted names is therefore sufficient, which confirms the answer to open question 11. The matrix test of decision 9 stays, as a regression test.
 - **When the configuration is read** (obligation 11). In SuperServer, a change to the trace configuration without a restart had no effect: the configuration is read when the trace session starts with the server process. The "changed after the server process started" branch of proof 2 applies. In SuperClassic, where each attachment starts its own trace session (R1), the configuration may be read again at each attachment. The same rule is fail closed there: any change after the server process started is not proven.
-- **First match only** (obligation 13). Sections are matched on the full database path, and only the first matching named section applies, after the default section. They do not accumulate. Proof 3 evaluates that section (R2, rule 4).
+- **First match only** (obligation 13). Only the first matching named section applies; sections do not accumulate. Proof 3 is restated on that basis in R2, rule 4.
 - **Failed logins.** After three rapid failed logins from one loopback source, the fourth was delayed about 8 s. Later attempts were fast again, and a correct login then succeeded (a delay, not a lockout). The rule of decision 1 (no retry until the next heartbeat check after an authentication failure) keeps the agent from triggering the delay. The mapping `isc_login` → `authentication_failed` is confirmed.
 
 ### Obligations still open
 
 - **Obligation 1**: done; the result is with the maintainer.
 - **Obligation 2**: a client that offers protocol 16 only, and `op_cancel` during a pending fetch. Both need the connector's own client (P10-B lot 1) and the engine matrix.
-- **True Classic mode** (open question 9): the peer-uid rule under per-connection processes, and the header rule (R1, rule 8: Limited until then).
+- **True Classic mode** (open question 9): the peer-uid rule under per-connection processes, and the header rule (R1, rule 10: Limited until then).
 - **`PLG$SRP` / `PLG$USERS` in a database that is its own security database**: their system flag and readability, on the matrix with a pre-built self-security database. Until then, the M5 closed list never samples them whatever their flag, and the decision 4 probe refuses a readable verifier relation.
 - **The `sysdba_mapped` account** (obligation 15): a user mapped to `SYSDBA` or `RDB$ADMIN` through `RDB$AUTH_MAPPING`, refused by `check()`, tested on the matrix with an explicit mapping (the images had none).
-- **New with this refinement**: 3b (R3), 7b (R4), 8a to 8d (R1), and 12b and 12c (R2), measured before the pull request that relies on them.
+- **New with this refinement**, each measured before the pull request that relies on it:
+  - 3b (R3);
+  - 7b (R4);
+  - 8a to 8f (R1), 8f deciding whether rule 9 applies and whether the misattribution residual stands;
+  - 12b, 12c and 13b (R2).
 
 ### Protocol (P10-C)
 
-New `TargetNoteLabel` values, sent only once the console lists the note-label revision that includes them ([ADR-0022](0022-protocol-capability-negotiation.md)):
-- `databases_conf`, for `audit.trace_config_not_evaluated`;
-- `server_config_readable`, for `privilege.global_privileges`.
+- **New note** under the engine's token: `audit.log_readable_by_others` (R4, proof 1).
+- **New `TargetNoteLabel` values**, sent only once the console lists the note-label revision that includes them ([ADR-0022](0022-protocol-capability-negotiation.md)):
+  - `databases_conf`, `foreign_databases_logged` and `database_path_not_unique`, for `audit.trace_config_not_evaluated`;
+  - `run_confirmation_stalled`, for `audit.log_records_ambiguous`;
+  - `server_config_readable`, for `privilege.global_privileges`.
+- **No new field.** The two heartbeat metrics of R1 rule 2 follow the existing metrics rules.
 
-No new note code, no new field.
+### Security review of 2026-10-25 (refinement)
+
+Review of the first version of this refinement at commit `837e9a7`; verdict **not ready**, with one blocking High, six Mediums and six Lows. Every finding is applied in this revision; a re-review is requested.
+
+| Finding | Fix |
+|---|---|
+| **H-1** (blocking): a forged trailer defeats H1 fix 2. The forger ends its own record with a complete fake trailer, so no record is ambiguous and no split window opens; the real trailer lands in a forged record of an undeclared database (dropped, no guess needed) or, after a forged `ATTACH_DATABASE`, under another principal on a declared database | R1: new **proof 11** (sections writing the declared log apply only to declared databases, by exact resolved path or mapped alias; default section disabled or writing another file; single link); under it, records of undeclared databases are ambiguous, never dropped; without it, Limited with `foreign_databases_logged` (rule 8, amending "Records of undeclared databases"). The forger analysis is corrected (no "needs a correct guess", no "the forger's own record stays ambiguous"); the honest residual (quiet misattribution on declared databases, the read still reported with its real objects and row count) replaces the accepted residual "Forged trace records" once accepted; measurement 8f (line breaks per field, 4-tuple corroboration) and the conditional rule 9; open question 6 for the maintainer |
+| **M-1**: silent forged `ATTACH_DATABASE` records | R1 rule 5: restores recognised from `check()` only (own `CURRENT_CONNECTION` below the watermark, changed `DB_GUID` or `MON$CREATION_DATE`), the own-attachment set cleared on a confirmed restore, a non-monotonic log `ATTACH_DATABASE` ambiguous; rule 7: a window ends only at an own anchored binding's record or after 60 s, the ending record ambiguous unless own, every window record with the fix-3 attribution; rule 3: duplicate ids within a run poison both bindings, keyed by database identity |
+| **M-2**: run identity | R1 rule 1: (pid, start time from `/proc/<pid>/stat`); rule 2: a changed start time with the same pid is a confirmed run change, every old binding ends (detached or not) and the own lifetimes close; the crash case without `TRACE_FINI` specified; "a run does not resume" removed (a reused pid is confirmed against the start time); rule 3: bindings end with their run |
+| **M-3**: stop-and-confirm amplification | R1 rule 2: one unresolved stop at a time, at most 60 s; failed pids remembered and ambiguous at once; a 10-minute cooldown without stops; metrics `firebird_audit_stream_stopped_seconds_total` and `firebird_audit_run_confirmations_failed_total`; label `run_confirmation_stalled` above 60 s of stops per hour |
+| **M-4**: bounds | R1 rule 11: names above 4 KiB ambiguous and not kept, undeclared names as a keyed hash; per-database, per-identity, service and window caps and a 16 MiB global cap; fail-closed eviction (learned and undeclared first, declared anchored bindings kept), evicted bindings' records ambiguous |
+| **M-5**: proof 3 with the measured semantics | R2 rule 4: a named section applies only when its metacharacter-free pattern equals the full resolved path (or the alias string, pending 12b); a plain file name is no match and caps the level when before the first match; effective settings are the default section's overridden by the matched section's; measurement 13b (4.0 and 5.0, SuperClassic, an enabled default section, case sensitivity, inheritance); the first-match relaxation kept on that basis; an alias absent from the map ambiguous |
+| **M-6**: log readers | R4: at every re-evaluation, `check()` inspects mode bits, groups (enumerated, or counted as others) and the access and default ACLs of the log, the rotated files and the directory; any reader other than root, the server and the agent gives `audit.log_readable_by_others` and withholds Partial (proof 1); in the docs/05 follow-up |
+| **L-1**: own-read conditions | R3: the per-table block names exactly the constant text's relations, `records fetched` at most the key count; the duplicate-id poisoning applies to own attachments (R1 rule 3) |
+| **L-2** | R1 rule 1: the pid-namespace sentence reworded: another pid namespace is Limited under proof 2, the rules run there as a best effort |
+| **L-3**: measurements | 8e (ids of system attachments and failed attaches, records without `ATTACH_DATABASE`), 8f (H-1), 8a extended to worker threads in SuperClassic |
+| **L-4**: `databases.conf` | R2 rule 2: a closed list of `$(dir_*)` macros resolved against the declared root, entries with others treated as aliases with an unknown path without making the map unevaluated; the path must be `<root>/databases.conf`; ADR-0043 file rules stated; R2 rule 1: a case-only variant of a declared alias ambiguous pending 12c |
+| **L-5**: R4 handling | R4: buffers reserved at the 1 MiB bound or `Zeroizing`; tailer chunks, the oversize skip and the record held at EOF zeroized; errors, panics and `tracing` fields with offsets and kinds only; the marker test cases added, with the spool and the `audit_own_*` metrics asserted marker-free |
+| **L-6** | R3: measurement 3b on a populated state, over every `MON$`, `SEC$`, `PLG$` and virtual relation |
 
 ### Open questions (for the maintainer)
 
-Each with the answer this refinement proposes; none is decided until the maintainer confirms it.
+Each with the answer this refinement proposes, revised to the security review's assessments; none is decided until the maintainer confirms it.
 
-**R1, header tokens**
-1. Replace the per-database token rule with rules 1 to 9 (run pid, bindings per attachment, one live binding per token, learned bindings, watermark, split windows)?
-   **Proposed**: yes. The accepted rule cannot stand, because many tokens are current at once for one database.
-2. Accept a new pid only once `MON$SERVER_PID` confirms it, stopping the stream for up to 10 minutes?
-   **Proposed**: yes. Every client can read the pid, so a run change taken from a `TRACE_INIT` in the log alone would let a forged one end every binding. The stop loses nothing (the position is not advanced).
-3. Treat an attachment above the agent's watermark with no `ATTACH_DATABASE` read for it as ambiguous?
-   **Proposed**: yes. Attachment ids are allocated in order, so such an attachment cannot predate the read position. It costs one comparison per record.
-4. Mark the records after a finish record with no trailer as ambiguous until a pre-window binding appears (split windows), and never drop them as records of an undeclared database?
-   **Proposed**: yes. Only an injected text splits a record, so the cost (a few real records reported as ambiguous after an actual split) falls on attack conditions. Without it, a moved trailer under an invented attachment of an undeclared database would be dropped.
-5. Classic mode: Limited until a later refinement, withdrawing the "Partial if the token rule holds" branch of open question 9?
+**R1, header tokens and forged records**
+1. Replace the per-database token rule with rules 1 to 11: run identity, bindings per attachment keyed by database identity, duplicate-id poisoning, one live binding per token, learned bindings, the watermark, split windows, and bounds?
+   **Proposed**: yes. The accepted rule cannot stand, because many tokens are current at once for one database. The review's M-1, M-2 and M-4 conditions are part of the rules.
+2. Confirm a run change through `MON$SERVER_PID` and the process start time, with at most one stop of at most 60 s at a time, remembered failed pids, and a 10-minute cooldown?
+   **Proposed**: yes. Every client can read the pid, so a run change taken from the log alone would let a forged `TRACE_INIT` end every binding. The limits keep a forger from holding the stream stopped (M-3).
+3. Treat an attachment above the agent's watermark with no `ATTACH_DATABASE` read for it as ambiguous, and recognise restores only from `check()`?
+   **Proposed**: yes, subject to measurement 8e. A restore inferred from a log record would let a forged record reset the watermark (M-1).
+4. End split windows only at the agent's own anchored record or after 60 s, with every record of the window ambiguous and attributed under fix 3?
+   **Proposed**: yes. A window that ended at any earlier binding could be ended by a forged record (M-1).
+5. Add proof 11: the declared log holds only declared databases (default section disabled or writing another file, named sections by exact resolved path or mapped alias, a single link); under it, records of undeclared databases are ambiguous; without it, Limited?
+   **Proposed**: yes. Without proof 11, a forged record of an undeclared database hides a read with no guess (H-1).
+6. **The H-1 residual.** If measurement 8f shows that line breaks are written verbatim and that the remote address cannot be corroborated, should Partial accept this residual: on a declared database, a client with no privilege can quietly attribute its own real read to an invented principal or to another user's name, the read still reported with its real objects and row count?
+   **For the maintainer to accept or reject.**
+   - **Accept**: this refinement recommends accepting it, stated in docs/08 ("principals of Firebird Audit events are not authenticated by the log") and in the restated residual, because the read itself stays reported with its objects and volume.
+   - **Reject**: Firebird Audit is Limited at best.
+   - **If 8f shows that the server escapes line breaks** in the statement text and the other fields, the residual falls away for those fields.
+7. Apply the remote 4-tuple corroboration (rule 9) if measurement 8f shows it is possible?
+   **Proposed**: yes. It raises the cost of a forged `ATTACH_DATABASE` (a held socket is needed) without closing it.
+8. Classic mode: Limited until a later refinement, withdrawing the "Partial if the token rule holds" branch of open question 9?
    **Proposed**: yes. With one process per connection, the pid is not a run constant.
 
-**R2, aliases**
+**R2, aliases and sections**
 
-6. Match a declared database on the alias as written in `agent.yaml` and on the resolved path from `MON$DATABASE_NAME`, exactly?
-   **Proposed**: yes, with no case folding. A name that does not match exactly falls to rule 2 or 3 and, when unresolved, is ambiguous, never dropped.
-7. Read `databases.conf` (new key `firebird.audit.databases_conf`) and require an evaluated map for Partial?
-   **Proposed**: yes. Without the map, clients that attach through another alias of a declared file would be dropped as records of an undeclared database, with nothing reported.
-8. Evaluate the first matching trace section for the resolved path and for every alias of a declared database, with Limited when they differ, and let a section after the first match no longer cap the level?
-   **Proposed**: yes, until measurement 12b shows which name the server matches. The first-match rule was measured.
-9. A changed `databases.conf`: not proven until the server restarts (proof 2), with a `stat` before each read cycle and the records that use alias names after the change handled as ambiguous until the re-evaluation?
-   **Proposed**: yes, until measurement 12c shows when the server applies the change.
+9. Match a declared database on the alias as written in `agent.yaml` and on the resolved path from `MON$DATABASE_NAME`, exactly, with case-only variants ambiguous?
+   **Proposed**: yes. A name that does not match exactly falls to rule 2 or 3 and, when unresolved, is ambiguous, never dropped.
+10. Read `<root>/databases.conf` under the ADR-0043 file rules, with closed macros, and require an evaluated map for Partial?
+    **Proposed**: yes. Without the map, clients that attach through another alias of a declared file would go unseen.
+11. Restate proof 3 with the measured semantics: exact full-path or alias patterns only, plain file names not a match and capping the level before the first match, effective settings as default overridden by the matched section, and sections after the first match not capping the level?
+    **Proposed**: yes, with measurement 13b confirming the inheritance, and 12b the name matched for aliases (M-5).
+12. A changed `databases.conf`: not proven until the server restarts (proof 2), with a `stat` before each read cycle, and the records that use alias names after the change handled as ambiguous until the re-evaluation?
+    **Proposed**: yes, until measurement 12c shows when the server applies the change.
+
+**R4, readers of the log**
+
+13. Withhold Partial while anyone other than root, the server's account and the agent's account can read the log, its rotated files or new files in its directory, reported as `audit.log_readable_by_others`?
+    **Proposed**: yes. The log holds passwords and every live token (M-6).
 
 **R3, extended variant**
 
-10. Keep `extended_grants: true` opt-in, with `RDB$CONFIG` named in the never-sampled list, its readability reported as `privilege.global_privileges` / `server_config_readable`, and a drift test on its key names (option (a)), or drop the variant (option (b))?
-    **Proposed**: (a). The exposure is server configuration, not user data, and it is reported. Reopen if the drift test finds a key that carries a credential.
-11. Treat the agent's one constant `RDB$CONFIG` read (closed key list, after the probe) and the probe itself as its own reads, as the `SEC$USERS` own-row read is?
+14. Keep `extended_grants: true` opt-in (option (a)), or drop the variant (option (b))? Option (a) comes with `RDB$CONFIG` named in the never-sampled list, its readability reported as `privilege.global_privileges` / `server_config_readable`, and a drift test on a populated state.
+    **Proposed**: (a). The exposure is server configuration, not user data, and it is reported. Reopen if the drift test finds a key that carries a credential or a relation outside the reviewed list (L-6).
+15. Treat the agent's one constant `RDB$CONFIG` read (a closed key list, after the probe) and the probe itself as its own reads, under the L-1 conditions (exact text, exact per-table block, bounded `records fetched`, an anchored and unpoisoned binding)?
     **Proposed**: yes. Otherwise every `check()` on an extended-variant target writes an always-reported read of the agent's own. Any other read of `RDB$CONFIG` stays always reported.
