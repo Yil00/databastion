@@ -2207,14 +2207,11 @@
                 "type": "array",
                 "not": {
                   "contains": {
-                    "description": "An object that names a `schema`.",
+                    "description": "An object that names a `schema`, whatever its value: it does not satisfy\n\"`schema` absent\" (`properties: {schema: false}`). Written without `required`,\nwhich Ajv's strict mode and the redocly lint accept only with `type` and a\ndeclared property.\n",
                     "type": "object",
-                    "required": [
-                      "schema"
-                    ],
-                    "properties": {
-                      "schema": {
-                        "$ref": "#/$defs/Identifier"
+                    "not": {
+                      "properties": {
+                        "schema": false
                       }
                     }
                   }

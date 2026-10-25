@@ -52,6 +52,7 @@ The schemas sit in `components/schemas` rather than in separate `schemas/*.json`
 ## Rules enforced by the scripts
 - Every object schema is closed with `additionalProperties: false` (invariant I2). The only exception is a map marked `x-databastion-numeric-map: true` (heartbeat metrics): keys restricted by pattern, values numbers only.
 - Below a `not`, subschemas are fragments, `items` and `contains` included, and need not be closed: a negated schema only refuses data, which the closed schemas outside the `not` still validate (the `firebird_audit_trace` rule refusing an object `schema` uses `not: {contains: …}`).
+- A `$ref` points only at a whole component schema (`#/components/schemas/<Name>`), never into a fragment, and no `$defs`, `$id`, `$anchor`, `$dynamicAnchor` or `$dynamicRef` appears in a schema. Every typed array value schema has `items` or `prefixItems`.
 - No `true` or `{}` schema, except directly under `not` / `if` / `then` / `else`. Every value schema has a `type`, `$ref`, `enum`, `const` or composition.
 - Every string has `maxLength` (or `enum` / `const`), every array `maxItems`, every number `minimum` and `maximum`, including each member of a `type` array such as `[string, "null"]`.
 - Valid fixtures of a schema with `x-databastion-max-bytes` stay under that size.

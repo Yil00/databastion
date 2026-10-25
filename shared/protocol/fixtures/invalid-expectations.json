@@ -28,6 +28,7 @@
   "EventsBatch.db-user-bidi-override.json": "pattern",
   "EventsBatch.entry-dn-in-object.json": "pattern",
   "EventsBatch.firebird-application.json": "false schema",
+  "EventsBatch.firebird-object-schema-not-identifier.json": "not",
   "EventsBatch.firebird-object-schema.json": "not",
   "EventsBatch.fractional-bytes.json": "type",
   "EventsBatch.hostname-client-addr.json": "anyOf",
