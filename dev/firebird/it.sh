@@ -63,7 +63,8 @@ WORK="$(mktemp -d)"
 cleanup() {
   local c=("$NAME-init" "$NAME" "$NAME-socat")
   for n in $VARIANTS; do c+=("$NAME-$n"); done
-  timeout 60 docker rm -f "${c[@]}" "$NET" >/dev/null 2>&1 || true
+  # -v: the anonymous volumes of the image's VOLUME declarations too.
+  timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
   timeout 60 docker volume rm "$VOLUME" >/dev/null 2>&1 || true
   timeout 60 docker rmi "$LOCAL_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
@@ -161,7 +162,7 @@ started "$NAME-init"
 seeded "$NAME-init"
 timeout 60 docker stop "$NAME-init" >/dev/null
 timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
-timeout 60 docker rm "$NAME-init" >/dev/null
+timeout 60 docker rm -v "$NAME-init" >/dev/null
 timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$VOLUME:/d" --entrypoint chown \
   "$LOCAL_IMAGE" -R 84:84 /d
 timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" --user 84:84 \
