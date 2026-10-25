@@ -142,7 +142,7 @@ Targets are declared **only** in `agent.yaml`, on the agent host: the console ca
 
 Each target has:
 - `id`: a slug shown in the console (do not put a host name in it);
-- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` since 0.8.0 ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets));
+- `engine`: `postgres`, `mysql`, `mariadb`, `mongodb`, `openldap` or `cas` (Apereo CAS, below; since 0.4.0); `redis`, `valkey` and `sqlserver` since 0.8.0 ([Redis / Valkey](#redis--valkey-targets), [Microsoft SQL Server](#microsoft-sql-server-targets)); `sqlite` on `dev`, not released yet ([SQLite](#sqlite-targets));
 - `host` and `port`, or `socket`;
 - `account` and `secret`: a **reference** to the password, `env: VAR_NAME` or `file: /path` (`0600`, owned by the agent user), never the password itself. OpenLDAP with `bind: sasl_external` over `ldapi://` needs no secret;
 - an optional engine block (`postgres`, `mysql`, `mongodb`, `openldap`): databases to connect to, `tls` (`verify_full` by default; `disable` only on a socket or a loopback address; `disable_insecure` is an explicit, warned opt-in and does not exist for OpenLDAP), `ca_file`, and the Audit source files:
@@ -418,9 +418,77 @@ What to do:
 **Not covered**: a refused `xp_cmdshell` leaves no event on this source; the plan cache (`sys.dm_exec_query_stats`) is not a source, so a server where neither SQL Server Audit nor a session is usable reports None; RPC calls of user procedures, `event_file` rollover while the agent reads, Windows servers and the Developer edition are not measured; this source is not in the end-to-end or load tests (integration tests and the engine matrix only).
 
 ### SQLite targets
-A SQLite target is one database file declared in `agent.yaml` ([ADR-0059](adr/0059-sqlite-connector.md); not released yet). SQLite has no server and no access log, so a SQLite target is **Discovery only**: its audit level is `none`, the agent page shows "Discovery only" and no server version, and the console refuses Audit settings for it.
-- **Name the target after the application, not the file** (`crm-app`, not `customers.db` or a path): the target id is the only thing that tells two SQLite files apart in the console, and the path is never sent. Every SQLite location is the database `main`, so the console shows a SQLite finding as its target, its table and its column.
-- **Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count. Exceptions follow the target id, not the file: if you point a target at another file in `agent.yaml`, its exceptions now apply to the new file.
+*On `dev`, not released yet (phase 10, [ADR-0059](adr/0059-sqlite-connector.md)).* A SQLite target is one database file declared in `agent.yaml`. SQLite has no server and no access log, so a SQLite target is **Discovery only**: its audit level is `none`, the agent page shows "Discovery only" and no server version, and the console refuses Audit settings for it. The agent needs a console that lists the `engine.sqlite` capability; until then it reports no SQLite target and keeps their findings spooled. What is read and what is not: [08-engine-capabilities.md](08-engine-capabilities.md#sqlite-discovery); the security model: [05-security.md](05-security.md#sqlite-connector).
+
+**Declare each file**:
+
+```yaml
+targets:
+  - id: crm-app                  # named after the application, not the file
+    engine: sqlite
+    sqlite:
+      path: /srv/crm/data/crm.db # absolute, canonical, no symbolic link in any component
+      max_statement_ms: 500      # optional, 50 to 5000 (default 500): a local limit
+      rollback_mode: skip        # optional: skip (default) or read
+```
+
+- **`path`**: one database file per target. No directory, glob or search: to scan several files, declare several targets. The path must be absolute and canonical (no `.`, `..`, `//` or trailing `/`), at most 1 024 bytes, with **no symbolic link in any component**: declare the real path. It may not be under the agent's own directories, `/etc/databastion`, a directory holding a file `agent.yaml` references, `/proc`, `/sys`, `/dev` or `/run/user`, and two targets may not name the same file. The path is never sent to the console nor written to the agent's log. `host`, `port`, `socket`, `account` and `secret` are refused for `engine: sqlite`.
+- **`max_statement_ms`**: the deadline of each statement the reader runs. In rollback mode it is also the longest time one statement can delay the application's commits.
+- **`rollback_mode`**: a file in a rollback-journal mode (`DELETE`, `TRUNCATE`, `PERSIST`) is skipped by default (`coverage.rollback_mode_not_read`), because every read there delays the application's commits, and an application without a busy timeout gets `SQLITE_BUSY`. Set `read` for files that are rarely written, or whose application sets a busy timeout. WAL files are read either way.
+
+**File ownership and permissions.** The agent only reads; a file, side file or directory on the path that its account could write is refused (`privilege.database_file_writable`). Give it read access through a group:
+
+```sh
+# The application runs as "crm"; the agent's account is in the group "databastion".
+chown -R crm:databastion /srv/crm/data
+chmod 2750 /srv/crm/data            # setgid: the -wal, -shm and -journal files get the group
+chmod 0640 /srv/crm/data/crm.db
+# The application should create its files with a umask that keeps the group read bit (027).
+```
+
+Every ancestor directory needs search (`x`) permission for the agent, and the file's directory must not be writable by every local user. A database file readable by every local user is read and reported (`security.file_world_readable`): restrict it to the application and the agent's group.
+
+**A read-only file system for the agent.** The file system holding the database must be mounted read-only in the agent's view, or the file is refused (`coverage.filesystem_not_read_only`):
+- **systemd unit** (`.deb`): `ProtectSystem=strict` already makes every path outside `/var/lib/databastion` read-only for the agent. A file **under `/home`** is hidden by `ProtectHome=yes`: expose its directory read-only with a drop-in, rather than `ProtectHome=read-only`, which would expose every home directory:
+
+  ```ini
+  # systemctl edit databastion-agent
+  [Service]
+  BindReadOnlyPaths=/home/crm/data
+  # If the files' group is not the agent account's own group:
+  # SupplementaryGroups=databastion
+  ```
+
+- **Container**: bind-mount the directory read-only (`-v /srv/crm/data:/srv/crm/data:ro`, or `:ro` in Compose), with the files' group added to the agent's container (`--group-add`). Docker's default seccomp profile allows the reader's Landlock calls since Docker 25 (moby 25); an older engine, or a custom profile without them, gives `coverage.reader_sandbox_unavailable`.
+- **Manual run**: a read-only bind mount of the directory.
+
+**Kernel requirements.** The file is read by a sandboxed reader process that needs **Landlock**: Linux 5.13 or later, with Landlock in the kernel's active security modules (`cat /sys/kernel/security/lsm` lists `landlock`; on some distributions it must be added with the `lsm=` boot parameter). Without it, no SQLite file is read (`coverage.reader_sandbox_unavailable`). Network and FUSE file systems are refused. Only Linux is supported.
+
+**WAL files are read while the application holds them open.** A WAL database can be read only while its `-wal` and `-shm` files exist; when the last application connection closes cleanly, SQLite deletes them and the agent cannot open the file without writing (`coverage.wal_files_not_readable`). The file is read again at the next check after the application reopens it. If the application truncates its `-shm` during a scan, the scan loses its remaining units (`skipped_error`) until the application rebuilds its WAL index; the agent keeps running.
+
+**Notes you may see, and what to do**:
+
+| Note | What to do |
+|------|------------|
+| `coverage.filesystem_not_read_only` | Mount the directory read-only for the agent (above) |
+| `privilege.database_file_writable` | Remove the agent's write access to the file, its `-wal` / `-shm` / `-journal` files and every directory on the path (owner, group and other bits, ACLs) |
+| `coverage.file_path_refused` | Declare the real path (no symbolic link), give the file one hard link, keep side files owned by the application on the same file system, and do not declare the same file twice or a file under a refused location |
+| `coverage.network_filesystem_refused` | Move the file to a local file system; NFS, SMB, FUSE and the like are refused |
+| `coverage.reader_sandbox_unavailable` | Enable Landlock in the kernel; in a container, use Docker 25 or later or a seccomp profile that allows the `landlock_*` calls |
+| `coverage.unrecognized_file_format` | The file is not a SQLite 3 database the agent reads: encrypted (SQLCipher and the like are not supported), another file type, a corrupt schema or syntax newer than the bundled SQLite 3.53.2. Check that the path is the right file |
+| `coverage.wal_files_not_readable` | The application does not hold the WAL file open, or its `-wal` is above 128 MiB: the file is read while the application runs; checkpoint the WAL if it keeps growing |
+| `coverage.hot_journal_pending` | An interrupted write is waiting for the application to recover it at its next open; nothing to do on the agent's side |
+| `coverage.rollback_mode_not_read` | Expected with `rollback_mode: skip`; set `read` if the impact on the application's commits is acceptable |
+| `coverage.reader_process_failed` | The reader process died during the scan (count): the file may be crafted or its `-shm` truncated. Check the agent's log for the target; the agent and its other targets are not affected |
+| `security.file_world_readable` | Remove the "other" read bit from the database file |
+| `coverage.views_not_sampled`, `coverage.virtual_tables_not_sampled`, `coverage.computed_columns_not_sampled` | Information: these objects are never read (their base or shadow tables are) |
+| `check.timed_out` | A writer held its lock past the reader's busy timeout, or a statement hit `max_statement_ms`; it is retried at the next check |
+
+While a scan runs, the agent page shows the target's state from the last check before the scan: the scan's reader checks the file before every unit, but the console sees a change only after the scan.
+
+**Name the target after the application, not the file** (`crm-app`, not `customers.db` or a path): the target id is the only thing that tells two SQLite files apart in the console, and the path is never sent. Every SQLite location is the database `main`, so the console shows a SQLite finding as its target, its table and its column.
+
+**Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count. Exceptions follow the target id, not the file: if you point a target at another file in `agent.yaml`, its exceptions now apply to the new file.
 
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
@@ -434,6 +502,7 @@ Give each target a **dedicated, read-only** account (I4). The recommended accoun
 | Apereo CAS (`cas`) | no account: the registry directory (`0750`) and its files (`0640`) readable through the agent's group, never writable, no access to the CAS configuration | the audit log (`0640`, directory `2750`) readable the same way | [ADR-0041](adr/0041-cas-connector.md), [05-security.md](05-security.md#recommended-database-accounts-read-only) (also the column grants for CAS tables held in a database), [connector README](../agent/crates/connector-cas/README.md) |
 | Microsoft SQL Server (since 0.8.0) | SQL login with `CHECK_POLICY = ON`, a database user and `SELECT` per schema in each monitored database; database `VIEW DEFINITION` too with the row-level security opt-in, or Discovery samples nothing; never `sysadmin`, `db_owner` or the other refused rights | Only where Audit runs. SQL Server Audit (2022+): `VIEW SERVER SECURITY AUDIT` and `VIEW ANY SECURITY DEFINITION`. Extended Events: `VIEW SERVER STATE` (2019) or `VIEW SERVER PERFORMANCE STATE` (2022+), which expose every statement text on the server. Never `VIEW SERVER SECURITY STATE` or `CONTROL SERVER` | [ADR-0051](adr/0051-sqlserver-connector.md), [section 6](#microsoft-sql-server-targets), [05-security.md](05-security.md#microsoft-sql-server-connector) |
 | Redis / Valkey (since 0.8.0) | ACL user: `-@all` plus `select`, `scan`, `type`, `getrange`, `hrandfield`, `hstrlen`, `hmget`, `srandmember`, `zrandmember`, `lrange`, `xrevrange`, `info`, `acl\|dryrun`, on `%R~*` or the declared patterns, `resetchannels`; never `default` | `slowlog\|get`, `acl\|log`, `client\|list` (Valkey 8.1+: `commandlog\|get`) | [ADR-0052](adr/0052-redis-valkey-connector.md), [05-security.md](05-security.md#redis--valkey-connector) |
+| SQLite (on `dev`, not released yet) | no account: the file `0640` and its directory `2750` readable through the agent's group, never writable, on a file system mounted read-only for the agent | none (Discovery only) | [ADR-0059](adr/0059-sqlite-connector.md), [section 6](#sqlite-targets), [05-security.md](05-security.md#sqlite-connector) |
 
 Also:
 - Size the account's connection limit as the recommended statements say: Audit holds its own connections.
