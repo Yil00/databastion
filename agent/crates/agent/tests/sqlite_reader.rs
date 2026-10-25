@@ -914,3 +914,89 @@ async fn seeded_dev_files_match_the_ground_truth() {
         assert!(!text.contains(needle), "{needle} logged");
     }
 }
+
+/// ADR-0059 decision 4 and the end-to-end scenario of decision 10: a
+/// `-shm` truncated by the application while a paced scan (the default
+/// 1 % duty cycle) runs kills the reader at its next unit with `SIGBUS`:
+/// one reader lost, its unit counted `skipped_error`; the scan goes on
+/// and succeeds (until the application rebuilds its WAL index the next
+/// readers find the file not readable, `wal_files_not_readable`, and
+/// count their tables `skipped_error` too, without dying); once the
+/// application opened the file again a new scan loses nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_shm_truncated_during_a_paced_scan_costs_a_unit_never_the_agent() {
+    let Some(env) = Env::new("paced-shm") else {
+        return;
+    };
+    let logs = Logs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let rw = env.rw.join("app.db");
+    seed(&rw, true);
+    env.mount();
+    let mut writer = writer_process(&rw);
+    let c = SqliteConnector::new();
+    let t = env.target("app.db", RollbackMode::Skip);
+    assert!(c.check(&t).await.reachable);
+    let key = Arc::new(databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap());
+    let job = ScanJob::new(
+        ScanParams::contract_defaults(),
+        &t,
+        &databastion_core::config::Limits::default(),
+        key,
+    )
+    .with_rotation(42);
+    let (sink, mut rx) = FindingSink::channel(4096);
+    let shm = databastion_connector_sqlite::files::side_path(&rw, "-shm");
+    let truncate = async {
+        // A few paced units in: the reader has mapped the -shm.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&shm)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        std::time::Instant::now()
+    };
+    let started = std::time::Instant::now();
+    let (outcome, truncated_at) = tokio::join!(c.discover(&job, &sink), truncate);
+    outcome.unwrap();
+    let cov = sink.coverage_for_tests().unwrap_or_default();
+    drop(sink);
+    let mut found = 0;
+    while rx.recv().await.is_some() {
+        found += 1;
+    }
+    eprintln!(
+        "[it] sqlite paced scan with a truncated -shm: truncated after {:?}, scan {:?}, {found} finding(s), {cov:?}",
+        truncated_at - started,
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() > truncated_at - started,
+        "the scan ended before the truncation"
+    );
+    assert!(cov.error >= 1, "no unit lost: {cov:?}");
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("sqlite reader process lost").count(),
+        1,
+        "one reader death"
+    );
+    // The application crashed or not, it opens the file again.
+    let _ = writer.kill();
+    let _ = writer.wait();
+    let mut writer = writer_process(&rw);
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{h:?}");
+    let (found, cov) = scan(&c, &t).await;
+    assert_eq!(cov.error, 0, "{cov:?}");
+    assert!(!found.is_empty());
+    let _ = writer.kill();
+    let _ = writer.wait();
+}
