@@ -28,8 +28,7 @@
       "ts": "2026-10-25T09:05:00Z",
       "principal": {
         "db_user": "DBA_OPS",
-        "client_addr": "127.0.0.1",
-        "application": "gbak"
+        "client_addr": "127.0.0.1"
       },
       "action": "read",
       "objects": [

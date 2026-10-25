@@ -77,13 +77,14 @@ export function foldName(s: string): string {
 /**
  * Engines whose identifier comparisons ignore trailing spaces, so a location exception also
  * covers a name that differs from its globs by trailing spaces only (N1): SQL Server (padded
- * comparisons under every collation) and MySQL / MariaDB (identifiers cannot end with a space).
- * Elsewhere a trailing space can be part of a distinct name (a quoted PostgreSQL identifier, a
+ * comparisons under every collation), MySQL / MariaDB (identifiers cannot end with a space) and
+ * Firebird (catalog names are space-padded `CHAR`, so `"A "` and `"A"` are one table; ADR-0060
+ * decision 5 and open question 11). Elsewhere a trailing space can be part of a distinct name (a quoted PostgreSQL identifier, a
  * MongoDB collection, a Redis / Valkey key), and an exception never loosens there: looser
  * exceptions suppress more. Policy conditions and scoring ignore trailing spaces on every engine
  * (looser matching only reports more).
  */
-export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb"];
+export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "firebird"];
 
 /**
  * Database name as hashed in the access-event incident dedup key (ADR-0021 decision 6,

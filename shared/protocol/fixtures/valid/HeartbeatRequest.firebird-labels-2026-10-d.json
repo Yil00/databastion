@@ -71,6 +71,17 @@
             "enabled",
             "log_services"
           ]
+        },
+        {
+          "code": "audit.trace_config_not_evaluated",
+          "labels": [
+            "firebird_conf_unreadable",
+            "trace_config_unreadable",
+            "trace_config_file_mismatch",
+            "config_changed_since_start",
+            "server_process_not_visible",
+            "similar_to_pattern"
+          ]
         }
       ]
     }

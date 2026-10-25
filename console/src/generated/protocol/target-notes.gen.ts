@@ -304,7 +304,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.trace_config_not_evaluated": {
-    "description": "Limited: the Firebird trace configuration that applies to a declared database could not be evaluated: firebird.conf or the trace configuration not readable, refused or not parsed, AuditTraceConfigFile not the declared file, a file changed after the server started, the server process not visible, or a section with a SIMILAR TO pattern (_ and % included).",
+    "description": "Limited: the Firebird trace configuration that applies to a declared database could not be evaluated. Labels give the reason: firebird_conf_unreadable or trace_config_unreadable (not readable, refused or not parsed), trace_config_file_mismatch (AuditTraceConfigFile names another file), config_changed_since_start, server_process_not_visible (e.g. another pid namespace), similar_to_pattern (a section with a SIMILAR TO pattern, or _ or % in a file name).",
     "engines": [
       "firebird"
     ]

@@ -186,7 +186,7 @@ info:
     - `openldap_accesslog` -> `openldap`;
     - `cas_audit_log` -> `cas`;
     - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
-    - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+    - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;
     - `firebird_audit_trace` -> `firebird`.
     No source serves `sqlite` (ADR-0059 decision 7): the schema refuses a `sqlite` target that
     names one (see `TargetStatus`).
@@ -1678,10 +1678,11 @@ components:
           then:
             description: |
               A `firebird` target (ADR-0060 decision 6) is Partial at best: `audit_level` is never
-              `full`.
+              `full`. Firebird has no editions: no `edition`.
             properties:
               audit_level:
                 enum: [partial, limited, none]
+              edition: false
     NameCase:
       description: |
         How names compare (ADR-0055): `sensitive`, names that differ only by case are distinct;
@@ -1826,7 +1827,12 @@ components:
           exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
           relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
           (another readable credential relation, `privilege.global_privileges`); `role_graph`
-          (the role graph not evaluated, `privilege.not_evaluated`); and the trace configuration
+          (the role graph not evaluated, `privilege.not_evaluated`); the reasons of
+          `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,
+          `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:
+          `AuditTraceConfigFile` names another file; `config_changed_since_start`;
+          `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a
+          section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration
           settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
           `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
           and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
@@ -2093,6 +2099,13 @@ components:
         - credential_relation_readable
         # Firebird check() reads not evaluated (privilege.not_evaluated)
         - role_graph
+        # Firebird trace configuration not evaluated (audit.trace_config_not_evaluated)
+        - firebird_conf_unreadable
+        - trace_config_unreadable
+        - trace_config_file_mismatch
+        - config_changed_since_start
+        - server_process_not_visible
+        - similar_to_pattern
         # Firebird trace configuration settings (fbtrace.conf)
         - enabled
         - log_filename
@@ -2116,7 +2129,7 @@ components:
         Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
         local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A
         `firebird` server is detected by its local port (3050) or its `firebird` process
-        (ADR-0060 decision 7).
+        (ADR-0060 decision 7), never by a `unix_socket` (checked by this schema).
       type: object
       additionalProperties: false
       required: [engine]
@@ -2140,15 +2153,27 @@ components:
             of such an engine is not sent before the token is listed.
           type: string
           enum: [postgres, mysqld, mariadbd, mongod, slapd, sqlservr, redis-server, valkey-server, firebird]
-      if:
-        required: [engine]
-        properties:
-          engine:
-            const: sqlite
-      then:
-        description: No detected target of the `sqlite` engine (ADR-0059 decision 2).
-        properties:
-          engine: false
+      allOf:
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: sqlite
+          then:
+            description: No detected target of the `sqlite` engine (ADR-0059 decision 2).
+            properties:
+              engine: false
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: firebird
+          then:
+            description: |
+              A `firebird` server is detected by its port or its process only (ADR-0060 decision
+              7): no `unix_socket` (Firebird listens on TCP; a local socket path is never sent).
+            properties:
+              unix_socket: false
     SpoolStatus:
       type: object
       additionalProperties: false
@@ -3016,6 +3041,32 @@ components:
                   properties:
                     account_not_recorded:
                       const: true
+        - description: |
+            Firebird trace events (ADR-0060 decisions 5 and 6): no `principal.application` (the
+            client process name is set by the client, can be spoofed and may hold a path with a
+            user name, so the agent drops it) and no `schema` in an object (Firebird 4.0 and 5.0
+            have no schemas).
+          if:
+            required: [source]
+            properties:
+              source:
+                const: firebird_audit_trace
+          then:
+            properties:
+              principal:
+                type: object
+                properties:
+                  application: false
+              objects:
+                type: array
+                not:
+                  contains:
+                    description: An object that names a `schema`.
+                    type: object
+                    required: [schema]
+                    properties:
+                      schema:
+                        $ref: "#/components/schemas/Identifier"
     Principal:
       description: |
         Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with

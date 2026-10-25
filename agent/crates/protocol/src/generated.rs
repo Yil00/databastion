@@ -10,10 +10,14 @@
 // - #/$defs/AccessEvent/allOf/1/then
 // - #/$defs/AccessEvent/allOf/2/if
 // - #/$defs/AccessEvent/allOf/2/then
+// - #/$defs/AccessEvent/allOf/3/if
+// - #/$defs/AccessEvent/allOf/3/then
 // - #/$defs/AccessEvent/if
 // - #/$defs/AccessEvent/then
-// - #/$defs/DetectedTarget/if
-// - #/$defs/DetectedTarget/then
+// - #/$defs/DetectedTarget/allOf/0/if
+// - #/$defs/DetectedTarget/allOf/0/then
+// - #/$defs/DetectedTarget/allOf/1/if
+// - #/$defs/DetectedTarget/allOf/1/then
 // - #/$defs/JobStatusUpdate/else
 // - #/$defs/JobStatusUpdate/if
 // - #/$defs/JobStatusUpdate/then
@@ -1181,7 +1185,7 @@ of `unix_socket`, `port`, `process` is present. The agent never connects to a de
 Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
 local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A
 `firebird` server is detected by its local port (3050) or its `firebird` process
-(ADR-0060 decision 7).
+(ADR-0060 decision 7), never by a `unix_socket` (checked by this schema).
 */
 #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -4431,7 +4435,12 @@ Revisions:
   exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
   relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
   (another readable credential relation, `privilege.global_privileges`); `role_graph`
-  (the role graph not evaluated, `privilege.not_evaluated`); and the trace configuration
+  (the role graph not evaluated, `privilege.not_evaluated`); the reasons of
+  `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,
+  `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:
+  `AuditTraceConfigFile` names another file; `config_changed_since_start`;
+  `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a
+  section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration
   settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
   `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
   and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
@@ -4913,6 +4922,18 @@ pub enum TargetNoteLabel {
     CredentialRelationReadable,
     #[serde(rename = "role_graph")]
     RoleGraph,
+    #[serde(rename = "firebird_conf_unreadable")]
+    FirebirdConfUnreadable,
+    #[serde(rename = "trace_config_unreadable")]
+    TraceConfigUnreadable,
+    #[serde(rename = "trace_config_file_mismatch")]
+    TraceConfigFileMismatch,
+    #[serde(rename = "config_changed_since_start")]
+    ConfigChangedSinceStart,
+    #[serde(rename = "server_process_not_visible")]
+    ServerProcessNotVisible,
+    #[serde(rename = "similar_to_pattern")]
+    SimilarToPattern,
     #[serde(rename = "enabled")]
     Enabled,
     #[serde(rename = "log_filename")]
@@ -5247,6 +5268,12 @@ impl ::std::fmt::Display for TargetNoteLabel {
                 f.write_str("credential_relation_readable")
             }
             Self::RoleGraph => f.write_str("role_graph"),
+            Self::FirebirdConfUnreadable => f.write_str("firebird_conf_unreadable"),
+            Self::TraceConfigUnreadable => f.write_str("trace_config_unreadable"),
+            Self::TraceConfigFileMismatch => f.write_str("trace_config_file_mismatch"),
+            Self::ConfigChangedSinceStart => f.write_str("config_changed_since_start"),
+            Self::ServerProcessNotVisible => f.write_str("server_process_not_visible"),
+            Self::SimilarToPattern => f.write_str("similar_to_pattern"),
             Self::Enabled => f.write_str("enabled"),
             Self::LogFilename => f.write_str("log_filename"),
             Self::LogConnections => f.write_str("log_connections"),
@@ -5531,6 +5558,12 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "verifier_relation_readable" => Ok(Self::VerifierRelationReadable),
             "credential_relation_readable" => Ok(Self::CredentialRelationReadable),
             "role_graph" => Ok(Self::RoleGraph),
+            "firebird_conf_unreadable" => Ok(Self::FirebirdConfUnreadable),
+            "trace_config_unreadable" => Ok(Self::TraceConfigUnreadable),
+            "trace_config_file_mismatch" => Ok(Self::TraceConfigFileMismatch),
+            "config_changed_since_start" => Ok(Self::ConfigChangedSinceStart),
+            "server_process_not_visible" => Ok(Self::ServerProcessNotVisible),
+            "similar_to_pattern" => Ok(Self::SimilarToPattern),
             "enabled" => Ok(Self::Enabled),
             "log_filename" => Ok(Self::LogFilename),
             "log_connections" => Ok(Self::LogConnections),

@@ -53,6 +53,19 @@ const SEVERITY: &[TargetNoteLabel] = {
         L::CreateAnyDatabaseEventSession,
         L::DropAnyDatabaseEventSession,
         L::TakeOwnership,
+        // Firebird refusal list and the system privileges that read or
+        // administer every attachment or the users (ADR-0060 decision 4):
+        // first, so a long Firebird refusal never loses them.
+        L::Sysdba,
+        L::RdbAdmin,
+        L::SecurityDatabaseAdmin,
+        L::DatabaseOwner,
+        L::VerifierRelationReadable,
+        L::TraceAnyAttachment,
+        L::MonitorAnyAttachment,
+        L::ReadRawPages,
+        L::UserManagement,
+        L::ProfileAnyAttachment,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -749,7 +762,8 @@ pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 /// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
 /// and 6): the Firebird 4.0 and 5.0 system privileges, the identities of
 /// the refusal list, the `usage` object right, the credential-relation and
-/// role-graph probes, and the trace configuration settings. Negotiated on
+/// role-graph probes, the reasons of `audit.trace_config_not_evaluated`
+/// and the trace configuration settings. Negotiated on
 /// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
 /// console lists it. Only [`NoteLabel::firebird`] builds them.
 pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
@@ -788,6 +802,12 @@ pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
     "verifier_relation_readable",
     "credential_relation_readable",
     "role_graph",
+    "firebird_conf_unreadable",
+    "trace_config_unreadable",
+    "trace_config_file_mismatch",
+    "config_changed_since_start",
+    "server_process_not_visible",
+    "similar_to_pattern",
     "enabled",
     "log_filename",
     "log_connections",
@@ -934,23 +954,37 @@ impl NoteLabel {
         })
     }
 
-    /// A Microsoft SQL Server label (ADR-0051 decision 4): any contract
-    /// value, the revisions `target_status.note_labels.2026_10`,
-    /// `2026_10_b` and `2026_10_c` included (each sent as `other` until the console lists
-    /// its token, see [`to_protocol`]); anything else is `other`.
+    /// A Microsoft SQL Server label (ADR-0051 decision 4): a value of
+    /// protocol 0.1.0 or of the SQL Server revisions
+    /// `target_status.note_labels.2026_10`, `2026_10_b` and `2026_10_c`
+    /// (each sent as `other` until the console lists its token, see
+    /// [`to_protocol`]). Anything else is `other`, the Firebird revision
+    /// `2026_10_d` included: SQL Server's `CREATE DATABASE` is not
+    /// Firebird's `CREATE_DATABASE` system privilege, and stays `other` as
+    /// before that revision.
     #[must_use]
     pub fn sqlserver(value: &str) -> Self {
+        if LABELS_REVISION_2026_10_D.contains(&value) {
+            return Self::OTHER;
+        }
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
-    /// A Firebird label (ADR-0060 decisions 4 and 6): any contract value,
-    /// the revision `target_status.note_labels.2026_10_d` included (sent as
-    /// `other` until the console lists its token, see [`to_protocol`]);
-    /// anything else is `other`. Firebird system privileges are given
-    /// lowercased (`trace_any_attachment`); object and DDL rights use the
-    /// values of protocol 0.1.0 (`insert`, `create`…).
+    /// A Firebird label (ADR-0060 decisions 4 and 6): a value of protocol
+    /// 0.1.0 or of the Firebird revision `target_status.note_labels.2026_10_d`
+    /// (sent as `other` until the console lists its token, see
+    /// [`to_protocol`]). Anything else is `other`, the SQL Server revisions
+    /// included. Firebird system privileges are given lowercased
+    /// (`trace_any_attachment`); object and DDL rights use the values of
+    /// protocol 0.1.0 (`insert`, `create`…).
     #[must_use]
     pub fn firebird(value: &str) -> Self {
+        if LABELS_REVISION_2026_10.contains(&value)
+            || LABELS_REVISION_2026_10_B.contains(&value)
+            || LABELS_REVISION_2026_10_C.contains(&value)
+        {
+            return Self::OTHER;
+        }
         value.parse::<TargetNoteLabel>().map_or(Self::OTHER, Self)
     }
 
@@ -1469,6 +1503,33 @@ mod tests {
         // A MySQL privilege named like a Firebird one stays `other`.
         assert!(super::NoteLabel::privilege("CREATE DATABASE").is_other());
         assert!(super::NoteLabel::privilege("USAGE").is_other());
+        // Security review L3: SQL Server names never build a Firebird
+        // label (`CREATE DATABASE` was `other` before this revision, and
+        // stays so), and Firebird never builds a SQL Server one.
+        for value in super::LABELS_REVISION_2026_10_D {
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+        }
+        assert!(super::NoteLabel::sqlserver_name("CREATE DATABASE").is_other());
+        assert!(super::NoteLabel::sqlserver_name("ALTER ANY USAGE").is_other());
+        assert!(super::NoteLabel::sqlserver_name("USAGE").is_other());
+        assert_eq!(
+            super::NoteLabel::sqlserver_name("CONTROL SERVER").as_str(),
+            "control_server"
+        );
+        for value in super::LABELS_REVISION_2026_10
+            .iter()
+            .chain(super::LABELS_REVISION_2026_10_B)
+            .chain(super::LABELS_REVISION_2026_10_C)
+        {
+            assert!(super::NoteLabel::firebird(value).is_other(), "{value}");
+        }
+        // 0.1.0 values are shared.
+        assert_eq!(super::NoteLabel::firebird("insert").as_str(), "insert");
+        assert_eq!(super::NoteLabel::sqlserver("select").as_str(), "select");
+        assert_eq!(
+            super::NoteLabel::firebird("similar_to_pattern").as_str(),
+            "similar_to_pattern"
+        );
         // Not a contract value: `other`, never the raw name.
         assert!(super::NoteLabel::firebird("TRACE_ANY_ATTACHMENT").is_other());
         assert!(super::NoteLabel::firebird("trace any attachment").is_other());
@@ -1500,6 +1561,46 @@ mod tests {
             sent(&refused, LabelRevisions::ALL),
             vec!["select", "trace_any_attachment", "rdb_admin"]
         );
+    }
+
+    /// Security review L2: with every Firebird system privilege held, the
+    /// cut to sixteen keeps the refusal-list identities and the privileges
+    /// that read or administer every attachment or the users.
+    #[test]
+    fn the_cut_to_sixteen_keeps_the_firebird_refusal_list() {
+        let privileges = &super::LABELS_REVISION_2026_10_D[..27];
+        assert_eq!(privileges.last(), Some(&"profile_any_attachment"));
+        let n = TargetNote::new(NoteCode::PrivilegeRefused)
+            .with_labels(privileges.iter().map(|p| NoteLabel::firebird(p)))
+            .with_labels(
+                [
+                    "sysdba",
+                    "rdb_admin",
+                    "security_database_admin",
+                    "database_owner",
+                    "verifier_relation_readable",
+                    "usage",
+                    "select",
+                    "insert",
+                ]
+                .map(NoteLabel::firebird),
+            );
+        let kept = sent(&n, LabelRevisions::ALL);
+        assert_eq!(kept.len(), MAX_LABELS);
+        for must in [
+            "sysdba",
+            "rdb_admin",
+            "security_database_admin",
+            "database_owner",
+            "verifier_relation_readable",
+            "trace_any_attachment",
+            "monitor_any_attachment",
+            "read_raw_pages",
+            "user_management",
+            "profile_any_attachment",
+        ] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
     }
 
     #[test]

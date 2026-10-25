@@ -13,6 +13,9 @@
 // or a branch of a composition whose parent has its own `type`. Fragments are not required to be
 // closed, typed or bounded, but cannot be `true` / `{}` (except under not / if / then / else) and cannot open
 // the parent (no `additionalProperties` other than `false`).
+// Below a `not`, every subschema is a fragment, `items` and `contains` included: a negated schema
+// only refuses data (the data is still validated by the closed, bounded schemas outside the `not`),
+// and closing an object there would make the refusal match less, not accept more.
 // Anywhere: no `patternProperties`, no `unevaluatedProperties` other than `false`, and no
 // `propertyNames` outside the numeric map.
 
@@ -25,7 +28,7 @@ function typesOf(node) {
   return Array.isArray(node.type) ? node.type : [node.type];
 }
 
-function lintNode(node, path, { fragment, via }, fail) {
+function lintNode(node, path, { fragment, via, negated = false }, fail) {
   const underConditional = CONDITIONAL.has(via);
   if (node === false) return;
   if (node === true) {
@@ -96,17 +99,17 @@ function lintNode(node, path, { fragment, via }, fail) {
     if (key === "properties" || key === "patternProperties" || key === "$defs") {
       for (const [name, sub] of Object.entries(value)) {
         // Inside a fragment, `properties` only constrains existing (already typed) properties.
-        lintNode(sub, `${path}/${key}/${name}`, { fragment: fragment && key === "properties", via: key }, fail);
+        lintNode(sub, `${path}/${key}/${name}`, { fragment: negated || (fragment && key === "properties"), via: key, negated }, fail);
       }
     } else if (["items", "propertyNames", "contains"].includes(key)) {
-      lintNode(value, `${path}/${key}`, { fragment: false, via: key }, fail);
+      lintNode(value, `${path}/${key}`, { fragment: negated, via: key, negated }, fail);
     } else if (key === "additionalProperties" && value !== false) {
-      lintNode(value, `${path}/${key}`, { fragment: false, via: key }, fail);
+      lintNode(value, `${path}/${key}`, { fragment: negated, via: key, negated }, fail);
     } else if (CONDITIONAL.has(key)) {
-      lintNode(value, `${path}/${key}`, { fragment: true, via: key }, fail);
+      lintNode(value, `${path}/${key}`, { fragment: true, via: key, negated: negated || key === "not" }, fail);
     } else if (COMPOSITION.includes(key) || key === "prefixItems") {
       const branchFragment = key !== "prefixItems" && types.length > 0;
-      value.forEach((sub, i) => lintNode(sub, `${path}/${key}/${i}`, { fragment: branchFragment, via: key }, fail));
+      value.forEach((sub, i) => lintNode(sub, `${path}/${key}/${i}`, { fragment: negated || branchFragment, via: key, negated }, fail));
     }
   }
 }
