@@ -27,7 +27,7 @@
 //! such an event carries a fingerprint instead of being dropped. An event is
 //! only dropped (and counted) if no conforming principal can be built at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use databastion_classifiers::keys::is_key_pattern;
 use databastion_classifiers::masking::{HmacKey, RawSample};
@@ -484,13 +484,32 @@ fn enforce_firebird_event(e: &mut AccessEvent) {
         }
     }
     if changed {
-        let mut seen = HashSet::new();
-        e.objects.retain(|o| {
-            seen.insert((
+        // Objects that became the same `*` of their database merge, and
+        // their `altered` markers are united (ADR-0056, review N6): the
+        // database name of one of them may have been altered.
+        let mut kept: Vec<ObjectRef> = Vec::with_capacity(e.objects.len());
+        let mut index: HashMap<(String, String), usize> = HashMap::new();
+        for o in e.objects.drain(..) {
+            let k = (
                 o.database.as_str().to_owned(),
                 serde_json::to_string(&o.object).unwrap_or_default(),
-            ))
-        });
+            );
+            match index.get(&k) {
+                Some(&i) => {
+                    if let Some(parts) = o.altered {
+                        kept[i].altered.get_or_insert_with(Vec::new).extend(parts);
+                    }
+                }
+                None => {
+                    index.insert(k, kept.len());
+                    kept.push(o);
+                }
+            }
+        }
+        for o in &mut kept {
+            canonical_object_parts(o);
+        }
+        e.objects = kept;
     }
 }
 
@@ -745,6 +764,36 @@ pub(crate) mod tests {
             "source": "pgaudit", "aggregated_count": 1
         }))
         .unwrap()
+    }
+
+    /// Review N6: Firebird objects merged into `*` of their database keep
+    /// the union of their `altered` markers.
+    #[test]
+    fn merged_firebird_objects_unite_their_altered_markers() {
+        let mut e: AccessEvent = serde_json::from_value(serde_json::json!({
+            "target_id": "fb", "ts": "2026-09-28T14:02:11Z",
+            "principal": {"db_user": "u", "application": "x"}, "action": "read",
+            "objects": [
+                {"database": "app", "schema": "s1", "object": "t1"},
+                {"database": "app", "schema": "s2", "object": "t2",
+                 "altered": ["database", "object"]},
+                {"database": "app", "object": "*"},
+                {"database": "other", "schema": "s", "object": "t", "altered": ["schema"]},
+                {"database": "app", "object": "kept", "altered": ["object"]}
+            ],
+            "source": "firebird_audit_trace", "aggregated_count": 1
+        }))
+        .unwrap();
+        enforce_firebird_event(&mut e);
+        let v = serde_json::to_value(&e.objects).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"database": "app", "object": "*", "altered": ["database"]},
+                {"database": "other", "object": "*"},
+                {"database": "app", "object": "kept", "altered": ["object"]}
+            ])
+        );
     }
 
     #[test]

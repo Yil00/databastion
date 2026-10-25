@@ -6,7 +6,7 @@
 //! the core enforces them itself (SQLite R1, Firebird C1) and these tests
 //! check every item the agent produces against the branches read from the
 //! contract. The evaluator understands a closed subset of JSON Schema
-//! (`type`, `properties`, `const`, `enum`, `not`, `contains`, boolean
+//! (`type`, `properties`, `const`, `enum`, `not`, `contains`, `allOf`, boolean
 //! schemas, `description`): any other keyword fails the test, so a
 //! contract change to a branch must be reflected here.
 
@@ -16,23 +16,73 @@ use serde_json::Value;
 
 const OPENAPI: &str = include_str!("../../../../shared/protocol/openapi.yaml");
 
-/// The `then` schema of the `allOf` entry of `components.schemas.<def>`
-/// whose `if` is `<key>: const <value>`.
+fn contract() -> Value {
+    serde_yaml_ng::from_str(OPENAPI).expect("openapi.yaml parses")
+}
+
+/// Whether an `if` names `<key>: <value>` (`const`, or `enum` holding it).
+fn names(cond: &Value, key: &str, value: &str) -> bool {
+    let p = &cond["properties"][key];
+    p["const"] == value
+        || p["enum"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|x| x == value))
+}
+
+/// Every `then` schema of the `allOf` entries of `components.schemas.<def>`
+/// whose `if` names `<key>: <value>` (review N5: not only the first), as
+/// one `allOf`.
 ///
 /// # Panics
 /// When the contract has no such branch (a contract change to reflect).
 #[must_use]
 pub fn branch(def: &str, key: &str, value: &str) -> Value {
-    let doc: Value = serde_yaml_ng::from_str(OPENAPI).expect("openapi.yaml parses");
+    let doc = contract();
     let all = doc["components"]["schemas"][def]["allOf"]
         .as_array()
         .unwrap_or_else(|| panic!("{def}: no allOf"))
         .clone();
-    let entry = all
+    let thens: Vec<Value> = all
         .into_iter()
-        .find(|e| e["if"]["properties"][key]["const"] == value)
-        .unwrap_or_else(|| panic!("{def}: no branch on {key} = {value}"));
-    entry["then"].clone()
+        .filter(|e| names(&e["if"], key, value))
+        .map(|e| e["then"].clone())
+        .collect();
+    assert!(!thens.is_empty(), "{def}: no branch on {key} = {value}");
+    serde_json::json!({ "allOf": thens })
+}
+
+/// The `if` / `then` entries anywhere under `components.schemas` that
+/// mention Firebird (`firebird` or `firebird_audit_trace`, in their `if`
+/// or `then`): the test below pins their number, so a new Firebird branch
+/// cannot be added to the contract without the core's enforcement and
+/// these tests being revisited.
+#[must_use]
+pub fn firebird_entries() -> Vec<String> {
+    fn walk(node: &Value, path: &str, out: &mut Vec<String>) {
+        match node {
+            Value::Object(o) => {
+                if let Some(Value::Array(entries)) = o.get("allOf") {
+                    for (i, e) in entries.iter().enumerate() {
+                        if e.get("if").is_some() && e.to_string().contains("firebird") {
+                            out.push(format!("{path}/allOf/{i}"));
+                        }
+                    }
+                }
+                for (k, v) in o {
+                    walk(v, &format!("{path}/{k}"), out);
+                }
+            }
+            Value::Array(a) => {
+                for (i, v) in a.iter().enumerate() {
+                    walk(v, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&contract()["components"]["schemas"], "", &mut out);
+    out
 }
 
 /// Whether `item` satisfies `schema` (the subset above).
@@ -50,6 +100,11 @@ pub fn conforms(schema: &Value, item: &Value) -> Result<(), String> {
             for (keyword, rule) in o {
                 match keyword.as_str() {
                     "description" => {}
+                    "allOf" => {
+                        for sub in rule.as_array().expect("allOf is an array") {
+                            conforms(sub, item)?;
+                        }
+                    }
                     "type" => {
                         let ok = match rule.as_str() {
                             Some("object") => item.is_object(),
@@ -139,5 +194,28 @@ mod tests {
         let detected = branch("DetectedTarget", "engine", "firebird");
         assert!(conforms(&detected, &serde_json::json!({"port": 3050})).is_ok());
         assert!(conforms(&detected, &serde_json::json!({"unix_socket": "/tmp/x"})).is_err());
+    }
+
+    /// Review N5: the number of Firebird branches is pinned; a change
+    /// needs the core's C1 enforcement and these tests revisited.
+    #[test]
+    fn the_firebird_branches_are_counted() {
+        let mut entries = firebird_entries();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                "/AccessEvent/allOf/3",
+                "/DetectedTarget/allOf/1",
+                "/Location/allOf/2",
+                "/TargetStatus/allOf/0",
+                "/TargetStatus/allOf/2",
+            ],
+            "the contract's Firebird branches changed: revisit sanitize::firebird and \
+             contract_rules"
+        );
+        // Every branch is returned, not only the first.
+        let all = branch("TargetStatus", "engine", "firebird");
+        assert_eq!(all["allOf"].as_array().unwrap().len(), 1);
     }
 }

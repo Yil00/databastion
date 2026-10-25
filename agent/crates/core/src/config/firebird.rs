@@ -14,9 +14,12 @@
 //!   reader's user namespace shows as) always refused.
 //! - **Declared databases only** (decision 5, I5): `databases: [{name,
 //!   attach}]`. `attach` (a `databases.conf` alias or an absolute path) is
-//!   sent to the server inside the encrypted session and never leaves the
-//!   agent otherwise; `name` is the operator's label, sent as
-//!   `Location.database`.
+//!   sent to the server only, and **in clear**: `op_connect` names it
+//!   before wire encryption starts (the server picks its per-database
+//!   `AuthServer` and `WireCrypt` from it; measured on 4.0.7 and 5.0.4,
+//!   ADR-0060 decision 5), and `op_attach` names it again encrypted. It is
+//!   never sent to the console nor logged; an alias keeps the path off the
+//!   loopback. `name` is the operator's label, sent as `Location.database`.
 //!
 //! The block has no field the console can set (I3). Errors name the key
 //! and the rule, never the value.
@@ -274,17 +277,69 @@ fn lookup_user(passwd: &str, name: &str) -> Option<u32> {
     })
 }
 
-/// Whether the agent runs in a container (decision 3): `/.dockerenv`,
-/// `/run/.containerenv` (Podman), or a container runtime named in
-/// `/proc/1/cgroup`. Read once per configuration load.
+/// Whether the agent runs in a container (decision 3, review L6): any of
+/// `/.dockerenv`, `/run/.containerenv` (Podman), a container runtime named
+/// in `/proc/1/cgroup`, a user namespace (`/proc/self/uid_map` not the
+/// identity map), `KUBERNETES_SERVICE_HOST` set, an overlay file system as
+/// the root (`/proc/self/mountinfo`), or a process 1 that is not pid 1 of
+/// the kernel (`/proc/1/sched`, a pid namespace). Any signal is enough: in
+/// a container a `peer_uid` name is refused (it would resolve against the
+/// agent image's `/etc/passwd`). Read once per configuration load.
 #[must_use]
 pub fn agent_in_container() -> bool {
-    if std::path::Path::new("/.dockerenv").exists()
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
-    {
-        return true;
-    }
-    std::fs::read_to_string("/proc/1/cgroup").is_ok_and(|text| cgroup_names_container(&text))
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+        || read("/proc/1/cgroup").is_some_and(|t| cgroup_names_container(&t))
+        || read("/proc/self/uid_map").is_some_and(|t| uid_map_is_namespaced(&t))
+        || read("/proc/self/mountinfo").is_some_and(|t| root_is_overlay(&t))
+        || read("/proc/1/sched").is_some_and(|t| sched_pid_is_not_1(&t))
+}
+
+/// Whether a `/proc/self/uid_map` text is anything but the identity map
+/// of the initial user namespace (`0 0 4294967295`).
+pub(crate) fn uid_map_is_namespaced(text: &str) -> bool {
+    let lines: Vec<Vec<&str>> = text
+        .lines()
+        .take(340)
+        .map(|l| l.split_whitespace().collect())
+        .filter(|f: &Vec<&str>| !f.is_empty())
+        .collect();
+    lines != [vec!["0", "0", "4294967295"]]
+}
+
+/// Whether the root mount of a `/proc/self/mountinfo` text is an overlay
+/// (or another union) file system.
+pub(crate) fn root_is_overlay(text: &str) -> bool {
+    text.lines().take(65_536).any(|l| {
+        let mut halves = l.splitn(2, " - ");
+        let (Some(head), Some(tail)) = (halves.next(), halves.next()) else {
+            return false;
+        };
+        head.split_whitespace().nth(4) == Some("/")
+            && tail
+                .split_whitespace()
+                .next()
+                .is_some_and(|fs| ["overlay", "fuse-overlayfs", "aufs", "overlayfs"].contains(&fs))
+    })
+}
+
+/// Whether the first line of `/proc/1/sched` (`name (pid, #threads: n)`)
+/// gives a pid other than 1: process 1 of the agent's view is another
+/// process of the kernel's (older kernels in a pid namespace).
+pub(crate) fn sched_pid_is_not_1(text: &str) -> bool {
+    let Some(first) = text.lines().next() else {
+        return false;
+    };
+    let Some(open) = first.rfind(" (") else {
+        return false;
+    };
+    first[open + 2..]
+        .split(',')
+        .next()
+        .and_then(|p| p.trim().parse::<u64>().ok())
+        .is_some_and(|pid| pid != 1)
 }
 
 /// Whether a `/proc/1/cgroup` text names a container runtime.
@@ -303,6 +358,29 @@ mod tests {
 
     fn block(yaml: &str) -> FirebirdTargetConfig {
         serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// Review L6: the container signals beyond the marker files.
+    #[test]
+    fn container_signals() {
+        assert!(!uid_map_is_namespaced("         0          0 4294967295\n"));
+        assert!(uid_map_is_namespaced("         0     100000      65536\n"));
+        assert!(uid_map_is_namespaced("0 0 4294967295\n1 2 3\n"));
+        assert!(uid_map_is_namespaced(""));
+        let host = "28 1 254:0 / / rw,relatime - ext4 /dev/vda rw\n\
+                    29 28 0:5 / /dev rw - devtmpfs udev rw\n";
+        assert!(!root_is_overlay(host));
+        let docker = "500 400 0:52 / / rw,relatime master:1 - overlay overlay rw,lowerdir=/x\n";
+        assert!(root_is_overlay(docker));
+        // An overlay mounted elsewhere is not the root.
+        assert!(!root_is_overlay(
+            "28 1 254:0 / / rw - ext4 /dev/vda rw\n30 28 0:52 / /var/lib/x rw - overlay overlay rw\n"
+        ));
+        assert!(!sched_pid_is_not_1("systemd (1, #threads: 1)\n-----\n"));
+        assert!(!sched_pid_is_not_1("process_api (1, #threads: 8)\n"));
+        assert!(sched_pid_is_not_1("sh (12345, #threads: 1)\n"));
+        assert!(sched_pid_is_not_1("my (odd) name (4242, #threads: 1)\n"));
+        assert!(!sched_pid_is_not_1(""));
     }
 
     #[test]
