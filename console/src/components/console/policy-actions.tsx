@@ -103,6 +103,8 @@ export function exceptionRequestBody(values: Record<string, string>): Record<str
     if (text(`location.${part}`)) location[part] = text(`location.${part}`);
   }
   if (Object.keys(location).length > 0) body.location = location;
+  // P10-C review R2: the explicit cross-target confirmation for SQLite targets (a checkbox).
+  if (values.cross_target === "on") body.cross_target = true;
   body.reason = text("reason");
   if (text("expires_at")) {
     const t = new Date(text("expires_at"));
@@ -118,6 +120,8 @@ const EXCEPTION_ERRORS: Record<string, string> = {
   classifier: "Classifier: a registered id (e.g. pii.email) or a family (e.g. pii.*).",
   target_id: "Target: a target id as declared in agent.yaml.",
   agent_id: "Agent: an agent UUID.",
+  cross_target:
+    "The cross-target confirmation applies only to an exception with a location pattern that does not name both an agent and a target.",
 };
 
 export function exceptionErrorMessage(status: number, body: unknown): string {
@@ -132,9 +136,27 @@ export function exceptionErrorMessage(status: number, body: unknown): string {
   return `The exception could not be saved (${status}).`;
 }
 
-/** How location patterns compare names (ADR-0054 decision 7, ADR-0055 decision 7, N1). */
+/**
+ * What an exception's creation answer says about SQLite targets (`sqlite_scope`, P10-C review R2):
+ * nothing to add for an exception scoped to an agent and a target or without a location.
+ */
+export function exceptionSqliteScopeMessage(scope: unknown): string {
+  if (scope === "excluded") {
+    return " It covers no SQLite target: SQLite locations are always main, so a SQLite exception needs both the agent id and the target, or the cross-target confirmation.";
+  }
+  if (scope === "every_target") return " It also covers the same table and column names on every SQLite target it reaches (cross-target, confirmed).";
+  return "";
+}
+
+/** The cross-target confirmation of SQLite location exceptions (P10-C review R2). */
+export const CROSS_TARGET_NOTE =
+  "SQLite locations are always the database main, whatever the file: a location exception covers SQLite findings only when it names " +
+  "both the agent id and the target, unless you confirm below that it covers the same table and column names in every SQLite file " +
+  "of its scope (other agents and targets included).";
+
+/** How location patterns compare names (ADR-0054 decision 7, ADR-0055 decision 7, N1, ADR-0059 decision 6). */
 export const EXCEPTION_MATCHING_NOTE =
-  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS targets, without case on OpenLDAP targets, " +
+  "Names are compared with case on PostgreSQL, MongoDB, Redis, Valkey, Apereo CAS and SQLite targets, without case on OpenLDAP targets, " +
   "and on SQL Server, MySQL and MariaDB targets according to the server's settings, as the agent reports them on the agent page " +
   "(unknown: with case; not reported by an older agent: without case); trailing spaces are ignored on SQL Server, MySQL and MariaDB " +
   "targets only. To cover two spellings, use one exception per spelling or a ? in place of the letter.";
@@ -198,8 +220,9 @@ export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; poli
       setMessage(exceptionErrorMessage(res.status, await res.json().catch(() => null)));
       return;
     }
+    const created = (await res.json().catch(() => null)) as { sqlite_scope?: unknown } | null;
     formEl.reset();
-    setMessage("Exception added.");
+    setMessage(`Exception added.${exceptionSqliteScopeMessage(created?.sqlite_scope)}`);
     router.refresh();
   }
 
@@ -229,6 +252,14 @@ export function ExceptionForm({ csrfToken, policyId }: { csrfToken: string; poli
       <p className="text-xs text-muted-foreground">
         {EXCEPTION_MATCHING_NOTE}
       </p>
+      <p className="text-xs text-muted-foreground">{CROSS_TARGET_NOTE}</p>
+      <div className="flex items-center gap-2">
+        <input id={id("cross_target")} name="cross_target" type="checkbox" className="size-4" />
+        <Label htmlFor={id("cross_target")}>
+          Also cover every SQLite target of this scope (cross-target): I confirm the table and column names mean the same data in
+          every SQLite file
+        </Label>
+      </div>
       <div className="flex flex-col gap-1">
         <Label htmlFor={id("reason")}>Reason</Label>
         <Input id={id("reason")} name="reason" required maxLength={500} autoComplete="off" />

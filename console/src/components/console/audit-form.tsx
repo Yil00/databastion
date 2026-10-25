@@ -151,6 +151,10 @@ export function AuditForm({
     }
     setPending(null);
     if (!res.ok) {
+      if (res.status === 409 && json?.error === "audit_unsupported") {
+        setMessage("This target is Discovery only (no Audit on this engine): the settings were not saved.");
+        return;
+      }
       const field = typeof json?.field === "string" ? json.field : "";
       setMessage(Object.hasOwn(ERRORS, field) ? (ERRORS[field] as string) : res.status === 404 ? "The agent or the target is no longer active." : `The settings could not be saved (${res.status}).`);
       return;

@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { EventConditions, ObjectPattern } from "@/lib/event-model";
+import { exceptionIsCrossTarget } from "@/lib/policy-common";
 import type { FindingConditions, LocationPattern, PolicyConditions, PolicySource } from "@/lib/policy-model";
 import type { CaseInventoryStatus } from "@/server/exception-case-inventory";
 import type { ExceptionView, PolicyView } from "@/server/policies";
@@ -223,6 +224,17 @@ export function exceptionScopeLabels(e: ExceptionView): string[] {
     e.targetId ? `target ${e.targetId}` : null,
     e.classifier ? `classifier ${e.classifier}` : null,
     e.location ? locationPatternLabel(e.location) : null,
+    // P10-C review R2: how a location exception not scoped to an agent and a target treats SQLite.
+    // N2 (review of 342a257): an agent-scoped confirmation reaches that agent's SQLite targets only.
+    exceptionIsCrossTarget(e)
+      ? e.crossTarget
+        ? e.agentId
+          ? `every SQLite target of agent ${e.agentName ?? e.agentId} (cross-target, confirmed)`
+          : e.targetId
+            ? `every SQLite target ${e.targetId}, on any agent (cross-target, confirmed)`
+            : "every SQLite target (cross-target, confirmed)"
+        : "no SQLite target (not target-scoped)"
+      : null,
   ].filter((x): x is string => x !== null);
 }
 
@@ -249,7 +261,7 @@ export function CaseInventoryView({
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm text-muted-foreground">
-        Location exceptions compare names with case on PostgreSQL, MongoDB, Redis, Valkey and Apereo CAS
+        Location exceptions compare names with case on PostgreSQL, MongoDB, Redis, Valkey, Apereo CAS and SQLite
         targets. The exceptions below covered stored findings or access events only because case was ignored: review them, and
         correct a pattern written in another case than the real name.
       </p>

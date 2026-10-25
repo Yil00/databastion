@@ -47,7 +47,7 @@ const finding = (over: Partial<FindingFacts> = {}): FindingFacts => ({
   ...over,
 });
 
-const exception = (location: LocationPattern): ExceptionScope => ({ policyId: null, agentId: null, targetId: null, classifier: null, location, expiresAt: null });
+const exception = (location: LocationPattern): ExceptionScope => ({ policyId: null, agentId: null, targetId: null, classifier: null, location, expiresAt: null, crossTarget: false });
 
 const event = (over: Partial<EventFacts> = {}): EventFacts => ({
   agentId: "01890a5d-ac96-774b-bcce-b302099a8058",
@@ -72,6 +72,7 @@ const eventException = (location: EventExceptionScope["location"]): EventExcepti
   classifier: null,
   location,
   expiresAt: null,
+  crossTarget: false,
 });
 
 describe("canonicalNameCase (#301 review L2, L3)", () => {

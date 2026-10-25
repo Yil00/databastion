@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { AgentActions } from "@/components/console/agent-actions";
+import { AuditLevelLabel } from "@/components/console/audit-level";
 import { findingsHref } from "@/components/console/findings-table";
 import { ScanCoverageView } from "@/components/console/scan-coverage";
 import { ScanDialog } from "@/components/console/scan-dialog";
@@ -15,7 +16,7 @@ import { getDb } from "@/db/client";
 import { displayStatus, formatAge } from "@/lib/agent-status";
 import { auditWarningText } from "@/lib/audit-warning";
 import { detectedHow, setupHint } from "@/lib/detected-targets";
-import { engineDisplayName } from "@/lib/location-labels";
+import { DISCOVERY_ONLY_LABEL, DISCOVERY_ONLY_TITLE, engineDisplayName, isDiscoveryOnlyEngine } from "@/lib/location-labels";
 import { eventsHref } from "@/lib/events-filter";
 import { getAgentDetail } from "@/server/agents";
 import { auditSummaries } from "@/server/audit-config";
@@ -228,10 +229,12 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                       {!t.present && " (removed)"}
                     </TableCell>
                     <TableCell title={t.engine}>{[engineDisplayName(t.engine), t.edition].filter(Boolean).join(" ")}</TableCell>
-                    <TableCell>{t.serverVersion ?? ""}</TableCell>
+                    <TableCell>
+                      {isDiscoveryOnlyEngine(t.engine) ? <span className="text-muted-foreground">no server</span> : (t.serverVersion ?? "")}
+                    </TableCell>
                     <TableCell>{t.reachable ? "yes" : "no"}</TableCell>
                     <TableCell>
-                      {t.auditLevel}
+                      <AuditLevelLabel engine={t.engine} level={t.auditLevel} />
                       {streamStopped(t.notes) && (
                         <Badge variant="destructive" className="ml-2">
                           stream stopped
@@ -260,7 +263,11 @@ export default async function AgentPage({ params }: { params: Promise<{ id: stri
                       })()}
                     </TableCell>
                     <TableCell className="max-w-56 whitespace-normal">
-                      {(() => {
+                      {isDiscoveryOnlyEngine(t.engine) ? (
+                        <span className="text-muted-foreground" title={DISCOVERY_ONLY_TITLE}>
+                          none ({DISCOVERY_ONLY_LABEL})
+                        </span>
+                      ) : (() => {
                         const a = audits.get(t.targetId);
                         const label = !a ? "not configured" : a.enabled ? `enabled, ${a.objects} sensitive objects` : "disabled";
                         return (

@@ -3,7 +3,7 @@ import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatAge } from "@/lib/agent-status";
-import { engineDisplayName, hasNamedLocationParts, isKeyPatternEngine, locationPartLabels } from "@/lib/location-labels";
+import { engineDisplayName, hasNamedLocationParts, isKeyPatternEngine, locationDatabaseShown, locationPartLabels } from "@/lib/location-labels";
 import { findingAlteredText, NAMES_ALTERED_TITLE } from "@/lib/names-altered";
 import type { Engine } from "@/lib/protocol/enums";
 import type { FindingSummaryRow, FindingView } from "@/server/findings";
@@ -33,7 +33,8 @@ type LocationParts = Pick<FindingView, "databaseName" | "schemaName" | "objectNa
  * A finding location on one line. OpenLDAP (ADR-0029 decision 6), CAS (ADR-0041 decision 4) and
  * Redis / Valkey (ADR-0052 decision 7): each part is named (naming context, container, object
  * class, attribute; store, service type, service, path; database, type, key pattern, field), since
- * `schema` and `object` do not mean a schema and a table there. Plain text: callers render it as
+ * `schema` and `object` do not mean a schema and a table there. SQLite (ADR-0059 decision 6): table
+ * and column, without the database `main`, the same on every target. Plain text: callers render it as
  * a text node (escaped), never as a link.
  */
 export function locationLabel(f: LocationParts, engine: string | null = null): string {
@@ -46,7 +47,8 @@ export function locationLabel(f: LocationParts, engine: string | null = null): s
 function namedParts(f: LocationParts, engine: string | null): [string, string][] {
   const l = locationPartLabels(engine, f.databaseName);
   const parts: [string, string | null][] = [
-    [l.database, f.databaseName],
+    // SQLite: `main` on every target, left out (the target column tells files apart).
+    [l.database, locationDatabaseShown(engine) ? f.databaseName : null],
     [l.schema, f.schemaName],
     [l.object, f.objectName],
     [l.field, f.fieldName],

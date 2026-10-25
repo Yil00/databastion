@@ -10,7 +10,7 @@ import { formatAge } from "@/lib/agent-status";
 import { validateSchema } from "@/lib/protocol/validate";
 import { getAgentDetail } from "@/server/agents";
 import { auditWarningText, MIN_ROWS_WARNING_TEXT, minRowsWarning } from "@/lib/audit-warning";
-import { engineDisplayName, isKeyPatternEngine } from "@/lib/location-labels";
+import { DISCOVERY_ONLY_LABEL, DISCOVERY_ONLY_TITLE, engineDisplayName, isDiscoveryOnlyEngine, isKeyPatternEngine } from "@/lib/location-labels";
 import { deriveSensitiveObjects, getAuditConfig, sendableDerivedObjects, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
 import { requestTime, requirePageSession } from "@/server/ui-session";
 
@@ -30,6 +30,8 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   const derived = await deriveSensitiveObjects(db, id, targetId);
   derived.sort((a, b) => b.sensitivity - a.sensitivity);
   const keyPatterns = isKeyPatternEngine(config.engine);
+  // ADR-0059 decision 7: no Audit on a Discovery-only engine (SQLite); the API refuses settings.
+  const discoveryOnly = isDiscoveryOnlyEngine(config.engine);
   // Key-pattern objects (Redis / Valkey) are sent only to an agent that lists
   // `sensitive_object.key_pattern` (P9-E review M3, phase 9 follow-ups).
   const notSendable = sendableDerivedObjects(derived, keyPatterns && config.agentAcceptsKeyPatterns).skipped;
@@ -40,7 +42,7 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   const active = agent.revokedAt === null && agent.lockedAt === null && config.present;
   const facts: [string, string][] = [
     ["Engine", engineDisplayName(config.engine)],
-    ["Audit level reported", config.auditLevel],
+    ["Audit level reported", discoveryOnly ? `${config.auditLevel} (${DISCOVERY_ONLY_LABEL})` : config.auditLevel],
     ["Settings", config.configured ? (config.enabled ? "enabled" : "disabled") : "never sent"],
     ["Sensitive objects sent", String(config.sentObjects.length)],
     ["Objects with findings now", String(derived.length)],
@@ -57,6 +59,11 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
         </Link>
         <h1 className="text-2xl font-semibold tracking-tight">Audit settings of {targetId}</h1>
       </div>
+      {discoveryOnly && (
+        <p role="note" className="rounded-md border p-3 text-sm text-muted-foreground" data-discovery-only="">
+          {DISCOVERY_ONLY_LABEL}: {DISCOVERY_ONLY_TITLE}
+        </p>
+      )}
       {config.warning && (
         <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
           {auditWarningText(config.warning, config.warningRemoved)}
@@ -102,7 +109,7 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
           </dl>
         </CardContent>
       </Card>
-      {isAdmin && active && (
+      {isAdmin && active && !discoveryOnly && (
         <Card>
           <CardHeader>
             <CardTitle>Change the settings</CardTitle>

@@ -9,6 +9,7 @@ import {
   createException,
   createPolicy,
   deleteException,
+  exceptionSqliteScope,
   deletePolicy,
   parseExceptionInput,
   parsePolicyInput,
@@ -579,7 +580,8 @@ export function handleRequestScan(req: Request, agentId: string, targetId: strin
  * `409 confirmation_required` with the counts and the `digest` to send back as `confirm`; nothing is
  * queued until then. `202 {job_id, ...counts}` when the `audit.configure` job is queued. Audited.
  * Both answers carry `min_rows_warning` (`"no_row_counts"` for `min_rows` on a Redis / Valkey
- * target, #235 review N2, else `null`): a warning, never a refusal.
+ * target, #235 review N2, else `null`): a warning, never a refusal. A Discovery-only target
+ * (SQLite, ADR-0059 decision 7) answers `409 audit_unsupported`, nothing queued (audited).
  */
 export function handleConfigureAudit(req: Request, agentId: string, targetId: string): Promise<Response> {
   return guardedUser("audit.configure", async () => {
@@ -626,6 +628,9 @@ export function handleConfigureAudit(req: Request, agentId: string, targetId: st
         return error(400, "invalid_params");
       case "not_found":
         return error(404, "not_found");
+      case "unsupported":
+        // A Discovery-only target (SQLite, ADR-0059 decision 7): Audit cannot be configured.
+        return error(409, "audit_unsupported");
     }
   });
 }
@@ -724,8 +729,12 @@ export function handleDeletePolicy(req: Request, id: string): Promise<Response> 
 
 /**
  * Creates an exception (admin, CSRF): `{policy_id?, agent_id?, target_id?, classifier?, location?,
- * reason, expires_at?}`, at least one of agent / target / classifier / location. `400
- * invalid_exception` (+ `field`), `404 not_found` for an unknown policy or agent. `201 {id}`.
+ * reason, expires_at?, cross_target?}`, at least one of agent / target / classifier / location. `400
+ * invalid_exception` (+ `field`), `404 not_found` for an unknown policy or agent. `201 {id,
+ * sqlite_scope}`: how the exception reaches SQLite items (P10-C review R2): `target` (scoped to an
+ * agent and a target), `every_target` (a location exception confirmed with `cross_target: true`),
+ * `excluded` (a location exception not scoped to an agent and a target, not confirmed: it covers no
+ * SQLite item) or `not_location` (no location: the scope's usual meaning).
  */
 export function handleCreateException(req: Request): Promise<Response> {
   return guardedUser("policy_exception.create", async () => {
@@ -737,7 +746,7 @@ export function handleCreateException(req: Request): Promise<Response> {
     if (!parsed.ok) return json({ error: "invalid_exception", field: parsed.error }, 400);
     const r = await createException(getDb(), parsed.value, { userId: g.session.user.id, ip: g.ip });
     if (r.outcome !== "ok") return error(404, "not_found");
-    return json({ id: r.id }, 201);
+    return json({ id: r.id, sqlite_scope: exceptionSqliteScope(parsed.value) }, 201);
   });
 }
 

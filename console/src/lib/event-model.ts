@@ -5,6 +5,7 @@ import { exceptionPartOptions, type NameCaseRule } from "./name-case";
 import {
   alteredPartsCoverable,
   ENGINES,
+  exceptionReachesItem,
   fail,
   globMatch,
   isGlob,
@@ -505,6 +506,8 @@ export interface EventExceptionScope {
   classifier: string | null;
   location: Partial<Record<"database" | "schema" | "object" | "field", string>> | null;
   expiresAt: Date | null;
+  /** The `cross_target` confirmation (P10-C review R2, `exceptionReachesItem`). */
+  crossTarget: boolean;
 }
 
 /**
@@ -521,7 +524,10 @@ export interface EventExceptionScope {
  * (ADR-0053) is covered only by an exception that covers every object of its database
  * (`exceptionCoversOverflowStar`). A part of an object that the agent reported altered by its name
  * normalization is covered only by an absent glob or exactly `*` (ADR-0056 decision 3 item 4,
- * `alteredPartsCoverable`), per object: the other objects of the event keep their own result.
+ * `alteredPartsCoverable`), per object: the other objects of the event keep their own result. On
+ * SQLite (no Audit today, ADR-0059: kept for an event that would carry the engine), a location
+ * exception reaches the event only when scoped to its agent and target or confirmed `cross_target`
+ * (P10-C review R2, `exceptionReachesItem`).
  */
 export function exceptionCoversEvent(
   x: EventExceptionScope,
@@ -535,6 +541,7 @@ export function exceptionCoversEvent(
   if (x.agentId !== null && x.agentId !== e.agentId) return false;
   if (x.targetId !== null && x.targetId !== e.targetId) return false;
   if (x.classifier !== null) return false;
+  if (!exceptionReachesItem(x, e.engine)) return false;
   if (x.location !== null) {
     const { field, ...parts } = x.location;
     if (field !== undefined && field !== "*") return false;

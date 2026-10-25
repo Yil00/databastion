@@ -770,6 +770,30 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       }
     });
 
+    it("stores the sqlite heartbeat fixture: Discovery-only targets with every sqlite note as sent (P10-E)", async () => {
+      const [, body] = fixtures("valid", "HeartbeatRequest").find(([f]) => f === "HeartbeatRequest.sqlite.json") ?? [];
+      expect(body).toBeDefined();
+      const hb = body as {
+        connectors: string[];
+        targets: { target_id: string; engine: string; audit_level: string; notes?: unknown[] }[];
+      };
+      expect(unlistedEngineDetails("HeartbeatRequest", hb)).toEqual([]);
+      const auth = await enroll();
+      const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }));
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { accepts: string[] }).accepts).toContain("engine.sqlite");
+      const stored = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId)).orderBy(agentTargets.targetId);
+      const sent = [...hb.targets].sort((a, b) => (a.target_id < b.target_id ? -1 : 1));
+      expect(stored.map((t) => [t.targetId, t.engine, t.auditLevel, t.auditSource, t.serverVersion, t.edition, t.nameCase, t.notes])).toEqual(
+        sent.map((t) => [t.target_id, t.engine, t.audit_level, null, null, null, null, t.notes ?? null]),
+      );
+      const sqlite = stored.filter((t) => t.engine === "sqlite");
+      expect(sqlite.length).toBeGreaterThan(0);
+      for (const t of sqlite) expect(t.auditLevel).toBe("none");
+      const detail = await getAgentDetail(getDb(), auth.agentId);
+      expect(detail?.connectors).toEqual(hb.connectors);
+    });
+
     it("stores a target whose audit source does not serve its engine without the source, with an integrity event; 200 (P9-E review M2)", async () => {
       const auth = await enroll();
       const body = {
@@ -950,26 +974,7 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(await rows()).toHaveLength(targetMismatchChangeBudget.limit);
     });
 
-    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`sqlite`, ADR-0059
-    // decision 8: in the contract since P10-C, listed by P10-E).
-    const unlistedHeartbeat = ([, body]: [string, unknown]) => unlistedEngineDetails("HeartbeatRequest", body).length > 0;
-
-    it.each(fixtures("valid", "HeartbeatRequest").filter(unlistedHeartbeat))(
-      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
-      async (_f, body) => {
-        const auth = await enroll();
-        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
-        expect(res.status).toBe(400);
-        const err = await expectConformingError(res, body);
-        expect(err.code).toBe("invalid_request");
-        const details = err.details as { pointer: string; keyword: string }[];
-        expect(details.length).toBeGreaterThan(0);
-        expect(details.every((d) => d.keyword === "enum")).toBe(true);
-        expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
-      },
-    );
-
-    it.each(fixtures("valid", "HeartbeatRequest").filter((f) => !unlistedHeartbeat(f)))("valid fixture %s -> 200", async (_f, body) => {
+    it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);
