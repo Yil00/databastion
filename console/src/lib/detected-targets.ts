@@ -47,6 +47,8 @@ const ACCOUNT_HINTS: Record<Engine, string> = {
   valkey:
     "an ACL user with an explicit command allow-list (ADR-0052 decision 4), never the default user",
   sqlite: "no account: a declared database file, read-only for the agent (ADR-0059); never detected",
+  firebird:
+    "a dedicated Firebird user with a SELECT-only reader role (ADR-0060 decision 4), never SYSDBA or RDB$ADMIN, reached on 127.0.0.1 or ::1 only",
 };
 
 /**

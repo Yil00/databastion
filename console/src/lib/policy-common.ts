@@ -77,13 +77,14 @@ export function foldName(s: string): string {
 /**
  * Engines whose identifier comparisons ignore trailing spaces, so a location exception also
  * covers a name that differs from its globs by trailing spaces only (N1): SQL Server (padded
- * comparisons under every collation) and MySQL / MariaDB (identifiers cannot end with a space).
- * Elsewhere a trailing space can be part of a distinct name (a quoted PostgreSQL identifier, a
+ * comparisons under every collation), MySQL / MariaDB (identifiers cannot end with a space) and
+ * Firebird (catalog names are space-padded `CHAR`, so `"A "` and `"A"` are one table; ADR-0060
+ * decision 5 and open question 11). Elsewhere a trailing space can be part of a distinct name (a quoted PostgreSQL identifier, a
  * MongoDB collection, a Redis / Valkey key), and an exception never loosens there: looser
  * exceptions suppress more. Policy conditions and scoring ignore trailing spaces on every engine
  * (looser matching only reports more).
  */
-export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb"];
+export const TRAILING_SPACE_BLIND_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "firebird"];
 
 /**
  * Database name as hashed in the access-event incident dedup key (ADR-0021 decision 6,
@@ -108,7 +109,8 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
  * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
  * Redis, Valkey, Apereo CAS and SQLite by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES};
  * SQLite: ADR-0059 decision 6, it folds ASCII letters only, so the Unicode fold would let an
- * exception for `Ärzte` cover a distinct table `ärzte`), and an engine added later is never
+ * exception for `Ärzte` cover a distinct table `ärzte`; Firebird: ADR-0060 decision 5, quoted names
+ * are compared exactly), and an engine added later is never
  * loosened before its connector ADR decides. Policy conditions,
  * per-object sensitivity and scores stay case-insensitive on every engine (looser matching only
  * reports more).
@@ -116,7 +118,7 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
 export const CASE_BLIND_EXCEPTION_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "openldap"];
 
 /** The contract engines on which location exceptions compare names with case (ADR-0054). */
-export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas", "sqlite"];
+export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas", "sqlite", "firebird"];
 
 /** Whether location exceptions compare names with case on `engine` (ADR-0054 decision 1). */
 export function exceptionMatchesCase(engine: string | null): boolean {

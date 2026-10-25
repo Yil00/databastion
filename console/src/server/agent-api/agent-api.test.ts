@@ -974,7 +974,26 @@ describe.skipIf(!hasDb)("agent API v1 (PostgreSQL)", () => {
       expect(await rows()).toHaveLength(targetMismatchChangeBudget.limit);
     });
 
-    it.each(fixtures("valid", "HeartbeatRequest"))("valid fixture %s -> 200", async (_f, body) => {
+    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`firebird`, ADR-0060
+    // decision 8: in the contract since P10-C, listed by P10-E).
+    const unlistedHeartbeat = ([, body]: [string, unknown]) => unlistedEngineDetails("HeartbeatRequest", body).length > 0;
+
+    it.each(fixtures("valid", "HeartbeatRequest").filter(unlistedHeartbeat))(
+      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
+      async (_f, body) => {
+        const auth = await enroll();
+        const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err.code).toBe("invalid_request");
+        const details = err.details as { pointer: string; keyword: string }[];
+        expect(details.length).toBeGreaterThan(0);
+        expect(details.every((d) => d.keyword === "enum")).toBe(true);
+        expect(await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId))).toHaveLength(0);
+      },
+    );
+
+    it.each(fixtures("valid", "HeartbeatRequest").filter((f) => !unlistedHeartbeat(f)))("valid fixture %s -> 200", async (_f, body) => {
       const auth = await enroll();
       const res = await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body }));
       expect(res.status).toBe(200);

@@ -25,6 +25,8 @@ const defs = bundle.$defs as Record<string, Def>;
 
 type Token = (typeof CONSOLE_ACCEPTS)[number];
 type EngineToken = Extract<Token, `engine.${string}`>;
+/** Engine tokens of the contract not in CONSOLE_ACCEPTS yet. */
+type PendingEngineToken = Exclude<ContractEngineToken, EngineToken>;
 /** Enum revision tokens (ADR-0022 decision 4): `<object>.<field>.<revision>`. */
 type RevisionToken = Extract<Token, `target_status.note_labels.${string}`>;
 
@@ -57,6 +59,12 @@ const ENGINE_TOKENS: Record<EngineToken, { engine: string; connector?: string; s
   "engine.valkey": { engine: "valkey", connector: "redis", sources: ["redis_slowlog", "redis_commandlog", "redis_acl_log", "redis_sync"] },
   // Discovery only (ADR-0059 decision 7): no Audit source.
   "engine.sqlite": { engine: "sqlite", connector: "sqlite", sources: [] },
+};
+
+/** The engine tokens of the contract that this console does not list yet, with their values. */
+const PENDING_ENGINE_TOKENS: Record<PendingEngineToken, { engine: string; connector: string; sources: string[] }> = {
+  // ADR-0060 decision 8: in the contract since P10-C, listed by P10-E with the console's Firebird support.
+  "engine.firebird": { engine: "firebird", connector: "firebird", sources: ["firebird_audit_trace"] },
 };
 
 function isEngineToken(token: Token): token is EngineToken {
@@ -98,11 +106,19 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
     }
   });
 
-  it("lists every engine added after protocol 0.1.0 (engine.sqlite since P10-E)", () => {
+  it("lists every engine added after protocol 0.1.0 (engine.sqlite since P10-E), except those whose console lot is pending", () => {
     const v010 = ["postgres", "mysql", "mariadb", "mongodb", "openldap"];
+    const pending = UNLISTED_ENGINE_TOKENS.map((t) => PENDING_ENGINE_TOKENS[t].engine);
     const listed = CONSOLE_ACCEPTS.filter(isEngineToken).map((t) => ENGINE_TOKENS[t].engine);
-    expect(enumOf("Engine").filter((e) => !v010.includes(e)).sort()).toEqual([...listed].sort());
+    expect(enumOf("Engine").filter((e) => !v010.includes(e) && !pending.includes(e)).sort()).toEqual([...listed].sort());
     expect(CONSOLE_ACCEPTS).toContain("engine.sqlite");
+    for (const t of UNLISTED_ENGINE_TOKENS) {
+      const v = PENDING_ENGINE_TOKENS[t];
+      expect(CONSOLE_ACCEPTS as readonly string[], t).not.toContain(t);
+      expect(enumOf("Engine"), t).toContain(v.engine);
+      expect(enumOf("Connector"), t).toContain(v.connector);
+      for (const source of v.sources) expect(enumOf("AuditSource"), t).toContain(source);
+    }
   });
 
   it("lists engine.redis and engine.valkey together (ADR-0052 decision 12: the shared values need both)", () => {
@@ -158,8 +174,15 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
   });
 });
 
-/** Every engine token of the contract, all listed since P10-E. */
-const ALL_ENGINE_TOKENS: ContractEngineToken[] = ["engine.cas", "engine.sqlserver", "engine.redis", "engine.valkey", "engine.sqlite"];
+/** Every engine token of the contract, listed by this console or not yet. */
+const ALL_ENGINE_TOKENS: ContractEngineToken[] = ["engine.cas", "engine.sqlserver", "engine.redis", "engine.valkey", "engine.sqlite", "engine.firebird"];
+/**
+ * The engine tokens of the contract that this console does not list yet: `engine.firebird` (ADR-0060
+ * decision 8), in the contract since P10-C and listed by P10-E with the console's Firebird support.
+ */
+const UNLISTED_ENGINE_TOKENS: PendingEngineToken[] = ["engine.firebird"];
+/** Fixtures whose name says they carry a value of an unlisted engine. */
+const UNLISTED_FIXTURE = /firebird/;
 
 describe("AGENT_TOKENS (ADR-0022 decision 3)", () => {
   it("is a valid, sorted CapabilityList that the contract names in HeartbeatRequest.accepts", () => {
@@ -200,6 +223,10 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     expect(processTokens("redis-server")).toEqual(["engine.redis"]);
     expect(processTokens("valkey-server")).toEqual(["engine.valkey"]);
     expect(processTokens("mysqld")).toEqual([]);
+    expect(engineTokens("firebird")).toEqual(["engine.firebird"]);
+    expect(connectorTokens("firebird")).toEqual(["engine.firebird"]);
+    expect(auditSourceTokens("firebird_audit_trace")).toEqual(["engine.firebird"]);
+    expect(processTokens("firebird")).toEqual(["engine.firebird"]);
   });
 
   it("names only contract tokens, each `engine.<value>` of an engine added after protocol 0.1.0", () => {
@@ -208,11 +235,42 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     expect(validateSchema("CapabilityList", ALL_ENGINE_TOKENS).ok).toBe(true);
   });
 
-  it("lets every valid fixture through with CONSOLE_ACCEPTS (P10-E lists every engine token of the contract)", () => {
-    for (const t of ALL_ENGINE_TOKENS) expect(CONSOLE_ACCEPTS as readonly string[]).toContain(t);
-    for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
-      for (const [file, body] of fixtures("valid", name)) expect(unlistedEngineDetails(name, body), file).toEqual([]);
+  it("lets every valid fixture through with CONSOLE_ACCEPTS, except those of an engine not listed yet", () => {
+    for (const t of ALL_ENGINE_TOKENS) {
+      expect((CONSOLE_ACCEPTS as readonly string[]).includes(t), t).toBe(!(UNLISTED_ENGINE_TOKENS as string[]).includes(t));
     }
+    for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
+      for (const [file, body] of fixtures("valid", name)) {
+        const unlisted = unlistedEngineDetails(name, body);
+        expect(unlisted.length > 0, file).toBe(UNLISTED_FIXTURE.test(file));
+        for (const d of unlisted) expect(d.keyword).toBe("enum");
+        // Listed, the same fixture goes through.
+        expect(unlistedEngineDetails(name, body, [...CONSOLE_ACCEPTS, ...UNLISTED_ENGINE_TOKENS]), file).toEqual([]);
+      }
+    }
+  });
+
+  it("refuses every firebird value until engine.firebird is listed (ADR-0060 decision 8; listed by P10-E)", () => {
+    expect(unlistedEngineDetails("EnrollRequest", { connectors: ["postgres", "firebird"] })).toEqual([{ pointer: "/connectors/1", keyword: "enum" }]);
+    const hb = {
+      connectors: ["firebird"],
+      targets: [{ engine: "firebird", audit_source: "firebird_audit_trace" }],
+      detected_targets: [{ engine: "firebird", process: "firebird" }],
+    };
+    expect(unlistedEngineDetails("HeartbeatRequest", hb)).toEqual([
+      { pointer: "/connectors/0", keyword: "enum" },
+      { pointer: "/targets/0/engine", keyword: "enum" },
+      { pointer: "/targets/0/audit_source", keyword: "enum" },
+      { pointer: "/detected_targets/0/engine", keyword: "enum" },
+      { pointer: "/detected_targets/0/process", keyword: "enum" },
+    ]);
+    const findings = { findings: [{ location: { engine: "firebird" } }] };
+    expect(unlistedEngineDetails("FindingsBatch", findings)).toEqual([{ pointer: "/findings/0/location/engine", keyword: "enum" }]);
+    const events = { batch_id: "x", events: [{ source: "firebird_audit_trace" }] };
+    expect(unlistedEngineDetails("EventsBatch", events)).toEqual([{ pointer: "/events/0/source", keyword: "enum" }]);
+    const listed = [...CONSOLE_ACCEPTS, "engine.firebird"];
+    expect(unlistedEngineDetails("HeartbeatRequest", hb, listed)).toEqual([]);
+    expect(unlistedEngineDetails("EventsBatch", events, listed)).toEqual([]);
   });
 
   it("gates every sqlite value on engine.sqlite, listed since P10-E (ADR-0059 decision 8)", () => {
@@ -240,7 +298,7 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
       for (const [file, body] of fixtures("valid", name)) {
         const unlisted = unlistedEngineDetails(name, body, before);
-        expect(unlisted.length > 0, file).toBe(/sqlserver|redis|valkey|sqlite/.test(file));
+        expect(unlisted.length > 0, file).toBe(/sqlserver|redis|valkey|sqlite|firebird/.test(file));
         for (const d of unlisted) expect(d.keyword).toBe("enum");
       }
     }

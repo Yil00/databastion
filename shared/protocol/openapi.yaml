@@ -126,7 +126,7 @@ info:
     added after protocol 0.1.0** are negotiated with the token `engine.<value>` (`engine.cas`,
     ADR-0041 decision 12, applying ADR-0039 decision 8; `engine.sqlserver`, ADR-0051 decision 8;
     `engine.redis` and `engine.valkey`, ADR-0052 decision 12; `engine.sqlite`, ADR-0059 decision
-    8; agent handling in ADR-0042): until
+    8; `engine.firebird`, ADR-0060 decision 8; agent handling in ADR-0042): until
     the console's latest heartbeat response lists it, the agent sends no `Connector`, `Engine` or
     `AuditSource` value of that engine (no target, detected target, finding or event of it, and
     no such connector in `/enroll`, which precedes every heartbeat), so a `ConnectorList` longer
@@ -186,7 +186,8 @@ info:
     - `openldap_accesslog` -> `openldap`;
     - `cas_audit_log` -> `cas`;
     - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
-    - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+    - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;
+    - `firebird_audit_trace` -> `firebird`.
     No source serves `sqlite` (ADR-0059 decision 7): the schema refuses a `sqlite` target that
     names one (see `TargetStatus`).
 
@@ -1221,22 +1222,26 @@ components:
         handling in ADR-0042). Every later engine value follows the
         same rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,
         ADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`
-        and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.
+        and `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`,
+        `firebird` (Firebird 4.0 and 5.0, ADR-0060) with `engine.firebird`.
         A `sqlite` target is Discovery only: it has no server and no access log, so its
         `TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or
         `edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059
-        decision 7).
+        decision 7). A `firebird` target never reports `audit_level` `full` (checked by this
+        schema; ADR-0060 decision 6) and never sends `name_case` (its name rules are the
+        engine's, fixed: ADR-0060 decision 5).
       type: string
-      enum: [postgres, mysql, mariadb, mongodb, openldap, cas, sqlserver, redis, valkey, sqlite]
+      enum: [postgres, mysql, mariadb, mongodb, openldap, cas, sqlserver, redis, valkey, sqlite, firebird]
     Connector:
       description: |
         Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and
         Valkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`
         only when it listed `engine.sqlserver`, `redis` only when it listed **both**
-        `engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`
-        (ADR-0059 decision 8; see `Engine`).
+        `engine.redis` and `engine.valkey`, `sqlite` only when it listed `engine.sqlite`
+        (ADR-0059 decision 8), and `firebird` only when it listed `engine.firebird` (ADR-0060
+        decision 8; see `Engine`).
       type: string
-      enum: [postgres, mysql, mongodb, openldap, cas, sqlserver, redis, sqlite]
+      enum: [postgres, mysql, mongodb, openldap, cas, sqlserver, redis, sqlite, firebird]
     ConnectorList:
       description: |
         Connectors compiled in and enabled in this agent. A connector of an engine added after
@@ -1253,7 +1258,9 @@ components:
         Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:
         e.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community
         `limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a
-        SQLite target is always `none` (no access log exists, ADR-0059 decision 7).
+        SQLite target is always `none` (no access log exists, ADR-0059 decision 7); a Firebird
+        target is never `full` (the trace does not see file-level copies, embedded access or
+        replication, ADR-0060 decision 6).
       type: string
       enum: [full, partial, limited, none]
     AuditSource:
@@ -1269,7 +1276,9 @@ components:
           `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`
           (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)
           (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when
-          **both** `engine.redis` and `engine.valkey` are listed.
+          **both** `engine.redis` and `engine.valkey` are listed;
+        - `firebird_audit_trace` (the Firebird system audit trace log, `AuditTraceConfigFile`,
+          read locally as a text file, ADR-0060 decision 6): `engine.firebird`.
 
         The engines each source serves (a source is reported only for a target of one of them;
         see "Heartbeat target checks" and, for access events, "Target engine" under `POST /events`):
@@ -1279,7 +1288,8 @@ components:
         - `openldap_accesslog` -> `openldap`;
         - `cas_audit_log` -> `cas`;
         - `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;
-        - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.
+        - `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;
+        - `firebird_audit_trace` -> `firebird`.
         No value serves `sqlite` (Discovery only, ADR-0059 decision 7).
       type: string
       enum:
@@ -1301,6 +1311,7 @@ components:
         - redis_commandlog
         - redis_acl_log
         - redis_sync
+        - firebird_audit_trace
     Edition:
       description: Engine edition or distribution, when the agent can tell.
       type: string
@@ -1591,7 +1602,8 @@ components:
           description: |
             Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL
             Server's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`
-            or Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does
+            or Valkey `valkey_version` such as `8.1.0-rc1`; Firebird's `ENGINE_VERSION` context
+            variable such as `5.0.4`). Omitted when the reported string does
             not match this pattern. Never sent for a `sqlite` target, which has no server (the
             SQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).
           type: string
@@ -1637,7 +1649,8 @@ components:
                 $ref: "#/components/schemas/TargetNameCase"
           then:
             description: |
-              `name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).
+              `name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1;
+              never on `firebird`, ADR-0060 decision 5).
             properties:
               engine:
                 enum: [mysql, mariadb, sqlserver]
@@ -1656,6 +1669,19 @@ components:
                 const: none
               audit_source: false
               server_version: false
+              edition: false
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: firebird
+          then:
+            description: |
+              A `firebird` target (ADR-0060 decision 6) is Partial at best: `audit_level` is never
+              `full`. Firebird has no editions: no `edition`.
+            properties:
+              audit_level:
+                enum: [partial, limited, none]
               edition: false
     NameCase:
       description: |
@@ -1792,6 +1818,25 @@ components:
           for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
           whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
           read, so records lost to a failing audit target are not counted.
+        - `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird
+          labels below `on_failure_probe`. Firebird system privileges are lowercased as written
+          in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
+          `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
+          the `RDB$ADMIN` role, `database_owner`, `security_database_admin` for the security
+          database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,
+          exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
+          relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
+          (another readable credential relation, `privilege.global_privileges`); `role_graph`
+          (the role graph not evaluated, `privilege.not_evaluated`); the reasons of
+          `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,
+          `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:
+          `AuditTraceConfigFile` names another file; `config_changed_since_start`;
+          `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a
+          section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration
+          settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
+          `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
+          and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
+          `references`, `execute`, `create`, `alter`, `drop`) use that value, with no token.
 
         Each revision is negotiated on its own: a value is sent only when the token of its own
         revision is listed.
@@ -2013,12 +2058,78 @@ components:
         # Microsoft SQL Server.
         # SQL Server check() reads not evaluated (privilege.not_evaluated)
         - on_failure_probe
+        # Revision target_status.note_labels.2026_10_d (ADR-0060 decisions 4 and 6): Firebird.
+        # Firebird system privileges (Firebird 4.0 and 5.0)
+        - user_management
+        - read_raw_pages
+        - create_user_types
+        - use_nbackup_utility
+        - change_shutdown_mode
+        - trace_any_attachment
+        - monitor_any_attachment
+        - access_shutdown_database
+        - create_database
+        - drop_database
+        - use_gbak_utility
+        - use_gstat_utility
+        - use_gfix_utility
+        - ignore_db_triggers
+        - change_header_settings
+        - select_any_object_in_database
+        - access_any_object_in_database
+        - modify_any_object_in_database
+        - change_mapping_rules
+        - use_granted_by_clause
+        - grant_revoke_on_any_object
+        - grant_revoke_any_ddl_right
+        - create_privileged_roles
+        - get_dbcrypt_info
+        - modify_ext_conn_pool
+        - replicate_into_database
+        - profile_any_attachment
+        # Firebird identities of the refusal list
+        - sysdba
+        - rdb_admin
+        - database_owner
+        - security_database_admin
+        # Firebird object rights
+        - usage
+        # Firebird credential relations
+        - verifier_relation_readable
+        - credential_relation_readable
+        # Firebird check() reads not evaluated (privilege.not_evaluated)
+        - role_graph
+        # Firebird trace configuration not evaluated (audit.trace_config_not_evaluated)
+        - firebird_conf_unreadable
+        - trace_config_unreadable
+        - trace_config_file_mismatch
+        - config_changed_since_start
+        - server_process_not_visible
+        - similar_to_pattern
+        # Firebird trace configuration settings (fbtrace.conf)
+        - enabled
+        - log_filename
+        - log_connections
+        - log_statement_finish
+        - log_blr_requests
+        - log_procedure_finish
+        - log_function_finish
+        - log_trigger_finish
+        - log_errors
+        - log_services
+        - time_threshold
+        - print_perf
+        - include_filter
+        - exclude_filter
+        - connection_id
     DetectedTarget:
       description: |
         A local engine spotted by a Unix socket, a local listening port or a process name. At least one
         of `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.
         Never `sqlite` (checked by this schema): SQLite targets are declared files only, with no
-        local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).
+        local detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A
+        `firebird` server is detected by its local port (3050) or its `firebird` process
+        (ADR-0060 decision 7), never by a `unix_socket` (checked by this schema).
       type: object
       additionalProperties: false
       required: [engine]
@@ -2037,19 +2148,32 @@ components:
           description: |
             Process name only (the command line may contain secrets and is never read or sent).
             `sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and
-            `valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see
-            `Engine`): a detected target of such an engine is not sent before the token is listed.
+            `valkey-server` (ADR-0052 decision 11) and `firebird` (the Firebird server, ADR-0060
+            decision 7) belong to engines gated by their token (see `Engine`): a detected target
+            of such an engine is not sent before the token is listed.
           type: string
-          enum: [postgres, mysqld, mariadbd, mongod, slapd, sqlservr, redis-server, valkey-server]
-      if:
-        required: [engine]
-        properties:
-          engine:
-            const: sqlite
-      then:
-        description: No detected target of the `sqlite` engine (ADR-0059 decision 2).
-        properties:
-          engine: false
+          enum: [postgres, mysqld, mariadbd, mongod, slapd, sqlservr, redis-server, valkey-server, firebird]
+      allOf:
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: sqlite
+          then:
+            description: No detected target of the `sqlite` engine (ADR-0059 decision 2).
+            properties:
+              engine: false
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: firebird
+          then:
+            description: |
+              A `firebird` server is detected by its port or its process only (ADR-0060 decision
+              7): no `unix_socket` (Firebird listens on TCP; a local socket path is never sent).
+            properties:
+              unix_socket: false
     SpoolStatus:
       type: object
       additionalProperties: false
@@ -2590,6 +2714,9 @@ components:
         database, the same on every SQLite target: the `target_id` tells files apart; checked by
         this schema), no `schema`, `object` = the table name, `field` = the column name. Never
         the file's path, its name or a side file's name.
+        Firebird (ADR-0060 decision 5): `database` = the name declared in `agent.yaml`, never a
+        file path or alias; `object` = the table; `field` = the column; no `schema` (checked by
+        this schema: Firebird 4.0 and 5.0 have no schemas).
 
         `object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on
         every other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or
@@ -2653,6 +2780,16 @@ components:
             properties:
               database:
                 const: main
+              schema: false
+        - if:
+            required: [engine]
+            properties:
+              engine:
+                const: firebird
+          then:
+            description: |
+              Firebird (ADR-0060 decision 5): database, table and column; no `schema`.
+            properties:
               schema: false
     LocationPart:
       description: |
@@ -2904,6 +3041,35 @@ components:
                   properties:
                     account_not_recorded:
                       const: true
+        - description: |
+            Firebird trace events (ADR-0060 decisions 5 and 6): no `principal.application` (the
+            client process name is set by the client, can be spoofed and may hold a path with a
+            user name, so the agent drops it) and no `schema` in an object (Firebird 4.0 and 5.0
+            have no schemas).
+          if:
+            required: [source]
+            properties:
+              source:
+                const: firebird_audit_trace
+          then:
+            properties:
+              principal:
+                type: object
+                properties:
+                  application: false
+              objects:
+                type: array
+                not:
+                  contains:
+                    description: |
+                      An object that names a `schema`, whatever its value: it does not satisfy
+                      "`schema` absent" (`properties: {schema: false}`). Written without `required`,
+                      which Ajv's strict mode and the redocly lint accept only with `type` and a
+                      declared property.
+                    type: object
+                    not:
+                      properties:
+                        schema: false
     Principal:
       description: |
         Who accessed. Exactly one of `db_user` / `db_user_fingerprint` / `account_not_recorded`. For a failed authentication with
