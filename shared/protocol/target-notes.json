@@ -137,7 +137,7 @@
     ]
   },
   "audit.log_readable_by_others": {
-    "description": "A uid other than root, the server's account and the agent's account can read the Firebird trace log, a rotated file it still tracks or new files in its directory (mode bits, groups, access or default ACLs; also when a group's members cannot be enumerated, or the agent's identity files are not the host's): that account sees the logged statements, passwords set through SQL included, and every live token. Partial is withheld while it lasts.",
+    "description": "A uid other than root, the server's account and the agent's account can read the Firebird trace log, a rotated file it still tracks or new files in its directory (mode bits, groups, access or default ACLs; also when a group's members cannot be enumerated, or the agent's identity files are not the host's): that account sees the logged statements, passwords set through SQL included, and the record tokens that tell forged trace records apart. Partial is withheld while it lasts.",
     "engines": [
       "firebird"
     ]
@@ -306,7 +306,7 @@
     ]
   },
   "audit.trace_config_not_evaluated": {
-    "description": "Limited: the Firebird trace configuration of a declared database could not be evaluated. Labels give the reason: firebird_conf_unreadable, trace_config_unreadable (refused or not parsed), trace_config_file_mismatch, config_changed_since_start, server_process_not_visible, similar_to_pattern (a SIMILAR TO pattern, or _ or % in a file name), databases_conf (alias map not evaluated or changed), foreign_databases_logged (undeclared databases can reach the log), database_path_not_unique (several hard links).",
+    "description": "Limited: a declared database's Firebird trace configuration was not evaluated: firebird_conf_unreadable or trace_config_unreadable (unreadable, refused or unparsed), trace_config_file_mismatch (AuditTraceConfigFile names another file), config_changed_since_start, server_process_not_visible (e.g. another pid namespace), similar_to_pattern (SIMILAR TO, _ or % in a file name), databases_conf (alias map unproven), foreign_databases_logged (undeclared databases logged), database_path_not_unique (hard-linked).",
     "engines": [
       "firebird"
     ]
