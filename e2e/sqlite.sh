@@ -295,10 +295,11 @@ phase_done audit-configure
 # `skipped_error` too, without dying (on this file every later table: the scan ends with all its
 # tables `skipped_error` and none sampled, unless the application restarted during it). The
 # application exits at its next heartbeat write (build.py: a -shm truncated under its connection)
-# and is restarted (restart: on-failure); the restarted process's open rebuilds the WAL index.
-# No cadence decides when either: once the scan ended, the run triggers that write (SIGUSR1), waits
-# for the restart and the restarted process's "paced.db: held open, -shm N bytes" line (the WAL index
-# rebuilt), then for an agent heartbeat reported after it, before the next scan.
+# and is restarted (by Docker, restart: on-failure, or else by the run); the restarted process's
+# open rebuilds the WAL index. No cadence decides when either: once the scan ended, the run
+# triggers that write (SIGUSR1), waits for the restarted process's "paced.db: held open, -shm N
+# bytes" line (the WAL index rebuilt), then for an agent heartbeat reported after it, before the
+# next scan.
 # No delay decides when to truncate: the trigger is the agent's "sqlite catalog read" line for this
 # target, logged when the scan's first unit is done (the catalog read, whose failure fails the whole
 # scan, so it must not be the unit that meets the truncation; the reader has mapped the -shm then and
@@ -312,6 +313,7 @@ restarts0="$(docker inspect -f '{{.RestartCount}}' "$agent_cid")"
 app_cid="$(compose ps -q target-sqlite)"
 app_restarts0="$(docker inspect -f '{{.RestartCount}}' "$app_cid")"
 app_opens0="$(app_log_count "${PACED_FILE}: held open")"
+app_exits0="$(app_log_count "${PACED_FILE}-shm: truncated under the held connection")"
 deaths0="$(agent_log_count "sqlite reader process lost" "$PACED_TARGET")"
 catalogs0="$(agent_log_count "sqlite catalog read" "$PACED_TARGET")"
 printf '%s' '{"sample_rows":100,"max_duration_s":600,"statement_timeout_ms":5000}' >"$E2E_WORK_DIR/scan-req.json"
@@ -344,27 +346,42 @@ deaths=$(( $(agent_log_count "sqlite reader process lost" "$PACED_TARGET") - dea
 log "truncated -shm: scan succeeded, coverage ${progress}, reader(s) lost ${deaths}; agent running, not restarted"
 [ "$deaths" = 1 ] || fail "the truncated -shm cost ${deaths} reader(s), expected 1"
 [ "$lost" -ge 1 ] || fail "the truncated -shm cost no unit (skipped_error ${lost})"
-# The application's next write (triggered now; it may already have come at its 20 s cadence): it
-# exits, is restarted, and the restarted process rebuilds the WAL index.
-if [ "$(docker inspect -f '{{.RestartCount}}' "$app_cid")" = "$app_restarts0" ]; then
+# The application's next write, triggered now (unless its 20 s cadence came first): it exits (75).
+# The signal is sent from inside the container, not by `docker kill`: the daemon may take a killed
+# container as stopped by hand and skip its restart policy (seen in CI: exited 75, restarts 0).
+# Either Docker restarts it (restart: on-failure) or, once it is seen exited, the run starts it, as
+# an operator or a supervisor would: what the scenario proves is the agent's recovery once the
+# application rebuilt its index, not Docker's restart. The proof of that rebuild is the restarted
+# process's "held open, -shm N bytes" line, with N at least one WAL-index region.
+if [ "$(docker inspect -f '{{.State.Running}}' "$app_cid")" = true ]; then
   # Not fatal: a write at its cadence may have just made it exit (the wait below decides).
-  docker kill -s USR1 "$app_cid" >/dev/null || log "target-sqlite not signalled (SIGUSR1): already exiting?"
+  compose exec -T target-sqlite python3 -I -B -c 'import os, signal; os.kill(1, signal.SIGUSR1)' \
+    || log "target-sqlite not signalled (SIGUSR1): already exiting?"
 fi
+started=0
 deadline=$(( $(date +%s) + 90 ))
-until [ "$(docker inspect -f '{{.RestartCount}}' "$app_cid")" -gt "$app_restarts0" ] \
+until [ "$(docker inspect -f '{{.State.Running}}' "$app_cid")" = true ] \
     && [ "$(app_log_count "${PACED_FILE}: held open")" -gt "$app_opens0" ]; do
+  if [ "$started" = 0 ] && [ "$(docker inspect -f '{{.State.Status}}' "$app_cid")" = exited ]; then
+    [ "$(app_log_count "${PACED_FILE}-shm: truncated under the held connection")" -gt "$app_exits0" ] \
+      || fail "target-sqlite exited ($(docker inspect -f 'exit {{.State.ExitCode}}' "$app_cid")) without finding the truncated -shm of ${PACED_FILE}"
+    log "target-sqlite exited ($(docker inspect -f 'exit {{.State.ExitCode}}, restarts {{.RestartCount}}' "$app_cid")), not restarted by Docker: starting it"
+    compose start target-sqlite >&2 || fail "cannot start target-sqlite again"
+    started=1
+  fi
   [ "$(date +%s)" -lt "$deadline" ] || fail "target-sqlite did not restart and reopen ${PACED_FILE} within 90 s \
-($(docker inspect -f '{{.State.Status}} exit {{.State.ExitCode}} restarts {{.RestartCount}}' "$app_cid"))"
+($(docker inspect -f '{{.State.Status}} exit {{.State.ExitCode}} restarts {{.RestartCount}}' "$app_cid"), started by the run: ${started})"
   sleep 0.5
 done
 shm="$(app_logs | grep -F "${PACED_FILE}: held open, -shm " | tail -n1 | sed -n 's/.*-shm \([0-9]*\) bytes.*/\1/p')"
 [ "${shm:-0}" -ge 32768 ] || fail "the restarted application did not rebuild the WAL index of ${PACED_FILE} (-shm ${shm:-?} bytes)"
-log "application restarts: $(( $(docker inspect -f '{{.RestartCount}}' "$app_cid") - app_restarts0 )), WAL index rebuilt (-shm ${shm} bytes)"
-# Then an agent heartbeat checked after it, reporting the target reachable with no WAL note.
-reopened="$(console_sql "SELECT now()")"
+log "application reopened ${PACED_FILE} (Docker restarts $(( $(docker inspect -f '{{.RestartCount}}' "$app_cid") - app_restarts0 )), started by the run ${started}), WAL index rebuilt (-shm ${shm} bytes)"
+# Then an agent heartbeat whose checks all ran after that line: received at least 3 s (the 2 s check
+# budget, and slack) after the time taken here, which is after the line.
+reopened="$(console_sql "SELECT now() + interval '3 seconds'")"
 deadline=$(( $(date +%s) + 120 ))
 until [ "$(console_sql "SELECT count(*) FROM agent_targets WHERE agent_id = '${AGENT_ID}' AND target_id = '${PACED_TARGET}' AND last_reported_at > '${reopened}'::timestamptz")" = 1 ]; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "no agent heartbeat for ${PACED_TARGET} within 120 s of the application's restart"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "no agent heartbeat for ${PACED_TARGET} within 120 s of the application's reopening"
   sleep 1
 done
 wait_target_state "$PACED_TARGET" 60 '.reachable == true and ([.notes[]?.code] | index("coverage.wal_files_not_readable") | not)' \

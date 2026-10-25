@@ -801,12 +801,15 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   application rebuilds its WAL index the next readers cannot use the truncated `-shm` (a read-only
   reader cannot map or rebuild it) and count each later table `skipped_error` without dying, so the 3-deaths stop is not reached; fewer
   only if the application restarted during the scan, hence `≥ 1`. Then, with no wait on the
-  application's 20 s write cadence: the run sends it `SIGUSR1` (one write now), the application
-  exits at that write (a `-shm` truncated under its connection, status 75) and is restarted; the run
-  waits (90 s at most) for its restart count to grow and for the restarted process's
+  application's 20 s write cadence: the run sends it `SIGUSR1` from inside its container (one write
+  now; not `docker kill`, after which Docker did not apply the restart policy in CI), the
+  application exits at that write (a `-shm` truncated under its connection, status 75), and either
+  Docker restarts it (`restart: on-failure`) or, once it is seen exited, the run starts it
+  (`docker compose start`), as an operator or a supervisor would: the scenario proves the agent's
+  recovery, not Docker's restart. The run waits (90 s at most) for the restarted process's
   "paced.db: held open, -shm N bytes" line with N ≥ 32 768 (the WAL index rebuilt), then (120 s at
-  most) for an agent heartbeat reported after that, with the target reachable and no
-  `coverage.wal_files_not_readable` note. A new scan then loses no unit and finds nothing. Last, the I2 scans of the console
+  most) for an agent heartbeat received at least 3 s after it (so its checks ran after the
+  rebuild), with the target reachable and no `coverage.wal_files_not_readable` note. A new scan then loses no unit and finds nothing. Last, the I2 scans of the console
   database, the pages, the agent's state and every log (no ground-truth value or value-bearing
   name), no path or side-file name on the console side or in the agent's log, and the secret
   hygiene of the other runs.
