@@ -1127,9 +1127,8 @@ jobs:
   # the dev seed's three files written and held open by the application sidecar, mounted read-only
   # into the agent; Discovery against the ground truth, "Discovery only" on the agent page, an
   # audit.configure attempt ending unsupported, a -shm truncated during a scan, the I2 check.
-  # Needs the console to list `engine.sqlite` (P10-E): until then the agent holds the targets' items
-  # (ADR-0042) and the run fails at its first wait. NOT in ci-result's needs yet: added there (as
-  # e2e-cas, e2e-sqlserver and e2e-redis are) once P10-E is merged and this job is green.
+  # Needs the console to list `engine.sqlite` (P10-E, #357). Required through ci-result, like
+  # e2e-cas, e2e-sqlserver and e2e-redis.
   e2e-sqlite:
     name: E2E SQLite targets
     needs: detect
@@ -1199,7 +1198,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
