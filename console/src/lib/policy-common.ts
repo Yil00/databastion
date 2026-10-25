@@ -106,15 +106,17 @@ export function dedupDatabaseName(name: string, engine: string | null): string {
  * `exceptionPartOptions` in src/lib/name-case.ts), and OpenLDAP (case-insensitive matching rules
  * of the naming attributes).
  * Every other engine compares with case, an unknown or null engine included: PostgreSQL, MongoDB,
- * Redis, Valkey and Apereo CAS by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES}), and an
- * engine added later is never loosened before its connector ADR decides. Policy conditions,
+ * Redis, Valkey, Apereo CAS and SQLite by definition ({@link CASE_SENSITIVE_EXCEPTION_ENGINES};
+ * SQLite: ADR-0059 decision 6, it folds ASCII letters only, so the Unicode fold would let an
+ * exception for `Ärzte` cover a distinct table `ärzte`), and an engine added later is never
+ * loosened before its connector ADR decides. Policy conditions,
  * per-object sensitivity and scores stay case-insensitive on every engine (looser matching only
  * reports more).
  */
 export const CASE_BLIND_EXCEPTION_ENGINES: readonly string[] = ["sqlserver", "mysql", "mariadb", "openldap"];
 
 /** The contract engines on which location exceptions compare names with case (ADR-0054). */
-export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas"];
+export const CASE_SENSITIVE_EXCEPTION_ENGINES: readonly string[] = ["postgres", "mongodb", "redis", "valkey", "cas", "sqlite"];
 
 /** Whether location exceptions compare names with case on `engine` (ADR-0054 decision 1). */
 export function exceptionMatchesCase(engine: string | null): boolean {
@@ -131,6 +133,50 @@ export function exceptionGlobOptions(engine: string | null): GlobOptions {
     ignoreTrailingSpaces: engine !== null && TRAILING_SPACE_BLIND_ENGINES.includes(engine),
     matchCase: exceptionMatchesCase(engine),
   };
+}
+
+/**
+ * Engines whose locations cannot tell two targets apart (P10-C security review R2): every SQLite
+ * location has `database` `main` and no schema (ADR-0059 decision 6), so a location glob names a
+ * table and a column of any SQLite file. On these engines a location exception reaches an item
+ * only when it is scoped to the item's agent **and** target (a target id is an agent-local slug,
+ * so a target id alone may name files on several agents), or when it was created with the explicit
+ * `cross_target` confirmation (policy exception API, audited). Exceptions without a location
+ * (agent, target or classifier scopes only) are not location-keyed and keep their meaning.
+ * Stricter only: an exception that does not reach an item suppresses nothing there.
+ */
+export const TARGET_SCOPED_EXCEPTION_ENGINES: readonly string[] = ["sqlite"];
+
+/** Whether `engine` is in {@link TARGET_SCOPED_EXCEPTION_ENGINES}. */
+export function exceptionsTargetScoped(engine: string | null | undefined): boolean {
+  return engine !== null && engine !== undefined && TARGET_SCOPED_EXCEPTION_ENGINES.includes(engine);
+}
+
+/** The scope of an exception that {@link exceptionReachesItem} reads. */
+export interface ExceptionReach {
+  agentId: string | null;
+  targetId: string | null;
+  location: object | null;
+  /** The `cross_target` confirmation stored with the exception (`policy_exceptions.cross_target`). */
+  crossTarget: boolean;
+}
+
+/**
+ * Whether a location exception may be compared with an item of `engine` at all (P10-C review R2):
+ * always on engines outside {@link TARGET_SCOPED_EXCEPTION_ENGINES} and for exceptions without a
+ * location; on those engines, only when it is scoped to an agent and a target (the caller still
+ * compares them with the item's) or carries the `cross_target` confirmation. A null engine is
+ * not a target-scoped one (every finding and event has an engine; an event's engine is its
+ * source's or its target's).
+ */
+export function exceptionReachesItem(x: ExceptionReach, engine: string | null | undefined): boolean {
+  if (x.location === null || !exceptionsTargetScoped(engine)) return true;
+  return (x.agentId !== null && x.targetId !== null) || x.crossTarget;
+}
+
+/** Whether an exception scope needs the `cross_target` confirmation to reach the items of {@link TARGET_SCOPED_EXCEPTION_ENGINES}. */
+export function exceptionIsCrossTarget(x: Pick<ExceptionReach, "agentId" | "targetId" | "location">): boolean {
+  return x.location !== null && (x.agentId === null || x.targetId === null);
 }
 
 /** The parts of a location (finding) or an event object (no `field`). */

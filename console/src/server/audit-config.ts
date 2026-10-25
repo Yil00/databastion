@@ -4,7 +4,7 @@ import type { Database } from "@/db/client";
 import { agents, agentTargets, auditConfigs, findings, jobs } from "@/db/schema";
 import { minRowsWarning, type AuditWarning, type MinRowsWarning } from "@/lib/audit-warning";
 import { objectSensitivity } from "@/lib/event-model";
-import { isKeyPatternEngine } from "@/lib/location-labels";
+import { isDiscoveryOnlyEngine, isKeyPatternEngine } from "@/lib/location-labels";
 import { logger } from "@/lib/logger";
 import { checkSemantics, validateSchema, type Schemas } from "@/lib/protocol/validate";
 
@@ -354,7 +354,9 @@ export type AuditConfigureOutcome =
       minRowsWarning: MinRowsWarning | null;
     }
   | { outcome: "not_found" }
-  | { outcome: "invalid" };
+  | { outcome: "invalid" }
+  /** A Discovery-only target (SQLite, ADR-0059 decision 7): no Audit, nothing queued. */
+  | { outcome: "unsupported" };
 
 /**
  * Computes the settings of `input` for the target, and, unless a confirmation is required and
@@ -421,6 +423,9 @@ async function queueAuditSettings(
       .where(and(eq(agentTargets.agentId, agentId), eq(agentTargets.targetId, targetId)))
       .limit(1);
     if (!target?.present) return { outcome: "not_found" };
+    // ADR-0059 decision 7: Audit is None by nature on SQLite; the agent would end the job
+    // `unsupported`, so the console never queues one (refused clearly, audited by the caller).
+    if (isDiscoveryOnlyEngine(target.engine)) return { outcome: "unsupported" };
     const keyPatternTarget = isKeyPatternEngine(target.engine);
     const rowsWarning = minRowsWarning(keyPatternTarget, input.minRows);
     // A key pattern names a Redis / Valkey object only (contract `SensitiveObject`, as `ObjectRef`).

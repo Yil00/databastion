@@ -95,6 +95,32 @@ const PHONE = {
   matched: 40,
 };
 
+/** P10-E: an agent with two SQLite files whose tables and columns have the same names. */
+const SQLITE_HEARTBEAT = {
+  ...HEARTBEAT,
+  connectors: ["sqlite"],
+  targets: [
+    { target_id: "crm-app", engine: "sqlite", reachable: true, audit_level: "none" },
+    { target_id: "billing-app", engine: "sqlite", reachable: true, audit_level: "none" },
+  ],
+};
+
+/** A SQLite finding: `database` is `main` on every target (ADR-0059 decision 6). */
+const sqliteFinding = (targetId: string) => ({
+  target_id: targetId,
+  location: { engine: "sqlite", database: "main", object: "customers", field: "email" },
+  classifier: "pii.email",
+  confidence: 0.97,
+  sampled: 64,
+  matched: 61,
+});
+
+async function sqliteAgent(): Promise<Auth> {
+  const auth = await enroll();
+  expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: SQLITE_HEARTBEAT }))).status).toBe(200);
+  return auth;
+}
+
 async function agentWithTargets(): Promise<Auth> {
   const auth = await enroll();
   expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: HEARTBEAT }))).status).toBe(200);
@@ -490,6 +516,73 @@ describe.skipIf(!hasDb)("policies and incidents (PostgreSQL)", () => {
       expect((await unexcept(id)).status).toBe(204);
       await drainPolicyWork(getDb());
       expect(await incidentsOf(auth.agentId)).toHaveLength(3);
+    });
+
+    it("P10-E (P10-C review R2): a SQLite location exception covers its agent and target only, unless confirmed cross_target (audited)", async () => {
+      const auth = await sqliteAgent();
+      const policyId = await newPolicy({ ...EMAIL_POLICY, name: "SQLite e-mails", conditions: { classifiers: ["pii.email"] } });
+      const location = { database: "main", object: "customers", field: "email" };
+      // Not scoped to an agent and a target, not confirmed: created, but covers no SQLite file.
+      let res = await except({ policy_id: policyId, location, reason: "Test data" });
+      expect(res.status).toBe(201);
+      const wide = (await res.json()) as { id: string; sqlite_scope: string };
+      expect(wide.sqlite_scope).toBe("excluded");
+      expect((await audits("policy_exception.create", wide.id))[0]?.details).toMatchObject({ cross_target: false, sqlite_scope: "excluded" });
+      // A target id alone (an agent-local slug) is not a target scope either.
+      res = await except({ policy_id: policyId, target_id: "billing-app", location, reason: "Test data" });
+      expect(((await res.json()) as { sqlite_scope: string }).sqlite_scope).toBe("excluded");
+      // Scoped to the agent and crm-app: that file only.
+      res = await except({ policy_id: policyId, agent_id: auth.agentId, target_id: "crm-app", location, reason: "Test data" });
+      expect(res.status).toBe(201);
+      const scoped = (await res.json()) as { id: string; sqlite_scope: string };
+      expect(scoped.sqlite_scope).toBe("target");
+      expect((await audits("policy_exception.create", scoped.id))[0]?.details).toMatchObject({ cross_target: false, sqlite_scope: "target" });
+      await scanWith(auth, [sqliteFinding("crm-app")], "crm-app");
+      await scanWith(auth, [sqliteFinding("billing-app")], "billing-app");
+      await drainPolicyWork(getDb());
+      const open = await incidentsOf(auth.agentId);
+      expect(open.map((i) => i.targetId)).toEqual(["billing-app"]);
+      // Rows kept apart per target (finding key, dedup key): two findings, one incident.
+      expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(2);
+
+      // Confirmed cross_target: it reaches every SQLite file of its scope, on any agent.
+      res = await except({ policy_id: policyId, location, reason: "Shared schema", cross_target: true });
+      expect(res.status).toBe(201);
+      const cross = (await res.json()) as { id: string; sqlite_scope: string };
+      expect(cross.sqlite_scope).toBe("every_target");
+      expect((await audits("policy_exception.create", cross.id))[0]?.details).toMatchObject({ cross_target: true, sqlite_scope: "every_target" });
+      const [row] = await getDb().select().from(policyExceptions).where(eq(policyExceptions.id, cross.id));
+      expect(row?.crossTarget).toBe(true);
+      const other = await sqliteAgent();
+      await scanWith(other, [sqliteFinding("crm-app")], "crm-app");
+      await scanWith(other, [sqliteFinding("billing-app")], "billing-app");
+      await drainPolicyWork(getDb());
+      expect(await incidentsOf(other.agentId)).toHaveLength(0);
+      // Deleting it lets the policy apply to the other agent's files again (the exception scoped
+      // to the first agent's crm-app does not reach them).
+      expect((await unexcept(cross.id)).status).toBe(204);
+      await drainPolicyWork(getDb());
+      expect((await incidentsOf(other.agentId)).map((i) => i.targetId).sort()).toEqual(["billing-app", "crm-app"]);
+    });
+
+    it("the database refuses cross_target on an exception it means nothing on (CHECK, migration 0048)", async () => {
+      await expect(
+        getDb().insert(policyExceptions).values({ targetId: "crm-app", reason: "x", crossTarget: true }),
+      ).rejects.toThrow();
+      const agentId = (await sqliteAgent()).agentId;
+      await expect(
+        getDb().insert(policyExceptions).values({ agentId, targetId: "crm-app", location: { object: "x" }, reason: "x", crossTarget: true }),
+      ).rejects.toThrow();
+    });
+
+    it.each([
+      ["cross_target on an exception scoped to an agent and a target", { agent_id: "01890a5d-ac96-774b-bcce-b302099a8057", target_id: "crm-app", location: { object: "x" }, reason: "x", cross_target: true }, "cross_target"],
+      ["cross_target without a location", { target_id: "crm-app", reason: "x", cross_target: true }, "cross_target"],
+      ["cross_target not a boolean", { location: { object: "x" }, reason: "x", cross_target: "yes" }, "cross_target"],
+    ])("rejects %s", async (_name, body, field) => {
+      const res = await except(body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "invalid_exception", field });
     });
 
     it.each([

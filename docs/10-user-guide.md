@@ -417,6 +417,11 @@ What to do:
 
 **Not covered**: a refused `xp_cmdshell` leaves no event on this source; the plan cache (`sys.dm_exec_query_stats`) is not a source, so a server where neither SQL Server Audit nor a session is usable reports None; RPC calls of user procedures, `event_file` rollover while the agent reads, Windows servers and the Developer edition are not measured; this source is not in the end-to-end or load tests (integration tests and the engine matrix only).
 
+### SQLite targets
+A SQLite target is one database file declared in `agent.yaml` ([ADR-0059](adr/0059-sqlite-connector.md); not released yet). SQLite has no server and no access log, so a SQLite target is **Discovery only**: its audit level is `none`, the agent page shows "Discovery only" and no server version, and the console refuses Audit settings for it.
+- **Name the target after the application, not the file** (`crm-app`, not `customers.db` or a path): the target id is the only thing that tells two SQLite files apart in the console, and the path is never sent. Every SQLite location is the database `main`, so the console shows a SQLite finding as its target, its table and its column.
+- **Location exceptions are scoped to the target**: an exception with a location pattern covers SQLite findings only when it names both the agent id and the target. Without both, it still applies to the other engines but covers no SQLite target, and the console says so when you create it. To cover the same table and column names in every SQLite file of the exception's scope, tick the cross-target confirmation: the confirmation is recorded in the console audit log. Exceptions without a location (agent, target or classifier only) work as on other engines. SQLite names are compared with case, and trailing spaces count.
+
 ## 7. Least-privilege accounts
 Give each target a **dedicated, read-only** account (I4). The recommended accounts, with the exact statements, are in [05-security.md, "Recommended database accounts"](05-security.md#recommended-database-accounts-read-only):
 

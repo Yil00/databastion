@@ -280,12 +280,14 @@ that replica accepts (capability tokens, [ADR-0022](../docs/adr/0022-protocol-ca
 decision 8); an agent that learned a new token from an upgraded replica sends the field to every
 replica, an older replica answers `400`, and the agent resends those items without the field, so
 they lose it (for example the overflowed-objects flag of an event, the name case of a target, the
-"altered by normalization" marker of a finding). To avoid that, hold the new tokens back with
+"altered by normalization" marker of a finding). An engine token is worse: a 0.9 replica answers
+`400` to every heartbeat that reports a SQLite target and to every SQLite findings batch, once an
+agent learned `engine.sqlite` from an upgraded replica. To avoid that, hold the new tokens back with
 `DATABASTION_AGENT_TOKENS_HOLD` ([console/README.md](../console/README.md#configuration)) until no
 older replica remains:
 
 1. Set `DATABASTION_AGENT_TOKENS_HOLD` to the release line the replicas run now (`0.8` for 0.8.0,
-   0.8.1 or 0.8.2, the only value today) in the environment of every web process of the new build
+   0.8.1 or 0.8.2; `0.9` for 0.9.x) in the environment of every web process of the new build
    (in `compose.yaml`, the `environment` of the `console` service; the worker answers no agent and
    only checks the value). An older build ignores the variable; a value the new build does not
    know stops it at startup. **Check every replica**: each web process reports its hold on its
@@ -308,7 +310,9 @@ older replica remains:
    it is removed, no agent sends the held fields, so the detection rules of the new release that
    depend on them do not apply (for 0.9: overflowed event objects reaching object- and
    sensitivity-scoped policies, ADR-0053; exceptions following the server's name case, ADR-0055;
-   exceptions not covering names altered by normalization, ADR-0056). Check that every replica's
+   exceptions not covering names altered by normalization, ADR-0056; after 0.9: SQLite targets,
+   ADR-0059, which the agents report only once `engine.sqlite` is listed and whose findings wait
+   in their spool until then). Check that every replica's
    `databastion_console_agent_tokens_hold` is back to `0`; alerting on it staying `1` is a good idea.
 4. Upgrade the agents. They send the new fields once a heartbeat answer lists their tokens.
 

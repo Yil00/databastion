@@ -6,7 +6,7 @@ import { objectMatches, type EventObject } from "@/lib/event-model";
 import { auditSourceEngine, auditSourceTable } from "@/lib/location-labels";
 import { errorSummary, type Logger } from "@/lib/logger";
 import { anyWithCase, canonicalNameCase, exceptionPartOptions, withoutCase, type NameCaseRule } from "@/lib/name-case";
-import { CASE_BLIND_EXCEPTION_ENGINES, exceptionMatchesCase, UUID, type PartGlobOptions } from "@/lib/policy-common";
+import { CASE_BLIND_EXCEPTION_ENGINES, exceptionMatchesCase, exceptionReachesItem, UUID, type PartGlobOptions } from "@/lib/policy-common";
 import { classifierSelected, locationMatches, type FindingFacts, type LocationPattern } from "@/lib/policy-model";
 
 import { writeAudit } from "./audit";
@@ -71,6 +71,8 @@ export interface InventoryException {
   classifier: string | null;
   location: LocationPattern | null;
   expiresAt: Date | null;
+  /** `policy_exceptions.cross_target` (P10-C review R2): see `exceptionReachesItem`. */
+  crossTarget: boolean;
 }
 
 export interface FindingNameGroup {
@@ -139,6 +141,8 @@ export function findingCaseChange(x: InventoryException, g: FindingNameGroup): b
   if (!anyWithCase(strict)) return false;
   if (x.agentId !== null && x.agentId !== g.agentId) return false;
   if (x.targetId !== null && x.targetId !== g.targetId) return false;
+  // P10-C review R2: an exception that never reaches a SQLite finding did not cover it before either.
+  if (!exceptionReachesItem(x, g.engine)) return false;
   if (x.classifier !== null && !classifierSelected([x.classifier], g.classifier)) return false;
   const f: FindingFacts = { ...g, confidence: 0, sampled: 0, matched: 0 };
   return locationMatches(x.location, f, loose) && !locationMatches(x.location, f, strict);
@@ -156,6 +160,7 @@ export function eventCaseChange(x: InventoryException, g: EventNameGroup): boole
   if (x.classifier !== null) return false;
   if (x.agentId !== null && x.agentId !== g.agentId) return false;
   if (x.targetId !== null && x.targetId !== g.targetId) return false;
+  if (!exceptionReachesItem(x, g.engine)) return false;
   const { field, ...parts } = x.location;
   if (field !== undefined && field !== "*") return false;
   const o: EventObject = g.schema === null ? { database: g.database, object: g.object } : { database: g.database, schema: g.schema, object: g.object };
@@ -240,6 +245,7 @@ async function loadExceptions(tx: Tx): Promise<InventoryException[]> {
       classifier: policyExceptions.classifier,
       location: policyExceptions.location,
       expiresAt: policyExceptions.expiresAt,
+      crossTarget: policyExceptions.crossTarget,
     })
     .from(policyExceptions)
     .where(sql`${policyExceptions.location} is not null`)

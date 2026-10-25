@@ -42,7 +42,7 @@ const HEARTBEAT = {
   agent_version: "0.1.0",
   uptime_s: 12,
   classifiers_version: "2026.09.1",
-  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis"],
+  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis", "sqlite"],
   targets: [
     { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "limited" },
     { target_id: "pg-other", engine: "postgres", reachable: true, audit_level: "limited" },
@@ -54,6 +54,8 @@ const HEARTBEAT = {
     { target_id: "mssql-prod", engine: "sqlserver", reachable: true, audit_level: "partial", audit_source: "sqlserver_audit" },
     { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
     { target_id: "sessions-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+    // P10-E: CONSOLE_ACCEPTS lists engine.sqlite (Discovery only: audit level none, no server version).
+    { target_id: "crm-app", engine: "sqlite", reachable: true, audit_level: "none" },
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
@@ -147,8 +149,8 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
   });
 
   describe("contract fixtures", () => {
-    it("stores the sqlserver, redis and valkey fixtures with their locations as sent (P9-E)", async () => {
-      for (const name of ["FindingsBatch.sqlserver.json", "FindingsBatch.redis.json", "FindingsBatch.valkey.json"]) {
+    it("stores the sqlserver, redis, valkey and sqlite fixtures with their locations as sent (P9-E, P10-E)", async () => {
+      for (const name of ["FindingsBatch.sqlserver.json", "FindingsBatch.redis.json", "FindingsBatch.valkey.json", "FindingsBatch.sqlite.json"]) {
         const [, fixture] = fixtures("valid", "FindingsBatch").find(([f]) => f === name) ?? [];
         expect(fixture, name).toBeDefined();
         expect(unlistedEngineDetails("FindingsBatch", fixture), name).toEqual([]);
@@ -185,27 +187,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
       expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
     });
 
-    // Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`sqlite`, ADR-0059
-    // decision 8: in the contract since P10-C, listed by P10-E).
-    const unlistedFindings = ([, body]: [string, unknown]) => unlistedEngineDetails("FindingsBatch", body).length > 0;
-
-    it.each(fixtures("valid", "FindingsBatch").filter(unlistedFindings))(
-      "valid fixture %s -> 400 enum on every unlisted engine value, nothing stored",
-      async (_f, fixture) => {
-        const auth = await agentWithTargets();
-        const body = structuredClone(fixture) as Body;
-        body.job_id = await deliveredScan(auth);
-        body.batch_id = uuidv7();
-        const res = await post(auth, body);
-        expect(res.status).toBe(400);
-        const err = await expectConformingError(res, body);
-        expect(err.code).toBe("invalid_request");
-        expect(err.details).toEqual(body.findings.map((_, i) => ({ pointer: `/findings/${i}/location/engine`, keyword: "enum" })));
-        expect(await getDb().select().from(findings).where(eq(findings.agentId, auth.agentId))).toHaveLength(0);
-      },
-    );
-
-    it.each(fixtures("valid", "FindingsBatch").filter((f) => !unlistedFindings(f)))("valid fixture %s -> 202 and stored", async (_f, fixture) => {
+    it.each(fixtures("valid", "FindingsBatch"))("valid fixture %s -> 202 and stored", async (_f, fixture) => {
       const auth = await agentWithTargets();
       const body = structuredClone(fixture) as Body;
       const target = String(body.findings[0]?.target_id);
@@ -792,7 +774,7 @@ describe.skipIf(!hasDb)("POST /findings (PostgreSQL)", () => {
     };
     const covers = (row: typeof findings.$inferSelect, location: Record<string, string>) =>
       exceptionCovers(
-        { policyId: null, agentId: null, targetId: null, classifier: null, location, expiresAt: null },
+        { policyId: null, agentId: null, targetId: null, classifier: null, location, expiresAt: null, crossTarget: false },
         "p",
         { ...row, altered: row.altered },
         new Date(),

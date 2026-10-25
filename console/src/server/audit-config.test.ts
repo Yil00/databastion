@@ -652,6 +652,30 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(await off.json()).toMatchObject({ error: "confirmation_required", min_rows_warning: "no_row_counts" });
   });
 
+  it("P10-E: Audit settings of a SQLite target (Discovery only) are refused with 409 audit_unsupported, audited, nothing queued", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "sqlite"],
+      targets: [...HEARTBEAT.targets, { target_id: "crm-app", engine: "sqlite", reachable: true, audit_level: "none" }],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    for (const body of [{ enabled: true }, { enabled: false }]) {
+      const res = await configure(auth, body, { target: "crm-app" });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "audit_unsupported" });
+    }
+    expect(await auditJobs(auth.agentId)).toHaveLength(0);
+    const [audit] = await audits(auth.agentId);
+    expect(audit?.outcome).toBe("failure");
+    expect(audit?.details).toMatchObject({ target_id: "crm-app", reason: "unsupported" });
+    expect(await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId))).toHaveLength(0);
+    // The page reads the target as Discovery only (engine and level as reported).
+    expect(await getAuditConfig(getDb(), auth.agentId, "crm-app")).toMatchObject({ engine: "sqlite", auditLevel: "none", configured: false });
+    // The SQL target of the same agent is unaffected.
+    expect((await configure(auth, { enabled: true })).status).toBe(202);
+  });
+
   it("supersedes the settings jobs not delivered yet", async () => {
     const auth = await agentWithFindings(["clients"]);
     expect((await configure(auth, { enabled: true })).status).toBe(202);

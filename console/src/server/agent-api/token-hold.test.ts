@@ -36,13 +36,38 @@ const LISTED_BY_0_8 = [
 /** Tokens added after 0.8.2, held by `0.8`. */
 const ADDED_AFTER_0_8 = [
   "access_event.objects_overflowed",
+  "engine.sqlite",
   "location.altered",
   "object_ref.altered",
   "target_status.name_case",
   "target_status.note_labels.2026_10_c",
 ];
 
+/** The tokens listed by 0.9.0 (`git show 0.9.0:console/src/server/agent-api/capabilities.ts`). */
+const LISTED_BY_0_9 = [
+  "access_event.bytes",
+  "access_event.objects_overflowed",
+  "engine.cas",
+  "engine.redis",
+  "engine.sqlserver",
+  "engine.valkey",
+  "job_progress.coverage",
+  "location.altered",
+  "object_ref.altered",
+  "target_status.name_case",
+  "target_status.note_labels.2026_10",
+  "target_status.note_labels.2026_10_b",
+  "target_status.note_labels.2026_10_c",
+  "target_status.notes",
+];
+
+/** Tokens added after 0.9.0, held by `0.9` (P10-E). */
+const ADDED_AFTER_0_9 = ["engine.sqlite"];
+
 const held = { DATABASTION_AGENT_TOKENS_HOLD: "0.8" };
+const held09 = { DATABASTION_AGENT_TOKENS_HOLD: "0.9" };
+/** A release line no console knows (fatal at startup). */
+const UNKNOWN_LINE = "0.10";
 
 describe("token hold: listing (unit)", () => {
   it("lists every token when unset or empty (today's behaviour)", () => {
@@ -57,9 +82,17 @@ describe("token hold: listing (unit)", () => {
     expect([...listedAccepts(held), ...heldAccepts(held)].sort()).toEqual([...CONSOLE_ACCEPTS]);
   });
 
-  it("never holds an engine token nor a token of 0.8 or earlier", () => {
-    for (const t of CONSOLE_ACCEPTS.filter((t) => t.startsWith("engine."))) expect(listedAccepts(held)).toContain(t);
+  it("never holds an engine token of 0.8 nor a token of 0.8 or earlier", () => {
+    for (const t of LISTED_BY_0_8.filter((t) => t.startsWith("engine."))) expect(listedAccepts(held)).toContain(t);
     expect(heldAccepts(held).filter((t) => LISTED_BY_0_8.includes(t))).toEqual([]);
+  });
+
+  it("0.9 lists exactly the 0.9.0 list and holds engine.sqlite (P10-E: a 0.9 replica refuses sqlite values)", () => {
+    expect(listedAccepts(held09)).toEqual(LISTED_BY_0_9);
+    expect(heldAccepts(held09)).toEqual(ADDED_AFTER_0_9);
+    expect([...listedAccepts(held09), ...heldAccepts(held09)].sort()).toEqual([...CONSOLE_ACCEPTS]);
+    // Each release line lists at least what the previous one listed.
+    for (const t of LISTED_BY_0_8) expect(listedAccepts(held09)).toContain(t);
   });
 
   it("every release list is a sorted, duplicate-free subset of CONSOLE_ACCEPTS and a valid CapabilityList", () => {
@@ -71,7 +104,7 @@ describe("token hold: listing (unit)", () => {
   });
 
   it("an invalid value seen at run time lists the oldest known set (fail closed)", () => {
-    expect(listedAccepts({ DATABASTION_AGENT_TOKENS_HOLD: "0.9" })).toEqual(LISTED_BY_0_8);
+    expect(listedAccepts({ DATABASTION_AGENT_TOKENS_HOLD: UNKNOWN_LINE })).toEqual(LISTED_BY_0_8);
   });
 });
 
@@ -81,7 +114,7 @@ describe("token hold: startup checks (unit)", () => {
   it("refuses to start on an unknown value, in every environment, without echoing it", () => {
     for (const NODE_ENV of ["production", "development", "test"]) {
       const fatal = startupFatal(env({ NODE_ENV, DATABASTION_AGENT_TOKENS_HOLD: "0.8.2", DATABASTION_ENCRYPTION_KEY: "k".repeat(44) }));
-      expect(fatal).toContain("DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8");
+      expect(fatal).toContain("DATABASTION_AGENT_TOKENS_HOLD must be unset or one of: 0.8, 0.9");
       expect(fatal).toContain("Refusing to start");
       expect(fatal).not.toContain("0.8.2");
     }
@@ -96,6 +129,11 @@ describe("token hold: startup checks (unit)", () => {
     expect(warning).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.8");
     for (const t of ADDED_AFTER_0_8) expect(warning).toContain(t);
     expect(startupWarnings(env({ ...base, ...held }))).toContain(warning);
+    expect(startupFatal(env({ ...base, ...held09 }))).toBeNull();
+    const warning09 = agentTokensHoldWarning(env({ ...base, ...held09 }));
+    expect(warning09).toContain("DATABASTION_AGENT_TOKENS_HOLD=0.9");
+    expect(warning09).toContain("not engine.sqlite;");
+    expect(warning09).toContain("(ADR-0059)");
   });
 });
 
@@ -117,14 +155,15 @@ describe("token hold: recurring signals (unit, review L1)", () => {
 
   it("never warns when unset, empty or invalid (invalid is fatal at startup)", () => {
     resetTokensHoldWarning();
-    for (const v of [undefined, "", "0.9"]) expect(tokensHoldWarningDue(Date.now(), { DATABASTION_AGENT_TOKENS_HOLD: v })).toBeNull();
+    for (const v of [undefined, "", UNKNOWN_LINE]) expect(tokensHoldWarningDue(Date.now(), { DATABASTION_AGENT_TOKENS_HOLD: v })).toBeNull();
   });
 
   it("the gauge series: 1 with the release line while held, 0 without label when unset", () => {
     expect(tokensHoldMetric(held)).toEqual({ value: 1, labels: { release: "0.8" } });
     expect(tokensHoldMetric({})).toEqual({ value: 0, labels: {} });
     expect(tokensHoldMetric({ DATABASTION_AGENT_TOKENS_HOLD: "" })).toEqual({ value: 0, labels: {} });
-    expect(tokensHoldMetric({ DATABASTION_AGENT_TOKENS_HOLD: "0.9" })).toEqual({ value: 1, labels: { release: "invalid" } });
+    expect(tokensHoldMetric(held09)).toEqual({ value: 1, labels: { release: "0.9" } });
+    expect(tokensHoldMetric({ DATABASTION_AGENT_TOKENS_HOLD: UNKNOWN_LINE })).toEqual({ value: 1, labels: { release: "invalid" } });
   });
 });
 
@@ -201,6 +240,18 @@ describe.skipIf(!hasDb)("token hold: a held console still accepts and stores eve
     const res = await heartbeat(auth, fixture("HeartbeatRequest.sqlserver-labels-2026-10-c.json"));
     expect(res.status).toBe(200);
     expect(((await res.json()) as { accepts: string[] }).accepts).not.toContain("target_status.note_labels.2026_10_c");
+  });
+
+  it("0.9: does not list engine.sqlite, yet accepts and stores a sqlite heartbeat (P10-E)", async () => {
+    vi.stubEnv("DATABASTION_AGENT_TOKENS_HOLD", "0.9");
+    const auth = await enroll();
+    const body = fixture<{ targets: { target_id: string; engine: string }[] }>("HeartbeatRequest.sqlite.json");
+    const res = await heartbeat(auth, body);
+    expect(res.status).toBe(200);
+    const out = (await res.json()) as { accepts: string[] };
+    expect(out.accepts).toEqual(LISTED_BY_0_9);
+    const rows = await getDb().select().from(agentTargets).where(eq(agentTargets.agentId, auth.agentId));
+    expect(rows.filter((r) => r.engine === "sqlite").length).toBe(body.targets.filter((t) => t.engine === "sqlite").length);
   });
 
   it("stores objects_overflowed and ObjectRef.altered of an events batch", async () => {
