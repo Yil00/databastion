@@ -658,9 +658,20 @@ export const policyExceptions = pgTable(
     expiresAt: tsz("expires_at"),
     createdAt: tsz("created_at").notNull().defaultNow(),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    /**
+     * P10-C review R2 (migration 0048): the administrator confirmed that this location exception,
+     * not scoped to one agent and target, also covers the items of every SQLite target
+     * (`TARGET_SCOPED_EXCEPTION_ENGINES`, src/lib/policy-common.ts), whose locations are `main` on
+     * every file. False (the default, every row before 0048): it never covers a SQLite item.
+     */
+    crossTarget: boolean("cross_target").notNull().default(false),
   },
   (t) => [
     index("policy_exceptions_policy_idx").on(t.policyId),
+    check(
+      "policy_exceptions_cross_target",
+      sql`not ${t.crossTarget} or (${t.location} is not null and (${t.agentId} is null or ${t.targetId} is null))`,
+    ),
     check(
       "policy_exceptions_scope",
       sql`${t.agentId} is not null or ${t.targetId} is not null or ${t.classifier} is not null or ${t.location} is not null`,

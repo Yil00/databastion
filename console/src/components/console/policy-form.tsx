@@ -72,6 +72,12 @@ export interface PolicyFormValues {
   [key: string]: string | boolean;
 }
 
+/**
+ * P10-E (security review N3 of 342a257): every SQLite location is the database `main`, so a
+ * location condition names a table and a column of every SQLite file.
+ */
+export const SQLITE_LOCATION_HINT =
+  "On SQLite targets the database is always main: a location pattern matches the same table and column in every SQLite file. Add target or agent ids above to narrow it.";
 const list = (v: string | boolean | undefined) =>
   [...new Set(String(v ?? "").split(",").map((s) => s.trim()).filter((s) => s !== ""))];
 
@@ -322,6 +328,9 @@ export function PolicyForm({
         <p className="text-xs text-muted-foreground">
           Location patterns apply to normalized names: <code>*</code> matches any run of characters, <code>?</code> one
           character, <code>\</code> escapes the next one; case-insensitive, trailing spaces ignored.
+        </p>
+        <p className="text-xs text-muted-foreground" data-sqlite-location-hint="">
+          {SQLITE_LOCATION_HINT}
         </p>
         <div className="grid gap-3 md:grid-cols-4">
           {LOCATION_FIELDS.map((f) => (

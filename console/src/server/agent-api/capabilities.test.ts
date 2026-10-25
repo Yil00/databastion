@@ -55,6 +55,8 @@ const ENGINE_TOKENS: Record<EngineToken, { engine: string; connector?: string; s
   // One connector and four sources serve both Redis and Valkey (ADR-0052 decision 12).
   "engine.redis": { engine: "redis", connector: "redis", sources: ["redis_slowlog", "redis_commandlog", "redis_acl_log", "redis_sync"] },
   "engine.valkey": { engine: "valkey", connector: "redis", sources: ["redis_slowlog", "redis_commandlog", "redis_acl_log", "redis_sync"] },
+  // Discovery only (ADR-0059 decision 7): no Audit source.
+  "engine.sqlite": { engine: "sqlite", connector: "sqlite", sources: [] },
 };
 
 function isEngineToken(token: Token): token is EngineToken {
@@ -96,12 +98,11 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
     }
   });
 
-  it("lists every engine added after protocol 0.1.0, except those whose console lot is pending", () => {
+  it("lists every engine added after protocol 0.1.0 (engine.sqlite since P10-E)", () => {
     const v010 = ["postgres", "mysql", "mariadb", "mongodb", "openldap"];
-    const pending = UNLISTED_ENGINE_TOKENS.map((t) => t.slice("engine.".length));
     const listed = CONSOLE_ACCEPTS.filter(isEngineToken).map((t) => ENGINE_TOKENS[t].engine);
-    expect(enumOf("Engine").filter((e) => !v010.includes(e) && !pending.includes(e)).sort()).toEqual([...listed].sort());
-    for (const e of pending) expect(enumOf("Engine"), e).toContain(e);
+    expect(enumOf("Engine").filter((e) => !v010.includes(e)).sort()).toEqual([...listed].sort());
+    expect(CONSOLE_ACCEPTS).toContain("engine.sqlite");
   });
 
   it("lists engine.redis and engine.valkey together (ADR-0052 decision 12: the shared values need both)", () => {
@@ -157,15 +158,8 @@ describe("CONSOLE_ACCEPTS (ADR-0022)", () => {
   });
 });
 
-/** Every engine token of the contract, listed by this console or not yet. */
+/** Every engine token of the contract, all listed since P10-E. */
 const ALL_ENGINE_TOKENS: ContractEngineToken[] = ["engine.cas", "engine.sqlserver", "engine.redis", "engine.valkey", "engine.sqlite"];
-/**
- * The engine tokens of the contract that this console does not list yet: `engine.sqlite` (ADR-0059
- * decision 8), in the contract since P10-C and listed by P10-E with the console's SQLite support.
- */
-const UNLISTED_ENGINE_TOKENS: ContractEngineToken[] = ["engine.sqlite"];
-/** Fixtures whose name says they carry a value of an unlisted engine. */
-const UNLISTED_FIXTURE = /sqlite/;
 
 describe("AGENT_TOKENS (ADR-0022 decision 3)", () => {
   it("is a valid, sorted CapabilityList that the contract names in HeartbeatRequest.accepts", () => {
@@ -214,34 +208,30 @@ describe("engine token gate (ADR-0042, P9-C review H1)", () => {
     expect(validateSchema("CapabilityList", ALL_ENGINE_TOKENS).ok).toBe(true);
   });
 
-  it("lets every valid fixture through with CONSOLE_ACCEPTS, except those of an engine not listed yet", () => {
-    for (const t of ALL_ENGINE_TOKENS) {
-      expect((CONSOLE_ACCEPTS as readonly string[]).includes(t), t).toBe(!UNLISTED_ENGINE_TOKENS.includes(t));
-    }
+  it("lets every valid fixture through with CONSOLE_ACCEPTS (P10-E lists every engine token of the contract)", () => {
+    for (const t of ALL_ENGINE_TOKENS) expect(CONSOLE_ACCEPTS as readonly string[]).toContain(t);
     for (const name of ["EnrollRequest", "HeartbeatRequest", "FindingsBatch", "EventsBatch"] as const) {
-      for (const [file, body] of fixtures("valid", name)) {
-        const unlisted = unlistedEngineDetails(name, body);
-        expect(unlisted.length > 0, file).toBe(UNLISTED_FIXTURE.test(file));
-        for (const d of unlisted) expect(d.keyword).toBe("enum");
-        // Listed, the same fixture goes through.
-        expect(unlistedEngineDetails(name, body, [...CONSOLE_ACCEPTS, ...UNLISTED_ENGINE_TOKENS]), file).toEqual([]);
-      }
+      for (const [file, body] of fixtures("valid", name)) expect(unlistedEngineDetails(name, body), file).toEqual([]);
     }
   });
 
-  it("refuses every sqlite value until engine.sqlite is listed (ADR-0059 decision 8; listed by P10-E)", () => {
+  it("gates every sqlite value on engine.sqlite, listed since P10-E (ADR-0059 decision 8)", () => {
     expect(engineTokens("sqlite")).toEqual(["engine.sqlite"]);
     expect(connectorTokens("sqlite")).toEqual(["engine.sqlite"]);
     for (const s of AUDIT_SOURCES) expect(auditSourceTokens(s), s).not.toContain("engine.sqlite");
-    expect(unlistedEngineDetails("EnrollRequest", { connectors: ["postgres", "sqlite"] })).toEqual([{ pointer: "/connectors/1", keyword: "enum" }]);
+    const without = CONSOLE_ACCEPTS.filter((t) => t !== "engine.sqlite");
+    expect(unlistedEngineDetails("EnrollRequest", { connectors: ["postgres", "sqlite"] }, without)).toEqual([{ pointer: "/connectors/1", keyword: "enum" }]);
     const hb = { connectors: ["sqlite"], targets: [{ engine: "sqlite" }], detected_targets: [] };
-    expect(unlistedEngineDetails("HeartbeatRequest", hb)).toEqual([
+    expect(unlistedEngineDetails("HeartbeatRequest", hb, without)).toEqual([
       { pointer: "/connectors/0", keyword: "enum" },
       { pointer: "/targets/0/engine", keyword: "enum" },
     ]);
     const findings = { findings: [{ location: { engine: "sqlite" } }] };
-    expect(unlistedEngineDetails("FindingsBatch", findings)).toEqual([{ pointer: "/findings/0/location/engine", keyword: "enum" }]);
-    expect(unlistedEngineDetails("HeartbeatRequest", hb, ["engine.sqlite"])).toEqual([]);
+    expect(unlistedEngineDetails("FindingsBatch", findings, without)).toEqual([{ pointer: "/findings/0/location/engine", keyword: "enum" }]);
+    // Listed by this console: nothing refused.
+    expect(unlistedEngineDetails("EnrollRequest", { connectors: ["postgres", "sqlite"] })).toEqual([]);
+    expect(unlistedEngineDetails("HeartbeatRequest", hb)).toEqual([]);
+    expect(unlistedEngineDetails("FindingsBatch", findings)).toEqual([]);
   });
 
   it("still refuses, with enum, every value of an engine a token list leaves out (the gate for later engines)", () => {

@@ -278,7 +278,7 @@ describe("access_event conditions", () => {
 
   it("exceptions: with case on PostgreSQL, MongoDB, Redis, Valkey and CAS, without case elsewhere (ADR-0054); trailing spaces ignored only on SQL Server and MySQL / MariaDB (N1)", () => {
     const now = new Date("2026-09-28T12:00:00Z");
-    const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null };
+    const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null, crossTarget: false };
     const x = { ...base, location: { database: "crm", schema: "public", object: "clients" } };
     const exact = { ...FACTS, objects: [{ database: "crm", schema: "public", object: "clients" }] };
     const upper = { ...FACTS, objects: [{ database: "CRM", schema: "PUBLIC", object: "Clients" }] };
@@ -327,7 +327,7 @@ describe("access_event conditions", () => {
 
   it("exceptions: agent, target and database / schema / object location only; never classifier-scoped", () => {
     const now = new Date("2026-09-28T12:00:00Z");
-    const base = { policyId: null, agentId: null, targetId: null, classifier: null, location: null, expiresAt: null };
+    const base = { policyId: null, agentId: null, targetId: null, classifier: null, location: null, expiresAt: null, crossTarget: false };
     expect(exceptionCoversEvent({ ...base, targetId: "pg-prod-1" }, "p", FACTS, [0, 1], now)).toBe(true);
     expect(exceptionCoversEvent({ ...base, targetId: "pg-prod-1", expiresAt: now }, "p", FACTS, [0, 1], now)).toBe(false);
     expect(exceptionCoversEvent({ ...base, policyId: "q", targetId: "pg-prod-1" }, "p", FACTS, [0, 1], now)).toBe(false);
@@ -438,7 +438,7 @@ describe("dedup scope", () => {
 
 describe("overflowed objects (ADR-0053 decision 3)", () => {
   const now = new Date("2026-09-28T12:00:00Z");
-  const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null };
+  const base = { policyId: null, agentId: null, targetId: null, classifier: null, expiresAt: null, crossTarget: false };
   const named = { database: "crm", schema: "public", object: "audit_log" };
   const dbStar = { database: "crm", object: "*" };
   const allStar = { database: "*", object: "*" };
@@ -616,6 +616,7 @@ describe("exceptionCoversEvent: names altered by normalization (ADR-0056 decisio
     classifier: null,
     location,
     expiresAt: null,
+    crossTarget: false,
   });
   const event = (objects: EventObject[], over: Partial<EventFacts> = {}): EventFacts => ({ ...FACTS, ...over, objects });
   const PLAIN: EventObject = { database: "crm", schema: "public", object: "clients" };
