@@ -156,7 +156,7 @@ The same harness against Redis 8.10.2 (`LOAD_REDIS_ENGINE=redis`, target `redis-
 
 The Redis target reported the notes `audit.slow_operations_only` and `coverage.cas_guard_tripped`, as the Valkey target does.
 
-The SQLite targets have their own run (`e2e/load/sqlite.sh`, CI job `load-sqlite`, on `dev`, not released yet), which measures the impact of a scan on a concurrent writer rather than on a server: [SQLite, load on the application](#load-on-the-application). Figures: load run pending.
+The SQLite targets have their own run (`e2e/load/sqlite.sh`, CI job `load-sqlite`, on `dev`, not released yet), which measures the impact of a scan on a concurrent writer rather than on a server: [SQLite, load on the application](#load-on-the-application). First run 40197453899 (branch `fix/load-sqlite-paths`, PR #359), every check passed: in WAL mode no added commit latency, no busy or failed commit and no `-wal` growth; in rollback mode 47 of 5 592 commits failed with `SQLITE_BUSY` for a writer without a busy timeout (measured, not judged), none with a 5 s busy timeout (p99 +0.18 ms); the agent and its readers at about 1.1 % of one core during a scan, 19.4 MiB peak RSS.
 
 Scope of these figures: one CI run per harness on shared runners, one agent, 2-CPU targets. MongoDB Audit under load and the OpenLDAP audit proof searches are not measured yet (ROADMAP phase 7 follow-ups). The SQL Server runs cover SQL Server 2022 Express, with SQL Server Audit and with the Extended Events source; the harness can run SQL Server 2019 and 2025, with no recorded run yet (the 2019 Extended Events drain run is pending, [above](#load-and-database-impact-measured)). The harness's growth check only catches a fast leak: the 72 h stability test of the MVP criteria is run separately by the maintainer and is not reported here.
 
@@ -1398,7 +1398,41 @@ A file that breaks a rule is refused (`unsupported`), never read "read-only anyw
 The reader is always the agent's bundled library, so the versions that matter are those of the **writers**. The weekly engine matrix (job `sqlite`) reads the dev seed written by the SQLite of Debian 12 (3.40, `python:3.13.16-slim-bookworm`), Debian 13 (3.46, `python:3.13.16-slim-trixie`), the Ubuntu 24.04 runner's python3 (3.45) and the bundled **3.53.2**, each in the `DELETE`, `TRUNCATE`, `PERSIST` and `WAL` journal modes, with page sizes 512, 4 096 and 65 536, and `auto_vacuum` off and on, against `dev/ground-truth.json`. On every change, the CI job `agent-sqlite` runs the reader tests on files the bundled library writes, and `e2e-sqlite` (required through `CI result`) runs the end-to-end test with files written by Debian 12's 3.40. Other SQLite 3 versions are expected to work but are not tested. Only x86_64 runs are tested so far (an aarch64 run is a [follow-up](ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird)).
 
 ### Load on the application
-SQLite has no server whose CPU a scan could cost: the measured impact is on a concurrent writer (commit latency, `SQLITE_BUSY` answers and WAL growth during a scan, WAL and rollback modes, busy timeouts 0 and 5 s; job `load-sqlite`, [e2e/load/README.md](../e2e/load/README.md#sqlite-targets)). Figures: load run pending.
+SQLite has no server whose CPU a scan could cost: the reader runs in the agent's processes, on the application's host. The load harness therefore measures the impact of a scan on a **concurrent writer**: its commit latency, its `SQLITE_BUSY` answers and the WAL growth during a scan, in WAL and rollback modes, with the writer's busy timeout at 0 and at 5 s (job `load-sqlite`, [e2e/load/README.md](../e2e/load/README.md#sqlite-targets): method and checks).
+
+First run: 40197453899, on branch `fix/load-sqlite-paths` (the Compose bind-mount paths fix, PR #359), every check passed. Configuration: two files of about 1 027 MiB, 8 tables each, written by SQLite 3.40.1, one in WAL mode and one in the `DELETE` rollback journal mode (declared `rollback_mode: read`); a writer at 200 transactions/s (`BEGIN IMMEDIATE`, one `INSERT`, one `UPDATE`, `COMMIT`); a 60 s baseline without scan before each scan; Discovery at the default 1 % duty cycle with 200 sample rows; a 2-CPU GitHub runner.
+
+Writer commit latency (ms) and outcome:
+
+| Mode | Busy timeout | Phase | Transactions | Committed | `SQLITE_BUSY` / failed | p50 | p95 | p99 | Max | `-wal` peak |
+|---|---|---|---|---|---|---|---|---|---|---|
+| WAL | 0 | baseline | 12 000 | 12 000 | 0 / 0 | 0.198 | 0.412 | 0.714 | 20.041 | 3.93 MiB |
+| WAL | 0 | scan | 8 055 | 8 055 | 0 / 0 | 0.167 | 0.259 | 0.607 | 19.776 | 3.94 MiB |
+| WAL | 5 s | baseline | 12 000 | 12 000 | 0 / 0 | 0.172 | 0.258 | 0.561 | 18.554 | 3.94 MiB |
+| WAL | 5 s | scan | 8 640 | 8 640 | 0 / 0 | 0.184 | 0.252 | 0.581 | 16.07 | 3.94 MiB |
+| rollback (`DELETE`) | 0 | baseline | 12 000 | 12 000 | 0 / 0 | 0.809 | 1.138 | 2.086 | 19.183 | |
+| rollback (`DELETE`) | 0 | scan | 5 592 | 5 545 | 47 / 47 | 0.75 | 1.14 | 2.142 | 18.108 | |
+| rollback (`DELETE`) | 5 s | baseline | 12 000 | 12 000 | 0 / 0 | 0.739 | 1.072 | 1.875 | 20.458 | |
+| rollback (`DELETE`) | 5 s | scan | 6 850 | 6 850 | 0 / 0 | 0.72 | 1.102 | 2.051 | 54.579 | |
+
+Scans (every one succeeded):
+
+| Mode | Busy timeout | Duration | Findings | Coverage | Agent and its readers during the scan |
+|---|---|---|---|---|---|
+| WAL | 0 | 40.3 s | 16 | `objects_sampled` 9 | 0.0115 core (1.15 % of one core) |
+| WAL | 5 s | 43.2 s | 16 | `objects_sampled` 9 | 0.0103 core (1.03 %) |
+| rollback (`DELETE`) | 0 | 28 s | 4 | `objects_sampled` 3, `skipped_error` 6 | 0.011 core (1.10 %) |
+| rollback (`DELETE`) | 5 s | 34.2 s | 12 | `objects_sampled` 6, `skipped_error` 3 | 0.011 core (1.10 %) |
+
+The agent used 0.0001 core idle, with a peak RSS of 19.4 MiB (memory peak 10.9 MiB); nothing was lost.
+
+- **WAL mode**: no added latency and no busy or failed commit, with or without a busy timeout on the writer; the `-wal` did not grow during the scan (3.94 MiB, as in the baseline).
+- **Rollback mode, writer without a busy timeout**: 47 of 5 592 commits failed with `SQLITE_BUSY` during the scan (about 1.7 per second). This rate is measured, not judged against a criterion (ADR-0059 open question 8), and it is why rollback-mode files are read only with the opt-in `sqlite.rollback_mode: read`.
+- **Rollback mode, writer with a 5 s busy timeout**: no failed commit; the p99 rose by 0.18 ms (2.051 against 1.875 ms; the criterion is less than `max_statement_ms`, 500 ms, above the baseline).
+- **Rollback coverage in `DELETE` mode**: the application deletes and recreates its `-journal` at every commit, so a reader started before a commit cannot read the new journal and loses its unit (`side_file_appeared`, [above](#journal-modes-and-side-files)): 3 to 6 of the 9 tables were counted `skipped_error` per scan. For full coverage of a file that is written often, use WAL, or the `TRUNCATE` or `PERSIST` journal modes, which keep the `-journal` file.
+- **Agent CPU**: the figure counts the agent **and** its reader processes, about 1.1 % of one core over each scan, under the run's criterion of 2 % of one core (the analogue of the < 2 % criterion of [04-mvp-scope.md](04-mvp-scope.md#mvp-success-criteria)). It is above the 1 % duty cycle because the duty cycle paces the time spent on the target's units, not the agent's own work around them (for example starting readers and classifying values).
+
+Scope: one CI run on a shared runner, files written by one SQLite version, one rollback journal mode (`DELETE`).
 
 ## Known export signatures
 | Tool | Observable signature | Engine |
@@ -1430,5 +1464,5 @@ Signatures are easy to forge (`application_name` and `program_name` are chosen b
 | Redis / Valkey slow log and command log, polled by the agent | Low: a poll reads at most 512 entries per log (capped at 4 MiB) every poll interval, plus one `CLIENT LIST` (capped at 4 MiB) when there are new entries; a lower `slowlog-log-slower-than` costs server memory per entry | Measured with every command logged and 1 s polls at 200 `GET`/s: on Valkey 9.0.6, 0.0174 core without the stream, 0.0178 with it; on Redis 8.10.2, 0.0156 and 0.0162 ([figures](#load-and-database-impact-measured)) |
 | Redis / Valkey Discovery | `SCAN COUNT 500`, `TYPE`, bounded reads of at most 16 members or 4 KiB per key, paced | Declare a replica as the Discovery node; measured for 1 000 146 keys at 0.267 % of a 2-CPU server on Valkey 9.0.6 and 0.259 % on Redis 8.10.2 ([figures](#load-and-database-impact-measured)) |
 | SQL Server Audit, polled by the agent | A `fn_get_audit_file` read of at most 500 records per read (each read scans the files after its position), the catalog proofs every 5 minutes | Size `MAXSIZE` and `MAX_ROLLOVER_FILES` so a file outlives a few poll intervals; measured on 2022 at 300 statements/s: 0.1189 core without the stream, 0.1378 with it ([figures](#load-and-database-impact-measured)) |
-| SQLite Discovery (on `dev`, not released yet) | No server: the reader runs on the agent's host. In WAL mode, shared locks while the reader's connection is open and a pinned read mark while a statement runs; in rollback mode (only with `rollback_mode: read`), each statement can delay a commit by up to `max_statement_ms` | Keep `rollback_mode: skip` for files written often; impact on a concurrent writer: load run pending ([above](#load-on-the-application)) |
+| SQLite Discovery (on `dev`, not released yet) | No server: the reader runs on the agent's host. In WAL mode, shared locks while the reader's connection is open and a pinned read mark while a statement runs; in rollback mode (only with `rollback_mode: read`), each statement can delay a commit by up to `max_statement_ms` | Keep `rollback_mode: skip` for files written often, or use WAL (or `TRUNCATE` / `PERSIST`) for files written often. Measured at 200 transactions/s: no added latency in WAL mode; in `DELETE` rollback mode 47 of 5 592 commits failed for a writer without a busy timeout, none with 5 s ([figures](#load-on-the-application)) |
 | Discovery scan (every engine) | Paced: at most about `limits.discovery_duty_cycle_percent` % (default 1 %) of one core while a scan runs, one scan at a time per agent | Raise the duty cycle only where the server has spare cores, and size the scan's `max_duration_s` ([above](#discovery-load-on-the-monitored-database-every-engine)) |
