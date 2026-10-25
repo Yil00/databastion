@@ -35,10 +35,11 @@
       "notes": [
         {
           "code": "privilege.global_privileges",
-          "count": 2,
+          "count": 3,
           "labels": [
             "select_any_object_in_database",
-            "credential_relation_readable"
+            "credential_relation_readable",
+            "server_config_readable"
           ]
         },
         {
@@ -80,8 +81,21 @@
             "trace_config_file_mismatch",
             "config_changed_since_start",
             "server_process_not_visible",
-            "similar_to_pattern"
+            "similar_to_pattern",
+            "databases_conf",
+            "foreign_databases_logged",
+            "database_path_not_unique"
           ]
+        },
+        {
+          "code": "audit.log_records_ambiguous",
+          "count": 4,
+          "labels": [
+            "run_confirmation_stalled"
+          ]
+        },
+        {
+          "code": "audit.log_readable_by_others"
         }
       ]
     }

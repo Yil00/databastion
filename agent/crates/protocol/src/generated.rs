@@ -4426,7 +4426,8 @@ Revisions:
   for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
   whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
   read, so records lost to a failing audit target are not counted.
-- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird
+- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6, and its refinement of
+  2026-10-25): the Firebird
   labels below `on_failure_probe`. Firebird system privileges are lowercased as written
   in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
   `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
@@ -4434,13 +4435,19 @@ Revisions:
   database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,
   exceptions and domains); `verifier_relation_readable` (a readable verifier or hash
   relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`
-  (another readable credential relation, `privilege.global_privileges`); `role_graph`
+  (another readable credential relation, `privilege.global_privileges`);
+  `server_config_readable` (`RDB$CONFIG` readable, `privilege.global_privileges`); `role_graph`
   (the role graph not evaluated, `privilege.not_evaluated`); the reasons of
   `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,
   `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:
   `AuditTraceConfigFile` names another file; `config_changed_since_start`;
   `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a
-  section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration
+  section with a `SIMILAR TO` pattern or `_` / `%` in a file name; `databases_conf`: the
+  `databases.conf` alias map not evaluated, or changed since the server started;
+  `foreign_databases_logged`: records of undeclared databases can reach the declared log;
+  `database_path_not_unique`: the declared database file has more than one link);
+  `run_confirmation_stalled` (`audit.log_records_ambiguous`: the stream stopped more than
+  60 s within one hour waiting for server run confirmations); and the trace configuration
   settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
   `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
   and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
@@ -4920,6 +4927,8 @@ pub enum TargetNoteLabel {
     VerifierRelationReadable,
     #[serde(rename = "credential_relation_readable")]
     CredentialRelationReadable,
+    #[serde(rename = "server_config_readable")]
+    ServerConfigReadable,
     #[serde(rename = "role_graph")]
     RoleGraph,
     #[serde(rename = "firebird_conf_unreadable")]
@@ -4934,6 +4943,14 @@ pub enum TargetNoteLabel {
     ServerProcessNotVisible,
     #[serde(rename = "similar_to_pattern")]
     SimilarToPattern,
+    #[serde(rename = "databases_conf")]
+    DatabasesConf,
+    #[serde(rename = "foreign_databases_logged")]
+    ForeignDatabasesLogged,
+    #[serde(rename = "database_path_not_unique")]
+    DatabasePathNotUnique,
+    #[serde(rename = "run_confirmation_stalled")]
+    RunConfirmationStalled,
     #[serde(rename = "enabled")]
     Enabled,
     #[serde(rename = "log_filename")]
@@ -5267,6 +5284,7 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::CredentialRelationReadable => {
                 f.write_str("credential_relation_readable")
             }
+            Self::ServerConfigReadable => f.write_str("server_config_readable"),
             Self::RoleGraph => f.write_str("role_graph"),
             Self::FirebirdConfUnreadable => f.write_str("firebird_conf_unreadable"),
             Self::TraceConfigUnreadable => f.write_str("trace_config_unreadable"),
@@ -5274,6 +5292,10 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::ConfigChangedSinceStart => f.write_str("config_changed_since_start"),
             Self::ServerProcessNotVisible => f.write_str("server_process_not_visible"),
             Self::SimilarToPattern => f.write_str("similar_to_pattern"),
+            Self::DatabasesConf => f.write_str("databases_conf"),
+            Self::ForeignDatabasesLogged => f.write_str("foreign_databases_logged"),
+            Self::DatabasePathNotUnique => f.write_str("database_path_not_unique"),
+            Self::RunConfirmationStalled => f.write_str("run_confirmation_stalled"),
             Self::Enabled => f.write_str("enabled"),
             Self::LogFilename => f.write_str("log_filename"),
             Self::LogConnections => f.write_str("log_connections"),
@@ -5557,6 +5579,7 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "usage" => Ok(Self::Usage),
             "verifier_relation_readable" => Ok(Self::VerifierRelationReadable),
             "credential_relation_readable" => Ok(Self::CredentialRelationReadable),
+            "server_config_readable" => Ok(Self::ServerConfigReadable),
             "role_graph" => Ok(Self::RoleGraph),
             "firebird_conf_unreadable" => Ok(Self::FirebirdConfUnreadable),
             "trace_config_unreadable" => Ok(Self::TraceConfigUnreadable),
@@ -5564,6 +5587,10 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "config_changed_since_start" => Ok(Self::ConfigChangedSinceStart),
             "server_process_not_visible" => Ok(Self::ServerProcessNotVisible),
             "similar_to_pattern" => Ok(Self::SimilarToPattern),
+            "databases_conf" => Ok(Self::DatabasesConf),
+            "foreign_databases_logged" => Ok(Self::ForeignDatabasesLogged),
+            "database_path_not_unique" => Ok(Self::DatabasePathNotUnique),
+            "run_confirmation_stalled" => Ok(Self::RunConfirmationStalled),
             "enabled" => Ok(Self::Enabled),
             "log_filename" => Ok(Self::LogFilename),
             "log_connections" => Ok(Self::LogConnections),
