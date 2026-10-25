@@ -57,9 +57,18 @@ const HEARTBEAT = {
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
 };
 
-/** Every valid contract fixture is storable since P9-E lists every engine token of the contract. */
+/**
+ * Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`firebird`, ADR-0060 decision
+ * 8: in the contract since P10-C, listed by P10-E) are refused; every other valid fixture is storable.
+ */
+const isUnlisted = ([, body]: [string, unknown]) => unlistedEngineDetails("EventsBatch", body).length > 0;
+
 function storableFixtures(): [string, unknown][] {
-  return fixtures("valid", "EventsBatch");
+  return fixtures("valid", "EventsBatch").filter((f) => !isUnlisted(f));
+}
+
+function unlistedFixtures(): [string, unknown][] {
+  return fixtures("valid", "EventsBatch").filter(isUnlisted);
 }
 
 function fixture(name: string): Batch {
@@ -182,6 +191,28 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
         });
       }
     });
+
+    it("leaves fixtures of every unlisted engine to refuse", () => {
+      expect(unlistedFixtures().map(([name]) => name).sort()).toEqual(["EventsBatch.firebird.json"]);
+    });
+
+    it.each(unlistedFixtures())(
+      "refuses %s while its engine token is unlisted: 400 enum on each source, integrity event, nothing stored",
+      async (_name, body) => {
+        const auth = await agentWithTargets();
+        const res = await post(auth, body);
+        expect(res.status).toBe(400);
+        const err = await expectConformingError(res, body);
+        expect(err.code).toBe("invalid_request");
+        const b = body as Batch;
+        expect(err.details).toEqual(b.events.map((_e, i) => ({ pointer: `/events/${i}/source`, keyword: "enum" })));
+        expect(await storedEvents(auth.agentId)).toHaveLength(0);
+        expect(await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId))).toHaveLength(0);
+        const events = await integrityRows(auth.agentId, "agent.batch_rejected");
+        expect(events).toHaveLength(1);
+        expect(events[0]?.details).toMatchObject({ endpoint: "events", status: 400 });
+      },
+    );
 
     it.each(storableFixtures())("accepts %s and stores exactly the contract fields", async (_name, body) => {
       const auth = await agentWithTargets();

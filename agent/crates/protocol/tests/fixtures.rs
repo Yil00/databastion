@@ -283,6 +283,39 @@ const NOT_ENFORCED_BY_SERDE: &[(&str, &str)] = &[
         "HeartbeatRequest.sqlite-server-version.json",
         "false schema (via if/then on engine, removed before generation)",
     ),
+    // Firebird (P10-C, ADR-0060 decisions 5, 6 and 8): the console's Ajv
+    // validation enforces these engine conditionals; the Firebird connector
+    // (P10-B) builds its target status and locations to match them.
+    (
+        "FindingsBatch.firebird-with-schema.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.firebird-audit-level-full.json",
+        "enum (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.firebird-name-case.json",
+        "enum (via if/then on name_case, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.firebird-edition.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    (
+        "HeartbeatRequest.firebird-detected-unix-socket.json",
+        "false schema (via if/then on engine, removed before generation)",
+    ),
+    // Firebird trace events (security review L1 and L4): no
+    // `principal.application`, no object `schema`.
+    (
+        "EventsBatch.firebird-application.json",
+        "false schema (via if/then on source, removed before generation)",
+    ),
+    (
+        "EventsBatch.firebird-object-schema.json",
+        "not (via if/then on source, removed before generation)",
+    ),
 ];
 
 fn fixtures_dir(kind: &str) -> PathBuf {

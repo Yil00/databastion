@@ -198,7 +198,7 @@
       ]
     },
     "Engine": {
-      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,\nADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`\nand `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`.\nA `sqlite` target is Discovery only: it has no server and no access log, so its\n`TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or\n`edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059\ndecision 7).\n",
+      "description": "Database, directory or identity service engine. `cas` (Apereo CAS, ADR-0041) was added after\nprotocol 0.1.0: the agent sends it only when the console's latest heartbeat response lists the\ncapability `engine.cas` (ADR-0041 decision 12, applying ADR-0039 decision 8 and ADR-0022; agent\nhandling in ADR-0042). Every later engine value follows the\nsame rule with its own `engine.<value>` token: `sqlserver` (Microsoft SQL Server,\nADR-0051) with `engine.sqlserver`, `redis` and `valkey` (ADR-0052) with `engine.redis`\nand `engine.valkey`, `sqlite` (SQLite database files, ADR-0059) with `engine.sqlite`,\n`firebird` (Firebird 4.0 and 5.0, ADR-0060) with `engine.firebird`.\nA `sqlite` target is Discovery only: it has no server and no access log, so its\n`TargetStatus` reports `audit_level` `none` with no `audit_source`, `server_version` or\n`edition` (checked by this schema), and no `AuditSource` value serves it (ADR-0059\ndecision 7). A `firebird` target never reports `audit_level` `full` (checked by this\nschema; ADR-0060 decision 6) and never sends `name_case` (its name rules are the\nengine's, fixed: ADR-0060 decision 5).\n",
       "type": "string",
       "enum": [
         "postgres",
@@ -210,11 +210,12 @@
         "sqlserver",
         "redis",
         "valkey",
-        "sqlite"
+        "sqlite",
+        "firebird"
       ]
     },
     "Connector": {
-      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and\nValkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`\nonly when it listed `engine.sqlserver`, `redis` only when it listed **both**\n`engine.redis` and `engine.valkey`, and `sqlite` only when it listed `engine.sqlite`\n(ADR-0059 decision 8; see `Engine`).\n",
+      "description": "Agent connector (Cargo feature). `mysql` covers MySQL and MariaDB, `redis` covers Redis and\nValkey (ADR-0052). `cas` is sent only when the console listed `engine.cas`, `sqlserver`\nonly when it listed `engine.sqlserver`, `redis` only when it listed **both**\n`engine.redis` and `engine.valkey`, `sqlite` only when it listed `engine.sqlite`\n(ADR-0059 decision 8), and `firebird` only when it listed `engine.firebird` (ADR-0060\ndecision 8; see `Engine`).\n",
       "type": "string",
       "enum": [
         "postgres",
@@ -224,7 +225,8 @@
         "cas",
         "sqlserver",
         "redis",
-        "sqlite"
+        "sqlite",
+        "firebird"
       ]
     },
     "ConnectorList": {
@@ -237,7 +239,7 @@
       }
     },
     "AuditLevel": {
-      "description": "Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:\ne.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community\n`limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a\nSQLite target is always `none` (no access log exists, ADR-0059 decision 7).\n",
+      "description": "Audit level actually reached for a target (docs/08-engine-capabilities.md). Reported honestly:\ne.g. PostgreSQL without pgaudit is `limited`, MySQL Community `partial`, MongoDB Community\n`limited` (or `partial` with profiler level 2), a target with audit disabled `none`; a\nSQLite target is always `none` (no access log exists, ADR-0059 decision 7); a Firebird\ntarget is never `full` (the trace does not see file-level copies, embedded access or\nreplication, ADR-0060 decision 6).\n",
       "type": "string",
       "enum": [
         "full",
@@ -247,7 +249,7 @@
       ]
     },
     "AuditSource": {
-      "description": "Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only\nunder their engine's token (see `Engine`):\n- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;\n- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through\n  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's\n  `event_file` target), `sqlserver_query_stats` (plan cache statistics,\n  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;\n- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),\n  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`\n  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)\n  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when\n  **both** `engine.redis` and `engine.valkey` are listed.\n\nThe engines each source serves (a source is reported only for a target of one of them;\nsee \"Heartbeat target checks\" and, for access events, \"Target engine\" under `POST /events`):\n- `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;\n- `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;\n- `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;\n- `openldap_accesslog` -> `openldap`;\n- `cas_audit_log` -> `cas`;\n- `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;\n- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`.\nNo value serves `sqlite` (Discovery only, ADR-0059 decision 7).\n",
+      "description": "Native source used for Audit on a target. Values added after protocol 0.1.0 are sent only\nunder their engine's token (see `Engine`):\n- `cas_audit_log` (the CAS JSON audit log file, ADR-0041 decision 7): `engine.cas`;\n- `sqlserver_audit` (SQL Server Audit, `FILE` target, read through\n  `sys.fn_get_audit_file`), `sqlserver_xevents` (an Extended Events session's\n  `event_file` target), `sqlserver_query_stats` (plan cache statistics,\n  `sys.dm_exec_query_stats`) (ADR-0051 decision 6): `engine.sqlserver`;\n- `redis_slowlog` (`SLOWLOG GET`, or Valkey's command log `slow` type),\n  `redis_commandlog` (Valkey's command log `large-reply` type), `redis_acl_log`\n  (`ACL LOG`), `redis_sync` (`INFO stats` `sync_full`, full synchronizations)\n  (ADR-0052 decision 8): these serve Redis and Valkey, so they are sent only when\n  **both** `engine.redis` and `engine.valkey` are listed;\n- `firebird_audit_trace` (the Firebird system audit trace log, `AuditTraceConfigFile`,\n  read locally as a text file, ADR-0060 decision 6): `engine.firebird`.\n\nThe engines each source serves (a source is reported only for a target of one of them;\nsee \"Heartbeat target checks\" and, for access events, \"Target engine\" under `POST /events`):\n- `pgaudit`, `pg_stat_statements`, `pg_stat_activity` -> `postgres`;\n- `mariadb_server_audit`, `mysql_audit_log`, `performance_schema` -> `mysql`, `mariadb`;\n- `mongodb_audit_log`, `mongodb_profiler`, `mongodb_log` -> `mongodb`;\n- `openldap_accesslog` -> `openldap`;\n- `cas_audit_log` -> `cas`;\n- `sqlserver_audit`, `sqlserver_xevents`, `sqlserver_query_stats` -> `sqlserver`;\n- `redis_slowlog`, `redis_commandlog`, `redis_acl_log`, `redis_sync` -> `redis`, `valkey`;\n- `firebird_audit_trace` -> `firebird`.\nNo value serves `sqlite` (Discovery only, ADR-0059 decision 7).\n",
       "type": "string",
       "enum": [
         "pgaudit",
@@ -267,7 +269,8 @@
         "redis_slowlog",
         "redis_commandlog",
         "redis_acl_log",
-        "redis_sync"
+        "redis_sync",
+        "firebird_audit_trace"
       ]
     },
     "Edition": {
@@ -574,7 +577,7 @@
           "$ref": "#/$defs/Edition"
         },
         "server_version": {
-          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL\nServer's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`\nor Valkey `valkey_version` such as `8.1.0-rc1`). Omitted when the reported string does\nnot match this pattern. Never sent for a `sqlite` target, which has no server (the\nSQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).\n",
+          "description": "Engine version as reported by the server (e.g. `16.4`, `11.4.3`, `7.0.12`, `2.6.8`; SQL\nServer's `ProductVersion` such as `16.0.4305.5`; Redis `redis_version` such as `7.4.11`\nor Valkey `valkey_version` such as `8.1.0-rc1`; Firebird's `ENGINE_VERSION` context\nvariable such as `5.0.4`). Omitted when the reported string does\nnot match this pattern. Never sent for a `sqlite` target, which has no server (the\nSQLite version that last wrote the file stays in the agent's log, ADR-0059 decision 7).\n",
           "type": "string",
           "maxLength": 32,
           "pattern": "^[0-9A-Za-z._+-]+$"
@@ -622,7 +625,7 @@
             }
           },
           "then": {
-            "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1).\n",
+            "description": "`name_case` only on a `mysql`, `mariadb` or `sqlserver` target (ADR-0055 decision 1;\nnever on `firebird`, ADR-0060 decision 5).\n",
             "properties": {
               "engine": {
                 "enum": [
@@ -653,6 +656,31 @@
               },
               "audit_source": false,
               "server_version": false,
+              "edition": false
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "firebird"
+              }
+            }
+          },
+          "then": {
+            "description": "A `firebird` target (ADR-0060 decision 6) is Partial at best: `audit_level` is never\n`full`. Firebird has no editions: no `edition`.\n",
+            "properties": {
+              "audit_level": {
+                "enum": [
+                  "partial",
+                  "limited",
+                  "none"
+                ]
+              },
               "edition": false
             }
           }
@@ -745,7 +773,7 @@
       "pattern": "^(audit|coverage|privilege|security|check)\\.[a-z]{1,16}(_[a-z]{1,16}){0,5}$"
     },
     "TargetNoteLabel": {
-      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n\nRevisions:\n- protocol 0.1.0 (no token): every value down to `stage_kill`;\n- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server\n  labels below `stage_kill`. SQL Server permission names are lowercased with spaces\n  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in\n  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are\n  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->\n  `ms_login_manager`). SQL Server permissions whose name is already a value above\n  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,\n  `shutdown`…) use that value, with no token. A console that lists the token renders\n  every value of the revision.\n- `target_status.note_labels.2026_10_b` (ADR-0051 refinement of 2026-10-14, items 5 to\n  7): the SQL Server labels below `password_hash_probe`, written by the same rule: the\n  database-scoped event-session permissions of the refusal list (`ALTER ANY DATABASE\n  EVENT SESSION` and its granular forms, `CREATE` / `DROP ANY DATABASE EVENT SESSION`),\n  the other database and server permissions the SQL Server connector judges by name\n  (`VIEW SECURITY DEFINITION`, `VIEW DATABASE SECURITY STATE`, `VIEW ANY PERFORMANCE\n  DEFINITION`…), and the `check()` reads named with `privilege.not_evaluated` when they\n  cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the\n  minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,\n  so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's\n  column read cut or failed).\n- `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9\n  follow-ups): the SQL Server label below `cas_store_guard_probe`, `on_failure_probe`\n  for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,\n  whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not\n  read, so records lost to a failing audit target are not counted.\n\nEach revision is negotiated on its own: a value is sent only when the token of its own\nrevision is listed.\n",
+      "description": "Closed label of a target note, in lower snake case: PostgreSQL role attributes and\npredefined roles; MySQL / MariaDB privilege names lowercased with spaces replaced by `_`\n(so MariaDB `BINLOG ADMIN` and MySQL `BINLOG_ADMIN` are both `binlog_admin`); audit\ncollection states; check stages (`stage_*`). Anything the agent cannot map to this list\nis sent as `other`. A new value is a\nchange of this enum: the agent sends it only when the latest `HeartbeatResponse.accepts`\nlists `target_status.note_labels.<revision>` for a revision that includes it (see\nADR-0022), and sends `other` otherwise.\n\nRevisions:\n- protocol 0.1.0 (no token): every value down to `stage_kill`;\n- `target_status.note_labels.2026_10` (ADR-0051 decision 4): the Microsoft SQL Server\n  labels below `stage_kill`. SQL Server permission names are lowercased with spaces\n  replaced by `_` (`CONTROL SERVER` -> `control_server`); fixed role names are kept in\n  lower case (`sysadmin`, `db_owner`), and the SQL Server 2022 `##MS_*##` roles are\n  written `ms_` then their name in lower snake case (`##MS_LoginManager##` ->\n  `ms_login_manager`). SQL Server permissions whose name is already a value above\n  (`select`, `insert`, `update`, `delete`, `alter`, `execute`, `references`,\n  `shutdown`…) use that value, with no token. A console that lists the token renders\n  every value of the revision.\n- `target_status.note_labels.2026_10_b` (ADR-0051 refinement of 2026-10-14, items 5 to\n  7): the SQL Server labels below `password_hash_probe`, written by the same rule: the\n  database-scoped event-session permissions of the refusal list (`ALTER ANY DATABASE\n  EVENT SESSION` and its granular forms, `CREATE` / `DROP ANY DATABASE EVENT SESSION`),\n  the other database and server permissions the SQL Server connector judges by name\n  (`VIEW SECURITY DEFINITION`, `VIEW DATABASE SECURITY STATE`, `VIEW ANY PERFORMANCE\n  DEFINITION`…), and the `check()` reads named with `privilege.not_evaluated` when they\n  cannot be evaluated (`logon_trigger_probe`: server logon triggers, whose catalog the\n  minimal grants do not show; `refusal_list_probe`: a refusal-list read cut or failed,\n  so Discovery and Audit do not run; `cas_store_guard_probe`: the CAS store guard's\n  column read cut or failed).\n- `target_status.note_labels.2026_10_c` (ADR-0051 refinement option (a'), phase 9\n  follow-ups): the SQL Server label below `cas_store_guard_probe`, `on_failure_probe`\n  for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,\n  whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not\n  read, so records lost to a failing audit target are not counted.\n- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6): the Firebird\n  labels below `on_failure_probe`. Firebird system privileges are lowercased as written\n  in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->\n  `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for\n  the `RDB$ADMIN` role, `database_owner`, `security_database_admin` for the security\n  database's administrator flag `SEC$ADMIN`); `usage` (the object right on generators,\n  exceptions and domains); `verifier_relation_readable` (a readable verifier or hash\n  relation such as `PLG$SRP`, `privilege.refused`) and `credential_relation_readable`\n  (another readable credential relation, `privilege.global_privileges`); `role_graph`\n  (the role graph not evaluated, `privilege.not_evaluated`); the reasons of\n  `audit.trace_config_not_evaluated` (`firebird_conf_unreadable`,\n  `trace_config_unreadable`: unreadable, refused or not parsed; `trace_config_file_mismatch`:\n  `AuditTraceConfigFile` names another file; `config_changed_since_start`;\n  `server_process_not_visible`, e.g. another pid namespace; `similar_to_pattern`: a\n  section with a `SIMILAR TO` pattern or `_` / `%` in a file name); and the trace configuration\n  settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for\n  `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights\n  and DDL rights whose name is already a value above (`insert`, `update`, `delete`,\n  `references`, `execute`, `create`, `alter`, `drop`) use that value, with no token.\n\nEach revision is negotiated on its own: a value is sent only when the token of its own\nrevision is listed.\n",
       "type": "string",
       "enum": [
         "other",
@@ -942,11 +970,67 @@
         "logon_trigger_probe",
         "refusal_list_probe",
         "cas_store_guard_probe",
-        "on_failure_probe"
+        "on_failure_probe",
+        "user_management",
+        "read_raw_pages",
+        "create_user_types",
+        "use_nbackup_utility",
+        "change_shutdown_mode",
+        "trace_any_attachment",
+        "monitor_any_attachment",
+        "access_shutdown_database",
+        "create_database",
+        "drop_database",
+        "use_gbak_utility",
+        "use_gstat_utility",
+        "use_gfix_utility",
+        "ignore_db_triggers",
+        "change_header_settings",
+        "select_any_object_in_database",
+        "access_any_object_in_database",
+        "modify_any_object_in_database",
+        "change_mapping_rules",
+        "use_granted_by_clause",
+        "grant_revoke_on_any_object",
+        "grant_revoke_any_ddl_right",
+        "create_privileged_roles",
+        "get_dbcrypt_info",
+        "modify_ext_conn_pool",
+        "replicate_into_database",
+        "profile_any_attachment",
+        "sysdba",
+        "rdb_admin",
+        "database_owner",
+        "security_database_admin",
+        "usage",
+        "verifier_relation_readable",
+        "credential_relation_readable",
+        "role_graph",
+        "firebird_conf_unreadable",
+        "trace_config_unreadable",
+        "trace_config_file_mismatch",
+        "config_changed_since_start",
+        "server_process_not_visible",
+        "similar_to_pattern",
+        "enabled",
+        "log_filename",
+        "log_connections",
+        "log_statement_finish",
+        "log_blr_requests",
+        "log_procedure_finish",
+        "log_function_finish",
+        "log_trigger_finish",
+        "log_errors",
+        "log_services",
+        "time_threshold",
+        "print_perf",
+        "include_filter",
+        "exclude_filter",
+        "connection_id"
       ]
     },
     "DetectedTarget": {
-      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\nNever `sqlite` (checked by this schema): SQLite targets are declared files only, with no\nlocal detection and no file system search (ADR-0059 decision 2, ADR-0006, I5).\n",
+      "description": "A local engine spotted by a Unix socket, a local listening port or a process name. At least one\nof `unix_socket`, `port`, `process` is present. The agent never connects to a detected target.\nNever `sqlite` (checked by this schema): SQLite targets are declared files only, with no\nlocal detection and no file system search (ADR-0059 decision 2, ADR-0006, I5). A\n`firebird` server is detected by its local port (3050) or its `firebird` process\n(ADR-0060 decision 7), never by a `unix_socket` (checked by this schema).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -967,7 +1051,7 @@
           "maximum": 65535
         },
         "process": {
-          "description": "Process name only (the command line may contain secrets and is never read or sent).\n`sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and\n`valkey-server` (ADR-0052 decision 11) belong to engines gated by their token (see\n`Engine`): a detected target of such an engine is not sent before the token is listed.\n",
+          "description": "Process name only (the command line may contain secrets and is never read or sent).\n`sqlservr` (SQL Server on Linux, ADR-0051 decision 7), `redis-server` and\n`valkey-server` (ADR-0052 decision 11) and `firebird` (the Firebird server, ADR-0060\ndecision 7) belong to engines gated by their token (see `Engine`): a detected target\nof such an engine is not sent before the token is listed.\n",
           "type": "string",
           "enum": [
             "postgres",
@@ -977,26 +1061,49 @@
             "slapd",
             "sqlservr",
             "redis-server",
-            "valkey-server"
+            "valkey-server",
+            "firebird"
           ]
         }
       },
-      "if": {
-        "required": [
-          "engine"
-        ],
-        "properties": {
-          "engine": {
-            "const": "sqlite"
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "sqlite"
+              }
+            }
+          },
+          "then": {
+            "description": "No detected target of the `sqlite` engine (ADR-0059 decision 2).",
+            "properties": {
+              "engine": false
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "firebird"
+              }
+            }
+          },
+          "then": {
+            "description": "A `firebird` server is detected by its port or its process only (ADR-0060 decision\n7): no `unix_socket` (Firebird listens on TCP; a local socket path is never sent).\n",
+            "properties": {
+              "unix_socket": false
+            }
           }
         }
-      },
-      "then": {
-        "description": "No detected target of the `sqlite` engine (ADR-0059 decision 2).",
-        "properties": {
-          "engine": false
-        }
-      }
+      ]
     },
     "SpoolStatus": {
       "type": "object",
@@ -1641,7 +1748,7 @@
       }
     },
     "Location": {
-      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\nSQL Server (ADR-0051 decision 5): database, schema, table, column.\nRedis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type\n(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern\n(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and\nsorted-set members, the normalized field name for hash fields and stream entry fields, or\n`#key` / `#field` for values found in key names / hash field names.\nSQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the file's\ndatabase, the same on every SQLite target: the `target_id` tells files apart; checked by\nthis schema), no `schema`, `object` = the table name, `field` = the column name. Never\nthe file's path, its name or a side file's name.\n\n`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on\nevery other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or\n`/` is still rejected).\n",
+      "description": "Where the data lives, down to the column / field / attribute; never a record. All names are\nnormalized (see `Identifier`).\nPostgreSQL: database, schema, table, column. MySQL / MariaDB: database, table, column (no schema).\nMongoDB: database, collection, normalized field path. OpenLDAP: naming context (as\n`database`), the entry's container reduced to `ou`/`dc`/`o`/`c`/`l`/`st` RDNs (as `schema`,\nnever an entry DN), structural objectClass (as `object`), attribute (ADR-0029).\nCAS (ADR-0041 decision 4): for the service registry, `database` = `service_registry`,\n`schema` = the service type (`cas`, `oauth`, `oidc`, `saml`, `ws_federation` or `other`),\n`object` = the normalized service name (`*` when masked, then the numeric service id), `field`\n= the normalized JSON path of the definition (indices as `[]`, keys of data-keyed maps as `*`,\ne.g. `contacts[].email`, `properties.*.values[]`); for the audit log, `database` =\n`audit_trail`, `object` = `audit_log`, `field` = `who`. Never a file name, never a credential\nfield (`clientSecret`, keys holding secrets), never a ticket id. CAS stores held in another\nengine (JPA tables, MongoDB collections, the LDAP registry) are located under that engine.\nSQL Server (ADR-0051 decision 5): database, schema, table, column.\nRedis / Valkey (ADR-0052 decision 7): `database` = `db<index>`; `schema` = the Redis type\n(`string`, `hash`, `list`, `set`, `zset`, `stream`); `object` = the normalized key pattern\n(`KeyPattern`, e.g. `user:*:email`); `field` = `value` for strings and for list, set and\nsorted-set members, the normalized field name for hash fields and stream entry fields, or\n`#key` / `#field` for values found in key names / hash field names.\nSQLite (ADR-0059 decision 6): `database` = `main` (SQLite's own name for the file's\ndatabase, the same on every SQLite target: the `target_id` tells files apart; checked by\nthis schema), no `schema`, `object` = the table name, `field` = the column name. Never\nthe file's path, its name or a side file's name.\nFirebird (ADR-0060 decision 5): `database` = the name declared in `agent.yaml`, never a\nfile path or alias; `object` = the table; `field` = the column; no `schema` (checked by\nthis schema: Firebird 4.0 and 5.0 have no schemas).\n\n`object` is a `KeyPattern` when `engine` is `redis` or `valkey`, and an `Identifier` on\nevery other engine (so a PostgreSQL, MySQL, MongoDB or OpenLDAP object containing `:` or\n`/` is still rejected).\n",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1724,6 +1831,24 @@
               "database": {
                 "const": "main"
               },
+              "schema": false
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "engine"
+            ],
+            "properties": {
+              "engine": {
+                "const": "firebird"
+              }
+            }
+          },
+          "then": {
+            "description": "Firebird (ADR-0060 decision 5): database, table and column; no `schema`.\n",
+            "properties": {
               "schema": false
             }
           }
@@ -2051,6 +2176,43 @@
                   "properties": {
                     "account_not_recorded": {
                       "const": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "description": "Firebird trace events (ADR-0060 decisions 5 and 6): no `principal.application` (the\nclient process name is set by the client, can be spoofed and may hold a path with a\nuser name, so the agent drops it) and no `schema` in an object (Firebird 4.0 and 5.0\nhave no schemas).\n",
+          "if": {
+            "required": [
+              "source"
+            ],
+            "properties": {
+              "source": {
+                "const": "firebird_audit_trace"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "principal": {
+                "type": "object",
+                "properties": {
+                  "application": false
+                }
+              },
+              "objects": {
+                "type": "array",
+                "not": {
+                  "contains": {
+                    "description": "An object that names a `schema`, whatever its value: it does not satisfy\n\"`schema` absent\" (`properties: {schema: false}`). Written without `required`,\nwhich Ajv's strict mode and the redocly lint accept only with `type` and a\ndeclared property.\n",
+                    "type": "object",
+                    "not": {
+                      "properties": {
+                        "schema": false
+                      }
                     }
                   }
                 }

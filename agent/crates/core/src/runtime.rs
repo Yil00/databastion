@@ -1196,6 +1196,9 @@ impl Runtime {
                     r2026_10_c: self
                         .console_caps
                         .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_C),
+                    r2026_10_d: self
+                        .console_caps
+                        .console_accepts(crate::capabilities::token::NOTE_LABELS_2026_10_D),
                 },
             )
         } else {

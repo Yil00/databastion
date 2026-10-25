@@ -5414,6 +5414,22 @@ fn spool_engine_findings(rt: &Runtime, engine: databastion_protocol::Engine, n: 
             })
             .collect();
     }
+    if engine == databastion_protocol::Engine::Firebird {
+        // A `firebird` location has no schema (ADR-0060 decision 5).
+        use databastion_classifiers::masking::FindingLocation;
+        use databastion_classifiers::names::normalize_path;
+        found = found
+            .into_iter()
+            .map(|f| {
+                f.with_location(FindingLocation {
+                    database: normalize_path("crm"),
+                    schema: None,
+                    object: normalize_path("CUSTOMERS"),
+                    field: normalize_path("EMAIL"),
+                })
+            })
+            .collect();
+    }
     rt.spool_findings(
         Uuid::try_from("01920f5e-8a10-7c4d-8e21-0f1e2d3c4b5a").unwrap(),
         &TargetId::try_from("t-1").unwrap(),
@@ -5524,6 +5540,89 @@ async fn sqlite_findings_wait_for_engine_sqlite() {
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert_eq!(sent[1]["findings"][0]["location"]["engine"], "sqlite");
     assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0060 decision 8, ADR-0042: findings of a `firebird` target are
+/// held in the spool until the console lists `engine.firebird`; the other
+/// batches are not blocked behind them.
+#[tokio::test]
+async fn firebird_findings_wait_for_engine_firebird() {
+    use crate::capabilities::token;
+    use databastion_protocol::Engine as E;
+    let server = MockServer::start().await;
+    let env = enrolled(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/agent/v1/findings"))
+        .respond_with(Script(std::sync::Mutex::new(
+            vec![Step::Ack(false), Step::Ack(false)].into(),
+        )))
+        .mount(&server)
+        .await;
+    let rt = runtime(&env);
+    spool_engine_findings(&rt, E::Firebird, 2);
+    spool_engine_findings(&rt, E::Postgres, 3);
+    // Every other engine token, not Firebird's: the `firebird` batch is
+    // held.
+    accept_tokens(
+        &rt,
+        &[
+            token::ENGINE_CAS,
+            token::ENGINE_SQLSERVER,
+            token::ENGINE_REDIS,
+            token::ENGINE_VALKEY,
+            token::ENGINE_SQLITE,
+        ],
+    );
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].to_string().contains("firebird"));
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    accept_tokens(&rt, &[token::ENGINE_FIREBIRD]);
+    drain(&rt).await;
+    let sent = sent_batches(&server).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1]["findings"][0]["location"]["engine"], "firebird");
+    assert!(sent[1]["findings"][0]["location"].get("schema").is_none());
+    assert_eq!(sent[1]["findings"].as_array().unwrap().len(), 2);
+    assert_eq!(rt.lock_spool().status().batches.0, 0);
+}
+
+/// ADR-0060 decision 8, ADR-0042: events of the `firebird_audit_trace`
+/// source are held in the spool until the console lists
+/// `engine.firebird`.
+#[tokio::test]
+async fn firebird_events_wait_for_engine_firebird() {
+    use crate::capabilities::token;
+    let server = MockServer::start().await;
+    let (_env, rt) = events_runtime(&server, vec![Step::Ack(false)]).await;
+    accept_tokens(
+        &rt,
+        &[
+            token::ACCESS_EVENT_BYTES,
+            token::ENGINE_SQLITE,
+            token::TARGET_STATUS_NOTES,
+        ],
+    );
+    let fb: databastion_protocol::EventsBatch = serde_json::from_str(include_str!(
+        "../../../../shared/protocol/fixtures/valid/EventsBatch.firebird.json"
+    ))
+    .unwrap();
+    let n = fb.events.len();
+    let batch = ResultBatch::parse(false, serde_json::to_vec(&fb).unwrap()).unwrap();
+    rt.lock_spool().push(&batch).unwrap();
+    drain(&rt).await;
+    assert!(sent_event_batches(&server).await.is_empty());
+    assert_eq!(rt.lock_spool().status().batches.0, 1, "held, not dropped");
+
+    accept_tokens(&rt, &[token::ENGINE_FIREBIRD]);
+    drain(&rt).await;
+    let sent = sent_event_batches(&server).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["events"].as_array().unwrap().len(), n);
+    assert_eq!(sent[0]["events"][0]["source"], "firebird_audit_trace");
     assert_eq!(rt.lock_spool().status().batches.0, 0);
 }
 

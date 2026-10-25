@@ -53,7 +53,31 @@ const mutations = {
   "unevaluatedProperties: true": (s) => { s.Location.unevaluatedProperties = true; },
   "propertyNames outside the numeric map": (s) => { s.Location.propertyNames = { type: "string", maxLength: 8 }; },
   "empty items schema": (s) => { s.Finding.properties.masked_samples.items = {}; },
+  "open items object in a then branch (not negated)": (s) => {
+    s.JobStatusUpdate.then.properties = { raw: { type: "array", maxItems: 4, items: { type: "object", properties: { n: COUNT } } } };
+  },
+  "$ref into a fragment": (s) => {
+    s.Finding.properties.raw = { $ref: "#/components/schemas/AccessEvent/allOf/3/then/properties/objects/not/contains" };
+  },
+  "$ref to another document": (s) => { s.Finding.properties.raw = { $ref: "https://example.invalid/s.json" }; },
+  "$defs below a not": (s) => {
+    s.MaskedSample.allOf.push({ not: { $defs: { open: { type: "object" } }, required: ["x"] } });
+  },
+  "$id below the top level": (s) => { s.Finding.properties.raw = { ...COUNT, $id: "https://example.invalid/count" }; },
+  "$anchor below the top level": (s) => { s.Finding.properties.raw = { ...COUNT, $anchor: "count" }; },
+  "$dynamicRef below the top level": (s) => { s.Finding.properties.raw = { $dynamicRef: "#count" }; },
+  "typed array without items": (s) => { delete s.Finding.properties.masked_samples.items; },
+  "fragment opening its parent below a not": (s) => {
+    s.MaskedSample.allOf.push({ not: { additionalProperties: true } });
+  },
 };
+
+test("an open object below a `not` is a fragment (it only refuses data)", () => {
+  const problems = mutate((s) => {
+    s.JobStatusUpdate.then.properties = { raw: { type: "array", not: { contains: { type: "object", required: ["n"] } } } };
+  });
+  assert.deepEqual(problems, []);
+});
 
 for (const [name, fn] of Object.entries(mutations)) {
   test(`mutation is caught: ${name}`, () => {

@@ -81,6 +81,7 @@ pub fn sent_labels(note: &crate::TargetNote, all_revisions: bool) -> Vec<String>
         r2026_10: all_revisions,
         r2026_10_b: all_revisions,
         r2026_10_c: all_revisions,
+        r2026_10_d: all_revisions,
     };
     crate::notes::to_protocol(std::slice::from_ref(note), revisions)
         .first()
@@ -116,6 +117,7 @@ pub fn contract_target_status_json(
                 r2026_10: true,
                 r2026_10_b: true,
                 r2026_10_c: true,
+                r2026_10_d: true,
             },
         ),
         reachable: health.reachable,

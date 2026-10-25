@@ -225,7 +225,13 @@ type Connector = ProtocolSchemas["Connector"];
 type DetectedProcess = NonNullable<ProtocolSchemas["DetectedTarget"]["process"]>;
 
 /** Every `engine.<value>` token of the contract, listed by this console or not yet. */
-export type EngineToken = "engine.cas" | "engine.sqlserver" | "engine.redis" | "engine.valkey" | "engine.sqlite";
+export type EngineToken =
+  | "engine.cas"
+  | "engine.sqlserver"
+  | "engine.redis"
+  | "engine.valkey"
+  | "engine.sqlite"
+  | "engine.firebird";
 
 /**
  * The tokens gating each `Engine` value (ADR-0039 decision 8, ADR-0042): none for the engines of
@@ -246,6 +252,7 @@ const ENGINE_TOKENS: Record<Engine, readonly EngineToken[]> = {
   redis: ["engine.redis"],
   valkey: ["engine.valkey"],
   sqlite: ["engine.sqlite"],
+  firebird: ["engine.firebird"],
 };
 
 /** Engines each `Connector` serves (`mysql` covers MySQL and MariaDB, `redis` Redis and Valkey). */
@@ -258,6 +265,7 @@ const CONNECTOR_ENGINES: Record<Connector, readonly Engine[]> = {
   sqlserver: ["sqlserver"],
   redis: ["redis", "valkey"],
   sqlite: ["sqlite"],
+  firebird: ["firebird"],
 };
 
 /** Engine of each `DetectedTarget.process`. */
@@ -270,6 +278,7 @@ const PROCESS_ENGINES: Record<DetectedProcess, readonly Engine[]> = {
   sqlservr: ["sqlserver"],
   "redis-server": ["redis"],
   "valkey-server": ["valkey"],
+  firebird: ["firebird"],
 };
 
 function tokensOf(engines: readonly Engine[]): readonly EngineToken[] {

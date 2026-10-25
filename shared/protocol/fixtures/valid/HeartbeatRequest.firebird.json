@@ -1,0 +1,126 @@
+{
+  "ts": "2026-10-25T09:00:00Z",
+  "agent_version": "0.10.0",
+  "uptime_s": 3600,
+  "classifiers_version": "2026.09.1",
+  "connectors": [
+    "postgres",
+    "mysql",
+    "mongodb",
+    "openldap",
+    "firebird"
+  ],
+  "targets": [
+    {
+      "target_id": "fb-crm",
+      "engine": "firebird",
+      "server_version": "5.0.4",
+      "reachable": true,
+      "audit_level": "partial",
+      "audit_source": "firebird_audit_trace",
+      "notes": [
+        {
+          "code": "coverage.external_file_tables",
+          "count": 1
+        },
+        {
+          "code": "coverage.views_not_sampled",
+          "count": 3
+        },
+        {
+          "code": "coverage.computed_columns_not_sampled",
+          "count": 2
+        },
+        {
+          "code": "coverage.relations_without_select",
+          "count": 4
+        },
+        {
+          "code": "security.login_event_trigger"
+        },
+        {
+          "code": "audit.services_not_audited",
+          "labels": [
+            "other"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "fb-legacy",
+      "engine": "firebird",
+      "server_version": "4.0.7",
+      "reachable": true,
+      "audit_level": "limited",
+      "audit_source": "firebird_audit_trace",
+      "notes": [
+        {
+          "code": "audit.trace_settings_missing",
+          "labels": [
+            "other"
+          ]
+        },
+        {
+          "code": "audit.trace_config_not_evaluated"
+        },
+        {
+          "code": "audit.log_records_ambiguous",
+          "count": 2
+        },
+        {
+          "code": "audit.statement_text_limit_low",
+          "count": 300
+        },
+        {
+          "code": "privilege.global_privileges",
+          "count": 1,
+          "labels": [
+            "other"
+          ]
+        }
+      ]
+    },
+    {
+      "target_id": "fb-remote",
+      "engine": "firebird",
+      "server_version": "5.0.4",
+      "reachable": true,
+      "audit_level": "none",
+      "notes": [
+        {
+          "code": "security.firebird_tunnel"
+        },
+        {
+          "code": "audit.source_not_configured"
+        }
+      ]
+    },
+    {
+      "target_id": "fb-down",
+      "engine": "firebird",
+      "reachable": false,
+      "audit_level": "none",
+      "last_error": "target_unreachable",
+      "notes": [
+        {
+          "code": "check.stage_failed",
+          "labels": [
+            "stage_tls"
+          ]
+        }
+      ]
+    }
+  ],
+  "detected_targets": [
+    {
+      "engine": "firebird",
+      "port": 3050,
+      "process": "firebird"
+    }
+  ],
+  "spool": {
+    "bytes": 0,
+    "max_bytes": 104857600,
+    "batches": 0
+  }
+}
