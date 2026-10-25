@@ -92,7 +92,8 @@ pub fn sent_labels(note: &crate::TargetNote, all_revisions: bool) -> Vec<String>
 
 /// The `TargetStatus` the heartbeat would send for `health` (a console
 /// listing every note label revision), through the core's last step for
-/// `sqlite` targets (`sanitize::enforce_sqlite_target_status`), as JSON.
+/// `sqlite` and `firebird` targets (`sanitize::enforce_target_status`), as
+/// JSON.
 /// `server_version` is what a connector would report.
 ///
 /// # Panics
@@ -125,6 +126,6 @@ pub fn contract_target_status_json(
             .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
         target_id: databastion_protocol::TargetId::try_from("test-target").expect("target id"),
     };
-    crate::sanitize::enforce_sqlite_target_status(&mut status);
+    crate::sanitize::enforce_target_status(&mut status);
     serde_json::to_string(&status).expect("a target status serializes")
 }

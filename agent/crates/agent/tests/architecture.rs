@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const CONNECTORS: [&str; 8] = [
+const CONNECTORS: [&str; 9] = [
     "connector-postgres",
     "connector-mysql",
     "connector-mongodb",
@@ -28,6 +28,7 @@ const CONNECTORS: [&str; 8] = [
     "connector-redis",
     "connector-sqlserver",
     "connector-sqlite",
+    "connector-firebird",
 ];
 
 /// Crates a connector must never depend on (directly or through a rename).
@@ -519,6 +520,78 @@ fn sqlserver_statements_never_read_definitions() {
     assert!(!databastion_connector_sqlserver::statement_checked(
         "SELECT definition FROM sys.sql_modules"
     ));
+}
+
+/// ADR-0060 decisions 1, 4 and 5: the Firebird connector's statements are
+/// a closed allow-list of constant texts (`connector-firebird/src/sql.rs`),
+/// each read-only (no word of the crate's deny-list outside quotes: no
+/// write, no DDL, no PSQL, no `EXECUTE STATEMENT … ON EXTERNAL`, no
+/// `RDB$SET_CONTEXT`), and none reads a source text (`*_SOURCE` columns:
+/// literals and credentials) nor an external file's path.
+#[cfg(feature = "firebird")]
+#[test]
+fn firebird_statements_are_closed_and_read_only() {
+    let list = databastion_connector_firebird::statement_allow_list();
+    assert!(list.len() >= 20, "allow-list looks empty");
+    for (name, text) in &list {
+        assert!(
+            !databastion_connector_firebird::statement_has_denied_word(text),
+            "{name}: {text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        for d in [
+            "_source",
+            "rdb$external_file",
+            "on external",
+            "execute statement",
+        ] {
+            assert!(!lower.contains(d), "{name} names {d}");
+        }
+        assert!(
+            databastion_connector_firebird::statement_checked(text),
+            "{name}"
+        );
+    }
+    for denied in [
+        "UPDATE CUSTOMERS SET EMAIL = NULL",
+        "EXECUTE BLOCK AS BEGIN END",
+        "SELECT RDB$SET_CONTEXT('USER_SESSION', 'A', 'B') FROM RDB$DATABASE",
+        "SELECT 1 FROM T FOR UPDATE",
+    ] {
+        assert!(
+            databastion_connector_firebird::statement_has_denied_word(denied),
+            "{denied}"
+        );
+        assert!(!databastion_connector_firebird::statement_checked(denied));
+    }
+}
+
+/// ADR-0060 decision 1 and Consequences: no Firebird driver crate nor C
+/// client in the graph, and the connector's big integers are
+/// `crypto-bigint` (constant time), never `num-bigint`.
+#[test]
+fn the_firebird_connector_has_its_own_client_only() {
+    let metadata = cargo_metadata();
+    let nodes = resolved_nodes(&metadata);
+    for (name, _, deps, _) in &nodes {
+        assert!(
+            !name.starts_with("rsfbclient") && name != "firebirust" && !name.contains("fbclient"),
+            "{name} is in the graph"
+        );
+        if name == "databastion-connector-firebird" {
+            for (d, normal, _) in deps {
+                assert!(
+                    !(*normal && (d == "num-bigint" || d == "num-bigint-dig" || d == "rug")),
+                    "connector-firebird depends on {d}"
+                );
+            }
+            assert!(
+                deps.iter()
+                    .any(|(d, normal, _)| d == "crypto-bigint" && *normal),
+                "connector-firebird lost crypto-bigint"
+            );
+        }
+    }
 }
 
 /// The resolved graph: `(package name, links, [(dependency name, normal,

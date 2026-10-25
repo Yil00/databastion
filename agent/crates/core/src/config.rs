@@ -21,6 +21,7 @@ use serde::Deserialize;
 use crate::engine::Engine;
 
 pub mod cas;
+pub mod firebird;
 pub mod redis;
 pub mod sqlite;
 pub mod sqlserver;
@@ -273,6 +274,8 @@ pub enum TargetEngine {
     /// SQLite: one declared local database file (`sqlite:` block;
     /// ADR-0059).
     Sqlite,
+    /// Firebird 4.0 and 5.0 on loopback (`firebird:` block; ADR-0060).
+    Firebird,
 }
 
 impl TargetEngine {
@@ -288,6 +291,7 @@ impl TargetEngine {
             Self::Redis | Self::Valkey => Engine::Redis,
             Self::Sqlserver => Engine::Sqlserver,
             Self::Sqlite => Engine::Sqlite,
+            Self::Firebird => Engine::Firebird,
         }
     }
 }
@@ -361,6 +365,11 @@ pub struct TargetConfig {
     /// `sqlite` targets' files.
     #[serde(skip)]
     sqlite_resolved: Option<sqlite::SqliteSettings>,
+    /// Firebird settings (`engine: firebird` only, required there): the
+    /// declared databases and the loopback peer (ADR-0060 decisions 3 and
+    /// 5).
+    #[serde(default)]
+    pub firebird: Option<firebird::FirebirdTargetConfig>,
     /// The agent's `state_dir`, set when the configuration was loaded
     /// ([`AgentConfig::parse`]): where a connector keeps small per-target
     /// marks ([`crate::local_state`]).
@@ -783,7 +792,7 @@ impl TargetConfig {
             TargetEngine::Openldap => self.openldap.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Redis | TargetEngine::Valkey => self.redis.as_ref()?.cas_stores.as_ref(),
             TargetEngine::Sqlserver => self.sqlserver.as_ref()?.cas_stores.as_ref(),
-            TargetEngine::Cas | TargetEngine::Sqlite => None,
+            TargetEngine::Cas | TargetEngine::Sqlite | TargetEngine::Firebird => None,
         }
     }
 
@@ -829,6 +838,7 @@ impl TargetConfig {
             cas_resolved: None,
             sqlite: None,
             sqlite_resolved: Some(settings),
+            firebird: None,
             state_dir: None,
         }
     }
@@ -844,6 +854,51 @@ impl TargetConfig {
     #[must_use]
     pub fn state_dir(&self) -> Option<&std::path::Path> {
         self.state_dir.as_deref()
+    }
+
+    /// The `firebird` block of an `engine: firebird` target (ADR-0060),
+    /// its `peer_uid` resolved when the configuration was loaded. `None`
+    /// for other engines.
+    #[must_use]
+    pub fn firebird_settings(&self) -> Option<&firebird::FirebirdTargetConfig> {
+        self.firebird.as_ref()
+    }
+
+    /// Test support: a `firebird` target on loopback with these settings
+    /// (the connector's own tests).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn firebird_for_tests(
+        id: &str,
+        host: &str,
+        port: u16,
+        account: &str,
+        secret: SecretRef,
+        settings: firebird::FirebirdTargetConfig,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            engine: TargetEngine::Firebird,
+            host: Some(host.to_owned()),
+            port: Some(port),
+            socket: None,
+            account: account.to_owned(),
+            secret,
+            phone_region: None,
+            postgres: None,
+            mysql: None,
+            mongodb: None,
+            openldap: None,
+            redis: None,
+            sqlserver: None,
+            cas: None,
+            cas_resolved: None,
+            sqlite: None,
+            sqlite_resolved: None,
+            firebird: Some(settings),
+            state_dir: None,
+        }
     }
 
     /// Microsoft SQL Server settings, defaults when absent.
@@ -874,6 +929,7 @@ impl TargetConfig {
             TargetEngine::Mongodb => 27017,
             TargetEngine::Redis | TargetEngine::Valkey => redis::DEFAULT_PORT,
             TargetEngine::Sqlserver => sqlserver::DEFAULT_PORT,
+            TargetEngine::Firebird => firebird::DEFAULT_PORT,
             TargetEngine::Openldap => {
                 if self.openldap_settings().tls == OpenldapTlsMode::VerifyFull {
                     636
@@ -1105,6 +1161,12 @@ const KNOWN_KEYS: &[&str] = &[
     "rollback_mode",
     "skip",
     "read",
+    "firebird",
+    "name",
+    "attach",
+    "peer_uid",
+    "peer_uid_root",
+    "tunnel",
     "spool",
     "max_batches",
     "max_bytes",
@@ -1214,6 +1276,7 @@ impl AgentConfig {
         let mut config = config;
         config.resolve_cas()?;
         config.resolve_sqlite(path)?;
+        config.resolve_firebird()?;
         for target in &mut config.targets {
             target.state_dir = Some(config.state_dir.clone());
         }
@@ -1239,6 +1302,35 @@ impl AgentConfig {
                         }
                     })?;
                 target.cas_resolved = Some(settings);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the `peer_uid` of every `firebird` block (ADR-0060
+    /// decision 3): `/etc/passwd` and the container check are read only
+    /// when a block names a user.
+    fn resolve_firebird(&mut self) -> Result<(), ConfigError> {
+        let names_a_user = self.targets.iter().any(|t| {
+            t.firebird.as_ref().is_some_and(|f| {
+                !matches!(&f.peer_uid, Some(firebird::PeerUid::Number(_)))
+                    && !matches!(&f.peer_uid, Some(firebird::PeerUid::Name(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        });
+        let (passwd, in_container) = if names_a_user {
+            (
+                std::fs::read_to_string("/etc/passwd").ok(),
+                firebird::agent_in_container(),
+            )
+        } else {
+            (None, false)
+        };
+        for (i, t) in self.targets.iter_mut().enumerate() {
+            if let Some(f) = t.firebird.as_mut() {
+                f.resolve(passwd.as_deref(), in_container)
+                    .map_err(|(key, reason)| {
+                        invalid(format!("targets[{i}].firebird.{key}"), reason)
+                    })?;
             }
         }
         Ok(())
@@ -1512,6 +1604,12 @@ impl TargetConfig {
         if self.engine == TargetEngine::Sqlserver {
             self.validate_sqlserver(i)?;
         }
+        if self.firebird.is_some() && self.engine != TargetEngine::Firebird {
+            return Err(invalid(f("firebird"), "only for engine firebird"));
+        }
+        if self.engine == TargetEngine::Firebird {
+            self.validate_firebird(i)?;
+        }
         match (&self.host, &self.socket) {
             (Some(host), None) => {
                 if host.is_empty() || host.len() > 253 || host.chars().any(char::is_control) {
@@ -1652,6 +1750,7 @@ impl TargetConfig {
             ("redis", self.redis.is_some()),
             ("sqlserver", self.sqlserver.is_some()),
             ("sqlite", self.sqlite.is_some()),
+            ("firebird", self.firebird.is_some()),
         ];
         if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
             return Err(invalid(
@@ -1684,6 +1783,7 @@ impl TargetConfig {
             ("redis", self.redis.is_some()),
             ("sqlserver", self.sqlserver.is_some()),
             ("cas", self.cas.is_some()),
+            ("firebird", self.firebird.is_some()),
         ];
         if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
             return Err(invalid(
@@ -1710,6 +1810,54 @@ impl TargetConfig {
         self.sqlserver_settings()
             .validate()
             .map_err(|(key, reason)| invalid(f(&format!("sqlserver.{key}")), reason))
+    }
+
+    /// A Firebird target (ADR-0060 decisions 3 and 5): a loopback IP
+    /// literal (`127.0.0.1` or `::1`) over TCP, no socket, no other engine
+    /// block, and the `firebird` block's own rules. A remote server is
+    /// reached through an operator-run tunnel ending on loopback
+    /// (`firebird.tunnel: true`).
+    fn validate_firebird(&self, i: usize) -> Result<(), ConfigError> {
+        let f = |name: &str| format!("targets[{i}].{name}");
+        let refused = [
+            ("socket", self.socket.is_some()),
+            ("postgres", self.postgres.is_some()),
+            ("mysql", self.mysql.is_some()),
+            ("mongodb", self.mongodb.is_some()),
+            ("openldap", self.openldap.is_some()),
+            ("redis", self.redis.is_some()),
+            ("sqlserver", self.sqlserver.is_some()),
+        ];
+        if let Some((name, _)) = refused.iter().find(|(_, set)| *set) {
+            return Err(invalid(
+                f(name),
+                "not used by a firebird target (remove it)",
+            ));
+        }
+        if !self
+            .host
+            .as_deref()
+            .is_some_and(firebird::host_is_loopback_literal)
+        {
+            return Err(invalid(
+                f("host"),
+                "a Firebird target is reached on loopback only: 127.0.0.1 or ::1 (a remote \
+                 server through an operator-run tunnel ending on loopback, firebird.tunnel: true)",
+            ));
+        }
+        if !firebird::account_ok(&self.account) {
+            return Err(invalid(
+                f("account"),
+                "a Firebird account is a regular identifier: an ASCII letter, then up to 62 \
+                 ASCII letters, digits, _ or $ (the server stores it upper-cased)",
+            ));
+        }
+        let Some(block) = &self.firebird else {
+            return Err(invalid(f("firebird"), "required for engine firebird"));
+        };
+        block
+            .validate()
+            .map_err(|(key, reason)| invalid(f(&format!("firebird.{key}")), reason))
     }
 
     /// A Redis / Valkey target (ADR-0052 decision 3): a named ACL user with
@@ -2082,6 +2230,139 @@ targets:
         assert!(err(&dup).contains("duplicate_file"), "{}", err(&dup));
     }
 
+    const FIREBIRD: &str = "
+console:
+  url: https://console.example.internal
+state_dir: /var/lib/databastion
+targets:
+  - id: fb-app
+    engine: firebird
+    host: 127.0.0.1
+    account: DATABASTION_AGENT
+    secret:
+      env: DATABASTION_FB_PASSWORD
+    firebird:
+      peer_uid: 84
+      databases:
+        - name: app
+          attach: appalias
+";
+
+    /// ADR-0060 decisions 3 and 5: a loopback IP literal, a numeric or
+    /// resolved peer uid, declared databases, and errors that name the
+    /// rule, never the value.
+    #[test]
+    fn firebird_targets_are_loopback_with_declared_databases() {
+        let cfg = parse(FIREBIRD).unwrap();
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Firebird);
+        assert_eq!(t.engine.connector(), Engine::Firebird);
+        assert_eq!(t.effective_port(), Some(firebird::DEFAULT_PORT));
+        assert!(t.cas_stores().is_none());
+        let fb = t.firebird_settings().unwrap();
+        assert_eq!(fb.peer_uid(), Some(84));
+        assert_eq!(fb.databases[0].attach, "appalias");
+        assert!(!fb.tunnel && !fb.extended_grants);
+        let v6 = parse(&FIREBIRD.replace("host: 127.0.0.1", "host: \"::1\"")).unwrap();
+        assert!(v6.targets[0].firebird_settings().is_some());
+        for (from, to, key) in [
+            ("host: 127.0.0.1", "host: localhost", "targets[0].host"),
+            ("host: 127.0.0.1", "host: db.example", "targets[0].host"),
+            ("host: 127.0.0.1", "host: 127.0.0.2", "targets[0].host"),
+            (
+                "    host: 127.0.0.1\n",
+                "    socket: /tmp/fb.sock\n",
+                "targets[0].socket",
+            ),
+            (
+                "      peer_uid: 84\n",
+                "      peer_uid: 0\n",
+                "targets[0].firebird.peer_uid",
+            ),
+            (
+                "      peer_uid: 84\n",
+                "      peer_uid: 65534\n",
+                "targets[0].firebird.peer_uid",
+            ),
+            (
+                "      peer_uid: 84\n",
+                "      peer_uid: no_such_user_databastion\n",
+                "targets[0].firebird.peer_uid",
+            ),
+            (
+                "      peer_uid: 84\n",
+                "      tunnel: true\n",
+                "targets[0].firebird.peer_uid",
+            ),
+            (
+                "account: DATABASTION_AGENT",
+                "account: \"agent x\"",
+                "targets[0].account",
+            ),
+            (
+                "account: DATABASTION_AGENT",
+                "account: 9agent",
+                "targets[0].account",
+            ),
+            (
+                "          attach: appalias\n",
+                "          attach: /srv/../x.fdb\n",
+                "targets[0].firebird.databases.attach",
+            ),
+            (
+                "          attach: appalias\n",
+                "          attach: host:/srv/x.fdb\n",
+                "targets[0].firebird.databases.attach",
+            ),
+        ] {
+            let text = FIREBIRD.replace(from, to);
+            let e = err(&text);
+            assert!(e.contains(key), "{to}: {e}");
+            assert!(!e.contains("/srv"), "{e}");
+        }
+        // The root opt-in and the tunnel mode.
+        let root = FIREBIRD.replace(
+            "      peer_uid: 84\n",
+            "      peer_uid: 0\n      peer_uid_root: true\n",
+        );
+        assert_eq!(
+            parse(&root).unwrap().targets[0]
+                .firebird_settings()
+                .unwrap()
+                .peer_uid(),
+            Some(0)
+        );
+        let tunnel = FIREBIRD.replace(
+            "      peer_uid: 84\n",
+            "      peer_uid: 1001\n      tunnel: true\n",
+        );
+        assert!(
+            parse(&tunnel).unwrap().targets[0]
+                .firebird_settings()
+                .unwrap()
+                .tunnel
+        );
+        // The block is required, and only for firebird; other blocks refused.
+        let bare = FIREBIRD.split("    firebird:\n").next().unwrap();
+        assert!(err(bare).contains("targets[0].firebird"), "{}", err(bare));
+        let misplaced = BASE.replace(
+            "    port: 5432\n",
+            "    port: 5432\n    firebird: {databases: [{name: a, attach: a}]}\n",
+        );
+        assert!(err(&misplaced).contains("targets[0].firebird"));
+        let other = FIREBIRD.replace("    firebird:\n", "    postgres: {}\n    firebird:\n");
+        assert!(
+            err(&other).contains("targets[0].postgres"),
+            "{}",
+            err(&other)
+        );
+        let unknown = FIREBIRD.replace(
+            "      peer_uid: 84\n",
+            "      peer_uid: 84\n      audit: {}\n",
+        );
+        assert!(err(&unknown).contains("unknown field"), "{}", err(&unknown));
+    }
+
     #[test]
     fn cas_targets_are_local_paths_only() {
         let cfg = parse(CAS).unwrap();
@@ -2207,6 +2488,42 @@ targets:
         let s = t.sqlite_settings().unwrap();
         assert_eq!(s.max_statement_ms(), 500);
         assert_eq!(s.rollback_mode(), sqlite::RollbackMode::Skip);
+    }
+
+    /// The commented Firebird target of the example file is valid once
+    /// uncommented, with its optional keys uncommented too.
+    #[test]
+    fn example_firebird_target_is_valid_uncommented() {
+        let text = include_str!("../../../agent.example.yaml");
+        let start = text.find("  # - id: app-fb\n").unwrap();
+        let end = start + text[start..].find("\n\n").unwrap() + 1;
+        let block: String = text[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.strip_prefix("  # ").map(|r| format!("  {r}"))?;
+                let t = l.trim_start();
+                if t.starts_with("# tunnel:") || t.starts_with("# extended_grants:") {
+                    Some(l.replacen("# ", "", 1))
+                } else if t.starts_with('#') {
+                    None
+                } else {
+                    Some(l)
+                }
+            })
+            .map(|l| l + "\n")
+            .collect();
+        assert!(block.contains("tunnel: false") && block.contains("extended_grants: false"));
+        // A numeric uid: the test host need not have a `firebird` user.
+        let block = block.replace("peer_uid: firebird", "peer_uid: 84");
+        let base = BASE.split("targets:\n").next().unwrap();
+        let cfg =
+            parse(&format!("{base}targets:\n{block}")).unwrap_or_else(|e| panic!("{e}\n{block}"));
+        let t = &cfg.targets[0];
+        assert_eq!(t.engine, TargetEngine::Firebird);
+        let fb = t.firebird_settings().unwrap();
+        assert_eq!(fb.peer_uid(), Some(84));
+        assert_eq!(fb.databases[0].attach, "appdb");
+        assert!(!fb.tunnel && !fb.extended_grants);
     }
 
     /// The commented SQL Server target of the example file is valid once
@@ -3053,6 +3370,8 @@ targets:
         names.extend(expected_names::<sqlserver::SqlserverAuditConfig>(KEY));
         names.extend(expected_names::<redis::RedisTargetConfig>(KEY));
         names.extend(expected_names::<redis::RedisNode>(KEY));
+        names.extend(expected_names::<firebird::FirebirdTargetConfig>(KEY));
+        names.extend(expected_names::<firebird::FirebirdDatabase>(KEY));
         names.extend(expected_names::<TargetEngine>(VALUE));
         names.extend(expected_names::<PgLogFormat>(VALUE));
         names.extend(expected_names::<PgTlsMode>(VALUE));

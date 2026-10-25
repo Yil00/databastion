@@ -77,6 +77,14 @@ jobs:
           - { target: sqlite_file, seconds: 600 }
           - { target: sqlite_header, seconds: 120 }
           - { target: sqlite_ipc, seconds: 180 }
+          # ADR-0060 decision 1: the Firebird protocol-16 client's parsers (server messages and
+          # status vectors, describe answers and rows, SRP data, wire-crypt keys) and the
+          # /proc/net/tcp lookup of the peer-uid rule (decision 3).
+          - { target: firebird_messages, seconds: 300 }
+          - { target: firebird_describe_rows, seconds: 300 }
+          - { target: firebird_srp_data, seconds: 120 }
+          - { target: firebird_keys, seconds: 120 }
+          - { target: firebird_proc_net_tcp, seconds: 180 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

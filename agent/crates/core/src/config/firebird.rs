@@ -1,0 +1,450 @@
+//! `targets[].firebird`: settings of a Firebird target (ADR-0060).
+//!
+//! - **Loopback only** (decision 3): the declared `host` is the IP literal
+//!   `127.0.0.1` or `::1` (no name: `localhost` resolution is not trusted).
+//!   A remote server is reached only through an operator-run tunnel that
+//!   ends on the agent host's loopback, declared with `tunnel: true`.
+//! - **The listening peer** (decision 3, security review L1): `peer_uid`
+//!   is the account that must own the server side of every connection
+//!   (default `firebird`; the tunnel process's account with `tunnel:
+//!   true`, then required). Resolved when the configuration is loaded: a
+//!   name through `/etc/passwd`, refused in a container (names resolve
+//!   against the agent image's own `/etc/passwd`); `0` refused unless
+//!   `peer_uid_root: true`; `65534` (`nobody`, what a uid outside the
+//!   reader's user namespace shows as) always refused.
+//! - **Declared databases only** (decision 5, I5): `databases: [{name,
+//!   attach}]`. `attach` (a `databases.conf` alias or an absolute path) is
+//!   sent to the server inside the encrypted session and never leaves the
+//!   agent otherwise; `name` is the operator's label, sent as
+//!   `Location.database`.
+//!
+//! The block has no field the console can set (I3). Errors name the key
+//! and the rule, never the value.
+
+use serde::Deserialize;
+
+/// Default TCP port of the Firebird remote protocol.
+pub const DEFAULT_PORT: u16 = 3050;
+/// Most declared databases per target.
+pub const MAX_DATABASES: usize = 64;
+/// Longest database label, in characters.
+pub const MAX_NAME_CHARS: usize = 128;
+/// Longest `attach` string, in bytes.
+pub const MAX_ATTACH_BYTES: usize = 1024;
+/// The account of the Firebird server processes on the distributions and
+/// the official images (decision 3).
+pub const DEFAULT_PEER_USER: &str = "firebird";
+/// The overflow uid (`nobody`): what a uid outside the reader's user
+/// namespace shows as in `/proc/net/tcp`. Never a valid peer.
+pub const OVERFLOW_UID: u32 = 65_534;
+
+/// `firebird.peer_uid`: a user name resolved when the configuration is
+/// loaded, or a number.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PeerUid {
+    /// A numeric uid.
+    Number(u32),
+    /// A user name (or a number written as a string).
+    Name(String),
+}
+
+/// One declared database (decision 5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirebirdDatabase {
+    /// The operator's label, sent as `Location.database` (normalized
+    /// under ADR-0009). Never a path.
+    pub name: String,
+    /// A `databases.conf` alias or an absolute path, sent to the server
+    /// only (never logged, never in a location or an error).
+    pub attach: String,
+}
+
+/// Firebird settings of a target.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirebirdTargetConfig {
+    /// The declared databases (1 to 64).
+    pub databases: Vec<FirebirdDatabase>,
+    /// The account that owns the server side of the connection (default
+    /// `firebird`; required with `tunnel: true`).
+    #[serde(default)]
+    pub peer_uid: Option<PeerUid>,
+    /// Allows `peer_uid: 0` (a root-owned socket is usually a proxy, and
+    /// every root process matches it).
+    #[serde(default)]
+    pub peer_uid_root: bool,
+    /// The target is reached through a tunnel the operator runs, ending on
+    /// the agent host's loopback (decision 3, security review M2): the
+    /// forwarder check is not applied, the permanent note
+    /// `security.firebird_tunnel` is reported, and there is no Audit.
+    #[serde(default)]
+    pub tunnel: bool,
+    /// The extended grant variant (`SELECT_ANY_OBJECT_IN_DATABASE` through
+    /// a default role, decision 4 and refinement R3), reported as
+    /// `privilege.extended_variant` instead of over-privilege.
+    #[serde(default)]
+    pub extended_grants: bool,
+    /// `peer_uid` resolved when the configuration was loaded.
+    #[serde(skip)]
+    resolved_peer_uid: Option<u32>,
+}
+
+impl FirebirdTargetConfig {
+    /// The uid the server side of every connection must be owned by,
+    /// resolved when the configuration was loaded (`None` for a block that
+    /// did not come from [`crate::AgentConfig::parse`]).
+    #[must_use]
+    pub const fn peer_uid(&self) -> Option<u32> {
+        self.resolved_peer_uid
+    }
+
+    /// Test support: the block with a resolved `peer_uid`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_peer_uid_for_tests(mut self, uid: u32) -> Self {
+        self.resolved_peer_uid = Some(uid);
+        self
+    }
+
+    /// Local rules of the block: `(key, reason)` on error.
+    pub(crate) fn validate(&self) -> Result<(), (&'static str, &'static str)> {
+        if self.databases.is_empty() || self.databases.len() > MAX_DATABASES {
+            return Err(("databases", "must list 1 to 64 databases"));
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut attaches = std::collections::HashSet::new();
+        for db in &self.databases {
+            if db.name.trim().is_empty()
+                || db.name.chars().count() > MAX_NAME_CHARS
+                || db.name.chars().any(char::is_control)
+            {
+                return Err((
+                    "databases.name",
+                    "each name must be 1 to 128 characters without control characters",
+                ));
+            }
+            if !names.insert(db.name.to_lowercase()) {
+                return Err(("databases.name", "listed twice"));
+            }
+            if !attach_ok(&db.attach) {
+                return Err((
+                    "databases.attach",
+                    "must be a databases.conf alias ([A-Za-z0-9_][A-Za-z0-9_.$-]*) or a \
+                     canonical absolute path (no //, . or .. component, no :, no \\, no \
+                     control character, at most 1024 bytes)",
+                ));
+            }
+            if !attaches.insert(db.attach.as_str()) {
+                return Err(("databases.attach", "the same database is declared twice"));
+            }
+        }
+        if self.tunnel && self.peer_uid.is_none() {
+            return Err((
+                "peer_uid",
+                "is required with tunnel: true (the account of the tunnel process)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolves `peer_uid` (decision 3): `passwd` is the content of the
+    /// agent host's `/etc/passwd` (`None` when unreadable), `in_container`
+    /// whether the agent runs in a container.
+    pub(crate) fn resolve(
+        &mut self,
+        passwd: Option<&str>,
+        in_container: bool,
+    ) -> Result<(), (&'static str, &'static str)> {
+        let uid = resolve_peer_uid(
+            self.peer_uid.as_ref(),
+            self.peer_uid_root,
+            passwd,
+            in_container,
+        )?;
+        self.resolved_peer_uid = Some(uid);
+        Ok(())
+    }
+}
+
+/// Whether `attach` is an alias or a canonical absolute path (decision 5).
+/// The server resolves it; the agent only refuses forms that could name
+/// another host (`:`), a Windows path (`\`) or a path that is not
+/// canonical (the trace prints canonical paths, refinement R2).
+#[must_use]
+pub fn attach_ok(attach: &str) -> bool {
+    if attach.is_empty()
+        || attach.len() > MAX_ATTACH_BYTES
+        || attach
+            .chars()
+            .any(|c| c.is_control() || c == ':' || c == '\\')
+    {
+        return false;
+    }
+    if let Some(rest) = attach.strip_prefix('/') {
+        return !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..");
+    }
+    let mut bytes = attach.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'-'))
+        && attach.len() <= 128
+}
+
+/// Whether `account` is a Firebird regular identifier (decision 3): an
+/// ASCII letter, then up to 62 ASCII letters, digits, `_` or `$`. The
+/// server stores it upper-cased, and so does the SRP exchange; delimited
+/// (quoted) user names are not supported.
+#[must_use]
+pub fn account_ok(account: &str) -> bool {
+    let mut bytes = account.bytes();
+    account.len() <= 63
+        && bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+}
+
+/// Whether `host` is a loopback IP literal (decision 3): `127.0.0.1` or
+/// `::1` exactly. `localhost` and other names are refused (their
+/// resolution is not trusted), and so is any other address of `127/8`.
+#[must_use]
+pub fn host_is_loopback_literal(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1")
+}
+
+/// The resolution rule of `peer_uid` (decision 3, open question 10).
+pub(crate) fn resolve_peer_uid(
+    spec: Option<&PeerUid>,
+    root_ok: bool,
+    passwd: Option<&str>,
+    in_container: bool,
+) -> Result<u32, (&'static str, &'static str)> {
+    let uid = match spec {
+        Some(PeerUid::Number(n)) => *n,
+        Some(PeerUid::Name(s)) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s
+            .parse::<u32>()
+            .map_err(|_| ("peer_uid", "is not a valid uid"))?,
+        named => {
+            let name = match named {
+                Some(PeerUid::Name(s)) => s.as_str(),
+                _ => DEFAULT_PEER_USER,
+            };
+            if in_container {
+                return Err((
+                    "peer_uid",
+                    "must be numeric when the agent runs in a container (names resolve against \
+                     the agent image's own /etc/passwd)",
+                ));
+            }
+            lookup_user(
+                passwd.ok_or(("peer_uid", "/etc/passwd is not readable"))?,
+                name,
+            )
+            .ok_or(("peer_uid", "names no user of /etc/passwd"))?
+        }
+    };
+    if uid == 0 && !root_ok {
+        return Err((
+            "peer_uid",
+            "0 (root) is refused unless peer_uid_root: true (a root-owned socket is usually a \
+             proxy)",
+        ));
+    }
+    if uid == OVERFLOW_UID {
+        return Err((
+            "peer_uid",
+            "65534 (the overflow uid) is never accepted: declare the server's own account",
+        ));
+    }
+    Ok(uid)
+}
+
+/// The uid of `name` in a `/etc/passwd` text (first match), bounded.
+fn lookup_user(passwd: &str, name: &str) -> Option<u32> {
+    passwd.lines().take(65_536).find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == name)
+            .then(|| fields.nth(1)?.parse::<u32>().ok())
+            .flatten()
+    })
+}
+
+/// Whether the agent runs in a container (decision 3): `/.dockerenv`,
+/// `/run/.containerenv` (Podman), or a container runtime named in
+/// `/proc/1/cgroup`. Read once per configuration load.
+#[must_use]
+pub fn agent_in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+    {
+        return true;
+    }
+    std::fs::read_to_string("/proc/1/cgroup").is_ok_and(|text| cgroup_names_container(&text))
+}
+
+/// Whether a `/proc/1/cgroup` text names a container runtime.
+pub(crate) fn cgroup_names_container(text: &str) -> bool {
+    text.lines().take(256).any(|l| {
+        ["docker", "kubepods", "containerd", "libpod", "lxc", "crio"]
+            .iter()
+            .any(|m| l.contains(m))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn block(yaml: &str) -> FirebirdTargetConfig {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn block_rules() {
+        let ok = block("{databases: [{name: app, attach: appalias}]}");
+        assert!(ok.validate().is_ok());
+        assert!(!ok.tunnel && !ok.extended_grants && !ok.peer_uid_root);
+        assert!(block("{databases: []}").validate().is_err());
+        let dup = block("{databases: [{name: app, attach: a}, {name: APP, attach: b}]}");
+        assert_eq!(dup.validate().unwrap_err().0, "databases.name");
+        let same = block("{databases: [{name: a, attach: /d/x.fdb}, {name: b, attach: /d/x.fdb}]}");
+        assert_eq!(same.validate().unwrap_err().0, "databases.attach");
+        let tunnel = block("{tunnel: true, databases: [{name: a, attach: a}]}");
+        assert_eq!(tunnel.validate().unwrap_err().0, "peer_uid");
+        let tunnel = block("{tunnel: true, peer_uid: 1001, databases: [{name: a, attach: a}]}");
+        assert!(tunnel.validate().is_ok());
+        assert!(
+            serde_yaml_ng::from_str::<FirebirdTargetConfig>(
+                "{databases: [{name: a, attach: a, path: /x}]}"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml_ng::from_str::<FirebirdTargetConfig>("{databases: [], audit: {}}").is_err()
+        );
+    }
+
+    #[test]
+    fn attach_forms() {
+        for good in [
+            "appalias",
+            "app_db",
+            "a.b-c$d",
+            "/var/lib/firebird/data/app.fdb",
+            "/d/a b.fdb",
+        ] {
+            assert!(attach_ok(good), "{good}");
+        }
+        for bad in [
+            "",
+            "/",
+            "relative/x.fdb",
+            "/d//x.fdb",
+            "/d/./x.fdb",
+            "/d/../x.fdb",
+            "/d/x.fdb/",
+            "host:/d/x.fdb",
+            "inet://h/x",
+            "C:\\x.fdb",
+            "a\nb",
+            "-alias",
+            ".alias",
+            "al ias",
+        ] {
+            assert!(!attach_ok(bad), "{bad:?}");
+        }
+        assert!(!attach_ok(&format!("/{}", "a".repeat(MAX_ATTACH_BYTES))));
+    }
+
+    #[test]
+    fn accounts_are_regular_identifiers() {
+        for good in ["DATABASTION_AGENT", "agent", "a$1"] {
+            assert!(account_ok(good), "{good}");
+        }
+        for bad in ["", "1a", "_a", "a b", "a\"b", "é", &"a".repeat(64)] {
+            assert!(!account_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn loopback_literals_only() {
+        assert!(host_is_loopback_literal("127.0.0.1"));
+        assert!(host_is_loopback_literal("::1"));
+        for bad in [
+            "localhost",
+            "127.0.0.2",
+            "[::1]",
+            "0.0.0.0",
+            "::",
+            "db.example",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!host_is_loopback_literal(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn peer_uid_resolution() {
+        let passwd = "root:x:0:0::/root:/bin/sh\nfirebird:x:84:84::/opt/firebird:/bin/false\n";
+        assert_eq!(resolve_peer_uid(None, false, Some(passwd), false), Ok(84));
+        assert_eq!(
+            resolve_peer_uid(Some(&PeerUid::Number(1001)), false, None, true),
+            Ok(1001)
+        );
+        assert_eq!(
+            resolve_peer_uid(Some(&PeerUid::Name("1001".into())), false, None, true),
+            Ok(1001)
+        );
+        // Names are refused in a container, unknown names everywhere.
+        assert!(resolve_peer_uid(None, false, Some(passwd), true).is_err());
+        assert!(
+            resolve_peer_uid(
+                Some(&PeerUid::Name("nope".into())),
+                false,
+                Some(passwd),
+                false
+            )
+            .is_err()
+        );
+        assert!(resolve_peer_uid(None, false, None, false).is_err());
+        // Root only with the opt-in; the overflow uid never.
+        assert!(resolve_peer_uid(Some(&PeerUid::Number(0)), false, None, false).is_err());
+        assert!(
+            resolve_peer_uid(
+                Some(&PeerUid::Name("root".into())),
+                false,
+                Some(passwd),
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_peer_uid(Some(&PeerUid::Number(0)), true, None, false),
+            Ok(0)
+        );
+        assert!(resolve_peer_uid(Some(&PeerUid::Number(OVERFLOW_UID)), true, None, false).is_err());
+        let yaml: FirebirdTargetConfig =
+            serde_yaml_ng::from_str("{peer_uid: firebird, databases: [{name: a, attach: a}]}")
+                .unwrap();
+        assert_eq!(yaml.peer_uid, Some(PeerUid::Name("firebird".into())));
+        let yaml: FirebirdTargetConfig =
+            serde_yaml_ng::from_str("{peer_uid: 84, databases: [{name: a, attach: a}]}").unwrap();
+        assert_eq!(yaml.peer_uid, Some(PeerUid::Number(84)));
+    }
+
+    #[test]
+    fn container_markers() {
+        assert!(cgroup_names_container("0::/docker/abc\n"));
+        assert!(cgroup_names_container(
+            "1:name=systemd:/kubepods/burstable/pod1\n"
+        ));
+        assert!(!cgroup_names_container("0::/\n"));
+        assert!(!cgroup_names_container("9:name=systemd:/\n"));
+    }
+}

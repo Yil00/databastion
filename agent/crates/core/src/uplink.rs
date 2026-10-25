@@ -679,13 +679,23 @@ impl ResultBatch {
         // with a `sqlite` location that breaks the contract rule (written by
         // another build, or altered on disk) is never sent: `None`, so the
         // spool counts and quarantines it as corrupt.
-        if let Parsed::Findings(b) = &parsed
-            && !b
-                .findings
-                .iter()
-                .all(|f| sanitize::sqlite_location_ok(&f.location))
-        {
-            return None;
+        // The same for the Firebird rules (P10-C Firebird review, merge
+        // condition C1): a `firebird` location with a schema, and a
+        // `firebird_audit_trace` event with an application or an object
+        // schema.
+        match &parsed {
+            Parsed::Findings(b)
+                if !b
+                    .findings
+                    .iter()
+                    .all(|f| sanitize::location_rules_ok(&f.location)) =>
+            {
+                return None;
+            }
+            Parsed::Events(b) if !b.events.iter().all(sanitize::firebird_event_ok) => {
+                return None;
+            }
+            _ => {}
         }
         let signature = parsed.signature();
         let gates = parsed.gates();

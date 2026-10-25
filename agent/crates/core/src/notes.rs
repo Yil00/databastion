@@ -66,6 +66,9 @@ const SEVERITY: &[TargetNoteLabel] = {
         L::ReadRawPages,
         L::UserManagement,
         L::ProfileAnyAttachment,
+        L::CredentialRelationReadable,
+        L::ServerConfigReadable,
+        L::RoleGraph,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -380,6 +383,20 @@ pub enum NoteCode {
     PrivilegeDatabaseFileWritable,
     /// `security.file_world_readable` (SQLite, ADR-0059).
     SecurityFileWorldReadable,
+    /// `coverage.external_file_tables` (Firebird, ADR-0060).
+    CoverageExternalFileTables,
+    /// `audit.trace_config_not_evaluated` (Firebird, ADR-0060).
+    AuditTraceConfigNotEvaluated,
+    /// `audit.trace_settings_missing` (Firebird, ADR-0060).
+    AuditTraceSettingsMissing,
+    /// `audit.services_not_audited` (Firebird, ADR-0060).
+    AuditServicesNotAudited,
+    /// `audit.log_records_ambiguous` (Firebird, ADR-0060).
+    AuditLogRecordsAmbiguous,
+    /// `audit.log_readable_by_others` (Firebird, ADR-0060 refinement R4).
+    AuditLogReadableByOthers,
+    /// `security.firebird_tunnel` (Firebird, ADR-0060 decision 3).
+    SecurityFirebirdTunnel,
 }
 
 impl NoteCode {
@@ -501,6 +518,27 @@ impl NoteCode {
         Self::CoverageVirtualTablesNotSampled,
         Self::PrivilegeDatabaseFileWritable,
         Self::SecurityFileWorldReadable,
+        Self::CoverageExternalFileTables,
+        Self::AuditTraceConfigNotEvaluated,
+        Self::AuditTraceSettingsMissing,
+        Self::AuditServicesNotAudited,
+        Self::AuditLogRecordsAmbiguous,
+        Self::AuditLogReadableByOthers,
+        Self::SecurityFirebirdTunnel,
+    ];
+
+    /// The codes registered for `firebird` only (`target-notes.json`):
+    /// attached to `firebird` targets only, whatever a connector built
+    /// (P10-C Firebird review, merge condition C1; enforced by the core
+    /// before a status is sent).
+    pub const FIREBIRD_ONLY: &'static [Self] = &[
+        Self::CoverageExternalFileTables,
+        Self::AuditTraceConfigNotEvaluated,
+        Self::AuditTraceSettingsMissing,
+        Self::AuditServicesNotAudited,
+        Self::AuditLogRecordsAmbiguous,
+        Self::AuditLogReadableByOthers,
+        Self::SecurityFirebirdTunnel,
     ];
 
     /// The registered code.
@@ -627,24 +665,35 @@ impl NoteCode {
             Self::CoverageVirtualTablesNotSampled => "coverage.virtual_tables_not_sampled",
             Self::PrivilegeDatabaseFileWritable => "privilege.database_file_writable",
             Self::SecurityFileWorldReadable => "security.file_world_readable",
+            Self::CoverageExternalFileTables => "coverage.external_file_tables",
+            Self::AuditTraceConfigNotEvaluated => "audit.trace_config_not_evaluated",
+            Self::AuditTraceSettingsMissing => "audit.trace_settings_missing",
+            Self::AuditServicesNotAudited => "audit.services_not_audited",
+            Self::AuditLogRecordsAmbiguous => "audit.log_records_ambiguous",
+            Self::AuditLogReadableByOthers => "audit.log_readable_by_others",
+            Self::SecurityFirebirdTunnel => "security.firebird_tunnel",
         }
     }
 
     /// Order in which notes are kept when a target has more than the
-    /// contract allows: insecure settings first, then the check itself,
-    /// privileges, audit and coverage.
+    /// contract allows: a refused right and a tunnel first (they explain
+    /// why Discovery and Audit do not run, P10-C Firebird review), then
+    /// insecure settings, the check itself, privileges, audit and coverage.
     fn rank(self) -> u8 {
+        if matches!(self, Self::PrivilegeRefused | Self::SecurityFirebirdTunnel) {
+            return 0;
+        }
         let code = self.as_str();
         if code.starts_with("security.") {
-            0
-        } else if code.starts_with("check.") {
             1
-        } else if code.starts_with("privilege.") {
+        } else if code.starts_with("check.") {
             2
-        } else if code.starts_with("audit.") {
+        } else if code.starts_with("privilege.") {
             3
-        } else {
+        } else if code.starts_with("audit.") {
             4
+        } else {
+            5
         }
     }
 }
@@ -1901,9 +1950,16 @@ mod tests {
         notes.push(TargetNote::new(NoteCode::SecurityTlsDisabled));
         let out = to_protocol(&notes, LabelRevisions::default());
         assert_eq!(out.len(), MAX_NOTES);
-        // Security and check notes are never the ones cut.
+        // A refused right, a tunnel, security and check notes are never
+        // the ones cut (P10-C Firebird review: `privilege.refused` and
+        // `security.firebird_tunnel` first).
+        for code in ["privilege.refused", "security.firebird_tunnel"] {
+            assert!(out.iter().any(|n| n.code.as_str() == code), "{code}");
+        }
+        assert_eq!(NoteCode::PrivilegeRefused.rank(), 0);
+        assert_eq!(NoteCode::SecurityFirebirdTunnel.rank(), 0);
         for c in NoteCode::ALL {
-            if c.rank() <= 1 {
+            if c.rank() <= 2 {
                 assert!(out.iter().any(|n| n.code.as_str() == c.as_str()), "{c:?}");
             }
         }

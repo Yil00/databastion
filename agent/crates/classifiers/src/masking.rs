@@ -969,6 +969,10 @@ pub enum EventSource {
     /// SQL Server Extended Events session, `event_file` target, read
     /// through `sys.fn_xe_file_target_read_file` (ADR-0051 decision 6).
     SqlserverXevents,
+    /// The Firebird system audit trace log (`AuditTraceConfigFile`), read
+    /// locally (ADR-0060 decision 6). Its events never carry an
+    /// application name nor an object schema (the core enforces both).
+    FirebirdAuditTrace,
 }
 
 impl EventSource {
@@ -993,6 +997,7 @@ impl EventSource {
             Self::RedisSync => "redis_sync",
             Self::SqlserverAudit => "sqlserver_audit",
             Self::SqlserverXevents => "sqlserver_xevents",
+            Self::FirebirdAuditTrace => "firebird_audit_trace",
         }
     }
 

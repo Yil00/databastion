@@ -108,6 +108,7 @@ fn proto_connector(engine: Engine) -> ProtoConnector {
         Engine::Redis => ProtoConnector::Redis,
         Engine::Sqlserver => ProtoConnector::Sqlserver,
         Engine::Sqlite => ProtoConnector::Sqlite,
+        Engine::Firebird => ProtoConnector::Firebird,
     }
 }
 
@@ -1240,9 +1241,11 @@ impl Runtime {
                 .and_then(|v| databastion_protocol::TargetStatusServerVersion::try_from(v).ok()),
             target_id,
         };
-        // ADR-0059 decision 7 (P10-C review R1): a `sqlite` target status is
-        // rewritten to the contract rule, whatever its connector reported.
-        crate::sanitize::enforce_sqlite_target_status(&mut status);
+        // ADR-0059 decision 7 (P10-C review R1) and ADR-0060 (P10-C Firebird
+        // review, merge condition C1): a `sqlite` or `firebird` target
+        // status is rewritten to the contract rules, whatever its connector
+        // reported.
+        crate::sanitize::enforce_target_status(&mut status);
         (status, outcome)
     }
 
@@ -1426,11 +1429,13 @@ impl Runtime {
             ts: now(),
             uptime_s: crate::sanitize::clamped_count(self.started.elapsed().as_secs()),
         };
-        // ADR-0059 decision 7 (P10-C review R1): the last step before the
-        // heartbeat leaves, on every target status.
+        // ADR-0059 decision 7 (P10-C review R1) and merge condition C1
+        // (ADR-0060): the last step before the heartbeat leaves, on every
+        // target status and detected target.
         for t in &mut heartbeat.targets {
-            crate::sanitize::enforce_sqlite_target_status(t);
+            crate::sanitize::enforce_target_status(t);
         }
+        crate::sanitize::enforce_detected_targets(&mut heartbeat.detected_targets);
         // Engines added after protocol 0.1.0 are reported only once the
         // console lists their token (ADR-0039 decision 8): an older console
         // rejects the whole heartbeat for an unknown `Engine` value.
@@ -3584,6 +3589,7 @@ pub(crate) fn proto_engine(engine: TargetEngine) -> databastion_protocol::Engine
         TargetEngine::Valkey => databastion_protocol::Engine::Valkey,
         TargetEngine::Sqlserver => databastion_protocol::Engine::Sqlserver,
         TargetEngine::Sqlite => databastion_protocol::Engine::Sqlite,
+        TargetEngine::Firebird => databastion_protocol::Engine::Firebird,
     }
 }
 
