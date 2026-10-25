@@ -163,7 +163,11 @@ describe("exceptionCoversEvent on a SQLite event (P10-C review R2)", () => {
     objects: [{ database: "main", object: "customers" }],
     rows: 10,
     signals: [],
-    source: "pgaudit",
+    // SQLite has no contract `AuditSource` (Discovery only, ADR-0059 decision 7), so no real
+    // SQLite event exists: this one is hypothetical, guarding the rule should one ever be stored
+    // with its target's engine. `exceptionCoversEvent` does not read the source; it is left empty
+    // rather than borrowing another engine's source.
+    source: "",
     sensitivity: 0,
     score: 0,
     anomaly: false,

@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { TARGET_NOTE_REGISTRY } from "@/generated/protocol/target-notes.gen";
 import { setupHint } from "@/lib/detected-targets";
@@ -21,6 +21,9 @@ import { FindingsTable, locationLabel, LocationCell } from "./findings-table";
 import { incidentLocation } from "./incidents-table";
 import { exceptionScopeLabels } from "./policies-table";
 import { CROSS_TARGET_NOTE, EXCEPTION_MATCHING_NOTE, exceptionErrorMessage, exceptionRequestBody, exceptionSqliteScopeMessage } from "./policy-actions";
+import { PolicyForm, SQLITE_LOCATION_HINT } from "./policy-form";
+
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: () => undefined, push: () => undefined }) }));
 
 /**
  * P10-E: SQLite targets (ADR-0059): "Discovery only", the sqlite target notes, locations shown as
@@ -143,6 +146,20 @@ describe("SQLite locations: target, table and column (ADR-0059 decision 6)", () 
     expect(renderToStaticMarkup(<LocationCell location={finding({ objectName: "main" })} engine="sqlite" />)).toContain(">main<");
   });
 
+  it("a hostile table or column name is escaped text, never markup nor a link (review N4)", () => {
+    const hostile = '<img src=x onerror="alert(1)">';
+    const link = "javascript:alert(1)";
+    for (const over of [{ objectName: hostile }, { fieldName: hostile }, { objectName: link, fieldName: link }]) {
+      const html = renderToStaticMarkup(<LocationCell location={finding(over)} engine="sqlite" />);
+      expect(html).not.toContain("<img");
+      expect(html).not.toMatch(/<a\b|href=/);
+      expect(html).toContain(over.objectName === hostile || over.fieldName === hostile ? "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;" : link);
+    }
+    const table = renderToStaticMarkup(<FindingsTable findings={[finding({ objectName: hostile, fieldName: hostile })]} csrfToken="t" now={NOW} canMark={false} />);
+    expect(table).not.toContain("<img");
+    for (const h of [...table.matchAll(/href="([^"]*)"/g)].map((m) => m[1] ?? "")) expect(decodeURIComponent(h)).not.toContain("onerror");
+  });
+
   it("incidents and e-mails: table and column; the webhook keeps the contract location as is", () => {
     const incident = {
       engine: "sqlite",
@@ -209,8 +226,26 @@ describe("SQLite location exceptions in the UI (P10-C review R2)", () => {
   it("the exceptions table states the SQLite reach of a location exception that is not target-scoped", () => {
     expect(exceptionScopeLabels(ex())).toContain("no SQLite target (not target-scoped)");
     expect(exceptionScopeLabels(ex({ crossTarget: true }))).toContain("every SQLite target (cross-target, confirmed)");
+    // Review N2: a confirmation scoped to an agent (or a target id) says so.
+    expect(exceptionScopeLabels(ex({ crossTarget: true, agentId: AGENT, agentName: "app-host" }))).toContain(
+      "every SQLite target of agent app-host (cross-target, confirmed)",
+    );
+    expect(exceptionScopeLabels(ex({ crossTarget: true, agentId: AGENT }))).toContain(`every SQLite target of agent ${AGENT} (cross-target, confirmed)`);
+    expect(exceptionScopeLabels(ex({ crossTarget: true, targetId: "crm-app" }))).toContain(
+      "every SQLite target crm-app, on any agent (cross-target, confirmed)",
+    );
     const scoped = exceptionScopeLabels(ex({ agentId: AGENT, targetId: "crm-app" }));
     expect(scoped.join(";")).not.toContain("SQLite");
     expect(exceptionScopeLabels(ex({ location: null, classifier: "pii.email" })).join(";")).not.toContain("SQLite");
+  });
+});
+
+describe("SQLite location conditions in the policy form (review N3)", () => {
+  it("the form says a SQLite location pattern matches every SQLite file, and how to narrow it", () => {
+    expect(SQLITE_LOCATION_HINT).toContain("every SQLite file");
+    expect(SQLITE_LOCATION_HINT).toContain("target or agent ids");
+    const html = renderToStaticMarkup(<PolicyForm csrfToken="c" />);
+    expect(html).toContain("data-sqlite-location-hint");
+    expect(html).toContain("every SQLite file");
   });
 });

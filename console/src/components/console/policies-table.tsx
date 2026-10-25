@@ -225,7 +225,16 @@ export function exceptionScopeLabels(e: ExceptionView): string[] {
     e.classifier ? `classifier ${e.classifier}` : null,
     e.location ? locationPatternLabel(e.location) : null,
     // P10-C review R2: how a location exception not scoped to an agent and a target treats SQLite.
-    exceptionIsCrossTarget(e) ? (e.crossTarget ? "every SQLite target (cross-target, confirmed)" : "no SQLite target (not target-scoped)") : null,
+    // N2 (review of 342a257): an agent-scoped confirmation reaches that agent's SQLite targets only.
+    exceptionIsCrossTarget(e)
+      ? e.crossTarget
+        ? e.agentId
+          ? `every SQLite target of agent ${e.agentName ?? e.agentId} (cross-target, confirmed)`
+          : e.targetId
+            ? `every SQLite target ${e.targetId}, on any agent (cross-target, confirmed)`
+            : "every SQLite target (cross-target, confirmed)"
+        : "no SQLite target (not target-scoped)"
+      : null,
   ].filter((x): x is string => x !== null);
 }
 

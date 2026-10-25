@@ -216,7 +216,12 @@ Upgrading to the P10-E console (SQLite, ADR-0059): `migrate` applies `0048`
 (`policy_exceptions.cross_target`, `false` on every existing row, and its CHECK, validated in the
 migration: a small table). The console lists `engine.sqlite`, so with several replicas set
 `DATABASTION_AGENT_TOKENS_HOLD=0.9` during the upgrade (a 0.9 replica answers `400` to SQLite
-values). Location exceptions keep their meaning on every other engine; on SQLite targets they
+values); remove the hold only once every web replica **and every worker** runs this build. At its
+first start, a worker of this build marks every stored SQLite finding pending again, once, so it
+is evaluated with the target scope of exceptions (`src/server/sqlite-reach-reevaluation.ts`,
+audit entry `findings.reevaluate_target_scoped` with the count only, under an advisory lock; a
+failure is logged and retried at the next start). Do not downgrade the console once it holds
+SQLite findings, or delete them first. Location exceptions keep their meaning on every other engine; on SQLite targets they
 apply only when scoped to an agent and a target, or created with `cross_target: true` (see
 "Policies"). Webhook receivers get SQLite findings with `location.database` `main` and no
 `schema`: tell SQLite files apart by `target_id`.

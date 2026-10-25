@@ -304,8 +304,11 @@ older replica remains:
    accept and store every field of the new release, but list only the tokens of the held release
    (each logs a warning at startup naming the tokens it holds back), so the agents keep sending
    what the older replicas accept.
-3. Once **every** replica runs the new build, remove the variable and restart the replicas, one
-   by one if you like: every replica now accepts the new fields, so a replica that already lists
+3. Once **every** replica runs the new build, **and every worker too** (an older worker evaluates
+   new items with the older rules: a 0.9 worker applies location exceptions to SQLite findings
+   without their target scope), remove the variable and restart the replicas, one by one if you
+   like. At its first start a worker of the new build also evaluates every SQLite finding again
+   once (audit entry `findings.reevaluate_target_scoped`), in case an older worker evaluated some: every replica now accepts the new fields, so a replica that already lists
    them and one that does not yet can answer side by side. **Do not leave the hold set**: until
    it is removed, no agent sends the held fields, so the detection rules of the new release that
    depend on them do not apply (for 0.9: overflowed event objects reaching object- and
