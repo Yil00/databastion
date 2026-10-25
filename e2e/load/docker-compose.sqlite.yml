@@ -27,6 +27,8 @@ x-sqlite-app: &sqlite-app
   tmpfs: [/tmp]
   entrypoint: ["python3", "-I", "-B", "/opt/load/sqlite_writer.py"]
 
+# Relative paths resolve against e2e/, the directory of the first compose file (e2e/docker-compose.yml),
+# not against e2e/load/: a wrong path is silently bind-mounted as an empty directory.
 services:
   sqlite-files-init:
     image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
@@ -42,14 +44,14 @@ services:
       DATABASTION_DEV_AGENT_GID: "10030"
     entrypoint: ["sh", "/usr/local/bin/files-init.sh", "setup"]
     volumes:
-      - ../../dev/sqlite/files-init.sh:/usr/local/bin/files-init.sh:ro
+      - ../dev/sqlite/files-init.sh:/usr/local/bin/files-init.sh:ro
       - sqlite-load:/state
 
   sqlite-writer:
     <<: *sqlite-app
     profiles: [tools]
     volumes:
-      - ./sqlite_writer.py:/opt/load/sqlite_writer.py:ro
+      - ./load/sqlite_writer.py:/opt/load/sqlite_writer.py:ro
       - sqlite-load:/srv/sqlite
       - ${E2E_WORK_DIR:?set by sqlite.sh}/writer:/out
 
@@ -57,7 +59,7 @@ services:
     <<: *sqlite-app
     command: ["hold", "/srv/sqlite/data/load-wal.db", "--ready", "/tmp/databastion-ready"]
     volumes:
-      - ./sqlite_writer.py:/opt/load/sqlite_writer.py:ro
+      - ./load/sqlite_writer.py:/opt/load/sqlite_writer.py:ro
       - sqlite-load:/srv/sqlite
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/databastion-ready"]

@@ -813,14 +813,14 @@ over this stack (Compose project `databastion-e2e-sqlite`) and starts only `db`,
   database, the pages, the agent's state and every log (no ground-truth value or value-bearing
   name), no path or side-file name on the console side or in the agent's log, and the secret
   hygiene of the other runs.
-- **Depends on the console listing `engine.sqlite`** (ROADMAP P10-E): until then the agent holds the
-  SQLite targets' items (ADR-0042) and the run fails at its first wait ("agent not online").
+- **Depends on the console listing `engine.sqlite`** (ROADMAP P10-E, #357): with an older console the
+  agent holds the SQLite targets' items (ADR-0042) and the run fails at its first wait.
 
 The CI job is `e2e-sqlite` in [`ci.yml`](../.github/workflows/ci.yml) (40 min budget, `sqlite.sh`
 at most 1980 s); it runs when `agent/`, `console/`, `shared/`, `e2e/`, `deploy/initdb/`,
 `dev/sqlite/`, the SQLite seed, `dev/ground-truth.json`, `dev/docker-compose.yml` or `ci.yml`
-change. It is **not required** through `CI result` until P10-E is merged and the job is green; then
-it joins `e2e-cas`, `e2e-sqlserver` and `e2e-redis` there. Locally: `e2e/sqlite.sh`
+change. It is required through `CI result`, like `e2e-cas`, `e2e-sqlserver` and `e2e-redis`
+(since #358). Locally: `e2e/sqlite.sh`
 (`E2E_SKIP_BUILD=1` reuses the images; logs in `e2e/.logs-sqlite`).
 
 ## Load / database impact
