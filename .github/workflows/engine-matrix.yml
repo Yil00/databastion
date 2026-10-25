@@ -28,6 +28,14 @@ name: Engine matrix
 #   - MySQL / MariaDB (#256): the digests of the agent's performance_schema poll and stats texts as
 #     each service renders them, in the format of the connector's fixture poll_digests.tsv
 #     (dev/capture-poll-digests.sh, after the tests sent every text).
+# Job sqlite (ADR-0059 decision 10, P10-D): the reader is always the agent's bundled SQLite, so the
+# matrix covers the *writers*: the dev seed (dev/seed/out/sqlite.json) written by the SQLite of the
+# supported distributions' Python images (Debian 12 and 13, pinned by digest), by the Ubuntu 24.04
+# runner's python3, and by the bundled library itself, each in the DELETE, TRUNCATE, PERSIST and WAL
+# journal modes, with page sizes 512, 4096 and 65536 and auto_vacuum off and on (72 files,
+# dev/sqlite/build.py matrix, as the application's account, holding the WAL files open), then read
+# by the sandboxed reader against dev/ground-truth.json (agent/crates/agent/tests/sqlite_reader.rs,
+# seeded_dev_files_match_the_ground_truth, as root on a read-only bind mount, as ci.yml agent-sqlite).
 # Job e2e-sqlserver (ROADMAP phase 9 follow-up P9-D): e2e/sqlserver.sh on the versions and Audit
 # sources the required ci.yml job (2022, SQL Server Audit) does not run: 2022 with Extended Events,
 # 2019 (Extended Events only) and 2025 with each source, the I2 check and incidents included.
@@ -58,6 +66,10 @@ on:
       - "agent/crates/connector-mongodb/**"
       - "agent/crates/connector-redis/**"
       - "agent/crates/connector-sqlserver/**"
+      - "agent/crates/connector-sqlite/**"
+      - "agent/crates/agent/tests/sqlite_reader.rs"
+      - "dev/sqlite/**"
+      - "dev/seed/out/sqlite*"
 
 permissions:
   contents: read
@@ -450,6 +462,120 @@ jobs:
       - name: Stop
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
+
+  sqlite:
+    name: SQLite writer ${{ matrix.writer }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Debian 12: SQLite 3.40 (the dev and e2e sidecar's image).
+          - writer: "Debian 12 (python:3.13.16-slim-bookworm)"
+            image: python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+          # Debian 13: SQLite 3.46.
+          - writer: "Debian 13 (python:3.13.16-slim-trixie)"
+            image: python:3.13.16-slim-trixie@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f
+          # Ubuntu 24.04: SQLite 3.45, the runner's own python3 (runs-on is pinned to 24.04).
+          - writer: "Ubuntu 24.04 (the runner's python3)"
+            host: "1"
+          # The agent's bundled library (the test writes the files itself, without FTS5).
+          - writer: "bundled"
+            bundled: "1"
+    env:
+      IMAGE: ${{ matrix.image }}
+      HOST_WRITER: ${{ matrix.host }}
+      BUNDLED: ${{ matrix.bundled }}
+      # The application's account and the group the agent's account reads through: the uid and gid
+      # tests/sqlite_reader.rs gives its files (APP_UID, SHARED_GID).
+      APP_IDS: "10001:10002"
+      BASE: /tmp/databastion-sqlite-matrix
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+          key: sqlite
+      - name: Kernel and Landlock
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || true
+          echo
+      - name: Build the reader tests
+        run: |
+          exe="$(timeout 1200 cargo test -p databastion-agent --test sqlite_reader --all-features --locked --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sqlite_reader" and .executable != null) | .executable')"
+          test -x "$exe"
+          echo "SQLITE_READER_TESTS=$exe" >>"$GITHUB_ENV"
+      # The writer, as the application's account: the seed and build.py copied out of the workspace
+      # (the account cannot read the runner's home), the files' directory 2750 with the agent's
+      # group; it writes the 72 variants and holds the WAL ones open until stopped.
+      - name: Write the files
+        if: matrix.bundled != '1'
+        working-directory: .
+        run: |
+          sudo rm -rf "$BASE"
+          sudo install -d -m 0755 "$BASE" "$BASE/src" "$BASE/src/sqlite" "$BASE/src/seed" "$BASE/src/seed/out"
+          sudo install -m 0644 dev/sqlite/build.py "$BASE/src/sqlite/"
+          sudo install -m 0644 dev/seed/out/sqlite.json dev/seed/out/sqlite-*.sql "$BASE/src/seed/out/"
+          sudo install -d -m 2750 -o "${APP_IDS%%:*}" -g "${APP_IDS##*:}" "$BASE/files"
+          sudo install -d -m 0700 -o "${APP_IDS%%:*}" -g "${APP_IDS##*:}" "$BASE/run"
+          if [ "$HOST_WRITER" = 1 ]; then
+            ( sudo setpriv --reuid="${APP_IDS%%:*}" --regid="${APP_IDS##*:}" --clear-groups \
+                python3 -I -B "$BASE/src/sqlite/build.py" matrix --manifest "$BASE/src/seed/out/sqlite.json" \
+                --out "$BASE/files" --hold --ready "$BASE/run/ready" ) >"$RUNNER_TEMP/writer.log" 2>&1 &
+          else
+            timeout 300 docker pull --quiet "$IMAGE"
+            docker run -d --name databastion-sqlite-writer --user "$APP_IDS" --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp \
+              -v "$BASE/src:/opt/dev:ro" -v "$BASE/files:/data" -v "$BASE/run:/run/writer" \
+              "$IMAGE" python3 -I -B /opt/dev/sqlite/build.py matrix --manifest /opt/dev/seed/out/sqlite.json \
+              --out /data --hold --ready /run/writer/ready
+          fi
+          for _ in $(seq 1 120); do
+            sudo test -f "$BASE/run/ready" && break
+            if [ "$HOST_WRITER" != 1 ] && [ "$(docker inspect -f '{{.State.Running}}' databastion-sqlite-writer)" != true ]; then
+              docker logs databastion-sqlite-writer; exit 1
+            fi
+            sleep 1
+          done
+          sudo test -f "$BASE/run/ready" || { cat "$RUNNER_TEMP/writer.log" 2>/dev/null || docker logs databastion-sqlite-writer; exit 1; }
+          if [ "$HOST_WRITER" = 1 ]; then cat "$RUNNER_TEMP/writer.log"; else docker logs databastion-sqlite-writer; fi
+          sudo jq -c '{sqlite_version, python, variants: (.variants | length), modules: ([.variants[].modules[]] | unique)}' "$BASE/files/variants.json"
+          echo "DATABASTION_IT_SQLITE_SEEDED=$BASE/files" >>"$GITHUB_ENV"
+      - name: Reader tests on the seeded files (as root, read-only bind mount)
+        run: |
+          set -o pipefail
+          sudo env DATABASTION_IT_SQLITE_REQUIRE=1 ${DATABASTION_IT_SQLITE_SEEDED:+DATABASTION_IT_SQLITE_SEEDED="$DATABASTION_IT_SQLITE_SEEDED"} \
+            timeout 900 "$SQLITE_READER_TESTS" seeded_dev_files_match_the_ground_truth --exact --test-threads 1 --nocapture 2>&1 \
+            | grep -v '^{' | tee "$RUNNER_TEMP/it.log"
+      - name: Summary
+        if: always()
+        env:
+          WRITER: ${{ matrix.writer }}
+        run: |
+          {
+            echo "### SQLite writer: $WRITER"
+            echo '```'
+            grep -oE '(\[it\] sqlite seeded .*|test result: .*|panicked at .*)' "$RUNNER_TEMP/it.log" 2>/dev/null | sed 's/^\[it\] sqlite seeded //' | head -n 100 || true
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Stop the writer
+        if: always()
+        working-directory: .
+        run: |
+          docker rm -f databastion-sqlite-writer >/dev/null 2>&1 || true
+          sudo pkill -u "${APP_IDS%%:*}" -f 'sqlite/build.py' || true
+          sudo rm -rf "$BASE"
 
   # e2e/sqlserver.sh (e2e/README.md "SQL Server target", "Other versions and the Extended Events
   # source") on what the required ci.yml job e2e-sqlserver (2022, SQL Server Audit) does not run:
