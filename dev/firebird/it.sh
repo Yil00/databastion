@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 # Firebird connector integration tests, lot 1 (ADR-0060 decision 10: the wire client, SRP-256,
 # ChaCha, the loopback, peer-uid and forwarder rules, check()). The full dev service and its seed
-# come with lot 2; until then this script starts a throwaway server from the pinned image, on the
-# host's loopback only, seeds three fake accounts, and runs agent/crates/connector-firebird's
-# it.rs tests against it:
+# come with lot 2; until then this script starts throwaway servers from the pinned images, seeds
+# fake accounts, and runs agent/crates/connector-firebird's it.rs tests against them:
 #
 #   dev/firebird/it.sh [5|4]        # Firebird 5.0.4 (default) or 4.0.7
 #
-# The server runs as uid 84 (`firebird`), as on a distribution, not as the image's root: the
-# image is initialized once as root (its entrypoint), committed to a local image, then restarted
-# as 84:84 on the same data volume. A `socat` forwarder on loopback is started too, so the
-# forwarder rule is exercised (refused without `tunnel: true`). Every container shares the host's
-# network namespace (as the agent shares the server's in production) and binds 127.0.0.1 only.
+# Network (review L3): every container joins one dedicated network namespace, owned by a
+# placeholder container started with `--network none` (loopback only, nothing reachable from the
+# host or another container), and drops NET_RAW and NET_ADMIN. The test binary is built first, then
+# run inside that namespace with nsenter (root, or sudo, for the namespace only: the tests run as
+# the calling user). So the tests see the servers on 127.0.0.1 and read the namespace's own
+# /proc/net/tcp, as the agent does next to its server.
 #
-# The passwords are random, written to private files of a temporary directory and passed to the
-# containers through --env-file and a read-only init script, never on a command line (ADR-0060
-# security review N4). Everything is removed at exit. Ports: FIREBIRD_PORT (default 13050) and
-# FIREBIRD_PORT + 10 for the forwarder, + 1 to + 4 for the wire-encryption variants and Firebird
-# 3.0 (servers run as the image's root there: the peer rule then needs peer_uid_root, which the
-# tests set for uid 0); COMPOSE_PROJECT_NAME prefixes the container names, so
-# parallel runs do not collide.
+# The main server runs as uid 84 (`firebird`), as on a distribution, not as the image's root: the
+# image is initialized once as root (its entrypoint), committed to a local image without the
+# SYSDBA password in its configuration, then restarted as 84:84 on the same data volume. A `socat`
+# forwarder is started too, so the forwarder rule is exercised (refused without `tunnel: true`).
+# The other servers (ChaCha only, Arc4 only, no wire encryption, Firebird 3.0, mappings to SYSDBA
+# and RDB$ADMIN) run as the image's root: the tests declare uid 0 with peer_uid_root for them.
+#
+# Secrets (review L4): random passwords, generated after the build, in 0600 files of a 0700
+# temporary directory. The containers read the SYSDBA password through --env-file and the seed
+# from a read-only bind mount (the entrypoint runs as root); the tests read the agent passwords
+# from their files (FIREBIRD_IT_*_PASSWORD_FILE, `secret: {file: …}`). No password is on a command
+# line, in an environment variable of the build, or in a committed image's configuration.
+# Everything is removed at exit. Ports, all inside the namespace: FIREBIRD_PORT (default 13050),
+# + 1 to + 5 for the variants, + 10 for the forwarder. COMPOSE_PROJECT_NAME prefixes the
+# container names, so parallel runs do not collide.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -37,27 +45,40 @@ FWD_PORT="$((PORT + 10))"
 NAME="${COMPOSE_PROJECT_NAME:-databastion}-it-firebird${MAJOR}"
 LOCAL_IMAGE="databastion-it/${NAME}:local"
 VOLUME="${NAME}-data"
-WORK="$(mktemp -d)"
-chmod 700 "$WORK"
+NET="$NAME-net"
+VARIANTS="chacha arc4 nocrypt fb3 mapping"
+SUDO=""
+[ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
+# 1. The test binary, before any secret exists.
+cd "$ROOT/agent"
+EXE="$(timeout 900 cargo test -p databastion-connector-firebird --all-features --locked --lib \
+  --no-run --message-format=json \
+  | jq -r 'select(.reason == "compiler-artifact" and .target.name == "databastion_connector_firebird"
+             and .profile.test == true and .executable != null) | .executable' | tail -n 1)"
+[ -x "$EXE" ] || { echo "[it] the test binary was not built" >&2; exit 1; }
+
+umask 077
+WORK="$(mktemp -d)"
 cleanup() {
-  timeout 60 docker rm -f "$NAME-init" "$NAME" "$NAME-socat" "$NAME-chacha" "$NAME-arc4" \
-    "$NAME-nocrypt" "$NAME-fb3" >/dev/null 2>&1 || true
+  local c=("$NAME-init" "$NAME" "$NAME-socat")
+  for n in $VARIANTS; do c+=("$NAME-$n"); done
+  timeout 60 docker rm -f "${c[@]}" "$NET" >/dev/null 2>&1 || true
   timeout 60 docker volume rm "$VOLUME" >/dev/null 2>&1 || true
   timeout 60 docker rmi "$LOCAL_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
+# 2. Secrets: 0600 files only.
 pw() { head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-32; }
-AGENT_PW="$(pw)"
-ROOT_PW="$(pw)"
-WRONG_PW="$(pw)"
-umask 077
-mkdir -p "$WORK/init"
-printf 'FIREBIRD_ROOT_PASSWORD=%s\n' "$ROOT_PW" > "$WORK/env"
+for f in agent root wrong; do pw > "$WORK/$f.pw"; done
+AGENT_PW="$(cat "$WORK/agent.pw")"
+printf 'FIREBIRD_ROOT_PASSWORD=%s\n' "$(cat "$WORK/root.pw")" > "$WORK/env"
+mkdir -p "$WORK/init" "$WORK/init-mapping"
 # The seed: the minimal variant (ADR-0060 decision 4), the extended variant's role, an account with
-# no grant, and two tables (one granted, one not). Fake values only.
+# no grant, a refused right through a role not in use, and two tables (one granted, one not).
+# Fake values only.
 cat > "$WORK/init/10-seed.sql" <<SQL
 CREATE TABLE CUSTOMERS (ID INTEGER, EMAIL VARCHAR(100));
 INSERT INTO CUSTOMERS VALUES (1, 'it-fake@example.test');
@@ -76,6 +97,8 @@ CREATE ROLE DBI_OUTER;
 GRANT SELECT ON TABLE CUSTOMERS TO ROLE DBI_OUTER;
 GRANT DBI_NESTED TO ROLE DBI_OUTER;
 GRANT DBI_OUTER TO USER AGENT_NESTED;
+CREATE USER AGENT_ADMIN_OPT PASSWORD '$AGENT_PW' USING PLUGIN Srp;
+GRANT DATABASTION_READER TO USER AGENT_ADMIN_OPT WITH ADMIN OPTION;
 COMMIT;
 SQL
 # The drift test of the system-privilege bit table (decision 4): one role per privilege of the
@@ -91,42 +114,72 @@ for p in $privileges; do
   printf 'CREATE ROLE DBI_P_%s SET SYSTEM PRIVILEGES TO %s;\n' "$p" "$p"
 done > "$WORK/init/20-privilege-roles.sql"
 echo "COMMIT;" >> "$WORK/init/20-privilege-roles.sql"
-chmod 755 "$WORK" "$WORK/init"
-chmod 644 "$WORK/init/20-privilege-roles.sql"
-chmod 644 "$WORK/init/10-seed.sql"
+# The mapping server (review L2): a local mapping to SYSDBA for one account through the `Srp`
+# plugin name, a global one to RDB$ADMIN for another account restricted to another database, and
+# two that cannot match the agent's login (another user; the Legacy_Auth plugin).
+cp "$WORK/init/10-seed.sql" "$WORK/init-mapping/10-seed.sql"
+cat > "$WORK/init-mapping/30-mappings.sql" <<SQL
+CREATE USER MAP_LOCAL PASSWORD '$AGENT_PW' USING PLUGIN Srp;
+CREATE USER MAP_GLOBAL PASSWORD '$AGENT_PW' USING PLUGIN Srp;
+CREATE USER OTHER_U PASSWORD '$AGENT_PW' USING PLUGIN Srp;
+CREATE MAPPING IT_MAP_LOCAL USING PLUGIN SRP FROM USER MAP_LOCAL TO USER SYSDBA;
+CREATE GLOBAL MAPPING IT_MAP_GLOBAL USING ANY PLUGIN IN "/var/lib/firebird/data/other.fdb"
+  FROM USER MAP_GLOBAL TO ROLE RDB\$ADMIN;
+CREATE MAPPING IT_MAP_OTHER USING PLUGIN SRP FROM USER OTHER_U TO USER SYSDBA;
+CREATE GLOBAL MAPPING IT_MAP_LEGACY USING PLUGIN LEGACY_AUTH FROM ANY USER TO USER SYSDBA;
+COMMIT;
+SQL
+unset AGENT_PW
+
+# 3. The namespace and the servers.
+HARDEN=(--cap-drop NET_RAW --cap-drop NET_ADMIN)
+JOIN=(--network "container:$NET" "${HARDEN[@]}")
+timeout 120 docker run -d --name "$NET" --network none "${HARDEN[@]}" --entrypoint sleep \
+  "$SOCAT" infinity >/dev/null
+started() { # container: waits for the server's start line
+  for _ in $(seq 1 120); do
+    if timeout 10 docker logs "$1" 2>&1 | grep -q "Starting Firebird"; then return 0; fi
+    sleep 1
+  done
+  echo "[it] $1 did not start" >&2
+  return 1
+}
+seeded() { # container: the seed must not have failed
+  if timeout 10 docker logs "$1" 2>&1 | grep -q "Statement failed"; then
+    echo "[it] the seed of $1 failed" >&2
+    return 1
+  fi
+}
 
 echo "[it] Firebird $MAJOR: initializing" >&2
-timeout 300 docker run -d --name "$NAME-init" --network host --env-file "$WORK/env" \
+timeout 300 docker run -d --name "$NAME-init" "${JOIN[@]}" --env-file "$WORK/env" \
   -e FIREBIRD_DATABASE=app.fdb -e FIREBIRD_CONF_RemoteServicePort="$PORT" \
   -e FIREBIRD_CONF_RemoteBindAddress=127.0.0.1 -e FIREBIRD_CONF_WireCrypt=Required \
   -e FIREBIRD_CONF_AuthServer=Srp256 -v "$VOLUME:/var/lib/firebird/data" \
   -v "$WORK/init:/docker-entrypoint-initdb.d:ro" "$IMAGE" >/dev/null
-for _ in $(seq 1 120); do
-  if timeout 10 docker logs "$NAME-init" 2>&1 | grep -q "Starting Firebird"; then break; fi
-  sleep 1
-done
-timeout 10 docker logs "$NAME-init" 2>&1 | grep -q "Starting Firebird" \
-  || { echo "[it] the server did not start" >&2; exit 1; }
-if timeout 10 docker logs "$NAME-init" 2>&1 | grep -q "Statement failed"; then
-  echo "[it] the seed failed" >&2; exit 1
-fi
+started "$NAME-init"
+seeded "$NAME-init"
 timeout 60 docker stop "$NAME-init" >/dev/null
-timeout 120 docker commit "$NAME-init" "$LOCAL_IMAGE" >/dev/null
+timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker rm "$NAME-init" >/dev/null
-timeout 60 docker run --rm -v "$VOLUME:/d" --entrypoint chown "$LOCAL_IMAGE" -R 84:84 /d
-timeout 60 docker run -d --name "$NAME" --network host --user 84:84 \
+timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$VOLUME:/d" --entrypoint chown \
+  "$LOCAL_IMAGE" -R 84:84 /d
+timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" --user 84:84 \
   -v "$VOLUME:/var/lib/firebird/data" --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
-timeout 60 docker run -d --name "$NAME-socat" --network host "$SOCAT" \
+timeout 60 docker run -d --name "$NAME-socat" "${JOIN[@]}" "$SOCAT" \
   "TCP-LISTEN:$FWD_PORT,bind=127.0.0.1,fork,reuseaddr" "TCP:127.0.0.1:$PORT" >/dev/null
-# The wire-encryption variants (decision 1: ChaCha when ChaCha64 is not offered; Arc4 only and no
-# encryption refused) and Firebird 3.0 (refused at op_connect, decision 2), each on its own port.
-# The 3.0 server gets no seed: the seed's syntax is 4.0+ (system privileges, DEFAULT roles), and
-# the connector is refused at op_connect, before any account is used.
+# The variants: ChaCha when ChaCha64 is not offered, Arc4 only and no encryption refused (decision
+# 1), Firebird 3.0 refused at op_connect (decision 2), the mappings (review L2). The 3.0 server
+# gets no seed: the seed's syntax is 4.0+ (system privileges, DEFAULT roles), and the connector is
+# refused at op_connect, before any account is used.
 variant() { # name port image extra-env...
   local n="$1" p="$2" img="$3" init=(-v "$WORK/init:/docker-entrypoint-initdb.d:ro")
   shift 3
-  [ "$n" = fb3 ] && init=()
-  timeout 300 docker run -d --name "$NAME-$n" --network host --env-file "$WORK/env" \
+  case "$n" in
+    fb3) init=() ;;
+    mapping) init=(-v "$WORK/init-mapping:/docker-entrypoint-initdb.d:ro") ;;
+  esac
+  timeout 300 docker run -d --name "$NAME-$n" "${JOIN[@]}" --env-file "$WORK/env" \
     -e FIREBIRD_DATABASE=app.fdb -e FIREBIRD_CONF_RemoteServicePort="$p" \
     -e FIREBIRD_CONF_RemoteBindAddress=127.0.0.1 "$@" "${init[@]}" "$img" >/dev/null
 }
@@ -138,21 +191,24 @@ variant nocrypt "$((PORT + 3))" "$IMAGE" -e FIREBIRD_CONF_WireCrypt=Disabled \
   -e FIREBIRD_CONF_AuthServer=Srp256
 variant fb3 "$((PORT + 4))" "$IMAGE3" -e FIREBIRD_CONF_WireCrypt=Required \
   -e FIREBIRD_CONF_AuthServer=Srp256
-for n in chacha arc4 nocrypt fb3; do
-  for _ in $(seq 1 120); do
-    if timeout 10 docker logs "$NAME-$n" 2>&1 | grep -q "Starting Firebird"; then break; fi
-    sleep 1
-  done
-done
+variant mapping "$((PORT + 5))" "$IMAGE" -e FIREBIRD_CONF_WireCrypt=Required \
+  -e FIREBIRD_CONF_AuthServer=Srp256
+for n in $VARIANTS; do started "$NAME-$n"; done
+seeded "$NAME-mapping"
 sleep 3
-echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
 
-export DATABASTION_IT_FIREBIRD=1 FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 \
-  FIREBIRD_IT_MAJOR="$MAJOR" FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
-  FIREBIRD_IT_AGENT_PASSWORD="$AGENT_PW" FIREBIRD_IT_SYSDBA_PASSWORD="$ROOT_PW" \
-  FIREBIRD_IT_WRONG_PASSWORD="$WRONG_PW" FIREBIRD_IT_FORWARDER_PORT="$FWD_PORT" \
-  FIREBIRD_IT_FORWARDER_UID=0 FIREBIRD_IT_CHACHA_PORT="$((PORT + 1))" \
-  FIREBIRD_IT_ARC4_PORT="$((PORT + 2))" FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" \
-  FIREBIRD_IT_FB3_PORT="$((PORT + 4))"
-cd "$ROOT/agent"
-timeout 900 cargo test -p databastion-connector-firebird --all-features --locked --lib it:: -- --nocapture
+# 4. The tests, in the namespace, as the calling user.
+echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
+PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
+timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
+  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+  FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
+  FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
+  FIREBIRD_IT_AGENT_PASSWORD_FILE="$WORK/agent.pw" \
+  FIREBIRD_IT_SYSDBA_PASSWORD_FILE="$WORK/root.pw" \
+  FIREBIRD_IT_WRONG_PASSWORD_FILE="$WORK/wrong.pw" \
+  FIREBIRD_IT_FORWARDER_PORT="$FWD_PORT" FIREBIRD_IT_FORWARDER_UID=0 \
+  FIREBIRD_IT_CHACHA_PORT="$((PORT + 1))" FIREBIRD_IT_ARC4_PORT="$((PORT + 2))" \
+  FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
+  FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
+  "$EXE" it:: --nocapture

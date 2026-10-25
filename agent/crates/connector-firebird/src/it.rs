@@ -7,11 +7,13 @@
 //!   owning the server's sockets, default 84; 0 needs the root opt-in,
 //!   which the tests then set);
 //! - `FIREBIRD_IT_ATTACH`: the seeded database's path on the server;
-//! - `FIREBIRD_IT_AGENT_PASSWORD`: the fake password of the seeded
+//! - `FIREBIRD_IT_AGENT_PASSWORD_FILE`: a `0600` file holding the fake
+//!   password of the seeded
 //!   accounts `DATABASTION_AGENT` (minimal variant), `AGENT_EXT` (the
 //!   extended variant's role) and `AGENT_NONE` (no grant);
-//! - `FIREBIRD_IT_WRONG_PASSWORD`: any other fake value;
-//! - `FIREBIRD_IT_SYSDBA_PASSWORD` (optional): the throwaway server's
+//! - `FIREBIRD_IT_WRONG_PASSWORD_FILE`: a file with any other fake value;
+//! - `FIREBIRD_IT_SYSDBA_PASSWORD_FILE` (optional): a file with the
+//!   throwaway server's
 //!   `SYSDBA` password (the refusal test only);
 //! - `FIREBIRD_IT_MAJOR` (optional): the major version the server must
 //!   report, so an entry cannot silently test another image;
@@ -24,7 +26,11 @@
 //!   only, no wire encryption, and a Firebird 3.0 server, each seeded with
 //!   the same accounts.
 //!
-//! Passwords reach the connector through `secret: {env: …}` only.
+//! - `FIREBIRD_IT_MAPPING_PORT` (optional): a server (run as root) whose
+//!   seed adds the authentication mappings of review L2.
+//!
+//! Passwords reach the connector through `secret: {file: …}` only (review
+//! L4): the variables name the files, never hold a password.
 
 #![allow(
     clippy::unwrap_used,
@@ -58,8 +64,9 @@ fn attach() -> String {
     var("FIREBIRD_IT_ATTACH", "/var/lib/firebird/data/app.fdb")
 }
 
-/// A target for `account` whose password is in the environment variable
-/// `secret_env`, with extra `firebird` keys and a given database.
+/// A target for `account` whose password is in the file named by the
+/// environment variable `secret_env`, with extra
+/// `firebird` keys and a given database.
 fn target_on(
     account: &str,
     secret_env: &str,
@@ -73,10 +80,11 @@ fn target_on(
     } else {
         ""
     };
+    let secret_file = var(secret_env, "/nonexistent/databastion-it-secret");
     let yaml = format!(
         "{{console: {{url: \"https://c.example\"}}, state_dir: /tmp, targets: [{{id: fb-it, \
          engine: firebird, host: 127.0.0.1, port: {port}, account: {account}, \
-         secret: {{env: {secret_env}}}, firebird: {{peer_uid: {peer_uid}, {root}{extra} \
+         secret: {{file: \"{secret_file}\"}}, firebird: {{peer_uid: {peer_uid}, {root}{extra} \
          databases: [{{name: app, attach: \"{attach}\"}}]}}}}]}}"
     );
     databastion_core::AgentConfig::parse(&yaml)
@@ -98,7 +106,7 @@ fn target(
 fn agent(extra: &str) -> TargetConfig {
     target(
         "DATABASTION_AGENT",
-        "FIREBIRD_IT_AGENT_PASSWORD",
+        "FIREBIRD_IT_AGENT_PASSWORD_FILE",
         extra,
         &port(),
         &peer_uid(),
@@ -169,7 +177,7 @@ async fn the_extended_variant_and_the_server_configuration() {
     let ext = |extra: &str| {
         target(
             "AGENT_EXT",
-            "FIREBIRD_IT_AGENT_PASSWORD",
+            "FIREBIRD_IT_AGENT_PASSWORD_FILE",
             extra,
             &port(),
             &peer_uid(),
@@ -207,7 +215,7 @@ async fn an_account_without_grants_is_clean_and_sysdba_is_refused() {
     let c = FirebirdConnector::new();
     let none = target(
         "AGENT_NONE",
-        "FIREBIRD_IT_AGENT_PASSWORD",
+        "FIREBIRD_IT_AGENT_PASSWORD_FILE",
         "",
         &port(),
         &peer_uid(),
@@ -215,12 +223,12 @@ async fn an_account_without_grants_is_clean_and_sysdba_is_refused() {
     let h = c.check(&none).await;
     assert!(h.reachable, "{:?}", h.detail);
     assert_eq!(codes(&h), ["audit.source_not_configured"], "{:?}", h.notes);
-    if std::env::var("FIREBIRD_IT_SYSDBA_PASSWORD").is_err() {
+    if std::env::var("FIREBIRD_IT_SYSDBA_PASSWORD_FILE").is_err() {
         return;
     }
     let sysdba = target(
         "SYSDBA",
-        "FIREBIRD_IT_SYSDBA_PASSWORD",
+        "FIREBIRD_IT_SYSDBA_PASSWORD_FILE",
         "",
         &port(),
         &peer_uid(),
@@ -243,11 +251,11 @@ async fn failures_are_closed_codes_at_their_stage() {
     }
     let c = FirebirdConnector::new();
     // A wrong password: the server refuses the proof.
-    if std::env::var("FIREBIRD_IT_WRONG_PASSWORD").is_ok() {
+    if std::env::var("FIREBIRD_IT_WRONG_PASSWORD_FILE").is_ok() {
         let h = c
             .check(&target(
                 "DATABASTION_AGENT",
-                "FIREBIRD_IT_WRONG_PASSWORD",
+                "FIREBIRD_IT_WRONG_PASSWORD_FILE",
                 "",
                 &port(),
                 &peer_uid(),
@@ -267,7 +275,7 @@ async fn failures_are_closed_codes_at_their_stage() {
     let h = c
         .check(&target(
             "DATABASTION_AGENT",
-            "FIREBIRD_IT_AGENT_PASSWORD",
+            "FIREBIRD_IT_AGENT_PASSWORD_FILE",
             "",
             &port(),
             other,
@@ -283,7 +291,7 @@ async fn failures_are_closed_codes_at_their_stage() {
         let h = c
             .check(&target(
                 "DATABASTION_AGENT",
-                "FIREBIRD_IT_AGENT_PASSWORD",
+                "FIREBIRD_IT_AGENT_PASSWORD_FILE",
                 "",
                 &fwd,
                 &fwd_uid,
@@ -299,7 +307,7 @@ async fn failures_are_closed_codes_at_their_stage() {
         let h = c
             .check(&target(
                 "DATABASTION_AGENT",
-                "FIREBIRD_IT_AGENT_PASSWORD",
+                "FIREBIRD_IT_AGENT_PASSWORD_FILE",
                 "tunnel: true,",
                 &fwd,
                 &fwd_uid,
@@ -318,7 +326,7 @@ async fn an_unknown_database_is_an_unknown_target() {
     let c = FirebirdConnector::new();
     let t = target_on(
         "DATABASTION_AGENT",
-        "FIREBIRD_IT_AGENT_PASSWORD",
+        "FIREBIRD_IT_AGENT_PASSWORD_FILE",
         "",
         &port(),
         &peer_uid(),
@@ -376,7 +384,7 @@ async fn wire_encryption_variants_and_firebird_3() {
     let on = |port: &str| {
         target(
             "DATABASTION_AGENT",
-            "FIREBIRD_IT_AGENT_PASSWORD",
+            "FIREBIRD_IT_AGENT_PASSWORD_FILE",
             "",
             port,
             "0",
@@ -501,7 +509,7 @@ async fn a_refused_privilege_through_a_role_not_in_use_is_refused() {
     let h = c
         .check(&target(
             "AGENT_NESTED",
-            "FIREBIRD_IT_AGENT_PASSWORD",
+            "FIREBIRD_IT_AGENT_PASSWORD_FILE",
             "",
             &port(),
             &peer_uid(),
@@ -514,4 +522,60 @@ async fn a_refused_privilege_through_a_role_not_in_use_is_refused() {
         ["trace_any_attachment"]
     );
     assert!(c.state.blocks("fb-it"));
+}
+
+/// Review L2 against a real server: a mapping to SYSDBA through the `Srp`
+/// plugin name and a global mapping to RDB$ADMIN restricted to another
+/// database are refused; mappings of another user or of `Legacy_Auth` do
+/// not refuse the account.
+#[tokio::test]
+async fn mappings_to_sysdba_or_rdb_admin_are_refused() {
+    if !enabled() {
+        return;
+    }
+    let Ok(p) = std::env::var("FIREBIRD_IT_MAPPING_PORT") else {
+        return;
+    };
+    let c = FirebirdConnector::new();
+    let on = |account: &str| target(account, "FIREBIRD_IT_AGENT_PASSWORD_FILE", "", &p, "0");
+    let h = c.check(&on("DATABASTION_AGENT")).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    assert!(!codes(&h).contains(&"privilege.refused"), "{:?}", h.notes);
+    assert!(!c.state.blocks("fb-it"), "{:?}", h.detail);
+    for (account, label) in [("MAP_LOCAL", "sysdba"), ("MAP_GLOBAL", "rdb_admin")] {
+        let h = c.check(&on(account)).await;
+        assert!(h.reachable, "{account}: {:?}", h.detail);
+        eprintln!("[it] {account}: {:?}", h.detail);
+        assert!(
+            labels(&h, NoteCode::PrivilegeRefused).contains(&label.to_owned()),
+            "{account}: {:?}",
+            h.notes
+        );
+        assert!(c.state.blocks("fb-it"));
+        assert_contract(&h, None);
+    }
+}
+
+/// Review L5 against a real server: a role granted `WITH ADMIN OPTION`.
+#[tokio::test]
+async fn a_membership_with_the_admin_option_is_a_grant_option() {
+    if !enabled() {
+        return;
+    }
+    let c = FirebirdConnector::new();
+    let h = c
+        .check(&target(
+            "AGENT_ADMIN_OPT",
+            "FIREBIRD_IT_AGENT_PASSWORD_FILE",
+            "",
+            &port(),
+            &peer_uid(),
+        ))
+        .await;
+    assert!(h.reachable, "{:?}", h.detail);
+    assert!(
+        codes(&h).contains(&"privilege.grant_option"),
+        "{:?}",
+        h.notes
+    );
 }

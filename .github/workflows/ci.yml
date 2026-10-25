@@ -809,15 +809,17 @@ jobs:
   # Firebird connector integration tests, lot 1 (ADR-0060 decision 10): the own protocol-16
   # client, SRP-256, ChaCha64 / ChaCha (Arc4 and unencrypted servers refused), the loopback,
   # peer-uid and forwarder rules (a socat forwarder) and check() against throwaway servers of the
-  # pinned 5.0.4 and 4.0.7 images run as uid 84 on loopback, plus Firebird 3.0's refusal
-  # (dev/firebird/it.sh; the dev service comes with lot 2). Fake random passwords, never on a
-  # command line.
+  # pinned 5.0.4 and 4.0.7 images run as uid 84 on the loopback of a dedicated network namespace
+  # (the tests enter it with sudo nsenter and run as the runner user; every container drops NET_RAW
+  # and NET_ADMIN), the authentication mappings to SYSDBA and RDB$ADMIN, plus Firebird 3.0's
+  # refusal (dev/firebird/it.sh; the dev service comes with lot 2). Fake random passwords in 0600
+  # files, never on a command line nor in an environment variable.
   agent-firebird:
     name: Agent Firebird integration
     needs: detect
     if: needs.detect.outputs.agent == 'true' && needs.detect.outputs.firebird == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50 # the two 20-minute test steps, plus setup (review N8)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
