@@ -100,6 +100,52 @@ pub(crate) struct Membership {
     pub(crate) grantee: String,
     pub(crate) grantee_type: i64,
     pub(crate) role: String,
+    /// `RDB$GRANT_OPTION`: above 0, the membership was granted with the
+    /// admin option (review L5).
+    pub(crate) admin: i64,
+}
+
+/// An authentication mapping row (review L2), local or global.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Mapping {
+    /// `RDB$MAP_USING`: `P`, `S`, `M` or `*`.
+    pub(crate) using: String,
+    pub(crate) plugin: Option<String>,
+    pub(crate) from_type: Option<String>,
+    /// The source is the account's name or `*` (any user).
+    pub(crate) from_matches: bool,
+    /// 0 a user, 1 a role.
+    pub(crate) to_type: i64,
+    pub(crate) to: Option<String>,
+}
+
+impl Mapping {
+    /// The refusal label of a mapping that could map the agent's login to
+    /// `SYSDBA` or `RDB$ADMIN`, fail closed: a source type other than the
+    /// group types (which an `Srp256` login never carries) counts as the
+    /// account's when not `USER`; a plugin condition matches unless it
+    /// names a plugin other than the `Srp` family; a database condition is
+    /// not compared (an alias and a path cannot be matched reliably).
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        let label = match (self.to_type, self.to.as_deref()) {
+            (0, Some("SYSDBA")) => "sysdba",
+            (1, Some("RDB$ADMIN")) => "rdb_admin",
+            _ => return None,
+        };
+        let source = match self.from_type.as_deref().map(str::to_ascii_uppercase) {
+            Some(t) if t == "USER" => self.from_matches,
+            Some(t) if t == "GROUP" || t == "PREDEFINED_GROUP" => false,
+            _ => true,
+        };
+        let plugin = match self.using.as_str() {
+            "P" => self
+                .plugin
+                .as_deref()
+                .is_none_or(|p| p.to_ascii_uppercase().starts_with("SRP")),
+            _ => true,
+        };
+        (source && plugin).then_some(label)
+    }
 }
 
 /// An object grant row.
@@ -128,6 +174,12 @@ pub(crate) struct Facts {
     pub(crate) memberships: Option<Vec<Membership>>,
     pub(crate) role_masks: Option<Vec<(String, Vec<u8>)>>,
     pub(crate) grants: Option<Vec<Grant>>,
+    /// The database's mappings and the security database's global ones.
+    pub(crate) mappings: Option<Vec<Mapping>>,
+    pub(crate) global_mappings: Option<Vec<Mapping>>,
+    /// Catalog rows with a NULL key column (review N3): the read they
+    /// belong to is not evaluated.
+    pub(crate) dropped_rows: u64,
     pub(crate) owned: Option<i64>,
     /// Active `ON CONNECT` and `ON TRANSACTION START` triggers.
     pub(crate) triggers: Option<(i64, i64)>,
@@ -158,6 +210,8 @@ pub(crate) struct Evaluation {
     pub(crate) roles: BTreeSet<String>,
     /// `extended_grants: true` without the privilege (local detail).
     pub(crate) extended_unused: bool,
+    /// Catalog rows with a NULL key column (local detail).
+    pub(crate) dropped_rows: u64,
 }
 
 /// Whether bit `n` of a mask is set.
@@ -297,6 +351,31 @@ impl Evaluation {
                 BTreeSet::new()
             }
         };
+        // A reachable membership held with the admin option (review L5).
+        if let (Some(u), Some(m)) = (&user, &f.memberships)
+            && m.iter().any(|m| {
+                m.admin > 0
+                    && ((m.grantee_type == USER && (m.grantee == *u || m.grantee == "PUBLIC"))
+                        || (m.grantee_type == ROLE && roles.contains(&m.grantee)))
+            })
+        {
+            self.grant_option = true;
+        }
+        // Mappings to SYSDBA or RDB$ADMIN the account's login could match
+        // (review L2).
+        match (&f.mappings, &f.global_mappings) {
+            (Some(local), Some(global)) => {
+                for label in local.iter().chain(global).filter_map(Mapping::refusal) {
+                    self.refused.insert(label.to_owned());
+                }
+            }
+            _ => {
+                self.not_evaluated.insert("sysdba".to_owned());
+                self.not_evaluated.insert("rdb_admin".to_owned());
+                self.incomplete.insert("auth_mappings");
+            }
+        }
+        self.dropped_rows = self.dropped_rows.saturating_add(f.dropped_rows);
         if roles.contains("RDB$ADMIN") {
             self.refused.insert("rdb_admin".to_owned());
         }
@@ -469,6 +548,12 @@ impl Evaluation {
         if !self.roles.is_empty() {
             parts.push(format!("{} role(s) reachable", self.roles.len()));
         }
+        if self.dropped_rows > 0 {
+            parts.push(format!(
+                "{} catalog row(s) with a NULL key column",
+                self.dropped_rows
+            ));
+        }
         if self.transaction_triggers > 0 {
             parts.push(format!(
                 "{} active ON TRANSACTION START trigger(s)",
@@ -511,6 +596,7 @@ pub(crate) mod tests {
                 grantee: "DATABASTION_AGENT".into(),
                 grantee_type: USER,
                 role: "DATABASTION_READER".into(),
+                admin: 0,
             }]),
             role_masks: Some(vec![
                 ("RDB$ADMIN".into(), vec![0xFF; 8]),
@@ -554,8 +640,127 @@ pub(crate) mod tests {
                 ("SEC$USERS".into(), false),
                 ("RDB$CONFIG".into(), false),
             ]),
+            // The default mappings of the images: none locally, none
+            // global (Windows-only predefined groups are not on Linux).
+            mappings: Some(vec![]),
+            global_mappings: Some(vec![]),
+            dropped_rows: 0,
             extended_grants: false,
         }
+    }
+
+    fn mapping(
+        using: &str,
+        plugin: Option<&str>,
+        from_type: &str,
+        from_matches: bool,
+        to_type: i64,
+        to: &str,
+    ) -> Mapping {
+        Mapping {
+            using: using.into(),
+            plugin: plugin.map(Into::into),
+            from_type: Some(from_type.into()),
+            from_matches,
+            to_type,
+            to: Some(to.into()),
+        }
+    }
+
+    /// Review L2: a mapping to SYSDBA or RDB$ADMIN that the account's
+    /// login could match is refused; one it cannot match is not.
+    #[test]
+    fn mappings_to_sysdba_or_rdb_admin_are_refused() {
+        let refused = [
+            (
+                mapping("P", Some("SRP"), "USER", true, 0, "SYSDBA"),
+                "sysdba",
+            ),
+            (
+                mapping("P", Some("Srp256"), "USER", true, 0, "SYSDBA"),
+                "sysdba",
+            ),
+            (
+                mapping("P", None, "USER", true, 1, "RDB$ADMIN"),
+                "rdb_admin",
+            ),
+            (
+                mapping("S", None, "USER", true, 1, "RDB$ADMIN"),
+                "rdb_admin",
+            ),
+            (mapping("*", None, "USER", true, 0, "SYSDBA"), "sysdba"),
+            (
+                mapping("M", Some("OTHER_MAP"), "USER", true, 0, "SYSDBA"),
+                "sysdba",
+            ),
+            // An unknown source type: fail closed.
+            (
+                mapping("P", None, "SOMETHING_NEW", false, 0, "SYSDBA"),
+                "sysdba",
+            ),
+        ];
+        for (m, label) in refused {
+            assert_eq!(m.refusal(), Some(label), "{m:?}");
+            for global in [false, true] {
+                let mut f = minimal();
+                if global {
+                    f.global_mappings = Some(vec![m.clone()]);
+                } else {
+                    f.mappings = Some(vec![m.clone()]);
+                }
+                let mut e = Evaluation::default();
+                e.add(&f);
+                assert!(e.refused.contains(label) && e.blocks(), "{m:?}");
+            }
+        }
+        for m in [
+            // Another user, another plugin, a group, another target.
+            mapping("P", Some("SRP"), "USER", false, 0, "SYSDBA"),
+            mapping("P", Some("Legacy_Auth"), "USER", true, 0, "SYSDBA"),
+            mapping("P", Some("Win_Sspi"), "USER", true, 1, "RDB$ADMIN"),
+            mapping("P", None, "GROUP", true, 1, "RDB$ADMIN"),
+            mapping("P", None, "Predefined_Group", true, 1, "RDB$ADMIN"),
+            mapping("P", None, "USER", true, 0, "APP_OWNER"),
+            mapping("P", None, "USER", true, 1, "APP_ROLE"),
+            // A user named like the role, a role named like the user.
+            mapping("P", None, "USER", true, 1, "SYSDBA"),
+            mapping("P", None, "USER", true, 0, "RDB$ADMIN"),
+        ] {
+            assert_eq!(m.refusal(), None, "{m:?}");
+        }
+        // Unread: not evaluated, blocking.
+        for change in [
+            Box::new(|f: &mut Facts| f.mappings = None) as Box<dyn Fn(&mut Facts)>,
+            Box::new(|f| f.global_mappings = None),
+        ] {
+            let mut f = minimal();
+            change(&mut f);
+            let mut e = Evaluation::default();
+            e.add(&f);
+            assert!(e.blocks() && e.incomplete.contains("auth_mappings"));
+            assert!(e.not_evaluated.contains("sysdba") && e.not_evaluated.contains("rdb_admin"));
+        }
+    }
+
+    /// Review L5: a reachable membership held with the admin option.
+    #[test]
+    fn a_membership_with_the_admin_option_is_a_grant_option() {
+        let mut f = minimal();
+        f.memberships.as_mut().unwrap()[0].admin = 2;
+        let mut e = Evaluation::default();
+        e.add(&f);
+        assert!(e.grant_option && codes(&e).contains(&"privilege.grant_option"));
+        // Another user's admin option does not count.
+        let mut f = minimal();
+        f.memberships.as_mut().unwrap().push(Membership {
+            grantee: "OTHER".into(),
+            grantee_type: USER,
+            role: "DATABASTION_READER".into(),
+            admin: 1,
+        });
+        let mut e = Evaluation::default();
+        e.add(&f);
+        assert!(!e.grant_option);
     }
 
     fn codes(e: &Evaluation) -> Vec<&'static str> {
@@ -596,6 +801,7 @@ pub(crate) mod tests {
                         grantee: "PUBLIC".into(),
                         grantee_type: USER,
                         role: "RDB$ADMIN".into(),
+                        admin: 0,
                     });
                 }),
                 "rdb_admin",
@@ -631,6 +837,7 @@ pub(crate) mod tests {
             grantee: "DATABASTION_READER".into(),
             grantee_type: ROLE,
             role: "NESTED".into(),
+            admin: 0,
         });
         f.role_masks
             .as_mut()
@@ -765,6 +972,7 @@ pub(crate) mod tests {
                 grantee: "PUBLIC".into(),
                 grantee_type: USER,
                 role: format!("R{i}"),
+                admin: 0,
             });
         }
         let mut e = Evaluation::default();

@@ -291,7 +291,9 @@ fn response(r: &mut Reader<'_>) -> Result<Response, XdrError> {
 /// `op_connect` with the user identification of decision 1: the login,
 /// `Srp256` as the plugin and the plugin list, the SRP public value `A`
 /// (hex) as `CNCT_specific_data`, wire encryption required. No
-/// `CNCT_user` (the OS user) and no `CNCT_host`.
+/// `CNCT_user` (the OS user) and no `CNCT_host`. `attach` is sent in
+/// clear (`p_cnct_file`): the server chooses its per-database
+/// authentication and wire-crypt settings from it.
 pub(crate) fn connect(attach: &str, login: &str, public_hex: &[u8]) -> Writer {
     let mut user = Vec::new();
     push_item(&mut user, cnct::LOGIN, login.as_bytes());

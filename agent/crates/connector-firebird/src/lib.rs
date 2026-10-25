@@ -115,6 +115,20 @@ impl FirebirdConnector {
     }
 }
 
+impl FirebirdConnector {
+    /// `permission_denied` unless the last `check()` of the target cleared
+    /// it ([`check::CheckState::blocks`] defaults to blocked).
+    fn refused(&self, target: Option<&TargetConfig>) -> Option<ConnectorError> {
+        target
+            .is_none_or(|t| self.state.blocks(&t.id))
+            .then_some(ConnectorError::Target {
+                engine: Engine::Firebird,
+                code: databastion_core::FailureCode::PermissionDenied,
+                engine_code: None,
+            })
+    }
+}
+
 #[async_trait]
 impl Connector for FirebirdConnector {
     fn engine(&self) -> Engine {
@@ -125,20 +139,29 @@ impl Connector for FirebirdConnector {
         check::check(&self.state, target).await
     }
 
-    /// Discovery comes with lot 2 (ADR-0060 decision 10).
-    async fn discover(&self, _job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
+    /// Discovery comes with lot 2 (ADR-0060 decision 10). The check's
+    /// verdict is consulted first (review N11): a target never checked, or
+    /// whose account is refused or not evaluated, is refused.
+    async fn discover(&self, job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
+        if let Some(e) = self.refused(job.target()) {
+            return Err(e);
+        }
         Err(ConnectorError::NotImplemented {
             engine: Engine::Firebird,
             operation: "discover",
         })
     }
 
-    /// Audit comes with lot 3 (ADR-0060 decision 10).
+    /// Audit comes with lot 3 (ADR-0060 decision 10), behind the same
+    /// verdict as Discovery.
     async fn audit_stream(
         &self,
-        _cfg: &AuditConfig,
+        cfg: &AuditConfig,
         _sink: &EventSink,
     ) -> Result<(), ConnectorError> {
+        if let Some(e) = self.refused(cfg.target()) {
+            return Err(e);
+        }
         Err(ConnectorError::NotImplemented {
             engine: Engine::Firebird,
             operation: "audit_stream",
@@ -184,13 +207,60 @@ mod tests {
         assert!(c.state.blocks("t"));
     }
 
+    fn denied(r: Result<(), ConnectorError>) -> bool {
+        matches!(
+            r,
+            Err(ConnectorError::Target {
+                code: FailureCode::PermissionDenied,
+                ..
+            })
+        )
+    }
+
+    /// Review N11: the verdict defaults to blocked, and Discovery and
+    /// Audit consult it before anything else.
     #[tokio::test]
-    async fn discovery_and_audit_are_later_lots() {
+    async fn discovery_and_audit_consult_the_check_first() {
         let c = FirebirdConnector::new();
         assert_eq!(c.engine(), Engine::Firebird);
         assert!(!c.supports_audit());
+        assert!(c.state.blocks("never-checked"));
         let (findings, _rx) = FindingSink::channel(1);
-        assert!(c.discover(&ScanJob::default(), &findings).await.is_err());
+        let (events, _erx) = EventSink::channel(1);
+        assert!(denied(c.discover(&ScanJob::default(), &findings).await));
+        assert!(denied(
+            c.audit_stream(&AuditConfig::default(), &events).await
+        ));
+        let t = parse(
+            "{id: t, engine: firebird, host: 127.0.0.1, port: 9, account: a, \
+             secret: {env: DATABASTION_TEST_UNSET_FIREBIRD_SECRET}, \
+             firebird: {peer_uid: 84, databases: [{name: app, attach: app}]}}",
+        )
+        .unwrap()
+        .targets[0]
+            .clone();
+        let key = std::sync::Arc::new(
+            databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap(),
+        );
+        let job = ScanJob::new(
+            databastion_core::ScanParams::contract_defaults(),
+            &t,
+            &databastion_core::config::Limits::default(),
+            key,
+        );
+        // Never checked: refused.
+        assert!(denied(c.discover(&job, &findings).await));
+        // A failed check leaves it blocked.
+        let _ = c.check(&t).await;
+        assert!(denied(c.discover(&job, &findings).await));
+        // Cleared by a check: the later lots' entry point.
+        c.state.set_blocked("t", false);
+        assert!(matches!(
+            c.discover(&job, &findings).await,
+            Err(ConnectorError::NotImplemented { .. })
+        ));
+        c.state.set_blocked("t", true);
+        assert!(denied(c.discover(&job, &findings).await));
     }
 
     #[test]

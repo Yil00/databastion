@@ -49,7 +49,7 @@ pub(crate) enum SrpError {
     /// The data is longer than Firebird's bound, or the lengths inside it
     /// do not add up.
     Length,
-    /// An empty or overlong salt.
+    /// An empty or overlong salt, or one that is not hexadecimal text.
     Salt,
     /// `B` is not hexadecimal, longer than 128 bytes, or `B mod N` is 0
     /// or 1.
@@ -124,7 +124,8 @@ pub(crate) struct ServerData<'a> {
 
 impl<'a> ServerData<'a> {
     /// Parses and checks the server data (decision 1): at most 324
-    /// bytes, a salt of 1 to 64 bytes, `B` of at most 128 bytes in
+    /// bytes, a salt of 1 to 64 hexadecimal characters, `B` of at most
+    /// 128 bytes in
     /// hexadecimal with `B mod N` neither 0 nor 1.
     pub(crate) fn parse(data: &'a [u8]) -> Result<Self, SrpError> {
         if data.len() > MAX_SERVER_DATA || data.len() < 4 {
@@ -135,6 +136,9 @@ impl<'a> ServerData<'a> {
             return Err(SrpError::Salt);
         }
         let salt = data.get(2..2 + salt_len).ok_or(SrpError::Length)?;
+        if !salt.iter().all(u8::is_ascii_hexdigit) {
+            return Err(SrpError::Salt);
+        }
         let rest = data.get(2 + salt_len..).ok_or(SrpError::Length)?;
         if rest.len() < 2 {
             return Err(SrpError::Length);
@@ -453,6 +457,15 @@ mod tests {
             data.extend_from_slice(&hex);
             assert!(ServerData::parse(&data).is_err());
         }
+        // A salt that is not hexadecimal text (decision 1).
+        for bad in [b"abcg".as_slice(), b"ab d", b"ab\0d", "é1".as_bytes()] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&u16::try_from(bad.len()).unwrap().to_le_bytes());
+            data.extend_from_slice(bad);
+            data.extend_from_slice(&2u16.to_le_bytes());
+            data.extend_from_slice(b"05");
+            assert_eq!(ServerData::parse(&data).err(), Some(SrpError::Salt));
+        }
         // Lengths that do not add up, an empty or long salt, a non-hex B.
         assert_eq!(ServerData::parse(&[]).err(), Some(SrpError::Length));
         assert_eq!(
@@ -464,11 +477,11 @@ mod tests {
         long.extend_from_slice(&[2, 0, b'1', b'2']);
         assert_eq!(ServerData::parse(&long).err(), Some(SrpError::Salt));
         assert_eq!(
-            ServerData::parse(&[1, 0, b's', 3, 0, b'1', b'2']).err(),
+            ServerData::parse(&[1, 0, b'a', 3, 0, b'1', b'2']).err(),
             Some(SrpError::Length)
         );
         assert_eq!(
-            ServerData::parse(&[1, 0, b's', 2, 0, b'1', b'g']).err(),
+            ServerData::parse(&[1, 0, b'a', 2, 0, b'1', b'g']).err(),
             Some(SrpError::PublicValue)
         );
         assert_eq!(

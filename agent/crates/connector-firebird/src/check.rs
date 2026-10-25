@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use crate::conn::{self, Endpoint, Session};
 use crate::error::{Detail, FbError, Stage};
-use crate::privileges::{Evaluation, Facts, Grant, Membership};
+use crate::privileges::{Evaluation, Facts, Grant, Mapping, Membership};
 use crate::sql::{self, Col, Value};
 
 /// Per-statement timeout of `check()` (decision 4).
@@ -86,7 +86,7 @@ impl CheckState {
             .unwrap_or(true)
     }
 
-    fn set_blocked(&self, target_id: &str, blocked: bool) {
+    pub(crate) fn set_blocked(&self, target_id: &str, blocked: bool) {
         self.blocked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -216,6 +216,64 @@ struct DatabaseFacts {
 
 fn text(row: &[Value], i: usize) -> Option<String> {
     row.get(i).and_then(Value::as_text).map(str::to_owned)
+}
+
+/// Every row of a read through `f`, or `None` when any row has a NULL key
+/// column (`f` returns `None`; review N3): such rows are counted in
+/// `dropped` and the read is not evaluated (fail closed).
+fn all_rows<T>(
+    rows: &[Vec<Value>],
+    dropped: &mut u64,
+    f: impl Fn(&[Value]) -> Option<T>,
+) -> Option<Vec<T>> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut missing = 0u64;
+    for row in rows {
+        match f(row) {
+            Some(v) => out.push(v),
+            None => missing += 1,
+        }
+    }
+    *dropped = dropped.saturating_add(missing);
+    (missing == 0).then_some(out)
+}
+
+/// The mappings of `statement` (review L2).
+async fn mappings(
+    s: &mut Session,
+    statement: &'static str,
+    dropped: &mut u64,
+    deadline: Instant,
+) -> Result<Option<Vec<Mapping>>, FbError> {
+    Ok(soft(
+        s.query(
+            statement,
+            &[
+                Col::Text(16),
+                Col::Text(252),
+                Col::Text(252),
+                Col::Bool,
+                Col::Int,
+                Col::Text(252),
+            ],
+            MAX_CATALOG_ROWS,
+            deadline,
+        )
+        .await,
+    )?
+    .filter(|r| !r.cut)
+    .and_then(|r| {
+        all_rows(&r.rows, dropped, |row| {
+            Some(Mapping {
+                using: text(row, 0)?,
+                plugin: text(row, 1),
+                from_type: text(row, 2),
+                from_matches: row.get(3)?.as_bool().unwrap_or(true),
+                to_type: row.get(4)?.as_int()?,
+                to: text(row, 5),
+            })
+        })
+    }))
 }
 
 /// The non-fatal outcome of a read: `None` when it failed or was cut (the
@@ -353,24 +411,22 @@ async fn database(
     f.memberships = soft(
         s.query(
             sql::ROLE_MEMBERSHIPS,
-            &[Col::Text(252), Col::Int, Col::Text(252)],
+            &[Col::Text(252), Col::Int, Col::Text(252), Col::Int],
             MAX_CATALOG_ROWS,
             deadline,
         )
         .await,
     )?
     .filter(|r| !r.cut)
-    .map(|r| {
-        r.rows
-            .iter()
-            .filter_map(|row| {
-                Some(Membership {
-                    grantee: text(row, 0)?,
-                    grantee_type: row.get(1)?.as_int()?,
-                    role: text(row, 2)?,
-                })
+    .and_then(|r| {
+        all_rows(&r.rows, &mut f.dropped_rows, |row| {
+            Some(Membership {
+                grantee: text(row, 0)?,
+                grantee_type: row.get(1)?.as_int()?,
+                role: text(row, 2)?,
+                admin: row.get(3)?.as_int().unwrap_or(1),
             })
-            .collect()
+        })
     });
     f.role_masks = soft(
         s.query(
@@ -382,19 +438,17 @@ async fn database(
         .await,
     )?
     .filter(|r| !r.cut)
-    .map(|r| {
-        r.rows
-            .iter()
-            .filter_map(|row| {
-                Some((
-                    text(row, 0)?,
-                    row.get(1)
-                        .and_then(Value::as_bytes)
-                        .map(<[u8]>::to_vec)
-                        .unwrap_or_default(),
-                ))
-            })
-            .collect()
+    .and_then(|r| {
+        all_rows(&r.rows, &mut f.dropped_rows, |row| {
+            Some((
+                text(row, 0)?,
+                // A NULL mask: no system privilege.
+                row.get(1)
+                    .and_then(Value::as_bytes)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default(),
+            ))
+        })
     });
     f.grants = soft(
         s.query(
@@ -415,22 +469,22 @@ async fn database(
         .await,
     )?
     .filter(|r| !r.cut)
-    .map(|r| {
-        r.rows
-            .iter()
-            .filter_map(|row| {
-                Some(Grant {
-                    grantee: text(row, 0)?,
-                    grantee_type: row.get(1)?.as_int()?,
-                    privilege: text(row, 2)?,
-                    grant_option: row.get(3)?.as_int().unwrap_or(0),
-                    // An object not found in its catalog (NULL flag) is
-                    // counted as the account's (fail closed).
-                    system: row.get(7).and_then(Value::as_int).unwrap_or(0) != 0,
-                })
+    .and_then(|r| {
+        all_rows(&r.rows, &mut f.dropped_rows, |row| {
+            Some(Grant {
+                grantee: text(row, 0)?,
+                grantee_type: row.get(1)?.as_int()?,
+                privilege: text(row, 2)?,
+                grant_option: row.get(3)?.as_int().unwrap_or(0),
+                // An object not found in its catalog (NULL flag) is
+                // counted as the account's (fail closed).
+                system: row.get(7).and_then(Value::as_int).unwrap_or(0) != 0,
             })
-            .collect()
+        })
     });
+    f.mappings = mappings(s, sql::AUTH_MAPPINGS, &mut f.dropped_rows, deadline).await?;
+    f.global_mappings =
+        mappings(s, sql::GLOBAL_AUTH_MAPPINGS, &mut f.dropped_rows, deadline).await?;
     f.owned = soft(s.query(sql::OWNED_OBJECTS, &[Col::Int], 1, deadline).await)?
         .and_then(|r| r.rows.into_iter().next())
         .and_then(|row| row.first().and_then(Value::as_int));
@@ -499,7 +553,29 @@ async fn credential_relations(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Review N3: one row with a NULL key column leaves the read not
+    /// evaluated, and is counted.
+    #[test]
+    fn rows_with_a_null_key_column_fail_the_read_closed() {
+        let rows = vec![
+            vec![Value::Int(1)],
+            vec![Value::Null],
+            vec![Value::Int(3)],
+            vec![Value::Null],
+        ];
+        let mut dropped = 0;
+        assert_eq!(all_rows(&rows, &mut dropped, |r| r[0].as_int()), None);
+        assert_eq!(dropped, 2);
+        let mut dropped = 0;
+        assert_eq!(
+            all_rows(&rows[..1], &mut dropped, |r| r[0].as_int()),
+            Some(vec![1])
+        );
+        assert_eq!(dropped, 0);
+    }
 
     #[test]
     fn only_firebird_4_and_5() {

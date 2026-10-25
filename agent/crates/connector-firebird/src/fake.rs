@@ -916,16 +916,16 @@ mod tests {
         let script = Script {
             statements: vec![canned(
                 crate::sql::ROLE_MEMBERSHIPS,
-                vec![text_col(252), int_col(), text_col(252)],
+                vec![text_col(252), int_col(), text_col(252), int_col()],
                 (0..10)
-                    .map(|i| vec![v(&format!("U{i}")), Value::Int(8), v("R")])
+                    .map(|i| vec![v(&format!("U{i}")), Value::Int(8), v("R"), Value::Int(0)])
                     .collect(),
             )],
             ..Script::default()
         };
         let (mut s, server) = session(script.clone()).await;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let shape = [Col::Text(252), Col::Int, Col::Text(252)];
+        let shape = [Col::Text(252), Col::Int, Col::Text(252), Col::Int];
         let rows = s
             .query(crate::sql::ROLE_MEMBERSHIPS, &shape, 4, deadline)
             .await

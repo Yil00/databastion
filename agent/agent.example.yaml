@@ -319,7 +319,9 @@ targets:
   #     peer_uid: firebird
   #     databases:
   #       # name: the label sent to the console; attach: a databases.conf
-  #       # alias (recommended) or an absolute path, never sent.
+  #       # alias (recommended: the server sees it in clear on loopback
+  #       # before wire encryption starts) or an absolute path. Never sent
+  #       # to the console.
   #       - name: app
   #         attach: appdb
   #     # A remote server reached through a TLS or WireGuard tunnel you run,

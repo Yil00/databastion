@@ -2,7 +2,12 @@
 //!
 //! 1. TCP to the declared loopback address and port; the peer-uid rule
 //!    before anything is sent ([`crate::peer`]).
-//! 2. `op_connect` offering protocol 16 only and `Srp256` only, with `A`.
+//! 2. `op_connect` offering protocol 16 only and `Srp256` only, with `A`,
+//!    naming the database (`attach`) **in clear**: wire encryption has not
+//!    started yet, and the server needs the name to apply a per-database
+//!    `AuthServer` or `WireCrypt` (with an empty name, a server enabling
+//!    `Srp256` or `WireCrypt` for that database only refuses the login or
+//!    offers no key; measured on 4.0.7 and 5.0.4).
 //!    The answer must be `op_cond_accept` of protocol 16, generic,
 //!    `ptype_batch_send`, plugin `Srp256`, not yet authenticated; anything
 //!    else ends the connection before anything derived from the password

@@ -58,9 +58,19 @@ pub(crate) const SYSTEM_PRIVILEGES_5: &str =
 
 /// Role memberships (`RDB$PRIVILEGE = 'M'`), for the role graph of
 /// decision 4: every role the account could use, not only those in use.
-pub(crate) const ROLE_MEMBERSHIPS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$USER) AS VARCHAR(63) CHARACTER SET UTF8), CAST(RDB$USER_TYPE AS INTEGER), CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8) FROM RDB$USER_PRIVILEGES WHERE RDB$PRIVILEGE = 'M' AND RDB$USER_TYPE IN (8, 13)";
+pub(crate) const ROLE_MEMBERSHIPS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$USER) AS VARCHAR(63) CHARACTER SET UTF8), CAST(RDB$USER_TYPE AS INTEGER), CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8), CAST(COALESCE(RDB$GRANT_OPTION, 0) AS INTEGER) FROM RDB$USER_PRIVILEGES WHERE RDB$PRIVILEGE = 'M' AND RDB$USER_TYPE IN (8, 13)";
 
 /// Every role's system-privilege bit mask (decision 4), as 8 raw bytes.
+/// The authentication mappings of the database (review L2): how each
+/// mapping is used (`P` a plugin, `S` any plugin server-wide, `M` another
+/// mapping, `*` any), its plugin, its source type, whether its source is
+/// the account or any user (computed by the server: the source name is
+/// never read), and its target type and name.
+pub(crate) const AUTH_MAPPINGS: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$MAP_USING) AS VARCHAR(4) CHARACTER SET UTF8), CAST(TRIM(TRAILING FROM RDB$MAP_PLUGIN) AS VARCHAR(63) CHARACTER SET UTF8), CAST(TRIM(TRAILING FROM RDB$MAP_FROM_TYPE) AS VARCHAR(63) CHARACTER SET UTF8), CASE WHEN RDB$MAP_FROM IN (CURRENT_USER, '*') THEN TRUE ELSE FALSE END, CAST(RDB$MAP_TO_TYPE AS INTEGER), CAST(TRIM(TRAILING FROM RDB$MAP_TO) AS VARCHAR(63) CHARACTER SET UTF8) FROM RDB$AUTH_MAPPING";
+
+/// The same for the global mappings of the security database.
+pub(crate) const GLOBAL_AUTH_MAPPINGS: &str = "SELECT CAST(TRIM(TRAILING FROM SEC$MAP_USING) AS VARCHAR(4) CHARACTER SET UTF8), CAST(TRIM(TRAILING FROM SEC$MAP_PLUGIN) AS VARCHAR(63) CHARACTER SET UTF8), CAST(TRIM(TRAILING FROM SEC$MAP_FROM_TYPE) AS VARCHAR(63) CHARACTER SET UTF8), CASE WHEN SEC$MAP_FROM IN (CURRENT_USER, '*') THEN TRUE ELSE FALSE END, CAST(SEC$MAP_TO_TYPE AS INTEGER), CAST(TRIM(TRAILING FROM SEC$MAP_TO) AS VARCHAR(63) CHARACTER SET UTF8) FROM SEC$GLOBAL_AUTH_MAPPING";
+
 pub(crate) const ROLE_PRIVILEGES: &str = "SELECT CAST(TRIM(TRAILING FROM RDB$ROLE_NAME) AS VARCHAR(63) CHARACTER SET UTF8), CAST(RDB$SYSTEM_PRIVILEGES AS VARCHAR(8) CHARACTER SET OCTETS) FROM RDB$ROLES";
 
 /// Object grants to the account, `PUBLIC` and roles (decision 4) other
@@ -162,6 +172,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "role_privileges",
         text: ROLE_PRIVILEGES,
+    },
+    Statement {
+        name: "auth_mappings",
+        text: AUTH_MAPPINGS,
+    },
+    Statement {
+        name: "global_auth_mappings",
+        text: GLOBAL_AUTH_MAPPINGS,
     },
     Statement {
         name: "object_grants",

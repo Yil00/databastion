@@ -228,6 +228,9 @@ pub(crate) mod gds {
     pub(crate) const CONNECT_REJECT: u32 = 335_544_421;
     pub(crate) const UPDATE_CONFLICT: u32 = 335_544_451;
     pub(crate) const LOGIN: u32 = 335_544_472;
+    /// `isc_login_error`: the server found no usable authentication plugin
+    /// (for example `Srp256` enabled only for another database).
+    pub(crate) const LOGIN_ERROR: u32 = 335_545_106;
     pub(crate) const SHUTDOWN: u32 = 335_544_528;
     pub(crate) const TRANSLITERATION_FAILED: u32 = 335_544_565;
     pub(crate) const DSQL_FIELD_ERR: u32 = 335_544_578;
@@ -271,7 +274,7 @@ pub(crate) fn failure_of(codes: &[u32]) -> FailureCode {
 fn table(code: u32) -> Option<FailureCode> {
     use FailureCode as F;
     Some(match code {
-        gds::LOGIN => F::AuthenticationFailed,
+        gds::LOGIN | gds::LOGIN_ERROR => F::AuthenticationFailed,
         gds::NO_PRIV => F::PermissionDenied,
         gds::CANCELLED => F::Cancelled,
         gds::CFG_STMT_TIMEOUT | gds::ATT_STMT_TIMEOUT | gds::REQ_STMT_TIMEOUT => F::Timeout,
@@ -317,6 +320,10 @@ mod tests {
     #[test]
     fn codes_map_through_the_closed_table() {
         assert_eq!(failure_of(&[gds::LOGIN]), FailureCode::AuthenticationFailed);
+        assert_eq!(
+            failure_of(&[gds::LOGIN_ERROR]),
+            FailureCode::AuthenticationFailed
+        );
         // The generic code first, the specific one after it.
         assert_eq!(
             failure_of(&[335_544_569, 335_544_436, gds::DSQL_RELATION_ERR]),
