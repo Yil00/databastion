@@ -31,6 +31,7 @@ Exact versions are pinned in `console/package.json` and `console/pnpm-lock.yaml`
 | MongoDB | Own minimal wire-protocol client (`OP_MSG`, bounded BSON reader, SCRAM-SHA-256) + rustls, no driver crate | P5-A, #74 ([ADR-0026](adr/0026-mongodb-connector.md) decision 1); see below |
 | OpenLDAP | Own bounded LDAPv3 client (bind, search, StartTLS and Who am I? only; bounded BER reader) + rustls, no LDAP crate | Phase 6, #79 ([ADR-0029](adr/0029-openldap-connector.md) decision 1); see below |
 | Redis / Valkey | Own bounded RESP3 client (closed read-only command set, replies bounded before allocation) + rustls, no client crate | Phase 9, #237 ([ADR-0052](adr/0052-redis-valkey-connector.md) decision 1: the `redis` crate pulls `xxhash-rust`, BSL-1.0, outside the `deny.toml` allow-list, and has no reply bounds; `fred` had no release for 19 months); since 0.8.0 |
+| SQLite | The bundled SQLite C library (3.53.2) through `rusqlite` 0.40 (`bundled`, `hooks`, `limits` only), run only in a sandboxed reader process (the agent's own binary re-executed, Landlock and seccomp) | Phase 10, #356 ([ADR-0059](adr/0059-sqlite-connector.md) decision 1): a reviewed exception to "no C client library", scoped to `connector-sqlite` by `agent/deny.toml` and architecture tests; on `dev`, not released yet |
 | HTTP client (uplink) | reqwest + rustls (`ring` provider, system trust store) | No OpenSSL → portable binary; OpenSSL / native-tls are banned by `agent/deny.toml` |
 | Packaging | Distroless Docker image + `.deb` | |
 | Architectures | x86_64 + arm64 | |
@@ -80,7 +81,9 @@ databastion/
 │   ├── crates/connector-mongodb/
 │   ├── crates/connector-openldap/
 │   ├── crates/connector-cas/
-│   └── crates/connector-redis/
+│   ├── crates/connector-redis/
+│   ├── crates/connector-sqlserver/
+│   └── crates/connector-sqlite/
 ├── shared/protocol/    # openapi.yaml + JSON Schemas + fixtures
 ├── deploy/             # docker-compose, later helm/
 ├── dev/                # dev environment: databases seeded with fake PII + ground truth
