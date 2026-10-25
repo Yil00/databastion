@@ -32,7 +32,7 @@ use databastion_connector_sqlite::ipc::{
     Request, Response, RowidAlias, SampleRange, SampleRequest,
 };
 use databastion_connector_sqlite::process::{Death, ReaderProcess};
-use databastion_connector_sqlite::testing::{Writer, seed};
+use databastion_connector_sqlite::testing::{Writer, build_from_sql, seed};
 use databastion_core::config::TargetConfig;
 use databastion_core::config::sqlite::{RollbackMode, SqliteSettings};
 use databastion_core::notes::NoteCode;
@@ -141,6 +141,15 @@ impl Env {
             .arg("--bind")
             .arg(&self.rw)
             .arg(&self.ro));
+        run(Command::new("mount")
+            .args(["-o", "remount,bind,ro"])
+            .arg(&self.ro));
+    }
+
+    /// Mounts `dir` (files another writer created, with their owners and
+    /// modes) read-only on `ro`.
+    fn mount_dir(&self, dir: &Path) {
+        run(Command::new("mount").arg("--bind").arg(dir).arg(&self.ro));
         run(Command::new("mount")
             .args(["-o", "remount,bind,ro"])
             .arg(&self.ro));
@@ -648,4 +657,260 @@ fn writer_helper_process() {
     stdout.flush().unwrap();
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
+}
+
+/// The dev directory (the seed manifest, its SQL scripts, the ground truth).
+fn dev_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../dev")
+}
+
+/// One file of the seeded matrix: its name, the manifest file it was
+/// written from, its journal mode and the optional modules its writer had.
+struct Variant {
+    file: String,
+    base: String,
+    journal_mode: String,
+    modules: Vec<String>,
+}
+
+const JOURNAL_MODES: [&str; 4] = ["delete", "truncate", "persist", "wal"];
+const PAGE_SIZES: [u32; 3] = [512, 4096, 65_536];
+const AUTO_VACUUM: [&str; 2] = ["none", "full"];
+
+/// The script without its `-- databastion:requires fts5` blocks (the
+/// bundled library compiles FTS5 out).
+fn without_fts5(sql: &str) -> String {
+    let mut out = String::new();
+    let mut skip = false;
+    for line in sql.split_inclusive('\n') {
+        match line.trim() {
+            "-- databastion:requires fts5" => skip = true,
+            "-- databastion:end" => skip = false,
+            _ if !skip => out.push_str(line),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Writes the matrix of `dev/sqlite/build.py matrix` into `dir` with the
+/// bundled library, without the FTS5 blocks.
+fn build_matrix(dir: &Path) -> Vec<Variant> {
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dev_dir().join("seed/out/sqlite.json")).unwrap(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for e in manifest["files"].as_array().unwrap() {
+        let base = e["file"].as_str().unwrap();
+        let sql = without_fts5(
+            &std::fs::read_to_string(dev_dir().join("seed/out").join(e["sql"].as_str().unwrap()))
+                .unwrap(),
+        );
+        let encoding = e["encoding"].as_str().unwrap();
+        for jm in JOURNAL_MODES {
+            for ps in PAGE_SIZES {
+                for (i, av) in AUTO_VACUUM.iter().enumerate() {
+                    let file = format!("{}-{jm}-p{ps}-av{i}.db", base.trim_end_matches(".db"));
+                    build_from_sql(&dir.join(&file), &sql, jm, encoding, ps, av);
+                    out.push(Variant {
+                        file,
+                        base: base.to_owned(),
+                        journal_mode: jm.to_owned(),
+                        modules: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The variants another writer recorded in `dir/variants.json`.
+fn read_variants(dir: &Path) -> (String, Vec<Variant>) {
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("variants.json")).unwrap()).unwrap();
+    let s = |v: &serde_json::Value| v.as_str().unwrap().to_owned();
+    let variants = doc["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Variant {
+            file: s(&v["file"]),
+            base: s(&v["base"]),
+            journal_mode: s(&v["journal_mode"]),
+            modules: v["modules"].as_array().unwrap().iter().map(s).collect(),
+        })
+        .collect();
+    (s(&doc["sqlite_version"]), variants)
+}
+
+/// A ground-truth location as a finding stores it: the part of a name
+/// that carries a value replaced by its expected normalized name.
+fn location_key(loc: &serde_json::Value) -> (String, String) {
+    let s = |k: &str| loc[k].as_str().unwrap_or_default().to_owned();
+    let (mut object, mut field) = (s("object"), s("field"));
+    if let Some(norm) = loc["expected_normalized_name"].as_str() {
+        let in_name = |n: &str| {
+            loc["name_values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|v| n.contains(v.as_str().unwrap()))
+        };
+        if in_name(&object) {
+            norm.clone_into(&mut object);
+        } else if in_name(&field) {
+            norm.clone_into(&mut field);
+        }
+    }
+    (object, field)
+}
+
+/// ADR-0059 decision 10 (P10-D): the dev seed's files (dev/seed/out/sqlite.json),
+/// in every journal mode (DELETE, TRUNCATE, PERSIST, WAL), page size (512,
+/// 4 096, 65 536) and `auto_vacuum` setting, read by the sandboxed reader
+/// and compared with dev/ground-truth.json: every location with an
+/// expected classifier found, no finding anywhere else, no value in the
+/// logs. The writer is the bundled library (this process, holding the WAL
+/// files open), or, with `DATABASTION_IT_SQLITE_SEEDED=<dir>`, another
+/// SQLite: the engine matrix's writers, which wrote `<dir>` with
+/// `dev/sqlite/build.py matrix --hold` as the application's account and
+/// hold its WAL files open.
+#[tokio::test(flavor = "current_thread")]
+async fn seeded_dev_files_match_the_ground_truth() {
+    let Some(env) = Env::new("seeded") else {
+        return;
+    };
+    let mut writers = Vec::new();
+    let (writer, variants) = if let Some(dir) = std::env::var_os("DATABASTION_IT_SQLITE_SEEDED") {
+        let dir = PathBuf::from(dir);
+        let (version, variants) = read_variants(&dir);
+        env.mount_dir(&dir);
+        (format!("SQLite {version} (another process)"), variants)
+    } else {
+        let variants = build_matrix(&env.rw);
+        for v in variants.iter().filter(|v| v.journal_mode == "wal") {
+            writers.push(Writer::hold(&env.rw.join(&v.file)));
+        }
+        env.mount();
+        ("the bundled library (this process)".to_owned(), variants)
+    };
+    assert_eq!(
+        variants.len(),
+        72,
+        "3 files x 4 journal modes x 3 page sizes x 2"
+    );
+    let truth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dev_dir().join("ground-truth.json")).unwrap(),
+    )
+    .unwrap();
+    let locations: Vec<&serde_json::Value> = truth["locations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["engine"] == "sqlite")
+        .collect();
+    assert!(!locations.is_empty());
+    let logs = Logs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let c = SqliteConnector::new();
+    let mut errors = Vec::new();
+    for v in &variants {
+        let id = v.file.trim_end_matches(".db").to_owned();
+        let t = TargetConfig::sqlite_for_tests(
+            &id,
+            SqliteSettings::for_tests(env.ro.join(&v.file), 500, RollbackMode::Read),
+        );
+        let h = c.check(&t).await;
+        if !h.reachable || h.failure.is_some() || h.audit_level != AuditLevel::None {
+            errors.push(format!("{id}: check {h:?}"));
+            continue;
+        }
+        let (found, cov) = scan(&c, &t).await;
+        let mut expected = 0;
+        let mut missing = Vec::new();
+        let mut want: Vec<((String, String), Vec<&str>)> = Vec::new();
+        for loc in locations.iter().filter(|l| l["file"] == v.base.as_str()) {
+            if let Some(m) = loc["requires"].as_str()
+                && !v.modules.iter().any(|x| x == m)
+            {
+                continue;
+            }
+            let key = location_key(loc);
+            let classifiers: Vec<&str> = loc["expected_classifiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap())
+                .collect();
+            if !classifiers.is_empty() {
+                expected += 1;
+                if !found.iter().any(|f| {
+                    (&f.0, &f.1) == (&key.0, &key.1) && classifiers.contains(&f.2.as_str())
+                }) {
+                    // Location names without the value-bearing part (the
+                    // normalized key) are safe to print.
+                    missing.push(format!("{}.{} {classifiers:?}", key.0, key.1));
+                }
+            }
+            want.push((key, classifiers));
+        }
+        let unexpected: Vec<String> = found
+            .iter()
+            .filter(|f| {
+                !want
+                    .iter()
+                    .any(|(k, cl)| (&k.0, &k.1) == (&f.0, &f.1) && cl.contains(&f.2.as_str()))
+            })
+            .map(|f| {
+                // A finding's names are normalized: no value.
+                format!("{}.{} {}", f.0, f.1, f.2)
+            })
+            .collect();
+        eprintln!(
+            "[it] sqlite seeded ({writer}): {id}: {} finding(s), {}/{expected} expected location(s), \
+             sampled {}, unsupported {}, limit {}",
+            found.len(),
+            expected - missing.len(),
+            cov.sampled,
+            cov.unsupported,
+            cov.limit,
+        );
+        if !missing.is_empty() {
+            errors.push(format!("{id}: not found: {missing:?}"));
+        }
+        if !unexpected.is_empty() {
+            errors.push(format!("{id}: unexpected: {unexpected:?}"));
+        }
+    }
+    drop(writers);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    // I2 and decision 2: no ground-truth value (long enough not to match a
+    // word of a log line by chance) and no path in the logs.
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(!text.is_empty());
+    let mut leaked = 0;
+    for loc in &locations {
+        for v in loc["values"]
+            .as_array()
+            .into_iter()
+            .chain(loc["name_values"].as_array())
+            .flatten()
+        {
+            let v = v.as_str().unwrap();
+            if v.chars().count() >= 8 && text.contains(v) {
+                leaked += 1;
+            }
+        }
+    }
+    assert_eq!(leaked, 0, "ground-truth value(s) in the logs");
+    for needle in ["/tmp/databastion-sqlite-reader", ".db\""] {
+        assert!(!text.contains(needle), "{needle} logged");
+    }
 }

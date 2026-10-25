@@ -68,6 +68,44 @@ pub fn seed(path: &Path, wal: bool) {
     c.execute_batch("ANALYZE;").unwrap();
 }
 
+/// Writes a database from a SQL script as `dev/sqlite/build.py` does (the
+/// dev seed of ADR-0059 decision 10, written by the bundled library): the
+/// page size, `auto_vacuum` and text encoding first, then the journal
+/// mode, then the script. `journal_mode`, `encoding` and `auto_vacuum` are
+/// SQLite's pragma values (`wal`, `UTF-16le`, `full`).
+pub fn build_from_sql(
+    path: &Path,
+    sql: &str,
+    journal_mode: &str,
+    encoding: &str,
+    page_size: u32,
+    auto_vacuum: &str,
+) {
+    for v in [journal_mode, encoding, auto_vacuum] {
+        assert!(
+            v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "{v}"
+        );
+    }
+    let c = Connection::open(path).unwrap();
+    c.execute_batch(&format!(
+        "PRAGMA page_size = {page_size}; PRAGMA auto_vacuum = {auto_vacuum}; \
+         PRAGMA encoding = '{encoding}';"
+    ))
+    .unwrap();
+    let mode: String = c
+        .query_row(&format!("PRAGMA journal_mode = {journal_mode}"), [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(mode, journal_mode);
+    c.execute_batch(sql).unwrap();
+    let ok: String = c
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ok, "ok");
+}
+
 /// A writer that keeps a database open (its `-wal` and `-shm` exist in WAL
 /// mode) and writes rows on demand.
 pub struct Writer(Connection);
@@ -83,6 +121,18 @@ impl Writer {
     #[must_use]
     pub fn open(path: &Path) -> Self {
         Self(Connection::open(path).unwrap())
+    }
+
+    /// Opens `path` read-write and reads its schema, so that a WAL
+    /// database's `-wal` and `-shm` exist while the writer lives (as with a
+    /// running application).
+    #[must_use]
+    pub fn hold(path: &Path) -> Self {
+        let c = Connection::open(path).unwrap();
+        let _: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+            .unwrap();
+        Self(c)
     }
 
     /// Inserts one row into `clients`.
