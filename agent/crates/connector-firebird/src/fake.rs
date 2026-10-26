@@ -102,6 +102,9 @@ pub(crate) struct Script {
     pub(crate) flood_rows: Option<u32>,
     /// Answer `op_attach` with this message instead of a success.
     pub(crate) attach_answer: Option<Vec<u8>>,
+    /// Answer the first `op_commit` after this statement is prepared with
+    /// a lock conflict.
+    pub(crate) fail_commit_after: Option<&'static str>,
 }
 
 impl Default for Script {
@@ -114,6 +117,7 @@ impl Default for Script {
             stall_execute: false,
             flood_rows: None,
             attach_answer: None,
+            fail_commit_after: None,
         }
     }
 }
@@ -472,6 +476,7 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
     let b_public = srp::server::public(LOGIN, PASSWORD, SALT, &b);
     let mut a_public = U1024::ZERO;
     let mut prepared: Option<Canned> = None;
+    let mut fail_commit = false;
     let mut cursor = 0usize;
     while let Some(msg) = s.next(&mut seen).await {
         let answer: Vec<u8> = match msg {
@@ -552,6 +557,9 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
             Msg::Transaction => response(1, b"", None),
             Msg::Allocate => response(2, b"", None),
             Msg::Prepare { text } => {
+                if script.fail_commit_after == Some(text.as_str()) {
+                    fail_commit = true;
+                }
                 seen.prepared.push(text.clone());
                 match script.statements.iter().find(|c| c.text == text) {
                     Some(c) if c.error.is_some() => {
@@ -605,6 +613,10 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
                     .u32(0);
                 out.extend_from_slice(w.as_slice());
                 out
+            }
+            Msg::Simple if fail_commit && seen.ops.last() == Some(&op::COMMIT) => {
+                fail_commit = false;
+                response(0, b"", Some(crate::error::gds::LOCK_CONFLICT))
             }
             Msg::Free | Msg::Simple => response(0, b"", None),
             Msg::Disconnect => break,

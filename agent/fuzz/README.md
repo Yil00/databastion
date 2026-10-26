@@ -43,6 +43,7 @@ tests of each connector (`src/proptests.rs`).
 | `firebird_srp_data` | `…::fuzz::srp_data` | The server's SRP data (salt and `B` with their checks), and the client proof when accepted |
 | `firebird_keys` | `…::fuzz::keys` | The wire-crypt key clumplets, the plugin choice (never Arc4) and the cipher it builds |
 | `firebird_proc_net_tcp` | `…::fuzz::proc_net_tcp` | `/proc/net/tcp` tables for the peer-uid rule (decision 3, security review L1): the right row or none |
+| `firebird_catalog` | `…::fuzz::catalog` | Discovery's reads (decision 5): rows of the relation list, the column list or a sampling statement, through the catalog parsing, the conversions, the column batches and built statements, and the sampled values kept or dropped |
 
 The core and the connectors expose these entry points only with their `fuzzing` feature, which the agent binary
 never enables. This directory is its own Cargo workspace: `cargo test` and `cargo clippy` in

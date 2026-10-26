@@ -287,10 +287,13 @@ fn load_truth() -> Truth {
         // connector tests of P9-A / P9-B, not by this seed-file test yet.
         // SQLite (P10-D): one location key per table of three files, scored
         // per file by `seeded_dev_files_match_the_ground_truth`
-        // (crates/agent/tests/sqlite_reader.rs).
+        // (crates/agent/tests/sqlite_reader.rs). Firebird (P10-B): scored
+        // by the connector's integration test against the real server
+        // (`discovery_matches_the_ground_truth_and_keeps_i2`,
+        // crates/connector-firebird/src/it.rs).
         if matches!(
             s("engine").as_deref(),
-            Some("sqlserver" | "redis" | "valkey" | "sqlite")
+            Some("sqlserver" | "redis" | "valkey" | "sqlite" | "firebird")
         ) {
             continue;
         }
