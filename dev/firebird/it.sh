@@ -208,7 +208,27 @@ variant mapping "$((PORT + 5))" "$IMAGE" -e FIREBIRD_CONF_WireCrypt=Required \
   -e FIREBIRD_CONF_AuthServer=Srp256
 for n in $VARIANTS; do started "$NAME-$n"; done
 seeded "$NAME-mapping"
-sleep 3
+# Every server and the forwarder must listen before the tests start (a test that connects too
+# early would see "connection refused" instead of the rule it checks): a LISTEN row (state 0A) on
+# 127.0.0.1:<port> in the namespace's own /proc/net/tcp.
+NETPID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
+listening() { # port
+  local hex
+  hex="$(printf '0100007F:%04X' "$1")"
+  for _ in $(seq 1 120); do
+    if timeout 10 $SUDO nsenter --net="/proc/$NETPID/ns/net" cat /proc/net/tcp \
+      | awk -v a="$hex" '$2 == a && $4 == "0A" { found = 1 } END { exit !found }'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[it] nothing listens on 127.0.0.1:$1" >&2
+  return 1
+}
+for p in "$PORT" "$((PORT + 1))" "$((PORT + 2))" "$((PORT + 3))" "$((PORT + 4))" "$((PORT + 5))" \
+  "$FWD_PORT"; do
+  listening "$p"
+done
 
 # 4. The tests, in the namespace, as the calling user.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
