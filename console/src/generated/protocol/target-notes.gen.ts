@@ -540,7 +540,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "coverage.security_database_excluded": {
-    "description": "{count} declared Firebird database(s) excluded from Discovery and Audit: a security database (its own or another database's, shown by MON$SEC_DATABASE, a PLG$SRP verifier relation in its catalog or a SecurityDatabase key in databases.conf), or not shown not to be one (a failed or cut read). Their trace records are handled as an undeclared database's; the target's other databases keep running.",
+    "description": "{count} declared Firebird database(s) excluded from Discovery and Audit: a security database (its own, shown by MON$SEC_DATABASE or a SecurityDatabase key in databases.conf naming itself, or one holding a PLG$SRP verifier relation or a legacy user-manager relation), or not shown not to be one (a failed or cut read). Their trace records are handled as an undeclared database's; the target's other databases keep running.",
     "engines": [
       "firebird"
     ]
