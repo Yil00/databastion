@@ -528,7 +528,9 @@ fn sqlserver_statements_never_read_definitions() {
 /// write, no DDL, no PSQL, no `EXECUTE STATEMENT … ON EXTERNAL`, no
 /// `RDB$SET_CONTEXT`), and none reads a source text (`*_SOURCE` columns:
 /// literals and credentials) nor an external file's path (Discovery only
-/// tests whether it is set: `RDB$EXTERNAL_FILE IS NULL`, decision 5).
+/// tests whether it is set: `RDB$EXTERNAL_FILE IS NULL`, and joins a
+/// column to its base field on `RDB$FIELD_SOURCE`, a field name, decision
+/// 5).
 #[cfg(feature = "firebird")]
 #[test]
 fn firebird_statements_are_closed_and_read_only() {
@@ -541,7 +543,8 @@ fn firebird_statements_are_closed_and_read_only() {
         );
         let lower = text
             .to_ascii_lowercase()
-            .replace("r.rdb$external_file is null", "");
+            .replace("r.rdb$external_file is null", "")
+            .replace("f.rdb$field_name = rf.rdb$field_source", "");
         for d in [
             "_source",
             "rdb$external_file",
