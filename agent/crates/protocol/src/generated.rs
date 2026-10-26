@@ -4426,8 +4426,8 @@ Revisions:
   for `privilege.not_evaluated`: the server audit runs with `ON_FAILURE = CONTINUE`,
   whose failure counter (`sys.dm_server_audit_status`) the option (a') grants do not
   read, so records lost to a failing audit target are not counted.
-- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6, and its refinement of
-  2026-10-25): the Firebird
+- `target_status.note_labels.2026_10_d` (ADR-0060 decisions 4 and 6, and its refinements of
+  2026-10-25 and 2026-10-26 b): the Firebird
   labels below `on_failure_probe`. Firebird system privileges are lowercased as written
   in `CREATE ROLE … SET SYSTEM PRIVILEGES TO` (`TRACE_ANY_ATTACHMENT` ->
   `trace_any_attachment`); the identities of the refusal list (`sysdba`, `rdb_admin` for
@@ -4449,9 +4449,11 @@ Revisions:
   `run_confirmation_stalled` (`audit.log_records_ambiguous`: the stream stopped more than
   60 s within one hour waiting for server run confirmations); and the trace configuration
   settings as written in `fbtrace.conf` (`log_statement_finish`, `print_perf`…, for
-  `audit.trace_settings_missing` and `audit.services_not_audited`). Firebird object rights
-  and DDL rights whose name is already a value above (`insert`, `update`, `delete`,
-  `references`, `execute`, `create`, `alter`, `drop`) use that value, with no token.
+  `audit.trace_settings_missing` and `audit.services_not_audited`; `log_transactions`,
+  `log_initfini` and `log_sweep` from the refinement of 2026-10-26 b, R21). Firebird
+  object rights and DDL rights whose name is already a value above (`insert`, `update`,
+  `delete`, `references`, `execute`, `create`, `alter`, `drop`) use that value, with no
+  token.
 
 Each revision is negotiated on its own: a value is sent only when the token of its own
 revision is listed.
@@ -4967,6 +4969,12 @@ pub enum TargetNoteLabel {
     LogFunctionFinish,
     #[serde(rename = "log_trigger_finish")]
     LogTriggerFinish,
+    #[serde(rename = "log_transactions")]
+    LogTransactions,
+    #[serde(rename = "log_initfini")]
+    LogInitfini,
+    #[serde(rename = "log_sweep")]
+    LogSweep,
     #[serde(rename = "log_errors")]
     LogErrors,
     #[serde(rename = "log_services")]
@@ -5304,6 +5312,9 @@ impl ::std::fmt::Display for TargetNoteLabel {
             Self::LogProcedureFinish => f.write_str("log_procedure_finish"),
             Self::LogFunctionFinish => f.write_str("log_function_finish"),
             Self::LogTriggerFinish => f.write_str("log_trigger_finish"),
+            Self::LogTransactions => f.write_str("log_transactions"),
+            Self::LogInitfini => f.write_str("log_initfini"),
+            Self::LogSweep => f.write_str("log_sweep"),
             Self::LogErrors => f.write_str("log_errors"),
             Self::LogServices => f.write_str("log_services"),
             Self::TimeThreshold => f.write_str("time_threshold"),
@@ -5599,6 +5610,9 @@ impl ::std::str::FromStr for TargetNoteLabel {
             "log_procedure_finish" => Ok(Self::LogProcedureFinish),
             "log_function_finish" => Ok(Self::LogFunctionFinish),
             "log_trigger_finish" => Ok(Self::LogTriggerFinish),
+            "log_transactions" => Ok(Self::LogTransactions),
+            "log_initfini" => Ok(Self::LogInitfini),
+            "log_sweep" => Ok(Self::LogSweep),
             "log_errors" => Ok(Self::LogErrors),
             "log_services" => Ok(Self::LogServices),
             "time_threshold" => Ok(Self::TimeThreshold),
