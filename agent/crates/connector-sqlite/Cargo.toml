@@ -42,7 +42,7 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 # 0.29, the last series where `close` takes a descriptor number; sound there
 # because the reader has opened nothing yet (sandbox::early). Scoped to this
 # crate by agent/deny.toml.
-nix = { version = "0.29", default-features = false }
+nix = { version = "0.31", default-features = false }
 
 [features]
 # Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
