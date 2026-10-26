@@ -124,3 +124,23 @@ fn code_is_mysql_only(code: &str) -> bool {
         .get(code)
         .is_some_and(|(engines, _)| engines.iter().all(|e| e == "mysql" || e == "mariadb"))
 }
+
+/// P10-C Firebird review, merge condition C1: the codes the core attaches
+/// to `firebird` targets only (`NoteCode::FIREBIRD_ONLY`) are exactly the
+/// codes registered for `firebird` alone, both ways: a Firebird-only code
+/// missing from the list could reach another engine's status, and a listed
+/// code registered for another engine would be stripped from it.
+#[test]
+fn firebird_only_codes_match_the_registry() {
+    let listed: BTreeSet<&str> = NoteCode::FIREBIRD_ONLY.iter().map(|c| c.as_str()).collect();
+    let registered: BTreeSet<String> = registry()
+        .into_iter()
+        .filter(|(_, (engines, _))| engines.len() == 1 && engines[0] == "firebird")
+        .map(|(code, _)| code)
+        .collect();
+    let registered: BTreeSet<&str> = registered.iter().map(String::as_str).collect();
+    assert_eq!(listed, registered);
+    assert_eq!(listed.len(), NoteCode::FIREBIRD_ONLY.len(), "listed twice");
+    // ADR-0060 refinement of 2026-10-26, R9.
+    assert!(listed.contains("coverage.security_database_excluded"));
+}

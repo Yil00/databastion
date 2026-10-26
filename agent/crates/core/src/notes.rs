@@ -397,6 +397,9 @@ pub enum NoteCode {
     AuditLogReadableByOthers,
     /// `security.firebird_tunnel` (Firebird, ADR-0060 decision 3).
     SecurityFirebirdTunnel,
+    /// `coverage.security_database_excluded` (Firebird, ADR-0060
+    /// refinement of 2026-10-26, R9).
+    CoverageSecurityDatabaseExcluded,
 }
 
 impl NoteCode {
@@ -525,6 +528,7 @@ impl NoteCode {
         Self::AuditLogRecordsAmbiguous,
         Self::AuditLogReadableByOthers,
         Self::SecurityFirebirdTunnel,
+        Self::CoverageSecurityDatabaseExcluded,
     ];
 
     /// The codes registered for `firebird` only (`target-notes.json`):
@@ -539,6 +543,7 @@ impl NoteCode {
         Self::AuditLogRecordsAmbiguous,
         Self::AuditLogReadableByOthers,
         Self::SecurityFirebirdTunnel,
+        Self::CoverageSecurityDatabaseExcluded,
     ];
 
     /// The registered code.
@@ -672,15 +677,23 @@ impl NoteCode {
             Self::AuditLogRecordsAmbiguous => "audit.log_records_ambiguous",
             Self::AuditLogReadableByOthers => "audit.log_readable_by_others",
             Self::SecurityFirebirdTunnel => "security.firebird_tunnel",
+            Self::CoverageSecurityDatabaseExcluded => "coverage.security_database_excluded",
         }
     }
 
     /// Order in which notes are kept when a target has more than the
-    /// contract allows: a refused right and a tunnel first (they explain
-    /// why Discovery and Audit do not run, P10-C Firebird review), then
-    /// insecure settings, the check itself, privileges, audit and coverage.
+    /// contract allows: a refused right, a tunnel and an excluded Firebird
+    /// security database first (they explain why Discovery and Audit do not
+    /// run, on the target or on one of its databases: P10-C Firebird review,
+    /// ADR-0060 R9), then insecure settings, the check itself, privileges,
+    /// audit and coverage.
     fn rank(self) -> u8 {
-        if matches!(self, Self::PrivilegeRefused | Self::SecurityFirebirdTunnel) {
+        if matches!(
+            self,
+            Self::PrivilegeRefused
+                | Self::SecurityFirebirdTunnel
+                | Self::CoverageSecurityDatabaseExcluded
+        ) {
             return 0;
         }
         let code = self.as_str();
@@ -1953,13 +1966,18 @@ mod tests {
         // A refused right, a tunnel, security and check notes are never
         // the ones cut (P10-C Firebird review: `privilege.refused` and
         // `security.firebird_tunnel` first).
-        for code in ["privilege.refused", "security.firebird_tunnel"] {
+        for code in [
+            "privilege.refused",
+            "security.firebird_tunnel",
+            "coverage.security_database_excluded",
+        ] {
             assert!(out.iter().any(|n| n.code.as_str() == code), "{code}");
         }
         assert_eq!(NoteCode::PrivilegeRefused.rank(), 0);
         assert_eq!(NoteCode::SecurityFirebirdTunnel.rank(), 0);
+        assert_eq!(NoteCode::CoverageSecurityDatabaseExcluded.rank(), 0);
         for c in NoteCode::ALL {
-            if c.rank() <= 2 {
+            if c.rank() == 0 {
                 assert!(out.iter().any(|n| n.code.as_str() == c.as_str()), "{c:?}");
             }
         }
@@ -1984,5 +2002,43 @@ mod tests {
             serde_json::to_value(&one).unwrap(),
             serde_json::json!([{"code": "check.timed_out"}])
         );
+    }
+
+    /// With every code registered for one engine present at once (more
+    /// than [`MAX_NOTES`] on most engines), no refused right, tunnel,
+    /// excluded security database (ADR-0060 R9), security or check note of
+    /// that engine is cut: every code of rank 2 or less one engine can
+    /// carry fits in the bound.
+    #[test]
+    fn per_engine_ranked_notes_are_never_cut() {
+        let registry: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            include_str!("../../../../shared/protocol/target-notes.json"),
+        )
+        .unwrap();
+        let engines: std::collections::BTreeSet<&str> = registry
+            .values()
+            .flat_map(|e| e["engines"].as_array().unwrap())
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        for engine in engines {
+            let codes: Vec<NoteCode> = NoteCode::ALL
+                .iter()
+                .copied()
+                .filter(|c| {
+                    registry.get(c.as_str()).is_some_and(|e| {
+                        e["engines"].as_array().unwrap().iter().any(|x| x == engine)
+                    })
+                })
+                .collect();
+            let notes: Vec<TargetNote> = codes.iter().map(|c| TargetNote::new(*c)).collect();
+            let out = to_protocol(&notes, LabelRevisions::default());
+            assert_eq!(out.len(), codes.len().min(MAX_NOTES), "{engine}");
+            for c in codes.iter().filter(|c| c.rank() <= 2) {
+                assert!(
+                    out.iter().any(|n| n.code.as_str() == c.as_str()),
+                    "{engine}: {c:?}"
+                );
+            }
+        }
     }
 }
