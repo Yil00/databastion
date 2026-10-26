@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Firebird connector integration tests, lot 1 (ADR-0060 decision 10: the wire client, SRP-256,
-# ChaCha, the loopback, peer-uid and forwarder rules, check()). The full dev service and its seed
-# come with lot 2; until then this script starts throwaway servers from the pinned images, seeds
-# fake accounts, and runs agent/crates/connector-firebird's it.rs tests against them:
+# Firebird connector integration tests (ADR-0060 decision 10: lot 1, the wire client, SRP-256,
+# ChaCha, the loopback, peer-uid and forwarder rules, check(); lot 2, Discovery and the CAS store
+# guard). This script starts throwaway servers from the pinned images, seeds fake accounts and the
+# dev seed (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the
+# one of the dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
 #
 #   dev/firebird/it.sh [5|4]        # Firebird 5.0.4 (default) or 4.0.7
+#   FIREBIRD_IT_FILTER=it::discovery dev/firebird/it.sh 5   # a subset of the tests
 #
 # Network (review L3): every container joins one dedicated network namespace, owned by a
 # placeholder container started with `--network none` (loopback only, nothing reachable from the
@@ -61,7 +63,7 @@ EXE="$(timeout 900 cargo test -p databastion-connector-firebird --all-features -
 umask 077
 WORK="$(mktemp -d)"
 cleanup() {
-  local c=("$NAME-init" "$NAME" "$NAME-socat")
+  local c=("$NAME-init" "$NAME" "$NAME-socat" "$NAME-secdb")
   for n in $VARIANTS; do c+=("$NAME-$n"); done
   # -v: the anonymous volumes of the image's VOLUME declarations too.
   timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
@@ -100,8 +102,12 @@ GRANT DBI_NESTED TO ROLE DBI_OUTER;
 GRANT DBI_OUTER TO USER AGENT_NESTED;
 CREATE USER AGENT_ADMIN_OPT PASSWORD '$AGENT_PW' USING PLUGIN Srp;
 GRANT DATABASTION_READER TO USER AGENT_ADMIN_OPT WITH ADMIN OPTION;
+CREATE USER AGENT_SYSDBA_MAPPED PASSWORD '$AGENT_PW' USING PLUGIN Srp;
 COMMIT;
 SQL
+# The dev seed, as the database `crm` (its own reader role, and the mapping of AGENT_SYSDBA_MAPPED
+# to SYSDBA): run by the image's entrypoint as an init script, over an embedded connection.
+install -m 0700 "$ROOT/dev/firebird/seed.sh" "$WORK/init/40-crm.sh"
 # The drift test of the system-privilege bit table (decision 4): one role per privilege of the
 # version, DBI_P_<name>.
 privileges="USER_MANAGEMENT READ_RAW_PAGES CREATE_USER_TYPES USE_NBACKUP_UTILITY CHANGE_SHUTDOWN_MODE
@@ -137,16 +143,19 @@ HARDEN=(--cap-drop NET_RAW --cap-drop NET_ADMIN)
 JOIN=(--network "container:$NET" "${HARDEN[@]}")
 timeout 120 docker run -d --name "$NET" --network none "${HARDEN[@]}" --entrypoint sleep \
   "$SOCAT" infinity >/dev/null
+# Log checks read the whole log (`grep >/dev/null`, never `grep -q`): with pipefail, `grep -q`
+# exits at its first match and `docker logs` then fails on the closed pipe, so a check could fail
+# on a log that has the line (seen 2 runs in 20 on the seeded server's long log).
 started() { # container: waits for the server's start line
   for _ in $(seq 1 120); do
-    if timeout 10 docker logs "$1" 2>&1 | grep -q "Starting Firebird"; then return 0; fi
+    if timeout 10 docker logs "$1" 2>&1 | grep -F "Starting Firebird" >/dev/null; then return 0; fi
     sleep 1
   done
   echo "[it] $1 did not start" >&2
   return 1
 }
 seeded() { # container: the seed must not have failed
-  if timeout 10 docker logs "$1" 2>&1 | grep -q "Statement failed"; then
+  if timeout 10 docker logs "$1" 2>&1 | grep -F "Statement failed" >/dev/null; then
     echo "[it] the seed of $1 failed" >&2
     return 1
   fi
@@ -156,10 +165,16 @@ echo "[it] Firebird $MAJOR: initializing" >&2
 timeout 300 docker run -d --name "$NAME-init" "${JOIN[@]}" --env-file "$WORK/env" \
   -e FIREBIRD_DATABASE=app.fdb -e FIREBIRD_CONF_RemoteServicePort="$PORT" \
   -e FIREBIRD_CONF_RemoteBindAddress=127.0.0.1 -e FIREBIRD_CONF_WireCrypt=Required \
-  -e FIREBIRD_CONF_AuthServer=Srp256 -v "$VOLUME:/var/lib/firebird/data" \
-  -v "$WORK/init:/docker-entrypoint-initdb.d:ro" "$IMAGE" >/dev/null
+  -e FIREBIRD_CONF_AuthServer=Srp256 \
+  -e "FIREBIRD_CONF_ExternalFileAccess=Restrict /var/lib/firebird/data/external" \
+  -v "$VOLUME:/var/lib/firebird/data" -v "$WORK/init:/docker-entrypoint-initdb.d:ro" \
+  -v "$ROOT/dev/seed/out/firebird.sql:/databastion/seed/firebird.sql:ro" "$IMAGE" >/dev/null
 started "$NAME-init"
 seeded "$NAME-init"
+if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -F "crm.fdb seeded" >/dev/null; then
+  echo "[it] the dev seed (crm) was not loaded" >&2
+  exit 1
+fi
 timeout 60 docker stop "$NAME-init" >/dev/null
 timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker rm -v "$NAME-init" >/dev/null
@@ -196,7 +211,36 @@ variant mapping "$((PORT + 5))" "$IMAGE" -e FIREBIRD_CONF_WireCrypt=Required \
   -e FIREBIRD_CONF_AuthServer=Srp256
 for n in $VARIANTS; do started "$NAME-$n"; done
 seeded "$NAME-mapping"
-sleep 3
+# Every server and the forwarder must listen before the tests start (a test that connects too
+# early would see "connection refused" instead of the rule it checks): a LISTEN row (state 0A) on
+# 127.0.0.1:<port> in the namespace's own /proc/net/tcp.
+NETPID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
+listening() { # port
+  local hex
+  hex="$(printf '0100007F:%04X' "$1")"
+  for _ in $(seq 1 120); do
+    if timeout 10 $SUDO nsenter --net="/proc/$NETPID/ns/net" cat /proc/net/tcp \
+      | awk -v a="$hex" '$2 == a && $4 == "0A" { found = 1 } END { exit !found }'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[it] nothing listens on 127.0.0.1:$1" >&2
+  return 1
+}
+for p in "$PORT" "$((PORT + 1))" "$((PORT + 2))" "$((PORT + 3))" "$((PORT + 4))" "$((PORT + 5))" \
+  "$FWD_PORT"; do
+  listening "$p"
+done
+# Every relation of the image's own security database (security review L5), for the drift test:
+# an embedded read of a fresh copy (the image's file, no network), as the server's account.
+# shellcheck disable=SC2016 # Firebird names, not shell expansions.
+printf 'SET HEADING OFF;\nSELECT TRIM(RDB$RELATION_NAME) FROM RDB$RELATIONS ORDER BY 1;\n' \
+  | timeout 120 docker run -i --rm --name "$NAME-secdb" --network none "${HARDEN[@]}" \
+    --user 84:84 --entrypoint /opt/firebird/bin/isql "$IMAGE" \
+    -q -b -user SYSDBA "/opt/firebird/$SECDB" \
+  | awk 'NF { print $1 }' > "$WORK/secdb.txt"
+[ "$(wc -l < "$WORK/secdb.txt")" -ge 8 ] || { echo "[it] $SECDB: relation list not read" >&2; exit 1; }
 
 # 4. The tests, in the namespace, as the calling user.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
@@ -205,6 +249,7 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
   FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
   FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
+  FIREBIRD_IT_CRM_ATTACH=/var/lib/firebird/data/crm.fdb \
   FIREBIRD_IT_AGENT_PASSWORD_FILE="$WORK/agent.pw" \
   FIREBIRD_IT_SYSDBA_PASSWORD_FILE="$WORK/root.pw" \
   FIREBIRD_IT_WRONG_PASSWORD_FILE="$WORK/wrong.pw" \
@@ -212,4 +257,5 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_CHACHA_PORT="$((PORT + 1))" FIREBIRD_IT_ARC4_PORT="$((PORT + 2))" \
   FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
-  "$EXE" it:: --nocapture
+  FIREBIRD_IT_SECDB_RELATIONS_FILE="$WORK/secdb.txt" \
+  "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture

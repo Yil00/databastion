@@ -12,7 +12,7 @@ WAIT_TIMEOUT ?= 600
 TAIL ?= 200
 LOG_DIRS := postgres mariadb mongodb percona psmdb
 # Opt-in dev services (Compose profiles), stopped by dev-down / dev-reset too.
-DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas --profile sqlserver --profile redis --profile sqlite
+DEV_OPT_IN := --profile psmdb --profile keycloak --profile cas --profile sqlserver --profile redis --profile sqlite --profile firebird
 # pnpm at the version pinned by console/package.json (`packageManager`), through corepack.
 PNPM ?= corepack pnpm
 export COREPACK_ENABLE_DOWNLOAD_PROMPT ?= 0
@@ -31,7 +31,7 @@ AGENT_CONFIG ?=
 
 .PHONY: help \
 	install doctor \
-	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-sqlserver dev-redis dev-sqlite dev-down \
+	dev-dirs dev-metrics-token dev dev-smoke dev-keycloak dev-keycloak-smoke dev-cas dev-cas-smoke dev-sqlserver dev-redis dev-sqlite dev-firebird dev-down \
 	dev-reset dev-logs dev-ps seed seed-check test-dev \
 	console-dev console-worker console-migrate console-lint console-typecheck console-test console-build \
 	console-licenses \
@@ -143,6 +143,9 @@ dev-redis: dev/.env ## Start the opt-in Valkey and Redis services (ADR-0052 targ
 
 dev-sqlite: dev/.env dev-dirs ## Start the opt-in SQLite writer (ADR-0059 files in dev/.state/sqlite/data: crm.db, app.db held open, intl.db) and wait until healthy
 	timeout $(UP_TIMEOUT) $(COMPOSE) --profile sqlite up -d --wait --wait-timeout $(WAIT_TIMEOUT) sqlite
+
+dev-firebird: dev/.env ## Start the opt-in Firebird service (ADR-0060 target: 5.0.4 as uid 84, loopback of its own namespace, database crm) and wait until healthy
+	timeout $(UP_TIMEOUT) $(COMPOSE) --profile firebird up -d --wait --wait-timeout $(WAIT_TIMEOUT) firebird
 
 dev-down: ## Stop the dev environment (keeps data volumes)
 	timeout 180 $(COMPOSE) $(DEV_OPT_IN) down --remove-orphans
@@ -268,10 +271,11 @@ protocol-check: protocol-lint protocol-append-only protocol-test protocol-drift 
 docs-check: ## Internal Markdown links (CI)
 	timeout 120 python3 scripts/check-md-links.py
 
-shell-lint: ## shellcheck of the load harness (CI), the OIDC and SQLite e2e scenarios (CI), dev/agent-it.sh and the Keycloak, CAS and SQLite dev scripts
+shell-lint: ## shellcheck of the load harness (CI), the OIDC and SQLite e2e scenarios (CI), dev/agent-it.sh and the Keycloak, CAS, SQLite and Firebird dev scripts
 	timeout 120 shellcheck -x e2e/load/run.sh e2e/load/initdb/*.sh e2e/oidc.sh dev/agent-it.sh dev/keycloak/smoke.sh \
 	  dev/cas/smoke.sh dev/cas/files-init.sh dev/cas/db-init.sh dev/sqlserver/entrypoint.sh dev/redis/entrypoint.sh \
-	  dev/redis/tls-init.sh dev/sqlite/files-init.sh e2e/sqlite.sh e2e/load/sqlite.sh
+	  dev/redis/tls-init.sh dev/sqlite/files-init.sh e2e/sqlite.sh e2e/load/sqlite.sh \
+	  dev/firebird/entrypoint.sh dev/firebird/seed.sh dev/firebird/it.sh
 
 test-scripts: ## Unit tests of scripts/ and the release settings check fixtures (CI)
 	timeout 60 python3 -m unittest discover -s scripts -p 'test_*.py'

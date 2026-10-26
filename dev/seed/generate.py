@@ -14,6 +14,7 @@ byte-identical files. Outputs:
 - ``dev/seed/out/redis.txt``     Redis / Valkey keyspace, databases 0 and 1 (opt-in profile ``redis``)
 - ``dev/seed/out/sqlite-*.sql``  SQLite files ``crm.db``, ``app.db``, ``intl.db`` and their manifest
                                  ``sqlite.json`` (built by ``dev/sqlite/build.py``, opt-in profile ``sqlite``)
+- ``dev/seed/out/firebird.sql``  Firebird database ``crm`` (opt-in profile ``firebird``)
 - ``dev/ground-truth.json``      every seeded location and the classifiers expected on it
 
 All values are fictitious by construction:
@@ -1534,6 +1535,248 @@ CREATE INDEX customers_email ON customers (email);
 
 
 # --------------------------------------------------------------------------------------------------
+# Firebird: database crm (opt-in profile `firebird`, ADR-0060 decision 9)
+# --------------------------------------------------------------------------------------------------
+# The file of the declared database `crm` (dev/firebird/seed.sh creates it before running the seed).
+FIREBIRD_DATABASE_FILE = "/var/lib/firebird/data/crm.fdb"
+# The directory of external-file tables (`ExternalFileAccess = Restrict`, dev/firebird/firebird.conf).
+FIREBIRD_EXTERNAL_DIR = "/var/lib/firebird/data/external"
+
+
+def fb_lit(v) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def fb_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def fb_inserts(table: str, cols: list[str], rows: list[tuple]) -> str:
+    """One INSERT per row: Firebird 4.0 and 5.0 have no multi-row VALUES."""
+    head = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ("
+    return "".join(head + ", ".join(fb_lit(v) for v in row) + ");\n" for row in rows)
+
+
+def gen_firebird(f: Fake, t: Truth) -> str:
+    """isql script (dialect 3, connection character set UTF8) run by dev/firebird/seed.sh as SYSDBA
+    over an embedded connection, after it created the database. The fixtures of ADR-0060 decision 9
+    (quoted mixed-case names, a name with a trailing space, a value-bearing name, BLOB SUB_TYPE TEXT,
+    NONE and WIN1252 columns, a computed column calling a PSQL function, a view, an external-file
+    table, a GTT, an ON CONNECT trigger, a user table named like a system relation, a CAS-shaped ticket
+    table) sit next to the PII. The reader role (minimal variant, decision 4) and the mapping of the
+    refused account are created here; the accounts themselves, with their passwords, by the service's
+    entrypoint (dev/firebird/entrypoint.sh) or the integration test script (dev/firebird/it.sh)."""
+    E, DB = "firebird", "crm"
+    people = [f.person() for _ in range(60)]
+    s = [HEADER.format(seed=SEED), "SET SQL DIALECT 3;\nSET AUTODDL ON;\n"]
+    granted: list[str] = []
+
+    # Plain upper-case names (unquoted identifiers); 9 text columns: 3 column batches.
+    s.append("CREATE TABLE CUSTOMERS (ID INTEGER NOT NULL PRIMARY KEY, FIRST_NAME VARCHAR(60), "
+             "LAST_NAME VARCHAR(60), EMAIL VARCHAR(160), PHONE VARCHAR(32), BIRTH_DATE DATE, "
+             "STREET VARCHAR(200), POSTAL_CODE VARCHAR(16), CITY VARCHAR(80), NIR VARCHAR(32), "
+             "IBAN VARCHAR(42), EMAIL_OPT_IN BOOLEAN, CREATED_AT TIMESTAMP);\n")
+    rows = [(i + 1, p["first"], p["last"], p["email"], p["phone"], p["birth_date"], p["street"],
+             p["postal_code"], p["city"], p["nir"], p["iban"], f.r.random() < 0.5,
+             f.timestamp()[:19].replace("T", " ")) for i, p in enumerate(people)]
+    s.append(fb_inserts("CUSTOMERS", ["ID", "FIRST_NAME", "LAST_NAME", "EMAIL", "PHONE", "BIRTH_DATE",
+                                      "STREET", "POSTAL_CODE", "CITY", "NIR", "IBAN", "EMAIL_OPT_IN",
+                                      "CREATED_AT"], rows))
+    granted.append("CUSTOMERS")
+    c = (None, "CUSTOMERS")
+    t.add(E, DB, *c, "FIRST_NAME", ["pii.person_name"], [r[1] for r in rows])
+    t.add(E, DB, *c, "LAST_NAME", ["pii.person_name"], [r[2] for r in rows])
+    t.add(E, DB, *c, "EMAIL", ["pii.email"], [r[3] for r in rows])
+    t.add(E, DB, *c, "PHONE", ["pii.phone"], [r[4] for r in rows])
+    t.add(E, DB, *c, "BIRTH_DATE", ["pii.birth_date"], [r[5] for r in rows],
+          note="DATE, converted on the server to YYYY-MM-DD")
+    t.add(E, DB, *c, "STREET", ["pii.postal_address"], [r[6] for r in rows])
+    t.add(E, DB, *c, "NIR", ["pii.nir"], [r[9] for r in rows])
+    t.add(E, DB, *c, "IBAN", ["pii.iban"], [r[10] for r in rows])
+    t.add(E, DB, *c, "EMAIL_OPT_IN", [], negative_control=True, note="BOOLEAN: never sampled")
+    t.add(E, DB, *c, "CREATED_AT", [], negative_control=True, note="timestamp, not a birth date")
+
+    # A quoted mixed-case table and column, and a BLOB SUB_TYPE TEXT column.
+    notes, note_emails, note_phones = [], [], []
+    for i in range(30):
+        p = f.r.choice(people)
+        ph, em = f.fr_phone(), f.email(p["first"], p["last"])
+        note_phones.append(ph)
+        note_emails.append(em)
+        notes.append((i + 1, f"Customer called from {ph} and asked to use {em} for invoices."))
+    s.append(f"CREATE TABLE {fb_ident('Customer Notes')} (ID INTEGER NOT NULL, "
+             f"{fb_ident('Note Text')} BLOB SUB_TYPE TEXT CHARACTER SET UTF8);\n")
+    s.append(fb_inserts(fb_ident("Customer Notes"), ["ID", fb_ident("Note Text")], notes))
+    granted.append(fb_ident("Customer Notes"))
+    t.add(E, DB, None, "Customer Notes", "Note Text", ["pii.email", "pii.phone"], note_emails + note_phones,
+          note="quoted mixed-case names; BLOB SUB_TYPE TEXT, its first 4000 characters cast on the server")
+
+    # Trailing spaces in quoted names: not significant in a Firebird name (stored padded).
+    rows = [(i + 1, p["email"]) for i, p in enumerate(people[:20])]
+    s.append(f"CREATE TABLE {fb_ident('Legacy Contacts ')} ({fb_ident('Contact Email ')} VARCHAR(160));\n")
+    s.append(fb_inserts(fb_ident("Legacy Contacts "), [fb_ident("Contact Email ")], [(r[1],) for r in rows]))
+    granted.append(fb_ident("Legacy Contacts "))
+    t.add(E, DB, None, "Legacy Contacts", "Contact Email", ["pii.email"], [r[1] for r in rows],
+          note="declared with a trailing space in the table and column names (not significant: dropped, "
+               "no ADR-0056 marker)")
+
+    # WIN1252 and NONE columns.
+    rows = [(i + 1, f"{p['first']} {p['last']}", p["email"]) for i, p in enumerate(people[20:50])]
+    s.append("CREATE TABLE LEGACY_1252 (ID INTEGER NOT NULL, FULL_NAME VARCHAR(120) CHARACTER SET WIN1252, "
+             "RAW_EMAIL VARCHAR(160) CHARACTER SET NONE);\n")
+    s.append(fb_inserts("LEGACY_1252", ["ID", "FULL_NAME", "RAW_EMAIL"], rows))
+    granted.append("LEGACY_1252")
+    t.add(E, DB, None, "LEGACY_1252", "FULL_NAME", ["pii.person_name"], [r[1] for r in rows],
+          note="CHARACTER SET WIN1252, transliterated to UTF8 on the server")
+    t.add(E, DB, None, "LEGACY_1252", "RAW_EMAIL", ["pii.email"], [r[2] for r in rows],
+          note="CHARACTER SET NONE, read as OCTETS and kept as valid UTF-8 text")
+
+    # A computed column calling a PSQL function (user code on read), and the ON CONNECT trigger.
+    s.append("""SET TERM ^ ;
+CREATE FUNCTION FN_IBAN_PREFIX (IBAN VARCHAR(42)) RETURNS VARCHAR(8) AS
+BEGIN
+  RETURN SUBSTRING(IBAN FROM 1 FOR 4) || '****';
+END^
+CREATE TRIGGER TRG_DEV_ON_CONNECT ACTIVE ON CONNECT POSITION 0 AS
+DECLARE V INTEGER;
+BEGIN
+  V = RDB$SET_CONTEXT('USER_SESSION', 'DEV_ON_CONNECT', 'seen');
+END^
+SET TERM ; ^
+""")
+    s.append("CREATE TABLE PAYMENT_CARDS (ID INTEGER NOT NULL, CARD_BRAND VARCHAR(16), CARD_NUMBER VARCHAR(24), "
+             "CARD_HOLDER VARCHAR(120), IBAN VARCHAR(42), TRACKING_REF VARCHAR(16), "
+             "IBAN_PREFIX COMPUTED BY (FN_IBAN_PREFIX(IBAN)));\n")
+    rows = [(i + 1, p["card_brand"], p["card"], f"{p['first']} {p['last']}".upper(), p["iban"], f.not_luhn(16))
+            for i, p in enumerate(people[:40])]
+    s.append(fb_inserts("PAYMENT_CARDS", ["ID", "CARD_BRAND", "CARD_NUMBER", "CARD_HOLDER", "IBAN",
+                                          "TRACKING_REF"], rows))
+    granted.append("PAYMENT_CARDS")
+    c = (None, "PAYMENT_CARDS")
+    t.add(E, DB, *c, "CARD_NUMBER", ["pii.card_number"], [r[2] for r in rows])
+    t.add(E, DB, *c, "CARD_HOLDER", ["pii.person_name"], [r[3] for r in rows])
+    t.add(E, DB, *c, "IBAN", ["pii.iban"], [r[4] for r in rows])
+    t.add(E, DB, *c, "CARD_BRAND", [], negative_control=True, note="brand name, not a card number")
+    t.add(E, DB, *c, "TRACKING_REF", [], negative_control=True, note="16-digit numbers that FAIL the Luhn check")
+    t.add(E, DB, *c, "IBAN_PREFIX", [], note=(
+        "computed column calling the PSQL function FN_IBAN_PREFIX (user code on read): never sampled, "
+        "coverage.computed_columns_not_sampled"))
+
+    # A view: never sampled (its base table is).
+    s.append("CREATE VIEW V_CUSTOMER_EMAILS (EMAIL) AS SELECT EMAIL FROM CUSTOMERS;\n")
+    t.add(E, DB, None, "V_CUSTOMER_EMAILS", "EMAIL", [], note="view: never sampled, coverage.views_not_sampled")
+
+    # An external-file table: the server reads a file outside the database: never read (I5).
+    ext = [(f.r.choice(people)["email"].ljust(40), "\n") for _ in range(5)]
+    s.append(f"CREATE TABLE EXT_EXPORT EXTERNAL FILE '{FIREBIRD_EXTERNAL_DIR}/ext_export.dat' "
+             "(EMAIL CHAR(40), EOL CHAR(1));\n")
+    s.append(fb_inserts("EXT_EXPORT", ["EMAIL", "EOL"], ext))
+    granted.append("EXT_EXPORT")
+    t.add(E, DB, None, "EXT_EXPORT", "EMAIL", [], [r[0].strip() for r in ext], never_sampled=True,
+          note="external-file table: never read (skipped_remote, coverage.external_file_tables)")
+
+    # A global temporary table: its rows belong to other attachments.
+    s.append("CREATE GLOBAL TEMPORARY TABLE SESSION_SCRATCH (EMAIL VARCHAR(160)) ON COMMIT PRESERVE ROWS;\n")
+    granted.append("SESSION_SCRATCH")
+    t.add(E, DB, None, "SESSION_SCRATCH", "EMAIL", [], note="global temporary table: never sampled")
+
+    # A user table named like a system relation: a user table all the same (system flag 0).
+    rows = [(i + 1, p["email"]) for i, p in enumerate(people[50:60])]
+    s.append(f"CREATE TABLE {fb_ident('RDB$CUSTOMER_ARCHIVE')} (ID INTEGER NOT NULL, EMAIL VARCHAR(160));\n")
+    s.append(fb_inserts(fb_ident("RDB$CUSTOMER_ARCHIVE"), ["ID", "EMAIL"], rows))
+    granted.append(fb_ident("RDB$CUSTOMER_ARCHIVE"))
+    t.add(E, DB, None, "RDB$CUSTOMER_ARCHIVE", "EMAIL", ["pii.email"], [r[1] for r in rows],
+          note="user table (system flag 0) named with the RDB$ prefix: sampled as a user table")
+
+    # A value-bearing table name: an e-mail address in a quoted name.
+    p = people[3]
+    tname = f"EXPORT_{p['email']}"
+    s.append(f"CREATE TABLE {fb_ident(tname)} (ID INTEGER NOT NULL, PHONE VARCHAR(32));\n")
+    s.append(fb_inserts(fb_ident(tname), ["ID", "PHONE"], [(1, p["phone"])]))
+    granted.append(fb_ident(tname))
+    t.add(E, DB, None, tname, "PHONE", ["pii.phone"], [p["phone"]], name_values=[p["email"]],
+          name_value_classifiers=["pii.email"], normalized="*", note="table name embeds an e-mail address")
+
+    # CAS JPA ticket registry shape (ADR-0041 decisions 5 and 6): counted per type, never sampled.
+    s.append("CREATE TABLE CAS_TICKETS (ID VARCHAR(768) NOT NULL, TYPE VARCHAR(255) NOT NULL, "
+             "BODY BLOB SUB_TYPE TEXT, PARENT_ID VARCHAR(768), PRINCIPAL_ID VARCHAR(768), "
+             "CREATION_TIME TIMESTAMP NOT NULL, EXPIRATION_TIME TIMESTAMP);\n")
+    tickets = []
+    for i in range(6):
+        kind = ("TGT", "org.apereo.cas.ticket.TicketGrantingTicketImpl") if i % 2 == 0 else \
+            ("ST", "org.apereo.cas.ticket.ServiceTicketImpl")
+        tid = f"{kind[0]}-{i + 1}-dev-only-{f.chars(B64_CHARSET, 24)}"
+        tickets.append((tid, kind[1], "{}", None, f.person()["email"], f"2026-09-{i + 1:02d} 10:00:00", None))
+    s.append(fb_inserts("CAS_TICKETS", ["ID", "TYPE", "BODY", "PARENT_ID", "PRINCIPAL_ID", "CREATION_TIME",
+                                        "EXPIRATION_TIME"], tickets))
+    granted.append("CAS_TICKETS")
+    t.add(E, DB, None, "CAS_TICKETS", "ID", [], [r[0] for r in tickets], never_sampled=True,
+          note="CAS ticket registry (ADR-0041): its type counts only, never sampled; Firebird grants SELECT "
+               "per table, so check() reports privilege.ticket_credentials_readable")
+    t.add(E, DB, None, "CAS_TICKETS", "PRINCIPAL_ID", [], [r[4] for r in tickets], never_sampled=True,
+          note="CAS ticket registry: never sampled")
+
+    # Ticket ids in an ordinary table: the tripwire drops the column before classification.
+    refs = [(i + 1, f"TGT-{i + 10}-dev-only-{f.chars(B64_CHARSET, 24)}", f.r.choice(people)["email"])
+            for i in range(10)]
+    s.append("CREATE TABLE LOGIN_REFS (ID INTEGER NOT NULL, SESSION_REF VARCHAR(80), USER_EMAIL VARCHAR(160));\n")
+    s.append(fb_inserts("LOGIN_REFS", ["ID", "SESSION_REF", "USER_EMAIL"], refs))
+    granted.append("LOGIN_REFS")
+    t.add(E, DB, None, "LOGIN_REFS", "SESSION_REF", [], [r[1] for r in refs], never_sampled=True,
+          note="CAS ticket ids: the ticket-id tripwire drops the column before classification "
+               "(coverage.cas_guard_tripped)")
+    t.add(E, DB, None, "LOGIN_REFS", "USER_EMAIL", ["pii.email"], [r[2] for r in refs])
+
+    # Secrets.
+    rows = []
+    for i, svc in enumerate(("erp-export", "warehouse-sync", "backup")):
+        a, k = f.aws_key_pair()
+        rows.append((i + 1, svc, a, k))
+    s.append("CREATE TABLE APP_CREDENTIALS (ID INTEGER NOT NULL, SERVICE VARCHAR(32), "
+             "AWS_ACCESS_KEY_ID VARCHAR(32), AWS_SECRET_ACCESS_KEY VARCHAR(64));\n")
+    s.append(fb_inserts("APP_CREDENTIALS", ["ID", "SERVICE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], rows))
+    granted.append("APP_CREDENTIALS")
+    c = (None, "APP_CREDENTIALS")
+    t.add(E, DB, *c, "AWS_ACCESS_KEY_ID", ["secret.aws_key"], [r[2] for r in rows])
+    t.add(E, DB, *c, "AWS_SECRET_ACCESS_KEY", ["secret.aws_key"], [r[3] for r in rows])
+    t.add(E, DB, *c, "SERVICE", [], negative_control=True)
+
+    # Numeric types converted on the server: look-alikes only.
+    rows = [(i + 1, f"INV-2026-{i + 1:06d}", f"{f.r.randint(500, 250000)}.{f.r.randint(0, 99):02d}",
+             f.r.randint(1, 10 ** 30), f"{f.r.randint(1, 999)}.5", f.r.randint(1, 9)) for i in range(40)]
+    s.append("CREATE TABLE INVOICES (ID INTEGER NOT NULL, INVOICE_NUMBER VARCHAR(20), AMOUNT NUMERIC(18,2), "
+             "REF_ID INT128, SCORE DOUBLE PRECISION, RATE DECFLOAT(34));\n")
+    s.append(fb_inserts("INVOICES", ["ID", "INVOICE_NUMBER", "AMOUNT", "REF_ID", "SCORE", "RATE"], rows))
+    granted.append("INVOICES")
+    for col in ("INVOICE_NUMBER", "AMOUNT", "REF_ID", "SCORE", "RATE"):
+        t.add(E, DB, None, "INVOICES", col, [], negative_control=True,
+              note="NUMERIC, INT128, DOUBLE PRECISION and DECFLOAT converted on the server")
+
+    # A table the reader role is not granted: never read (coverage.relations_without_select).
+    staff = [f.person() for _ in range(10)]
+    s.append("CREATE TABLE HR_SALARIES (EMPLOYEE_EMAIL VARCHAR(160), SALARY_EUR INTEGER);\n")
+    s.append(fb_inserts("HR_SALARIES", ["EMPLOYEE_EMAIL", "SALARY_EUR"],
+                        [(p["email"], f.r.randint(28000, 95000)) for p in staff]))
+    t.add(E, DB, None, "HR_SALARIES", "EMPLOYEE_EMAIL", [], note=(
+        "no SELECT for the reader role: never read, skipped_not_readable, coverage.relations_without_select"))
+
+    # The minimal variant (decision 4): a reader role holding the table grants, granted DEFAULT; the
+    # refused account mapped to SYSDBA (the refusal tests).
+    s.append("COMMIT;\nCREATE ROLE DATABASTION_READER;\n")
+    for name in granted:
+        s.append(f"GRANT SELECT ON TABLE {name} TO ROLE DATABASTION_READER;\n")
+    s.append("GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;\n")
+    s.append("CREATE MAPPING DEV_MAP_SYSDBA USING PLUGIN SRP FROM USER AGENT_SYSDBA_MAPPED TO USER SYSDBA;\n")
+    s.append("COMMIT;\n")
+    return "".join(s)
+
+# --------------------------------------------------------------------------------------------------
 def build(seed: int = SEED) -> dict[str, str]:
     f = Fake(seed)
     t = Truth()
@@ -1549,6 +1792,7 @@ def build(seed: int = SEED) -> dict[str, str]:
     files["seed/out/sqlserver.sql"] = gen_sqlserver(Fake(seed + 51), t)
     files["seed/out/redis.txt"] = gen_redis(Fake(seed + 52), t)
     files.update(gen_sqlite(Fake(seed + 53), t))
+    files["seed/out/firebird.sql"] = gen_firebird(Fake(seed + 54), t)
     truth = {
         "version": 1,
         "generator": "dev/seed/generate.py",
@@ -1583,6 +1827,11 @@ def build(seed: int = SEED) -> dict[str, str]:
             "writer with FTS5 (the agent's bundled library has none). Locations with a note and no "
             "classifier are fixtures Discovery must not report (view, VIRTUAL generated column, BLOB, "
             "value above 64 KiB, FTS5 virtual table).",
+            "firebird: opt-in profile `firebird` (ADR-0060 decision 9); database is the name declared in "
+            "agent.yaml (`crm`, file targets.firebird.file), no container (no schema). Object and field are "
+            "the catalog names, trailing spaces dropped. Locations with a note and no classifier are "
+            "fixtures Discovery must not sample (BOOLEAN, computed column, view, external-file table, "
+            "global temporary table, table without SELECT).",
         ],
         "targets": {
             "postgresql": {"service": "postgres", "databases": ["shop"]},
@@ -1598,6 +1847,7 @@ def build(seed: int = SEED) -> dict[str, str]:
                       "key_patterns_scoped_user": list(REDIS_SCOPED_PATTERNS)},
             "sqlite": {"service": "sqlite", "databases": ["main"],
                        "files": {file: target for file, target, *_ in SQLITE_FILES}},
+            "firebird": {"service": "firebird", "databases": ["crm"], "file": FIREBIRD_DATABASE_FILE},
         },
         "locations": t.locations,
     }

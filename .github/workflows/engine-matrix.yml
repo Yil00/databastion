@@ -36,6 +36,12 @@ name: Engine matrix
 # dev/sqlite/build.py matrix, as the application's account, holding the WAL files open), then read
 # by the sandboxed reader against dev/ground-truth.json (agent/crates/agent/tests/sqlite_reader.rs,
 # seeded_dev_files_match_the_ground_truth, as root on a read-only bind mount, as ci.yml agent-sqlite).
+# Job firebird (ADR-0060 decision 9, P10-B): dev/firebird/it.sh on 4.0.7 and 5.0.4, the pinned
+# images of the dev service, as ci.yml agent-firebird: throwaway servers run as uid 84 in a
+# dedicated network namespace, the dev seed loaded as `crm`, every connector integration test
+# (Discovery against dev/ground-truth.json, the CAS store guard, pacing, the refusals, the drift
+# test of the never-sampled list, the op_cancel and statement-timeout measurements, printed as
+# `[measure]` lines and kept in the artifact `measure-firebird-<version>`).
 # Job e2e-sqlserver (ROADMAP phase 9 follow-up P9-D): e2e/sqlserver.sh on the versions and Audit
 # sources the required ci.yml job (2022, SQL Server Audit) does not run: 2022 with Extended Events,
 # 2019 (Extended Events only) and 2025 with each source, the I2 check and incidents included.
@@ -70,6 +76,9 @@ on:
       - "agent/crates/agent/tests/sqlite_reader.rs"
       - "dev/sqlite/**"
       - "dev/seed/out/sqlite*"
+      - "dev/firebird/**"
+      - "dev/seed/out/firebird.sql"
+      - "agent/crates/connector-firebird/**"
 
 permissions:
   contents: read
@@ -576,6 +585,52 @@ jobs:
           docker rm -f databastion-sqlite-writer >/dev/null 2>&1 || true
           sudo pkill -u "${APP_IDS%%:*}" -f 'sqlite/build.py' || true
           sudo rm -rf "$BASE"
+
+  firebird:
+    name: Firebird ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "4.0.7"
+            major: "4"
+          - version: "5.0.4"
+            major: "5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Connector integration tests
+        run: |
+          set -o pipefail
+          timeout 1200 dev/firebird/it.sh "${{ matrix.major }}" 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Measurement lines
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/measure"
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -E "^\[measure\]|^\[it\] crm " "$RUNNER_TEMP/it.log" > "$RUNNER_TEMP/measure/firebird.txt" || true
+          cat "$RUNNER_TEMP/measure/firebird.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: measure-firebird-${{ matrix.version }}
+          path: ${{ runner.temp }}/measure
+          if-no-files-found: ignore
+      # Last, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error|^\[it\] " "$RUNNER_TEMP/it.log" | head -n 120 || true
 
   # e2e/sqlserver.sh (e2e/README.md "SQL Server target", "Other versions and the Extended Events
   # source") on what the required ci.yml job e2e-sqlserver (2022, SQL Server Audit) does not run:

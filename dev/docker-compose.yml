@@ -573,6 +573,42 @@ services:
       test: ["CMD", "test", "-f", "/tmp/databastion-ready"]
       <<: *healthcheck
 
+  # Firebird (phase 10, P10-B): the target of the Firebird connector (ADR-0060 decision 9). Opt-in
+  # (profile `firebird`): `make dev-firebird`. 5.0.4 by default, pinned by digest;
+  # `DATABASTION_DEV_FIREBIRD_IMAGE` selects 4.0.7 (its security4.fdb found from the image, or set
+  # `DATABASTION_DEV_FIREBIRD_MAJOR`). firebird/entrypoint.sh runs as the server's own
+  # account (uid 84, `firebird`), never root, so the agent's default `peer_uid: firebird` matches its
+  # sockets: it creates the accounts (SYSDBA, the minimal-variant DATABASTION_AGENT, the refused
+  # AGENT_SYSDBA_MAPPED) over embedded connections, loads seed/out/firebird.sql as the database `crm`
+  # on the first start (firebird/seed.sh), then starts the SuperServer. firebird/firebird.conf:
+  # `WireCrypt = Required`, ChaCha64 / ChaCha, `Srp256`, and the server listens on the loopback of
+  # its own network namespace only (no published port): the agent runs in that namespace, and every
+  # container of it drops NET_RAW and NET_ADMIN (dev/README.md, "Firebird"). Audit (the trace
+  # configuration and its log) comes with the connector's lot 3.
+  firebird:
+    image: ${DATABASTION_DEV_FIREBIRD_IMAGE:-firebirdsql/firebird:5.0.4@sha256:1529560400fc7847f015c57fc9d70729c44d9a9d8f9000df19c5ce1950b4c202}
+    profiles: [firebird]
+    user: "84:84"
+    entrypoint: ["/bin/bash", "/databastion/entrypoint.sh"]
+    environment:
+      FIREBIRD_SYSDBA_PASSWORD: ${FIREBIRD_SYSDBA_PASSWORD:-dev-only-firebird-sysdba}
+      FIREBIRD_DATABASTION_PASSWORD: ${FIREBIRD_DATABASTION_PASSWORD:-dev-only-firebird-agent}
+      # The image's major version (security<N>.fdb); empty: read from the image's isql.
+      FIREBIRD_MAJOR: ${DATABASTION_DEV_FIREBIRD_MAJOR:-}
+    volumes:
+      - firebird-data:/var/lib/firebird/data
+      - ./firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ./firebird/entrypoint.sh:/databastion/entrypoint.sh:ro
+      - ./firebird/seed.sh:/databastion/seed.sh:ro
+      - ./seed/out/firebird.sql:/databastion/seed/firebird.sql:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # The seed marker, then a bare TCP connect on the namespace's loopback: no login.
+      test: ["CMD", "bash", "-c", "test -f /var/lib/firebird/data/.databastion-seeded && exec 3<>/dev/tcp/127.0.0.1/3050"]
+      <<: *healthcheck
+      start_period: 60s
+
   mailpit:
     image: axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d
     environment:
@@ -664,3 +700,4 @@ volumes:
   valkey-data:
   redis-data:
   redis-tls:
+  firebird-data:
