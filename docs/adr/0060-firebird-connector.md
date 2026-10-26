@@ -1,6 +1,6 @@
 # ADR-0060: Firebird connector: own bounded wire client, Firebird 4.0 and 5.0, SRP-256 with ChaCha wire encryption on loopback only, least-privilege grants, Discovery bounds, Audit from the system audit trace log
 
-- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, accepted by the maintainer on 2026-10-25 (residual of open question 6 accepted)
+- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, accepted by the maintainer on 2026-10-25 (residual of open question 6 accepted). A [refinement of 2026-10-26](#refinement-2026-10-26-proposed-awaiting-the-maintainers-decision-the-lot-3-measurements), answering the six contradictions of the lot 3 measurements (per-attachment `TRACE_INIT` in every mode, the Garbage Collector's attachments, the attach order at a database open, records without a per-table block, self-security databases, failed logins), is proposed, awaiting the maintainer's decision
 - **Date**: 2026-10-24
 - **Amends** (on acceptance, subject to open question 1): [ADR-0039](0039-engine-scope-expansion.md) decision 3, the Firebird row of the ceilings table, whose first cell reads "Firebird (4.0, 5.0; 3.0 if still maintained when the connector ships)". This ADR refuses Firebird 3.0 at connection whatever its maintenance status (decision 2), for technical reasons that ADR-0039 decision 1 allows ("a connector may keep refusing old servers at connection time"). ADR-0039 is not edited in place; the docs-keeper records the amendment in its status line if this ADR is accepted.
 - **Relies on**: [ADR-0039](0039-engine-scope-expansion.md) decision 1 (end-of-life versions, accepted) and decision 8 (new engines as capability tokens, accepted, with [ADR-0042](0042-hold-items-of-unlisted-engines.md)), and proposes for acceptance, **for Firebird only**, its decisions 3 (the Firebird row: ceiling Partial), 4 (client criteria), 5 (the Firebird bullet: least privilege and a refusal list), 6 (transport: this ADR chooses loopback only), 7 (I5 and local detection) and 9 (test obligations). Decision 2 (order of delivery) is the ROADMAP's. Nothing here applies to SQLite, whose connector ADR is written separately (ADR-0059).
@@ -842,3 +842,227 @@ Recorded after the merge of lot 2 of the connector (#370, at `de4ed01` on `dev`:
 - An opt-in Compose profile `firebird` (`make dev-firebird`): 5.0.4 pinned by digest (4.0.7 selectable with `DATABASTION_DEV_FIREBIRD_IMAGE` and `DATABASTION_DEV_FIREBIRD_MAJOR`); the server runs as uid 84 with `cap_drop: ALL` and `no-new-privileges`, on loopback only, with no published port; a minimal account and a `SYSDBA`-mapped account that `check()` refuses; a seed covering decision 9's list.
 - The engine-matrix job `firebird` on 4.0.7 and 5.0.4, and the fuzz target `firebird_catalog`.
 - The integration harness `dev/firebird/it.sh` now waits for the listeners and reads whole logs: a `pipefail` with `grep -q` exited with 141 and caused the rare harness failures seen with lot 1.
+
+## Refinement (2026-10-26, proposed, awaiting the maintainer's decision): the lot 3 measurements
+
+Status: **Proposed**, awaiting the maintainer's decision and a `security-reviewer` review. It answers the six contradictions found by the [lot 3 prerequisite measurements](../measurements/phase10-firebird-facts.md#lot-3-prerequisites-2026-10-26) (measurements 3b, 7b, 8a to 8f, 12b, 12c and 13b, which the [refinement of 2026-10-25](#obligations-still-open) required before the Audit lot), records what those measurements confirm, and settles the lot 1 re-review residual A. It amends, by reference:
+
+- the refinement of 2026-10-25: R1 rules 2 (run change), 3 and 5 (bindings, the watermark, monotonic ids), 7 (split windows, through H1 fix 2); R2 rules 1, 4 and 5; R3's own-read exceptions;
+- decision 4: the readability probe of credential relations, and the scope of declared databases;
+- decision 6: "Missing trailers" (H1 fix 2), "Principals", "The agent's own statements and the always-reported rules".
+
+The accepted text and the accepted refinement of 2026-10-25 stay as they are; where this refinement differs from them, it applies once accepted. Until then, the P10-B Audit lot (decision 10, pull request 3) does not merge. ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
+
+### R5. `TRACE_INIT` / `TRACE_FINI` are per attachment in every mode (measurement 8c)
+
+**Measured** (4.0.7 and 5.0.4, SuperServer, SuperClassic and Classic): every attachment, the server's own `<internal>` attachments included, every service session and every failed or unauthorized attach is preceded by a `TRACE_INIT` and followed by a `TRACE_FINI`, both on that attachment's token. Nothing brackets a server run: one 5.0.4 SuperServer run held 77 `TRACE_INIT` records for 70 `ATTACH_DATABASE`, 3 `ATTACH_SERVICE`, 1 `UNAUTHORIZED ATTACH_DATABASE`, 1 `CREATE_DATABASE` and 2 Garbage Collector attachments. `MON$SERVER_PID` equals the header pid on the minimal account's own row, and `/proc/<pid>/stat` (field 22, the start time) is readable by another uid in the same pid namespace (8d).
+
+R1 rule 2's SuperServer branch (a `TRACE_INIT` that carries the current pid triggers a stop and a confirmation; a second `TRACE_INIT` in the run is ambiguous) would stop the stream at every attachment, or, during the cooldown, make every attachment ambiguous.
+
+**Proposed**, amending R1 rule 2:
+
+1. **One rule for every mode.** In SuperServer, as R1 already said for SuperClassic, `TRACE_INIT` and `TRACE_FINI` belong to the attachment, service session or failed attach whose token they carry. They **never trigger a stop**, never start or end a run, and never end a binding. The SuperServer items of R1 rule 2 that rely on a run-wide `TRACE_INIT` (the stop on a `TRACE_INIT` with the current pid, the cooldown keyed on the start time, "a second `TRACE_INIT` in the current run", "a record of the current run after its `TRACE_FINI`", and the boundary "at the first `TRACE_INIT` after the last confirmed position") are withdrawn.
+2. **How the two records are checked.** They carry no objects and produce no event.
+   - A `TRACE_INIT` is well formed when it carries the current run's pid, its body is the fixed session line the matrix records per version (to pin in measurement 8h), and its token is held by no live binding. Otherwise it is ambiguous.
+   - A `TRACE_FINI` is well formed when it carries the current run's pid, its body is the fixed session line, and its token's binding ended at the previous record that carried that token (`DETACH_DATABASE`, `DROP_DATABASE`, `DETACH_SERVICE`, a `FAILED` or `UNAUTHORIZED ATTACH_DATABASE`, or the end of an internal attachment, R6). Otherwise it is ambiguous.
+   - A `TRACE_FINI` ends nothing by itself, as R1 already said.
+3. **A new pid** still goes through R1 rule 2's stop and confirmation, with its limits (one unresolved stop at a time, at most 60 s, remembered failed pids, the 10-minute cooldown). Unchanged.
+4. **A restart with the same pid is found from the start time only.** The stream reads `/proc/<run pid>/stat` at stream start, before and after each read cycle (a read of one file, no SQL, no network), and `check()` reads `MON$SERVER_PID` and the start time at every re-evaluation, as R1 rule 1 says.
+   - When the start time differs from the current run's, or the process is gone, the run ends: every binding of the old run ends, the own-attachment lifetimes of the old run close, and the stream asks for an immediate `check()` to confirm the new run.
+   - **Records between the restart and its detection.** The run boundary is not known within the records read since the last read cycle at which the start time was still unchanged. Those records are ambiguous (always reported, with `*`, under the fix-3 attribution). With the per-cycle reading this is at most one read cycle of records.
+   - **Until the new run is confirmed** by `check()` (the same pid and the new start time, or a new pid), records are handled as R1 rule 2 handles an unconfirmed pid: ambiguous, the stream not stopped.
+   - **In another pid namespace** (Limited under proof 2), no start time is readable: R1 rule 1's best effort applies, and a restart with the same pid is not detected.
+5. **History walks.** In every mode, a pid change in a history walk starts a run only at a `TRACE_INIT` record; any other pid change is ambiguous. A restart with the same pid inside a walked history cannot be seen from the log: the old run's bindings are then never ended, and a reused token makes its records ambiguous (rule 4 of R1).
+
+**Alternatives considered.** (a) Keep a run-wide boundary from the log, for example the first `TRACE_INIT` after a gap in time: forgeable by any client and not written by the server. (b) Stop the stream at every `TRACE_INIT` and confirm: one stop per attachment, unusable. (c) Read the start time only at `check()` (every 5 minutes): rejected because it leaves up to 5 minutes of records with an unknown boundary; reading one `/proc` file per read cycle costs nothing.
+
+**Residual risks.**
+- **A restart with the same pid within one clock tick** of the start time (`/proc/<pid>/stat` counts in clock ticks, usually 10 ms) is not detected. The old run's bindings then stay live; a new attachment that reuses one of their tokens is ambiguous (loud), and the agent's own attachments are closed by the lost-connection rule of decision 3. Nothing is hidden: records are over-reported, not dropped.
+- **Local processes that run Firebird's embedded engine** with write access to the log (8e: root or the server's account, whose client fell back to its embedded provider) write records under their own pid. Each such pid costs one stop, then is remembered (R1 rule 2). These processes can write the log anyway and are outside what the parser can defend against (proof 1, R4).
+
+**Effect.** No change to the levels, notes or protocol. The metrics `firebird_audit_stream_stopped_seconds_total` and `firebird_audit_run_confirmations_failed_total` and the label `run_confirmation_stalled` stay as R1 defined them.
+
+### R6. The server's internal attachments: Garbage Collector and Cache Writer (measurement 8e)
+
+**Measured**: in SuperServer only, each time the server opens a database (the first attachment after it was closed), a `Cache Writer` and a `Garbage Collector` system attachment (`MON$SYSTEM_FLAG = 1`) take the two attachment ids before the opening attachment. The Cache Writer writes nothing. The Garbage Collector writes a `TRACE_INIT`, then `START_TRANSACTION` and `COMMIT_TRANSACTION` records with the attachment line `<database> (ATT_<n>, Garbage Collector, NONE, <internal>)` (no `:role`), on a token no live binding holds, and **no `ATTACH_DATABASE` record**. SuperClassic and Classic have neither attachment. Under R1 rule 5's watermark, the Garbage Collector's records name an id above the watermark with no `ATTACH_DATABASE` read for it: ambiguous at every database open.
+
+**Proposed**, amending R1 rules 3 and 5:
+
+1. **The internal shape.** A record has the internal shape when all hold:
+   - the server mode, proven by proof 2, is SuperServer;
+   - its event is `TRACE_INIT`, `START_TRANSACTION`, `COMMIT_TRANSACTION`, `ROLLBACK_TRANSACTION` or `TRACE_FINI`;
+   - its attachment line (for the transaction events) is exactly `<name> (ATT_<n>, <process>, NONE, <internal>)`, byte for byte: `<process>` from the closed list `Garbage Collector`, `Cache Writer`; the character set field `NONE`; the protocol field exactly `<internal>`; no `:role`, no address, no port;
+   - its other lines are exactly the lines the matrix records for that shape per version (the transaction line, and a client-process line if the server writes one; measurement 8h), with no statement, no separator line, no parameter, no trailer;
+   - `<name>` belongs to a declared database (R2), or, without proof 11, to an undeclared one.
+2. **The internal binding.** The first record of an id with the internal shape (its `TRACE_INIT`, matched to the following transaction record by its token) creates an **internal binding**, anchored like an `ATTACH_DATABASE` binding, with these limits:
+   - its id must be above the highest id seen for the database identity in the run and within R1 rule 5's margin, and it raises the highest id as an `ATTACH_DATABASE` would;
+   - at most **two** live internal bindings per database identity in the run (one per process name); a third, or a second with the same process name, is ambiguous;
+   - it ends at its `TRACE_FINI` or with its run.
+3. **What the internal binding allows.** Only records of the internal shape, on its token. Any other record that carries its id or its token (a statement, procedure or BLR record, a per-table block, an `ATTACH_DATABASE`, a service record, another process name) is ambiguous and **poisons** the internal binding: every later record of it is ambiguous too.
+4. **What the internal records become.** Well-formed internal records produce no access event (transaction records carry no object) and are not the agent's own. They count as records parsed for proof 9.
+5. **Anything else** with `<internal>` in the protocol field, or a process name outside the closed list (an automatic sweep worker, a replication or profiler worker, if a version adds one), is ambiguous until a measurement adds its shape to the list.
+
+**Can a client forge the shape?** Yes. Line breaks are written verbatim in the statement text, the process name, the user name of an attachment (created by an administrator), the role of a failed attach and user exception messages (8f), so any client can write lines with the internal shape.
+- **Inside its own finish record**, the forged header captures the real trailer that the server writes after the client's text: a trailer under a transaction event does not fit the event (H1 fix 1), so the forged record is ambiguous, and the read stays reported with its real counters.
+- **In a record without a trailer** (an `ERROR` record carrying a user exception message, a client-process line), a forged internal record parses as well formed. It carries no object and no row count, so it cannot hide a read. What it can do: occupy one of the two internal slots, so that the real Garbage Collector of the next database open becomes ambiguous (over-reporting, a denial of the Partial level for 24 h, loud), or raise the highest id within the margin, so that later real attaches are out of order and ambiguous (loud; R7 bounds how far).
+
+**Alternatives considered.** (a) Leave R1 rule 5 as written: every database open in SuperServer caps the level for 24 h. (b) Ignore every record of an id with no `ATTACH_DATABASE`: a forger could then put a real trailer under such an id and have it dropped. (c) Recognise the Garbage Collector from `MON$ATTACHMENTS`: the minimal account sees only its own row (first round, obligation 3), so it cannot.
+
+**Residual risk** (for docs/08): a client can forge internal Garbage Collector or Cache Writer records that carry no read. This adds no hidden read, and can make the server's own internal records of the next database open ambiguous (a denial of Partial for 24 h, loud).
+
+**Effect.** No new note, label or protocol change. Measurement 8h pins the exact lines.
+
+### R7. Attach order at a database open (measurement 8e)
+
+**Measured**: on an open database, bursts of 16, 32 and 64 concurrent attaches wrote `ATTACH_DATABASE` records at most 11 ids out of order (4.0.7 SuperServer; at most 7 on 5.0.4, at most 6 in SuperClassic). When a burst of 30 concurrent attaches **opens** the database, 4.0.7 SuperServer wrote them up to 30 ids out of order (the whole burst), the late records about 1 s after those of higher ids; 5.0.4 SuperServer up to 12, SuperClassic 2 to 6. R1 rule 5's constant tolerance of 16 does not hold: on 4.0.7 the inversion grows with the burst.
+
+**Proposed**, replacing the tolerance of R1 rule 5 ("Out-of-order attaches"). An `ATTACH_DATABASE` whose id is below the highest id seen for its database identity in the run, whose id was not seen before (otherwise R1 rule 3's duplicate poisoning applies), outside a confirmed restore, is **accepted in order** when both hold:
+
+- **count**: its id is at most **256** below the highest id;
+- **time**: it is read within **10 s of reading time** (as R1 rule 7 counts it: stops, back-pressure, parking and downtime not counted) of the record that first raised the highest id above its id.
+
+Otherwise it is ambiguous and taints its binding, as R1 rule 5 says. The bounds are the same for every version and mode: the measured worst case (30 ids, about 1 s) is well inside them, and one rule is easier to test than a table. The P10-D load run checks them (measurement 8g: bursts of 256 concurrent attaches that open the database on 4.0.7 and 5.0.4). If 8g exceeds them, the bounds are raised in an implementation note before the Audit lot ships, never removed.
+
+R1 rule 5's other parts stay: the highest id is raised only by ids at or below the agent's latest own `CURRENT_CONNECTION` plus the margin (4 096), and an id above that bound is ambiguous.
+
+**Why widening the tolerance adds no power to a forger.** An accepted late id must be unseen. The unseen ids below the highest are: ids of real attachments whose `ATTACH_DATABASE` is still to come (forging one makes the real one a duplicate, which poisons both: loud), the Garbage Collector's id (an `ATTACH_DATABASE` on an id held by an internal binding poisons it, R6), and the Cache Writer's id, which writes nothing. A forged attachment on a Cache Writer id is a fresh binding, which is what the accepted misattribution residual (R1, open question 6) already allows with a fresh id above the watermark.
+
+**Alternatives considered.** (a) A per-version count table (16 on 5.0, 64 on 4.0): the 4.0.7 inversion is bounded only by the burst size. (b) Time only, with the server's header timestamps: forgeable. (c) No tolerance at a database open: every application start that opens the database with a connection pool would cap the level for 24 h.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R8. Records without a per-table block, and the agent's own constant statements (measurement 3b)
+
+**Measured** (as `ext`, 4.0.7 and 5.0.4): reads of only virtual relations (`SELECT … FROM RDB$CONFIG`, `COUNT(*) FROM RDB$CONFIG`, `COUNT(*) FROM MON$ATTACHMENTS`, the agent's `MON$SERVER_PID` own-row read) and an `EXECUTE BLOCK` that reads no table have **no per-table block**: their finish record ends with `records fetched` and a performance line (`0 ms`, no fetch count). The decision 4 probe `SELECT CASE WHEN EXISTS (SELECT 1 FROM RDB$CONFIG) THEN 1 ELSE 0 END FROM RDB$DATABASE` has a block naming `RDB$DATABASE` only. The first `MON$` read of an attachment named `RDB$DATABASE` and `RDB$RELATIONS` (metadata loading), later ones nothing.
+
+So R3's own-read condition (a block naming `RDB$CONFIG`) cannot hold, and under H1 fix 2 (a statement finish without a per-table block while `print_perf` is proven on is ambiguous) and R1 rule 7, every such statement, the agent's own reads at every `check()` included, would open a split window.
+
+**Proposed**, amending H1 fix 2 ("Missing trailers"), R3's own-read exceptions and "The agent's own statements and the always-reported rules":
+
+1. **A second trailer shape for statement finish records.** An `EXECUTE_STATEMENT_FINISH` whose trailer is exactly `<n> records fetched` followed by a performance line, with no per-table block, has the **block-less** shape. It is well formed (it opens no window, and it is not ambiguous for that reason) when all hold:
+   - the record is otherwise not ambiguous (header, token, binding, attachment line, no header-shaped line in the text, text not cut);
+   - its normalized text parses, and the relations it names are only (a) relations of a closed per-version list of **virtual relations** (`MON$*`, `RDB$CONFIG`, the virtual `SEC$*` relations; checked by a drift test that each listed relation has relation type 3, virtual, on each image), or (b) none at all (`EXECUTE BLOCK`, `EXECUTE PROCEDURE`, a selectable procedure or function whose body reads no table, a statement with no `FROM`).
+
+   A block-less finish whose text names a relation outside that list (a persistent table, a view, `RDB$DATABASE`), or whose text does not parse or is cut, stays ambiguous under H1 fix 2 and opens a window, as now: a block was expected and is missing. Procedure, function and trigger finish records keep H1 fix 2 unchanged (their counters are what R4 folds).
+2. **What a well-formed block-less record becomes.**
+   - Its objects are the virtual relations its text names. They are system relations, left out of the objects of reads as noise, **except** those on the always-reported lists (`MON$STATEMENTS`, `MON$COMPILED_STATEMENTS`, `MON$CONTEXT_VARIABLES`, `MON$CALL_STACK`, `RDB$CONFIG`, the `SEC$` credential relations), which keep their name and the always-reported mark.
+   - When the text names no relation, decision 6's rules for code that runs out of sight apply: `*` is added ("whenever a record has no per-table block, `*` is added"), and `EXECUTE BLOCK` and calls of functions that are not built in are always reported.
+   - A record with no object left after the filters produces no event.
+3. **The agent's own constant statements, restated** (replacing R3's own-read exceptions and the own-read exceptions of the two always-reported lists). A record is the agent's own only when the own-attachment rule holds (decision 6, with R1's anchored, unpoisoned binding) **and** all of the following:
+   - its text is exactly one of the connector's **constant `check()` texts**, from one closed table in the connector: the `CURRENT_CONNECTION` / `MON$SERVER_PID` / `MON$REMOTE_ADDRESS` own-row read of `MON$ATTACHMENTS`, the `MON$DATABASE` read, the `RDB$GET_CONTEXT` reads, the `SEC$USERS` own-row read, the one-bit readability probes, the `RDB$CONFIG` read of R3, the `RDB$AUTH_MAPPING` and `SEC$GLOBAL_AUTH_MAPPING` reads of the lot 1 mapping refusal, the catalog reads of decision 4 and the read-back probe;
+   - its trailer is the shape the matrix records for that text and version (measurement 3d): block-less, or a block whose relations, after removing the per-version **metadata-loading set** (`RDB$DATABASE` and `RDB$RELATIONS` as measured), are exactly the expected set (`RDB$DATABASE` for the probes);
+   - its `records fetched` is at most the bound the table gives for that text (1 for own-row reads and probes, the key count for the `RDB$CONFIG` read, the catalog bounds of decision 4 for catalog reads);
+   - **it consumes one execution credit.** The connector records each execution of a constant text (attachment, text, time) as it records sampling credits; a matching record consumes one credit, and a record with no credit left is not the agent's own (it is reported). A forged copy of an agent's statement therefore cannot turn into a second own record.
+4. **What is no longer the agent's own.** Any other read of the always-reported relations, and any record of the agent's attachments that misses one condition, is reported, always reported where the lists say so.
+
+**Alternatives considered.** (a) Keep H1 fix 2 for every statement finish: every `check()` opens a window of 60 s of reading time, so Partial holds nowhere. (b) Accept every block-less finish as well formed: a forger's record that names a persistent table would then hide that its real block moved. (c) Exempt only the agent's own texts: other clients' monitoring reads (`MON$` dashboards) would still open windows constantly.
+
+**Residual risks.**
+- **Block-less records do not show volume or relations** beyond what the text names. A read of virtual relations is reported from the text, with the `records fetched` count; this is what the server writes, not a parser choice.
+- **The forger's view.** A forger can end its own record with a block-less fake trailer when its text names only virtual relations; the real trailer then lands in the forged record that follows. This gives nothing beyond the fake full trailer that H-1 already showed; the real trailer is handled by R1 rules 3, 4 and 8, unchanged.
+- **The agent's own reads under a guessed token.** 8b shows that few addresses occur (10 to 19 per run), so guessing the token of a live agent attachment is not hard. A forger who also knows the agent's attachment id could make one block-less read of its own look like one of the agent's constant reads, but only one per execution credit, within that text's row bound, and only for a text whose expected trailer is block-less; the agent's real record then lacks a credit and is reported (loud). A read of a persistent table cannot be hidden this way: its block names the table.
+
+**Effect.** No new note, label or protocol change. The never-sampled list (decision 5, lot 2) is unchanged.
+
+### R9. A database that is its own security database (measurement 3b, open item of the refinement of 2026-10-25)
+
+**Measured** (`databases.conf` `selfsec = /data/self.fdb { SecurityDatabase = selfsec }`, 4.0.7 and 5.0.4):
+- `PLG$SRP` is a persistent user table (system flag 0, relation type 0), readable by `ext`: 4 rows, every user's SRP verifier and salt. R3's "server configuration, not user data" does not hold there; decision 4 refuses `ext` there, which is right.
+- `PUBLIC` holds `SELECT` on `PLG$SRP_VIEW`, which shows each account its own verifier row: `min` and `none` read 1 row. Decision 4's one-bit probe ("a readable verifier or hash relation (`PLG$SRP`, `PLG$USERS`, their views) is a refusal") therefore refuses **every** account, the minimal one included, under the label `verifier_relation_readable`, which then names a right the account does not hold beyond its own row.
+- `PLG$USERS` (the legacy user manager) was not measured.
+- In such a database, the server's verifier lookups for every login (`SELECT PLG$VERIFIER, PLG$SALT FROM PLG$SRP WHERE PLG$USER_NAME = ? AND PLG$ACTIVE`, the attempted name as a parameter) and the verifier updates of `CREATE USER` are records **of the declared database**.
+
+**Proposed**: a declared database that is its own security database is **out of scope** in phase 10, for Discovery and Audit alike. It is refused at `check()` with the failure code `unsupported` (as Firebird 3.0 and 6.0, decision 2) and a local detail naming the declared database (its operator label) and the reason. Since `check()` covers every declared database (lot 1 implementation decision 2), the target's check fails until the operator removes that database from `firebird.databases`. Detection fails closed; any one of these refuses:
+
+1. `MON$DATABASE.MON$SEC_DATABASE` on the agent's own attachment reads `Self` (to verify on both versions, measurement 3c; any value other than `Default` or `Other`, or a failed read, counts as `Self`);
+2. the catalog of the declared database, which Discovery and the CAS guard already read, holds a relation named `PLG$SRP`, `PLG$SRP_VIEW`, `PLG$USERS` or `PLG$VIEW_USERS`, whatever its system flag;
+3. the evaluated `databases.conf` (R2 rule 2) gives the declared database a `SecurityDatabase` key that names itself (its alias or its resolved path).
+
+In every other database, decision 4's probe stays as written (no `PLG$` verifier relation exists there, so a readable one is still a refusal), and the never-sampled list stays (it covers `PLG$SRP*` and `PLG$USERS*` whatever the flag, lot 2). The shared security database (`security<N>.fdb`) cannot be attached remotely at all (first round, obligation 3).
+
+**Alternatives considered.**
+- **(b) A probe that tells the own row from every row**, such as `SELECT CASE WHEN EXISTS (SELECT 1 FROM PLG$SRP_VIEW WHERE PLG$USER_NAME IS DISTINCT FROM CURRENT_USER) THEN 1 ELSE 0 END FROM RDB$DATABASE`, together with the unchanged probe of `PLG$SRP` itself, would let Discovery run. Not proposed for phase 10: Audit of such a database would see the server's verifier lookup at every login in the declared log (an always-reported read of `PLG$SRP` by an internal attachment at each login, needing a third internal shape in R6, with client-chosen user names as parameters), and the configuration is uncommon (embedded-style deployments). Revisit if operators ask.
+- **(c) A dedicated note code**: not needed; `unsupported` with a local detail is how the connector already refuses servers it does not support, and the contract stays unchanged.
+
+**Residual risks.** A user database holding a user table named like a security relation (`PLG$USERS`, rule 2) is refused although it is not a security database: an over-refusal, stated in docs/08, which the operator fixes by renaming the table. The agent cannot see the security database's own content, so it does not tell an operator which users exist there.
+
+**Effect.** No new note, label or protocol change. docs/08 and the user guide (P10-G) state that a self-security database cannot be monitored.
+
+### R10. Failed logins are not in the trace of the target database
+
+**Measured** (4.0.7 and 5.0.4, SuperServer and SuperClassic, `log_connections = true`, `AuthServer` = `Srp256`, `Srp256, Srp` and `Srp256, Srp, Legacy_Auth`): a wrong password, for an existing user or an unknown one, writes **no `FAILED ATTACH_DATABASE` record** for the target database. The only trace is the server's own attachment to its security database (the verifier lookup with the attempted name as a parameter), written only where a section applies to the security database's path, so **never under proof 11**, whose sections apply to declared databases only. `FAILED ATTACH_DATABASE` is written when an authenticated attach fails (a missing file), `UNAUTHORIZED ATTACH_DATABASE` when remote access is refused. A failed service login writes nothing (8c). The first round's obligation 9 note was wrong on this point.
+
+**Proposed**, amending decision 6, "Principals":
+
+1. **Failed logins are not audited on Firebird.** `check()` reports `audit.failed_logins_not_audited` (an existing code whose engines already include `firebird`) for every Firebird target whose Audit source is configured, at every check, whatever `log_connections` says; with `log_connections = false` it is reported as well, and `log_connections` stays a label of `audit.trace_settings_missing` (proof 4).
+2. **Not required for Partial**, as for SQL Server ([ADR-0051](0051-sqlserver-connector.md) decision 6: `FAILED_LOGIN_GROUP` "not required for Partial"). The level rests on reads and their objects; a wrong password reads nothing. docs/08 states the limitation in the Firebird Audit section: wrong passwords and failed service logins are not seen; password guessing against a Firebird server is visible only in the server's own failed-login delay (first round, obligation 9) and in host logs outside the agent.
+3. **What stays.** `FAILED ATTACH_DATABASE` and `UNAUTHORIZED ATTACH_DATABASE` records are still parsed: their user names are fingerprinted, never sent in clear, and they count toward the failed-login flood cap. They are authenticated failures (a wrong file, remote access refused), not password failures, and docs/08 says so. An attachment line holding a role with a line break (8f, failed attaches) is ambiguous as any attachment line that does not parse.
+4. **The registry text** of `audit.failed_logins_not_audited` names only "Firebird trace: log_connections off". It is made accurate in the same unreleased contract revision as `engine.firebird` (P10-C, `security-reviewer` review): "Firebird trace: a wrong password writes no record of the target database". No new code; see "Protocol" below.
+
+**Alternatives considered.**
+- **(b) An optional section for the security database**, written to its own declared log (`firebird.audit.security_log`), so that proof 11 still holds for the declared log. It would show the verifier lookups of failed logins, but: the attempted user name is a parameter, today dropped at parse unread (decision 6, I2), and this would make the parser read it and fingerprint it, a new I2 path with its own marker tests; a wrong password is not written as such, only inferred (a lookup with no following `ATTACH_DATABASE` on the same internal attachment, an unknown user as `0 records fetched`), and that inference is forgeable, because the attempted name is client-chosen text that may hold line breaks (8f); and the log would also carry `CREATE USER` verifier updates (secrets, R4). Not proposed for phase 10; a later refinement may take it up if the maintainer wants failed-login visibility.
+- **(c) Withhold Partial without failed logins**: inconsistent with SQL Server, and it would make Firebird Audit Limited at best for a fact that says nothing about reads.
+
+**Residual risk.** Failed logins against Firebird targets are not seen by the agent; the documentation says so in docs/08 and in the user guide.
+
+**Effect.** No level change. A registry description is amended (P10-C); no new code or label.
+
+### R11. Confirmations and smaller amendments
+
+- **7b confirmed**: nested procedure, function and trigger finish records come before their statement's finish record, on the same attachment and token, innermost first. R4's folding by maximum stands.
+- **8a, 8b confirmed**: an attachment's records always carry one token, `DETACH_DATABASE` carries it, and addresses are reused only after a detach. R1 rules 3 and 4 stand. Few addresses occur (10 to 19 per run in SuperServer, two in Classic): H1 fix 7's "guessable" is restated as "guessable in a few tries". Each wrong guess is ambiguous (loud); a right guess on a live attachment is covered by the R1 forger analysis and R8's residual.
+- **8c, other records, confirmed**: `FAILED` and `UNAUTHORIZED ATTACH_DATABASE` records take a fresh token of their own, never a live one (R1 rule 4); service records share one token from `ATTACH_SERVICE` to `DETACH_SERVICE` (R1 rule 6); `SWEEP_START` / `SWEEP_FINISH` carry the sweeping attachment's id and token and are bound like any of its records.
+- **8d confirmed, and restores through the services API**: R1 rules 1 and 5 stand (`MON$SERVER_PID`, the start time, `DB_GUID` and `MON$CREATION_DATE` changed by a restore). A services restore writes `DROP_DATABASE` (on the service's database attachment) and then `CREATE_DATABASE` on the same token, with no `ATTACH_DATABASE`. Amending R1 rules 3 and 5:
+  - `DROP_DATABASE` ends its binding, as `DETACH_DATABASE` does;
+  - `CREATE_DATABASE` anchors a binding, as `ATTACH_DATABASE` does, and its token may be the token whose binding the `DROP_DATABASE` just ended;
+  - the restored database's ids restart low, so its `CREATE_DATABASE` and the next attaches are out of order and ambiguous until `check()` confirms the restore (restores are recognised from `check()` only, R1 rule 5). A `DROP_DATABASE` of a declared database asks for an immediate `check()` (a request, not a stop and not a confirmation), so that the ambiguous interval lasts one check, not up to 5 minutes.
+- **8f confirmed**: line breaks are written verbatim in statement texts, process names, user and role names and user exception messages (escaped only inside the quoted value of a conversion error). The misattribution residual of R1 stands, as the maintainer accepted it (open question 6 of the refinement of 2026-10-25), and R1 rule 9 (remote 4-tuple corroboration) applies: the record was in the log about 40 ms after the statement, inside rule 9's 10 s, and a held TCP connection that never attaches writes nothing, which is the limit R1 already states.
+- **12b, per-version section matching**: on 4.0.7, a section `database = <alias>` applies to attaches through that alias only; on 5.0.4, to attaches through the alias and through the resolved path. A section naming the path applies to path attaches only, on both, and attaches through an alias are then written nowhere. Amending R2 rule 4: the agent evaluates which section applies to each name of a declared database (its resolved path and every alias of the map that maps to it) with the matching rule of the server's version, from a per-version table (4.0: alias sections match the alias only; 5.0: the alias and its resolved path). For a version not in the table, the fail-closed evaluation of R2 rule 4 (both readings, Limited when they differ) applies. A name whose effective settings miss proof 4, or that no section covers, caps the level at Limited (R2 rule 4, unchanged).
+- **12c, alias case and live changes**:
+  - Alias lookup is case-sensitive (a case variant is opened as a file name). R2 rule 1's "a case-only variant of a declared alias is ambiguous, pending 12c" becomes: a case variant is not the alias; as a non-absolute name not in the map, it is ambiguous under R2 rule 2 (the same effect, now measured).
+  - A changed `databases.conf` takes effect at the next attach, without a restart. Amending R2 rule 5: the restart branch ("a file changed after the server process started is not proven until the next server restart") is withdrawn for `databases.conf`, because the file on disk is what the server applies. The agent keeps the `stat` before and after each read cycle; after a change it re-reads and re-evaluates the map, and the records read between the change and the re-evaluation that use a non-absolute name stay ambiguous. A new alias of a declared database that no section covers then caps the level at Limited from the re-evaluation on (R2 rule 4). `firebird.conf` and the trace configuration keep proof 2's restart rule (obligation 11).
+  - No per-database key of `databases.conf` changes what the trace logs (`AuditTraceConfigFile` is ignored there); the closed key set of R2 rule 2 lists the keys measured per image, `SecurityDatabase` and `RemoteAccess` included (R9 uses the first).
+- **13b confirmed**: effective settings are the default section's, overridden by the first matching named section's; a disabled matching section stops the search; a plain file name does not match; path matching is case-sensitive. R2 rule 4 stands.
+- **True Classic mode**: one process per connection, a new `MON$SERVER_PID` for each, two addresses shared by every child. R1 rule 10 stands: Audit is Limited in Classic. The peer-uid rule of decision 3 holds under Classic (the connection's socket is owned by uid 84); Classic under socket activation by a service manager is still not measured.
+- **Lot 1 residual A, `SEC$GLOBAL_AUTH_MAPPING`**: every account sees every global mapping (4.0.7 and 5.0.4). Amending decision 4 ("a readable credential relation"): `SEC$GLOBAL_AUTH_MAPPING` leaves the probe list of `credential_relation_readable`, whose readability it would make universal. Global mappings are then a fact visible to every account, not a credential; `RDB$AUTH_MAPPING`, readable by every account as well (first round), was never on the probe list. The lot 1 mapping refusal, which reads both tables, is unchanged, and both tables stay on decision 6's always-reported list, with the agent's own reads of them matched under R8 rule 3.
+
+### Obligations still open after the lot 3 measurements
+
+Each measured before the pull request that relies on it:
+
+- **3c** (R9): the values of `MON$DATABASE.MON$SEC_DATABASE` on 4.0.7 and 5.0.4 for a database with the default, its own and another security database.
+- **3d** (R8): the trailer shape and the `records fetched` bound of every constant `check()` text per version and mode, including the metadata-loading set; recorded as the connector's closed table with a matrix test.
+- **8g** (R7): in the P10-D load run, bursts of 256 concurrent attaches that open the database, on 4.0.7 and 5.0.4 SuperServer: the largest inversion and the latest late record stay within 256 ids and 10 s.
+- **8h** (R5, R6): the exact lines of `TRACE_INIT` / `TRACE_FINI` session records and of the Garbage Collector and Cache Writer records per version, for the closed shapes; whether an automatic sweep (`sweep interval`) runs in an internal attachment and with what shape.
+- Still open from earlier: `PLG$USERS` in a security database built with the legacy schema (R9 refuses such a database whatever the result), Classic under socket activation, the `sysdba_mapped` account on the matrix (obligation 15).
+
+### Protocol (P10-C, lot 3 refinement)
+
+- **One registry text**: the Firebird part of the description of `audit.failed_logins_not_audited` in `shared/protocol/target-notes.json` becomes "Firebird trace: a wrong password writes no record of the target database" (R10). `firebird` is already among its engines and `engine.firebird` is not released, so no console knows the old Firebird text; a contract change all the same, reviewed by `security-reviewer`.
+- **No new note code, label or field.** The self-security refusal uses the failure code `unsupported` (R9); the internal attachments, the block-less shape, the run-change reading and the attach-order bounds are parser rules. The note-label revision `target_status.note_labels.2026_10_d` is unchanged.
+- **No new metric** is needed; the two metrics of R1 cover the stops.
+
+### Open questions (for the maintainer, lot 3 refinement)
+
+Each with the answer this refinement proposes; none is decided until the maintainer confirms it.
+
+1. **R5**: treat `TRACE_INIT` / `TRACE_FINI` as per-attachment records in every mode (never a stop, never a run boundary), and detect a restart with the same pid only from the process start time, read at stream start, around each read cycle and at every `check()`, with the records of the undetected interval ambiguous?
+   **Proposed**: yes. Nothing in the log brackets a run, and a run boundary taken from the log would be forgeable. The residual (a restart within one clock tick) over-reports and hides nothing.
+2. **R6**: recognise the Garbage Collector and Cache Writer records by an exact closed shape (SuperServer only, user field from a closed list, `NONE`, `<internal>`, transaction and session events only, at most two per database in the run), poisoning the internal binding on any other record?
+   **Proposed**: yes, with the stated residual: a forged internal record carries no read, and can only make the next real ones ambiguous (loud).
+3. **R7**: accept an out-of-order `ATTACH_DATABASE` within 256 ids and 10 s of reading time, the same for every version and mode, confirmed by the load run (8g)?
+   **Proposed**: yes. The measured worst case is 30 ids and about 1 s on 4.0.7, and an accepted late id gives a forger nothing that a fresh id does not.
+4. **R8**: accept a statement finish with no per-table block as well formed when its text names only listed virtual relations or no relation, keeping H1 fix 2 for texts that name a persistent table, a view or `RDB$DATABASE`?
+   **Proposed**: yes. Otherwise every `check()` and every monitoring read opens a split window, and the change gives a forger nothing beyond the fake trailer of H-1.
+5. **R8**: restate the agent's own constant statements as one closed table of texts, each with its measured trailer shape (3d), a row bound and one execution credit per run of the text, replacing R3's own-read condition?
+   **Proposed**: yes. The credit keeps a forged copy of an agent statement from becoming a second own record.
+6. **R9**: refuse a declared database that is its own security database (`unsupported`, local detail), detected by `MON$SEC_DATABASE`, by a `PLG$` verifier relation in its catalog, or by its `SecurityDatabase` key, rather than an own-row-aware probe?
+   **Proposed**: refuse in phase 10; the configuration is uncommon, its Audit would carry the server's verifier lookups, and refusal is fail closed. Revisit with option (b) if operators ask.
+7. **R10**: report `audit.failed_logins_not_audited` for every Firebird Audit target, not required for Partial, with the registry text corrected in P10-C?
+   **Proposed**: yes, as for SQL Server without `FAILED_LOGIN_GROUP`. The read-based level is unchanged, and docs/08 states the limitation.
+8. **R10, option (b)**: a separate, optional security-database log in a later refinement, with attempted user names read from a parameter and fingerprinted?
+   **Proposed**: not in phase 10. It adds an I2 path that reads parameters, and its signal is inferred from forgeable text. A ROADMAP follow-up only if the maintainer wants failed-login visibility on Firebird.
+9. **R11, 12b and 12c**: evaluate section matching per server version, and withdraw R2 rule 5's restart branch for `databases.conf` because the server applies a change at the next attach?
+   **Proposed**: yes. The restart rule stays for `firebird.conf` and the trace configuration, which the server reads at start.
+10. **R11, residual A**: drop `SEC$GLOBAL_AUTH_MAPPING` from the `credential_relation_readable` probe list, keeping it on the always-reported list and in the lot 1 mapping refusal?
+    **Proposed**: yes. Every account can read it, so the label would be raised for every target with a global mapping and say nothing about the agent's account.
