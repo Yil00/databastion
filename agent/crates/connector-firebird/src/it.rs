@@ -377,7 +377,7 @@ async fn many_exchanges_authenticate() {
     let t = agent("");
     let endpoint = crate::conn::Endpoint::of(&t).unwrap();
     let password = t.secret.read().unwrap();
-    for _ in 0..64 {
+    for i in 0..64 {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let s = crate::conn::connect(
             &endpoint,
@@ -387,7 +387,15 @@ async fn many_exchanges_authenticate() {
             std::time::Duration::from_secs(3),
         )
         .await
-        .unwrap_or_else(|e| panic!("{e:?}"));
+        .unwrap_or_else(|e| {
+            panic!(
+                "exchange {i}: code {}, stage {}, gds {:?}, detail {}",
+                e.code,
+                e.stage.as_str(),
+                e.gds,
+                e.detail.map_or("none", crate::error::Detail::as_str)
+            )
+        });
         s.close().await;
     }
 }
