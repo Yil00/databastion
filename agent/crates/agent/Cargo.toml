@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis", "sqlserver", "sqlite"]
+default = ["postgres", "mysql", "mongodb", "openldap", "cas", "redis", "sqlserver", "sqlite", "firebird"]
 postgres = ["dep:databastion-connector-postgres"]
 mysql = ["dep:databastion-connector-mysql"]
 mongodb = ["dep:databastion-connector-mongodb"]
@@ -20,6 +20,8 @@ sqlserver = ["dep:databastion-connector-sqlserver"]
 # ADR-0059: the bundled SQLite C library, run only in the sandboxed reader
 # process (`databastion-agent sqlite-reader`).
 sqlite = ["dep:databastion-connector-sqlite"]
+# ADR-0060: the own Firebird protocol-16 client (no fbclient).
+firebird = ["dep:databastion-connector-firebird"]
 
 [dependencies]
 databastion-core.workspace = true
@@ -31,6 +33,7 @@ databastion-connector-cas = { workspace = true, optional = true }
 databastion-connector-redis = { workspace = true, optional = true }
 databastion-connector-sqlserver = { workspace = true, optional = true }
 databastion-connector-sqlite = { workspace = true, optional = true }
+databastion-connector-firebird = { workspace = true, optional = true }
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tracing.workspace = true

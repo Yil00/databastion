@@ -4,8 +4,9 @@
 # cn=accesslog entries; Redis / Valkey RESP3 replies, INFO sections and key names; CAS service definitions (JSON and YAML, the YAML parser also against
 # serde_yaml_ng as a differential oracle) and JSON audit log lines; and the name normalizers
 # (classifiers, ADR-0057); SQLite database files with their -wal, -shm and -journal
-# files, the SQLite header pre-check and the reader IPC decoders (ADR-0059). See
-# README.md.
+# files, the SQLite header pre-check and the reader IPC decoders (ADR-0059); the
+# Firebird server messages, describe answers and rows, SRP data, wire-crypt keys and
+# /proc/net/tcp tables (ADR-0060). See README.md.
 #
 # Its own workspace, outside the agent workspace: `cargo test` and `cargo clippy`
 # in agent/ never build it, and the agent binary never links libFuzzer. The
@@ -30,6 +31,7 @@ databastion-connector-openldap = { path = "../crates/connector-openldap", featur
 databastion-connector-cas = { path = "../crates/connector-cas", features = ["fuzzing"] }
 databastion-connector-redis = { path = "../crates/connector-redis", features = ["fuzzing"] }
 databastion-connector-sqlserver = { path = "../crates/connector-sqlserver", features = ["fuzzing"] }
+databastion-connector-firebird = { path = "../crates/connector-firebird", features = ["fuzzing"] }
 # The oracle of the differential target cas_registry_yaml_diff (ADR-0046): the YAML parser
 # connector-cas used before its own.
 serde_yaml_ng = "0.10"
@@ -271,6 +273,41 @@ bench = false
 [[bin]]
 name = "sqlite_ipc"
 path = "fuzz_targets/sqlite_ipc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_messages"
+path = "fuzz_targets/firebird_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_describe_rows"
+path = "fuzz_targets/firebird_describe_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_srp_data"
+path = "fuzz_targets/firebird_srp_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_keys"
+path = "fuzz_targets/firebird_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "firebird_proc_net_tcp"
+path = "fuzz_targets/firebird_proc_net_tcp.rs"
 test = false
 doc = false
 bench = false

@@ -47,8 +47,12 @@ pub mod cas_guard;
 mod checks;
 pub mod config;
 pub mod connector;
+#[cfg(any(test, feature = "test-support"))]
+pub mod contract_rules;
 mod detect;
 pub mod engine;
+#[cfg(test)]
+mod firebird_contract_tests;
 mod fsutil;
 pub mod identity;
 pub mod job;

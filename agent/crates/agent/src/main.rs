@@ -88,6 +88,8 @@ fn compiled_connectors() -> Vec<Box<dyn Connector>> {
         Box::new(databastion_connector_sqlserver::SqlserverConnector::new()),
         #[cfg(feature = "sqlite")]
         Box::new(databastion_connector_sqlite::SqliteConnector::new()),
+        #[cfg(feature = "firebird")]
+        Box::new(databastion_connector_firebird::FirebirdConnector::new()),
     ]
 }
 
@@ -324,6 +326,10 @@ mod tests {
             cfg!(feature = "sqlserver")
         );
         assert_eq!(engines.contains(&Engine::Sqlite), cfg!(feature = "sqlite"));
+        assert_eq!(
+            engines.contains(&Engine::Firebird),
+            cfg!(feature = "firebird")
+        );
     }
 
     /// The reader mode is the mode alone: never with another argument,

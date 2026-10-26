@@ -31,6 +31,7 @@ const NOTE_ENGINES: &[&str] = &[
     "valkey",
     "sqlserver",
     "sqlite",
+    "firebird",
 ];
 
 /// Registered engines and description of each code.

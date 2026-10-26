@@ -4,11 +4,12 @@
 //! - a fixed list of Unix socket paths (contract `UnixSocketPath`
 //!   directories: `/run`, `/var/run`, `/tmp`, `/var/lib/mysql`);
 //! - `LISTEN` entries of `/proc/net/tcp` and `/proc/net/tcp6` for the ports
-//!   5432, 3306, 27017, 389, 636, 6379, 1433 (only the port is kept; the listening
-//!   address is never reported);
+//!   5432, 3306, 27017, 389, 636, 6379, 1433, 3050 (only the port is kept; the
+//!   listening address is never reported);
 //! - `/proc/<pid>/comm` for `postgres`, `mysqld`, `mariadbd`, `mongod`,
-//!   `slapd`, `redis-server`, `valkey-server`, `sqlservr` (the process name only: the command line may contain secrets
-//!   and is never read).
+//!   `slapd`, `redis-server`, `valkey-server`, `sqlservr`, `firebird` (the
+//!   process name only: the command line may contain secrets and is never
+//!   read).
 //!
 //! The agent never connects to a detected engine. Engines already declared
 //! in `agent.yaml` are excluded; the result is capped at the contract limit
@@ -69,6 +70,9 @@ const PORTS: &[(u16, Engine)] = &[
     // ADR-0051 decision 7: the default instance port only (no SQL Server
     // Browser, UDP 1434, is ever looked at).
     (1433, Engine::Sqlserver),
+    // ADR-0060 decision 7: the default port of the Firebird remote
+    // protocol (no other port, no Unix socket: Firebird has none on Linux).
+    (3050, Engine::Firebird),
 ];
 
 const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
@@ -99,6 +103,13 @@ const PROCESSES: &[(&str, DetectedTargetProcess, Engine)] = &[
         "sqlservr",
         DetectedTargetProcess::Sqlservr,
         Engine::Sqlserver,
+    ),
+    // The Firebird 4.0 / 5.0 server process (`bin/firebird`, SuperServer
+    // and SuperClassic; ADR-0060 decision 7).
+    (
+        "firebird",
+        DetectedTargetProcess::Firebird,
+        Engine::Firebird,
     ),
 ];
 
@@ -134,8 +145,7 @@ fn family(engine: Engine) -> u8 {
         // only, no process or port to detect, no file system search); its
         // own family.
         Engine::Sqlite => 7,
-        // ADR-0060 decision 7: port 3050 and the `firebird` process (not
-        // detected yet: local detection comes with the connector, P10-B).
+        // ADR-0060 decision 7: port 3050 and the `firebird` process.
         Engine::Firebird => 8,
     }
 }
@@ -150,6 +160,7 @@ fn target_family(engine: TargetEngine) -> u8 {
         TargetEngine::Sqlserver => 5,
         TargetEngine::Redis | TargetEngine::Valkey => 6,
         TargetEngine::Sqlite => 7,
+        TargetEngine::Firebird => 8,
     }
 }
 
@@ -174,6 +185,7 @@ fn default_port(engine: TargetEngine) -> u16 {
         TargetEngine::Sqlserver => crate::config::sqlserver::DEFAULT_PORT,
         // Never detected (declared files only; ADR-0059 decision 2).
         TargetEngine::Sqlite => 0,
+        TargetEngine::Firebird => crate::config::firebird::DEFAULT_PORT,
     }
 }
 
@@ -526,6 +538,50 @@ mod tests {
         let t = target("{id: s, engine: sqlserver, host: 127.0.0.1, account: a, secret: {env: X}}");
         let json = serde_json::to_string(&detect(&view, &[t])).unwrap();
         assert!(!json.contains("sqlserver"), "{json}");
+    }
+
+    /// ADR-0060 decision 7: port 3050 and the `firebird` process; never
+    /// another port (3049, the SuperClassic service port, is not read),
+    /// never a Unix socket.
+    #[test]
+    fn firebird_is_detected_by_port_and_process() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        fs::create_dir_all(root.join("proc/net")).unwrap();
+        // 3050 (0x0BEA) and 3049 (0x0BE9) listening.
+        fs::write(
+            root.join("proc/net/tcp"),
+            "  sl  local_address rem_address   st\n\
+   0: 0100007F:0BEA 00000000:0000 0A 0\n\
+   1: 00000000:0BE9 00000000:0000 0A 0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("proc/31")).unwrap();
+        fs::write(root.join("proc/31/comm"), "firebird\n").unwrap();
+        let view = HostView {
+            root,
+            is_socket: exists,
+        };
+        let found = detect(&view, &[]);
+        let json = serde_json::to_string(&found).unwrap();
+        assert!(
+            json.contains(r#"{"engine":"firebird","port":3050}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#"{"engine":"firebird","process":"firebird"}"#),
+            "{json}"
+        );
+        assert!(
+            !json.contains("3049") && !json.contains("unix_socket"),
+            "{json}"
+        );
+        let t = target(
+            "{id: f, engine: firebird, host: 127.0.0.1, account: a, secret: {env: X}, \
+             firebird: {peer_uid: 84, databases: [{name: a, attach: a}]}}",
+        );
+        let json = serde_json::to_string(&detect(&view, &[t])).unwrap();
+        assert!(!json.contains("firebird"), "{json}");
     }
 
     #[test]

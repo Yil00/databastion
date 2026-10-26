@@ -23,6 +23,8 @@ pub enum Engine {
     Sqlserver,
     /// SQLite database files (declared local files only, ADR-0059).
     Sqlite,
+    /// Firebird 4.0 and 5.0, on loopback only (ADR-0060).
+    Firebird,
 }
 
 impl Engine {
@@ -38,6 +40,7 @@ impl Engine {
             Self::Redis => "redis",
             Self::Sqlserver => "sqlserver",
             Self::Sqlite => "sqlite",
+            Self::Firebird => "firebird",
         }
     }
 }

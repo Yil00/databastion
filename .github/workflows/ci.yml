@@ -29,6 +29,7 @@ jobs:
       oidc: ${{ steps.e2e.outputs.oidc }}
       cas: ${{ steps.e2e.outputs.cas }}
       sqlserver: ${{ steps.e2e.outputs.sqlserver }}
+      firebird: ${{ steps.e2e.outputs.firebird }}
       e2e_sqlserver: ${{ steps.e2e.outputs.e2e_sqlserver }}
       e2e_redis: ${{ steps.e2e.outputs.e2e_redis }}
       e2e_sqlite: ${{ steps.e2e.outputs.e2e_sqlite }}
@@ -99,6 +100,14 @@ jobs:
             sqlserver=false
           fi
           echo "sqlserver=$sqlserver" | tee -a "$GITHUB_OUTPUT"
+          # Firebird connector (agent-firebird, ADR-0060 lot 1): the agent, the throwaway-server
+          # script (image pins) and this workflow.
+          if [ -z "$changed" ] || grep -qE '^(agent/|dev/firebird/|\.github/workflows/ci\.yml$)' <<<"$changed"; then
+            firebird=true
+          else
+            firebird=false
+          fi
+          echo "firebird=$firebird" | tee -a "$GITHUB_OUTPUT"
           # SQL Server target end to end (e2e/sqlserver.sh, the 2.3 GB image): the agent, the console,
           # the e2e harness, the SQL Server dev service and its seed, the ground truth, the compose
           # file (image pin) and this workflow.
@@ -797,6 +806,45 @@ jobs:
         if: always()
         run: timeout 120 docker compose -f dev/docker-compose.yml down -v
 
+  # Firebird connector integration tests, lot 1 (ADR-0060 decision 10): the own protocol-16
+  # client, SRP-256, ChaCha64 / ChaCha (Arc4 and unencrypted servers refused), the loopback,
+  # peer-uid and forwarder rules (a socat forwarder) and check() against throwaway servers of the
+  # pinned 5.0.4 and 4.0.7 images run as uid 84 on the loopback of a dedicated network namespace
+  # (the tests enter it with sudo nsenter and run as the runner user; every container drops NET_RAW
+  # and NET_ADMIN), the authentication mappings to SYSDBA and RDB$ADMIN, plus Firebird 3.0's
+  # refusal (dev/firebird/it.sh; the dev service comes with lot 2). Fake random passwords in 0600
+  # files, never on a command line nor in an environment variable.
+  agent-firebird:
+    name: Agent Firebird integration
+    needs: detect
+    if: needs.detect.outputs.agent == 'true' && needs.detect.outputs.firebird == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50 # the two 20-minute test steps, plus setup (review N8)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: agent
+      - name: Connector integration tests (Firebird 5.0.4)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/firebird/it.sh 5 2>&1 | tee "$RUNNER_TEMP/it.log"
+      - name: Connector integration tests (Firebird 4.0.7)
+        run: |
+          set -o pipefail
+          timeout 1200 dev/firebird/it.sh 4 2>&1 | tee -a "$RUNNER_TEMP/it.log"
+      # Last, so that the end of the job log shows why the tests failed.
+      - name: Failure summary
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/it.log" ] || exit 0
+          grep -nE "panicked at|^test .* FAILED$|^failures:$|^---- |test result: FAILED|^error|^\[it\] " "$RUNNER_TEMP/it.log" | head -n 120 || true
+
   # Release-mode Unicode sweep of the Redis / Valkey key-pattern gate against the contract's
   # KeyPattern rule (classifiers test keys_contract): every code point, in the shapes the rules look
   # at, so that a Unicode version drift between the `regex` crate and the contract's validator shows
@@ -1198,7 +1246,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-compat, packaging]
+    needs: [detect, docs, secrets, console, agent, agent-msrv, agent-pg, agent-mysql, agent-mongodb, agent-openldap, agent-redis, agent-sqlserver, agent-sqlite, agent-firebird, agent-keys-sweep, agent-fuzz-smoke, protocol, e2e, e2e-oidc, e2e-cas, e2e-sqlserver, e2e-redis, e2e-sqlite, e2e-compat, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -1,0 +1,48 @@
+[package]
+name = "databastion-connector-firebird"
+description = "DataBastion agent: Firebird connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Architecture rule: a connector depends on `databastion-core` (trait, sinks)
+# and `databastion-classifiers` (masking) only. Never on an HTTP client: it has
+# no access to the uplink (checked by crates/agent/tests/architecture.rs).
+[dependencies]
+databastion-core.workspace = true
+databastion-classifiers.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "net", "io-util"] }
+tracing.workspace = true
+zeroize.workspace = true
+# Own client for a closed subset of the Firebird remote protocol 16 (`xdr`,
+# `wire`, `conn`), no driver crate and no fbclient (ADR-0060 decision 1):
+# bounded values, closed operation and type sets, no server text kept.
+# SRP-256 (`srp`): SHA-1 inside SRP and for the session key, SHA-256 for the
+# client proof; the modular exponentiations over the password-derived and
+# private exponents in constant time (`crypto-bigint`, ADR-0060
+# Consequences), never `num-bigint`.
+sha1.workspace = true
+sha2.workspace = true
+crypto-bigint = { version = "0.7", default-features = false, features = ["zeroize"] }
+# Wire encryption (`crypt`): `ChaCha20Legacy` for ChaCha64, `ChaCha20` for
+# ChaCha, always through `try_apply_keystream` (decision 1).
+chacha20 = { version = "0.10", default-features = false, features = ["cipher", "legacy", "zeroize"] }
+getrandom = { version = "0.4", default-features = false }
+
+[features]
+# Public entry points of the parsers for the fuzz targets (`agent/fuzz`,
+# cargo-fuzz): never enabled by the agent binary.
+fuzzing = []
+
+[dev-dependencies]
+databastion-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "io-util"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

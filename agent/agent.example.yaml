@@ -293,6 +293,45 @@ targets:
   #     # application's commits) or read.
   #     # rollback_mode: skip
 
+  # Firebird 4.0 or 5.0 (ADR-0060), on loopback only: the agent runs on the
+  # server's host (Firebird has no TLS; its wire encryption has no integrity
+  # and no server authentication). Create the account with the Srp user
+  # manager and a random password of at least 32 characters, a reader role
+  # with SELECT on each table, granted DEFAULT:
+  #   CREATE USER DATABASTION_AGENT PASSWORD '<random>' USING PLUGIN Srp;
+  #   CREATE ROLE DATABASTION_READER;
+  #   GRANT SELECT ON TABLE CUSTOMERS TO ROLE DATABASTION_READER;
+  #   GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;
+  # firebird.conf: AuthServer listing Srp256, WireCrypt = Required and
+  # WireCryptPlugin listing ChaCha64 or ChaCha; RemoteBindAddress = 127.0.0.1
+  # when no other client needs the network. No other container may share the
+  # agent's and the server's network namespace unless it drops NET_RAW and
+  # NET_ADMIN. Discovery and Audit come with the next lots: check() only.
+  # - id: app-fb
+  #   engine: firebird
+  #   host: 127.0.0.1
+  #   account: DATABASTION_AGENT
+  #   secret:
+  #     file: /etc/databastion/secrets/app-fb
+  #   firebird:
+  #     # The account that owns the server's sockets (default firebird; a
+  #     # number when the agent runs in a container).
+  #     peer_uid: firebird
+  #     databases:
+  #       # name: the label sent to the console; attach: a databases.conf
+  #       # alias (recommended: the server sees it in clear on loopback
+  #       # before wire encryption starts) or an absolute path. Never sent
+  #       # to the console.
+  #       - name: app
+  #         attach: appdb
+  #     # A remote server reached through a TLS or WireGuard tunnel you run,
+  #     # ending on this host's loopback (peer_uid: the tunnel's account;
+  #     # no Audit): tunnel: true
+  #     # tunnel: false
+  #     # The role holds SELECT_ANY_OBJECT_IN_DATABASE (it also exposes the
+  #     # server configuration, RDB$CONFIG):
+  #     # extended_grants: false
+
 # metrics.local_listen is not implemented yet: a local listener is an
 # exception to I1 that needs a reviewed allowlist entry (ADR-0004). Setting
 # it is rejected.

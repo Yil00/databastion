@@ -27,7 +27,7 @@
 //! such an event carries a fingerprint instead of being dropped. An event is
 //! only dropped (and counted) if no conforming principal can be built at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use databastion_classifiers::keys::is_key_pattern;
 use databastion_classifiers::masking::{HmacKey, RawSample};
@@ -372,9 +372,150 @@ pub(crate) fn enforce_sqlite_target_status(t: &mut databastion_protocol::TargetS
     }
 }
 
+/// The Firebird location rule of the contract (ADR-0060 decision 5, the
+/// `Location` `if` / `then` on `engine: firebird`; P10-C Firebird review,
+/// merge condition C1): a `firebird` location has no schema (Firebird 4.0
+/// and 5.0 have none). Enforced in the core like [`sqlite_location_ok`]:
+/// before spooling ([`check_finding`], dropped and counted) and before
+/// sending (`ResultBatch::parse`).
+pub(crate) fn firebird_location_ok(l: &databastion_protocol::Location) -> bool {
+    l.engine != Engine::Firebird || l.schema.is_none()
+}
+
+/// Every engine rule of the contract's `Location` the core enforces
+/// ([`sqlite_location_ok`], [`firebird_location_ok`]).
+pub(crate) fn location_rules_ok(l: &databastion_protocol::Location) -> bool {
+    sqlite_location_ok(l) && firebird_location_ok(l)
+}
+
+/// The Firebird target status rule of the contract (ADR-0060 decisions 2,
+/// 5 and 6, the `TargetStatus` `if` / `then` on `engine: firebird`; merge
+/// condition C1), applied to every heartbeat target status before it is
+/// sent, whatever the connector reported:
+///
+/// - a `firebird` target is Partial at best: `full` becomes `partial`
+///   (the ceiling, ADR-0039 decision 3);
+/// - it has no `edition` (Firebird has none) and no `name_case` (its name
+///   rules are fixed by the engine, decision 5);
+/// - the Firebird-only note codes ([`crate::NoteCode::FIREBIRD_ONLY`]) are
+///   attached to `firebird` targets only.
+pub(crate) fn enforce_firebird_target_status(t: &mut databastion_protocol::TargetStatus) {
+    if t.engine == Engine::Firebird {
+        if t.audit_level == databastion_protocol::AuditLevel::Full {
+            t.audit_level = databastion_protocol::AuditLevel::Partial;
+        }
+        t.edition = None;
+        t.name_case = None;
+    } else {
+        t.notes.retain(|n| {
+            !crate::notes::NoteCode::FIREBIRD_ONLY
+                .iter()
+                .any(|c| c.as_str() == n.code.as_str())
+        });
+    }
+}
+
+/// Every engine rule of the contract's `TargetStatus` the core enforces
+/// (SQLite R1, Firebird C1): the last step of every status built and of
+/// every heartbeat sent.
+pub(crate) fn enforce_target_status(t: &mut databastion_protocol::TargetStatus) {
+    enforce_sqlite_target_status(t);
+    enforce_firebird_target_status(t);
+}
+
+/// The Firebird detected-target rule of the contract (ADR-0060 decision
+/// 7, the `DetectedTarget` `if` / `then` on `engine: firebird`; merge
+/// condition C1): a `firebird` server is detected by its port or its
+/// process, never by a Unix socket. A `unix_socket` is removed, and the
+/// entry is dropped when nothing else is left (`minProperties: 2`).
+pub(crate) fn enforce_detected_targets(targets: &mut Vec<databastion_protocol::DetectedTarget>) {
+    for t in targets.iter_mut() {
+        if t.engine == Engine::Firebird {
+            t.unix_socket = None;
+        }
+    }
+    targets.retain(|t| t.unix_socket.is_some() || t.port.is_some() || t.process.is_some());
+}
+
+/// Whether an access event satisfies the Firebird trace rules of the
+/// contract (ADR-0060 decisions 5 and 6, the `AccessEvent` `if` / `then`
+/// on `source: firebird_audit_trace`; merge condition C1): no
+/// `principal.application` and no object `schema`. Checked on spooled
+/// batches before they are sent (`ResultBatch::parse`).
+pub(crate) fn firebird_event_ok(e: &AccessEvent) -> bool {
+    e.source != AuditSource::FirebirdAuditTrace
+        || (principal_application(&e.principal).is_none()
+            && e.objects.iter().all(|o| o.schema.is_none()))
+}
+
+fn principal_application(p: &Principal) -> Option<&str> {
+    match p {
+        Principal::Variant0 { application, .. } => application.as_deref().map(String::as_str),
+        Principal::Variant1 { application, .. } => application.as_deref().map(String::as_str),
+        Principal::Variant2 { application, .. } => application.as_deref().map(String::as_str),
+    }
+}
+
+/// Rewrites a `firebird_audit_trace` event to the contract's Firebird
+/// rules (merge condition C1), whatever the connector built: the
+/// client-set process name is never sent as `principal.application`, and
+/// an object that names a `schema` is replaced by `*` of its database
+/// (the read stays reported, as one of objects the agent cannot name).
+fn enforce_firebird_event(e: &mut AccessEvent) {
+    if e.source != AuditSource::FirebirdAuditTrace {
+        return;
+    }
+    match &mut e.principal {
+        Principal::Variant0 { application, .. } => *application = None,
+        Principal::Variant1 { application, .. } => *application = None,
+        Principal::Variant2 { application, .. } => *application = None,
+    }
+    let mut changed = false;
+    for o in &mut e.objects {
+        if o.schema.is_some() {
+            o.schema = None;
+            if let Some(w) = wildcard() {
+                o.object = w.into();
+            }
+            if let Some(parts) = o.altered.as_mut() {
+                parts.retain(|p| *p == ObjectRefPart::Database);
+            }
+            changed = true;
+        }
+    }
+    if changed {
+        // Objects that became the same `*` of their database merge, and
+        // their `altered` markers are united (ADR-0056, review N6): the
+        // database name of one of them may have been altered.
+        let mut kept: Vec<ObjectRef> = Vec::with_capacity(e.objects.len());
+        let mut index: HashMap<(String, String), usize> = HashMap::new();
+        for o in e.objects.drain(..) {
+            let k = (
+                o.database.as_str().to_owned(),
+                serde_json::to_string(&o.object).unwrap_or_default(),
+            );
+            match index.get(&k) {
+                Some(&i) => {
+                    if let Some(parts) = o.altered {
+                        kept[i].altered.get_or_insert_with(Vec::new).extend(parts);
+                    }
+                }
+                None => {
+                    index.insert(k, kept.len());
+                    kept.push(o);
+                }
+            }
+        }
+        for o in &mut kept {
+            canonical_object_parts(o);
+        }
+        e.objects = kept;
+    }
+}
+
 /// Validates and sanitizes a finding in place. `false`: drop it.
 pub(crate) fn check_finding(f: &mut Finding) -> bool {
-    if !sqlite_location_ok(&f.location) {
+    if !location_rules_ok(&f.location) {
         return false;
     }
     let l = &mut f.location;
@@ -501,6 +642,8 @@ fn keep_overflow_wildcard(e: &mut AccessEvent, left_out: &[(Identifier, bool)]) 
 
 /// Validates and sanitizes an access event in place. `false`: drop it.
 pub(crate) fn check_event(e: &mut AccessEvent) -> bool {
+    // Merge condition C1 (ADR-0060): before the other rules.
+    enforce_firebird_event(e);
     let redis = is_redis_source(e.source);
     // `account_not_recorded` is valid only on Redis / Valkey sources and
     // never on `auth_failure` (contract `Principal`, ADR-0052 decision 8).
@@ -621,6 +764,36 @@ pub(crate) mod tests {
             "source": "pgaudit", "aggregated_count": 1
         }))
         .unwrap()
+    }
+
+    /// Review N6: Firebird objects merged into `*` of their database keep
+    /// the union of their `altered` markers.
+    #[test]
+    fn merged_firebird_objects_unite_their_altered_markers() {
+        let mut e: AccessEvent = serde_json::from_value(serde_json::json!({
+            "target_id": "fb", "ts": "2026-09-28T14:02:11Z",
+            "principal": {"db_user": "u", "application": "x"}, "action": "read",
+            "objects": [
+                {"database": "app", "schema": "s1", "object": "t1"},
+                {"database": "app", "schema": "s2", "object": "t2",
+                 "altered": ["database", "object"]},
+                {"database": "app", "object": "*"},
+                {"database": "other", "schema": "s", "object": "t", "altered": ["schema"]},
+                {"database": "app", "object": "kept", "altered": ["object"]}
+            ],
+            "source": "firebird_audit_trace", "aggregated_count": 1
+        }))
+        .unwrap();
+        enforce_firebird_event(&mut e);
+        let v = serde_json::to_value(&e.objects).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"database": "app", "object": "*", "altered": ["database"]},
+                {"database": "other", "object": "*"},
+                {"database": "app", "object": "kept", "altered": ["object"]}
+            ])
+        );
     }
 
     #[test]

@@ -65,6 +65,15 @@ deny = [
     { crate = "landlock", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
     { crate = "seccompiler", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: SQLite reader sandbox only" },
     { crate = "nix", wrappers = ["databastion-connector-sqlite"], reason = "ADR-0059 decision 4: the reader closes its inherited descriptors" },
+    # ADR-0060 decision 1: the Firebird connector speaks the remote protocol
+    # itself; no Firebird C client (fbclient) and no driver crate.
+    { name = "rsfbclient", reason = "no Firebird C client, ADR-0060 decision 1" },
+    { name = "rsfbclient-native", reason = "no Firebird C client, ADR-0060 decision 1" },
+    { name = "rsfbclient-rust", reason = "own bounded client, ADR-0060 decision 1" },
+    { name = "rsfbclient-core", reason = "own bounded client, ADR-0060 decision 1" },
+    { name = "firebirust", reason = "own bounded client, ADR-0060 decision 1" },
+    { name = "fbclient-sys", reason = "no Firebird C client, ADR-0060 decision 1" },
+    { name = "ibase-sys", reason = "no Firebird C client, ADR-0060 decision 1" },
     # TLS: rustls only (AGENTS.md).
     { name = "openssl", reason = "rustls only" },
     { name = "openssl-sys", reason = "rustls only" },
