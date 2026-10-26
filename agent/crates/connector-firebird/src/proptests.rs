@@ -243,3 +243,136 @@ proptest! {
     }
 
 }
+
+fn identifier() -> impl Strategy<Value = String> {
+    // Any characters, quotes and keywords included: 1 to 63, no NUL, no
+    // trailing space (the catalog's names after the trim).
+    prop::collection::vec(
+        prop_oneof![
+            any::<char>(),
+            Just('"'),
+            Just('\''),
+            Just(' '),
+            Just(';'),
+            Just('-'),
+        ],
+        1..63,
+    )
+    .prop_map(|c| c.into_iter().filter(|c| *c != '\0').collect::<String>())
+    .prop_map(|s| s.trim_end_matches(' ').to_owned())
+    .prop_filter("non-empty", |s| !s.is_empty())
+}
+
+fn conv() -> impl Strategy<Value = sql::Conv> {
+    prop_oneof![
+        Just(sql::Conv::Text),
+        Just(sql::Conv::Octets),
+        Just(sql::Conv::Number),
+        Just(sql::Conv::Float),
+        Just(sql::Conv::Date),
+    ]
+}
+
+/// The statement skeleton with every quoted identifier emptied and runs
+/// of quotes collapsed: what a name could change if it escaped its quotes.
+fn skeleton(text: &str) -> String {
+    let s = sql::unquoted(text);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '"' && out.ends_with("\"\"") {
+            continue;
+        }
+        if c == '"' && out.ends_with('"') {
+            out.push('"');
+            continue;
+        }
+        out.push(c);
+    }
+    out.replace("\"\"\"", "\"\"")
+}
+
+proptest! {
+    /// Discovery's built statements (decision 5): whatever the catalog
+    /// names, the statement stays the same read with only its identifiers
+    /// changed, no string literal and no denied word; the bounds hold.
+    #[test]
+    fn built_statements_cannot_be_escaped_by_a_name(
+        table in identifier(),
+        cols in prop::collection::vec((identifier(), conv()), 1..=4),
+        n in 1u32..10_000,
+    ) {
+        let named: Vec<(&str, sql::Conv)> = cols.iter().map(|(c, v)| (c.as_str(), *v)).collect();
+        let plain: Vec<(&str, sql::Conv)> = cols.iter().map(|(_, v)| ("A", *v)).collect();
+        let built = sql::sample_statement(&table, &named, n).unwrap();
+        let reference = sql::sample_statement("T", &plain, n).unwrap();
+        prop_assert_eq!(skeleton(built.text()), skeleton(reference.text()));
+        prop_assert!(!sql::has_denied_word(built.text()));
+        prop_assert!(!sql::unquoted(built.text()).contains('\''));
+        let tickets = sql::ticket_type_counts(&table, &cols[0].0).unwrap();
+        let reference = sql::ticket_type_counts("T", "A").unwrap();
+        prop_assert_eq!(skeleton(tickets.text()), skeleton(reference.text()));
+    }
+
+    /// Column batches keep every column once, in order, within the bounds.
+    #[test]
+    fn column_batches_are_bounded(convs in prop::collection::vec(conv(), 0..700)) {
+        let cols: Vec<(usize, sql::Conv)> = convs.iter().copied().enumerate().collect();
+        let batches = crate::catalog::batches(&cols);
+        let flat: Vec<(usize, sql::Conv)> = batches.iter().flatten().copied().collect();
+        prop_assert_eq!(flat, cols);
+        for b in &batches {
+            prop_assert!(!b.is_empty() && b.len() <= sql::MAX_STATEMENT_COLUMNS);
+            prop_assert!(b.iter().map(|(_, c)| c.row_bytes()).sum::<usize>() <= sql::MAX_ROW_BYTES);
+            let names: Vec<String> = b.iter().map(|(i, _)| format!("C{i}")).collect();
+            let named: Vec<(&str, sql::Conv)> = names.iter().zip(b).map(|(n, (_, c))| (n.as_str(), *c)).collect();
+            prop_assert!(sql::sample_statement("T", &named, 1).is_some());
+        }
+    }
+
+    /// Sampled values (decision 5): never a panic; octets kept only as
+    /// UTF-8 text without control characters (tab and line breaks
+    /// allowed), floating values only as integer digits, `CHAR` padding
+    /// dropped.
+    #[test]
+    fn sampled_values_are_kept_only_as_decided(
+        bytes in prop::collection::vec(any::<u8>(), 0..64),
+        text in ".{0,40}",
+        padded in any::<bool>(),
+    ) {
+        let v = crate::catalog::value_text(sql::Value::Bytes(Zeroizing::new(bytes)), sql::Conv::Octets, padded);
+        if let Some(t) = v {
+            prop_assert!(!t.chars().any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')));
+            prop_assert!(!t.is_empty());
+        }
+        let v = crate::catalog::value_text(sql::Value::Text(Zeroizing::new(text.clone())), sql::Conv::Float, false);
+        if let Some(t) = v {
+            prop_assert!(t.trim_start_matches('-').bytes().all(|b| b.is_ascii_digit()), "{t}");
+        }
+        let v = crate::catalog::value_text(sql::Value::Text(Zeroizing::new(text)), sql::Conv::Text, padded);
+        if let (Some(t), true) = (v, padded) {
+            prop_assert!(!t.ends_with(' '));
+        }
+    }
+
+    /// The catalog reads on any cells: never a panic; a relation or a
+    /// column is kept only with a name that can be quoted.
+    #[test]
+    fn catalog_rows_never_panic(
+        rows in prop::collection::vec(prop::collection::vec(prop_oneof![
+            Just(sql::Value::Null),
+            any::<i64>().prop_map(sql::Value::Int),
+            any::<bool>().prop_map(sql::Value::Bool),
+            ".{0,70}".prop_map(|s| sql::Value::Text(Zeroizing::new(s))),
+        ], 0..12), 0..8),
+    ) {
+        if let Some(rels) = crate::catalog::relations(&rows) {
+            prop_assert!(rels.iter().all(|r| sql::identifier_ok(&r.name)));
+        }
+        if let Some(cols) = crate::catalog::columns(&rows) {
+            prop_assert!(cols.iter().all(|c| sql::identifier_ok(&c.name) && sql::identifier_ok(&c.relation)));
+            for c in &cols {
+                let _ = c.conv();
+            }
+        }
+    }
+}

@@ -203,9 +203,18 @@ impl Db<'_> {
         }
     }
 
-    /// Ends the session after a unit's failure that left it unusable.
+    /// After a unit's failure: the session ends when the failure left it
+    /// unusable; otherwise the unit's transaction is ended, so that none
+    /// spans the next pause (decision 4).
     async fn after(&mut self, e: &FbError) {
-        if e.fatal {
+        let ended = match self.session.as_mut() {
+            Some(s) if !e.fatal && !s.is_broken() => {
+                let deadline = Instant::now() + UNIT_MARGIN;
+                s.commit(deadline).await.is_ok()
+            }
+            _ => false,
+        };
+        if !ended {
             self.close().await;
         }
     }
