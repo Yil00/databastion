@@ -527,7 +527,8 @@ fn sqlserver_statements_never_read_definitions() {
 /// each read-only (no word of the crate's deny-list outside quotes: no
 /// write, no DDL, no PSQL, no `EXECUTE STATEMENT … ON EXTERNAL`, no
 /// `RDB$SET_CONTEXT`), and none reads a source text (`*_SOURCE` columns:
-/// literals and credentials) nor an external file's path.
+/// literals and credentials) nor an external file's path (Discovery only
+/// tests whether it is set: `RDB$EXTERNAL_FILE IS NULL`, decision 5).
 #[cfg(feature = "firebird")]
 #[test]
 fn firebird_statements_are_closed_and_read_only() {
@@ -538,7 +539,9 @@ fn firebird_statements_are_closed_and_read_only() {
             !databastion_connector_firebird::statement_has_denied_word(text),
             "{name}: {text}"
         );
-        let lower = text.to_ascii_lowercase();
+        let lower = text
+            .to_ascii_lowercase()
+            .replace("r.rdb$external_file is null", "");
         for d in [
             "_source",
             "rdb$external_file",

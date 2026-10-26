@@ -203,10 +203,6 @@ impl FbError {
         )
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Discovery (lot 2) and Audit (lot 3)")
-    )]
     pub(crate) fn into_connector_error(self) -> ConnectorError {
         ConnectorError::Target {
             engine: Engine::Firebird,

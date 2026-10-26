@@ -135,6 +135,25 @@ pub(crate) const PROBES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Discovery's relation list (decision 5): user relations (system flag 0;
+/// a user table named like a system relation is one), trailing padding
+/// trimmed on the server (and again by the client), the relation type,
+/// whether it is a view or an external-file table (booleans only: the
+/// file path is never read), and whether the account can read it, as the
+/// server computes it: `SELECT_ANY_OBJECT_IN_DATABASE`, ownership, or a
+/// table `SELECT` granted to the account, `PUBLIC` or a role in use
+/// (`RDB$ROLE_IN_USE`, never `CURRENT_ROLE`: refinement R4). Firebird
+/// grants `SELECT` per table only. A relation counted readable that the
+/// server then refuses is `skipped_not_readable` all the same.
+pub(crate) const RELATIONS: &str = "SELECT CAST(TRIM(TRAILING FROM R.RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8), CAST(COALESCE(R.RDB$RELATION_TYPE, 0) AS INTEGER), CASE WHEN R.RDB$VIEW_BLR IS NULL THEN FALSE ELSE TRUE END, CASE WHEN R.RDB$EXTERNAL_FILE IS NULL THEN FALSE ELSE TRUE END, CASE WHEN RDB$SYSTEM_PRIVILEGE(SELECT_ANY_OBJECT_IN_DATABASE) OR R.RDB$OWNER_NAME = CURRENT_USER OR EXISTS (SELECT 1 FROM RDB$USER_PRIVILEGES P WHERE P.RDB$RELATION_NAME = R.RDB$RELATION_NAME AND P.RDB$PRIVILEGE = 'S' AND P.RDB$FIELD_NAME IS NULL AND ((P.RDB$USER_TYPE = 8 AND P.RDB$USER IN (CURRENT_USER, 'PUBLIC')) OR (P.RDB$USER_TYPE = 13 AND RDB$ROLE_IN_USE(TRIM(TRAILING FROM P.RDB$USER))))) THEN TRUE ELSE FALSE END FROM RDB$RELATIONS R WHERE COALESCE(R.RDB$SYSTEM_FLAG, 0) = 0 ORDER BY 1";
+
+/// Discovery's column list (decision 5): the columns of the persistent
+/// user tables (no view, no external file), with the type of the base
+/// field (`RDB$FIELDS`, never a domain's name), whether it is an array or
+/// computed. The `*_SOURCE` columns (source texts with literals) are never
+/// read.
+pub(crate) const COLUMNS: &str = "SELECT CAST(TRIM(TRAILING FROM RF.RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8), CAST(TRIM(TRAILING FROM RF.RDB$FIELD_NAME) AS VARCHAR(63) CHARACTER SET UTF8), CAST(COALESCE(RF.RDB$FIELD_POSITION, 0) AS INTEGER), CAST(F.RDB$FIELD_TYPE AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SUB_TYPE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SCALE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_LENGTH, 0) AS INTEGER), CAST(COALESCE(F.RDB$CHARACTER_SET_ID, -1) AS INTEGER), CASE WHEN F.RDB$DIMENSIONS IS NULL THEN FALSE ELSE TRUE END, CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$RELATIONS R ON R.RDB$RELATION_NAME = RF.RDB$RELATION_NAME JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE WHERE COALESCE(R.RDB$SYSTEM_FLAG, 0) = 0 AND COALESCE(R.RDB$RELATION_TYPE, 0) = 0 AND R.RDB$VIEW_BLR IS NULL AND R.RDB$EXTERNAL_FILE IS NULL ORDER BY 1, 3, 2";
+
 /// Every statement the connector may send.
 pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
@@ -196,6 +215,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "credential_relations",
         text: CREDENTIAL_RELATIONS,
+    },
+    Statement {
+        name: "relations",
+        text: RELATIONS,
+    },
+    Statement {
+        name: "columns",
+        text: COLUMNS,
     },
 ];
 
@@ -277,10 +304,9 @@ pub(crate) fn checked(text: &str) -> bool {
     STATEMENTS.iter().any(|s| s.text == text) || PROBES.iter().any(|(_, t)| *t == text)
 }
 
-/// Quotes an identifier from the catalog (Discovery, lot 2): `"`, with `"`
-/// doubled. The only quoting function of the connector.
+/// Quotes an identifier from the catalog: `"`, with `"` doubled. The only
+/// quoting function of the connector.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code, reason = "used by Discovery (lot 2)"))]
 pub(crate) fn quote_identifier(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
     out.push('"');
@@ -292,6 +318,144 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Longest identifier, in characters (Firebird 4.0 and 5.0).
+pub(crate) const MAX_IDENTIFIER_CHARS: usize = 63;
+
+/// Whether a catalog name can be quoted into a statement: 1 to 63
+/// characters, no NUL, no trailing space (trimmed: not significant in a
+/// Firebird name).
+#[must_use]
+pub(crate) fn identifier_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_IDENTIFIER_CHARS
+        && !name.contains('\0')
+        && !name.ends_with(' ')
+}
+
+/// How Discovery converts a column's values on the server (decision 5):
+/// syntax-level built-ins only (`CAST`, `SUBSTRING`), which no user
+/// function can shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conv {
+    /// `CHAR` / `VARCHAR` / `BLOB SUB_TYPE TEXT` of a declared character
+    /// set: the first 4 000 characters as `UTF8` (the server
+    /// transliterates).
+    Text,
+    /// Character set `NONE` or `OCTETS`, `BLOB SUB_TYPE BINARY`: the first
+    /// 4 000 bytes as `OCTETS`, kept only when valid UTF-8 without control
+    /// characters.
+    Octets,
+    /// Integers, `INT128`, `NUMERIC` / `DECIMAL`, `DECFLOAT`: digits.
+    Number,
+    /// `FLOAT` / `DOUBLE PRECISION`: integral values only (client side).
+    Float,
+    /// `DATE`, `TIMESTAMP [WITH TIME ZONE]`: `YYYY-MM-DD`.
+    Date,
+}
+
+impl Conv {
+    /// The expression for the quoted column `c`.
+    fn expr(self, c: &str) -> String {
+        match self {
+            Self::Text => {
+                format!("CAST(SUBSTRING({c} FROM 1 FOR 4000) AS VARCHAR(4000) CHARACTER SET UTF8)")
+            }
+            Self::Octets => {
+                format!(
+                    "CAST(SUBSTRING({c} FROM 1 FOR 4000) AS VARCHAR(4000) CHARACTER SET OCTETS)"
+                )
+            }
+            Self::Number | Self::Float => format!("CAST({c} AS VARCHAR(64) CHARACTER SET UTF8)"),
+            Self::Date => format!("CAST(CAST({c} AS DATE) AS VARCHAR(10) CHARACTER SET UTF8)"),
+        }
+    }
+
+    /// The column the describe answer must show.
+    pub(crate) const fn shape(self) -> Col {
+        match self {
+            Self::Text => Col::Text(16_000),
+            Self::Octets => Col::Octets(4_000),
+            Self::Number | Self::Float => Col::Text(256),
+            Self::Date => Col::Text(40),
+        }
+    }
+
+    /// Declared bytes of the converted value in a row (with its length
+    /// and null indicator): what the 64 KiB row bound counts.
+    pub(crate) const fn row_bytes(self) -> usize {
+        match self.shape() {
+            Col::Text(n) | Col::Octets(n) => n as usize + 8,
+            Col::Int | Col::Bool => 16,
+        }
+    }
+}
+
+/// A statement built by this module from catalog names (Discovery): the
+/// only texts outside [`STATEMENTS`] the session sends. Identifiers are
+/// quoted by [`quote_identifier`]; there is no string literal and no
+/// value from a job parameter in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Built {
+    text: String,
+}
+
+impl Built {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn checked(text: String) -> Option<Self> {
+        (!has_denied_word(&text) && !unquoted(&text).contains('\'')).then_some(Self { text })
+    }
+}
+
+/// Most columns of one sampling statement (decision 5, security review
+/// N3).
+pub(crate) const MAX_STATEMENT_COLUMNS: usize = 255;
+/// Most declared bytes of one sampled row (decision 5: 64 KiB).
+pub(crate) const MAX_ROW_BYTES: usize = 64 * 1024;
+
+/// `SELECT FIRST <n> <conversions> FROM "<table>"` (decision 5): `None`
+/// for a name that cannot be quoted, no column, more than
+/// [`MAX_STATEMENT_COLUMNS`] or a row above [`MAX_ROW_BYTES`].
+#[must_use]
+pub(crate) fn sample_statement(table: &str, columns: &[(&str, Conv)], n: u32) -> Option<Built> {
+    if !identifier_ok(table)
+        || columns.is_empty()
+        || columns.len() > MAX_STATEMENT_COLUMNS
+        || columns.iter().map(|(_, c)| c.row_bytes()).sum::<usize>() > MAX_ROW_BYTES
+        || n == 0
+        || columns.iter().any(|(c, _)| !identifier_ok(c))
+    {
+        return None;
+    }
+    let exprs: Vec<String> = columns
+        .iter()
+        .map(|(c, conv)| conv.expr(&quote_identifier(c)))
+        .collect();
+    Built::checked(format!(
+        "SELECT FIRST {n} {} FROM {}",
+        exprs.join(", "),
+        quote_identifier(table)
+    ))
+}
+
+/// The CAS store guard's metadata aggregate of a ticket registry (ADR-0041
+/// decision 6): the ticket types (only compared, never kept) and their
+/// counts.
+#[must_use]
+pub(crate) fn ticket_type_counts(table: &str, column: &str) -> Option<Built> {
+    if !identifier_ok(table) || !identifier_ok(column) {
+        return None;
+    }
+    Built::checked(format!(
+        "SELECT CAST(SUBSTRING({} FROM 1 FOR 255) AS VARCHAR(255) CHARACTER SET UTF8), COUNT(*) \
+         FROM {} GROUP BY 1",
+        quote_identifier(column),
+        quote_identifier(table)
+    ))
 }
 
 /// `isc_info_sql_*` items.

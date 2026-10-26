@@ -500,12 +500,11 @@ impl Session {
     }
 
     /// Whether nothing more can be sent on this attachment.
-    #[cfg_attr(not(test), allow(dead_code, reason = "Discovery uses it next"))]
     pub(crate) fn is_broken(&self) -> bool {
         self.broken
     }
 
-    /// A statement whose text the caller has checked.
+    /// A statement whose text the caller has checked: its rows collected.
     async fn query_text(
         &mut self,
         text: &str,
@@ -513,13 +512,64 @@ impl Session {
         max_rows: usize,
         deadline: Instant,
     ) -> Result<Rows, FbError> {
+        let mut rows = Vec::new();
+        let fetched = self
+            .statement(text, shape, max_rows, deadline, &mut |row| {
+                rows.push(row);
+                Flow::Continue
+            })
+            .await?;
+        Ok(Rows {
+            rows,
+            cut: fetched.cut,
+        })
+    }
+
+    /// Runs a statement built from catalog names (Discovery, decision 5):
+    /// each row is handed to `on_row` as it arrives, which may stop the
+    /// fetch ([`Flow::Stop`]: no further `op_fetch`, the rows of the round
+    /// in flight read and dropped, then the cursor closed).
+    pub(crate) async fn sample(
+        &mut self,
+        stmt: &sql::Built,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+        on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
+    ) -> Result<Fetched, FbError> {
+        self.statement(stmt.text(), shape, max_rows, deadline, on_row)
+            .await
+    }
+
+    /// A built statement's rows collected (the CAS guard's aggregate).
+    pub(crate) async fn query_built(
+        &mut self,
+        stmt: &sql::Built,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+    ) -> Result<Rows, FbError> {
+        self.query_text(stmt.text(), shape, max_rows, deadline)
+            .await
+    }
+
+    async fn statement(
+        &mut self,
+        text: &str,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+        on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
+    ) -> Result<Fetched, FbError> {
         self.begin(deadline).await?;
         let tx = self.tx.unwrap_or(0);
         let stmt = self
             .request(&wire::allocate(), deadline, Stage::Check)
             .await?
             .object;
-        let result = self.run(tx, stmt, text, shape, max_rows, deadline).await;
+        let result = self
+            .run((tx, stmt), text, shape, max_rows, deadline, on_row)
+            .await;
         if !self.broken {
             // `DSQL_drop` closes the cursor and releases the handle; after
             // a statement cancelled at the deadline, within the cancel's
@@ -581,13 +631,13 @@ impl Session {
 
     async fn run(
         &mut self,
-        tx: u16,
-        stmt: u16,
+        (tx, stmt): (u16, u16),
         text: &str,
         shape: &[Col],
         max_rows: usize,
         deadline: Instant,
-    ) -> Result<Rows, FbError> {
+        on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
+    ) -> Result<Fetched, FbError> {
         let prepared = self
             .request(
                 &wire::prepare(tx, stmt, text, sql::DESCRIBE_ITEMS, sql::DESCRIBE_BUFFER),
@@ -603,7 +653,8 @@ impl Session {
             return Err(self.fail(Stage::Check));
         }
         self.execute(stmt, tx, deadline, Some(&d.columns)).await?;
-        self.fetch_all(stmt, &d.columns, max_rows, deadline).await
+        self.fetch_all(stmt, &d.columns, max_rows, deadline, on_row)
+            .await
     }
 
     /// `op_execute` with the server-side timeout; the client's deadline
@@ -646,12 +697,13 @@ impl Session {
         columns: &[Column],
         max_rows: usize,
         deadline: Instant,
-    ) -> Result<Rows, FbError> {
+        on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
+    ) -> Result<Fetched, FbError> {
         let blr = sql::output_blr(columns);
-        let mut out = Rows::default();
+        let mut out = Fetched::default();
         let mut first = true;
         loop {
-            let want = u32::try_from((max_rows + 1).saturating_sub(out.rows.len()))
+            let want = u32::try_from((max_rows + 1).saturating_sub(out.rows))
                 .unwrap_or(FETCH_ROWS)
                 .clamp(1, FETCH_ROWS);
             let msg = wire::fetch(stmt, if first { &blr } else { &[] }, want);
@@ -671,14 +723,19 @@ impl Session {
                         if received > want {
                             return Err(self.fail(Stage::Check));
                         }
-                        if out.rows.len() < max_rows {
-                            out.rows.push(row);
+                        if out.stopped {
+                            // Read and dropped (zeroized with the row).
+                        } else if out.rows < max_rows {
+                            out.rows += 1;
+                            if on_row(row) == Flow::Stop {
+                                out.stopped = true;
+                            }
                         } else {
                             out.cut = true;
                         }
                     }
                     Ok(Next::End { more }) => {
-                        if !more || out.cut {
+                        if !more || out.cut || out.stopped {
                             return Ok(out);
                         }
                         break;
@@ -776,6 +833,24 @@ impl Session {
         }
         self.conn.shutdown().await;
     }
+}
+
+/// What a row callback asks of the fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    Continue,
+    Stop,
+}
+
+/// How a fetch ended.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fetched {
+    /// Rows handed to the callback.
+    pub(crate) rows: usize,
+    /// More rows than `max_rows` were sent.
+    pub(crate) cut: bool,
+    /// The callback stopped the fetch.
+    pub(crate) stopped: bool,
 }
 
 /// A message of a running statement.
