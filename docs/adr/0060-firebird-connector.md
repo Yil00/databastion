@@ -1,6 +1,6 @@
 # ADR-0060: Firebird connector: own bounded wire client, Firebird 4.0 and 5.0, SRP-256 with ChaCha wire encryption on loopback only, least-privilege grants, Discovery bounds, Audit from the system audit trace log
 
-- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, accepted by the maintainer on 2026-10-25 (residual of open question 6 accepted). A [refinement of 2026-10-26](#refinement-2026-10-26-accepted-by-the-maintainer-on-2026-10-26-the-lot-3-measurements), answering the six contradictions of the lot 3 measurements (per-attachment `TRACE_INIT` in every mode, the Garbage Collector's attachments, the attach order at a database open, records without a per-table block, self-security databases, failed logins), was proposed and revised after its security review of 2026-10-26 (sound after changes), and accepted by the maintainer on 2026-10-26 with the proposed answers (the R6 residual and the new note code `coverage.security_database_excluded` accepted)
+- **Status**: Accepted by the maintainer on 2026-10-24 with the proposed answer to every open question, revised after its [security review of 2026-10-24](#security-review-of-2026-10-24) (sound after changes); this amends the Firebird row of [ADR-0039](0039-engine-scope-expansion.md) (Firebird 3.0 and 6.0 refused). A [refinement of 2026-10-25](#refinement-2026-10-25-proposed-awaiting-the-maintainers-decision-the-p10-b-measurements), answering the three contradictions of the P10-B measurements (header tokens per attachment, `databases.conf` aliases, the extended variant's `RDB$CONFIG`), is proposed, accepted by the maintainer on 2026-10-25 (residual of open question 6 accepted). A [refinement of 2026-10-26](#refinement-2026-10-26-accepted-by-the-maintainer-on-2026-10-26-the-lot-3-measurements), answering the six contradictions of the lot 3 measurements (per-attachment `TRACE_INIT` in every mode, the Garbage Collector's attachments, the attach order at a database open, records without a per-table block, self-security databases, failed logins), was proposed and revised after its security review of 2026-10-26 (sound after changes), and accepted by the maintainer on 2026-10-26 with the proposed answers (the R6 residual and the new note code `coverage.security_database_excluded` accepted). A [second refinement of 2026-10-26](#refinement-2026-10-26-b-proposed-awaiting-the-maintainers-decision-the-second-round-lot-3-measurements), answering the six contradictions of the second-round lot 3 measurements (statements that touch no record, data-dependent relation sets of the agent's own texts, routine and database-trigger finish records, the Garbage Collector's late first record and the automatic sweep, the padded `MON$SEC_DATABASE`), with no contract change, is proposed, awaiting a `security-reviewer` review and the maintainer's decision
 - **Date**: 2026-10-24
 - **Amends** (on acceptance, subject to open question 1): [ADR-0039](0039-engine-scope-expansion.md) decision 3, the Firebird row of the ceilings table, whose first cell reads "Firebird (4.0, 5.0; 3.0 if still maintained when the connector ships)". This ADR refuses Firebird 3.0 at connection whatever its maintenance status (decision 2), for technical reasons that ADR-0039 decision 1 allows ("a connector may keep refusing old servers at connection time"). ADR-0039 is not edited in place; the docs-keeper records the amendment in its status line if this ADR is accepted.
 - **Relies on**: [ADR-0039](0039-engine-scope-expansion.md) decision 1 (end-of-life versions, accepted) and decision 8 (new engines as capability tokens, accepted, with [ADR-0042](0042-hold-items-of-unlisted-engines.md)), and proposes for acceptance, **for Firebird only**, its decisions 3 (the Firebird row: ceiling Partial), 4 (client criteria), 5 (the Firebird bullet: least privilege and a refusal list), 6 (transport: this ADR chooses loopback only), 7 (I5 and local detection) and 9 (test obligations). Decision 2 (order of delivery) is the ROADMAP's. Nothing here applies to SQLite, whose connector ADR is written separately (ADR-0059).
@@ -1120,3 +1120,293 @@ Each with the answer this refinement proposed, revised to the security review of
     **Proposed**: yes. Both keep a forger from driving the agent's work, and neither relies on a timestamp in the log.
 12. **R11, residual A**: drop `SEC$GLOBAL_AUTH_MAPPING` from the `credential_relation_readable` probe list, keeping it on the always-reported list and in the lot 1 mapping refusal?
     **Proposed**: yes. Every account can read it, so the label would be raised for every target with a global mapping and say nothing about the agent's account.
+
+## Refinement (2026-10-26 b, proposed, awaiting the maintainer's decision): the second-round lot 3 measurements
+
+Status: **Proposed on 2026-10-26, awaiting a `security-reviewer` review and the maintainer's decision.** It answers the six contradictions found by the [second round of lot 3 prerequisite measurements](../measurements/phase10-firebird-facts.md#lot-3-prerequisites-second-round-2026-10-26) (measurements 3c, 3d, 3e, 7c and 8h, which the accepted refinement of 2026-10-26 lists under ["Obligations still open after the lot 3 measurements"](#obligations-still-open-after-the-lot-3-measurements); pull request #375, [summary](../measurements/phase10-firebird-facts.md#second-round-summary-of-contradictions)), and records what they confirm. It amends, by reference:
+
+- the refinement of 2026-10-26: R6 (items 1, 2 and 5, and its residual), R8 items 1, 2 and 4, and R9 detection rule 1;
+- the refinement of 2026-10-25: R4 ("When a nested record is not folded", "No statement finish follows"), for database triggers;
+- decision 6: "Trailer first" (H1 fix 1, the expected trailer shapes), "Missing trailers" (H1 fix 2), the injection points (H1 fix 6) and "What is kept (I2)" (function return values).
+
+The accepted text and the two accepted refinements stay as they are; where this refinement differs from them, it applies once accepted. Until then, the P10-B Audit lot (decision 10, pull request 3) does not merge. It changes no contract ("Protocol" below). ROADMAP: [phase 10](../ROADMAP.md#phase-10--engine-scope-wave-2-sqlite-firebird), P10-B.
+
+### R12. Statements that touch no record (measurement 3d)
+
+**Measured** (4.0.7 and 5.0.4, SuperServer and SuperClassic, the minimal account): the server writes a per-table row only for a relation whose counters are not all zero. A statement that touches no record therefore has **no per-table block**, whatever relations its text names: a primary-key lookup that finds nothing, any read of an empty table, `FIRST 0`, a view read that finds nothing, a read of an empty system table (`RDB$AUTH_MAPPING`). Its trailer is `<n> records fetched` and a performance line, with `n = 0`, except for an aggregate over no record (`SELECT COUNT(*) FROM T_EMPTY`), which fetches 1. A scan that reads records and matches none keeps its block (natural reads). `WHERE 1 = 0` has no block on 5.0.4 and a block on 4.0.7.
+
+R8 item 1 keeps a block-less finish whose text names a persistent table, a view or `RDB$DATABASE` ambiguous, on the premise that "a block was expected and is missing". That premise does not hold: every lookup that finds nothing would open a split window, so Partial would rarely hold on a database with ordinary traffic. The agent's own `AUTH_MAPPINGS` is block-less on every database without a local mapping (R13).
+
+**Proposed**, amending R8 item 1 (its paragraph "A block-less finish whose text names a relation outside the virtual list … stays ambiguous"):
+
+1. **The no-record shape.** An `EXECUTE_STATEMENT_FINISH` whose trailer is `<n> records fetched` followed by a performance line, with no per-table block, and which is not in case (a), (b) or (c) of R8 item 1, has the **no-record shape** when:
+   - `n` is 0; or `n` is 1 and its text parses (R8 item 1's meaning) as one `SELECT` whose top-level select list holds only built-in aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `LIST`) and constants, with no `GROUP BY` and no set operation;
+   - the record is otherwise not ambiguous (header, token, binding, attachment line, no header-shaped line in the text, text not cut).
+
+   A text that calls code (`EXECUTE BLOCK`, a procedure, a function outside the built-in list, `EXECUTE STATEMENT`) stays case (c) of R8, unchanged.
+2. **Well formed.** A record of the no-record shape opens no split window and is not ambiguous for its missing block.
+3. **What it becomes.** An access event of the record's principal, with the objects decision 6 takes from the text under the filters (system relations outside the always-reported lists are noise; always-reported relations keep their mark), `rows` set to `n`, and the signals the text gives. A text that does not parse (and is not cut) names `*` and is always reported, still with no split window. A record with no object left after the filters produces no event.
+4. **Any other block-less statement finish** (more than one row fetched, or one row outside the aggregate form, with a relation outside the virtual list in the text) stays ambiguous and opens a window, as R8 item 1 says: a statement that returned rows from a persistent table or a view touched records, so its block is missing.
+
+**Why nothing read is missing from such a record.** Nested PSQL reads are counted in the block of their statement (obligation 7); reads through `EXECUTE STATEMENT` and UDR queries are written as statement records of their own (7c, R18); a statement whose execution touched any record has a block. A block-less record that fetched no row, or one aggregate row, read nothing that the log does not show elsewhere.
+
+**The forger's view** (as in H-1). A forger can end its own record with a fake trailer of the no-record shape (`0 records fetched` and a performance line). H-1 already allows a full fake trailer naming `RDB$DATABASE`, and this one gives no more:
+- the forger's text is reported as a read of the relations it names, with 0 rows;
+- the real trailer, written by the server after the client's text, lands in the forged record that follows, which R1 rules 3, 4 and 8 judge as before: ambiguous on a wrong token, or on an undeclared database under proof 11; under a fresh forged attachment, the accepted misattribution residual, with the real objects and row count;
+- a real trailer with a block cannot lose it: the block is the last thing the server writes for the record, and the parser reads trailers from the end.
+
+Leaving out the window for a text that does not parse does not weaken this. The window catches a forger who wrote no fake trailer; the forger controls both its text and its fake trailer, parsable or not, and the record is reported with `*`.
+
+**Alternatives considered.** (a) Keep R8 item 1: one split window per lookup that finds nothing. (b) Accept every block-less statement finish whatever `n`: a block-less record that returned rows of a persistent table has lost its block, which is what H1 fix 2 detects. (c) No event for a no-record read: a query that found nothing is still a query of that table, and block-shaped records with 0 rows (a scan without a match) are reported too.
+
+**Residual risks.** A no-record read is reported from its text: a view read names the view, not its base tables, as any object taken from a text. On 4.0.7, `WHERE 1 = 0` keeps a block, so the two versions report it with different objects (both report the read).
+
+**Effect.** No change to levels, notes or protocol; fewer split windows.
+
+### R13. The agent's own constant texts read a subset of their relations (measurement 3d)
+
+**Measured**: for one constant text, the relations in the block depend on the data and the account.
+- `OBJECT_GRANTS` names 1 to 7 of the relations its text names, never `RDB$PROCEDURES`, `RDB$EXCEPTIONS` or `RDB$FUNCTIONS`, whose `CASE` branch no grant row reaches.
+- `OWNED_OBJECTS` leaves out `RDB$EXCEPTIONS` when it is empty.
+- `RELATIONS` leaves out `RDB$USER_PRIVILEGES` when `SELECT_ANY_OBJECT_IN_DATABASE` or ownership already decides.
+- `AUTH_MAPPINGS` is block-less on a database with no local mapping (R12).
+- The metadata-loading relations (`RDB$RELATIONS`, and extra `RDB$DATABASE` reads) appear on the attachment's first read of a `MON$` or `SEC$` relation only (`OWN_ATTACHMENT`, `IDENTITY`, a first `MON$SEC_DATABASE` read). Sampling texts name exactly the sampled table, never a metadata-loading relation.
+- `records fetched` is 1 for own-row reads and probes, and grows with the catalog for the catalog reads (up to 1 080 rows for `OBJECT_GRANTS` in these databases).
+
+R8 item 4's trailer condition ("a block whose relations, after removing the per-version metadata-loading set, are exactly the expected set") cannot hold.
+
+**Proposed**, replacing R8 item 4's trailer and `records fetched` conditions; its other conditions (the own-attachment rule, the closed statement set, one execution credit per execution) and R8 items 5 and 6 stay:
+
+1. **The own-statement table** (3d, R20) records, per text of the closed set and per version:
+   - the **may-read set**: every relation the text names, whatever the data;
+   - the **must-read set**: the relations every execution touches because the text forces it, possibly empty. For example `RDB$DATABASE` for a text that selects `FROM RDB$DATABASE`, whose one record is always read (`VERSION`, `SESSION`, `IDENTITY`, the system-privilege texts, `OWNED_OBJECTS`, `DATABASE_TRIGGERS`, the probes); nothing for `AUTH_MAPPINGS`, `GLOBAL_AUTH_MAPPINGS` and `IDLE_TIMEOUT`. The matrix test of R20 checks each row;
+   - whether the text reads a `MON$` or `SEC$` relation, so that the metadata-loading set may appear;
+   - the static row bound (below).
+2. **The trailer condition.** A record matches when its block, block-less included, holds every relation of the must-read set and no relation outside the may-read set, apart from the metadata-loading set (`RDB$DATABASE`, `RDB$RELATIONS`) for a text that reads a `MON$` or `SEC$` relation. The metadata-loading set is allowed on any execution of such a text, not only the first: only the first was measured, and allowing it later adds only these two system relations. For a sampling text, the block names exactly the sampled table when the connector counted at least one row, and is absent when it counted none (an empty table, R12).
+3. **`records fetched`.** Every execution credit now carries the number of rows the connector counted, for constant texts as for sampling texts. A matching record's `records fetched` equals that count when the connector read the cursor to its end. When the connector closed the cursor early (the byte budget of lot 2, a deadline), the count in the record lies between the counted rows and the counted rows plus 64 (one fetch round in flight, decision 1), until measurement 3f shows what the server writes then. The table's static bound stays as an outer bound: 1 for own-row reads and probes, the key count for the `RDB$CONFIG` read, and for a catalog read the connector's own row limit for that read (decisions 4 and 5).
+
+**The forging analysis, rechecked.** R8's residual "The agent's own reads under a guessed token" relied on an exact expected set. With subsets, a forger who has guessed the token of a live agent attachment, and knows its attachment id and transaction, can make one record of its own pass for an agent execution only when all hold:
+- its block holds the text's must-read set and lies within its may-read set plus the metadata-loading set: catalog relations, and `RDB$AUTH_MAPPING` or `SEC$GLOBAL_AUTH_MAPPING` for the two mapping texts;
+- its `records fetched` equals the counted rows of an unconsumed credit of that text (within the 64-row tolerance after an early close);
+- it consumes that credit, so the agent's real record of that execution finds none and is ambiguous (loud).
+
+No constant text's may-read set holds a user table, and a sampling credit requires exactly the sampled table and its exact count, so a read of a user table cannot pass. What the change adds is a block-less match for texts with an empty must-read set; the most it can hide is a read, within one credit's row count, of the catalog relations that text may read, and only at the cost of making the real record loud. R8's analysis holds.
+
+**Alternatives considered.** (a) Record every block observed per text: the sets depend on the data and are not enumerable. (b) Allow any block of system relations: a forged copy of an unrelated constant text could then carry a read of an always-reported relation such as `RDB$AUTH_MAPPING`. (c) A static row bound only: a forged copy of a catalog read could fetch up to the bound; the counted rows tie it to one execution.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R14. Procedure, function and trigger finish records (measurement 3e)
+
+**Measured** (4.0.7 and 5.0.4, SuperServer and SuperClassic):
+- Executable procedures, functions and triggers **never write a `records fetched` line**, whether they touch records or not. Their trailer is the performance line, followed by a block when the routine touched records.
+- Function records also carry a `returns:` line and the returned value as a `param0 = <type>, "<value>"` line, before the performance line.
+- Selectable procedures (PSQL and UDR) keep the statement-like trailer: `<n> records fetched`, the performance line, and a block when they touched records.
+- The name line: on 5.0.4, `Procedure <name>:`, `Function <name>:`, `Trigger <name> FOR <relation> (<kind>):` and, for database triggers, `Trigger <name> (ON CONNECT):`. On 4.0.7, procedures and functions are the same; trigger lines are a tab, then `<name> FOR <relation> (<kind>)` with a trailing space, no `Trigger` prefix and no colon.
+- Every procedure, function, row-trigger and UDR record was followed, on the same attachment and transaction, by the finish record of its own statement, innermost first: R4's folding is confirmed for routines called by a statement.
+
+H1 fix 2 ("a statement, procedure, function, trigger or BLR finish record … without its trailer (no `records fetched`, …) is ambiguous") would make every executable procedure, function and trigger record ambiguous.
+
+**Proposed**, amending H1 fixes 1 and 2 and R8 item 2:
+
+1. **Expected trailers per record kind.**
+   - `EXECUTE_FUNCTION_FINISH`, `EXECUTE_TRIGGER_FINISH`, and `EXECUTE_PROCEDURE_FINISH` of an executable procedure: the performance line, then a block or none, and **no `records fetched` line**.
+   - `EXECUTE_PROCEDURE_FINISH` of a selectable procedure: `<n> records fetched`, the performance line, then a block or none.
+   - The log does not say which kind a procedure is, so both shapes are accepted for `EXECUTE_PROCEDURE_FINISH`, told apart by the trailer. A `records fetched` line in a function or trigger record does not fit the event: ambiguous (H1 fix 1).
+   - A routine record with no performance line is missing its trailer: H1 fix 2 applies (ambiguous, a window at its position).
+2. **Above the trailer**, parsed upwards: for a function, the `param0` return-value line and the `returns:` line; then the input parameter lines; then the name line. The name line must match the version's grammar on one line; a name holding a line break, or a line matching the header grammar, makes the record ambiguous. The grammar is kept per major series (4.0.x from 4.0.7, 5.0.x from 5.0.4), checked by a matrix drift test as patch releases join the matrix. A name line that matches no grammar makes the record ambiguous, so a grammar change in a later patch release caps the level (loud) instead of losing records. That is why a per-series grammar is enough here, while section matching (R11, 12b) needs a table of exact tested versions: there, a wrong table would lose records quietly.
+3. **The returned value (I2).** The `param0` line of a function record is a value. It is dropped at parse like every parameter line: never kept, logged or sent, and its bytes are zeroized with the record buffer (R4, L-5). A returned value can hold any text, including header-shaped lines, so it joins the injection points of H1 fix 6; the trailer under it is still the server's, written after it. The #82 end-to-end marker test gains a case: a function that returns a marker.
+4. **Folding (R4) and block-less records (R8 item 2)**, restated for these shapes:
+   - a routine record with a block is folded by R4 into the next statement finish of the same binding and transaction, or becomes an event of its own when R4 does not fold it (unchanged);
+   - a block-less routine record (the performance line alone, or a selectable procedure's `records fetched` and performance line) is accepted when R4 folds it, under R8 item 2's hold bound (256 records, 1 MiB, 10 s of reading time); otherwise it keeps H1 fix 2 (ambiguous, a window at its position), **except database-trigger records**, which R15 handles;
+   - the "next statement finish" can be a statement record written by `EXECUTE STATEMENT` or by a UDR inside a routine (7c, R18). A routine record written before such a record is folded into it, not into the outer statement. Its objects stay reported, under the same principal, attachment and transaction; docs/08 says that the object can appear on the inner statement's event.
+5. **BLR request finish records** were not measured in this round. They keep H1 fix 2 as written (`records fetched` expected) until measurement 3g records their trailer.
+
+**Forging.** The new shapes give a forger nothing beyond H-1's fake trailer: it can end its own text, or a parameter value, with a fake performance line.
+- A real statement trailer always holds `records fetched`, so a forged function or trigger header that captures one does not fit: ambiguous.
+- A forged executable-procedure header that captures a real statement trailer reads as a selectable procedure record. R1 rules 3, 4 and 8 and R4 then judge it: folded by maximum, or an event of its own with the real counters and row count. The read stays reported.
+- A forged header that captures a real routine trailer leaves the calling statement's own trailer in place, and that trailer includes the nested reads (obligation 7).
+
+**Alternatives considered.** (a) Require `records fetched` on every routine record: every executable procedure, function and trigger record ambiguous. (b) Tell executable from selectable procedures through the catalog: the Audit path reads no routine definitions, and the trailer already shows the shape.
+
+**Effect.** No change to levels, notes or protocol. Proof 4 is unchanged (`log_procedure_finish`, `log_function_finish` and `log_trigger_finish` stay required).
+
+### R15. Database triggers (measurement 3e)
+
+**Measured** (both versions and modes, triggers whose bodies read no table):
+- `ON CONNECT` runs in a transaction of its own, started and committed before the client's first statement, and is never followed by a statement finish of that transaction (2 of 2). `ON DISCONNECT` does the same at detach (2 of 2).
+- `ON TRANSACTION START` is followed by the transaction's first statement, which is unrelated to the trigger (4 of 8), or by none (4 of 8).
+- `ON TRANSACTION COMMIT` and `ON TRANSACTION ROLLBACK` are written before the transaction-end record. They are followed by no statement finish when the client ends the transaction through the API (6 of 7), otherwise only by `isql`'s own `COMMIT` or `ROLLBACK` statement record.
+- The name line gives the kind: `ON CONNECT`, `ON DISCONNECT`, `ON TRANSACTION_START`, `ON TRANSACTION_COMMIT`, `ON TRANSACTION_ROLLBACK`.
+
+Under R4 and R8 item 2, a block-less database-trigger record is never folded, so it is ambiguous and opens a window: at every attachment of a database with an `ON CONNECT` or `ON DISCONNECT` trigger (the agent's own included), and at every API commit with a commit trigger. A transaction-start trigger with a block would be folded into an unrelated statement.
+
+**Proposed**, amending R4 ("When a nested record is not folded", "No statement finish follows") and R8 item 2 for database triggers:
+
+1. **Database-trigger records.** An `EXECUTE_TRIGGER_FINISH` whose name line (R14 item 2) names a kind of the closed list above is a database-trigger record. DDL triggers are not on the list: they follow R14's routine rules (folded into their DDL statement) until measurement 3g records them.
+2. **Well formed**, with no split window, when all hold:
+   - its trailer is R14's routine trailer (the performance line, then a block or none, no `records fetched`), and the record is otherwise not ambiguous;
+   - it carries the token of a live binding of its attachment (R1 rules 3 and 4), its transaction's `START_TRANSACTION` was read on that binding, and that transaction has not ended;
+   - by kind, checked within R8 item 2's hold bound:
+     - `ON CONNECT`: its transaction is the binding's first;
+     - `ON DISCONNECT`: after its transaction's end record, the binding's next record is its `DETACH_DATABASE`;
+     - `ON TRANSACTION_COMMIT` and `ON TRANSACTION_ROLLBACK`: the next record of that binding in that transaction is the transaction's end record;
+     - `ON TRANSACTION_START`: no further condition (the statements that follow are the client's).
+
+   Statement records of the trigger's transaction written before the trigger record are the trigger's own `EXECUTE STATEMENT` or UDR queries (7c), handled as statement records (R18).
+3. **Never folded.** A database-trigger record is never folded into a statement finish, whatever follows it.
+4. **What it becomes.** With a block: an access event of the binding's principal (the attachment's user and role), with the relations of the block under the filters, and no row count (`rows` left out: the record has none). It is never the agent's own, on the agent's attachments too: the trigger is user code running with the agent's rights (decision 4, `security.login_event_trigger`). Block-less: no event (the trigger touched no record).
+5. **Otherwise** (a condition of item 2 fails): ambiguous; a block-less one also opens a window at its position (R8 item 2, fail closed).
+
+**Forging.**
+- A forged database-trigger record on a live binding needs that binding's token: a wrong guess is ambiguous.
+- A forged header that captures a real statement trailer does not fit, because that trailer holds `records fetched`.
+- A forged header that captures a real routine trailer of the forger's own call (through a parameter value or a returned value), on a fresh forged attachment with a forged `ATTACH_DATABASE` and `START_TRANSACTION`, is the accepted misattribution residual. The captured block is reported as an event of its own (never folded), and the calling statement's trailer still reports the nested reads under the true principal.
+- A forged block-less trigger record produces no event and hides nothing.
+
+**Alternatives considered.** (a) `*` and always reported for every block-less database-trigger record, as R8 case (c) does for code called by a statement: one always-reported `*` event per attachment of a database with a connect trigger, matching every "every read" policy, for records that touched nothing; 7c shows that what such code reads through `EXECUTE STATEMENT` or a UDR is written as records of its own. (b) Fold a transaction-start trigger into the next statement: that statement is unrelated, and folding by maximum would merge unrelated counts. (c) Keep R8 item 2: a window at every attachment of such a database.
+
+**Residual risks.**
+- A trigger that reads through a path the trace does not log would go unseen. None is known: nested PSQL reads are in the block, `EXECUTE STATEMENT` and UDR queries are records of their own, and `ON EXTERNAL` opens an attachment (R18).
+- The place of `ON CONNECT` records relative to their attachment's `ATTACH_DATABASE` record was not recorded in this round. The rule assumes that the `ATTACH_DATABASE` comes first. If measurement 3g shows the opposite, those records name an attachment with no binding yet and stay ambiguous (R1 rule 5), and this part is revised before the Audit lot.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R16. The Garbage Collector, revised (measurement 8h)
+
+**Measured** (SuperServer; SuperClassic has neither system attachment, on both versions):
+- In sequential opens, `MON$ATTACHMENTS` shows the opener at `n`, the Cache Writer at `n + 1` and the Garbage Collector at `n + 2` (4 of 4 opens per version): after the opener, not before it as R6 said from the first round's id gaps. In a burst that opens the database, the two system ids fall anywhere among the burst's ids (offsets from +1 to +17 from the lowest id).
+- The Garbage Collector writes its `TRACE_INIT` only when it starts its first transaction, that is when it has garbage to collect, never at the open: no record at all in every open without garbage, and in 5 of the 6 bursts that read garbage. When it writes, its `TRACE_INIT` comes after the opener's `ATTACH_DATABASE`, from 6 ms to 20 s after it in these runs, and its id can be below ids attached since.
+- It then holds one transaction until the database closes, then writes `COMMIT_TRANSACTION` and `TRACE_FINI`. No `ROLLBACK_TRANSACTION` was seen; one transaction per `TRACE_INIT` / `TRACE_FINI`.
+- Lines: `TRACE_INIT` and `TRACE_FINI` hold the session lines of R20. `START_TRANSACTION`: `\t<path> (ATT_<n>, Garbage Collector, NONE, <internal>)` and `\t\t(TRA_<n>, READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY)`. `COMMIT_TRANSACTION`: the same two lines and a performance line `      <n> ms`. No client line. Also seen on a database that is its own security database.
+- The Cache Writer writes nothing (0 records in 14 logs).
+
+R6 item 2's structural binding ("the next `ATTACH_DATABASE` … has the internal id plus 1 or plus 2") cannot be built. Its interim id rule (above the highest id, or below it only within R7's 256 ids and 10 s of reading time) makes a late Garbage Collector ambiguous whenever another attachment raised the highest id more than 10 s of reading time before the Garbage Collector's first record, a delay that the workload sets. R6 item 1's "no trailer" excludes the measured `COMMIT_TRANSACTION`.
+
+**Proposed**, replacing R6 item 1's event list and lines, R6 item 2 and R6's residual; R6 items 3 to 5 (as amended by R17 and R18) and R6's forging analysis stay:
+
+1. **The internal shape, restated.** SuperServer, proven by proof 2; the events `TRACE_INIT`, `START_TRANSACTION`, `COMMIT_TRANSACTION` and `TRACE_FINI` only. `ROLLBACK_TRANSACTION` leaves the list: it was not seen, so it is ambiguous until a measurement shows one. The exact lines above, per version, from the matrix table (R20). A performance line on `COMMIT_TRANSACTION` and on no other internal record; no statement, separator, parameter, `records fetched` or block line. `<name>` as R6 item 1 says.
+2. **The internal binding** is created at a `START_TRANSACTION` of the internal shape that follows a well-formed `TRACE_INIT` on the same token, with no other record of that token between them. It is accepted when:
+   - **its id** has not been seen in the run for the database identity (no binding, live or ended, anchored, learned or internal, and no record has named it), and is at most R1 rule 5's run bound (the agent's latest own `CURRENT_CONNECTION` plus 4 096). When the parser knows the current **open** of the database (item 3), the id must also be above the lowest attachment id read in that open. **No order or time condition** relative to the highest id: R7's bounds do not apply to it. It raises the highest id as an `ATTACH_DATABASE` would;
+   - **one live internal binding per database identity**: a second one while one is live is ambiguous, unless, since the live one's `START_TRANSACTION`, the parser has seen a point at which no other binding of that database identity was live (the database may have closed and opened again). Then the new binding replaces the live one, which ends; any later record of the ended one is ambiguous;
+   - **one transaction**: a second `START_TRANSACTION` on the binding is ambiguous and poisons it (R6 item 3).
+
+   It ends at its `TRACE_FINI` (R5 item 2), at a replacement, or with its run.
+3. **The open.** For each database identity, the parser marks an **open** from an `ATTACH_DATABASE` or `CREATE_DATABASE` read while it knows no live binding of that identity, to the next point at which it knows none (internal bindings not counted). After a first start or a gap, until such a point has been seen once, the open is unknown and the lowest-id condition of item 2 does not apply.
+
+**Can a client forge the shape?** Yes, as R6 says, in a record that carries no trailer of its own (an `ERROR` record, a client-process line). What changes:
+- A forged internal record still carries no read. Its `COMMIT_TRANSACTION` may now carry a performance line, so a forged `COMMIT_TRANSACTION` header can capture a real trailer made of a performance line alone: that of a block-less routine record (R14), which touched no record, or that of a transaction-end record, which carries no object. A real trailer with a block or `records fetched` does not fit the internal shape: ambiguous. Nothing read is hidden.
+- Without the time condition, a forged internal binding can take an unseen id at any time in an open, as the real late Garbage Collector does. An unseen id is that of a real attachment still to come (its `ATTACH_DATABASE` then poisons the forged binding: loud, R7), of the Cache Writer (it writes nothing), or of the real Garbage Collector (its records then name a seen id: ambiguous, loud).
+- The forged binding holds its database's internal slot only until the parser next sees the database with no live user binding, no longer until the run ends.
+
+**Alternatives considered.** (a) Keep R6 item 2's interim rule: a late Garbage Collector, common under workloads that leave garbage, caps the level for 24 h. (b) Bind the Garbage Collector to the opener's id plus 2: 8h shows that in a burst the id can be anywhere. (c) No internal binding, Garbage Collector records ambiguous: every SuperServer open with garbage caps the level. (d) One internal binding per open, ended at the open's end: with a linger set (`ALTER DATABASE SET LINGER TO`), the database stays open after its last detach (not measured with the Garbage Collector), so the parser cannot place the close; the replacement rule fails loud there instead.
+
+**Residual risk** (replacing R6's, for docs/08): a client can forge an internal Garbage Collector record. It carries no read and hides no read. A forged internal binding that receives no `TRACE_FINI` holds its database's internal slot until the parser next sees that database with no live user binding (usually its next close), so the real Garbage Collector of that open is ambiguous: a loud denial of Partial for 24 h after it (proof 8), no longer for the rest of the run. Under a linger, a forged binding that replaces the real one makes the real one's later records ambiguous (loud).
+
+**Effect.** No change to levels, notes or protocol. Measurement 8i records the place of the Garbage Collector's `COMMIT_TRANSACTION` and `TRACE_FINI` relative to an open's last `DETACH_DATABASE`, with and without a linger.
+
+### R17. The automatic sweep (measurement 8h)
+
+**Measured** (SuperServer and SuperClassic, 4.0.7 and 5.0.4): an automatic sweep (`sweep interval`) runs in an internal attachment of its own, which writes:
+- `TRACE_INIT`, `ATTACH_DATABASE` on a fresh id (unlike the Garbage Collector), `SWEEP_START`, `START_TRANSACTION`, on 4.0.7 two `SWEEP_PROGRESS` records (each with a performance line and a block), `SWEEP_FINISH`, `COMMIT_TRANSACTION`, `DETACH_DATABASE` and `TRACE_FINI`;
+- the attachment line `\t<path> (ATT_<n>, SWEEPER:NONE, NONE, <internal>)` (with a `:role` part, unlike the Garbage Collector), and no client line;
+- the transaction line `READ_COMMITTED | REC_VERSION | WAIT | READ_ONLY`;
+- on `SWEEP_START` and `SWEEP_FINISH`, a `Transaction counters:` list (`Oldest interesting`, `Oldest active`, `Oldest snapshot`, `Next transaction`);
+- on `SWEEP_FINISH`, a performance line and a block naming system relations and, on 5.0.4, the swept user table (on 4.0.7, in `SWEEP_PROGRESS`).
+
+Under R6 item 5 every such record is ambiguous ("anything else with `<internal>`").
+
+**Proposed**, amending R6 item 5:
+
+1. **The sweep binding.** A binding anchored by an `ATTACH_DATABASE` under R1 rules 3 to 5 (fresh id, fresh token, the watermark, R7's order rule), whose attachment line is exactly `<name> (ATT_<n>, SWEEPER:NONE, NONE, <internal>)`, byte for byte, with no client line, is a **sweep binding**, in every server mode.
+   - Its records must follow the sequence above, per version, from the matrix table (R20): `SWEEP_START`, one transaction with the transaction line above, `SWEEP_PROGRESS` records (4.0.x), one `SWEEP_FINISH`, the transaction's `COMMIT_TRANSACTION` with its performance line, then `DETACH_DATABASE` and `TRACE_FINI`.
+   - The `Transaction counters:` list is a closed list of four named numeric lines.
+   - `SWEEP_PROGRESS` and `SWEEP_FINISH` have the trailer "a performance line, then a block or none", with no `records fetched`.
+   - Any other record on the binding (a statement, procedure or BLR record, a second transaction, a client line) is ambiguous and poisons it.
+2. **At most one live sweep binding per database identity**; a second is ambiguous. R1 rule 9 (the remote 4-tuple) does not apply: the attachment has no address.
+3. **What its records become.** A sweep is the server's maintenance, but its records are reported, not dropped (fail closed): each `SWEEP_PROGRESS` or `SWEEP_FINISH` block gives an access event of the principal `SWEEPER`, with the relations of the block under the filters (system relations are noise), no row count and no signal, never the agent's own. Its other records produce no event. docs/08 states that automatic sweeps appear as reads of the swept tables by `SWEEPER`, and that a policy exception for that principal also covers a forged sweep attachment.
+4. **A sweep on a client's attachment** (`SWEEP_START` / `SWEEP_FINISH` on that attachment's token, 8c) is judged with the same record shapes, and its blocks are reported as reads by that attachment's principal.
+
+**Why report rather than drop.** Any client can write the sweep shape (8f): a forged `ATTACH_DATABASE` with the `SWEEPER` line, then a forged `SWEEP_FINISH` header that captures a real routine trailer (a performance line and a block) through a parameter value or a returned value. If sweep blocks produced no event, that read would be hidden. Reported under `SWEEPER`, it is the accepted misattribution residual (the read reported with its real objects under a wrong principal), and the calling statement's trailer still reports the nested reads. A real statement trailer holds `records fetched` and does not fit the sweep shape: ambiguous.
+
+**Alternatives considered.** (a) Keep R6 item 5: every automatic sweep caps the level for 24 h. (b) No event for sweep records: a forged sweep binding would hide a read (above).
+
+**Residual risks.** Each sweep gives events naming the swept tables under `SWEEPER`, which match "every read" policies (noise, stated in docs/08). A user named `SWEEPER` who attaches remotely has a protocol and an address in its attachment line, so it is not a sweep binding.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R18. `EXECUTE STATEMENT`, `ON EXTERNAL` and UDRs (measurement 7c)
+
+**Measured** (both versions and modes):
+- A local `EXECUTE STATEMENT` in a procedure, a function or an `EXECUTE BLOCK` is written as an `EXECUTE_STATEMENT_FINISH` of its own (its own `Statement <n>:` line, its text, `records fetched`, a block), on the caller's attachment and transaction, before the routine's finish record. The routine's record and the outer statement's record carry no block for those reads.
+- `EXECUTE STATEMENT … ON EXTERNAL '127.0.0.1/3050:<path>' AS USER …` opens a new attachment of the server process: `TRACE_INIT`, an `ATTACH_DATABASE` with the `ON EXTERNAL` user and `TCPv4:127.0.0.1/<port>`, the client line `/opt/firebird/bin/firebird:<server pid>`, `START_TRANSACTION`, the statement's finish record with its block, then `COMMIT_TRANSACTION`, `DETACH_DATABASE` and `TRACE_FINI` when the caller's transaction ends. The caller's routine and statement records are block-less.
+- A UDR's internal query is written as an `EXECUTE_STATEMENT_FINISH` of its own on the caller's attachment and transaction (its text, a `param0` line with the value, `records fetched`, a block). A local external data source (a path with no host) opened an `<internal>` attachment with a user, `<path> (ATT_<n>, SYSDBA:NONE, NONE, <internal>)`, with no client line and with its own statement record.
+
+**Confirmed**: R8 item 1 case (c) (the outer record block-less, `*` added and always reported). docs/08 can state what the `*` stands for: reads written as statement records of their own on the same attachment and transaction, or by another attachment.
+
+**Proposed**, amending R6 item 5 and recording the handling:
+
+1. **Inner statement records** (`EXECUTE STATEMENT`, UDR queries) are statement finish records of the caller's binding and transaction, judged as any other: their text goes through the normalizer, their parameter lines are dropped, and R12 applies to their no-record shape. They are never the agent's own (the agent sends no PSQL). R14 item 4 says how routine records fold around them.
+2. **`ON EXTERNAL` attachments over TCP** are attachments like any other (R1): bound by their own `ATTACH_DATABASE`, with the `ON EXTERNAL` user as their principal and the loopback address and port as their address; R1 rule 9 applies (the server process holds the socket). The client line is client-set in general and dropped at parse (decision 6), so it is not used to recognise them. They are never the agent's own: the own rule requires the agent's attachment ids and local ports, which an attachment the server opens does not have. docs/08 states that such reads appear as another attachment, from the loopback address, under the `ON EXTERNAL` user, next to the calling statement's always-reported `*` event and its `signature.remote_data_access`.
+3. **`<internal>` attachments with a user** (a local external data source) stay ambiguous under R6 item 5 in phase 10. Recognising them needs their complete record sequence (whether they write `TRACE_INIT` and `ATTACH_DATABASE`: measurement 7d). Once it is recorded, the proposal is to bind them like a TCP attachment, by their own `ATTACH_DATABASE`, with their user as the principal and no address condition; never as an internal binding, since their reads are user reads. Until then, a declared database that a routine opens through a local external data source is capped at Limited each time that happens (loud).
+
+**Alternatives considered.** (a) Fold inner statement records into the outer statement: they are written as statements, carry their own blocks and are already reported on their own. (b) Accept `<internal>` attachments with a user now, from the 7c sample alone: their record sequence is not recorded, and an `<internal>` line with any user name is easy to forge.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R19. `MON$SEC_DATABASE` is `CHAR(7)` (measurement 3c)
+
+**Measured**: `MON$DATABASE.MON$SEC_DATABASE` reads `Default` (the default security database), `Self` (the database is its own) and `Other` (another named security database), on 4.0.7 and 5.0.4, in both modes, and is readable by the minimal account and by an account with no grant. The column is `CHAR(7)`: `Self` and `Other` come padded with trailing spaces (`'Self   '`, `'Other  '`), and a `VARCHAR(7)` cast keeps them. A `MON$DATABASE`-only text placed after the attachment's first `MON$` read is block-less (R8 case (a)); as the first `MON$` read, it carries the metadata-loading set (R13).
+
+**Proposed**, amending R9 detection rule 1: the value is compared after removing trailing U+0020 spaces only, on the client, whatever the text trims on the server, then exactly and with case. `Default` and `Other` do not exclude the database under this rule; `Self` excludes it; any other value (empty, `NULL`, another case, a leading space, any other character), a failed read or a cut read excludes it, as before. R9 rules 2 and 3 are unchanged.
+
+**Alternative considered.** A byte-exact comparison: `'Other  '` would exclude every database that uses a named security database.
+
+**Effect.** No change to levels, notes or protocol.
+
+### R20. The own-statement table, and other facts (measurements 3d and 8h)
+
+- **The 3d table is the source of the own-statement table** of R8 item 4 and R13: per text of the closed set and per version, the must-read set, the may-read set, whether the metadata-loading set may appear, and the static row bound. The closed set is every text that `sql::checked` accepts in `connector-firebird`: `sql::STATEMENTS` **and** `sql::PROBES`. The one-bit probes are a separate list in the code; R8 item 4 counted them among "the constant texts of `sql::STATEMENTS`". The test of R8 item 4 asserts that the table and these two lists hold the same texts, and a matrix test checks each row on 4.0.7 and 5.0.4.
+- **The lot 3 texts** (the `MON$SEC_DATABASE` read of R9 and R19, the `RDB$CONFIG` read of R3, the read-back probe of proof 7) are not in `sql::STATEMENTS` on `dev` yet. Each joins `sql::STATEMENTS`, the table and the matrix test in the pull request that adds it, with its 3d row measured then.
+- **`max_sql_length`** (R8 item 6): the longest constant text today is `OBJECT_GRANTS`, 2 023 characters, so Partial requires `max_sql_length` of at least 2 023 with today's set (security review L7 of 2026-10-26). The bound is computed from the closed set by a test, not written as a constant, so it follows the lot 3 texts. The user guide keeps proof 5's recommendation of 4 096.
+- **A statement finish without a `Statement <n>:` line.** `SET SESSION IDLE TIMEOUT 2 MINUTE` sent by the connector, and `isql`'s `SET TRANSACTION`, `COMMIT` and `ROLLBACK`, are written with no `Statement <n>:` line, `0 records fetched` and a performance line. That form is well formed only for a text of R8 case (b) (statement kinds that cannot read); any other statement finish without that line is ambiguous. `COMMIT` and `ROLLBACK` statement records come after the end record of the transaction they end: expected, with no event (case (b)).
+- **Session lines** (8h): every `TRACE_INIT` and `TRACE_FINI` holds exactly two lines after its header, `\tSESSION_1 Firebird Audit` and a line holding a single tab, then the blank separator line, on both versions and in both modes (8 376 records). This is R5 item 2's fixed session line, recorded in the table per version.
+- **Transaction-end records** carry a performance line (8h): it is their expected trailer under H1 fix 1, and a transaction-end record without one is ambiguous.
+- **Confirmed**: the Cache Writer writes nothing (R6's exclusion stands); SuperClassic has no internal attachment (R6, SuperServer only); nested records come first, innermost first (3e, R11 7b).
+
+### Obligations still open after this refinement
+
+Each is measured before the pull request that relies on it; 3f, 3g and 7d before the Audit lot (lot 3) merges:
+
+- **3f** (R13): `records fetched` of an own statement whose cursor the connector closed early (byte budget, deadline), on both versions; and the 3d row of each lot 3 text when it lands (R20).
+- **3g** (R14, R15): the trailer of BLR request finish records (`log_blr_requests`, `gbak`); DDL trigger records; the place of database-trigger records relative to their attachment's `ATTACH_DATABASE` and `DETACH_DATABASE` records; database triggers whose bodies read a table.
+- **7d** (R18): the complete record sequence of a local external data source's `<internal>` attachment.
+- **8g** (R7, unchanged) in the P10-D load run, and with it **8i** (R16): the Garbage Collector's `COMMIT_TRANSACTION` and `TRACE_FINI` relative to an open's last `DETACH_DATABASE`, with and without a linger.
+- Still open from earlier: `PLG$USERS` in a security database built with the legacy schema, Classic under socket activation, the `sysdba_mapped` account on the matrix (obligation 15).
+
+### Protocol (P10-C)
+
+**No contract change.** No new note code, note label, field, signal, capability token or metric: the no-record shape, the routine and database-trigger shapes, the revised internal binding, the sweep binding and the own-statement table are parser rules of the agent. Events of database triggers and sweeps use the existing `AccessEvent` fields: `rows` is optional and is left out where the record has no row count, and a no-record event sends `rows: 0`, which `Count` allows. The pending contract follow-up of the accepted refinement of 2026-10-26 (`coverage.security_database_excluded` and the Firebird text of `audit.failed_logins_not_audited`) is unchanged. The Audit lot itself keeps its `security-reviewer` review (AGENTS.md).
+
+### Open questions (for the maintainer, refinement of 2026-10-26 b)
+
+Each with the answer this refinement proposes; none is decided until the maintainer confirms it. A `security-reviewer` review of this refinement is requested before the decision.
+
+1. **R12**: treat a block-less statement finish that fetched no row (or one aggregate row of an aggregate-only `SELECT` without `GROUP BY`) and calls no code as well formed, reported as a read of the relations its text names with that row count (`*` and always reported when the text does not parse), with no split window?
+   **Proposed**: yes. A statement that touches no record has no block on either version; the shape gives a forger nothing beyond H-1's fake trailer, and the real trailer is still judged by R1 rules 3, 4 and 8.
+2. **R13**: replace R8 item 4's exact block with a must-read set and a may-read set per text, the metadata-loading set allowed on texts that read `MON$` or `SEC$` relations, and the exact counted rows in every execution credit (a 64-row tolerance after an early close until measurement 3f)?
+   **Proposed**: yes. The relations a constant text touches depend on the data and the account; the counted rows keep a forged copy tied to one execution, and a user table still cannot pass for an own read.
+3. **R14**: give executable procedures, functions and triggers the trailer "performance line, then a block or none" with no `records fetched`, keep the statement-like trailer for selectable procedures, use per-series name-line grammars, and drop function return values at parse as parameter values?
+   **Proposed**: yes. Otherwise every executable routine record is ambiguous; a grammar mismatch stays loud, and the return value is a value (I2).
+4. **R15**: give database-trigger records their own well-formed shape bound to the attachment's connect, disconnect or transaction events, never folded, a block reported as reads by the attachment's principal and a block-less record producing no event?
+   **Proposed**: yes, with measurement 3g before the Audit lot. The alternative, `*` and always reported for every block-less trigger record, reports a read at every attachment of such a database for records that touched nothing.
+5. **R16**: accept the Garbage Collector's internal binding on an unseen id at any time in an open (above the open's lowest id when known, within the run bound), one live per database with a replacement after a point with no live user binding, a performance line allowed on its `COMMIT_TRANSACTION`, and `ROLLBACK_TRANSACTION` removed from the shape?
+   **Proposed**: yes, with the restated residual: a forged internal binding carries no read and holds the slot until the database next has no live user binding, no longer for the rest of the run.
+6. **R17**: recognise the automatic sweep's `SWEEPER:NONE` `<internal>` attachment by its exact record sequence, and report its blocks as reads by `SWEEPER` instead of dropping them?
+   **Proposed**: yes. Dropping them would let a forged sweep attachment hide a read; reporting them costs one event per sweep record, stated in docs/08.
+7. **R18**: handle `EXECUTE STATEMENT` and UDR queries as statement records of the caller, `ON EXTERNAL` TCP attachments as ordinary attachments under the `ON EXTERNAL` user, and keep `<internal>` attachments with a user ambiguous until measurement 7d?
+   **Proposed**: yes. The first two are what the log shows; the third has no recorded sequence yet, and its shape is easy to forge.
+8. **R19**: compare `MON$SEC_DATABASE` after removing trailing spaces only, with any value other than `Default`, `Self` or `Other` excluding the database?
+   **Proposed**: yes. The column is `CHAR(7)`; a byte-exact comparison would exclude every database with a named security database.
+9. **R20**: make the own-statement table the 3d table over `sql::STATEMENTS` and `sql::PROBES`, with `max_sql_length` at least the longest text (2 023 characters today) computed by a test, and accept a statement finish without a `Statement <n>:` line only for R8 case (b) texts?
+   **Proposed**: yes. The probes are a separate list in the code, the bound must follow the lot 3 texts, and the form without a statement line was seen only for statements that cannot read.
