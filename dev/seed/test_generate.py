@@ -88,7 +88,7 @@ class Outputs(unittest.TestCase):
         locs = self.truth["locations"]
         engines = {loc["engine"] for loc in locs}
         self.assertEqual(engines, {"postgresql", "mysql", "mariadb", "mongodb", "openldap", "cas",
-                                   "sqlserver", "valkey", "redis", "sqlite"})
+                                   "sqlserver", "valkey", "redis", "sqlite", "firebird"})
         for loc in locs:
             for key in ("engine", "database", "object", "expected_classifiers", "negative_control",
                         "name_contains_value"):
@@ -126,7 +126,7 @@ class Outputs(unittest.TestCase):
     def test_positive_values_are_in_seed_files(self):
         seed_file = {"postgresql": "postgres.sql", "mysql": "mysql.sql", "mariadb": "mariadb.sql",
                      "mongodb": "mongo.json", "sqlserver": "sqlserver.sql", "valkey": "redis.txt",
-                     "redis": "redis.txt"}
+                     "redis": "redis.txt", "firebird": "firebird.sql"}
         for loc in self.truth["locations"]:
             if loc["engine"] == "sqlite":
                 content = self.files[f"seed/out/sqlite-{loc['file'][:-3]}.sql"]
@@ -175,6 +175,37 @@ class SqlServerAndRedis(unittest.TestCase):
         self.assertTrue(all(line.startswith('"') for line in commands))
         for name in ("SET", "HSET", "SADD", "ZADD", "RPUSH", "XADD", "SELECT"):
             self.assertIn(f'"{name}" ', text)
+
+
+class Firebird(unittest.TestCase):
+    """The opt-in Firebird seed (ADR-0060 decision 9)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = g.build()
+        cls.truth = json.loads(cls.files["ground-truth.json"])
+
+    def test_fixtures_of_decision_9(self):
+        sql = self.files["seed/out/firebird.sql"]
+        for fixture in ('"Customer Notes"', '"Legacy Contacts "', '"Contact Email "', 'CREATE TABLE "EXPORT_',
+                        "BLOB SUB_TYPE TEXT", "CHARACTER SET NONE", "CHARACTER SET WIN1252",
+                        "COMPUTED BY (FN_IBAN_PREFIX(IBAN))", "CREATE VIEW", "EXTERNAL FILE",
+                        "CREATE GLOBAL TEMPORARY TABLE", "ON CONNECT", '"RDB$CUSTOMER_ARCHIVE"',
+                        "CREATE TABLE CAS_TICKETS", "GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT",
+                        "TO USER SYSDBA"):
+            self.assertIn(fixture, sql)
+        # No password in the seed: the accounts are created by the service's entrypoint.
+        self.assertNotIn("PASSWORD", sql.upper())
+        # No multi-row VALUES (Firebird has none).
+        self.assertNotIn("),\n  (", sql)
+
+    def test_locations(self):
+        locs = [loc for loc in self.truth["locations"] if loc["engine"] == "firebird"]
+        self.assertEqual({loc["database"] for loc in locs}, {"crm"})
+        self.assertTrue(all(loc["container"] is None for loc in locs))
+        self.assertTrue(all(not loc["object"].endswith(" ") and not (loc["field"] or "").endswith(" ")
+                            for loc in locs))
+        self.assertTrue(any(loc["name_contains_value"] for loc in locs))
 
 
 class Sqlite(unittest.TestCase):

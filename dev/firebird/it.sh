@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Firebird connector integration tests, lot 1 (ADR-0060 decision 10: the wire client, SRP-256,
-# ChaCha, the loopback, peer-uid and forwarder rules, check()). The full dev service and its seed
-# come with lot 2; until then this script starts throwaway servers from the pinned images, seeds
-# fake accounts, and runs agent/crates/connector-firebird's it.rs tests against them:
+# Firebird connector integration tests (ADR-0060 decision 10: lot 1, the wire client, SRP-256,
+# ChaCha, the loopback, peer-uid and forwarder rules, check(); lot 2, Discovery and the CAS store
+# guard). This script starts throwaway servers from the pinned images, seeds fake accounts and the
+# dev seed (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the
+# one of the dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
 #
 #   dev/firebird/it.sh [5|4]        # Firebird 5.0.4 (default) or 4.0.7
+#   FIREBIRD_IT_FILTER=it::discovery dev/firebird/it.sh 5   # a subset of the tests
 #
 # Network (review L3): every container joins one dedicated network namespace, owned by a
 # placeholder container started with `--network none` (loopback only, nothing reachable from the
@@ -100,8 +102,12 @@ GRANT DBI_NESTED TO ROLE DBI_OUTER;
 GRANT DBI_OUTER TO USER AGENT_NESTED;
 CREATE USER AGENT_ADMIN_OPT PASSWORD '$AGENT_PW' USING PLUGIN Srp;
 GRANT DATABASTION_READER TO USER AGENT_ADMIN_OPT WITH ADMIN OPTION;
+CREATE USER AGENT_SYSDBA_MAPPED PASSWORD '$AGENT_PW' USING PLUGIN Srp;
 COMMIT;
 SQL
+# The dev seed, as the database `crm` (its own reader role, and the mapping of AGENT_SYSDBA_MAPPED
+# to SYSDBA): run by the image's entrypoint as an init script, over an embedded connection.
+install -m 0700 "$ROOT/dev/firebird/seed.sh" "$WORK/init/40-crm.sh"
 # The drift test of the system-privilege bit table (decision 4): one role per privilege of the
 # version, DBI_P_<name>.
 privileges="USER_MANAGEMENT READ_RAW_PAGES CREATE_USER_TYPES USE_NBACKUP_UTILITY CHANGE_SHUTDOWN_MODE
@@ -156,10 +162,16 @@ echo "[it] Firebird $MAJOR: initializing" >&2
 timeout 300 docker run -d --name "$NAME-init" "${JOIN[@]}" --env-file "$WORK/env" \
   -e FIREBIRD_DATABASE=app.fdb -e FIREBIRD_CONF_RemoteServicePort="$PORT" \
   -e FIREBIRD_CONF_RemoteBindAddress=127.0.0.1 -e FIREBIRD_CONF_WireCrypt=Required \
-  -e FIREBIRD_CONF_AuthServer=Srp256 -v "$VOLUME:/var/lib/firebird/data" \
-  -v "$WORK/init:/docker-entrypoint-initdb.d:ro" "$IMAGE" >/dev/null
+  -e FIREBIRD_CONF_AuthServer=Srp256 \
+  -e "FIREBIRD_CONF_ExternalFileAccess=Restrict /var/lib/firebird/data/external" \
+  -v "$VOLUME:/var/lib/firebird/data" -v "$WORK/init:/docker-entrypoint-initdb.d:ro" \
+  -v "$ROOT/dev/seed/out/firebird.sql:/databastion/seed/firebird.sql:ro" "$IMAGE" >/dev/null
 started "$NAME-init"
 seeded "$NAME-init"
+if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -q "crm.fdb seeded"; then
+  echo "[it] the dev seed (crm) was not loaded" >&2
+  exit 1
+fi
 timeout 60 docker stop "$NAME-init" >/dev/null
 timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker rm -v "$NAME-init" >/dev/null
@@ -205,6 +217,7 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
   FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
   FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
+  FIREBIRD_IT_CRM_ATTACH=/var/lib/firebird/data/crm.fdb \
   FIREBIRD_IT_AGENT_PASSWORD_FILE="$WORK/agent.pw" \
   FIREBIRD_IT_SYSDBA_PASSWORD_FILE="$WORK/root.pw" \
   FIREBIRD_IT_WRONG_PASSWORD_FILE="$WORK/wrong.pw" \

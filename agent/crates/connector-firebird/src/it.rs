@@ -154,7 +154,17 @@ async fn the_minimal_account_is_reachable_with_no_privilege_note() {
     let h = c.check(&t).await;
     assert!(h.reachable, "{:?} {:?}", h.detail, h.failure);
     assert_eq!(h.audit_level, AuditLevel::None);
-    assert_eq!(codes(&h), ["audit.source_not_configured"], "{:?}", h.detail);
+    // NOGRANT: the reader role has no SELECT on it (decision 5).
+    assert_eq!(
+        codes(&h),
+        [
+            "coverage.relations_without_select",
+            "audit.source_not_configured"
+        ],
+        "{:?}",
+        h.detail
+    );
+    assert_eq!(count(&h, NoteCode::CoverageRelationsWithoutSelect), Some(1));
     let v = c.server_version(&t).unwrap();
     let major = crate::check::major_of(&v).unwrap();
     if let Ok(want) = std::env::var("FIREBIRD_IT_MAJOR")
@@ -222,7 +232,16 @@ async fn an_account_without_grants_is_clean_and_sysdba_is_refused() {
     );
     let h = c.check(&none).await;
     assert!(h.reachable, "{:?}", h.detail);
-    assert_eq!(codes(&h), ["audit.source_not_configured"], "{:?}", h.notes);
+    assert_eq!(
+        codes(&h),
+        [
+            "coverage.relations_without_select",
+            "audit.source_not_configured"
+        ],
+        "{:?}",
+        h.notes
+    );
+    assert_eq!(count(&h, NoteCode::CoverageRelationsWithoutSelect), Some(2));
     if std::env::var("FIREBIRD_IT_SYSDBA_PASSWORD_FILE").is_err() {
         return;
     }
@@ -669,4 +688,328 @@ async fn op_cancel_ends_a_pending_fetch() {
     assert!(s.last_cancel.is_none());
     assert!(!s.is_broken());
     s.close().await;
+}
+
+// ---------------------------------------------------------------------
+// Discovery (lot 2): the seeded database `crm` (dev/seed/out/firebird.sql,
+// loaded by dev/firebird/seed.sh), declared as `crm`, against the ground
+// truth (dev/ground-truth.json). FIREBIRD_IT_CRM_ATTACH names its file.
+// ---------------------------------------------------------------------
+
+fn crm_attach() -> Option<String> {
+    std::env::var("FIREBIRD_IT_CRM_ATTACH")
+        .ok()
+        .filter(|a| !a.is_empty())
+}
+
+fn crm(account: &str, extra: &str) -> TargetConfig {
+    // Every seeded account has the agent's fake password.
+    let secret_file = var(
+        "FIREBIRD_IT_AGENT_PASSWORD_FILE",
+        "/nonexistent/databastion-it-secret",
+    );
+    let yaml = format!(
+        "{{console: {{url: \"https://c.example\"}}, state_dir: /tmp, targets: [{{id: fb-crm, \
+         engine: firebird, host: 127.0.0.1, port: {}, account: {account}, \
+         secret: {{file: \"{secret_file}\"}}, firebird: {{peer_uid: {}, {extra} \
+         databases: [{{name: crm, attach: \"{}\"}}]}}}}]}}",
+        port(),
+        peer_uid(),
+        crm_attach().unwrap_or_default()
+    );
+    databastion_core::AgentConfig::parse(&yaml)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .targets
+        .remove(0)
+}
+
+fn truth() -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../dev/ground-truth.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+struct Scan {
+    result: Result<(), databastion_core::ConnectorError>,
+    findings: Vec<databastion_classifiers::masking::MaskedFinding>,
+    coverage: databastion_core::ScanCoverage,
+    job: databastion_core::ScanJob,
+}
+
+async fn scan(
+    c: &FirebirdConnector,
+    t: &TargetConfig,
+    limits: databastion_core::config::Limits,
+) -> Scan {
+    let key =
+        std::sync::Arc::new(databastion_classifiers::masking::HmacKey::new(&[7u8; 32]).unwrap());
+    let job = databastion_core::ScanJob::new(
+        databastion_core::ScanParams::contract_defaults(),
+        t,
+        &limits,
+        key,
+    );
+    let (sink, mut rx) = databastion_core::FindingSink::channel(10_000);
+    let result = c.discover(&job, &sink).await;
+    let coverage = databastion_core::test_support::coverage_of(&sink);
+    drop(sink);
+    let mut findings = Vec::new();
+    while let Ok(f) = rx.try_recv() {
+        findings.push(f);
+    }
+    Scan {
+        result,
+        findings,
+        coverage,
+        job,
+    }
+}
+
+fn unpaced() -> databastion_core::config::Limits {
+    databastion_core::config::Limits {
+        discovery_duty_cycle_percent: 100,
+        ..databastion_core::config::Limits::default()
+    }
+}
+
+fn count(h: &TargetHealth, code: NoteCode) -> Option<u64> {
+    h.notes
+        .iter()
+        .find(|n| n.code() == code)
+        .and_then(|n| n.count())
+}
+
+/// Decision 5 against the seed of decision 9: every expected finding at
+/// its location (names as stored, trailing spaces dropped, a value-bearing
+/// name as `*`), no finding on a negative control or a fixture Discovery
+/// must not sample, the coverage of the fixtures, and I2: no ground-truth
+/// value (sampled or not, names included) in what the uplink would send.
+#[tokio::test]
+async fn discovery_matches_the_ground_truth_and_keeps_i2() {
+    if !enabled() || crm_attach().is_none() {
+        return;
+    }
+    let c = FirebirdConnector::new();
+    let t = crm("DATABASTION_AGENT", "");
+    let h = c.check(&t).await;
+    eprintln!("[it] crm check: {:?} {:?}", codes(&h), h.detail);
+    assert!(h.reachable, "{:?}", h.detail);
+    assert!(!codes(&h).contains(&"privilege.refused"), "{:?}", h.notes);
+    assert_eq!(count(&h, NoteCode::CoverageViewsNotSampled), Some(1));
+    assert_eq!(
+        count(&h, NoteCode::CoverageComputedColumnsNotSampled),
+        Some(1)
+    );
+    assert_eq!(count(&h, NoteCode::CoverageExternalFileTables), Some(1));
+    assert_eq!(count(&h, NoteCode::CoverageRelationsWithoutSelect), Some(1));
+    // CAS_TICKETS: SELECT is per table in Firebird.
+    assert_eq!(
+        count(&h, NoteCode::PrivilegeTicketCredentialsReadable),
+        Some(1)
+    );
+    assert!(codes(&h).contains(&"security.login_event_trigger"));
+    assert!(!c.state.blocks("fb-crm"));
+    assert_contract(&h, None);
+    let s = scan(&c, &t, unpaced()).await;
+    s.result.as_ref().unwrap();
+    eprintln!("[it] crm coverage: {:?}", s.coverage);
+    let got: Vec<String> = s
+        .findings
+        .iter()
+        .map(|f| {
+            let l = f.location().unwrap();
+            assert!(l.schema.is_none());
+            format!(
+                "{}.{}.{} {}",
+                l.database.as_str(),
+                l.object.as_str(),
+                l.field.as_str(),
+                f.classifier().as_str()
+            )
+        })
+        .collect();
+    for g in &got {
+        eprintln!("[it] finding {g}");
+    }
+    let truth = truth();
+    let mut values: Vec<String> = Vec::new();
+    let mut checked = 0;
+    for loc in truth["locations"].as_array().unwrap() {
+        if loc["engine"] != "firebird" {
+            continue;
+        }
+        let name = |k: &str| loc[k].as_str().unwrap_or_default().to_owned();
+        let object = loc["expected_normalized_name"].as_str().map_or_else(
+            || {
+                crate::discover::normalize(&name("object"))
+                    .as_str()
+                    .to_owned()
+            },
+            str::to_owned,
+        );
+        let field = crate::discover::normalize(&name("field"))
+            .as_str()
+            .to_owned();
+        let at = format!("{}.{object}.{field}", name("database"));
+        let expected: Vec<&str> = loc["expected_classifiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect();
+        for c in &expected {
+            assert!(got.contains(&format!("{at} {c}")), "missing {at} {c}");
+            checked += 1;
+        }
+        if expected.is_empty() {
+            assert!(
+                !got.iter().any(|g| g.starts_with(&format!("{at} "))),
+                "unexpected finding at {at}"
+            );
+        }
+        for v in loc["values"].as_array().into_iter().flatten() {
+            if let Some(v) = v.as_str().filter(|v| v.len() >= 6) {
+                values.push(v.to_owned());
+            }
+        }
+        for v in loc["name_values"].as_array().into_iter().flatten() {
+            values.push(v.as_str().unwrap().to_owned());
+        }
+    }
+    assert!(checked >= 20, "{checked}");
+    // CUSTOMERS, Customer Notes, Legacy Contacts, LEGACY_1252,
+    // PAYMENT_CARDS, RDB$CUSTOMER_ARCHIVE, EXPORT_…, LOGIN_REFS,
+    // APP_CREDENTIALS, INVOICES.
+    assert_eq!(s.coverage.sampled, 10, "{:?}", s.coverage);
+    assert_eq!(s.coverage.remote, 1, "EXT_EXPORT: {:?}", s.coverage);
+    assert_eq!(s.coverage.not_readable, 1, "HR_SALARIES: {:?}", s.coverage);
+    assert_eq!(s.coverage.unsupported, 1, "CAS_TICKETS: {:?}", s.coverage);
+    assert_eq!(s.coverage.error, 0, "{:?}", s.coverage);
+    assert_eq!(s.coverage.limit, 0, "{:?}", s.coverage);
+    // The CAS store guard: the registry's type counts, the tripwire on
+    // LOGIN_REFS.SESSION_REF.
+    assert_eq!(s.job.cas_guard().registries(), 1);
+    assert_eq!(s.job.cas_guard().tripped(), 1);
+    assert_eq!(s.job.cas_guard().unencrypted(), 6);
+    let json = databastion_core::test_support::contract_findings_json(
+        &s.findings,
+        databastion_core::config::TargetEngine::Firebird,
+    );
+    assert!(json.contains("\"engine\":\"firebird\""));
+    for v in &values {
+        assert!(
+            !json.contains(v.as_str()),
+            "raw ground-truth value in the contract JSON"
+        );
+    }
+}
+
+/// ADR-0035 against the real server: at a 25 % duty cycle the scan pauses
+/// about three times its query time; a scan whose window is too short for
+/// its pauses stops and reports the objects left as `skipped_limit`.
+#[tokio::test]
+async fn discovery_is_paced() {
+    if !enabled() || crm_attach().is_none() {
+        return;
+    }
+    let c = FirebirdConnector::new();
+    let t = crm("DATABASTION_AGENT", "");
+    assert!(c.check(&t).await.reachable);
+    let paced = databastion_core::config::Limits {
+        discovery_duty_cycle_percent: 25,
+        ..databastion_core::config::Limits::default()
+    };
+    let s = scan(&c, &t, paced).await;
+    s.result.as_ref().unwrap();
+    let (busy, paused) = s.job.pacer().totals();
+    eprintln!(
+        "[measure] Discovery of crm at 25 %: busy {} ms, paused {} ms",
+        busy.as_millis(),
+        paused.as_millis()
+    );
+    assert!(paused >= busy * 2, "{busy:?} {paused:?}");
+    assert_eq!(s.coverage.sampled, 10, "{:?}", s.coverage);
+    // 1 %, 2 s window: out of time.
+    let short = databastion_core::config::Limits {
+        discovery_duty_cycle_percent: 1,
+        max_scan_duration_s: 2,
+        ..databastion_core::config::Limits::default()
+    };
+    let started = std::time::Instant::now();
+    let s = scan(&c, &t, short).await;
+    s.result.as_ref().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(s.coverage.limit > 0, "{:?}", s.coverage);
+    assert!(s.coverage.sampled < 10, "{:?}", s.coverage);
+}
+
+/// Open question 4: an account mapped to SYSDBA is refused by `check()`,
+/// and Discovery does not run.
+#[tokio::test]
+async fn a_sysdba_mapped_account_is_refused_and_discovery_does_not_run() {
+    if !enabled() || crm_attach().is_none() {
+        return;
+    }
+    let c = FirebirdConnector::new();
+    let t = crm("AGENT_SYSDBA_MAPPED", "");
+    let h = c.check(&t).await;
+    assert!(h.reachable, "{:?}", h.detail);
+    assert_eq!(codes(&h)[0], "privilege.refused", "{:?}", h.notes);
+    assert!(labels(&h, NoteCode::PrivilegeRefused).contains(&"sysdba".to_owned()));
+    assert!(c.state.blocks("fb-crm"));
+    let s = scan(&c, &t, unpaced()).await;
+    assert!(matches!(
+        s.result,
+        Err(databastion_core::ConnectorError::Target {
+            code: FailureCode::PermissionDenied,
+            ..
+        })
+    ));
+    assert!(s.findings.is_empty());
+}
+
+/// Decision 5, security review M5: every system relation of the image is
+/// on the closed never-sampled list (the drift test of the list).
+#[tokio::test]
+async fn every_system_relation_is_never_sampled() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let rows = s
+        .query_for_tests(
+            "SELECT CAST(TRIM(TRAILING FROM RDB$RELATION_NAME) AS VARCHAR(63) CHARACTER SET UTF8) \
+             FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG, 0) <> 0",
+            &[crate::sql::Col::Text(252)],
+            4096,
+            deadline,
+        )
+        .await
+        .unwrap();
+    s.close().await;
+    assert!(rows.rows.len() > 40, "{}", rows.rows.len());
+    for r in &rows.rows {
+        let name = r[0].as_text().unwrap();
+        assert!(
+            crate::catalog::never_sampled(name),
+            "system relation {name} is not on the never-sampled list"
+        );
+    }
 }
