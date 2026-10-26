@@ -66,7 +66,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.failed_logins_not_audited": {
-    "description": "The audit source records no failed logins (SQL Server Audit: no enabled audit specification with FAILED_LOGIN_GROUP; Extended Events: no error_reported event in the session; Firebird trace: log_connections off): failed authentications are not seen.",
+    "description": "The audit source records no failed logins (SQL Server Audit: no enabled audit specification with FAILED_LOGIN_GROUP; Extended Events: no error_reported event in the session; Firebird trace: a wrong password writes no record of the target database): failed authentications are not seen.",
     "engines": [
       "sqlserver",
       "firebird"
@@ -537,6 +537,12 @@ export const TARGET_NOTE_REGISTRY = {
     "description": "{count} schema(s) without USAGE for the agent's role, not covered.",
     "engines": [
       "postgres"
+    ]
+  },
+  "coverage.security_database_excluded": {
+    "description": "{count} declared Firebird database(s) excluded from Discovery and Audit: a security database (its own, shown by MON$SEC_DATABASE or a SecurityDatabase key in databases.conf naming itself, or one holding a PLG$SRP verifier relation or a legacy user-manager relation), or not shown not to be one (a failed or cut read). Their trace records are handled as an undeclared database's; the target's other databases keep running.",
+    "engines": [
+      "firebird"
     ]
   },
   "coverage.timeseries_not_readable": {
