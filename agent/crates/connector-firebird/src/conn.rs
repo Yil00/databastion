@@ -205,6 +205,19 @@ pub(crate) struct Session {
     /// After a failure that may have left the connection out of step
     /// (a client deadline, a protocol violation), nothing more is sent.
     broken: bool,
+    /// The outcome of the last `op_cancel` (the client deadline's
+    /// backstop): what the server answered and how long it took.
+    pub(crate) last_cancel: Option<CancelOutcome>,
+}
+
+/// What the server answered to the client's `op_cancel` (decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CancelOutcome {
+    /// The first GDS code of the answer to the cancelled operation
+    /// (`isc_cancelled` expected), `None` for a success answer.
+    pub(crate) gds: Option<u32>,
+    /// From `op_cancel` sent to that answer read.
+    pub(crate) after: Duration,
 }
 
 /// Opens TCP to the endpoint, applies the peer rule, then runs the
@@ -376,6 +389,7 @@ pub(crate) async fn handshake(
         tx: None,
         statement_timeout,
         broken: false,
+        last_cancel: None,
     };
     session
         .request(&wire::attach(attach, login), deadline, Stage::SessionSetup)
@@ -470,6 +484,35 @@ impl Session {
         if !sql::checked(text) {
             return Err(FbError::new(FailureCode::Internal, Stage::Check));
         }
+        self.query_text(text, shape, max_rows, deadline).await
+    }
+
+    /// Test support: any text (the integration measurements).
+    #[cfg(test)]
+    pub(crate) async fn query_for_tests(
+        &mut self,
+        text: &str,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+    ) -> Result<Rows, FbError> {
+        self.query_text(text, shape, max_rows, deadline).await
+    }
+
+    /// Whether nothing more can be sent on this attachment.
+    #[cfg_attr(not(test), allow(dead_code, reason = "Discovery uses it next"))]
+    pub(crate) fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// A statement whose text the caller has checked.
+    async fn query_text(
+        &mut self,
+        text: &str,
+        shape: &[Col],
+        max_rows: usize,
+        deadline: Instant,
+    ) -> Result<Rows, FbError> {
         self.begin(deadline).await?;
         let tx = self.tx.unwrap_or(0);
         let stmt = self
@@ -478,9 +521,12 @@ impl Session {
             .object;
         let result = self.run(tx, stmt, text, shape, max_rows, deadline).await;
         if !self.broken {
-            // `DSQL_drop` closes the cursor and releases the handle.
+            // `DSQL_drop` closes the cursor and releases the handle; after
+            // a statement cancelled at the deadline, within the cancel's
+            // own bound (decision 4: 5 s).
+            let cleanup = deadline.max(Instant::now() + CANCEL_WAIT);
             let free = self
-                .request(&wire::free(stmt, wire::DSQL_DROP), deadline, Stage::Check)
+                .request(&wire::free(stmt, wire::DSQL_DROP), cleanup, Stage::Check)
                 .await;
             if let (Ok(_), Err(e)) = (&result, free) {
                 return Err(e);
@@ -537,7 +583,7 @@ impl Session {
         &mut self,
         tx: u16,
         stmt: u16,
-        text: &'static str,
+        text: &str,
         shape: &[Col],
         max_rows: usize,
         deadline: Instant,
@@ -658,7 +704,8 @@ impl Session {
             self.broken = true;
             return e;
         }
-        let wait = Instant::now() + CANCEL_WAIT;
+        let sent = Instant::now();
+        let wait = sent + CANCEL_WAIT;
         if self
             .conn
             .send(&wire::cancel(), wait, Stage::Check)
@@ -670,7 +717,19 @@ impl Session {
         }
         loop {
             match self.next(wait, columns).await {
-                Ok(Next::Response(_)) => return e,
+                Ok(Next::Response(r)) => {
+                    let outcome = CancelOutcome {
+                        gds: r.status.codes.first().copied(),
+                        after: sent.elapsed(),
+                    };
+                    tracing::debug!(
+                        gds = outcome.gds,
+                        after_ms = u64::try_from(outcome.after.as_millis()).unwrap_or(u64::MAX),
+                        "statement cancelled at the client deadline"
+                    );
+                    self.last_cancel = Some(outcome);
+                    return e;
+                }
                 Ok(Next::Row(_) | Next::End { .. }) => {}
                 Err(_) => {
                     self.broken = true;

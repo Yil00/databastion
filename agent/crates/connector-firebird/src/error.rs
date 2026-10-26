@@ -263,8 +263,19 @@ const FATAL_GDS: &[u32] = &[
 /// The one closed table from a status vector's GDS codes to a failure
 /// code: the first code of the vector found in the table decides (Firebird
 /// puts a generic code such as `isc_dsql_error` before the specific one);
-/// none: `internal`.
+/// none: `internal`. One exception: a statement timeout is written
+/// `isc_cancelled` then the timeout code (measured on 4.0.7 and 5.0.4,
+/// ADR-0060 obligation 2), so a timeout code anywhere in the vector is
+/// `timeout`.
 pub(crate) fn failure_of(codes: &[u32]) -> FailureCode {
+    if codes.iter().any(|c| {
+        matches!(
+            *c,
+            gds::CFG_STMT_TIMEOUT | gds::ATT_STMT_TIMEOUT | gds::REQ_STMT_TIMEOUT
+        )
+    }) {
+        return FailureCode::Timeout;
+    }
     codes
         .iter()
         .find_map(|c| table(*c))
@@ -335,6 +346,15 @@ mod tests {
         );
         assert_eq!(failure_of(&[gds::REQ_STMT_TIMEOUT]), FailureCode::Timeout);
         assert_eq!(failure_of(&[gds::CANCELLED]), FailureCode::Cancelled);
+        // A server-side statement timeout, as 4.0.7 and 5.0.4 write it.
+        assert_eq!(
+            failure_of(&[gds::CANCELLED, gds::CFG_STMT_TIMEOUT]),
+            FailureCode::Timeout
+        );
+        assert_eq!(
+            failure_of(&[gds::CANCELLED, gds::REQ_STMT_TIMEOUT]),
+            FailureCode::Timeout
+        );
         assert_eq!(failure_of(&[1, 2, 3]), FailureCode::Internal);
         assert_eq!(failure_of(&[]), FailureCode::Internal);
         let e = FbError::server(&[gds::LOGIN], Stage::Auth);

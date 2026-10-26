@@ -212,4 +212,4 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_CHACHA_PORT="$((PORT + 1))" FIREBIRD_IT_ARC4_PORT="$((PORT + 2))" \
   FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
-  "$EXE" it:: --nocapture
+  "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture

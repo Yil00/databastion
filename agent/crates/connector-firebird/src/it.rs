@@ -579,3 +579,94 @@ async fn a_membership_with_the_admin_option_is_a_grant_option() {
         h.notes
     );
 }
+
+/// ADR-0060 obligation 2, second half (decision 4): `op_cancel` sent at
+/// the client deadline while an `op_fetch` is pending (a `COUNT(*)` that
+/// the server computes during the first fetch) ends the statement with
+/// `isc_cancelled`, within the 5 s the connector waits, and the attachment
+/// stays usable.
+#[tokio::test]
+async fn op_cancel_ends_a_pending_fetch() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let r = s
+        .query_for_tests(
+            "SELECT COUNT(*) FROM RDB$FIELDS A, RDB$FIELDS B, RDB$FIELDS C, RDB$FIELDS D",
+            &[crate::sql::Col::Int],
+            1,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await;
+    let elapsed = start.elapsed();
+    let e = r.unwrap_err();
+    assert_eq!(e.code, FailureCode::Timeout, "{e:?}");
+    let outcome = s.last_cancel.expect("no answer to op_cancel");
+    eprintln!(
+        "[measure] op_cancel during a pending fetch: answered {:?} after {} ms (statement ended \
+         after {} ms)",
+        outcome.gds,
+        outcome.after.as_millis(),
+        elapsed.as_millis()
+    );
+    assert_eq!(outcome.gds, Some(crate::error::gds::CANCELLED));
+    assert!(outcome.after < std::time::Duration::from_secs(5));
+    assert!(!s.is_broken());
+    // The attachment is still usable.
+    let rows = s
+        .query(
+            crate::sql::VERSION,
+            &[crate::sql::Col::Text(128)],
+            1,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1);
+    s.close().await;
+    // The server-side statement timeout (decision 4) ends the same fetch
+    // before the client's deadline: no op_cancel.
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    let e = s
+        .query_for_tests(
+            "SELECT COUNT(*) FROM RDB$FIELDS A, RDB$FIELDS B, RDB$FIELDS C, RDB$FIELDS D",
+            &[crate::sql::Col::Int],
+            1,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+    eprintln!(
+        "[measure] server-side statement timeout of 1 s during a fetch: {:?} (first gds {:?}) \
+         after {} ms",
+        e.code,
+        e.gds,
+        start.elapsed().as_millis()
+    );
+    assert_eq!(e.code, FailureCode::Timeout, "{e:?}");
+    assert!(s.last_cancel.is_none());
+    assert!(!s.is_broken());
+    s.close().await;
+}
