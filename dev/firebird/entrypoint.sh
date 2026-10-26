@@ -17,7 +17,25 @@ if [ "$(id -u)" -eq 0 ]; then
   echo "[firebird] refusing to run as root (ADR-0060 decision 9)" >&2
   exit 1
 fi
-SECDB="/opt/firebird/security${FIREBIRD_MAJOR:-5}.fdb"
+# The security database of the image's own major version: from FIREBIRD_MAJOR when set (Compose
+# passes DATABASTION_DEV_FIREBIRD_MAJOR), otherwise from the image's isql, so that selecting the
+# 4.0.7 image targets security4.fdb with no other setting.
+MAJOR="${FIREBIRD_MAJOR:-}"
+if [ -z "$MAJOR" ]; then
+  MAJOR="$(/opt/firebird/bin/isql -z </dev/null 2>&1 | sed -n 's/.*Firebird \([0-9][0-9]*\)\..*/\1/p' | head -n 1 || true)"
+fi
+case "$MAJOR" in
+  4 | 5) ;;
+  *)
+    echo "[firebird] unsupported or unknown major version '$MAJOR' (4 or 5)" >&2
+    exit 1
+    ;;
+esac
+SECDB="/opt/firebird/security${MAJOR}.fdb"
+if [ ! -f "$SECDB" ]; then
+  echo "[firebird] $SECDB is not in this image (FIREBIRD_MAJOR does not match the image)" >&2
+  exit 1
+fi
 DATA=/var/lib/firebird/data
 sql_string() { printf "'%s'" "${1//\'/\'\'}"; }
 

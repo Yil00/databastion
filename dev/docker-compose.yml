@@ -575,7 +575,8 @@ services:
 
   # Firebird (phase 10, P10-B): the target of the Firebird connector (ADR-0060 decision 9). Opt-in
   # (profile `firebird`): `make dev-firebird`. 5.0.4 by default, pinned by digest;
-  # `DATABASTION_DEV_FIREBIRD_IMAGE` selects 4.0.7. firebird/entrypoint.sh runs as the server's own
+  # `DATABASTION_DEV_FIREBIRD_IMAGE` selects 4.0.7 (its security4.fdb found from the image, or set
+  # `DATABASTION_DEV_FIREBIRD_MAJOR`). firebird/entrypoint.sh runs as the server's own
   # account (uid 84, `firebird`), never root, so the agent's default `peer_uid: firebird` matches its
   # sockets: it creates the accounts (SYSDBA, the minimal-variant DATABASTION_AGENT, the refused
   # AGENT_SYSDBA_MAPPED) over embedded connections, loads seed/out/firebird.sql as the database `crm`
@@ -592,6 +593,8 @@ services:
     environment:
       FIREBIRD_SYSDBA_PASSWORD: ${FIREBIRD_SYSDBA_PASSWORD:-dev-only-firebird-sysdba}
       FIREBIRD_DATABASTION_PASSWORD: ${FIREBIRD_DATABASTION_PASSWORD:-dev-only-firebird-agent}
+      # The image's major version (security<N>.fdb); empty: read from the image's isql.
+      FIREBIRD_MAJOR: ${DATABASTION_DEV_FIREBIRD_MAJOR:-}
     volumes:
       - firebird-data:/var/lib/firebird/data
       - ./firebird/firebird.conf:/opt/firebird/firebird.conf:ro
