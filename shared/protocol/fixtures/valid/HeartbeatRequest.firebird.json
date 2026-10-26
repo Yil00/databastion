@@ -43,6 +43,13 @@
           "labels": [
             "other"
           ]
+        },
+        {
+          "code": "audit.failed_logins_not_audited"
+        },
+        {
+          "code": "coverage.security_database_excluded",
+          "count": 1
         }
       ]
     },
