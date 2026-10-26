@@ -63,7 +63,7 @@ EXE="$(timeout 900 cargo test -p databastion-connector-firebird --all-features -
 umask 077
 WORK="$(mktemp -d)"
 cleanup() {
-  local c=("$NAME-init" "$NAME" "$NAME-socat")
+  local c=("$NAME-init" "$NAME" "$NAME-socat" "$NAME-secdb")
   for n in $VARIANTS; do c+=("$NAME-$n"); done
   # -v: the anonymous volumes of the image's VOLUME declarations too.
   timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
@@ -229,6 +229,15 @@ for p in "$PORT" "$((PORT + 1))" "$((PORT + 2))" "$((PORT + 3))" "$((PORT + 4))"
   "$FWD_PORT"; do
   listening "$p"
 done
+# Every relation of the image's own security database (security review L5), for the drift test:
+# an embedded read of a fresh copy (the image's file, no network), as the server's account.
+# shellcheck disable=SC2016 # Firebird names, not shell expansions.
+printf 'SET HEADING OFF;\nSELECT TRIM(RDB$RELATION_NAME) FROM RDB$RELATIONS ORDER BY 1;\n' \
+  | timeout 120 docker run -i --rm --name "$NAME-secdb" --network none "${HARDEN[@]}" \
+    --user 84:84 --entrypoint /opt/firebird/bin/isql "$IMAGE" \
+    -q -b -user SYSDBA "/opt/firebird/$SECDB" \
+  | awk 'NF { print $1 }' > "$WORK/secdb.txt"
+[ "$(wc -l < "$WORK/secdb.txt")" -ge 8 ] || { echo "[it] $SECDB: relation list not read" >&2; exit 1; }
 
 # 4. The tests, in the namespace, as the calling user.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
@@ -245,4 +254,5 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_CHACHA_PORT="$((PORT + 1))" FIREBIRD_IT_ARC4_PORT="$((PORT + 2))" \
   FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
+  FIREBIRD_IT_SECDB_RELATIONS_FILE="$WORK/secdb.txt" \
   "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture

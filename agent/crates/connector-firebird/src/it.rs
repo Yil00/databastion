@@ -1014,3 +1014,35 @@ async fn every_system_relation_is_never_sampled() {
         );
     }
 }
+
+/// Security review L5: every relation of the image's own security database
+/// (`security<N>.fdb`, listed by `dev/firebird/it.sh` through an embedded
+/// read: the agent account cannot attach it) is on the never-sampled list,
+/// whatever its system flag (`PLG$SRP` and `PLG$USERS` have flag 0).
+#[test]
+fn every_security_database_relation_is_never_sampled() {
+    if !enabled() {
+        return;
+    }
+    let path = std::env::var("FIREBIRD_IT_SECDB_RELATIONS_FILE")
+        .expect("dev/firebird/it.sh sets FIREBIRD_IT_SECDB_RELATIONS_FILE");
+    let list = std::fs::read_to_string(path).unwrap();
+    let names: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert!(names.len() > 40, "{}", names.len());
+    for want in ["PLG$SRP", "PLG$USERS", "SEC$USERS"] {
+        assert!(
+            names.contains(&want),
+            "{want} not in the security database list"
+        );
+    }
+    for name in names {
+        assert!(
+            crate::catalog::never_sampled(name),
+            "security database relation {name} is not on the never-sampled list"
+        );
+    }
+}
