@@ -4,6 +4,9 @@
 //!
 //! Nothing here holds a value of a table: names and types only.
 
+use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
+
 use databastion_core::cas_guard::{self, StoreKind};
 use tokio::time::Instant;
 
@@ -19,11 +22,11 @@ pub(crate) const MAX_COLUMNS: usize = 65_536;
 
 /// The relation-list read's columns ([`sql::RELATIONS`]).
 pub(crate) const RELATIONS_SHAPE: [Col; 5] =
-    [Col::Text(252), Col::Int, Col::Bool, Col::Bool, Col::Bool];
+    [Col::Octets(252), Col::Int, Col::Bool, Col::Bool, Col::Bool];
 /// The column-list read's columns ([`sql::COLUMNS`]).
 pub(crate) const COLUMNS_SHAPE: [Col; 10] = [
-    Col::Text(252),
-    Col::Text(252),
+    Col::Octets(252),
+    Col::Octets(252),
     Col::Int,
     Col::Int,
     Col::Int,
@@ -237,57 +240,105 @@ impl Column {
     }
 }
 
-/// The relations of [`sql::RELATIONS`] rows; `None` when a key cell is
-/// NULL or a name cannot be quoted (the read fails closed).
+/// A catalog name cell: the raw bytes of a padded `CHAR(63)` name
+/// (`OCTETS`, [`sql::RELATIONS`]), trailing spaces dropped, then UTF-8 that
+/// can be quoted ([`sql::identifier_ok`]); `None` otherwise. A text cell is
+/// taken as is (tests).
 #[must_use]
-pub(crate) fn relations(rows: &[Vec<Value>]) -> Option<Vec<Relation>> {
-    rows.iter()
-        .map(|r| {
-            let name = trimmed(r.first()?.as_text()?).to_owned();
-            if !sql::identifier_ok(&name) {
-                return None;
-            }
-            let view = r.get(2)?.as_bool()?;
-            let external = r.get(3)?.as_bool()?;
-            let kind = match r.get(1)?.as_int()? {
-                _ if view => Kind::View,
-                _ if external => Kind::External,
-                0 => Kind::Table,
-                1 => Kind::View,
-                2 => Kind::External,
-                4 | 5 => Kind::Temporary,
-                _ => Kind::Other,
-            };
-            Some(Relation {
-                name,
-                kind,
-                readable: r.get(4)?.as_bool()?,
-            })
-        })
-        .collect()
+pub(crate) fn name_cell(v: &Value) -> Option<String> {
+    let name = match v {
+        Value::Bytes(b) => {
+            let end = b.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1);
+            std::str::from_utf8(b.get(..end)?).ok()?.to_owned()
+        }
+        Value::Text(t) => trimmed(t).to_owned(),
+        Value::Null | Value::Int(_) | Value::Bool(_) => return None,
+    };
+    sql::identifier_ok(&name).then_some(name)
 }
 
-/// The columns of [`sql::COLUMNS`] rows; `None` as [`relations`].
+/// The relations of [`sql::RELATIONS`] rows, and how many rows were
+/// dropped (review L3): a NULL key cell, or a name that is not UTF-8 or
+/// cannot be quoted, drops that relation only (`skipped_error`), never
+/// the list.
 #[must_use]
-pub(crate) fn columns(rows: &[Vec<Value>]) -> Option<Vec<Column>> {
-    rows.iter()
-        .map(|r| {
-            let relation = trimmed(r.first()?.as_text()?).to_owned();
-            let name = trimmed(r.get(1)?.as_text()?).to_owned();
-            if !sql::identifier_ok(&relation) || !sql::identifier_ok(&name) {
-                return None;
+pub(crate) fn relations(rows: &[Vec<Value>]) -> (Vec<Relation>, u64) {
+    let mut dropped = 0u64;
+    let list = rows
+        .iter()
+        .filter_map(|r| {
+            let rel = relation(r);
+            if rel.is_none() {
+                dropped += 1;
             }
+            rel
+        })
+        .collect();
+    (list, dropped)
+}
+
+fn relation(r: &[Value]) -> Option<Relation> {
+    let name = name_cell(r.first()?)?;
+    let view = r.get(2)?.as_bool()?;
+    let external = r.get(3)?.as_bool()?;
+    let kind = match r.get(1)?.as_int()? {
+        _ if view => Kind::View,
+        _ if external => Kind::External,
+        0 => Kind::Table,
+        1 => Kind::View,
+        2 => Kind::External,
+        4 | 5 => Kind::Temporary,
+        _ => Kind::Other,
+    };
+    Some(Relation {
+        name,
+        kind,
+        readable: r.get(4)?.as_bool()?,
+    })
+}
+
+/// The columns of [`sql::COLUMNS`] rows.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Columns {
+    pub(crate) list: Vec<Column>,
+    /// Relations with a column row dropped (a column name that is not
+    /// UTF-8 or cannot be quoted, a NULL key cell): their column list is
+    /// incomplete, so they are `skipped_error`, never sampled without it.
+    pub(crate) incomplete: BTreeSet<String>,
+    /// Column rows dropped whose relation name itself was unusable (that
+    /// relation is dropped from the relation list too).
+    pub(crate) unlinked: u64,
+}
+
+/// The columns of [`sql::COLUMNS`] rows (review L3: a bad row drops its
+/// relation's column list only).
+#[must_use]
+pub(crate) fn columns(rows: &[Vec<Value>]) -> Columns {
+    let mut out = Columns::default();
+    for r in rows {
+        let Some(relation) = r.first().and_then(name_cell) else {
+            out.unlinked += 1;
+            continue;
+        };
+        let col = (|| {
             Some(Column {
-                relation,
-                name,
+                name: name_cell(r.get(1)?)?,
                 field_type: r.get(3)?.as_int()?,
                 sub_type: r.get(4)?.as_int()?,
                 charset: r.get(7)?.as_int()?,
                 array: r.get(8)?.as_bool()?,
                 computed: r.get(9)?.as_bool()?,
+                relation: relation.clone(),
             })
-        })
-        .collect()
+        })();
+        match col {
+            Some(c) => out.list.push(c),
+            None => {
+                out.incomplete.insert(relation);
+            }
+        }
+    }
+    out
 }
 
 /// The column batches of one table (decision 5, security review N3): in
@@ -344,32 +395,79 @@ pub(crate) fn counts(relations: &[Relation], columns: &[Column]) -> Counts {
 }
 
 /// The catalog of one database as read: `None` parts were not evaluated
-/// (a read failed, a NULL key cell); `cut`: a bound was reached.
+/// (a read failed); `cut`: a bound was reached; `*_dropped`, `incomplete`:
+/// rows that could not be used (review L3).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
     pub(crate) relations: Option<Vec<Relation>>,
     pub(crate) relations_cut: bool,
-    pub(crate) columns: Option<Vec<Column>>,
+    /// Relation rows dropped (`skipped_error` each).
+    pub(crate) relations_dropped: u64,
+    pub(crate) columns: Option<Columns>,
     /// The column list reached [`MAX_COLUMNS`]: the columns of its last
     /// relation, and of every relation after it, are incomplete.
     pub(crate) columns_cut: bool,
+    /// The positions of each relation's columns, built once at first use
+    /// (review L4).
+    /// (Built from `columns`, never set by hand.)
+    pub(crate) index: OnceLock<HashMap<String, Vec<usize>>>,
+}
+
+/// Why a relation's columns are not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// The column list was cut at or before it (`skipped_limit`).
+    Cut,
+    /// The column list was not read, or a row of it was dropped
+    /// (`skipped_error`).
+    Error,
 }
 
 impl Catalog {
-    /// The columns of `relation`, `None` when they were not read
-    /// completely (the list was cut at or before it).
+    /// Whether any row was dropped (the CAS store guard is then not
+    /// evaluated completely: a dropped relation could be a ticket
+    /// registry).
     #[must_use]
-    pub(crate) fn columns_of(&self, relation: &str) -> Option<Vec<&Column>> {
-        let all = self.columns.as_ref()?;
-        let cols: Vec<&Column> = all.iter().filter(|c| c.relation == relation).collect();
+    pub(crate) fn dropped(&self) -> u64 {
+        let cols = self
+            .columns
+            .as_ref()
+            .map_or(0, |c| c.unlinked + c.incomplete.len() as u64);
+        self.relations_dropped + cols
+    }
+
+    fn index(&self) -> Option<&HashMap<String, Vec<usize>>> {
+        let all = &self.columns.as_ref()?.list;
+        Some(self.index.get_or_init(|| {
+            let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, c) in all.iter().enumerate() {
+                map.entry(c.relation.clone()).or_default().push(i);
+            }
+            map
+        }))
+    }
+
+    /// The columns of `relation`, or why they are not usable.
+    pub(crate) fn columns_of(&self, relation: &str) -> Result<Vec<&Column>, Missing> {
+        let (Some(columns), Some(index)) = (self.columns.as_ref(), self.index()) else {
+            return Err(Missing::Error);
+        };
+        if columns.incomplete.contains(relation) {
+            return Err(Missing::Error);
+        }
+        let all = &columns.list;
+        let cols: Vec<&Column> = index
+            .get(relation)
+            .map(|ix| ix.iter().filter_map(|&i| all.get(i)).collect())
+            .unwrap_or_default();
         // Cut: complete only for a relation seen before the last one (the
         // list comes by relation; a relation not seen may come after).
         if self.columns_cut
             && (cols.is_empty() || all.last().is_some_and(|c| c.relation == relation))
         {
-            return None;
+            return Err(Missing::Cut);
         }
-        Some(cols)
+        Ok(cols)
     }
 
     /// The CAS store guard's view of the catalog (ADR-0041 decision 6,
@@ -382,14 +480,14 @@ impl Catalog {
     pub(crate) fn cas_readable(&self) -> cas_guard::ReadableCheck {
         let mut out = cas_guard::ReadableCheck {
             readable: 0,
-            complete: !self.relations_cut,
+            complete: !self.relations_cut && self.dropped() == 0,
         };
         let Some(relations) = &self.relations else {
             out.complete = false;
             return out;
         };
         for r in relations.iter().filter(|r| r.kind == Kind::Table) {
-            let Some(cols) = self.columns_of(&r.name) else {
+            let Ok(cols) = self.columns_of(&r.name) else {
                 out.complete = false;
                 continue;
             };
@@ -424,7 +522,9 @@ pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<Catalog, 
     {
         Ok(rows) => {
             out.relations_cut = rows.cut;
-            out.relations = relations(&rows.rows);
+            let (list, dropped) = relations(&rows.rows);
+            out.relations = Some(list);
+            out.relations_dropped = dropped;
         }
         Err(e) if !e.fatal => {}
         Err(e) => return Err(e),
@@ -435,7 +535,7 @@ pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<Catalog, 
     {
         Ok(rows) => {
             out.columns_cut = rows.cut;
-            out.columns = columns(&rows.rows);
+            out.columns = Some(columns(&rows.rows));
         }
         Err(e) if !e.fatal => {}
         Err(e) => return Err(e),
@@ -605,7 +705,8 @@ mod tests {
                 Value::Bool(false),
             ],
         ];
-        let r = relations(&rows).unwrap();
+        let (r, dropped) = relations(&rows);
+        assert_eq!(dropped, 0);
         assert_eq!(r[0].name, "CUSTOMERS");
         assert_eq!(
             r.iter().map(|x| x.kind).collect::<Vec<_>>(),
@@ -622,13 +723,18 @@ mod tests {
             (c.views, c.external, c.temporary, c.without_select),
             (1, 1, 1, 1)
         );
-        // A NULL key cell, a name that cannot be quoted: not evaluated.
+        // A NULL key cell, a name that cannot be quoted: that relation
+        // only is dropped (review L3).
         let mut bad = rows.clone();
         bad[1][4] = Value::Null;
-        assert!(relations(&bad).is_none());
+        let (r, dropped) = relations(&bad);
+        assert_eq!((r.len(), dropped), (4, 1));
+        assert!(r.iter().all(|x| x.name != "V"));
         let mut bad = rows;
         bad[0][0] = t("A\0B");
-        assert!(relations(&bad).is_none());
+        let (r, dropped) = relations(&bad);
+        assert_eq!((r.len(), dropped), (4, 1));
+        assert_eq!(r[0].name, "V");
         let crow = vec![
             t("T"),
             t("E-Mail "),
@@ -641,10 +747,138 @@ mod tests {
             Value::Bool(false),
             Value::Bool(true),
         ];
-        let cols = columns(&[crow]).unwrap();
+        let cols = columns(&[crow]).list;
         assert_eq!(cols[0].name, "E-Mail");
         assert!(cols[0].computed);
         assert_eq!(cols[0].conv(), None);
+    }
+
+    fn raw(b: &[u8]) -> Value {
+        let mut v = b.to_vec();
+        v.resize(v.len().max(63), b' ');
+        Value::Bytes(Zeroizing::new(v))
+    }
+
+    fn rel_row(name: Value, readable: bool) -> Vec<Value> {
+        vec![
+            name,
+            Value::Int(0),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(readable),
+        ]
+    }
+
+    fn col_row(rel: Value, name: Value) -> Vec<Value> {
+        vec![
+            rel,
+            name,
+            Value::Int(0),
+            Value::Int(37),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(100),
+            Value::Int(4),
+            Value::Bool(false),
+            Value::Bool(false),
+        ]
+    }
+
+    #[test]
+    fn name_cells_are_raw_padded_utf8() {
+        assert_eq!(
+            name_cell(&raw("CAFÉ_X".as_bytes())).as_deref(),
+            Some("CAFÉ_X")
+        );
+        // Inner spaces and quotes are kept (quoted at use).
+        assert_eq!(name_cell(&raw(b"A \"B")).as_deref(), Some("A \"B"));
+        // Hostile bytes: not UTF-8, a NUL, all spaces, too long.
+        assert_eq!(name_cell(&raw(&[b'B', 0xff, 0xfe])), None);
+        assert_eq!(name_cell(&raw(b"A\0B")), None);
+        assert_eq!(name_cell(&raw(b"")), None);
+        assert_eq!(name_cell(&raw("é".repeat(64).as_bytes())), None);
+        assert_eq!(name_cell(&Value::Null), None);
+        assert_eq!(name_cell(&Value::Int(1)), None);
+    }
+
+    #[test]
+    fn a_hostile_name_drops_its_relation_only() {
+        let hostile = raw(&[b'T', 0xC3, 0x28, b'X']);
+        let (rels, dropped) = relations(&[
+            rel_row(raw(b"CUSTOMERS"), true),
+            rel_row(hostile.clone(), true),
+            rel_row(raw(b"ORDERS"), true),
+        ]);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            rels.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["CUSTOMERS", "ORDERS"]
+        );
+        let cols = columns(&[
+            col_row(raw(b"CUSTOMERS"), raw(b"EMAIL")),
+            col_row(hostile, raw(b"X")),
+            col_row(raw(b"ORDERS"), raw(b"ID")),
+            col_row(raw(b"ORDERS"), raw(&[0xff])),
+        ]);
+        assert_eq!(cols.unlinked, 1);
+        assert_eq!(cols.incomplete.iter().collect::<Vec<_>>(), ["ORDERS"]);
+        let catalog = Catalog {
+            relations: Some(rels),
+            relations_dropped: dropped,
+            columns: Some(cols),
+            ..Catalog::default()
+        };
+        assert_eq!(catalog.columns_of("CUSTOMERS").unwrap().len(), 1);
+        assert_eq!(catalog.columns_of("ORDERS"), Err(Missing::Error));
+        assert_eq!(catalog.dropped(), 3);
+        // The CAS store guard: a dropped relation could be a ticket
+        // registry, so the guard is not complete.
+        assert!(!catalog.cas_readable().complete);
+        let clean = Catalog {
+            relations: Some(relations(&[rel_row(raw(b"CUSTOMERS"), true)]).0),
+            columns: Some(columns(&[col_row(raw(b"CUSTOMERS"), raw(b"EMAIL"))])),
+            ..Catalog::default()
+        };
+        assert!(clean.cas_readable().complete);
+        // No column list at all: every table is an error, not a limit.
+        let none = Catalog {
+            relations: clean.relations.clone(),
+            ..Catalog::default()
+        };
+        assert_eq!(none.columns_of("CUSTOMERS"), Err(Missing::Error));
+    }
+
+    #[test]
+    fn columns_are_grouped_once_and_cut_as_before() {
+        // 2 000 relations of 3 columns: grouped once, each lookup direct.
+        let mut rows = Vec::new();
+        for r in 0..2_000 {
+            for c in 0..3 {
+                rows.push(col_row(
+                    raw(format!("T{r:05}").as_bytes()),
+                    raw(format!("C{c}").as_bytes()),
+                ));
+            }
+        }
+        let mut catalog = Catalog {
+            columns: Some(columns(&rows)),
+            ..Catalog::default()
+        };
+        let started = std::time::Instant::now();
+        for r in 0..2_000 {
+            let cols = catalog.columns_of(&format!("T{r:05}")).unwrap();
+            assert_eq!(
+                cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                ["C0", "C1", "C2"]
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(catalog.columns_of("ABSENT").unwrap().len(), 0);
+        // Cut: the last relation and the ones not seen are incomplete.
+        catalog.columns_cut = true;
+        assert!(catalog.columns_of("T00000").is_ok());
+        assert_eq!(catalog.columns_of("T01999"), Err(Missing::Cut));
+        assert_eq!(catalog.columns_of("ABSENT"), Err(Missing::Cut));
     }
 
     #[test]

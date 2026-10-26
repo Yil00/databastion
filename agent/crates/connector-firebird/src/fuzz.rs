@@ -159,24 +159,25 @@ pub fn catalog(data: &[u8]) {
     }
     match which % 3 {
         0 => {
-            if let Some(rels) = crate::catalog::relations(&rows) {
-                for rel in &rels {
-                    assert!(sql::identifier_ok(&rel.name));
-                    let _ = crate::catalog::never_sampled(&rel.name);
-                }
+            let (rels, dropped) = crate::catalog::relations(&rows);
+            assert_eq!(rels.len() as u64 + dropped, rows.len() as u64);
+            for rel in &rels {
+                assert!(sql::identifier_ok(&rel.name));
+                let _ = crate::catalog::never_sampled(&rel.name);
             }
         }
         1 => {
-            if let Some(cols) = crate::catalog::columns(&rows) {
-                let picked: Vec<(&str, sql::Conv)> = cols
-                    .iter()
-                    .filter_map(|c| c.conv().map(|v| (c.name.as_str(), v)))
-                    .collect();
-                for batch in crate::catalog::batches(&picked) {
-                    if let Some(table) = cols.first() {
-                        let built = sql::sample_statement(&table.relation, &batch, 200);
-                        assert!(built.is_some_and(|b| !sql::has_denied_word(b.text())));
-                    }
+            let parsed = crate::catalog::columns(&rows);
+            let cols = &parsed.list;
+            assert!(cols.len() as u64 + parsed.unlinked <= rows.len() as u64);
+            let picked: Vec<(&str, sql::Conv)> = cols
+                .iter()
+                .filter_map(|c| c.conv().map(|v| (c.name.as_str(), v)))
+                .collect();
+            for batch in crate::catalog::batches(&picked) {
+                if let Some(table) = cols.first() {
+                    let built = sql::sample_statement(&table.relation, &batch, 200);
+                    assert!(built.is_some_and(|b| !sql::has_denied_word(b.text())));
                 }
             }
         }

@@ -223,6 +223,8 @@ struct Coverage {
     cas: u64,
     cas_complete: bool,
     databases: u64,
+    /// Catalog rows dropped (review L3).
+    dropped: u64,
 }
 
 impl Coverage {
@@ -234,8 +236,9 @@ impl Coverage {
         let cas = c.cas_readable();
         self.cas += cas.readable;
         self.cas_complete &= cas.complete && c.columns.is_some();
+        self.dropped += c.dropped();
         if let (Some(r), Some(cols)) = (&c.relations, &c.columns) {
-            let n = catalog::counts(r, cols);
+            let n = catalog::counts(r, &cols.list);
             self.counts.views += n.views;
             self.counts.external += n.external;
             self.counts.temporary += n.temporary;
@@ -273,6 +276,13 @@ impl Coverage {
                 self.prefixed
             ));
         }
+        if self.dropped > 0 {
+            detail.push(format!(
+                "{} catalog row(s) with a name that is not UTF-8 or cannot be quoted: their \
+                 relations are not sampled",
+                self.dropped
+            ));
+        }
         if self.cas > 0 {
             notes.add(
                 TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(self.cas),
@@ -287,7 +297,9 @@ impl Coverage {
                 TargetNote::new(NoteCode::PrivilegeNotEvaluated),
                 databastion_core::CountMerge::Sum,
             );
-            detail.push("the CAS store guard's catalog read was cut or failed".to_owned());
+            detail.push(
+                "the CAS store guard's catalog read was cut, failed or dropped a row".to_owned(),
+            );
         }
     }
 }
@@ -673,6 +685,46 @@ mod tests {
             Some(vec![1])
         );
         assert_eq!(dropped, 0);
+    }
+
+    /// Review L3: a dropped catalog row leaves the CAS store guard not
+    /// evaluated (it could be a ticket registry), and is in the detail.
+    #[test]
+    fn a_dropped_catalog_row_leaves_the_cas_guard_not_evaluated() {
+        let raw = |b: &[u8]| Value::Bytes(zeroize::Zeroizing::new(b.to_vec()));
+        let rel = |name: Value| {
+            vec![
+                name,
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+            ]
+        };
+        let (list, dropped) =
+            catalog::relations(&[rel(raw(b"CUSTOMERS")), rel(raw(&[0xC3, 0x28]))]);
+        let read = catalog::Catalog {
+            relations: Some(list),
+            relations_dropped: dropped,
+            columns: Some(catalog::Columns::default()),
+            ..catalog::Catalog::default()
+        };
+        let mut cov = Coverage::default();
+        cov.add(&read);
+        let (mut notes, mut detail) = (Notes::default(), Vec::new());
+        cov.notes(&mut notes, &mut detail);
+        let notes = notes.into_vec();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated),
+            "{notes:?}"
+        );
+        assert!(
+            detail.iter().any(|d| d.starts_with("1 catalog row(s)")),
+            "{detail:?}"
+        );
+        assert!(!detail.iter().any(|d| d.contains('\u{fffd}')));
     }
 
     #[test]

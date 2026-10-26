@@ -363,16 +363,17 @@ proptest! {
             any::<i64>().prop_map(sql::Value::Int),
             any::<bool>().prop_map(sql::Value::Bool),
             ".{0,70}".prop_map(|s| sql::Value::Text(Zeroizing::new(s))),
+            prop::collection::vec(any::<u8>(), 0..260).prop_map(|b| sql::Value::Bytes(Zeroizing::new(b))),
         ], 0..12), 0..8),
     ) {
-        if let Some(rels) = crate::catalog::relations(&rows) {
-            prop_assert!(rels.iter().all(|r| sql::identifier_ok(&r.name)));
-        }
-        if let Some(cols) = crate::catalog::columns(&rows) {
-            prop_assert!(cols.iter().all(|c| sql::identifier_ok(&c.name) && sql::identifier_ok(&c.relation)));
-            for c in &cols {
-                let _ = c.conv();
-            }
+        let (rels, dropped) = crate::catalog::relations(&rows);
+        prop_assert_eq!(rels.len() as u64 + dropped, rows.len() as u64);
+        prop_assert!(rels.iter().all(|r| sql::identifier_ok(&r.name)));
+        let cols = crate::catalog::columns(&rows);
+        prop_assert!(cols.list.iter().all(|c| sql::identifier_ok(&c.name) && sql::identifier_ok(&c.relation)));
+        prop_assert!(cols.list.len() as u64 + cols.unlinked <= rows.len() as u64);
+        for c in &cols.list {
+            let _ = c.conv();
         }
     }
 }

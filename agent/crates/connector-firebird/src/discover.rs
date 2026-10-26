@@ -32,6 +32,10 @@
 //!   permission, a lock conflict, a timeout) skips the table
 //!   (`skipped_error`, `skipped_not_readable`), with the column types in the
 //!   local detail, never a value.
+//! - Catalog names are read as raw bytes: a relation whose name, or one of
+//!   whose column names, is not UTF-8 or cannot be quoted is
+//!   `skipped_error` alone (review L3), never the database, and leaves the
+//!   CAS store guard not evaluated.
 //! - Names: trailing spaces dropped (the engine's rule, no marker), then
 //!   ADR-0009 normalization with the ADR-0056 marker and the ADR-0057 rules
 //!   (`normalize_field_path`).
@@ -363,6 +367,13 @@ async fn database(
     if read.relations_cut {
         sink.add_coverage(cov(|c| c.limit = 1));
     }
+    if read.relations_dropped > 0 {
+        // Review L3: only these relations are lost, never the list; their
+        // names are not logged (not UTF-8 or not quotable).
+        let n = read.relations_dropped;
+        sink.add_coverage(cov(|c| c.error = n));
+        tracing::warn!(target_id = %target.id, database = dbn.as_str(), relations = n, "relations with a name that is not UTF-8 or cannot be quoted: not sampled");
+    }
     let mut tables: Vec<&catalog::Relation> = Vec::new();
     let (mut views, mut temporary, mut prefixed) = (0u64, 0u64, 0u64);
     for r in relations {
@@ -400,9 +411,17 @@ async fn database(
             sink.add_coverage(cov(|c| c.not_readable = 1));
             continue;
         }
-        let Some(columns) = read.columns_of(&r.name) else {
-            sink.add_coverage(cov(|c| c.limit = 1));
-            continue;
+        let columns = match read.columns_of(&r.name) {
+            Ok(c) => c,
+            Err(catalog::Missing::Cut) => {
+                sink.add_coverage(cov(|c| c.limit = 1));
+                continue;
+            }
+            Err(catalog::Missing::Error) => {
+                sink.add_coverage(cov(|c| c.error = 1));
+                tracing::warn!(target_id = %target.id, database = dbn.as_str(), object = object.as_str(), "column list not read, or a column name that is not UTF-8 or cannot be quoted: table not sampled");
+                continue;
+            }
         };
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         let table = Table {
@@ -824,9 +843,17 @@ mod tests {
         ]
     }
 
+    /// A catalog name as the server sends it: raw bytes, padded with
+    /// spaces as a `CHAR(63)`.
+    fn nb(name: &str) -> Value {
+        let mut b = name.as_bytes().to_vec();
+        b.resize(b.len().max(63), b' ');
+        Value::Bytes(Zeroizing::new(b))
+    }
+
     fn relation(name: &str, kind: i64, view: bool, external: bool, readable: bool) -> Vec<Value> {
         vec![
-            v(name),
+            nb(name),
             Value::Int(kind),
             Value::Bool(view),
             Value::Bool(external),
@@ -844,8 +871,8 @@ mod tests {
         computed: bool,
     ) -> Vec<Value> {
         vec![
-            v(rel),
-            v(name),
+            nb(rel),
+            nb(name),
             Value::Int(pos),
             Value::Int(ft),
             Value::Int(sub),
@@ -861,14 +888,20 @@ mod tests {
         vec![
             canned(
                 sql::RELATIONS,
-                vec![text_col(252), int_col(), bool_col(), bool_col(), bool_col()],
+                vec![
+                    octets_col(252),
+                    int_col(),
+                    bool_col(),
+                    bool_col(),
+                    bool_col(),
+                ],
                 relations,
             ),
             canned(
                 sql::COLUMNS,
                 vec![
-                    text_col(252),
-                    text_col(252),
+                    octets_col(252),
+                    octets_col(252),
                     int_col(),
                     int_col(),
                     int_col(),
@@ -947,6 +980,64 @@ mod tests {
         "lea.durand@example.net",
         "hugo.petit@example.com",
     ];
+
+    #[tokio::test]
+    async fn a_hostile_name_skips_its_relation_not_the_database() {
+        let hostile = || Value::Bytes(Zeroizing::new(vec![b'T', 0xC3, 0x28, b' ', b' ']));
+        let mut statements = session_statements("AGENT");
+        let mut bad_rel = relation("X", 0, false, false, true);
+        bad_rel[0] = hostile();
+        let mut bad_col_rel = column("HALF", "X", 0, 37, 0, 4, false);
+        bad_col_rel[0] = hostile();
+        let mut bad_col = column("HALF", "X", 1, 37, 0, 4, false);
+        bad_col[1] = Value::Bytes(Zeroizing::new(vec![0xff]));
+        statements.extend(catalog_statements(
+            vec![
+                relation("CUSTOMERS", 0, false, false, true),
+                relation("HALF", 0, false, false, true),
+                bad_rel,
+            ],
+            vec![
+                column("CUSTOMERS", "EMAIL", 0, 37, 0, 4, false),
+                column("HALF", "EMAIL", 0, 37, 0, 4, false),
+                bad_col,
+                bad_col_rel,
+            ],
+        ));
+        let sample = sql::sample_statement("CUSTOMERS", &[("EMAIL", Conv::Text)], 3).unwrap();
+        statements.push(canned(
+            sample.text(),
+            vec![text_col(16_000)],
+            EMAILS.iter().map(|e| vec![v(e)]).collect(),
+        ));
+        let opener = FakeOpener {
+            script: Script {
+                statements,
+                ..Script::default()
+            },
+            servers: Mutex::default(),
+        };
+        let job = job(3);
+        let (sink, mut rx) = FindingSink::channel(64);
+        let state = CheckState::default();
+        run(&job, &sink, &state, &opener).await.unwrap();
+        let cov = sink.coverage_for_tests().unwrap();
+        drop(sink);
+        let mut findings = Vec::new();
+        while let Some(f) = rx.recv().await {
+            findings.push(f);
+        }
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].location().unwrap().object.as_str(), "CUSTOMERS");
+        assert_eq!(cov.sampled, 1);
+        // The hostile relation, and HALF (a column row dropped).
+        assert_eq!(cov.error, 2);
+        let prepared = opener.prepared().await;
+        assert!(
+            !prepared.iter().any(|t| t.contains("\"HALF\"")),
+            "HALF was read"
+        );
+    }
 
     #[tokio::test]
     async fn samples_readable_tables_and_never_the_others() {
