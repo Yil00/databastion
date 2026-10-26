@@ -322,7 +322,8 @@ async fn failures_are_closed_codes_at_their_stage() {
             "{:?}",
             h.detail
         );
-        assert!(h.detail.unwrap().contains("forwarder"));
+        let detail = h.detail.unwrap_or_default();
+        assert!(detail.contains("forwarder"), "{detail}");
         let h = c
             .check(&target(
                 "DATABASTION_AGENT",

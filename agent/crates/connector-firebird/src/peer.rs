@@ -168,7 +168,18 @@ pub(crate) fn lookup(_server: SocketAddr, _client: SocketAddr) -> Lookup {
     }
 }
 
-/// The peer rule of decision 3 for one connection.
+/// Lookups of one connection, when one sees no row or two.
+const LOOKUPS: u32 = 3;
+/// The wait between two lookups.
+const LOOKUP_RETRY: Duration = Duration::from_millis(20);
+
+/// The peer rule of decision 3 for one connection. A lookup that sees no
+/// matching row, or two, is repeated (at most [`LOOKUPS`] in all, within
+/// [`LOOKUP_TIME`]): while the server completes the handshake, its socket
+/// can move from the listener's `SYN_RECV` entry to an `ESTABLISHED` one
+/// during a read of the table, which then shows both, or neither (seen on
+/// a forwarder that accepts at once, 1 run in 4). The last lookup decides,
+/// so the rule stays: exactly one row, owned by `peer_uid`.
 pub(crate) async fn check(
     server: SocketAddr,
     client: SocketAddr,
@@ -177,13 +188,24 @@ pub(crate) async fn check(
     if !cfg!(target_os = "linux") {
         return Err(Detail::PeerPlatform);
     }
-    let found = tokio::task::spawn_blocking(move || lookup(server, client))
-        .await
-        .unwrap_or(Lookup {
-            cut: true,
-            ..Lookup::default()
-        });
-    found.verdict(peer_uid)
+    let started = Instant::now();
+    let mut attempt = 1;
+    loop {
+        let found = tokio::task::spawn_blocking(move || lookup(server, client))
+            .await
+            .unwrap_or(Lookup {
+                cut: true,
+                ..Lookup::default()
+            });
+        let verdict = found.verdict(peer_uid);
+        let transient =
+            !found.cut && matches!(verdict, Err(Detail::PeerNotFound | Detail::PeerAmbiguous));
+        if !transient || attempt >= LOOKUPS || started.elapsed() >= LOOKUP_TIME {
+            return verdict;
+        }
+        attempt += 1;
+        tokio::time::sleep(LOOKUP_RETRY).await;
+    }
 }
 
 /// Whether the server's view of the connection (`MON$REMOTE_PROTOCOL`,
