@@ -822,12 +822,13 @@ pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 
 /// The `TargetNoteLabel` values of the revision
 /// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
-/// and 6 and its refinement of 2026-10-25): the Firebird 4.0 and 5.0
+/// and 6 and its refinements of 2026-10-25 and 2026-10-26 b): the Firebird 4.0 and 5.0
 /// system privileges, the identities of the refusal list, the `usage`
 /// object right, the credential-relation, server-configuration and
 /// role-graph probes, the reasons of `audit.trace_config_not_evaluated`,
 /// `run_confirmation_stalled` for `audit.log_records_ambiguous` and the
-/// trace configuration settings. Negotiated on
+/// trace configuration settings (`log_transactions`, `log_initfini` and
+/// `log_sweep` from refinement b, R21). Negotiated on
 /// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
 /// console lists it. Only [`NoteLabel::firebird`] builds them.
 pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
@@ -885,6 +886,9 @@ pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
     "log_procedure_finish",
     "log_function_finish",
     "log_trigger_finish",
+    "log_transactions",
+    "log_initfini",
+    "log_sweep",
     "log_errors",
     "log_services",
     "time_threshold",
@@ -1045,7 +1049,10 @@ impl NoteLabel {
     /// [`to_protocol`]). Anything else is `other`, the SQL Server revisions
     /// included. Firebird system privileges are given lowercased
     /// (`trace_any_attachment`); object and DDL rights use the values of
-    /// protocol 0.1.0 (`insert`, `create`…).
+    /// protocol 0.1.0 (`insert`, `create`…); trace settings are given as
+    /// written in `fbtrace.conf` (`log_statement_finish`, and since the
+    /// ADR-0060 refinement of 2026-10-26 b, R21, `log_transactions`,
+    /// `log_initfini` and `log_sweep`).
     #[must_use]
     pub fn firebird(value: &str) -> Self {
         if LABELS_REVISION_2026_10.contains(&value)
@@ -1632,8 +1639,9 @@ mod tests {
         );
     }
 
-    /// The labels of the ADR-0060 refinement of 2026-10-25 belong to the
-    /// same revision `2026_10_d`: `other` until the console lists its token.
+    /// The labels of the ADR-0060 refinements of 2026-10-25 and 2026-10-26 b
+    /// (R21) belong to the same revision `2026_10_d`: `other` until the
+    /// console lists its token.
     #[test]
     fn labels_of_the_firebird_refinement_are_in_revision_2026_10_d() {
         const REFINEMENT: [&str; 5] = [
@@ -1643,7 +1651,7 @@ mod tests {
             "run_confirmation_stalled",
             "server_config_readable",
         ];
-        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 61);
+        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 64);
         for value in REFINEMENT {
             assert!(super::LABELS_REVISION_2026_10_D.contains(&value), "{value}");
             assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
@@ -1681,6 +1689,44 @@ mod tests {
                 "databases_conf",
                 "foreign_databases_logged",
                 "run_confirmation_stalled"
+            ]
+        );
+        // Refinement b, R21: the trace settings the binding, folding,
+        // internal-attachment and sweep rules rely on, labels of
+        // `audit.trace_settings_missing`, in contract order after the
+        // trigger finish events.
+        const R21: [&str; 3] = ["log_transactions", "log_initfini", "log_sweep"];
+        let after = super::LABELS_REVISION_2026_10_D
+            .iter()
+            .position(|v| *v == "log_trigger_finish")
+            .expect("log_trigger_finish");
+        assert_eq!(super::LABELS_REVISION_2026_10_D[after + 1..after + 4], R21);
+        for value in R21 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+            assert!(super::NoteLabel::privilege(value).is_other(), "{value}");
+        }
+        let missing = TargetNote::new(NoteCode::AuditTraceSettingsMissing).with_labels(
+            [
+                "log_sweep",
+                "log_initfini",
+                "log_transactions",
+                "print_perf",
+            ]
+            .map(NoteLabel::firebird),
+        );
+        assert_eq!(sent(&missing, LabelRevisions::default()), vec!["other"]);
+        let mut kept = sent(&missing, d);
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "log_initfini",
+                "log_sweep",
+                "log_transactions",
+                "print_perf"
             ]
         );
     }

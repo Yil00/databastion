@@ -63,6 +63,9 @@
             "time_threshold",
             "print_perf",
             "log_blr_requests",
+            "log_transactions",
+            "log_initfini",
+            "log_sweep",
             "exclude_filter"
           ]
         },
