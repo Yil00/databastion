@@ -776,3 +776,43 @@ Each with the answer this refinement proposes, revised to the security review's 
     **Proposed**: (a). The exposure is server configuration, not user data, and it is reported. Reopen if the drift test finds a key that carries a credential or a relation outside the reviewed list (L-6).
 15. Treat the agent's one constant `RDB$CONFIG` read (a closed key list, after the probe) and the probe itself as its own reads, under the L-1 conditions (exact text, exact per-table block, bounded `records fetched`, an anchored and unpoisoned binding)?
     **Proposed**: yes. Otherwise every `check()` on an extended-variant target writes an always-reported read of the agent's own. Any other read of `RDB$CONFIG` stays always reported.
+
+## Implementation note (2026-10-26): lot 1
+
+Recorded after the merge of lot 1 of the connector (#365, at `21518f5` on `dev`: the `connector-firebird` crate with its own wire client, SRP-256, ChaCha wire encryption, `check()` and the core's C1 rules); not released yet. No decision changes; the accepted text above is unchanged, and the corrections below take precedence over it where they differ.
+
+**Protocol facts measured on 4.0.7 and 5.0.4.** They differ from the forms written in decision 1 and are recorded as protocol facts; the lot 1 security review judged them not a weakening.
+
+- **SRP-256 forms**: `k = SHA1(N | PAD(g))`; `u = SHA1(min(A) | min(B))`, from the minimal big-endian bytes of `A` and `B` (not padded); the salt is hashed as its hex text (1 to 64 hex characters, checked); `M = SHA256(H(N) xor H(g) | SHA1(user) | salt | A | B | K)`, Firebird's own form.
+- **Wire keys** arrive in the `op_response` that follows `op_cont_auth`. The cipher key is `SHA-256(K)`. The `ChaCha64` plugin data is an 8-byte nonce; the `ChaCha` plugin data is 16 bytes, a 12-byte nonce then a big-endian 32-bit initial counter.
+- **The accepted protocol version** comes back sign-extended (`0xFFFF8010` for protocol 16).
+
+**Obligations.**
+
+- **Obligation 2, first half, done**: 4.0.7 and 5.0.4 accept an offer of protocol 16 only; 3.0.14 answers `op_reject` before any password-derived data is sent. **Second half still open**: `op_cancel` during a pending fetch on a real server, to run on the engine matrix before lot 2's sampling relies on it.
+- **Obligation 14, done**: `MON$REMOTE_ADDRESS` shows a `socat` forwarder on loopback as the forwarder's address, so the forwarder check of decision 3 works.
+- **System privileges**: bit *n* of `RDB$ROLES.RDB$SYSTEM_PRIVILEGES` is the privilege at position *n* of the server's list. A drift test pins the list: 26 bits on 4.0.7, 27 on 5.0.4.
+
+**Correction to decision 5 (lot 1 review L1): the `attach` name is sent in clear.** Decision 5 says `attach` is sent inside the encrypted session. It is not: the name (alias or path) travels in `op_connect`, before wire encryption starts, because the server selects the per-database `AuthServer` and `WireCrypt` settings of `databases.conf` by that name. Measured: with an empty name, a server whose `databases.conf` alone sets `Srp256` fails the login with `isc_login_error`, and a server whose `databases.conf` alone requires `WireCrypt` sends no wire key. The name travels on loopback only (decision 3) and is still never sent to the console, logged or put in `last_error`. Operators should declare a `databases.conf` alias rather than a path that names a person.
+
+**Corrections to decision 4.**
+
+- **The default-role grant**: the form that works on 4.0 and 5.0 is `GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT;`. The example in decision 4, `GRANT DATABASTION_READER TO USER DATABASTION_AGENT DEFAULT;`, is a syntax error on both versions; the user and security documentation use the working form.
+- **The server's account and `peer_uid`**: the official image runs the server as root, so the default `peer_uid: firebird` fails against it. Run the server as its own account (uid 84 in the image) and declare that uid, rather than setting `peer_uid_root: true`: a root-owned socket matches any root process, which leaves the forwarder check as the only guard.
+- **Containers**: a numeric `peer_uid` is required when the agent runs in a container, detected by `/.dockerenv`, its cgroup, a `uid_map` that is not the identity, `KUBERNETES_SERVICE_HOST`, an overlay root filesystem or `/proc/1/sched` (this settles the "to settle at implementation" of decision 3).
+
+**Implementation decisions of lot 1.**
+
+1. **C1** (P10-C review): a `firebird` target status at `audit_level` `full` is rewritten to `partial`, the ceiling (decision 6), before spooling and before sending.
+2. **`check()` covers every declared database** (at most 64): it attaches to each, and the check fails as a whole if one attachment fails.
+3. **Fail closed on unreadable account facts**: an unreadable own `SEC$USERS` row, unreadable object grants or authentication mappings, or rows with NULL key columns block Discovery and Audit. The role graph not evaluated stays the non-blocking `role_graph` note of decision 4.
+4. **Other roles (review N4, decided)**: roles other than the reader role get no note of their own.
+5. **Authentication mappings**: entries of `RDB$AUTH_MAPPING` and `SEC$GLOBAL_AUTH_MAPPING` whose target is the user `SYSDBA` or the role `RDB$ADMIN` and whose source can match the account are refused (labels `sysdba` and `rdb_admin`). A database condition on a mapping is treated as a match, which may over-refuse; a failed read of either table blocks.
+6. **Role memberships held `WITH ADMIN OPTION`** give `privilege.grant_option`.
+7. **`discover` and `audit_stream` refuse** until a `check()` has cleared the target.
+
+**Residuals from the lot 1 re-review (notes A to C).**
+
+- **(A) `SEC$GLOBAL_AUTH_MAPPING` visibility is not measured**: whether a plain account sees other users' global mappings is not known. A read that returns no row cannot be told from "no mapping"; if the table is not filtered, any global mapping makes every account report `credential_relation_readable`. To measure on the engine matrix, then keep the probe with this residual stated, or drop the table from the probe list.
+- **(B) Chained mappings**: the mapping match compares the source with `CURRENT_USER`, the name after mapping, so a chain of mappings from the original login name is not followed. Mappings in effect are still caught through `CURRENT_USER` and `RDB$ROLE_IN_USE`.
+- **(C) Mappings to other roles**: a mapping to a role other than `RDB$ADMIN` that holds refused system privileges is caught only while that role is in use, the same residual as the role graph (decision 4).
