@@ -184,7 +184,10 @@ impl Db<'_> {
                 s.close().await;
                 return Err(e);
             }
-            s.commit(deadline).await?;
+            if let Err(e) = s.commit(deadline).await {
+                s.close().await;
+                return Err(e);
+            }
             self.session = Some(s);
         }
         self.session
@@ -205,6 +208,18 @@ impl Db<'_> {
         if let Some(s) = self.session.take() {
             s.close().await;
         }
+    }
+
+    /// Commits a unit's transaction; on a failure the session is closed
+    /// (review N2): the transaction handle is spent by the attempt, so
+    /// whether the server ended it is unknown, and none may survive into
+    /// the next pause.
+    async fn commit(&mut self, deadline: Instant) -> Result<(), FbError> {
+        let result = self.session().await?.commit(deadline).await;
+        if result.is_err() {
+            self.close().await;
+        }
+        result
     }
 
     /// After a unit's failure: the session ends when the failure left it
@@ -479,7 +494,7 @@ async fn tickets(d: &mut Db<'_>, table: &Table<'_>) -> Result<Option<Paced<()>>,
                     return Err(e);
                 }
             };
-            d.session().await?.commit(deadline).await?;
+            d.commit(deadline).await?;
             let mut counts = TicketCounts::default();
             for r in &rows.rows {
                 let kind = r.first().and_then(Value::as_text).unwrap_or_default();
@@ -601,7 +616,7 @@ async fn sample_table(
                     .await;
                 match fetched {
                     Ok(f) => {
-                        d.session().await?.commit(deadline).await?;
+                        d.commit(deadline).await?;
                         Ok((
                             Batch {
                                 values,
@@ -688,6 +703,7 @@ mod tests {
     use super::*;
     use crate::fake::{self, Canned, Script, int_col, text_col};
     use crate::sql::{Column as Described, charset, sqltype};
+    use crate::wire;
 
     fn bool_col() -> Described {
         Described {
@@ -942,6 +958,15 @@ mod tests {
     }
 
     impl FakeOpener {
+        async fn seen(self) -> Vec<fake::Seen> {
+            let handles = std::mem::take(&mut *self.servers.lock().unwrap());
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.unwrap());
+            }
+            out
+        }
+
         async fn prepared(self) -> Vec<String> {
             let handles = std::mem::take(&mut *self.servers.lock().unwrap());
             let mut out = Vec::new();
@@ -980,6 +1005,67 @@ mod tests {
         "lea.durand@example.net",
         "hugo.petit@example.com",
     ];
+
+    /// Review N2: a commit that fails after a successful fetch ends the
+    /// session, so that no server transaction survives into a pause.
+    #[tokio::test]
+    async fn a_failed_commit_after_a_fetch_closes_the_session() {
+        let mut statements = session_statements("AGENT");
+        statements.extend(catalog_statements(
+            vec![
+                relation("A", 0, false, false, true),
+                relation("B", 0, false, false, true),
+            ],
+            vec![
+                column("A", "EMAIL", 0, 37, 0, 4, false),
+                column("B", "EMAIL", 0, 37, 0, 4, false),
+            ],
+        ));
+        let a = sql::sample_statement("A", &[("EMAIL", Conv::Text)], 3).unwrap();
+        let b = sql::sample_statement("B", &[("EMAIL", Conv::Text)], 3).unwrap();
+        for stmt in [&a, &b] {
+            statements.push(canned(
+                stmt.text(),
+                vec![text_col(16_000)],
+                EMAILS.iter().map(|e| vec![v(e)]).collect(),
+            ));
+        }
+        let opener = FakeOpener {
+            script: Script {
+                statements,
+                fail_commit_after: Some(Box::leak(a.text().to_owned().into_boxed_str())),
+                ..Script::default()
+            },
+            servers: Mutex::default(),
+        };
+        let job = job(3);
+        let (sink, _rx) = FindingSink::channel(64);
+        let state = CheckState::default();
+        run(&job, &sink, &state, &opener).await.unwrap();
+        let cov = sink.coverage_for_tests().unwrap();
+        let seen = opener.seen().await;
+        let with_a: Vec<&fake::Seen> = seen
+            .iter()
+            .filter(|s| s.prepared.iter().any(|t| t == a.text()))
+            .collect();
+        assert_eq!(with_a.len(), 1);
+        let ops = &with_a[0].ops;
+        let commit = ops.iter().rposition(|&o| o == wire::op::COMMIT).unwrap();
+        assert!(
+            ops[commit..].contains(&wire::op::DETACH),
+            "the session was not closed after the failed commit: {ops:?}"
+        );
+        assert!(
+            !with_a[0].prepared.iter().any(|t| t == b.text()),
+            "B was read in the session whose commit failed"
+        );
+        // B is read in a new session.
+        assert!(
+            seen.iter()
+                .any(|s| s.prepared.iter().any(|t| t == b.text()))
+        );
+        assert_eq!(cov.sampled + cov.error, 2, "{cov:?}");
+    }
 
     #[tokio::test]
     async fn a_hostile_name_skips_its_relation_not_the_database() {
