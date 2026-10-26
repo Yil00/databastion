@@ -143,16 +143,19 @@ HARDEN=(--cap-drop NET_RAW --cap-drop NET_ADMIN)
 JOIN=(--network "container:$NET" "${HARDEN[@]}")
 timeout 120 docker run -d --name "$NET" --network none "${HARDEN[@]}" --entrypoint sleep \
   "$SOCAT" infinity >/dev/null
+# Log checks read the whole log (`grep >/dev/null`, never `grep -q`): with pipefail, `grep -q`
+# exits at its first match and `docker logs` then fails on the closed pipe, so a check could fail
+# on a log that has the line (seen 2 runs in 20 on the seeded server's long log).
 started() { # container: waits for the server's start line
   for _ in $(seq 1 120); do
-    if timeout 10 docker logs "$1" 2>&1 | grep -q "Starting Firebird"; then return 0; fi
+    if timeout 10 docker logs "$1" 2>&1 | grep -F "Starting Firebird" >/dev/null; then return 0; fi
     sleep 1
   done
   echo "[it] $1 did not start" >&2
   return 1
 }
 seeded() { # container: the seed must not have failed
-  if timeout 10 docker logs "$1" 2>&1 | grep -q "Statement failed"; then
+  if timeout 10 docker logs "$1" 2>&1 | grep -F "Statement failed" >/dev/null; then
     echo "[it] the seed of $1 failed" >&2
     return 1
   fi
@@ -168,7 +171,7 @@ timeout 300 docker run -d --name "$NAME-init" "${JOIN[@]}" --env-file "$WORK/env
   -v "$ROOT/dev/seed/out/firebird.sql:/databastion/seed/firebird.sql:ro" "$IMAGE" >/dev/null
 started "$NAME-init"
 seeded "$NAME-init"
-if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -q "crm.fdb seeded"; then
+if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -F "crm.fdb seeded" >/dev/null; then
   echo "[it] the dev seed (crm) was not loaded" >&2
   exit 1
 fi
