@@ -26,7 +26,7 @@ use crate::error::Detail;
 const MAX_LINES: usize = 1 << 20;
 /// Longest line considered (a row is about 150 bytes).
 const MAX_LINE_BYTES: usize = 512;
-/// Time bound of one lookup (both tables).
+/// Time bound of the whole peer check (every lookup and wait).
 pub(crate) const LOOKUP_TIME: Duration = Duration::from_secs(2);
 /// The overflow uid.
 const OVERFLOW_UID: u32 = 65_534;
@@ -138,12 +138,16 @@ pub(crate) fn scan(
 }
 
 /// Reads `/proc/net/tcp` and `/proc/net/tcp6` (both: a dual-stack
-/// listener shows IPv4 connections in `tcp6`), bounded.
+/// listener shows IPv4 connections in `tcp6`), bounded by lines and by
+/// `deadline`, the end of the whole peer check (not of this read).
 #[cfg(target_os = "linux")]
-pub(crate) fn lookup(server: SocketAddr, client: SocketAddr) -> Lookup {
-    let deadline = Instant::now() + LOOKUP_TIME;
+pub(crate) fn lookup(server: SocketAddr, client: SocketAddr, deadline: Instant) -> Lookup {
     let mut out = Lookup::default();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if Instant::now() > deadline {
+            out.cut = true;
+            break;
+        }
         let Ok(file) = std::fs::File::open(path) else {
             continue;
         };
@@ -161,14 +165,26 @@ pub(crate) fn lookup(server: SocketAddr, client: SocketAddr) -> Lookup {
 
 /// Off Linux there is no table to read: the check fails (decision 3).
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn lookup(_server: SocketAddr, _client: SocketAddr) -> Lookup {
+pub(crate) fn lookup(_server: SocketAddr, _client: SocketAddr, _deadline: Instant) -> Lookup {
     Lookup {
         cut: true,
         ..Lookup::default()
     }
 }
 
-/// The peer rule of decision 3 for one connection.
+/// Lookups of one connection, when one sees no row or two.
+const LOOKUPS: u32 = 3;
+/// The wait between two lookups.
+const LOOKUP_RETRY: Duration = Duration::from_millis(20);
+
+/// The peer rule of decision 3 for one connection. A lookup that sees no
+/// matching row, or two, is repeated (at most [`LOOKUPS`] in all): while
+/// the server completes the handshake, its socket can move from the
+/// listener's `SYN_RECV` entry to an `ESTABLISHED` one during a read of
+/// the table, which then shows both, or neither (seen on a forwarder that
+/// accepts at once, 1 run in 4). The last lookup decides, so the rule
+/// stays: exactly one row, owned by `peer_uid`. Every lookup and wait
+/// shares one deadline, [`LOOKUP_TIME`] after the start (review L2).
 pub(crate) async fn check(
     server: SocketAddr,
     client: SocketAddr,
@@ -177,13 +193,33 @@ pub(crate) async fn check(
     if !cfg!(target_os = "linux") {
         return Err(Detail::PeerPlatform);
     }
-    let found = tokio::task::spawn_blocking(move || lookup(server, client))
-        .await
-        .unwrap_or(Lookup {
-            cut: true,
-            ..Lookup::default()
-        });
-    found.verdict(peer_uid)
+    let deadline = Instant::now() + LOOKUP_TIME;
+    check_until(deadline, peer_uid, move |d| lookup(server, client, d)).await
+}
+
+/// The retry loop of [`check`], with the lookup given (tests).
+async fn check_until<F>(deadline: Instant, peer_uid: u32, read: F) -> Result<(), Detail>
+where
+    F: Fn(Instant) -> Lookup + Clone + Send + 'static,
+{
+    let mut attempt = 1;
+    loop {
+        let read = read.clone();
+        let found = tokio::task::spawn_blocking(move || read(deadline))
+            .await
+            .unwrap_or(Lookup {
+                cut: true,
+                ..Lookup::default()
+            });
+        let verdict = found.verdict(peer_uid);
+        let transient =
+            !found.cut && matches!(verdict, Err(Detail::PeerNotFound | Detail::PeerAmbiguous));
+        if !transient || attempt >= LOOKUPS || Instant::now() + LOOKUP_RETRY >= deadline {
+            return verdict;
+        }
+        attempt += 1;
+        tokio::time::sleep(LOOKUP_RETRY).await;
+    }
 }
 
 /// Whether the server's view of the connection (`MON$REMOTE_PROTOCOL`,
@@ -316,6 +352,76 @@ mod tests {
         scan(rows.into_iter(), server, client, None, &mut out);
         // The row with a 4-tuple but no uid counts, with no uid: refused.
         assert_eq!(out.verdict(84), Err(Detail::PeerNotFound));
+    }
+
+    #[tokio::test]
+    async fn every_retry_shares_one_deadline() {
+        use std::sync::{Arc, Mutex};
+        // Each lookup sees two rows (transient) and takes 30 ms.
+        let seen: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let s = Arc::clone(&seen);
+        let read = move |d: Instant| {
+            s.lock().unwrap().push(d);
+            std::thread::sleep(Duration::from_millis(30));
+            Lookup {
+                matches: 2,
+                uid: Some(84),
+                cut: false,
+            }
+        };
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let verdict = check_until(deadline, 84, read).await;
+        assert_eq!(verdict, Err(Detail::PeerAmbiguous));
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty() && seen.len() <= LOOKUPS as usize);
+        assert!(seen.iter().all(|d| *d == deadline), "one deadline for all");
+        // Within the deadline plus at most one lookup's own time.
+        assert!(started.elapsed() < Duration::from_millis(100 + 30 + 50));
+
+        // A deadline too close for a retry: one lookup only.
+        let count = Arc::new(Mutex::new(0u32));
+        let c = Arc::clone(&count);
+        let read = move |_d: Instant| {
+            *c.lock().unwrap() += 1;
+            Lookup::default()
+        };
+        let deadline = Instant::now() + Duration::from_millis(5);
+        assert_eq!(
+            check_until(deadline, 84, read).await,
+            Err(Detail::PeerNotFound)
+        );
+        assert_eq!(*count.lock().unwrap(), 1);
+
+        // A transient miss then the row: accepted, all within the deadline.
+        let n = Arc::new(Mutex::new(0u32));
+        let c = Arc::clone(&n);
+        let read = move |_d: Instant| {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Lookup::default()
+            } else {
+                Lookup {
+                    matches: 1,
+                    uid: Some(84),
+                    cut: false,
+                }
+            }
+        };
+        let deadline = Instant::now() + LOOKUP_TIME;
+        assert_eq!(check_until(deadline, 84, read).await, Ok(()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_passed_deadline_cuts_the_lookup() {
+        let server: SocketAddr = "127.0.0.1:3050".parse().unwrap();
+        let client: SocketAddr = "127.0.0.1:41370".parse().unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(lookup(server, client, past).cut);
     }
 
     #[test]

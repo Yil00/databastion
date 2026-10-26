@@ -95,6 +95,102 @@ fn rows_of(columns: &[Column], rows: &[u8]) {
     }
 }
 
+/// The described column of a closed shape.
+fn described(shape: sql::Col) -> Column {
+    match shape {
+        sql::Col::Int => Column {
+            sqltype: sql::sqltype::LONG,
+            sub_type: 0,
+            scale: 0,
+            length: 4,
+        },
+        sql::Col::Bool => Column {
+            sqltype: sql::sqltype::BOOLEAN,
+            sub_type: 0,
+            scale: 0,
+            length: 1,
+        },
+        sql::Col::Text(n) => Column {
+            sqltype: sql::sqltype::VARYING,
+            sub_type: sql::charset::UTF8,
+            scale: 0,
+            length: n,
+        },
+        sql::Col::Octets(n) => Column {
+            sqltype: sql::sqltype::VARYING,
+            sub_type: sql::charset::OCTETS,
+            scale: 0,
+            length: n,
+        },
+    }
+}
+
+/// Discovery's reads (ADR-0060 decision 5): rows of the relation list,
+/// the column list or a sampling statement (the first byte selects which;
+/// the rest is the rows as the server sends them), through what Discovery
+/// does with them: the catalog parsed, each column's conversion, the
+/// column batches and the built statements, each sampled value kept or
+/// dropped. Never a panic.
+pub fn catalog(data: &[u8]) {
+    let Some((&which, rest)) = data.split_first() else {
+        return;
+    };
+    let convs = [
+        sql::Conv::Text,
+        sql::Conv::Octets,
+        sql::Conv::Number,
+        sql::Conv::Float,
+        sql::Conv::Date,
+    ];
+    let shape: Vec<sql::Col> = match which % 3 {
+        0 => crate::catalog::RELATIONS_SHAPE.to_vec(),
+        1 => crate::catalog::COLUMNS_SHAPE.to_vec(),
+        _ => convs.iter().map(|c| c.shape()).collect(),
+    };
+    let columns: Vec<Column> = shape.iter().map(|s| described(*s)).collect();
+    let mut r = Reader::new(rest);
+    let mut rows = Vec::new();
+    for _ in 0..256 {
+        let before = r.pos();
+        match sql::parse_row(&mut r, &columns) {
+            Ok(row) if r.pos() > before => rows.push(row),
+            _ => break,
+        }
+    }
+    match which % 3 {
+        0 => {
+            let (rels, dropped) = crate::catalog::relations(&rows);
+            assert_eq!(rels.len() as u64 + dropped, rows.len() as u64);
+            for rel in &rels {
+                assert!(sql::identifier_ok(&rel.name));
+                let _ = crate::catalog::never_sampled(&rel.name);
+            }
+        }
+        1 => {
+            let parsed = crate::catalog::columns(&rows);
+            let cols = &parsed.list;
+            assert!(cols.len() as u64 + parsed.unlinked <= rows.len() as u64);
+            let picked: Vec<(&str, sql::Conv)> = cols
+                .iter()
+                .filter_map(|c| c.conv().map(|v| (c.name.as_str(), v)))
+                .collect();
+            for batch in crate::catalog::batches(&picked) {
+                if let Some(table) = cols.first() {
+                    let built = sql::sample_statement(&table.relation, &batch, 200);
+                    assert!(built.is_some_and(|b| !sql::has_denied_word(b.text())));
+                }
+            }
+        }
+        _ => {
+            for row in rows {
+                for (v, conv) in row.into_iter().zip(convs) {
+                    let _ = crate::catalog::value_text(v, conv, which & 0x80 != 0);
+                }
+            }
+        }
+    }
+}
+
 /// The server's SRP data (`p_acpt_data`): parsed with its checks, and,
 /// when accepted, the client proof computed with a fixed private value.
 pub fn srp_data(data: &[u8]) {
@@ -167,7 +263,14 @@ mod tests {
     /// captured describe answer of the 5.0.4 server with a row.
     #[test]
     fn entry_points_run() {
-        for f in [messages, describe_and_rows, srp_data, keys, proc_net_tcp] {
+        for f in [
+            messages,
+            describe_and_rows,
+            srp_data,
+            keys,
+            proc_net_tcp,
+            catalog,
+        ] {
             f(&[]);
             f(&[0]);
             f(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);

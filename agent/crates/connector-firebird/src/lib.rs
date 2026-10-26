@@ -31,9 +31,11 @@
 
 #![forbid(unsafe_code)]
 
+mod catalog;
 mod check;
 mod conn;
 mod crypt;
+mod discover;
 mod error;
 mod peer;
 mod privileges;
@@ -139,17 +141,15 @@ impl Connector for FirebirdConnector {
         check::check(&self.state, target).await
     }
 
-    /// Discovery comes with lot 2 (ADR-0060 decision 10). The check's
+    /// Discovery (ADR-0060 decision 5, lot 2 of decision 10). The check's
     /// verdict is consulted first (review N11): a target never checked, or
-    /// whose account is refused or not evaluated, is refused.
-    async fn discover(&self, job: &ScanJob, _sink: &FindingSink) -> Result<(), ConnectorError> {
+    /// whose account is refused or not evaluated, is refused; the scan
+    /// evaluates the refusal list again at each database.
+    async fn discover(&self, job: &ScanJob, sink: &FindingSink) -> Result<(), ConnectorError> {
         if let Some(e) = self.refused(job.target()) {
             return Err(e);
         }
-        Err(ConnectorError::NotImplemented {
-            engine: Engine::Firebird,
-            operation: "discover",
-        })
+        discover::discover(job, sink, &self.state).await
     }
 
     /// Audit comes with lot 3 (ADR-0060 decision 10), behind the same
@@ -253,11 +253,15 @@ mod tests {
         // A failed check leaves it blocked.
         let _ = c.check(&t).await;
         assert!(denied(c.discover(&job, &findings).await));
-        // Cleared by a check: the later lots' entry point.
+        // Cleared by a check: Discovery runs (here it cannot read the
+        // secret).
         c.state.set_blocked("t", false);
         assert!(matches!(
             c.discover(&job, &findings).await,
-            Err(ConnectorError::NotImplemented { .. })
+            Err(ConnectorError::Target {
+                code: FailureCode::AuthenticationFailed,
+                ..
+            })
         ));
         c.state.set_blocked("t", true);
         assert!(denied(c.discover(&job, &findings).await));

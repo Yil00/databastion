@@ -292,6 +292,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "firebird_catalog"
+path = "fuzz_targets/firebird_catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "firebird_srp_data"
 path = "fuzz_targets/firebird_srp_data.rs"
 test = false

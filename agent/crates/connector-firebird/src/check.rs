@@ -24,6 +24,7 @@ use databastion_core::{
 };
 use tokio::time::Instant;
 
+use crate::catalog;
 use crate::conn::{self, Endpoint, Session};
 use crate::error::{Detail, FbError, Stage};
 use crate::privileges::{Evaluation, Facts, Grant, Mapping, Membership};
@@ -73,10 +74,6 @@ impl CheckState {
 
     /// Whether Discovery and Audit must not run for `target_id`: blocked
     /// by the last check, or never checked (fail closed).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "Discovery (lot 2) and Audit (lot 3)")
-    )]
     pub(crate) fn blocks(&self, target_id: &str) -> bool {
         self.blocked
             .lock()
@@ -170,6 +167,7 @@ async fn run(
         detail.push("reached through an operator-run tunnel (firebird.tunnel)".to_owned());
     }
     let mut eval = Evaluation::default();
+    let mut coverage = Coverage::default();
     let mut version: Option<String> = None;
     for db in &settings.databases {
         let mut s = conn::connect(
@@ -181,16 +179,23 @@ async fn run(
         )
         .await?;
         let result = database(&mut s, settings.tunnel, settings.extended_grants, deadline).await;
+        let read = match &result {
+            Ok(_) => Some(catalog::read(&mut s, deadline).await),
+            Err(_) => None,
+        };
         s.close().await;
         let (v, facts) = result?;
+        let read = read.transpose()?.unwrap_or_default();
         detail.push(format!("Firebird {v}, wire encryption {}", facts.plugin));
         version = Some(v);
         eval.add(&facts.facts);
+        coverage.add(&read);
     }
     if let Some(v) = &version {
         state.set_version(&target.id, Some(v.clone()));
     }
     eval.notes(&mut notes);
+    coverage.notes(&mut notes, &mut detail);
     // Audit: lot 3 (decision 10).
     notes.add(TargetNote::new(NoteCode::AuditSourceNotConfigured));
     let summary = eval.summary();
@@ -208,10 +213,101 @@ async fn run(
     })
 }
 
+/// What the catalogs of the declared databases show (decision 5): the
+/// coverage notes, and the CAS store guard's readable credential columns
+/// (ADR-0041 decision 6), summed over the databases.
+#[derive(Debug, Default)]
+struct Coverage {
+    counts: catalog::Counts,
+    prefixed: u64,
+    cas: u64,
+    cas_complete: bool,
+    databases: u64,
+    /// Catalog rows dropped (review L3).
+    dropped: u64,
+}
+
+impl Coverage {
+    fn add(&mut self, c: &catalog::Catalog) {
+        if self.databases == 0 {
+            self.cas_complete = true;
+        }
+        self.databases += 1;
+        let cas = c.cas_readable();
+        self.cas += cas.readable;
+        self.cas_complete &= cas.complete && c.columns.is_some();
+        self.dropped += c.dropped();
+        if let (Some(r), Some(cols)) = (&c.relations, &c.columns) {
+            let n = catalog::counts(r, &cols.list);
+            self.counts.views += n.views;
+            self.counts.external += n.external;
+            self.counts.temporary += n.temporary;
+            self.counts.computed += n.computed;
+            self.counts.without_select += n.without_select;
+            self.prefixed += r
+                .iter()
+                .filter(|x| catalog::system_prefixed(&x.name) && !catalog::never_sampled(&x.name))
+                .count() as u64;
+        }
+    }
+
+    fn notes(&self, notes: &mut Notes, detail: &mut Vec<String>) {
+        let c = &self.counts;
+        for (code, n) in [
+            (NoteCode::CoverageViewsNotSampled, c.views),
+            (NoteCode::CoverageComputedColumnsNotSampled, c.computed),
+            (NoteCode::CoverageExternalFileTables, c.external),
+            (NoteCode::CoverageRelationsWithoutSelect, c.without_select),
+        ] {
+            if n > 0 {
+                notes.add(TargetNote::new(code).with_count(n));
+            }
+        }
+        if c.temporary > 0 {
+            detail.push(format!(
+                "{} global temporary table(s) not sampled (their rows belong to other attachments)",
+                c.temporary
+            ));
+        }
+        if self.prefixed > 0 {
+            detail.push(format!(
+                "{} user table(s) named with a system prefix (RDB$, MON$, SEC$, PLG$), sampled as \
+                 user tables",
+                self.prefixed
+            ));
+        }
+        if self.dropped > 0 {
+            detail.push(format!(
+                "{} catalog row(s) with a name that is not UTF-8 or cannot be quoted: their \
+                 relations are not sampled",
+                self.dropped
+            ));
+        }
+        if self.cas > 0 {
+            notes.add(
+                TargetNote::new(NoteCode::PrivilegeTicketCredentialsReadable).with_count(self.cas),
+            );
+            detail.push(format!(
+                "the account can read credential columns of {} CAS ticket registry or audit trail \
+                 table(s) (grant SELECT on another table, or revoke it)",
+                self.cas
+            ));
+        } else if self.databases > 0 && !self.cas_complete {
+            notes.merge(
+                TargetNote::new(NoteCode::PrivilegeNotEvaluated),
+                databastion_core::CountMerge::Sum,
+            );
+            detail.push(
+                "the CAS store guard's catalog read was cut, failed or dropped a row".to_owned(),
+            );
+        }
+    }
+}
+
 /// What one database's check read.
-struct DatabaseFacts {
-    facts: Facts,
-    plugin: &'static str,
+pub(crate) struct DatabaseFacts {
+    pub(crate) facts: Facts,
+    pub(crate) plugin: &'static str,
 }
 
 fn text(row: &[Value], i: usize) -> Option<String> {
@@ -286,12 +382,16 @@ fn soft<T>(r: Result<T, FbError>) -> Result<Option<T>, FbError> {
     }
 }
 
-async fn database(
+/// What every attachment checks before anything else (decisions 2 to 4):
+/// the version (4.0 or 5.0), the wire encryption and the read-only
+/// read-committed transaction as the server reports them, the forwarder
+/// rule (unless the operator declared a tunnel), and the server-side idle
+/// timeout. Returns the version and its major.
+pub(crate) async fn prepare(
     s: &mut Session,
     tunnel: bool,
-    extended_grants: bool,
     deadline: Instant,
-) -> Result<(String, DatabaseFacts), FbError> {
+) -> Result<(String, u32), FbError> {
     // Decision 2: the version, before any other read.
     let rows = s
         .query(sql::VERSION, &[Col::Text(128)], 1, deadline)
@@ -352,6 +452,16 @@ async fn database(
     }
     // The server-side safety net (decision 3).
     s.exec(sql::IDLE_TIMEOUT, deadline).await?;
+    Ok((version, major))
+}
+
+pub(crate) async fn database(
+    s: &mut Session,
+    tunnel: bool,
+    extended_grants: bool,
+    deadline: Instant,
+) -> Result<(String, DatabaseFacts), FbError> {
+    let (version, major) = prepare(s, tunnel, deadline).await?;
     let mut f = Facts {
         major,
         extended_grants,
@@ -575,6 +685,46 @@ mod tests {
             Some(vec![1])
         );
         assert_eq!(dropped, 0);
+    }
+
+    /// Review L3: a dropped catalog row leaves the CAS store guard not
+    /// evaluated (it could be a ticket registry), and is in the detail.
+    #[test]
+    fn a_dropped_catalog_row_leaves_the_cas_guard_not_evaluated() {
+        let raw = |b: &[u8]| Value::Bytes(zeroize::Zeroizing::new(b.to_vec()));
+        let rel = |name: Value| {
+            vec![
+                name,
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+            ]
+        };
+        let (list, dropped) =
+            catalog::relations(&[rel(raw(b"CUSTOMERS")), rel(raw(&[0xC3, 0x28]))]);
+        let read = catalog::Catalog {
+            relations: Some(list),
+            relations_dropped: dropped,
+            columns: Some(catalog::Columns::default()),
+            ..catalog::Catalog::default()
+        };
+        let mut cov = Coverage::default();
+        cov.add(&read);
+        let (mut notes, mut detail) = (Notes::default(), Vec::new());
+        cov.notes(&mut notes, &mut detail);
+        let notes = notes.into_vec();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.code() == NoteCode::PrivilegeNotEvaluated),
+            "{notes:?}"
+        );
+        assert!(
+            detail.iter().any(|d| d.starts_with("1 catalog row(s)")),
+            "{detail:?}"
+        );
+        assert!(!detail.iter().any(|d| d.contains('\u{fffd}')));
     }
 
     #[test]
