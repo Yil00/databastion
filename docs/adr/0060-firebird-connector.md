@@ -816,3 +816,29 @@ Recorded after the merge of lot 1 of the connector (#365, at `21518f5` on `dev`:
 - **(A) `SEC$GLOBAL_AUTH_MAPPING` visibility is not measured**: whether a plain account sees other users' global mappings is not known. A read that returns no row cannot be told from "no mapping"; if the table is not filtered, any global mapping makes every account report `credential_relation_readable`. To measure on the engine matrix, then keep the probe with this residual stated, or drop the table from the probe list.
 - **(B) Chained mappings**: the mapping match compares the source with `CURRENT_USER`, the name after mapping, so a chain of mappings from the original login name is not followed. Mappings in effect are still caught through `CURRENT_USER` and `RDB$ROLE_IN_USE`.
 - **(C) Mappings to other roles**: a mapping to a role other than `RDB$ADMIN` that holds refused system privileges is caught only while that role is in use, the same residual as the role graph (decision 4).
+
+## Implementation note (2026-10-26): lot 2
+
+Recorded after the merge of lot 2 of the connector (#370, at `de4ed01` on `dev`: Discovery, the CAS store guard, the dev service and the engine-matrix entries); not released yet. No decision changes; the accepted text above is unchanged, and the clarifications below take precedence over it where they differ.
+
+**Obligations.**
+
+- **Obligation 2, second half, done**: on 4.0.7 and 5.0.4, `op_cancel` sent at the client deadline during a pending fetch is answered with `isc_cancelled` within 0 to 2 ms, and the attachment stays usable. The server's own statement timeout is written as `isc_cancelled` followed by the timeout code, after about 1005 ms; the connector reports it as `timeout`. Obligation 2 is done, except the two items still open: `PLG$SRP` in a database that is its own security database, and true Classic mode.
+- **Obligation 5, done**: every conversion form of decision 5 works on both versions (`WIN1252`, `NONE`, text and binary blobs, `INT128`, `DECFLOAT`, `DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`). User tables named `RDB$…` or `MON$…` are allowed and carry system flag 0; a trailing space in a quoted name is not stored; neither server lets a client create a name that is not valid UTF-8.
+
+**Clarifications of decision 5.**
+
+- **The byte budget (lot 2 review L1, a deviation judged equivalent or better)**: at 32 MiB the connector stops requesting rows at the current round (at most 64 rows of at most 64 KiB each in flight, parsed row by row and zeroized), then closes the cursor (`DSQL_drop`) instead of sending `op_cancel`: no fetch is pending at that point, and a cancel could reach the next request. `op_cancel` stays the answer to the client deadline.
+- **`BLOB SUB_TYPE BINARY`** (sub-type 0) is sampled as `OCTETS` and kept only when it is valid UTF-8 without control characters, as decision 5's conversion text says. The Consequences line "non-text blobs" means blob sub-types above 1 (user sub-types and the other system sub-types), which are never read.
+- **Catalog names are read as raw bytes** (`CAST … CHARACTER SET OCTETS`): trailing `0x20` bytes are dropped, then strict UTF-8 and the identifier rules are checked per row. A bad relation row makes that relation `skipped_error` alone; a bad column row skips its relation; any dropped row leaves the CAS store guard incomplete (`privilege.not_evaluated`). Local details give counts only.
+- **The never-sampled list** holds every system relation of both images (`RDB$CONFIG` included) and the prefixes `PLG$SRP*`, `PLG$USERS*` and `PLG$PROF_*`, with drift tests over a user database and the image's own `security<N>.fdb` (more than 40 names). Residual: profiler tables created by `RDB$PROFILER` are covered only by the `PLG$PROF_` prefix.
+
+**Refinement of decision 3: the peer-uid lookup (lot 1 review L1).** A lookup that sees 0 or 2 matching rows is repeated, at most 3 times 20 ms apart, under one overall deadline of 2 s; the last read decides and must show exactly one row for the full 4-tuple, owned by `peer_uid`. A wrong uid, 65534, root without the opt-in or a cut read fails at once. Cause, measured: while a concurrent connection completes its handshake, its socket moves from the listener's `SYN_RECV` entry to an `ESTABLISHED` entry during the `/proc/net/tcp` read (7 of 22 integration runs failed without the retry, 0 of 40 with it). The security review found that a local process cannot add a row for the agent's 4-tuple under another uid.
+
+**The CAS store guard.** Firebird `SELECT` is granted per table only, so a readable ticket registry always raises `privilege.ticket_credentials_readable`. `check()` reads the catalog of every declared database at each heartbeat, bounded by the check deadline and failing closed; its cost is to measure in the P10-D load run.
+
+**Dev service and CI (P10-D, decision 9).**
+
+- An opt-in Compose profile `firebird` (`make dev-firebird`): 5.0.4 pinned by digest (4.0.7 selectable with `DATABASTION_DEV_FIREBIRD_IMAGE` and `DATABASTION_DEV_FIREBIRD_MAJOR`); the server runs as uid 84 with `cap_drop: ALL` and `no-new-privileges`, on loopback only, with no published port; a minimal account and a `SYSDBA`-mapped account that `check()` refuses; a seed covering decision 9's list.
+- The engine-matrix job `firebird` on 4.0.7 and 5.0.4, and the fuzz target `firebird_catalog`.
+- The integration harness `dev/firebird/it.sh` now waits for the listeners and reads whole logs: a `pipefail` with `grep -q` exited with 141 and caused the rare harness failures seen with lot 1.
