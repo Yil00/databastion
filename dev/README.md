@@ -19,6 +19,7 @@ make dev-cas-smoke       # logs a fake user in, then checks the audit log, permi
 make dev-sqlserver       # opt-in: SQL Server 2022 Express with the seeded `retail` database and audit setup (below)
 make dev-redis           # opt-in: Valkey 9.0 and Redis 8.10 with the seeded keyspace and ACL users (below)
 make dev-sqlite          # opt-in: the seeded SQLite files and the writer holding the WAL file open (below)
+make dev-firebird        # opt-in: Firebird 5.0.4 as uid 84 with the seeded `crm` database, loopback only (below)
 ```
 `make help` lists every target by section (setup with `make install` / `make doctor`, console, agent, protocol, `make check`, end-to-end, release). The CI workflow `.github/workflows/dev-env.yml` runs the same steps as `make dev` / `make dev-smoke`; `make agent-it` ([agent-it.sh](agent-it.sh)) runs the "dev image" step of the CI connector jobs, with the variables shown below.
 
@@ -40,6 +41,7 @@ All ports are published on **127.0.0.1 only**; host ports can be changed in `dev
 | SQL Server 2022 Express (`sqlserver`, opt-in: profile `sqlserver`) | 1433 | `retail` (schemas `crm`, `finance`) | SQL Server Audit (`FILE`) and the Extended Events session `databastion_xe` ([below](#sql-server)) | Partial at best ([ADR-0051](../docs/adr/0051-sqlserver-connector.md)) |
 | Valkey 9.0 (`valkey`) and Redis 8.10 (`redis`), opt-in: profile `redis` | 6379 (Valkey), 6389 (Redis), TLS only | `db0`, `db1` ([below](#valkey-and-redis)) | `SLOWLOG` at every command, `ACL LOG` (Valkey: `COMMANDLOG`) | Limited at best ([ADR-0052](../docs/adr/0052-redis-valkey-connector.md)) |
 | SQLite files and their writer (`sqlite`, opt-in: profile `sqlite`) | none (files in `dev/.state/sqlite/data`) | `crm.db` (rollback journal), `app.db` (WAL), `intl.db` (UTF-16) ([below](#sqlite)) | none: Discovery only | None ([ADR-0059](../docs/adr/0059-sqlite-connector.md)) |
+| Firebird 5.0.4 (`firebird`, opt-in: profile `firebird`) | none (3050 on the loopback of its own network namespace) | `crm` ([below](#firebird)) | none yet (the trace configuration comes with the connector's Audit lot) | None for now ([ADR-0060](../docs/adr/0060-firebird-connector.md): Partial at best) |
 | Prometheus (`prometheus`) | 9090 | | | |
 | Grafana (`grafana`) | 3001 | | | |
 
@@ -297,6 +299,30 @@ The files of the SQLite connector ([ADR-0059](../docs/adr/0059-sqlite-connector.
   ```
 - **Connector integration tests**: `make agent-it ENGINE=sqlite` ([agent-it.sh](agent-it.sh); no service needed, `sudo` for the reader tests, as the CI job `agent-sqlite`): their `seeded_dev_files_match_the_ground_truth` writes this seed itself with the agent's bundled library in every journal mode (`DELETE`, `TRUNCATE`, `PERSIST`, `WAL`), page size (512, 4 096, 65 536) and `auto_vacuum` setting, without the FTS5 table (the bundled library has no FTS5), and checks every scan against `ground-truth.json`. The weekly engine matrix runs the same test on files written by other SQLite versions (`build.py matrix --hold` as the application's account, then `DATABASTION_IT_SQLITE_SEEDED=<directory>`).
 
+## Firebird
+The target of the Firebird connector ([ADR-0060](../docs/adr/0060-firebird-connector.md) decision 9, ROADMAP P10-B). Opt-in (Compose profile `firebird`): `make dev-firebird`.
+
+- **Image**: `firebirdsql/firebird:5.0.4`, pinned by digest (`sha256:15295604…`, unchanged on 2026-10-26); `DATABASTION_DEV_FIREBIRD_IMAGE` selects 4.0.7 (`firebirdsql/firebird:4.0.7@sha256:456aeb74…`, amd64 only). The images are pulled and run as tools, never redistributed (IPL / IDPL).
+- **The server's own account** ([firebird/entrypoint.sh](firebird/entrypoint.sh)): the container runs as uid 84 (`firebird`), never root, with no capability (`cap_drop: [ALL]`) and `no-new-privileges`, so the agent's default `firebird.peer_uid: firebird` (uid 84) matches the server's sockets. Before the server starts, over embedded connections of the image's `isql` (no network, no password on any command line: they come from the environment and reach `isql` on its standard input), it creates the accounts in the container's security database, at every start, and on the first start of the `firebird-data` volume loads the seed ([firebird/seed.sh](firebird/seed.sh)); then it runs the SuperServer.
+- **Configuration** ([firebird/firebird.conf](firebird/firebird.conf), mounted read-only): `RemoteBindAddress = 127.0.0.1` (port 3050), `WireCrypt = Required`, `WireCryptPlugin = ChaCha64, ChaCha`, `AuthServer = Srp256`, `ExternalFileAccess = Restrict /var/lib/firebird/data/external` (the seed's external-file table), `UdfAccess = None`. No trace configuration yet: Audit comes with the connector's third lot, so the target reports `audit.source_not_configured`.
+- **Seed** ([seed/out/firebird.sql](seed/out/firebird.sql), generated): the database `crm` (`/var/lib/firebird/data/crm.fdb`, declared as `crm` in `agent.yaml`) with the PII and the fixtures of decision 9: a quoted mixed-case table (`"Customer Notes"`, its `BLOB SUB_TYPE TEXT` column `"Note Text"`), names declared with a trailing space (`"Legacy Contacts "`, `"Contact Email "`: not significant, stored without it), a table named after an e-mail address, a `WIN1252` and a `NONE` column (`LEGACY_1252`), a computed column calling a PSQL function (`PAYMENT_CARDS.IBAN_PREFIX`), a view, an external-file table (`EXT_EXPORT`), a global temporary table, an `ON CONNECT` trigger, a user table named like a system relation (`"RDB$CUSTOMER_ARCHIVE"`), a CAS-shaped ticket table (`CAS_TICKETS`), CAS ticket ids in an ordinary column (`LOGIN_REFS.SESSION_REF`), numeric types converted on the server (`INVOICES`), and a table without `SELECT` for the agent (`HR_SALARIES`).
+- **Accounts**: `DATABASTION_AGENT` (password `FIREBIRD_DATABASTION_PASSWORD`), the minimal variant of ADR-0060 decision 4: a role `DATABASTION_READER` holding one `SELECT` grant per table, granted `DEFAULT` (`GRANT DEFAULT DATABASTION_READER TO USER DATABASTION_AGENT`). Firebird grants `SELECT` per table only, so `check()` reports `privilege.ticket_credentials_readable` for `CAS_TICKETS`, as it should. `AGENT_SYSDBA_MAPPED` (the same password) is mapped to `SYSDBA` in `crm` (`CREATE MAPPING … TO USER SYSDBA`): `check()` refuses it (`privilege.refused`, `sysdba`) and Discovery does not run. `SYSDBA` (`FIREBIRD_SYSDBA_PASSWORD`) is for inspection only, never the agent's.
+- **The agent runs in the service's network namespace** (decision 3: loopback only, and the forwarder rule refuses a published port's proxy): nothing outside the container reaches the server. Every container of that namespace must drop `NET_RAW` and `NET_ADMIN` (security review M1); the service itself drops every capability. Either a container joining it, `docker run --network "container:$(docker compose -f dev/docker-compose.yml --profile firebird ps -q firebird)" --cap-drop NET_RAW --cap-drop NET_ADMIN …`, or, on the host, `nsenter` into it as [firebird/it.sh](firebird/it.sh) does. A target:
+
+  ```yaml
+  targets:
+    - id: firebird-crm
+      engine: firebird
+      host: 127.0.0.1
+      port: 3050
+      account: DATABASTION_AGENT
+      secret: { file: /path/to/firebird-agent.password }   # a 0600 file
+      firebird:
+        peer_uid: 84            # numeric: the agent in a container resolves no name
+        databases: [{ name: crm, attach: /var/lib/firebird/data/crm.fdb }]
+  ```
+- **Connector integration tests**: [firebird/it.sh](firebird/it.sh) `5` or `4` (as the CI job `agent-firebird` and the engine matrix): throwaway servers of the pinned images, each in a dedicated network namespace (a placeholder container started with `--network none`, every container dropping `NET_RAW` and `NET_ADMIN`), the main one run as uid 84 with this seed loaded as `crm` next to the lot-1 seed (`app.fdb`) and the variants (ChaCha only, Arc4 only, no wire encryption, Firebird 3.0, mappings); the tests run in the namespace through `sudo nsenter`, as the calling user, and check Discovery against `ground-truth.json` (I2 included), the CAS store guard, pacing and the refusals. Random fake passwords in `0600` files; `FIREBIRD_IT_FILTER` selects tests (default `it::`).
+
 ## Connector integration tests
 The PostgreSQL connector tests (`agent/crates/connector-postgres/src/it.rs`) run against this
 environment when these variables are set, and are skipped otherwise:
@@ -431,6 +457,7 @@ All values are fake: `example.com/.org/.net` e-mails, CAS client secrets and `Au
 - **negative controls** (`negative_control: true`): look-alike columns (`email_opt_in`, Luhn-invalid 16-digit references, year-named columns…) that must produce no finding;
 - **credentials never sampled** (`never_sampled: true`, CAS): the client secrets and the `Authorization` header of the registry. No classifier is expected there; their `values` must never reach the console, the agent's logs or the spool (ADR-0041 decision 14);
 - **value-bearing names** (`name_contains_value: true`, [ADR-0009](../docs/adr/0009-name-normalization-and-item-sanitization.md), security review M2): MongoDB dynamic keys that are e-mail addresses or digit-only phone numbers, an LDAP `ou=` named after a person, SQL tables whose names embed a phone number, a person name or an e-mail address, a SQLite column named after an e-mail address. Their `name_values` must never reach the console (invariant I2 test, P2-E);
-- **SQLite** ([above](#sqlite)): database `main`, no container, and `file`, the database file (one dev target per file, `targets.sqlite.files`); `never_sampled` there marks values the connector does not read (a `BLOB`, a value above 64 KiB); `requires: fts5` marks the locations only a writer with FTS5 creates.
+- **SQLite** ([above](#sqlite)): database `main`, no container, and `file`, the database file (one dev target per file, `targets.sqlite.files`); `never_sampled` there marks values the connector does not read (a `BLOB`, a value above 64 KiB); `requires: fts5` marks the locations only a writer with FTS5 creates;
+- **Firebird** ([above](#firebird)): database `crm` (the name declared in `agent.yaml`, `targets.firebird.file` its file), no container (no schema), the catalog names with their trailing spaces dropped; `never_sampled` there marks values the connector never reads, masks nor fingerprints (the external-file table, the CAS ticket registry, ticket ids dropped by the tripwire).
 
 Classifier ids in the ground truth are provisional until the classifier set is frozen (P2-A).
