@@ -34,7 +34,7 @@ export const SIGNAL_REGISTRY = {
     ]
   },
   "signature.backup_database": {
-    "description": "A full copy of a database made by or through the server. SQL Server: BACKUP DATABASE or BACKUP LOG (to a file or URL), DBCC CLONEDATABASE, or sp_detach_db (the data files become copyable). Firebird: a services Backup Database or Incremental Backup Database, ALTER DATABASE BEGIN BACKUP (nbackup), CREATE SHADOW, ALTER DATABASE ADD FILE or ADD DIFFERENCE FILE, or BLR requests reading a whole relation from a client whose process name is gbak (declared by the client, so evadable).",
+    "description": "A full copy of a database made by or through the server. SQL Server: BACKUP DATABASE or BACKUP LOG (to a file or URL), DBCC CLONEDATABASE, or sp_detach_db (the data files become copyable). Firebird: a services Backup Database or Incremental Backup Database, a connection whose client process name is gbak (declared by the client, so evadable), ALTER DATABASE BEGIN BACKUP (nbackup), CREATE SHADOW, ALTER DATABASE ADD FILE or ADD DIFFERENCE FILE; each reported as a read of *, always reported.",
     "engines": [
       "sqlserver",
       "firebird"
