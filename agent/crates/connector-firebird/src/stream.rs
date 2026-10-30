@@ -1614,6 +1614,16 @@ impl Machine {
         }
     }
 
+    /// A binding past the caps of R1 rule 11: its record is ambiguous,
+    /// except for an undeclared database without proof 11, whose records
+    /// are dropped and counted (R1 rule 8, re-review L-3).
+    fn refused(&self, db: DbId, at: u32) -> Decision {
+        match db {
+            DbId::Undeclared(_) if !self.s.proof11 => Decision::Dropped,
+            _ => Decision::Ambiguous { window: false, at },
+        }
+    }
+
     fn normal(&mut self, db: DbId, key: Option<Key>) -> Decision {
         match db {
             DbId::Declared(i) => {
@@ -1648,11 +1658,14 @@ impl Machine {
         match rec.header.event {
             Event::StartTransaction if shape && rec.trailer.block.is_none() => {
                 let seen = self.is_seen(db, key.1) || self.bindings.contains_key(&key);
-                if seen || self.token_live.contains_key(&token) || !self.admit(db) {
+                if seen || self.token_live.contains_key(&token) {
                     return Decision::Ambiguous {
                         window: false,
                         at: line!(),
                     };
+                }
+                if !self.admit(db) {
+                    return self.refused(db, line!());
                 }
                 if let Some(old) = self.internal.get(&db).copied() {
                     // The replacement rule (R16 item 2).
@@ -1800,10 +1813,7 @@ impl Machine {
         }
         // R1 rule 11: caps before anything is kept (review H-A).
         if !self.admit(db) {
-            return Decision::Ambiguous {
-                window: false,
-                at: line!(),
-            };
+            return self.refused(db, line!());
         }
         if raise {
             self.highest.insert(db, (id, now));
@@ -1931,16 +1941,14 @@ impl Machine {
             let below_floor = self.learned_floor.get(&db).is_some_and(|f| id <= *f);
             // R1 rule 11 (review H-A): the caps on the learned path too,
             // checked before anything is kept.
-            if above_watermark
-                || seen
-                || below_floor
-                || self.token_live.contains_key(&token)
-                || !self.admit(db)
-            {
+            if above_watermark || seen || below_floor || self.token_live.contains_key(&token) {
                 return Decision::Ambiguous {
                     window: false,
                     at: line!(),
                 };
+            }
+            if !self.admit(db) {
+                return self.refused(db, line!());
             }
             self.see(db, id);
             self.token_live.insert(token, key);

@@ -1827,3 +1827,31 @@ fn reserved_words_and_constant_texts_do_not_match_the_dependent_set() {
         &[("CUSTOMERS", 1)]
     ));
 }
+
+/// Re-review L-3: past the undeclared-identity cap (256), an undeclared
+/// database's records are dropped and counted without proof 11 (R1 rule
+/// 8), never ambiguous; with proof 11 they stay ambiguous.
+#[test]
+fn undeclared_records_past_the_identity_cap_are_dropped_without_proof_11() {
+    for proof11 in [false, true] {
+        let mut m = Machine::new(settings(proof11, Series::V5), Arc::new(Ledger::default()));
+        let cat = Cat;
+        let cats: [&dyn Catalog; 1] = [&cat];
+        for i in 0u64..300 {
+            let token = format!("24:0x{:x}", 0x2000_0000 + i);
+            let db = format!("/x/db{i}.fdb");
+            feed(&mut m, &cats, &attach(&token, 1000 + i, &db), i * 1000);
+        }
+        let token = "24:0x30000000";
+        let db = "/x/past-the-cap.fdb";
+        let (amb, dropped) = (m.counts.ambiguous, m.counts.undeclared_dropped);
+        feed(&mut m, &cats, &attach(token, 5000, db), 400_000);
+        feed(&mut m, &cats, &select(token, 5000, 5, db, "T", 1), 401_000);
+        if proof11 {
+            assert!(m.counts.ambiguous > amb, "{:?}", m.counts);
+        } else {
+            assert_eq!(m.counts.ambiguous, amb, "{:?}", m.counts);
+            assert!(m.counts.undeclared_dropped > dropped, "{:?}", m.counts);
+        }
+    }
+}
