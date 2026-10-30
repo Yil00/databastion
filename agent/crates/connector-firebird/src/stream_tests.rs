@@ -1946,3 +1946,58 @@ fn a_ddl_text_names_its_tables_until_the_next_check() {
     let out = feed(&mut m, &cats, &read(7, "ORDERS"), 2500);
     assert!(!marked(&out), "{:?}", names(&out));
 }
+
+/// Re-review note: a record that panics loses the DDL names lent to it;
+/// their databases then count every relation as dependent until the next
+/// check (never fail open).
+#[test]
+fn a_record_panic_keeps_ddl_named_relations_dependent() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            5,
+            "APP",
+            "ALTER TABLE CUSTOMERS ADD X COMPUTED BY (1)",
+            0,
+            &[],
+        ),
+        1000,
+    );
+    let read = |tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            "SELECT ID FROM CUSTOMERS WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        )
+    };
+    let marked = |out: &[Emitted]| !out.is_empty() && out.iter().all(|(_, e)| e.always_report());
+    let out = feed(&mut m, &cats, &read(6), 2000);
+    assert!(marked(&out), "named before the panic: {:?}", names(&out));
+    let panics = m.counts.panics;
+    feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{HEAD} ({a}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\nPANIC-FOR-TESTS"
+        ),
+        3000,
+    );
+    assert_eq!(m.counts.panics, panics + 1);
+    // The loud record opens a split window (every record marked for 60 s
+    // of reading time): the fallback is checked on the state itself.
+    assert!(m.all_relations_for_tests(0), "the lent names fall back");
+    let out = feed(&mut m, &cats, &read(8), 4000);
+    assert!(marked(&out), "after the panic: {:?}", names(&out));
+}

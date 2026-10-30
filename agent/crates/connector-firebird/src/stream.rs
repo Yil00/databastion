@@ -445,6 +445,10 @@ pub(crate) struct Machine {
     /// Databases where an unparsable or ambiguous DDL record makes every
     /// relation dependent.
     all_relations: std::collections::HashSet<usize>,
+    /// The databases whose `ddl_named` set is lent to the record being
+    /// read; on a panic of that record the sets are lost, and these
+    /// databases fall back to `all_relations` (never fail open).
+    ddl_named_lent: Vec<usize>,
     /// The `(st_dev, st_ino)` of the log file being read (the ledger keys
     /// consumed credits by record position).
     file: (u64, u64),
@@ -509,6 +513,7 @@ impl Machine {
             invalid_after: HashMap::new(),
             ddl_named: HashMap::new(),
             all_relations: std::collections::HashSet::new(),
+            ddl_named_lent: Vec::new(),
             ledger,
             hash_key: std::collections::hash_map::RandomState::new(),
             pending_end: Vec::new(),
@@ -533,6 +538,13 @@ impl Machine {
         for t in 0..MAX_DDL_OPEN as u64 {
             self.ddl_open.insert(((DbId::Declared(db), 50), t), db);
         }
+    }
+
+    /// Test support: whether every relation of `db` counts as dependent
+    /// until the next check.
+    #[cfg(test)]
+    pub(crate) fn all_relations_for_tests(&self, db: usize) -> bool {
+        self.all_relations.contains(&db)
     }
 
     /// Test support: the DDL transactions tracked.
@@ -1154,6 +1166,11 @@ impl Machine {
             Some(false) => self.loud(now, cat, out),
             None => {
                 self.counts.panics += 1;
+                // The DDL names lent to the record are lost with it: every
+                // relation of those databases counts until the next check.
+                for db in std::mem::take(&mut self.ddl_named_lent) {
+                    self.all_relations.insert(db);
+                }
                 self.loud(now, cat, out);
             }
         }
@@ -1172,6 +1189,7 @@ impl Machine {
         // view (and every name the catalog read does not know) counts as
         // dependent.
         let named = std::mem::take(&mut self.ddl_named);
+        self.ddl_named_lent = named.keys().copied().collect();
         let all = self.all_relations.clone();
         let invalid = self.views_invalid.clone();
         let wrapped: Vec<Invalidated<'_>> = cat
@@ -1189,6 +1207,7 @@ impl Machine {
         drop(cats);
         drop(wrapped);
         // The names of the interval, with those this record added.
+        self.ddl_named_lent.clear();
         for (db, n) in named {
             self.ddl_named.entry(db).or_default().extend(n);
         }
