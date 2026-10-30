@@ -1111,8 +1111,29 @@ async fn the_lot_3_texts_and_the_ledger() {
         .await
         .unwrap();
     assert_eq!(probe.rows.len(), 1);
+    // R12 item 5: the two view-dependency texts run for the minimal
+    // account, complete (no view of the seed depends on an
+    // always-reported relation).
+    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    assert!(deps.complete, "{deps:?}");
+    assert!(deps.dependent.is_empty());
     let ledger = crate::own::ledger_for(endpoint.addr);
     assert!(ledger.latest_id(&attach()).is_some());
     assert!(ledger.server_pid().is_some());
+    s.close().await;
+    // R9: the declared database is not excluded, before any probe.
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    let a = crate::check::attached(&mut s, false, false, &attach(), None, deadline)
+        .await
+        .unwrap();
+    assert!(matches!(a, crate::check::Attached::Checked { .. }));
     s.close().await;
 }

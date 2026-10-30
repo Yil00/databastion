@@ -508,11 +508,6 @@ pub(crate) async fn stream(
         last_growth: Instant::now(),
         reread_end: None,
     };
-    // R39 (a): the re-read region is emitted again, not suppressed; its end
-    // is kept for the local count only.
-    if let Some(r) = runner.tailer.take_replay() {
-        runner.reread_end = Some((r.file, r.replay.end));
-    }
     loop {
         // A new check: new names, classes, run.
         let (s, c, run, g) = settings(&state, &id, account, series);
@@ -571,22 +566,7 @@ pub(crate) async fn stream(
         for (_db, ev) in out {
             sink.submit(ev).await?;
         }
-        let held = machine
-            .held_from()
-            .into_iter()
-            .chain(runner.record_start)
-            .min();
-        let held: Vec<(u64, databastion_core::audit::tail::RecordPos)> = match (held, runner.file) {
-            (Some(start), Some(file)) => vec![(
-                0,
-                databastion_core::audit::tail::RecordPos {
-                    file,
-                    start,
-                    end: start,
-                },
-            )],
-            _ => Vec::new(),
-        };
+        let held = runner.held(&machine);
         runner = tokio::task::spawn_blocking(move || {
             runner.tailer.commit_from(&held);
             runner
@@ -627,6 +607,11 @@ impl Runner {
             return Ok(false);
         }
         let polled = self.tailer.poll()?;
+        // R39 (a): the re-read region (known once the file is open) is
+        // emitted again, not suppressed; its end is kept for the count.
+        if let Some(r) = self.tailer.take_replay() {
+            self.reread_end = Some((r.file, r.replay.end));
+        }
         let now = Instant::now();
         if !polled.records.is_empty() {
             self.last_growth = now;
@@ -666,6 +651,23 @@ impl Runner {
         Ok(polled.more)
     }
 
+    /// The position the cursor may be saved at: the first record of the
+    /// oldest pending group or the record in progress (R25 item 7).
+    fn held(&self, m: &Machine) -> Vec<(u64, databastion_core::audit::tail::RecordPos)> {
+        let held = m.held_from().into_iter().chain(self.record_start).min();
+        match (held, self.file) {
+            (Some(start), Some(file)) => vec![(
+                0,
+                databastion_core::audit::tail::RecordPos {
+                    file,
+                    start,
+                    end: start,
+                },
+            )],
+            _ => Vec::new(),
+        }
+    }
+
     fn count_reread(&self, m: &mut Machine, start: u64) {
         if self
             .reread_end
@@ -680,6 +682,183 @@ impl Runner {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    fn test_settings() -> Settings {
+        Settings {
+            databases: vec![DeclaredNames {
+                label: "app".to_owned(),
+                resolved: Some("/var/lib/firebird/data/app.fdb".to_owned()),
+                alias: None,
+                excluded: false,
+                attach: "/var/lib/firebird/data/app.fdb".to_owned(),
+            }],
+            aliases: Some(AliasMap::default()),
+            proof11: true,
+            account: "DATABASTION_AGENT".to_owned(),
+            parse: ParseOptions {
+                max_sql_length: Some(65_000),
+                series: Series::V5,
+            },
+            superserver: true,
+        }
+    }
+
+    fn runner(
+        log: &std::path::Path,
+        store: Option<databastion_core::audit::CursorStore>,
+    ) -> Runner {
+        Runner {
+            tailer: Tailer::new(log.to_path_buf(), Framing::Lines, store)
+                .with_open_check(open_check(log.to_path_buf())),
+            asm: Assembler::new(),
+            record_start: None,
+            file: None,
+            last_growth: Instant::now(),
+            reread_end: None,
+        }
+    }
+
+    fn append(log: &std::path::Path, text: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn objects(out: &[crate::stream::Emitted]) -> Vec<String> {
+        out.iter()
+            .flat_map(|(_, e)| e.objects().iter().map(|o| o.object().as_str().to_owned()))
+            .collect()
+    }
+
+    /// One reading session: polls (no stable end of file), then saves the
+    /// cursor as the stream does; the process then stops.
+    fn session(log: &std::path::Path, dir: &std::path::Path) -> (Vec<crate::stream::Emitted>, u64) {
+        let store = databastion_core::audit::CursorStore::new(dir, "t", "fb");
+        let mut r = runner(log, store);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        r.tailer.commit_from(&r.held(&m));
+        (out, m.counts.reread)
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+        crate::fsread::allow_own_files_for_tests();
+        let dir = std::env::temp_dir().join(format!("fb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// R39 (a), review M1 (1): the record in progress when the agent stops
+    /// (the cursor saved before it) is read again after the restart and
+    /// its event sent; before, it lay inside the re-read region and was
+    /// dropped as a replay: one lost read per restart.
+    #[test]
+    fn a_restart_mid_record_sends_the_record_in_progress() {
+        use crate::stream_tests::{attach, select};
+        let dir = temp("mid");
+        let log = dir.join("audit.log");
+        let a = "24:0x7f0000000100";
+        let b = "24:0x7f0000000200";
+        let full = select(b, 4, 7, crate::stream_tests::APP, "PAYROLL", 3);
+        // The second attachment's read is being written when the agent
+        // stops: its header and part of its body are in the file.
+        let cut = full.len() / 2;
+        // A first start reads from the end: the stream starts on an
+        // empty log.
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        append(
+            &log,
+            &format!(
+                "{}{}{}{}",
+                attach(a, 3, crate::stream_tests::APP),
+                select(a, 3, 5, crate::stream_tests::APP, "CUSTOMERS", 2),
+                attach(b, 4, crate::stream_tests::APP),
+                &full[..cut]
+            ),
+        );
+        let (first, _) = session(&log, &dir);
+        assert!(objects(&first).contains(&"CUSTOMERS".to_owned()));
+        assert!(!objects(&first).contains(&"PAYROLL".to_owned()));
+        // The server finishes the record; a new record follows.
+        append(&log, &full[cut..]);
+        append(
+            &log,
+            &attach("24:0x7f0000000300", 5, crate::stream_tests::APP),
+        );
+        let (second, reread) = session(&log, &dir);
+        assert!(reread > 0, "the re-read region was read again");
+        assert!(
+            objects(&second).contains(&"PAYROLL".to_owned()),
+            "{:?}",
+            objects(&second)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R39 (a), review M1 (2): a restart while a block-less nested record
+    /// pends (a fold group holds the cursor back), with another binding's
+    /// read held behind it and an ambiguous record in the re-read region:
+    /// the held read and the ambiguous record are sent after the restart,
+    /// none is suppressed.
+    #[test]
+    fn a_restart_during_a_hold_sends_the_held_and_ambiguous_records() {
+        use crate::stream_tests::{APP, HEAD, attach, select};
+        let dir = temp("hold");
+        let log = dir.join("audit.log");
+        let a = "24:0x7f0000000100";
+        let b = "24:0x7f0000000200";
+        // A block-less routine record of `a`'s transaction 5, pending.
+        let start = format!(
+            "{HEAD} ({a}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n"
+        );
+        let routine = format!(
+            "{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nProcedure P1:\n      0 ms, 3 fetch(es)\n\n"
+        );
+        // An ambiguous record: another pid.
+        let other_pid = select("99:0x7f0000000900", 9, 9, APP, "LEDGER", 1);
+        // A first start reads from the end: the stream starts on an
+        // empty log.
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        append(
+            &log,
+            &format!(
+                "{}{}{}{}{}{}{}",
+                attach(a, 3, APP),
+                attach(b, 4, APP),
+                start,
+                routine,
+                select(b, 4, 7, APP, "PAYROLL", 3),
+                other_pid,
+                attach("24:0x7f0000000300", 5, APP),
+            ),
+        );
+        let (first, _) = session(&log, &dir);
+        // Held behind the pending block-less record: not sent yet.
+        assert!(
+            !objects(&first).contains(&"PAYROLL".to_owned()),
+            "{:?}",
+            objects(&first)
+        );
+        // The agent stops and starts again; nothing more was written.
+        let (second, reread) = session(&log, &dir);
+        assert!(reread > 0);
+        let o = objects(&second);
+        assert!(o.contains(&"PAYROLL".to_owned()), "{o:?}");
+        assert!(o.contains(&"LEDGER".to_owned()), "{o:?}");
+        assert!(
+            second
+                .iter()
+                .filter(|(_, e)| e.objects().iter().any(|x| x.object().as_str() == "LEDGER"))
+                .all(|(_, e)| e.always_report())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The runner over a real file: records assembled from the tailer's
     /// lines, the last one held at end of file, events out.

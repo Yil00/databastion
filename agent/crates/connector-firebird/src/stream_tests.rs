@@ -10,7 +10,7 @@ use super::stream::*;
 use super::trace_events::{Catalog, RelClass};
 use super::trace_log::{Assembled, Assembler, ParseOptions, Series};
 
-const APP: &str = "/var/lib/firebird/data/app.fdb";
+pub(crate) const APP: &str = "/var/lib/firebird/data/app.fdb";
 
 struct Cat;
 impl Catalog for Cat {
@@ -141,15 +141,15 @@ fn recorded_logs() {
     assert!(m5.counts.ambiguous > 0, "the forged split is loud");
 }
 
-const HEAD: &str = "2026-10-30T15:22:38.4210";
+pub(crate) const HEAD: &str = "2026-10-30T15:22:38.4210";
 
-fn attach(token: &str, id: u64, db: &str) -> String {
+pub(crate) fn attach(token: &str, id: u64, db: &str) -> String {
     format!(
         "{HEAD} ({token}) TRACE_INIT\n\tSESSION_1 Firebird Audit\n\t\n\n{HEAD} ({token}) ATTACH_DATABASE\n\t{db} (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\n"
     )
 }
 
-fn select(token: &str, id: u64, tra: u64, db: &str, rel: &str, rows: u64) -> String {
+pub(crate) fn select(token: &str, id: u64, tra: u64, db: &str, rel: &str, rows: u64) -> String {
     format!(
         "{HEAD} ({token}) START_TRANSACTION\n\t{db} (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n\
          {HEAD} ({token}) EXECUTE_STATEMENT_FINISH\n\t{db} (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\nSELECT * FROM {rel} WHERE ID > 0\n{rows} records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{rows:>10}{:>70}\n\n",
@@ -317,4 +317,247 @@ fn runs_and_held_positions() {
     let before = m.counts.ambiguous;
     feed(&mut m, &select(a, 3, 6, APP, "T", 1), &mut out);
     assert_eq!(m.counts.ambiguous, before);
+}
+
+/// A statement finish of `user` on attachment `id` (port `40000 + id`).
+#[allow(clippy::too_many_arguments)]
+fn stmt(
+    token: &str,
+    id: u64,
+    tra: u64,
+    user: &str,
+    text: &str,
+    fetched: u64,
+    block: &[(&str, u64)],
+) -> String {
+    let mut out = format!(
+        "{HEAD} ({token}) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_{id}, {user}:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\n{text}\n{fetched} records fetched\n      0 ms, 7 fetch(es)\n",
+        "-".repeat(79)
+    );
+    if !block.is_empty() {
+        out.push_str(&format!(
+            "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n",
+            "Table",
+            "*".repeat(115)
+        ));
+        for (r, n) in block {
+            out.push_str(&format!("{r:<35}{n:>10}{:>70}\n", ""));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn attach_as(token: &str, id: u64, user: &str) -> String {
+    format!(
+        "{HEAD} ({token}) ATTACH_DATABASE\n\t{APP} (ATT_{id}, {user}:NONE, UTF8, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\n"
+    )
+}
+
+fn feed(m: &mut Machine, cats: &[&dyn Catalog], log: &str, base: u64) -> Vec<Emitted> {
+    let mut asm = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split('\n') {
+        recs.extend(asm.push_line(line.as_bytes()));
+    }
+    recs.extend(asm.flush());
+    let mut out = Vec::new();
+    let now = Instant::now();
+    for (i, r) in recs.iter().enumerate() {
+        if let Assembled::Record(raw) = r {
+            m.push(raw, base + i as u64 * 1000, now, cats, &mut out);
+        }
+    }
+    out
+}
+
+/// Review L2: a permission refusal of another client is an attempt to
+/// read: `*`, always reported, no text; other error codes give nothing.
+#[test]
+fn permission_refusals_of_other_clients_are_reported() {
+    let a = "24:0x7f0000000100";
+    let err = |code: &str| {
+        format!(
+            "{HEAD} ({a}) ERROR AT JStatement::prepare\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n{code} : no permission for SELECT access to TABLE PAYROLL\n\n"
+        )
+    };
+    let (m, out) = run(
+        &format!("{}{}", attach(a, 3, APP), err("335544352")),
+        true,
+        Series::V5,
+    );
+    assert_eq!(m.counts.ambiguous, 0);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].1.always_report());
+    assert_eq!(names(&out), ["*"]);
+    let (_, out) = run(
+        &format!("{}{}", attach(a, 3, APP), err("335544334")),
+        true,
+        Series::V5,
+    );
+    assert!(out.is_empty());
+}
+
+struct ViewCat;
+impl Catalog for ViewCat {
+    fn class(&self, r: &str) -> RelClass {
+        match r {
+            "V_X" => RelClass::View,
+            _ => Cat.class(r),
+        }
+    }
+    fn always_view(&self, r: &str) -> bool {
+        r == "V_DEP"
+    }
+}
+
+/// R12 item 5: a view of the dependency set gives `*` and the mark; R28
+/// item 4: view DDL invalidates the sets until the next check.
+#[test]
+fn views_over_always_reported_relations_and_view_ddl() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let read = |rel: &str, tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            &format!("SELECT * FROM {rel} WHERE ID > 0"),
+            2,
+            &[("CUSTOMERS", 2)],
+        )
+    };
+    let out = feed(
+        &mut m,
+        &cats,
+        &format!("{}{}", attach(a, 3, APP), read("V_DEP", 5)),
+        0,
+    );
+    assert!(
+        out.iter().any(|(_, e)| e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+    assert!(names(&out).contains(&"*".to_owned()));
+    let out = feed(&mut m, &cats, &read("V_X", 6), 10_000);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| !e.always_report()));
+    // A view DDL record: every view counts as dependent until a check.
+    let ddl = stmt(
+        a,
+        3,
+        7,
+        "APP",
+        "CREATE VIEW V_NEW AS SELECT ID FROM CUSTOMERS",
+        0,
+        &[],
+    );
+    feed(&mut m, &cats, &ddl, 20_000);
+    let out = feed(&mut m, &cats, &read("V_X", 8), 30_000);
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+    m.reconfigure(settings(true, Series::V5));
+    let out = feed(&mut m, &cats, &read("V_X", 9), 40_000);
+    assert!(out.iter().all(|(_, e)| !e.always_report()));
+}
+
+/// R39 (g) through the stream: an own record is the agent's only with its
+/// text's row (here `RDB$DATABASE` must be read, nothing outside the
+/// may-read set); a copy with a user table in its block is not, and a
+/// closed-set text with no credit left is `*`, always reported. Review
+/// M3: the clock offset learned from the own attach is confirmed only by
+/// the credited record, and reverted when its binding is poisoned.
+#[test]
+fn own_records_follow_the_table_and_confirm_the_offset() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let a = "24:0x7f0000000100";
+    let ledger = Arc::new(Ledger::default());
+    // Opened one hour after the printed time: a whole-hour offset.
+    let printed = super::stream::naive_seconds(super::trace_log::LogTime {
+        year: 2026,
+        month: 10,
+        day: 30,
+        hour: 15,
+        minute: 22,
+        second: 38,
+        frac: 4210,
+    });
+    let opened = std::time::SystemTime::UNIX_EPOCH
+        + Duration::from_secs(u64::try_from(printed + 3600).unwrap());
+    ledger.register_at(APP, 3, 40003, 24, opened);
+    let account = |counted| FetchAccount {
+        counted,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    feed(&mut m, &cats, &attach_as(a, 3, agent), 0);
+    assert_eq!(m.offset_for_tests(), None, "provisional until credited");
+    let before = m.counts.own;
+    let v = crate::sql::VERSION;
+    ledger.credit(APP, 3, v, None, account(1));
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(a, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]),
+        1000,
+    );
+    assert!(out.is_empty());
+    assert_eq!(m.counts.own, before + 1);
+    assert_eq!(m.offset_for_tests(), Some(3600));
+    // A copy carrying a user table: not the agent's own, reported.
+    ledger.credit(APP, 3, v, None, account(1));
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(a, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1), ("PAYROLL", 1)]),
+        2000,
+    );
+    assert!(names(&out).contains(&"PAYROLL".to_owned()));
+    // The credit is still there for the agent's real record.
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(a, 3, 7, agent, v, 1, &[("RDB$DATABASE", 1)]),
+        3000,
+    );
+    assert!(out.is_empty());
+    // No credit left: loud.
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(a, 3, 8, agent, v, 1, &[("RDB$DATABASE", 1)]),
+        4000,
+    );
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+    assert!(names(&out).contains(&"*".to_owned()));
+    // A duplicate attach poisons the binding: the offset reverts.
+    feed(
+        &mut m,
+        &cats,
+        &attach_as("24:0x7f0000000200", 3, agent),
+        5000,
+    );
+    assert_eq!(m.offset_for_tests(), None);
+}
+
+#[test]
+fn plausible_offsets() {
+    for o in [0, 3600, -3600, 19_800, 20_700, -12_600, 3603, 3597] {
+        assert!(super::stream::plausible_offset(o), "{o}");
+    }
+    for o in [7, 3610, 900 * 4 + 450, 15 * 3600, -15 * 3600] {
+        assert!(!super::stream::plausible_offset(o), "{o}");
+    }
 }

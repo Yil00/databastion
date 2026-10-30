@@ -44,11 +44,7 @@ fn series() -> Series {
 }
 
 fn longest_own_text() -> usize {
-    crate::sql::STATEMENTS
-        .iter()
-        .map(|s| s.text.len())
-        .max()
-        .unwrap_or(0)
+    crate::own_table::longest_text()
 }
 
 /// The image's `firebird.conf` (with the image entrypoint's settings and

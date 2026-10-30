@@ -150,6 +150,22 @@ impl Ledger {
         });
     }
 
+    /// Test support: an attachment opened at `opened`.
+    #[cfg(test)]
+    pub(crate) fn register_at(
+        &self,
+        attach: &str,
+        id: u64,
+        port: u16,
+        pid: u32,
+        opened: SystemTime,
+    ) {
+        self.register(attach, id, port, pid);
+        if let Some(a) = self.state().attachments.last_mut() {
+            a.opened = opened;
+        }
+    }
+
     /// The session ended: cleanly (`lost` false) or not, after its
     /// statement timeout.
     pub(crate) fn close(&self, attach: &str, id: u64, lost: bool, statement_timeout: Duration) {

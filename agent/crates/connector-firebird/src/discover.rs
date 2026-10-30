@@ -1333,4 +1333,131 @@ mod tests {
         assert!(!normalize("CUSTOMERS ").altered());
         assert_eq!(normalize("EXPORT_jean.martin@example.org").as_str(), "*");
     }
+
+    /// Opens `crm` with one script and `sec` with another.
+    struct TwoOpener {
+        crm: Script,
+        sec: Script,
+        servers: Mutex<Vec<(String, tokio::task::JoinHandle<fake::Seen>)>>,
+    }
+
+    #[async_trait]
+    impl Opener for TwoOpener {
+        async fn open(&self, attach: &str, deadline: Instant) -> Result<Session, FbError> {
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let script = if attach == "sec" {
+                &self.sec
+            } else {
+                &self.crm
+            };
+            self.servers.lock().unwrap().push((
+                attach.to_owned(),
+                tokio::spawn(fake::serve(server, script.clone())),
+            ));
+            conn::handshake(
+                Box::new(client),
+                fake::LOGIN,
+                fake::PASSWORD,
+                attach,
+                deadline,
+                Duration::from_secs(5),
+            )
+            .await
+        }
+    }
+
+    fn two_databases() -> ScanJob {
+        let t = databastion_core::AgentConfig::parse(
+            "{console: {url: \"https://c.example\"}, state_dir: /s, targets: [{id: t, \
+             engine: firebird, host: 127.0.0.1, port: 9, account: AGENT, \
+             secret: {env: DATABASTION_TEST_UNSET_FIREBIRD_SECRET}, firebird: {peer_uid: 84, \
+             tunnel: true, databases: [{name: sec, attach: sec}, {name: crm, attach: crm}]}}]}",
+        )
+        .unwrap()
+        .targets
+        .remove(0);
+        let limits = Limits {
+            discovery_duty_cycle_percent: 100,
+            max_sample_rows: 3,
+            ..Limits::default()
+        };
+        ScanJob::new(
+            ScanParams::contract_defaults(),
+            &t,
+            &limits,
+            Arc::new(HmacKey::new(&[7u8; 32]).unwrap()),
+        )
+    }
+
+    fn crm_script(sec: &str) -> Script {
+        let mut statements: Vec<Canned> = session_statements("AGENT")
+            .into_iter()
+            .map(|mut c| {
+                if c.text == sql::DATABASE_FILE {
+                    c.rows = vec![vec![v("/data/x.fdb"), v(sec)]];
+                }
+                c
+            })
+            .collect();
+        statements.extend(catalog_statements(
+            vec![relation("CUSTOMERS", 0, false, false, true)],
+            vec![column("CUSTOMERS", "EMAIL", 0, 37, 0, 4, false)],
+        ));
+        let sample = sql::sample_statement("CUSTOMERS", &[("EMAIL", Conv::Text)], 3).unwrap();
+        statements.push(canned(
+            sample.text(),
+            vec![text_col(16_000)],
+            EMAILS.iter().map(|e| vec![v(e)]).collect(),
+        ));
+        Script {
+            statements,
+            ..Script::default()
+        }
+    }
+
+    /// R39 (h), R9: a declared database that is its own security database
+    /// (`MON$SEC_DATABASE` reads `Self`) is not scanned and no privilege
+    /// probe runs on it, while the other declared database is scanned; a
+    /// database the last check excluded is not even attached.
+    #[tokio::test]
+    async fn a_security_database_is_excluded_and_the_others_scanned() {
+        for (sec_kind, by_check) in [("Self", false), ("Default", true)] {
+            let opener = TwoOpener {
+                crm: crm_script("Default"),
+                sec: crm_script(sec_kind),
+                servers: Mutex::default(),
+            };
+            let job = two_databases();
+            let (sink, mut rx) = FindingSink::channel(64);
+            let state = CheckState::default();
+            state.set_blocked("t", false);
+            if by_check {
+                state.set_excluded("t", vec!["sec".to_owned()]);
+            }
+            run(&job, &sink, &state, &opener).await.unwrap();
+            drop(sink);
+            let mut dbs = Vec::new();
+            while let Some(f) = rx.recv().await {
+                dbs.push(f.location().unwrap().database.as_str().to_owned());
+            }
+            assert!(!dbs.is_empty());
+            assert!(dbs.iter().all(|d| d == "crm"), "{dbs:?}");
+            assert!(!state.blocks("t"));
+            let servers = std::mem::take(&mut *opener.servers.lock().unwrap());
+            let mut sec_prepared = Vec::new();
+            let mut sec_attached = false;
+            for (attach, h) in servers {
+                let seen = h.await.unwrap();
+                if attach == "sec" {
+                    sec_attached = true;
+                    sec_prepared.extend(seen.prepared);
+                }
+            }
+            assert_eq!(sec_attached, !by_check);
+            assert!(!sec_prepared.iter().any(|t| t == sql::IDENTITY
+                || t == sql::CREDENTIAL_RELATIONS
+                || sql::PROBES.iter().any(|(_, p)| p == t)
+                || t.contains("\"CUSTOMERS\"")));
+        }
+    }
 }

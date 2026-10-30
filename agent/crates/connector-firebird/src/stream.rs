@@ -319,6 +319,12 @@ impl Machine {
         }
     }
 
+    /// Test support: the confirmed clock offset.
+    #[cfg(test)]
+    pub(crate) fn offset_for_tests(&self) -> Option<i64> {
+        self.offset
+    }
+
     /// The log file the next records come from.
     pub(crate) fn set_file(&mut self, file: (u64, u64)) {
         self.file = file;
@@ -1691,11 +1697,14 @@ impl Machine {
                     self.window_until = Some(now + WINDOW);
                 }
                 // The agent's own record (decision 6, R8 item 4).
+                // Also for a record with no event of its own (its objects all
+                // noise): its credit is consumed, and the read-back probe
+                // (proof 7) and the clock offset are confirmed by it.
                 if let Some(k) = key
-                    && let Some(d) = &draft
                     && !window
                 {
-                    match self.own_record(rec, k, d, pos) {
+                    let d = draft.clone().unwrap_or_default();
+                    match self.own_record(rec, k, &d, pos) {
                         Some(true) => {
                             self.counts.own += 1;
                             return;
@@ -1704,10 +1713,13 @@ impl Machine {
                         // attachment with no credit left (R8 item 4):
                         // ambiguous, `*` and always reported.
                         None => {
-                            if let Some(d) = draft.as_mut() {
-                                d.star = true;
-                                d.always = true;
-                            }
+                            let d = draft.get_or_insert_with(|| Draft {
+                                action: Some(databastion_classifiers::masking::EventAction::Read),
+                                rows: rec.trailer.fetched,
+                                ..Draft::default()
+                            });
+                            d.star = true;
+                            d.always = true;
                         }
                         Some(false) => {}
                     }

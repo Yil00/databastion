@@ -99,7 +99,7 @@ impl CheckState {
             .is_some_and(|v| v.iter().any(|a| a == attach))
     }
 
-    fn set_excluded(&self, target_id: &str, attach: Vec<String>) {
+    pub(crate) fn set_excluded(&self, target_id: &str, attach: Vec<String>) {
         self.excluded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
