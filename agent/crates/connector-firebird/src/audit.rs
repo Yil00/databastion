@@ -64,6 +64,10 @@ pub(crate) struct DbFacts {
     /// Excluded by R9 (`check()` decided it before any probe): not read by
     /// Discovery, an undeclared database for the stream.
     pub(crate) excluded: bool,
+    /// When the attachment's catalog read started (R41 item 8: only a
+    /// read started after every DDL transaction's end clears the
+    /// invalidation).
+    pub(crate) read_at: Option<SystemTime>,
 }
 
 /// The relation classes of one database's catalog read (decision 5's
@@ -127,14 +131,37 @@ impl Catalog for Classes {
         }
     }
 
-    /// R12 item 5: a view of the dependency set; with an incomplete
-    /// dependency read (failed, cut, past its bounds), every view and
-    /// every name the catalog read does not know.
+    /// R41: a name at an object position (a relation or routine of the
+    /// text, a block name, a routine name line) that is in the dependent
+    /// set, or that the last complete catalog read does not know (item 3);
+    /// with an incomplete read (failed, cut, past its bounds: item 2),
+    /// every view, routine, package, trigger and unknown name, and every
+    /// table with a computed column (every table when the columns were not
+    /// read).
     fn always_view(&self, relation: &str) -> bool {
-        if self.deps.complete {
-            return self.deps.dependent.contains(relation);
+        let r = relation.trim_end_matches(' ');
+        if !self.complete || !self.deps.complete {
+            return match self.class(r) {
+                RelClass::View | RelClass::Unknown => true,
+                RelClass::Table | RelClass::Gtt => {
+                    !self.deps.computed_known || self.deps.computed.contains(r)
+                }
+                RelClass::External | RelClass::System | RelClass::Virtual => false,
+            };
         }
-        matches!(self.class(relation), RelClass::View | RelClass::Unknown)
+        self.deps.dependent.contains(r)
+            || (self.class(r) == RelClass::Unknown && !self.deps.routines.contains(r))
+    }
+
+    fn computed(&self, relation: &str) -> bool {
+        let r = relation.trim_end_matches(' ');
+        matches!(self.class(r), RelClass::Table | RelClass::Gtt)
+            && (!self.deps.computed_known || self.deps.computed.contains(r))
+    }
+
+    /// R41 item 6: any identifier token equal to a dependent object's name.
+    fn dependent_token(&self, name: &str) -> bool {
+        self.deps.dependent.contains(name.trim_end_matches(' '))
     }
 }
 
@@ -378,6 +405,7 @@ pub(crate) fn evaluate(
             alias: alias.map(str::to_owned),
             excluded: excl,
             attach: d.attach.clone(),
+            read_at: None,
         });
     }
     // The trace configuration (proofs 3 to 6 and 11).
@@ -541,6 +569,7 @@ fn settings(
                 alias: (!d.attach.starts_with('/')).then(|| d.attach.clone()),
                 excluded: d.excluded,
                 attach: d.attach.clone(),
+                read_at: d.read_at,
             })
             .collect();
         (
@@ -939,6 +968,7 @@ mod tests {
                 alias: None,
                 excluded: false,
                 attach: "/var/lib/firebird/data/app.fdb".to_owned(),
+                read_at: None,
             }],
             aliases: Some(AliasMap::default()),
             proof11: true,
@@ -1385,6 +1415,7 @@ mod tests {
                 alias: None,
                 excluded: false,
                 attach: "/var/lib/firebird/data/app.fdb".to_owned(),
+                read_at: None,
             }],
             aliases: Some(AliasMap::default()),
             proof11: true,
@@ -1483,6 +1514,7 @@ mod tests {
             resolved: Some("/data/app.fdb".to_owned()),
             catalog: Classes::default(),
             excluded: false,
+            read_at: None,
         };
         let (mut notes, mut detail) = (Notes::default(), Vec::new());
         let _ = evaluate(
@@ -1515,6 +1547,7 @@ mod tests {
                 deps: crate::views::ViewDeps::default(),
             },
             excluded: false,
+            read_at: None,
         };
         let state = AuditState::default();
         state.with("t", |t| t.dbs = vec![d.clone()]);
@@ -1534,7 +1567,14 @@ mod tests {
             ]),
             complete: true,
             deps: crate::views::ViewDeps {
-                dependent: ["V_MIX".to_owned()].into_iter().collect(),
+                dependent: ["V_MIX".to_owned(), "P_MON".to_owned()]
+                    .into_iter()
+                    .collect(),
+                computed: ["T_COMP".to_owned()].into_iter().collect(),
+                computed_known: true,
+                routines: ["P_MON".to_owned(), "P_OK".to_owned()]
+                    .into_iter()
+                    .collect(),
                 complete: true,
             },
         };
@@ -1549,18 +1589,37 @@ mod tests {
         assert_eq!(c.class("PLG$LOOT"), RelClass::Unknown);
         let cut = Classes::default();
         assert_eq!(cut.class("RDB$RELATIONS"), RelClass::Unknown);
-        // R12 item 5.
+        // R12 item 5, R41.
         assert!(c.always_view("V_MIX"));
+        assert!(c.always_view("P_MON"));
         assert!(!c.always_view("V_PLAIN"));
-        assert!(!c.always_view("CUSTOMERS"));
-        // An incomplete dependency read: every view, and unknown names.
+        assert!(!c.always_view("P_OK"));
+        assert!(!c.always_view("RDB$CUSTOMER_ARCHIVE"));
+        // R41 item 3: unknown to the catalog read: dependent.
+        assert!(c.always_view("CUSTOMERS"));
+        assert!(c.always_view("P_NEW"));
+        // Tokens: the set only (no unknown-name rule).
+        assert!(c.dependent_token("P_MON  "));
+        assert!(!c.dependent_token("SELECT"));
+        // An incomplete dependency read: every view, routine and unknown
+        // name, and every table when the columns are not known.
         let open = Classes {
             deps: crate::views::ViewDeps::default(),
             ..c.clone()
         };
         assert!(open.always_view("V_PLAIN"));
         assert!(open.always_view("V_NEW"));
-        assert!(!open.always_view("RDB$CUSTOMER_ARCHIVE"));
+        assert!(open.always_view("P_OK"));
+        assert!(open.always_view("RDB$CUSTOMER_ARCHIVE"));
         assert!(!open.always_view("RDB$RELATIONS"));
+        let open = Classes {
+            deps: crate::views::ViewDeps {
+                computed_known: true,
+                computed: ["T_COMP".to_owned()].into_iter().collect(),
+                ..crate::views::ViewDeps::default()
+            },
+            ..c.clone()
+        };
+        assert!(!open.always_view("RDB$CUSTOMER_ARCHIVE"));
     }
 }

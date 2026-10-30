@@ -36,6 +36,7 @@ fn settings(proof11: bool, series: Series) -> Settings {
             alias: None,
             excluded: false,
             attach: APP.to_owned(),
+            read_at: None,
         }],
         aliases: Some(Default::default()),
         proof11,
@@ -462,9 +463,42 @@ fn views_over_always_reported_relations_and_view_ddl() {
         "{:?}",
         names(&out)
     );
-    m.reconfigure(settings(true, Series::V5));
+    // R41 item 8 (review M2): a check whose catalog read started before
+    // the DDL transaction's end does not clear the invalidation.
+    let early = std::time::SystemTime::now();
+    let at = |t: std::time::SystemTime| {
+        let mut s = settings(true, Series::V5);
+        s.databases[0].read_at = Some(t);
+        s
+    };
+    m.reconfigure(at(early));
     let out = feed(&mut m, &cats, &read("V_X", 9), 40_000);
-    assert!(out.iter().all(|(_, e)| !e.always_report()));
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "the DDL is still open"
+    );
+    // The DDL transaction ends; a check read started before the end does
+    // not clear it either, one started after does.
+    let commit = format!(
+        "{HEAD} ({a}) COMMIT_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms, 1 fetch(es)\n\n"
+    );
+    m.check_requested = false;
+    feed(&mut m, &cats, &commit, 45_000);
+    assert!(
+        m.check_requested,
+        "a DDL transaction's end asks for an early check"
+    );
+    m.reconfigure(at(early));
+    let out = feed(&mut m, &cats, &read("V_X", 10), 50_000);
+    assert!(out.iter().all(|(_, e)| e.always_report()));
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let out = feed(&mut m, &cats, &read("V_X", 11), 60_000);
+    assert!(
+        out.iter().all(|(_, e)| !e.always_report()),
+        "{:?}",
+        names(&out)
+    );
 }
 
 /// R39 (g) through the stream: an own record is the agent's only with its
@@ -741,6 +775,7 @@ fn ambiguous_records_use_the_attributed_databases_catalog() {
         alias: None,
         excluded: false,
         attach: CRM.to_owned(),
+        read_at: None,
     });
     let mut m = Machine::new(s, Arc::new(Ledger::default()));
     let (c0, c1) = (Cat, LootCat);
@@ -1178,4 +1213,140 @@ fn an_ambiguous_own_text_never_consumes_a_credit() {
     let out = feed(&mut m, &cats, &rec, 1000);
     assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
     assert_eq!(ledger.credits_left().len(), 1, "the credit stays");
+}
+
+/// A catalog with a given dependent set (R41).
+struct DepCat(&'static [&'static str]);
+impl Catalog for DepCat {
+    fn class(&self, r: &str) -> RelClass {
+        Cat.class(r)
+    }
+    fn always_view(&self, r: &str) -> bool {
+        self.0.contains(&r)
+    }
+}
+
+fn ctx(id: u64, tra: u64, charset: &str) -> String {
+    format!(
+        "\t{APP} (ATT_{id}, APP:NONE, {charset}, TCPv4:127.0.0.1/4{id:04})\n\t/usr/bin/app:28\n\t\t(TRA_{tra}, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    )
+}
+
+fn stmt_cs(token: &str, id: u64, tra: u64, charset: &str, text: &str, outcome: &str) -> String {
+    format!(
+        "{HEAD} ({token}) {outcome}EXECUTE_STATEMENT_FINISH\n{}\nStatement 1:\n{}\n{text}\n0 records fetched\n      0 ms, 7 fetch(es)\n\n",
+        ctx(id, tra, charset),
+        "-".repeat(79)
+    )
+}
+
+/// R41 items 4 and 6: a statement naming an object of the dependent set
+/// at any position (a procedure in `FROM`, a `MERGE … USING` source, a
+/// packaged name by its package), a failed one too, and a non-ASCII
+/// quoted identifier from a non-UTF8 attachment, gives `*` and the
+/// always-reported mark; another statement does not.
+#[test]
+fn records_naming_dependent_objects_are_marked() {
+    let a = "24:0x7f0000000100";
+    let cat = DepCat(&["P_MON", "PKG"]);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    for (text, outcome, charset, want) in [
+        ("SELECT * FROM P_MON", "", "UTF8", true),
+        (
+            "MERGE INTO T USING P_MON ON 1 = 1 WHEN MATCHED THEN DELETE",
+            "",
+            "UTF8",
+            true,
+        ),
+        ("SELECT PKG . F(1) FROM T WHERE ID = 1", "", "UTF8", true),
+        ("SELECT * FROM P_MON", "FAILED ", "UTF8", true),
+        (
+            "SELECT * FROM \"Tabelle_ä\" WHERE ID = 1",
+            "",
+            "WIN1252",
+            true,
+        ),
+        ("SELECT A FROM T WHERE ID = 1", "", "UTF8", false),
+    ] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        feed(&mut m, &cats, &attach(a, 3, APP), 0);
+        let out = feed(
+            &mut m,
+            &cats,
+            &stmt_cs(a, 3, 5, charset, text, outcome),
+            1000,
+        );
+        let marked = out.iter().any(|(_, e)| {
+            e.always_report() && e.objects().iter().any(|o| o.object().as_str() == "*")
+        });
+        assert_eq!(marked, want, "{text} {outcome}{charset}: {:?}", names(&out));
+    }
+}
+
+/// R41 item 5 (review M1): a block-less database-trigger record of a
+/// dependent trigger gives an always-reported `*` event; a block-less one
+/// of another trigger gives none (R15 item 4).
+#[test]
+fn block_less_dependent_database_triggers_are_reported() {
+    let a = "24:0x7f0000000100";
+    let cat = DepCat(&["TR_MON"]);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    for (trigger, want) in [("TR_MON", true), ("TR_OK", false)] {
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        let log = format!(
+            "{}{HEAD} ({a}) START_TRANSACTION\n{}\n{HEAD} ({a}) EXECUTE_TRIGGER_FINISH\n{}\nTrigger {trigger} (ON CONNECT):\n      0 ms, 2 fetch(es)\n\n",
+            attach(a, 3, APP),
+            ctx(3, 5, "UTF8"),
+            ctx(3, 5, "UTF8")
+        );
+        let out = feed(&mut m, &cats, &log, 0);
+        assert_eq!(m.counts.ambiguous, 0, "{trigger}: {:?}", m.why);
+        assert_eq!(!out.is_empty(), want, "{trigger}: {:?}", names(&out));
+        assert!(out.iter().all(|(_, e)| e.always_report()));
+    }
+}
+
+/// R41 item 7 (review L5): a dependent routine record inside a per-row
+/// group that ends early (its transaction ends unfolded) keeps the mark
+/// on the group's event.
+#[test]
+fn a_dependent_routine_in_a_group_ended_early_keeps_the_mark() {
+    let a = "24:0x7f0000000100";
+    let cat = DepCat(&["P_MON"]);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let blk = format!(
+        "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n",
+        "Table",
+        "*".repeat(115),
+        "CUSTOMERS",
+        3,
+        ""
+    );
+    let mut log = format!(
+        "{}{HEAD} ({a}) START_TRANSACTION\n{}\n",
+        attach(a, 3, APP),
+        ctx(3, 5, "UTF8")
+    );
+    for name in ["P_OK", "P_MON", "P_OK"] {
+        log.push_str(&format!(
+            "{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{}\nProcedure {name}:\n      0 ms, 3 fetch(es)\n{blk}\n",
+            ctx(3, 5, "UTF8")
+        ));
+    }
+    log.push_str(&format!(
+        "{HEAD} ({a}) COMMIT_TRANSACTION\n{}      0 ms, 1 fetch(es)\n\n",
+        ctx(3, 5, "UTF8")
+    ));
+    let out = feed(&mut m, &cats, &log, 0);
+    let ev: Vec<_> = out
+        .iter()
+        .filter(|(_, e)| {
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+        .collect();
+    assert!(!ev.is_empty(), "{:?}", names(&out));
+    assert!(ev.iter().all(|(_, e)| e.always_report()));
 }

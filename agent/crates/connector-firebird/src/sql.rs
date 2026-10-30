@@ -171,10 +171,22 @@ pub(crate) const COLUMNS: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(25
 /// names as raw bytes (`OCTETS`, as [`RELATIONS`]).
 pub(crate) const VIEW_RELATIONS: &str = "SELECT CAST(V.RDB$VIEW_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(V.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(V.RDB$CONTEXT_TYPE, 0) AS INTEGER) FROM RDB$VIEW_RELATIONS V";
 
-/// The view-dependency read of R12 item 5, second part: what views and
-/// code (procedures 5, functions 15, package headers and bodies 18 and
-/// 19) depend on, with the dependent's package.
-pub(crate) const DEPENDENCIES: &str = "SELECT CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDENT_TYPE AS INTEGER), CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDED_ON_TYPE AS INTEGER), CAST(D.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$DEPENDENCIES D WHERE D.RDB$DEPENDENT_TYPE IN (1, 5, 15, 18, 19)";
+/// The dependent-set read of R41 (R12 item 5), second part: what views
+/// (1), triggers (2), computed columns (3), domain checks (4), procedures
+/// (5), functions (15) and package headers and bodies (18 and 19) depend
+/// on, with the dependent's package.
+pub(crate) const DEPENDENCIES: &str = "SELECT CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDENT_TYPE AS INTEGER), CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDED_ON_TYPE AS INTEGER), CAST(D.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$DEPENDENCIES D WHERE D.RDB$DEPENDENT_TYPE IN (1, 2, 3, 4, 5, 15, 18, 19)";
+
+/// The dependent-set read of R41 item 1, third part: every column's field
+/// source (its domain) and whether it is computed, mapping computed
+/// columns (3) and domain checks (4) to their tables.
+pub(crate) const FIELD_SOURCES: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(RF.RDB$FIELD_SOURCE AS VARCHAR(252) CHARACTER SET OCTETS), CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE";
+
+/// The dependent-set read of R41 items 1 and 3, fourth part: the names of
+/// every procedure (5), function (15), package (18) and trigger (2), with
+/// the package of a packaged routine and a trigger's relation and system
+/// flag (a check constraint's trigger maps to its relation).
+pub(crate) const ROUTINES: &str = "SELECT CAST(P.RDB$PROCEDURE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(P.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(5 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$PROCEDURES P UNION ALL SELECT CAST(F.RDB$FUNCTION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(F.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(15 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$FUNCTIONS F UNION ALL SELECT CAST(K.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(18 AS INTEGER), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(0 AS INTEGER) FROM RDB$PACKAGES K UNION ALL SELECT CAST(T.RDB$TRIGGER_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(NULL AS VARCHAR(252) CHARACTER SET OCTETS), CAST(2 AS INTEGER), CAST(T.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(T.RDB$SYSTEM_FLAG, 0) AS INTEGER) FROM RDB$TRIGGERS T";
 
 pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
@@ -260,6 +272,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "dependencies",
         text: DEPENDENCIES,
+    },
+    Statement {
+        name: "field_sources",
+        text: FIELD_SOURCES,
+    },
+    Statement {
+        name: "routines",
+        text: ROUTINES,
     },
 ];
 

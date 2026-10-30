@@ -40,6 +40,7 @@ mod crypt;
 mod discover;
 mod error;
 mod fsread;
+mod idents;
 #[cfg_attr(not(test), allow(dead_code))]
 mod own;
 mod own_table;

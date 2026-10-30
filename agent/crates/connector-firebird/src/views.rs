@@ -1,24 +1,35 @@
-//! Views over always-reported relations (ADR-0060 R12 item 5, R28 items 3
-//! and 4): at every re-evaluation, `check()` reads `RDB$VIEW_RELATIONS`
-//! (every view's base relations and procedure contexts) and
-//! `RDB$DEPENDENCIES` (what views and code depend on) and computes,
-//! transitively and bounded, the views that depend on a relation of the
-//! statement-text or credential-bearing always-reported lists
-//! ([`crate::trace_events::always_listed`]). A read whose text or block
-//! names such a view gets `*` and the always-reported mark.
+//! The dependent set (ADR-0060 R41, replacing R12 item 5's view-only
+//! set): at every re-evaluation, `check()` reads `RDB$VIEW_RELATIONS`,
+//! `RDB$DEPENDENCIES` (views 1, triggers 2, computed columns 3, domain
+//! checks 4, procedures 5, functions 15, packages 18 and 19), every
+//! column's field source (`RDB$RELATION_FIELDS`) and every routine,
+//! package and trigger name, and computes the objects that depend,
+//! directly or transitively, on a relation of the statement-text or
+//! credential-bearing always-reported lists
+//! ([`crate::trace_events::always_listed`]): views, procedures, functions,
+//! packages, triggers, and tables with a dependent computed column, a
+//! dependent domain check (R41 item 1: writes would be enough; the whole
+//! table counts, over-reporting until the tracing of domain checks is
+//! measured) or a dependent check-constraint trigger.
 //!
-//! Fail closed: a failed or cut read, a name that is not UTF-8, more than
-//! [`MAX_VIEWS`] views or a chain deeper than [`MAX_DEPTH`] make every
-//! view of the database count as dependent ([`ViewDeps::complete`] false).
-//! Dependencies through code are followed (a view that calls a procedure
-//! or function that reads an always-reported relation, at any depth within
-//! the bound); a code dependency the read does not show (an external
-//! routine) adds nothing, its own queries being statement records of
-//! their own (R18).
+//! - **Nodes** are keyed by namespace (R41 item 1, review L2): relations
+//!   (tables and views), procedures, functions, packages, triggers and
+//!   fields (domains); a dependency row of a packaged routine resolves to
+//!   its package's node, so a standalone `P` and a packaged `PKG.P` are
+//!   distinct.
+//! - **Strongly connected components** (iterative Tarjan): each member of
+//!   a component is dependent when any member is or a component it
+//!   depends on is (recursive routines, packages calling each other).
+//! - **Bounds, fail closed** (R41 item 2): at most [`MAX_ROWS`] rows per
+//!   read and [`MAX_DEPENDENT`] dependent objects; no depth bound. A
+//!   failed or cut read, a name that is not UTF-8, a computed-column row
+//!   that maps to no table, or more dependent objects than the bound make
+//!   the set incomplete: every view, routine, package and trigger, every
+//!   table with a computed column, and every unknown name then count as
+//!   dependent ([`crate::audit::Classes`]).
 //!
 //! No view is block-blind (R28 item 3 is not implemented): a block-less
-//! view read that returned rows stays ambiguous, whatever the view's
-//! dependencies, so a view that depends on code is never block-blind.
+//! view read that returned rows stays ambiguous.
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,23 +40,29 @@ use crate::error::FbError;
 use crate::sql::{self, Col, Value};
 use crate::trace_events::always_listed;
 
-/// Rows read from each catalog relation at most.
+/// Rows read from each catalog relation at most (R41 item 2).
 pub(crate) const MAX_ROWS: usize = 65_536;
-/// Views considered at most (R12 item 5).
-pub(crate) const MAX_VIEWS: usize = 16_384;
-/// Dependency depth followed at most (R12 item 5).
-pub(crate) const MAX_DEPTH: usize = 16;
+/// Dependent objects at most (R41 item 2).
+pub(crate) const MAX_DEPENDENT: usize = 16_384;
 
-/// The views of one database that depend on an always-reported relation.
+/// The dependent set of one database (R41).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ViewDeps {
+    /// Names of the dependent objects, every kind (matched without regard
+    /// to kind, R41 item 6).
     pub(crate) dependent: HashSet<String>,
-    /// The reads were complete and within the bounds; otherwise every view
-    /// counts as dependent.
+    /// Tables with a computed column (counted dependent when incomplete).
+    pub(crate) computed: HashSet<String>,
+    /// The columns were read (`computed` is meaningful).
+    pub(crate) computed_known: bool,
+    /// Every routine, package and trigger name the read gave (a name in an
+    /// object position unknown to the catalog is dependent, R41 item 3).
+    pub(crate) routines: HashSet<String>,
+    /// The reads were complete and within the bounds.
     pub(crate) complete: bool,
 }
 
-/// A catalog object, by namespace.
+/// A catalog object, by namespace (R41 item 1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
     /// A table or a view (one namespace).
@@ -53,19 +70,34 @@ enum Node {
     Procedure(String),
     Function(String),
     Package(String),
+    Trigger(String),
+    /// A domain (field source): computed columns and domain checks.
+    Field(String),
 }
 
 impl Node {
-    /// `RDB$DEPENDENCIES` object types (0 relation, 1 view, 5 procedure,
-    /// 15 function, 18 and 19 package header and body); others are not
-    /// followed.
+    /// `RDB$DEPENDENCIES` object types; others are not followed.
     fn of(kind: i64, name: String) -> Option<Self> {
         match kind {
             0 | 1 => Some(Self::Relation(name)),
+            2 => Some(Self::Trigger(name)),
+            3 | 4 | 9 => Some(Self::Field(name)),
             5 => Some(Self::Procedure(name)),
             15 => Some(Self::Function(name)),
             18 | 19 => Some(Self::Package(name)),
             _ => None,
+        }
+    }
+
+    /// The object's name, `None` for a domain (not an object a record names).
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Relation(n)
+            | Self::Procedure(n)
+            | Self::Function(n)
+            | Self::Package(n)
+            | Self::Trigger(n) => Some(n),
+            Self::Field(_) => None,
         }
     }
 }
@@ -75,17 +107,43 @@ pub(crate) type ViewRow = (String, String, i64);
 /// One row of [`sql::DEPENDENCIES`]: dependent, its type, depended-on, its
 /// type, the dependent's package.
 pub(crate) type DepRow = (String, i64, String, i64, Option<String>);
+/// One row of [`sql::FIELD_SOURCES`]: relation, field source, computed.
+pub(crate) type FieldRow = (String, String, bool);
+/// One row of [`sql::ROUTINES`]: name, package, type, a trigger's
+/// relation, system flag.
+pub(crate) type RoutineRow = (String, Option<String>, i64, Option<String>, i64);
 
-/// The dependency set from the two reads (`None`: failed, cut, or a row
-/// dropped).
-pub(crate) fn compute(views: Option<Vec<ViewRow>>, deps: Option<Vec<DepRow>>) -> ViewDeps {
-    let (Some(views), Some(deps)) = (views, deps) else {
-        return ViewDeps::default();
+/// The reads of one database (`None`: failed, cut, or a row dropped).
+#[derive(Debug, Default)]
+pub(crate) struct Reads {
+    pub(crate) views: Option<Vec<ViewRow>>,
+    pub(crate) deps: Option<Vec<DepRow>>,
+    pub(crate) fields: Option<Vec<FieldRow>>,
+    pub(crate) routines: Option<Vec<RoutineRow>>,
+}
+
+/// The dependent set from the reads.
+pub(crate) fn compute(r: Reads) -> ViewDeps {
+    let mut out = ViewDeps::default();
+    if let Some(fields) = &r.fields {
+        out.computed_known = true;
+        out.computed = fields.iter().filter(|f| f.2).map(|f| f.0.clone()).collect();
+    }
+    if let Some(routines) = &r.routines {
+        for (name, package, _, _, _) in routines {
+            out.routines.insert(name.clone());
+            if let Some(p) = package {
+                out.routines.insert(p.clone());
+            }
+        }
+    }
+    let (Some(views), Some(deps), Some(fields), Some(routines)) =
+        (r.views, r.deps, r.fields, r.routines)
+    else {
+        return out;
     };
     let mut edges: HashMap<Node, Vec<Node>> = HashMap::new();
-    let mut view_names: HashSet<String> = HashSet::new();
     for (view, base, context) in views {
-        view_names.insert(view.clone());
         // Context type 2: a selectable procedure in the view's `FROM`.
         let to = if context == 2 {
             Node::Procedure(base)
@@ -94,43 +152,65 @@ pub(crate) fn compute(views: Option<Vec<ViewRow>>, deps: Option<Vec<DepRow>>) ->
         };
         edges.entry(Node::Relation(view)).or_default().push(to);
     }
-    for (dependent, dtype, on, otype, package) in deps {
-        if dtype == 1 {
-            view_names.insert(dependent.clone());
+    let computed_sources: HashSet<&str> = fields
+        .iter()
+        .filter(|f| f.2)
+        .map(|f| f.1.as_str())
+        .collect();
+    for (dependent, dtype, on, otype, package) in &deps {
+        // A computed column that maps to no table (R41 item 2).
+        if *dtype == 3 && !computed_sources.contains(dependent.as_str()) {
+            return out;
         }
-        // A packaged routine's dependencies are its package's.
+        // A packaged routine's dependencies are its package's (L2).
         let from = match package {
-            Some(p) if dtype != 1 => Some(Node::Package(p)),
-            _ => Node::of(dtype, dependent),
+            Some(p) if matches!(dtype, 5 | 15) => Some(Node::Package(p.clone())),
+            _ => Node::of(*dtype, dependent.clone()),
         };
-        if let (Some(from), Some(to)) = (from, Node::of(otype, on)) {
+        if let (Some(from), Some(to)) = (from, Node::of(*otype, on.clone())) {
             edges.entry(from).or_default().push(to);
         }
     }
-    if view_names.len() > MAX_VIEWS {
-        return ViewDeps::default();
+    // A table depends on its columns' domains (computed columns, domain
+    // checks) and on its check-constraint triggers (system flag set).
+    for (relation, source, _) in fields {
+        edges
+            .entry(Node::Relation(relation))
+            .or_default()
+            .push(Node::Field(source));
     }
-    let Some(dep) = dependent_nodes(&edges) else {
-        // Deeper than the bound: fail closed.
-        return ViewDeps::default();
-    };
-    let dependent = view_names
-        .into_iter()
-        .filter(|v| dep.contains(&Node::Relation(v.clone())))
+    for (name, _, kind, relation, system) in routines {
+        if kind == 2
+            && system != 0
+            && let Some(rel) = relation
+        {
+            edges
+                .entry(Node::Relation(rel))
+                .or_default()
+                .push(Node::Trigger(name));
+        }
+    }
+    let dep = dependent_nodes(&edges);
+    let names: HashSet<String> = dep
+        .iter()
+        .filter_map(|n| n.name())
+        .filter(|n| !always_listed(n))
+        .map(str::to_owned)
         .collect();
-    ViewDeps {
-        dependent,
-        complete: true,
+    if names.len() > MAX_DEPENDENT {
+        return out;
     }
+    out.dependent = names;
+    out.complete = true;
+    out
 }
 
 /// The nodes that depend on an always-reported relation, through the
 /// strongly connected components of the graph (review M2: mutually
 /// recursive routines share what any of them reaches, whatever the order
-/// of the walk); `None` when the condensed graph is deeper than
-/// [`MAX_DEPTH`]. Iterative (Tarjan), so a long chain cannot exhaust the
-/// stack.
-fn dependent_nodes(edges: &HashMap<Node, Vec<Node>>) -> Option<HashSet<Node>> {
+/// of the walk). Iterative (Tarjan), so a long chain cannot exhaust the
+/// stack; no depth bound (R41 item 2).
+fn dependent_nodes(edges: &HashMap<Node, Vec<Node>>) -> HashSet<Node> {
     const UNSEEN: usize = usize::MAX;
     let mut ids: HashMap<&Node, usize> = HashMap::new();
     let mut nodes: Vec<&Node> = Vec::new();
@@ -211,20 +291,15 @@ fn dependent_nodes(edges: &HashMap<Node, Vec<Node>>) -> Option<HashSet<Node>> {
                         }
                     }
                 }
-                if h > MAX_DEPTH {
-                    return None;
-                }
                 dep.push(d);
                 height.push(h);
             }
         }
     }
-    Some(
-        (0..n)
-            .filter(|&v| dep[comp[v]])
-            .map(|v| nodes[v].clone())
-            .collect(),
-    )
+    (0..n)
+        .filter(|&v| dep[comp[v]])
+        .map(|v| nodes[v].clone())
+        .collect()
 }
 
 /// A catalog name as the `OCTETS` cast sends it: UTF-8, padding dropped.
@@ -234,66 +309,95 @@ fn name(v: Option<&Value>) -> Option<String> {
     Some(t.trim_end_matches(' ').to_owned())
 }
 
-/// Reads the dependency set on the agent's attachment (R12 item 5). A
-/// failed or cut read gives the incomplete set; a fatal error ends the
+/// The optional package column of a read (NULL: none).
+fn opt_name(v: Option<&Value>) -> Option<Option<String>> {
+    match v {
+        Some(Value::Null) | None => Some(None),
+        v => Some(Some(name(v)?)),
+    }
+}
+
+/// A read whose rows all convert; `None` when it failed, was cut, or a
+/// row did not convert (fail closed). A fatal error ends the check.
+async fn rows<T>(
+    s: &mut Session,
+    text: &'static str,
+    shape: &[Col],
+    deadline: Instant,
+    f: impl Fn(&[Value]) -> Option<T>,
+) -> Result<Option<Vec<T>>, FbError> {
+    match s.query(text, shape, MAX_ROWS, deadline).await {
+        Ok(r) if !r.cut => Ok(r.rows.iter().map(|row| f(row)).collect::<Option<Vec<_>>>()),
+        Ok(_) => Ok(None),
+        Err(e) if !e.fatal => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads the dependent set on the agent's attachment (R41). A failed or
+/// cut read gives the incomplete set (logged); a fatal error ends the
 /// check.
 pub(crate) async fn read(s: &mut Session, deadline: Instant) -> Result<ViewDeps, FbError> {
-    let views = match s
-        .query(
-            sql::VIEW_RELATIONS,
-            &[Col::Octets(252), Col::Octets(252), Col::Int],
-            MAX_ROWS,
-            deadline,
-        )
-        .await
-    {
-        Ok(r) if !r.cut => r
-            .rows
-            .iter()
-            .map(|row| Some((name(row.first())?, name(row.get(1))?, row.get(2)?.as_int()?)))
-            .collect::<Option<Vec<_>>>(),
-        Ok(_) => None,
-        Err(e) if !e.fatal => None,
-        Err(e) => return Err(e),
-    };
-    let deps = match s
-        .query(
-            sql::DEPENDENCIES,
-            &[
-                Col::Octets(252),
-                Col::Int,
-                Col::Octets(252),
-                Col::Int,
-                Col::Octets(252),
-            ],
-            MAX_ROWS,
-            deadline,
-        )
-        .await
-    {
-        Ok(r) if !r.cut => r
-            .rows
-            .iter()
-            .map(|row| {
-                let package = match row.get(4) {
-                    Some(Value::Null) | None => None,
-                    v => Some(name(v)?),
-                };
-                Some((
-                    name(row.first())?,
-                    row.get(1)?.as_int()?,
-                    name(row.get(2))?,
-                    row.get(3)?.as_int()?,
-                    package,
-                ))
-            })
-            .collect::<Option<Vec<_>>>(),
-        Ok(_) => None,
-        Err(e) if !e.fatal => None,
-        Err(e) => return Err(e),
-    };
+    let o = Col::Octets(252);
+    let views = rows(s, sql::VIEW_RELATIONS, &[o, o, Col::Int], deadline, |row| {
+        Some((name(row.first())?, name(row.get(1))?, row.get(2)?.as_int()?))
+    })
+    .await?;
+    let deps = rows(
+        s,
+        sql::DEPENDENCIES,
+        &[o, Col::Int, o, Col::Int, o],
+        deadline,
+        |row| {
+            Some((
+                name(row.first())?,
+                row.get(1)?.as_int()?,
+                name(row.get(2))?,
+                row.get(3)?.as_int()?,
+                opt_name(row.get(4))?,
+            ))
+        },
+    )
+    .await?;
+    let fields = rows(s, sql::FIELD_SOURCES, &[o, o, Col::Bool], deadline, |row| {
+        Some((
+            name(row.first())?,
+            name(row.get(1))?,
+            row.get(2)?.as_bool()?,
+        ))
+    })
+    .await?;
+    let routines = rows(
+        s,
+        sql::ROUTINES,
+        &[o, o, Col::Int, o, Col::Int],
+        deadline,
+        |row| {
+            Some((
+                name(row.first())?,
+                opt_name(row.get(1))?,
+                row.get(2)?.as_int()?,
+                opt_name(row.get(3))?,
+                row.get(4)?.as_int()?,
+            ))
+        },
+    )
+    .await?;
     s.commit(deadline).await?;
-    Ok(compute(views, deps))
+    let out = compute(Reads {
+        views,
+        deps,
+        fields,
+        routines,
+    });
+    if !out.complete {
+        tracing::warn!(
+            "Firebird dependent-set read cut or failed: every view, routine, package, trigger and \
+             computed-column table counts as dependent until the next complete read (ADR-0060 R41 \
+             item 2)"
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -308,27 +412,35 @@ mod tests {
         (dep.to_owned(), dt, on.to_owned(), ot, None)
     }
 
+    fn reads(views: Vec<ViewRow>, deps: Vec<DepRow>) -> Reads {
+        Reads {
+            views: Some(views),
+            deps: Some(deps),
+            fields: Some(Vec::new()),
+            routines: Some(Vec::new()),
+        }
+    }
+
+    fn sorted(d: &ViewDeps) -> Vec<&str> {
+        let mut v: Vec<&str> = d.dependent.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
     #[test]
-    fn views_over_always_reported_relations_transitively() {
-        let deps = compute(
-            Some(vec![
-                // A view mixing a table and a statement-text relation.
+    fn views_and_code_over_always_reported_relations_transitively() {
+        let deps = compute(reads(
+            vec![
                 v("V_MIX", "CUSTOMERS"),
                 v("V_MIX", "MON$STATEMENTS"),
-                // A view over that view.
                 v("V_TOP", "V_MIX"),
-                // A plain view.
                 v("V_PLAIN", "CUSTOMERS"),
-                // A view over a selectable procedure.
                 ("V_PROC".to_owned(), "P_SECRETS".to_owned(), 2),
-            ]),
-            Some(vec![
-                // The procedure reads a credential relation.
+            ],
+            vec![
                 d("P_SECRETS", 5, "SEC$USERS", 0),
-                // A view calling a function that reads `RDB$CONFIG`.
                 d("V_FUNC", 1, "F_CFG", 15),
                 d("F_CFG", 15, "RDB$CONFIG", 0),
-                // A packaged function, through its package.
                 d("V_PKG", 1, "PK", 18),
                 (
                     "F_IN".to_owned(),
@@ -337,39 +449,131 @@ mod tests {
                     0,
                     Some("PK".to_owned()),
                 ),
-                // A view calling a harmless function.
                 d("V_OK", 1, "F_OK", 15),
                 d("F_OK", 15, "CUSTOMERS", 0),
-            ]),
-        );
+            ],
+        ));
         assert!(deps.complete);
-        let mut got: Vec<&str> = deps.dependent.iter().map(String::as_str).collect();
-        got.sort_unstable();
-        assert_eq!(got, ["V_FUNC", "V_MIX", "V_PKG", "V_PROC", "V_TOP"]);
+        assert_eq!(
+            sorted(&deps),
+            [
+                "F_CFG",
+                "PK",
+                "P_SECRETS",
+                "V_FUNC",
+                "V_MIX",
+                "V_PKG",
+                "V_PROC",
+                "V_TOP"
+            ]
+        );
+    }
+
+    /// R41 item 1: a computed column (dependent type 3) maps its table; a
+    /// domain check (4) and a check-constraint trigger (2, system flag)
+    /// map theirs; a table trigger reading a virtual relation is dependent
+    /// by name; a computed column row that maps to no table fails closed.
+    #[test]
+    fn computed_columns_domains_and_triggers() {
+        let r = Reads {
+            views: Some(Vec::new()),
+            deps: Some(vec![
+                d("RDB$123", 3, "MON$STATEMENTS", 0),
+                d("D_CHECK", 4, "SEC$USERS", 0),
+                d("CHECK_7", 2, "MON$CALL_STACK", 0),
+                d("TR_AUDIT", 2, "MON$CONTEXT_VARIABLES", 0),
+            ]),
+            fields: Some(vec![
+                ("T_COMP".to_owned(), "RDB$123".to_owned(), true),
+                ("T_DOM".to_owned(), "D_CHECK".to_owned(), false),
+                ("T_PLAIN".to_owned(), "RDB$9".to_owned(), false),
+            ]),
+            routines: Some(vec![
+                ("CHECK_7".to_owned(), None, 2, Some("T_CHK".to_owned()), 3),
+                (
+                    "TR_AUDIT".to_owned(),
+                    None,
+                    2,
+                    Some("T_PLAIN".to_owned()),
+                    0,
+                ),
+            ]),
+        };
+        let deps = compute(r);
+        assert!(deps.complete);
+        assert_eq!(
+            sorted(&deps),
+            ["CHECK_7", "TR_AUDIT", "T_CHK", "T_COMP", "T_DOM"]
+        );
+        assert!(deps.computed.contains("T_COMP"));
+        // A computed column that maps to no table.
+        let mut r = reads(Vec::new(), vec![d("RDB$999", 3, "MON$STATEMENTS", 0)]);
+        r.fields = Some(Vec::new());
+        assert!(!compute(r).complete);
+    }
+
+    /// Review L2: a standalone `P` and a packaged `PKG.P` are distinct.
+    #[test]
+    fn packaged_and_standalone_routines_are_distinct() {
+        let deps = compute(reads(
+            vec![],
+            vec![
+                (
+                    "P".to_owned(),
+                    5,
+                    "MON$STATEMENTS".to_owned(),
+                    0,
+                    Some("PKG".to_owned()),
+                ),
+                d("P", 5, "CUSTOMERS", 0),
+            ],
+        ));
+        assert_eq!(sorted(&deps), ["PKG"]);
     }
 
     #[test]
-    fn a_failed_cut_or_too_deep_read_counts_every_view() {
-        assert!(!compute(None, Some(vec![])).complete);
-        assert!(!compute(Some(vec![]), None).complete);
-        // A chain deeper than the bound.
-        let chain: Vec<ViewRow> = (0..=MAX_DEPTH + 1)
+    fn a_failed_or_cut_read_is_incomplete_and_no_depth_bound() {
+        assert!(
+            !compute(Reads {
+                views: None,
+                ..reads(vec![], vec![])
+            })
+            .complete
+        );
+        assert!(
+            !compute(Reads {
+                deps: None,
+                ..reads(vec![], vec![])
+            })
+            .complete
+        );
+        assert!(
+            !compute(Reads {
+                fields: None,
+                ..reads(vec![], vec![])
+            })
+            .complete
+        );
+        assert!(
+            !compute(Reads {
+                routines: None,
+                ..reads(vec![], vec![])
+            })
+            .complete
+        );
+        // A chain of 100 views: no depth bound (R41 item 2).
+        let chain: Vec<ViewRow> = (0..100)
             .map(|i| v(&format!("V{i}"), &format!("V{}", i + 1)))
+            .chain([v("V100", "MON$STATEMENTS")])
             .collect();
-        assert!(!compute(Some(chain), Some(vec![])).complete);
-        // Within the bound.
-        let chain: Vec<ViewRow> = (0..MAX_DEPTH - 1)
-            .map(|i| v(&format!("V{i}"), &format!("V{}", i + 1)))
-            .chain([v(&format!("V{}", MAX_DEPTH - 1), "MON$STATEMENTS")])
+        let deps = compute(reads(chain, vec![]));
+        assert!(deps.complete && deps.dependent.contains("V0"));
+        // More dependent objects than the bound.
+        let many: Vec<ViewRow> = (0..=MAX_DEPENDENT)
+            .map(|i| v(&format!("V{i}"), "MON$STATEMENTS"))
             .collect();
-        let deps = compute(Some(chain), Some(vec![]));
-        assert!(deps.complete);
-        assert!(deps.dependent.contains("V0"));
-        // Too many views.
-        let many: Vec<ViewRow> = (0..=MAX_VIEWS).map(|i| v(&format!("V{i}"), "T")).collect();
-        assert!(!compute(Some(many), Some(vec![])).complete);
-        // A cycle (an invalid catalog) terminates.
-        let deps = compute(Some(vec![v("A", "B"), v("B", "A")]), Some(vec![]));
+        assert!(!compute(reads(many, vec![])).complete);
+        let deps = compute(reads(vec![v("A", "B"), v("B", "A")], vec![]));
         assert!(deps.complete && deps.dependent.is_empty());
     }
 
@@ -377,23 +581,20 @@ mod tests {
     /// whatever the order of the walk (repeated: the map order varies).
     #[test]
     fn mutually_recursive_code_shares_its_dependencies() {
-        let mk = |a: &str, at: i64, b: &str, bt: i64| (a.to_owned(), at, b.to_owned(), bt, None);
         for _ in 0..50 {
-            let d = compute(
-                Some(vec![
+            let deps = compute(reads(
+                vec![
                     ("V1".to_owned(), "P1".to_owned(), 2),
                     ("W".to_owned(), "P2".to_owned(), 2),
-                ]),
-                Some(vec![
-                    mk("P1", 5, "P2", 5),
-                    mk("P1", 5, "SEC$USERS", 0),
-                    mk("P2", 5, "P1", 5),
-                ]),
-            );
-            assert!(d.complete);
-            let mut got: Vec<&str> = d.dependent.iter().map(String::as_str).collect();
-            got.sort_unstable();
-            assert_eq!(got, ["V1", "W"]);
+                ],
+                vec![
+                    d("P1", 5, "P2", 5),
+                    d("P1", 5, "SEC$USERS", 0),
+                    d("P2", 5, "P1", 5),
+                ],
+            ));
+            assert!(deps.complete);
+            assert_eq!(sorted(&deps), ["P1", "P2", "V1", "W"]);
         }
     }
 

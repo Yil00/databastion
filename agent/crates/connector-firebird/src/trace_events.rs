@@ -98,8 +98,20 @@ pub(crate) enum RelClass {
 pub(crate) trait Catalog {
     /// The class of a relation, by its stored name.
     fn class(&self, relation: &str) -> RelClass;
-    /// A view that depends on an always-reported relation (R12 item 5).
+    /// An object, named at an object position, of the dependent set (a
+    /// view, routine, package, trigger or table that depends on an
+    /// always-reported relation, R12 item 5, R41), or unknown to the last
+    /// complete catalog read (R41 item 3).
     fn always_view(&self, relation: &str) -> bool;
+    /// Any identifier token of a text equal to a dependent object's name
+    /// (R41 item 6; no unknown-name rule: keywords and columns are tokens).
+    fn dependent_token(&self, name: &str) -> bool {
+        self.always_view(name)
+    }
+    /// A table with a computed column at the last read (R41 item 8).
+    fn computed(&self, _relation: &str) -> bool {
+        false
+    }
 }
 
 /// An event before its principal and database are attached.

@@ -223,6 +223,30 @@ const STATEMENT_ROWS: &[Row] = &[
         loading: NONE,
         bound: limit(crate::views::MAX_ROWS),
     },
+    // R41: every column's source; a join of two persistent catalog
+    // relations, both touched when a row is returned.
+    Row {
+        text: sql::FIELD_SOURCES,
+        may: &["RDB$RELATION_FIELDS", "RDB$FIELDS"],
+        must: NONE,
+        must_with_rows: &["RDB$RELATION_FIELDS", "RDB$FIELDS"],
+        loading: NONE,
+        bound: limit(crate::views::MAX_ROWS),
+    },
+    // R41: a union of four catalog relations; any part may be empty.
+    Row {
+        text: sql::ROUTINES,
+        may: &[
+            "RDB$PROCEDURES",
+            "RDB$FUNCTIONS",
+            "RDB$PACKAGES",
+            "RDB$TRIGGERS",
+        ],
+        must: NONE,
+        must_with_rows: NONE,
+        loading: NONE,
+        bound: limit(crate::views::MAX_ROWS),
+    },
 ];
 
 /// The probe of `relation` (decision 4): `RDB$DATABASE` always, the probed

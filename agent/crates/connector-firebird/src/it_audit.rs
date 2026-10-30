@@ -200,6 +200,7 @@ fn the_server_trace_log_through_the_stream() {
         alias: None,
         excluded: false,
         attach: path.to_owned(),
+        read_at: None,
     };
     let settings = crate::stream::Settings {
         databases: vec![names("app", APP), names("crm", CRM)],
@@ -291,6 +292,7 @@ fn the_agent_records_match_the_own_statement_table() {
         alias: None,
         excluded: false,
         attach: path.to_owned(),
+        read_at: None,
     };
     let settings = crate::stream::Settings {
         databases: vec![names("app", APP), names("crm", CRM)],

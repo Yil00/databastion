@@ -71,7 +71,8 @@ use crate::own::{Ledger, Verdict};
 use crate::trace_conf::AliasMap;
 use crate::trace_events::{Catalog, Converted, Draft, convert, to_event};
 use crate::trace_log::{
-    Body, Event, LogTime, Outcome, ParseOptions, Protocol, Record, RoutineKind, TriggerKind, parse,
+    Body, Event, LogTime, Outcome, ParseOptions, Protocol, Record, RoutineKind, ServiceName,
+    TriggerKind, parse,
 };
 
 /// R1 rule 7: a split window lasts this much reading time.
@@ -121,6 +122,8 @@ pub(crate) struct DeclaredNames {
     pub(crate) excluded: bool,
     /// The declared `attach` (the ledger's key; never sent).
     pub(crate) attach: String,
+    /// When the last check's catalog read of it started (R41 item 8).
+    pub(crate) read_at: Option<SystemTime>,
 }
 
 /// Database identity (R1 rule 3).
@@ -411,9 +414,21 @@ pub(crate) struct Machine {
     /// The binding whose credited record confirmed the offset, and the
     /// offset before it (restored if that binding is poisoned).
     offset_from: Option<(Key, Option<i64>)>,
-    /// Declared databases whose view sets a view DDL record invalidated
-    /// until the next `check()` (R28 item 4).
+    /// Declared databases whose dependent and block-blind sets are
+    /// invalidated (R28 item 4, R41 item 8).
     views_invalid: std::collections::HashSet<usize>,
+    /// DDL transactions seen without their end record: binding and
+    /// transaction, and the database (R41 item 8).
+    ddl_open: HashMap<(Key, u64), usize>,
+    /// Per database: a check's catalog read must start after this to
+    /// clear the invalidation (the latest invalidating record or DDL
+    /// transaction end, agent clock).
+    invalid_after: HashMap<usize, SystemTime>,
+    /// Per database: relations named by DDL texts in the interval.
+    ddl_named: HashMap<usize, std::collections::HashSet<String>>,
+    /// Databases where an unparsable or ambiguous DDL record makes every
+    /// relation dependent.
+    all_relations: std::collections::HashSet<usize>,
     /// The `(st_dev, st_ino)` of the log file being read (the ledger keys
     /// consumed credits by record position).
     file: (u64, u64),
@@ -471,6 +486,10 @@ impl Machine {
             offset_from: None,
             file: (0, 0),
             views_invalid: std::collections::HashSet::new(),
+            ddl_open: HashMap::new(),
+            invalid_after: HashMap::new(),
+            ddl_named: HashMap::new(),
+            all_relations: std::collections::HashSet::new(),
             ledger,
             hash_key: std::collections::hash_map::RandomState::new(),
             pending_end: Vec::new(),
@@ -496,8 +515,39 @@ impl Machine {
     /// New settings from a re-evaluation (names, map, proof 11).
     pub(crate) fn reconfigure(&mut self, s: Settings) {
         self.s = s;
-        // A new check read the view sets again (R28 item 4).
-        self.views_invalid.clear();
+        // R41 item 8: a database's sets are valid again only when this
+        // check's catalog read started after every DDL transaction seen
+        // since ended (none still open) and after the latest invalidating
+        // record.
+        let open: std::collections::HashSet<usize> = self.ddl_open.values().copied().collect();
+        let clear: Vec<usize> = self
+            .views_invalid
+            .iter()
+            .copied()
+            .filter(|db| {
+                !open.contains(db)
+                    && self
+                        .s
+                        .databases
+                        .get(*db)
+                        .and_then(|d| d.read_at)
+                        .is_some_and(|r| self.invalid_after.get(db).is_none_or(|a| r > *a))
+            })
+            .collect();
+        for db in clear {
+            self.views_invalid.remove(&db);
+            self.invalid_after.remove(&db);
+            self.ddl_named.remove(&db);
+            self.all_relations.remove(&db);
+        }
+    }
+
+    /// R41 item 8: the database's sets are invalidated from now.
+    fn invalidate(&mut self, db: usize, wall: SystemTime) {
+        self.views_invalid.insert(db);
+        let a = self.invalid_after.entry(db).or_insert(wall);
+        *a = (*a).max(wall);
+        self.check_requested = true;
     }
 
     /// A run confirmed by `check()` or a `/proc` sample (R1 rule 1, R5
@@ -689,29 +739,129 @@ impl Machine {
         self.groups.iter().map(|g| g.first).min()
     }
 
-    /// R28 item 4, review L5: any DDL statement record (views, and the
-    /// procedures, functions, packages and tables a view can depend on),
-    /// including one whose text does not parse, invalidates the view sets of
-    /// its database, an ambiguous DDL record those of every declared
-    /// database, until the next `check()`.
-    fn note_view_ddl(&mut self, rec: &Record<'_>, decision: &Decision) {
-        let Body::Statement { text, .. } = &rec.body else {
-            return;
+    /// R28 item 4, R41 item 8: what invalidates the dependent and
+    /// block-blind sets, and what ends a DDL transaction.
+    /// - any DDL statement record of a declared database (its relations
+    ///   join the interval's named set; a text that does not parse makes
+    ///   every relation dependent), opening a DDL transaction until its end
+    ///   record (or its binding's end);
+    /// - an ambiguous DDL record: every declared database, every relation;
+    /// - `DROP_DATABASE`, `CREATE_DATABASE` and a services restore of a
+    ///   declared database.
+    ///
+    /// Each asks for an early check, and so does the end of a DDL
+    /// transaction (R11 8d's merging).
+    fn note_ddl(&mut self, rec: &Record<'_>, decision: &Decision, wall: SystemTime) {
+        let key = rec.att.and_then(|att| match self.resolve(att.database) {
+            Resolved::Db(d) => Some((d, att.id)),
+            Resolved::Ambiguous => None,
+        });
+        // The end of a DDL transaction, or of its binding.
+        let tra = rec.tra.map(|t| t.id);
+        let ended: Vec<(Key, u64)> = match rec.header.event {
+            Event::CommitTransaction | Event::RollbackTransaction => self
+                .ddl_open
+                .keys()
+                .filter(|(k, t)| Some(*k) == key && Some(*t) == tra)
+                .copied()
+                .collect(),
+            Event::DetachDatabase | Event::DropDatabase => self
+                .ddl_open
+                .keys()
+                .filter(|(k, _)| Some(*k) == key)
+                .copied()
+                .collect(),
+            _ => Vec::new(),
         };
-        let a = analyze_firebird(text);
-        if a.kind != FirebirdKind::Ddl {
-            return;
+        for e in ended {
+            if let Some(db) = self.ddl_open.remove(&e) {
+                self.invalidate(db, wall);
+            }
         }
-        match decision {
-            Decision::Ambiguous { .. } => {
-                self.views_invalid.extend(0..self.s.databases.len());
-                self.check_requested = true;
+        match (&rec.body, rec.header.event, decision) {
+            (Body::Statement { text, .. }, _, _) => {
+                let a = analyze_firebird(text);
+                if a.kind != FirebirdKind::Ddl {
+                    return;
+                }
+                match decision {
+                    Decision::Ambiguous { .. } => {
+                        for db in 0..self.s.databases.len() {
+                            self.invalidate(db, wall);
+                            self.all_relations.insert(db);
+                        }
+                    }
+                    Decision::Normal { db, key } => {
+                        let db = *db;
+                        self.invalidate(db, wall);
+                        if a.parses() {
+                            let named = self.ddl_named.entry(db).or_default();
+                            for r in a.relations.iter().chain(&a.procedures) {
+                                if named.len() < 4096 {
+                                    named.insert(r.trim_end_matches(' ').to_owned());
+                                }
+                            }
+                        } else {
+                            self.all_relations.insert(db);
+                        }
+                        if let (Some(k), Some(t)) = (key, tra)
+                            && self.ddl_open.len() < 4096
+                        {
+                            self.ddl_open.insert((*k, t), db);
+                        }
+                    }
+                    _ => {}
+                }
             }
-            Decision::Normal { db, .. } => {
-                self.views_invalid.insert(*db);
-                self.check_requested = true;
+            (_, Event::DropDatabase | Event::CreateDatabase, Decision::Normal { db, .. }) => {
+                self.invalidate(*db, wall);
             }
+            (
+                Body::Service {
+                    name:
+                        Some(ServiceName::RestoreDatabase | ServiceName::IncrementalRestoreDatabase),
+                    ..
+                },
+                _,
+                Decision::Normal { db, .. },
+            ) => self.invalidate(*db, wall),
             _ => {}
+        }
+    }
+
+    /// R41 items 3 and 6: whether a record names an object of the dependent
+    /// set: any identifier token of its text (both dialect readings,
+    /// packaged names by their package), its text's relations and routines
+    /// and its block's relations at object positions (where a name unknown
+    /// to the catalog read counts too), a routine record's name line, and a
+    /// non-ASCII quoted identifier from an attachment whose character set
+    /// is not `UTF8`.
+    fn dependent_hit(&self, rec: &Record<'_>, cat: &dyn Catalog) -> bool {
+        if let Some(b) = &rec.trailer.block
+            && b.iter().any(|(n, _)| cat.always_view(n))
+        {
+            return true;
+        }
+        match &rec.body {
+            Body::Statement { text, .. } => {
+                let ids = crate::idents::idents(text);
+                if ids.cut
+                    || ids.names.iter().any(|n| cat.dependent_token(n))
+                    || ids.packaged.iter().any(|(p, _)| cat.dependent_token(p))
+                {
+                    return true;
+                }
+                if ids.non_ascii_quoted && rec.att.is_none_or(|a| a.charset != "UTF8") {
+                    return true;
+                }
+                let a = analyze_firebird(text);
+                a.relations
+                    .iter()
+                    .chain(&a.procedures)
+                    .any(|n| cat.always_view(n))
+            }
+            Body::Routine { name, .. } => cat.always_view(name.name),
+            _ => false,
         }
     }
 
@@ -857,16 +1007,38 @@ impl Machine {
         // R28 item 4: after a view DDL record, until the next check, every
         // view (and every name the catalog read does not know) counts as
         // dependent.
+        let named = std::mem::take(&mut self.ddl_named);
+        let all = self.all_relations.clone();
+        let invalid = self.views_invalid.clone();
         let wrapped: Vec<Invalidated<'_>> = cat
             .iter()
             .enumerate()
             .map(|(i, c)| Invalidated {
                 inner: *c,
-                invalid: self.views_invalid.contains(&i),
+                invalid: invalid.contains(&i),
+                named: named.get(&i),
+                all: all.contains(&i),
             })
             .collect();
-        let cat: Vec<&dyn Catalog> = wrapped.iter().map(|w| w as &dyn Catalog).collect();
-        let cat = cat.as_slice();
+        let cats: Vec<&dyn Catalog> = wrapped.iter().map(|w| w as &dyn Catalog).collect();
+        let done = self.record_in(raw, pos, now, &cats, out);
+        drop(cats);
+        drop(wrapped);
+        // The names of the interval, with those this record added.
+        for (db, n) in named {
+            self.ddl_named.entry(db).or_default().extend(n);
+        }
+        done
+    }
+
+    fn record_in(
+        &mut self,
+        raw: &[u8],
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) -> bool {
         self.expire(now, cat, out);
         let Some(rec) = parse(raw, self.s.parse) else {
             return false;
@@ -879,7 +1051,7 @@ impl Machine {
         }
         let decision = self.judge(&rec, pos, now, cat);
         self.check_offset_binding();
-        self.note_view_ddl(&rec, &decision);
+        self.note_ddl(&rec, &decision, SystemTime::now());
         self.apply(decision, &rec, pos, now, cat, out);
         true
     }
@@ -912,6 +1084,8 @@ impl Machine {
             .map(|c| Invalidated {
                 inner: *c,
                 invalid: false,
+                named: None,
+                all: false,
             })
             .collect();
         let cats: Vec<&dyn Catalog> = wrapped.iter().map(|w| w as &dyn Catalog).collect();
@@ -1010,10 +1184,16 @@ impl Machine {
     }
 }
 
-/// A database's catalog while its view sets are invalidated (R28 item 4).
+/// A database's catalog while its sets are invalidated (R28 item 4, R41
+/// item 8): every view, routine, package, trigger and unknown name, every
+/// table with a computed column at the last read, every name a DDL text of
+/// the interval named, and every relation after an unparsable or
+/// ambiguous DDL record count as dependent.
 struct Invalidated<'a> {
     inner: &'a dyn Catalog,
     invalid: bool,
+    named: Option<&'a std::collections::HashSet<String>>,
+    all: bool,
 }
 
 impl Catalog for Invalidated<'_> {
@@ -1023,12 +1203,30 @@ impl Catalog for Invalidated<'_> {
 
     fn always_view(&self, relation: &str) -> bool {
         use crate::trace_events::RelClass;
-        self.inner.always_view(relation)
+        if self.inner.always_view(relation) {
+            return true;
+        }
+        if !self.invalid {
+            return false;
+        }
+        let r = relation.trim_end_matches(' ');
+        let class = self.inner.class(r);
+        matches!(class, RelClass::View | RelClass::Unknown)
+            || self.inner.computed(r)
+            || self.named.is_some_and(|n| n.contains(r))
+            || (self.all && !matches!(class, RelClass::System | RelClass::Virtual))
+    }
+
+    fn dependent_token(&self, name: &str) -> bool {
+        self.inner.dependent_token(name)
             || (self.invalid
-                && matches!(
-                    self.inner.class(relation),
-                    RelClass::View | RelClass::Unknown
-                ))
+                && self
+                    .named
+                    .is_some_and(|n| n.contains(name.trim_end_matches(' '))))
+    }
+
+    fn computed(&self, relation: &str) -> bool {
+        self.inner.computed(relation)
     }
 }
 
@@ -1760,7 +1958,13 @@ impl Machine {
             // read (R4).
             let foldable = b.anchored && tra.is_some_and(|t| b.open_tras.contains(&t));
             if foldable && let Some(t) = tra {
-                let draft = routine_draft(rec, *kind, cat[db_index(db)]);
+                let mut draft = routine_draft(rec, *kind, cat[db_index(db)]);
+                // R41 item 7: the match is decided per nested record; the
+                // mark is sticky in the group (its parts keep `*`).
+                if self.dependent_hit(rec, cat[db_index(db)]) {
+                    draft.star = true;
+                    draft.always = true;
+                }
                 let block_less = rec.trailer.block.is_none();
                 let m = Member {
                     name: name.name.to_owned(),
@@ -2044,13 +2248,27 @@ impl Machine {
         match decision {
             Decision::Nothing => {}
             Decision::Trigger { db } => {
-                if rec.trailer.block.is_none() {
+                let c = cat[db.min(cat.len() - 1)];
+                // R41 item 5: a database-trigger record of the dependent set
+                // (or naming a trigger unknown to the catalog read) gives an
+                // always-reported `*` event, block-less ones too, never own.
+                let dependent = self.dependent_hit(rec, c);
+                if rec.trailer.block.is_none() && !dependent {
                     return;
                 }
-                if let Converted::Event(mut d) | Converted::Ambiguous { draft: mut d, .. } =
-                    convert(rec, cat[db.min(cat.len() - 1)])
-                {
-                    d.rows = None;
+                let mut d = match convert(rec, c) {
+                    Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
+                    Converted::Nothing => Draft {
+                        action: Some(databastion_classifiers::masking::EventAction::Read),
+                        ..Draft::default()
+                    },
+                };
+                if dependent {
+                    d.star = true;
+                    d.always = true;
+                }
+                d.rows = None;
+                if let Some(d) = finish(d) {
                     let ev = self.draft_event(&d, Some(rec), db);
                     self.emit(db, ev, out);
                 }
@@ -2149,6 +2367,19 @@ impl Machine {
                 if window {
                     self.window_until = Some(now + WINDOW);
                 }
+                // R41 item 4: a record naming an object of the dependent set
+                // gets `*` and the always-reported mark in every shape
+                // (failed records included), and is never the agent's own.
+                let dependent = self.dependent_hit(rec, cat[db.min(cat.len() - 1)]);
+                if dependent {
+                    let d = draft.get_or_insert_with(|| Draft {
+                        action: Some(databastion_classifiers::masking::EventAction::Read),
+                        rows: rec.trailer.fetched,
+                        ..Draft::default()
+                    });
+                    d.star = true;
+                    d.always = true;
+                }
                 // The agent's own record (decision 6, R8 item 4).
                 // Also for a record with no event of its own (its objects all
                 // noise): its credit is consumed, and the read-back probe
@@ -2161,6 +2392,7 @@ impl Machine {
                     && !window
                     && !ambiguous
                     && !folded
+                    && !dependent
                 {
                     let d = draft.clone().unwrap_or_default();
                     match self.own_record(rec, k, &d, pos) {

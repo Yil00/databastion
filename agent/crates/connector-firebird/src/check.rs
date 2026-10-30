@@ -263,6 +263,8 @@ async fn run(
         )
         .await?;
         let rule3 = map.as_ref().map(|m| (m, audit_cfg.as_ref()));
+        // R41 item 8: the catalog reads below start after this.
+        let read_at = std::time::SystemTime::now();
         let result = attached(
             &mut s,
             settings.tunnel,
@@ -324,6 +326,7 @@ async fn run(
             resolved: file.0,
             catalog: crate::audit::Classes::from_catalog(&read, deps),
             excluded: reason.is_some(),
+            read_at: Some(read_at),
         });
         version = Some(v);
     }
