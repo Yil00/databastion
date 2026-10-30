@@ -1,0 +1,1651 @@
+//! The multi-record rules of the Firebird system audit trace (ADR-0060
+//! decision 6 and its refinements R1 to R36): what the single-record
+//! rules of [`crate::trace_events`] cannot decide alone.
+//!
+//! [`Machine`] is a pure state machine (no I/O): the runner
+//! ([`crate::audit`]) feeds it assembled records with their log positions,
+//! the reading time, and the facts `check()` and `/proc` give (the run,
+//! the catalog classes, the agent's own attachments and execution
+//! credits); it hands back masked events per declared database.
+//!
+//! Implemented, fail closed:
+//! - **Runs** (R1 rules 1 and 2, R5): the run is the pid and start time
+//!   `check()` and `/proc` confirm; a record of another pid is ambiguous
+//!   (the stream is not stopped: such records are loud until a check
+//!   confirms a new run, which ends every binding of the old one); a start
+//!   time change of the same pid makes the records read until the next
+//!   confirmation ambiguous (R5 item 4).
+//! - **Bindings** (R1 rules 3 to 6, R7): per database identity and
+//!   attachment id, anchored at `ATTACH_DATABASE` (or learned from the
+//!   first record after a gap); every record of an attachment carries its
+//!   binding's token; one live binding per token; a duplicate attach
+//!   poisons both; ids out of order within R7's bounds (256 ids, 10 s of
+//!   reading time); ids above the agent's latest own id plus 4 096
+//!   ambiguous; the watermark; learned bindings never the agent's own;
+//!   service sessions bound from `ATTACH_SERVICE` to `DETACH_SERVICE`;
+//!   the bounds of R1 rule 11.
+//! - **`TRACE_INIT` / `TRACE_FINI`** (R5 item 2).
+//! - **The Garbage Collector** (R6, R16, R30): one internal binding per
+//!   database identity, one transaction, its end only with no other live
+//!   binding; the sweep binding of R17 with its record sequence.
+//! - **Database names** (R2): the resolved path, the declared alias and
+//!   the aliases of the evaluated map; same file name as a declared
+//!   database ambiguous (M4); undeclared databases ambiguous under proof
+//!   11, dropped and counted otherwise (R1 rule 8).
+//! - **Split windows** (H1 fix 2, R1 rule 7): 60 s of reading time,
+//!   ended by a record of the agent's own anchored binding; bindings
+//!   attached inside a window tainted until they detach.
+//! - **Folding** (R4, R25): a routine finish record pends in its binding's
+//!   transaction group and folds, by maximum, into the next statement
+//!   finish of that binding and transaction; database triggers never fold
+//!   (R15) and are checked against their sequence (`ON CONNECT` in the
+//!   binding's first transaction, `ON DISCONNECT` followed by the detach,
+//!   the reset pair of R34); a group whose transaction ends unfolded
+//!   becomes the block-ful part's events and the block-less part's
+//!   ambiguous records; the stream budget (4 096 groups, 16 transactions
+//!   per binding) ends the oldest first. While a block-less nested record
+//!   pends, the events of every other record are held (65 536 records,
+//!   10 s) and released, or made ambiguous, with the decision (R8 item 2).
+//! - **The agent's own records** (decision 6, R8 item 4, R13, R22, R35):
+//!   only on an anchored, unpoisoned, untainted binding whose attachment
+//!   id and local port are an own attachment of the ledger, with the
+//!   agent's account, role `NONE`, a text of the closed set or a sampling
+//!   text that consumes an execution credit, `records fetched` within the
+//!   credit's bounds, a block within the text's relations and the
+//!   metadata-loading set, no signal.
+//!
+//! Not implemented here (each fail closed or left to the stream's caller,
+//! listed in the lot 3 report): the stop of R1 rule 2 (records of an
+//! unconfirmed pid are ambiguous instead), R1 rule 9, the checkpoint of
+//! parser state (R25 items 7 and 9: positions are held back instead and
+//! the records re-read for state), local external data sources (R29:
+//! their `<internal>` attachments are ambiguous, as R18 item 3 accepted).
+
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime};
+
+use databastion_classifiers::masking::MaskedEvent;
+use databastion_classifiers::query::firebird::{FirebirdKind, analyze_firebird};
+
+use crate::own::{Ledger, Verdict};
+use crate::trace_conf::AliasMap;
+use crate::trace_events::{Catalog, Converted, Draft, convert, to_event};
+use crate::trace_log::{
+    Body, Event, LogTime, Outcome, ParseOptions, Protocol, Record, RoutineKind, TriggerKind, parse,
+};
+
+/// R1 rule 7: a split window lasts this much reading time.
+const WINDOW: Duration = Duration::from_secs(60);
+/// R7: ids accepted out of order.
+const ORDER_IDS: u64 = 256;
+/// R7: reading time within which an out-of-order id is accepted.
+const ORDER_TIME: Duration = Duration::from_secs(10);
+/// R1 rule 5: the margin above the agent's latest own id.
+const ID_MARGIN: u64 = 4096;
+/// R1 rule 11.
+const MAX_BINDINGS_DECLARED: usize = 16_384;
+const MAX_BINDINGS_UNDECLARED: usize = 4096;
+const MAX_UNDECLARED: usize = 256;
+const MAX_SERVICES: usize = 1024;
+/// R25: the stream budget.
+const MAX_GROUPS: usize = 4096;
+const MAX_GROUPS_PER_BINDING: usize = 16;
+/// R25 item 5: block-ful-only groups end after this much reading time.
+const GROUP_TIME: Duration = Duration::from_secs(10);
+/// R8 item 2, R25 item 6: the hold bound.
+const MAX_HELD: usize = 65_536;
+const HOLD_TIME: Duration = Duration::from_secs(10);
+/// R30 item 3: the Garbage Collector's expected end.
+const GC_END: Duration = Duration::from_secs(10);
+/// The per-version metadata-loading set (R8 item 4, R23).
+const METADATA_LOADING: &[&str] = &["RDB$DATABASE", "RDB$RELATIONS"];
+
+/// The names one declared database can be printed under (R2 rule 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredNames {
+    /// The operator's label (sent as `Location.database`).
+    pub(crate) label: String,
+    /// `MON$DATABASE_NAME` from the agent's own attachment.
+    pub(crate) resolved: Option<String>,
+    /// The declared `attach` when it is an alias.
+    pub(crate) alias: Option<String>,
+    /// Excluded by R9: handled as an undeclared database.
+    pub(crate) excluded: bool,
+    /// The declared `attach` (the ledger's key; never sent).
+    pub(crate) attach: String,
+}
+
+/// Database identity (R1 rule 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DbId {
+    Declared(usize),
+    /// A keyed hash of the printed name (never kept in clear).
+    Undeclared(u64),
+}
+
+/// What resolving a printed name gave.
+enum Resolved {
+    Db(DbId),
+    /// Same file name as a declared database, an alias not in the map, a
+    /// case variant: ambiguous (R2 rules 2 and 3, M4).
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    User,
+    /// The Garbage Collector (R6, R16).
+    Internal,
+    /// The automatic sweep (R17).
+    Sweep,
+}
+
+#[derive(Debug, Clone)]
+struct Binding {
+    token: (u32, u64),
+    anchored: bool,
+    poisoned: bool,
+    tainted: bool,
+    kind: Kind,
+    /// Transactions started on it (R15: `ON CONNECT` in the first).
+    first_tra: Option<u64>,
+    open_tras: Vec<u64>,
+    /// R17's sequence position.
+    sweep_step: u8,
+    /// The own attachment of the ledger it matched, when it did.
+    own: bool,
+    /// A database trigger waiting for its sequence (R15 item 2, R34).
+    trigger_wait: Option<TriggerWait>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerWait {
+    /// `ON DISCONNECT` in this transaction: after the transaction's end
+    /// record, its `DETACH_DATABASE` (R15 item 2), or `ON CONNECT` (R34).
+    Disconnect(u64),
+    /// The reset pair: `ALTER SESSION RESET` next (R34 item 2).
+    Reset,
+    /// `ON TRANSACTION_COMMIT` / `_ROLLBACK`: the next record of the
+    /// binding in this transaction is its end record (R15 item 2).
+    TraEnd(u64),
+}
+
+type Key = (DbId, u64);
+
+/// A pending fold group (R4, R25): one binding and transaction.
+#[derive(Debug, Clone)]
+struct Group {
+    key: Key,
+    tra: u64,
+    members: Vec<Member>,
+    started: Instant,
+    /// The position of its first record (the persisted position is held
+    /// back to it).
+    first: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Member {
+    draft: Draft,
+    block_less: bool,
+}
+
+/// One output waiting for the hold to end (R8 item 2).
+#[derive(Debug)]
+struct Held {
+    db: Vec<usize>,
+    event: MaskedEvent,
+}
+
+/// Facts of the run (R1 rule 1, R5 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub(crate) pid: u32,
+    /// `/proc/<pid>/stat` field 22, `None` when not visible.
+    pub(crate) start: Option<u64>,
+}
+
+/// Counters for notes and metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub(crate) records: u64,
+    pub(crate) ambiguous: u64,
+    pub(crate) undeclared_dropped: u64,
+    pub(crate) own: u64,
+    pub(crate) panics: u64,
+    pub(crate) oversized: u64,
+    /// Records of each declared database parsed (proof 9), by index.
+    pub(crate) parsed_declared: u64,
+}
+
+/// The stream's settings.
+pub(crate) struct Settings {
+    pub(crate) databases: Vec<DeclaredNames>,
+    pub(crate) aliases: Option<AliasMap>,
+    /// Proof 11 holds (R1 rule 8).
+    pub(crate) proof11: bool,
+    /// The agent's account (upper-cased, as the server stores it).
+    pub(crate) account: String,
+    pub(crate) parse: ParseOptions,
+    /// SuperServer proven (R6, R16): the internal shape applies.
+    pub(crate) superserver: bool,
+}
+
+/// The state machine.
+pub(crate) struct Machine {
+    s: Settings,
+    run: Option<Run>,
+    /// Records are ambiguous until the next confirmation (R5 item 4).
+    unconfirmed: bool,
+    failed_pids: Vec<u32>,
+    bindings: HashMap<Key, Binding>,
+    token_live: HashMap<(u32, u64), Key>,
+    /// Tokens whose binding ended at the last record that carried them
+    /// (R5 item 2: the `TRACE_FINI` after it).
+    token_ended: HashMap<(u32, u64), ()>,
+    services: HashMap<(u32, u64), bool>,
+    highest: HashMap<DbId, (u64, Instant)>,
+    seen_ids: HashMap<DbId, Vec<u64>>,
+    watermark: HashMap<usize, u64>,
+    internal: HashMap<DbId, Key>,
+    gc_alone_since: HashMap<DbId, Instant>,
+    window_until: Option<Instant>,
+    groups: VecDeque<Group>,
+    held: Vec<Held>,
+    hold_since: Option<Instant>,
+    /// The declared database of the last well-formed record (fix 3).
+    last_declared: Option<usize>,
+    /// Local time offset: agent time minus the server's printed time.
+    offset: Option<i64>,
+    ledger: std::sync::Arc<Ledger>,
+    hash_key: std::collections::hash_map::RandomState,
+    /// Groups ended by the record being judged, emitted in `apply`.
+    pending_end: Vec<Group>,
+    pub(crate) counts: Counts,
+    /// Ambiguous records by the rule (source line) that judged them, for
+    /// the tests and the local detail.
+    pub(crate) why: std::collections::BTreeMap<u32, u64>,
+}
+
+/// What the machine emits: an event and the declared databases it goes to.
+pub(crate) type Emitted = (usize, MaskedEvent);
+
+impl Machine {
+    pub(crate) fn new(s: Settings, ledger: std::sync::Arc<Ledger>) -> Self {
+        Self {
+            s,
+            run: None,
+            unconfirmed: false,
+            failed_pids: Vec::new(),
+            bindings: HashMap::new(),
+            token_live: HashMap::new(),
+            token_ended: HashMap::new(),
+            services: HashMap::new(),
+            highest: HashMap::new(),
+            seen_ids: HashMap::new(),
+            watermark: HashMap::new(),
+            internal: HashMap::new(),
+            gc_alone_since: HashMap::new(),
+            window_until: None,
+            groups: VecDeque::new(),
+            held: Vec::new(),
+            hold_since: None,
+            last_declared: None,
+            offset: None,
+            ledger,
+            hash_key: std::collections::hash_map::RandomState::new(),
+            pending_end: Vec::new(),
+            counts: Counts::default(),
+            why: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// New settings from a re-evaluation (names, map, proof 11).
+    pub(crate) fn reconfigure(&mut self, s: Settings) {
+        self.s = s;
+    }
+
+    /// A run confirmed by `check()` or a `/proc` sample (R1 rule 1, R5
+    /// item 4). A different pid or start time ends every binding of the
+    /// old run.
+    pub(crate) fn confirm_run(&mut self, run: Run) {
+        if self.run.is_some_and(|r| r != run) {
+            self.end_run();
+        }
+        self.run = Some(run);
+        self.unconfirmed = false;
+    }
+
+    /// A `/proc` sample that shows another start time than the current
+    /// run's: records are ambiguous until `check()` confirms (R5 item 4).
+    pub(crate) fn start_time_changed(&mut self) {
+        self.unconfirmed = true;
+    }
+
+    fn end_run(&mut self) {
+        self.bindings.clear();
+        self.token_live.clear();
+        self.token_ended.clear();
+        self.services.clear();
+        self.highest.clear();
+        self.seen_ids.clear();
+        self.watermark.clear();
+        self.internal.clear();
+        self.gc_alone_since.clear();
+        self.groups.clear();
+        self.failed_pids.clear();
+    }
+
+    /// The position the persisted cursor may advance to: the first record
+    /// of the oldest pending group (R25 item 7), `None` when nothing pends.
+    pub(crate) fn held_from(&self) -> Option<u64> {
+        self.groups.iter().map(|g| g.first).min()
+    }
+
+    fn hash(&self, name: &str) -> u64 {
+        use std::hash::BuildHasher;
+        self.hash_key.hash_one(name)
+    }
+
+    fn resolve(&self, printed: &str) -> Resolved {
+        if printed.len() > 4096 {
+            return Resolved::Ambiguous;
+        }
+        for (i, d) in self.s.databases.iter().enumerate() {
+            let mine =
+                d.resolved.as_deref() == Some(printed) || d.alias.as_deref() == Some(printed);
+            if mine {
+                return if d.excluded {
+                    Resolved::Db(DbId::Undeclared(self.hash(printed)))
+                } else {
+                    Resolved::Db(DbId::Declared(i))
+                };
+            }
+        }
+        let path = if printed.starts_with('/') {
+            Some(printed.to_owned())
+        } else {
+            match self.s.aliases.as_ref().map(|m| m.get(printed)) {
+                Some(Some(a)) => match &a.path {
+                    Some(p) => Some(p.clone()),
+                    None => return Resolved::Ambiguous,
+                },
+                // Not in the map, or no map (R2 rule 2).
+                _ => return Resolved::Ambiguous,
+            }
+        };
+        let Some(path) = path else {
+            return Resolved::Ambiguous;
+        };
+        for (i, d) in self.s.databases.iter().enumerate() {
+            if d.resolved.as_deref() == Some(path.as_str()) {
+                return if d.excluded {
+                    Resolved::Db(DbId::Undeclared(self.hash(&path)))
+                } else {
+                    Resolved::Db(DbId::Declared(i))
+                };
+            }
+        }
+        let file = |p: &str| p.rsplit('/').next().map(str::to_owned);
+        if self.s.databases.iter().any(|d| {
+            d.resolved
+                .as_deref()
+                .is_some_and(|r| file(r) == file(&path))
+                || d.alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(printed))
+        }) {
+            return Resolved::Ambiguous;
+        }
+        Resolved::Db(DbId::Undeclared(self.hash(&path)))
+    }
+
+    /// Converts a header time with the learned offset (decision 6: the
+    /// server's local time).
+    fn time(&self, t: LogTime) -> SystemTime {
+        let naive = naive_seconds(t);
+        let secs = naive + self.offset.unwrap_or(0);
+        let base = SystemTime::UNIX_EPOCH;
+        let frac = Duration::from_micros(u64::from(t.frac) * 100);
+        match u64::try_from(secs) {
+            Ok(s) => base + Duration::from_secs(s) + frac,
+            Err(_) => base,
+        }
+    }
+
+    /// One assembled record at log offset `pos` (its first byte), read at
+    /// reading time `now`. Events go to `out`; `replay` marks a record
+    /// re-read for state only (it emits nothing).
+    pub(crate) fn push(
+        &mut self,
+        raw: &[u8],
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        replay: bool,
+        out: &mut Vec<Emitted>,
+    ) {
+        self.counts.records += 1;
+        self.expire(now, cat, replay, out);
+        let Some(rec) = parse(raw, self.s.parse) else {
+            return;
+        };
+        let decided = databastion_core::isolate(|| self.judge(&rec, pos, now, cat));
+        let Some(decision) = decided else {
+            self.counts.panics += 1;
+            return;
+        };
+        self.apply(decision, &rec, now, cat, replay, out);
+    }
+
+    /// The bounds that run on reading time: windows, groups, holds, the
+    /// Garbage Collector's expected end.
+    pub(crate) fn expire(
+        &mut self,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        replay: bool,
+        out: &mut Vec<Emitted>,
+    ) {
+        if self.window_until.is_some_and(|u| now >= u) {
+            self.window_until = None;
+        }
+        while let Some(g) = self.groups.front() {
+            let blockless = g.members.iter().any(|m| m.block_less);
+            let bound = if blockless { HOLD_TIME } else { GROUP_TIME };
+            if now.duration_since(g.started) < bound {
+                break;
+            }
+            let Some(g) = self.groups.pop_front() else {
+                break;
+            };
+            self.end_group(g, now, cat, replay, out);
+        }
+        if self.hold_since.is_some()
+            && !self
+                .groups
+                .iter()
+                .any(|g| g.members.iter().any(|m| m.block_less))
+        {
+            self.release(false, replay, out);
+        }
+        let gone: Vec<DbId> = self
+            .gc_alone_since
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > GC_END)
+            .map(|(d, _)| *d)
+            .collect();
+        for d in gone {
+            self.gc_alone_since.remove(&d);
+            if let Some(k) = self.internal.remove(&d)
+                && let Some(b) = self.bindings.remove(&k)
+            {
+                self.token_live.remove(&b.token);
+            }
+        }
+    }
+
+    fn release(&mut self, ambiguous: bool, replay: bool, out: &mut Vec<Emitted>) {
+        self.hold_since = None;
+        for h in std::mem::take(&mut self.held) {
+            if replay {
+                continue;
+            }
+            let ev = if ambiguous {
+                self.counts.ambiguous += 1;
+                h.event.with_always_report()
+            } else {
+                h.event
+            };
+            for d in h.db {
+                out.push((d, ev.clone()));
+            }
+        }
+    }
+
+    fn live_others(&self, db: DbId, except: Key) -> bool {
+        self.bindings
+            .iter()
+            .any(|(k, b)| k.0 == db && *k != except && b.kind != Kind::Internal)
+    }
+}
+
+/// The verdict on one record before its event is built.
+enum Decision {
+    /// No event (well formed, nothing read, or the agent's own).
+    Nothing,
+    /// A dropped record of an undeclared database (R1 rule 8).
+    Dropped,
+    /// An event (or a fold) for a declared database.
+    Normal { db: usize, key: Option<Key> },
+    /// A well-formed database-trigger record (R15 item 4): the block's
+    /// relations under the filters, no rows; block-less, no event.
+    Trigger { db: usize },
+    /// Ambiguous (fix 3); `window`: it opens one.
+    Ambiguous { window: bool, at: u32 },
+}
+
+impl Machine {
+    #[allow(clippy::too_many_lines)]
+    fn judge(
+        &mut self,
+        rec: &Record<'_>,
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+    ) -> Decision {
+        let h = &rec.header;
+        let token = h.token();
+        // Runs (R1 rules 1 and 2, R5).
+        let pid_ok = match self.run {
+            Some(r) => r.pid == h.pid && !self.unconfirmed,
+            // Before the first confirmation, a history walk: the first pid
+            // is taken; the first check confirms it or ends it.
+            None => {
+                self.run = Some(Run {
+                    pid: h.pid,
+                    start: None,
+                });
+                true
+            }
+        };
+        if !pid_ok {
+            if !self.failed_pids.contains(&h.pid) && self.failed_pids.len() < 64 {
+                self.failed_pids.push(h.pid);
+            }
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        if rec.defect.is_some() {
+            let window = matches!(
+                convert(rec, cat[0]),
+                Converted::Ambiguous { window: true, .. }
+            );
+            return Decision::Ambiguous {
+                window,
+                at: line!(),
+            };
+        }
+        let in_window = self.window_until.is_some_and(|u| now < u);
+        match h.event {
+            Event::TraceInit => {
+                self.token_ended.remove(&token);
+                return if self.token_live.contains_key(&token) {
+                    Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    }
+                } else {
+                    Decision::Nothing
+                };
+            }
+            Event::TraceFini => {
+                if self.token_ended.remove(&token).is_some() {
+                    return Decision::Nothing;
+                }
+                if let Some(k) = self.token_live.get(&token).copied()
+                    && self
+                        .bindings
+                        .get(&k)
+                        .is_some_and(|b| b.kind == Kind::Internal)
+                {
+                    if self.live_others(k.0, k) {
+                        return Decision::Ambiguous {
+                            window: false,
+                            at: line!(),
+                        };
+                    }
+                    self.end_binding(k);
+                    return Decision::Nothing;
+                }
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+            Event::AttachService => {
+                if self.token_live.contains_key(&token) || self.services.len() >= MAX_SERVICES {
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                self.services.insert(token, true);
+                return Decision::Nothing;
+            }
+            Event::DetachService => {
+                if self.services.remove(&token).is_none() {
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                self.token_ended.insert(token, ());
+                return Decision::Nothing;
+            }
+            Event::StartService | Event::QueryService => {
+                if !self.services.contains_key(&token) {
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                // R27 item 1 (a): the backup's database argument.
+                if let Body::Service {
+                    database: Some(d), ..
+                } = &rec.body
+                {
+                    return match self.resolve(d) {
+                        Resolved::Db(DbId::Declared(i)) => Decision::Normal { db: i, key: None },
+                        Resolved::Db(DbId::Undeclared(_)) => Decision::Dropped,
+                        Resolved::Ambiguous => Decision::Ambiguous {
+                            window: false,
+                            at: line!(),
+                        },
+                    };
+                }
+                return match self.s.databases.iter().position(|d| !d.excluded) {
+                    // Attributed to every declared database (fix 3).
+                    Some(_) if matches!(&rec.body, Body::Service { name: Some(_), .. }) => {
+                        Decision::Ambiguous {
+                            window: false,
+                            at: line!(),
+                        }
+                    }
+                    _ => Decision::Nothing,
+                };
+            }
+            Event::Error | Event::Warning => {
+                // Their codes are kept, nothing else; follow-ups carry no
+                // object (R22 item 7).
+                return Decision::Nothing;
+            }
+            _ => {}
+        }
+        let Some(att) = rec.att else {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        };
+        let db = match self.resolve(att.database) {
+            Resolved::Db(d) => d,
+            Resolved::Ambiguous => {
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+        };
+        if let DbId::Declared(i) = db {
+            self.counts.parsed_declared += 1;
+            let _ = i;
+        }
+        let key = (db, att.id);
+        let internal_line = att.protocol == Protocol::Internal;
+        // The Garbage Collector (R6, R16, R30).
+        if internal_line && att.user == "Garbage Collector" && att.role.is_none() {
+            return self.internal_record(rec, key, token, now);
+        }
+        if internal_line
+            && !(att.user == "SWEEPER" && att.role == Some("NONE") && att.charset == "NONE")
+        {
+            // R6 item 5, R29: other internal attachments.
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        match h.event {
+            Event::AttachDatabase | Event::CreateDatabase if h.outcome == Outcome::Ok => {
+                self.attach(rec, key, token, now, in_window, internal_line)
+            }
+            Event::AttachDatabase => {
+                // FAILED / UNAUTHORIZED (R10): one live token is a breach.
+                if self.token_live.contains_key(&token) {
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                self.token_ended.insert(token, ());
+                self.normal(db, None)
+            }
+            _ => self.attached_record(rec, key, token, pos, now, in_window, cat),
+        }
+    }
+
+    fn normal(&mut self, db: DbId, key: Option<Key>) -> Decision {
+        match db {
+            DbId::Declared(i) => {
+                self.last_declared = Some(i);
+                Decision::Normal { db: i, key }
+            }
+            DbId::Undeclared(_) if self.s.proof11 => Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            },
+            DbId::Undeclared(_) => Decision::Dropped,
+        }
+    }
+
+    fn internal_record(
+        &mut self,
+        rec: &Record<'_>,
+        key: Key,
+        token: (u32, u64),
+        now: Instant,
+    ) -> Decision {
+        if !self.s.superserver {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        let db = key.0;
+        let shape = rec.client.is_none()
+            && rec.tra.is_some_and(|t| t.internal_flags)
+            && rec.att.is_some_and(|a| a.charset == "NONE");
+        match rec.header.event {
+            Event::StartTransaction if shape && rec.trailer.block.is_none() => {
+                let seen = self.seen_ids.get(&db).is_some_and(|v| v.contains(&key.1))
+                    || self.bindings.contains_key(&key);
+                if seen || self.token_live.contains_key(&token) {
+                    return Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    };
+                }
+                if let Some(old) = self.internal.get(&db).copied() {
+                    // The replacement rule (R16 item 2).
+                    if self.live_others(db, old) {
+                        return Decision::Ambiguous {
+                            window: false,
+                            at: line!(),
+                        };
+                    }
+                    self.end_binding(old);
+                }
+                self.see(db, key.1);
+                self.internal.insert(db, key);
+                self.token_live.insert(token, key);
+                self.bindings.insert(
+                    key,
+                    Binding {
+                        token,
+                        anchored: true,
+                        poisoned: false,
+                        tainted: false,
+                        kind: Kind::Internal,
+                        first_tra: rec.tra.map(|t| t.id),
+                        open_tras: rec.tra.map(|t| t.id).into_iter().collect(),
+                        sweep_step: 0,
+                        own: false,
+                        trigger_wait: None,
+                    },
+                );
+                if !self.live_others(db, key) {
+                    self.gc_alone_since.insert(db, now);
+                }
+                Decision::Nothing
+            }
+            Event::CommitTransaction if shape && rec.trailer.block.is_none() => {
+                let ok =
+                    self.bindings.get(&key).is_some_and(|b| {
+                        b.token == token && b.kind == Kind::Internal && !b.poisoned
+                    }) && !self.live_others(db, key);
+                if ok {
+                    Decision::Nothing
+                } else {
+                    if let Some(b) = self.bindings.get_mut(&key) {
+                        b.poisoned = true;
+                    }
+                    Decision::Ambiguous {
+                        window: false,
+                        at: line!(),
+                    }
+                }
+            }
+            _ => {
+                if let Some(b) = self.bindings.get_mut(&key) {
+                    b.poisoned = true;
+                }
+                Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                }
+            }
+        }
+    }
+
+    fn see(&mut self, db: DbId, id: u64) {
+        let v = self.seen_ids.entry(db).or_default();
+        if !v.contains(&id) {
+            if v.len() >= MAX_BINDINGS_DECLARED {
+                v.remove(0);
+            }
+            v.push(id);
+        }
+    }
+
+    fn attach(
+        &mut self,
+        rec: &Record<'_>,
+        key: Key,
+        token: (u32, u64),
+        now: Instant,
+        in_window: bool,
+        internal_line: bool,
+    ) -> Decision {
+        let (db, id) = key;
+        let sweep = internal_line;
+        if sweep && rec.client.is_some() {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // R1 rule 3: a duplicate poisons both.
+        if self.bindings.contains_key(&key)
+            || self.seen_ids.get(&db).is_some_and(|v| v.contains(&id))
+        {
+            if let Some(b) = self.bindings.get_mut(&key) {
+                b.poisoned = true;
+                b.own = false;
+            }
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // R1 rule 4: one live binding per token.
+        if self.token_live.contains_key(&token) || self.services.contains_key(&token) {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // R1 rule 5 and R7: order and the run bound.
+        let bound = match db {
+            DbId::Declared(i) => self
+                .ledger
+                .latest_id(&self.s.databases[i].attach)
+                .map(|l| l.saturating_add(ID_MARGIN)),
+            DbId::Undeclared(_) => None,
+        };
+        let mut ambiguous = false;
+        if bound.is_some_and(|b| id > b) {
+            ambiguous = true;
+        } else {
+            match self.highest.get(&db).copied() {
+                Some((hi, at)) if id < hi => {
+                    if hi - id > ORDER_IDS || now.duration_since(at) > ORDER_TIME {
+                        ambiguous = true;
+                    }
+                }
+                _ => {
+                    self.highest.insert(db, (id, now));
+                }
+            }
+        }
+        let caps = match db {
+            DbId::Declared(_) => MAX_BINDINGS_DECLARED,
+            DbId::Undeclared(_) => MAX_BINDINGS_UNDECLARED,
+        };
+        let undeclared = self
+            .bindings
+            .keys()
+            .filter_map(|k| match k.0 {
+                DbId::Undeclared(h) => Some(h),
+                DbId::Declared(_) => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let count = self.bindings.keys().filter(|k| k.0 == db).count();
+        if count >= caps || (matches!(db, DbId::Undeclared(_)) && undeclared >= MAX_UNDECLARED) {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // The agent's own attachment (decision 6, R1 rule 5).
+        let own = match (db, rec.att) {
+            (DbId::Declared(i), Some(att)) => {
+                let port = match att.protocol {
+                    Protocol::Tcp(ip, p) if ip.is_loopback() => Some(p),
+                    _ => None,
+                };
+                let label = &self.s.databases[i].attach;
+                let mine = port.is_some_and(|p| self.ledger.is_own_attach(label, id, p))
+                    && att.user.eq_ignore_ascii_case(&self.s.account)
+                    && att.role.is_none_or(|r| r == "NONE");
+                if mine {
+                    self.watermark.entry(i).or_insert(id);
+                    // The clock offset, from the agent's own attach.
+                    if let Some(opened) = self.ledger.opened(label, id) {
+                        let naive = naive_seconds(rec.header.time);
+                        if let Ok(d) = opened.duration_since(SystemTime::UNIX_EPOCH) {
+                            let agent = i64::try_from(d.as_secs()).unwrap_or(0);
+                            self.offset = Some(agent - naive);
+                        }
+                    }
+                }
+                mine
+            }
+            _ => false,
+        };
+        self.see(db, id);
+        self.token_ended.remove(&token);
+        self.token_live.insert(token, key);
+        self.gc_alone_since.remove(&db);
+        self.bindings.insert(
+            key,
+            Binding {
+                token,
+                anchored: true,
+                poisoned: false,
+                tainted: in_window || ambiguous,
+                kind: if sweep { Kind::Sweep } else { Kind::User },
+                first_tra: None,
+                open_tras: Vec::new(),
+                sweep_step: 0,
+                own: own && !in_window && !ambiguous,
+                trigger_wait: None,
+            },
+        );
+        if ambiguous {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        self.normal(db, Some(key))
+    }
+
+    fn end_binding(&mut self, key: Key) {
+        if let Some(b) = self.bindings.remove(&key) {
+            self.token_live.remove(&b.token);
+            self.token_ended.insert(b.token, ());
+            if self.internal.get(&key.0) == Some(&key) {
+                self.internal.remove(&key.0);
+            }
+            self.groups.retain(|g| g.key != key);
+            if !self.live_others(key.0, key) && self.internal.contains_key(&key.0) {
+                self.gc_alone_since.insert(key.0, Instant::now());
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn attached_record(
+        &mut self,
+        rec: &Record<'_>,
+        key: Key,
+        token: (u32, u64),
+        pos: u64,
+        now: Instant,
+        in_window: bool,
+        cat: &[&dyn Catalog],
+    ) -> Decision {
+        let (db, id) = key;
+        let h = &rec.header;
+        // Learned bindings (R1 rule 5).
+        if !self.bindings.contains_key(&key) {
+            let above_watermark = match db {
+                DbId::Declared(i) => self.watermark.get(&i).is_some_and(|w| id > *w),
+                DbId::Undeclared(_) => false,
+            };
+            let seen = self.seen_ids.get(&db).is_some_and(|v| v.contains(&id));
+            if above_watermark || seen || self.token_live.contains_key(&token) {
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+            self.see(db, id);
+            self.token_live.insert(token, key);
+            self.bindings.insert(
+                key,
+                Binding {
+                    token,
+                    anchored: false,
+                    poisoned: false,
+                    tainted: in_window,
+                    kind: Kind::User,
+                    first_tra: None,
+                    open_tras: Vec::new(),
+                    sweep_step: 0,
+                    own: false,
+                    trigger_wait: None,
+                },
+            );
+        }
+        let Some(b) = self.bindings.get(&key).cloned() else {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        };
+        if b.token != token || b.poisoned {
+            if let Some(b) = self.bindings.get_mut(&key) {
+                b.poisoned |= !b.anchored;
+            }
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        if b.tainted {
+            if matches!(h.event, Event::DetachDatabase | Event::DropDatabase) {
+                self.end_binding(key);
+            }
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // The own binding ends a window (R1 rule 7).
+        if b.own && b.anchored {
+            self.window_until = None;
+        } else if in_window {
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        // A database trigger waiting for its sequence (R15, R34).
+        if let Some(wait) = b.trigger_wait {
+            let this_tra = rec.tra.map(|t| t.id);
+            let is_end = matches!(
+                h.event,
+                Event::CommitTransaction | Event::RollbackTransaction
+            );
+            let (next_ok, keep) = match (wait, h.event, &rec.body) {
+                (TriggerWait::Disconnect(t), _, _) if is_end && this_tra == Some(t) => (true, true),
+                (TriggerWait::Disconnect(_), Event::DetachDatabase, _) => (true, false),
+                (
+                    TriggerWait::Disconnect(_),
+                    Event::ExecuteTriggerFinish,
+                    Body::Routine { name, .. },
+                ) if name.trigger == Some(TriggerKind::OnConnect) => {
+                    if let Some(b) = self.bindings.get_mut(&key) {
+                        b.trigger_wait = Some(TriggerWait::Reset);
+                    }
+                    return Decision::Trigger { db: db_index(db) };
+                }
+                (TriggerWait::Reset, _, _) if is_end || h.event == Event::StartTransaction => {
+                    (true, true)
+                }
+                (
+                    TriggerWait::Reset,
+                    Event::ExecuteStatementFinish,
+                    Body::Statement { text, .. },
+                ) => (
+                    analyze_firebird(text).kind == FirebirdKind::SessionReset,
+                    false,
+                ),
+                (TriggerWait::TraEnd(t), _, _) if this_tra != Some(t) => (true, true),
+                (TriggerWait::TraEnd(_), _, _) => (is_end, false),
+                _ => (false, false),
+            };
+            if !keep && let Some(b) = self.bindings.get_mut(&key) {
+                b.trigger_wait = None;
+            }
+            if !next_ok {
+                return Decision::Ambiguous {
+                    window: false,
+                    at: line!(),
+                };
+            }
+        }
+        if b.kind == Kind::Sweep {
+            return self.sweep_record(rec, key);
+        }
+        let tra = rec.tra.map(|t| t.id);
+        match h.event {
+            Event::DetachDatabase | Event::DropDatabase => {
+                if self.groups.iter().any(|g| g.key == key) {
+                    // The pending groups end with the attachment (R4).
+                    let gs: Vec<Group> = self
+                        .groups
+                        .iter()
+                        .filter(|g| g.key == key)
+                        .cloned()
+                        .collect();
+                    self.groups.retain(|g| g.key != key);
+                    for g in gs {
+                        self.pending_end.push(g);
+                    }
+                }
+                self.end_binding(key);
+                if b.own
+                    && let DbId::Declared(i) = db
+                {
+                    self.ledger.note_detach(&self.s.databases[i].attach, id);
+                }
+                return self.normal(db, Some(key));
+            }
+            Event::StartTransaction => {
+                if let (Some(t), Some(bm)) = (tra, self.bindings.get_mut(&key)) {
+                    bm.first_tra.get_or_insert(t);
+                    if bm.open_tras.len() < MAX_GROUPS_PER_BINDING * 4 {
+                        bm.open_tras.push(t);
+                    }
+                }
+                return self.normal(db, Some(key));
+            }
+            Event::CommitTransaction | Event::RollbackTransaction => {
+                if let Some(t) = tra {
+                    if let Some(bm) = self.bindings.get_mut(&key) {
+                        bm.open_tras.retain(|x| *x != t);
+                    }
+                    let gs: Vec<Group> = self
+                        .groups
+                        .iter()
+                        .filter(|g| g.key == key && g.tra == t)
+                        .cloned()
+                        .collect();
+                    self.groups.retain(|g| !(g.key == key && g.tra == t));
+                    self.pending_end.extend(gs);
+                }
+                return self.normal(db, Some(key));
+            }
+            _ => {}
+        }
+        // Routine finish records (R4, R14, R15, R25).
+        if let Body::Routine { name, kind, .. } = &rec.body {
+            if let Some(trig) = name.trigger.filter(|t| t.is_database_trigger()) {
+                // R15 item 2: a live binding, its transaction started on it
+                // and not ended, and the kind's condition.
+                let open = tra.is_some_and(|t| b.open_tras.contains(&t));
+                let ok = open
+                    && match trig {
+                        TriggerKind::OnConnect => b.first_tra == tra,
+                        TriggerKind::OnDisconnect => {
+                            if let (Some(bm), Some(t)) = (self.bindings.get_mut(&key), tra) {
+                                bm.trigger_wait = Some(TriggerWait::Disconnect(t));
+                            }
+                            true
+                        }
+                        TriggerKind::OnTransactionCommit | TriggerKind::OnTransactionRollback => {
+                            if let (Some(bm), Some(t)) = (self.bindings.get_mut(&key), tra) {
+                                bm.trigger_wait = Some(TriggerWait::TraEnd(t));
+                            }
+                            true
+                        }
+                        _ => true,
+                    };
+                return if ok {
+                    self.normal(db, Some(key));
+                    Decision::Trigger { db: db_index(db) }
+                } else {
+                    // R15 item 5: a block-less one opens a window.
+                    Decision::Ambiguous {
+                        window: rec.trailer.block.is_none(),
+                        at: line!(),
+                    }
+                };
+            }
+            // Foldable: an anchored binding whose transaction start was
+            // read (R4).
+            let foldable = b.anchored && tra.is_some_and(|t| b.open_tras.contains(&t));
+            if foldable && let Some(t) = tra {
+                let draft = routine_draft(rec, name.name, *kind, cat[db_index(db)]);
+                let block_less = rec.trailer.block.is_none();
+                if !self.add_to_group(key, t, Member { draft, block_less }, now, pos) {
+                    return Decision::Ambiguous {
+                        window: block_less,
+                        at: line!(),
+                    };
+                }
+                return Decision::Nothing;
+            }
+            // Not foldable: its own event (R4), or ambiguous block-less.
+            return self.normal(db, Some(key));
+        }
+        self.normal(db, Some(key))
+    }
+
+    fn sweep_record(&mut self, rec: &Record<'_>, key: Key) -> Decision {
+        let step = self.bindings.get(&key).map_or(0, |b| b.sweep_step);
+        let (ok, next) = match (step, rec.header.event) {
+            (0, Event::SweepStart) => (true, 1),
+            (1, Event::StartTransaction) => (rec.tra.is_some_and(|t| t.internal_flags), 2),
+            (2, Event::SweepProgress) => (true, 2),
+            (2, Event::SweepFinish) => (true, 3),
+            (3, Event::CommitTransaction) => (true, 4),
+            (4, Event::DetachDatabase) => {
+                self.end_binding(key);
+                return self.normal(key.0, None);
+            }
+            _ => (false, step),
+        };
+        if !ok {
+            if let Some(b) = self.bindings.get_mut(&key) {
+                b.poisoned = true;
+            }
+            return Decision::Ambiguous {
+                window: false,
+                at: line!(),
+            };
+        }
+        if let Some(b) = self.bindings.get_mut(&key) {
+            b.sweep_step = next;
+        }
+        self.normal(key.0, Some(key))
+    }
+
+    fn add_to_group(&mut self, key: Key, tra: u64, m: Member, now: Instant, pos: u64) -> bool {
+        if let Some(g) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.key == key && g.tra == tra)
+        {
+            if g.members.len() >= 4096 {
+                return false;
+            }
+            if m.block_less && self.hold_since.is_none() {
+                self.hold_since = Some(now);
+            }
+            g.members.push(m);
+            return true;
+        }
+        let per = self.groups.iter().filter(|g| g.key == key).count();
+        if per >= MAX_GROUPS_PER_BINDING || self.groups.len() >= MAX_GROUPS {
+            // Ended oldest first, fail closed (R25 item 4).
+            if let Some(i) = self
+                .groups
+                .iter()
+                .position(|g| per < MAX_GROUPS_PER_BINDING || g.key == key)
+                && let Some(old) = self.groups.remove(i)
+            {
+                self.pending_end.push(old);
+            }
+        }
+        if m.block_less && self.hold_since.is_none() {
+            self.hold_since = Some(now);
+        }
+        self.groups.push_back(Group {
+            key,
+            tra,
+            members: vec![m],
+            started: now,
+            first: pos,
+        });
+        true
+    }
+
+    fn end_group(
+        &mut self,
+        g: Group,
+        _now: Instant,
+        _cat: &[&dyn Catalog],
+        replay: bool,
+        out: &mut Vec<Emitted>,
+    ) {
+        let DbId::Declared(db) = g.key.0 else {
+            return;
+        };
+        let any_blockless = g.members.iter().any(|m| m.block_less);
+        for m in g.members {
+            let mut d = m.draft;
+            if m.block_less {
+                *self.why.entry(1).or_default() += 1;
+                d.star = true;
+                d.always = true;
+                self.counts.ambiguous += 1;
+                self.window_until = Some(Instant::now() + WINDOW);
+            }
+            if let Some(d) = finish(d)
+                && !replay
+            {
+                out.push((db, self.draft_event(&d, None, db)));
+            }
+        }
+        if any_blockless && self.hold_since.is_some() {
+            self.release(true, replay, out);
+        }
+    }
+
+    fn draft_event(&self, d: &Draft, rec: Option<&Record<'_>>, db: usize) -> MaskedEvent {
+        let label = &self.s.databases[db].label;
+        match rec {
+            Some(r) => to_event(d, r, label, self.time(r.header.time)),
+            None => {
+                let principal = databastion_classifiers::masking::EventPrincipal::unidentified();
+                let mut ev = MaskedEvent::new(
+                    databastion_classifiers::masking::EventSource::FirebirdAuditTrace,
+                    d.action
+                        .unwrap_or(databastion_classifiers::masking::EventAction::Read),
+                    principal,
+                    SystemTime::now(),
+                );
+                let dbn = crate::discover::normalize(label);
+                if d.star {
+                    ev = ev.with_object(databastion_classifiers::masking::EventObject::new(
+                        dbn.clone(),
+                        None,
+                        databastion_classifiers::names::NormalizedName::wildcard(),
+                    ));
+                }
+                for o in &d.objects {
+                    ev = ev.with_object(databastion_classifiers::masking::EventObject::new(
+                        dbn.clone(),
+                        None,
+                        crate::discover::normalize(o),
+                    ));
+                }
+                ev = ev.with_rows(d.rows);
+                for s in &d.signals {
+                    ev = ev.with_signal(*s);
+                }
+                if d.always {
+                    ev = ev.with_always_report();
+                }
+                ev
+            }
+        }
+    }
+}
+
+fn db_index(db: DbId) -> usize {
+    match db {
+        DbId::Declared(i) => i,
+        DbId::Undeclared(_) => 0,
+    }
+}
+
+/// A routine record's draft for folding (R4): its counters' relations,
+/// rows and the routine's name.
+fn routine_draft(rec: &Record<'_>, name: &str, _kind: RoutineKind, cat: &dyn Catalog) -> Draft {
+    let mut d = match convert(rec, cat) {
+        Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
+        Converted::Nothing => Draft::default(),
+    };
+    d.star = false;
+    d.always = false;
+    if !d.objects.iter().any(|o| o == name) {
+        d.objects.push(name.to_owned());
+    }
+    d.rows = rec.trailer.fetched;
+    d
+}
+
+/// The R36 rule on a merged draft (no object and no signal: no event).
+fn finish(mut d: Draft) -> Option<Draft> {
+    if d.signals
+        .contains(&databastion_classifiers::masking::Signal::BackupDatabase)
+    {
+        d.star = true;
+        d.always = true;
+    }
+    if d.objects.is_empty() && !d.star {
+        if d.signals.is_empty() {
+            return None;
+        }
+        d.star = true;
+        d.always = true;
+    }
+    Some(d)
+}
+
+/// Unites a fold group into a statement's draft (R4: objects united, rows
+/// by maximum; R33 item 6: the "no event" rules after the union).
+fn fold(mut stmt: Draft, members: Vec<Member>) -> Draft {
+    for m in members {
+        for o in m.draft.objects {
+            if !stmt.objects.contains(&o) {
+                stmt.objects.push(o);
+            }
+        }
+        stmt.rows = match (stmt.rows, m.draft.rows) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        for s in m.draft.signals {
+            if !stmt.signals.contains(&s) {
+                stmt.signals.push(s);
+            }
+        }
+        stmt.always |= m.draft.always;
+        if stmt
+            .rows
+            .is_some_and(|n| n > crate::trace_events::LARGE_RESULT)
+            && !stmt
+                .signals
+                .contains(&databastion_classifiers::masking::Signal::LargeResult)
+        {
+            stmt.signals
+                .push(databastion_classifiers::masking::Signal::LargeResult);
+        }
+    }
+    stmt
+}
+
+impl Machine {
+    #[allow(clippy::too_many_lines)]
+    fn apply(
+        &mut self,
+        decision: Decision,
+        rec: &Record<'_>,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        replay: bool,
+        out: &mut Vec<Emitted>,
+    ) {
+        // Groups ended by this record (a transaction end, a detach).
+        for g in std::mem::take(&mut self.pending_end) {
+            self.end_group(g, now, cat, replay, out);
+        }
+        match decision {
+            Decision::Nothing => {}
+            Decision::Trigger { db } => {
+                if replay || rec.trailer.block.is_none() {
+                    return;
+                }
+                if let Converted::Event(mut d) | Converted::Ambiguous { draft: mut d, .. } =
+                    convert(rec, cat[db.min(cat.len() - 1)])
+                {
+                    d.rows = None;
+                    let ev = self.draft_event(&d, Some(rec), db);
+                    self.emit(db, ev, out);
+                }
+            }
+            Decision::Dropped => self.counts.undeclared_dropped += 1,
+            Decision::Ambiguous { window, at } => {
+                self.counts.ambiguous += 1;
+                *self.why.entry(at).or_default() += 1;
+                #[cfg(test)]
+                if std::env::var_os("FB_STREAM_DEBUG").is_some() {
+                    #[allow(clippy::print_stderr)]
+                    {
+                        eprintln!(
+                            "ambiguous at {at}: {:?} {:?} {:?}",
+                            rec.header.event,
+                            rec.header.token(),
+                            rec.att.map(|a| a.id)
+                        );
+                    }
+                }
+                if window {
+                    self.window_until = Some(now + WINDOW);
+                }
+                let mut d = match convert(rec, cat[0]) {
+                    Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
+                    Converted::Nothing => Draft::default(),
+                };
+                d.star = true;
+                d.always = true;
+                if d.action == Some(databastion_classifiers::masking::EventAction::AuthFailure) {
+                    d.action = Some(databastion_classifiers::masking::EventAction::Read);
+                }
+                // Fix 3: the preceding well-formed record's database, or
+                // every declared database.
+                let dbs: Vec<usize> = match self.last_declared {
+                    Some(i) => vec![i],
+                    None => (0..self.s.databases.len())
+                        .filter(|i| !self.s.databases[*i].excluded)
+                        .collect(),
+                };
+                if replay {
+                    return;
+                }
+                for db in dbs {
+                    let ev = self.draft_event(&d, Some(rec), db);
+                    self.emit(db, ev, out);
+                }
+            }
+            Decision::Normal { db, key } => {
+                let c = convert(rec, cat[db.min(cat.len() - 1)]);
+                let (mut draft, window) = match c {
+                    Converted::Nothing => (None, false),
+                    Converted::Event(d) => (Some(d), false),
+                    Converted::Ambiguous { draft, window } => {
+                        self.counts.ambiguous += 1;
+                        *self.why.entry(0).or_default() += 1;
+                        #[cfg(test)]
+                        if std::env::var_os("FB_STREAM_DEBUG").is_some() {
+                            #[allow(clippy::print_stderr)]
+                            {
+                                eprintln!(
+                                    "record rule ambiguous: {:?} {:?}",
+                                    rec.header.event, rec.body
+                                );
+                            }
+                        }
+                        (Some(draft), window)
+                    }
+                };
+                // Folding into a statement finish (R4).
+                if rec.header.event == Event::ExecuteStatementFinish
+                    && let (Some(k), Some(t)) = (key, rec.tra.map(|t| t.id))
+                    && let Some(i) = self.groups.iter().position(|g| g.key == k && g.tra == t)
+                {
+                    let Some(g) = self.groups.remove(i) else {
+                        return;
+                    };
+                    let base = draft.take().unwrap_or_default();
+                    draft = finish(fold(base, g.members));
+                    if self.hold_since.is_some()
+                        && !self
+                            .groups
+                            .iter()
+                            .any(|g| g.members.iter().any(|m| m.block_less))
+                    {
+                        self.release(false, replay, out);
+                    }
+                }
+                if window {
+                    self.window_until = Some(now + WINDOW);
+                }
+                // The agent's own record (decision 6, R8 item 4).
+                if let Some(k) = key
+                    && let Some(d) = &draft
+                    && !window
+                    && self.own_record(rec, k, d)
+                {
+                    self.counts.own += 1;
+                    return;
+                }
+                let Some(d) = draft else {
+                    return;
+                };
+                if replay {
+                    return;
+                }
+                let ev = self.draft_event(&d, Some(rec), db);
+                self.emit(db, ev, out);
+            }
+        }
+    }
+
+    fn emit(&mut self, db: usize, ev: MaskedEvent, out: &mut Vec<Emitted>) {
+        if self.hold_since.is_some() {
+            if self.held.len() >= MAX_HELD {
+                // Past the hold bound: the held records become ambiguous.
+                self.release(true, false, out);
+            } else {
+                self.held.push(Held {
+                    db: vec![db],
+                    event: ev,
+                });
+                return;
+            }
+        }
+        out.push((db, ev));
+    }
+
+    /// The own-record rule (decision 6, R8 item 4, R13, R22, R35).
+    fn own_record(&mut self, rec: &Record<'_>, key: Key, d: &Draft) -> bool {
+        let Some(b) = self.bindings.get(&key) else {
+            return false;
+        };
+        let DbId::Declared(i) = key.0 else {
+            return false;
+        };
+        if !(b.own && b.anchored) || b.poisoned || b.tainted || !d.signals.is_empty() {
+            return false;
+        }
+        let Some(att) = rec.att else { return false };
+        if !att.user.eq_ignore_ascii_case(&self.s.account) || att.role.is_some_and(|r| r != "NONE")
+        {
+            return false;
+        }
+        let label = self.s.databases[i].attach.clone();
+        let text = match &rec.body {
+            Body::Statement {
+                text,
+                params: false,
+                ..
+            } => *text,
+            // Transaction records of an own attachment read nothing.
+            Body::Context => return true,
+            _ => return false,
+        };
+        let block: Vec<&str> = rec
+            .trailer
+            .block
+            .as_ref()
+            .map(|b| b.iter().map(|(n, _)| *n).collect())
+            .unwrap_or_default();
+        let named = analyze_firebird(text).relations;
+        if !block
+            .iter()
+            .all(|r| METADATA_LOADING.contains(r) || named.iter().any(|n| n == r))
+        {
+            return false;
+        }
+        let fetched = rec.trailer.fetched.unwrap_or(0);
+        match self.ledger.consume(
+            &label,
+            key.1,
+            text,
+            fetched,
+            rec.header.outcome == Outcome::Failed,
+        ) {
+            Verdict::Own => true,
+            Verdict::NotOwn => false,
+            // A text of the set with no credit left: loud (R8 item 4).
+            Verdict::NoCredit => {
+                self.counts.ambiguous += 1;
+                false
+            }
+        }
+    }
+}
+
+/// Seconds since the epoch of a printed time, read as UTC.
+pub(crate) fn naive_seconds(t: LogTime) -> i64 {
+    let (y, m, d) = (i64::from(t.year), i64::from(t.month), i64::from(t.day));
+    // Days from civil (Howard Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + i64::from(t.hour) * 3600 + i64::from(t.minute) * 60 + i64::from(t.second)
+}

@@ -415,8 +415,10 @@ fn statement(rec: &Record<'_>, text: &str, params: bool, cat: &dyn Catalog) -> C
             let case_a = a.parses() && all_virtual && !a.calls_code();
             let case_c = a.parses() && all_virtual && a.calls_code();
             let no_record = fetched == 0
+                // R12 item 3: a text whose dialect readings differ keeps
+                // the shape, and names `*` below (no window).
                 || (fetched == 1
-                    && a.parses()
+                    && !a.unterminated
                     && a.aggregate_only
                     // R28: global temporary tables join persistent
                     // tables in R12's aggregate branch.

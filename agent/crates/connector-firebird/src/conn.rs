@@ -215,6 +215,21 @@ pub(crate) struct Session {
     /// its end rather than by `isc_cancelled` (R22 item 3, a stale
     /// cancel): the next request may meet it.
     stale_cancel: bool,
+    /// The agent's own attachment (decision 6): the ledger of the
+    /// endpoint, the declared `attach`, the attachment id once
+    /// `CURRENT_CONNECTION` was read, and the credits of executions run
+    /// before it (moved to the ledger then).
+    own: Own,
+}
+
+/// A session's place in the ledger of its endpoint ([`crate::own`]).
+#[derive(Default)]
+struct Own {
+    ledger: Option<std::sync::Arc<crate::own::Ledger>>,
+    attach: String,
+    id: Option<u64>,
+    early: Vec<(String, FetchAccount)>,
+    closed: bool,
 }
 
 /// How the fetch of one execution ended (ADR-0060 R22 item 1, R35).
@@ -308,6 +323,7 @@ pub(crate) async fn connect(
     )
     .await?;
     s.local = Some(local);
+    s.own.ledger = Some(crate::own::ledger_for(endpoint.addr));
     Ok(s)
 }
 
@@ -443,6 +459,10 @@ pub(crate) async fn handshake(
         last_cancel: None,
         last_fetch: FetchAccount::default(),
         stale_cancel: false,
+        own: Own {
+            attach: attach.to_owned(),
+            ..Own::default()
+        },
     };
     session
         .request(&wire::attach(attach, login), deadline, Stage::SessionSetup)
@@ -639,6 +659,9 @@ impl Session {
         let result = self
             .run((tx, stmt), text, shape, max_rows, deadline, on_row)
             .await;
+        if result.is_err() && self.last_fetch.end == FetchEnd::NotRun {
+            self.last_fetch.end = FetchEnd::Error;
+        }
         if !self.broken {
             // `DSQL_drop` closes the cursor and releases the handle; after
             // a statement cancelled at the deadline, within the cancel's
@@ -646,10 +669,42 @@ impl Session {
             let cleanup = deadline.max(Instant::now() + CANCEL_WAIT);
             let free = self.free_after(stmt, cleanup).await;
             if let (Ok(_), Err(e)) = (&result, free) {
+                self.record_credit(text);
                 return Err(e);
             }
         }
+        self.record_credit(text);
         result
+    }
+
+    /// One execution's credit (decision 6, R22 item 1): to the ledger once
+    /// the attachment id is known, held until then.
+    fn record_credit(&mut self, text: &str) {
+        let account = self.last_fetch;
+        match (&self.own.ledger, self.own.id) {
+            (Some(l), Some(id)) => l.credit(&self.own.attach, id, text, account),
+            (Some(_), None) if self.own.early.len() < 64 => {
+                self.own.early.push((text.to_owned(), account));
+            }
+            _ => {}
+        }
+    }
+
+    /// The attachment id read from `CURRENT_CONNECTION` and the server pid
+    /// (decision 6, R1 rule 1): the session's attachment enters the
+    /// ledger, with the credits of the executions before it.
+    pub(crate) fn register_own(&mut self, id: u64, pid: u32) {
+        let (Some(l), Some(local)) = (self.own.ledger.clone(), self.local) else {
+            return;
+        };
+        if self.own.id.is_some() {
+            return;
+        }
+        l.register(&self.own.attach, id, local.port(), pid);
+        self.own.id = Some(id);
+        for (text, account) in std::mem::take(&mut self.own.early) {
+            l.credit(&self.own.attach, id, &text, account);
+        }
     }
 
     /// `DSQL_drop` of a statement handle (R22 item 3). After a stale
@@ -749,6 +804,15 @@ impl Session {
                 .request(&wire::free(stmt, wire::DSQL_DROP), deadline, Stage::Check)
                 .await;
         }
+        self.last_fetch = FetchAccount {
+            end: if result.is_ok() {
+                FetchEnd::NotRun
+            } else {
+                FetchEnd::Error
+            },
+            ..FetchAccount::default()
+        };
+        self.record_credit(text);
         result
     }
 
@@ -1009,6 +1073,28 @@ impl Session {
                 .await;
         }
         self.conn.shutdown().await;
+        self.end_own();
+    }
+
+    /// The attachment's end in the ledger: clean when nothing failed.
+    fn end_own(&mut self) {
+        if std::mem::replace(&mut self.own.closed, true) {
+            return;
+        }
+        if let (Some(l), Some(id)) = (&self.own.ledger, self.own.id) {
+            l.close(&self.own.attach, id, self.broken, self.statement_timeout);
+        }
+    }
+}
+
+impl Drop for Session {
+    /// A session dropped without `close` (an error path): its attachment
+    /// lives on in the ledger for the statement timeout plus 5 s (R22).
+    fn drop(&mut self) {
+        if !self.own.closed {
+            self.broken = true;
+            self.end_own();
+        }
     }
 }
 

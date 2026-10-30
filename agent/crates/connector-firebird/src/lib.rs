@@ -37,9 +37,15 @@ mod conn;
 mod crypt;
 mod discover;
 mod error;
+#[cfg_attr(not(test), allow(dead_code))]
+mod own;
 mod peer;
 mod privileges;
 mod sql;
+#[cfg_attr(not(test), allow(dead_code))]
+mod stream;
+#[cfg(test)]
+mod stream_tests;
 // The Audit stream (lot 3) uses the parsers; until it is wired, only the
 // tests and the fuzz targets do.
 mod srp;

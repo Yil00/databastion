@@ -438,6 +438,12 @@ pub(crate) async fn prepare(
         )
         .await?;
     let row = rows.rows.first().cloned().unwrap_or_default();
+    // The agent's own attachment (decision 6, R1 rule 1).
+    if let (Some(Value::Int(id)), Some(Value::Int(pid))) = (row.first(), row.get(3))
+        && let (Ok(id), Ok(pid)) = (u64::try_from(*id), u32::try_from(*pid))
+    {
+        s.register_own(id, pid);
+    }
     if !tunnel {
         let same = match (s.local, text(&row, 1), text(&row, 2)) {
             (Some(local), Some(protocol), Some(remote)) => {
