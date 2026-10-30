@@ -593,3 +593,72 @@ fn an_ambiguous_failed_attach_never_sends_the_user_name() {
     }
     assert!(m.counts.ambiguous >= 2);
 }
+
+/// Review M1: a transaction-end record of the agent's own attachment whose
+/// block names a user relation is reported, not credited; a statement of
+/// the agent's attachment that folded a routine group is not credited and
+/// keeps the group's relations.
+#[test]
+fn own_transaction_records_and_folds_keep_their_relations() {
+    let l = Arc::new(Ledger::default());
+    l.register(APP, 3, 40003, 24);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&l));
+    m.confirm_run(Run {
+        pid: 24,
+        start: None,
+    });
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let tok = "24:0x7f0000000100";
+    let att = format!(
+        "\t{APP} (ATT_3, DATABASTION_AGENT:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/agent:28\n"
+    );
+    let tra = "\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_ONLY)\n";
+    let blk = |rel: &str| {
+        format!(
+            "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n",
+            "Table",
+            "*".repeat(115),
+            50,
+            ""
+        )
+    };
+    let log = format!(
+        "{HEAD} ({tok}) ATTACH_DATABASE\n{att}\n{HEAD} ({tok}) START_TRANSACTION\n{att}{tra}\n{HEAD} ({tok}) COMMIT_TRANSACTION\n{att}{tra}      0 ms, 7 fetch(es)\n{}\n",
+        blk("PAYROLL")
+    );
+    let out = feed(&mut m, &cats, &log, 0);
+    assert!(
+        names(&out).contains(&"PAYROLL".to_owned()),
+        "{:?}",
+        names(&out)
+    );
+    // A routine group folded into an own-text statement.
+    let v = crate::sql::VERSION;
+    l.credit(
+        APP,
+        3,
+        v,
+        None,
+        crate::conn::FetchAccount {
+            counted: 1,
+            requested: 64,
+            last: 64,
+            largest: 64,
+            end: crate::conn::FetchEnd::End,
+            ..crate::conn::FetchAccount::default()
+        },
+    );
+    let log = format!(
+        "{HEAD} ({tok}) START_TRANSACTION\n{att}\t\t(TRA_6, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_ONLY)\n\n\
+         {HEAD} ({tok}) EXECUTE_PROCEDURE_FINISH\n{att}\t\t(TRA_6, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_ONLY)\n\nProcedure P1:\n      0 ms, 3 fetch(es)\n{}\n{}",
+        blk("SECRETS"),
+        stmt(tok, 3, 6, "DATABASTION_AGENT", v, 1, &[("RDB$DATABASE", 1)])
+    );
+    let out = feed(&mut m, &cats, &log, 10_000);
+    assert!(
+        names(&out).contains(&"SECRETS".to_owned()),
+        "{:?}",
+        names(&out)
+    );
+}

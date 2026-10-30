@@ -1709,6 +1709,8 @@ impl Machine {
             }
             Decision::Normal { db, key } => {
                 let c = convert(rec, cat[db.min(cat.len() - 1)]);
+                let ambiguous = matches!(c, Converted::Ambiguous { .. });
+                let mut folded = false;
                 let (mut draft, window) = match c {
                     Converted::Nothing => (None, false),
                     Converted::Event(d) => (Some(d), false),
@@ -1738,6 +1740,7 @@ impl Machine {
                     };
                     let base = draft.take().unwrap_or_default();
                     draft = finish(fold(base, g.members));
+                    folded = true;
                     if self.hold_since.is_some()
                         && !self
                             .groups
@@ -1754,8 +1757,14 @@ impl Machine {
                 // Also for a record with no event of its own (its objects all
                 // noise): its credit is consumed, and the read-back probe
                 // (proof 7) and the clock offset are confirmed by it.
+                // Never for an ambiguous record (review L4), nor for a
+                // statement that folded a routine group (review M1: the
+                // agent's texts call no routine, and crediting it would drop
+                // the group's relations).
                 if let Some(k) = key
                     && !window
+                    && !ambiguous
+                    && !folded
                 {
                     let d = draft.clone().unwrap_or_default();
                     match self.own_record(rec, k, &d, pos) {
@@ -1830,8 +1839,10 @@ impl Machine {
                 params: false,
                 ..
             } => *text,
-            // Transaction records of an own attachment read nothing.
-            Body::Context => return Some(true),
+            // Transaction records of an own attachment: the agent's only
+            // when no relation is left after the filters (review M1: an
+            // R24 block naming a user relation is reported).
+            Body::Context => return Some(d.objects.is_empty() && !d.star && !d.always),
             _ => return Some(false),
         };
         let block: Vec<&str> = rec
