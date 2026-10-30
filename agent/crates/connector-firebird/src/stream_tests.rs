@@ -1855,3 +1855,50 @@ fn undeclared_records_past_the_identity_cap_are_dropped_without_proof_11() {
         }
     }
 }
+
+/// Re-review L-6 (review L-B): a routine group pending when its run ends
+/// is ended as R25 item 3 says (its event at the next record), never
+/// dropped.
+#[test]
+fn a_pending_group_ends_with_its_run() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let ctx = format!(
+        "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    let log = format!(
+        "{}{HEAD} ({a}) START_TRANSACTION\n{ctx}\n{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n",
+        attach(a, 3, APP),
+        "Table",
+        "*".repeat(115),
+        "CUSTOMERS",
+        4,
+        ""
+    );
+    let mut out = feed(&mut m, &cats, &log, 0);
+    let named = |out: &[Emitted]| {
+        out.iter().any(|(_, e)| {
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "CUSTOMERS")
+        })
+    };
+    assert!(!named(&out), "pending, not yet ended: {:?}", names(&out));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(2),
+    });
+    out.extend(feed(
+        &mut m,
+        &cats,
+        &attach("24:0x7f0000000200", 4, APP),
+        1000,
+    ));
+    assert!(named(&out), "{:?}", names(&out));
+}
