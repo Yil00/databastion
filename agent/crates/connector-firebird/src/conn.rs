@@ -1007,7 +1007,10 @@ impl Session {
                         "statement cancelled at the client deadline"
                     );
                     self.last_cancel = Some(outcome);
-                    if r.status.codes.first() == Some(&crate::error::gds::CANCELLED) {
+                    // Cancelled only when `isc_cancelled` is the sole code
+                    // (R35; review of part 1, L4): with the timeout code
+                    // too it is the server's own timeout.
+                    if r.status.codes == [crate::error::gds::CANCELLED] {
                         self.last_fetch.end = FetchEnd::Cancelled;
                     } else if r.status.failed() {
                         self.last_fetch.end = server_end(&r.status.codes);
