@@ -672,8 +672,20 @@ impl Runner {
             let line = line.strip_suffix(b"\n").unwrap_or(line);
             let start = pos.start;
             if self.file != Some(pos.file) {
-                // A rotation: the record in progress belongs to the old file.
+                if self.file.is_some() {
+                    // A rotation (review M3): the old file ended. Its last
+                    // record is complete; what it still holds (pending fold
+                    // groups, held records) ends now, as R25 item 3 says,
+                    // since a held position in a rotated file cannot be
+                    // re-read after a restart.
+                    let done = self.asm.flush();
+                    let rs = self.record_start.unwrap_or(0);
+                    self.hand(m, done, rs, now, cats, out);
+                    self.record_start = None;
+                    m.end_all(now, cats, out);
+                }
                 self.file = Some(pos.file);
+                m.set_file(pos.file);
             }
             if header(line).is_some() {
                 // The record in progress ends here.
@@ -1041,6 +1053,51 @@ mod tests {
             "{:?}",
             objects(&out)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review M3: a rotation while a fold group pends in the old file ends
+    /// the group there (its relations sent), so that nothing held lies in
+    /// the rotated file when the cursor is saved; a restart then loses
+    /// nothing.
+    #[test]
+    fn a_rotation_ends_what_the_old_file_holds() {
+        use crate::stream_tests::{APP, attach};
+        let dir = temp("rotate");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        let store = || databastion_core::audit::CursorStore::new(&dir, "t", "fb");
+        let mut r = runner(&log, store());
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        append(
+            &log,
+            &format!(
+                "{}{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                pending_routine(true),
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert!(!objects(&out).contains(&"SECRETS".to_owned()), "pending");
+        // The server rotates the log.
+        std::fs::rename(&log, dir.join("audit.log.1")).unwrap();
+        std::fs::write(&log, attach("24:0x7f0000000400", 6, APP)).unwrap();
+        append(&log, &attach("24:0x7f0000000500", 7, APP));
+        for _ in 0..3 {
+            while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        }
+        assert!(
+            objects(&out).contains(&"SECRETS".to_owned()),
+            "{:?}",
+            objects(&out)
+        );
+        let held = r.held(&m);
+        assert!(held.iter().all(|(_, p)| Some(p.file) == r.file));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

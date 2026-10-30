@@ -596,6 +596,18 @@ impl Machine {
         }
     }
 
+    /// Ends every pending group and releases the held records (a log
+    /// rotation, review M3): as R25 item 3 says, the block-ful part of a
+    /// group becomes its event and its block-less part is ambiguous.
+    pub(crate) fn end_all(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
+        while let Some(g) = self.groups.pop_front() {
+            self.end_group(g, now, cat, out);
+        }
+        if self.hold_since.is_some() {
+            self.release(false, out);
+        }
+    }
+
     /// The bounds that run on reading time: windows, groups, holds, the
     /// Garbage Collector's expected end.
     pub(crate) fn expire(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
