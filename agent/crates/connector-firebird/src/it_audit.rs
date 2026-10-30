@@ -562,6 +562,117 @@ fn a_procedure_committed_after_an_intervening_check_stays_dependent() {
     late_commit_case(&log, "P_LATE_B", true);
 }
 
+/// Round 4 M-1b: the machine over the log's tail of defective DDL records
+/// (`dev/firebird/it.sh`): the finish record of `CREATE PROCEDURE <name>`
+/// (found by its bytes: its text is not read), a check placed right after
+/// it, then the call after the commit, which must still be marked. Records
+/// are read 61 s apart, so that no split window covers the call. Returns
+/// the DDL record's defect.
+fn defect_commit_case(log: &[u8], name: &str) -> Option<crate::trace_log::Defect> {
+    let names = |label: &str, path: &str, at: Option<SystemTime>| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: at,
+    };
+    let settings = |at: Option<SystemTime>| crate::stream::Settings {
+        databases: vec![names("app", APP, at), names("crm", CRM, at)],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m = crate::stream::Machine::new(
+        settings(None),
+        std::sync::Arc::new(crate::own::Ledger::default()),
+    );
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let opts = ParseOptions {
+        max_sql_length: Some(65_000),
+        series: series(),
+    };
+    let start = std::time::Instant::now();
+    let create = format!("CREATE PROCEDURE {name} ");
+    let call = format!("SELECT * FROM {name}");
+    let (mut defect, mut seen_call) = (None, false);
+    let mut seen_create = false;
+    for (i, r) in recs.iter().enumerate() {
+        let Assembled::Record(raw) = r else { continue };
+        let rec = parse(raw, opts);
+        let is_create = !seen_create
+            && rec
+                .as_ref()
+                .is_some_and(|r| r.header.event == crate::trace_log::Event::ExecuteStatementFinish)
+            && raw.windows(create.len()).any(|w| w == create.as_bytes());
+        let is_call = rec.as_ref().is_some_and(
+            |r| matches!(r.body, crate::trace_log::Body::Statement { text, .. } if text == call),
+        );
+        if is_create {
+            defect = rec.as_ref().and_then(|r| r.defect);
+        }
+        drop(rec);
+        let now = start + std::time::Duration::from_secs(61 * i as u64);
+        let mut out = Vec::new();
+        m.push(raw, i as u64, now, &cats, &mut out);
+        if is_create {
+            seen_create = true;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            m.reconfigure(settings(Some(SystemTime::now())));
+        }
+        if is_call && seen_create {
+            seen_call = true;
+            assert!(
+                !out.is_empty() && out.iter().all(|(_, e)| e.always_report()),
+                "{name} ({defect:?}): the call after the commit is marked"
+            );
+        }
+    }
+    assert!(seen_create && seen_call, "{name}: the case is in the log");
+    defect
+}
+
+/// Round 4 M-1b (R41 item 8): DDL records committed after an intervening
+/// check: one split from its trailer by a header-shaped comment line (a
+/// missing trailer, its text not read), and two meant to carry a byte that
+/// is not UTF-8 (0xE9) in a comment from WIN1252 and NONE attachments.
+/// `isql` does not send that byte (measured: the bytes after `caf`), so
+/// the reader's encoding defect is tested with a recorded shape
+/// (`stream_tests::a_non_utf8_ddl_record_keeps_the_sets_invalid_until_its_transaction_ends`);
+/// here the two are held on the normal path.
+#[test]
+fn defective_ddl_records_committed_after_a_check_stay_dependent() {
+    let Some(log) = file("FIREBIRD_IT_DEFECT_LOG") else {
+        return;
+    };
+    use crate::trace_log::Defect;
+    assert_eq!(
+        defect_commit_case(&log, "P_SPLIT_A"),
+        Some(Defect::MissingTrailer)
+    );
+    for name in ["P_ENC_A", "P_ENC_B"] {
+        let d = defect_commit_case(&log, name);
+        let head = format!("CREATE PROCEDURE {name} /* caf");
+        let after = log
+            .windows(head.len())
+            .position(|w| w == head.as_bytes())
+            .map(|i| &log[i + head.len()..(i + head.len() + 4).min(log.len())]);
+        eprintln!("[measure] {name}: DDL record defect {d:?}, bytes after caf {after:02x?}");
+        assert!(after.is_some(), "{name}: the text is in the log");
+    }
+}
+
 /// R42 item 6: header times follow the server process's time zone, not a
 /// session's `SET TIME ZONE` (here `+09:00`): the marker statement of that
 /// session is printed within a minute of the record before it.

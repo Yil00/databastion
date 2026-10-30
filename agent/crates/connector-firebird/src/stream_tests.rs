@@ -2103,6 +2103,33 @@ fn feed_raw(
     out
 }
 
+/// The round 4 DDL cases: attachment `a` (ATT_3) holds a DDL record in
+/// transaction 7, attachment `b` (ATT_4) reads a view. Returns the machine
+/// after the DDL record and the reading time past its split window.
+fn defective_ddl_case(ddl: &[u8], charset: &str) -> (Machine, Instant) {
+    let a = "24:0x7f0000000100";
+    let b = "24:0x7f0000000200";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let now = Instant::now();
+    let ctx7 = format!(
+        "\t{APP} (ATT_3, APP:NONE, {charset}, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    let log = format!(
+        "{}{}{HEAD} ({a}) START_TRANSACTION\n{ctx7}\n",
+        attach(a, 3, APP).replace("UTF8", charset),
+        attach(b, 4, APP)
+    );
+    feed_raw(&mut m, &cats, log.as_bytes(), 0, now);
+    feed_raw(&mut m, &cats, ddl, 1000, now);
+    (m, now + WINDOW_FOR_TESTS)
+}
+
 const WINDOW_FOR_TESTS: Duration = Duration::from_secs(120);
 
 /// Reads a view from attachment `b` after a check whose catalog read
@@ -2126,6 +2153,122 @@ fn read_after_check(m: &mut Machine, tra: u64, later: Instant) -> (bool, Vec<Str
     let out = feed_raw(m, &cats, read.as_bytes(), 10_000 + tra * 1000, later);
     assert!(!out.is_empty());
     (out.iter().all(|(_, e)| e.always_report()), names(&out))
+}
+
+fn commit_7(m: &mut Machine, later: Instant, charset: &str) {
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let commit = format!(
+        "{HEAD} (24:0x7f0000000100) COMMIT_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, {charset}, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms, 1 fetch(es)\n\n"
+    );
+    feed_raw(m, &cats, commit.as_bytes(), 5000, later);
+}
+
+/// Round 4 M-1b (R41 item 8): a DDL statement finish split from its
+/// trailer (here a missing trailer) is a possible DDL record: every
+/// relation of its database is dependent until a check after its
+/// transaction's end, even with a check in between.
+#[test]
+fn a_split_ddl_record_keeps_the_sets_invalid_until_its_transaction_ends() {
+    let full = stmt(
+        "24:0x7f0000000100",
+        3,
+        7,
+        "APP",
+        "CREATE PROCEDURE P_SPLIT AS BEGIN END",
+        0,
+        &[],
+    );
+    let cut = &full[..full.find("0 records fetched").expect("trailer")];
+    let ddl = format!("{cut}\n");
+    let (mut m, later) = defective_ddl_case(ddl.as_bytes(), "UTF8");
+    let (marked, n) = read_after_check(&mut m, 8, later);
+    assert!(marked, "still open: {n:?}");
+    commit_7(&mut m, later, "UTF8");
+    let (marked, n) = read_after_check(&mut m, 9, later);
+    assert!(!marked, "{n:?}");
+}
+
+/// Round 4 M-1b: a DDL record whose text is not UTF-8 (an attachment with
+/// character set `NONE`, a WIN1252 byte in a comment) keeps the sets
+/// invalid until its transaction ends: its attachment and transaction
+/// lines are read before the text's encoding is checked.
+#[test]
+fn a_non_utf8_ddl_record_keeps_the_sets_invalid_until_its_transaction_ends() {
+    let text = stmt(
+        "24:0x7f0000000100",
+        3,
+        7,
+        "APP",
+        "CREATE PROCEDURE P_ENC AS BEGIN /* caf\u{e9} */ END",
+        0,
+        &[],
+    )
+    .replace("UTF8", "NONE");
+    let mut ddl = Vec::new();
+    for ch in text.chars() {
+        if ch == '\u{e9}' {
+            ddl.push(0xE9);
+        } else {
+            let mut b = [0u8; 4];
+            ddl.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+        }
+    }
+    assert!(std::str::from_utf8(&ddl).is_err());
+    let rec = crate::trace_log::parse(
+        &ddl,
+        ParseOptions {
+            max_sql_length: Some(65_000),
+            series: Series::V5,
+        },
+    )
+    .expect("a record");
+    assert_eq!(rec.defect, Some(crate::trace_log::Defect::Encoding));
+    assert_eq!(rec.att.map(|a| a.id), Some(3));
+    assert_eq!(rec.tra.map(|t| t.id), Some(7));
+    let (mut m, later) = defective_ddl_case(&ddl, "NONE");
+    let (marked, n) = read_after_check(&mut m, 8, later);
+    assert!(marked, "still open: {n:?}");
+    commit_7(&mut m, later, "NONE");
+    let (marked, n) = read_after_check(&mut m, 9, later);
+    assert!(!marked, "{n:?}");
+}
+
+/// Round 4 M-1b and L-7: a record that could not be read (oversized,
+/// orphan, or whose rules panicked) is a possible DDL record of any
+/// declared database: every relation is dependent until the bindings
+/// live at it have ended (a check in between does not clear it), not
+/// until the run ends.
+#[test]
+fn an_unreadable_record_keeps_the_sets_invalid_until_the_live_bindings_end() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let now = Instant::now();
+    feed_raw(&mut m, &cats, attach(a, 3, APP).as_bytes(), 0, now);
+    let mut out = Vec::new();
+    m.unreadable(now, &cats, &mut out);
+    let later = now + WINDOW_FOR_TESTS;
+    feed_raw(
+        &mut m,
+        &cats,
+        attach("24:0x7f0000000200", 4, APP).as_bytes(),
+        2000,
+        later,
+    );
+    let (marked, n) = read_after_check(&mut m, 8, later);
+    assert!(marked, "still open: {n:?}");
+    let detach = format!(
+        "{HEAD} ({a}) DETACH_DATABASE\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\n"
+    );
+    feed_raw(&mut m, &cats, detach.as_bytes(), 3000, later);
+    let (marked, n) = read_after_check(&mut m, 9, later);
+    assert!(!marked, "{n:?}");
 }
 
 /// Round 4 L-7: an ambiguous DDL record of a database that resolves as

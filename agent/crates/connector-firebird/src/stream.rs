@@ -189,7 +189,7 @@ enum TriggerWait {
 type Key = (DbId, u64);
 
 /// What a held DDL record's database waits on (re-review M-1, round 4
-/// L-7): a transaction's end record (or its binding's end), or a
+/// M-1b): a transaction's end record (or its binding's end), or a
 /// binding's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Pend {
@@ -449,7 +449,7 @@ pub(crate) struct Machine {
     /// Per database: after an ambiguous DDL record whose transaction could
     /// not be kept in `ddl_open`, the transactions known open on that
     /// database at the record, or the bindings live at it; invalidated
-    /// until each has ended (re-review M-1, round 4 L-7).
+    /// until each has ended (re-review M-1, round 4 M-1b and L-7).
     ddl_wait: HashMap<usize, std::collections::HashSet<Pend>>,
     /// Databases invalidated until the run ends (an ambiguous DDL record
     /// with nothing to wait on).
@@ -869,7 +869,7 @@ impl Machine {
     /// not among them, or they are too many, until the run ends (re-review
     /// M-1, never fail open).
     ///
-    /// Round 4 L-7: a record whose transaction is not known waits
+    /// Round 4 M-1b and L-7: a record whose transaction is not known waits
     /// for the end of its binding when that binding is live; a record of
     /// which no binding is known (`key` `None`: its database does not
     /// resolve, or nothing of it was read) waits for the end of every
@@ -914,10 +914,11 @@ impl Machine {
         }
     }
 
-    /// An ambiguous DDL record: every relation of its database counts as
-    /// dependent until a check after its transaction's end (re-review M-1).
-    /// A database that resolves as undeclared invalidates nothing (round 4
-    /// L-7).
+    /// A record that may be DDL whose text was not read whole (an
+    /// ambiguous DDL statement, a defective statement finish, an
+    /// unreadable record): every relation of its database counts as
+    /// dependent until a check after its transaction's end (round 4 M-1b).
+    /// A database that resolves as undeclared invalidates nothing (L-7).
     fn possible_ddl(&mut self, key: Option<Key>, tra: Option<u64>, wall: SystemTime) {
         let dbs: Vec<usize> = match key {
             Some((DbId::Declared(i), _)) => vec![i],
@@ -941,9 +942,13 @@ impl Machine {
             Resolved::Db(d) => Some((d, att.id)),
             Resolved::Ambiguous => None,
         });
-        // The end of a DDL transaction, or of its binding.
+        // The end of a DDL transaction, or of its binding: only a well-formed
+        // record ends one (a defective record may be forged; never fail
+        // open).
         let tra = rec.tra.map(|t| t.id);
+        let well_formed = rec.defect.is_none();
         let ended: Vec<(Key, u64)> = match rec.header.event {
+            _ if !well_formed => Vec::new(),
             Event::CommitTransaction | Event::RollbackTransaction => self
                 .ddl_open
                 .keys()
@@ -963,14 +968,17 @@ impl Machine {
                 self.invalidate(db, wall);
             }
         }
-        // What a held DDL record waits on (M-1, L-7): a binding's wait
+        // What a held DDL record waits on (M-1, M-1b): a binding's wait
         // also ends when the binding is gone by any other path.
-        let ends = |p: &Pend| match (p, rec.header.event) {
-            (Pend::Tra(k, t), Event::CommitTransaction | Event::RollbackTransaction) => {
-                Some(*k) == key && Some(*t) == tra
-            }
-            (_, Event::DetachDatabase | Event::DropDatabase) => Some(p.key()) == key,
-            _ => false,
+        let ends = |p: &Pend| {
+            well_formed
+                && match (p, rec.header.event) {
+                    (Pend::Tra(k, t), Event::CommitTransaction | Event::RollbackTransaction) => {
+                        Some(*k) == key && Some(*t) == tra
+                    }
+                    (_, Event::DetachDatabase | Event::DropDatabase) => Some(p.key()) == key,
+                    _ => false,
+                }
         };
         let bindings = &self.bindings;
         let mut done = Vec::new();
@@ -983,6 +991,16 @@ impl Machine {
         for db in done {
             self.ddl_wait.remove(&db);
             self.invalidate(db, wall);
+        }
+        // Round 4 M-1b: a statement finish whose text was not read (a
+        // missing trailer, a text that is not UTF-8, an injected or
+        // misshapen body) may be DDL.
+        if rec.header.event == Event::ExecuteStatementFinish
+            && rec.defect.is_some()
+            && !matches!(rec.body, Body::Statement { .. })
+        {
+            self.possible_ddl(key, tra, wall);
+            return;
         }
         match (&rec.body, rec.header.event, decision) {
             (Body::Statement { text, .. }, _, _) => {
@@ -1316,6 +1334,9 @@ impl Machine {
     fn loud(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
         self.counts.ambiguous += 1;
         *self.why.entry(line!()).or_default() += 1;
+        // Round 4 M-1b: it may be a DDL record (R41 item 8): every declared
+        // database, every relation, until the bindings live at it end.
+        self.possible_ddl(None, None, SystemTime::now());
         let wrapped: Vec<Invalidated<'_>> = cat
             .iter()
             .map(|c| Invalidated {

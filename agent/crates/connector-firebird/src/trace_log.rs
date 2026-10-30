@@ -1150,6 +1150,11 @@ pub(crate) fn parse(raw: &[u8], opts: ParseOptions) -> Option<Record<'_>> {
     rec.trailer = raw_trailer(body);
     let Ok(body) = std::str::from_utf8(body) else {
         rec.defect = Some(Defect::Encoding);
+        // Round 4 M-1b: the server writes the attachment and transaction
+        // lines before any client text; each is decoded on its own, so the
+        // record's binding and transaction are known (its DDL transaction
+        // tracked under them) even when a later line is not UTF-8.
+        raw_context(&mut rec, body);
         return Some(rec);
     };
     // The record ends with blank lines before the next header.
@@ -1187,6 +1192,37 @@ fn raw_trailer(body: &[u8]) -> Trailer<'_> {
     }
     lines.reverse();
     trailer(&lines).0
+}
+
+/// The context lines of a record whose body is not UTF-8 (round 4 M-1b):
+/// the attachment line, an optional client line (skipped unread) and an
+/// optional transaction line, each decoded on its own. Session and service
+/// records have none.
+fn raw_context<'a>(rec: &mut Record<'a>, body: &'a [u8]) {
+    if matches!(rec.header.event.family(), Family::Session | Family::Service) {
+        return;
+    }
+    let mut lines = body.split(|b| *b == b'\n');
+    let Some(att) = lines
+        .next()
+        .and_then(|l| std::str::from_utf8(l).ok())
+        .and_then(att_line)
+    else {
+        return;
+    };
+    rec.att = Some(att);
+    let mut next = lines.next();
+    if let Some(l) = next
+        && l.starts_with(b"\t")
+        && !l.starts_with(b"\t\t")
+    {
+        next = lines.next();
+    }
+    if let Some(l) = next
+        && l.starts_with(b"\t\t")
+    {
+        rec.tra = std::str::from_utf8(l).ok().and_then(tra_line);
+    }
 }
 
 type Parsed<T> = Result<T, Defect>;

@@ -455,6 +455,46 @@ sleep 3
 timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
 [ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
 
+# Round 4 M-1b (ADR-0060 R41 item 8): DDL records whose text the reader cannot take, each
+# committed after an intervening check (placed by the test), written after the log above was
+# copied (they are defective by design) and handed to the tests as the log's tail: a
+# CREATE PROCEDURE split from its trailer by a header-shaped line in a comment, and two meant to
+# carry a byte that is not UTF-8 (0xE9) in a comment from a WIN1252 and a NONE attachment. isql
+# does not send that byte (under the image's C.UTF-8 it swallows the bytes after it, so the
+# statement never ends; in the C locale, used here, it drops it): the tests measure what reached
+# the log, and the reader's encoding defect is tested with a recorded shape.
+E=$'\xe9'
+for c in "P_SPLIT_A UTF8" "P_ENC_A WIN1252" "P_ENC_B NONE"; do
+  read -r proc cs <<<"$c"
+  if [ "$proc" = P_SPLIT_A ]; then
+    note="/*
+2026-10-30T15:22:38.4210 (1:0x7f0000000001) EXECUTE_STATEMENT_FINISH
+*/"
+  else
+    note="/* caf$E */"
+  fi
+  {
+    cat "$WORK/root.pw"
+    cat <<SQL
+SET AUTODDL OFF;
+SET TERM ^ ;
+CREATE PROCEDURE $proc $note
+RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM MON\$STATEMENTS INTO :N; SUSPEND; END^
+SET TERM ; ^
+COMMIT;
+SELECT * FROM $proc;
+COMMIT;
+DROP PROCEDURE $proc;
+COMMIT;
+SQL
+  } | as_sysdba env LC_ALL=C LANG=C /opt/firebird/bin/isql -q -ch "$cs" -user SYSDBA \
+    "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" >/dev/null
+done
+sleep 3
+timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log \
+  | tail -c +"$(($(wc -c < "$WORK/audit.log") + 1))" > "$WORK/defect.log"
+[ -s "$WORK/defect.log" ] || { echo "[it] the defective DDL records are not in the log" >&2; exit 1; }
+
 # Security review N5 of 2026-10-30: what the server applies for each boolean spelling, from a user
 # trace session (`log_connections = <spelling>`) around one attachment: `true` (traced), `false`
 # (not traced) or `refused` (the session does not start). After the log is copied.
@@ -490,5 +530,6 @@ timeout 30 docker exec "$NAME" sh -c \
 # 4. The tests.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
 run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
+  FIREBIRD_IT_DEFECT_LOG="$WORK/defect.log" \
   FIREBIRD_IT_TZ_OFFSET="${FIREBIRD_IT_TZ_OFFSET:-0}" \
   FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"
