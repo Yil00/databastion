@@ -838,3 +838,98 @@ fn ten_thousand_per_row_routine_records_fold() {
         }
     }
 }
+
+/// The clock offset's change limit (coordinator's note on R40 item 2): a
+/// confirmed offset moves by at most one hour on an ordinary credited own
+/// record; a larger move needs the read-back probe (proof 7).
+#[test]
+fn a_confirmed_offset_moves_by_more_than_an_hour_only_on_the_probe() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let printed = super::stream::naive_seconds(super::trace_log::LogTime {
+        year: 2026,
+        month: 10,
+        day: 30,
+        hour: 15,
+        minute: 22,
+        second: 38,
+        frac: 4210,
+    });
+    let at = |h: i64| {
+        std::time::SystemTime::UNIX_EPOCH
+            + Duration::from_secs(u64::try_from(printed + h * 3600).unwrap())
+    };
+    let account = FetchAccount {
+        counted: 1,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 3, 40003, 24, at(1));
+    ledger.register_at(APP, 4, 40004, 24, at(4));
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let v = crate::sql::VERSION;
+    let p = crate::sql::READ_BACK_PROBE;
+    feed(&mut m, &cats, &attach_as("24:0x7f0000000100", 3, agent), 0);
+    ledger.credit(APP, 3, v, None, account);
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            "24:0x7f0000000100",
+            3,
+            5,
+            agent,
+            v,
+            1,
+            &[("RDB$DATABASE", 1)],
+        ),
+        1000,
+    );
+    assert_eq!(m.offset_for_tests(), Some(3600));
+    // Three hours away: an ordinary credited record does not move it.
+    feed(
+        &mut m,
+        &cats,
+        &attach_as("24:0x7f0000000200", 4, agent),
+        2000,
+    );
+    ledger.credit(APP, 4, v, None, account);
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            "24:0x7f0000000200",
+            4,
+            6,
+            agent,
+            v,
+            1,
+            &[("RDB$DATABASE", 1)],
+        ),
+        3000,
+    );
+    assert_eq!(m.offset_for_tests(), Some(3600));
+    // The read-back probe on that attachment does.
+    ledger.credit(APP, 4, p, None, account);
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            "24:0x7f0000000200",
+            4,
+            7,
+            agent,
+            p,
+            1,
+            &[("RDB$DATABASE", 1)],
+        ),
+        4000,
+    );
+    assert_eq!(m.offset_for_tests(), Some(4 * 3600));
+}

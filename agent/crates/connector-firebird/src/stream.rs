@@ -95,6 +95,9 @@ const GROUP_TIME: Duration = Duration::from_secs(10);
 /// R8 item 2, R25 item 6: the hold bound.
 const MAX_HELD: usize = 65_536;
 const HOLD_TIME: Duration = Duration::from_secs(10);
+/// The largest change of a confirmed clock offset a credited record other
+/// than the read-back probe may make (one hour: a daylight-saving change).
+const OFFSET_STEP: i64 = 3600;
 /// R30 item 3: the Garbage Collector's expected end.
 const GC_END: Duration = Duration::from_secs(10);
 
@@ -520,9 +523,13 @@ impl Machine {
     }
 
     /// A credited own record of `key` confirms the offset its attach gave.
-    fn confirm_offset(&mut self, key: Key) {
+    /// A confirmed offset changes by at most [`OFFSET_STEP`] unless the
+    /// credited record is the read-back probe (proof 7, `by_probe`); a
+    /// larger change stays pending until the probe confirms it.
+    fn confirm_offset(&mut self, key: Key, by_probe: bool) {
         if let Some((o, k)) = self.offset_pending
             && k == key
+            && (by_probe || self.offset.is_none_or(|cur| (o - cur).abs() <= OFFSET_STEP))
         {
             self.offset_from = Some((key, self.offset));
             self.offset = Some(o);
@@ -2033,7 +2040,7 @@ impl Machine {
                 {
                     self.probe_seen = Some(SystemTime::now());
                 }
-                self.confirm_offset(key);
+                self.confirm_offset(key, text == crate::sql::READ_BACK_PROBE);
                 Some(true)
             }
             Verdict::NotOwn => {
