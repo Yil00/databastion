@@ -424,6 +424,10 @@ pub(crate) struct Machine {
     pub(crate) counts: Counts,
     /// A view DDL record asks for an early check (R28 item 4).
     pub(crate) check_requested: bool,
+    /// The record being judged is of the agent's own anchored binding
+    /// inside a split window: it ends the window only if it is the agent's
+    /// own (R1 rule 7, re-review L-C).
+    window_ender: bool,
     /// The read-back probe's own record was read (proof 7).
     pub(crate) probe_seen: Option<SystemTime>,
     /// Ambiguous records by the rule (source line) that judged them, for
@@ -472,6 +476,7 @@ impl Machine {
             pending_end: Vec::new(),
             counts: Counts::default(),
             check_requested: false,
+            window_ender: false,
             probe_seen: None,
             why: std::collections::BTreeMap::new(),
         }
@@ -866,6 +871,7 @@ impl Machine {
         let Some(rec) = parse(raw, self.s.parse) else {
             return false;
         };
+        self.window_ender = false;
         let decision = self.judge(&rec, pos, now, cat);
         self.check_offset_binding();
         self.note_view_ddl(&rec, &decision);
@@ -1602,9 +1608,10 @@ impl Machine {
                 at: line!(),
             };
         }
-        // The own binding ends a window (R1 rule 7).
+        // The own binding ends a window (R1 rule 7), only if the record is
+        // the agent's own (re-review L-C): decided in `apply`.
         if b.own && b.anchored {
-            self.window_until = None;
+            self.window_ender = in_window;
         } else if in_window {
             return Decision::Ambiguous {
                 window: false,
@@ -2154,6 +2161,9 @@ impl Machine {
                     match self.own_record(rec, k, &d, pos) {
                         Some(true) => {
                             self.counts.own += 1;
+                            if std::mem::take(&mut self.window_ender) {
+                                self.window_until = None;
+                            }
                             return;
                         }
                         // A text of the closed set on the agent's
@@ -2170,6 +2180,19 @@ impl Machine {
                         }
                         Some(false) => {}
                     }
+                }
+                // A record of the agent's binding inside a window that is
+                // not its own: ambiguous (fix 3), the window stays.
+                if std::mem::take(&mut self.window_ender) {
+                    self.counts.ambiguous += 1;
+                    *self.why.entry(line!()).or_default() += 1;
+                    let d = draft.get_or_insert_with(|| Draft {
+                        action: Some(databastion_classifiers::masking::EventAction::Read),
+                        rows: rec.trailer.fetched,
+                        ..Draft::default()
+                    });
+                    d.star = true;
+                    d.always = true;
                 }
                 let Some(d) = draft else {
                     return;

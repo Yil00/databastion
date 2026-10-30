@@ -1038,3 +1038,88 @@ fn an_unfolded_group_keeps_the_always_reported_mark() {
     assert!(!ev.is_empty(), "{:?}", names(&out));
     assert!(ev.iter().all(|(_, e)| e.always_report()));
 }
+
+/// Re-review L-C, R1 rule 7: a record of the agent's anchored binding
+/// inside a split window ends it only when it is the agent's own; a
+/// record of that binding that is not (no credit) is ambiguous and the
+/// window stays.
+#[test]
+fn only_an_own_record_ends_a_split_window() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let ledger = Arc::new(Ledger::default());
+    ledger.register(APP, 3, 40003, 24);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    m.confirm_run(Run {
+        pid: 24,
+        start: None,
+    });
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let own = "24:0x7f0000000100";
+    let other = "24:0x7f0000000200";
+    feed(&mut m, &cats, &attach_as(own, 3, agent), 0);
+    feed(&mut m, &cats, &attach(other, 4, APP), 1000);
+    // A cut statement of the other client opens a window.
+    let cut = format!(
+        "{HEAD} ({other}) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_4, APP:NONE, UTF8, TCPv4:127.0.0.1/40004)\n\t/usr/bin/app:28\n\t\t(TRA_9, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\nSELECT 1 FROM RDB$DATABASE\n\n",
+        "-".repeat(79)
+    );
+    feed(&mut m, &cats, &cut, 2000);
+    let v = crate::sql::VERSION;
+    // The agent's binding, a text with no credit: ambiguous, window stays.
+    let before = m.counts.ambiguous;
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(
+            own,
+            3,
+            5,
+            agent,
+            "SELECT A FROM T WHERE ID = 1",
+            1,
+            &[("T", 1)],
+        ),
+        3000,
+    );
+    assert!(m.counts.ambiguous > before);
+    assert!(out.iter().all(|(_, e)| e.always_report()));
+    let before = m.counts.ambiguous;
+    feed(
+        &mut m,
+        &cats,
+        &select(other, 4, 10, APP, "CUSTOMERS", 2),
+        4000,
+    );
+    assert!(m.counts.ambiguous > before, "the window is still open");
+    // A credited own record ends it.
+    ledger.credit(
+        APP,
+        3,
+        v,
+        None,
+        FetchAccount {
+            counted: 1,
+            requested: 64,
+            last: 64,
+            largest: 64,
+            end: FetchEnd::End,
+            ..FetchAccount::default()
+        },
+    );
+    feed(
+        &mut m,
+        &cats,
+        &stmt(own, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1)]),
+        5000,
+    );
+    let before = m.counts.ambiguous;
+    feed(
+        &mut m,
+        &cats,
+        &select(other, 4, 11, APP, "CUSTOMERS", 2),
+        6000,
+    );
+    assert_eq!(m.counts.ambiguous, before, "{:?}", m.why);
+}
