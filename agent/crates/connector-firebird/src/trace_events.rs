@@ -206,6 +206,18 @@ fn text_objects(d: &mut Draft, a: &FirebirdAnalysis, cat: &dyn Catalog) {
     }
 }
 
+/// The finish record's trailer has the shape its event always gets:
+/// `records fetched` and a performance line on a statement finish, a
+/// performance line on routine and BLR records.
+fn trailer_verified(rec: &Record<'_>) -> bool {
+    match rec.header.event {
+        Event::ExecuteStatementFinish => {
+            rec.trailer.fetched.is_some() && rec.trailer.perf.is_some()
+        }
+        _ => rec.trailer.perf.is_some(),
+    }
+}
+
 /// The ambiguous form of a record (H1 fix 3).
 fn ambiguous(rec: &Record<'_>, cat: &dyn Catalog, window: bool) -> Converted {
     let mut d = Draft {
@@ -253,7 +265,10 @@ fn action_of(kind: FirebirdKind) -> EventAction {
 /// documentation).
 pub(crate) fn convert(rec: &Record<'_>, cat: &dyn Catalog) -> Converted {
     if let Some(defect) = rec.defect {
-        let window = defect == Defect::MissingTrailer && rec.header.event.is_finish();
+        // Any defect of a finish record whose trailer could not be
+        // verified opens a window (review of part 1, H1).
+        let window = rec.header.event.is_finish()
+            && (defect == Defect::MissingTrailer || !trailer_verified(rec));
         return ambiguous(rec, cat, window);
     }
     match (&rec.body, rec.header.event) {
@@ -370,6 +385,31 @@ fn statement(rec: &Record<'_>, text: &str, params: bool, cat: &dyn Catalog) -> C
     if a.unterminated {
         return ambiguous(rec, cat, true);
     }
+    let ddl = matches!(a.kind, FirebirdKind::Ddl | FirebirdKind::Dcl);
+    let mut large_virtual = false;
+    // R20 (security review M2): the form without a `Statement <n>:` line
+    // only for R8 case (b) with exactly 0 records fetched and no
+    // parameter line, a block only on the kinds of R24 item 3 and R34.
+    let no_id = matches!(rec.body, Body::Statement { id: None, .. });
+    if no_id
+        && !(a.kind.cannot_read()
+            && fetched == 0
+            && !params
+            && (rec.trailer.block.is_none()
+                || matches!(
+                    a.kind,
+                    FirebirdKind::Transaction | FirebirdKind::SessionReset
+                )))
+    {
+        // The text's server-side copy and remote-access signals stay on
+        // the ambiguous event (R36: a signal always gives an event; it
+        // only reports more).
+        let mut c = ambiguous(rec, cat, false);
+        if let Converted::Ambiguous { draft, .. } = &mut c {
+            text_signals(draft, &a);
+        }
+        return c;
+    }
     let mut d = Draft {
         action: Some(action_of(a.kind)),
         rows: Some(fetched),
@@ -408,65 +448,85 @@ fn statement(rec: &Record<'_>, text: &str, params: bool, cat: &dyn Catalog) -> C
                     ambiguous(rec, cat, true)
                 };
             }
-            let all_virtual = a
-                .relations
-                .iter()
-                .all(|r| cat.class(r) == RelClass::Virtual);
-            let case_a = a.parses() && all_virtual && !a.calls_code();
-            let case_c = a.parses() && all_virtual && a.calls_code();
-            let no_record = fetched == 0
-                // R12 item 3: a text whose dialect readings differ keeps
-                // the shape, and names `*` below (no window).
-                || (fetched == 1
-                    && !a.unterminated
-                    && a.aggregate_only
-                    // R28: global temporary tables join persistent
-                    // tables in R12's aggregate branch.
-                    && a
-                        .relations
-                        .iter()
-                        .all(|r| matches!(cat.class(r), RelClass::Table | RelClass::Gtt)));
-            if a.credential || matches!(a.kind, FirebirdKind::Ddl | FirebirdKind::Dcl) {
+            if ddl {
                 // DDL and DCL keep their kind (decision 6): a block-less
                 // DDL record read no record.
                 if fetched != 0 {
                     return ambiguous(rec, cat, true);
                 }
-            } else if case_c {
-                d.star = true;
-                d.always = true;
-            } else if !case_a && !no_record {
-                return ambiguous(rec, cat, true);
-            } else if a.dialects_differ {
-                // R12 item 3: the readings differ, `*`, no window.
-                d.star = true;
-                d.always = true;
+            } else {
+                // Case (a) and the no-record shape need a relation named
+                // in the text (review of part 1, H2): with none, nothing
+                // shows what the statement read.
+                let named = !a.relations.is_empty();
+                let all_virtual = a
+                    .relations
+                    .iter()
+                    .all(|r| cat.class(r) == RelClass::Virtual);
+                let case_a = a.parses() && named && all_virtual && !a.calls_code();
+                let case_c = a.parses() && all_virtual && a.calls_code();
+                let no_record = named
+                    && (fetched == 0
+                        // R12 item 3: a text whose dialect readings differ
+                        // keeps the shape, and names `*` (no window).
+                        || (fetched == 1
+                            && a.aggregate_only
+                            // R28: global temporary tables join persistent
+                            // tables in R12's aggregate branch.
+                            && a
+                                .relations
+                                .iter()
+                                .all(|r| matches!(cat.class(r), RelClass::Table | RelClass::Gtt))));
+                if case_c {
+                    d.star = true;
+                    d.always = true;
+                } else if case_a {
+                    // R20 (security review M2): above the volume threshold,
+                    // a read of noise relations names them.
+                    large_virtual = fetched > LARGE_RESULT;
+                } else if no_record {
+                    if a.dialects_differ {
+                        d.star = true;
+                        d.always = true;
+                    }
+                } else {
+                    return ambiguous(rec, cat, true);
+                }
             }
         }
     }
-    if a.credential || matches!(a.kind, FirebirdKind::Ddl | FirebirdKind::Dcl) {
-        // DDL and DCL keep their kind, never text (decision 6), and the
-        // credential forms their kind only (the #82 rule): `*`, always
-        // reported, with the block's objects under the filters and the
-        // text's server-side copy and remote-access flags.
+    if ddl || a.credential {
+        // DDL and DCL keep their kind, never text (decision 6), and a
+        // password-bearing text its kind and flags only (the #82 rule):
+        // `*`, always reported, with the block's objects under the
+        // filters.
         d.star = true;
         d.always = true;
-        if !a.credential {
-            text_signals(&mut d, &a);
-        }
-        return d.finish().map_or(Converted::Nothing, Converted::Event);
     }
-    text_objects(&mut d, &a, cat);
+    if large_virtual {
+        for r in &a.relations {
+            d.object(r);
+        }
+    }
+    if !ddl && !a.credential {
+        text_objects(&mut d, &a, cat);
+    }
     text_signals(&mut d, &a);
-    // The volume and shape signals are about the objects read: a read
-    // of noise relations only raises none.
-    if !d.objects.is_empty() {
-        if a.kind == FirebirdKind::Select && a.unrestricted_select && fetched > 0 {
-            d.signal(Signal::FullTableRead);
-        }
-        if fetched > LARGE_RESULT {
-            d.signal(Signal::LargeResult);
-        }
+    // `volume.large_result` whatever the objects (R20, review of part 1,
+    // M4: with no object left, R36 names `*`). `shape.full_table_read`
+    // only on objects other than noise relations: the tools' catalog
+    // reads would otherwise all be always reported (a decision recorded
+    // for the implementation note).
+    if !ddl
+        && a.kind == FirebirdKind::Select
+        && a.unrestricted_select
+        && fetched > 0
+        && !d.objects.is_empty()
+    {
+        d.signal(Signal::FullTableRead);
+    }
+    if fetched > LARGE_RESULT {
+        d.signal(Signal::LargeResult);
     }
     d.finish().map_or(Converted::Nothing, Converted::Event)
 }

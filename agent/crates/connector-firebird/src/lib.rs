@@ -41,6 +41,8 @@ mod error;
 mod own;
 mod peer;
 mod privileges;
+#[cfg(test)]
+mod review_regressions;
 mod sql;
 #[cfg_attr(not(test), allow(dead_code))]
 mod stream;

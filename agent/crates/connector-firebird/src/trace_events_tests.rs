@@ -179,7 +179,18 @@ fn server_side_copies_always_give_one_event() {
         "ALTER DATABASE ADD DIFFERENCE FILE '/tmp/app.delta'",
     ] {
         for blk in [Some(files.as_str()), None] {
-            let rec = statement(text, "", 0, blk).replace("Statement 7:\n", "");
+            // R20: the form without `Statement <n>:` (as isql writes DDL)
+            // is ambiguous outside R8 case (b); its event keeps the signal.
+            let bare = statement(text, "", 0, blk).replace("Statement 7:\n", "");
+            match one(&bare) {
+                Converted::Ambiguous { draft, .. } => {
+                    assert!(
+                        draft.signals == [Signal::BackupDatabase] && draft.star && draft.always
+                    );
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+            let rec = statement(text, "", 0, blk);
             let d = event(one(&rec));
             assert_eq!(d.signals, [Signal::BackupDatabase], "{text}");
             assert!(d.star && d.always, "{text}");
@@ -197,7 +208,7 @@ fn server_side_copies_always_give_one_event() {
     // The end of a backup and dropping a copy are DDL events (kind kept,
     // `*`, always reported) without the signal.
     for text in ["ALTER DATABASE END BACKUP", "DROP SHADOW 1"] {
-        let rec = statement(text, "", 0, Some(&files)).replace("Statement 7:\n", "");
+        let rec = statement(text, "", 0, Some(&files));
         let d = event(one(&rec));
         assert_eq!(d.action, Some(EventAction::Ddl), "{text}");
         assert!(d.signals.is_empty() && d.star && d.always, "{text}");

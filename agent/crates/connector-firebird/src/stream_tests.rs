@@ -72,6 +72,32 @@ fn run(log: &str, proof11: bool, series: Series) -> (Machine, Vec<Emitted>) {
     (m, out)
 }
 
+/// Statement finishes without a `Statement <n>:` line whose text is not a
+/// transaction statement (isql's DDL and DCL).
+fn bare_ddl(log: &str) -> u64 {
+    let lines: Vec<&str> = log.lines().collect();
+    let mut n = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if !l.ends_with(") EXECUTE_STATEMENT_FINISH") {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < lines.len() && !lines[j].starts_with("---") && !lines[j].starts_with("Statement ")
+        {
+            j += 1;
+        }
+        if lines.get(j).is_some_and(|x| x.starts_with("---"))
+            && let Some(t) = lines.get(j + 1)
+            && !t.starts_with("SET TRANSACTION")
+            && !t.starts_with("COMMIT")
+            && !t.starts_with("ROLLBACK")
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn names(out: &[Emitted]) -> Vec<String> {
     out.iter()
         .flat_map(|(_, e)| e.objects().iter().map(|o| o.object().as_str().to_owned()))
@@ -98,9 +124,15 @@ fn recorded_logs() {
         Series::V4,
     );
     assert_eq!(m4.counts.panics, 0);
-    // No forgery in the trigger logs.
-    assert_eq!(m.counts.ambiguous, 0, "5.0.4 {:?}", m.why);
-    assert_eq!(m4.counts.ambiguous, 0, "4.0.7");
+    // No forgery in the trigger logs: the only ambiguous records are the
+    // statement finishes `isql` writes without a `Statement <n>:` line for
+    // DDL and DCL, which R20 makes ambiguous outside R8 case (b) (a fact
+    // that contradicts R20, reported for a refinement).
+    let t5 = include_str!("../testdata/trace-5.0.4-triggers-sweep.log");
+    let t4 = include_str!("../testdata/trace-4.0.7-triggers-sweep.log");
+    assert_eq!(m.counts.ambiguous, bare_ddl(t5), "5.0.4 {:?}", m.why);
+    assert_eq!(m4.counts.ambiguous, bare_ddl(t4), "4.0.7 {:?}", m4.why);
+    assert!(bare_ddl(t5) > 0);
     let (m5, _) = run(
         include_str!("../testdata/trace-5.0.4-isql-gbak.log"),
         false,

@@ -378,7 +378,6 @@ pub(crate) fn is_header(line: &[u8]) -> bool {
 // The assembler.
 
 /// What the assembler hands over.
-#[derive(Debug)]
 pub(crate) enum Assembled {
     /// One record: its header line first, then its body lines. Zeroized
     /// when dropped.
@@ -492,7 +491,7 @@ pub(crate) enum Protocol {
 }
 
 /// `\t<database> (ATT_<n>, <user>[:<role>], <charset>, <protocol>)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttLine<'a> {
     /// The printed database name (a path or an alias, R2): mapped to a
     /// declared database, then discarded.
@@ -886,6 +885,10 @@ fn block_row(line: &str, width: usize) -> Option<(&str, Counters)> {
         return None;
     }
     let (name, cols) = line.split_at(width - 80);
+    // The counters are ASCII digits and spaces (review of part 1, M1).
+    if !cols.is_ascii() {
+        return None;
+    }
     let name = name.trim_end_matches(' ');
     if name.is_empty() {
         return None;
@@ -1007,7 +1010,7 @@ pub(crate) struct Record<'a> {
 }
 
 /// The event-specific part of a record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Body<'a> {
     /// `TRACE_INIT` / `TRACE_FINI` with the fixed session lines.
     Session,
@@ -1134,6 +1137,14 @@ pub(crate) fn parse(raw: &[u8], opts: ParseOptions) -> Option<Record<'_>> {
         trailer: Trailer::default(),
         defect: None,
     };
+    // Trailer first, from the raw bytes (H1 fix 1; review of part 1, H1):
+    // the server writes the trailer after everything a client controls,
+    // so it is read before any line a client could have spoiled (a text
+    // that is not UTF-8, an attachment or client line that does not
+    // parse). Each trailer line is decoded on its own; the defects found
+    // later keep it, so an ambiguous record keeps its real counters and
+    // row count.
+    rec.trailer = raw_trailer(body);
     let Ok(body) = std::str::from_utf8(body) else {
         rec.defect = Some(Defect::Encoding);
         return Some(rec);
@@ -1152,6 +1163,27 @@ pub(crate) fn parse(raw: &[u8], opts: ParseOptions) -> Option<Record<'_>> {
     let defect = body_of(&mut rec, body, lines, opts).err();
     rec.defect = defect;
     Some(rec)
+}
+
+/// The trailer of a record body read from its end, line by line (each
+/// line decoded on its own; the first line from the end that is not
+/// UTF-8 ends the trailer area).
+fn raw_trailer(body: &[u8]) -> Trailer<'_> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut parts: Vec<&[u8]> = body.split(|b| *b == b'\n').collect();
+    while parts.last().is_some_and(|l| l.is_empty()) {
+        parts.pop();
+    }
+    // Enough lines for the largest block, the performance line and
+    // `records fetched`.
+    for l in parts.iter().rev().take(MAX_BLOCK_ROWS + 8) {
+        match std::str::from_utf8(l) {
+            Ok(l) => lines.push(l),
+            Err(_) => break,
+        }
+    }
+    lines.reverse();
+    trailer(&lines).0
 }
 
 type Parsed<T> = Result<T, Defect>;
@@ -1384,6 +1416,12 @@ fn statement_body<'a>(
         .iter()
         .position(|l| *l == CARETS || param_line(l))
         .unwrap_or(area.len());
+    // A parameter line only after a blank line that follows the text
+    // (review of part 1, H2): a `param<i> = ` line inside the text is
+    // client text.
+    if area.get(cut).is_some_and(|l| param_line(l)) && (cut == 0 || !area[cut - 1].is_empty()) {
+        return Err(Defect::Injected);
+    }
     let (mut text_lines, after) = area.split_at(cut);
     // A blank line separates the text from its parameters.
     while text_lines.len() > 1 && text_lines.last() == Some(&"") {
@@ -1401,6 +1439,14 @@ fn statement_body<'a>(
     }
     // The text as one borrowed slice of the record buffer.
     let text = join_borrowed(parent, text_lines).ok_or(Defect::Shape)?;
+    // As many parameter lines as the text has `?` placeholders outside
+    // literals and comments (review of part 1, H2).
+    let params = after.iter().filter(|l| param_line(l)).count();
+    let placeholders =
+        databastion_classifiers::query::firebird::analyze_firebird(text).placeholders;
+    if params != placeholders {
+        return Err(Defect::Injected);
+    }
     if let Some(limit) = opts.max_sql_length
         && text.len() >= limit
         && text.ends_with("...")
@@ -1497,19 +1543,35 @@ fn service_body<'a>(rec: &mut Record<'a>, lines: &[&'a str]) -> Parsed<()> {
             .and_then(|l| l.strip_prefix("\t\""))
             .and_then(|l| l.strip_suffix('"'))
             .ok_or(Defect::Shape)?;
+        // One service name line, and no line after it shaped like the
+        // service line's client part (review of part 1, M5).
+        let named = rest
+            .iter()
+            .filter(|l| l.starts_with("\t\"") && l.ends_with('"'))
+            .count();
+        let client_shaped = rest.iter().skip(1).any(|l| {
+            l.strip_suffix(')')
+                .and_then(|l| l.rsplit_once(':'))
+                .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        });
+        if named != 1 || client_shaped {
+            return Err(Defect::Injected);
+        }
         let n = service_name(n);
         if matches!(
             n,
             ServiceName::BackupDatabase | ServiceName::IncrementalBackupDatabase
         ) {
-            // `-b <database> <file>`: the first argument after `-b`; any
-            // other form does not resolve (attributed to every declared
-            // database, R27 item 1 (a)).
+            // Exactly `-b <database> <file>`; any other form (a path with
+            // a space included) does not resolve: attributed to every
+            // declared database (R27 item 1 (a)).
             database = rest
                 .get(1)
                 .and_then(|l| l.strip_prefix("\t-b "))
-                .and_then(|a| a.split(' ').next())
-                .filter(|d| !d.is_empty());
+                .and_then(|a| {
+                    let parts: Vec<&str> = a.split(' ').collect();
+                    (parts.len() == 2 && parts.iter().all(|p| !p.is_empty())).then(|| parts[0])
+                });
         }
         name = Some(n);
     } else if !rest.iter().all(|l| l.is_empty()) {
@@ -1522,4 +1584,70 @@ fn service_body<'a>(rec: &mut Record<'a>, lines: &[&'a str]) -> Parsed<()> {
         database,
     };
     Ok(())
+}
+
+// Redacting `Debug` (review of part 1, N1): record bytes, statement
+// texts, printed database names, user, role and service names never reach
+// a debug string (a panic payload, a test message, a log).
+
+impl std::fmt::Debug for Assembled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Record(r) => write!(f, "Record({} bytes)", r.len()),
+            Self::Oversized(h) => f.debug_tuple("Oversized").field(h).finish(),
+            Self::Orphan => f.write_str("Orphan"),
+        }
+    }
+}
+
+impl std::fmt::Debug for AttLine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttLine")
+            .field("id", &self.id)
+            .field("role", &self.role.is_some())
+            .field("charset", &self.charset)
+            .field(
+                "protocol",
+                &match self.protocol {
+                    Protocol::Tcp(..) => "tcp",
+                    Protocol::Internal => "internal",
+                },
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Body<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session => f.write_str("Session"),
+            Self::Context => f.write_str("Context"),
+            Self::Statement { id, text, params } => f
+                .debug_struct("Statement")
+                .field("id", id)
+                .field("text_bytes", &text.len())
+                .field("params", params)
+                .finish(),
+            Self::Routine { kind, returns, .. } => f
+                .debug_struct("Routine")
+                .field("kind", kind)
+                .field("returns", returns)
+                .finish_non_exhaustive(),
+            Self::Blr => f.write_str("Blr"),
+            Self::Error { codes, other_lines } => f
+                .debug_struct("Error")
+                .field("codes", codes)
+                .field("other_lines", other_lines)
+                .finish(),
+            Self::Service { name, database, .. } => f
+                .debug_struct("Service")
+                .field("name", name)
+                .field("database", &database.is_some())
+                .finish_non_exhaustive(),
+            Self::Sweep { counters } => {
+                f.debug_struct("Sweep").field("counters", counters).finish()
+            }
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
