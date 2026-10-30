@@ -247,6 +247,18 @@ impl AuditState {
         f(m.entry(id.to_owned()).or_default())
     }
 
+    /// The declared `attach` of every database the last evaluation
+    /// excluded (R9), for Discovery.
+    pub(crate) fn excluded_attach(&self, id: &str) -> Vec<String> {
+        self.with(id, |t| {
+            t.dbs
+                .iter()
+                .filter(|d| d.excluded)
+                .map(|d| d.attach.clone())
+                .collect()
+        })
+    }
+
     pub(crate) fn note_stream(&self, id: &str, f: impl FnOnce(&mut StreamFacts)) {
         self.with(id, |t| f(&mut t.stream));
     }
@@ -335,7 +347,8 @@ pub(crate) fn evaluate(
     // the note; the map read here may also exclude one (rule 3, fail
     // closed: a map changed since the check).
     let mut names = Vec::new();
-    for d in &input.dbs {
+    let mut dbs = input.dbs.clone();
+    for (d, kept) in input.dbs.iter().zip(dbs.iter_mut()) {
         let alias = (!d.attach.starts_with('/')).then_some(d.attach.as_str());
         let decl = DeclaredDb {
             label: &d.label,
@@ -344,6 +357,9 @@ pub(crate) fn evaluate(
         };
         let map_self = trace_conf::own_security_database(aliases.as_ref(), &decl, &root);
         let excl = d.excluded || map_self != Some(false);
+        // Re-review L-E: kept with the target's facts, for the stream and
+        // for Discovery (`excluded_attach`).
+        kept.excluded = excl;
         if excl && !d.excluded {
             detail.push(format!(
                 "{}: excluded from Audit (databases.conf, rule 3 of R9)",
@@ -471,7 +487,7 @@ pub(crate) fn evaluate(
         if !fresh {
             notes.add(TargetNote::new(NoteCode::AuditPartialPendingFirstRecord));
         }
-        t.dbs = input.dbs.clone();
+        t.dbs = dbs;
         t.aliases = aliases.clone();
         t.proof11 = proof11;
         t.superserver = mode == ServerMode::Super;
@@ -484,7 +500,6 @@ pub(crate) fn evaluate(
         }
         t.probe_sent = Some(now);
         t.generation += 1;
-        let _ = names;
         if proven && probe_ok && fresh {
             AuditLevel::Partial
         } else if fresh {
@@ -1446,6 +1461,44 @@ mod tests {
         r.serve(3, t0 + Duration::from_secs(100), &start);
         r.serve(3, t0 + Duration::from_secs(200), &start);
         assert_eq!(started.load(Ordering::Relaxed), 2);
+    }
+
+    /// Re-review L-E: the `databases.conf` rule of R9, decided by the
+    /// evaluation (here a map that cannot be read: fail closed), reaches
+    /// the stream's settings and Discovery's exclusions.
+    #[test]
+    fn the_databases_conf_exclusion_reaches_the_stream_and_discovery() {
+        let state = AuditState::default();
+        let cfg = FirebirdAuditConfig {
+            log: "/nonexistent/fb/audit.log".into(),
+            trace_config: "/nonexistent/fb/fbtrace.conf".into(),
+            firebird_conf: "/nonexistent/fb/firebird.conf".into(),
+            root: "/nonexistent/fb".into(),
+            databases_conf: Some("/nonexistent/fb/databases.conf".into()),
+        };
+        let db = DbFacts {
+            attach: "/data/app.fdb".to_owned(),
+            label: "app".to_owned(),
+            resolved: Some("/data/app.fdb".to_owned()),
+            catalog: Classes::default(),
+            excluded: false,
+        };
+        let (mut notes, mut detail) = (Notes::default(), Vec::new());
+        let _ = evaluate(
+            &state,
+            "t",
+            &cfg,
+            CheckInputs {
+                dbs: vec![db],
+                server_pid: None,
+                peer_uid: None,
+            },
+            &mut notes,
+            &mut detail,
+        );
+        assert_eq!(state.excluded_attach("t"), ["/data/app.fdb"]);
+        let (s, _, _, _) = settings(&state, "t", "AGENT", Series::V5);
+        assert!(s.databases.iter().all(|d| d.excluded));
     }
 
     /// Review N3: the audit facts' `Debug` shows no path, label or name.

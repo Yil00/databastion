@@ -327,14 +327,7 @@ async fn run(
         });
         version = Some(v);
     }
-    // R9: the note, with Discovery or Audit.
-    if !excluded.is_empty() {
-        notes.add(
-            TargetNote::new(NoteCode::CoverageSecurityDatabaseExcluded)
-                .with_count(excluded.len() as u64),
-        );
-    }
-    state.set_excluded(&target.id, excluded.into_iter().map(|(a, _)| a).collect());
+    let mut excluded: Vec<String> = excluded.into_iter().map(|(a, _)| a).collect();
     if let Some(v) = &version {
         state.set_version(&target.id, Some(v.clone()));
     }
@@ -379,6 +372,23 @@ async fn run(
             AuditLevel::None
         }
     };
+    // R9: the databases excluded here and by the evaluation's
+    // `databases.conf` rule (re-review L-E), for Discovery; the note with
+    // Discovery or Audit.
+    if settings.audit.is_some() && !settings.tunnel {
+        for a in state.audit.excluded_attach(&target.id) {
+            if !excluded.contains(&a) {
+                excluded.push(a);
+            }
+        }
+    }
+    if !excluded.is_empty() {
+        notes.add(
+            TargetNote::new(NoteCode::CoverageSecurityDatabaseExcluded)
+                .with_count(excluded.len() as u64),
+        );
+    }
+    state.set_excluded(&target.id, excluded);
     let summary = eval.summary();
     if !summary.is_empty() {
         detail.push(summary);
