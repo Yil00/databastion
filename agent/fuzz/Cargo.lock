@@ -244,6 +244,7 @@ dependencies = [
  "databastion-classifiers",
  "databastion-core",
  "getrandom 0.4.3",
+ "rustix",
  "sha1",
  "sha2",
  "tokio",
