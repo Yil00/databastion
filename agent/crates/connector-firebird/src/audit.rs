@@ -120,7 +120,7 @@ impl Catalog for Classes {
         if !self.complete || !catalog::NEVER_SAMPLED.contains(&r) {
             return RelClass::Unknown;
         }
-        if r.starts_with("MON$") || r.starts_with("SEC$") || r == "RDB$CONFIG" {
+        if VIRTUAL.contains(&r) {
             RelClass::Virtual
         } else {
             RelClass::System
@@ -137,6 +137,31 @@ impl Catalog for Classes {
         matches!(self.class(relation), RelClass::View | RelClass::Unknown)
     }
 }
+
+/// The virtual relations (relation type 3) of the tested images, 4.0.7
+/// and 5.0.4 (R8 item 1's per-version list; the engine-matrix drift test
+/// checks it against each server in both directions). A name of this list
+/// that a version lacks is never in its log.
+const VIRTUAL: &[&str] = &[
+    "MON$ATTACHMENTS",
+    "MON$CALL_STACK",
+    "MON$COMPILED_STATEMENTS",
+    "MON$CONTEXT_VARIABLES",
+    "MON$DATABASE",
+    "MON$IO_STATS",
+    "MON$MEMORY_USAGE",
+    "MON$RECORD_STATS",
+    "MON$STATEMENTS",
+    "MON$TABLE_STATS",
+    "MON$TRANSACTIONS",
+    "RDB$CONFIG",
+    "RDB$KEYWORDS",
+    "RDB$TIME_ZONES",
+    "SEC$DB_CREATORS",
+    "SEC$GLOBAL_AUTH_MAPPING",
+    "SEC$USERS",
+    "SEC$USER_ATTRIBUTES",
+];
 
 /// What the stream reports back to `check()`.
 #[derive(Debug, Clone, Copy, Default)]
