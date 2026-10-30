@@ -419,9 +419,10 @@ pub(crate) struct Machine {
     /// Read-back probe records seen per own binding (R42 item 2: a probe
     /// that confirms must be unique on its binding).
     probe_records: HashMap<Key, u32>,
-    /// The binding whose credited record confirmed the offset, and the
-    /// offset before it (restored if that binding is poisoned).
-    offset_from: Option<(Key, Option<i64>)>,
+    /// The binding that learned the offset, the one whose credited record
+    /// confirmed it (the same, or a probe's), and the offset before it
+    /// (restored if either binding is poisoned).
+    offset_from: Option<(Key, Key, Option<i64>)>,
     /// Declared databases whose dependent and block-blind sets are
     /// invalidated (R28 item 4, R41 item 8).
     views_invalid: std::collections::HashSet<usize>,
@@ -1040,7 +1041,7 @@ impl Machine {
             && measured.is_some_and(|m| (m - o).abs() <= 5)
             && (by_probe || (k == key && !needs_probe))
         {
-            self.offset_from = Some((k, self.offset));
+            self.offset_from = Some((k, key, self.offset));
             self.offset = Some(o);
             self.offset_pending = None;
         }
@@ -1064,8 +1065,8 @@ impl Machine {
         {
             self.offset_pending = None;
         }
-        if let Some((k, prev)) = self.offset_from
-            && poisoned(self, &k)
+        if let Some((k, by, prev)) = self.offset_from
+            && (poisoned(self, &k) || poisoned(self, &by))
         {
             self.offset = prev;
             self.offset_from = None;

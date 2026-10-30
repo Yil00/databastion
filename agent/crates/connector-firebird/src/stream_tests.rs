@@ -2001,3 +2001,75 @@ fn a_record_panic_keeps_ddl_named_relations_dependent() {
     let out = feed(&mut m, &cats, &read(8), 4000);
     assert!(marked(&out), "after the panic: {:?}", names(&out));
 }
+
+/// Re-review note (R42 item 2): an offset confirmed by the read-back probe
+/// on another own binding than the one that learned it is reverted when a
+/// second probe record poisons the confirming binding.
+#[test]
+fn a_duplicate_probe_on_the_confirming_binding_reverts_the_offset() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let account = FetchAccount {
+        counted: 1,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let (h1, now) = now_head(3600);
+    let (h4, _) = now_head(3600 + 900);
+    // The probe's credits three seconds before (inside its life on both
+    // sides: its record reads 15 minutes back under the old offset).
+    let early = now - Duration::from_secs(3);
+    let ledger = Arc::new(Ledger::default());
+    for id in [3, 4, 5] {
+        ledger.register_at(APP, id, 40000 + u16::try_from(id).unwrap(), 24, now);
+    }
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let v = crate::sql::VERSION;
+    let p = crate::sql::READ_BACK_PROBE;
+    let (t3, t4, t5) = (
+        "24:0x7f0000000100",
+        "24:0x7f0000000200",
+        "24:0x7f0000000300",
+    );
+    feed_h(&h1, &mut m, &cats, &attach_as(t3, 3, agent), 0);
+    ledger.credit_at(APP, 3, v, account, now);
+    feed_h(
+        &h1,
+        &mut m,
+        &cats,
+        &stmt(t3, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]),
+        1000,
+    );
+    assert_eq!(m.offset_for_tests(), Some(3600));
+    // Attachment 4 learns a change of fifteen minutes; the probe on
+    // attachment 5 (attached under the confirmed offset) confirms it.
+    feed_h(&h4, &mut m, &cats, &attach_as(t4, 4, agent), 2000);
+    feed_h(&h1, &mut m, &cats, &attach_as(t5, 5, agent), 2500);
+    ledger.credit_at(APP, 5, p, account, early);
+    feed_h(
+        &h4,
+        &mut m,
+        &cats,
+        &stmt(t5, 5, 7, agent, p, 1, &[("RDB$DATABASE", 1)]),
+        3000,
+    );
+    assert_eq!(m.offset_for_tests(), Some(3600 + 900));
+    ledger.credit_at(APP, 5, p, account, early);
+    feed_h(
+        &h4,
+        &mut m,
+        &cats,
+        &stmt(t5, 5, 8, agent, p, 1, &[("RDB$DATABASE", 1)]),
+        4000,
+    );
+    assert_eq!(
+        m.offset_for_tests(),
+        Some(3600),
+        "reverted with the poisoned confirming binding"
+    );
+}
