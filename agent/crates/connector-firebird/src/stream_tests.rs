@@ -513,17 +513,7 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     let a = "24:0x7f0000000100";
     let ledger = Arc::new(Ledger::default());
     // Opened one hour after the printed time: a whole-hour offset.
-    let printed = super::stream::naive_seconds(super::trace_log::LogTime {
-        year: 2026,
-        month: 10,
-        day: 30,
-        hour: 15,
-        minute: 22,
-        second: 38,
-        frac: 4210,
-    });
-    let opened = std::time::SystemTime::UNIX_EPOCH
-        + Duration::from_secs(u64::try_from(printed + 3600).unwrap());
+    let (head, opened) = now_head(3600);
     ledger.register_at(APP, 3, 40003, 24, opened);
     let account = |counted| FetchAccount {
         counted,
@@ -537,12 +527,13 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     let cat = Cat;
     let cats: [&dyn Catalog; 1] = [&cat];
     let agent = "DATABASTION_AGENT";
-    feed(&mut m, &cats, &attach_as(a, 3, agent), 0);
+    feed_h(&head, &mut m, &cats, &attach_as(a, 3, agent), 0);
     assert_eq!(m.offset_for_tests(), None, "provisional until credited");
     let before = m.counts.own;
     let v = crate::sql::VERSION;
-    ledger.credit(APP, 3, v, None, account(1));
-    let out = feed(
+    ledger.credit_at(APP, 3, v, account(1), opened);
+    let out = feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(a, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]),
@@ -552,8 +543,9 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     assert_eq!(m.counts.own, before + 1);
     assert_eq!(m.offset_for_tests(), Some(3600));
     // A copy carrying a user table: not the agent's own, reported.
-    ledger.credit(APP, 3, v, None, account(1));
-    let out = feed(
+    ledger.credit_at(APP, 3, v, account(1), opened);
+    let out = feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(a, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1), ("PAYROLL", 1)]),
@@ -561,7 +553,8 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     );
     assert!(names(&out).contains(&"PAYROLL".to_owned()));
     // The credit is still there for the agent's real record.
-    let out = feed(
+    let out = feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(a, 3, 7, agent, v, 1, &[("RDB$DATABASE", 1)]),
@@ -569,7 +562,8 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     );
     assert!(out.is_empty());
     // No credit left: loud.
-    let out = feed(
+    let out = feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(a, 3, 8, agent, v, 1, &[("RDB$DATABASE", 1)]),
@@ -578,7 +572,8 @@ fn own_records_follow_the_table_and_confirm_the_offset() {
     assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
     assert!(names(&out).contains(&"*".to_owned()));
     // A duplicate attach poisons the binding: the offset reverts.
-    feed(
+    feed_h(
+        &head,
         &mut m,
         &cats,
         &attach_as("24:0x7f0000000200", 3, agent),
@@ -880,19 +875,6 @@ fn ten_thousand_per_row_routine_records_fold() {
 #[test]
 fn a_confirmed_offset_moves_by_more_than_an_hour_only_on_the_probe() {
     use crate::conn::{FetchAccount, FetchEnd};
-    let printed = super::stream::naive_seconds(super::trace_log::LogTime {
-        year: 2026,
-        month: 10,
-        day: 30,
-        hour: 15,
-        minute: 22,
-        second: 38,
-        frac: 4210,
-    });
-    let at = |h: i64| {
-        std::time::SystemTime::UNIX_EPOCH
-            + Duration::from_secs(u64::try_from(printed + h * 3600).unwrap())
-    };
     let account = FetchAccount {
         counted: 1,
         requested: 64,
@@ -901,72 +883,75 @@ fn a_confirmed_offset_moves_by_more_than_an_hour_only_on_the_probe() {
         end: FetchEnd::End,
         ..FetchAccount::default()
     };
+    // Attachment 3 sees the server one hour behind, attachment 4 four.
+    let (h1, now) = now_head(3600);
+    let (h4, _) = now_head(4 * 3600);
     let ledger = Arc::new(Ledger::default());
-    ledger.register_at(APP, 3, 40003, 24, at(1));
-    ledger.register_at(APP, 4, 40004, 24, at(4));
+    ledger.register_at(APP, 3, 40003, 24, now);
+    ledger.register_at(APP, 4, 40004, 24, now);
     let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
     let cat = Cat;
     let cats: [&dyn Catalog; 1] = [&cat];
     let agent = "DATABASTION_AGENT";
     let v = crate::sql::VERSION;
     let p = crate::sql::READ_BACK_PROBE;
-    feed(&mut m, &cats, &attach_as("24:0x7f0000000100", 3, agent), 0);
-    ledger.credit(APP, 3, v, None, account);
-    feed(
+    let (t3, t4) = ("24:0x7f0000000100", "24:0x7f0000000200");
+    feed_h(&h1, &mut m, &cats, &attach_as(t3, 3, agent), 0);
+    ledger.credit_at(APP, 3, v, account, now);
+    feed_h(
+        &h1,
         &mut m,
         &cats,
-        &stmt(
-            "24:0x7f0000000100",
-            3,
-            5,
-            agent,
-            v,
-            1,
-            &[("RDB$DATABASE", 1)],
-        ),
+        &stmt(t3, 3, 5, agent, v, 1, &[("RDB$DATABASE", 1)]),
         1000,
     );
     assert_eq!(m.offset_for_tests(), Some(3600));
-    // Three hours away: an ordinary credited record does not move it.
-    feed(
+    // Three hours away: an ordinary credited record does not move it, and
+    // an early check is asked for (R42 item 3).
+    m.check_requested = false;
+    feed_h(&h4, &mut m, &cats, &attach_as(t4, 4, agent), 2000);
+    assert!(m.check_requested);
+    ledger.credit_at(APP, 4, v, account, now);
+    feed_h(
+        &h4,
         &mut m,
         &cats,
-        &attach_as("24:0x7f0000000200", 4, agent),
-        2000,
-    );
-    ledger.credit(APP, 4, v, None, account);
-    feed(
-        &mut m,
-        &cats,
-        &stmt(
-            "24:0x7f0000000200",
-            4,
-            6,
-            agent,
-            v,
-            1,
-            &[("RDB$DATABASE", 1)],
-        ),
+        &stmt(t4, 4, 6, agent, v, 1, &[("RDB$DATABASE", 1)]),
         3000,
     );
     assert_eq!(m.offset_for_tests(), Some(3600));
-    // The read-back probe on that attachment does.
-    ledger.credit(APP, 4, p, None, account);
-    feed(
+    // A later attach does not overwrite the pending change.
+    feed_h(
+        &h1,
         &mut m,
         &cats,
-        &stmt(
-            "24:0x7f0000000200",
-            4,
-            7,
-            agent,
-            p,
-            1,
-            &[("RDB$DATABASE", 1)],
-        ),
+        &attach_as("24:0x7f0000000300", 5, agent),
+        3500,
+    );
+    // The read-back probe on that attachment confirms it.
+    ledger.credit_at(APP, 4, p, account, now);
+    feed_h(
+        &h4,
+        &mut m,
+        &cats,
+        &stmt(t4, 4, 7, agent, p, 1, &[("RDB$DATABASE", 1)]),
         4000,
     );
     assert_eq!(m.offset_for_tests(), Some(4 * 3600));
+    // A second probe record on that binding poisons it (R42 item 2).
+    ledger.credit_at(APP, 4, p, account, now);
+    feed_h(
+        &h4,
+        &mut m,
+        &cats,
+        &stmt(t4, 4, 8, agent, p, 1, &[("RDB$DATABASE", 1)]),
+        5000,
+    );
+    assert_eq!(
+        m.offset_for_tests(),
+        Some(3600),
+        "reverted with the poisoned binding"
+    );
 }
 
 /// Review H-A, R1 rule 11: a million forged records (fresh attachment ids
@@ -1082,7 +1067,8 @@ fn an_unfolded_group_keeps_the_always_reported_mark() {
 fn only_an_own_record_ends_a_split_window() {
     use crate::conn::{FetchAccount, FetchEnd};
     let ledger = Arc::new(Ledger::default());
-    ledger.register(APP, 3, 40003, 24);
+    let (head, printed) = now_head(0);
+    ledger.register_at(APP, 3, 40003, 24, printed);
     let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
     m.confirm_run(Run {
         pid: 24,
@@ -1093,18 +1079,19 @@ fn only_an_own_record_ends_a_split_window() {
     let agent = "DATABASTION_AGENT";
     let own = "24:0x7f0000000100";
     let other = "24:0x7f0000000200";
-    feed(&mut m, &cats, &attach_as(own, 3, agent), 0);
-    feed(&mut m, &cats, &attach(other, 4, APP), 1000);
+    feed_h(&head, &mut m, &cats, &attach_as(own, 3, agent), 0);
+    feed_h(&head, &mut m, &cats, &attach(other, 4, APP), 1000);
     // A cut statement of the other client opens a window.
     let cut = format!(
         "{HEAD} ({other}) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_4, APP:NONE, UTF8, TCPv4:127.0.0.1/40004)\n\t/usr/bin/app:28\n\t\t(TRA_9, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\nSELECT 1 FROM RDB$DATABASE\n\n",
         "-".repeat(79)
     );
-    feed(&mut m, &cats, &cut, 2000);
+    feed_h(&head, &mut m, &cats, &cut, 2000);
     let v = crate::sql::VERSION;
     // The agent's binding, a text with no credit: ambiguous, window stays.
     let before = m.counts.ambiguous;
-    let out = feed(
+    let out = feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(
@@ -1121,7 +1108,8 @@ fn only_an_own_record_ends_a_split_window() {
     assert!(m.counts.ambiguous > before);
     assert!(out.iter().all(|(_, e)| e.always_report()));
     let before = m.counts.ambiguous;
-    feed(
+    feed_h(
+        &head,
         &mut m,
         &cats,
         &select(other, 4, 10, APP, "CUSTOMERS", 2),
@@ -1129,11 +1117,10 @@ fn only_an_own_record_ends_a_split_window() {
     );
     assert!(m.counts.ambiguous > before, "the window is still open");
     // A credited own record ends it.
-    ledger.credit(
+    ledger.credit_at(
         APP,
         3,
         v,
-        None,
         FetchAccount {
             counted: 1,
             requested: 64,
@@ -1142,15 +1129,18 @@ fn only_an_own_record_ends_a_split_window() {
             end: FetchEnd::End,
             ..FetchAccount::default()
         },
+        printed,
     );
-    feed(
+    feed_h(
+        &head,
         &mut m,
         &cats,
         &stmt(own, 3, 6, agent, v, 1, &[("RDB$DATABASE", 1)]),
         5000,
     );
     let before = m.counts.ambiguous;
-    feed(
+    feed_h(
+        &head,
         &mut m,
         &cats,
         &select(other, 4, 11, APP, "CUSTOMERS", 2),
@@ -1349,4 +1339,106 @@ fn a_dependent_routine_in_a_group_ended_early_keeps_the_mark() {
         .collect();
     assert!(!ev.is_empty(), "{:?}", names(&out));
     assert!(ev.iter().all(|(_, e)| e.always_report()));
+}
+
+/// A header time `offset` seconds before now (the server's printed local
+/// time when the agent's clock minus it is `offset`), and the agent time
+/// it stands for, whole seconds (R42 tests: credits live 15 minutes on the
+/// agent's clock).
+fn now_head(offset: i64) -> (String, std::time::SystemTime) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let agent = i64::try_from(now).unwrap();
+    let printed = agent - offset;
+    // Civil from days (Howard Hinnant).
+    let days = printed.div_euclid(86_400);
+    let secs = printed.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let head = format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.0000",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    );
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(now);
+    (head, at)
+}
+
+#[test]
+fn now_head_round_trips() {
+    let (head, at) = now_head(3600);
+    let t = super::trace_log::LogTime {
+        year: head[0..4].parse().unwrap(),
+        month: head[5..7].parse().unwrap(),
+        day: head[8..10].parse().unwrap(),
+        hour: head[11..13].parse().unwrap(),
+        minute: head[14..16].parse().unwrap(),
+        second: head[17..19].parse().unwrap(),
+        frac: 0,
+    };
+    let agent = i64::try_from(
+        at.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    assert_eq!(agent - super::stream::naive_seconds(t), 3600);
+}
+
+/// `feed` with every header time replaced by `head` (R42 tests).
+fn feed_h(
+    head: &str,
+    m: &mut Machine,
+    cats: &[&dyn Catalog],
+    log: &str,
+    base: u64,
+) -> Vec<Emitted> {
+    feed(m, cats, &log.replace(HEAD, head), base)
+}
+
+/// R42 item 1 (TZ test): the measured offset is the agent's UTC minus the
+/// server's printed local time, so a server zone of UTC+h gives −h. Every
+/// zone in use, from UTC−12 to UTC+14 on the quarter-hour grid, is
+/// accepted within 5 s and rounded to the grid; zones outside the range,
+/// and offsets off the grid by more than 5 s, are refused.
+#[test]
+fn time_zones_on_the_grid() {
+    use super::stream::grid_offset;
+    let zone = |h: i64, m: i64| -(h * 3600 + h.signum() * m * 60);
+    for (name, z) in [
+        ("UTC", zone(0, 0)),
+        ("Europe/Paris CET", zone(1, 0)),
+        ("Europe/Paris CEST", zone(2, 0)),
+        ("Asia/Kolkata", zone(5, 30)),
+        ("Asia/Kathmandu", zone(5, 45)),
+        ("Australia/Eucla", zone(8, 45)),
+        ("Pacific/Kiritimati", zone(14, 0)),
+        ("Pacific/Marquesas", zone(-9, 30)),
+        ("Etc/GMT+12", zone(-12, 0)),
+    ] {
+        for drift in [-5, -1, 0, 3, 5] {
+            assert_eq!(grid_offset(z + drift), Some(z), "{name} {drift}");
+        }
+        assert_eq!(grid_offset(z + 6), None, "{name} off the grid");
+    }
+    assert_eq!(
+        grid_offset(zone(-13, 0)),
+        None,
+        "UTC-13 is outside the range"
+    );
+    assert_eq!(
+        grid_offset(zone(15, 0)),
+        None,
+        "UTC+15 is outside the range"
+    );
 }

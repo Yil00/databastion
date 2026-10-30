@@ -410,7 +410,12 @@ pub(crate) struct Machine {
     /// confirmed by a credited own record (review M3).
     offset: Option<i64>,
     /// An offset learned from an own attach, not confirmed yet.
-    offset_pending: Option<(i64, Key)>,
+    /// `(offset, binding, needs the probe)`: a change of more than an hour
+    /// from the confirmed offset is applied only on the probe (R42 item 3).
+    offset_pending: Option<(i64, Key, bool)>,
+    /// Read-back probe records seen per own binding (R42 item 2: a probe
+    /// that confirms must be unique on its binding).
+    probe_records: HashMap<Key, u32>,
     /// The binding whose credited record confirmed the offset, and the
     /// offset before it (restored if that binding is poisoned).
     offset_from: Option<(Key, Option<i64>)>,
@@ -483,6 +488,7 @@ impl Machine {
             last_declared: None,
             offset: None,
             offset_pending: None,
+            probe_records: HashMap::new(),
             offset_from: None,
             file: (0, 0),
             views_invalid: std::collections::HashSet::new(),
@@ -865,25 +871,37 @@ impl Machine {
         }
     }
 
-    /// A credited own record of `key` confirms the offset its attach gave.
-    /// A confirmed offset changes by at most [`OFFSET_STEP`] unless the
-    /// credited record is the read-back probe (proof 7, `by_probe`); a
-    /// larger change stays pending until the probe confirms it.
-    fn confirm_offset(&mut self, key: Key, by_probe: bool) {
-        if let Some((o, k)) = self.offset_pending
-            && k == key
-            && (by_probe || self.offset.is_none_or(|cur| (o - cur).abs() <= OFFSET_STEP))
+    /// R42 item 2: a provisional offset is confirmed only by a record
+    /// whose own measured offset (`measured`: the connector's time of the
+    /// statement against the record's printed time) is within 5 s of it:
+    /// a credited own record of the binding that learned it, or the
+    /// read-back probe (`by_probe`, on any own binding: the probe alone
+    /// confirms a change of more than an hour, item 3).
+    fn confirm_offset(&mut self, key: Key, by_probe: bool, measured: Option<i64>) {
+        if let Some((o, k, needs_probe)) = self.offset_pending
+            && measured.is_some_and(|m| (m - o).abs() <= 5)
+            && (by_probe || (k == key && !needs_probe))
         {
-            self.offset_from = Some((key, self.offset));
+            self.offset_from = Some((k, self.offset));
             self.offset = Some(o);
             self.offset_pending = None;
         }
     }
 
+    /// A record's time: the printed time with `offset`, bounded by the
+    /// observation (not later than now plus 5 s, R42 item 5).
+    fn record_time(&self, t: LogTime, offset: Option<i64>) -> SystemTime {
+        let naive = naive_seconds(t) + offset.unwrap_or(0);
+        let printed = u64::try_from(naive)
+            .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        printed.min(SystemTime::now() + crate::own::LIFETIME_SLACK)
+    }
+
     /// The offset's binding poisoned (or the pending one): reverted.
     fn check_offset_binding(&mut self) {
         let poisoned = |m: &Self, k: &Key| m.bindings.get(k).is_some_and(|b| b.poisoned);
-        if let Some((_, k)) = self.offset_pending
+        if let Some((_, k, _)) = self.offset_pending
             && poisoned(self, &k)
         {
             self.offset_pending = None;
@@ -1655,27 +1673,40 @@ impl Machine {
                     Protocol::Tcp(ip, p) if ip.is_loopback() => Some(p),
                     _ => None,
                 };
-                let label = &self.s.databases[i].attach;
-                let mine = port.is_some_and(|p| self.ledger.is_own_attach(label, id, p))
+                let label = self.s.databases[i].attach.clone();
+                // R42 item 1: this attach's measured offset, on the grid.
+                let measured = self
+                    .ledger
+                    .opened(&label, id)
+                    .and_then(|o| o.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok())
+                    .and_then(|agent| grid_offset(agent - naive_seconds(rec.header.time)));
+                // R42 item 5: the attachment's lifetime holds the record's
+                // time (this attach's offset, else the confirmed one).
+                let t = self.record_time(rec.header.time, measured.or(self.offset));
+                let mine = port.is_some_and(|p| self.ledger.is_own_attach(&label, id, p, Some(t)))
                     && att.user.eq_ignore_ascii_case(&self.s.account)
                     && att.role.is_none_or(|r| r == "NONE");
                 if mine {
                     self.watermark.entry(i).or_insert(id);
-                    // The clock offset (R40 item 2, review M3): only from
-                    // an own attach outside a window and not ambiguous,
-                    // near a whole quarter-hour offset, and provisional
-                    // until a credited own record of that binding
-                    // confirms it.
+                    // The clock offset (R40 item 2, R42): only from an own
+                    // attach outside a window and not ambiguous, rounded to
+                    // the grid, provisional until confirmed. A pending
+                    // change that needs the probe is not overwritten by a
+                    // later attach (R42 item 3).
                     if !in_window
                         && !ambiguous
-                        && let Some(opened) = self.ledger.opened(label, id)
-                        && let Ok(d) = opened.duration_since(SystemTime::UNIX_EPOCH)
+                        && let Some(o) = measured
+                        && !self.offset_pending.is_some_and(|p| p.2)
                     {
-                        let naive = naive_seconds(rec.header.time);
-                        let agent = i64::try_from(d.as_secs()).unwrap_or(0);
-                        let offset = agent - naive;
-                        if plausible_offset(offset) {
-                            self.offset_pending = Some((offset, key));
+                        let needs_probe =
+                            self.offset.is_some_and(|cur| (o - cur).abs() > OFFSET_STEP);
+                        if needs_probe {
+                            // R42 item 3: the probe re-confirms it.
+                            self.check_requested = true;
+                        }
+                        if self.offset != Some(o) {
+                            self.offset_pending = Some((o, key, needs_probe));
                         }
                     }
                 }
@@ -1713,6 +1744,7 @@ impl Machine {
     }
 
     fn end_binding(&mut self, key: Key) {
+        self.probe_records.remove(&key);
         if let Some(b) = self.remove_binding(key) {
             self.token_live.remove(&b.token);
             self.end_token(b.token);
@@ -2518,11 +2550,37 @@ impl Machine {
             .unwrap_or_default();
         let fetched = rec.trailer.fetched.unwrap_or(0);
         let failed = rec.header.outcome == Outcome::Failed;
-        // The own-statement table's row (R13, R20, R23) and the credit's
-        // R22 / R35 bounds, checked before the credit is consumed.
-        let accept = |a: &crate::conn::FetchAccount, table: Option<&str>| {
+        // R42 item 2: a second read-back probe record on a binding poisons
+        // it (the probe that confirms must be unique).
+        let probe = text == crate::sql::READ_BACK_PROBE;
+        if probe {
+            let n = self.probe_records.entry(key).or_insert(0);
+            *n += 1;
+            if *n > 1 {
+                if let Some(b) = self.bindings.get_mut(&key) {
+                    b.poisoned = true;
+                    b.own = false;
+                }
+                self.check_offset_binding();
+                return Some(false);
+            }
+        }
+        // The record's time under the binding's offset (confirmed, or the
+        // one it learned), bounded by the observation (R42 item 5).
+        let effective = match self.offset_pending {
+            Some((o, k, _)) if k == key => Some(o),
+            _ => self.offset,
+        };
+        let t = self.record_time(rec.header.time, effective);
+        let measured_base = naive_seconds(rec.header.time);
+        // The own-statement table's row (R13, R20, R23), the credit's
+        // R22 / R35 bounds and its life on both sides (R42 item 5),
+        // checked before the credit is consumed.
+        let accept = |a: &crate::conn::FetchAccount, table: Option<&str>, at: SystemTime| {
             crate::own_table::matches(text, table, &block, fetched, a)
                 && crate::own::within(a, fetched, failed)
+                && t <= at + crate::own::LIFETIME_SLACK
+                && t + crate::own::CREDIT_LIFE >= at
         };
         match self
             .ledger
@@ -2537,7 +2595,13 @@ impl Machine {
                 {
                     self.probe_seen = Some(SystemTime::now());
                 }
-                self.confirm_offset(key, text == crate::sql::READ_BACK_PROBE);
+                let measured = self
+                    .ledger
+                    .consumed_time((self.file, pos))
+                    .and_then(|c| c.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok())
+                    .map(|c| c - measured_base);
+                self.confirm_offset(key, probe, measured);
                 Some(true)
             }
             Verdict::NotOwn => {
@@ -2554,11 +2618,12 @@ impl Machine {
     }
 }
 
-/// An offset (agent UTC minus the server's printed local time) within a
-/// few seconds of a whole quarter hour, at most 14 hours (review M3):
-/// time zones are whole quarter hours; a forged attach time or a skewed
-/// clock is not taken.
-pub(crate) fn plausible_offset(offset: i64) -> bool {
+/// R42 item 1: a measured offset (agent UTC minus the server's printed
+/// local time) within 5 s of a whole quarter hour, for a UTC offset of the
+/// server's zone from −12 h to +14 h (so an offset from −14 h to +12 h),
+/// rounded to the grid; `None` otherwise (a forged attach time or a
+/// skewed clock is not taken).
+pub(crate) fn grid_offset(offset: i64) -> Option<i64> {
     const QUARTER: i64 = 15 * 60;
     let r = offset.rem_euclid(QUARTER);
     let (dist, nearest) = if r <= QUARTER / 2 {
@@ -2566,7 +2631,14 @@ pub(crate) fn plausible_offset(offset: i64) -> bool {
     } else {
         (QUARTER - r, offset - r + QUARTER)
     };
-    dist <= 5 && nearest.abs() <= 14 * 3600
+    // The zone's UTC offset is the opposite of this one.
+    let zone = -nearest;
+    (dist <= 5 && (-12 * 3600..=14 * 3600).contains(&zone)).then_some(nearest)
+}
+
+/// Whether a measured offset is accepted (R42 item 1).
+pub(crate) fn plausible_offset(offset: i64) -> bool {
+    grid_offset(offset).is_some()
 }
 
 /// Seconds since the epoch of a printed time, read as UTC.
