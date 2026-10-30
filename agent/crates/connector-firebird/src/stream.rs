@@ -387,10 +387,11 @@ impl Machine {
         self.groups.iter().map(|g| g.first).min()
     }
 
-    /// R28 item 4: a statement record that creates, alters, recreates or
-    /// drops a view, a DDL text that does not parse, or an ambiguous DDL
-    /// record invalidates the view sets (of its database; of every
-    /// declared database when ambiguous) until the next `check()`.
+    /// R28 item 4, review L5: any DDL statement record (views, and the
+    /// procedures, functions, packages and tables a view can depend on),
+    /// including one whose text does not parse, invalidates the view sets of
+    /// its database, an ambiguous DDL record those of every declared
+    /// database, until the next `check()`.
     fn note_view_ddl(&mut self, rec: &Record<'_>, decision: &Decision) {
         let Body::Statement { text, .. } = &rec.body else {
             return;
@@ -404,7 +405,7 @@ impl Machine {
                 self.views_invalid.extend(0..self.s.databases.len());
                 self.check_requested = true;
             }
-            Decision::Normal { db, .. } if !a.parses() || names_view(text) => {
+            Decision::Normal { db, .. } => {
                 self.views_invalid.insert(*db);
                 self.check_requested = true;
             }
@@ -524,6 +525,29 @@ impl Machine {
         out: &mut Vec<Emitted>,
     ) {
         self.counts.records += 1;
+        // Review L3: the whole record (parse, judgement, view sets, event)
+        // under the panic isolation; a record that panics, or whose header
+        // does not parse, is ambiguous (loud), never dropped.
+        let done = databastion_core::isolate(|| self.record(raw, pos, now, cat, out));
+        match done {
+            Some(true) => {}
+            Some(false) => self.loud(now, cat, out),
+            None => {
+                self.counts.panics += 1;
+                self.loud(now, cat, out);
+            }
+        }
+    }
+
+    /// One record; `false` when it does not parse.
+    fn record(
+        &mut self,
+        raw: &[u8],
+        pos: u64,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) -> bool {
         // R28 item 4: after a view DDL record, until the next check, every
         // view (and every name the catalog read does not know) counts as
         // dependent.
@@ -539,16 +563,13 @@ impl Machine {
         let cat = cat.as_slice();
         self.expire(now, cat, out);
         let Some(rec) = parse(raw, self.s.parse) else {
-            return;
+            return false;
         };
-        let decided = databastion_core::isolate(|| self.judge(&rec, pos, now, cat));
-        let Some(decision) = decided else {
-            self.counts.panics += 1;
-            return;
-        };
+        let decision = self.judge(&rec, pos, now, cat);
         self.check_offset_binding();
         self.note_view_ddl(&rec, &decision);
         self.apply(decision, &rec, pos, now, cat, out);
+        true
     }
 
     /// A record that could not be read (review H1): longer than the
@@ -566,6 +587,12 @@ impl Machine {
     ) {
         self.counts.records += 1;
         self.counts.oversized += 1;
+        self.loud(now, cat, out);
+    }
+
+    /// A record of which nothing is known (unreadable, unparsable, or its
+    /// rules panicked): `*`, always reported, fix 3, a window.
+    fn loud(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
         self.counts.ambiguous += 1;
         *self.why.entry(line!()).or_default() += 1;
         let wrapped: Vec<Invalidated<'_>> = cat
@@ -691,15 +718,6 @@ impl Catalog for Invalidated<'_> {
                     RelClass::View | RelClass::Unknown
                 ))
     }
-}
-
-/// Whether a DDL text names a view as its object: the word `VIEW` outside
-/// literals and quoted identifiers (more than the statement forms of R28
-/// item 4, which only invalidates more).
-fn names_view(text: &str) -> bool {
-    crate::sql::unquoted(text)
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-        .any(|w| w == "view")
 }
 
 /// The verdict on one record before its event is built.
@@ -1697,17 +1715,9 @@ impl Machine {
                 if window {
                     self.window_until = Some(now + WINDOW);
                 }
-                let mut d = match convert(rec, cat[0]) {
-                    Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
-                    Converted::Nothing => Draft::default(),
-                };
-                d.star = true;
-                d.always = true;
-                if d.action == Some(databastion_classifiers::masking::EventAction::AuthFailure) {
-                    d.action = Some(databastion_classifiers::masking::EventAction::Read);
-                }
                 // Fix 3: the preceding well-formed record's database, or
-                // every declared database.
+                // every declared database; the relations classed with that
+                // database's catalog (review L6).
                 let dbs: Vec<usize> = match self.last_declared {
                     Some(i) => vec![i],
                     None => (0..self.s.databases.len())
@@ -1715,6 +1725,16 @@ impl Machine {
                         .collect(),
                 };
                 for db in dbs {
+                    let mut d = match convert(rec, cat[db.min(cat.len() - 1)]) {
+                        Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
+                        Converted::Nothing => Draft::default(),
+                    };
+                    d.star = true;
+                    d.always = true;
+                    if d.action == Some(databastion_classifiers::masking::EventAction::AuthFailure)
+                    {
+                        d.action = Some(databastion_classifiers::masking::EventAction::Read);
+                    }
                     let ev = self.draft_event(&d, Some(rec), db);
                     self.emit(db, ev, out);
                 }

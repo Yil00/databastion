@@ -662,3 +662,103 @@ fn own_transaction_records_and_folds_keep_their_relations() {
         names(&out)
     );
 }
+
+/// Review L3: a record whose header does not parse is ambiguous (loud),
+/// never dropped silently.
+#[test]
+fn an_unparsable_record_is_loud() {
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut out = Vec::new();
+    m.push(
+        b"not a trace record\nPAYROLL 50",
+        0,
+        Instant::now(),
+        &cats,
+        &mut out,
+    );
+    assert_eq!(m.counts.ambiguous, 1);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+}
+
+/// Review L5: DDL of code a view can depend on (a procedure) invalidates
+/// the view sets as view DDL does.
+#[test]
+fn procedure_ddl_invalidates_the_view_sets() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let ddl = stmt(a, 3, 7, "APP", "ALTER PROCEDURE P1 AS BEGIN END", 0, &[]);
+    feed(&mut m, &cats, &ddl, 1000);
+    assert!(m.check_requested);
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            8,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        ),
+        2000,
+    );
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}
+
+struct LootCat;
+impl Catalog for LootCat {
+    fn class(&self, r: &str) -> RelClass {
+        if r == "RDB$LOOT" {
+            RelClass::Table
+        } else {
+            Cat.class(r)
+        }
+    }
+    fn always_view(&self, _: &str) -> bool {
+        false
+    }
+}
+
+/// Review L6: an ambiguous record attributed to a database (fix 3) is
+/// classed with that database's catalog, not the first one's.
+#[test]
+fn ambiguous_records_use_the_attributed_databases_catalog() {
+    const CRM: &str = "/var/lib/firebird/data/crm.fdb";
+    let mut s = settings(true, Series::V5);
+    s.databases.push(DeclaredNames {
+        label: "crm".to_owned(),
+        resolved: Some(CRM.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: CRM.to_owned(),
+    });
+    let mut m = Machine::new(s, Arc::new(Ledger::default()));
+    let (c0, c1) = (Cat, LootCat);
+    let cats: [&dyn Catalog; 2] = [&c0, &c1];
+    let a = "24:0x7f0000000100";
+    // A well-formed record of crm, then an ambiguous one (another token
+    // on crm's attachment) whose block names RDB$LOOT, a user table of
+    // crm only.
+    let log = format!(
+        "{}{}",
+        attach(a, 3, CRM),
+        select("24:0x7f0000000999", 3, 5, CRM, "RDB$LOOT", 2)
+    );
+    let out = feed(&mut m, &cats, &log, 0);
+    assert!(m.counts.ambiguous > 0);
+    assert!(
+        names(&out).contains(&"RDB$LOOT".to_owned()),
+        "{:?}",
+        names(&out)
+    );
+}
