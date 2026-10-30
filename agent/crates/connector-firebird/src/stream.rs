@@ -87,6 +87,13 @@ const MAX_BINDINGS_DECLARED: usize = 16_384;
 const MAX_BINDINGS_UNDECLARED: usize = 4096;
 const MAX_UNDECLARED: usize = 256;
 const MAX_SERVICES: usize = 1024;
+/// R1 rule 11: the global cap on the stream's state (bindings, seen ids,
+/// ended tokens, groups, held records).
+pub(crate) const MAX_STREAM_BYTES: usize = 16 << 20;
+/// The estimated state of one binding (its key, token, transactions).
+const BINDING_BYTES: usize = 256;
+/// Ended tokens remembered (R5 item 2), oldest dropped first.
+const MAX_TOKENS_ENDED: usize = 65_536;
 /// R25: the stream budget.
 const MAX_GROUPS: usize = 4096;
 const MAX_GROUPS_PER_BINDING: usize = 16;
@@ -143,6 +150,8 @@ enum Kind {
 
 #[derive(Debug, Clone)]
 struct Binding {
+    /// Insertion order (R1 rule 11's eviction).
+    seq: u64,
     token: (u32, u64),
     anchored: bool,
     poisoned: bool,
@@ -172,6 +181,16 @@ enum TriggerWait {
 }
 
 type Key = (DbId, u64);
+
+/// The ids seen for one database identity (R16 item 2, R30 review L7):
+/// kept up to a bound, oldest dropped first; ids at or below the floor
+/// count as seen.
+#[derive(Debug, Default)]
+struct SeenIds {
+    set: std::collections::HashSet<u64>,
+    order: VecDeque<u64>,
+    floor: Option<u64>,
+}
 
 /// A pending fold group (R4, R25 item 1): one binding and transaction,
 /// its records merged as they come (never kept): the block-ful part and
@@ -322,6 +341,8 @@ pub(crate) struct Counts {
     pub(crate) parsed_declared: u64,
     /// Records read again after a restart, and emitted again (R39 (a)).
     pub(crate) reread: u64,
+    /// Bindings evicted under R1 rule 11's global cap.
+    pub(crate) evicted: u64,
     /// Statement records of the agent's own anchored attachments whose
     /// block or count matched no credit's own-statement table row (the
     /// engine-matrix test of R20 expects none).
@@ -353,9 +374,21 @@ pub(crate) struct Machine {
     /// Tokens whose binding ended at the last record that carried them
     /// (R5 item 2: the `TRACE_FINI` after it).
     token_ended: HashMap<(u32, u64), ()>,
+    /// Their order, for the bound (stale entries skipped).
+    token_ended_order: VecDeque<(u32, u64)>,
     services: HashMap<(u32, u64), bool>,
     highest: HashMap<DbId, (u64, Instant)>,
-    seen_ids: HashMap<DbId, Vec<u64>>,
+    seen_ids: HashMap<DbId, SeenIds>,
+    /// Ids kept in `seen_ids`, every identity (the global cap).
+    seen_total: usize,
+    /// Bindings per database identity (the per-database caps).
+    binding_count: HashMap<DbId, usize>,
+    /// Evictable bindings (learned, or of an undeclared database), oldest
+    /// first, with their sequence number (R1 rule 11).
+    evictable: VecDeque<(u64, Key)>,
+    next_seq: u64,
+    /// R1 rule 11's learned floor per database identity.
+    learned_floor: HashMap<DbId, u64>,
     watermark: HashMap<usize, u64>,
     internal: HashMap<DbId, Key>,
     gc_alone_since: HashMap<DbId, Instant>,
@@ -408,9 +441,15 @@ impl Machine {
             bindings: HashMap::new(),
             token_live: HashMap::new(),
             token_ended: HashMap::new(),
+            token_ended_order: VecDeque::new(),
             services: HashMap::new(),
             highest: HashMap::new(),
             seen_ids: HashMap::new(),
+            seen_total: 0,
+            binding_count: HashMap::new(),
+            evictable: VecDeque::new(),
+            next_seq: 0,
+            learned_floor: HashMap::new(),
             watermark: HashMap::new(),
             internal: HashMap::new(),
             gc_alone_since: HashMap::new(),
@@ -477,17 +516,163 @@ impl Machine {
     }
 
     fn end_run(&mut self) {
+        // Review L-B: the run's pending groups end as R25 item 3 says (at the
+        // next record or reading-time bound), never dropped silently.
+        let groups: Vec<Group> = self.groups.drain(..).collect();
+        self.pending_end.extend(groups);
         self.bindings.clear();
         self.token_live.clear();
         self.token_ended.clear();
+        self.token_ended_order.clear();
         self.services.clear();
         self.highest.clear();
         self.seen_ids.clear();
+        self.seen_total = 0;
+        self.binding_count.clear();
+        self.evictable.clear();
+        self.learned_floor.clear();
         self.watermark.clear();
         self.internal.clear();
         self.gc_alone_since.clear();
-        self.groups.clear();
         self.failed_pids.clear();
+    }
+
+    /// The stream's state in bytes, estimated (R1 rule 11's global cap).
+    pub(crate) fn state_bytes(&self) -> usize {
+        self.bindings.len() * BINDING_BYTES
+            + self.seen_total * 16
+            + self.token_ended.len() * 48
+            + self.token_ended_order.len() * 16
+            + (self.highest.len() + self.seen_ids.len() + self.binding_count.len()) * 64
+            + self.services.len() * 48
+            + self.evictable.len() * 32
+            + self.groups.iter().map(Group::bytes).sum::<usize>()
+            + self.held_bytes
+    }
+
+    /// Whether `id` was seen for the database identity: kept, or at or
+    /// below the seen-id floor (R30 review L7).
+    fn is_seen(&self, db: DbId, id: u64) -> bool {
+        self.seen_ids
+            .get(&db)
+            .is_some_and(|s| s.set.contains(&id) || s.floor.is_some_and(|f| id <= f))
+    }
+
+    /// Room for the database identity: declared, already known, or fewer
+    /// than 256 undeclared identities known (R1 rule 11).
+    fn identity_room(&self, db: DbId) -> bool {
+        match db {
+            DbId::Declared(_) => true,
+            DbId::Undeclared(_) => {
+                self.seen_ids.contains_key(&db)
+                    || self.binding_count.contains_key(&db)
+                    || self
+                        .seen_ids
+                        .keys()
+                        .filter(|d| matches!(d, DbId::Undeclared(_)))
+                        .count()
+                        < MAX_UNDECLARED
+            }
+        }
+    }
+
+    /// Whether a new binding of `db` may be kept (R1 rule 11): its
+    /// identity has room, its database is under its cap, and the global
+    /// cap holds, after evicting the oldest evictable bindings if needed.
+    /// `false`: the binding is not kept and its record is ambiguous.
+    fn admit(&mut self, db: DbId) -> bool {
+        if !self.identity_room(db) {
+            return false;
+        }
+        let cap = match db {
+            DbId::Declared(_) => MAX_BINDINGS_DECLARED,
+            DbId::Undeclared(_) => MAX_BINDINGS_UNDECLARED,
+        };
+        if self.binding_count.get(&db).copied().unwrap_or(0) >= cap {
+            return false;
+        }
+        // The binding and what comes with it (its seen id, its token, the
+        // highest id): a margin.
+        while self.state_bytes() + BINDING_BYTES + 1024 > MAX_STREAM_BYTES {
+            if !self.evict_one() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Evicts the oldest evictable binding (learned, or of an undeclared
+    /// database; never an anchored binding of a declared database). Its
+    /// records become ambiguous (its id stays seen), its pending groups
+    /// end, and a learned eviction raises the learned floor.
+    fn evict_one(&mut self) -> bool {
+        while let Some((seq, key)) = self.evictable.pop_front() {
+            if !self.bindings.get(&key).is_some_and(|b| b.seq == seq) {
+                continue;
+            }
+            let Some(b) = self.remove_binding(key) else {
+                continue;
+            };
+            self.token_live.remove(&b.token);
+            let groups: Vec<Group> = self
+                .groups
+                .iter()
+                .filter(|g| g.key == key)
+                .cloned()
+                .collect();
+            self.groups.retain(|g| g.key != key);
+            self.pending_end.extend(groups);
+            if !b.anchored {
+                let f = self.learned_floor.entry(key.0).or_insert(0);
+                *f = (*f).max(key.1);
+            }
+            self.counts.evicted += 1;
+            return true;
+        }
+        false
+    }
+
+    fn insert_binding(&mut self, key: Key, mut b: Binding) {
+        b.seq = self.next_seq;
+        self.next_seq += 1;
+        if !b.anchored || matches!(key.0, DbId::Undeclared(_)) {
+            self.evictable.push_back((b.seq, key));
+        }
+        *self.binding_count.entry(key.0).or_insert(0) += 1;
+        if let Some(old) = self.bindings.insert(key, b) {
+            // Replaced (not expected): the count stays one.
+            let _ = old;
+            if let Some(n) = self.binding_count.get_mut(&key.0) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+
+    fn remove_binding(&mut self, key: Key) -> Option<Binding> {
+        let b = self.bindings.remove(&key)?;
+        if let Some(n) = self.binding_count.get_mut(&key.0) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.binding_count.remove(&key.0);
+            }
+        }
+        Some(b)
+    }
+
+    /// A token whose binding ended (R5 item 2), bounded, oldest first.
+    fn end_token(&mut self, token: (u32, u64)) {
+        if self.token_ended.insert(token, ()).is_none() {
+            self.token_ended_order.push_back(token);
+        }
+        // Bounded, and under the global cap (a dropped token's `TRACE_FINI`
+        // is ambiguous: fail closed).
+        while self.token_ended_order.len() > MAX_TOKENS_ENDED
+            || (self.state_bytes() > MAX_STREAM_BYTES && !self.token_ended_order.is_empty())
+        {
+            if let Some(t) = self.token_ended_order.pop_front() {
+                self.token_ended.remove(&t);
+            }
+        }
     }
 
     /// The position the persisted cursor may advance to: the first record
@@ -754,6 +939,10 @@ impl Machine {
         if self.window_until.is_some_and(|u| now >= u) {
             self.window_until = None;
         }
+        // Groups ended outside a record (a run's end, an eviction).
+        for g in std::mem::take(&mut self.pending_end) {
+            self.end_group(g, now, cat, out);
+        }
         while let Some(g) = self.groups.front() {
             let blockless = g.blockless();
             let bound = if blockless { HOLD_TIME } else { GROUP_TIME };
@@ -777,7 +966,7 @@ impl Machine {
         for d in gone {
             self.gc_alone_since.remove(&d);
             if let Some(k) = self.internal.remove(&d)
-                && let Some(b) = self.bindings.remove(&k)
+                && let Some(b) = self.remove_binding(k)
             {
                 self.token_live.remove(&b.token);
             }
@@ -943,7 +1132,7 @@ impl Machine {
                         at: line!(),
                     };
                 }
-                self.token_ended.insert(token, ());
+                self.end_token(token);
                 return Decision::Nothing;
             }
             Event::StartService | Event::QueryService => {
@@ -1046,7 +1235,7 @@ impl Machine {
                         at: line!(),
                     };
                 }
-                self.token_ended.insert(token, ());
+                self.end_token(token);
                 self.normal(db, None)
             }
             _ => self.attached_record(rec, key, token, pos, now, in_window, cat),
@@ -1086,9 +1275,8 @@ impl Machine {
             && rec.att.is_some_and(|a| a.charset == "NONE");
         match rec.header.event {
             Event::StartTransaction if shape && rec.trailer.block.is_none() => {
-                let seen = self.seen_ids.get(&db).is_some_and(|v| v.contains(&key.1))
-                    || self.bindings.contains_key(&key);
-                if seen || self.token_live.contains_key(&token) {
+                let seen = self.is_seen(db, key.1) || self.bindings.contains_key(&key);
+                if seen || self.token_live.contains_key(&token) || !self.admit(db) {
                     return Decision::Ambiguous {
                         window: false,
                         at: line!(),
@@ -1107,9 +1295,10 @@ impl Machine {
                 self.see(db, key.1);
                 self.internal.insert(db, key);
                 self.token_live.insert(token, key);
-                self.bindings.insert(
+                self.insert_binding(
                     key,
                     Binding {
+                        seq: 0,
                         token,
                         anchored: true,
                         poisoned: false,
@@ -1156,13 +1345,27 @@ impl Machine {
         }
     }
 
+    /// Marks `id` seen for the database identity, within the per-identity
+    /// bound (16 384 declared, 4 096 undeclared): past it the oldest id
+    /// goes and the seen-id floor rises to it (R30 review L7). Called only
+    /// after the caps passed.
     fn see(&mut self, db: DbId, id: u64) {
+        let cap = match db {
+            DbId::Declared(_) => MAX_BINDINGS_DECLARED,
+            DbId::Undeclared(_) => MAX_BINDINGS_UNDECLARED,
+        };
         let v = self.seen_ids.entry(db).or_default();
-        if !v.contains(&id) {
-            if v.len() >= MAX_BINDINGS_DECLARED {
-                v.remove(0);
+        if !v.set.insert(id) {
+            return;
+        }
+        v.order.push_back(id);
+        self.seen_total += 1;
+        while v.order.len() > cap {
+            if let Some(old) = v.order.pop_front() {
+                v.set.remove(&old);
+                v.floor = Some(v.floor.map_or(old, |f| f.max(old)));
+                self.seen_total -= 1;
             }
-            v.push(id);
         }
     }
 
@@ -1184,9 +1387,7 @@ impl Machine {
             };
         }
         // R1 rule 3: a duplicate poisons both.
-        if self.bindings.contains_key(&key)
-            || self.seen_ids.get(&db).is_some_and(|v| v.contains(&id))
-        {
+        if self.bindings.contains_key(&key) || self.is_seen(db, id) {
             if let Some(b) = self.bindings.get_mut(&key) {
                 b.poisoned = true;
                 b.own = false;
@@ -1212,6 +1413,7 @@ impl Machine {
             DbId::Undeclared(_) => None,
         };
         let mut ambiguous = false;
+        let mut raise = false;
         if bound.is_some_and(|b| id > b) {
             ambiguous = true;
         } else {
@@ -1221,30 +1423,18 @@ impl Machine {
                         ambiguous = true;
                     }
                 }
-                _ => {
-                    self.highest.insert(db, (id, now));
-                }
+                _ => raise = true,
             }
         }
-        let caps = match db {
-            DbId::Declared(_) => MAX_BINDINGS_DECLARED,
-            DbId::Undeclared(_) => MAX_BINDINGS_UNDECLARED,
-        };
-        let undeclared = self
-            .bindings
-            .keys()
-            .filter_map(|k| match k.0 {
-                DbId::Undeclared(h) => Some(h),
-                DbId::Declared(_) => None,
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        let count = self.bindings.keys().filter(|k| k.0 == db).count();
-        if count >= caps || (matches!(db, DbId::Undeclared(_)) && undeclared >= MAX_UNDECLARED) {
+        // R1 rule 11: caps before anything is kept (review H-A).
+        if !self.admit(db) {
             return Decision::Ambiguous {
                 window: false,
                 at: line!(),
             };
+        }
+        if raise {
+            self.highest.insert(db, (id, now));
         }
         // The agent's own attachment (decision 6, R1 rule 5).
         let own = match (db, rec.att) {
@@ -1285,9 +1475,10 @@ impl Machine {
         self.token_ended.remove(&token);
         self.token_live.insert(token, key);
         self.gc_alone_since.remove(&db);
-        self.bindings.insert(
+        self.insert_binding(
             key,
             Binding {
+                seq: 0,
                 token,
                 anchored: true,
                 poisoned: false,
@@ -1310,13 +1501,21 @@ impl Machine {
     }
 
     fn end_binding(&mut self, key: Key) {
-        if let Some(b) = self.bindings.remove(&key) {
+        if let Some(b) = self.remove_binding(key) {
             self.token_live.remove(&b.token);
-            self.token_ended.insert(b.token, ());
+            self.end_token(b.token);
             if self.internal.get(&key.0) == Some(&key) {
                 self.internal.remove(&key.0);
             }
+            // Its pending groups end, never dropped silently.
+            let groups: Vec<Group> = self
+                .groups
+                .iter()
+                .filter(|g| g.key == key)
+                .cloned()
+                .collect();
             self.groups.retain(|g| g.key != key);
+            self.pending_end.extend(groups);
             if !self.live_others(key.0, key) && self.internal.contains_key(&key.0) {
                 self.gc_alone_since.insert(key.0, Instant::now());
             }
@@ -1342,8 +1541,16 @@ impl Machine {
                 DbId::Declared(i) => self.watermark.get(&i).is_some_and(|w| id > *w),
                 DbId::Undeclared(_) => false,
             };
-            let seen = self.seen_ids.get(&db).is_some_and(|v| v.contains(&id));
-            if above_watermark || seen || self.token_live.contains_key(&token) {
+            let seen = self.is_seen(db, id);
+            let below_floor = self.learned_floor.get(&db).is_some_and(|f| id <= *f);
+            // R1 rule 11 (review H-A): the caps on the learned path too,
+            // checked before anything is kept.
+            if above_watermark
+                || seen
+                || below_floor
+                || self.token_live.contains_key(&token)
+                || !self.admit(db)
+            {
                 return Decision::Ambiguous {
                     window: false,
                     at: line!(),
@@ -1351,9 +1558,10 @@ impl Machine {
             }
             self.see(db, id);
             self.token_live.insert(token, key);
-            self.bindings.insert(
+            self.insert_binding(
                 key,
                 Binding {
+                    seq: 0,
                     token,
                     anchored: false,
                     poisoned: false,

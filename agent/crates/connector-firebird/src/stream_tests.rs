@@ -933,3 +933,46 @@ fn a_confirmed_offset_moves_by_more_than_an_hour_only_on_the_probe() {
     );
     assert_eq!(m.offset_for_tests(), Some(4 * 3600));
 }
+
+/// Review H-A, R1 rule 11: a million forged records (fresh attachment ids
+/// on a declared database, learned records with fresh ids, attaches to a
+/// thousand undeclared databases, failed attaches with fresh tokens)
+/// leave the stream's state under its 16 MiB cap; past the caps, records
+/// are ambiguous, never kept.
+#[test]
+fn a_million_forged_records_stay_under_the_cap() {
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let now = Instant::now();
+    let mut out = Vec::new();
+    let mut max = 0usize;
+    for i in 0u64..1_000_000 {
+        let token = format!("24:0x{:x}", 0x1000_0000 + i);
+        let id = 100_000 + i;
+        let rec = match i % 4 {
+            0 => format!(
+                "{HEAD} ({token}) ATTACH_DATABASE\n\t{APP} (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/41000)\n\t/usr/bin/app:28\n"
+            ),
+            1 => format!(
+                "{HEAD} ({token}) START_TRANSACTION\n\t{APP} (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/41000)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+            ),
+            2 => format!(
+                "{HEAD} ({token}) ATTACH_DATABASE\n\t/x/db{}.fdb (ATT_{id}, APP:NONE, UTF8, TCPv4:127.0.0.1/41000)\n\t/usr/bin/app:28\n",
+                i % 1000
+            ),
+            _ => format!(
+                "{HEAD} ({token}) FAILED ATTACH_DATABASE\n\t{APP} (ATT_0, APP:NONE, UTF8, TCPv4:127.0.0.1/41000)\n\t/usr/bin/app:28\n"
+            ),
+        };
+        m.push(rec.as_bytes(), i * 300, now, &cats, &mut out);
+        out.clear();
+        if i % 10_000 == 0 {
+            max = max.max(m.state_bytes());
+        }
+    }
+    max = max.max(m.state_bytes());
+    assert!(max <= super::stream::MAX_STREAM_BYTES, "{max}");
+    assert!(m.counts.ambiguous > 0);
+    assert_eq!(m.counts.panics, 0);
+}
