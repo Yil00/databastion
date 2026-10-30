@@ -44,6 +44,9 @@ tests of each connector (`src/proptests.rs`).
 | `firebird_keys` | `…::fuzz::keys` | The wire-crypt key clumplets, the plugin choice (never Arc4) and the cipher it builds |
 | `firebird_proc_net_tcp` | `…::fuzz::proc_net_tcp` | `/proc/net/tcp` tables for the peer-uid rule (decision 3, security review L1): the right row or none |
 | `firebird_catalog` | `…::fuzz::catalog` | Discovery's reads (decision 5): rows of the relation list, the column list or a sampling statement, through the catalog parsing, the conversions, the column batches and built statements, and the sampled values kept or dropped |
+| `firebird_trace_log` | `…::fuzz::trace_log` | The system audit trace log ([ADR-0060](../../docs/adr/0060-firebird-connector.md) decision 6, "Parsing a hostile text log"): lines assembled into bounded records, each parsed under the 4.0 and 5.0 name-line grammars, converted with a fixed catalog and made an event |
+| `firebird_trace_conf` | `…::fuzz::trace_conf` | The configuration files of the Audit proofs (decision 6, refinement R2): `firebird.conf`, `databases.conf` and the trace configuration, which is then evaluated against one declared database |
+| `firebird_statement` | `databastion_classifiers::query::firebird::analyze_firebird` | The Firebird mode of the statement analysis: any text lexed and analyzed; a password-bearing text keeps no name |
 
 The core and the connectors expose these entry points only with their `fuzzing` feature, which the agent binary
 never enables. This directory is its own Cargo workspace: `cargo test` and `cargo clippy` in

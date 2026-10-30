@@ -129,7 +129,10 @@ impl FirebirdAuditConfig {
         }
         let files = [&self.log, &self.trace_config, &self.firebird_conf];
         if files[0] == files[1] || files[0] == files[2] || files[1] == files[2] {
-            return Err(("audit", "log, trace_config and firebird_conf must be distinct files"));
+            return Err((
+                "audit",
+                "log, trace_config and firebird_conf must be distinct files",
+            ));
         }
         Ok(())
     }
@@ -528,7 +531,10 @@ mod tests {
                 .split(", ")
                 .filter(|kv| !kv.starts_with(&format!("{field}:")))
                 .collect();
-            let cfg = block(&format!("{{{base}, audit: {{{bad}, {}}}}}", rest.join(", ")));
+            let cfg = block(&format!(
+                "{{{base}, audit: {{{bad}, {}}}}}",
+                rest.join(", ")
+            ));
             assert_eq!(cfg.validate().unwrap_err().0, key, "{bad}");
         }
         assert!(
