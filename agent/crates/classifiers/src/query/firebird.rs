@@ -182,6 +182,9 @@ pub fn builtin_words() -> &'static [&'static str] {
     BUILTINS
 }
 
+// `ANY_VALUE` (5.0 only, not a keyword of `RDB$KEYWORDS`) is not on the
+// list: on 4.0 a user function of that name would pass as built in (the
+// drift test of 2026-10-30); a call of it is reported as unknown code.
 const BUILTINS: &[&str] = &[
     "ABS",
     "ACOS",
@@ -189,7 +192,6 @@ const BUILTINS: &[&str] = &[
     "ALL",
     "AND",
     "ANY",
-    "ANY_VALUE",
     "AS",
     "ASCII_CHAR",
     "ASCII_VAL",
@@ -1106,6 +1108,9 @@ mod tests {
     #[test]
     fn quoted_calls_are_code() {
         assert!(a("SELECT \"F\"() FROM MON$DATABASE").unknown_call);
+        // Not built in on 4.0 (the engine-matrix drift test): unknown code.
+        assert!(a("SELECT ANY_VALUE(X) FROM T GROUP BY Y").unknown_call);
+        assert!(!a("SELECT COUNT(X) FROM T").unknown_call);
         assert!(a("SELECT \"P\".\"F\"(1) FROM T").unknown_call);
         assert!(!a("INSERT INTO \"T\" (A) VALUES (1)").unknown_call);
         let r = a("SELECT COUNT(*), \"F\"(1) FROM T_EMPTY");
