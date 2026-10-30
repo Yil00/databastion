@@ -1304,6 +1304,56 @@ async fn drift_of_the_virtual_relations_and_the_built_in_words() {
             e.code
         ),
     }
+    // Re-review L-2: every word of the reserved list is reserved on this
+    // server: in `RDB$KEYWORDS` when readable (5.0), and refused as a
+    // relation name by the parser (not "table unknown") on both.
+    if let Ok(k) = s
+        .query_for_tests(
+            "SELECT CAST(RDB$KEYWORD_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$KEYWORDS \
+             WHERE RDB$KEYWORD_RESERVED",
+            &[crate::sql::Col::Octets(252)],
+            4096,
+            deadline,
+        )
+        .await
+    {
+        let reserved: std::collections::BTreeSet<String> =
+            k.rows.iter().map(|r| octets(r, 0)).collect();
+        let not: Vec<&str> = crate::idents::RESERVED
+            .iter()
+            .copied()
+            .filter(|w| !reserved.contains(*w))
+            .collect();
+        eprintln!(
+            "[measure] reserved keywords {}, listed words not reserved {not:?}",
+            reserved.len()
+        );
+        assert!(not.is_empty(), "{not:?}");
+    }
+    let mut accepted = Vec::new();
+    for w in crate::idents::RESERVED {
+        let text = format!("SELECT 1 FROM {w}");
+        match s
+            .query_for_tests(&text, &[crate::sql::Col::Int], 1, deadline)
+            .await
+        {
+            Err(e) if e.code != databastion_core::FailureCode::UnknownTarget && !e.fatal => {}
+            other => accepted.push((*w, other.map(|_| ()).map_err(|e| e.code))),
+        }
+    }
+    eprintln!(
+        "[measure] reserved words read as a relation name: {accepted:?} of {}",
+        crate::idents::RESERVED.len()
+    );
+    assert!(accepted.is_empty(), "{accepted:?}");
+    // The control: a non-reserved keyword reads as a relation name.
+    let control = s
+        .query_for_tests("SELECT 1 FROM NAME", &[crate::sql::Col::Int], 1, deadline)
+        .await;
+    assert_eq!(
+        control.map(|_| ()).map_err(|e| e.code),
+        Err(databastion_core::FailureCode::UnknownTarget)
+    );
     s.close().await;
 }
 

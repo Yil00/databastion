@@ -12,6 +12,154 @@
 /// as matching, fail closed).
 const MAX_TOKENS: usize = 65_536;
 
+/// Re-review L-2: words reserved on both Firebird 4.0 and 5.0, sorted
+/// (an unquoted one cannot name an object). Checked on the pinned servers
+/// by the engine-matrix drift test: each is reserved in `RDB$KEYWORDS`
+/// (5.0) and refused as a relation name (4.0 and 5.0). A word missing
+/// here is only matched (fail closed).
+pub(crate) const RESERVED: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "AT",
+    "AVG",
+    "BEGIN",
+    "BETWEEN",
+    "BIGINT",
+    "BLOB",
+    "BOOLEAN",
+    "BOTH",
+    "BY",
+    "CASE",
+    "CAST",
+    "CHAR",
+    "CHARACTER",
+    "CHECK",
+    "CLOSE",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "CONNECT",
+    "CONSTRAINT",
+    "COUNT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_ROLE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
+    "CURSOR",
+    "DATE",
+    "DAY",
+    "DEC",
+    "DECIMAL",
+    "DECLARE",
+    "DEFAULT",
+    "DELETE",
+    "DISTINCT",
+    "DOUBLE",
+    "DROP",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXECUTE",
+    "EXISTS",
+    "EXTERNAL",
+    "EXTRACT",
+    "FALSE",
+    "FETCH",
+    "FILTER",
+    "FLOAT",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "FUNCTION",
+    "GLOBAL",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "HOUR",
+    "IN",
+    "INDEX",
+    "INNER",
+    "INSERT",
+    "INT",
+    "INTEGER",
+    "INTO",
+    "IS",
+    "JOIN",
+    "LEADING",
+    "LEFT",
+    "LIKE",
+    "LOWER",
+    "MAX",
+    "MERGE",
+    "MIN",
+    "MINUTE",
+    "MONTH",
+    "NATURAL",
+    "NOT",
+    "NULL",
+    "NUMERIC",
+    "OF",
+    "ON",
+    "ONLY",
+    "OPEN",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "PLAN",
+    "PRIMARY",
+    "PROCEDURE",
+    "REAL",
+    "RECREATE",
+    "REFERENCES",
+    "RETURNS",
+    "REVOKE",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SECOND",
+    "SELECT",
+    "SET",
+    "SMALLINT",
+    "SOME",
+    "SUM",
+    "TABLE",
+    "THEN",
+    "TIME",
+    "TIMESTAMP",
+    "TO",
+    "TRAILING",
+    "TRIGGER",
+    "TRIM",
+    "TRUE",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "UPPER",
+    "USER",
+    "USING",
+    "VALUE",
+    "VALUES",
+    "VARCHAR",
+    "VARIABLE",
+    "VARYING",
+    "VIEW",
+    "WHEN",
+    "WHERE",
+    "WHILE",
+    "WITH",
+    "YEAR",
+];
+
 /// The identifiers of one text.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Idents {
@@ -111,7 +259,13 @@ pub(crate) fn idents(text: &str) -> Idents {
                         break;
                     }
                 }
-                tokens.push(Token::Ident(name));
+                // Re-review L-2: an unquoted reserved word is the keyword,
+                // never an object's name (a quoted `"COUNT"` is).
+                if RESERVED.binary_search(&name.as_str()).is_ok() {
+                    tokens.push(Token::Other);
+                } else {
+                    tokens.push(Token::Ident(name));
+                }
             }
             c if c.is_whitespace() => {}
             _ => tokens.push(Token::Other),
@@ -168,5 +322,19 @@ mod tests {
         assert!(!i.names.iter().any(|n| n == "P_MON"), "{:?}", i.names);
         assert!(idents("SELECT * FROM \"Tabelle_ä\"").non_ascii_quoted);
         assert!(!idents("SELECT * FROM T").non_ascii_quoted);
+    }
+
+    /// Re-review L-2: unquoted reserved words are not tokens; quoted, they
+    /// are; the list is sorted for the binary search.
+    #[test]
+    fn reserved_words_are_keywords_unless_quoted() {
+        assert!(RESERVED.windows(2).all(|w| w[0] < w[1]));
+        let n = names("SELECT COUNT(*) FROM RDB$DATABASE");
+        assert!(!n.iter().any(|n| n == "COUNT" || n == "SELECT"), "{n:?}");
+        assert!(n.iter().any(|n| n == "RDB$DATABASE"), "{n:?}");
+        let n = names("SELECT * FROM \"COUNT\"");
+        assert!(n.iter().any(|n| n == "COUNT"), "{n:?}");
+        // A non-reserved keyword can name an object unquoted.
+        assert!(names("SELECT * FROM NAME").iter().any(|n| n == "NAME"));
     }
 }

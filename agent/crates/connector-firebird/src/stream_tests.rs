@@ -1782,3 +1782,48 @@ fn an_own_read_of_a_dependent_table_is_credited() {
         names(&out)
     );
 }
+
+/// Re-review L-2: a quoted `"COUNT"` (or `"COALESCE"`) object of the
+/// dependent set is matched by a quoted token, not by the keyword; the
+/// connector's constant texts are matched at object positions only.
+#[test]
+fn reserved_words_and_constant_texts_do_not_match_the_dependent_set() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = DepCat(&["COUNT", "COALESCE"]);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let marked = |m: &mut Machine, tra: u64, text: &str, block: &[(&str, u64)]| {
+        let out = feed(
+            m,
+            &cats,
+            &stmt(a, 3, tra, "APP", text, 1, block),
+            tra * 1000,
+        );
+        out.iter().any(|(_, e)| e.always_report())
+    };
+    assert!(!marked(
+        &mut m,
+        5,
+        "SELECT COUNT(*) FROM CUSTOMERS WHERE ID > 0",
+        &[("CUSTOMERS", 1)]
+    ));
+    assert!(!marked(
+        &mut m,
+        6,
+        crate::sql::OWNED_OBJECTS,
+        &[("RDB$RELATIONS", 1)]
+    ));
+    assert!(marked(
+        &mut m,
+        7,
+        "SELECT * FROM \"COUNT\" WHERE ID > 0",
+        &[]
+    ));
+    assert!(marked(
+        &mut m,
+        8,
+        "SELECT COALESCE(ID, 0) FROM CUSTOMERS WHERE ID > 0",
+        &[("CUSTOMERS", 1)]
+    ));
+}

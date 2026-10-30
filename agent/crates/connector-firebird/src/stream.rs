@@ -985,7 +985,14 @@ impl Machine {
         }
         match &rec.body {
             Body::Statement { text, .. } => {
-                let ids = crate::idents::idents(text);
+                // Re-review L-2: the connector's own constant texts are
+                // matched at object positions only (their other tokens are
+                // its column names, aliases and built-in calls).
+                let ids = if crate::sql::checked(text) {
+                    crate::idents::Idents::default()
+                } else {
+                    crate::idents::idents(text)
+                };
                 if ids.cut
                     || ids.names.iter().any(|n| cat.dependent_token(n))
                     || ids.packaged.iter().any(|(p, _)| cat.dependent_token(p))
