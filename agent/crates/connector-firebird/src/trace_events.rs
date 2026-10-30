@@ -557,8 +557,17 @@ pub(crate) fn to_event(draft: &Draft, rec: &Record<'_>, db: &str, ts: SystemTime
         Protocol::Internal => None,
     });
     let action = draft.action.unwrap_or(EventAction::Read);
+    // Review H2 (I2): the user name of a failed or unauthorized attach (to
+    // a database or the services manager) may be a mistyped password: it
+    // is fingerprinted whatever the record became (an ambiguous record's
+    // event is a read).
+    let failed_attach = matches!(
+        rec.header.event,
+        Event::AttachDatabase | Event::AttachService
+    ) && matches!(rec.header.outcome, Outcome::Failed | Outcome::Unauthorized);
     let principal = match (action, user) {
         (EventAction::AuthFailure, Some(u)) => EventPrincipal::failed_account(u),
+        (_, Some(u)) if failed_attach => EventPrincipal::failed_account(u),
         (_, Some(u)) => EventPrincipal::account(u),
         (_, None) => EventPrincipal::unidentified(),
     }

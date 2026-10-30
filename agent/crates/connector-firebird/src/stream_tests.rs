@@ -562,3 +562,34 @@ fn plausible_offsets() {
         assert!(!super::stream::plausible_offset(o), "{o}");
     }
 }
+
+/// Review H2 (I2): an ambiguous failed attach (here of a pid other than
+/// the run's) never sends the attempted user name in clear: its principal
+/// is fingerprinted, as for a well-formed failed attach (#82 marker case).
+#[test]
+fn an_ambiguous_failed_attach_never_sends_the_user_name() {
+    const M: &str = "hunter2marker";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: None,
+    });
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    for (token, outcome) in [
+        ("99:0x7f0000000900", "FAILED"),
+        ("99:0x7f0000000901", "UNAUTHORIZED"),
+        ("24:0x7f0000000902", "FAILED"),
+    ] {
+        let rec = format!(
+            "{HEAD} ({token}) {outcome} ATTACH_DATABASE\n\t{APP} (ATT_0, {M}:NONE, UTF8, TCPv4:127.0.0.1/45555)\n\t/usr/bin/app:28\n\n"
+        );
+        let out = feed(&mut m, &cats, &rec, 0);
+        assert!(!out.is_empty(), "{token}");
+        for (_, e) in &out {
+            assert!(!e.principal().send_name(), "{token}");
+            assert!(!format!("{e:?}").contains(M), "{token}: {e:?}");
+        }
+    }
+    assert!(m.counts.ambiguous >= 2);
+}
