@@ -752,7 +752,7 @@ mod tests {
         dir
     }
 
-    /// R39 (a), review M1 (1): the record in progress when the agent stops
+    /// R39 (a) test 1, review M1 (1): the record in progress when the agent stops
     /// (the cursor saved before it) is read again after the restart and
     /// its event sent; before, it lay inside the re-read region and was
     /// dropped as a replay: one lost read per restart.
@@ -800,64 +800,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// R39 (a), review M1 (2): a restart while a block-less nested record
-    /// pends (a fold group holds the cursor back), with another binding's
-    /// read held behind it and an ambiguous record in the re-read region:
-    /// the held read and the ambiguous record are sent after the restart,
-    /// none is suppressed.
-    #[test]
-    fn a_restart_during_a_hold_sends_the_held_and_ambiguous_records() {
-        use crate::stream_tests::{APP, HEAD, attach, select};
-        let dir = temp("hold");
-        let log = dir.join("audit.log");
+    /// `a`'s transaction 5 starts, then a procedure record of it pends
+    /// (block-less, or with a block naming `SECRETS`).
+    fn pending_routine(block: bool) -> String {
+        use crate::stream_tests::{APP, HEAD};
         let a = "24:0x7f0000000100";
-        let b = "24:0x7f0000000200";
-        // A block-less routine record of `a`'s transaction 5, pending.
-        let start = format!(
-            "{HEAD} ({a}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n"
+        let ctx = format!(
+            "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
         );
-        let routine = format!(
-            "{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nProcedure P1:\n      0 ms, 3 fetch(es)\n\n"
-        );
-        // An ambiguous record: another pid.
-        let other_pid = select("99:0x7f0000000900", 9, 9, APP, "LEDGER", 1);
+        let blk = if block {
+            format!(
+                "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n",
+                "Table",
+                "*".repeat(115),
+                "SECRETS",
+                5,
+                ""
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "{HEAD} ({a}) START_TRANSACTION\n{ctx}\n{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n{blk}\n"
+        )
+    }
+
+    /// Writes `records` after a first start on an empty log, reads them
+    /// in one session, then restarts on the unchanged log: both sessions'
+    /// events.
+    fn restart_over(
+        name: &str,
+        records: &str,
+    ) -> (
+        Vec<crate::stream::Emitted>,
+        Vec<crate::stream::Emitted>,
+        u64,
+    ) {
+        let dir = temp(name);
+        let log = dir.join("audit.log");
         // A first start reads from the end: the stream starts on an
         // empty log.
         std::fs::write(&log, b"").unwrap();
         let _ = session(&log, &dir);
-        append(
-            &log,
+        append(&log, records);
+        let (first, _) = session(&log, &dir);
+        let (second, reread) = session(&log, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        (first, second, reread)
+    }
+
+    /// R39 (a) test 2 (review M1 (2)): a restart during a block-less hold,
+    /// with another binding's read held behind it: the held read is sent
+    /// after the restart.
+    #[test]
+    fn a_restart_during_a_block_less_hold_sends_the_held_records() {
+        use crate::stream_tests::{APP, attach, select};
+        let b = "24:0x7f0000000200";
+        let (first, second, reread) = restart_over(
+            "hold",
             &format!(
-                "{}{}{}{}{}{}{}",
-                attach(a, 3, APP),
+                "{}{}{}{}{}",
+                attach("24:0x7f0000000100", 3, APP),
                 attach(b, 4, APP),
-                start,
-                routine,
+                pending_routine(false),
                 select(b, 4, 7, APP, "PAYROLL", 3),
-                other_pid,
                 attach("24:0x7f0000000300", 5, APP),
             ),
         );
-        let (first, _) = session(&log, &dir);
-        // Held behind the pending block-less record: not sent yet.
-        assert!(
-            !objects(&first).contains(&"PAYROLL".to_owned()),
-            "{:?}",
-            objects(&first)
-        );
-        // The agent stops and starts again; nothing more was written.
-        let (second, reread) = session(&log, &dir);
+        assert!(!objects(&first).contains(&"PAYROLL".to_owned()), "held");
         assert!(reread > 0);
-        let o = objects(&second);
-        assert!(o.contains(&"PAYROLL".to_owned()), "{o:?}");
-        assert!(o.contains(&"LEDGER".to_owned()), "{o:?}");
         assert!(
-            second
-                .iter()
-                .filter(|(_, e)| e.objects().iter().any(|x| x.object().as_str() == "LEDGER"))
-                .all(|(_, e)| e.always_report())
+            objects(&second).contains(&"PAYROLL".to_owned()),
+            "{:?}",
+            objects(&second)
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R39 (a) test 3: a restart with a pending fold group (block-ful)
+    /// inside the re-read region: its relations are sent after the
+    /// restart.
+    #[test]
+    fn a_restart_with_a_pending_group_sends_its_relations() {
+        use crate::stream_tests::{APP, attach};
+        let (first, second, reread) = restart_over(
+            "group",
+            &format!(
+                "{}{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                pending_routine(true),
+                attach("24:0x7f0000000300", 5, APP),
+            ),
+        );
+        assert!(!objects(&first).contains(&"SECRETS".to_owned()), "pending");
+        assert!(reread > 0);
+        assert!(
+            objects(&second).contains(&"SECRETS".to_owned()),
+            "{:?}",
+            objects(&second)
+        );
+    }
+
+    /// R39 (a) test 4: a restart with an ambiguous record (another pid)
+    /// inside the re-read region (held back by a pending group before it):
+    /// it is sent again after the restart, `*` and always reported.
+    #[test]
+    fn a_restart_with_an_ambiguous_record_sends_it_again() {
+        use crate::stream_tests::{APP, attach, select};
+        let (_, second, reread) = restart_over(
+            "ambiguous",
+            &format!(
+                "{}{}{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                pending_routine(true),
+                select("99:0x7f0000000900", 9, 9, APP, "LEDGER", 1),
+                attach("24:0x7f0000000300", 5, APP),
+            ),
+        );
+        assert!(reread > 0);
+        let ledger: Vec<_> = second
+            .iter()
+            .filter(|(_, e)| e.objects().iter().any(|x| x.object().as_str() == "LEDGER"))
+            .collect();
+        assert!(!ledger.is_empty(), "{:?}", objects(&second));
+        assert!(ledger.iter().all(|(_, e)| e.always_report()));
+        assert!(objects(&second).contains(&"*".to_owned()));
     }
 
     /// The runner over a real file: records assembled from the tailer's
