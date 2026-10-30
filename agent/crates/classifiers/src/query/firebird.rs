@@ -92,6 +92,9 @@ impl FirebirdKind {
 pub struct FirebirdAnalysis {
     /// The statement kind.
     pub kind: FirebirdKind,
+    /// `?` placeholders outside literals and comments (the parameter
+    /// lines a trace record may carry).
+    pub placeholders: usize,
     /// The text ends inside a comment, a string literal or a quoted
     /// identifier (or is above [`MAX_QUERY_BYTES`] or the token bound).
     pub unterminated: bool,
@@ -105,6 +108,9 @@ pub struct FirebirdAnalysis {
     pub relations: Vec<String>,
     /// Procedures called (`EXECUTE PROCEDURE p`, `FROM p(…)`).
     pub procedures: Vec<String>,
+    /// More names than the bound were found: the lists are not complete
+    /// (review of part 1, L5), and the text does not parse.
+    pub names_truncated: bool,
     /// Kind only (the #82 rule).
     pub credential: bool,
     /// `signature.backup_database` (R27, R36).
@@ -135,7 +141,7 @@ impl FirebirdAnalysis {
     /// dialect readings give the same relation set.
     #[must_use]
     pub fn parses(&self) -> bool {
-        !self.unterminated && !self.dialects_differ
+        !self.unterminated && !self.dialects_differ && !self.names_truncated
     }
 
     /// The text calls code (R8 case (c)): `EXECUTE BLOCK`, a PSQL body, a
@@ -158,8 +164,8 @@ enum Tok {
     /// An integer literal: its value only for the row-limit rule, never
     /// kept in the analysis (`None` past `u64`).
     Number(Option<u64>),
-    /// A parameter (`?`, `:name`).
-    Param,
+    /// A parameter: `?` (true) or a named one, `:name` (false).
+    Param(bool),
     Punct(char),
 }
 
@@ -468,7 +474,7 @@ fn lex(text: &str) -> (Vec<Tok>, bool) {
                 out.push(Tok::Literal);
             }
             b'?' => {
-                out.push(Tok::Param);
+                out.push(Tok::Param(true));
                 i += 1;
             }
             b':' if b
@@ -490,7 +496,7 @@ fn lex(text: &str) -> (Vec<Tok>, bool) {
                         i += 1;
                     }
                 }
-                out.push(Tok::Param);
+                out.push(Tok::Param(false));
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let s = i;
@@ -583,6 +589,10 @@ pub fn analyze_firebird(text: &str) -> FirebirdAnalysis {
     }
     let (toks, unterminated) = lex(text);
     a.unterminated = unterminated;
+    a.placeholders = toks
+        .iter()
+        .filter(|t| matches!(t, Tok::Param(true)))
+        .count();
     a.kind = kind(&toks);
     // The #82 rule: kind only.
     let password = toks
@@ -607,15 +617,24 @@ pub fn analyze_firebird(text: &str) -> FirebirdAnalysis {
         [Tok::Word(c), ..] => c == "CONNECT",
         _ => false,
     };
-    if password || identity {
-        a.credential = true;
+    // Flags, shape and kind are computed on the token stream for every
+    // text (review of part 1, M3): a `PASSWORD` word keeps the statement's
+    // kind (Dcl only for the identity statements of the #82 rule) and its
+    // flags (`EXECUTE STATEMENT … ON EXTERNAL … PASSWORD` is remote data
+    // access), and only its names are not kept. Literal contents are
+    // never in the tokens.
+    a.credential = password || identity;
+    if identity {
         a.kind = FirebirdKind::Dcl;
-        return a;
     }
     flags(&toks, &mut a);
     if !a.psql {
         names(&toks, &mut a);
         shape(&toks, &mut a);
+    }
+    if a.credential {
+        a.relations.clear();
+        a.procedures.clear();
     }
     a
 }
@@ -744,9 +763,15 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
         }
     }
     let ddl = a.kind == FirebirdKind::Ddl || a.kind == FirebirdKind::Dcl;
-    let push = |v: &mut Vec<String>, n: String| {
-        if v.len() < MAX_NAMES && !v.contains(&n) {
+    let mut truncated = false;
+    let mut push = |v: &mut Vec<String>, n: String| {
+        if v.contains(&n) {
+            return;
+        }
+        if v.len() < MAX_NAMES {
             v.push(n);
+        } else {
+            truncated = true;
         }
     };
     // The word that opened each enclosing parenthesis: `FROM` inside
@@ -791,6 +816,15 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
             if matches!(toks.get(i.wrapping_sub(1)), Some(Tok::Punct('.'))) {
                 a.unknown_call = true;
             }
+        }
+        // A quoted name followed by `(` (`"F"()`, `"P"."F"()`) is a call
+        // of code outside the built-in list (review of part 1, M2), unless
+        // it stands where a relation name does (`INSERT INTO "T" (…)`).
+        if let (Tok::Quoted(_), Some(Tok::Punct('('))) = (t, toks.get(i + 1))
+            && !(i > 0 && is_name_position(toks, i))
+            && !ddl
+        {
+            a.unknown_call = true;
         }
         if !introduces || ddl {
             i += 1;
@@ -843,6 +877,7 @@ fn names(toks: &[Tok], a: &mut FirebirdAnalysis) {
         }
         i += 1;
     }
+    a.names_truncated |= truncated;
 }
 
 /// The word at `i` is in a position where a name, not a call, stands:
@@ -965,7 +1000,9 @@ fn shape(toks: &[Tok], a: &mut FirebirdAnalysis) {
                 }
             }
             Tok::Literal | Tok::Number(_) | Tok::Punct(',' | '*' | '+' | '-' | '/') if d == 0 => {}
-            Tok::Quoted(_) if d == 0 => {}
+            // A quoted name is a column or a call, not a constant
+            // (review of part 1, M2).
+            Tok::Quoted(_) if d == 0 => only_aggregates_and_constants = false,
             _ if d > 0 => {}
             _ => only_aggregates_and_constants = false,
         }
@@ -1038,13 +1075,42 @@ mod tests {
             "CREATE DATABASE '/x.fdb' USER 'a' PASSWORD 'b'",
             "CONNECT '/x.fdb' USER 'a' PASSWORD 'b'",
             "CREATE MAPPING M USING PLUGIN SRP FROM USER A TO USER B",
-            "EXECUTE BLOCK AS DECLARE X INT; BEGIN EXECUTE STATEMENT 'select 1 from t' ON EXTERNAL 'h:/d' AS USER 'u' PASSWORD 'marker' INTO :X; END",
         ] {
             let r = a(t);
             assert!(r.credential, "{t}");
             assert_eq!(r.kind, FirebirdKind::Dcl, "{t}");
             assert!(r.relations.is_empty() && r.procedures.is_empty(), "{t}");
         }
+        // Review of part 1, M3: a PASSWORD word elsewhere keeps the kind
+        // and the flags; only the names go.
+        let r = a(
+            "EXECUTE BLOCK AS DECLARE X INT; BEGIN EXECUTE STATEMENT 'select 1 from t' ON EXTERNAL 'h:/d' AS USER 'u' PASSWORD 'marker' INTO :X; END",
+        );
+        assert!(r.credential && r.remote_access && r.psql);
+        assert_eq!(r.kind, FirebirdKind::ExecuteBlock);
+        let r = a("SELECT C.*, 1 AS PASSWORD FROM SECRET C");
+        assert!(r.credential && r.unrestricted_select && r.relations.is_empty());
+        assert_eq!(r.kind, FirebirdKind::Select);
+    }
+
+    /// Review of part 1, M2: quoted calls are code.
+    #[test]
+    fn quoted_calls_are_code() {
+        assert!(a("SELECT \"F\"() FROM MON$DATABASE").unknown_call);
+        assert!(a("SELECT \"P\".\"F\"(1) FROM T").unknown_call);
+        assert!(!a("INSERT INTO \"T\" (A) VALUES (1)").unknown_call);
+        let r = a("SELECT COUNT(*), \"F\"(1) FROM T_EMPTY");
+        assert!(r.unknown_call && !r.aggregate_only);
+        assert!(!a("SELECT COUNT(*), \"X\" FROM T").aggregate_only);
+    }
+
+    #[test]
+    fn placeholders_outside_literals() {
+        assert_eq!(
+            a("SELECT * FROM T WHERE A = ? AND B = '?' /* ? */").placeholders,
+            1
+        );
+        assert_eq!(a("SELECT 1 FROM T").placeholders, 0);
     }
 
     /// R36: the four server-side copy forms, with or without comments and
