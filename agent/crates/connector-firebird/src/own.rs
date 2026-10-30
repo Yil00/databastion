@@ -166,6 +166,87 @@ impl Ledger {
         }
     }
 
+    /// Test support (the engine-matrix own-statement test, R20): the
+    /// attachments and the credits, one per line (texts last; the closed
+    /// set's texts and built texts hold no tab or line break).
+    #[cfg(test)]
+    pub(crate) fn dump(&self) -> String {
+        let s = self.state();
+        let mut out = String::new();
+        for a in &s.attachments {
+            out.push_str(&format!(
+                "A\t{}\t{}\t{}\t{}\n",
+                a.attach, a.id, a.port, a.pid
+            ));
+        }
+        for c in s.credits.iter().chain(s.consumed.iter().map(|(_, c)| c)) {
+            let a = &c.account;
+            out.push_str(&format!(
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\n",
+                c.attach,
+                c.id,
+                c.table.as_deref().unwrap_or("-"),
+                a.counted,
+                a.requested,
+                a.last,
+                a.largest,
+                a.end,
+                c.text
+            ));
+        }
+        out
+    }
+
+    /// Test support: a ledger from [`Self::dump`].
+    #[cfg(test)]
+    pub(crate) fn load(dump: &str) -> Self {
+        let l = Self::default();
+        for line in dump.lines() {
+            let f: Vec<&str> = line.splitn(10, '\t').collect();
+            match f.first() {
+                Some(&"A") => l.register(
+                    f[1],
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                ),
+                Some(&"C") => {
+                    let end = match f[8] {
+                        "End" => FetchEnd::End,
+                        "Early" => FetchEnd::Early,
+                        "Lost" => FetchEnd::Lost,
+                        "Failed" => FetchEnd::Failed,
+                        "Cancelled" => FetchEnd::Cancelled,
+                        "NotRun" => FetchEnd::NotRun,
+                        _ => FetchEnd::Error,
+                    };
+                    let account = FetchAccount {
+                        counted: f[4].parse().unwrap(),
+                        requested: f[5].parse().unwrap(),
+                        last: f[6].parse().unwrap(),
+                        largest: f[7].parse().unwrap(),
+                        end,
+                        ..FetchAccount::default()
+                    };
+                    let table = (f[3] != "-").then_some(f[3]);
+                    l.credit(f[1], f[2].parse().unwrap(), f[9], table, account);
+                }
+                _ => {}
+            }
+        }
+        l
+    }
+
+    /// Test support: the credits not consumed, `(text, end)`.
+    #[cfg(test)]
+    pub(crate) fn credits_left(&self) -> Vec<(String, FetchEnd)> {
+        self.state()
+            .credits
+            .iter()
+            .map(|c| (c.text.clone(), c.account.end))
+            .collect()
+    }
+
     /// The session ended: cleanly (`lost` false) or not, after its
     /// statement timeout.
     pub(crate) fn close(&self, attach: &str, id: u64, lost: bool, statement_timeout: Duration) {

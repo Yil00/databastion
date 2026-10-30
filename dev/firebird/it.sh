@@ -286,19 +286,60 @@ COMMIT;
 SQL
 } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
   >/dev/null
+# The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
+# `EXECUTE STATEMENT`'s inner text, a client process name, and a database-trigger record's process
+# name (an `ON CONNECT` trigger on crm.fdb while the renamed client attaches). A BLR literal
+# (`print_blr` is off in the proved trace configuration) and a parameter (isql sends none) are
+# parser fixtures (`trace_events_tests::markers_never_reach_an_event`).
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TERM ^ ;
+CREATE FUNCTION F_IT_MARKER RETURNS VARCHAR(20) AS BEGIN RETURN 'it-marker-ret-7'; END^
+EXECUTE BLOCK AS DECLARE X VARCHAR(20); BEGIN EXECUTE STATEMENT 'SELECT ''it-marker-es-7'' FROM RDB$DATABASE' INTO X; END^
+SET TERM ; ^
+COMMIT;
+SELECT F_IT_MARKER() FROM RDB$DATABASE;
+DROP FUNCTION F_IT_MARKER;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TERM ^ ;
+CREATE TRIGGER T_IT_CONNECT ON CONNECT AS BEGIN END^
+SET TERM ; ^
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" \
+  >/dev/null
+timeout 60 docker exec --user 84:84 "$NAME" sh -c \
+  'mkdir -p /tmp/it-marker-proc-7 && cp /opt/firebird/bin/isql /tmp/it-marker-proc-7/isql'
+{
+  cat "$WORK/root.pw"
+  # shellcheck disable=SC2016 # A Firebird name, not a shell expansion.
+  echo 'SELECT COUNT(*) FROM RDB$DATABASE;'
+} | as_sysdba env LD_LIBRARY_PATH=/opt/firebird/lib FIREBIRD=/opt/firebird \
+  /tmp/it-marker-proc-7/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" >/dev/null
+{
+  cat "$WORK/root.pw"
+  printf 'DROP TRIGGER T_IT_CONNECT;\nCOMMIT;\n'
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/crm.fdb" \
+  >/dev/null
+timeout 60 docker exec "$NAME" rm -rf /tmp/it-marker-proc-7
 as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
   /var/lib/firebird/data/app.fdb /tmp/it-app.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
 timeout 60 docker exec "$NAME" rm -f /tmp/it-app.fbk
-sleep 3
-# The log is the server's (0600, uid 84): read through the container, written here by the caller.
-timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
-[ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
 
-# 4. The tests, in the namespace, as the calling user.
-echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
+# The tests run in the network namespace, as the calling user.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
-timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
-  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 \
+run_tests() { # filter, then extra NAME=value settings
+  local filter="$1"
+  shift
+  timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid "$(id -g)" -- \
+  env -i PATH=/usr/bin:/bin RUST_BACKTRACE=1 DATABASTION_IT_FIREBIRD=1 "$@" \
   FIREBIRD_PORT="$PORT" FIREBIRD_IT_PEER_UID=84 FIREBIRD_IT_MAJOR="$MAJOR" \
   FIREBIRD_IT_ATTACH=/var/lib/firebird/data/app.fdb \
   FIREBIRD_IT_CRM_ATTACH=/var/lib/firebird/data/crm.fdb \
@@ -311,5 +352,44 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
   FIREBIRD_IT_SECDB_RELATIONS_FILE="$WORK/secdb.txt" \
   FIREBIRD_IT_FIREBIRD_CONF="$WORK/firebird.conf" FIREBIRD_IT_DATABASES_CONF="$WORK/databases.conf" \
-  FIREBIRD_IT_TRACE_CONF="$WORK/fbtrace.conf" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
-  "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture
+  FIREBIRD_IT_TRACE_CONF="$WORK/fbtrace.conf" \
+  "$EXE" "$filter" --nocapture
+}
+# The own-statement matrix test of R20, phase 1: the agent's own reads while the trace runs, its
+# ledger (attachment ids, ports, statement texts and counts; no value) written for phase 2.
+run_tests it::own_reads_for_the_matrix FIREBIRD_IT_MATRIX_OUT="$WORK/matrix.txt" >&2
+[ -s "$WORK/matrix.txt" ] || { echo "[it] the matrix ledger was not written" >&2; exit 1; }
+sleep 3
+# The log is the server's (0600, uid 84): read through the container, written here by the caller.
+timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
+[ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
+
+# Security review N5 of 2026-10-30: what the server applies for each boolean spelling, from a user
+# trace session (`log_connections = <spelling>`) around one attachment: `true` (traced), `false`
+# (not traced) or `refused` (the session does not start). After the log is copied.
+# shellcheck disable=SC2016 # The script's variables are the inner shell's.
+for spelling in true false TRUE False yes no on off 1 0 Yes ON enabled 2 '"true"' "'true'"; do
+  verdict="$({
+    cat "$WORK/root.pw"
+  } | timeout 60 docker exec -i --user 84:84 "$NAME" bash -c '
+    IFS= read -r ISC_PASSWORD; export ISC_PASSWORD
+    printf "database\n{\n\tenabled = true\n\tlog_connections = %s\n}\n" "$1" > /tmp/it-bool.conf
+    timeout 8 /opt/firebird/bin/fbtracemgr -se "127.0.0.1/$2:service_mgr" -user SYSDBA -start \
+      -name it-bool -config /tmp/it-bool.conf > /tmp/it-bool.out 2>&1 &
+    sleep 2
+    echo "SELECT 1 FROM RDB\$DATABASE;" | /opt/firebird/bin/isql -q -user SYSDBA \
+      "127.0.0.1/$2:/var/lib/firebird/data/crm.fdb" > /dev/null 2>&1
+    sleep 2
+    wait
+    if grep -q ATTACH_DATABASE /tmp/it-bool.out; then echo true
+    elif grep -qiE "error|wrong|invalid|unknown" /tmp/it-bool.out; then echo refused
+    else echo false; fi
+    rm -f /tmp/it-bool.conf /tmp/it-bool.out' bash "$spelling" "$PORT")"
+  echo "$spelling $verdict" >> "$WORK/booleans.txt"
+done
+cat "$WORK/booleans.txt" | sed 's/^/[measure] trace boolean (server) /' >&2
+
+# 4. The tests.
+echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
+run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
+  FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"

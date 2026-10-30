@@ -24,8 +24,16 @@ const ROOT: &str = "/opt/firebird";
 const APP: &str = "/var/lib/firebird/data/app.fdb";
 const CRM: &str = "/var/lib/firebird/data/crm.fdb";
 const LOG: &str = "/var/lib/firebird/audit/audit.log";
-/// The workload's markers (fake values, `dev/firebird/it.sh`).
-const MARKERS: [&str; 2] = ["it-marker-lit-7", "it-marker-pw-7"];
+/// The workload's markers (fake values, `dev/firebird/it.sh`): a statement
+/// literal, a password, a routine's returned value, `EXECUTE STATEMENT`'s
+/// inner text, a client process name (also on a database-trigger record).
+const MARKERS: [&str; 5] = [
+    "it-marker-lit-7",
+    "it-marker-pw-7",
+    "it-marker-ret-7",
+    "it-marker-es-7",
+    "it-marker-proc-7",
+];
 
 fn file(var: &str) -> Option<Vec<u8>> {
     if !super::enabled() {
@@ -236,4 +244,163 @@ fn the_server_trace_log_through_the_stream() {
     assert_eq!(m.counts.panics, 0);
     assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);
     assert!(!out.is_empty());
+    // #82: no marker of the workload reaches an event through the stream.
+    for (_, ev) in &out {
+        let all = format!("{ev:?}");
+        for mk in MARKERS {
+            assert!(!all.contains(mk), "a marker reached an event: {all}");
+        }
+    }
+    // The markers are in the log (the cases were written).
+    let text = String::from_utf8_lossy(&log);
+    for mk in MARKERS {
+        // The server may mask a password; the other cases must be there.
+        if mk == "it-marker-pw-7" {
+            eprintln!(
+                "[measure] password marker in the trace: {}",
+                text.contains(mk)
+            );
+            continue;
+        }
+        assert!(text.contains(mk), "{mk} not in the server's log");
+    }
+}
+
+/// The engine-matrix own-statement test of R20, phase 2: the server's log
+/// (written while phase 1, `it::own_reads_for_the_matrix`, ran the agent's
+/// `check()`, a Discovery scan, the view-dependency read and the read-back
+/// probe) through the stream with phase 1's ledger. Every statement
+/// record of the agent's own attachments matches its text's row of the
+/// own-statement table and its credit (none rejected, none without a
+/// credit), the read-back probe is found (proof 7), and every credit of a
+/// statement that ran is consumed.
+#[test]
+fn the_agent_records_match_the_own_statement_table() {
+    let (Some(log), Some(dump)) = (
+        file("FIREBIRD_IT_AUDIT_LOG"),
+        file("FIREBIRD_IT_MATRIX_FILE"),
+    ) else {
+        return;
+    };
+    let ledger = std::sync::Arc::new(crate::own::Ledger::load(
+        std::str::from_utf8(&dump).unwrap(),
+    ));
+    let names = |label: &str, path: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+    };
+    let settings = crate::stream::Settings {
+        databases: vec![names("app", APP), names("crm", CRM)],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m = crate::stream::Machine::new(settings, std::sync::Arc::clone(&ledger));
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let mut out = Vec::new();
+    let now = std::time::Instant::now();
+    let mut pos = 0u64;
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        m.push(raw, pos, now, &cats, &mut out);
+        pos += raw.len() as u64 + 1;
+    }
+    eprintln!(
+        "[it] own records {} not matched {} why {:?}",
+        m.counts.own, m.counts.own_not_matched, m.why
+    );
+    assert!(m.counts.own > 50, "{:?}", m.counts);
+    assert_eq!(m.counts.own_not_matched, 0, "{:?}", m.counts);
+    assert!(m.probe_seen.is_some(), "the read-back probe (proof 7)");
+    // Credits left only for executions the server did not finish.
+    let left: Vec<_> = ledger
+        .credits_left()
+        .into_iter()
+        .filter(|(_, end)| !matches!(end, crate::conn::FetchEnd::Error))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// Security review N5 of 2026-10-30: each boolean spelling the agent's
+/// trace-configuration parser accepts means what the server applies
+/// (`dev/firebird/it.sh` starts a user trace session with
+/// `log_connections = <spelling>` and records whether an attachment was
+/// traced, not traced, or the configuration refused). A spelling the agent
+/// accepts as true is applied as true, as false as false; a spelling the
+/// server refuses is refused by the agent.
+#[test]
+fn boolean_spellings_mean_what_the_server_applies() {
+    let Some(results) = file("FIREBIRD_IT_BOOLEANS_FILE") else {
+        return;
+    };
+    let results = String::from_utf8(results).unwrap();
+    let mut n = 0;
+    for line in results.lines() {
+        let Some((spelling, server)) = line.split_once(' ') else {
+            continue;
+        };
+        let conf = format!("database\n{{\n\tenabled = true\n\tlog_connections = {spelling}\n}}\n");
+        let agent = parse_trace_conf(conf.as_bytes()).ok().and_then(|t| {
+            t.sections.first().and_then(|s| {
+                s.settings
+                    .0
+                    .iter()
+                    .find(|(k, _)| *k == "log_connections")
+                    .map(|(_, v)| v.clone())
+            })
+        });
+        match agent {
+            Some(crate::trace_conf::Value::Bool(true)) => assert_eq!(server, "true", "{spelling}"),
+            Some(crate::trace_conf::Value::Bool(false)) => {
+                assert_eq!(server, "false", "{spelling}")
+            }
+            _ => {}
+        }
+        if server == "refused" {
+            assert!(
+                agent.is_none(),
+                "{spelling}: refused by the server, accepted by the agent"
+            );
+        }
+        eprintln!("[measure] trace boolean {spelling:?}: server {server}, agent {agent:?}");
+        n += 1;
+    }
+    assert!(n >= 8, "{n} spellings");
+}
+
+/// Drift test per series (item 5): every performance line the server
+/// wrote (an indented `<n> ms` line) parses under the series' grammar.
+#[test]
+fn every_performance_line_of_the_server_parses() {
+    let Some(log) = file("FIREBIRD_IT_AUDIT_LOG") else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&log);
+    let mut n = 0;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if line.starts_with(' ')
+            && t.split_once(" ms")
+                .is_some_and(|(d, _)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        {
+            assert!(crate::trace_log::perf_line(line).is_some(), "{line:?}");
+            n += 1;
+        }
+    }
+    eprintln!("[measure] performance lines {n}");
+    assert!(n > 20, "{n}");
 }

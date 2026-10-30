@@ -173,6 +173,15 @@ enum Tok {
 /// keywords that take parentheses), checked per image by the engine-matrix
 /// drift test (decision 9). Anything else followed by `(` is a call of
 /// code the trace does not show.
+/// The built-in word list, for the connector's engine-matrix drift test
+/// (decision 9): every word must be a keyword of the server's
+/// `RDB$KEYWORDS`.
+#[doc(hidden)]
+#[must_use]
+pub fn builtin_words() -> &'static [&'static str] {
+    BUILTINS
+}
+
 const BUILTINS: &[&str] = &[
     "ABS",
     "ACOS",

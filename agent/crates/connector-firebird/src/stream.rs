@@ -216,6 +216,10 @@ pub(crate) struct Counts {
     pub(crate) parsed_declared: u64,
     /// Records read again after a restart, and emitted again (R39 (a)).
     pub(crate) reread: u64,
+    /// Statement records of the agent's own anchored attachments whose
+    /// block or count matched no credit's own-statement table row (the
+    /// engine-matrix test of R20 expects none).
+    pub(crate) own_not_matched: u64,
 }
 
 /// The stream's settings.
@@ -1815,7 +1819,10 @@ impl Machine {
                 self.confirm_offset(key);
                 Some(true)
             }
-            Verdict::NotOwn => Some(false),
+            Verdict::NotOwn => {
+                self.counts.own_not_matched += 1;
+                Some(false)
+            }
             // A text of the set with no credit left: loud (R8 item 4).
             Verdict::NoCredit => {
                 self.counts.ambiguous += 1;
