@@ -677,26 +677,23 @@ impl Runner {
             }
             if header(line).is_some() {
                 // The record in progress ends here.
-                if let Some(Assembled::Record(raw)) = self.asm.push_line(line) {
-                    let rs = self.record_start.unwrap_or(start);
-                    self.count_reread(m, rs);
-                    m.push(&raw, rs, now, cats, out);
-                }
+                let done = self.asm.push_line(line);
+                let rs = self.record_start.unwrap_or(start);
+                self.hand(m, done, rs, now, cats, out);
                 self.record_start = Some(start);
                 m.set_file(pos.file);
             } else {
-                if let Some(Assembled::Oversized(_)) = self.asm.push_line(line) {
-                    m.counts.oversized += 1;
-                }
+                // Only a header ends a record (`push_line` returns
+                // nothing for a body line).
+                let done = self.asm.push_line(line);
+                self.hand(m, done, start, now, cats, out);
             }
         }
         // A stable end of file: the record in progress is complete.
         if !polled.more && now.duration_since(self.last_growth) >= STABLE_EOF {
-            if let Some(Assembled::Record(raw)) = self.asm.flush() {
-                let rs = self.record_start.unwrap_or(0);
-                self.count_reread(m, rs);
-                m.push(&raw, rs, now, cats, out);
-            }
+            let done = self.asm.flush();
+            let rs = self.record_start.unwrap_or(0);
+            self.hand(m, done, rs, now, cats, out);
             self.record_start = None;
         }
         m.expire(now, cats, out);
@@ -717,6 +714,30 @@ impl Runner {
                 },
             )],
             _ => Vec::new(),
+        }
+    }
+
+    /// Hands an assembled record to the machine: a record is judged; an
+    /// oversized record or orphan lines are ambiguous (review H1).
+    fn hand(
+        &self,
+        m: &mut Machine,
+        done: Option<Assembled>,
+        start: u64,
+        now: Instant,
+        cats: &[&dyn Catalog],
+        out: &mut Vec<crate::stream::Emitted>,
+    ) {
+        match done {
+            Some(Assembled::Record(raw)) => {
+                self.count_reread(m, start);
+                m.push(&raw, start, now, cats, out);
+            }
+            Some(Assembled::Oversized(_) | Assembled::Orphan) => {
+                self.count_reread(m, start);
+                m.unreadable(now, cats, out);
+            }
+            None => {}
         }
     }
 
@@ -976,6 +997,77 @@ mod tests {
         assert!(!ledger.is_empty(), "{:?}", objects(&second));
         assert!(ledger.iter().all(|(_, e)| e.always_report()));
         assert!(objects(&second).contains(&"*".to_owned()));
+    }
+
+    /// Review H1: a record above the assembler's bound (a block of 10 000
+    /// relations, more than 1 MiB) is not dropped: it gives an ambiguous
+    /// `*` event, always reported, counted as ambiguous.
+    #[test]
+    fn an_oversized_record_is_ambiguous_never_dropped() {
+        use crate::stream_tests::{APP, HEAD, attach};
+        let dir = temp("over");
+        let log = dir.join("audit.log");
+        let a = "24:0x7f0000000100";
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        let att = format!(
+            "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+        );
+        let mut big = format!(
+            "{HEAD} ({a}) START_TRANSACTION\n{att}\n{HEAD} ({a}) EXECUTE_STATEMENT_FINISH\n{att}\nStatement 1:\n{}\nSELECT * FROM PAYROLL WHERE ID > 0\n50 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n",
+            "-".repeat(79),
+            "Table",
+            "*".repeat(115)
+        );
+        big.push_str(&format!("{:<35}{:>10}{:>70}\n", "PAYROLL", 50, ""));
+        for i in 0..10_000 {
+            big.push_str(&format!("{:<35}{:>10}{:>70}\n", format!("T{i}"), 1, ""));
+        }
+        big.push('\n');
+        assert!(big.len() > crate::trace_log::MAX_RECORD);
+        append(
+            &log,
+            &format!(
+                "{}{}{}",
+                attach(a, 3, APP),
+                big,
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        let (out, _) = session(&log, &dir);
+        assert!(
+            out.iter().any(|(_, e)| e.always_report()
+                && e.objects().iter().any(|o| o.object().as_str() == "*")),
+            "{:?}",
+            objects(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review H1: lines before any header (a read that starts inside a
+    /// record) are ambiguous too, never dropped silently.
+    #[test]
+    fn orphan_lines_are_ambiguous() {
+        use crate::stream_tests::{APP, attach};
+        let dir = temp("orphan");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        append(
+            &log,
+            &format!(
+                "PAYROLL                                    50\n\n{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        let (out, _) = session(&log, &dir);
+        assert!(
+            out.iter().any(|(_, e)| e.always_report()),
+            "{:?}",
+            objects(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The runner over a real file: records assembled from the tailer's

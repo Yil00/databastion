@@ -551,6 +551,51 @@ impl Machine {
         self.apply(decision, &rec, pos, now, cat, out);
     }
 
+    /// A record that could not be read (review H1): longer than the
+    /// assembler's bound (`Oversized`), or lines before any header
+    /// (`Orphan`). Nothing of it is known, so it is ambiguous: an event
+    /// naming `*`, always reported, attributed by fix 3 (the preceding
+    /// well-formed record's database, or every declared database), counted
+    /// as ambiguous (proof 8), and it opens a split window (it may hide a
+    /// split, H1 fix 2).
+    pub(crate) fn unreadable(
+        &mut self,
+        now: Instant,
+        cat: &[&dyn Catalog],
+        out: &mut Vec<Emitted>,
+    ) {
+        self.counts.records += 1;
+        self.counts.oversized += 1;
+        self.counts.ambiguous += 1;
+        *self.why.entry(line!()).or_default() += 1;
+        let wrapped: Vec<Invalidated<'_>> = cat
+            .iter()
+            .map(|c| Invalidated {
+                inner: *c,
+                invalid: false,
+            })
+            .collect();
+        let cats: Vec<&dyn Catalog> = wrapped.iter().map(|w| w as &dyn Catalog).collect();
+        self.expire(now, &cats, out);
+        self.window_until = Some(now + WINDOW);
+        let d = Draft {
+            action: Some(databastion_classifiers::masking::EventAction::Read),
+            star: true,
+            always: true,
+            ..Draft::default()
+        };
+        let dbs: Vec<usize> = match self.last_declared {
+            Some(i) => vec![i],
+            None => (0..self.s.databases.len())
+                .filter(|i| !self.s.databases[*i].excluded)
+                .collect(),
+        };
+        for db in dbs {
+            let ev = self.draft_event(&d, None, db);
+            self.emit(db, ev, out);
+        }
+    }
+
     /// The bounds that run on reading time: windows, groups, holds, the
     /// Garbage Collector's expected end.
     pub(crate) fn expire(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
