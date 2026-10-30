@@ -69,6 +69,30 @@ const SEVERITY: &[TargetNoteLabel] = {
         L::CredentialRelationReadable,
         L::ServerConfigReadable,
         L::RoleGraph,
+        // Firebird trace settings of `audit.trace_settings_missing`
+        // (ADR-0060 R36 item 2): proof 4, R21 and R27 item 2 name 18, more
+        // than a note carries. First the settings that say the applying
+        // section does not apply or filters records out, then
+        // `log_blr_requests` (R32 item 1, review N5), then the missing
+        // record kinds; the level is Limited whatever is cut.
+        L::ConnectionId,
+        L::Enabled,
+        L::LogFilename,
+        L::IncludeFilter,
+        L::ExcludeFilter,
+        L::LogBlrRequests,
+        L::PrintPerf,
+        L::TimeThreshold,
+        L::LogStatementFinish,
+        L::LogConnections,
+        L::LogTransactions,
+        L::LogInitfini,
+        L::LogProcedureFinish,
+        L::LogFunctionFinish,
+        L::LogTriggerFinish,
+        L::LogErrors,
+        L::LogSweep,
+        L::LogServices,
         // PostgreSQL role attributes and predefined roles.
         L::Superuser,
         L::Bypassrls,
@@ -1893,6 +1917,52 @@ mod tests {
         assert_eq!(kept.len(), MAX_LABELS);
         for must in ["superuser", "bypassrls", "createrole"] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
+    }
+
+    /// ADR-0060 R36 item 2 (review of #377, N5): with all 18 Firebird trace
+    /// settings missing, the five that say the section does not apply or
+    /// filters records, and `log_blr_requests`, are never cut.
+    #[test]
+    fn firebird_trace_setting_labels_keep_the_section_and_filter_ones() {
+        // Listed least severe first, so input order cannot save them.
+        let all = [
+            "log_services",
+            "log_sweep",
+            "log_errors",
+            "log_trigger_finish",
+            "log_function_finish",
+            "log_procedure_finish",
+            "log_initfini",
+            "log_transactions",
+            "log_connections",
+            "log_statement_finish",
+            "time_threshold",
+            "print_perf",
+            "log_blr_requests",
+            "exclude_filter",
+            "include_filter",
+            "log_filename",
+            "enabled",
+            "connection_id",
+        ];
+        assert_eq!(all.len(), 18);
+        let n = TargetNote::new(NoteCode::AuditTraceSettingsMissing)
+            .with_labels(all.map(NoteLabel::firebird));
+        let kept = sent(&n, LabelRevisions::ALL);
+        assert_eq!(kept.len(), MAX_LABELS);
+        for must in [
+            "connection_id",
+            "enabled",
+            "log_filename",
+            "include_filter",
+            "exclude_filter",
+            "log_blr_requests",
+        ] {
+            assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
+        }
+        for gone in ["log_sweep", "log_services"] {
+            assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
         }
     }
 
