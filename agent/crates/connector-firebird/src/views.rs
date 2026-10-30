@@ -110,69 +110,121 @@ pub(crate) fn compute(views: Option<Vec<ViewRow>>, deps: Option<Vec<DepRow>>) ->
     if view_names.len() > MAX_VIEWS {
         return ViewDeps::default();
     }
-    let mut memo: HashMap<Node, (bool, usize)> = HashMap::new();
-    let mut dependent = HashSet::new();
-    for v in &view_names {
-        match depends(
-            &Node::Relation(v.clone()),
-            &edges,
-            &mut memo,
-            &mut Vec::new(),
-        ) {
-            Some((true, _)) => {
-                dependent.insert(v.clone());
-            }
-            Some((false, _)) => {}
-            // Deeper than the bound: fail closed.
-            None => return ViewDeps::default(),
-        }
-    }
+    let Some(dep) = dependent_nodes(&edges) else {
+        // Deeper than the bound: fail closed.
+        return ViewDeps::default();
+    };
+    let dependent = view_names
+        .into_iter()
+        .filter(|v| dep.contains(&Node::Relation(v.clone())))
+        .collect();
     ViewDeps {
         dependent,
         complete: true,
     }
 }
 
-/// Whether `n` depends on an always-reported relation, with the height of
-/// its dependency chain; `None` past the depth bound (wherever the walk
-/// enters the chain: heights are memoized with the results). A cycle (not
-/// possible in a valid catalog) counts as no dependency through itself.
-fn depends(
-    n: &Node,
-    edges: &HashMap<Node, Vec<Node>>,
-    memo: &mut HashMap<Node, (bool, usize)>,
-    path: &mut Vec<Node>,
-) -> Option<(bool, usize)> {
-    if let Node::Relation(r) = n
-        && always_listed(r)
-    {
-        return Some((true, 0));
+/// The nodes that depend on an always-reported relation, through the
+/// strongly connected components of the graph (review M2: mutually
+/// recursive routines share what any of them reaches, whatever the order
+/// of the walk); `None` when the condensed graph is deeper than
+/// [`MAX_DEPTH`]. Iterative (Tarjan), so a long chain cannot exhaust the
+/// stack.
+fn dependent_nodes(edges: &HashMap<Node, Vec<Node>>) -> Option<HashSet<Node>> {
+    const UNSEEN: usize = usize::MAX;
+    let mut ids: HashMap<&Node, usize> = HashMap::new();
+    let mut nodes: Vec<&Node> = Vec::new();
+    for (from, tos) in edges {
+        for n in std::iter::once(from).chain(tos) {
+            ids.entry(n).or_insert_with(|| {
+                nodes.push(n);
+                nodes.len() - 1
+            });
+        }
     }
-    if let Some(d) = memo.get(n) {
-        return Some(*d);
+    let succ: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|n| {
+            edges
+                .get(*n)
+                .map(|v| v.iter().map(|t| ids[t]).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    let n = nodes.len();
+    let (mut index, mut low, mut comp) = (vec![UNSEEN; n], vec![0; n], vec![UNSEEN; n]);
+    let mut on_stack = vec![false; n];
+    let (mut stack, mut next) = (Vec::new(), 0usize);
+    // Component facts in Tarjan's emission order (successors first).
+    let (mut dep, mut height): (Vec<bool>, Vec<usize>) = (Vec::new(), Vec::new());
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(top) = work.last_mut() {
+            let (v, i) = *top;
+            if i == 0 && index[v] == UNSEEN {
+                index[v] = next;
+                low[v] = next;
+                next += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = succ[v].get(i) {
+                top.1 += 1;
+                if index[w] == UNSEEN {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let c = dep.len();
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp[w] = c;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                let mut d = false;
+                let mut h = 0usize;
+                for &m in &members {
+                    if let Node::Relation(r) = nodes[m]
+                        && always_listed(r)
+                    {
+                        d = true;
+                    }
+                    for &t in &succ[m] {
+                        let tc = comp[t];
+                        if tc != c && tc != UNSEEN {
+                            d |= dep[tc];
+                            h = h.max(height[tc] + 1);
+                        }
+                    }
+                }
+                if h > MAX_DEPTH {
+                    return None;
+                }
+                dep.push(d);
+                height.push(h);
+            }
+        }
     }
-    if path.contains(n) || path.len() > MAX_DEPTH {
-        return if path.contains(n) {
-            Some((false, 0))
-        } else {
-            None
-        };
-    }
-    path.push(n.clone());
-    let mut out = (false, 0usize);
-    for next in edges.get(n).map(Vec::as_slice).unwrap_or_default() {
-        let Some((dep, h)) = depends(next, edges, memo, path) else {
-            path.pop();
-            return None;
-        };
-        out = (out.0 || dep, out.1.max(h + 1));
-    }
-    path.pop();
-    if out.1 > MAX_DEPTH {
-        return None;
-    }
-    memo.insert(n.clone(), out);
-    Some(out)
+    Some(
+        (0..n)
+            .filter(|&v| dep[comp[v]])
+            .map(|v| nodes[v].clone())
+            .collect(),
+    )
 }
 
 /// A catalog name as the `OCTETS` cast sends it: UTF-8, padding dropped.
@@ -319,6 +371,30 @@ mod tests {
         // A cycle (an invalid catalog) terminates.
         let deps = compute(Some(vec![v("A", "B"), v("B", "A")]), Some(vec![]));
         assert!(deps.complete && deps.dependent.is_empty());
+    }
+
+    /// Review M2: mutually recursive procedures share what either reaches,
+    /// whatever the order of the walk (repeated: the map order varies).
+    #[test]
+    fn mutually_recursive_code_shares_its_dependencies() {
+        let mk = |a: &str, at: i64, b: &str, bt: i64| (a.to_owned(), at, b.to_owned(), bt, None);
+        for _ in 0..50 {
+            let d = compute(
+                Some(vec![
+                    ("V1".to_owned(), "P1".to_owned(), 2),
+                    ("W".to_owned(), "P2".to_owned(), 2),
+                ]),
+                Some(vec![
+                    mk("P1", 5, "P2", 5),
+                    mk("P1", 5, "SEC$USERS", 0),
+                    mk("P2", 5, "P1", 5),
+                ]),
+            );
+            assert!(d.complete);
+            let mut got: Vec<&str> = d.dependent.iter().map(String::as_str).collect();
+            got.sort_unstable();
+            assert_eq!(got, ["V1", "W"]);
+        }
     }
 
     #[test]
