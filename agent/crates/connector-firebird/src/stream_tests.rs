@@ -1730,3 +1730,55 @@ fn a_ddl_transaction_ends_with_its_run() {
         names(&out)
     );
 }
+
+/// Re-review L-1: the agent's own exact text on a table of the dependent
+/// set (a sampling read of a table with a computed column) is credited;
+/// the same text with no credit left is marked.
+#[test]
+fn an_own_read_of_a_dependent_table_is_credited() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let account = FetchAccount {
+        counted: 2,
+        requested: 64,
+        last: 64,
+        largest: 64,
+        end: FetchEnd::End,
+        ..FetchAccount::default()
+    };
+    let (h, now) = now_head(0);
+    let ledger = Arc::new(Ledger::default());
+    ledger.register_at(APP, 3, 40003, 24, now);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = DepCat(&["T_COMP"]);
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let agent = "DATABASTION_AGENT";
+    let t = "24:0x7f0000000100";
+    let built =
+        crate::sql::sample_statement("T_COMP", &[("FULL_NAME", crate::sql::Conv::Text)], 64)
+            .unwrap();
+    let text = built.text();
+    feed_h(&h, &mut m, &cats, &attach_as(t, 3, agent), 0);
+    ledger.credit(APP, 3, text, Some(built.table()), account);
+    let before = m.counts.own;
+    let out = feed_h(
+        &h,
+        &mut m,
+        &cats,
+        &stmt(t, 3, 5, agent, text, 2, &[("T_COMP", 2)]),
+        1000,
+    );
+    assert!(out.is_empty(), "{:?}", names(&out));
+    assert_eq!(m.counts.own, before + 1);
+    let out = feed_h(
+        &h,
+        &mut m,
+        &cats,
+        &stmt(t, 3, 6, agent, text, 2, &[("T_COMP", 2)]),
+        2000,
+    );
+    assert!(
+        !out.is_empty() && out.iter().all(|(_, e)| e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}

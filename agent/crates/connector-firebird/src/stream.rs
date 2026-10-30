@@ -2536,17 +2536,10 @@ impl Machine {
                 }
                 // R41 item 4: a record naming an object of the dependent set
                 // gets `*` and the always-reported mark in every shape
-                // (failed records included), and is never the agent's own.
+                // (failed records included), unless it is one of the
+                // agent's own texts (re-review L-1: an exact sampling text
+                // or a closed-set constant text, credited first).
                 let dependent = self.dependent_hit(rec, cat[db.min(cat.len() - 1)]);
-                if dependent {
-                    let d = draft.get_or_insert_with(|| Draft {
-                        action: Some(databastion_classifiers::masking::EventAction::Read),
-                        rows: rec.trailer.fetched,
-                        ..Draft::default()
-                    });
-                    d.star = true;
-                    d.always = true;
-                }
                 // The agent's own record (decision 6, R8 item 4).
                 // Also for a record with no event of its own (its objects all
                 // noise): its credit is consumed, and the read-back probe
@@ -2559,7 +2552,6 @@ impl Machine {
                     && !window
                     && !ambiguous
                     && !folded
-                    && !dependent
                 {
                     let d = draft.clone().unwrap_or_default();
                     match self.own_record(rec, k, &d, pos) {
@@ -2584,6 +2576,15 @@ impl Machine {
                         }
                         Some(false) => {}
                     }
+                }
+                if dependent {
+                    let d = draft.get_or_insert_with(|| Draft {
+                        action: Some(databastion_classifiers::masking::EventAction::Read),
+                        rows: rec.trailer.fetched,
+                        ..Draft::default()
+                    });
+                    d.star = true;
+                    d.always = true;
                 }
                 // A record of the agent's binding inside a window that is
                 // not its own: ambiguous (fix 3), the window stays.
