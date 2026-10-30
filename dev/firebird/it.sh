@@ -389,6 +389,13 @@ for spelling in true false TRUE False yes no on off 1 0 Yes ON enabled 2 '"true"
 done
 cat "$WORK/booleans.txt" | sed 's/^/[measure] trace boolean (server) /' >&2
 
+# Security review N4 of 94530b3: the server's command line (argv[0] must be absolute for the
+# layout check, R40 item 6); it holds no secret.
+# shellcheck disable=SC2016 # The inner shell's variables.
+timeout 30 docker exec "$NAME" sh -c \
+  'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = firebird ] && tr "\0" " " < "$p/cmdline" && echo; done; true' \
+  | sed 's/^/[measure] server command line: /' >&2
+
 # 4. The tests.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
 run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \

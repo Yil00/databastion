@@ -1252,6 +1252,13 @@ async fn drift_of_the_virtual_relations_and_the_built_in_words() {
         crate::views::ViewDeps::default(),
     );
     let mut virtual_n = 0;
+    let server_virtual: Vec<String> = rows
+        .rows
+        .iter()
+        .filter(|r| r.get(1).and_then(crate::sql::Value::as_int) == Some(3))
+        .map(|r| octets(r, 0))
+        .collect();
+    eprintln!("[measure] virtual relations {server_virtual:?}");
     for row in &rows.rows {
         let name = octets(row, 0);
         let virtual_rel = row.get(1).and_then(crate::sql::Value::as_int) == Some(3);

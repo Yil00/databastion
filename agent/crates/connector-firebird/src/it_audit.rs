@@ -316,6 +316,43 @@ fn the_agent_records_match_the_own_statement_table() {
     let mut pos = 0u64;
     for r in &recs {
         let Assembled::Record(raw) = r else { continue };
+        // The closed set's trailers, for the table (constant texts only:
+        // no value).
+        if let Some(rec) = parse(
+            raw,
+            ParseOptions {
+                max_sql_length: Some(65_000),
+                series: series(),
+            },
+        ) && let crate::trace_log::Body::Statement {
+            text, id, params, ..
+        } = rec.body
+            && crate::sql::checked(text)
+        {
+            let verdict = match convert(&rec, &Cat) {
+                Converted::Nothing => "nothing".to_owned(),
+                Converted::Event(d) => format!("event {:?} {:?}", d.signals, d.always),
+                Converted::Ambiguous { window, .. } => format!("ambiguous window {window}"),
+            };
+            eprintln!("[measure] own text id {id:?} params {params}: {verdict}");
+            let name = crate::sql::STATEMENTS
+                .iter()
+                .find(|s| s.text == text)
+                .map_or_else(
+                    || format!("probe of {} bytes", text.len()),
+                    |s| s.name.to_owned(),
+                );
+            let block: Vec<&str> = rec
+                .trailer
+                .block
+                .as_ref()
+                .map(|b| b.iter().map(|(n, _)| *n).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "[measure] own text {name}: {:?} fetched {:?} block {block:?} defect {:?}",
+                rec.header.outcome, rec.trailer.fetched, rec.defect
+            );
+        }
         m.push(raw, pos, now, &cats, &mut out);
         pos += raw.len() as u64 + 1;
     }
