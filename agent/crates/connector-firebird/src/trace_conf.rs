@@ -173,8 +173,15 @@ pub(crate) const DATABASES_CONF_KEYS: &[&str] = &[
     "WireCryptPlugin",
 ];
 
-/// The macros resolved against the declared root (R2 rule 2, review L-4):
-/// on the images, every one of them is the root directory.
+/// The macros resolved against the declared root (R2 rule 2, review L-4).
+/// Assumption (review of part 1, L2): the layout of the official images
+/// and of the tarball install, `/opt/firebird`, where `$(root)`,
+/// `$(install)`, `$(this)` (the directory of `firebird.conf` and
+/// `databases.conf`), `$(dir_conf)` and `$(dir_secDb)` are all the root
+/// directory. A distribution layout (`/etc/firebird`, `/var/lib/firebird`)
+/// resolves them elsewhere: a path through them then names another file
+/// than the server's, which fails closed (the binding or the alias does
+/// not match, Limited). The engine-matrix drift test checks the images.
 const ROOT_MACROS: &[&str] = &["root", "install", "this", "dir_conf", "dir_secdb"];
 
 /// Why a configuration file is not evaluated (kinds only, never content).
@@ -367,9 +374,9 @@ fn canonical(path: &str) -> Option<String> {
     for p in path.split('/') {
         match p {
             "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
+            // Refused (review of part 1, L2): a `..` component may cross
+            // a symlinked directory the server resolves otherwise.
+            ".." => return None,
             p => parts.push(p),
         }
     }
@@ -377,7 +384,7 @@ fn canonical(path: &str) -> Option<String> {
 }
 
 /// One `databases.conf` entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Alias {
     pub(crate) name: String,
     /// The resolved path, `None` when it uses a macro outside the closed
@@ -385,6 +392,17 @@ pub(crate) struct Alias {
     pub(crate) path: Option<String>,
     /// `SecurityDatabase` of its block, as written (R9 rule 3).
     pub(crate) security_database: Option<String>,
+}
+
+impl std::fmt::Debug for Alias {
+    // Names and paths stay on the agent host, out of debug strings too
+    // (review of part 1, N1).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Alias")
+            .field("path_known", &self.path.is_some())
+            .field("security_database", &self.security_database.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The evaluated alias map (R2 rule 2).
@@ -565,6 +583,10 @@ pub(crate) enum Value {
 }
 
 fn parse_value(key: &str, raw: &str) -> Result<Value, ConfError> {
+    // Booleans and numbers unquoted only (review of part 1, L3).
+    if value_kind(key) != ValueKind::Text && raw.contains(['\'', '"']) {
+        return Err(ConfError::Value);
+    }
     let v = unquote(raw)?;
     Ok(match value_kind(key) {
         ValueKind::Bool => Value::Bool(match v.to_ascii_lowercase().as_str() {
@@ -668,7 +690,13 @@ pub(crate) fn parse_trace_conf(text: &[u8]) -> Result<TraceConf, ConfError> {
                 SectionKind::Database(_) => DATABASE_KEYS,
                 SectionKind::Services(_) => SERVICES_KEYS,
             };
-            let key = known(keys, key).ok_or(ConfError::UnknownKey)?;
+            // Exact case (review of part 1, L3): the images write them
+            // lower-case; another spelling is not evaluated.
+            let key = keys
+                .iter()
+                .copied()
+                .find(|k| *k == key)
+                .ok_or(ConfError::UnknownKey)?;
             if sec.settings.get(key).is_some() {
                 return Err(ConfError::Duplicate);
             }
@@ -860,7 +888,7 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         match db.resolved {
             Some(p) => names.push(p.to_owned()),
             None => {
-                add(&mut not_evaluated, "trace_config_unreadable");
+                add(&mut not_evaluated, "databases_conf");
                 detail.push(format!(
                     "{}: the resolved path was not read on the agent's own attachment",
                     db.label

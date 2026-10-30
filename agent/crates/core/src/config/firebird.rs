@@ -119,6 +119,14 @@ impl FirebirdAuditConfig {
                 ));
             }
         }
+        // The server reads `<root>/firebird.conf` (review of part 1, L2):
+        // another file cannot be the configuration it runs with.
+        if self.firebird_conf != self.root.join("firebird.conf") {
+            return Err((
+                "audit.firebird_conf",
+                "must be <audit.root>/firebird.conf (the file the server reads)",
+            ));
+        }
         if let Some(d) = &self.databases_conf
             && *d != self.root.join("databases.conf")
         {

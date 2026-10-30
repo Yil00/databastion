@@ -248,12 +248,27 @@ fn the_declared_log_holds_only_declared_databases() {
         labels(&v.notes, NoteCode::AuditTraceConfigNotEvaluated)
             .contains(&"similar_to_pattern".to_owned())
     );
-    // A relative log name is resolved against the root.
+    // A relative log name is resolved against the root; one with a `..`
+    // component is not evaluated (review of part 1, L2).
     let t = DEV_TRACE.replace(
         "log_filename = /var/lib/firebird/audit/audit.log",
         "log_filename = ../../var/lib/firebird/audit/audit.log",
     );
-    assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+    assert!(!eval(&t, Some(&empty_map()), &crm()).partial);
+    let rel = DEV_TRACE.replace(
+        "log_filename = /var/lib/firebird/audit/audit.log",
+        "log_filename = audit.log",
+    );
+    let t = parse_trace_conf(rel.as_bytes()).unwrap();
+    let v = evaluate(&Inputs {
+        trace: &t,
+        aliases: Some(&empty_map()),
+        databases: &crm(),
+        log: "/opt/firebird/audit.log",
+        root: ROOT,
+        longest_own_text: 900,
+    });
+    assert!(v.partial, "{:?}", v.notes);
 }
 
 /// Proof 6 and R27 item 2: the services section, required for Partial.
@@ -337,6 +352,13 @@ fn firebird_conf_grammar() {
     let rel = parse_firebird_conf(b"AuditTraceConfigFile = fbtrace.conf\n").unwrap();
     assert!(binds_trace_config(&rel, ROOT, "/opt/firebird/fbtrace.conf"));
     let mac = parse_firebird_conf(b"AuditTraceConfigFile = $(ROOT)/a/../fbtrace.conf\n").unwrap();
+    // A `..` component is refused (review of part 1, L2).
+    assert!(!binds_trace_config(
+        &mac,
+        ROOT,
+        "/opt/firebird/fbtrace.conf"
+    ));
+    let mac = parse_firebird_conf(b"AuditTraceConfigFile = $(ROOT)/./fbtrace.conf\n").unwrap();
     assert!(binds_trace_config(&mac, ROOT, "/opt/firebird/fbtrace.conf"));
     let unknown_macro = parse_firebird_conf(b"AuditTraceConfigFile = $(dir_udf)/x\n").unwrap();
     assert!(!binds_trace_config(
@@ -502,6 +524,10 @@ fn trace_conf_grammar() {
         b"database\n{\n",
         b"include x.conf\n",
         b"database = a{b\n{\n}\n",
+        // Review of part 1, L3: exact-case keys, unquoted booleans.
+        b"database\n{\n\tEnabled = true\n}\n",
+        b"database\n{\n\tenabled = \"true\"\n}\n",
+        b"database\n{\n\ttime_threshold = '0'\n}\n",
     ] {
         assert!(
             parse_trace_conf(bad).is_err(),
@@ -528,7 +554,8 @@ fn macros_and_paths() {
         resolve("$(DIR_CONF)/x", ROOT).as_deref(),
         Some("/opt/firebird/x")
     );
-    assert_eq!(resolve("/a//b/./c/../d", ROOT).as_deref(), Some("/a/b/d"));
+    assert_eq!(resolve("/a//b/./c", ROOT).as_deref(), Some("/a/b/c"));
+    assert_eq!(resolve("/a/b/../d", ROOT), None);
     assert_eq!(resolve("/..", ROOT), None);
     assert_eq!(resolve("$(dir_plugins)/x", ROOT), None);
     assert_eq!(resolve("$(root", ROOT), None);
