@@ -180,3 +180,64 @@ fn the_server_trace_log_parses_and_gives_the_events() {
             .all(|e| e.1.always_report())
     );
 }
+
+/// The stream rules on the server's own log: bindings, tokens, the
+/// Garbage Collector, triggers and services hold; the only ambiguous
+/// records are the statement finishes isql writes without a
+/// `Statement <n>:` line for DDL and DCL (R20, reported for a refinement).
+#[test]
+fn the_server_trace_log_through_the_stream() {
+    let Some(log) = file("FIREBIRD_IT_AUDIT_LOG") else {
+        return;
+    };
+    let names = |label: &str, path: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+    };
+    let settings = crate::stream::Settings {
+        databases: vec![names("app", APP), names("crm", CRM)],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m =
+        crate::stream::Machine::new(settings, std::sync::Arc::new(crate::own::Ledger::default()));
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let mut out = Vec::new();
+    let now = std::time::Instant::now();
+    let mut bare = 0u64;
+    for (i, r) in recs.iter().enumerate() {
+        let Assembled::Record(raw) = r else { continue };
+        if let Some(rec) = parse(
+            raw,
+            ParseOptions {
+                max_sql_length: Some(65_000),
+                series: series(),
+            },
+        ) && let crate::trace_log::Body::Statement { id: None, text, .. } = rec.body
+            && !databastion_classifiers::query::firebird::analyze_firebird(text)
+                .kind
+                .cannot_read()
+        {
+            bare += 1;
+        }
+        m.push(raw, i as u64, now, &cats, false, &mut out);
+    }
+    assert_eq!(m.counts.panics, 0);
+    assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);
+    assert!(!out.is_empty());
+}

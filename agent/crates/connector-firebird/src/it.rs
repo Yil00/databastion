@@ -1059,3 +1059,60 @@ fn every_security_database_relation_is_never_sampled() {
 /// and the log of the `dev/firebird/it.sh` workload.
 #[path = "it_audit.rs"]
 mod audit;
+
+/// The lot 3 texts on the agent's own attachment (R2 rule 1, R9, proof
+/// 7): the resolved path, `Default` as the security-database kind of an
+/// ordinary database, and one row for the read-back probe; the session's
+/// attachment and credits reach the endpoint's ledger.
+#[tokio::test]
+async fn the_lot_3_texts_and_the_ledger() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        &attach(),
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    let rows = s
+        .query(
+            crate::sql::DATABASE_FILE,
+            &[crate::sql::Col::Text(4080), crate::sql::Col::Text(28)],
+            1,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let row = &rows.rows[0];
+    let text = |i: usize| match &row[i] {
+        crate::sql::Value::Text(t) => t.trim_end().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(text(0), attach());
+    assert_eq!(text(1), "Default");
+    let probe = s
+        .query(
+            crate::sql::READ_BACK_PROBE,
+            &[crate::sql::Col::Int],
+            1,
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(probe.rows.len(), 1);
+    let ledger = crate::own::ledger_for(endpoint.addr);
+    assert!(ledger.latest_id(&attach()).is_some());
+    assert!(ledger.server_pid().is_some());
+    s.close().await;
+}
