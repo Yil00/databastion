@@ -248,6 +248,37 @@ pub(crate) fn idents(text: &str) -> Idents {
                 tokens.push(Token::Ident(trimmed(name)));
             }
             '.' => tokens.push(Token::Dot),
+            // The alternate quoting `q'<c>…<c>'` (`(`, `{`, `[`, `<` closed
+            // by their pair): a literal, its `'` inside never ends it. Not
+            // closed: the text counts as matching (fail closed).
+            'q' | 'Q' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                let Some(open) = chars.next() else {
+                    out.cut = true;
+                    break;
+                };
+                let close = match open {
+                    '(' => ')',
+                    '{' => '}',
+                    '[' => ']',
+                    '<' => '>',
+                    c => c,
+                };
+                let mut prev = None;
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if prev == Some(close) && c == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    prev = Some(c);
+                }
+                if !closed {
+                    out.cut = true;
+                    break;
+                }
+                tokens.push(Token::Other);
+            }
             c if c.is_ascii_alphabetic() => {
                 let mut name = String::new();
                 name.push(c.to_ascii_uppercase());
@@ -322,6 +353,31 @@ mod tests {
         assert!(!i.names.iter().any(|n| n == "P_MON"), "{:?}", i.names);
         assert!(idents("SELECT * FROM \"Tabelle_ä\"").non_ascii_quoted);
         assert!(!idents("SELECT * FROM T").non_ascii_quoted);
+    }
+
+    /// Re-review note: `q'<c>…<c>'` is a literal whose inner `'` does not
+    /// end it, so the tokens after it are read; not closed, the text
+    /// counts as matching.
+    #[test]
+    fn alternate_quoted_literals() {
+        for t in [
+            "SELECT q'{it's P_LIT}', F_MON(1) FROM T",
+            "SELECT Q'!it's P_LIT!', F_MON(1) FROM T",
+            "SELECT q'(a')', F_MON(1) FROM T",
+        ] {
+            let i = idents(t);
+            assert!(i.names.iter().any(|n| n == "F_MON"), "{t}: {:?}", i.names);
+            assert!(
+                !i.names.iter().any(|n| n == "P_LIT" || n == "S"),
+                "{t}: {:?}",
+                i.names
+            );
+            assert!(!i.cut, "{t}");
+        }
+        assert!(idents("SELECT q'{open FROM T").cut);
+        assert!(idents("SELECT q'").cut);
+        // An identifier starting with Q is not a literal.
+        assert!(names("SELECT QTY FROM T").iter().any(|n| n == "QTY"));
     }
 
     /// Re-review L-2: unquoted reserved words are not tokens; quoted, they
