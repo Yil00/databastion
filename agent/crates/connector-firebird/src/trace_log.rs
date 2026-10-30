@@ -449,7 +449,10 @@ impl Assembler {
         }
         if self.buf.len() + bytes.len() > MAX_RECORD {
             self.oversized = true;
-            zeroize::Zeroize::zeroize(&mut *self.buf);
+            // Only the written bytes (the bytes past them were zeroized
+            // when last cleared): `Vec::zeroize` would clear the whole
+            // 1 MiB reservation at every record.
+            zeroize::Zeroize::zeroize(self.buf.as_mut_slice());
             self.buf.clear();
             return;
         }
@@ -472,7 +475,7 @@ impl Assembler {
         }
         let mut out = Zeroizing::new(Vec::with_capacity(self.buf.len()));
         out.extend_from_slice(&self.buf);
-        zeroize::Zeroize::zeroize(&mut *self.buf);
+        zeroize::Zeroize::zeroize(self.buf.as_mut_slice());
         self.buf.clear();
         Some(Assembled::Record(out))
     }
