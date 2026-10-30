@@ -932,7 +932,7 @@ fn trailer<'a, 'b>(mut lines: &'b [&'a str]) -> (Trailer<'a>, &'b [&'a str]) {
         }
         rows += 1;
     }
-    if rows >= 1 && rows <= MAX_BLOCK_ROWS && lines.len() >= rows + 2 {
+    if (1..=MAX_BLOCK_ROWS).contains(&rows) && lines.len() >= rows + 2 {
         let stars = lines[lines.len() - 1 - rows];
         let head = lines[lines.len() - 2 - rows];
         if let Some(width) = block_header(head)

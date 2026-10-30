@@ -44,6 +44,10 @@ mod sql;
 // tests and the fuzz targets do.
 mod srp;
 #[cfg_attr(not(test), allow(dead_code))]
+mod trace_conf;
+#[cfg(test)]
+mod trace_conf_tests;
+#[cfg_attr(not(test), allow(dead_code))]
 mod trace_log;
 #[cfg(test)]
 mod trace_log_tests;
