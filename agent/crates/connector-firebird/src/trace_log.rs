@@ -257,6 +257,8 @@ pub(crate) struct Header {
 
 impl Header {
     /// The token `(pid, address)` of R1.
+    // Used by the stream (bindings, folding), the next part of lot 3.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn token(&self) -> (u32, u64) {
         (self.pid, self.address)
     }
@@ -536,6 +538,8 @@ pub(crate) struct Counters {
 
 impl Counters {
     /// The counter-wise maximum (R4, R25: folding by maximum).
+    // Used by the stream (bindings, folding), the next part of lot 3.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn max(self, o: Self) -> Self {
         Self {
             natural: self.natural.max(o.natural),
@@ -609,6 +613,8 @@ pub(crate) enum TriggerKind {
 
 impl TriggerKind {
     /// A database trigger of R15 (never folded).
+    // Used by the stream (bindings, folding), the next part of lot 3.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn is_database_trigger(self) -> bool {
         !matches!(self, Self::Row | Self::Ddl)
     }
@@ -1237,9 +1243,25 @@ fn body_of<'a>(
             if rec.header.event == Event::CompileBlr && rec.trailer.block.is_some() {
                 return Err(Defect::Shape);
             }
-            // The BLR area (and a `print_blr` dump) is dropped unread
-            // (R33 item 5), but may not hold a trailer or a header.
-            if above.iter().any(|l| trailer_shaped(l)) {
+            // `Statement <n>:` and the separator, as on statement
+            // records; then the BLR area (and a `print_blr` dump), dropped
+            // unread (R33 item 5), which may not hold a trailer or a
+            // header.
+            let mut area = above;
+            if area.first() == Some(&"") {
+                area = &area[1..];
+            }
+            if area.first().is_some_and(|l| {
+                l.strip_prefix("Statement ")
+                    .and_then(|r| r.strip_suffix(':'))
+                    .is_some_and(|n| decimal(n, 20).is_some())
+            }) {
+                area = &area[1..];
+            }
+            if area.first() == Some(&DASHES) {
+                area = &area[1..];
+            }
+            if area.iter().any(|l| trailer_shaped(l)) {
                 return Err(Defect::Injected);
             }
             rec.body = Body::Blr;

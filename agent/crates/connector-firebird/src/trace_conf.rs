@@ -252,9 +252,7 @@ fn strip_comment(line: &str) -> &str {
 /// `key = value` (or `key value`, the images' comments show both): the
 /// key and the raw value.
 fn entry(line: &str) -> Option<(&str, &str)> {
-    let end = line
-        .find(['=', ' ', '\t'])
-        .unwrap_or(line.len());
+    let end = line.find(['=', ' ', '\t']).unwrap_or(line.len());
     let (key, rest) = line.split_at(end);
     if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return None;

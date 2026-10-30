@@ -512,6 +512,13 @@ fn trace_conf_grammar() {
 }
 
 #[test]
+fn binding_notes() {
+    let n = not_evaluated("config_changed_since_start");
+    assert_eq!(n.code(), NoteCode::AuditTraceConfigNotEvaluated);
+    assert_eq!(n.labels()[0].as_str(), "config_changed_since_start");
+}
+
+#[test]
 fn macros_and_paths() {
     assert_eq!(
         resolve("$(root)/x", ROOT).as_deref(),
