@@ -235,6 +235,8 @@ struct Part {
     rows: Option<u64>,
     signals: Vec<databastion_classifiers::masking::Signal>,
     always: bool,
+    /// `*` from a member (a view over an always-reported relation).
+    star: bool,
     write: bool,
     bytes: usize,
 }
@@ -272,6 +274,7 @@ impl Part {
             }
         }
         self.always |= m.draft.always;
+        self.star |= m.draft.star;
         self.write |= m.draft.action == Some(databastion_classifiers::masking::EventAction::Write);
     }
 
@@ -290,7 +293,7 @@ impl Part {
                 EventAction::Read
             }),
             objects,
-            star: self.overflow,
+            star: self.overflow || self.star,
             always: self.always || self.overflow,
             rows: self.rows,
             signals: self.signals.clone(),
@@ -1936,11 +1939,18 @@ fn db_index(db: DbId) -> usize {
 /// rows and the routine's name.
 fn routine_draft(rec: &Record<'_>, _kind: RoutineKind, cat: &dyn Catalog) -> Draft {
     let mut d = match convert(rec, cat) {
-        Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
+        // A block-ful record: its marks stay (always-reported relations,
+        // views over them: re-review L-A).
+        Converted::Event(d) => d,
+        // A block-less one: only the ambiguous form's `*` and mark go (the
+        // group decides its ambiguity, R25 item 3).
+        Converted::Ambiguous { mut draft, .. } => {
+            draft.star = false;
+            draft.always = false;
+            draft
+        }
         Converted::Nothing => Draft::default(),
     };
-    d.star = false;
-    d.always = false;
     d.rows = rec.trailer.fetched;
     d
 }

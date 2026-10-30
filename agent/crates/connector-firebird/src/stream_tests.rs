@@ -1006,3 +1006,35 @@ fn attach_error_records_never_send_the_user_name() {
     }
     assert!(seen >= 2, "{seen}");
 }
+
+/// Re-review L-A: a routine record whose block names an always-reported
+/// relation keeps the mark in its group; a group ended unfolded (its
+/// transaction ends) gives an always-reported event.
+#[test]
+fn an_unfolded_group_keeps_the_always_reported_mark() {
+    let a = "24:0x7f0000000100";
+    let ctx = format!(
+        "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    let log = format!(
+        "{}{HEAD} ({a}) START_TRANSACTION\n{ctx}\n{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n{HEAD} ({a}) COMMIT_TRANSACTION\n{ctx}      0 ms, 1 fetch(es)\n\n",
+        attach(a, 3, APP),
+        "Table",
+        "*".repeat(115),
+        "MON$STATEMENTS",
+        4,
+        ""
+    );
+    let (m, out) = run(&log, true, Series::V5);
+    assert_eq!(m.counts.ambiguous, 0, "{:?}", m.why);
+    let ev: Vec<_> = out
+        .iter()
+        .filter(|(_, e)| {
+            e.objects()
+                .iter()
+                .any(|o| o.object().as_str() == "MON$STATEMENTS")
+        })
+        .collect();
+    assert!(!ev.is_empty(), "{:?}", names(&out));
+    assert!(ev.iter().all(|(_, e)| e.always_report()));
+}
