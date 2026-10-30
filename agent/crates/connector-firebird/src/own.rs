@@ -12,7 +12,14 @@
 //!
 //! In memory only: after a restart, the attachments of the previous
 //! process are no longer known, so their records are reported as any
-//! client's (fail closed).
+//! client's (fail closed, R39 (a)).
+//!
+//! A consumed credit is remembered with the record position that consumed
+//! it (the log file identity and offset): a stream restarted in the same
+//! process re-reads its held-back region (R39 (a)) and finds the credit of
+//! the same record at the same position again, so the agent's own records
+//! there are not made loud for a credit their first reading consumed. A
+//! different position never finds it (one credit per execution).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,6 +35,8 @@ const MAX_ATTACHMENTS: usize = 4096;
 /// A credit expires this long after its execution (decision 6: the
 /// statement's deadline plus 5 minutes, the outer bound).
 const CREDIT_LIFE: Duration = Duration::from_secs(15 * 60);
+/// Consumed credits remembered for a re-read (the oldest go first).
+const MAX_CONSUMED: usize = 65_536;
 /// R22 item 3, L7: a lost attachment lives on for the statement timeout
 /// plus 5 s.
 const LOST_MARGIN: Duration = Duration::from_secs(5);
@@ -47,6 +56,9 @@ struct Credit {
     attach: String,
     id: u64,
     text: String,
+    /// The table a built text (sampling, CAS guard) reads; `None` for a
+    /// constant text of the closed set.
+    table: Option<String>,
     account: FetchAccount,
     at: SystemTime,
 }
@@ -73,7 +85,13 @@ pub(crate) struct Ledger {
 struct State {
     attachments: Vec<Attachment>,
     credits: std::collections::VecDeque<Credit>,
+    /// Credits consumed, with the record position that consumed them.
+    consumed: std::collections::VecDeque<(RecordAt, Credit)>,
 }
+
+/// A record's position: the log file's `(st_dev, st_ino)` and the offset
+/// of its first byte.
+pub(crate) type RecordAt = ((u64, u64), u64);
 
 /// The ledger of an endpoint (one per Firebird target).
 pub(crate) fn ledger_for(addr: SocketAddr) -> Arc<Ledger> {
@@ -108,8 +126,16 @@ impl Ledger {
         });
     }
 
-    /// One execution of `text` on the attachment.
-    pub(crate) fn credit(&self, attach: &str, id: u64, text: &str, account: FetchAccount) {
+    /// One execution of `text` on the attachment; `table`: the table a
+    /// built text reads.
+    pub(crate) fn credit(
+        &self,
+        attach: &str,
+        id: u64,
+        text: &str,
+        table: Option<&str>,
+        account: FetchAccount,
+    ) {
         let mut s = self.state();
         if s.credits.len() >= MAX_CREDITS {
             s.credits.pop_front();
@@ -118,6 +144,7 @@ impl Ledger {
             attach: attach.to_owned(),
             id,
             text: text.to_owned(),
+            table: table.map(str::to_owned),
             account,
             at: SystemTime::now(),
         });
@@ -185,28 +212,42 @@ impl Ledger {
         self.state().attachments.last().map(|a| a.pid)
     }
 
-    /// Consumes the credit of a record of an own attachment: its text, and
-    /// `records fetched` within the credit's bounds (R22 items 1 to 5,
-    /// R35). `failed`: a `FAILED` finish.
+    /// Consumes the credit of a record of an own attachment at `at`: an
+    /// unconsumed credit of the same attachment and text that `accept`
+    /// takes (`accept` gets the credit's fetch account and, for a built
+    /// text, its table: the own-statement table's row and the R22 bounds,
+    /// [`crate::own_table`]). A credit is consumed only by a record that
+    /// matches it; a record re-read at the position that consumed a credit
+    /// finds that credit again.
     pub(crate) fn consume(
         &self,
         attach: &str,
         id: u64,
         text: &str,
-        fetched: u64,
-        failed: bool,
+        at: RecordAt,
+        accept: impl Fn(&FetchAccount, Option<&str>) -> bool,
     ) -> Verdict {
         let now = SystemTime::now();
         let mut s = self.state();
-        s.credits
-            .retain(|c| now.duration_since(c.at).unwrap_or_default() < CREDIT_LIFE);
-        let pos = s
+        let live = |c: &Credit| now.duration_since(c.at).unwrap_or_default() < CREDIT_LIFE;
+        s.credits.retain(live);
+        s.consumed.retain(|(_, c)| live(c));
+        let same = |c: &Credit| c.attach == attach && c.id == id && c.text == text;
+        if let Some((_, c)) = s.consumed.iter().find(|(p, c)| *p == at && same(c)) {
+            return if accept(&c.account, c.table.as_deref()) {
+                Verdict::Own
+            } else {
+                Verdict::NotOwn
+            };
+        }
+        let any = s.credits.iter().any(same);
+        let Some(pos) = s
             .credits
             .iter()
-            .position(|c| c.attach == attach && c.id == id && c.text == text);
-        let Some(pos) = pos else {
-            let known = crate::sql::checked(text);
-            return if known {
+            .position(|c| same(c) && accept(&c.account, c.table.as_deref()))
+        else {
+            return if !any && crate::sql::checked(text) {
+                // A text of the closed set with no credit left (R8 item 4).
                 Verdict::NoCredit
             } else {
                 Verdict::NotOwn
@@ -215,11 +256,11 @@ impl Ledger {
         let Some(c) = s.credits.remove(pos) else {
             return Verdict::NotOwn;
         };
-        if within(&c.account, fetched, failed) {
-            Verdict::Own
-        } else {
-            Verdict::NotOwn
+        if s.consumed.len() >= MAX_CONSUMED {
+            s.consumed.pop_front();
         }
+        s.consumed.push_back((at, c));
+        Verdict::Own
     }
 }
 
@@ -275,6 +316,13 @@ mod tests {
         assert!(within(&acc(FetchEnd::NotRun, 0, 0, 0, 0), 0, false));
     }
 
+    const AT: RecordAt = ((1, 2), 100);
+    const AT2: RecordAt = ((1, 2), 900);
+
+    fn bounded(n: u64) -> impl Fn(&FetchAccount, Option<&str>) -> bool {
+        move |a, _| within(a, n, false)
+    }
+
     #[test]
     fn credits_are_consumed_once() {
         let l = Ledger::default();
@@ -282,19 +330,59 @@ mod tests {
         assert!(l.is_own_attach("app", 7, 40000));
         assert!(!l.is_own_attach("app", 7, 40001));
         let text = crate::sql::OWN_ATTACHMENT;
-        l.credit("app", 7, text, acc(FetchEnd::End, 1, 64, 64, 64));
-        assert_eq!(l.consume("app", 7, text, 1, false), Verdict::Own);
+        l.credit("app", 7, text, None, acc(FetchEnd::End, 1, 64, 64, 64));
+        assert_eq!(l.consume("app", 7, text, AT, bounded(1)), Verdict::Own);
         // A second record of the same text: no credit left, loud.
-        assert_eq!(l.consume("app", 7, text, 1, false), Verdict::NoCredit);
+        assert_eq!(
+            l.consume("app", 7, text, AT2, bounded(1)),
+            Verdict::NoCredit
+        );
         // A text outside the set on the agent's attachment: not own.
         assert_eq!(
-            l.consume("app", 7, "SELECT * FROM T", 1, false),
+            l.consume("app", 7, "SELECT * FROM T", AT2, bounded(1)),
             Verdict::NotOwn
         );
-        // Outside the bound: not own.
-        l.credit("app", 7, text, acc(FetchEnd::End, 1, 64, 64, 64));
-        assert_eq!(l.consume("app", 7, text, 2, false), Verdict::NotOwn);
+        // Outside the bound: not own, and the credit is not consumed.
+        l.credit("app", 7, text, None, acc(FetchEnd::End, 1, 64, 64, 64));
+        assert_eq!(l.consume("app", 7, text, AT2, bounded(2)), Verdict::NotOwn);
+        assert_eq!(l.consume("app", 7, text, AT2, bounded(1)), Verdict::Own);
         assert_eq!(l.latest_id("app"), Some(7));
         assert_eq!(l.server_pid(), Some(24));
+    }
+
+    /// R39 (a): a stream restarted in the same process re-reads the record
+    /// that consumed a credit, at the same position, and finds it again;
+    /// another file with the same offset, or another attachment, does not.
+    #[test]
+    fn a_re_read_record_finds_its_credit_again() {
+        let l = Ledger::default();
+        l.register("app", 7, 40000, 24);
+        let text = crate::sql::OWN_ATTACHMENT;
+        l.credit("app", 7, text, None, acc(FetchEnd::End, 1, 64, 64, 64));
+        assert_eq!(l.consume("app", 7, text, AT, bounded(1)), Verdict::Own);
+        assert_eq!(l.consume("app", 7, text, AT, bounded(1)), Verdict::Own);
+        assert_eq!(l.consume("app", 7, text, AT, bounded(2)), Verdict::NotOwn);
+        assert_eq!(
+            l.consume("app", 7, text, ((1, 3), 100), bounded(1)),
+            Verdict::NoCredit
+        );
+        assert_eq!(l.consume("app", 8, text, AT, bounded(1)), Verdict::NoCredit);
+    }
+
+    /// A built text's credit carries its table.
+    #[test]
+    fn a_sampling_credit_names_its_table() {
+        let l = Ledger::default();
+        l.register("app", 7, 40000, 24);
+        let t = "SELECT FIRST 3 X FROM \"T\"";
+        l.credit("app", 7, t, Some("T"), acc(FetchEnd::End, 3, 3, 3, 3));
+        assert_eq!(
+            l.consume("app", 7, t, AT, |_, table| table == Some("U")),
+            Verdict::NotOwn
+        );
+        assert_eq!(
+            l.consume("app", 7, t, AT, |_, table| table == Some("T")),
+            Verdict::Own
+        );
     }
 }

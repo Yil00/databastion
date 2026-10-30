@@ -18,8 +18,13 @@
 //!   ([`crate::trace_log`]), the last one held until a following header or
 //!   a stable end of file (2 s); [`crate::stream::Machine`] applies the
 //!   rules; the persisted position is held back to the first record of a
-//!   pending fold group or of the record in progress, and the records read
-//!   again after a restart are replayed for state only.
+//!   pending fold group or of the record in progress. The records read
+//!   again after a restart (from that held-back position) are judged and
+//!   emitted as on their first reading (R39 (a)): with no checkpoint of
+//!   the parser's state, a re-read record can be judged differently, so
+//!   none is suppressed; the events of the re-read region the previous
+//!   reading had handed over are sent twice (accepted over-reporting,
+//!   never a loss).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -55,9 +60,10 @@ pub(crate) struct DbFacts {
     pub(crate) attach: String,
     pub(crate) label: String,
     pub(crate) resolved: Option<String>,
-    /// `MON$SEC_DATABASE` (R9 rule 1): `Default`, `Self`, `Other`.
-    pub(crate) sec_database: Option<String>,
     pub(crate) catalog: Classes,
+    /// Excluded by R9 (`check()` decided it before any probe): not read by
+    /// Discovery, an undeclared database for the stream.
+    pub(crate) excluded: bool,
 }
 
 /// The relation classes of one database's catalog read (decision 5's
@@ -67,12 +73,17 @@ pub(crate) struct DbFacts {
 pub(crate) struct Classes {
     user: HashMap<String, RelClass>,
     complete: bool,
+    /// The views that depend on an always-reported relation (R12 item 5).
+    deps: crate::views::ViewDeps,
 }
 
 impl Classes {
-    pub(crate) fn from_catalog(c: &catalog::Catalog) -> Self {
+    pub(crate) fn from_catalog(c: &catalog::Catalog, deps: crate::views::ViewDeps) -> Self {
         let Some(rels) = &c.relations else {
-            return Self::default();
+            return Self {
+                deps,
+                ..Self::default()
+            };
         };
         let user = rels
             .iter()
@@ -90,6 +101,7 @@ impl Classes {
         Self {
             user,
             complete: !c.relations_cut && c.relations_dropped == 0,
+            deps,
         }
     }
 }
@@ -100,23 +112,29 @@ impl Catalog for Classes {
             return *c;
         }
         // Not a user relation (system flag 0) of a complete read: a
-        // system relation; the virtual ones by their names (R8 item 1).
-        if !self.complete {
+        // system relation only when it is on the explicit list of the
+        // tested images (decision 5, drift-tested), the virtual ones among
+        // them by kind (R8 item 1). Any other name, whatever its prefix
+        // (a table `RDB$LOOT` created since the read), is an object
+        // (review M2 of the refinement of 2026-10-30).
+        if !self.complete || !catalog::NEVER_SAMPLED.contains(&r) {
             return RelClass::Unknown;
         }
         if r.starts_with("MON$") || r.starts_with("SEC$") || r == "RDB$CONFIG" {
             RelClass::Virtual
-        } else if r.starts_with("RDB$") || r.starts_with("PLG$") {
-            RelClass::System
         } else {
-            RelClass::Unknown
+            RelClass::System
         }
     }
 
-    fn always_view(&self, _relation: &str) -> bool {
-        // R12 item 5's view-dependency read is not implemented yet: no
-        // view is known to depend on an always-reported relation.
-        false
+    /// R12 item 5: a view of the dependency set; with an incomplete
+    /// dependency read (failed, cut, past its bounds), every view and
+    /// every name the catalog read does not know.
+    fn always_view(&self, relation: &str) -> bool {
+        if self.deps.complete {
+            return self.deps.dependent.contains(relation);
+        }
+        matches!(self.class(relation), RelClass::View | RelClass::Unknown)
     }
 }
 
@@ -169,6 +187,16 @@ pub(crate) struct CheckInputs {
     /// `MON$SERVER_PID` on the agent's own attachment.
     pub(crate) server_pid: Option<u32>,
     pub(crate) peer_uid: Option<u32>,
+}
+
+/// R9 rule 3: the evaluated `databases.conf` (read under the file rules
+/// and parsed), `None` when not configured, unreadable or not parsed.
+/// Blocking: reads a local file.
+pub(crate) fn alias_map(cfg: &FirebirdAuditConfig) -> Option<AliasMap> {
+    let root = cfg.root.to_string_lossy().into_owned();
+    let p = cfg.databases_conf.as_ref()?;
+    let (bytes, _) = crate::fsread::read_checked(p, trace_conf::MAX_CONF_BYTES).ok()?;
+    trace_conf::parse_databases_conf(&bytes, &root).ok()
 }
 
 /// The proofs, the level and the notes (decision 6; refinements).
@@ -231,8 +259,10 @@ pub(crate) fn evaluate(
             Err(_) => None,
         }
     });
-    // R9: databases that are their own security database are excluded.
-    let mut excluded = 0u64;
+    // R9: `check()` excluded the databases that are their own security
+    // database (or not shown not to be one) before any probe, and reported
+    // the note; the map read here may also exclude one (rule 3, fail
+    // closed: a map changed since the check).
     let mut names = Vec::new();
     for d in &input.dbs {
         let alias = (!d.attach.starts_with('/')).then_some(d.attach.as_str());
@@ -241,16 +271,11 @@ pub(crate) fn evaluate(
             resolved: d.resolved.as_deref(),
             alias,
         };
-        let shape = d.catalog.user.contains_key("PLG$SRP")
-            || d.catalog.user.contains_key("PLG$USERS")
-            || d.catalog.user.contains_key("PLG$VIEW_USERS");
-        let sec_ok = matches!(d.sec_database.as_deref(), Some("Default" | "Other"));
         let map_self = trace_conf::own_security_database(aliases.as_ref(), &decl, &root);
-        let excl = !sec_ok || shape || map_self != Some(false);
-        if excl {
-            excluded += 1;
+        let excl = d.excluded || map_self != Some(false);
+        if excl && !d.excluded {
             detail.push(format!(
-                "{}: excluded from Audit (its own security database, or not shown not to be one)",
+                "{}: excluded from Audit (databases.conf, rule 3 of R9)",
                 d.label
             ));
         }
@@ -267,9 +292,6 @@ pub(crate) fn evaluate(
             excluded: excl,
             attach: d.attach.clone(),
         });
-    }
-    if excluded > 0 {
-        notes.add(TargetNote::new(NoteCode::CoverageSecurityDatabaseExcluded).with_count(excluded));
     }
     // The trace configuration (proofs 3 to 6 and 11).
     let mut proof11 = false;
@@ -296,11 +318,7 @@ pub(crate) fn evaluate(
                         databases: &decls,
                         log: &cfg.log.to_string_lossy(),
                         root: &root,
-                        longest_own_text: crate::sql::STATEMENTS
-                            .iter()
-                            .map(|s| s.text.len())
-                            .max()
-                            .unwrap_or(0),
+                        longest_own_text: crate::own_table::longest_text(),
                     });
                     proven &= v.partial;
                     proof11 = !v.notes.iter().any(|n| {
@@ -326,10 +344,24 @@ pub(crate) fn evaluate(
         notes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
         proven = false;
     }
+    // R4 (R39 (i)): the server's uid from the server process proof 2
+    // finds, or the declared `peer_uid`, never a default.
     let in_container = databastion_core::config::firebird::agent_in_container();
-    if crate::fsread::readable_by_others(&cfg.log, input.peer_uid.unwrap_or(84), in_container) {
+    let server = input.server_pid.and_then(crate::fsread::server_ids);
+    if let Err(why) = crate::fsread::readers_check(&cfg.log, server, input.peer_uid, in_container) {
         notes.add(TargetNote::new(NoteCode::AuditLogReadableByOthers));
+        detail.push(format!("readers check: {why}"));
         proven = false;
+    }
+    // Review L4: the declared root is the server's layout (its binary in
+    // `<root>/bin` or `<root>`); otherwise the macros may not resolve to
+    // the root and proof 2 is not proven.
+    if started.is_some() {
+        let dir = input.server_pid.and_then(crate::fsread::server_binary_dir);
+        let root_path = std::path::Path::new(&root);
+        if !dir.is_some_and(|d| d == root_path.join("bin") || d == root_path) {
+            not_eval.push("server_layout_not_the_root");
+        }
     }
     // Proof 10 and R1 rule 10: Classic is Limited.
     if mode == ServerMode::Classic {
@@ -420,7 +452,7 @@ fn settings(
                 label: d.label.clone(),
                 resolved: d.resolved.clone(),
                 alias: (!d.attach.starts_with('/')).then(|| d.attach.clone()),
-                excluded: !matches!(d.sec_database.as_deref(), Some("Default" | "Other")),
+                excluded: d.excluded,
                 attach: d.attach.clone(),
             })
             .collect();
@@ -474,10 +506,12 @@ pub(crate) async fn stream(
         record_start: None,
         file: None,
         last_growth: Instant::now(),
-        replay_end: None,
+        reread_end: None,
     };
+    // R39 (a): the re-read region is emitted again, not suppressed; its end
+    // is kept for the local count only.
     if let Some(r) = runner.tailer.take_replay() {
-        runner.replay_end = Some(r.replay.end);
+        runner.reread_end = Some((r.file, r.replay.end));
     }
     loop {
         // A new check: new names, classes, run.
@@ -577,9 +611,9 @@ struct Runner {
     /// The `(st_dev, st_ino)` of the file read last.
     file: Option<(u64, u64)>,
     last_growth: Instant,
-    /// After a restart: records ending before this were handed over
-    /// already, and are replayed for state only.
-    replay_end: Option<u64>,
+    /// After a restart: the file and the end of what the previous reading
+    /// had read. Records before it are emitted again (R39 (a)) and counted.
+    reread_end: Option<((u64, u64), u64)>,
 }
 
 impl Runner {
@@ -608,10 +642,11 @@ impl Runner {
                 // The record in progress ends here.
                 if let Some(Assembled::Record(raw)) = self.asm.push_line(line) {
                     let rs = self.record_start.unwrap_or(start);
-                    let replay = self.replay_end.is_some_and(|e| rs < e);
-                    m.push(&raw, rs, now, cats, replay, out);
+                    self.count_reread(m, rs);
+                    m.push(&raw, rs, now, cats, out);
                 }
                 self.record_start = Some(start);
+                m.set_file(pos.file);
             } else {
                 if let Some(Assembled::Oversized(_)) = self.asm.push_line(line) {
                     m.counts.oversized += 1;
@@ -622,13 +657,22 @@ impl Runner {
         if !polled.more && now.duration_since(self.last_growth) >= STABLE_EOF {
             if let Some(Assembled::Record(raw)) = self.asm.flush() {
                 let rs = self.record_start.unwrap_or(0);
-                let replay = self.replay_end.is_some_and(|e| rs < e);
-                m.push(&raw, rs, now, cats, replay, out);
+                self.count_reread(m, rs);
+                m.push(&raw, rs, now, cats, out);
             }
             self.record_start = None;
         }
-        m.expire(now, cats, false, out);
+        m.expire(now, cats, out);
         Ok(polled.more)
+    }
+
+    fn count_reread(&self, m: &mut Machine, start: u64) {
+        if self
+            .reread_end
+            .is_some_and(|(f, e)| self.file == Some(f) && start < e)
+        {
+            m.counts.reread += 1;
+        }
     }
 }
 
@@ -674,7 +718,7 @@ mod tests {
             record_start: None,
             file: None,
             last_growth: Instant::now(),
-            replay_end: None,
+            reread_end: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());
@@ -693,14 +737,40 @@ mod tests {
     #[test]
     fn classes_from_the_catalog() {
         let c = Classes {
-            user: HashMap::from([("RDB$CUSTOMER_ARCHIVE".to_owned(), RelClass::Table)]),
+            user: HashMap::from([
+                ("RDB$CUSTOMER_ARCHIVE".to_owned(), RelClass::Table),
+                ("V_MIX".to_owned(), RelClass::View),
+                ("V_PLAIN".to_owned(), RelClass::View),
+            ]),
             complete: true,
+            deps: crate::views::ViewDeps {
+                dependent: ["V_MIX".to_owned()].into_iter().collect(),
+                complete: true,
+            },
         };
         assert_eq!(c.class("RDB$CUSTOMER_ARCHIVE"), RelClass::Table);
         assert_eq!(c.class("RDB$RELATIONS"), RelClass::System);
         assert_eq!(c.class("MON$STATEMENTS"), RelClass::Virtual);
         assert_eq!(c.class("CUSTOMERS"), RelClass::Unknown);
+        // Review M2: a name off the explicit list is an object, whatever
+        // its prefix.
+        assert_eq!(c.class("RDB$LOOT"), RelClass::Unknown);
+        assert_eq!(c.class("MON$LOOT"), RelClass::Unknown);
+        assert_eq!(c.class("PLG$LOOT"), RelClass::Unknown);
         let cut = Classes::default();
         assert_eq!(cut.class("RDB$RELATIONS"), RelClass::Unknown);
+        // R12 item 5.
+        assert!(c.always_view("V_MIX"));
+        assert!(!c.always_view("V_PLAIN"));
+        assert!(!c.always_view("CUSTOMERS"));
+        // An incomplete dependency read: every view, and unknown names.
+        let open = Classes {
+            deps: crate::views::ViewDeps::default(),
+            ..c.clone()
+        };
+        assert!(open.always_view("V_PLAIN"));
+        assert!(open.always_view("V_NEW"));
+        assert!(!open.always_view("RDB$CUSTOMER_ARCHIVE"));
+        assert!(!open.always_view("RDB$RELATIONS"));
     }
 }

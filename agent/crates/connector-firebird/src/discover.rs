@@ -269,6 +269,13 @@ pub(crate) async fn run(
             break;
         }
         let dbn = normalize(&db.name);
+        // R9: a database the last check excluded as its own security
+        // database (or not shown not to be one) is not scanned; the other
+        // databases are.
+        if state.excluded(&target.id, &db.attach) {
+            tracing::warn!(target_id = %target.id, database = dbn.as_str(), "database excluded from Discovery (coverage.security_database_excluded)");
+            continue;
+        }
         job.begin_database(dbn.as_str());
         let mut d = Db {
             job,
@@ -283,17 +290,16 @@ pub(crate) async fn run(
             .paced(async {
                 let deadline = d.unit_deadline();
                 let mut s = opener.open(&db.attach, deadline).await?;
-                let read = async {
-                    let (_, facts) = check::database(
-                        &mut s,
-                        settings.tunnel,
-                        settings.extended_grants,
-                        deadline,
-                    )
-                    .await?;
-                    let read = catalog::read(&mut s, deadline).await?;
-                    Ok::<_, FbError>((facts, read))
-                }
+                // R9 rules 1 and 2 before any probe (rule 3 is the check's,
+                // where Audit reads `databases.conf`).
+                let read = check::attached(
+                    &mut s,
+                    settings.tunnel,
+                    settings.extended_grants,
+                    &db.attach,
+                    None,
+                    deadline,
+                )
                 .await;
                 match read {
                     Ok(r) => {
@@ -313,7 +319,12 @@ pub(crate) async fn run(
                 job.skip_out_of_time(sink, dbs.len() - i);
                 break;
             }
-            Paced::Done(Ok(r)) => r,
+            Paced::Done(Ok(check::Attached::Checked { facts, read, .. })) => (facts, read),
+            Paced::Done(Ok(check::Attached::Excluded { reason, .. })) => {
+                d.close().await;
+                tracing::warn!(target_id = %target.id, database = dbn.as_str(), reason, "database excluded from Discovery (coverage.security_database_excluded)");
+                continue;
+            }
             Paced::Done(Err(e)) => {
                 d.close().await;
                 // The attachment itself failed (unknown database, refused):
@@ -762,6 +773,11 @@ mod tests {
                 ]],
             ),
             canned(sql::IDLE_TIMEOUT, vec![], vec![]),
+            canned(
+                sql::DATABASE_FILE,
+                vec![text_col(4080), text_col(28)],
+                vec![vec![v("/var/lib/firebird/data/app.fdb"), v("Default")]],
+            ),
             canned(
                 sql::IDENTITY,
                 vec![

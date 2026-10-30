@@ -42,6 +42,7 @@ mod error;
 mod fsread;
 #[cfg_attr(not(test), allow(dead_code))]
 mod own;
+mod own_table;
 mod peer;
 mod privileges;
 #[cfg(test)]
@@ -66,6 +67,7 @@ mod trace_events_tests;
 mod trace_log;
 #[cfg(test)]
 mod trace_log_tests;
+mod views;
 mod wire;
 mod xdr;
 

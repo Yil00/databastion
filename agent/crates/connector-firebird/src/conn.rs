@@ -228,8 +228,10 @@ struct Own {
     ledger: Option<std::sync::Arc<crate::own::Ledger>>,
     attach: String,
     id: Option<u64>,
-    early: Vec<(String, FetchAccount)>,
+    early: Vec<(String, Option<String>, FetchAccount)>,
     closed: bool,
+    /// The table of the built statement being run (its credit names it).
+    table: Option<String>,
 }
 
 /// How the fetch of one execution ended (ADR-0060 R22 item 1, R35).
@@ -557,6 +559,7 @@ impl Session {
         if !sql::checked(text) {
             return Err(FbError::new(FailureCode::Internal, Stage::Check));
         }
+        self.own.table = None;
         self.query_text(text, shape, max_rows, deadline).await
     }
 
@@ -624,6 +627,7 @@ impl Session {
         deadline: Instant,
         on_row: &mut (dyn FnMut(Vec<Value>) -> Flow + Send),
     ) -> Result<Fetched, FbError> {
+        self.own.table = Some(stmt.table().to_owned());
         self.statement(stmt.text(), shape, max_rows, deadline, on_row)
             .await
     }
@@ -636,6 +640,7 @@ impl Session {
         max_rows: usize,
         deadline: Instant,
     ) -> Result<Rows, FbError> {
+        self.own.table = Some(stmt.table().to_owned());
         self.query_text(stmt.text(), shape, max_rows, deadline)
             .await
     }
@@ -681,10 +686,11 @@ impl Session {
     /// the attachment id is known, held until then.
     fn record_credit(&mut self, text: &str) {
         let account = self.last_fetch;
+        let table = self.own.table.take();
         match (&self.own.ledger, self.own.id) {
-            (Some(l), Some(id)) => l.credit(&self.own.attach, id, text, account),
+            (Some(l), Some(id)) => l.credit(&self.own.attach, id, text, table.as_deref(), account),
             (Some(_), None) if self.own.early.len() < 64 => {
-                self.own.early.push((text.to_owned(), account));
+                self.own.early.push((text.to_owned(), table, account));
             }
             _ => {}
         }
@@ -702,8 +708,8 @@ impl Session {
         }
         l.register(&self.own.attach, id, local.port(), pid);
         self.own.id = Some(id);
-        for (text, account) in std::mem::take(&mut self.own.early) {
-            l.credit(&self.own.attach, id, &text, account);
+        for (text, table, account) in std::mem::take(&mut self.own.early) {
+            l.credit(&self.own.attach, id, &text, table.as_deref(), account);
         }
     }
 
@@ -778,6 +784,7 @@ impl Session {
         if !sql::checked(text) {
             return Err(FbError::new(FailureCode::Internal, Stage::Check));
         }
+        self.own.table = None;
         self.begin(deadline).await?;
         let tx = self.tx.unwrap_or(0);
         let stmt = self

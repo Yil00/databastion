@@ -166,6 +166,16 @@ pub(crate) const RELATIONS: &str = "SELECT CAST(R.RDB$RELATION_NAME AS VARCHAR(2
 pub(crate) const COLUMNS: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(RF.RDB$FIELD_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(RF.RDB$FIELD_POSITION, 0) AS INTEGER), CAST(F.RDB$FIELD_TYPE AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SUB_TYPE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_SCALE, 0) AS INTEGER), CAST(COALESCE(F.RDB$FIELD_LENGTH, 0) AS INTEGER), CAST(COALESCE(F.RDB$CHARACTER_SET_ID, -1) AS INTEGER), CASE WHEN F.RDB$DIMENSIONS IS NULL THEN FALSE ELSE TRUE END, CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$RELATIONS R ON R.RDB$RELATION_NAME = RF.RDB$RELATION_NAME JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE WHERE COALESCE(R.RDB$SYSTEM_FLAG, 0) = 0 AND COALESCE(R.RDB$RELATION_TYPE, 0) = 0 AND R.RDB$VIEW_BLR IS NULL AND R.RDB$EXTERNAL_FILE IS NULL ORDER BY 1, 3, 2";
 
 /// Every statement the connector may send.
+/// The view-dependency read of R12 item 5 (ADR-0060), first part: every
+/// view's base relations and procedure contexts (`RDB$CONTEXT_TYPE` 2),
+/// names as raw bytes (`OCTETS`, as [`RELATIONS`]).
+pub(crate) const VIEW_RELATIONS: &str = "SELECT CAST(V.RDB$VIEW_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(V.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(COALESCE(V.RDB$CONTEXT_TYPE, 0) AS INTEGER) FROM RDB$VIEW_RELATIONS V";
+
+/// The view-dependency read of R12 item 5, second part: what views and
+/// code (procedures 5, functions 15, package headers and bodies 18 and
+/// 19) depend on, with the dependent's package.
+pub(crate) const DEPENDENCIES: &str = "SELECT CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDENT_TYPE AS INTEGER), CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDED_ON_TYPE AS INTEGER), CAST(D.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$DEPENDENCIES D WHERE D.RDB$DEPENDENT_TYPE IN (1, 5, 15, 18, 19)";
+
 pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "version",
@@ -242,6 +252,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "columns",
         text: COLUMNS,
+    },
+    Statement {
+        name: "view_relations",
+        text: VIEW_RELATIONS,
+    },
+    Statement {
+        name: "dependencies",
+        text: DEPENDENCIES,
     },
 ];
 
@@ -418,6 +436,9 @@ impl Conv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Built {
     text: String,
+    /// The catalog name of the one table it reads (its execution credit
+    /// names it: R13 items 2 and 4).
+    table: String,
 }
 
 impl Built {
@@ -425,8 +446,16 @@ impl Built {
         &self.text
     }
 
-    fn checked(text: String) -> Option<Self> {
-        (!has_denied_word(&text) && !unquoted(&text).contains('\'')).then_some(Self { text })
+    /// The table the statement reads, as the catalog stores its name.
+    pub(crate) fn table(&self) -> &str {
+        &self.table
+    }
+
+    fn checked(text: String, table: &str) -> Option<Self> {
+        (!has_denied_word(&text) && !unquoted(&text).contains('\'')).then(|| Self {
+            text,
+            table: table.to_owned(),
+        })
     }
 }
 
@@ -454,11 +483,14 @@ pub(crate) fn sample_statement(table: &str, columns: &[(&str, Conv)], n: u32) ->
         .iter()
         .map(|(c, conv)| conv.expr(&quote_identifier(c)))
         .collect();
-    Built::checked(format!(
-        "SELECT FIRST {n} {} FROM {}",
-        exprs.join(", "),
-        quote_identifier(table)
-    ))
+    Built::checked(
+        format!(
+            "SELECT FIRST {n} {} FROM {}",
+            exprs.join(", "),
+            quote_identifier(table)
+        ),
+        table,
+    )
 }
 
 /// The CAS store guard's metadata aggregate of a ticket registry (ADR-0041
@@ -469,12 +501,15 @@ pub(crate) fn ticket_type_counts(table: &str, column: &str) -> Option<Built> {
     if !identifier_ok(table) || !identifier_ok(column) {
         return None;
     }
-    Built::checked(format!(
-        "SELECT CAST(SUBSTRING({} FROM 1 FOR 255) AS VARCHAR(255) CHARACTER SET UTF8), COUNT(*) \
-         FROM {} GROUP BY 1",
-        quote_identifier(column),
-        quote_identifier(table)
-    ))
+    Built::checked(
+        format!(
+            "SELECT CAST(SUBSTRING({} FROM 1 FOR 255) AS VARCHAR(255) CHARACTER SET UTF8), \
+             COUNT(*) FROM {} GROUP BY 1",
+            quote_identifier(column),
+            quote_identifier(table)
+        ),
+        table,
+    )
 }
 
 /// `isc_info_sql_*` items.

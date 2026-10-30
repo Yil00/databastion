@@ -6,12 +6,15 @@
 //!   regular file with one hard link, not writable by the agent (owner,
 //!   mode bits, `faccessat(W_OK)`, no writable ancestor), the path naming
 //!   the handle before and after the checks (ADR-0043 decision 5).
-//! - [`readers`] (R4, proof 1): who other than root, the server's account
-//!   and the agent can read the log or its directory, from the mode bits,
-//!   the owner and group, the POSIX ACLs (mask applied) and the members
-//!   of every group with read access (`/etc/group`, `/etc/passwd`). An
-//!   agent whose identity files are not the host's (a container, a user
-//!   namespace) proves nothing: the log counts as readable by others.
+//! - [`readers_check`] (R4, proof 1): who other than root, the server's
+//!   account and the agent can read the log, its rotated files or its
+//!   directory, or the next log file through the directory's default ACL,
+//!   from the mode bits, the owner and group, the POSIX ACLs (mask
+//!   applied) and the members of every group with read access
+//!   (`/etc/group`, `/etc/passwd`). The server's uid is the server
+//!   process's (`/proc/<pid>/status`) or the declared `peer_uid`, never a
+//!   default. An agent whose identity files are not the host's (a
+//!   container, a user namespace) proves nothing.
 //! - [`process_start`] (R1 rule 1, R5): field 22 of `/proc/<pid>/stat`,
 //!   converted with the boot time and the clock ticks.
 //!
@@ -191,37 +194,166 @@ pub(crate) fn stat_start_ticks(stat: &str) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Who can read `path` (R4): `true` when a uid other than root, `server`
-/// and the agent can, or when that cannot be shown.
-pub(crate) fn readable_by_others(path: &Path, server: u32, in_container: bool) -> bool {
-    if in_container {
-        return true;
+/// The server process's effective uid and gid (`/proc/<pid>/status`),
+/// only when the process is a Firebird server (`comm` `firebird`): a pid
+/// read from another pid namespace names an unrelated process here.
+pub(crate) fn server_ids(pid: u32) -> Option<(u32, u32)> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    if comm.trim_end() != "firebird" {
+        return None;
     }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status_ids(&status)
+}
+
+/// The effective uid and gid of a `/proc/<pid>/status` text.
+pub(crate) fn status_ids(status: &str) -> Option<(u32, u32)> {
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|v| v.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u32>().ok())
+    };
+    Some((field("Uid:")?, field("Gid:")?))
+}
+
+/// The directory of the server's binary (`argv[0]` of
+/// `/proc/<pid>/cmdline`, absolute only), for the layout check (review
+/// L4).
+pub(crate) fn server_binary_dir(pid: u32) -> Option<std::path::PathBuf> {
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    binary_dir(&cmd)
+}
+
+pub(crate) fn binary_dir(cmdline: &[u8]) -> Option<std::path::PathBuf> {
+    let argv0 = cmdline.split(|b| *b == 0).next()?;
+    let p = Path::new(std::str::from_utf8(argv0).ok()?);
+    if !p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+        return None;
+    }
+    p.parent().map(Path::to_path_buf)
+}
+
+/// Rotated files examined at most next to the log (R4).
+const MAX_DIR_ENTRIES: usize = 4096;
+
+/// Who can read `path` (R4, proof 1): `Ok` when no uid other than root,
+/// the server's and the agent's can read the log, the files rotated from
+/// it (`<name>.*` and `<name>-*` next to it: the files the server may
+/// still write and the ones the agent may still be reading), or its
+/// directory, nor will the next log file through the directory's
+/// default ACL; otherwise the reason. `server`: the server's uid and gid
+/// as `/proc` shows them, `peer`: the declared `peer_uid`; neither, or
+/// both differing, is a refusal (never a default uid).
+pub(crate) fn readers_check(
+    path: &Path,
+    server: Option<(u32, u32)>,
+    peer: Option<u32>,
+    in_container: bool,
+) -> Result<(), &'static str> {
+    if in_container {
+        return Err("agent_in_container");
+    }
+    let (server_uid, server_gid) = match (server, peer) {
+        (Some((u, g)), Some(p)) if u == p => (u, Some(g)),
+        (Some(_), Some(_)) => return Err("server_uid_mismatch"),
+        (Some((u, g)), None) => (u, Some(g)),
+        (None, Some(p)) => (p, None),
+        (None, None) => return Err("server_uid_unknown"),
+    };
     let agent = rustix::process::geteuid().as_raw();
     let passwd = std::fs::read_to_string("/etc/passwd").ok();
     let group = std::fs::read_to_string("/etc/group").ok();
     let (Some(passwd), Some(group)) = (passwd, group) else {
-        return true;
+        return Err("identity_files_unreadable");
     };
-    let allowed = |uid: u32| uid == 0 || uid == server || uid == agent;
+    let allowed = |uid: u32| uid == 0 || uid == server_uid || uid == agent;
     let check = |p: &Path, need: u32| -> bool {
         let Ok(m) = std::fs::metadata(p) else {
             return true;
         };
-        let acl = acl_entries(p);
+        let acl = acl_entries(p, "system.posix_acl_access");
         others_can(&m, need, acl.as_deref(), &passwd, &group, &allowed)
     };
-    // The log (read) and its directory (search, for the rotated files).
-    check(path, 0o4) || path.parent().is_some_and(|d| check(d, 0o4))
+    if check(path, 0o4) {
+        return Err("log_readable_by_others");
+    }
+    let Some(dir) = path.parent() else {
+        return Err("log_directory_unknown");
+    };
+    if check(dir, 0o4) {
+        return Err("log_directory_readable_by_others");
+    }
+    // The next log file's access, from the directory's default ACL.
+    if let Some(def) = acl_entries(dir, "system.posix_acl_default") {
+        let Ok(dm) = std::fs::metadata(dir) else {
+            return Err("log_directory_unreadable");
+        };
+        let gids: Vec<u32> = server_gid.into_iter().chain([dm.gid()]).collect();
+        if default_acl_open(&def, &gids, &passwd, &group, &allowed) {
+            return Err("log_directory_default_acl");
+        }
+    }
+    // Rotated files.
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err("log_name_not_utf8");
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Err("log_directory_unreadable");
+    };
+    for (n, e) in entries.enumerate() {
+        if n >= MAX_DIR_ENTRIES {
+            return Err("log_directory_too_large");
+        }
+        let Ok(e) = e else {
+            return Err("log_directory_unreadable");
+        };
+        let f = e.file_name();
+        let Some(f) = f.to_str() else { continue };
+        let rotated = f
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'));
+        if rotated && check(&dir.join(f), 0o4) {
+            return Err("rotated_log_readable_by_others");
+        }
+    }
+    Ok(())
 }
 
-/// `system.posix_acl_access` entries `(tag, perm, id)`, `None` without an
-/// ACL; an unreadable ACL (other than "no ACL") counts as open.
-fn acl_entries(path: &Path) -> Option<Vec<(u16, u16, u32)>> {
+/// Whether a default ACL gives read to a uid outside `allowed` on the
+/// files created in the directory: named users and groups and other
+/// (under the mask), the owning group (the creating server's group or
+/// the directory's) when one of its members is not allowed. The owner
+/// entry is the creating server's own.
+fn default_acl_open(
+    entries: &[(u16, u16, u32)],
+    gids: &[u32],
+    passwd: &str,
+    group: &str,
+    allowed: &dyn Fn(u32) -> bool,
+) -> bool {
+    let group_ok =
+        |gid: u32| members(group, passwd, gid).is_none_or(|u| u.iter().any(|x| !allowed(*x)));
+    let mask = entries.iter().find(|e| e.0 == 0x10).map_or(7, |e| e.1);
+    entries.iter().any(|&(tag, perm, id)| match tag {
+        0x02 => perm & mask & 4 != 0 && !allowed(id),
+        0x04 => perm & mask & 4 != 0 && gids.iter().any(|g| group_ok(*g)),
+        0x08 => perm & mask & 4 != 0 && group_ok(id),
+        0x20 => perm & 4 != 0,
+        _ => false,
+    })
+}
+
+/// The ACL entries `(tag, perm, id)` of `xattr` (`system.posix_acl_access`
+/// or `system.posix_acl_default`), `None` without one; an ACL that does
+/// not parse, or an error other than "no ACL", counts as open.
+fn acl_entries(path: &Path, xattr: &str) -> Option<Vec<(u16, u16, u32)>> {
     let mut buf = vec![0u8; 4096];
-    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut buf) {
+    match rustix::fs::getxattr(path, xattr, &mut buf) {
         Ok(n) => parse_acl(&buf[..n]).or(Some(vec![(0x20, 7, 0)])),
-        Err(_) => None,
+        Err(e) if e == rustix::io::Errno::NODATA || e == rustix::io::Errno::NOTSUP => None,
+        Err(_) => Some(vec![(0x20, 7, 0)]),
     }
 }
 
@@ -335,6 +467,83 @@ mod tests {
         assert_eq!(e[1], (2, 4, 1001));
         assert!(parse_acl(&acl[..7]).is_none());
         assert!(process_start(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn server_ids_and_layout() {
+        let status = "Name:\tfirebird\nUid:\t84\t85\t85\t85\nGid:\t90\t91\t91\t91\n";
+        assert_eq!(status_ids(status), Some((85, 91)));
+        assert_eq!(status_ids("Name:\tx\n"), None);
+        assert_eq!(
+            binary_dir(b"/opt/firebird/bin/firebird\0-a\0"),
+            Some(std::path::PathBuf::from("/opt/firebird/bin"))
+        );
+        assert_eq!(binary_dir(b"firebird\0"), None);
+        assert_eq!(binary_dir(b"/opt/x/../firebird/bin/firebird\0"), None);
+        // This test process is not a Firebird server.
+        assert_eq!(server_ids(std::process::id()), None);
+    }
+
+    /// R39 (i): no default uid; a mismatch between the process and the
+    /// declared account refuses; a default ACL that gives the next log to
+    /// another account refuses.
+    #[test]
+    fn the_readers_check_needs_the_servers_uid() {
+        let p = Path::new("/nonexistent/fb/audit.log");
+        assert_eq!(
+            readers_check(p, None, None, false),
+            Err("server_uid_unknown")
+        );
+        assert_eq!(
+            readers_check(p, Some((84, 84)), Some(85), false),
+            Err("server_uid_mismatch")
+        );
+        assert_eq!(
+            readers_check(p, Some((84, 84)), Some(84), true),
+            Err("agent_in_container")
+        );
+        let passwd =
+            "root:x:0:0::/:/bin/sh\nfirebird:x:84:84::/:/bin/false\neve:x:1002:1002::/:/bin/sh\n";
+        let group = "firebird:x:84:\nstaff:x:50:eve\n";
+        let allowed = |u: u32| u == 0 || u == 84;
+        // Owner and owning group of server-only membership: closed.
+        let closed = [
+            (1u16, 6u16, u32::MAX),
+            (4, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ];
+        assert!(!default_acl_open(&closed, &[84], passwd, group, &allowed));
+        // A named user, a named group with another member, other: open.
+        assert!(default_acl_open(
+            &[(2, 4, 1002)],
+            &[84],
+            passwd,
+            group,
+            &allowed
+        ));
+        assert!(default_acl_open(
+            &[(8, 4, 50)],
+            &[84],
+            passwd,
+            group,
+            &allowed
+        ));
+        assert!(default_acl_open(
+            &[(0x20, 4, u32::MAX)],
+            &[84],
+            passwd,
+            group,
+            &allowed
+        ));
+        // Under a mask without read: closed.
+        assert!(!default_acl_open(
+            &[(2, 4, 1002), (0x10, 0, u32::MAX)],
+            &[84],
+            passwd,
+            group,
+            &allowed
+        ));
     }
 
     #[test]

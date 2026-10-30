@@ -235,7 +235,7 @@ fn the_server_trace_log_through_the_stream() {
         {
             bare += 1;
         }
-        m.push(raw, i as u64, now, &cats, false, &mut out);
+        m.push(raw, i as u64, now, &cats, &mut out);
     }
     assert_eq!(m.counts.panics, 0);
     assert_eq!(m.counts.ambiguous, bare, "{:?}", m.why);

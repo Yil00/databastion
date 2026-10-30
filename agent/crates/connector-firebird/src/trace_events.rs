@@ -174,6 +174,16 @@ fn keep(name: &str, cat: &dyn Catalog) -> Option<bool> {
     }
 }
 
+/// R12 item 5: a view that depends on an always-reported relation (a
+/// block-blind read of that relation may stand behind it) gives `*` and
+/// the always-reported mark, in every shape.
+fn always_view_star(d: &mut Draft, name: &str, cat: &dyn Catalog) {
+    if cat.always_view(name) {
+        d.star = true;
+        d.always = true;
+    }
+}
+
 fn block_objects(d: &mut Draft, block: &[(&str, Counters)], cat: &dyn Catalog) -> bool {
     let mut wrote = false;
     for (name, c) in block {
@@ -182,6 +192,7 @@ fn block_objects(d: &mut Draft, block: &[(&str, Counters)], cat: &dyn Catalog) -
             d.always |= always;
             wrote |= c.wrote();
         }
+        always_view_star(d, name, cat);
     }
     wrote
 }
@@ -192,6 +203,7 @@ fn text_objects(d: &mut Draft, a: &FirebirdAnalysis, cat: &dyn Catalog) {
             d.object(name);
             d.always |= always;
         }
+        always_view_star(d, name, cat);
         // Block-blind relations (R28): reads of external-file tables are
         // remote data and always reported; a view the block cannot show
         // through stays named from the text.

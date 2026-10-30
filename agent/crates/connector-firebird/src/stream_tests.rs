@@ -64,11 +64,11 @@ fn run(log: &str, proof11: bool, series: Series) -> (Machine, Vec<Emitted>) {
     recs.extend(a.flush());
     for r in &recs {
         if let Assembled::Record(raw) = r {
-            m.push(raw, pos, now, &cats, false, &mut out);
+            m.push(raw, pos, now, &cats, &mut out);
             pos += raw.len() as u64 + 1;
         }
     }
-    m.expire(now + Duration::from_secs(120), &cats, false, &mut out);
+    m.expire(now + Duration::from_secs(120), &cats, &mut out);
     (m, out)
 }
 
@@ -298,7 +298,7 @@ fn runs_and_held_positions() {
         recs.extend(asm.flush());
         for (i, r) in recs.iter().enumerate() {
             if let Assembled::Record(raw) = r {
-                m.push(raw, i as u64 * 100, now, &cats, false, out);
+                m.push(raw, i as u64 * 100, now, &cats, out);
             }
         }
     };

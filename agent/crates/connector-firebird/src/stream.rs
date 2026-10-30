@@ -97,8 +97,6 @@ const MAX_HELD: usize = 65_536;
 const HOLD_TIME: Duration = Duration::from_secs(10);
 /// R30 item 3: the Garbage Collector's expected end.
 const GC_END: Duration = Duration::from_secs(10);
-/// The per-version metadata-loading set (R8 item 4, R23).
-const METADATA_LOADING: &[&str] = &["RDB$DATABASE", "RDB$RELATIONS"];
 
 /// The names one declared database can be printed under (R2 rule 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +214,8 @@ pub(crate) struct Counts {
     pub(crate) oversized: u64,
     /// Records of each declared database parsed (proof 9), by index.
     pub(crate) parsed_declared: u64,
+    /// Records read again after a restart, and emitted again (R39 (a)).
+    pub(crate) reread: u64,
 }
 
 /// The stream's settings.
@@ -255,8 +255,20 @@ pub(crate) struct Machine {
     hold_since: Option<Instant>,
     /// The declared database of the last well-formed record (fix 3).
     last_declared: Option<usize>,
-    /// Local time offset: agent time minus the server's printed time.
+    /// Local time offset: agent time minus the server's printed time,
+    /// confirmed by a credited own record (review M3).
     offset: Option<i64>,
+    /// An offset learned from an own attach, not confirmed yet.
+    offset_pending: Option<(i64, Key)>,
+    /// The binding whose credited record confirmed the offset, and the
+    /// offset before it (restored if that binding is poisoned).
+    offset_from: Option<(Key, Option<i64>)>,
+    /// Declared databases whose view sets a view DDL record invalidated
+    /// until the next `check()` (R28 item 4).
+    views_invalid: std::collections::HashSet<usize>,
+    /// The `(st_dev, st_ino)` of the log file being read (the ledger keys
+    /// consumed credits by record position).
+    file: (u64, u64),
     ledger: std::sync::Arc<Ledger>,
     hash_key: std::collections::hash_map::RandomState,
     /// Groups ended by the record being judged, emitted in `apply`.
@@ -294,6 +306,10 @@ impl Machine {
             hold_since: None,
             last_declared: None,
             offset: None,
+            offset_pending: None,
+            offset_from: None,
+            file: (0, 0),
+            views_invalid: std::collections::HashSet::new(),
             ledger,
             hash_key: std::collections::hash_map::RandomState::new(),
             pending_end: Vec::new(),
@@ -303,16 +319,29 @@ impl Machine {
         }
     }
 
+    /// The log file the next records come from.
+    pub(crate) fn set_file(&mut self, file: (u64, u64)) {
+        self.file = file;
+    }
+
     /// New settings from a re-evaluation (names, map, proof 11).
     pub(crate) fn reconfigure(&mut self, s: Settings) {
         self.s = s;
+        // A new check read the view sets again (R28 item 4).
+        self.views_invalid.clear();
     }
 
     /// A run confirmed by `check()` or a `/proc` sample (R1 rule 1, R5
     /// item 4). A different pid or start time ends every binding of the
     /// old run.
     pub(crate) fn confirm_run(&mut self, run: Run) {
-        if self.run.is_some_and(|r| r != run) {
+        // Review N1: a provisional run (no start time, the first pid seen)
+        // is compared by its pid only.
+        let other = self.run.is_some_and(|r| match r.start {
+            None => r.pid != run.pid,
+            Some(_) => r != run,
+        });
+        if other {
             self.end_run();
         }
         self.run = Some(run);
@@ -343,6 +372,56 @@ impl Machine {
     /// of the oldest pending group (R25 item 7), `None` when nothing pends.
     pub(crate) fn held_from(&self) -> Option<u64> {
         self.groups.iter().map(|g| g.first).min()
+    }
+
+    /// R28 item 4: a statement record that creates, alters, recreates or
+    /// drops a view, a DDL text that does not parse, or an ambiguous DDL
+    /// record invalidates the view sets (of its database; of every
+    /// declared database when ambiguous) until the next `check()`.
+    fn note_view_ddl(&mut self, rec: &Record<'_>, decision: &Decision) {
+        let Body::Statement { text, .. } = &rec.body else {
+            return;
+        };
+        let a = analyze_firebird(text);
+        if a.kind != FirebirdKind::Ddl {
+            return;
+        }
+        match decision {
+            Decision::Ambiguous { .. } => {
+                self.views_invalid.extend(0..self.s.databases.len());
+            }
+            Decision::Normal { db, .. } if !a.parses() || names_view(text) => {
+                self.views_invalid.insert(*db);
+            }
+            _ => {}
+        }
+    }
+
+    /// A credited own record of `key` confirms the offset its attach gave.
+    fn confirm_offset(&mut self, key: Key) {
+        if let Some((o, k)) = self.offset_pending
+            && k == key
+        {
+            self.offset_from = Some((key, self.offset));
+            self.offset = Some(o);
+            self.offset_pending = None;
+        }
+    }
+
+    /// The offset's binding poisoned (or the pending one): reverted.
+    fn check_offset_binding(&mut self) {
+        let poisoned = |m: &Self, k: &Key| m.bindings.get(k).is_some_and(|b| b.poisoned);
+        if let Some((_, k)) = self.offset_pending
+            && poisoned(self, &k)
+        {
+            self.offset_pending = None;
+        }
+        if let Some((k, prev)) = self.offset_from
+            && poisoned(self, &k)
+        {
+            self.offset = prev;
+            self.offset_from = None;
+        }
     }
 
     fn hash(&self, name: &str) -> u64 {
@@ -417,19 +496,33 @@ impl Machine {
     }
 
     /// One assembled record at log offset `pos` (its first byte), read at
-    /// reading time `now`. Events go to `out`; `replay` marks a record
-    /// re-read for state only (it emits nothing).
+    /// reading time `now`. Events go to `out`. A record re-read after a
+    /// restart is judged and emitted as on its first reading (R39 (a):
+    /// without a state checkpoint it may be judged differently, so nothing
+    /// is suppressed; duplicates are the accepted over-reporting).
     pub(crate) fn push(
         &mut self,
         raw: &[u8],
         pos: u64,
         now: Instant,
         cat: &[&dyn Catalog],
-        replay: bool,
         out: &mut Vec<Emitted>,
     ) {
         self.counts.records += 1;
-        self.expire(now, cat, replay, out);
+        // R28 item 4: after a view DDL record, until the next check, every
+        // view (and every name the catalog read does not know) counts as
+        // dependent.
+        let wrapped: Vec<Invalidated<'_>> = cat
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Invalidated {
+                inner: *c,
+                invalid: self.views_invalid.contains(&i),
+            })
+            .collect();
+        let cat: Vec<&dyn Catalog> = wrapped.iter().map(|w| w as &dyn Catalog).collect();
+        let cat = cat.as_slice();
+        self.expire(now, cat, out);
         let Some(rec) = parse(raw, self.s.parse) else {
             return;
         };
@@ -438,18 +531,14 @@ impl Machine {
             self.counts.panics += 1;
             return;
         };
-        self.apply(decision, &rec, now, cat, replay, out);
+        self.check_offset_binding();
+        self.note_view_ddl(&rec, &decision);
+        self.apply(decision, &rec, pos, now, cat, out);
     }
 
     /// The bounds that run on reading time: windows, groups, holds, the
     /// Garbage Collector's expected end.
-    pub(crate) fn expire(
-        &mut self,
-        now: Instant,
-        cat: &[&dyn Catalog],
-        replay: bool,
-        out: &mut Vec<Emitted>,
-    ) {
+    pub(crate) fn expire(&mut self, now: Instant, cat: &[&dyn Catalog], out: &mut Vec<Emitted>) {
         if self.window_until.is_some_and(|u| now >= u) {
             self.window_until = None;
         }
@@ -462,7 +551,7 @@ impl Machine {
             let Some(g) = self.groups.pop_front() else {
                 break;
             };
-            self.end_group(g, now, cat, replay, out);
+            self.end_group(g, now, cat, out);
         }
         if self.hold_since.is_some()
             && !self
@@ -470,7 +559,7 @@ impl Machine {
                 .iter()
                 .any(|g| g.members.iter().any(|m| m.block_less))
         {
-            self.release(false, replay, out);
+            self.release(false, out);
         }
         let gone: Vec<DbId> = self
             .gc_alone_since
@@ -488,12 +577,9 @@ impl Machine {
         }
     }
 
-    fn release(&mut self, ambiguous: bool, replay: bool, out: &mut Vec<Emitted>) {
+    fn release(&mut self, ambiguous: bool, out: &mut Vec<Emitted>) {
         self.hold_since = None;
         for h in std::mem::take(&mut self.held) {
-            if replay {
-                continue;
-            }
             let ev = if ambiguous {
                 self.counts.ambiguous += 1;
                 h.event.with_always_report()
@@ -513,6 +599,37 @@ impl Machine {
     }
 }
 
+/// A database's catalog while its view sets are invalidated (R28 item 4).
+struct Invalidated<'a> {
+    inner: &'a dyn Catalog,
+    invalid: bool,
+}
+
+impl Catalog for Invalidated<'_> {
+    fn class(&self, relation: &str) -> crate::trace_events::RelClass {
+        self.inner.class(relation)
+    }
+
+    fn always_view(&self, relation: &str) -> bool {
+        use crate::trace_events::RelClass;
+        self.inner.always_view(relation)
+            || (self.invalid
+                && matches!(
+                    self.inner.class(relation),
+                    RelClass::View | RelClass::Unknown
+                ))
+    }
+}
+
+/// Whether a DDL text names a view as its object: the word `VIEW` outside
+/// literals and quoted identifiers (more than the statement forms of R28
+/// item 4, which only invalidates more).
+fn names_view(text: &str) -> bool {
+    crate::sql::unquoted(text)
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .any(|w| w == "view")
+}
+
 /// The verdict on one record before its event is built.
 enum Decision {
     /// No event (well formed, nothing read, or the agent's own).
@@ -526,6 +643,8 @@ enum Decision {
     Trigger { db: usize },
     /// Ambiguous (fix 3); `window`: it opens one.
     Ambiguous { window: bool, at: u32 },
+    /// A permission refusal of another client (review L2).
+    Denied { db: usize },
 }
 
 impl Machine {
@@ -660,11 +779,26 @@ impl Machine {
                     _ => Decision::Nothing,
                 };
             }
-            Event::Error | Event::Warning => {
+            Event::Error => {
                 // Their codes are kept, nothing else; follow-ups carry no
-                // object (R22 item 7).
+                // object (R22 item 7). A permission refusal on a binding
+                // that is not the agent's own is an attempt to read
+                // (review L2): `*`, always reported, the code only.
+                let denied = matches!(&rec.body, Body::Error { codes, .. }
+                    if codes.contains(&crate::error::gds::NO_PRIV));
+                if denied
+                    && let Some(att) = rec.att
+                    && let Resolved::Db(DbId::Declared(i)) = self.resolve(att.database)
+                    && !self
+                        .bindings
+                        .get(&(DbId::Declared(i), att.id))
+                        .is_some_and(|b| b.own && b.anchored)
+                {
+                    return Decision::Denied { db: i };
+                }
                 return Decision::Nothing;
             }
+            Event::Warning => return Decision::Nothing,
             _ => {}
         }
         let Some(att) = rec.att else {
@@ -926,12 +1060,21 @@ impl Machine {
                     && att.role.is_none_or(|r| r == "NONE");
                 if mine {
                     self.watermark.entry(i).or_insert(id);
-                    // The clock offset, from the agent's own attach.
-                    if let Some(opened) = self.ledger.opened(label, id) {
+                    // The clock offset (R40 item 2, review M3): only from
+                    // an own attach outside a window and not ambiguous,
+                    // near a whole quarter-hour offset, and provisional
+                    // until a credited own record of that binding
+                    // confirms it.
+                    if !in_window
+                        && !ambiguous
+                        && let Some(opened) = self.ledger.opened(label, id)
+                        && let Ok(d) = opened.duration_since(SystemTime::UNIX_EPOCH)
+                    {
                         let naive = naive_seconds(rec.header.time);
-                        if let Ok(d) = opened.duration_since(SystemTime::UNIX_EPOCH) {
-                            let agent = i64::try_from(d.as_secs()).unwrap_or(0);
-                            self.offset = Some(agent - naive);
+                        let agent = i64::try_from(d.as_secs()).unwrap_or(0);
+                        let offset = agent - naive;
+                        if plausible_offset(offset) {
+                            self.offset_pending = Some((offset, key));
                         }
                     }
                 }
@@ -1285,7 +1428,6 @@ impl Machine {
         g: Group,
         _now: Instant,
         _cat: &[&dyn Catalog],
-        replay: bool,
         out: &mut Vec<Emitted>,
     ) {
         let DbId::Declared(db) = g.key.0 else {
@@ -1301,14 +1443,12 @@ impl Machine {
                 self.counts.ambiguous += 1;
                 self.window_until = Some(Instant::now() + WINDOW);
             }
-            if let Some(d) = finish(d)
-                && !replay
-            {
+            if let Some(d) = finish(d) {
                 out.push((db, self.draft_event(&d, None, db)));
             }
         }
         if any_blockless && self.hold_since.is_some() {
-            self.release(true, replay, out);
+            self.release(true, out);
         }
     }
 
@@ -1433,19 +1573,19 @@ impl Machine {
         &mut self,
         decision: Decision,
         rec: &Record<'_>,
+        pos: u64,
         now: Instant,
         cat: &[&dyn Catalog],
-        replay: bool,
         out: &mut Vec<Emitted>,
     ) {
         // Groups ended by this record (a transaction end, a detach).
         for g in std::mem::take(&mut self.pending_end) {
-            self.end_group(g, now, cat, replay, out);
+            self.end_group(g, now, cat, out);
         }
         match decision {
             Decision::Nothing => {}
             Decision::Trigger { db } => {
-                if replay || rec.trailer.block.is_none() {
+                if rec.trailer.block.is_none() {
                     return;
                 }
                 if let Converted::Event(mut d) | Converted::Ambiguous { draft: mut d, .. } =
@@ -1457,6 +1597,16 @@ impl Machine {
                 }
             }
             Decision::Dropped => self.counts.undeclared_dropped += 1,
+            Decision::Denied { db } => {
+                let d = Draft {
+                    action: Some(databastion_classifiers::masking::EventAction::Read),
+                    star: true,
+                    always: true,
+                    ..Draft::default()
+                };
+                let ev = self.draft_event(&d, Some(rec), db);
+                self.emit(db, ev, out);
+            }
             Decision::Ambiguous { window, at } => {
                 self.counts.ambiguous += 1;
                 *self.why.entry(at).or_default() += 1;
@@ -1492,9 +1642,6 @@ impl Machine {
                         .filter(|i| !self.s.databases[*i].excluded)
                         .collect(),
                 };
-                if replay {
-                    return;
-                }
                 for db in dbs {
                     let ev = self.draft_event(&d, Some(rec), db);
                     self.emit(db, ev, out);
@@ -1537,7 +1684,7 @@ impl Machine {
                             .iter()
                             .any(|g| g.members.iter().any(|m| m.block_less))
                     {
-                        self.release(false, replay, out);
+                        self.release(false, out);
                     }
                 }
                 if window {
@@ -1547,17 +1694,27 @@ impl Machine {
                 if let Some(k) = key
                     && let Some(d) = &draft
                     && !window
-                    && self.own_record(rec, k, d)
                 {
-                    self.counts.own += 1;
-                    return;
+                    match self.own_record(rec, k, d, pos) {
+                        Some(true) => {
+                            self.counts.own += 1;
+                            return;
+                        }
+                        // A text of the closed set on the agent's
+                        // attachment with no credit left (R8 item 4):
+                        // ambiguous, `*` and always reported.
+                        None => {
+                            if let Some(d) = draft.as_mut() {
+                                d.star = true;
+                                d.always = true;
+                            }
+                        }
+                        Some(false) => {}
+                    }
                 }
                 let Some(d) = draft else {
                     return;
                 };
-                if replay {
-                    return;
-                }
                 let ev = self.draft_event(&d, Some(rec), db);
                 self.emit(db, ev, out);
             }
@@ -1568,7 +1725,7 @@ impl Machine {
         if self.hold_since.is_some() {
             if self.held.len() >= MAX_HELD {
                 // Past the hold bound: the held records become ambiguous.
-                self.release(true, false, out);
+                self.release(true, out);
             } else {
                 self.held.push(Held {
                     db: vec![db],
@@ -1581,20 +1738,24 @@ impl Machine {
     }
 
     /// The own-record rule (decision 6, R8 item 4, R13, R22, R35).
-    fn own_record(&mut self, rec: &Record<'_>, key: Key, d: &Draft) -> bool {
+    /// `Some(true)`: the agent's own (a credit consumed); `Some(false)`:
+    /// not; `None`: a closed-set text with no credit left (loud).
+    fn own_record(&mut self, rec: &Record<'_>, key: Key, d: &Draft, pos: u64) -> Option<bool> {
         let Some(b) = self.bindings.get(&key) else {
-            return false;
+            return Some(false);
         };
         let DbId::Declared(i) = key.0 else {
-            return false;
+            return Some(false);
         };
         if !(b.own && b.anchored) || b.poisoned || b.tainted || !d.signals.is_empty() {
-            return false;
+            return Some(false);
         }
-        let Some(att) = rec.att else { return false };
+        let Some(att) = rec.att else {
+            return Some(false);
+        };
         if !att.user.eq_ignore_ascii_case(&self.s.account) || att.role.is_some_and(|r| r != "NONE")
         {
-            return false;
+            return Some(false);
         }
         let label = self.s.databases[i].attach.clone();
         let text = match &rec.body {
@@ -1604,8 +1765,8 @@ impl Machine {
                 ..
             } => *text,
             // Transaction records of an own attachment read nothing.
-            Body::Context => return true,
-            _ => return false,
+            Body::Context => return Some(true),
+            _ => return Some(false),
         };
         let block: Vec<&str> = rec
             .trailer
@@ -1613,21 +1774,18 @@ impl Machine {
             .as_ref()
             .map(|b| b.iter().map(|(n, _)| *n).collect())
             .unwrap_or_default();
-        let named = analyze_firebird(text).relations;
-        if !block
-            .iter()
-            .all(|r| METADATA_LOADING.contains(r) || named.iter().any(|n| n == r))
-        {
-            return false;
-        }
         let fetched = rec.trailer.fetched.unwrap_or(0);
-        match self.ledger.consume(
-            &label,
-            key.1,
-            text,
-            fetched,
-            rec.header.outcome == Outcome::Failed,
-        ) {
+        let failed = rec.header.outcome == Outcome::Failed;
+        // The own-statement table's row (R13, R20, R23) and the credit's
+        // R22 / R35 bounds, checked before the credit is consumed.
+        let accept = |a: &crate::conn::FetchAccount, table: Option<&str>| {
+            crate::own_table::matches(text, table, &block, fetched, a)
+                && crate::own::within(a, fetched, failed)
+        };
+        match self
+            .ledger
+            .consume(&label, key.1, text, (self.file, pos), accept)
+        {
             Verdict::Own => {
                 // Proof 7: the probe's exact text, one record fetched, a
                 // block naming `RDB$DATABASE`.
@@ -1637,16 +1795,33 @@ impl Machine {
                 {
                     self.probe_seen = Some(SystemTime::now());
                 }
-                true
+                self.confirm_offset(key);
+                Some(true)
             }
-            Verdict::NotOwn => false,
+            Verdict::NotOwn => Some(false),
             // A text of the set with no credit left: loud (R8 item 4).
             Verdict::NoCredit => {
                 self.counts.ambiguous += 1;
-                false
+                *self.why.entry(line!()).or_default() += 1;
+                None
             }
         }
     }
+}
+
+/// An offset (agent UTC minus the server's printed local time) within a
+/// few seconds of a whole quarter hour, at most 14 hours (review M3):
+/// time zones are whole quarter hours; a forged attach time or a skewed
+/// clock is not taken.
+pub(crate) fn plausible_offset(offset: i64) -> bool {
+    const QUARTER: i64 = 15 * 60;
+    let r = offset.rem_euclid(QUARTER);
+    let (dist, nearest) = if r <= QUARTER / 2 {
+        (r, offset - r)
+    } else {
+        (QUARTER - r, offset - r + QUARTER)
+    };
+    dist <= 5 && nearest.abs() <= 14 * 3600
 }
 
 /// Seconds since the epoch of a printed time, read as UTC.
