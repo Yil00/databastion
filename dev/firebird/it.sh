@@ -185,6 +185,10 @@ timeout 60 docker stop "$NAME-init" >/dev/null
 timeout 60 docker cp "$NAME-init:/opt/firebird/firebird.conf" "$WORK/firebird.conf"
 timeout 60 docker cp "$NAME-init:/opt/firebird/databases.conf" "$WORK/databases.conf"
 printf '\nAuditTraceConfigFile = /databastion/fbtrace.conf\n' >> "$WORK/firebird.conf"
+# ADR-0060 R42 item 6 (optional): DefaultTimeZone different from the process TZ below.
+if [ -n "${FIREBIRD_IT_DEFAULT_TZ:-}" ]; then
+  printf 'DefaultTimeZone = %s\n' "$FIREBIRD_IT_DEFAULT_TZ" >> "$WORK/firebird.conf"
+fi
 awk -v app=/var/lib/firebird/data/app.fdb '
   /^database = \/var\/lib\/firebird\/data\/crm.fdb$/ { s = 1 }
   s { sec = sec $0 "\n" }
@@ -198,7 +202,10 @@ timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$VOLUME:/d" --entry
   "$LOCAL_IMAGE" -R 84:84 /d
 timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$AUDIT_VOLUME:/a" --entrypoint chown \
   "$LOCAL_IMAGE" 84:84 /a
-timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" --user 84:84 \
+# R42 item 6 (optional): the server process's time zone, POSIX form (no tzdata needed).
+SERVER_TZ=()
+[ -z "${FIREBIRD_IT_TZ:-}" ] || SERVER_TZ=(-e "TZ=$FIREBIRD_IT_TZ")
+timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" "${SERVER_TZ[@]}" --user 84:84 \
   -v "$VOLUME:/var/lib/firebird/data" -v "$AUDIT_VOLUME:/var/lib/firebird/audit" \
   -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
   -v "$WORK/fbtrace.conf:/databastion/fbtrace.conf:ro" \
@@ -288,7 +295,8 @@ SQL
   >/dev/null
 # ADR-0060 R41 item 9: a CREATE PROCEDURE committed after an intervening check() (the tests
 # place the check between the DDL record and its commit), for the normal and the ambiguous path;
-# dropped afterwards so that app.fdb keeps no dependent object.
+# dropped afterwards so that app.fdb keeps no dependent object; R42 item 6: a session with
+# SET TIME ZONE, whose header times must follow the process TZ.
 for late in P_LATE_A P_LATE_B; do
   {
     cat "$WORK/root.pw"
@@ -306,6 +314,24 @@ SQL
   } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
     >/dev/null
 done
+# The session time zone a default session gets (DefaultTimeZone, or the process TZ).
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET HEADING OFF;
+SELECT RDB$GET_CONTEXT('SYSTEM', 'SESSION_TIMEZONE') FROM RDB$DATABASE;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  | tr -d ' \r' | grep -v '^$' | sed 's/^/[measure] default session time zone: /' >&2
+{
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+SET TIME ZONE '+09:00';
+SELECT 'it-tz-session' FROM RDB$DATABASE;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
 
 # The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
 # `EXECUTE STATEMENT`'s inner text, a client process name, and a database-trigger record's process
@@ -464,4 +490,5 @@ timeout 30 docker exec "$NAME" sh -c \
 # 4. The tests.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
 run_tests "${FIREBIRD_IT_FILTER:-it::}" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
+  FIREBIRD_IT_TZ_OFFSET="${FIREBIRD_IT_TZ_OFFSET:-0}" \
   FIREBIRD_IT_MATRIX_FILE="$WORK/matrix.txt" FIREBIRD_IT_BOOLEANS_FILE="$WORK/booleans.txt"

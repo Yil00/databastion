@@ -365,6 +365,23 @@ fn the_agent_records_match_the_own_statement_table() {
     assert!(m.counts.own > 50, "{:?}", m.counts);
     assert_eq!(m.counts.own_not_matched, 0, "{:?}", m.counts);
     assert!(m.probe_seen.is_some(), "the read-back probe (proof 7)");
+    // R42 item 6: the offset the agent learned against the server's
+    // header times (it.sh can run the server with another process TZ and
+    // DefaultTimeZone; FIREBIRD_IT_TZ_OFFSET is the offset if headers
+    // follow the process TZ: agent UTC minus printed time).
+    let want: i64 = std::env::var("FIREBIRD_IT_TZ_OFFSET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    eprintln!(
+        "[measure] learned clock offset {:?} (process TZ gives {want})",
+        m.offset_for_tests()
+    );
+    assert_eq!(
+        m.offset_for_tests(),
+        Some(want),
+        "header times follow the process TZ"
+    );
     // Credits left only for executions the server did not finish.
     let left: Vec<_> = ledger
         .credits_left()
@@ -543,4 +560,46 @@ fn a_procedure_committed_after_an_intervening_check_stays_dependent() {
     };
     late_commit_case(&log, "P_LATE_A", false);
     late_commit_case(&log, "P_LATE_B", true);
+}
+
+/// R42 item 6: header times follow the server process's time zone, not a
+/// session's `SET TIME ZONE` (here `+09:00`): the marker statement of that
+/// session is printed within a minute of the record before it.
+#[test]
+fn header_times_ignore_the_session_time_zone() {
+    let Some(log) = file("FIREBIRD_IT_AUDIT_LOG") else {
+        return;
+    };
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let opts = ParseOptions {
+        max_sql_length: Some(65_000),
+        series: series(),
+    };
+    let mut prev: Option<i64> = None;
+    let mut found = false;
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        let Some(rec) = parse(raw, opts) else {
+            continue;
+        };
+        let t = crate::stream::naive_seconds(rec.header.time);
+        if let crate::trace_log::Body::Statement { text, .. } = rec.body
+            && text.contains("'it-tz-session'")
+        {
+            let p = prev.expect("a record before the marker");
+            eprintln!(
+                "[measure] session SET TIME ZONE '+09:00': header {} s from the record before",
+                t - p
+            );
+            assert!((t - p).abs() < 60, "{}", t - p);
+            found = true;
+        }
+        prev = Some(t);
+    }
+    assert!(found, "the session marker is in the log");
 }
