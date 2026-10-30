@@ -40,7 +40,13 @@ mod error;
 mod peer;
 mod privileges;
 mod sql;
+// The Audit stream (lot 3) uses the parsers; until it is wired, only the
+// tests and the fuzz targets do.
 mod srp;
+#[cfg_attr(not(test), allow(dead_code))]
+mod trace_log;
+#[cfg(test)]
+mod trace_log_tests;
 mod wire;
 mod xdr;
 
