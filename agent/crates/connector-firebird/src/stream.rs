@@ -1990,7 +1990,26 @@ impl Machine {
         let DbId::Declared(i) = key.0 else {
             return Some(false);
         };
-        if !(b.own && b.anchored) || b.poisoned || b.tainted || !d.signals.is_empty() {
+        // A signal refuses the record, except `shape.full_table_read` on a
+        // constant text of the closed set (measured on 5.0.4: IDENTITY and
+        // the `SEC$` / `RDB$CONFIG` probes name an always-reported relation
+        // in a `FROM RDB$DATABASE` select, so the text alone raises it at
+        // every execution; the block and the count are checked as for any
+        // own text).
+        let text_signal_only = match &rec.body {
+            Body::Statement { text, .. } => {
+                crate::sql::checked(text)
+                    && d.signals
+                        .iter()
+                        .all(|s| *s == databastion_classifiers::masking::Signal::FullTableRead)
+            }
+            _ => false,
+        };
+        if !(b.own && b.anchored)
+            || b.poisoned
+            || b.tainted
+            || (!d.signals.is_empty() && !text_signal_only)
+        {
             return Some(false);
         }
         let Some(att) = rec.att else {
