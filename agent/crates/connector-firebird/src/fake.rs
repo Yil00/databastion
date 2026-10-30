@@ -105,6 +105,13 @@ pub(crate) struct Script {
     /// Answer the first `op_commit` after this statement is prepared with
     /// a lock conflict.
     pub(crate) fail_commit_after: Option<&'static str>,
+    /// Wait this long before answering each `op_fetch`.
+    pub(crate) fetch_delay: Option<std::time::Duration>,
+    /// `op_cancel` arrives after the pending request was answered (a stale
+    /// cancel, ADR-0060 R22 item 3): no answer of its own.
+    pub(crate) late_cancel: bool,
+    /// The stale cancel meets the next `DSQL_drop` (`isc_cancelled`).
+    pub(crate) cancel_hits_drop: bool,
 }
 
 impl Default for Script {
@@ -118,6 +125,9 @@ impl Default for Script {
             flood_rows: None,
             attach_answer: None,
             fail_commit_after: None,
+            fetch_delay: None,
+            late_cancel: false,
+            cancel_hits_drop: false,
         }
     }
 }
@@ -477,6 +487,7 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
     let mut a_public = U1024::ZERO;
     let mut prepared: Option<Canned> = None;
     let mut fail_commit = false;
+    let mut pending_cancel = false;
     let mut cursor = 0usize;
     while let Some(msg) = s.next(&mut seen).await {
         let answer: Vec<u8> = match msg {
@@ -584,8 +595,19 @@ pub(crate) async fn serve(io: DuplexStream, script: Script) -> Seen {
                 }
                 response(0, b"", None)
             }
+            Msg::Cancel if script.late_cancel => {
+                pending_cancel = script.cancel_hits_drop;
+                continue;
+            }
             Msg::Cancel => response(0, b"", Some(crate::error::gds::CANCELLED)),
+            Msg::Free if pending_cancel => {
+                pending_cancel = false;
+                response(0, b"", Some(crate::error::gds::CANCELLED))
+            }
             Msg::Fetch { count } => {
+                if let Some(d) = script.fetch_delay {
+                    tokio::time::sleep(d).await;
+                }
                 let mut out = Vec::new();
                 let mut end = true;
                 if let Some(c) = &prepared {
@@ -1022,6 +1044,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.rows[0][0].as_text(), Some("4.0.7"));
+        s.close().await;
+        server.await.unwrap();
+    }
+
+    fn rows_of(n: usize) -> Vec<Vec<Value>> {
+        (0..n).map(|i| vec![v(&format!("r{i}"))]).collect()
+    }
+
+    const T: &str = "SELECT X FROM T";
+
+    /// ADR-0060 R22 item 1: a full read ends `end`, with the rows
+    /// requested and counted.
+    #[tokio::test]
+    async fn a_full_read_is_accounted_end() {
+        let (mut s, server) = session(Script {
+            statements: vec![canned(T, vec![text_col(16)], rows_of(70))],
+            ..Script::default()
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rows = s
+            .query_for_tests(T, &[Col::Text(16)], 1000, deadline)
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 70);
+        let a = s.last_fetch;
+        assert_eq!(a.end, conn::FetchEnd::End);
+        assert_eq!(
+            (a.counted, a.requested, a.last, a.largest),
+            (70, 128, 64, 64)
+        );
+        // The row-limit cut: early, the limit plus one requested.
+        let rows = s
+            .query_for_tests(T, &[Col::Text(16)], 10, deadline)
+            .await
+            .unwrap();
+        assert!(rows.cut);
+        let a = s.last_fetch;
+        assert_eq!(a.end, conn::FetchEnd::Early);
+        assert_eq!((a.counted, a.requested, a.largest), (11, 11, 11));
+        s.close().await;
+        server.await.unwrap();
+    }
+
+    /// R22 item 3: a client deadline that passes between rounds sends no
+    /// further `op_fetch` and no `op_cancel`; the cursor is closed and the
+    /// attachment stays usable.
+    #[tokio::test]
+    async fn a_deadline_between_rounds_closes_the_cursor_without_cancel() {
+        let (mut s, server) = session(Script {
+            statements: vec![canned(T, vec![text_col(16)], rows_of(200))],
+            ..Script::default()
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut first = true;
+        let e = s
+            .fetch_for_tests(T, &[Col::Text(16)], 1000, deadline, &mut |_row| {
+                if std::mem::take(&mut first) {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                conn::Flow::Continue
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Timeout);
+        assert!(!s.is_broken());
+        let a = s.last_fetch;
+        assert_eq!(a.end, conn::FetchEnd::Early);
+        assert_eq!((a.counted, a.requested), (64, 64));
+        let later = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            s.query_for_tests(T, &[Col::Text(16)], 5, later)
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            5
+        );
+        s.close().await;
+        let seen = server.await.unwrap();
+        assert!(!seen.ops.contains(&op::CANCEL), "{:?}", seen.ops);
+        assert!(seen.ops.contains(&op::FREE_STATEMENT));
+    }
+
+    /// R22 item 3, review L2: a cancel sent while a fetch is pending, which
+    /// the server answered with rows (a stale cancel), meets the next
+    /// `DSQL_drop`: its `isc_cancelled` is the expected follow-up and the
+    /// attachment stays usable.
+    #[tokio::test]
+    async fn a_stale_cancel_meeting_the_drop_is_a_follow_up() {
+        let (mut s, server) = session(Script {
+            statements: vec![canned(T, vec![text_col(16)], rows_of(3))],
+            fetch_delay: Some(Duration::from_millis(1600)),
+            late_cancel: true,
+            cancel_hits_drop: true,
+            ..Script::default()
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let e = s
+            .query_for_tests(T, &[Col::Text(16)], 10, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Timeout);
+        let a = s.last_fetch;
+        assert_eq!(a.end, conn::FetchEnd::Early);
+        assert!(a.stale_cancel_follow_up);
+        assert!(!a.session_retired);
+        assert!(!s.is_broken());
+        s.close().await;
+        let seen = server.await.unwrap();
+        assert!(seen.ops.contains(&op::CANCEL));
+        assert_eq!(
+            seen.ops
+                .iter()
+                .filter(|o| **o == op::FREE_STATEMENT)
+                .count(),
+            2,
+            "the drop is sent again after its cancelled answer: {:?}",
+            seen.ops
+        );
+    }
+
+    /// R22 item 3, review L7: after a stale cancel whose `DSQL_drop`
+    /// succeeds, the session ends cleanly (rolled back and detached).
+    #[tokio::test]
+    async fn a_stale_cancel_with_a_good_drop_ends_the_session_cleanly() {
+        let (mut s, server) = session(Script {
+            statements: vec![canned(T, vec![text_col(16)], rows_of(3))],
+            fetch_delay: Some(Duration::from_millis(1600)),
+            late_cancel: true,
+            ..Script::default()
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let e = s
+            .query_for_tests(T, &[Col::Text(16)], 10, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, FailureCode::Timeout);
+        let a = s.last_fetch;
+        assert!(a.session_retired);
+        assert!(!a.stale_cancel_follow_up);
+        assert!(s.is_broken());
+        s.close().await;
+        let seen = server.await.unwrap();
+        let tail: Vec<u32> = seen.ops.iter().rev().take(3).rev().copied().collect();
+        assert_eq!(
+            tail,
+            [op::ROLLBACK, op::DETACH, op::DISCONNECT],
+            "{:?}",
+            seen.ops
+        );
+    }
+
+    /// R35: an `op_cancel` answered by `isc_cancelled` ends the fetch
+    /// `cancelled`, and the session stays usable.
+    #[tokio::test]
+    async fn a_cancel_answered_by_isc_cancelled_is_accounted_cancelled() {
+        let (mut s, server) = session(Script {
+            statements: vec![canned(T, vec![text_col(16)], rows_of(3))],
+            stall_execute: true,
+            ..Script::default()
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let _ = s
+            .query_for_tests(T, &[Col::Text(16)], 10, deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(s.last_fetch.end, conn::FetchEnd::Cancelled);
+        assert!(!s.is_broken());
         s.close().await;
         server.await.unwrap();
     }
