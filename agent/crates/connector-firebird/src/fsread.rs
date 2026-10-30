@@ -122,6 +122,21 @@ pub(crate) fn check_opened(path: &Path, meta: &std::fs::Metadata) -> Result<(), 
     Ok(())
 }
 
+/// Opens `path` under the file rules and checks it on its handle, without
+/// reading its content (the audit log, proof 1; review H3: the log is
+/// never read into memory by `check()`).
+pub(crate) fn check_file(path: &Path) -> Result<(), Refusal> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|_| Refusal::NotReadable)?;
+    let file = File::from(fd);
+    let meta = file.metadata().map_err(|_| Refusal::NotReadable)?;
+    check_opened(path, &meta)
+}
+
 /// Reads a configuration file under the file rules (at most `max`
 /// bytes), with its modification and change times.
 pub(crate) fn read_checked(
@@ -544,6 +559,27 @@ mod tests {
             group,
             &allowed
         ));
+    }
+
+    /// Review H3: the log check opens and checks without reading, and a
+    /// symbolic link is refused.
+    #[test]
+    fn the_log_check_neither_reads_nor_follows() {
+        allow_own_files_for_tests();
+        let dir = std::env::temp_dir().join(format!("fb-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"x").unwrap();
+        assert_eq!(check_file(&log), Ok(()));
+        let link = dir.join("link.log");
+        std::os::unix::fs::symlink(&log, &link).unwrap();
+        assert_eq!(check_file(&link), Err(Refusal::NotReadable));
+        assert_eq!(
+            check_file(&dir.join("missing.log")),
+            Err(Refusal::NotReadable)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

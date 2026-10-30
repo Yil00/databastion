@@ -338,8 +338,8 @@ pub(crate) fn evaluate(
         Err(_) => not_eval.push("trace_config_unreadable"),
     }
     // Proof 1 and R4: the log and who can read it.
-    let log_ok = crate::fsread::read_checked(&cfg.log, usize::MAX).is_ok()
-        || std::fs::symlink_metadata(&cfg.log).is_ok_and(|m| m.is_file());
+    // Opened and checked on its handle, never read here (review H3).
+    let log_ok = crate::fsread::check_file(&cfg.log).is_ok();
     if !log_ok {
         notes.add(TargetNote::new(NoteCode::AuditLogNotReadable));
         proven = false;
