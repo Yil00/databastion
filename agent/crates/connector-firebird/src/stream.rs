@@ -170,20 +170,118 @@ enum TriggerWait {
 
 type Key = (DbId, u64);
 
-/// A pending fold group (R4, R25): one binding and transaction.
+/// A pending fold group (R4, R25 item 1): one binding and transaction,
+/// its records merged as they come (never kept): the block-ful part and
+/// the block-less part.
 #[derive(Debug, Clone)]
 struct Group {
     key: Key,
     tra: u64,
-    members: Vec<Member>,
+    /// Block-ful records merged.
+    full: Part,
+    /// Block-less records merged (H1 fix 2 if not folded).
+    bare: Part,
     started: Instant,
     /// The position of its first record (the persisted position is held
     /// back to it).
     first: u64,
+    /// The position of its first block-less record (R25 item 1).
+    first_bare: Option<u64>,
 }
 
+impl Group {
+    fn blockless(&self) -> bool {
+        self.bare.count > 0
+    }
+
+    /// The group's state in bytes (R25 item 4's budget).
+    fn bytes(&self) -> usize {
+        128 + self.full.bytes + self.bare.bytes
+    }
+}
+
+/// Merged records of one part of a group (R25 item 1): their count, at
+/// most [`MAX_GROUP_NAMES`] routine names and [`MAX_GROUP_NAMES`]
+/// relations (past either, `*` and the always-reported mark, never
+/// ambiguous), the largest row count, the signals.
+#[derive(Debug, Clone, Default)]
+struct Part {
+    count: u64,
+    names: Vec<String>,
+    rels: Vec<String>,
+    overflow: bool,
+    rows: Option<u64>,
+    signals: Vec<databastion_classifiers::masking::Signal>,
+    always: bool,
+    write: bool,
+    bytes: usize,
+}
+
+/// R25 item 2: names and relations kept per group part.
+const MAX_GROUP_NAMES: usize = 256;
+/// R25 items 4 and 6: group state and held state, each per stream.
+const MAX_STATE_BYTES: usize = 16 << 20;
+
+impl Part {
+    fn add(&mut self, m: Member) {
+        self.count += 1;
+        let keep = |v: &mut Vec<String>, o: String, overflow: &mut bool, bytes: &mut usize| {
+            if v.contains(&o) {
+                return;
+            }
+            if v.len() >= MAX_GROUP_NAMES {
+                *overflow = true;
+                return;
+            }
+            *bytes += o.len() + 24;
+            v.push(o);
+        };
+        keep(&mut self.names, m.name, &mut self.overflow, &mut self.bytes);
+        for o in m.draft.objects {
+            keep(&mut self.rels, o, &mut self.overflow, &mut self.bytes);
+        }
+        self.rows = match (self.rows, m.draft.rows) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        for sg in m.draft.signals {
+            if !self.signals.contains(&sg) {
+                self.signals.push(sg);
+            }
+        }
+        self.always |= m.draft.always;
+        self.write |= m.draft.action == Some(databastion_classifiers::masking::EventAction::Write);
+    }
+
+    fn draft(&self) -> Draft {
+        use databastion_classifiers::masking::EventAction;
+        let mut objects = self.rels.clone();
+        for n in &self.names {
+            if !objects.contains(n) {
+                objects.push(n.clone());
+            }
+        }
+        Draft {
+            action: Some(if self.write {
+                EventAction::Write
+            } else {
+                EventAction::Read
+            }),
+            objects,
+            star: self.overflow,
+            always: self.always || self.overflow,
+            rows: self.rows,
+            signals: self.signals.clone(),
+        }
+    }
+}
+
+/// One routine record for its group.
 #[derive(Debug, Clone)]
 struct Member {
+    /// The routine's name (R4's folded object name).
+    name: String,
+    /// Its block's relations, rows and signals.
     draft: Draft,
     block_less: bool,
 }
@@ -193,6 +291,11 @@ struct Member {
 struct Held {
     db: Vec<usize>,
     event: MaskedEvent,
+}
+
+/// The held state of one event, in bytes (R25 item 6's budget).
+fn held_bytes(ev: &MaskedEvent) -> usize {
+    256 + ev.objects().len() * 160
 }
 
 /// Facts of the run (R1 rule 1, R5 item 4).
@@ -256,6 +359,8 @@ pub(crate) struct Machine {
     window_until: Option<Instant>,
     groups: VecDeque<Group>,
     held: Vec<Held>,
+    /// The held state in bytes (R25 item 6).
+    held_bytes: usize,
     hold_since: Option<Instant>,
     /// The declared database of the last well-formed record (fix 3).
     last_declared: Option<usize>,
@@ -309,6 +414,7 @@ impl Machine {
             window_until: None,
             groups: VecDeque::new(),
             held: Vec::new(),
+            held_bytes: 0,
             hold_since: None,
             last_declared: None,
             offset: None,
@@ -642,7 +748,7 @@ impl Machine {
             self.window_until = None;
         }
         while let Some(g) = self.groups.front() {
-            let blockless = g.members.iter().any(|m| m.block_less);
+            let blockless = g.blockless();
             let bound = if blockless { HOLD_TIME } else { GROUP_TIME };
             if now.duration_since(g.started) < bound {
                 break;
@@ -652,12 +758,7 @@ impl Machine {
             };
             self.end_group(g, now, cat, out);
         }
-        if self.hold_since.is_some()
-            && !self
-                .groups
-                .iter()
-                .any(|g| g.members.iter().any(|m| m.block_less))
-        {
+        if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
             self.release(false, out);
         }
         let gone: Vec<DbId> = self
@@ -678,6 +779,7 @@ impl Machine {
 
     fn release(&mut self, ambiguous: bool, out: &mut Vec<Emitted>) {
         self.hold_since = None;
+        self.held_bytes = 0;
         for h in std::mem::take(&mut self.held) {
             let ev = if ambiguous {
                 self.counts.ambiguous += 1;
@@ -1428,9 +1530,14 @@ impl Machine {
             // read (R4).
             let foldable = b.anchored && tra.is_some_and(|t| b.open_tras.contains(&t));
             if foldable && let Some(t) = tra {
-                let draft = routine_draft(rec, name.name, *kind, cat[db_index(db)]);
+                let draft = routine_draft(rec, *kind, cat[db_index(db)]);
                 let block_less = rec.trailer.block.is_none();
-                if !self.add_to_group(key, t, Member { draft, block_less }, now, pos) {
+                let m = Member {
+                    name: name.name.to_owned(),
+                    draft,
+                    block_less,
+                };
+                if !self.add_to_group(key, t, m, now, pos) {
                     return Decision::Ambiguous {
                         window: block_less,
                         at: line!(),
@@ -1474,18 +1581,27 @@ impl Machine {
     }
 
     fn add_to_group(&mut self, key: Key, tra: u64, m: Member, now: Instant, pos: u64) -> bool {
+        if m.block_less && self.hold_since.is_none() {
+            self.hold_since = Some(now);
+        }
+        // R25 item 4: the group state budget, oldest groups ended first.
+        while self.groups.iter().map(Group::bytes).sum::<usize>() > MAX_STATE_BYTES {
+            let Some(old) = self.groups.pop_front() else {
+                break;
+            };
+            self.pending_end.push(old);
+        }
         if let Some(g) = self
             .groups
             .iter_mut()
             .find(|g| g.key == key && g.tra == tra)
         {
-            if g.members.len() >= 4096 {
-                return false;
+            if m.block_less {
+                g.first_bare.get_or_insert(pos);
+                g.bare.add(m);
+            } else {
+                g.full.add(m);
             }
-            if m.block_less && self.hold_since.is_none() {
-                self.hold_since = Some(now);
-            }
-            g.members.push(m);
             return true;
         }
         let per = self.groups.iter().filter(|g| g.key == key).count();
@@ -1500,19 +1616,28 @@ impl Machine {
                 self.pending_end.push(old);
             }
         }
-        if m.block_less && self.hold_since.is_none() {
-            self.hold_since = Some(now);
-        }
-        self.groups.push_back(Group {
+        let mut g = Group {
             key,
             tra,
-            members: vec![m],
+            full: Part::default(),
+            bare: Part::default(),
             started: now,
             first: pos,
-        });
+            first_bare: None,
+        };
+        if m.block_less {
+            g.first_bare = Some(pos);
+            g.bare.add(m);
+        } else {
+            g.full.add(m);
+        }
+        self.groups.push_back(g);
         true
     }
 
+    /// A group ended without folding (R25 item 3): its block-ful part is
+    /// one event; its block-less part is ambiguous (H1 fix 2: `*`, always
+    /// reported, a window), and the held records with it.
     fn end_group(
         &mut self,
         g: Group,
@@ -1523,22 +1648,24 @@ impl Machine {
         let DbId::Declared(db) = g.key.0 else {
             return;
         };
-        let any_blockless = g.members.iter().any(|m| m.block_less);
-        for m in g.members {
-            let mut d = m.draft;
-            if m.block_less {
-                *self.why.entry(1).or_default() += 1;
-                d.star = true;
-                d.always = true;
-                self.counts.ambiguous += 1;
-                self.window_until = Some(Instant::now() + WINDOW);
-            }
+        if g.full.count > 0
+            && let Some(d) = finish(g.full.draft())
+        {
+            out.push((db, self.draft_event(&d, None, db)));
+        }
+        if g.blockless() {
+            *self.why.entry(1).or_default() += g.bare.count;
+            self.counts.ambiguous += g.bare.count;
+            self.window_until = Some(Instant::now() + WINDOW);
+            let mut d = g.bare.draft();
+            d.star = true;
+            d.always = true;
             if let Some(d) = finish(d) {
                 out.push((db, self.draft_event(&d, None, db)));
             }
-        }
-        if any_blockless && self.hold_since.is_some() {
-            self.release(true, out);
+            if self.hold_since.is_some() {
+                self.release(true, out);
+            }
         }
     }
 
@@ -1592,16 +1719,13 @@ fn db_index(db: DbId) -> usize {
 
 /// A routine record's draft for folding (R4): its counters' relations,
 /// rows and the routine's name.
-fn routine_draft(rec: &Record<'_>, name: &str, _kind: RoutineKind, cat: &dyn Catalog) -> Draft {
+fn routine_draft(rec: &Record<'_>, _kind: RoutineKind, cat: &dyn Catalog) -> Draft {
     let mut d = match convert(rec, cat) {
         Converted::Event(d) | Converted::Ambiguous { draft: d, .. } => d,
         Converted::Nothing => Draft::default(),
     };
     d.star = false;
     d.always = false;
-    if !d.objects.iter().any(|o| o == name) {
-        d.objects.push(name.to_owned());
-    }
     d.rows = rec.trailer.fetched;
     d
 }
@@ -1626,23 +1750,31 @@ fn finish(mut d: Draft) -> Option<Draft> {
 
 /// Unites a fold group into a statement's draft (R4: objects united, rows
 /// by maximum; R33 item 6: the "no event" rules after the union).
-fn fold(mut stmt: Draft, members: Vec<Member>) -> Draft {
-    for m in members {
-        for o in m.draft.objects {
+fn fold(mut stmt: Draft, g: &Group) -> Draft {
+    for m in [&g.full, &g.bare]
+        .into_iter()
+        .filter(|p| p.count > 0)
+        .map(Part::draft)
+    {
+        stmt.star |= m.star;
+        for o in m.objects {
             if !stmt.objects.contains(&o) {
                 stmt.objects.push(o);
             }
         }
-        stmt.rows = match (stmt.rows, m.draft.rows) {
+        stmt.rows = match (stmt.rows, m.rows) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        for s in m.draft.signals {
+        for s in m.signals {
             if !stmt.signals.contains(&s) {
                 stmt.signals.push(s);
             }
         }
-        stmt.always |= m.draft.always;
+        stmt.always |= m.always;
+        if m.action == Some(databastion_classifiers::masking::EventAction::Write) {
+            stmt.action = Some(databastion_classifiers::masking::EventAction::Write);
+        }
         if stmt
             .rows
             .is_some_and(|n| n > crate::trace_events::LARGE_RESULT)
@@ -1771,14 +1903,9 @@ impl Machine {
                         return;
                     };
                     let base = draft.take().unwrap_or_default();
-                    draft = finish(fold(base, g.members));
+                    draft = finish(fold(base, &g));
                     folded = true;
-                    if self.hold_since.is_some()
-                        && !self
-                            .groups
-                            .iter()
-                            .any(|g| g.members.iter().any(|m| m.block_less))
-                    {
+                    if self.hold_since.is_some() && !self.groups.iter().any(Group::blockless) {
                         self.release(false, out);
                     }
                 }
@@ -1830,10 +1957,12 @@ impl Machine {
 
     fn emit(&mut self, db: usize, ev: MaskedEvent, out: &mut Vec<Emitted>) {
         if self.hold_since.is_some() {
-            if self.held.len() >= MAX_HELD {
+            let b = held_bytes(&ev);
+            if self.held.len() >= MAX_HELD || self.held_bytes + b > MAX_STATE_BYTES {
                 // Past the hold bound: the held records become ambiguous.
                 self.release(true, out);
             } else {
+                self.held_bytes += b;
                 self.held.push(Held {
                     db: vec![db],
                     event: ev,

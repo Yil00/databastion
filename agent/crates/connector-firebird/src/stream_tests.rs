@@ -762,3 +762,79 @@ fn ambiguous_records_use_the_attributed_databases_catalog() {
         names(&out)
     );
 }
+
+/// Review M5, R25: a per-row routine run 10 000 times before its
+/// statement finish (block-ful, then block-less) folds into one event,
+/// with no ambiguous record; past 256 distinct relations the folded event
+/// names `*` and is always reported, never ambiguous.
+#[test]
+fn ten_thousand_per_row_routine_records_fold() {
+    let a = "24:0x7f0000000100";
+    let ctx = format!(
+        "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    let blk = |rel: &str| {
+        format!(
+            "\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n",
+            "Table",
+            "*".repeat(115),
+            3,
+            ""
+        )
+    };
+    for (block, distinct) in [(true, false), (false, false), (true, true)] {
+        let mut log = format!(
+            "{}{HEAD} ({a}) START_TRANSACTION\n{ctx}\n",
+            attach(a, 3, APP)
+        );
+        for i in 0..10_000 {
+            let b = match (block, distinct) {
+                (true, false) => blk("CUSTOMERS"),
+                (true, true) => blk(&format!("T{i}")),
+                _ => String::new(),
+            };
+            log.push_str(&format!(
+                "{HEAD} ({a}) EXECUTE_PROCEDURE_FINISH\n{ctx}\nProcedure P1:\n      0 ms, 3 fetch(es)\n{b}\n"
+            ));
+        }
+        log.push_str(&stmt(
+            a,
+            3,
+            5,
+            "APP",
+            "SELECT P1_X FROM ORDERS WHERE ID > 0",
+            10_000,
+            &[("ORDERS", 10_000)],
+        ));
+        let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+        let cat = Cat;
+        let cats: [&dyn Catalog; 1] = [&cat];
+        let t = std::time::Instant::now();
+        let out = feed(&mut m, &cats, &log, 0);
+        // The assembler clears only what it wrote (it cleared its whole
+        // 1 MiB reservation per record before: about 100 s here).
+        assert!(t.elapsed() < Duration::from_secs(30), "{:?}", t.elapsed());
+        assert_eq!(
+            m.counts.ambiguous, 0,
+            "block {block} distinct {distinct}: {:?}",
+            m.why
+        );
+        assert_eq!(out.len(), 1, "{:?}", names(&out));
+        let n = names(&out);
+        if distinct {
+            // Past 256 relations: `*`, always reported (the core keeps 15
+            // named objects).
+            assert!(n.contains(&"*".to_owned()), "{n:?}");
+            assert!(out[0].1.always_report());
+        } else {
+            assert!(
+                n.contains(&"ORDERS".to_owned()) && n.contains(&"P1".to_owned()),
+                "{n:?}"
+            );
+            assert!(!out[0].1.always_report());
+        }
+        if block && !distinct {
+            assert!(n.contains(&"CUSTOMERS".to_owned()));
+        }
+    }
+}
