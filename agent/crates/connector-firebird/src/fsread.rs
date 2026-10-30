@@ -188,6 +188,9 @@ pub(crate) fn identity(path: &Path) -> Option<((u64, u64), u64)> {
 /// count (compared as is between samples) and as a wall-clock time (for
 /// the configuration files' times, proof 2). `None` when not visible.
 pub(crate) fn process_start(pid: u32) -> Option<(u64, SystemTime)> {
+    if !is_firebird(pid) {
+        return None;
+    }
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ticks = stat_start_ticks(&stat)?;
     let btime = std::fs::read_to_string("/proc/stat")
@@ -213,12 +216,18 @@ pub(crate) fn stat_start_ticks(stat: &str) -> Option<u64> {
 /// only when the process is a Firebird server (`comm` `firebird`): a pid
 /// read from another pid namespace names an unrelated process here.
 pub(crate) fn server_ids(pid: u32) -> Option<(u32, u32)> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    if comm.trim_end() != "firebird" {
+    if !is_firebird(pid) {
         return None;
     }
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status_ids(&status)
+}
+
+/// Whether `pid` is a Firebird server process (`comm` `firebird`): a pid
+/// read from `MON$SERVER_PID` in another pid namespace names an unrelated
+/// process here (review N2).
+pub(crate) fn is_firebird(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "firebird")
 }
 
 /// The effective uid and gid of a `/proc/<pid>/status` text.
@@ -237,6 +246,9 @@ pub(crate) fn status_ids(status: &str) -> Option<(u32, u32)> {
 /// `/proc/<pid>/cmdline`, absolute only), for the layout check (review
 /// L4).
 pub(crate) fn server_binary_dir(pid: u32) -> Option<std::path::PathBuf> {
+    if !is_firebird(pid) {
+        return None;
+    }
     let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     binary_dir(&cmd)
 }
@@ -481,7 +493,9 @@ mod tests {
         assert_eq!(e.len(), 5);
         assert_eq!(e[1], (2, 4, 1001));
         assert!(parse_acl(&acl[..7]).is_none());
-        assert!(process_start(std::process::id()).is_some());
+        // Review N2: only a Firebird server process (this test is not one).
+        assert!(process_start(std::process::id()).is_none());
+        assert!(server_binary_dir(std::process::id()).is_none());
     }
 
     #[test]

@@ -55,7 +55,7 @@ const STABLE_EOF: Duration = Duration::from_secs(2);
 const CURSOR: &str = "firebird_audit_trace";
 
 /// One declared database, as `check()` read it.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct DbFacts {
     pub(crate) attach: String,
     pub(crate) label: String,
@@ -69,7 +69,7 @@ pub(crate) struct DbFacts {
 /// The relation classes of one database's catalog read (decision 5's
 /// user relations; everything else is a system or virtual relation only
 /// when the read was complete).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Classes {
     user: HashMap<String, RelClass>,
     complete: bool,
@@ -155,12 +155,52 @@ pub(crate) struct StreamFacts {
 }
 
 /// Per target: what the last `check()` evaluated, and the stream's facts.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct AuditState {
     inner: Mutex<HashMap<String, Target>>,
 }
 
-#[derive(Debug, Default, Clone)]
+// Review N3: no path, alias, label or catalog name in a `Debug` output
+// (these structures must never reach a log in clear).
+impl std::fmt::Debug for DbFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbFacts")
+            .field("resolved", &self.resolved.is_some())
+            .field("excluded", &self.excluded)
+            .field("catalog", &self.catalog)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Classes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Classes")
+            .field("user_relations", &self.user.len())
+            .field("complete", &self.complete)
+            .field("dependent_views", &self.deps.dependent.len())
+            .field("dependencies_complete", &self.deps.complete)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AuditState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditState").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Target")
+            .field("dbs", &self.dbs)
+            .field("aliases", &self.aliases.is_some())
+            .field("proof11", &self.proof11)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default, Clone)]
 struct Target {
     dbs: Vec<DbFacts>,
     aliases: Option<AliasMap>,
@@ -539,10 +579,11 @@ pub(crate) async fn stream(
                 machine.confirm_run(r);
             }
         }
-        // R5 item 4: the run's start time before each read cycle.
+        // R5 item 4: the run's start time before each read cycle; a pid
+        // that is gone or no longer a Firebird server is a change too.
         if let Some(r) = run
             && let Some(start) = r.start
-            && crate::fsread::process_start(r.pid).is_some_and(|(t, _)| t != start)
+            && crate::fsread::process_start(r.pid).is_none_or(|(t, _)| t != start)
         {
             machine.start_time_changed();
         }
@@ -1372,6 +1413,28 @@ mod tests {
         r.serve(3, t0 + Duration::from_secs(100), &start);
         r.serve(3, t0 + Duration::from_secs(200), &start);
         assert_eq!(started.load(Ordering::Relaxed), 2);
+    }
+
+    /// Review N3: the audit facts' `Debug` shows no path, label or name.
+    #[test]
+    fn audit_facts_debug_is_redacted() {
+        let d = DbFacts {
+            attach: "/secret/app.fdb".to_owned(),
+            label: "secretlabel".to_owned(),
+            resolved: Some("/secret/app.fdb".to_owned()),
+            catalog: Classes {
+                user: HashMap::from([("SECRET_TABLE".to_owned(), RelClass::Table)]),
+                complete: true,
+                deps: crate::views::ViewDeps::default(),
+            },
+            excluded: false,
+        };
+        let state = AuditState::default();
+        state.with("t", |t| t.dbs = vec![d.clone()]);
+        let all = format!("{d:?} {state:?} {:?}", state.with("t", |t| t.clone()));
+        for s in ["/secret", "secretlabel", "SECRET_TABLE"] {
+            assert!(!all.contains(s), "{all}");
+        }
     }
 
     #[test]
