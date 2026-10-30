@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Firebird connector integration tests (ADR-0060 decision 10: lot 1, the wire client, SRP-256,
 # ChaCha, the loopback, peer-uid and forwarder rules, check(); lot 2, Discovery and the CAS store
-# guard). This script starts throwaway servers from the pinned images, seeds fake accounts and the
-# dev seed (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the
-# one of the dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
+# guard; lot 3, the Audit parsers against the server's own trace log). This script starts
+# throwaway servers from the pinned images, seeds fake accounts and the dev seed
+# (dev/seed/out/firebird.sql, loaded by dev/firebird/seed.sh as the database `crm`, the one of the
+# dev service), and runs agent/crates/connector-firebird's it.rs tests against them:
 #
 #   dev/firebird/it.sh [5|4]        # Firebird 5.0.4 (default) or 4.0.7
 #   FIREBIRD_IT_FILTER=it::discovery dev/firebird/it.sh 5   # a subset of the tests
@@ -47,6 +48,7 @@ FWD_PORT="$((PORT + 10))"
 NAME="${COMPOSE_PROJECT_NAME:-databastion}-it-firebird${MAJOR}"
 LOCAL_IMAGE="databastion-it/${NAME}:local"
 VOLUME="${NAME}-data"
+AUDIT_VOLUME="${NAME}-audit"
 NET="$NAME-net"
 VARIANTS="chacha arc4 nocrypt fb3 mapping"
 SUDO=""
@@ -67,7 +69,7 @@ cleanup() {
   for n in $VARIANTS; do c+=("$NAME-$n"); done
   # -v: the anonymous volumes of the image's VOLUME declarations too.
   timeout 60 docker rm -f -v "${c[@]}" "$NET" >/dev/null 2>&1 || true
-  timeout 60 docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+  timeout 60 docker volume rm "$VOLUME" "$AUDIT_VOLUME" >/dev/null 2>&1 || true
   timeout 60 docker rmi "$LOCAL_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -176,12 +178,31 @@ if ! timeout 10 docker logs "$NAME-init" 2>&1 | grep -F "crm.fdb seeded" >/dev/n
   exit 1
 fi
 timeout 60 docker stop "$NAME-init" >/dev/null
+# The system audit trace (lot 3, decision 6): the image's firebird.conf (with its entrypoint's
+# settings) plus AuditTraceConfigFile, and a trace configuration meeting the Partial proofs for
+# app.fdb and crm.fdb (the dev one, with a section for each), the log on its own volume. Mounted
+# read-only over the main server's; copies are kept for the configuration tests.
+timeout 60 docker cp "$NAME-init:/opt/firebird/firebird.conf" "$WORK/firebird.conf"
+timeout 60 docker cp "$NAME-init:/opt/firebird/databases.conf" "$WORK/databases.conf"
+printf '\nAuditTraceConfigFile = /databastion/fbtrace.conf\n' >> "$WORK/firebird.conf"
+awk -v app=/var/lib/firebird/data/app.fdb '
+  /^database = \/var\/lib\/firebird\/data\/crm.fdb$/ { s = 1 }
+  s { sec = sec $0 "\n" }
+  { print }
+  s && /^}$/ { s = 0; sub(/crm\.fdb/, "app.fdb", sec); printf "\n%s", sec }
+' "$ROOT/dev/firebird/fbtrace.conf" > "$WORK/fbtrace.conf"
+chmod 0644 "$WORK/firebird.conf" "$WORK/fbtrace.conf"
 timeout 120 docker commit --change 'ENV FIREBIRD_ROOT_PASSWORD=' "$NAME-init" "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker rm -v "$NAME-init" >/dev/null
 timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$VOLUME:/d" --entrypoint chown \
   "$LOCAL_IMAGE" -R 84:84 /d
+timeout 60 docker run --rm --network none "${HARDEN[@]}" -v "$AUDIT_VOLUME:/a" --entrypoint chown \
+  "$LOCAL_IMAGE" 84:84 /a
 timeout 60 docker run -d --name "$NAME" "${JOIN[@]}" --user 84:84 \
-  -v "$VOLUME:/var/lib/firebird/data" --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
+  -v "$VOLUME:/var/lib/firebird/data" -v "$AUDIT_VOLUME:/var/lib/firebird/audit" \
+  -v "$WORK/firebird.conf:/opt/firebird/firebird.conf:ro" \
+  -v "$WORK/fbtrace.conf:/databastion/fbtrace.conf:ro" \
+  --entrypoint /opt/firebird/bin/firebird "$LOCAL_IMAGE" >/dev/null
 timeout 60 docker run -d --name "$NAME-socat" "${JOIN[@]}" "$SOCAT" \
   "TCP-LISTEN:$FWD_PORT,bind=127.0.0.1,fork,reuseaddr" "TCP:127.0.0.1:$PORT" >/dev/null
 # The variants: ChaCha when ChaCha64 is not offered, Arc4 only and no encryption refused (decision
@@ -242,6 +263,37 @@ printf 'SET HEADING OFF;\nSELECT TRIM(RDB$RELATION_NAME) FROM RDB$RELATIONS ORDE
   | awk 'NF { print $1 }' > "$WORK/secdb.txt"
 [ "$(wc -l < "$WORK/secdb.txt")" -ge 8 ] || { echo "[it] $SECDB: relation list not read" >&2; exit 1; }
 
+# The Audit workload (lot 3), over loopback TCP as SYSDBA with the image's own tools, as the
+# server's account: the password on the tool's standard input (its first line, then ISC_PASSWORD),
+# never on a command line. Fake markers only: a literal and a password.
+as_sysdba() { # tool args...: stdin = the password line, then the tool's input
+  timeout 120 docker exec -i --user 84:84 "$NAME" bash -c \
+    'IFS= read -r ISC_PASSWORD; export ISC_PASSWORD; exec "$@"' bash "$@"
+}
+{
+  cat "$WORK/root.pw"
+  cat <<SQL
+SELECT * FROM CUSTOMERS;
+SELECT COUNT(*) FROM CUSTOMERS;
+SELECT * FROM CUSTOMERS WHERE EMAIL = 'it-marker-lit-7';
+CREATE USER IT_MARKER_USER PASSWORD 'it-marker-pw-7' USING PLUGIN Srp;
+COMMIT;
+DROP USER IT_MARKER_USER USING PLUGIN Srp;
+COMMIT;
+ALTER DATABASE BEGIN BACKUP;
+ALTER DATABASE END BACKUP;
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+  >/dev/null
+as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
+  /var/lib/firebird/data/app.fdb /tmp/it-app.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
+timeout 60 docker exec "$NAME" rm -f /tmp/it-app.fbk
+sleep 3
+# The log is the server's (0600, uid 84): read through the container, written here by the caller.
+timeout 60 docker exec --user 84:84 "$NAME" cat /var/lib/firebird/audit/audit.log > "$WORK/audit.log"
+[ -s "$WORK/audit.log" ] || { echo "[it] the audit log is empty" >&2; exit 1; }
+
 # 4. The tests, in the namespace, as the calling user.
 echo "[it] Firebird $MAJOR: running the tests ($SECDB, uid 84, port $PORT)" >&2
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
@@ -258,4 +310,6 @@ timeout 900 $SUDO nsenter --net="/proc/$PID/ns/net" --setuid "$(id -u)" --setgid
   FIREBIRD_IT_NOCRYPT_PORT="$((PORT + 3))" FIREBIRD_IT_FB3_PORT="$((PORT + 4))" \
   FIREBIRD_IT_MAPPING_PORT="$((PORT + 5))" \
   FIREBIRD_IT_SECDB_RELATIONS_FILE="$WORK/secdb.txt" \
+  FIREBIRD_IT_FIREBIRD_CONF="$WORK/firebird.conf" FIREBIRD_IT_DATABASES_CONF="$WORK/databases.conf" \
+  FIREBIRD_IT_TRACE_CONF="$WORK/fbtrace.conf" FIREBIRD_IT_AUDIT_LOG="$WORK/audit.log" \
   "$EXE" "${FIREBIRD_IT_FILTER:-it::}" --nocapture

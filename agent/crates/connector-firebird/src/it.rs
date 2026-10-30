@@ -1054,3 +1054,8 @@ fn every_security_database_relation_is_never_sampled() {
         );
     }
 }
+
+/// The system audit trace of the main server (lot 3): its configuration
+/// and the log of the `dev/firebird/it.sh` workload.
+#[path = "it_audit.rs"]
+mod audit;
