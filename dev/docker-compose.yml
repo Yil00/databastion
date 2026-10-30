@@ -583,12 +583,40 @@ services:
   # on the first start (firebird/seed.sh), then starts the SuperServer. firebird/firebird.conf:
   # `WireCrypt = Required`, ChaCha64 / ChaCha, `Srp256`, and the server listens on the loopback of
   # its own network namespace only (no published port): the agent runs in that namespace, and every
-  # container of it drops NET_RAW and NET_ADMIN (dev/README.md, "Firebird"). Audit (the trace
-  # configuration and its log) comes with the connector's lot 3.
+  # container of it drops NET_RAW and NET_ADMIN (dev/README.md, "Firebird"). Audit (lot 3): the
+  # system audit trace configured by firebird/firebird.conf (AuditTraceConfigFile) and
+  # firebird/fbtrace.conf (every setting of the Partial proofs), its log on the volume
+  # `firebird-audit`, prepared by firebird-audit-init: owner the server (84), group the agent's
+  # (DATABASTION_DEV_AGENT_GID, 10001 by default), the log 0640, so the agent can read it and not
+  # write it (ADR-0060 R4); mount the volume read-only into the agent's container.
+  firebird-audit-init:
+    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    profiles: [firebird]
+    user: "0:0"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASTION_DEV_AGENT_GID: ${DATABASTION_DEV_AGENT_GID:-10001}
+    command:
+      - sh
+      - -c
+      - >-
+        chown 84:"$$DATABASTION_DEV_AGENT_GID" /a && chmod 2750 /a &&
+        { [ -e /a/audit.log ] || touch /a/audit.log; } &&
+        chown 84:"$$DATABASTION_DEV_AGENT_GID" /a/audit.log && chmod 0640 /a/audit.log
+    volumes:
+      - firebird-audit:/a
+    restart: "no"
+
   firebird:
     image: ${DATABASTION_DEV_FIREBIRD_IMAGE:-firebirdsql/firebird:5.0.4@sha256:1529560400fc7847f015c57fc9d70729c44d9a9d8f9000df19c5ce1950b4c202}
     profiles: [firebird]
     user: "84:84"
+    depends_on:
+      firebird-audit-init:
+        condition: service_completed_successfully
     entrypoint: ["/bin/bash", "/databastion/entrypoint.sh"]
     environment:
       FIREBIRD_SYSDBA_PASSWORD: ${FIREBIRD_SYSDBA_PASSWORD:-dev-only-firebird-sysdba}
@@ -597,7 +625,9 @@ services:
       FIREBIRD_MAJOR: ${DATABASTION_DEV_FIREBIRD_MAJOR:-}
     volumes:
       - firebird-data:/var/lib/firebird/data
+      - firebird-audit:/var/lib/firebird/audit
       - ./firebird/firebird.conf:/opt/firebird/firebird.conf:ro
+      - ./firebird/fbtrace.conf:/databastion/fbtrace.conf:ro
       - ./firebird/entrypoint.sh:/databastion/entrypoint.sh:ro
       - ./firebird/seed.sh:/databastion/seed.sh:ro
       - ./seed/out/firebird.sql:/databastion/seed/firebird.sql:ro
@@ -701,3 +731,4 @@ volumes:
   redis-data:
   redis-tls:
   firebird-data:
+  firebird-audit:
