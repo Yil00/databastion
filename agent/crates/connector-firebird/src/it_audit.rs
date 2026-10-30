@@ -443,3 +443,104 @@ fn every_performance_line_of_the_server_parses() {
     eprintln!("[measure] performance lines {n}");
     assert!(n > 20, "{n}");
 }
+
+/// The machine over the server's log for R41 item 9's commit-after-check
+/// case: `CREATE PROCEDURE <name>` in a transaction committed after a
+/// `check()` placed between the DDL record and its commit (a check whose
+/// catalog read started there). `ambiguous`: the DDL record is made
+/// ambiguous without forging, by an unconfirmed run (as after a server
+/// restart) confirmed right after it. The call of the procedure after the
+/// commit, before any later check, must still be marked.
+fn late_commit_case(log: &[u8], name: &str, ambiguous: bool) {
+    let names = |label: &str, path: &str| crate::stream::DeclaredNames {
+        label: label.to_owned(),
+        resolved: Some(path.to_owned()),
+        alias: None,
+        excluded: false,
+        attach: path.to_owned(),
+        read_at: None,
+    };
+    let settings = |at: Option<SystemTime>| crate::stream::Settings {
+        databases: vec![
+            crate::stream::DeclaredNames {
+                read_at: at,
+                ..names("app", APP)
+            },
+            crate::stream::DeclaredNames {
+                read_at: at,
+                ..names("crm", CRM)
+            },
+        ],
+        aliases: Some(Default::default()),
+        proof11: true,
+        account: "DATABASTION_AGENT".to_owned(),
+        parse: ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        },
+        superserver: true,
+    };
+    let mut m = crate::stream::Machine::new(
+        settings(None),
+        std::sync::Arc::new(crate::own::Ledger::default()),
+    );
+    let cats: [&dyn Catalog; 2] = [&Cat, &Cat];
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(a.push_line(line));
+    }
+    recs.extend(a.flush());
+    let now = std::time::Instant::now();
+    let create = format!("CREATE PROCEDURE {name} ");
+    let call = format!("SELECT * FROM {name}");
+    let (mut seen_create, mut seen_call) = (false, false);
+    for (i, r) in recs.iter().enumerate() {
+        let Assembled::Record(raw) = r else { continue };
+        let opts = ParseOptions {
+            max_sql_length: Some(65_000),
+            series: series(),
+        };
+        let text = parse(raw, opts).and_then(|rec| match rec.body {
+            crate::trace_log::Body::Statement { text, .. } => Some(text.to_owned()),
+            _ => None,
+        });
+        let is_create = text.as_deref().is_some_and(|t| t.starts_with(&create));
+        let is_call = text.as_deref() == Some(call.as_str());
+        if is_create && ambiguous {
+            m.start_time_changed();
+        }
+        let pid = parse(raw, opts).map(|rec| rec.header.pid);
+        let mut out = Vec::new();
+        m.push(raw, i as u64, now, &cats, &mut out);
+        if is_create {
+            seen_create = true;
+            if ambiguous && let Some(pid) = pid {
+                m.confirm_run(crate::stream::Run { pid, start: None });
+            }
+            // The intervening check: its catalog read starts after the
+            // DDL record, before the commit.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            m.reconfigure(settings(Some(SystemTime::now())));
+        }
+        if is_call {
+            seen_call = true;
+            assert!(
+                !out.is_empty() && out.iter().all(|(_, e)| e.always_report()),
+                "{name} (ambiguous {ambiguous}): the call after the commit is marked"
+            );
+        }
+    }
+    assert!(seen_create && seen_call, "{name}: the case is in the log");
+}
+
+/// R41 item 9 (re-review M-1): a `CREATE PROCEDURE` committed after an
+/// intervening `check()`, on the normal path and on the ambiguous path.
+#[test]
+fn a_procedure_committed_after_an_intervening_check_stays_dependent() {
+    let Some(log) = file("FIREBIRD_IT_AUDIT_LOG") else {
+        return;
+    };
+    late_commit_case(&log, "P_LATE_A", false);
+    late_commit_case(&log, "P_LATE_B", true);
+}

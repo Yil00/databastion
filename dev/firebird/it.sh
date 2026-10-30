@@ -286,6 +286,27 @@ COMMIT;
 SQL
 } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
   >/dev/null
+# ADR-0060 R41 item 9: a CREATE PROCEDURE committed after an intervening check() (the tests
+# place the check between the DDL record and its commit), for the normal and the ambiguous path;
+# dropped afterwards so that app.fdb keeps no dependent object.
+for late in P_LATE_A P_LATE_B; do
+  {
+    cat "$WORK/root.pw"
+    cat <<SQL
+SET AUTODDL OFF;
+SET TERM ^ ;
+CREATE PROCEDURE $late RETURNS (N INTEGER) AS BEGIN SELECT COUNT(*) FROM MON\$STATEMENTS INTO :N; SUSPEND; END^
+SET TERM ; ^
+COMMIT;
+SELECT * FROM $late;
+COMMIT;
+DROP PROCEDURE $late;
+COMMIT;
+SQL
+  } | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/app.fdb" \
+    >/dev/null
+done
+
 # The #82 marker cases the stock tools can write (ADR-0060 item 5): a routine's returned value,
 # `EXECUTE STATEMENT`'s inner text, a client process name, and a database-trigger record's process
 # name (an `ON CONNECT` trigger on crm.fdb while the renamed client attaches). A BLR literal

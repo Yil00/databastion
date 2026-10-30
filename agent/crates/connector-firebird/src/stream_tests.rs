@@ -1442,3 +1442,291 @@ fn time_zones_on_the_grid() {
         "UTC+15 is outside the range"
     );
 }
+
+/// Re-review M-1, R41 item 8: an ambiguous DDL record (here a record of a
+/// live attachment under another token) keeps the sets invalidated while
+/// its transaction is open: a check whose catalog read started after the
+/// record, but before the transaction's end, does not clear them; one
+/// started after the end does.
+#[test]
+fn an_ambiguous_ddl_record_keeps_the_sets_invalid_until_its_transaction_ends() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let at = |t: std::time::SystemTime| {
+        let mut s = settings(true, Series::V5);
+        s.databases[0].read_at = Some(t);
+        s
+    };
+    let read = |tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        )
+    };
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    // The DDL record under a forged token: ambiguous.
+    let ddl = stmt(
+        "24:0x7f0000000999",
+        3,
+        7,
+        "APP",
+        "CREATE PROCEDURE P_LATE AS BEGIN END",
+        0,
+        &[],
+    );
+    let before = m.counts.ambiguous;
+    feed(&mut m, &cats, &ddl, 1000);
+    assert!(m.counts.ambiguous > before);
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let out = feed(&mut m, &cats, &read(8), 2000);
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "still open: {:?}",
+        names(&out)
+    );
+    let commit = format!(
+        "{HEAD} ({a}) COMMIT_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n      0 ms, 1 fetch(es)\n\n"
+    );
+    feed(&mut m, &cats, &commit, 3000);
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let out = feed(&mut m, &cats, &read(9), 4000);
+    assert!(
+        out.iter().all(|(_, e)| !e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}
+
+/// Re-review M-1: an ambiguous DDL record whose database does not resolve
+/// keeps every declared database's sets invalidated until the run ends.
+#[test]
+fn an_unresolved_ambiguous_ddl_record_keeps_the_sets_invalid_until_the_run_ends() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let at = |t: std::time::SystemTime| {
+        let mut s = settings(true, Series::V5);
+        s.databases[0].read_at = Some(t);
+        s
+    };
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let ddl = stmt(
+        a,
+        3,
+        7,
+        "APP",
+        "CREATE PROCEDURE P_LATE AS BEGIN END",
+        0,
+        &[],
+    )
+    .replace(APP, "unknownalias");
+    feed(&mut m, &cats, &ddl, 1000);
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let read = |tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        )
+    };
+    let out = feed(&mut m, &cats, &read(8), 2000);
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+    // A new run ends it; a check after that clears the sets.
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(2),
+    });
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    feed(&mut m, &cats, &attach("24:0x7f0000000200", 4, APP), 3000);
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(
+            "24:0x7f0000000200",
+            4,
+            9,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        ),
+        4000,
+    );
+    assert!(
+        out.iter().all(|(_, e)| !e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}
+
+/// Re-review M-1: a DDL transaction seen while `ddl_open` is full waits
+/// for its end (never fail open), as an unresolved record does.
+#[test]
+fn a_ddl_transaction_past_the_open_cap_keeps_the_sets_invalid_until_it_ends() {
+    let a = "24:0x7f0000000100";
+    let two = || {
+        let mut s = settings(true, Series::V5);
+        let mut crm = s.databases[0].clone();
+        crm.label = "crm".to_owned();
+        crm.resolved = Some("/srv/crm.fdb".to_owned());
+        crm.attach = "/srv/crm.fdb".to_owned();
+        s.databases.push(crm);
+        s
+    };
+    let at = |t: std::time::SystemTime| {
+        let mut s = two();
+        s.databases[0].read_at = Some(t);
+        s
+    };
+    let mut m = Machine::new(two(), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 2] = [&cat, &cat];
+    // The other database's DDL transactions fill the table.
+    m.fill_ddl_open_for_tests(1);
+    let ctx7 = format!(
+        "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_7, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+    );
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    feed(
+        &mut m,
+        &cats,
+        &format!("{HEAD} ({a}) START_TRANSACTION\n{ctx7}\n"),
+        500,
+    );
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            7,
+            "APP",
+            "CREATE PROCEDURE P_LATE AS BEGIN END",
+            0,
+            &[],
+        ),
+        1000,
+    );
+    let read = |tra: u64| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        )
+    };
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let out = feed(&mut m, &cats, &read(8), 2000);
+    assert!(
+        out.iter().all(|(_, e)| e.always_report()),
+        "still open: {:?}",
+        names(&out)
+    );
+    feed(
+        &mut m,
+        &cats,
+        &format!("{HEAD} ({a}) COMMIT_TRANSACTION\n{ctx7}      0 ms, 1 fetch(es)\n\n"),
+        3000,
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let out = feed(&mut m, &cats, &read(9), 4000);
+    assert!(
+        out.iter().all(|(_, e)| !e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}
+
+/// Re-review L-5: a DDL transaction whose end record never came ends
+/// with its run; a check after the run's end clears the sets.
+#[test]
+fn a_ddl_transaction_ends_with_its_run() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let at = |t: std::time::SystemTime| {
+        let mut s = settings(true, Series::V5);
+        s.databases[0].read_at = Some(t);
+        s
+    };
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            7,
+            "APP",
+            "CREATE PROCEDURE P_LATE AS BEGIN END",
+            0,
+            &[],
+        ),
+        1000,
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    assert_eq!(m.ddl_open_len_for_tests(), 1, "the DDL transaction is open");
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(2),
+    });
+    assert_eq!(m.ddl_open_len_for_tests(), 0);
+    std::thread::sleep(Duration::from_millis(5));
+    m.reconfigure(at(std::time::SystemTime::now()));
+    let b = "24:0x7f0000000200";
+    feed(&mut m, &cats, &attach(b, 4, APP), 3000);
+    let out = feed(
+        &mut m,
+        &cats,
+        &stmt(
+            b,
+            4,
+            9,
+            "APP",
+            "SELECT * FROM V_X WHERE ID > 0",
+            2,
+            &[("CUSTOMERS", 2)],
+        ),
+        4000,
+    );
+    assert!(
+        out.iter().all(|(_, e)| !e.always_report()),
+        "{:?}",
+        names(&out)
+    );
+}

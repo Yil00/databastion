@@ -95,6 +95,9 @@ pub(crate) const MAX_STREAM_BYTES: usize = 16 << 20;
 const BINDING_BYTES: usize = 256;
 /// Ended tokens remembered (R5 item 2), oldest dropped first.
 const MAX_TOKENS_ENDED: usize = 65_536;
+/// DDL transactions tracked at most (R41 item 8); past it, invalidated
+/// until the run ends.
+const MAX_DDL_OPEN: usize = 4096;
 /// R25: the stream budget.
 const MAX_GROUPS: usize = 4096;
 const MAX_GROUPS_PER_BINDING: usize = 16;
@@ -425,6 +428,14 @@ pub(crate) struct Machine {
     /// DDL transactions seen without their end record: binding and
     /// transaction, and the database (R41 item 8).
     ddl_open: HashMap<(Key, u64), usize>,
+    /// Per database: after an ambiguous DDL record whose transaction could
+    /// not be kept in `ddl_open`, the transactions known open on that
+    /// database at the record; invalidated until each has ended (re-review
+    /// M-1).
+    ddl_wait: HashMap<usize, std::collections::HashSet<(Key, u64)>>,
+    /// Databases invalidated until the run ends (an ambiguous DDL record
+    /// with nothing to wait on).
+    run_sticky: std::collections::HashSet<usize>,
     /// Per database: a check's catalog read must start after this to
     /// clear the invalidation (the latest invalidating record or DDL
     /// transaction end, agent clock).
@@ -493,6 +504,8 @@ impl Machine {
             file: (0, 0),
             views_invalid: std::collections::HashSet::new(),
             ddl_open: HashMap::new(),
+            ddl_wait: HashMap::new(),
+            run_sticky: std::collections::HashSet::new(),
             invalid_after: HashMap::new(),
             ddl_named: HashMap::new(),
             all_relations: std::collections::HashSet::new(),
@@ -513,6 +526,21 @@ impl Machine {
         self.offset
     }
 
+    /// Test support: fills `ddl_open` with another binding's DDL
+    /// transactions on database `db`.
+    #[cfg(test)]
+    pub(crate) fn fill_ddl_open_for_tests(&mut self, db: usize) {
+        for t in 0..MAX_DDL_OPEN as u64 {
+            self.ddl_open.insert(((DbId::Declared(db), 50), t), db);
+        }
+    }
+
+    /// Test support: the DDL transactions tracked.
+    #[cfg(test)]
+    pub(crate) fn ddl_open_len_for_tests(&self) -> usize {
+        self.ddl_open.len()
+    }
+
     /// The log file the next records come from.
     pub(crate) fn set_file(&mut self, file: (u64, u64)) {
         self.file = file;
@@ -525,7 +553,13 @@ impl Machine {
         // check's catalog read started after every DDL transaction seen
         // since ended (none still open) and after the latest invalidating
         // record.
-        let open: std::collections::HashSet<usize> = self.ddl_open.values().copied().collect();
+        let open: std::collections::HashSet<usize> = self
+            .ddl_open
+            .values()
+            .copied()
+            .chain(self.ddl_wait.keys().copied())
+            .chain(self.run_sticky.iter().copied())
+            .collect();
         let clear: Vec<usize> = self
             .views_invalid
             .iter()
@@ -580,6 +614,22 @@ impl Machine {
     }
 
     fn end_run(&mut self) {
+        // Re-review L-5: the run's DDL transactions end with it.
+        let wall = SystemTime::now();
+        let dbs: Vec<usize> = self
+            .ddl_open
+            .values()
+            .copied()
+            .chain(self.ddl_wait.keys().copied())
+            .chain(self.run_sticky.iter().copied())
+            .collect();
+        self.ddl_open.clear();
+        self.ddl_wait.clear();
+        self.run_sticky.clear();
+        for db in dbs {
+            self.invalidate(db, wall);
+        }
+        self.probe_records.clear();
         // Review L-B: the run's pending groups end as R25 item 3 says (at the
         // next record or reading-time bound), never dropped silently.
         let groups: Vec<Group> = self.groups.drain(..).collect();
@@ -690,6 +740,32 @@ impl Machine {
                 let f = self.learned_floor.entry(key.0).or_insert(0);
                 *f = (*f).max(key.1);
             }
+            // Re-review L-5: its DDL transactions end with it.
+            let wall = SystemTime::now();
+            let ended: Vec<(Key, u64)> = self
+                .ddl_open
+                .keys()
+                .filter(|(k, _)| *k == key)
+                .copied()
+                .collect();
+            for e in ended {
+                if let Some(db) = self.ddl_open.remove(&e) {
+                    self.invalidate(db, wall);
+                }
+            }
+            for w in self.ddl_wait.values_mut() {
+                w.retain(|(k, _)| *k != key);
+            }
+            let done: Vec<usize> = self
+                .ddl_wait
+                .iter()
+                .filter(|(_, w)| w.is_empty())
+                .map(|(db, _)| *db)
+                .collect();
+            for db in done {
+                self.ddl_wait.remove(&db);
+                self.invalidate(db, wall);
+            }
             self.counts.evicted += 1;
             return true;
         }
@@ -757,6 +833,28 @@ impl Machine {
     ///
     /// Each asks for an early check, and so does the end of a DDL
     /// transaction (R11 8d's merging).
+    /// A DDL record whose transaction cannot be kept in `ddl_open` (not
+    /// resolved, or no room): each database waits for every transaction
+    /// known open on it at the record; when the record's own transaction is
+    /// not among them, or they are too many, until the run ends (re-review
+    /// M-1, never fail open).
+    fn hold_ddl(&mut self, dbs: &[usize], key: Option<Key>, tra: Option<u64>) {
+        for &db in dbs {
+            let open: std::collections::HashSet<(Key, u64)> = self
+                .bindings
+                .iter()
+                .filter(|(k, _)| k.0 == DbId::Declared(db))
+                .flat_map(|(k, b)| b.open_tras.iter().map(move |t| (*k, *t)))
+                .collect();
+            let own_known = key.is_some_and(|k| tra.is_some_and(|t| open.contains(&(k, t))));
+            if !own_known || open.len() > MAX_DDL_OPEN {
+                self.run_sticky.insert(db);
+            } else {
+                self.ddl_wait.entry(db).or_default().extend(open);
+            }
+        }
+    }
+
     fn note_ddl(&mut self, rec: &Record<'_>, decision: &Decision, wall: SystemTime) {
         let key = rec.att.and_then(|att| match self.resolve(att.database) {
             Resolved::Db(d) => Some((d, att.id)),
@@ -784,6 +882,25 @@ impl Machine {
                 self.invalidate(db, wall);
             }
         }
+        // The transactions an ambiguous DDL record waits on (M-1).
+        let ends = |(k, t): &(Key, u64)| match rec.header.event {
+            Event::CommitTransaction | Event::RollbackTransaction => {
+                Some(*k) == key && Some(*t) == tra
+            }
+            Event::DetachDatabase | Event::DropDatabase => Some(*k) == key,
+            _ => false,
+        };
+        let mut done = Vec::new();
+        for (db, w) in &mut self.ddl_wait {
+            w.retain(|e| !ends(e));
+            if w.is_empty() {
+                done.push(*db);
+            }
+        }
+        for db in done {
+            self.ddl_wait.remove(&db);
+            self.invalidate(db, wall);
+        }
         match (&rec.body, rec.header.event, decision) {
             (Body::Statement { text, .. }, _, _) => {
                 let a = analyze_firebird(text);
@@ -792,9 +909,24 @@ impl Machine {
                 }
                 match decision {
                     Decision::Ambiguous { .. } => {
-                        for db in 0..self.s.databases.len() {
-                            self.invalidate(db, wall);
-                            self.all_relations.insert(db);
+                        // Re-review M-1: the DDL transaction is kept open
+                        // under its resolved binding and transaction, so a
+                        // check before its end does not clear the sets.
+                        let dbs: Vec<usize> = match key {
+                            Some((DbId::Declared(i), _)) => vec![i],
+                            _ => (0..self.s.databases.len()).collect(),
+                        };
+                        for db in &dbs {
+                            self.invalidate(*db, wall);
+                            self.all_relations.insert(*db);
+                        }
+                        match (key, tra) {
+                            (Some(k @ (DbId::Declared(i), _)), Some(t))
+                                if self.ddl_open.len() < MAX_DDL_OPEN =>
+                            {
+                                self.ddl_open.insert((k, t), i);
+                            }
+                            _ => self.hold_ddl(&dbs, key, tra),
                         }
                     }
                     Decision::Normal { db, key } => {
@@ -810,10 +942,13 @@ impl Machine {
                         } else {
                             self.all_relations.insert(db);
                         }
-                        if let (Some(k), Some(t)) = (key, tra)
-                            && self.ddl_open.len() < 4096
-                        {
-                            self.ddl_open.insert((*k, t), db);
+                        match (key, tra) {
+                            (Some(k), Some(t)) if self.ddl_open.len() < MAX_DDL_OPEN => {
+                                self.ddl_open.insert((*k, t), db);
+                            }
+                            // No room, or no transaction: held as an
+                            // unresolved record is (never fail open).
+                            _ => self.hold_ddl(&[db], *key, tra),
                         }
                     }
                     _ => {}
