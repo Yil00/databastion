@@ -342,6 +342,7 @@ dependencies = [
  "databastion-core",
  "getrandom 0.4.3",
  "proptest",
+ "rustix",
  "serde_json",
  "sha1",
  "sha2",

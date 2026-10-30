@@ -262,6 +262,8 @@ pub(crate) struct Machine {
     /// Groups ended by the record being judged, emitted in `apply`.
     pending_end: Vec<Group>,
     pub(crate) counts: Counts,
+    /// The read-back probe's own record was read (proof 7).
+    pub(crate) probe_seen: Option<SystemTime>,
     /// Ambiguous records by the rule (source line) that judged them, for
     /// the tests and the local detail.
     pub(crate) why: std::collections::BTreeMap<u32, u64>,
@@ -296,6 +298,7 @@ impl Machine {
             hash_key: std::collections::hash_map::RandomState::new(),
             pending_end: Vec::new(),
             counts: Counts::default(),
+            probe_seen: None,
             why: std::collections::BTreeMap::new(),
         }
     }
@@ -1625,7 +1628,17 @@ impl Machine {
             fetched,
             rec.header.outcome == Outcome::Failed,
         ) {
-            Verdict::Own => true,
+            Verdict::Own => {
+                // Proof 7: the probe's exact text, one record fetched, a
+                // block naming `RDB$DATABASE`.
+                if text == crate::sql::READ_BACK_PROBE
+                    && fetched == 1
+                    && block.contains(&"RDB$DATABASE")
+                {
+                    self.probe_seen = Some(SystemTime::now());
+                }
+                true
+            }
             Verdict::NotOwn => false,
             // A text of the set with no credit left: loud (R8 item 4).
             Verdict::NoCredit => {

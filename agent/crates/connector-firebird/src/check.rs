@@ -42,6 +42,9 @@ const MAJORS: [u32; 2] = [4, 5];
 /// Shared state of the connector.
 #[derive(Default)]
 pub(crate) struct CheckState {
+    /// The Audit facts per target (lot 3): what the stream needs from
+    /// `check()`, and what it reports back for the level.
+    pub(crate) audit: std::sync::Arc<crate::audit::AuditState>,
     versions: Mutex<HashMap<String, String>>,
     /// Per target: whether the last check blocks Discovery and Audit (a
     /// refused right, or a refusal list not evaluated completely).
@@ -169,6 +172,7 @@ async fn run(
     let mut eval = Evaluation::default();
     let mut coverage = Coverage::default();
     let mut version: Option<String> = None;
+    let mut audit_dbs = Vec::new();
     for db in &settings.databases {
         let mut s = conn::connect(
             &endpoint,
@@ -183,9 +187,39 @@ async fn run(
             Ok(_) => Some(catalog::read(&mut s, deadline).await),
             Err(_) => None,
         };
+        // Audit (lot 3): the resolved path and the security-database kind
+        // (R2 rule 1, R9), and the read-back probe (proof 7).
+        let mut file = (None, None);
+        if settings.audit.is_some() && result.is_ok() {
+            if let Ok(rows) = s
+                .query(
+                    sql::DATABASE_FILE,
+                    &[Col::Text(4080), Col::Text(28)],
+                    1,
+                    deadline,
+                )
+                .await
+            {
+                let row = rows.rows.first().cloned().unwrap_or_default();
+                file = (
+                    text(&row, 0),
+                    text(&row, 1).map(|t| t.trim_end().to_owned()),
+                );
+            }
+            let _ = s
+                .query(sql::READ_BACK_PROBE, &[Col::Int], 1, deadline)
+                .await;
+        }
         s.close().await;
         let (v, facts) = result?;
         let read = read.transpose()?.unwrap_or_default();
+        audit_dbs.push(crate::audit::DbFacts {
+            attach: db.attach.clone(),
+            label: db.name.clone(),
+            resolved: file.0,
+            sec_database: file.1,
+            catalog: crate::audit::Classes::from_catalog(&read),
+        });
         detail.push(format!("Firebird {v}, wire encryption {}", facts.plugin));
         version = Some(v);
         eval.add(&facts.facts);
@@ -196,8 +230,42 @@ async fn run(
     }
     eval.notes(&mut notes);
     coverage.notes(&mut notes, &mut detail);
-    // Audit: lot 3 (decision 10).
-    notes.add(TargetNote::new(NoteCode::AuditSourceNotConfigured));
+    // Audit (decision 6, lot 3): the proofs, under the file rules, off
+    // the async threads.
+    let audit_level = match settings.audit.clone() {
+        Some(cfg) if !settings.tunnel => {
+            let state_audit = std::sync::Arc::clone(&state.audit);
+            let id = target.id.clone();
+            let server_pid = crate::own::ledger_for(endpoint.addr).server_pid();
+            let peer_uid = settings.peer_uid();
+            let (level, n, d) = tokio::task::spawn_blocking(move || {
+                let mut n = Notes::default();
+                let mut d = Vec::new();
+                let level = crate::audit::evaluate(
+                    &state_audit,
+                    &id,
+                    &cfg,
+                    crate::audit::CheckInputs {
+                        dbs: audit_dbs,
+                        server_pid,
+                        peer_uid,
+                    },
+                    &mut n,
+                    &mut d,
+                );
+                (level, n, d)
+            })
+            .await
+            .map_err(|_| FbError::new(FailureCode::Internal, Stage::Check))?;
+            notes.extend(n.into_vec());
+            detail.extend(d);
+            level
+        }
+        _ => {
+            notes.add(TargetNote::new(NoteCode::AuditSourceNotConfigured));
+            AuditLevel::None
+        }
+    };
     let summary = eval.summary();
     if !summary.is_empty() {
         detail.push(summary);
@@ -206,7 +274,7 @@ async fn run(
     tracing::info!(target_id = %target.id, detail = %detail.join("; "), "Firebird checked");
     Ok(TargetHealth {
         reachable: true,
-        audit_level: AuditLevel::None,
+        audit_level,
         failure: None,
         detail: Some(detail.join("; ")),
         notes: notes.into_vec(),

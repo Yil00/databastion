@@ -40,6 +40,15 @@ pub(crate) const OWN_ATTACHMENT: &str = "SELECT CURRENT_CONNECTION, CAST(MON$REM
 /// an idle attachment is ended by the server after 2 minutes.
 pub(crate) const IDLE_TIMEOUT: &str = "SET SESSION IDLE TIMEOUT 2 MINUTE";
 
+/// The declared database's resolved path and its security database kind,
+/// on the agent's own attachment (ADR-0060 R2 rule 1 (a), R9 rule 1, R19:
+/// `MON$SEC_DATABASE` is `CHAR(7)`). A lot 3 text (R20): its 3d row is
+/// measured with the matrix test.
+pub(crate) const DATABASE_FILE: &str = "SELECT CAST(MON$DATABASE_NAME AS VARCHAR(1020) CHARACTER SET UTF8), CAST(MON$SEC_DATABASE AS VARCHAR(7) CHARACTER SET UTF8) FROM MON$DATABASE";
+
+/// The read-back probe of proof 7: its record must reach the declared log.
+pub(crate) const READ_BACK_PROBE: &str = "SELECT COUNT(*) FROM RDB$DATABASE";
+
 /// The effective identity (decision 4): never `CURRENT_ROLE` to decide
 /// (a `DEFAULT` role is in use while `CURRENT_ROLE` is `NONE`, refinement
 /// R4), the owner of the database, the security-database flag of the
@@ -173,6 +182,14 @@ pub(crate) const STATEMENTS: &[Statement] = &[
     Statement {
         name: "idle_timeout",
         text: IDLE_TIMEOUT,
+    },
+    Statement {
+        name: "database_file",
+        text: DATABASE_FILE,
+    },
+    Statement {
+        name: "read_back_probe",
+        text: READ_BACK_PROBE,
     },
     Statement {
         name: "identity",

@@ -31,12 +31,15 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod audit;
 mod catalog;
 mod check;
 mod conn;
 mod crypt;
 mod discover;
 mod error;
+mod fsread;
 #[cfg_attr(not(test), allow(dead_code))]
 mod own;
 mod peer;
@@ -174,20 +177,63 @@ impl Connector for FirebirdConnector {
         discover::discover(job, sink, &self.state).await
     }
 
-    /// Audit comes with lot 3 (ADR-0060 decision 10), behind the same
-    /// verdict as Discovery.
+    /// Audit from the system audit trace (ADR-0060 decision 6, lot 3),
+    /// behind the same verdict as Discovery.
     async fn audit_stream(
         &self,
         cfg: &AuditConfig,
-        _sink: &EventSink,
+        sink: &EventSink,
     ) -> Result<(), ConnectorError> {
         if let Some(e) = self.refused(cfg.target()) {
             return Err(e);
         }
-        Err(ConnectorError::NotImplemented {
+        let target = cfg.target().ok_or(ConnectorError::Target {
             engine: Engine::Firebird,
-            operation: "audit_stream",
-        })
+            code: databastion_core::FailureCode::Internal,
+            engine_code: None,
+        })?;
+        let audit = target
+            .firebird_settings()
+            .and_then(|s| s.audit.clone())
+            .filter(|_| !target.firebird_settings().is_some_and(|s| s.tunnel))
+            .ok_or(ConnectorError::Target {
+                engine: Engine::Firebird,
+                code: databastion_core::FailureCode::Unsupported,
+                engine_code: None,
+            })?;
+        let endpoint = conn::Endpoint::of(target).map_err(|_| ConnectorError::Target {
+            engine: Engine::Firebird,
+            code: databastion_core::FailureCode::Internal,
+            engine_code: None,
+        })?;
+        let series = match self.state.version(&target.id) {
+            Some(v) if v.starts_with("4.") => trace_log::Series::V4,
+            _ => trace_log::Series::V5,
+        };
+        audit::stream(
+            std::sync::Arc::clone(&self.state.audit),
+            own::ledger_for(endpoint.addr),
+            cfg,
+            &audit,
+            &target.account,
+            series,
+            sink,
+        )
+        .await
+    }
+
+    fn supports_audit(&self) -> bool {
+        true
+    }
+
+    fn audit_source(
+        &self,
+        target: &TargetConfig,
+    ) -> Option<databastion_classifiers::masking::EventSource> {
+        target
+            .firebird_settings()
+            .filter(|s| s.audit.is_some() && !s.tunnel)
+            .map(|_| databastion_classifiers::masking::EventSource::FirebirdAuditTrace)
     }
 
     fn server_version(&self, target: &TargetConfig) -> Option<String> {
@@ -245,7 +291,7 @@ mod tests {
     async fn discovery_and_audit_consult_the_check_first() {
         let c = FirebirdConnector::new();
         assert_eq!(c.engine(), Engine::Firebird);
-        assert!(!c.supports_audit());
+        assert!(c.supports_audit());
         assert!(c.state.blocks("never-checked"));
         let (findings, _rx) = FindingSink::channel(1);
         let (events, _erx) = EventSink::channel(1);
