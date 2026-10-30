@@ -1415,6 +1415,31 @@ async fn the_dependent_set_on_the_server() {
             eprintln!("[measure] dependency row {line:?}");
         }
     }
+    // Re-review L-4: the field sources read are user columns with a
+    // computed or checked domain only (here T_COMP's computed column, the
+    // domain-check table's column, V_PKG's expression), no system column.
+    let fields = s
+        .query(
+            crate::sql::FIELD_SOURCES,
+            &[o, o, crate::sql::Col::Bool],
+            65_536,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let field_tables: std::collections::BTreeSet<String> =
+        fields.rows.iter().map(|r| txt(&r[0])).collect();
+    eprintln!(
+        "[measure] field sources {} rows, tables {field_tables:?}",
+        fields.rows.len()
+    );
+    assert!(
+        !field_tables
+            .iter()
+            .any(|t| t.starts_with("RDB$") || t.starts_with("MON$") || t.starts_with("SEC$")),
+        "{field_tables:?}"
+    );
+    assert!(field_tables.contains("T_COMP"), "{field_tables:?}");
     let start = std::time::Instant::now();
     let deps = crate::views::read(&mut s, deadline).await.unwrap();
     eprintln!(

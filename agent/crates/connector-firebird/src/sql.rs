@@ -177,10 +177,12 @@ pub(crate) const VIEW_RELATIONS: &str = "SELECT CAST(V.RDB$VIEW_NAME AS VARCHAR(
 /// on, with the dependent's package.
 pub(crate) const DEPENDENCIES: &str = "SELECT CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDENT_TYPE AS INTEGER), CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(D.RDB$DEPENDED_ON_TYPE AS INTEGER), CAST(D.RDB$PACKAGE_NAME AS VARCHAR(252) CHARACTER SET OCTETS) FROM RDB$DEPENDENCIES D WHERE D.RDB$DEPENDENT_TYPE IN (1, 2, 3, 4, 5, 15, 18, 19)";
 
-/// The dependent-set read of R41 item 1, third part: every column's field
-/// source (its domain) and whether it is computed, mapping computed
-/// columns (3) and domain checks (4) to their tables.
-pub(crate) const FIELD_SOURCES: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(RF.RDB$FIELD_SOURCE AS VARCHAR(252) CHARACTER SET OCTETS), CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE";
+/// The dependent-set read of R41 item 1, third part: the field source (its
+/// domain) of every user column (system flag 0) whose domain is computed
+/// or carries a validation, and whether it is computed, mapping computed
+/// columns (3) and domain checks (4) to their tables (re-review L-4: no
+/// other column can depend on anything at read time).
+pub(crate) const FIELD_SOURCES: &str = "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR(252) CHARACTER SET OCTETS), CAST(RF.RDB$FIELD_SOURCE AS VARCHAR(252) CHARACTER SET OCTETS), CASE WHEN F.RDB$COMPUTED_BLR IS NULL THEN FALSE ELSE TRUE END FROM RDB$RELATION_FIELDS RF JOIN RDB$FIELDS F ON F.RDB$FIELD_NAME = RF.RDB$FIELD_SOURCE WHERE COALESCE(RF.RDB$SYSTEM_FLAG, 0) = 0 AND (F.RDB$COMPUTED_BLR IS NOT NULL OR F.RDB$VALIDATION_BLR IS NOT NULL)";
 
 /// The dependent-set read of R41 items 1 and 3, fourth part: the names of
 /// every procedure (5), function (15), package (18) and trigger (2), with
