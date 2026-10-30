@@ -400,7 +400,9 @@ pub(crate) fn parse_acl(b: &[u8]) -> Option<Vec<(u16, u16, u32)>> {
     }
     Some(
         b[4..]
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|e| {
                 (
                     u16::from_le_bytes([e[0], e[1]]),
