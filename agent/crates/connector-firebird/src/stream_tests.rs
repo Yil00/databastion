@@ -1123,3 +1123,59 @@ fn only_an_own_record_ends_a_split_window() {
     );
     assert_eq!(m.counts.ambiguous, before, "{:?}", m.why);
 }
+
+/// Review L3 (re-review note): a record whose rules actually panic is
+/// isolated: counted, ambiguous (`*`, always reported), and the next
+/// record is judged as usual.
+#[test]
+fn a_panicking_record_is_isolated_and_loud() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let mut out = Vec::new();
+    let rec = format!(
+        "{HEAD} ({a}) START_TRANSACTION\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\nPANIC-FOR-TESTS"
+    );
+    m.push(rec.as_bytes(), 5000, Instant::now(), &cats, &mut out);
+    assert_eq!(m.counts.panics, 1);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+    let out = feed(&mut m, &cats, &select(a, 3, 6, APP, "CUSTOMERS", 2), 9000);
+    assert!(names(&out).contains(&"CUSTOMERS".to_owned()));
+}
+
+/// Review L4 (dedicated): a record of the agent's attachment that the
+/// conversion judges ambiguous (here the session text written without a
+/// statement line but with a row) never consumes a credit, and is always
+/// reported.
+#[test]
+fn an_ambiguous_own_text_never_consumes_a_credit() {
+    use crate::conn::{FetchAccount, FetchEnd};
+    let ledger = Arc::new(Ledger::default());
+    ledger.register(APP, 3, 40003, 24);
+    let mut m = Machine::new(settings(true, Series::V5), Arc::clone(&ledger));
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let own = "24:0x7f0000000100";
+    let agent = "DATABASTION_AGENT";
+    feed(&mut m, &cats, &attach_as(own, 3, agent), 0);
+    let t = crate::sql::IDLE_TIMEOUT;
+    ledger.credit(
+        APP,
+        3,
+        t,
+        None,
+        FetchAccount {
+            end: FetchEnd::NotRun,
+            ..FetchAccount::default()
+        },
+    );
+    let rec = format!(
+        "{HEAD} ({own}) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_3, {agent}:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\n{}\n{t}\n1 records fetched\n      0 ms, 1 fetch(es)\n\n",
+        "-".repeat(79)
+    );
+    let out = feed(&mut m, &cats, &rec, 1000);
+    assert!(!out.is_empty() && out.iter().all(|(_, e)| e.always_report()));
+    assert_eq!(ledger.credits_left().len(), 1, "the credit stays");
+}

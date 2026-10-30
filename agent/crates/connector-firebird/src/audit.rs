@@ -441,12 +441,13 @@ pub(crate) fn evaluate(
         proven = false;
     }
     // Review L4: the declared root is the server's layout (its binary in
-    // `<root>/bin` or `<root>`); otherwise the macros may not resolve to
+    // `<root>/bin`); otherwise the macros may not resolve to
     // the root and proof 2 is not proven.
     if started.is_some() {
         let dir = input.server_pid.and_then(crate::fsread::server_binary_dir);
         let root_path = std::path::Path::new(&root);
-        if !dir.is_some_and(|d| d == root_path.join("bin") || d == root_path) {
+        // Re-review note: `<root>/bin` only (the images' and the tarball's).
+        if !dir.is_some_and(|d| d == root_path.join("bin")) {
             not_eval.push("server_layout_not_the_root");
         }
     }

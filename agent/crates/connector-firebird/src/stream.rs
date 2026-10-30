@@ -872,6 +872,11 @@ impl Machine {
             return false;
         };
         self.window_ender = false;
+        // Test support: a record that makes the rules panic (L3's test).
+        #[cfg(test)]
+        if raw.ends_with(b"\nPANIC-FOR-TESTS") {
+            panic!("a test panic");
+        }
         let decision = self.judge(&rec, pos, now, cat);
         self.check_offset_binding();
         self.note_view_ddl(&rec, &decision);

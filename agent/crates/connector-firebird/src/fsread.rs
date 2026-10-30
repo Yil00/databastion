@@ -249,6 +249,12 @@ pub(crate) fn server_binary_dir(pid: u32) -> Option<std::path::PathBuf> {
     if !is_firebird(pid) {
         return None;
     }
+    // The executable itself when its link is readable (the server's uid or
+    // ptrace rights; `comm` and `argv[0]` are the process's to set, re-review
+    // note), else `argv[0]`.
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        return exe.parent().map(Path::to_path_buf);
+    }
     let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     binary_dir(&cmd)
 }
@@ -586,6 +592,15 @@ mod tests {
         let log = dir.join("audit.log");
         std::fs::write(&log, b"x").unwrap();
         assert_eq!(check_file(&log), Ok(()));
+        // Reads nothing: an 8 GiB (sparse) log is checked at once.
+        let big = dir.join("big.log");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(8 << 30)
+            .unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(check_file(&big), Ok(()));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         let link = dir.join("link.log");
         std::os::unix::fs::symlink(&log, &link).unwrap();
         assert_eq!(check_file(&link), Err(Refusal::NotReadable));
