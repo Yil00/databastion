@@ -53,6 +53,28 @@ pub(crate) struct CheckState {
     /// excluded as its own security database, or not shown not to be one
     /// (R9): Discovery does not scan them.
     excluded: Mutex<HashMap<String, Vec<String>>>,
+    /// Per target: checks running now (R11 8d: an early check is never
+    /// started while one runs).
+    running: Mutex<HashMap<String, u32>>,
+}
+
+/// Counts a running check of a target for its lifetime.
+struct Running<'a> {
+    state: &'a CheckState,
+    id: String,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let mut m = self
+            .state
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&self.id) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 impl CheckState {
@@ -88,6 +110,28 @@ impl CheckState {
             .get(target_id)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Whether a check of `target_id` is running.
+    pub(crate) fn running(&self, target_id: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target_id)
+            .is_some_and(|n| *n > 0)
+    }
+
+    fn start(&self, target_id: &str) -> Running<'_> {
+        *self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(target_id.to_owned())
+            .or_default() += 1;
+        Running {
+            state: self,
+            id: target_id.to_owned(),
+        }
     }
 
     /// Whether the last check excluded the database `attach` (R9).
@@ -159,6 +203,7 @@ fn failed(e: FbError, target: &TargetConfig) -> TargetHealth {
 
 /// `check()` of one target.
 pub(crate) async fn check(state: &CheckState, target: &TargetConfig) -> TargetHealth {
+    let _running = state.start(&target.id);
     let deadline = Instant::now() + CHECK_TOTAL;
     let out = match tokio::time::timeout_at(deadline, run(state, target, deadline)).await {
         Ok(Ok(h)) => return h,

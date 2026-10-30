@@ -455,6 +455,7 @@ fn views_over_always_reported_relations_and_view_ddl() {
         &[],
     );
     feed(&mut m, &cats, &ddl, 20_000);
+    assert!(m.check_requested, "view DDL asks for an early check");
     let out = feed(&mut m, &cats, &read("V_X", 8), 30_000);
     assert!(
         out.iter().all(|(_, e)| e.always_report()),

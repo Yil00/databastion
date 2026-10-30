@@ -475,10 +475,19 @@ fn settings(
     })
 }
 
+/// Starts an early `check()` of the stream's target; `false` when one is
+/// running (R11 8d, R28 item 4).
+pub(crate) type EarlyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// At most one early check per target in this time (R11 8d).
+const EARLY_CHECK_EVERY: Duration = Duration::from_secs(30);
+
 /// The Audit stream of one target. Runs until the core drops it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream(
     state: Arc<AuditState>,
     ledger: Arc<crate::own::Ledger>,
+    early: EarlyCheck,
     cfg: &AuditConfig,
     audit: &FirebirdAuditConfig,
     account: &str,
@@ -496,6 +505,7 @@ pub(crate) async fn stream(
         });
     }
     let mut machine = Machine::new(s, ledger);
+    let mut requests = EarlyRequests::default();
     if let Some(r) = run {
         machine.confirm_run(r);
     }
@@ -555,6 +565,11 @@ pub(crate) async fn stream(
                 f.probe_seen = Some(p);
             }
         });
+        // R28 item 4: view DDL asks for an early check, merged.
+        if std::mem::take(&mut machine.check_requested) {
+            requests.request(generation);
+        }
+        requests.serve(generation, Instant::now(), &*early);
         let more = match polled {
             Ok(more) => more,
             Err(_) => {
@@ -579,6 +594,43 @@ pub(crate) async fn stream(
         })?;
         if !more {
             tokio::time::sleep(cfg.poll_interval()).await;
+        }
+    }
+}
+
+/// The merged early-check requests of one stream (R11 8d): a request is
+/// served by an early check at most once per [`EARLY_CHECK_EVERY`], never
+/// while a check runs, or by any newer check result (a new generation).
+#[derive(Debug, Default)]
+struct EarlyRequests {
+    /// The check generation the pending request was made under.
+    pending: Option<u64>,
+    last: Option<Instant>,
+}
+
+impl EarlyRequests {
+    fn request(&mut self, generation: u64) {
+        self.pending.get_or_insert(generation);
+    }
+
+    fn serve(&mut self, generation: u64, now: Instant, start: &dyn Fn() -> bool) {
+        let Some(g) = self.pending else {
+            return;
+        };
+        if generation != g {
+            // A newer check result serves it.
+            self.pending = None;
+            return;
+        }
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < EARLY_CHECK_EVERY)
+        {
+            return;
+        }
+        if start() {
+            self.last = Some(now);
+            self.pending = None;
         }
     }
 }
@@ -977,6 +1029,46 @@ mod tests {
         // The record in progress is held back.
         assert!(r.record_start.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R28 item 4 under R11 8d: requests are merged, at most one early
+    /// check per 30 s, never while one runs, and a newer check serves them.
+    #[test]
+    fn early_checks_are_merged() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let started = AtomicU32::new(0);
+        let busy = AtomicBool::new(false);
+        let start = || {
+            if busy.load(Ordering::Relaxed) {
+                return false;
+            }
+            started.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let t0 = Instant::now();
+        let mut r = EarlyRequests::default();
+        r.serve(1, t0, &start);
+        assert_eq!(started.load(Ordering::Relaxed), 0);
+        r.request(1);
+        r.request(1);
+        r.serve(1, t0, &start);
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+        // Within 30 s: held, not started.
+        r.request(1);
+        r.serve(1, t0 + Duration::from_secs(10), &start);
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+        // Past 30 s, but a check runs: held.
+        busy.store(true, Ordering::Relaxed);
+        r.serve(1, t0 + Duration::from_secs(31), &start);
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+        busy.store(false, Ordering::Relaxed);
+        r.serve(1, t0 + Duration::from_secs(32), &start);
+        assert_eq!(started.load(Ordering::Relaxed), 2);
+        // A newer check result serves a pending request.
+        r.request(2);
+        r.serve(3, t0 + Duration::from_secs(100), &start);
+        r.serve(3, t0 + Duration::from_secs(200), &start);
+        assert_eq!(started.load(Ordering::Relaxed), 2);
     }
 
     #[test]

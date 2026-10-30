@@ -274,6 +274,8 @@ pub(crate) struct Machine {
     /// Groups ended by the record being judged, emitted in `apply`.
     pending_end: Vec<Group>,
     pub(crate) counts: Counts,
+    /// A view DDL record asks for an early check (R28 item 4).
+    pub(crate) check_requested: bool,
     /// The read-back probe's own record was read (proof 7).
     pub(crate) probe_seen: Option<SystemTime>,
     /// Ambiguous records by the rule (source line) that judged them, for
@@ -314,6 +316,7 @@ impl Machine {
             hash_key: std::collections::hash_map::RandomState::new(),
             pending_end: Vec::new(),
             counts: Counts::default(),
+            check_requested: false,
             probe_seen: None,
             why: std::collections::BTreeMap::new(),
         }
@@ -395,9 +398,11 @@ impl Machine {
         match decision {
             Decision::Ambiguous { .. } => {
                 self.views_invalid.extend(0..self.s.databases.len());
+                self.check_requested = true;
             }
             Decision::Normal { db, .. } if !a.parses() || names_view(text) => {
                 self.views_invalid.insert(*db);
+                self.check_requested = true;
             }
             _ => {}
         }

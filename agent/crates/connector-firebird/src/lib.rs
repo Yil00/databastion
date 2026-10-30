@@ -127,7 +127,7 @@ pub fn statement_checked(text: &str) -> bool {
 #[derive(Default)]
 #[non_exhaustive]
 pub struct FirebirdConnector {
-    state: check::CheckState,
+    state: std::sync::Arc<check::CheckState>,
 }
 
 impl std::fmt::Debug for FirebirdConnector {
@@ -212,9 +212,27 @@ impl Connector for FirebirdConnector {
             Some(v) if v.starts_with("4.") => trace_log::Series::V4,
             _ => trace_log::Series::V5,
         };
+        // R28 item 4: the stream asks for early checks after view DDL; one
+        // runs on its own task, never while a check of the target runs.
+        let early: audit::EarlyCheck = {
+            let state = std::sync::Arc::clone(&self.state);
+            let target = target.clone();
+            std::sync::Arc::new(move || {
+                if state.running(&target.id) {
+                    return false;
+                }
+                let state = std::sync::Arc::clone(&state);
+                let target = target.clone();
+                tokio::spawn(async move {
+                    let _ = check::check(&state, &target).await;
+                });
+                true
+            })
+        };
         audit::stream(
             std::sync::Arc::clone(&self.state.audit),
             own::ledger_for(endpoint.addr),
+            early,
             cfg,
             &audit,
             &target.account,
