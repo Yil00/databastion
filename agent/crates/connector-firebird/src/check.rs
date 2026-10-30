@@ -245,7 +245,10 @@ async fn run(
         Some(cfg) => Some(
             tokio::task::spawn_blocking(move || crate::audit::alias_map(&cfg))
                 .await
-                .map_err(|_| FbError::new(FailureCode::Internal, Stage::Check))?,
+                .map_err(|e| {
+                    let _ = databastion_core::resume_panic(e);
+                    FbError::new(FailureCode::Internal, Stage::Check)
+                })?,
         ),
         None => None,
     };
@@ -363,7 +366,10 @@ async fn run(
                 (level, n, d)
             })
             .await
-            .map_err(|_| FbError::new(FailureCode::Internal, Stage::Check))?;
+            .map_err(|e| {
+                let _ = databastion_core::resume_panic(e);
+                FbError::new(FailureCode::Internal, Stage::Check)
+            })?;
             notes.extend(n.into_vec());
             detail.extend(d);
             level

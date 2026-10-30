@@ -621,10 +621,14 @@ pub(crate) async fn stream(
             (r, (m, cats), out, polled)
         })
         .await
-        .map_err(|_| ConnectorError::Target {
-            engine: databastion_core::Engine::Firebird,
-            code: FailureCode::Internal,
-            engine_code: None,
+        .map_err(|e| {
+            // A panic of the blocking task is resumed (re-review L-D).
+            let _ = databastion_core::resume_panic(e);
+            ConnectorError::Target {
+                engine: databastion_core::Engine::Firebird,
+                code: FailureCode::Internal,
+                engine_code: None,
+            }
         })?;
         runner = r;
         (machine, cats) = m;
@@ -670,10 +674,14 @@ pub(crate) async fn stream(
             runner
         })
         .await
-        .map_err(|_| ConnectorError::Target {
-            engine: databastion_core::Engine::Firebird,
-            code: FailureCode::Internal,
-            engine_code: None,
+        .map_err(|e| {
+            // A panic of the blocking task is resumed (re-review L-D).
+            let _ = databastion_core::resume_panic(e);
+            ConnectorError::Target {
+                engine: databastion_core::Engine::Firebird,
+                code: FailureCode::Internal,
+                engine_code: None,
+            }
         })?;
         if !more {
             tokio::time::sleep(cfg.poll_interval()).await;
