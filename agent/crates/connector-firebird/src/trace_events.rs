@@ -561,10 +561,17 @@ pub(crate) fn to_event(draft: &Draft, rec: &Record<'_>, db: &str, ts: SystemTime
     // a database or the services manager) may be a mistyped password: it
     // is fingerprinted whatever the record became (an ambiguous record's
     // event is a read).
-    let failed_attach = matches!(
-        rec.header.event,
-        Event::AttachDatabase | Event::AttachService
-    ) && matches!(rec.header.outcome, Outcome::Failed | Outcome::Unauthorized);
+    // Re-review M-A: also an `ERROR AT JProvider::attachDatabase` record and
+    // any record of attachment 0 (the id a failed attach carries), whatever
+    // the decision made of it (ambiguous, a permission refusal).
+    let failed_attach =
+        (matches!(
+            rec.header.event,
+            Event::AttachDatabase | Event::AttachService
+        ) && matches!(rec.header.outcome, Outcome::Failed | Outcome::Unauthorized))
+            || (rec.header.event == Event::Error
+                && rec.header.at == Some(crate::trace_log::ErrorAt::AttachDatabase))
+            || rec.att.is_some_and(|a| a.id == 0);
     let principal = match (action, user) {
         (EventAction::AuthFailure, Some(u)) => EventPrincipal::failed_account(u),
         (_, Some(u)) if failed_attach => EventPrincipal::failed_account(u),

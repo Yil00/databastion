@@ -976,3 +976,33 @@ fn a_million_forged_records_stay_under_the_cap() {
     assert!(m.counts.ambiguous > 0);
     assert_eq!(m.counts.panics, 0);
 }
+
+/// Re-review M-A (I2), #82: an `ERROR AT JProvider::attachDatabase`
+/// record (ambiguous from another pid, or a permission refusal of the run)
+/// never sends the attempted user name in clear.
+#[test]
+fn attach_error_records_never_send_the_user_name() {
+    const M: &str = "pw-marker-ma";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: None,
+    });
+    let cat = Cat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let mut seen = 0;
+    for (token, code) in [
+        ("99:0x7f0000000900", "335544472"),
+        ("24:0x7f0000000901", "335544352"),
+    ] {
+        let rec = format!(
+            "{HEAD} ({token}) ERROR AT JProvider::attachDatabase\n\t{APP} (ATT_0, {M}:NONE, UTF8, TCPv4:127.0.0.1/45555)\n\t/usr/bin/app:28\n{code} : Your user name and password are not defined\n\n"
+        );
+        for (_, e) in feed(&mut m, &cats, &rec, 0) {
+            seen += 1;
+            assert!(!e.principal().send_name(), "{token}");
+            assert!(!format!("{e:?}").contains(M), "{token}: {e:?}");
+        }
+    }
+    assert!(seen >= 2, "{seen}");
+}
