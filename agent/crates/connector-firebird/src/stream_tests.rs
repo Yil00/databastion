@@ -1902,3 +1902,47 @@ fn a_pending_group_ends_with_its_run() {
     ));
     assert!(named(&out), "{:?}", names(&out));
 }
+
+/// A DDL text names its identifier tokens until the next check: a
+/// computed column added to a known table (`ALTER TABLE CUSTOMERS ADD X
+/// COMPUTED BY (…)`) makes that table's reads dependent at once (the
+/// analysis takes no relation from a DDL text).
+#[test]
+fn a_ddl_text_names_its_tables_until_the_next_check() {
+    let a = "24:0x7f0000000100";
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    feed(&mut m, &cats, &attach(a, 3, APP), 0);
+    let read = |tra: u64, table: &str| {
+        stmt(
+            a,
+            3,
+            tra,
+            "APP",
+            &format!("SELECT ID FROM {table} WHERE ID > 0"),
+            2,
+            &[(table, 2)],
+        )
+    };
+    let marked = |out: &[Emitted]| !out.is_empty() && out.iter().all(|(_, e)| e.always_report());
+    assert!(!marked(&feed(&mut m, &cats, &read(4, "CUSTOMERS"), 500)));
+    feed(
+        &mut m,
+        &cats,
+        &stmt(
+            a,
+            3,
+            5,
+            "APP",
+            "ALTER TABLE CUSTOMERS ADD X COMPUTED BY ((SELECT COUNT(*) FROM P_NEW))",
+            0,
+            &[],
+        ),
+        1000,
+    );
+    let out = feed(&mut m, &cats, &read(6, "CUSTOMERS"), 2000);
+    assert!(marked(&out), "{:?}", names(&out));
+    let out = feed(&mut m, &cats, &read(7, "ORDERS"), 2500);
+    assert!(!marked(&out), "{:?}", names(&out));
+}

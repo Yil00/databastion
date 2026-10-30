@@ -932,13 +932,17 @@ impl Machine {
                     Decision::Normal { db, key } => {
                         let db = *db;
                         self.invalidate(db, wall);
-                        if a.parses() {
-                            let named = self.ddl_named.entry(db).or_default();
-                            for r in a.relations.iter().chain(&a.procedures) {
-                                if named.len() < 4096 {
-                                    named.insert(r.trim_end_matches(' ').to_owned());
-                                }
-                            }
+                        // Every identifier token of the DDL text is named
+                        // (the analysis takes no relation from a DDL text,
+                        // so `ALTER TABLE T ADD C COMPUTED BY (…)` names
+                        // `T` this way); past the bound, or a text that does
+                        // not lex whole, every relation.
+                        let ids = crate::idents::idents(text);
+                        let tokens = ids.names.len() + ids.packaged.len();
+                        let named = self.ddl_named.entry(db).or_default();
+                        if a.parses() && !ids.cut && named.len() + tokens <= 4096 {
+                            named.extend(ids.names);
+                            named.extend(ids.packaged.into_iter().map(|(p, _)| p));
                         } else {
                             self.all_relations.insert(db);
                         }
