@@ -146,6 +146,12 @@ pub(crate) struct StreamFacts {
     pub(crate) ambiguous: u64,
     pub(crate) gap: Option<SystemTime>,
     pub(crate) probe_seen: Option<SystemTime>,
+    /// Gap events counted (review M4): rotations or truncations, records
+    /// the tailer dropped, record-rule panics, cursor resets.
+    pub(crate) gaps: u64,
+    /// Where the last stream of this process saved its cursor: the file
+    /// and the offset the next stream must resume at (review M4).
+    pub(crate) saved: Option<((u64, u64), u64)>,
 }
 
 /// Per target: what the last `check()` evaluated, and the stream's facts.
@@ -506,6 +512,7 @@ pub(crate) async fn stream(
     }
     let mut machine = Machine::new(s, ledger);
     let mut requests = EarlyRequests::default();
+    let mut seen = Seen::default();
     if let Some(r) = run {
         machine.confirm_run(r);
     }
@@ -517,6 +524,9 @@ pub(crate) async fn stream(
         file: None,
         last_growth: Instant::now(),
         reread_end: None,
+        expect: state.with(&id, |t| t.stream.saved),
+        reset: false,
+        last_end: None,
     };
     loop {
         // A new check: new names, classes, run.
@@ -553,18 +563,17 @@ pub(crate) async fn stream(
         runner = r;
         (machine, cats) = m;
         let now = SystemTime::now();
-        state.note_stream(&id, |f| {
-            if machine.counts.parsed_declared > 0 {
-                f.last_record = Some(now);
-            }
-            if machine.counts.ambiguous > f.ambiguous {
-                f.last_ambiguous = Some(now);
-                f.ambiguous = machine.counts.ambiguous;
-            }
-            if let Some(p) = machine.probe_seen.take() {
-                f.probe_seen = Some(p);
-            }
-        });
+        // Proofs 8 and 9 from this stream's deltas (review L2: a restarted
+        // stream's counters start again at 0), and the gaps of proof 8
+        // (review M4, L3).
+        let c = machine.counts;
+        let gaps = runner.tailer.rotations
+            + runner.tailer.oversized
+            + runner.tailer.malformed()
+            + c.panics
+            + u64::from(runner.reset);
+        let probe = machine.probe_seen.take();
+        report(&state, &id, &mut seen, &c, gaps, probe, now);
         // R28 item 4: view DDL asks for an early check, merged.
         if std::mem::take(&mut machine.check_requested) {
             requests.request(generation);
@@ -582,6 +591,14 @@ pub(crate) async fn stream(
             sink.submit(ev).await?;
         }
         let held = runner.held(&machine);
+        // Where the next stream must resume (review M4).
+        let resume = held
+            .first()
+            .map(|(_, p)| (p.file, p.start))
+            .or(runner.last_end);
+        if resume.is_some() {
+            state.note_stream(&id, |f| f.saved = resume);
+        }
         runner = tokio::task::spawn_blocking(move || {
             runner.tailer.commit_from(&held);
             runner
@@ -635,6 +652,49 @@ impl EarlyRequests {
     }
 }
 
+/// Reports this stream's progress for proofs 8 and 9: by delta from the
+/// last report, so that a restarted stream (its counters at 0) still marks
+/// new ambiguous records, new records and new gaps (review L2, M4).
+fn report(
+    state: &AuditState,
+    id: &str,
+    seen: &mut Seen,
+    c: &crate::stream::Counts,
+    gaps: u64,
+    probe: Option<SystemTime>,
+    now: SystemTime,
+) {
+    state.note_stream(id, |f| {
+        if c.parsed_declared > seen.parsed {
+            f.last_record = Some(now);
+        }
+        if c.ambiguous > seen.ambiguous {
+            f.last_ambiguous = Some(now);
+            f.ambiguous += c.ambiguous - seen.ambiguous;
+        }
+        if gaps > seen.gaps {
+            f.gap = Some(now);
+            f.gaps += gaps - seen.gaps;
+        }
+        if let Some(p) = probe {
+            f.probe_seen = Some(p);
+        }
+    });
+    *seen = Seen {
+        parsed: c.parsed_declared,
+        ambiguous: c.ambiguous,
+        gaps,
+    };
+}
+
+/// This stream's counters at the last report (review L2).
+#[derive(Debug, Default, Clone, Copy)]
+struct Seen {
+    parsed: u64,
+    ambiguous: u64,
+    gaps: u64,
+}
+
 struct Runner {
     tailer: Tailer,
     asm: Assembler,
@@ -646,6 +706,13 @@ struct Runner {
     /// After a restart: the file and the end of what the previous reading
     /// had read. Records before it are emitted again (R39 (a)) and counted.
     reread_end: Option<((u64, u64), u64)>,
+    /// Where the previous stream of this process saved its cursor: the
+    /// first record read must start there, otherwise the cursor was reset
+    /// (a gap, review M4).
+    expect: Option<((u64, u64), u64)>,
+    reset: bool,
+    /// The file and end of the last line read.
+    last_end: Option<((u64, u64), u64)>,
 }
 
 impl Runner {
@@ -671,6 +738,12 @@ impl Runner {
         for (line, pos) in polled.records.iter().zip(&polled.positions) {
             let line = line.strip_suffix(b"\n").unwrap_or(line);
             let start = pos.start;
+            if let Some(e) = self.expect.take()
+                && e != (pos.file, pos.start)
+            {
+                self.reset = true;
+            }
+            self.last_end = Some((pos.file, pos.end));
             if self.file != Some(pos.file) {
                 if self.file.is_some() {
                     // A rotation (review M3): the old file ended. Its last
@@ -800,6 +873,9 @@ mod tests {
             file: None,
             last_growth: Instant::now(),
             reread_end: None,
+            expect: None,
+            reset: false,
+            last_end: None,
         }
     }
 
@@ -1056,6 +1132,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review L2: a restarted stream's first ambiguous record and first
+    /// record are reported although its counters are below the previous
+    /// stream's; review M4: a gap is reported.
+    #[test]
+    fn proofs_8_and_9_by_delta_across_stream_restarts() {
+        let state = AuditState::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut seen = Seen::default();
+        let mut c = crate::stream::Counts {
+            parsed_declared: 100,
+            ambiguous: 5,
+            ..Default::default()
+        };
+        report(&state, "t", &mut seen, &c, 0, None, t0);
+        // No progress: nothing new.
+        report(
+            &state,
+            "t",
+            &mut seen,
+            &c,
+            0,
+            None,
+            t0 + Duration::from_secs(10),
+        );
+        let f = state.with("t", |t| t.stream);
+        assert_eq!(f.last_record, Some(t0));
+        assert_eq!(f.ambiguous, 5);
+        assert!(f.gap.is_none());
+        // A new stream: its counters start at 0.
+        let mut seen = Seen::default();
+        c = crate::stream::Counts {
+            parsed_declared: 1,
+            ambiguous: 1,
+            ..Default::default()
+        };
+        let t1 = t0 + Duration::from_secs(60);
+        report(&state, "t", &mut seen, &c, 1, None, t1);
+        let f = state.with("t", |t| t.stream);
+        assert_eq!(f.last_record, Some(t1));
+        assert_eq!(f.last_ambiguous, Some(t1));
+        assert_eq!(f.ambiguous, 6);
+        assert_eq!(f.gap, Some(t1));
+    }
+
+    /// Review M4: a stream that does not resume where the previous one of
+    /// this process saved its cursor (a reset) counts a gap.
+    #[test]
+    fn a_cursor_reset_is_a_gap() {
+        use crate::stream_tests::{APP, attach};
+        let dir = temp("reset");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let _ = session(&log, &dir);
+        append(
+            &log,
+            &format!(
+                "{}{}",
+                attach("24:0x7f0000000100", 3, APP),
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        let mut r = runner(
+            &log,
+            databastion_core::audit::CursorStore::new(&dir, "t", "fb"),
+        );
+        r.expect = Some(((0, 0), 12_345));
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert!(r.reset);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review M3: a rotation while a fold group pends in the old file ends
     /// the group there (its relations sent), so that nothing held lies in
     /// the rotated file when the cursor is saved; a restart then loses
@@ -1165,6 +1316,9 @@ mod tests {
             file: None,
             last_growth: Instant::now(),
             reread_end: None,
+            expect: None,
+            reset: false,
+            last_end: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());
