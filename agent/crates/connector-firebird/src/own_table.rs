@@ -233,7 +233,7 @@ const STATEMENT_ROWS: &[Row] = &[
         loading: NONE,
         bound: limit(crate::views::MAX_ROWS),
     },
-    // R41: a union of four catalog relations; any part may be empty.
+    // R41: a union of five catalog relations; any part may be empty.
     Row {
         text: sql::ROUTINES,
         may: &[
@@ -241,6 +241,7 @@ const STATEMENT_ROWS: &[Row] = &[
             "RDB$FUNCTIONS",
             "RDB$PACKAGES",
             "RDB$TRIGGERS",
+            "RDB$INDICES",
         ],
         must: NONE,
         must_with_rows: NONE,

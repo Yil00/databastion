@@ -162,12 +162,16 @@ pub(crate) fn compute(r: Reads) -> ViewDeps {
         if *dtype == 3 && !computed_sources.contains(dependent.as_str()) {
             return out;
         }
-        // A packaged routine's dependencies are its package's (L2).
-        let from = match package {
-            Some(p) if matches!(dtype, 5 | 15) => Some(Node::Package(p.clone())),
-            _ => Node::of(*dtype, dependent.clone()),
+        // `RDB$PACKAGE_NAME` is the depended-on object's package (measured
+        // on 5.0.4: a view column calling `PKG.F` is recorded as depending
+        // on `F`, type 15, package `PKG`); a packaged routine's own
+        // dependencies are its package body's (type 19). A packaged routine
+        // resolves to its package's node (L2).
+        let to = match package {
+            Some(p) if matches!(otype, 5 | 15) => Some(Node::Package(p.clone())),
+            _ => Node::of(*otype, on.clone()),
         };
-        if let (Some(from), Some(to)) = (from, Node::of(*otype, on.clone())) {
+        if let (Some(from), Some(to)) = (Node::of(*dtype, dependent.clone()), to) {
             edges.entry(from).or_default().push(to);
         }
     }
@@ -179,24 +183,31 @@ pub(crate) fn compute(r: Reads) -> ViewDeps {
             .or_default()
             .push(Node::Field(source));
     }
+    // A table with an expression index: its dependency is not recorded
+    // (measured), so the table counts as dependent (R41 item 9).
+    let mut indexed: HashSet<String> = HashSet::new();
     for (name, _, kind, relation, system) in routines {
-        if kind == 2
-            && system != 0
-            && let Some(rel) = relation
-        {
-            edges
-                .entry(Node::Relation(rel))
-                .or_default()
-                .push(Node::Trigger(name));
+        match (kind, relation) {
+            (2, Some(rel)) if system != 0 => {
+                edges
+                    .entry(Node::Relation(rel))
+                    .or_default()
+                    .push(Node::Trigger(name));
+            }
+            (6, Some(rel)) => {
+                indexed.insert(rel);
+            }
+            _ => {}
         }
     }
     let dep = dependent_nodes(&edges);
-    let names: HashSet<String> = dep
+    let mut names: HashSet<String> = dep
         .iter()
         .filter_map(|n| n.name())
         .filter(|n| !always_listed(n))
         .map(str::to_owned)
         .collect();
+    names.extend(indexed);
     if names.len() > MAX_DEPENDENT {
         return out;
     }
@@ -442,13 +453,8 @@ mod tests {
                 d("V_FUNC", 1, "F_CFG", 15),
                 d("F_CFG", 15, "RDB$CONFIG", 0),
                 d("V_PKG", 1, "PK", 18),
-                (
-                    "F_IN".to_owned(),
-                    15,
-                    "MON$CONTEXT_VARIABLES".to_owned(),
-                    0,
-                    Some("PK".to_owned()),
-                ),
+                // A packaged routine's reads are its package body's.
+                d("PK", 19, "MON$CONTEXT_VARIABLES", 0),
                 d("V_OK", 1, "F_OK", 15),
                 d("F_OK", 15, "CUSTOMERS", 0),
             ],
@@ -512,23 +518,36 @@ mod tests {
         assert!(!compute(r).complete);
     }
 
-    /// Review L2: a standalone `P` and a packaged `PKG.P` are distinct.
+    /// Review L2, measured on 5.0.4: a standalone `P` and a packaged
+    /// `PKG.P` are distinct; the package column names the depended-on
+    /// object's package; a table with an expression index is dependent.
     #[test]
     fn packaged_and_standalone_routines_are_distinct() {
-        let deps = compute(reads(
+        let mut r = reads(
             vec![],
             vec![
+                d("PKG", 19, "MON$STATEMENTS", 0),
                 (
+                    "RDB$21".to_owned(),
+                    3,
                     "P".to_owned(),
-                    5,
-                    "MON$STATEMENTS".to_owned(),
-                    0,
+                    15,
                     Some("PKG".to_owned()),
                 ),
                 d("P", 5, "CUSTOMERS", 0),
+                d("V_STANDALONE", 1, "P", 5),
             ],
-        ));
-        assert_eq!(sorted(&deps), ["PKG"]);
+        );
+        r.fields = Some(vec![("V_PKG".to_owned(), "RDB$21".to_owned(), true)]);
+        r.routines = Some(vec![(
+            "IX_EXPR".to_owned(),
+            None,
+            6,
+            Some("T_IX".to_owned()),
+            0,
+        )]);
+        let deps = compute(r);
+        assert_eq!(sorted(&deps), ["PKG", "T_IX", "V_PKG"]);
     }
 
     #[test]

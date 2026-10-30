@@ -333,6 +333,50 @@ as_sysdba /opt/firebird/bin/gbak -b -se "127.0.0.1/$PORT:service_mgr" \
   /var/lib/firebird/data/app.fdb /tmp/it-app.fbk -user SYSDBA < "$WORK/root.pw" >/dev/null
 timeout 60 docker exec "$NAME" rm -f /tmp/it-app.fbk
 
+# ADR-0060 R41 item 9: a database outside the trace (deps.fdb) with the review's cases, for the
+# dependent-set read on the server: a procedure over MON$STATEMENTS, a computed column (dependent
+# type 3), a call cycle, a standalone P next to a packaged PKG.P, a view calling a packaged
+# function, ON CONNECT and row triggers, a check constraint and a domain check over virtual
+# relations; then whether an expression index can depend on a virtual relation.
+{
+  cat "$WORK/root.pw"
+  printf "CREATE DATABASE '127.0.0.1/%s:/var/lib/firebird/data/deps.fdb' DEFAULT CHARACTER SET UTF8;\n" "$PORT"
+  cat <<'SQL'
+CREATE TABLE T (ID INTEGER, X VARCHAR(10));
+CREATE TABLE T_COMP (ID INTEGER, C COMPUTED BY ((SELECT COUNT(*) FROM MON$STATEMENTS)));
+CREATE DOMAIN D_CHK AS INTEGER CHECK (VALUE > (SELECT COUNT(*) FROM MON$CALL_STACK));
+CREATE TABLE T_DOM (ID D_CHK);
+CREATE TABLE T_CHK (ID INTEGER CHECK (ID > (SELECT COUNT(*) FROM MON$CONTEXT_VARIABLES)));
+SET TERM ^ ;
+CREATE PROCEDURE P_MON RETURNS (S VARCHAR(100)) AS BEGIN FOR SELECT CAST(MON$SQL_TEXT AS VARCHAR(100)) FROM MON$STATEMENTS INTO :S DO SUSPEND; END^
+CREATE PROCEDURE P_OK RETURNS (I INTEGER) AS BEGIN FOR SELECT ID FROM T INTO :I DO SUSPEND; END^
+CREATE PROCEDURE P1 (N INTEGER) RETURNS (I INTEGER) AS BEGIN I = 0; END^
+CREATE PROCEDURE P2 (N INTEGER) RETURNS (I INTEGER) AS BEGIN I = 0; END^
+ALTER PROCEDURE P1 (N INTEGER) RETURNS (I INTEGER) AS BEGIN IF (N > 0) THEN EXECUTE PROCEDURE P2 (N - 1) RETURNING_VALUES :I; SELECT COUNT(*) FROM SEC$USERS INTO :I; END^
+ALTER PROCEDURE P2 (N INTEGER) RETURNS (I INTEGER) AS BEGIN IF (N > 0) THEN EXECUTE PROCEDURE P1 (N - 1) RETURNING_VALUES :I; END^
+CREATE PROCEDURE P RETURNS (I INTEGER) AS BEGIN I = 1; SUSPEND; END^
+CREATE PACKAGE PKG AS BEGIN FUNCTION F RETURNS INTEGER; PROCEDURE P RETURNS (I INTEGER); END^
+CREATE PACKAGE BODY PKG AS BEGIN FUNCTION F RETURNS INTEGER AS BEGIN RETURN (SELECT COUNT(*) FROM MON$STATEMENTS); END PROCEDURE P RETURNS (I INTEGER) AS BEGIN I = 1; SUSPEND; END END^
+CREATE VIEW V_PKG (N) AS SELECT PKG.F() FROM RDB$DATABASE^
+CREATE TRIGGER TR_CONN ON CONNECT AS DECLARE N INTEGER; BEGIN SELECT COUNT(*) FROM MON$STATEMENTS INTO :N; END^
+CREATE TRIGGER TR_ROW FOR T BEFORE INSERT AS DECLARE N INTEGER; BEGIN SELECT COUNT(*) FROM MON$CONTEXT_VARIABLES INTO :N; END^
+SET TERM ; ^
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -user SYSDBA >/dev/null
+if {
+  cat "$WORK/root.pw"
+  cat <<'SQL'
+CREATE INDEX IX_EXPR ON T COMPUTED BY ((SELECT COUNT(*) FROM MON$STATEMENTS));
+COMMIT;
+SQL
+} | as_sysdba /opt/firebird/bin/isql -q -b -user SYSDBA "127.0.0.1/$PORT:/var/lib/firebird/data/deps.fdb" \
+  >/dev/null 2>&1; then
+  echo "[measure] expression index over a virtual relation: accepted" >&2
+else
+  echo "[measure] expression index over a virtual relation: refused" >&2
+fi
+
 # The tests run in the network namespace, as the calling user.
 PID="$(timeout 30 docker inspect -f '{{.State.Pid}}' "$NET")"
 run_tests() { # filter, then extra NAME=value settings

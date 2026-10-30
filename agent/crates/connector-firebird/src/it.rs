@@ -1306,3 +1306,97 @@ async fn drift_of_the_virtual_relations_and_the_built_in_words() {
     }
     s.close().await;
 }
+
+/// ADR-0060 R41 item 9 on the pinned servers: `dev/firebird/it.sh`
+/// creates `deps.fdb` (outside the trace) with the review's cases. The
+/// server records dependencies on virtual relations for procedures,
+/// computed columns, packaged functions, views and triggers (asserted:
+/// a kind with none would have to count as dependent wholesale), and the
+/// agent's read gives the expected set: the procedure over
+/// `MON$STATEMENTS`, the computed-column table, both members of the call
+/// cycle, the package, the view calling it, the two triggers and the
+/// table with an expression index; not the standalone `P` next to the
+/// packaged `PKG.P`, nor a plain procedure. Check constraints and domain
+/// checks are measured.
+#[tokio::test]
+async fn the_dependent_set_on_the_server() {
+    if !enabled() {
+        return;
+    }
+    let t = agent("");
+    let endpoint = crate::conn::Endpoint::of(&t).unwrap();
+    let password = t.secret.read().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut s = crate::conn::connect(
+        &endpoint,
+        password.as_bytes(),
+        "/var/lib/firebird/data/deps.fdb",
+        deadline,
+        std::time::Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+    crate::check::prepare(&mut s, false, deadline)
+        .await
+        .unwrap();
+    // The rows the mapping relies on (catalog identifiers only).
+    let o = crate::sql::Col::Octets(252);
+    let rows = s
+        .query(
+            crate::sql::DEPENDENCIES,
+            &[o, crate::sql::Col::Int, o, crate::sql::Col::Int, o],
+            65_536,
+            deadline,
+        )
+        .await
+        .unwrap();
+    let txt = |v: &crate::sql::Value| match v {
+        crate::sql::Value::Bytes(b) => String::from_utf8_lossy(b).trim_end().to_owned(),
+        crate::sql::Value::Int(i) => i.to_string(),
+        crate::sql::Value::Null => "NULL".to_owned(),
+        other => format!("{other:?}"),
+    };
+    for r in &rows.rows {
+        let line: Vec<String> = r.iter().map(txt).collect();
+        if line
+            .iter()
+            .any(|c| c.contains("PKG") || c.contains("IX_") || c == "6")
+        {
+            eprintln!("[measure] dependency row {line:?}");
+        }
+    }
+    let start = std::time::Instant::now();
+    let deps = crate::views::read(&mut s, deadline).await.unwrap();
+    eprintln!(
+        "[measure] dependent set read in {} ms: complete {}, {} dependent, computed {:?}",
+        start.elapsed().as_millis(),
+        deps.complete,
+        deps.dependent.len(),
+        deps.computed
+    );
+    s.close().await;
+    assert!(deps.complete);
+    // `T` carries the expression index it.sh created over MON$STATEMENTS
+    // (accepted by the server, its dependency not recorded): dependent.
+    for name in [
+        "P_MON", "T_COMP", "P1", "P2", "PKG", "V_PKG", "TR_CONN", "TR_ROW", "T",
+    ] {
+        assert!(
+            deps.dependent.contains(name),
+            "{name}: {:?}",
+            deps.dependent
+        );
+    }
+    for name in ["P", "P_OK"] {
+        assert!(
+            !deps.dependent.contains(name),
+            "{name}: {:?}",
+            deps.dependent
+        );
+    }
+    eprintln!(
+        "[measure] check constraint table dependent {}, domain check table dependent {}",
+        deps.dependent.contains("T_CHK"),
+        deps.dependent.contains("T_DOM")
+    );
+}
