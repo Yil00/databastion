@@ -188,6 +188,23 @@ enum TriggerWait {
 
 type Key = (DbId, u64);
 
+/// What a held DDL record's database waits on (re-review M-1, round 4
+/// L-7): a transaction's end record (or its binding's end), or a
+/// binding's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Pend {
+    Tra(Key, u64),
+    Binding(Key),
+}
+
+impl Pend {
+    fn key(self) -> Key {
+        match self {
+            Self::Tra(k, _) | Self::Binding(k) => k,
+        }
+    }
+}
+
 /// The ids seen for one database identity (R16 item 2, R30 review L7):
 /// kept up to a bound, oldest dropped first; ids at or below the floor
 /// count as seen.
@@ -431,9 +448,9 @@ pub(crate) struct Machine {
     ddl_open: HashMap<(Key, u64), usize>,
     /// Per database: after an ambiguous DDL record whose transaction could
     /// not be kept in `ddl_open`, the transactions known open on that
-    /// database at the record; invalidated until each has ended (re-review
-    /// M-1).
-    ddl_wait: HashMap<usize, std::collections::HashSet<(Key, u64)>>,
+    /// database at the record, or the bindings live at it; invalidated
+    /// until each has ended (re-review M-1, round 4 L-7).
+    ddl_wait: HashMap<usize, std::collections::HashSet<Pend>>,
     /// Databases invalidated until the run ends (an ambiguous DDL record
     /// with nothing to wait on).
     run_sticky: std::collections::HashSet<usize>,
@@ -767,7 +784,7 @@ impl Machine {
                 }
             }
             for w in self.ddl_wait.values_mut() {
-                w.retain(|(k, _)| *k != key);
+                w.retain(|p| p.key() != key);
             }
             let done: Vec<usize> = self
                 .ddl_wait
@@ -851,20 +868,71 @@ impl Machine {
     /// known open on it at the record; when the record's own transaction is
     /// not among them, or they are too many, until the run ends (re-review
     /// M-1, never fail open).
+    ///
+    /// Round 4 L-7: a record whose transaction is not known waits
+    /// for the end of its binding when that binding is live; a record of
+    /// which no binding is known (`key` `None`: its database does not
+    /// resolve, or nothing of it was read) waits for the end of every
+    /// binding live on the database at the record (the agent's own and the
+    /// Garbage Collector's excepted: neither writes DDL), not for the run's
+    /// end, so one forged record does not invalidate a run.
     fn hold_ddl(&mut self, dbs: &[usize], key: Option<Key>, tra: Option<u64>) {
         for &db in dbs {
-            let open: std::collections::HashSet<(Key, u64)> = self
+            let Some(k) = key.filter(|k| k.0 == DbId::Declared(db)) else {
+                let live: std::collections::HashSet<Pend> = self
+                    .bindings
+                    .iter()
+                    .filter(|(k, b)| {
+                        k.0 == DbId::Declared(db) && !b.own && b.kind != Kind::Internal
+                    })
+                    .map(|(k, _)| Pend::Binding(*k))
+                    .collect();
+                if live.len() > MAX_DDL_OPEN {
+                    self.run_sticky.insert(db);
+                } else if !live.is_empty() {
+                    self.ddl_wait.entry(db).or_default().extend(live);
+                }
+                continue;
+            };
+            let open: std::collections::HashSet<Pend> = self
                 .bindings
                 .iter()
                 .filter(|(k, _)| k.0 == DbId::Declared(db))
-                .flat_map(|(k, b)| b.open_tras.iter().map(move |t| (*k, *t)))
+                .flat_map(|(k, b)| b.open_tras.iter().map(move |t| Pend::Tra(*k, *t)))
                 .collect();
-            let own_known = key.is_some_and(|k| tra.is_some_and(|t| open.contains(&(k, t))));
-            if !own_known || open.len() > MAX_DDL_OPEN {
-                self.run_sticky.insert(db);
-            } else {
+            let own_known = tra.is_some_and(|t| open.contains(&Pend::Tra(k, t)));
+            if own_known && open.len() <= MAX_DDL_OPEN {
                 self.ddl_wait.entry(db).or_default().extend(open);
+            } else if self.bindings.contains_key(&k) {
+                self.ddl_wait
+                    .entry(db)
+                    .or_default()
+                    .insert(Pend::Binding(k));
+            } else {
+                self.run_sticky.insert(db);
             }
+        }
+    }
+
+    /// An ambiguous DDL record: every relation of its database counts as
+    /// dependent until a check after its transaction's end (re-review M-1).
+    /// A database that resolves as undeclared invalidates nothing (round 4
+    /// L-7).
+    fn possible_ddl(&mut self, key: Option<Key>, tra: Option<u64>, wall: SystemTime) {
+        let dbs: Vec<usize> = match key {
+            Some((DbId::Declared(i), _)) => vec![i],
+            Some((DbId::Undeclared(_), _)) => return,
+            None => (0..self.s.databases.len()).collect(),
+        };
+        for db in &dbs {
+            self.invalidate(*db, wall);
+            self.all_relations.insert(*db);
+        }
+        match (key, tra) {
+            (Some(k @ (DbId::Declared(i), _)), Some(t)) if self.ddl_open.len() < MAX_DDL_OPEN => {
+                self.ddl_open.insert((k, t), i);
+            }
+            _ => self.hold_ddl(&dbs, key, tra),
         }
     }
 
@@ -895,17 +963,19 @@ impl Machine {
                 self.invalidate(db, wall);
             }
         }
-        // The transactions an ambiguous DDL record waits on (M-1).
-        let ends = |(k, t): &(Key, u64)| match rec.header.event {
-            Event::CommitTransaction | Event::RollbackTransaction => {
+        // What a held DDL record waits on (M-1, L-7): a binding's wait
+        // also ends when the binding is gone by any other path.
+        let ends = |p: &Pend| match (p, rec.header.event) {
+            (Pend::Tra(k, t), Event::CommitTransaction | Event::RollbackTransaction) => {
                 Some(*k) == key && Some(*t) == tra
             }
-            Event::DetachDatabase | Event::DropDatabase => Some(*k) == key,
+            (_, Event::DetachDatabase | Event::DropDatabase) => Some(p.key()) == key,
             _ => false,
         };
+        let bindings = &self.bindings;
         let mut done = Vec::new();
         for (db, w) in &mut self.ddl_wait {
-            w.retain(|e| !ends(e));
+            w.retain(|p| !ends(p) && !matches!(p, Pend::Binding(k) if !bindings.contains_key(k)));
             if w.is_empty() {
                 done.push(*db);
             }
@@ -921,27 +991,10 @@ impl Machine {
                     return;
                 }
                 match decision {
-                    Decision::Ambiguous { .. } => {
-                        // Re-review M-1: the DDL transaction is kept open
-                        // under its resolved binding and transaction, so a
-                        // check before its end does not clear the sets.
-                        let dbs: Vec<usize> = match key {
-                            Some((DbId::Declared(i), _)) => vec![i],
-                            _ => (0..self.s.databases.len()).collect(),
-                        };
-                        for db in &dbs {
-                            self.invalidate(*db, wall);
-                            self.all_relations.insert(*db);
-                        }
-                        match (key, tra) {
-                            (Some(k @ (DbId::Declared(i), _)), Some(t))
-                                if self.ddl_open.len() < MAX_DDL_OPEN =>
-                            {
-                                self.ddl_open.insert((k, t), i);
-                            }
-                            _ => self.hold_ddl(&dbs, key, tra),
-                        }
-                    }
+                    // Re-review M-1: the DDL transaction is kept open under
+                    // its resolved binding and transaction, so a check before
+                    // its end does not clear the sets.
+                    Decision::Ambiguous { .. } => self.possible_ddl(key, tra, wall),
                     Decision::Normal { db, key } => {
                         let db = *db;
                         self.invalidate(db, wall);

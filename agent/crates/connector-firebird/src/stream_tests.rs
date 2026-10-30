@@ -1506,10 +1506,11 @@ fn an_ambiguous_ddl_record_keeps_the_sets_invalid_until_its_transaction_ends() {
     );
 }
 
-/// Re-review M-1: an ambiguous DDL record whose database does not resolve
-/// keeps every declared database's sets invalidated until the run ends.
+/// Re-review M-1, round 4 L-7: an ambiguous DDL record whose database
+/// does not resolve keeps every declared database's sets invalidated until
+/// the bindings live at the record have ended (not until the run ends).
 #[test]
-fn an_unresolved_ambiguous_ddl_record_keeps_the_sets_invalid_until_the_run_ends() {
+fn an_unresolved_ambiguous_ddl_record_keeps_the_sets_invalid_until_the_live_bindings_end() {
     let a = "24:0x7f0000000100";
     let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
     m.confirm_run(Run {
@@ -1554,14 +1555,19 @@ fn an_unresolved_ambiguous_ddl_record_keeps_the_sets_invalid_until_the_run_ends(
         "{:?}",
         names(&out)
     );
-    // A new run ends it; a check after that clears the sets.
-    m.confirm_run(Run {
-        pid: 24,
-        start: Some(2),
-    });
+    // The binding live at the record ends; a check after that clears the
+    // sets (the run goes on).
+    feed(&mut m, &cats, &attach("24:0x7f0000000200", 4, APP), 2500);
+    feed(
+        &mut m,
+        &cats,
+        &format!(
+            "{HEAD} ({a}) DETACH_DATABASE\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\n"
+        ),
+        3000,
+    );
     std::thread::sleep(Duration::from_millis(5));
     m.reconfigure(at(std::time::SystemTime::now()));
-    feed(&mut m, &cats, &attach("24:0x7f0000000200", 4, APP), 3000);
     let out = feed(
         &mut m,
         &cats,
@@ -2072,4 +2078,95 @@ fn a_duplicate_probe_on_the_confirming_binding_reverts_the_offset() {
         Some(3600),
         "reverted with the poisoned confirming binding"
     );
+}
+
+/// Feeds raw log bytes at a given reading time.
+fn feed_raw(
+    m: &mut Machine,
+    cats: &[&dyn Catalog],
+    log: &[u8],
+    base: u64,
+    now: Instant,
+) -> Vec<Emitted> {
+    let mut asm = Assembler::new();
+    let mut recs = Vec::new();
+    for line in log.split(|b| *b == b'\n') {
+        recs.extend(asm.push_line(line));
+    }
+    recs.extend(asm.flush());
+    let mut out = Vec::new();
+    for (i, r) in recs.iter().enumerate() {
+        if let Assembled::Record(raw) = r {
+            m.push(raw, base + i as u64 * 1000, now, cats, &mut out);
+        }
+    }
+    out
+}
+
+const WINDOW_FOR_TESTS: Duration = Duration::from_secs(120);
+
+/// Reads a view from attachment `b` after a check whose catalog read
+/// started now; whether every event is always reported.
+fn read_after_check(m: &mut Machine, tra: u64, later: Instant) -> (bool, Vec<String>) {
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    std::thread::sleep(Duration::from_millis(5));
+    let mut s = settings(true, Series::V5);
+    s.databases[0].read_at = Some(std::time::SystemTime::now());
+    m.reconfigure(s);
+    let read = stmt(
+        "24:0x7f0000000200",
+        4,
+        tra,
+        "APP",
+        "SELECT * FROM V_X WHERE ID > 0",
+        2,
+        &[("CUSTOMERS", 2)],
+    );
+    let out = feed_raw(m, &cats, read.as_bytes(), 10_000 + tra * 1000, later);
+    assert!(!out.is_empty());
+    (out.iter().all(|(_, e)| e.always_report()), names(&out))
+}
+
+/// Round 4 L-7: an ambiguous DDL record of a database that resolves as
+/// undeclared invalidates no declared database.
+#[test]
+fn an_ambiguous_ddl_record_of_an_undeclared_database_invalidates_nothing() {
+    let mut m = Machine::new(settings(true, Series::V5), Arc::new(Ledger::default()));
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let cat = ViewCat;
+    let cats: [&dyn Catalog; 1] = [&cat];
+    let now = Instant::now();
+    feed_raw(
+        &mut m,
+        &cats,
+        attach("24:0x7f0000000200", 4, APP).as_bytes(),
+        0,
+        now,
+    );
+    let ddl = stmt(
+        "24:0x7f0000000100",
+        3,
+        7,
+        "APP",
+        "CREATE PROCEDURE P_OTHER AS BEGIN END",
+        0,
+        &[],
+    )
+    .replace(APP, "/srv/other/elsewhere.fdb");
+    // Ambiguous: the run's start time changed until the next check.
+    m.start_time_changed();
+    let before = m.counts.ambiguous;
+    feed_raw(&mut m, &cats, ddl.as_bytes(), 1000, now);
+    assert!(m.counts.ambiguous > before);
+    m.confirm_run(Run {
+        pid: 24,
+        start: Some(1),
+    });
+    let (marked, n) = read_after_check(&mut m, 8, now + WINDOW_FOR_TESTS);
+    assert!(!marked, "{n:?}");
+    assert!(!m.all_relations_for_tests(0));
 }
