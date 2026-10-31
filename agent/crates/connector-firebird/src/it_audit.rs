@@ -99,7 +99,7 @@ fn the_server_configuration_proves_partial() {
 /// ADR-0060 refinement of 2026-10-31 c, R54, on the configuration the
 /// rotation measurement of `dev/firebird/it.sh` (step 6) runs the server
 /// with (`max_log_size = 1`): not Partial, `max_log_size` the only missing
-/// setting (label `other` until the label set has it).
+/// setting (label `max_log_size`, R57).
 #[test]
 fn the_rotation_measurement_configuration_is_limited() {
     let (Some(trace), Some(dbconf)) = (
@@ -140,6 +140,8 @@ fn the_rotation_measurement_configuration_is_limited() {
         codes,
         [databastion_core::NoteCode::AuditTraceSettingsMissing]
     );
+    let labels: Vec<_> = v.notes[0].labels().iter().map(|l| l.as_str()).collect();
+    assert_eq!(labels, ["max_log_size"]);
     let max_log: Vec<_> = v
         .detail
         .iter()

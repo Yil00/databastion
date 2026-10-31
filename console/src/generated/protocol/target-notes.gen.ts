@@ -316,7 +316,7 @@ export const TARGET_NOTE_REGISTRY = {
     ]
   },
   "audit.trace_settings_missing": {
-    "description": "Limited: the Firebird trace configuration section of a declared database lacks settings the Partial level needs (enabled, log_filename the declared log, log_connections, log_statement_finish, log_blr_requests, the procedure, function and trigger finish events, log_transactions, log_initfini, log_sweep, log_errors, time_threshold 0, print_perf, no include_filter or exclude_filter, connection_id 0): {labels}.",
+    "description": "Limited: the Firebird trace configuration section of a declared database lacks settings the Partial level needs (enabled, log_filename the declared log, log_connections, log_statement_finish, log_blr_requests, the procedure, function and trigger finish events, log_transactions, log_initfini, log_sweep, log_errors, time_threshold 0, print_perf, no include_filter or exclude_filter, connection_id 0, max_log_size 0, max_sql_length at most 983040): {labels}.",
     "engines": [
       "firebird"
     ]

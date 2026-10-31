@@ -70,17 +70,21 @@ const SEVERITY: &[TargetNoteLabel] = {
         L::ServerConfigReadable,
         L::RoleGraph,
         // Firebird trace settings of `audit.trace_settings_missing`
-        // (ADR-0060 R36 item 2): proof 4, R21 and R27 item 2 name 18, more
-        // than a note carries. First the settings that say the applying
-        // section does not apply or filters records out, then
-        // `log_blr_requests` (R32 item 1, review N5), then the missing
-        // record kinds; the level is Limited whatever is cut.
+        // (ADR-0060 R36 item 2): proof 4, R21, R27 item 2 and R54 / R57
+        // name 20, more than a note carries. First the settings that say
+        // the applying section does not apply or filters records out, then
+        // `log_blr_requests` (R32 item 1, review N5), then the settings
+        // that make the log unreadable or its texts unread (`max_log_size`,
+        // R54; `max_sql_length`, refinement of 2026-10-31 c), then the
+        // missing record kinds; the level is Limited whatever is cut.
         L::ConnectionId,
         L::Enabled,
         L::LogFilename,
         L::IncludeFilter,
         L::ExcludeFilter,
         L::LogBlrRequests,
+        L::MaxLogSize,
+        L::MaxSqlLength,
         L::PrintPerf,
         L::TimeThreshold,
         L::LogStatementFinish,
@@ -846,13 +850,15 @@ pub(crate) const LABELS_REVISION_2026_10_C: &[&str] = &["on_failure_probe"];
 
 /// The `TargetNoteLabel` values of the revision
 /// `target_status.note_labels.2026_10_d` (Firebird, ADR-0060 decisions 4
-/// and 6 and its refinements of 2026-10-25 and 2026-10-26 b): the Firebird 4.0 and 5.0
+/// and 6 and its refinements of 2026-10-25, 2026-10-26 b and 2026-10-31 c):
+/// the Firebird 4.0 and 5.0
 /// system privileges, the identities of the refusal list, the `usage`
 /// object right, the credential-relation, server-configuration and
 /// role-graph probes, the reasons of `audit.trace_config_not_evaluated`,
 /// `run_confirmation_stalled` for `audit.log_records_ambiguous` and the
 /// trace configuration settings (`log_transactions`, `log_initfini` and
-/// `log_sweep` from refinement b, R21). Negotiated on
+/// `log_sweep` from refinement b, R21; `max_log_size` and `max_sql_length`
+/// from the refinement of 2026-10-31 c, R57). Negotiated on
 /// their own token, like [`LABELS_REVISION_2026_10_B`]: `other` until the
 /// console lists it. Only [`NoteLabel::firebird`] builds them.
 pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
@@ -920,6 +926,8 @@ pub(crate) const LABELS_REVISION_2026_10_D: &[&str] = &[
     "include_filter",
     "exclude_filter",
     "connection_id",
+    "max_log_size",
+    "max_sql_length",
 ];
 
 /// The `target_status.note_labels.<revision>` tokens the console listed in
@@ -1076,7 +1084,8 @@ impl NoteLabel {
     /// protocol 0.1.0 (`insert`, `create`…); trace settings are given as
     /// written in `fbtrace.conf` (`log_statement_finish`, and since the
     /// ADR-0060 refinement of 2026-10-26 b, R21, `log_transactions`,
-    /// `log_initfini` and `log_sweep`).
+    /// `log_initfini` and `log_sweep`, and since its refinement of
+    /// 2026-10-31 c, R57, `max_log_size` and `max_sql_length`).
     #[must_use]
     pub fn firebird(value: &str) -> Self {
         if LABELS_REVISION_2026_10.contains(&value)
@@ -1675,7 +1684,7 @@ mod tests {
             "run_confirmation_stalled",
             "server_config_readable",
         ];
-        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 64);
+        assert_eq!(super::LABELS_REVISION_2026_10_D.len(), 66);
         for value in REFINEMENT {
             assert!(super::LABELS_REVISION_2026_10_D.contains(&value), "{value}");
             assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
@@ -1753,6 +1762,22 @@ mod tests {
                 "print_perf"
             ]
         );
+        // Refinement of 2026-10-31 c, R57: `max_log_size` (R54) and
+        // `max_sql_length` (the tailer's line bound), last in contract
+        // order, sent as `other` until the console lists `2026_10_d`.
+        const R57: [&str; 2] = ["max_log_size", "max_sql_length"];
+        assert_eq!(super::LABELS_REVISION_2026_10_D[64..], R57);
+        for value in R57 {
+            assert!(value.parse::<super::TargetNoteLabel>().is_ok(), "{value}");
+            assert_eq!(super::NoteLabel::firebird(value).as_str(), value);
+            assert!(super::NoteLabel::parse(value).is_other(), "{value}");
+            assert!(super::NoteLabel::sqlserver(value).is_other(), "{value}");
+            assert!(super::NoteLabel::privilege(value).is_other(), "{value}");
+        }
+        let rotating = TargetNote::new(NoteCode::AuditTraceSettingsMissing)
+            .with_labels(["max_sql_length", "max_log_size"].map(NoteLabel::firebird));
+        assert_eq!(sent(&rotating, LabelRevisions::default()), vec!["other"]);
+        assert_eq!(sent(&rotating, d), vec!["max_log_size", "max_sql_length"]);
     }
 
     /// Security review L2: with every Firebird system privilege held, the
@@ -1920,9 +1945,11 @@ mod tests {
         }
     }
 
-    /// ADR-0060 R36 item 2 (review of #377, N5): with all 18 Firebird trace
+    /// ADR-0060 R36 item 2 (review of #377, N5): with all 20 Firebird trace
     /// settings missing, the five that say the section does not apply or
-    /// filters records, and `log_blr_requests`, are never cut.
+    /// filters records, and `log_blr_requests`, are never cut; nor are
+    /// `max_log_size` and `max_sql_length` (refinement of 2026-10-31 c,
+    /// R57), ranked right after them.
     #[test]
     fn firebird_trace_setting_labels_keep_the_section_and_filter_ones() {
         // Listed least severe first, so input order cannot save them.
@@ -1945,8 +1972,10 @@ mod tests {
             "log_filename",
             "enabled",
             "connection_id",
+            "max_sql_length",
+            "max_log_size",
         ];
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 20);
         let n = TargetNote::new(NoteCode::AuditTraceSettingsMissing)
             .with_labels(all.map(NoteLabel::firebird));
         let kept = sent(&n, LabelRevisions::ALL);
@@ -1958,10 +1987,17 @@ mod tests {
             "include_filter",
             "exclude_filter",
             "log_blr_requests",
+            "max_log_size",
+            "max_sql_length",
         ] {
             assert!(kept.iter().any(|k| k == must), "{must} cut: {kept:?}");
         }
-        for gone in ["log_sweep", "log_services"] {
+        for gone in [
+            "log_sweep",
+            "log_services",
+            "log_errors",
+            "log_trigger_finish",
+        ] {
             assert!(!kept.iter().any(|k| k == gone), "{gone} kept: {kept:?}");
         }
     }

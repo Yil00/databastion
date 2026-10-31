@@ -307,8 +307,7 @@ fn statement_text_limits() {
     let t = DEV_TRACE.replace("\tmax_sql_length = 65000\n", "");
     assert_eq!(eval(&t, Some(&empty_map()), &crm()).max_sql_length, 300);
     // Above what the tailer carries in one line: Partial withheld, the
-    // setting reported (as `other`: the label set has no
-    // `max_sql_length` yet), the detail local.
+    // setting reported with its label (R57), the detail local.
     let at = MAX_SQL_LENGTH_CARRIED;
     let t = DEV_TRACE.replace("max_sql_length = 65000", &format!("max_sql_length = {at}"));
     let v = eval(&t, Some(&empty_map()), &crm());
@@ -322,7 +321,7 @@ fn statement_text_limits() {
     assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
     assert_eq!(
         labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
-        ["other"]
+        ["max_sql_length"]
     );
     assert!(v.detail.iter().any(|d| d.contains("max_sql_length")));
     let t = DEV_TRACE.replace("max_sql_length = 65000", "max_sql_length = 10485760");
@@ -331,8 +330,8 @@ fn statement_text_limits() {
 
 /// ADR-0060 refinement of 2026-10-31 c, R54: Partial requires
 /// `max_log_size = 0` in the declared database's section and in the
-/// services section that writes the log (label `other` until the label
-/// set has `max_log_size`).
+/// services section that writes the log, with the label `max_log_size`
+/// (R57).
 #[test]
 fn a_rotating_log_is_not_partial() {
     assert!(eval(DEV_TRACE, Some(&empty_map()), &crm()).partial);
@@ -342,7 +341,7 @@ fn a_rotating_log_is_not_partial() {
     assert_eq!(codes(&v.notes), [NoteCode::AuditTraceSettingsMissing]);
     assert_eq!(
         labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
-        ["other"]
+        ["max_log_size"]
     );
     assert!(v.detail.iter().any(|d| d.starts_with("crm: max_log_size")));
     // Absent: the server's default, 0.
@@ -356,6 +355,10 @@ fn a_rotating_log_is_not_partial() {
     assert_ne!(t, DEV_TRACE);
     let v = eval(&t, Some(&empty_map()), &crm());
     assert!(!v.partial);
+    assert_eq!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing),
+        ["max_log_size"]
+    );
     assert!(
         v.detail
             .iter()
@@ -375,6 +378,9 @@ fn a_rotating_log_is_not_partial() {
     );
     let v = eval(&other, Some(&empty_map()), &crm());
     assert!(!v.partial);
+    assert!(
+        labels(&v.notes, NoteCode::AuditTraceSettingsMissing).contains(&"max_log_size".to_owned())
+    );
     assert!(
         v.detail
             .iter()
