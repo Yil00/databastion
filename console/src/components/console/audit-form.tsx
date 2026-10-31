@@ -5,7 +5,7 @@ import { useState, type FormEvent } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
-import { MIN_ROWS_WARNING_TEXT } from "@/lib/audit-warning";
+import { MIN_ROWS_WARNING_TEXT, SCHEMA_OBJECTS_WARNING_TEXT } from "@/lib/audit-warning";
 
 import { userApi } from "./client-api";
 
@@ -107,6 +107,10 @@ export function confirmationText(r: Pick<Refusal, "warning" | "previous_objects"
 const MANUAL_FORMAT = "database/schema/object: classifier, classifier";
 const MANUAL_FORMAT_KEY_PATTERNS = "database; object; classifier, classifier";
 
+/** `400 invalid_params`: objects the target's engine cannot name (review L2 of #391). */
+export const INVALID_PARAMS_MESSAGE =
+  "The sensitive objects do not fit this target's engine: on Firebird and SQLite name them as database/object, without a schema; key patterns only on Redis and Valkey. Nothing was saved.";
+
 const ERRORS: Record<string, string> = {
   aggregation_window_s: "Aggregation window: 1 to 300 seconds.",
   poll_interval_s: "Polling interval: 1 to 3600 seconds.",
@@ -155,6 +159,10 @@ export function AuditForm({
         setMessage("This target is Discovery only (no Audit on this engine): the settings were not saved.");
         return;
       }
+      if (res.status === 400 && json?.error === "invalid_params") {
+        setMessage(INVALID_PARAMS_MESSAGE);
+        return;
+      }
       const field = typeof json?.field === "string" ? json.field : "";
       setMessage(Object.hasOwn(ERRORS, field) ? (ERRORS[field] as string) : res.status === 404 ? "The agent or the target is no longer active." : `The settings could not be saved (${res.status}).`);
       return;
@@ -166,7 +174,9 @@ export function AuditForm({
         : "";
     // #235 review N2: saved, with a warning (min_rows on a Redis / Valkey target).
     const rows = json?.min_rows_warning === "no_row_counts" ? ` Warning: ${MIN_ROWS_WARNING_TEXT.no_row_counts}` : "";
-    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}${skipped}${rows}`);
+    // Review L2 of #391: saved, with a warning (a schema on an engine whose locations have none).
+    const schema = json?.schema_warning === "schema_never_matches" ? ` Warning: ${SCHEMA_OBJECTS_WARNING_TEXT.schema_never_matches}` : "";
+    setMessage(`Queued: the agent applies the settings at its next poll (${String(json?.next_objects ?? 0)} sensitive objects).${truncated}${skipped}${rows}${schema}`);
     router.refresh();
   }
 

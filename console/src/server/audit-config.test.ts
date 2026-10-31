@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { getDb } from "@/db/client";
 import { agents, auditConfigs, auditLog, jobs, securityEvents, users } from "@/db/schema";
-import { minRowsWarning } from "@/lib/audit-warning";
+import { minRowsWarning, objectsWithSchema, SCHEMA_REFUSED_ENGINES, SCHEMA_WARNED_ENGINES, schemaObjectsWarning } from "@/lib/audit-warning";
 import { validateSchema } from "@/lib/protocol/validate";
 import { failuresPerAgent } from "@/server/agent-api/auth";
 import { findingsPerAgent, findingsRequestsPerAgent, handleFindings, handleHeartbeat, handlePollJobs } from "@/server/agent-api/handlers";
@@ -45,6 +45,20 @@ describe("audit settings model", () => {
     expect(minRowsWarning(true, 1000)).toBe("no_row_counts");
     expect(minRowsWarning(true, null)).toBeNull();
     expect(minRowsWarning(false, 1000)).toBeNull();
+  });
+
+  it("review L2 of #391: a schema on an engine whose locations have none is refused (Firebird, SQLite) or warned (MySQL, MariaDB, MongoDB)", () => {
+    expect(SCHEMA_REFUSED_ENGINES).toEqual(["firebird", "sqlite"]);
+    expect(SCHEMA_WARNED_ENGINES).toEqual(["mysql", "mariadb", "mongodb"]);
+    const withSchema = [obj("a"), obj("b", ["pii.email"], null)];
+    expect(objectsWithSchema(withSchema)).toBe(1);
+    expect(objectsWithSchema([obj("b", ["pii.email"], null)])).toBe(0);
+    for (const e of SCHEMA_WARNED_ENGINES) {
+      expect(schemaObjectsWarning(e, withSchema), e).toBe("schema_never_matches");
+      expect(schemaObjectsWarning(e, [obj("b", ["pii.email"], null)]), e).toBeNull();
+    }
+    // Engines with schemas, and the refused engines (refused, never warned).
+    for (const e of ["postgres", "sqlserver", "openldap", "cas", "firebird", "sqlite"]) expect(schemaObjectsWarning(e, withSchema), e).toBeNull();
   });
 
   it("parses a request with the contract defaults made explicit", () => {
@@ -674,6 +688,52 @@ describe.skipIf(!hasDb)("audit.configure (PostgreSQL)", () => {
     expect(await getAuditConfig(getDb(), auth.agentId, "crm-app")).toMatchObject({ engine: "sqlite", auditLevel: "none", configured: false });
     // The SQL target of the same agent is unaffected.
     expect((await configure(auth, { enabled: true })).status).toBe(202);
+  });
+
+  it("review L2 of #391: manual objects with a schema are refused on a Firebird target, saved with a warning on MySQL / MongoDB", async () => {
+    const auth = await enroll();
+    const hb = {
+      ...HEARTBEAT,
+      connectors: ["postgres", "mysql", "mongodb", "firebird"],
+      targets: [
+        ...HEARTBEAT.targets,
+        { target_id: "fb-crm", engine: "firebird", server_version: "5.0.4", reachable: true, audit_level: "partial", audit_source: "firebird_audit_trace" },
+        { target_id: "mysql-crm", engine: "mysql", reachable: true, audit_level: "partial" },
+        { target_id: "mongo-app", engine: "mongodb", reachable: true, audit_level: "limited" },
+      ],
+    };
+    expect((await handleHeartbeat(agentRequest("POST", "/heartbeat", { auth, body: hb }))).status).toBe(200);
+    const withSchema = { enabled: true, manual_objects: [{ database: "crm", schema: "public", object: "CUSTOMERS", classifiers: ["pii.email"] }] };
+    const without = { enabled: true, manual_objects: [{ database: "crm", object: "CUSTOMERS", classifiers: ["pii.email"] }] };
+    // Firebird: refused, audited, nothing queued or stored.
+    const refused = await configure(auth, withSchema, { target: "fb-crm" });
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({ error: "invalid_params" });
+    expect(await auditJobs(auth.agentId)).toHaveLength(0);
+    const [failure] = await audits(auth.agentId);
+    expect(failure?.outcome).toBe("failure");
+    expect(failure?.details).toMatchObject({ target_id: "fb-crm", reason: "invalid" });
+    expect(await getDb().select().from(auditConfigs).where(eq(auditConfigs.agentId, auth.agentId))).toHaveLength(0);
+    // Without a schema: queued, no warning.
+    const ok = await configure(auth, without, { target: "fb-crm" });
+    expect(ok.status).toBe(202);
+    expect(await ok.json()).toMatchObject({ schema_warning: null });
+    // MySQL and MongoDB: saved (a stored configuration keeps saving after the upgrade), with a warning.
+    for (const target of ["mysql-crm", "mongo-app"]) {
+      const warned = await configure(auth, withSchema, { target });
+      expect(warned.status, target).toBe(202);
+      expect(await warned.json(), target).toMatchObject({ schema_warning: "schema_never_matches" });
+      const [audit] = await audits(auth.agentId);
+      expect(audit?.details, target).toMatchObject({ target_id: target, schema_warning: "schema_never_matches" });
+      const stored = await getAuditConfig(getDb(), auth.agentId, target);
+      expect(schemaObjectsWarning(stored?.engine ?? "", stored?.manualObjects ?? []), target).toBe("schema_never_matches");
+      const fixed = await configure(auth, without, { target });
+      expect(await fixed.json(), target).toMatchObject({ schema_warning: null });
+    }
+    // PostgreSQL has schemas: no warning.
+    const pg = await configure(auth, withSchema);
+    expect(pg.status).toBe(202);
+    expect(await pg.json()).toMatchObject({ schema_warning: null });
   });
 
   it("supersedes the settings jobs not delivered yet", async () => {
