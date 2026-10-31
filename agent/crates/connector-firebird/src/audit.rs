@@ -569,7 +569,7 @@ pub(crate) fn evaluate(
 }
 
 /// The tailer's open check (ADR-0043 decision 5): on its own handle.
-fn open_check(path: PathBuf) -> OpenCheck {
+pub(crate) fn open_check(path: PathBuf) -> OpenCheck {
     Arc::new(move |f: &OpenedFile<'_>| {
         if f.path != path.as_path() {
             return Err(std::io::ErrorKind::InvalidInput);
@@ -620,6 +620,13 @@ fn settings(
     })
 }
 
+/// How the trace log is split into lines: every line, empty ones
+/// included. A record of the trace log ends with empty lines its grammar
+/// requires (between the context lines and the statement, before the
+/// per-table block, at its end): dropping them makes every statement
+/// finish a [`crate::trace_log::Defect::Shape`] (found by the e2e job).
+pub(crate) const FRAMING: Framing = Framing::LinesKeepingEmpty;
+
 /// Starts an early `check()` of the stream's target; `false` when one is
 /// running (R11 8d, R28 item 4).
 pub(crate) type EarlyCheck = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -656,7 +663,7 @@ pub(crate) async fn stream(
         machine.confirm_run(r);
     }
     let mut runner = Runner {
-        tailer: Tailer::new(audit.log.clone(), Framing::Lines, cfg.cursor(CURSOR))
+        tailer: Tailer::new(audit.log.clone(), FRAMING, cfg.cursor(CURSOR))
             .with_open_check(open_check(audit.log.clone())),
         asm: Assembler::new(),
         record_start: None,
@@ -666,6 +673,8 @@ pub(crate) async fn stream(
         expect: state.with(&id, |t| t.stream.saved),
         reset: false,
         last_end: None,
+        lost_in: None,
+        ended: None,
     };
     loop {
         // A new check: new names, classes, run.
@@ -686,26 +695,8 @@ pub(crate) async fn stream(
         {
             machine.start_time_changed();
         }
-        let (r, m, out, polled) = tokio::task::spawn_blocking(move || {
-            let mut m = machine;
-            let mut r = runner;
-            let mut out = Vec::new();
-            let cats_ref: Vec<&dyn Catalog> = cats.iter().map(|c| c as &dyn Catalog).collect();
-            let polled = r.poll(&mut m, &cats_ref, &mut out);
-            (r, (m, cats), out, polled)
-        })
-        .await
-        .map_err(|e| {
-            // A panic of the blocking task is resumed (re-review L-D).
-            let _ = databastion_core::resume_panic(e);
-            ConnectorError::Target {
-                engine: databastion_core::Engine::Firebird,
-                code: FailureCode::Internal,
-                engine_code: None,
-            }
-        })?;
-        runner = r;
-        (machine, cats) = m;
+        let polled;
+        (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, sink).await?;
         let now = SystemTime::now();
         // Proofs 8 and 9 from this stream's deltas (review L2: a restarted
         // stream's counters start again at 0), and the gaps of proof 8
@@ -731,9 +722,6 @@ pub(crate) async fn stream(
                 continue;
             }
         };
-        for (_db, ev) in out {
-            sink.submit(ev).await?;
-        }
         let held = runner.held(&machine);
         // Where the next stream must resume (review M4).
         let resume = held
@@ -761,6 +749,43 @@ pub(crate) async fn stream(
             tokio::time::sleep(cfg.poll_interval()).await;
         }
     }
+}
+
+/// One read cycle of the stream: the runner's poll on a blocking thread,
+/// then every event it produced handed to the sink, and only then the
+/// poll's result. The events go first also when the poll failed: a
+/// rotation whose new file cannot be opened ends what the old file held
+/// (its last record, pending fold groups) into the events, then fails
+/// (security review H1 of #392); a caller that met the error first would
+/// drop them.
+async fn poll_and_deliver(
+    runner: Runner,
+    machine: Machine,
+    cats: Vec<Classes>,
+    sink: &EventSink,
+) -> Result<(Runner, Machine, Vec<Classes>, Result<bool, TailError>), ConnectorError> {
+    let (r, m, cats, out, polled) = tokio::task::spawn_blocking(move || {
+        let mut m = machine;
+        let mut r = runner;
+        let mut out = Vec::new();
+        let cats_ref: Vec<&dyn Catalog> = cats.iter().map(|c| c as &dyn Catalog).collect();
+        let polled = r.poll(&mut m, &cats_ref, &mut out);
+        (r, m, cats, out, polled)
+    })
+    .await
+    .map_err(|e| {
+        // A panic of the blocking task is resumed (re-review L-D).
+        let _ = databastion_core::resume_panic(e);
+        ConnectorError::Target {
+            engine: databastion_core::Engine::Firebird,
+            code: FailureCode::Internal,
+            engine_code: None,
+        }
+    })?;
+    for (_db, ev) in out {
+        sink.submit(ev).await?;
+    }
+    Ok((r, m, cats, polled))
 }
 
 /// The merged early-check requests of one stream (R11 8d): a request is
@@ -861,6 +886,11 @@ struct Runner {
     reset: bool,
     /// The file and end of the last line read.
     last_end: Option<((u64, u64), u64)>,
+    /// A line the tailer skipped for its size at the end of a poll, in a
+    /// file not read yet: the first record of that file lost a line.
+    lost_in: Option<(u64, u64)>,
+    /// The last file whose held records were ended ([`Self::end_file`]).
+    ended: Option<(u64, u64)>,
 }
 
 impl Runner {
@@ -873,7 +903,18 @@ impl Runner {
         if cats.is_empty() {
             return Ok(false);
         }
-        let polled = self.tailer.poll()?;
+        let polled = match self.tailer.poll() {
+            Ok(p) => p,
+            Err(e) => {
+                // A rotation whose new file cannot be opened still ended
+                // the old one (security review M1 of #392).
+                let now = Instant::now();
+                if let Some(f) = self.tailer.take_ended() {
+                    self.end_file(f, m, now, cats, out);
+                }
+                return Err(e);
+            }
+        };
         // R39 (a): the re-read region (known once the file is open) is
         // emitted again, not suppressed; its end is kept for the count.
         if let Some(r) = self.tailer.take_replay() {
@@ -883,9 +924,23 @@ impl Runner {
         if !polled.records.is_empty() {
             self.last_growth = now;
         }
-        for (line, pos) in polled.records.iter().zip(&polled.positions) {
+        // Lines the tailer skipped for their size (longer than 1 MiB): the
+        // record they belong to is made ambiguous, never parsed without
+        // them.
+        let skipped_at = |k: usize| {
+            polled
+                .skipped
+                .iter()
+                .filter(move |(i, _)| *i == k)
+                .map(|(_, f)| *f)
+        };
+        for (k, (line, pos)) in polled.records.iter().zip(&polled.positions).enumerate() {
             let line = line.strip_suffix(b"\n").unwrap_or(line);
             let start = pos.start;
+            let before = self.file;
+            if skipped_at(k).any(|f| Some(f) == before) {
+                self.asm.lose_line();
+            }
             if let Some(e) = self.expect.take()
                 && e != (pos.file, pos.start)
             {
@@ -893,20 +948,22 @@ impl Runner {
             }
             self.last_end = Some((pos.file, pos.end));
             if self.file != Some(pos.file) {
-                if self.file.is_some() {
-                    // A rotation (review M3): the old file ended. Its last
-                    // record is complete; what it still holds (pending fold
-                    // groups, held records) ends now, as R25 item 3 says,
-                    // since a held position in a rotated file cannot be
-                    // re-read after a restart.
-                    let done = self.asm.flush();
-                    let rs = self.record_start.unwrap_or(0);
-                    self.hand(m, done, rs, now, cats, out);
-                    self.record_start = None;
-                    m.end_all(now, cats, out);
+                if let Some(old) = self.file {
+                    // A rotation (review M3): the old file ended.
+                    self.end_file(old, m, now, cats, out);
                 }
                 self.file = Some(pos.file);
                 m.set_file(pos.file);
+                match self.lost_in.take() {
+                    Some(f) if f == pos.file => self.asm.lose_line(),
+                    // A line skipped in a file of which no line was read
+                    // (security review L2 of #392): a record lost whole.
+                    Some(_) => m.unreadable(now, cats, out),
+                    None => {}
+                }
+            }
+            if skipped_at(k).any(|f| Some(f) != before) {
+                self.asm.lose_line();
             }
             if header(line).is_some() {
                 // The record in progress ends here.
@@ -922,6 +979,19 @@ impl Runner {
                 self.hand(m, done, start, now, cats, out);
             }
         }
+        for f in skipped_at(polled.records.len()) {
+            if Some(f) == self.file {
+                self.asm.lose_line();
+            } else {
+                self.lost_in = Some(f);
+            }
+        }
+        // The file being read was ended by a rotation whose new file has
+        // given no line yet (or cannot be opened): what it holds ends now
+        // (security review M1 of #392).
+        if let Some(f) = self.tailer.take_ended() {
+            self.end_file(f, m, now, cats, out);
+        }
         // A stable end of file: the record in progress is complete.
         if !polled.more && now.duration_since(self.last_growth) >= STABLE_EOF {
             let done = self.asm.flush();
@@ -931,6 +1001,31 @@ impl Runner {
         }
         m.expire(now, cats, out);
         Ok(polled.more)
+    }
+
+    /// The file `f` ended (rotated away, read to its end): if it is the
+    /// file being read, its last record is complete and what it still
+    /// holds (pending fold groups, held records) ends now, as R25 item 3
+    /// says, since a held position in a rotated file cannot be re-read
+    /// after a restart. Once per file: the next file's first line finds
+    /// nothing left.
+    fn end_file(
+        &mut self,
+        f: (u64, u64),
+        m: &mut Machine,
+        now: Instant,
+        cats: &[&dyn Catalog],
+        out: &mut Vec<crate::stream::Emitted>,
+    ) {
+        if self.file != Some(f) || self.ended == Some(f) {
+            return;
+        }
+        let done = self.asm.flush();
+        let rs = self.record_start.unwrap_or(0);
+        self.hand(m, done, rs, now, cats, out);
+        self.record_start = None;
+        m.end_all(now, cats, out);
+        self.ended = Some(f);
     }
 
     /// The position the cursor may be saved at: the first record of the
@@ -1015,7 +1110,7 @@ mod tests {
         store: Option<databastion_core::audit::CursorStore>,
     ) -> Runner {
         Runner {
-            tailer: Tailer::new(log.to_path_buf(), Framing::Lines, store)
+            tailer: Tailer::new(log.to_path_buf(), FRAMING, store)
                 .with_open_check(open_check(log.to_path_buf())),
             asm: Assembler::new(),
             record_start: None,
@@ -1025,6 +1120,8 @@ mod tests {
             expect: None,
             reset: false,
             last_end: None,
+            lost_in: None,
+            ended: None,
         }
     }
 
@@ -1281,6 +1378,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Security review M1 of #392: a rotation whose new file cannot be
+    /// opened ends the old file all the same: the record held at its end
+    /// is handed on and nothing of it stays held (lost at a restart
+    /// otherwise), whether the poll that met the rotation read lines of
+    /// the old file (handed on) or nothing (the poll fails).
+    #[test]
+    fn a_rotation_to_an_unopenable_file_ends_what_the_old_file_holds() {
+        use crate::stream_tests::{APP, attach, select};
+        for read_in_the_rotating_poll in [true, false] {
+            let dir = temp(&format!("rotfail-{read_in_the_rotating_poll}"));
+            let log = dir.join("audit.log");
+            std::fs::write(&log, b"").unwrap();
+            let store = databastion_core::audit::CursorStore::new(&dir, "t", "fb");
+            let mut r = runner(&log, store);
+            let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+            let classes = Classes::default();
+            let cats: Vec<&dyn Catalog> = vec![&classes];
+            let mut out = Vec::new();
+            assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+            let a = "24:0x7f0000000100";
+            append(
+                &log,
+                &format!(
+                    "{}{}",
+                    attach(a, 3, APP),
+                    select(a, 3, 5, APP, "CUSTOMERS", 2)
+                ),
+            );
+            if !read_in_the_rotating_poll {
+                while r.poll(&mut m, &cats, &mut out).unwrap() {}
+                // The select is the record in progress: held.
+                assert!(r.record_start.is_some());
+                assert!(!objects(&out).contains(&"CUSTOMERS".to_owned()));
+            }
+            std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+            let elsewhere = dir.join("other");
+            std::fs::write(&elsewhere, b"").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+            for _ in 0..3 {
+                let _ = r.poll(&mut m, &cats, &mut out);
+            }
+            assert!(
+                objects(&out).contains(&"CUSTOMERS".to_owned()),
+                "{read_in_the_rotating_poll}: {:?}",
+                objects(&out)
+            );
+            assert!(r.record_start.is_none());
+            assert!(r.held(&m).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Security review H1 of #392, the live case: the last record is
+    /// held, the server rotates into a file the agent cannot open, and
+    /// the poll that meets the rotation reads nothing and fails. The held
+    /// record, ended into the poll's events, reaches the sink before the
+    /// stream handles the error.
+    #[tokio::test]
+    async fn the_held_record_reaches_the_sink_when_the_rotating_poll_fails() {
+        use crate::stream_tests::{APP, attach, select};
+        let dir = temp("deliver");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let store = databastion_core::audit::CursorStore::new(&dir, "t", "fb");
+        let runner = runner(&log, store);
+        let machine = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let cats = vec![Classes::default()];
+        let (sink, mut rx) = EventSink::channel(64);
+        let (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        assert!(!polled.unwrap());
+        let a = "24:0x7f0000000100";
+        append(
+            &log,
+            &format!(
+                "{}{}",
+                attach(a, 3, APP),
+                select(a, 3, 5, APP, "PAYROLL", 2)
+            ),
+        );
+        let (runner, machine, cats, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        polled.unwrap();
+        assert!(runner.record_start.is_some(), "the select is held");
+        assert!(rx.try_recv().is_err());
+        std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+        let elsewhere = dir.join("other");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+        let (_, _, _, polled) = poll_and_deliver(runner, machine, cats, &sink)
+            .await
+            .unwrap();
+        assert!(polled.is_err(), "the rotating poll fails");
+        let mut objects = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            objects.extend(ev.objects().iter().map(|o| o.object().as_str().to_owned()));
+        }
+        assert!(objects.contains(&"PAYROLL".to_owned()), "{objects:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Security review L2 of #392: a line skipped in a file of which no
+    /// line was read (it rotated away first) is a record lost whole:
+    /// ambiguous, counted oversized.
+    #[test]
+    fn a_line_skipped_in_a_file_never_read_is_ambiguous() {
+        use crate::stream_tests::{APP, attach};
+        let dir = temp("lostfile");
+        let log = dir.join("audit.log");
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        append(&log, &attach("24:0x7f0000000100", 3, APP));
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        // B: one line past the bound only, read in the poll that opens it.
+        std::fs::rename(&log, dir.join("audit.1.log")).unwrap();
+        std::fs::write(&log, format!("{}\n", "x".repeat(1_100_000))).unwrap();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(r.tailer.oversized, 1);
+        // C before any line of B.
+        std::fs::rename(&log, dir.join("audit.2.log")).unwrap();
+        std::fs::write(&log, attach("24:0x7f0000000300", 5, APP)).unwrap();
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(m.counts.oversized, 1, "{:?}", m.counts);
+        assert!(out.iter().any(|(_, e)| e.always_report()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A statement text line longer than the tailer's line bound (only
+    /// possible with `max_sql_length` above 1 MiB, which `check()` no
+    /// longer proves Partial) is skipped by the tailer; the record it
+    /// belonged to is made ambiguous (`*`, always reported, counted
+    /// oversized), never parsed without it, and the next record is read.
+    #[test]
+    fn a_record_that_lost_a_skipped_line_is_ambiguous() {
+        use crate::stream_tests::{APP, HEAD, attach};
+        let dir = temp("lostline");
+        let log = dir.join("audit.log");
+        let a = "24:0x7f0000000100";
+        std::fs::write(&log, b"").unwrap();
+        let mut r = runner(&log, None);
+        let mut m = Machine::new(test_settings(), Arc::new(crate::own::Ledger::default()));
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        let att = format!(
+            "\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n"
+        );
+        let record = |text: &str, rel: &str| {
+            format!(
+                "{HEAD} ({a}) EXECUTE_STATEMENT_FINISH\n{att}\nStatement 1:\n{}\n{text}\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{rel:<35}{:>10}{:>70}\n\n",
+                "-".repeat(79),
+                "Table",
+                "*".repeat(115),
+                1,
+                ""
+            )
+        };
+        let long = format!(
+            "SELECT A FROM T1\nUNION ALL SELECT B FROM T1 /* {} */",
+            "x".repeat(1_100_000)
+        );
+        append(
+            &log,
+            &format!(
+                "{}{HEAD} ({a}) START_TRANSACTION\n{att}\n{}{}{}",
+                attach(a, 3, APP),
+                record(&long, "T1"),
+                record("SELECT C FROM T2", "T2"),
+                attach("24:0x7f0000000300", 5, APP)
+            ),
+        );
+        while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        assert_eq!(r.tailer.oversized, 1);
+        assert_eq!(m.counts.oversized, 1, "{:?}", m.counts);
+        assert!(
+            out.iter().any(|(_, e)| e.always_report()
+                && e.objects().iter().any(|o| o.object().as_str() == "*")),
+            "{:?}",
+            objects(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review L2: a restarted stream's first ambiguous record and first
     /// record are reported although its counters are below the previous
     /// stream's; review M4: a gap is reported.
@@ -1459,7 +1747,7 @@ mod tests {
         let classes = Classes::default();
         let cats: Vec<&dyn Catalog> = vec![&classes];
         let mut r = Runner {
-            tailer: Tailer::new(log.clone(), Framing::Lines, None)
+            tailer: Tailer::new(log.clone(), FRAMING, None)
                 .with_open_check(open_check(log.clone())),
             asm: Assembler::new(),
             record_start: None,
@@ -1469,6 +1757,8 @@ mod tests {
             expect: None,
             reset: false,
             last_end: None,
+            lost_in: None,
+            ended: None,
         };
         let mut out = Vec::new();
         assert!(r.poll(&mut m, &cats, &mut out).is_ok());
@@ -1481,6 +1771,257 @@ mod tests {
         assert!(!out.is_empty());
         // The record in progress is held back.
         assert!(r.record_start.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What one path made of a recorded log: records, ambiguous records
+    /// (by rule), events, and the records whose parse found a defect.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Outcome {
+        records: u64,
+        ambiguous: u64,
+        why: std::collections::BTreeMap<u32, u64>,
+        events: usize,
+        defects: Vec<(crate::trace_log::Event, crate::trace_log::Defect)>,
+    }
+
+    fn settings_for(series: Series) -> Settings {
+        let mut s = test_settings();
+        s.parse.series = series;
+        s
+    }
+
+    fn defects_of(
+        recs: &[Assembled],
+        series: Series,
+    ) -> Vec<(crate::trace_log::Event, crate::trace_log::Defect)> {
+        let opts = settings_for(series).parse;
+        recs.iter()
+            .filter_map(|r| match r {
+                Assembled::Record(raw) => crate::trace_log::parse(raw, opts)
+                    .and_then(|p| p.defect.map(|d| (p.header.event, d))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The parser's path of the connector's other tests: the log split on
+    /// `\n` in memory and assembled, no tailer.
+    fn direct(log: &[u8], series: Series) -> Outcome {
+        let mut m = Machine::new(
+            settings_for(series),
+            Arc::new(crate::own::Ledger::default()),
+        );
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        for line in log.split(|b| *b == b'\n') {
+            recs.extend(asm.push_line(line));
+        }
+        recs.extend(asm.flush());
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        for r in &recs {
+            if let Assembled::Record(raw) = r {
+                m.push(raw, pos, now, &cats, &mut out);
+                pos += raw.len() as u64 + 1;
+            }
+        }
+        m.expire(now + Duration::from_secs(120), &cats, &mut out);
+        Outcome {
+            records: m.counts.records,
+            ambiguous: m.counts.ambiguous,
+            why: m.why.clone(),
+            events: out.len(),
+            defects: defects_of(&recs, series),
+        }
+    }
+
+    /// The live path: the log appended to a real file after a first start,
+    /// read by the core tailer with `framing` and the stream's runner (its
+    /// record held at end of file, then flushed as at a stable end); the
+    /// defects from the same tailer lines through the same assembler.
+    fn through_the_tailer(name: &str, log: &[u8], series: Series, framing: Framing) -> Outcome {
+        let dir = temp(name);
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut r = runner(&path, None);
+        r.tailer =
+            Tailer::new(path.clone(), framing, None).with_open_check(open_check(path.clone()));
+        let mut m = Machine::new(
+            settings_for(series),
+            Arc::new(crate::own::Ledger::default()),
+        );
+        let classes = Classes::default();
+        let cats: Vec<&dyn Catalog> = vec![&classes];
+        let mut out = Vec::new();
+        assert!(!r.poll(&mut m, &cats, &mut out).unwrap());
+        // Written in pieces that cut records and lines, as a server does.
+        for piece in log.chunks(4093) {
+            append(&path, std::str::from_utf8(piece).unwrap());
+            while r.poll(&mut m, &cats, &mut out).unwrap() {}
+        }
+        let now = Instant::now();
+        let done = r.asm.flush();
+        let rs = r.record_start.unwrap_or(0);
+        r.hand(&mut m, done, rs, now, &cats, &mut out);
+        m.expire(now + Duration::from_secs(120), &cats, &mut out);
+        // The same log read by a fresh tailer (a first start reads from
+        // the end: an empty copy first), its lines assembled.
+        let copy = dir.join("copy.log");
+        std::fs::write(&copy, b"").unwrap();
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        let mut t =
+            Tailer::new(copy.clone(), framing, None).with_open_check(open_check(copy.clone()));
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&copy, std::str::from_utf8(log).unwrap());
+        loop {
+            let p = t.poll().unwrap();
+            for line in &p.records {
+                recs.extend(asm.push_line(line));
+            }
+            if !p.more {
+                break;
+            }
+        }
+        recs.extend(asm.flush());
+        let _ = std::fs::remove_dir_all(&dir);
+        Outcome {
+            records: m.counts.records,
+            ambiguous: m.counts.ambiguous,
+            why: m.why.clone(),
+            events: out.len(),
+            defects: defects_of(&recs, series),
+        }
+    }
+
+    /// The e2e-firebird defect: the trace log's records need their empty
+    /// lines. The recorded logs of both images, read by the real tailer and
+    /// the stream's runner, give exactly what the parser's own tests see
+    /// (no statement finish judged a `Shape` defect, no ambiguous record
+    /// beyond the recorded logs' known ones); with empty lines dropped
+    /// (the framing of the other line-based sources), every statement
+    /// finish was a `Shape` defect and ambiguous.
+    #[test]
+    fn the_recorded_logs_read_through_the_tailer_are_parsed_as_recorded() {
+        use crate::trace_log::{Defect, Event};
+        let logs: [(&str, &[u8], Series); 3] = [
+            (
+                "rec5t",
+                include_bytes!("../testdata/trace-5.0.4-triggers-sweep.log"),
+                Series::V5,
+            ),
+            (
+                "rec4t",
+                include_bytes!("../testdata/trace-4.0.7-triggers-sweep.log"),
+                Series::V4,
+            ),
+            (
+                "rec5i",
+                include_bytes!("../testdata/trace-5.0.4-isql-gbak.log"),
+                Series::V5,
+            ),
+        ];
+        for (name, log, series) in logs {
+            let want = direct(log, series);
+            let got = through_the_tailer(name, log, series, FRAMING);
+            assert_eq!(got, want, "{name}");
+            let finishes = log
+                .split(|b| *b == b'\n')
+                .filter(|l| l.ends_with(b") EXECUTE_STATEMENT_FINISH"))
+                .count();
+            assert!(finishes > 10, "{name}: {finishes}");
+            if name != "rec5i" {
+                // The trigger logs: no defect at all.
+                assert!(got.defects.is_empty(), "{name}: {:?}", got.defects);
+            } else {
+                // The isql log's only defects are its forged split (a
+                // header in a comment, 8f), never a statement finish's
+                // shape.
+                assert!(!got.defects.is_empty());
+                assert!(
+                    !got.defects
+                        .contains(&(Event::ExecuteStatementFinish, Defect::Shape)),
+                    "{:?}",
+                    got.defects
+                );
+            }
+            // What the old framing did (this test would have caught it).
+            let old = through_the_tailer(&format!("{name}-old"), log, series, Framing::Lines);
+            let shaped = old
+                .defects
+                .iter()
+                .filter(|d| **d == (Event::ExecuteStatementFinish, Defect::Shape))
+                .count();
+            assert!(
+                shaped * 10 >= finishes * 9,
+                "{name}: {shaped} of {finishes}"
+            );
+            assert!(old.ambiguous > want.ambiguous, "{name}");
+        }
+    }
+
+    /// A statement text written with CRLF line breaks and cut by the
+    /// server at `max_sql_length` (its last bytes `...`): the tailer drops
+    /// the `\r` before each newline, so the text is shorter than the limit
+    /// when parsed; it is still judged cut (`CutText`, ambiguous), and a
+    /// shorter text ending `...` is not.
+    #[test]
+    fn a_cut_text_with_crlf_line_breaks_is_still_cut() {
+        use crate::stream_tests::{APP, HEAD};
+        use crate::trace_log::{Defect, parse};
+        let limit = 4096;
+        let record = |text: &str| {
+            format!(
+                "{HEAD} (24:0x7f0000000100) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\n{text}\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n",
+                "-".repeat(79),
+                "Table",
+                "*".repeat(115),
+                "T1",
+                1,
+                ""
+            )
+        };
+        // `max_sql_length` bytes as the server writes a cut text: the
+        // first `limit - 3` bytes of the text, then `...`.
+        let mut text = String::new();
+        while text.len() < limit - 3 {
+            text.push_str("SELECT A, B, C FROM T1 UNION ALL\r\n");
+        }
+        text.truncate(limit - 3);
+        let text = text.trim_end_matches(['\r', '\n']).to_owned();
+        let pad = limit - 3 - text.len();
+        let cut = format!("{text}{}...", " ".repeat(pad));
+        assert_eq!(cut.len(), limit);
+        let short = format!("{}...", cut[..limit / 2].trim_end_matches(['\r', '\n']));
+        let dir = temp("crlf");
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut t =
+            Tailer::new(path.clone(), FRAMING, None).with_open_check(open_check(path.clone()));
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&path, &format!("{}{}", record(&cut), record(&short)));
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        for line in &t.poll().unwrap().records {
+            recs.extend(asm.push_line(line));
+        }
+        recs.extend(asm.flush());
+        let opts = ParseOptions {
+            max_sql_length: Some(limit),
+            series: Series::V5,
+        };
+        let defects: Vec<Option<Defect>> = recs
+            .iter()
+            .map(|r| match r {
+                Assembled::Record(raw) => parse(raw, opts).unwrap().defect,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(defects, [Some(Defect::CutText), None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

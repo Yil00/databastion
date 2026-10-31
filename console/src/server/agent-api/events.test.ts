@@ -40,7 +40,7 @@ const HEARTBEAT = {
   agent_version: "0.1.0",
   uptime_s: 12,
   classifiers_version: "2026.09.1",
-  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis"],
+  connectors: ["postgres", "mysql", "mongodb", "openldap", "cas", "sqlserver", "redis", "firebird"],
   targets: [
     { target_id: "pg-prod-1", engine: "postgres", reachable: true, audit_level: "full", audit_source: "pgaudit" },
     { target_id: "mysql-crm", engine: "mysql", reachable: true, audit_level: "partial" },
@@ -52,23 +52,20 @@ const HEARTBEAT = {
     { target_id: "mssql-2019", engine: "sqlserver", reachable: true, audit_level: "limited", audit_source: "sqlserver_query_stats" },
     { target_id: "cache-redis", engine: "redis", reachable: true, audit_level: "limited", audit_source: "redis_slowlog" },
     { target_id: "sessions-valkey", engine: "valkey", reachable: true, audit_level: "limited", audit_source: "redis_commandlog" },
+    // P10-E: CONSOLE_ACCEPTS lists engine.firebird (Partial at best).
+    { target_id: "fb-crm", engine: "firebird", server_version: "5.0.4", reachable: true, audit_level: "partial", audit_source: "firebird_audit_trace" },
   ],
   detected_targets: [],
   spool: { bytes: 0, max_bytes: 1024, batches: 0 },
 };
 
 /**
- * Fixtures of an engine whose token CONSOLE_ACCEPTS does not list yet (`firebird`, ADR-0060 decision
- * 8: in the contract since P10-C, listed by P10-E) are refused; every other valid fixture is storable.
+ * Every valid fixture is storable: CONSOLE_ACCEPTS lists every engine token of the contract since
+ * P10-E (`engine.firebird`, ADR-0060 decision 8). The gate itself stays for later engine tokens
+ * (`unlistedEngineDetails`, tested in capabilities.test.ts).
  */
-const isUnlisted = ([, body]: [string, unknown]) => unlistedEngineDetails("EventsBatch", body).length > 0;
-
 function storableFixtures(): [string, unknown][] {
-  return fixtures("valid", "EventsBatch").filter((f) => !isUnlisted(f));
-}
-
-function unlistedFixtures(): [string, unknown][] {
-  return fixtures("valid", "EventsBatch").filter(isUnlisted);
+  return fixtures("valid", "EventsBatch");
 }
 
 function fixture(name: string): Batch {
@@ -192,27 +189,10 @@ describe.skipIf(!hasDb)("POST /events (PostgreSQL)", () => {
       }
     });
 
-    it("leaves fixtures of every unlisted engine to refuse", () => {
-      expect(unlistedFixtures().map(([name]) => name).sort()).toEqual(["EventsBatch.firebird.json"]);
+    it("leaves no valid fixture to refuse for its engine (every engine token listed since P10-E)", () => {
+      for (const [name, body] of fixtures("valid", "EventsBatch")) expect(unlistedEngineDetails("EventsBatch", body), name).toEqual([]);
+      expect(fixtures("valid", "EventsBatch").map(([name]) => name)).toContain("EventsBatch.firebird.json");
     });
-
-    it.each(unlistedFixtures())(
-      "refuses %s while its engine token is unlisted: 400 enum on each source, integrity event, nothing stored",
-      async (_name, body) => {
-        const auth = await agentWithTargets();
-        const res = await post(auth, body);
-        expect(res.status).toBe(400);
-        const err = await expectConformingError(res, body);
-        expect(err.code).toBe("invalid_request");
-        const b = body as Batch;
-        expect(err.details).toEqual(b.events.map((_e, i) => ({ pointer: `/events/${i}/source`, keyword: "enum" })));
-        expect(await storedEvents(auth.agentId)).toHaveLength(0);
-        expect(await getDb().select().from(eventsBatches).where(eq(eventsBatches.agentId, auth.agentId))).toHaveLength(0);
-        const events = await integrityRows(auth.agentId, "agent.batch_rejected");
-        expect(events).toHaveLength(1);
-        expect(events[0]?.details).toMatchObject({ endpoint: "events", status: 400 });
-      },
-    );
 
     it.each(storableFixtures())("accepts %s and stores exactly the contract fields", async (_name, body) => {
       const auth = await agentWithTargets();

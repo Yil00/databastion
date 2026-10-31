@@ -9,7 +9,7 @@ import { getDb } from "@/db/client";
 import { formatAge } from "@/lib/agent-status";
 import { validateSchema } from "@/lib/protocol/validate";
 import { getAgentDetail } from "@/server/agents";
-import { auditWarningText, MIN_ROWS_WARNING_TEXT, minRowsWarning } from "@/lib/audit-warning";
+import { auditWarningText, MIN_ROWS_WARNING_TEXT, minRowsWarning, SCHEMA_OBJECTS_WARNING_TEXT, schemaObjectsWarning } from "@/lib/audit-warning";
 import { DISCOVERY_ONLY_LABEL, DISCOVERY_ONLY_TITLE, engineDisplayName, isDiscoveryOnlyEngine, isKeyPatternEngine } from "@/lib/location-labels";
 import { deriveSensitiveObjects, getAuditConfig, sendableDerivedObjects, SHRINK_MIN_REMOVED, SHRINK_RATIO } from "@/server/audit-config";
 import { requestTime, requirePageSession } from "@/server/ui-session";
@@ -37,6 +37,8 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
   const notSendable = sendableDerivedObjects(derived, keyPatterns && config.agentAcceptsKeyPatterns).skipped;
   // #235 review N2: a row threshold drops the events of a key-pattern target (no row counts).
   const rowsWarning = config.configured ? minRowsWarning(keyPatterns, config.minRows) : null;
+  // Review L2 of #391: stored manual objects with a schema on an engine whose locations have none.
+  const schemaWarning = config.configured ? schemaObjectsWarning(config.engine, config.manualObjects) : null;
   const now = requestTime();
   const isAdmin = session.user.role === "admin";
   const active = agent.revokedAt === null && agent.lockedAt === null && config.present;
@@ -72,6 +74,11 @@ export default async function AuditSettingsPage({ params }: { params: Promise<{ 
       {rowsWarning && (
         <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive">
           {MIN_ROWS_WARNING_TEXT[rowsWarning]}
+        </p>
+      )}
+      {schemaWarning && (
+        <p role="alert" className="rounded-md border border-destructive p-3 text-sm text-destructive" data-schema-warning="">
+          {SCHEMA_OBJECTS_WARNING_TEXT[schemaWarning]}
         </p>
       )}
       {config.lastJob?.deliveredWithoutKeyPatterns ? (

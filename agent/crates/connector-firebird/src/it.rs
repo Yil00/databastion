@@ -1066,6 +1066,11 @@ mod audit;
 #[path = "it_host_identity.rs"]
 mod host_identity;
 
+/// A measurement: the agent's stream across a server rotation under the
+/// user guide's ACL layout (`dev/firebird/it.sh`, step 6).
+#[path = "it_rotation.rs"]
+mod rotation;
+
 /// The lot 3 texts on the agent's own attachment (R2 rule 1, R9, proof
 /// 7): the resolved path, `Default` as the security-database kind of an
 /// ordinary database, and one row for the read-back probe; the session's

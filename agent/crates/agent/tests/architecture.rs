@@ -417,10 +417,11 @@ fn agent_owned_logs_are_allowed_in_tests_only() {
         "set_reader_executable_for_tests(",
         "set_reader_credentials_for_tests(",
     ];
-    const TEST_ONLY: [&str; 6] = [
+    const TEST_ONLY: [&str; 7] = [
         "connector-postgres/src/it.rs",
         "connector-mysql/src/it/audit_it.rs",
         "connector-mongodb/src/it_audit.rs",
+        "connector-firebird/src/it_audit.rs",
         "core/tests/",
         "agent/tests/cas_runtime.rs",
         "agent/tests/sqlite_reader.rs",

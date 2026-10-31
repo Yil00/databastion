@@ -96,6 +96,59 @@ fn the_server_configuration_proves_partial() {
     assert!(v.partial, "{:?} {:?}", v.notes, v.detail);
 }
 
+/// ADR-0060 refinement of 2026-10-31 c, R54, on the configuration the
+/// rotation measurement of `dev/firebird/it.sh` (step 6) runs the server
+/// with (`max_log_size = 1`): not Partial, `max_log_size` the only missing
+/// setting (label `other` until the label set has it).
+#[test]
+fn the_rotation_measurement_configuration_is_limited() {
+    let (Some(trace), Some(dbconf)) = (
+        file("FIREBIRD_IT_ROTATION_TRACE_CONF"),
+        file("FIREBIRD_IT_DATABASES_CONF"),
+    ) else {
+        return;
+    };
+    let map = parse_databases_conf(&dbconf, ROOT).expect("the image's databases.conf parses");
+    let trace = parse_trace_conf(&trace).expect("the trace configuration parses");
+    let dbs = [
+        DeclaredDb {
+            label: "app",
+            resolved: Some(APP),
+            alias: None,
+        },
+        DeclaredDb {
+            label: "crm",
+            resolved: Some(CRM),
+            alias: None,
+        },
+    ];
+    let v = evaluate(&Inputs {
+        trace: &trace,
+        aliases: Some(&map),
+        databases: &dbs,
+        log: LOG,
+        root: ROOT,
+        longest_own_text: longest_own_text(),
+    });
+    assert!(!v.partial);
+    let codes: Vec<_> = v
+        .notes
+        .iter()
+        .map(databastion_core::TargetNote::code)
+        .collect();
+    assert_eq!(
+        codes,
+        [databastion_core::NoteCode::AuditTraceSettingsMissing]
+    );
+    let max_log: Vec<_> = v
+        .detail
+        .iter()
+        .filter(|d| d.contains("max_log_size"))
+        .collect();
+    assert_eq!(max_log.len(), 2, "{:?}", v.detail);
+    eprintln!("[measure] rotation configuration: Limited, {max_log:?}");
+}
+
 /// The test databases' catalog classes (in production: `check()`'s read).
 struct Cat;
 
@@ -265,6 +318,80 @@ fn the_server_trace_log_through_the_stream() {
         }
         assert!(text.contains(mk), "{mk} not in the server's log");
     }
+}
+
+/// The e2e-firebird defect, on the server's own log: written in pieces to
+/// a file and read by the core tailer with the stream's framing, it gives
+/// exactly the log's lines (empty ones included, which the record grammar
+/// needs), so the records the stream assembles are the server's; no
+/// statement finish is a `Shape` defect.
+#[test]
+fn the_server_trace_log_through_the_tailer_keeps_every_line() {
+    use databastion_core::audit::tail::Tailer;
+    let Some(log) = file("FIREBIRD_IT_AUDIT_LOG") else {
+        return;
+    };
+    databastion_core::audit::tail::allow_agent_owned_logs_for_tests();
+    let dir = std::env::temp_dir().join(format!("fb-it-tail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("audit.log");
+    std::fs::write(&path, b"").expect("log");
+    let mut t = Tailer::new(path.clone(), crate::audit::FRAMING, None);
+    assert!(t.poll().expect("poll").records.is_empty());
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for piece in log.chunks(4093) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        f.write_all(piece).expect("write");
+        loop {
+            let p = t.poll().expect("poll");
+            lines.extend(p.records.iter().map(|r| r.to_vec()));
+            if !p.more {
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut want: Vec<&[u8]> = log.split(|b| *b == b'\n').collect();
+    assert_eq!(want.pop(), Some(&b""[..]), "the log ends with a newline");
+    assert!(!log.contains(&b'\r'), "the server writes no CR here");
+    let empty = want.iter().filter(|l| l.is_empty()).count();
+    eprintln!(
+        "[measure] trace log through the tailer: {} lines, {empty} empty",
+        want.len()
+    );
+    assert!(empty > 0);
+    assert!(lines.iter().map(Vec::as_slice).eq(want.iter().copied()));
+    let mut a = Assembler::new();
+    let mut recs = Vec::new();
+    for l in &lines {
+        recs.extend(a.push_line(l));
+    }
+    recs.extend(a.flush());
+    let opts = ParseOptions {
+        max_sql_length: Some(65_000),
+        series: series(),
+    };
+    let (mut finishes, mut shaped) = (0, 0);
+    for r in &recs {
+        let Assembled::Record(raw) = r else { continue };
+        let Some(rec) = parse(raw, opts) else {
+            continue;
+        };
+        if rec.header.event == crate::trace_log::Event::ExecuteStatementFinish {
+            finishes += 1;
+            if rec.defect == Some(crate::trace_log::Defect::Shape) {
+                shaped += 1;
+            }
+        }
+    }
+    eprintln!("[measure] statement finishes through the tailer: {finishes}, Shape: {shaped}");
+    assert!(finishes > 0);
+    assert_eq!(shaped, 0);
 }
 
 /// The engine-matrix own-statement test of R20, phase 2: the server's log
