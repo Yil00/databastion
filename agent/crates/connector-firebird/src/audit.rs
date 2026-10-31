@@ -1681,6 +1681,67 @@ mod tests {
         }
     }
 
+    /// A statement text written with CRLF line breaks and cut by the
+    /// server at `max_sql_length` (its last bytes `...`): the tailer drops
+    /// the `\r` before each newline, so the text is shorter than the limit
+    /// when parsed; it is still judged cut (`CutText`, ambiguous), and a
+    /// shorter text ending `...` is not.
+    #[test]
+    fn a_cut_text_with_crlf_line_breaks_is_still_cut() {
+        use crate::stream_tests::{APP, HEAD};
+        use crate::trace_log::{Defect, parse};
+        let limit = 4096;
+        let record = |text: &str| {
+            format!(
+                "{HEAD} (24:0x7f0000000100) EXECUTE_STATEMENT_FINISH\n\t{APP} (ATT_3, APP:NONE, UTF8, TCPv4:127.0.0.1/40003)\n\t/usr/bin/app:28\n\t\t(TRA_5, READ_COMMITTED | READ_CONSISTENCY | WAIT | READ_WRITE)\n\nStatement 1:\n{}\n{text}\n1 records fetched\n      0 ms, 7 fetch(es)\n\n{:<35}   Natural     Index    Update    Insert    Delete   Backout     Purge   Expunge\n{}\n{:<35}{:>10}{:>70}\n\n",
+                "-".repeat(79),
+                "Table",
+                "*".repeat(115),
+                "T1",
+                1,
+                ""
+            )
+        };
+        // `max_sql_length` bytes as the server writes a cut text: the
+        // first `limit - 3` bytes of the text, then `...`.
+        let mut text = String::new();
+        while text.len() < limit - 3 {
+            text.push_str("SELECT A, B, C FROM T1 UNION ALL\r\n");
+        }
+        text.truncate(limit - 3);
+        let text = text.trim_end_matches(['\r', '\n']).to_owned();
+        let pad = limit - 3 - text.len();
+        let cut = format!("{text}{}...", " ".repeat(pad));
+        assert_eq!(cut.len(), limit);
+        let short = format!("{}...", cut[..limit / 2].trim_end_matches(['\r', '\n']));
+        let dir = temp("crlf");
+        let path = dir.join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut t =
+            Tailer::new(path.clone(), FRAMING, None).with_open_check(open_check(path.clone()));
+        assert!(t.poll().unwrap().records.is_empty());
+        append(&path, &format!("{}{}", record(&cut), record(&short)));
+        let mut asm = Assembler::new();
+        let mut recs = Vec::new();
+        for line in &t.poll().unwrap().records {
+            recs.extend(asm.push_line(line));
+        }
+        recs.extend(asm.flush());
+        let opts = ParseOptions {
+            max_sql_length: Some(limit),
+            series: Series::V5,
+        };
+        let defects: Vec<Option<Defect>> = recs
+            .iter()
+            .map(|r| match r {
+                Assembled::Record(raw) => parse(raw, opts).unwrap().defect,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(defects, [Some(Defect::CutText), None]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// R28 item 4 under R11 8d: requests are merged, at most one early
     /// check per 30 s, never while one runs, and a newer check serves them.
     #[test]

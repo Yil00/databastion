@@ -1486,8 +1486,14 @@ fn statement_body<'a>(
     if params != placeholders {
         return Err(Defect::Injected);
     }
+    // The server cuts a longer text to `max_sql_length` bytes, `...`
+    // included. The tailer drops one `\r` before each newline (as for the
+    // other line-based logs), so a text written with CRLF line breaks
+    // reaches here shorter than the server wrote it, by at most one byte
+    // per line break: counted as if each had been there (fail closed).
+    let breaks = text_lines.len() - 1;
     if let Some(limit) = opts.max_sql_length
-        && text.len() >= limit
+        && text.len().saturating_add(breaks) >= limit
         && text.ends_with("...")
     {
         rec.body = Body::Statement {
