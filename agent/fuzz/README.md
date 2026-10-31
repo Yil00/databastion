@@ -46,6 +46,7 @@ tests of each connector (`src/proptests.rs`).
 | `firebird_catalog` | `…::fuzz::catalog` | Discovery's reads (decision 5): rows of the relation list, the column list or a sampling statement, through the catalog parsing, the conversions, the column batches and built statements, and the sampled values kept or dropped |
 | `firebird_trace_log` | `…::fuzz::trace_log` | The system audit trace log ([ADR-0060](../../docs/adr/0060-firebird-connector.md) decision 6, "Parsing a hostile text log"): lines assembled into bounded records, each parsed under the 4.0 and 5.0 name-line grammars, converted with a fixed catalog and made an event |
 | `firebird_trace_conf` | `…::fuzz::trace_conf` | The configuration files of the Audit proofs (decision 6, refinement R2): `firebird.conf`, `databases.conf` and the trace configuration, which is then evaluated against one declared database |
+| `firebird_host_identity` | `…::fuzz::host_identity` | The identity files of the readers check ([ADR-0060](../../docs/adr/0060-firebird-connector.md) refinement of 2026-10-31, R45 item 7): the passwd, group, subordinate id, `nsswitch.conf` and `mountinfo` grammars, and the mount-id lookup: the only entry with the id, or none (R52 item 4) |
 | `firebird_statement` | `databastion_classifiers::query::firebird::analyze_firebird` | The Firebird mode of the statement analysis: any text lexed and analyzed; a password-bearing text keeps no name |
 
 The core and the connectors expose these entry points only with their `fuzzing` feature, which the agent binary
