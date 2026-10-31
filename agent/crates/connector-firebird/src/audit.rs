@@ -569,7 +569,7 @@ pub(crate) fn evaluate(
 }
 
 /// The tailer's open check (ADR-0043 decision 5): on its own handle.
-fn open_check(path: PathBuf) -> OpenCheck {
+pub(crate) fn open_check(path: PathBuf) -> OpenCheck {
     Arc::new(move |f: &OpenedFile<'_>| {
         if f.path != path.as_path() {
             return Err(std::io::ErrorKind::InvalidInput);
