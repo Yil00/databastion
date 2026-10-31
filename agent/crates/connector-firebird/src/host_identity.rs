@@ -634,26 +634,28 @@ impl Identity {
         if in_systemd_range(gid) || self.sub_gid.contains(gid) {
             return true;
         }
+        // One pass over the files (bounded at 65 536 lines each).
         let mut found = false;
+        let mut members: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
         for g in groups.iter().filter(|g| g.gid == gid) {
             found = true;
-            for m in &g.members {
-                let mut named = self.users.iter().filter(|u| u.name == *m).peekable();
-                if named.peek().is_none() {
-                    return true;
-                }
-                if named.any(|u| !allowed(u.uid)) {
-                    return true;
-                }
-            }
+            members.extend(g.members.iter().map(Vec::as_slice));
         }
         if !found {
             return true;
         }
-        self.users
-            .iter()
-            .filter(|u| u.gid == gid)
-            .any(|u| !allowed(u.uid))
+        let mut resolved: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        for u in &self.users {
+            let named = members.contains(u.name.as_slice());
+            if named {
+                resolved.insert(u.name.as_slice());
+            }
+            if (named || u.gid == gid) && !allowed(u.uid) {
+                return true;
+            }
+        }
+        // A member name with no passwd line.
+        resolved.len() != members.len()
     }
 }
 

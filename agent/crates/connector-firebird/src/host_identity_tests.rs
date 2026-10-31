@@ -935,3 +935,23 @@ fn reasons_name_no_path() {
     assert_eq!(Fail::UidCollision.reason(), "uid_collision");
     let _ = (SubFile::Absent, Nss::default(), Path::new("/"));
 }
+
+/// R45 item 6: files at their line bounds are judged in one pass (a group
+/// of 60 000 members over 65 000 passwd lines).
+#[test]
+fn a_large_group_is_judged_in_one_pass() {
+    let passwd: String = (0..65_000u32)
+        .map(|i| format!("u{i}:x:{}:{}::/:/x\n", 2000 + i, 2000 + i))
+        .collect();
+    let members: Vec<String> = (0..60_000u32).map(|i| format!("u{i}")).collect();
+    let group = format!("big:x:900:{}\n", members.join(","));
+    let id = identity_for_tests(&passwd, &group, Some(FILES), None, None, Place::BareHost).unwrap();
+    let t = std::time::Instant::now();
+    assert!(id.group_open(900, &|u| u == 0));
+    assert!(!id.group_open(900, &|u| u < 70_000));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        t.elapsed()
+    );
+}
