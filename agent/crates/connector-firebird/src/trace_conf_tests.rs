@@ -368,6 +368,20 @@ fn a_rotating_log_is_not_partial() {
     );
     assert_ne!(t, DEV_TRACE);
     assert!(eval(&t, Some(&empty_map()), &crm()).partial);
+    // Another enabled section writing the declared log (not Partial for
+    // proof 11 already): the rotation is named too (fail closed).
+    let other = format!(
+        "{DEV_TRACE}\ndatabase = /var/lib/firebird/data/other.fdb\n{{\n\tenabled = true\n\tlog_filename = {LOG}\n\tmax_log_size = 3\n}}\n"
+    );
+    let v = eval(&other, Some(&empty_map()), &crm());
+    assert!(!v.partial);
+    assert!(
+        v.detail
+            .iter()
+            .any(|d| d.contains("a trace section writing the declared log")),
+        "{:?}",
+        v.detail
+    );
 }
 
 /// R2 rule 4: every alias mapping to the database is evaluated; differing

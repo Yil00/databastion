@@ -1046,6 +1046,17 @@ pub(crate) fn evaluate(i: &Inputs<'_>) -> Verdict {
         }
         _ => false,
     };
+    // R54 for every other enabled section that writes the declared log
+    // (the default section, sections of undeclared databases: already not
+    // Partial for proof 11, the reason named too; fail closed).
+    let rotating = |s: &Settings| writes_here(s) && s.number("max_log_size").unwrap_or(0) != 0;
+    if rotating(&default_db) || named.iter().any(|(_, st)| rotating(&st.over(&default_db))) {
+        if !missing.contains(&"max_log_size") {
+            detail
+                .push("a trace section writing the declared log has max_log_size not 0".to_owned());
+        }
+        add(&mut missing, "max_log_size");
+    }
     // R54: the services section that writes the declared log rotates it
     // too.
     for s in &services {
